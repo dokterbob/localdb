@@ -1,0 +1,30 @@
+[package]
+name = "store-lancedb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "LanceDB implementation of the RetrievalStore trait"
+
+[dependencies]
+localdb-core = { path = "../core" }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# LanceDB embedded storage with tantivy BM25
+lancedb = { version = "0.23", default-features = false }
+# lance-index provides FullTextSearchQuery used by lancedb's query API
+lance-index = "1.0"
+
+# Arrow for schema/batch construction (match lancedb's dependency version)
+arrow-array = "56"
+arrow-schema = "56"
+arrow-cast = "56"
+futures = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tempfile = "3"
