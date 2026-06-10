@@ -51,6 +51,19 @@ blake3 = "1"
 # Async utilities
 futures = "0.3"
 
+# Platform paths
+directories = "6"
+dirs = "6"
+
+# Embedded runtime-state DB
+redb = "4"
+
+# Hashing for policy_version
+hex = "0.4"
+
+# Test utilities
+tempfile = "3"
+
 # Internal crates
 localdb-core = { path = "core" }
 extract = { path = "extract" }

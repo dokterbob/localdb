@@ -1,0 +1,10 @@
+version: 1
+
+stores:
+  - name: web
+    visibility: private
+    backend: lancedb
+    sources:
+      - kind: url
+        url: https://example.com/docs
+        refresh: not-a-duration

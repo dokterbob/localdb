@@ -4,6 +4,7 @@
 //! trait, the `Embedder` trait, and the shared error taxonomy live here.
 
 pub mod citation;
+pub mod config;
 pub mod error;
 pub mod ids;
 pub mod types;
