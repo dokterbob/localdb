@@ -46,23 +46,6 @@ pub struct StoreHandle {
     pub store: Box<dyn RetrievalStore>,
 }
 
-/// A fused search result prior to citation shaping.
-#[derive(Debug, Clone)]
-pub struct FusedResult {
-    /// Fused RRF score.
-    pub fused_score: f64,
-    /// Dense leg score (if this result appeared in the dense leg).
-    pub dense_score: Option<f64>,
-    /// BM25 leg score (if this result appeared in the BM25 leg).
-    pub bm25_score: Option<f64>,
-    /// The underlying chunk record.
-    pub chunk: ChunkRecord,
-    /// Which store this result came from.
-    pub store_id: String,
-    /// Store name for citation.
-    pub store_name: String,
-}
-
 /// Query request for the search orchestrator.
 #[derive(Debug, Clone)]
 pub struct QueryRequest {
@@ -121,8 +104,8 @@ pub struct FusedChunkEntry {
 ///
 /// # Algorithm
 ///
-/// For each result in each leg, add `1 / (k + rank)` to the chunk's fused score.
-/// Chunks appearing in only one leg still get a score.
+/// For each result in each leg at 0-indexed rank `r`, add `1 / (k + r + 1)` to the
+/// chunk's fused score. Chunks appearing in only one leg still get a score.
 pub fn rrf_fuse(
     dense_results: &[SearchResult],
     bm25_results: &[SearchResult],
@@ -673,9 +656,13 @@ mod tests {
     }
 
     /// Test many results in each leg with known rankings.
+    ///
+    /// dense input order: [chunk-4, chunk-3, chunk-2, chunk-1, chunk-0]
+    /// So chunk-4 is at rank 0 (score 1/61), chunk-3 at rank 1 (1/62), etc.
+    /// After RRF fusion the output order must match the input rank order.
     #[test]
     fn rrf_fuse_multiple_results_ordering() {
-        // 5 chunks, each only in dense leg, ordered by rank
+        // chunks 0..4 created in ascending ID order
         let chunks: Vec<ChunkRecord> = (0..5)
             .map(|i| {
                 make_chunk(
@@ -690,27 +677,39 @@ mod tests {
             })
             .collect();
 
+        // Provide chunks in reverse order so chunk-4 is at dense rank 0, chunk-0 at rank 4.
         let dense: Vec<SearchResult> = chunks
             .iter()
             .rev()
             .cloned()
-            .enumerate()
-            .map(|(rank, chunk)| {
-                let _ = rank;
-                SearchResult { chunk, score: 1.0 }
-            })
+            .map(|chunk| SearchResult { chunk, score: 1.0 })
             .collect();
 
-        // Verify ordering is preserved for single-leg case
         let fused = rrf_fuse(&dense, &[], 60.0);
         assert_eq!(fused.len(), 5);
-        // All should have strictly decreasing scores based on their rank in dense
+
+        // Fused scores must be strictly decreasing (each chunk is at a unique rank).
         for i in 0..fused.len() - 1 {
             assert!(
-                fused[i].fused_score >= fused[i + 1].fused_score,
-                "scores should be non-increasing"
+                fused[i].fused_score > fused[i + 1].fused_score,
+                "scores must be strictly decreasing: rank {} ({}) vs rank {} ({})",
+                i,
+                fused[i].fused_score,
+                i + 1,
+                fused[i + 1].fused_score,
             );
         }
+
+        // The chunk at rank 0 in the dense list (chunk-4) must be first in fused output.
+        assert_eq!(
+            fused[0].chunk.id, "4",
+            "chunk-4 (dense rank 0) should be first in fused output"
+        );
+        // The chunk at rank 4 in the dense list (chunk-0) must be last.
+        assert_eq!(
+            fused[4].chunk.id, "0",
+            "chunk-0 (dense rank 4) should be last in fused output"
+        );
     }
 
     // -----------------------------------------------------------------------
