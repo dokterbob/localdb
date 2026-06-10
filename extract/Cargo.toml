@@ -9,3 +9,12 @@ description = "Format detection and extraction to normalized document text and b
 [dependencies]
 localdb-core = { path = "../core" }
 thiserror = { workspace = true }
+
+# Markdown parsing
+pulldown-cmark = "0.13"
+
+# HTML parsing
+scraper = "0.27"
+
+# PDF text extraction
+pdf-extract = "0.10"
