@@ -361,7 +361,7 @@ async fn test_search_returns_canonical_citations() {
     // Since we seeded one chunk about Rust, and the query is about Rust, we should get a result.
     assert!(!citations.is_empty(), "should find at least one citation");
 
-    // Verify the canonical citation shape.
+    // Verify the canonical citation shape (specs/02-domain-model.md §6).
     let first = &citations[0];
     assert!(first.get("chunk_id").is_some(), "citation.chunk_id missing");
     assert!(
@@ -370,6 +370,15 @@ async fn test_search_returns_canonical_citations() {
     );
     assert!(first.get("store").is_some(), "citation.store missing");
     assert!(first.get("uri").is_some(), "citation.uri missing");
+    // title is optional but must be serialized (null or string).
+    assert!(
+        first.get("title").is_some() || first.get("title").map(|v| v.is_null()).unwrap_or(true),
+        "citation.title must be present (null or string)"
+    );
+    assert!(
+        first.get("heading_path").is_some(),
+        "citation.heading_path missing"
+    );
     assert!(first.get("span").is_some(), "citation.span missing");
     assert!(first.get("snippet").is_some(), "citation.snippet missing");
     assert!(first.get("score").is_some(), "citation.score missing");
@@ -378,9 +387,36 @@ async fn test_search_returns_canonical_citations() {
         "citation.provenance missing"
     );
 
-    // Score shape.
+    // Score shape: all three fields required per spec.
     let score = &first["score"];
     assert!(score.get("fused").is_some(), "score.fused missing");
+    // dense and bm25 may be null when only one leg fires, but the key must exist.
+    assert!(score.get("dense").is_some(), "score.dense missing");
+    assert!(score.get("bm25").is_some(), "score.bm25 missing");
+
+    // Store shape.
+    let store_obj = &first["store"];
+    assert!(store_obj.get("id").is_some(), "citation.store.id missing");
+    assert!(
+        store_obj.get("name").is_some(),
+        "citation.store.name missing"
+    );
+
+    // Span shape.
+    let span = &first["span"];
+    assert!(span.get("start").is_some(), "citation.span.start missing");
+    assert!(span.get("end").is_some(), "citation.span.end missing");
+
+    // Provenance shape.
+    let prov = &first["provenance"];
+    assert!(
+        prov.get("fetched_at").is_some(),
+        "citation.provenance.fetched_at missing"
+    );
+    assert!(
+        prov.get("content_hash").is_some(),
+        "citation.provenance.content_hash missing"
+    );
 }
 
 /// T10: search with unknown store name → store_not_found tool error

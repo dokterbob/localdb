@@ -49,7 +49,14 @@ pub enum Command {
     Serve,
 
     /// Run the MCP server on stdio for use with AI agents.
-    Mcp,
+    Mcp {
+        /// Enable write tools (reserved for future use; always rejected in v1).
+        ///
+        /// Parsing this flag now makes the CLI stable for callers even though
+        /// the server rejects all mutating operations in v1.
+        #[arg(long)]
+        allow_write: bool,
+    },
 
     /// Show stores, counts, policy staleness, and daemon state.
     Status,
@@ -138,8 +145,11 @@ fn run(cli: Cli) {
             eprintln!("serve: not yet implemented (T11)");
             std::process::exit(1);
         }
-        Command::Mcp => {
-            eprintln!("mcp: not yet implemented (T10)");
+        Command::Mcp { allow_write: _ } => {
+            // The mcp crate (T10) provides the full MCP server implementation.
+            // Binary wiring (config load + store init) requires T09 infrastructure.
+            // Daemon probe requires T11 unix socket; deferred to T11 integration.
+            eprintln!("mcp: binary wiring pending T09/T11 integration");
             std::process::exit(1);
         }
         Command::Status => {
