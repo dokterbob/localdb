@@ -1,0 +1,13 @@
+version: 1
+
+server:
+  bind: 127.0.0.1
+  port: 7700
+
+defaults:
+  indexing:
+    chunkng:
+      preset_overrides: {}
+    embedding:
+      model: pplx-embed-context-v1-0.6b
+      provider: local-onnx

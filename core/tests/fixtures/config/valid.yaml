@@ -1,0 +1,39 @@
+version: 1
+
+server:
+  bind: 127.0.0.1
+  port: 7700
+
+paths:
+  data: ~
+  models: ~
+  logs: ~
+
+defaults:
+  indexing:
+    chunking:
+      preset_overrides: {}
+    embedding:
+      model: pplx-embed-context-v1-0.6b
+      provider: local-onnx
+
+stores:
+  - name: notes
+    visibility: private
+    backend: lancedb
+    indexing: ~
+    sources:
+      - kind: path
+        root: ~/Documents/notes
+        include: ["**/*.md", "**/*.pdf"]
+        exclude: ["**/node_modules/**"]
+        preset: prose
+      - kind: url
+        url: https://example.com/handbook
+        refresh: 24h
+
+providers:
+  - name: my-ollama
+    kind: openai-compatible
+    base_url: http://localhost:11434/v1
+    api_key_env: OLLAMA_KEY
