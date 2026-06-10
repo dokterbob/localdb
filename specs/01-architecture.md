@@ -93,7 +93,27 @@ component must respect:
 3. **Per-store visibility** modeled as an enum, never a boolean bolted on later.
 4. **No assumption of a single store** anywhere in core, surfaces, or config.
 
-## 6. Development practices: TDD and coverage gates
+## 6. Runtime & concurrency
+
+**Decision:** async on **tokio** for all I/O and orchestration — but not literally everything.
+
+- **Async:** the daemon (HTTP API, file watching, schedulers, job queue), the `RetrievalStore`
+  and `Embedder` traits (their backends are inherently async: LanceDB's Rust API is async, hosted
+  providers are HTTP), URL fetching, and surface plumbing.
+- **Not async:** CPU-bound work — ONNX inference, extraction/parsing, chunking, blake3 hashing —
+  runs on a blocking/rayon pool via `spawn_blocking`-style handoff, never on the async executor.
+  Pure domain logic in `core` (ID derivation, fusion, policy hashing, config resolution) stays
+  sync and runtime-agnostic; only the orchestration around it is async.
+- **Embedded mode:** one-shot CLI/MCP commands spin up a tokio runtime per invocation; the cost
+  is negligible against model load and index I/O.
+
+**Rationale:** the daemon needs real concurrency (watchers + jobs + HTTP) regardless, and the
+storage/embedding dependencies are async-native — one execution model everywhere beats a sync
+core wrapped in adapter shims. **Rejected:** fully synchronous core with hand-rolled threads
+(fights LanceDB's async API, reinvents the daemon's scheduling); async-everything including CPU
+work (starves the executor during indexing).
+
+## 7. Development practices: TDD and coverage gates
 
 **Decision:** test-driven development is the **default mode** for all crates: write the failing
 test first, then the implementation. Coverage gates, enforced in CI (e.g. `cargo llvm-cov`):

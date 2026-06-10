@@ -5,7 +5,7 @@ to subagents. **DRY rule:** all design detail lives in the specs; a ticket is ex
 reading the ticket plus its `Spec:` references only. If a ticket seems to need design information
 not in a referenced spec section, that is a spec bug — fix the spec, don't improvise in code.
 
-**Process for every ticket (from [specs/01-architecture.md](specs/01-architecture.md) §6):**
+**Process for every ticket (from [specs/01-architecture.md](specs/01-architecture.md) §7):**
 TDD — failing test first. Coverage gates enforced per ticket: **≥80%** on critical functions,
 **≥90%** on anything that modifies data (store writes, deletes, jobs, config/state mutation).
 A ticket is not done below its gate.
@@ -35,7 +35,7 @@ T08 ← {T02,T05,T06}; T09 ← {T03,T07,T08}; T10 ← {T03,T08}; T11 ← {T03,T0
 CI running fmt, clippy (deny warnings), tests, and `cargo llvm-cov` with the coverage gates wired
 as a check.
 **Depends on:** —
-**Spec:** [01](specs/01-architecture.md) §1 (crate table, invariant), §6 (gates).
+**Spec:** [01](specs/01-architecture.md) §1 (crate table, invariant), §6 (runtime), §7 (gates).
 **Acceptance:** `cargo build --workspace` and `cargo test --workspace` pass; `localdb --help`
 lists the subcommands from [05](specs/05-surfaces.md) §2; CI fails a PR that drops below gates
 (demonstrate with a dummy function + test).

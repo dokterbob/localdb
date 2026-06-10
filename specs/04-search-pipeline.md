@@ -18,7 +18,7 @@ Pipeline: **acquire → extract → blocks → chunks → embed → index** (wri
   ones (new content-addressed IDs, [02-domain-model.md](02-domain-model.md) §3).
 - **Deletes:** file deleted / URL gone (404·410 after retry) / source removed → delete its
   documents and chunks from the backend. Deletes are data-modifying: ≥90% coverage gate
-  ([01-architecture.md](01-architecture.md) §6).
+  ([01-architecture.md](01-architecture.md) §7).
 
 ## 2. Extraction (v1 matrix)
 
