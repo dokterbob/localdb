@@ -7,12 +7,14 @@ pub mod citation;
 pub mod config;
 pub mod error;
 pub mod ids;
+pub mod store;
 pub mod types;
 
 /// Re-export key types at the crate root for convenience.
 pub use citation::Citation;
 pub use error::Error;
 pub use ids::{chunk_id, content_hash, document_id, new_ulid};
+pub use store::{ChunkRecord, FakeStore, MetadataFilter, RetrievalStore, SearchResult, StoreStats};
 pub use types::{
     validate_msg_meta_key, AclEntry, BackendConfig, Block, BlockKind, Chunk, ChunkingConfig,
     Document, EmbeddingConfig, FederationHop, IndexJob, IndexJobScope, IndexJobState,

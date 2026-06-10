@@ -50,6 +50,7 @@ blake3 = "1"
 
 # Async utilities
 futures = "0.3"
+async-trait = "0.1"
 
 # Platform paths
 directories = "6"

@@ -16,6 +16,7 @@ tracing = { workspace = true }
 ulid = { workspace = true }
 blake3 = { workspace = true }
 futures = { workspace = true }
+async-trait = { workspace = true }
 directories = { workspace = true }
 dirs = { workspace = true }
 redb = { workspace = true }
