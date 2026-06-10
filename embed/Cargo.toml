@@ -6,7 +6,40 @@ license.workspace = true
 rust-version.workspace = true
 description = "Embedder implementations: local ONNX, OpenAI-compatible, and contextualized providers"
 
+[features]
+default = []
+# Enable local ONNX inference via fastembed
+local-onnx = ["dep:fastembed"]
+# Enable all providers (for tests/CI)
+all-providers = ["local-onnx"]
+
 [dependencies]
 localdb-core = { path = "../core" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+async-trait = "0.1"
+
+# HTTP client for hosted providers
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+
+# Local ONNX inference (optional)
+# hf-hub-native-tls enables model downloading via HuggingFace Hub (includes hf-hub + native-tls)
+# ort-download-binaries-native-tls downloads the ONNX Runtime binary automatically
+fastembed = { version = "5", default-features = false, features = ["hf-hub-native-tls", "ort-download-binaries-native-tls"], optional = true }
+
+# For model cache path management
+dirs = "5"
+
+# SHA2 for checksum verification
+sha2 = "0.10"
+hex = "0.4"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# Mock HTTP server for testing hosted providers
+wiremock = "0.6"
+tempfile = "3"
