@@ -1,0 +1,11 @@
+[package]
+name = "extract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Format detection and extraction to normalized document text and blocks"
+
+[dependencies]
+localdb-core = { path = "../core" }
+thiserror = { workspace = true }
