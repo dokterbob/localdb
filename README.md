@@ -5,8 +5,63 @@ self-hosters: point it at your files and URLs and they become a hybrid-searchabl
 available everywhere you work — CLI, MCP agents, HTTP API, and (later) a web UI. Rust backend,
 embedded-first (no daemon required), local embeddings by default.
 
-**Status: specification phase.** No code yet; the name is a placeholder.
 **License:** [AGPL-3.0-or-later](LICENSE).
+
+## Install
+
+### Option 1 — Pre-built tarball (recommended)
+
+Download the tarball for your platform from the
+[latest release](https://github.com/localdb/localdb/releases/latest):
+
+| Platform | Download |
+|---|---|
+| macOS Apple Silicon | `localdb-<version>-aarch64-apple-darwin.tar.gz` |
+| Linux x86_64 | `localdb-<version>-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64 | `localdb-<version>-aarch64-unknown-linux-gnu.tar.gz` |
+
+```bash
+# Example: macOS Apple Silicon
+VERSION=0.1.0
+PLATFORM=aarch64-apple-darwin
+curl -L "https://github.com/localdb/localdb/releases/download/v${VERSION}/localdb-v${VERSION}-${PLATFORM}.tar.gz" \
+  | tar -xz -C /usr/local/bin --strip-components=1 localdb-v${VERSION}-${PLATFORM}/localdb
+localdb --version
+```
+
+### Option 2 — `cargo install` (from source)
+
+Requires a Rust toolchain (1.82 or later). Install via [rustup](https://rustup.rs/).
+
+```bash
+cargo install --git https://github.com/localdb/localdb localdb
+# Or, from a checked-out repo:
+cargo install --path localdb
+localdb --version
+```
+
+### Quick start
+
+```bash
+localdb init
+localdb store add my-docs
+localdb --store my-docs source add ~/Documents/notes
+localdb --store my-docs index
+localdb --store my-docs search "hybrid search embeddings"
+```
+
+> **Note:** The first `index` run downloads the default ONNX embedding model (~80 MB).
+> Disable downloads and use a hosted provider by setting `embedding.provider` in
+> `~/.config/localdb/config.yaml`.
+
+### Daemon mode (optional)
+
+```bash
+localdb serve   # starts the HTTP API + file watcher on localhost:7700
+```
+
+The daemon adds file watching, scheduled URL refresh, and the REST API.
+It is not required for CLI or MCP use.
 
 ## Documents
 
