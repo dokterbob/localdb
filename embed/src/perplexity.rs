@@ -448,6 +448,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn perplexity_embedder_timeout_returns_provider_unavailable() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/contextualizedembeddings"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(make_response(1, 768))
+                    .set_delay(std::time::Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+
+        let embedder = PerplexityEmbedder::new(
+            "test-key",
+            None,
+            Some(768),
+            RetryPolicy {
+                max_attempts: 1,
+                initial_backoff: std::time::Duration::from_millis(10),
+                request_timeout: std::time::Duration::from_millis(50),
+                batch_size: 32,
+            },
+        )
+        .with_base_url(server.uri());
+
+        let docs = vec![DocumentChunks {
+            document_context: "ctx".to_string(),
+            chunks: vec!["text".to_string()],
+        }];
+        let result = embedder.embed_documents(docs).await;
+        assert!(result.is_err(), "timed-out request should fail");
+        assert_eq!(
+            result.unwrap_err().code(),
+            "provider_unavailable",
+            "timeout should surface as provider_unavailable"
+        );
+    }
+
+    #[tokio::test]
     async fn perplexity_embedder_empty_docs() {
         let server = MockServer::start().await;
         let embedder = make_embedder(&server.uri());

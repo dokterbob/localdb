@@ -525,6 +525,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openai_embedder_timeout_returns_provider_unavailable() {
+        let server = MockServer::start().await;
+
+        // Respond with a delay longer than the client timeout
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(make_response(1, 64))
+                    .set_delay(std::time::Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+
+        let policy = RetryPolicy {
+            max_attempts: 1,
+            initial_backoff: std::time::Duration::from_millis(10),
+            // Very short timeout so the delayed response triggers a timeout
+            request_timeout: std::time::Duration::from_millis(50),
+            batch_size: 32,
+        };
+        let embedder = OpenAiEmbedder::new(server.uri(), None, "test-model", 64, None, policy);
+
+        let docs = vec![DocumentChunks {
+            document_context: "ctx".to_string(),
+            chunks: vec!["text".to_string()],
+        }];
+        let result = embedder.embed_documents(docs).await;
+        assert!(result.is_err(), "timed-out request should fail");
+        assert_eq!(
+            result.unwrap_err().code(),
+            "provider_unavailable",
+            "timeout should surface as provider_unavailable"
+        );
+    }
+
+    #[tokio::test]
     async fn openai_embedder_batches_chunks() {
         let server = MockServer::start().await;
 
