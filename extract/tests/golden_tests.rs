@@ -303,40 +303,37 @@ fn html_fixture_all_spans_valid() {
 // PDF tests: unsupported_format for scanned/empty PDFs
 // ---------------------------------------------------------------------------
 
+/// Golden test: the in-repo scanned PDF fixture must yield `unsupported_format`.
+///
+/// Acceptance criterion (PLAN.md T04): "a scanned-PDF fixture yields
+/// `unsupported_format`, not garbage text."  The fixture is a valid PDF with an
+/// empty content stream — no text operators at all.
 #[test]
-fn minimal_empty_pdf_returns_unsupported_or_empty() {
-    // A minimal PDF with an empty content stream — simulates a "scanned" PDF
-    let scanned_bytes: &[u8] = b"%PDF-1.4\n\
-        1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
-        2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n\
-        3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\nendobj\n\
-        4 0 obj\n<< /Length 2 >>\nstream\n  \nendstream\nendobj\n\
-        xref\n0 5\n\
-        0000000000 65535 f \n\
-        0000000009 00000 n \n\
-        0000000058 00000 n \n\
-        0000000115 00000 n \n\
-        0000000215 00000 n \n\
-        trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n270\n%%EOF\n";
+fn scanned_pdf_fixture_returns_unsupported_format() {
+    let bytes = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/scanned.pdf"
+    ))
+    .expect("scanned.pdf fixture not found");
 
-    let result = extract(scanned_bytes, Some("scanned.pdf"));
-    match &result {
+    let result = extract(&bytes, Some("scanned.pdf"));
+    match result {
         Err(Error::UnsupportedFormat { .. }) => {
-            // ✓ Expected: scanned PDF correctly returns UnsupportedFormat
-            let err = result.unwrap_err();
-            assert_eq!(err.code(), "unsupported_format");
+            // Expected: scanned PDF correctly returns UnsupportedFormat
         }
         Ok(out) => {
-            // If extraction "succeeds" but returns no blocks, that's also acceptable
-            // as the content is essentially empty
-            assert!(
-                out.blocks.is_empty() || out.text.trim().is_empty(),
-                "Scanned PDF should produce no meaningful content, got {} blocks",
-                out.blocks.len()
+            panic!(
+                "Expected UnsupportedFormat for scanned PDF fixture, \
+                 but extraction succeeded with {} blocks and text {:?}",
+                out.blocks.len(),
+                out.text
             );
         }
         Err(other) => {
-            panic!("Unexpected error for scanned PDF: {:?}", other);
+            panic!(
+                "Expected UnsupportedFormat for scanned PDF fixture, got {:?}",
+                other
+            );
         }
     }
 }

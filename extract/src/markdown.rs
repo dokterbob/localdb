@@ -17,7 +17,11 @@ use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 pub fn extract_markdown(input: &str) -> Result<ExtractionOutput, Error> {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
-    options.insert(Options::ENABLE_TABLES);
+    // Note: ENABLE_TABLES is intentionally omitted — table events are not yet
+    // handled by the state machine (tables fall through to the idle default and
+    // their content is silently dropped).  Disabling the extension keeps the
+    // parser in CommonMark mode for tables so they are emitted as paragraphs
+    // rather than structured but discarded table events.
 
     let parser = Parser::new_ext(input, options);
 
