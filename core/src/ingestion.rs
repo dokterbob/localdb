@@ -167,8 +167,14 @@ pub struct IngestionResult {
 
 /// Check if the store's existing data is stale relative to the current policy.
 ///
-/// Returns `true` if any existing chunk in the store was indexed with a
-/// different policy version. Callers should trigger a full reindex when this is true.
+/// Returns `true` if the sampled chunk was indexed with a different policy version.
+/// Callers should trigger a full reindex when this is true.
+///
+/// # Note
+/// This samples one chunk from the store as a representative. In a consistent
+/// store all chunks share the same policy version (reindex is atomic per document),
+/// so a single sample is sufficient in practice. If partial-reindex bugs occur,
+/// this check may give a false negative; a full scan is not performed for performance.
 pub async fn is_store_stale(
     store: &dyn RetrievalStore,
     current_policy_version: &str,
@@ -1583,6 +1589,23 @@ mod tests {
             out2.was_indexed,
             "policy change should trigger re-indexing even if content unchanged"
         );
+        assert!(out2.chunks_written > 0, "new chunks should be written");
+
+        // Because content hash is unchanged, doc_id is the same as before.
+        // The old chunks (policy-v1) are deleted and new chunks (policy-v2) are
+        // inserted under the same document_id.
+        // Verify all chunks for this document now carry the new policy version.
+        let chunks_after = store
+            .get_chunks_for_document(&out2.record.document_id)
+            .await
+            .unwrap();
+        assert!(!chunks_after.is_empty(), "new chunks should exist");
+        for chunk in &chunks_after {
+            assert_eq!(
+                chunk.policy_version, "policy-v2",
+                "all chunks must carry the updated policy version after reindex"
+            );
+        }
     }
 
     // ---------------------------------------------------------------------------
@@ -2009,6 +2032,151 @@ mod tests {
         // Check with different policy — stale
         let stale = is_store_stale(&store, "policy-v2").await.unwrap();
         assert!(stale, "store should be stale when policy changed");
+    }
+
+    // End-to-end: policy change → is_store_stale → reindex → all chunks have new policy version
+    #[tokio::test]
+    async fn policy_change_end_to_end_reindex_rewrites_all_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), b"Document A content.").unwrap();
+        std::fs::write(dir.path().join("b.md"), b"Document B content.").unwrap();
+
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let extractor = FakeExtractor;
+        let store_id = "store-1";
+        let source = make_path_source(store_id, dir.path().to_str().unwrap(), vec![]);
+
+        // Index with policy v1
+        let config_v1 = make_ingestion_config(store_id);
+        let mut doc_index = DocumentIndex::new();
+        let result1 = run_ingestion_for_source(
+            &source,
+            &mut doc_index,
+            &store,
+            &embedder,
+            &config_v1,
+            &extractor,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result1.docs_indexed, 2);
+
+        // Verify not stale with same policy
+        let not_stale = is_store_stale(&store, &config_v1.policy_version)
+            .await
+            .unwrap();
+        assert!(!not_stale, "store should not be stale with same policy");
+
+        // Verify stale with new policy
+        let config_v2 = IngestionConfig {
+            store_id: store_id.to_string(),
+            policy_version: "policy-v2".to_string(),
+            chunker: ChunkerConfig::code(),
+        };
+        let stale = is_store_stale(&store, &config_v2.policy_version)
+            .await
+            .unwrap();
+        assert!(stale, "store should be stale after policy change");
+
+        // Reindex with new policy
+        let result2 = run_ingestion_for_source(
+            &source,
+            &mut doc_index,
+            &store,
+            &embedder,
+            &config_v2,
+            &extractor,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result2.docs_indexed, 2,
+            "all docs should be re-indexed after policy change"
+        );
+
+        // After reindex, store should no longer be stale
+        let still_stale = is_store_stale(&store, &config_v2.policy_version)
+            .await
+            .unwrap();
+        assert!(!still_stale, "store should not be stale after reindex");
+
+        // All chunks in the store must carry the new policy version.
+        // Use dense_search with an empty query vector — FakeStore returns all chunks
+        // matching the filter regardless of similarity score.
+        let all_chunks_v2 = {
+            use crate::store::MetadataFilter;
+            store
+                .dense_search(
+                    &[],
+                    1000,
+                    &[MetadataFilter::PolicyVersion("policy-v2".to_string())],
+                )
+                .await
+                .unwrap()
+        };
+        // At least some chunks exist with the new policy version
+        assert!(
+            !all_chunks_v2.is_empty(),
+            "there must be chunks with new policy version"
+        );
+        for sr in &all_chunks_v2 {
+            assert_eq!(
+                sr.chunk.policy_version, "policy-v2",
+                "all chunks after reindex must carry policy-v2"
+            );
+        }
+        // No chunks should remain with the old policy version
+        let old_chunks = {
+            use crate::store::MetadataFilter;
+            store
+                .dense_search(
+                    &[],
+                    1000,
+                    &[MetadataFilter::PolicyVersion("policy-v1".to_string())],
+                )
+                .await
+                .unwrap()
+        };
+        assert!(
+            old_chunks.is_empty(),
+            "no chunks with policy-v1 should remain after reindex"
+        );
+    }
+
+    // Test: run_ingestion_for_source with URL source but no fetcher returns an error
+    #[tokio::test]
+    async fn run_ingestion_url_source_missing_fetcher_errors() {
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let extractor = FakeExtractor;
+        let store_id = "store-1";
+        let url = "https://example.com/page";
+        let source = make_url_source(store_id, url);
+        let config = make_ingestion_config(store_id);
+        let mut doc_index = DocumentIndex::new();
+
+        let result = run_ingestion_for_source(
+            &source,
+            &mut doc_index,
+            &store,
+            &embedder,
+            &config,
+            &extractor,
+            None, // no fetcher provided
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "URL source without fetcher should return an error"
+        );
+        assert!(
+            matches!(result.unwrap_err(), Error::Internal { .. }),
+            "error should be Internal"
+        );
     }
 
     // ---------------------------------------------------------------------------
