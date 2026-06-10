@@ -1,0 +1,12 @@
+[package]
+name = "store-lancedb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "LanceDB implementation of the RetrievalStore trait"
+
+[dependencies]
+localdb-core = { path = "../core" }
+thiserror = { workspace = true }
+tokio = { workspace = true }

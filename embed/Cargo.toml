@@ -1,0 +1,12 @@
+[package]
+name = "embed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Embedder implementations: local ONNX, OpenAI-compatible, and contextualized providers"
+
+[dependencies]
+localdb-core = { path = "../core" }
+thiserror = { workspace = true }
+tokio = { workspace = true }

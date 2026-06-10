@@ -1,0 +1,68 @@
+[workspace]
+members = [
+    "core",
+    "extract",
+    "store-lancedb",
+    "embed",
+    "server",
+    "mcp",
+    "cli",
+    "localdb",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.82"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Web framework
+axum = { version = "0.8", features = ["json"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive", "color", "env"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# ID generation
+ulid = { version = "1", features = ["serde"] }
+
+# Hashing
+blake3 = "1"
+
+# Async utilities
+futures = "0.3"
+
+# Internal crates
+localdb-core = { path = "core" }
+extract = { path = "extract" }
+store-lancedb = { path = "store-lancedb" }
+embed = { path = "embed" }
+server = { path = "server" }
+mcp = { path = "mcp" }
+cli = { path = "cli" }
+
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+opt-level = 3
+lto = "thin"
