@@ -77,6 +77,11 @@ pub struct ChunkRecord {
     pub title: Option<String>,
 
     /// Open key-value metadata (string → string for indexable fields).
+    ///
+    /// **Note:** The LanceDB backend does not currently persist this field.
+    /// Values stored here survive in-memory round-trips (FakeStore) but are
+    /// silently discarded on LanceDB serialization/deserialization.  T07/T08
+    /// should not populate `meta` until a schema migration adds the column.
     #[serde(default)]
     pub meta: HashMap<String, String>,
 }
@@ -189,7 +194,9 @@ pub trait RetrievalStore: Send + Sync + 'static {
     /// Upsert a batch of chunk records.
     ///
     /// If a record with the same `id` already exists, it is replaced.
-    /// Returns the number of records upserted.
+    /// Returns the number of records written (implementations may return the total
+    /// count passed in, or only net-new records — callers must not depend on the
+    /// exact value for replaced records).
     async fn upsert_chunks(&self, records: Vec<ChunkRecord>) -> Result<usize, Error>;
 
     /// Delete all chunks belonging to a given document.
@@ -801,16 +808,19 @@ pub mod conformance {
         assert_eq!(results.len(), 2, "BM25 limit should be respected");
     }
 
-    /// Run the complete conformance suite against a fresh store instance.
+    /// Run a subset of the conformance suite that does not require a pre-built FTS index.
     ///
     /// The store must be freshly created (empty) when this is called.
-    /// Each test gets a fresh store, so callers should call this once per store.
+    /// Tests that require an FTS index (BM25 search) must be called separately after
+    /// `create_fts_index()` (LanceDB) or can run directly on FakeStore.
     ///
-    /// Usage: in an async test, create a store, then call `run_all(store).await`.
-    pub async fn run_all(store: &dyn RetrievalStore) {
-        // We cannot run all in one store since they'd interfere; this function
-        // is a convenience runner for backends that can create fresh stores easily.
-        // For more granular control, call each test function directly.
+    /// Note: because each conformance function leaves data in the store, this helper
+    /// is only useful for backends that can provide a fresh store per call.  For
+    /// fine-grained control call each `test_*` function directly (as the per-backend
+    /// test modules do).
+    ///
+    /// Usage: in an async test, create a store, then call `run_non_fts(store).await`.
+    pub async fn run_non_fts(store: &dyn RetrievalStore) {
         test_upsert_and_stats(store).await;
     }
 }

@@ -1017,6 +1017,120 @@ mod tests {
         assert_eq!(results[0].chunk.id, "chunk-1");
     }
 
+    // --- Spec-required metadata filter tests (mime, uri prefix, fetched_at range) ---
+
+    #[tokio::test]
+    async fn lancedb_filter_by_mime() {
+        let (store, _dir) = fresh_store().await;
+
+        let mut r1 = make_record(
+            "chunk-1",
+            "doc-1",
+            "store-1",
+            "markdown content",
+            vec![1.0, 0.0, 0.0, 0.0],
+        );
+        r1.mime = Some("text/markdown".to_string());
+        let mut r2 = make_record(
+            "chunk-2",
+            "doc-2",
+            "store-1",
+            "html content",
+            vec![0.5, 0.5, 0.0, 0.0],
+        );
+        r2.mime = Some("text/html".to_string());
+
+        store.upsert_chunks(vec![r1, r2]).await.unwrap();
+
+        let filter = vec![MetadataFilter::Mime("text/markdown".to_string())];
+        let results = store
+            .dense_search(&[1.0, 0.0, 0.0, 0.0], 10, &filter)
+            .await
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "mime filter should return only markdown chunk"
+        );
+        assert_eq!(results[0].chunk.id, "chunk-1");
+    }
+
+    #[tokio::test]
+    async fn lancedb_filter_by_uri_prefix() {
+        let (store, _dir) = fresh_store().await;
+
+        let mut r1 = make_record(
+            "chunk-1",
+            "doc-1",
+            "store-1",
+            "notes file",
+            vec![1.0, 0.0, 0.0, 0.0],
+        );
+        r1.uri = "file:///home/user/notes/foo.md".to_string();
+        let mut r2 = make_record(
+            "chunk-2",
+            "doc-2",
+            "store-1",
+            "docs file",
+            vec![0.5, 0.5, 0.0, 0.0],
+        );
+        r2.uri = "file:///home/user/docs/bar.md".to_string();
+
+        store.upsert_chunks(vec![r1, r2]).await.unwrap();
+
+        let filter = vec![MetadataFilter::UriPrefix(
+            "file:///home/user/notes/".to_string(),
+        )];
+        let results = store
+            .dense_search(&[1.0, 0.0, 0.0, 0.0], 10, &filter)
+            .await
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "uri prefix filter should return only notes chunk"
+        );
+        assert_eq!(results[0].chunk.id, "chunk-1");
+    }
+
+    #[tokio::test]
+    async fn lancedb_filter_fetched_after() {
+        let (store, _dir) = fresh_store().await;
+
+        let mut r1 = make_record(
+            "old-chunk",
+            "doc-1",
+            "store-1",
+            "old content",
+            vec![1.0, 0.0, 0.0, 0.0],
+        );
+        r1.fetched_at = "2026-01-01T00:00:00Z".to_string();
+        let mut r2 = make_record(
+            "new-chunk",
+            "doc-2",
+            "store-1",
+            "new content",
+            vec![0.5, 0.5, 0.0, 0.0],
+        );
+        r2.fetched_at = "2026-06-10T00:00:00Z".to_string();
+
+        store.upsert_chunks(vec![r1, r2]).await.unwrap();
+
+        let filter = vec![MetadataFilter::FetchedAfter(
+            "2026-03-01T00:00:00Z".to_string(),
+        )];
+        let results = store
+            .dense_search(&[1.0, 0.0, 0.0, 0.0], 10, &filter)
+            .await
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "fetched_after filter should return only the newer chunk"
+        );
+        assert_eq!(results[0].chunk.id, "new-chunk");
+    }
+
     // --- Schema and helper tests ---
 
     #[test]
