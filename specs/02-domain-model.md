@@ -139,4 +139,4 @@ Surface mappings — defined here once, referenced by [05-surfaces.md](05-surfac
 prose-only text, so agents can cite mechanically.
 
 The `span` refers to the **normalized extracted text**, not raw bytes of the original file;
-original-file line mapping is a roadmap item ([06-roadmap.md](06-roadmap.md) §6).
+original-file line mapping is a roadmap item ([06-roadmap.md](06-roadmap.md) §5).

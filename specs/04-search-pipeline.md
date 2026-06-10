@@ -33,9 +33,9 @@ document (text + Blocks with heading paths and spans, [02-domain-model.md](02-do
 | PDF (text layer) | Rust PDF text extraction | Page numbers recorded in block metadata for citations. |
 
 **Out of scope for v1 (explicit):** OCR, scanned PDFs, DOCX/PPTX/XLSX, images. Rationale: no
-single mature Rust extraction stack covers these well (scope doc §2); shipping a sharp matrix
+single mature Rust extraction stack covers these well; shipping a sharp matrix
 beats shipping a ragged one. Unsupported files are skipped and counted in IndexJob stats, not
-errors. Roadmap: [06-roadmap.md](06-roadmap.md) §6.
+errors. Roadmap: [06-roadmap.md](06-roadmap.md) §5.
 
 ## 3. Chunking
 
@@ -104,7 +104,7 @@ embedded: on next `localdb index`, with a warning from `status`). Chunker and em
 the `RetrievalStore` trait: query both legs (top-K each, default K = 50), fuse, then shape
 results.
 
-**Rationale:** hybrid-by-default is a day-one requirement (scope doc); RRF is robust, parameter-light,
+**Rationale:** hybrid-by-default is a day-one requirement; RRF is robust, parameter-light,
 and score-scale-free. The LanceDB Rust API does not reliably provide server-side hybrid fusion
 (trails the Python API), and owning fusion keeps it identical across future backends.
 **Rejected:** score interpolation (needs per-model calibration); backend-native fusion (backend-dependent
@@ -115,7 +115,7 @@ behavior).
   backend where supported.
 - **Result shaping:** top-N (default 10) → Citation objects ([02-domain-model.md](02-domain-model.md) §6),
   with per-leg scores retained for debugging (`score: {fused, dense, bm25}`).
-- **Reranking: explicitly post-MVP** ([06-roadmap.md](06-roadmap.md) §6). The pipeline leaves a
+- **Reranking: explicitly post-MVP** ([06-roadmap.md](06-roadmap.md) §5). The pipeline leaves a
   seam (rerank stage between fuse and shape) but ships nothing.
 - Query rewriting and answer generation are **not** backend-core concerns — they belong to
   downstream consumers (agents, future UI). URL/image as *query* modes: out of scope v1.

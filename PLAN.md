@@ -97,8 +97,8 @@ metadata filters honored. ≥90% on upsert/delete paths; ≥80% elsewhere.
 **Scope:** document-aware `Embedder` trait in `core` (nested chunks-per-document); `embed` crate:
 local ONNX implementation (contextualized default model + bge-small-class fallback), model
 download/cache with checksum + resume, OpenAI-compatible flat provider, Perplexity/Voyage
-contextualized providers; timeout/retry/batching policy for hosted providers (design freedom
-within [06-roadmap](specs/06-roadmap.md) Appendix A §4).
+contextualized providers; timeout/retry/batching policy for hosted providers (not spec-constrained:
+pick sensible defaults and document them in the crate).
 **Depends on:** T02
 **Spec:** [04](specs/04-search-pipeline.md) §4; [03](specs/03-config.md) §1 (provider config), §6
 (secrets via env).
@@ -186,11 +186,11 @@ write paths ≥90%; handlers ≥80%.
 path verified; versioned `--version`; README install instructions; smoke script: install → init →
 index fixture → search on a clean machine/container.
 **Depends on:** T09, T11
-**Spec:** [06](specs/06-roadmap.md) §5.
+**Spec:** [06](specs/06-roadmap.md) §4.
 **Acceptance:** CI release job produces all three artifacts from a tag; smoke script passes in a
 clean Linux container; binary has no dynamic deps beyond platform baseline (check with
 otool/ldd). Coverage gates N/A (no product code); smoke script is the test.
-**Agent notes:** Homebrew/launchd/systemd are Phase ≥2 ([06](specs/06-roadmap.md) §5) — do not add.
+**Agent notes:** Homebrew/launchd/systemd are Phase ≥2 ([06](specs/06-roadmap.md) §4) — do not add.
 
 ---
 

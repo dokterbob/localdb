@@ -25,26 +25,23 @@ things to version and install instead of one).
 | `localdb` (bin) | Single binary with subcommands: `serve`, `mcp`, `init`, `index`, `search`, `status`, `store`, `source`. See [05-surfaces.md](05-surfaces.md). |
 
 **Invariant:** all surfaces (CLI, HTTP, MCP) sit on the same `core`; no retrieval, indexing, or
-domain logic is implemented in a surface crate. (Honors `rust_backend_scope.md` §1 and product
-principle 5.)
+domain logic is implemented in a surface crate — one shared core beats duplicated logic.
 
-## 2. Deviations from `rust_backend_scope.md`
+## 2. Surface ordering & storage default
 
-Two earlier decisions are explicitly revised:
-
-1. **Web UI first → CLI + MCP first.** The scope doc made the web UI the first management surface.
-   Revised: CLI and MCP ship first; web UI follows in a second iteration. Rationale: the primary
-   early users are technical/agent users (positioning doc, users 1–2); CLI+MCP exercise the entire
-   core without any frontend build, and the embedded-first process model (§3) makes them usable
-   with zero daemon setup.
-2. **Qdrant on-disk default → LanceDB embedded default, behind a trait.** The scope doc chose
-   on-disk Qdrant as the default store. Research finding: Qdrant has **no embedded mode** — it is
-   server-only; "on-disk Qdrant" would force a daemon-always model. Revised: storage goes behind
-   the `RetrievalStore` trait in `core`; the default implementation is **LanceDB embedded**
+1. **CLI + MCP ship first; web UI follows in a second iteration.** Rationale: the primary early
+   users are technical and agent users; CLI+MCP exercise the entire core without any frontend
+   build, and the embedded-first process model (§3) makes them usable with zero daemon setup.
+   **Rejected:** web-UI-first — front-loads a frontend build and a daemon before the core has
+   proven users.
+2. **LanceDB embedded is the local default, behind a trait.** Storage goes behind the
+   `RetrievalStore` trait in `core`; the default implementation is **LanceDB embedded**
    (in-process, Apache 2.0, tantivy BM25 + dense vectors). Qdrant server becomes the remote-mode
    adapter on the roadmap; **Qdrant Edge** (in-process, pre-GA ~0.6.x as of early 2026) is a
-   watch-item ([06-roadmap.md](06-roadmap.md) §4). Known cost: the LanceDB Rust API trails Python,
+   watch-item ([06-roadmap.md](06-roadmap.md) §3). Known cost: the LanceDB Rust API trails Python,
    so hybrid fusion (RRF) is done in our code, not delegated ([04-search-pipeline.md](04-search-pipeline.md) §5).
+   **Rejected:** Qdrant as local default — Qdrant has no embedded mode (server-only), which would
+   force a daemon-always model and contradict §3.
 
 ## 3. Process model: embedded-first, daemon-optional
 
@@ -65,8 +62,7 @@ optional; when one is running, CLI and MCP become thin clients of its HTTP API.
   (`localdb index` = scan now; no watching).
 
 **Rationale:** `localdb search foo` must work seconds after install with nothing running — this is
-the local-first promise. **Rejected:** daemon-always (implicit in the scope doc) — heavier
-install, worse first-run; pure-embedded with no daemon — loses watching, refresh, and the web
+the local-first promise. **Rejected:** daemon-always — heavier install, worse first-run; pure-embedded with no daemon — loses watching, refresh, and the web
 surface for home-server mode.
 
 ## 4. Stores vs. backends

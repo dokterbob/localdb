@@ -2,7 +2,7 @@
 
 > Status: direction, not commitment. Nothing in this document is MVP scope. It exists so that
 > near-term architecture decisions can be judged against the long-horizon goal. The MVP carries
-> only the *hooks* listed at the end. Companion to [product_positioning.md](product_positioning.md).
+> only the *hooks* listed at the end.
 
 ## The arc
 

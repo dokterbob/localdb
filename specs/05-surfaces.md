@@ -39,14 +39,14 @@ later if a consumer demands it).
   assumption: anything on this machine that can reach localhost is trusted, same boundary as the
   files themselves. Binding to a non-loopback address without auth configured is a **refused
   startup**, not a warning (forward-compatible with the shared/home-server mode in
-  [06-roadmap.md](06-roadmap.md) §2, which arrives together with real auth).
+  [06-roadmap.md](06-roadmap.md) §1, which arrives together with real auth).
 - **Resources** (`/v1`): `GET/POST /stores`, `GET/PATCH/DELETE /stores/{id}`,
   `GET/POST /stores/{id}/sources`, `POST /search` (body: query, store filter, metadata filters,
   limit), `GET /documents/{id}`, `POST /jobs` (index requests), `GET /jobs/{id}`, `GET /status`,
   `GET /config` (resolved, with ownership annotations; YAML-owned objects are read-only —
   `config_readonly` on write).
 - **Long-running work:** indexing is a **job resource**: `POST /jobs` → `202` + job; clients poll
-  `GET /jobs/{id}`. SSE progress streaming is roadmap ([06-roadmap.md](06-roadmap.md) §6) — the
+  `GET /jobs/{id}`. SSE progress streaming is roadmap ([06-roadmap.md](06-roadmap.md) §5) — the
   job resource is designed so SSE adds a representation, not a new model.
 - **Pagination:** cursor-based (`?cursor=`, `?limit=`) on list endpoints from day one.
 

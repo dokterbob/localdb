@@ -113,4 +113,4 @@ path; `paths.*` in config override the rest.
 
 Never inline in YAML. Provider credentials are referenced by environment variable name
 (`api_key_env`) in MVP; OS keychain integration is a roadmap item
-([06-roadmap.md](06-roadmap.md) §6).
+([06-roadmap.md](06-roadmap.md) §5).
