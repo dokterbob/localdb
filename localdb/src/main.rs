@@ -6,6 +6,7 @@
 //! See specs/05-surfaces.md §2 for the full subcommand table.
 
 use clap::{Parser, Subcommand};
+use cli::CliContext;
 
 /// localdb — local-first knowledge server with hybrid search.
 ///
@@ -125,69 +126,30 @@ fn main() {
         .init();
 
     let cli = Cli::parse();
-    run(cli);
-}
 
-fn run(cli: Cli) {
+    let ctx = CliContext {
+        config: cli.config,
+        json: cli.json,
+        stores: cli.stores,
+    };
+
     match &cli.command {
-        Command::Init => {
-            eprintln!("init: not yet implemented (T09)");
-            std::process::exit(1);
-        }
-        Command::Serve => {
-            eprintln!("serve: not yet implemented (T11)");
-            std::process::exit(1);
-        }
-        Command::Mcp => {
-            eprintln!("mcp: not yet implemented (T10)");
-            std::process::exit(1);
-        }
-        Command::Status => {
-            eprintln!("status: not yet implemented (T09)");
-            std::process::exit(1);
-        }
+        Command::Init => cli::run_init(&ctx),
+        Command::Serve => cli::run_serve(&ctx),
+        Command::Mcp => cli::run_mcp(&ctx),
+        Command::Status => cli::run_status(&ctx),
         Command::Store(cmd) => match cmd {
-            StoreCommand::Add { name } => {
-                eprintln!("store add {name}: not yet implemented (T09)");
-                std::process::exit(1);
-            }
-            StoreCommand::List => {
-                eprintln!("store list: not yet implemented (T09)");
-                std::process::exit(1);
-            }
-            StoreCommand::Remove { name } => {
-                eprintln!("store remove {name}: not yet implemented (T09)");
-                std::process::exit(1);
-            }
+            StoreCommand::Add { name } => cli::run_store_add(&ctx, name),
+            StoreCommand::List => cli::run_store_list(&ctx),
+            StoreCommand::Remove { name } => cli::run_store_remove(&ctx, name),
         },
         Command::Source(cmd) => match cmd {
-            SourceCommand::Add { source } => {
-                eprintln!("source add {source}: not yet implemented (T09)");
-                std::process::exit(1);
-            }
-            SourceCommand::List => {
-                eprintln!("source list: not yet implemented (T09)");
-                std::process::exit(1);
-            }
-            SourceCommand::Remove { id } => {
-                eprintln!("source remove {id}: not yet implemented (T09)");
-                std::process::exit(1);
-            }
+            SourceCommand::Add { source } => cli::run_source_add(&ctx, source),
+            SourceCommand::List => cli::run_source_list(&ctx),
+            SourceCommand::Remove { id } => cli::run_source_remove(&ctx, id),
         },
-        Command::Index { source } => {
-            eprintln!(
-                "index{}: not yet implemented (T09)",
-                source
-                    .as_deref()
-                    .map(|s| format!(" --source {s}"))
-                    .unwrap_or_default()
-            );
-            std::process::exit(1);
-        }
-        Command::Search { query, limit } => {
-            eprintln!("search {query:?} --limit {limit}: not yet implemented (T09)");
-            std::process::exit(1);
-        }
+        Command::Index { source } => cli::run_index(&ctx, source.as_deref()),
+        Command::Search { query, limit } => cli::run_search(&ctx, query, *limit),
     }
 }
 
@@ -209,7 +171,6 @@ mod tests {
         let cmd = Cli::command();
         let subcommand_names: Vec<&str> = cmd.get_subcommands().map(|sc| sc.get_name()).collect();
 
-        // All subcommands from specs/05-surfaces.md §2 must be present.
         for expected in &[
             "init", "serve", "mcp", "status", "store", "source", "index", "search",
         ] {
