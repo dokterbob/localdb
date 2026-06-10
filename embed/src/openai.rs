@@ -258,10 +258,7 @@ impl Embedder for OpenAiEmbedder {
         // Embed in batches
         let mut all_embeddings: Vec<Vec<f32>> = Vec::with_capacity(all_chunks.len());
         for batch in all_chunks.chunks(self.retry.batch_size) {
-            let vecs = self
-                .embed_batch(batch)
-                .await
-                .map_err(CoreError::from)?;
+            let vecs = self.embed_batch(batch).await.map_err(CoreError::from)?;
             all_embeddings.extend(vecs);
         }
 
