@@ -10,6 +10,7 @@ pub mod embedder;
 pub mod error;
 pub mod ids;
 pub mod ingestion;
+pub mod search;
 pub mod store;
 pub mod types;
 
@@ -24,6 +25,10 @@ pub use ingestion::{
     is_store_stale, run_ingestion_for_source, start_index_job, DocumentExtractor, DocumentIndex,
     DocumentInput, DocumentRecord, ExtractionResult, FetchMetadata, FetchResult, FoundFile,
     IngestionConfig, IngestionResult, UrlFetcher,
+};
+pub use search::{
+    rerank_noop, rrf_fuse, rrf_score, shape_citation, FusedChunkEntry, QueryRequest, QueryResponse,
+    SearchOrchestrator, StoreHandle,
 };
 pub use store::{ChunkRecord, FakeStore, MetadataFilter, RetrievalStore, SearchResult, StoreStats};
 pub use types::{
