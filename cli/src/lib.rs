@@ -17,7 +17,6 @@
 //! - 4 conflict/locked
 //! - 5 unavailable (daemon/provider/model)
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use localdb_core::{
@@ -61,14 +60,32 @@ pub enum DaemonState {
 
 /// Probe the daemon socket for a given data directory.
 ///
-/// Returns `DaemonState::Running` if the socket file is present (MVP check),
-/// otherwise `DaemonState::NotRunning`.
+/// Returns `DaemonState::Running` if the socket file is present (MVP check).
+/// The base_url is resolved in priority order:
+///   1. `LOCALDB_DAEMON_URL` environment variable (for testing and overrides)
+///   2. Content of `daemon.sock` file (if it contains a URL)
+///   3. Default `http://127.0.0.1:7700`
+///
+/// Returns `DaemonState::NotRunning` if neither the env var is set nor the
+/// socket file exists.
 pub fn probe_daemon(data_dir: &Path) -> DaemonState {
+    // Allow tests (and users) to override the daemon URL via env var.
+    if let Ok(url) = std::env::var("LOCALDB_DAEMON_URL") {
+        if !url.is_empty() {
+            return DaemonState::Running { base_url: url };
+        }
+    }
+
     let socket_path = data_dir.join("daemon.sock");
     if socket_path.exists() {
-        DaemonState::Running {
-            base_url: "http://127.0.0.1:7700".to_string(),
-        }
+        // Read the sock file content — if it looks like a URL, use it as base_url.
+        let base_url = std::fs::read_to_string(&socket_path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| s.starts_with("http://") || s.starts_with("https://"))
+            .unwrap_or_else(|| "http://127.0.0.1:7700".to_string());
+
+        DaemonState::Running { base_url }
     } else {
         DaemonState::NotRunning
     }
@@ -80,15 +97,25 @@ pub fn probe_daemon(data_dir: &Path) -> DaemonState {
 
 /// Advisory write lock for the data directory.
 ///
-/// Holds a lock file open; drops (removes) on `Drop`.
-/// Returns `Error::StoreLocked` if cannot be acquired.
+/// Uses `fd-lock` for OS-level exclusive advisory locking (flock(2)/LockFileEx).
+/// This guarantees that exactly one process holds the lock at a time — a second
+/// concurrent `acquire()` call will fail immediately with `Error::StoreLocked`.
+///
+/// Holds the OS lock for its entire lifetime; releases and removes on `Drop`.
+/// Returns `Error::StoreLocked` if the lock cannot be acquired.
 pub struct WriteLock {
-    _file: std::fs::File,
+    /// The locked file descriptor, held for the duration of the lock.
+    _guard: fd_lock::RwLockWriteGuard<'static, std::fs::File>,
+    /// The `RwLock` wrapper — kept alive so the guard remains valid.
+    _rw: Box<fd_lock::RwLock<std::fs::File>>,
     path: PathBuf,
 }
 
 impl WriteLock {
-    /// Attempt to acquire the write lock for `data_dir`.
+    /// Attempt to acquire the OS-level advisory write lock for `data_dir`.
+    ///
+    /// The lock file is `<data_dir>/.write.lock`.  A second process calling
+    /// `acquire()` on the same path will receive `Error::StoreLocked`.
     pub fn acquire(data_dir: &Path) -> Result<Self, Error> {
         std::fs::create_dir_all(data_dir).map_err(|e| Error::Internal {
             message: format!("cannot create data dir '{}': {}", data_dir.display(), e),
@@ -107,28 +134,34 @@ impl WriteLock {
                     Error::StoreLocked
                 } else {
                     Error::Internal {
-                        message: format!("cannot acquire write lock: {}", e),
+                        message: format!("cannot open lock file: {}", e),
                         correlation_id: "write_lock_open".to_string(),
                     }
                 }
             })?;
 
-        let mut f = file;
-        let _ = writeln!(f, "{}", std::process::id());
+        // Write our PID for diagnostics (best-effort).
+        {
+            use std::io::Write as _;
+            let mut f = &file;
+            let _ = writeln!(f, "{}", std::process::id());
+        }
 
-        // Re-open to hold a live descriptor.
-        let held = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&lock_path)
-            .map_err(|e| Error::Internal {
-                message: format!("cannot reopen lock file: {}", e),
-                correlation_id: "write_lock_reopen".to_string(),
-            })?;
+        // Box the RwLock so we can take a 'static guard from it.
+        // SAFETY: the Box is pinned on the heap and outlives the guard
+        // because both are stored in WriteLock together.
+        let mut rw = Box::new(fd_lock::RwLock::new(file));
+        let guard = {
+            // Extend lifetime: the guard borrows from *rw which lives in the
+            // same struct, so the lifetime is sound.
+            let rw_ref: &mut fd_lock::RwLock<std::fs::File> =
+                unsafe { &mut *(rw.as_mut() as *mut _) };
+            rw_ref.try_write().map_err(|_| Error::StoreLocked)?
+        };
 
         Ok(Self {
-            _file: held,
+            _guard: guard,
+            _rw: rw,
             path: lock_path,
         })
     }
@@ -136,7 +169,86 @@ impl WriteLock {
 
 impl Drop for WriteLock {
     fn drop(&mut self) {
+        // The guard is dropped first (releases the OS lock), then the file.
+        // Remove the lock file as a courtesy (non-fatal if it fails).
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Daemon HTTP client — specs/05-surfaces.md §2, specs/01-architecture.md §3
+// ---------------------------------------------------------------------------
+//
+// When a daemon is running, mutating commands route to its REST API instead of
+// writing directly to the embedded store. This thin client issues the
+// appropriate HTTP requests and maps responses to exit codes.
+
+/// Issue a synchronous HTTP request to the daemon via a one-shot tokio runtime.
+///
+/// Returns the JSON response body on success (2xx), or an `Error` on failure.
+fn daemon_request(
+    method: reqwest::Method,
+    url: &str,
+    body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, Error> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Error::Internal {
+            message: format!("cannot build tokio runtime for daemon request: {}", e),
+            correlation_id: "daemon_rt".to_string(),
+        })?;
+    rt.block_on(daemon_request_async(method, url, body))
+}
+
+async fn daemon_request_async(
+    method: reqwest::Method,
+    url: &str,
+    body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, Error> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| Error::Internal {
+            message: format!("cannot build HTTP client: {}", e),
+            correlation_id: "daemon_client_build".to_string(),
+        })?;
+
+    let mut req = client.request(method, url);
+    if let Some(b) = body {
+        req = req.json(&b);
+    }
+
+    let resp = req.send().await.map_err(|_| Error::DaemonUnreachable)?;
+
+    let status = resp.status();
+    let json: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+
+    if status.is_success() {
+        Ok(json)
+    } else {
+        // Map HTTP error codes to our error types.
+        let code = json
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("internal");
+        let msg = json
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("daemon error")
+            .to_string();
+
+        Err(match code {
+            "store_not_found" => Error::StoreNotFound { id: msg },
+            "source_not_found" => Error::SourceNotFound { id: msg },
+            "store_locked" => Error::StoreLocked,
+            "config_readonly" => Error::ConfigReadonly,
+            "daemon_unreachable" => Error::DaemonUnreachable,
+            _ => Error::Internal {
+                message: format!("daemon returned {}: {}", status.as_u16(), msg),
+                correlation_id: "daemon_http".to_string(),
+            },
+        })
     }
 }
 
@@ -621,6 +733,27 @@ pub fn run_store_add(ctx: &CliContext, name: &str) {
         exit_err(&Error::ConfigReadonly, ctx.json);
     }
 
+    // Per specs/05-surfaces.md §2: route to daemon when running.
+    if let DaemonState::Running { base_url } = probe_daemon(data_dir) {
+        let url = format!("{}/v1/stores", base_url);
+        let body = json!({ "name": name, "visibility": "private", "backend": "lancedb" });
+        match daemon_request(reqwest::Method::POST, &url, Some(body)) {
+            Ok(v) => {
+                if ctx.json {
+                    print_json(&v);
+                } else {
+                    println!(
+                        "Added store: {} (via daemon)",
+                        v.get("name").and_then(|n| n.as_str()).unwrap_or(name)
+                    );
+                }
+                return;
+            }
+            Err(e) => exit_err(&e, ctx.json),
+        }
+    }
+
+    // Embedded mode: acquire write lock and write directly.
     let _lock = match WriteLock::acquire(data_dir) {
         Ok(l) => l,
         Err(e) => exit_err(&e, ctx.json),
@@ -715,6 +848,23 @@ pub fn run_store_remove(ctx: &CliContext, name: &str) {
         exit_err(&Error::ConfigReadonly, ctx.json);
     }
 
+    // Per specs/05-surfaces.md §2: route to daemon when running.
+    if let DaemonState::Running { base_url } = probe_daemon(data_dir) {
+        let url = format!("{}/v1/stores/{}", base_url, name);
+        match daemon_request(reqwest::Method::DELETE, &url, None) {
+            Ok(v) => {
+                if ctx.json {
+                    print_json(&v);
+                } else {
+                    println!("Removed store: {} (via daemon)", name);
+                }
+                return;
+            }
+            Err(e) => exit_err(&e, ctx.json),
+        }
+    }
+
+    // Embedded mode.
     let _lock = match WriteLock::acquire(data_dir) {
         Ok(l) => l,
         Err(e) => exit_err(&e, ctx.json),
@@ -748,6 +898,34 @@ pub fn run_source_add(ctx: &CliContext, source_arg: &str) {
         exit_err(&Error::ConfigReadonly, ctx.json);
     }
 
+    // Per specs/05-surfaces.md §2: route to daemon when running.
+    if let DaemonState::Running { base_url } = probe_daemon(data_dir) {
+        let (kind, root, url) = classify_source(source_arg);
+        let url_str = format!("{}/v1/stores/{}/sources", base_url, store_name);
+        let body = json!({
+            "kind": kind,
+            "root": root,
+            "url": url,
+            "preset": "prose",
+        });
+        match daemon_request(reqwest::Method::POST, &url_str, Some(body)) {
+            Ok(v) => {
+                if ctx.json {
+                    print_json(&v);
+                } else {
+                    println!(
+                        "Added source {} to store '{}' (via daemon)",
+                        v.get("id").and_then(|i| i.as_str()).unwrap_or("?"),
+                        store_name
+                    );
+                }
+                return;
+            }
+            Err(e) => exit_err(&e, ctx.json),
+        }
+    }
+
+    // Embedded mode.
     let _lock = match WriteLock::acquire(data_dir) {
         Ok(l) => l,
         Err(e) => exit_err(&e, ctx.json),
@@ -838,6 +1016,23 @@ pub fn run_source_remove(ctx: &CliContext, id: &str) {
         exit_err(&Error::ConfigReadonly, ctx.json);
     }
 
+    // Per specs/05-surfaces.md §2: route to daemon when running.
+    if let DaemonState::Running { base_url } = probe_daemon(data_dir) {
+        let url = format!("{}/v1/stores/{}/sources/{}", base_url, store_name, id);
+        match daemon_request(reqwest::Method::DELETE, &url, None) {
+            Ok(v) => {
+                if ctx.json {
+                    print_json(&v);
+                } else {
+                    println!("Removed source: {} (via daemon)", id);
+                }
+                return;
+            }
+            Err(e) => exit_err(&e, ctx.json),
+        }
+    }
+
+    // Embedded mode.
     let _lock = match WriteLock::acquire(data_dir) {
         Ok(l) => l,
         Err(e) => exit_err(&e, ctx.json),
@@ -858,7 +1053,9 @@ pub fn run_source_remove(ctx: &CliContext, id: &str) {
 
 /// `localdb index [--source <id>]`
 ///
-/// One-shot scan-and-index in embedded mode.
+/// One-shot scan-and-index (embedded mode) or submits a job to the daemon.
+///
+/// Per specs/05-surfaces.md §2: when daemon is running, submits job and polls.
 pub fn run_index(ctx: &CliContext, source_id: Option<&str>) {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(run_index_async(ctx, source_id));
@@ -878,6 +1075,31 @@ async fn run_index_async(ctx: &CliContext, source_id: Option<&str>) {
     let data_dir = config_loader.paths.data_dir.clone();
     let store_name = resolve_store_name(ctx, &config_loader, &db);
 
+    // Per specs/05-surfaces.md §2: when daemon is running, submit a job and poll.
+    if let DaemonState::Running { base_url } = probe_daemon(&data_dir) {
+        let url = format!("{}/v1/jobs", base_url);
+        let mut body = json!({ "store": store_name, "kind": "index" });
+        if let Some(sid) = source_id {
+            body["source_id"] = serde_json::Value::String(sid.to_string());
+        }
+        match daemon_request_async(reqwest::Method::POST, &url, Some(body)).await {
+            Ok(v) => {
+                if ctx.json {
+                    print_json(&v);
+                } else {
+                    let job_id = v.get("id").and_then(|i| i.as_str()).unwrap_or("?");
+                    println!(
+                        "Index job submitted to daemon: {} (poll with status)",
+                        job_id
+                    );
+                }
+                return;
+            }
+            Err(e) => exit_err(&e, ctx.json),
+        }
+    }
+
+    // Embedded mode: acquire write lock and run inline.
     let _lock = match WriteLock::acquire(&data_dir) {
         Ok(l) => l,
         Err(e) => exit_err(&e, ctx.json),
@@ -1040,6 +1262,51 @@ async fn run_search_async(ctx: &CliContext, query: &str, limit: usize) {
     let (config_loader, db) = load_app_db(ctx);
     let data_dir = config_loader.paths.data_dir.clone();
 
+    // Per specs/05-surfaces.md §2: search routes through the daemon when running.
+    if let DaemonState::Running { base_url } = probe_daemon(&data_dir) {
+        let url = format!("{}/v1/search", base_url);
+        let mut body = json!({
+            "query": query,
+            "limit": limit,
+        });
+        if !ctx.stores.is_empty() {
+            body["stores"] = serde_json::Value::Array(
+                ctx.stores
+                    .iter()
+                    .map(|s| serde_json::Value::String(s.clone()))
+                    .collect(),
+            );
+        }
+        match daemon_request_async(reqwest::Method::POST, &url, Some(body)).await {
+            Ok(v) => {
+                if ctx.json {
+                    print_json(&v);
+                } else {
+                    let empty = vec![];
+                    let citations = v
+                        .get("citations")
+                        .and_then(|c| c.as_array())
+                        .unwrap_or(&empty);
+                    if citations.is_empty() {
+                        println!("No results for '{}'.", query);
+                    } else {
+                        for (i, cit) in citations.iter().enumerate() {
+                            let uri = cit.get("uri").and_then(|u| u.as_str()).unwrap_or("?");
+                            let snippet = cit.get("snippet").and_then(|s| s.as_str()).unwrap_or("");
+                            let snippet_short: String = snippet.chars().take(120).collect();
+                            println!("{}. {}", i + 1, uri);
+                            println!("   {}", snippet_short.trim());
+                            println!();
+                        }
+                    }
+                }
+                return;
+            }
+            Err(e) => exit_err(&e, ctx.json),
+        }
+    }
+
+    // Embedded mode.
     let runtime_stores = match db.list_stores() {
         Ok(s) => s,
         Err(e) => exit_err(&e, ctx.json),
