@@ -50,7 +50,14 @@ pub enum Command {
     Serve,
 
     /// Run the MCP server on stdio for use with AI agents.
-    Mcp,
+    Mcp {
+        /// Enable write tools (reserved for future use; always rejected in v1).
+        ///
+        /// Parsing this flag now makes the CLI stable for callers even though
+        /// the server rejects all mutating operations in v1.
+        #[arg(long)]
+        allow_write: bool,
+    },
 
     /// Show stores, counts, policy staleness, and daemon state.
     Status,
@@ -136,7 +143,7 @@ fn main() {
     match &cli.command {
         Command::Init => cli::run_init(&ctx),
         Command::Serve => cli::run_serve(&ctx),
-        Command::Mcp => cli::run_mcp(&ctx),
+        Command::Mcp { allow_write: _ } => cli::run_mcp(&ctx),
         Command::Status => cli::run_status(&ctx),
         Command::Store(cmd) => match cmd {
             StoreCommand::Add { name } => cli::run_store_add(&ctx, name),
