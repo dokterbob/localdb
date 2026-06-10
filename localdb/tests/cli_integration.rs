@@ -492,13 +492,46 @@ fn end_to_end_init_store_source_index_search() {
         "search should return at least one citation for the indexed document;\ngot: {stdout}"
     );
 
-    // Citation must have the expected canonical shape fields.
+    // Citation must have the FULL canonical shape from specs/02-domain-model.md §6.
     let cit = &citations[0];
     assert!(cit.get("chunk_id").is_some(), "missing chunk_id");
     assert!(cit.get("document_id").is_some(), "missing document_id");
     assert!(cit.get("uri").is_some(), "missing uri");
     assert!(cit.get("snippet").is_some(), "missing snippet");
     assert!(cit.get("score").is_some(), "missing score");
+
+    // store: {id, name}
+    let store = cit.get("store").expect("missing store field");
+    assert!(store.get("id").is_some(), "store.id missing");
+    assert!(store.get("name").is_some(), "store.name missing");
+
+    // span: {start, end}
+    let span = cit.get("span").expect("missing span field");
+    assert!(span.get("start").is_some(), "span.start missing");
+    assert!(span.get("end").is_some(), "span.end missing");
+
+    // heading_path (array, may be empty)
+    assert!(
+        cit.get("heading_path")
+            .map(|v| v.is_array())
+            .unwrap_or(false),
+        "heading_path must be a JSON array"
+    );
+
+    // provenance: {fetched_at, content_hash}
+    let prov = cit.get("provenance").expect("missing provenance field");
+    assert!(
+        prov.get("fetched_at").is_some(),
+        "provenance.fetched_at missing"
+    );
+    assert!(
+        prov.get("content_hash").is_some(),
+        "provenance.content_hash missing"
+    );
+
+    // score sub-fields
+    let score = cit.get("score").unwrap();
+    assert!(score.get("fused").is_some(), "score.fused missing");
 
     // URI must point to our fixture file.
     let uri = cit["uri"].as_str().unwrap();

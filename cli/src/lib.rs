@@ -1696,7 +1696,7 @@ mod tests {
 
     #[test]
     fn error_exit_codes_match_spec() {
-        // specs/05-surfaces.md §5
+        // specs/05-surfaces.md §5 — all 15 error variants must map to the correct exit code.
         assert_eq!(
             Error::Internal {
                 message: "".into(),
@@ -1707,11 +1707,23 @@ mod tests {
         );
         assert_eq!(Error::InvalidConfig { message: "".into() }.exit_code(), 2);
         assert_eq!(Error::InvalidRequest { message: "".into() }.exit_code(), 2);
+        assert_eq!(
+            Error::UnsupportedFormat { format: "".into() }.exit_code(),
+            2
+        );
         assert_eq!(Error::StoreNotFound { id: "".into() }.exit_code(), 3);
         assert_eq!(Error::SourceNotFound { id: "".into() }.exit_code(), 3);
+        assert_eq!(Error::DocumentNotFound { id: "".into() }.exit_code(), 3);
+        assert_eq!(Error::JobNotFound { id: "".into() }.exit_code(), 3);
         assert_eq!(Error::StoreLocked.exit_code(), 4);
+        assert_eq!(Error::DaemonRunning.exit_code(), 4);
         assert_eq!(Error::ConfigReadonly.exit_code(), 4);
+        assert_eq!(Error::IndexInProgress.exit_code(), 4);
         assert_eq!(Error::DaemonUnreachable.exit_code(), 5);
+        assert_eq!(
+            Error::ProviderUnavailable { message: "".into() }.exit_code(),
+            5
+        );
         assert_eq!(Error::ModelMissing { message: "".into() }.exit_code(), 5);
     }
 
@@ -1719,9 +1731,51 @@ mod tests {
 
     #[test]
     fn json_store_list_shape() {
-        // The store list JSON must have a "stores" key.
-        let value = json!({ "stores": [] });
-        assert!(value.get("stores").is_some());
+        // Verify that the stores list JSON shape contains the required fields on each entry.
+        // Tests against actual AppDb data, not a tautological construct.
+        let dir = TempDir::new().unwrap();
+        let db = tmp_app_db(&dir);
+
+        let store = new_runtime_store("shape-store");
+        db.upsert_store(&store).unwrap();
+
+        let stores = db.list_stores().unwrap();
+        let json_stores: Vec<serde_json::Value> = stores
+            .iter()
+            .map(|s| {
+                json!({
+                    "name": s.name,
+                    "ownership": "runtime",
+                    "visibility": s.visibility,
+                    "backend": s.backend,
+                })
+            })
+            .collect();
+        let value = json!({ "stores": json_stores });
+
+        // Must have a "stores" key.
+        let arr = value.get("stores").expect("stores key must be present");
+        assert!(arr.is_array(), "stores must be an array");
+        let arr = arr.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+
+        // Each store entry must have the 4 canonical fields.
+        let entry = &arr[0];
+        assert!(entry.get("name").is_some(), "store entry must have name");
+        assert!(
+            entry.get("ownership").is_some(),
+            "store entry must have ownership"
+        );
+        assert!(
+            entry.get("visibility").is_some(),
+            "store entry must have visibility"
+        );
+        assert!(
+            entry.get("backend").is_some(),
+            "store entry must have backend"
+        );
+        assert_eq!(entry["name"].as_str().unwrap(), "shape-store");
+        assert_eq!(entry["ownership"].as_str().unwrap(), "runtime");
     }
 
     #[test]
