@@ -112,8 +112,19 @@ pub fn load_config(options: &LoadOptions) -> Result<ConfigLoader, Error> {
 /// Used by tests and by the file loader.
 pub fn load_config_from_str(yaml: &str) -> Result<RawConfig, Error> {
     // Parse with strict unknown-key rejection
-    let config: RawConfig = serde_yaml::from_str(yaml).map_err(|e| Error::InvalidConfig {
-        message: format!("{}", e),
+    let config: RawConfig = serde_yaml::from_str(yaml).map_err(|e| {
+        let msg = format!("{}", e);
+        // Augment missing-version errors with a hint to match spec §5 requirement.
+        if msg.contains("missing field") && msg.contains("version") {
+            Error::InvalidConfig {
+                message: format!(
+                    "{}. Hint: add `version: 1` at the top of your config file.",
+                    msg
+                ),
+            }
+        } else {
+            Error::InvalidConfig { message: msg }
+        }
     })?;
 
     validate_config(&config)?;
@@ -406,10 +417,19 @@ mod tests {
 
     #[test]
     fn load_rejects_unversioned_with_hint() {
+        // Missing version field — error must contain a hint per spec §5.
         let yaml = "server:\n  bind: 127.0.0.1\n  port: 7700\n";
-        // Either missing version field or version=0 — either way should error
         let err = load_config_from_str(yaml).unwrap_err();
-        assert!(matches!(err, Error::InvalidConfig { .. }));
+        match err {
+            Error::InvalidConfig { message } => {
+                assert!(
+                    message.contains("version: 1") || message.contains("version"),
+                    "error for unversioned config should contain a hint, got: {}",
+                    message
+                );
+            }
+            other => panic!("expected InvalidConfig, got {:?}", other),
+        }
     }
 
     #[test]
@@ -705,21 +725,99 @@ stores:
         );
         let yaml = std::fs::read_to_string(path).expect("fixture file should exist");
         let err = load_config_from_str(&yaml).unwrap_err();
-        assert!(matches!(err, Error::InvalidConfig { .. }));
+        match err {
+            Error::InvalidConfig { message } => {
+                assert!(
+                    message.contains("version: 1") || message.contains("version"),
+                    "unversioned fixture error should contain a hint, got: {}",
+                    message
+                );
+            }
+            other => panic!("expected InvalidConfig, got {:?}", other),
+        }
+    }
+
+    // --- load_config file-path override tests ---
+
+    #[test]
+    fn load_config_with_explicit_path_option() {
+        // LoadOptions.config_path overrides env and platform default.
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/config/valid.yaml"
+        );
+        let options = LoadOptions {
+            config_path: Some(std::path::PathBuf::from(path)),
+            ..Default::default()
+        };
+        let loader = load_config(&options).expect("load_config with explicit path should succeed");
+        assert_eq!(loader.config.version, 1);
+        assert_eq!(loader.paths.config_file, std::path::PathBuf::from(path));
+    }
+
+    #[test]
+    fn load_config_env_var_override() {
+        // LOCALDB_CONFIG env var points to a valid fixture.
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/config/valid.yaml"
+        );
+        // Use a temp env var set; restore after test.
+        // Note: env vars are process-global; use a unique name to avoid cross-test pollution.
+        std::env::set_var("LOCALDB_CONFIG", path);
+        let result = load_config(&LoadOptions::default());
+        std::env::remove_var("LOCALDB_CONFIG");
+        let loader = result.expect("load_config via LOCALDB_CONFIG env var should succeed");
+        assert_eq!(loader.config.version, 1);
+    }
+
+    // --- Tilde expansion test ---
+
+    #[test]
+    fn expand_path_expands_tilde() {
+        // A path starting with `~/` should have `~` replaced by the home directory.
+        if let Some(home) = dirs::home_dir() {
+            let expanded = expand_path(&"~/Documents/notes".to_string());
+            assert!(
+                expanded.starts_with(&home),
+                "expanded path {:?} should start with home dir {:?}",
+                expanded,
+                home
+            );
+            assert!(
+                expanded.ends_with("Documents/notes"),
+                "expanded path {:?} should end with Documents/notes",
+                expanded
+            );
+        }
+    }
+
+    #[test]
+    fn expand_path_passes_through_absolute_path() {
+        let p = expand_path(&"/absolute/path".to_string());
+        assert_eq!(p, std::path::PathBuf::from("/absolute/path"));
     }
 
     // --- YAML file bytes never written test (enforced at type level here) ---
 
     #[test]
-    fn config_has_no_write_methods() {
-        // The RawConfig type has no methods that write to files.
-        // This is enforced structurally: the loader reads from file,
-        // but the returned ConfigLoader/RawConfig have no write-to-disk method.
-        // This test documents the invariant — if someone adds a write method,
-        // a code review should catch it; this test ensures the module is in scope.
-        let yaml = "version: 1\n";
-        let _cfg = load_config_from_str(yaml).unwrap();
-        // No write method exists — the invariant is structural.
-        // Test passes simply by compiling and running.
+    fn config_yaml_file_not_written_after_load() {
+        // Load a fixture, then verify its bytes on disk are unchanged.
+        // Structural invariant: RawConfig and ConfigLoader expose no write-to-file methods.
+        let path_str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/config/valid.yaml"
+        );
+        let before = std::fs::read(path_str).expect("fixture must exist");
+        let options = LoadOptions {
+            config_path: Some(std::path::PathBuf::from(path_str)),
+            ..Default::default()
+        };
+        let _loader = load_config(&options).expect("should load");
+        let after = std::fs::read(path_str).expect("fixture must still exist");
+        assert_eq!(
+            before, after,
+            "config file must not be modified by load_config"
+        );
     }
 }

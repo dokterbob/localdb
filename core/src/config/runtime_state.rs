@@ -38,10 +38,6 @@ pub enum ConfigOwnership {
 /// Runtime-owned stores: name → JSON-serialized `RuntimeStore`.
 const RUNTIME_STORES_TABLE: TableDefinition<&str, &str> = TableDefinition::new("runtime_stores");
 
-/// Runtime-owned store policy overrides: store_name → JSON-serialized policy.
-const RUNTIME_STORE_POLICIES_TABLE: TableDefinition<&str, &str> =
-    TableDefinition::new("runtime_store_policies");
-
 // ---------------------------------------------------------------------------
 // Runtime store type
 // ---------------------------------------------------------------------------
@@ -117,9 +113,6 @@ impl RuntimeStateDb {
             let write_txn = db.begin_write().map_err(map_redb_err)?;
             write_txn
                 .open_table(RUNTIME_STORES_TABLE)
-                .map_err(map_redb_err)?;
-            write_txn
-                .open_table(RUNTIME_STORE_POLICIES_TABLE)
                 .map_err(map_redb_err)?;
             write_txn.commit().map_err(map_redb_err)?;
         }
