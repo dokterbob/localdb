@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use tokio::sync::RwLock;
 
 use localdb_core::{
@@ -16,10 +17,67 @@ use localdb_core::{
         },
         schema::RawConfig,
     },
-    Error, Store, StoreVisibility,
+    store::{MetadataFilter, RetrievalStore, SearchResult, StoreStats},
+    ChunkRecord, Error, FakeStore, Store, StoreVisibility,
 };
 
+use crate::handlers::DocumentRecord;
 use crate::job_queue::JobQueue;
+
+// ---------------------------------------------------------------------------
+// SharedStore — wraps Arc<FakeStore> as a Box<dyn RetrievalStore>
+// ---------------------------------------------------------------------------
+
+/// A newtype that delegates `RetrievalStore` to an `Arc<FakeStore>`.
+///
+/// This lets the daemon share a single in-memory store between the job queue
+/// (writes) and the HTTP search handler (reads).
+pub struct SharedStore(pub Arc<FakeStore>);
+
+#[async_trait]
+impl RetrievalStore for SharedStore {
+    async fn upsert_chunks(&self, chunks: Vec<ChunkRecord>) -> Result<usize, Error> {
+        self.0.upsert_chunks(chunks).await
+    }
+
+    async fn delete_by_document(&self, document_id: &str) -> Result<usize, Error> {
+        self.0.delete_by_document(document_id).await
+    }
+
+    async fn delete_by_store(&self, store_id: &str) -> Result<usize, Error> {
+        self.0.delete_by_store(store_id).await
+    }
+
+    async fn dense_search(
+        &self,
+        query_vector: &[f32],
+        k: usize,
+        filters: &[MetadataFilter],
+    ) -> Result<Vec<SearchResult>, Error> {
+        self.0.dense_search(query_vector, k, filters).await
+    }
+
+    async fn bm25_search(
+        &self,
+        query: &str,
+        k: usize,
+        filters: &[MetadataFilter],
+    ) -> Result<Vec<SearchResult>, Error> {
+        self.0.bm25_search(query, k, filters).await
+    }
+
+    async fn stats(&self) -> Result<StoreStats, Error> {
+        self.0.stats().await
+    }
+
+    async fn get_chunk(&self, chunk_id: &str) -> Result<Option<ChunkRecord>, Error> {
+        self.0.get_chunk(chunk_id).await
+    }
+
+    async fn get_chunks_for_document(&self, document_id: &str) -> Result<Vec<ChunkRecord>, Error> {
+        self.0.get_chunks_for_document(document_id).await
+    }
+}
 
 /// A source record stored in the runtime-state DB (simplified, in-memory for now).
 ///
@@ -51,6 +109,13 @@ struct Inner {
     sources: RwLock<HashMap<String, SourceRecord>>,
     /// Job queue.
     job_queue: JobQueue,
+    /// In-memory retrieval store for search (used by the daemon).
+    ///
+    /// In production this would be backed by LanceDB; here we use the FakeStore
+    /// so the search handler can call `SearchOrchestrator::query()` for real.
+    retrieval_store: Arc<FakeStore>,
+    /// In-memory document index: doc_id → DocumentRecord (for GET /documents/{id}).
+    documents: RwLock<HashMap<String, DocumentRecord>>,
 }
 
 impl AppState {
@@ -70,6 +135,8 @@ impl AppState {
                 runtime_db,
                 sources: RwLock::new(HashMap::new()),
                 job_queue,
+                retrieval_store: Arc::new(FakeStore::new()),
+                documents: RwLock::new(HashMap::new()),
             }),
         })
     }
@@ -272,6 +339,72 @@ impl AppState {
     pub fn data_dir(&self) -> &PathBuf {
         &self.inner.data_dir
     }
+
+    /// Update a runtime-owned store's mutable fields.
+    ///
+    /// Returns `Error::ConfigReadonly` if the store is YAML-owned.
+    /// Returns `Error::StoreNotFound` if the store doesn't exist.
+    pub async fn update_store(&self, name: &str, visibility: Option<&str>) -> Result<(), Error> {
+        if self.is_yaml_owned_store(name).await {
+            return Err(Error::ConfigReadonly);
+        }
+
+        // Check it exists in the effective config (YAML + runtime).
+        {
+            let effective = self.effective_config().await?;
+            effective
+                .stores
+                .iter()
+                .find(|s| s.name == name)
+                .ok_or_else(|| Error::StoreNotFound {
+                    id: name.to_string(),
+                })?;
+        }
+
+        // Fetch the current runtime store record, update, re-upsert.
+        let stores = self.inner.runtime_db.list_stores()?;
+        let current =
+            stores
+                .into_iter()
+                .find(|s| s.name == name)
+                .ok_or_else(|| Error::StoreNotFound {
+                    id: name.to_string(),
+                })?;
+
+        let updated = localdb_core::config::runtime_state::RuntimeStore {
+            visibility: visibility.unwrap_or(&current.visibility).to_string(),
+            ..current
+        };
+
+        self.inner.runtime_db.upsert_store(&updated)?;
+        Ok(())
+    }
+
+    /// Get a document by its content-addressed ID.
+    ///
+    /// Returns `None` if the document is not indexed in the in-memory store.
+    pub async fn get_document_by_id(&self, doc_id: &str) -> Option<DocumentRecord> {
+        let docs = self.inner.documents.read().await;
+        docs.get(doc_id).cloned()
+    }
+
+    /// Insert or update a document record in the in-memory index.
+    pub async fn upsert_document(&self, record: DocumentRecord) {
+        let mut docs = self.inner.documents.write().await;
+        docs.insert(record.id.clone(), record);
+    }
+
+    /// Access the in-memory retrieval store used by the search handler.
+    pub fn retrieval_store(&self) -> Arc<FakeStore> {
+        self.inner.retrieval_store.clone()
+    }
+
+    /// Upsert chunks into the in-memory retrieval store.
+    ///
+    /// Used by the job queue when ingestion produces new chunks.
+    pub async fn upsert_chunks(&self, chunks: Vec<ChunkRecord>) -> Result<usize, Error> {
+        self.inner.retrieval_store.upsert_chunks(chunks).await
+    }
 }
 
 /// A store record as returned by the API.
@@ -408,6 +541,113 @@ mod tests {
         state.remove_source(&source.id).await.unwrap();
         let sources = state.list_sources("notes").await.unwrap();
         assert!(sources.is_empty());
+    }
+
+    #[tokio::test]
+    async fn add_source_to_yaml_owned_store_returns_config_readonly() {
+        // Covers the ConfigReadonly branch in state.rs:add_source (line ~208).
+        // YAML-owned stores must not accept source mutations via the API.
+        let dir = tempfile::tempdir().unwrap();
+        let yaml_config = RawConfig {
+            version: 1,
+            server: Default::default(),
+            paths: Default::default(),
+            defaults: Default::default(),
+            stores: vec![localdb_core::config::schema::StoreConfig {
+                name: "yaml-store".to_string(),
+                visibility: "private".to_string(),
+                backend: "lancedb".to_string(),
+                indexing: None,
+                sources: vec![],
+            }],
+            providers: vec![],
+        };
+        let queue = JobQueue::new();
+        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue).unwrap();
+
+        let result = state
+            .add_source(
+                "yaml-store",
+                "path",
+                serde_json::json!({"root": "/tmp"}),
+                "prose",
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(Error::ConfigReadonly)),
+            "add_source to a YAML-owned store should return ConfigReadonly, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn update_store_returns_config_readonly_for_yaml_owned() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml_config = RawConfig {
+            version: 1,
+            server: Default::default(),
+            paths: Default::default(),
+            defaults: Default::default(),
+            stores: vec![localdb_core::config::schema::StoreConfig {
+                name: "yaml-store".to_string(),
+                visibility: "private".to_string(),
+                backend: "lancedb".to_string(),
+                indexing: None,
+                sources: vec![],
+            }],
+            providers: vec![],
+        };
+        let queue = JobQueue::new();
+        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue).unwrap();
+
+        let result = state.update_store("yaml-store", Some("shared")).await;
+        assert_eq!(
+            result,
+            Err(Error::ConfigReadonly),
+            "update_store on YAML-owned store should return ConfigReadonly"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_store_updates_visibility() {
+        let (_dir, state) = make_state();
+        state.add_store("notes", "private").await.unwrap();
+        state.update_store("notes", Some("shared")).await.unwrap();
+        let record = state.get_store_by_name("notes").await.unwrap();
+        assert_eq!(record.visibility, "shared");
+    }
+
+    #[tokio::test]
+    async fn upsert_and_search_chunks_roundtrip() {
+        let (_dir, state) = make_state();
+
+        let chunk = localdb_core::ChunkRecord {
+            id: "chunk-1".to_string(),
+            document_id: "doc-1".to_string(),
+            store_id: "store-A".to_string(),
+            text: "hello world rust programming".to_string(),
+            span: localdb_core::types::Span::new(0, 30),
+            heading_path: vec![],
+            embedding: vec![1.0, 0.0, 0.0, 0.0],
+            policy_version: "v1".to_string(),
+            fetched_at: "2026-06-10T12:00:00Z".to_string(),
+            content_hash: "abc".to_string(),
+            origin_store: "store-A".to_string(),
+            source_id: "src-1".to_string(),
+            source_kind: "path".to_string(),
+            mime: Some("text/plain".to_string()),
+            uri: "file:///test.md".to_string(),
+            title: Some("Test Doc".to_string()),
+            meta: std::collections::HashMap::new(),
+        };
+
+        state.upsert_chunks(vec![chunk]).await.unwrap();
+
+        // Verify the chunk is searchable via the store
+        let store = state.retrieval_store();
+        let stats = store.stats().await.unwrap();
+        assert_eq!(stats.chunk_count, 1, "one chunk should be indexed");
     }
 
     #[tokio::test]

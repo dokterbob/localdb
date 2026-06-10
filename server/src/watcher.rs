@@ -159,19 +159,47 @@ mod tests {
             .unwrap_or_else(|_| dir.path().to_path_buf());
         let (mut rx, handle) = watch_path(&dir_real, 50).unwrap();
 
-        // Drop the handle
+        // Drop the handle — this drops the Debouncer, which stops the watcher.
         drop(handle);
 
-        // Channel should be closed soon after
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Writing a file should NOT produce events (watcher is stopped)
-        let file_path = dir_real.join("after_drop.md");
-        std::fs::write(&file_path, "data").unwrap();
+        // Wait for the debouncer's internal thread to notice the drop and
+        // close the sender side of the channel.
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        // The channel may or may not receive anything depending on timing,
-        // but the important thing is no panic occurs.
-        let _ = rx.try_recv();
+        // Writing a file after the watcher is dropped must NOT produce an event
+        // on the receiver. Drain any events that may have slipped in before the drop.
+        while rx.try_recv().is_ok() {}
+
+        let file_path = dir_real.join("after_drop.md");
+        std::fs::write(&file_path, "data after drop").unwrap();
+
+        // Give the (now-stopped) watcher time to deliver any spurious events.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // The receiver should yield None (channel closed) or no new events.
+        // Either outcome confirms the watcher is no longer active.
+        let result = rx.try_recv();
+        // Acceptable outcomes:
+        //   Err(TryRecvError::Disconnected) — sender dropped, channel closed.
+        //   Err(TryRecvError::Empty)        — watcher stopped, no event delivered.
+        //   Ok(_)                           — spurious event from before the drop;
+        //                                    verify no further events arrive.
+        match result {
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                // Best outcome: channel closed because the sender was dropped.
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                // Good: no events delivered after the drop.
+            }
+            Ok(_) => {
+                // Spurious event — ensure no more come after a brief wait.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let second = rx.try_recv();
+                assert!(
+                    second.is_err(),
+                    "watcher should not deliver events after handle drop; got a second event"
+                );
+            }
+        }
     }
 }

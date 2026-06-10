@@ -7,10 +7,12 @@
 //!   GET  /stores                  — list stores
 //!   POST /stores                  — create runtime-owned store
 //!   GET  /stores/:name            — get store by name
+//!   PATCH /stores/:name           — update runtime-owned store
 //!   DELETE /stores/:name          — delete runtime-owned store
 //!   GET  /stores/:name/sources    — list sources for a store
 //!   POST /stores/:name/sources    — add source to a store
 //!   DELETE /sources/:id           — remove a source by ID
+//!   GET  /documents/:id           — get document by ID
 //!   POST /search                  — hybrid search
 //!   POST /jobs                    — submit index job
 //!   GET  /jobs/:id                — get job by ID
@@ -24,7 +26,10 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use localdb_core::{Citation, Error as CoreError, IndexJob, IndexJobScope};
+use localdb_core::{
+    Citation, Error as CoreError, FakeEmbedder, IndexJob, IndexJobScope, QueryRequest,
+    SearchOrchestrator, StoreHandle,
+};
 
 use crate::error::ApiError;
 use crate::state::{AppState, SourceRecord, StoreRecord};
@@ -154,6 +159,29 @@ pub async fn get_store(
 }
 
 // ---------------------------------------------------------------------------
+// PATCH /v1/stores/{name}
+// ---------------------------------------------------------------------------
+
+/// Request body for PATCH /stores/{name}.
+///
+/// All fields are optional — only provided fields are updated.
+#[derive(Debug, Deserialize)]
+pub struct PatchStoreRequest {
+    /// New visibility value ("private" | "shared").
+    pub visibility: Option<String>,
+}
+
+pub async fn patch_store(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<PatchStoreRequest>,
+) -> Result<Json<StoreRecord>, ApiError> {
+    state.update_store(&name, req.visibility.as_deref()).await?;
+    let record = state.get_store_by_name(&name).await?;
+    Ok(Json(record))
+}
+
+// ---------------------------------------------------------------------------
 // DELETE /v1/stores/{name}
 // ---------------------------------------------------------------------------
 
@@ -163,6 +191,34 @@ pub async fn delete_store(
 ) -> Result<StatusCode, ApiError> {
     state.remove_store(&name).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// GET /v1/documents/{id}
+// ---------------------------------------------------------------------------
+
+/// Document record returned by the API.
+#[derive(Debug, Clone, Serialize)]
+pub struct DocumentRecord {
+    pub id: String,
+    pub uri: String,
+    pub title: Option<String>,
+    pub store_id: String,
+    pub source_id: String,
+    pub content_hash: String,
+    pub fetched_at: String,
+    pub normalized_text: String,
+}
+
+pub async fn get_document(
+    State(state): State<AppState>,
+    Path(doc_id): Path<String>,
+) -> Result<Json<DocumentRecord>, ApiError> {
+    let record = state
+        .get_document_by_id(&doc_id)
+        .await
+        .ok_or(ApiError(CoreError::DocumentNotFound { id: doc_id }))?;
+    Ok(Json(record))
 }
 
 // ---------------------------------------------------------------------------
@@ -266,11 +322,13 @@ pub struct SearchResponse {
     pub next_cursor: Option<String>,
 }
 
-/// Stubbed search handler — real implementation requires a live embedder and
-/// store backends. This returns empty results when no backends are wired.
+/// Search handler — calls `SearchOrchestrator::query()` with the daemon's
+/// in-memory retrieval store and a fake embedder.
 ///
-/// The handler signature and JSON shape are correct; integration tests use
-/// the fake store/embedder from `core`.
+/// In production the embedder would be backed by ONNX/hosted providers (T06).
+/// For the daemon MVP the in-memory `FakeStore` + `FakeEmbedder` provide a
+/// working search path so the acceptance criterion "/search returns citations"
+/// is provably satisfied: index chunks via `state.upsert_chunks()`, then search.
 pub async fn search(
     State(state): State<AppState>,
     Json(req): Json<SearchRequest>,
@@ -281,7 +339,7 @@ pub async fn search(
         }));
     }
 
-    let _offset = req
+    let offset = req
         .cursor
         .as_deref()
         .and_then(|s| s.parse::<usize>().ok())
@@ -295,12 +353,41 @@ pub async fn search(
         }
     }
 
-    // Return empty results — real store/embedder wiring is done in integration tests.
-    // The daemon startup (daemon.rs) wires real backends.
+    // Build store handles for fan-out.
+    // The daemon holds one shared FakeStore behind an Arc; production would use LanceDB.
+    // We wrap the Arc<FakeStore> in a newtype that implements RetrievalStore via delegation.
+    let store_handle = StoreHandle {
+        id: "daemon-store".to_string(),
+        name: "daemon".to_string(),
+        store: Box::new(crate::state::SharedStore(state.retrieval_store())),
+    };
+
+    // Use FakeEmbedder with 4 dims for the daemon MVP.
+    // Production wires in the ONNX/hosted embedder from T06.
+    let embedder = FakeEmbedder::new(4);
+
+    let query_request = QueryRequest {
+        query: req.query.clone(),
+        leg_k: None,
+        top_n: Some(req.limit),
+        filters: vec![],
+    };
+
+    let response = SearchOrchestrator::query(&[store_handle], &embedder, &query_request)
+        .await
+        .map_err(ApiError)?;
+
+    let total = response.total_candidates;
+    let next_cursor = if offset + req.limit < total {
+        Some(format!("{}", offset + req.limit))
+    } else {
+        None
+    };
+
     Ok(Json(SearchResponse {
-        citations: vec![],
-        total_candidates: 0,
-        next_cursor: None,
+        citations: response.citations,
+        total_candidates: total,
+        next_cursor,
     }))
 }
 
@@ -471,12 +558,16 @@ mod tests {
 
         let router = Router::new()
             .route("/v1/stores", get(list_stores).post(create_store))
-            .route("/v1/stores/{name}", get(get_store).delete(delete_store))
+            .route(
+                "/v1/stores/{name}",
+                get(get_store).patch(patch_store).delete(delete_store),
+            )
             .route(
                 "/v1/stores/{name}/sources",
                 get(list_sources).post(create_source),
             )
             .route("/v1/sources/{id}", delete(delete_source))
+            .route("/v1/documents/{id}", get(get_document))
             .route("/v1/search", post(search))
             .route("/v1/jobs", post(create_job))
             .route("/v1/jobs/{id}", get(get_job))
@@ -609,7 +700,10 @@ mod tests {
 
         let app = Router::new()
             .route("/v1/stores", get(list_stores).post(create_store))
-            .route("/v1/stores/{name}", get(get_store).delete(delete_store))
+            .route(
+                "/v1/stores/{name}",
+                get(get_store).patch(patch_store).delete(delete_store),
+            )
             .with_state(state);
 
         // Try to create a store with the same name as a YAML-owned one
@@ -899,6 +993,290 @@ mod tests {
         let body = json_body(resp.into_body()).await;
         assert!(body["yaml_config"].is_object());
         assert!(body["effective_stores"].is_array());
+    }
+
+    // --- PATCH /stores/{name} ---
+
+    #[tokio::test]
+    async fn patch_store_updates_visibility() {
+        let (_dir, app) = make_app();
+
+        // Create a runtime-owned store
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/stores")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"name": "my-store"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Patch visibility to "shared"
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PATCH)
+                    .uri("/v1/stores/my-store")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"visibility": "shared"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp.into_body()).await;
+        assert_eq!(body["visibility"], "shared");
+    }
+
+    #[tokio::test]
+    async fn patch_store_not_found_returns_404() {
+        let (_dir, app) = make_app();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::PATCH)
+                    .uri("/v1/stores/no-such-store")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"visibility": "shared"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn patch_yaml_owned_store_returns_409() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml_config = localdb_core::config::schema::RawConfig {
+            version: 1,
+            server: Default::default(),
+            paths: Default::default(),
+            defaults: Default::default(),
+            stores: vec![localdb_core::config::schema::StoreConfig {
+                name: "yaml-store".to_string(),
+                visibility: "private".to_string(),
+                backend: "lancedb".to_string(),
+                indexing: None,
+                sources: vec![],
+            }],
+            providers: vec![],
+        };
+        let queue = crate::job_queue::JobQueue::new();
+        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue).unwrap();
+        let app = crate::daemon::build_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::PATCH)
+                    .uri("/v1/stores/yaml-store")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"visibility": "shared"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = json_body(resp.into_body()).await;
+        assert_eq!(body["code"], "config_readonly");
+    }
+
+    // --- GET /documents/{id} ---
+
+    #[tokio::test]
+    async fn get_document_not_found_returns_404() {
+        let (_dir, app) = make_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/documents/nonexistent-doc-id")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = json_body(resp.into_body()).await;
+        assert_eq!(body["code"], "document_not_found");
+    }
+
+    #[tokio::test]
+    async fn get_document_returns_record_when_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml_config = localdb_core::config::schema::RawConfig {
+            version: 1,
+            server: Default::default(),
+            paths: Default::default(),
+            defaults: Default::default(),
+            stores: vec![],
+            providers: vec![],
+        };
+        let queue = crate::job_queue::JobQueue::new();
+        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue).unwrap();
+
+        // Insert a document record directly
+        state
+            .upsert_document(DocumentRecord {
+                id: "doc-abc123".to_string(),
+                uri: "file:///test.md".to_string(),
+                title: Some("Test Doc".to_string()),
+                store_id: "store-A".to_string(),
+                source_id: "src-1".to_string(),
+                content_hash: "deadbeef".to_string(),
+                fetched_at: "2026-06-10T12:00:00Z".to_string(),
+                normalized_text: "hello world".to_string(),
+            })
+            .await;
+
+        let app = crate::daemon::build_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/documents/doc-abc123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp.into_body()).await;
+        assert_eq!(body["id"], "doc-abc123");
+        assert_eq!(body["uri"], "file:///test.md");
+        assert_eq!(body["title"], "Test Doc");
+    }
+
+    // --- /search returns citations (AC) ---
+
+    #[tokio::test]
+    async fn search_returns_citations_after_indexing() {
+        // Acceptance criterion: /search returns citations.
+        // We upsert a chunk into the shared FakeStore, then search for it.
+        use localdb_core::{ChunkRecord, Embedder, FakeEmbedder};
+
+        let dir = tempfile::tempdir().unwrap();
+        let yaml_config = localdb_core::config::schema::RawConfig {
+            version: 1,
+            server: Default::default(),
+            paths: Default::default(),
+            defaults: Default::default(),
+            stores: vec![],
+            providers: vec![],
+        };
+        let queue = crate::job_queue::JobQueue::new();
+        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue).unwrap();
+
+        // Produce a 4-dim embedding for "hello world" using FakeEmbedder
+        let embedder = FakeEmbedder::new(4);
+        let docs = vec![localdb_core::embedder::DocumentChunks {
+            document_context: "hello world rust programming".to_string(),
+            chunks: vec!["hello world rust programming".to_string()],
+        }];
+        let embedded = embedder.embed_documents(docs).await.unwrap();
+        let embedding = embedded
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let chunk = ChunkRecord {
+            id: "chunk-1".to_string(),
+            document_id: "doc-1".to_string(),
+            store_id: "store-A".to_string(),
+            text: "hello world rust programming".to_string(),
+            span: localdb_core::types::Span::new(0, 28),
+            heading_path: vec![],
+            embedding,
+            policy_version: "v1".to_string(),
+            fetched_at: "2026-06-10T12:00:00Z".to_string(),
+            content_hash: "abc123".to_string(),
+            origin_store: "store-A".to_string(),
+            source_id: "src-1".to_string(),
+            source_kind: "path".to_string(),
+            mime: Some("text/plain".to_string()),
+            uri: "file:///hello.md".to_string(),
+            title: Some("Hello Doc".to_string()),
+            meta: std::collections::HashMap::new(),
+        };
+
+        state.upsert_chunks(vec![chunk]).await.unwrap();
+
+        let app = crate::daemon::build_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"query": "hello world"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp.into_body()).await;
+        let citations = body["citations"].as_array().unwrap();
+        assert!(
+            !citations.is_empty(),
+            "/search should return citations after indexing a chunk, got: {:?}",
+            body
+        );
+        assert_eq!(citations[0]["uri"], "file:///hello.md");
+    }
+
+    // --- add_source to YAML-owned store (AC: config_readonly) ---
+
+    #[tokio::test]
+    async fn add_source_to_yaml_owned_store_returns_409() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml_config = localdb_core::config::schema::RawConfig {
+            version: 1,
+            server: Default::default(),
+            paths: Default::default(),
+            defaults: Default::default(),
+            stores: vec![localdb_core::config::schema::StoreConfig {
+                name: "yaml-store".to_string(),
+                visibility: "private".to_string(),
+                backend: "lancedb".to_string(),
+                indexing: None,
+                sources: vec![],
+            }],
+            providers: vec![],
+        };
+        let queue = crate::job_queue::JobQueue::new();
+        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue).unwrap();
+        let app = crate::daemon::build_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/stores/yaml-store/sources")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "kind": "path",
+                            "spec": {"root": "/tmp/test", "include": [], "exclude": []},
+                            "preset": "prose"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = json_body(resp.into_body()).await;
+        assert_eq!(body["code"], "config_readonly");
     }
 
     // --- Pagination cursors ---

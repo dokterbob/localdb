@@ -23,6 +23,7 @@ pub mod error;
 pub mod handlers;
 pub mod job_queue;
 pub mod lock;
+pub mod scheduler;
 pub mod socket;
 pub mod state;
 pub mod watcher;
@@ -31,4 +32,5 @@ pub use daemon::{build_router, start_daemon, validate_bind_address, DaemonHandle
 pub use error::{ApiError, ErrorResponse};
 pub use job_queue::JobQueue;
 pub use lock::WriteLock;
+pub use scheduler::UrlRefreshScheduler;
 pub use state::AppState;

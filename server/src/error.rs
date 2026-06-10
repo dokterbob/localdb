@@ -135,6 +135,16 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_format_maps_to_422() {
+        assert_eq!(
+            http_status_for(&Error::UnsupportedFormat {
+                format: "application/octet-stream".into()
+            }),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    #[test]
     fn invalid_request_maps_to_400() {
         assert_eq!(
             http_status_for(&Error::InvalidRequest {
