@@ -201,7 +201,7 @@ This section documents verified divergences between the specs and the v0.1.0 imp
 They are listed honestly so contributors know where work remains. Each item names the
 responsible code area.
 
-**1. Embeddings are hash-based placeholders (`FakeEmbedder`).**
+**1. Embeddings are hash-based placeholders (`FakeEmbedder`).** ([#8](https://github.com/dokterbob/localdb/issues/8), [#16](https://github.com/dokterbob/localdb/issues/16))
 The `embed` crate contains real provider implementations (ONNX, OpenAI-compatible,
 Perplexity, Voyage), but `cli/src/lib.rs` wires `FakeEmbedder::new(128)` for both index
 and search. No model download occurs; the `init` message "embedding models will be downloaded
@@ -209,14 +209,14 @@ on first index" does not apply yet. Dense scores in search results are a constan
 (`dense: 1.0`); ranking is driven entirely by BM25. The `embed` crate and `RetrievalStore`
 trait are ready — the wiring in the CLI command handlers is the remaining work.
 
-**2. The HTTP daemon uses an in-memory `FakeStore`.**
+**2. The HTTP daemon uses an in-memory `FakeStore`.** ([#9](https://github.com/dokterbob/localdb/issues/9))
 `server/src/handlers.rs` holds one shared in-memory store behind an `Arc`. All API routes
 return correct JSON shapes, but `POST /v1/search` returns empty citations and job indexing
 operates on the in-memory store regardless of what the CLI has indexed into LanceDB on disk.
 The daemon is an experimental preview; do not rely on it for search correctness today.
 Plumbing the `LanceDbStore` into `AppState` is the remaining work.
 
-**3. CLI commands are blocked while the daemon runs.**
+**3. CLI commands are blocked while the daemon runs.** ([#10](https://github.com/dokterbob/localdb/issues/10), [#11](https://github.com/dokterbob/localdb/issues/11))
 Every CLI command opens `runtime-state.redb` before completing the daemon probe, so running
 any CLI command while `localdb serve` is active returns `error: internal error ... Database
 already open. Cannot acquire lock.` (exit 1). The spec's thin-client routing path
@@ -226,7 +226,7 @@ so it assumes the default port. A stale `daemon.sock` left by a killed daemon ca
 report "daemon running" and `search` to exit with 5 "daemon is unreachable"; fix by removing
 the socket file manually.
 
-**4. YAML-declared stores cannot be indexed.**
+**4. YAML-declared stores cannot be indexed.** ([#12](https://github.com/dokterbob/localdb/issues/12))
 Stores declared in `config.yaml` under the `stores:` key appear in `localdb store list` as
 `(yaml)`, but `localdb index --store <name>` returns `error: store not found: <name>` (exit
 3). The `run_index` function in `cli/src/lib.rs` (~line 1108) resolves stores only from the
@@ -234,18 +234,18 @@ runtime-state database. The working path today is to create stores at runtime wi
 `localdb store add <name>` and add sources with `localdb source add`. YAML store
 declarations are config-only for now.
 
-**5. `search --store <unknown>` exits 0 instead of 3.**
+**5. `search --store <unknown>` exits 0 instead of 3.** ([#13](https://github.com/dokterbob/localdb/issues/13))
 When `--store` names an unknown store, `localdb search` prints "No indexed stores found.
 Run `localdb index` first." and exits 0 with `{"citations":[]}`, rather than returning exit
 code 3 as `store remove` and other not-found cases do. This inconsistency lives in the
 search command handler in `cli/src/lib.rs`.
 
-**6. `source add` does not validate path existence.**
+**6. `source add` does not validate path existence.** ([#14](https://github.com/dokterbob/localdb/issues/14))
 `localdb source add /does/not/exist --store notes` succeeds (exit 0) even when the path does
 not exist on disk. Validation is deferred to index time. The source spec validation in
 `core/src/config/` or the CLI source-add handler is the place to add an existence check.
 
-**7. macOS default paths use a verbose bundle ID.**
+**7. macOS default paths use a verbose bundle ID.** ([#15](https://github.com/dokterbob/localdb/issues/15))
 The default config, data, and model-cache locations on macOS all live under the bundle ID
 `com.localdb.localdb.localdb` (e.g. data at
 `~/Library/Application Support/com.localdb.localdb.localdb/data`). The triple-repeat comes
