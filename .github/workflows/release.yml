@@ -1,0 +1,184 @@
+name: Release
+
+# Triggered by a tag push matching `v*` (e.g. v0.1.0).
+# Produces three release tarballs:
+#   localdb-<version>-aarch64-apple-darwin.tar.gz
+#   localdb-<version>-x86_64-unknown-linux-gnu.tar.gz
+#   localdb-<version>-aarch64-unknown-linux-gnu.tar.gz
+#
+# See specs/06-roadmap.md §4 for the packaging roadmap.
+# Note: Homebrew, launchd, and systemd are Phase ≥2 — not included here.
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]*"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-release:
+    name: Build release (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS Apple Silicon
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            cross: false
+
+          # Linux x86_64 (native)
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            cross: false
+
+          # Linux arm64 (cross-compiled via cross or cargo with linker)
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            cross: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation linker (aarch64-linux only)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-${{ matrix.target }}-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-release-
+
+      - name: Build release binary
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: |
+          cargo build --release --target ${{ matrix.target }} -p localdb
+
+      - name: Strip binary (Linux/macOS)
+        run: |
+          BINARY=target/${{ matrix.target }}/release/localdb
+          if [ -f "$BINARY" ]; then
+            # Use target-specific strip for cross-compiled binaries.
+            if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+              aarch64-linux-gnu-strip "$BINARY" || true
+            else
+              strip "$BINARY" || true
+            fi
+          fi
+
+      - name: Verify no unexpected dynamic dependencies
+        run: |
+          BINARY=target/${{ matrix.target }}/release/localdb
+          if [ "${{ runner.os }}" = "Linux" ] && [ "${{ matrix.cross }}" = "false" ]; then
+            # Allow only: linux-vdso, libgcc_s, libc, libm, libdl, libpthread, ld-linux
+            # (these are the platform baseline — no external shared libs like libssl)
+            # Note: skip for cross-compiled aarch64 target (cannot run ldd on foreign arch binary).
+            ldd "$BINARY" | tee /dev/stderr | \
+              grep -vE '(linux-vdso|libgcc_s|libc\.|libm\.|libdl\.|libpthread|ld-linux|ld-musl)' | \
+              grep -v "0x0" | \
+              (! grep -q "=>")
+            echo "Dynamic dependency check passed."
+          fi
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            otool -L "$BINARY" | tee /dev/stderr
+            # Assert only system libraries are linked (no unexpected .dylib from /usr/local or /opt).
+            if otool -L "$BINARY" | tail -n +2 | grep -vE '(/usr/lib/|/System/Library/|@rpath|@loader_path)'; then
+              echo "ERROR: macOS binary has unexpected dynamic dependencies listed above." >&2
+              exit 1
+            fi
+            echo "macOS dynamic dependency check passed."
+          fi
+
+      - name: Package tarball
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          TARNAME="localdb-${VERSION}-${{ matrix.target }}"
+          mkdir -p "dist/${TARNAME}"
+          cp "target/${{ matrix.target }}/release/localdb" "dist/${TARNAME}/"
+          cp README.md LICENSE "dist/${TARNAME}/"
+          tar -C dist -czf "dist/${TARNAME}.tar.gz" "${TARNAME}"
+          echo "TARBALL=dist/${TARNAME}.tar.gz" >> "$GITHUB_ENV"
+          echo "TARNAME=${TARNAME}" >> "$GITHUB_ENV"
+          ls -lh "dist/${TARNAME}.tar.gz"
+
+      - name: Verify binary runs after packaging
+        # Cannot execute a cross-compiled ARM64 binary on the x86_64 runner.
+        if: matrix.cross == false
+        run: |
+          ./target/${{ matrix.target }}/release/localdb --version
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TARNAME }}
+          path: ${{ env.TARBALL }}
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: build-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+
+      - name: List artifacts
+        run: find dist/ -type f | sort
+
+      - name: Create GitHub Release and upload tarballs
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*.tar.gz
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
+  smoke-test:
+    name: Smoke test (Linux x86_64)
+    needs: build-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Linux x86_64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "localdb-*-x86_64-unknown-linux-gnu"
+          path: dist/
+
+      - name: Install binary from tarball
+        run: |
+          TARBALL=$(find dist/ -name "*.tar.gz" | head -1)
+          tar -xzf "$TARBALL" -C /tmp/
+          BINDIR=$(find /tmp -name "localdb" -type f | head -1 | xargs dirname)
+          echo "$BINDIR" >> "$GITHUB_PATH"
+
+      - name: Run smoke test script
+        run: bash smoke_test.sh
