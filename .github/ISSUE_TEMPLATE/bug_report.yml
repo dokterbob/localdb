@@ -1,0 +1,112 @@
+name: Bug Report
+description: Something is not working as documented or expected.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing, check [docs/](https://github.com/dokterbob/localdb/blob/main/docs/)
+        and the relevant spec in `specs/`. If the behavior is undocumented rather than wrong,
+        a documentation issue may be more appropriate.
+
+  - type: input
+    id: version
+    attributes:
+      label: localdb version
+      description: Output of `localdb --version`
+      placeholder: "localdb 0.1.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - macOS (Apple Silicon / arm64)
+        - macOS (Intel / x86_64)
+        - Linux (x86_64)
+        - Linux (arm64)
+        - Other (describe in repro steps)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      description: Which surface or process model were you using when the bug occurred?
+      options:
+        - embedded (CLI without daemon)
+        - daemon (localdb serve + CLI)
+        - MCP (localdb mcp)
+        - HTTP API (direct curl / client)
+        - unsure
+    validations:
+      required: true
+
+  - type: input
+    id: backend
+    attributes:
+      label: Store backend
+      description: Output of `localdb store list` (or `--json`). Redact any sensitive store names if needed.
+      placeholder: "notes [lancedb] (runtime)"
+    validations:
+      required: false
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Config (redacted)
+      description: >
+        Paste the relevant sections of your `config.yaml`. Remove any API keys,
+        credentials, or personal file paths before posting. You can use placeholder
+        paths like `~/notes` or `/redacted/path`.
+      render: yaml
+    validations:
+      required: false
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: >
+        Exact commands that trigger the bug, in order. Include `--json` output where
+        relevant — it is easier to read and contains more detail than the human-readable
+        output.
+      placeholder: |
+        1. localdb store add notes
+        2. localdb source add ~/notes --store notes
+        3. localdb index --store notes
+        4. localdb search "..."
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What actually happened? Include the full error message and exit code if relevant.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: >
+        Paste any relevant log output. If the daemon is running, check the log file in
+        your configured `paths.logs` directory. For internal errors, include the
+        `correlation_id` from the error message.
+      render: text
+    validations:
+      required: false

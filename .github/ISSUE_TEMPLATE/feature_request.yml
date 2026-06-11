@@ -1,0 +1,78 @@
+name: Feature Request
+description: Propose a new feature or behavior change.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Before opening this issue:**
+        - Check [specs/06-roadmap.md](https://github.com/dokterbob/localdb/blob/main/specs/06-roadmap.md)
+          to see if the feature is already planned or explicitly deferred.
+        - If explicitly deferred, explain in your proposal why the deferral reasoning
+          no longer applies.
+        - Anything that changes documented behavior, adds a new CLI flag, HTTP endpoint,
+          MCP tool, error code, config key, or data model field requires an issue before
+          a PR. See [CONTRIBUTING.md](https://github.com/dokterbob/localdb/blob/main/CONTRIBUTING.md).
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or motivation
+      description: >
+        What are you trying to do that you cannot do today? Describe the use case, not
+        the solution. A concrete example is more useful than a general statement.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: >
+        Describe what you want. If you have a specific API or behavior in mind, sketch
+        it out (command flags, JSON shapes, config keys). If you are unsure of the
+        right approach, describe the goal and leave the design open.
+    validations:
+      required: true
+
+  - type: input
+    id: spec_section
+    attributes:
+      label: Which spec section does this touch?
+      description: >
+        Identify the most relevant section in `specs/` (e.g. `specs/05-surfaces.md §2`,
+        `specs/03-config.md §2`, `specs/06-roadmap.md §1`). If you are unsure, name
+        the closest file. This helps route the issue to the right spec maintainer.
+      placeholder: "specs/05-surfaces.md §2"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: roadmap_check
+    attributes:
+      label: Roadmap check
+      options:
+        - label: >
+            I have read [specs/06-roadmap.md](https://github.com/dokterbob/localdb/blob/main/specs/06-roadmap.md)
+            and confirmed this feature is not already planned or explicitly deferred
+            (or I have explained above why the deferral no longer applies).
+          required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: >
+        Have you considered any other approaches? Why are they insufficient?
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: >
+        Any other information that would help evaluate this request — links to related
+        issues, prior art in similar tools, constraints you are working under, etc.
+    validations:
+      required: false

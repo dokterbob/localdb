@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://github.com/dokterbob/localdb/blob/main/docs/
+    about: User-facing documentation — CLI reference, configuration, search, MCP, daemon.
+  - name: Vision
+    url: https://github.com/dokterbob/localdb/blob/main/VISION.md
+    about: Long-horizon goals and federation direction for localdb.
