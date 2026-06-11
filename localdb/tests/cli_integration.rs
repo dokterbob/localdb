@@ -130,27 +130,20 @@ fn search_requires_query() {
 }
 
 // ---------------------------------------------------------------------------
-// serve / mcp stubs
+// serve / mcp wiring
 // ---------------------------------------------------------------------------
+// Full behavioral coverage lives in tests/surface_wiring.rs; here we only
+// check that the subcommands exist and run (mcp exits 0 on stdin EOF).
 
 #[test]
-fn serve_stub_exits_nonzero() {
+fn mcp_exits_cleanly_on_stdin_eof() {
     let dir = TempDir::new().unwrap();
-    cmd_with_dir(&dir)
-        .arg("serve")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("T11"));
-}
-
-#[test]
-fn mcp_stub_exits_nonzero() {
-    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
     cmd_with_dir(&dir)
         .arg("mcp")
+        .write_stdin("")
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("T10"));
+        .success();
 }
 
 // ---------------------------------------------------------------------------

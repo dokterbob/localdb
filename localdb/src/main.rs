@@ -143,7 +143,7 @@ fn main() {
     match &cli.command {
         Command::Init => cli::run_init(&ctx),
         Command::Serve => cli::run_serve(&ctx),
-        Command::Mcp { allow_write: _ } => cli::run_mcp(&ctx),
+        Command::Mcp { allow_write } => cli::run_mcp(&ctx, *allow_write),
         Command::Status => cli::run_status(&ctx),
         Command::Store(cmd) => match cmd {
             StoreCommand::Add { name } => cli::run_store_add(&ctx, name),

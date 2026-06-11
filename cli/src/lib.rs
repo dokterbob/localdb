@@ -1417,16 +1417,135 @@ async fn run_search_async(ctx: &CliContext, query: &str, limit: usize) {
     }
 }
 
-/// `localdb serve` — stub; delegates to T11.
-pub fn run_serve(_ctx: &CliContext) {
-    eprintln!("serve: not yet implemented (T11)");
-    std::process::exit(1);
+/// `localdb serve` — start the HTTP daemon (specs/05-surfaces.md §3).
+pub fn run_serve(ctx: &CliContext) {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(run_serve_async(ctx));
 }
 
-/// `localdb mcp` — stub; delegates to T10.
-pub fn run_mcp(_ctx: &CliContext) {
-    eprintln!("mcp: not yet implemented (T10)");
-    std::process::exit(1);
+async fn run_serve_async(ctx: &CliContext) {
+    let options = LoadOptions {
+        config_path: ctx.config.clone(),
+        ..Default::default()
+    };
+    let config_loader = match load_config(&options) {
+        Ok(c) => c,
+        Err(e) => exit_err(&e, ctx.json),
+    };
+    if let Err(e) = std::fs::create_dir_all(&config_loader.paths.data_dir) {
+        exit_err(
+            &Error::Internal {
+                message: format!("cannot create data dir: {}", e),
+                correlation_id: "serve_datadir".to_string(),
+            },
+            ctx.json,
+        );
+    }
+
+    let daemon_options = server::DaemonOptions {
+        paths: config_loader.paths.clone(),
+        config: config_loader.config.clone(),
+    };
+    match server::start_daemon(daemon_options).await {
+        Ok((handle, fut)) => {
+            // Announce the bound address before blocking on the server future
+            // so callers (and tests) can discover an OS-assigned port.
+            if ctx.json {
+                print_json(&json!({
+                    "status": "listening",
+                    "url": format!("http://{}", handle.addr),
+                }));
+            } else {
+                println!("daemon listening on http://{}", handle.addr);
+            }
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+            fut.await;
+            // Keep the handle (write lock + socket) alive until shutdown.
+            drop(handle);
+        }
+        Err(e) => exit_err(&e, ctx.json),
+    }
+}
+
+/// `localdb mcp` — run the MCP server on stdio (specs/05-surfaces.md §4).
+pub fn run_mcp(ctx: &CliContext, allow_write: bool) {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(run_mcp_async(ctx, allow_write));
+}
+
+async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
+    use localdb_core::FakeEmbedder;
+    use mcp::{AvailableStore, McpServer, StoreDescriptor};
+
+    let (config_loader, db) = load_app_db(ctx);
+    let data_dir = config_loader.paths.data_dir.clone();
+
+    let runtime_stores = match db.list_stores() {
+        Ok(s) => s,
+        Err(e) => exit_err(&e, ctx.json),
+    };
+
+    // Same store resolution as `localdb search`: YAML stores + runtime stores,
+    // narrowed by --store flags when given.
+    let store_names: Vec<String> = if ctx.stores.is_empty() {
+        let mut names: Vec<String> = config_loader
+            .config
+            .stores
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        let yaml_set: std::collections::HashSet<&str> = config_loader
+            .config
+            .stores
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        for s in &runtime_stores {
+            if !yaml_set.contains(s.name.as_str()) {
+                names.push(s.name.clone());
+            }
+        }
+        names
+    } else {
+        ctx.stores.clone()
+    };
+
+    let mut available: Vec<AvailableStore> = Vec::new();
+    for name in &store_names {
+        let store_data_dir = data_dir.join("stores").join(name);
+        if !store_data_dir.exists() {
+            continue; // Not yet indexed.
+        }
+        let runtime = runtime_stores.iter().find(|s| s.name == *name);
+        let descriptor = StoreDescriptor {
+            id: runtime
+                .map(|s| s.id.clone())
+                .unwrap_or_else(|| name.clone()),
+            name: name.clone(),
+            visibility: runtime
+                .map(|s| s.visibility.clone())
+                .unwrap_or_else(|| "private".to_string()),
+        };
+        let lance_path = store_data_dir.to_string_lossy().to_string();
+        match store_lancedb::LanceDbStore::open(&lance_path, 128).await {
+            Ok(s) => available.push(AvailableStore::new(descriptor, Box::new(s))),
+            Err(e) => eprintln!("warning: cannot open store '{}': {}", name, e),
+        }
+    }
+
+    let mut mcp_server = McpServer::new(available, Box::new(FakeEmbedder::new(128)));
+    mcp_server.allow_write = allow_write;
+
+    if let Err(e) = mcp::run_stdio_loop(&mcp_server).await {
+        exit_err(
+            &Error::Internal {
+                message: format!("mcp stdio loop failed: {}", e),
+                correlation_id: "mcp_stdio".to_string(),
+            },
+            ctx.json,
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -10,6 +10,8 @@ description = "CLI command implementations, thin layer on core / daemon client"
 localdb-core = { path = "../core" }
 store-lancedb = { path = "../store-lancedb" }
 extract = { path = "../extract" }
+mcp = { path = "../mcp" }
+server = { path = "../server" }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
