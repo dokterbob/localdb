@@ -31,11 +31,12 @@ fn cmd_with_dir(dir: &TempDir) -> Command {
 
 /// Write a minimal valid config to `dir/config.yaml`, with `paths.data`
 /// pointing inside the temp dir to avoid polluting the user's data dir.
+/// Pins `provider: fake` so integration tests run offline without any API key.
 fn write_default_config(dir: &TempDir) {
     let data_dir = dir.path().join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
     let config = format!(
-        "version: 1\npaths:\n  data: {}\n",
+        "version: 1\npaths:\n  data: {}\ndefaults:\n  indexing:\n    embedding:\n      provider: fake\n      model: bge-small-en-v1.5\n",
         data_dir.to_string_lossy()
     );
     std::fs::write(dir.path().join("config.yaml"), &config).unwrap();

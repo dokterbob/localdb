@@ -657,7 +657,10 @@ pub fn run_init(ctx: &CliContext) {
         println!("  Config: {}", config_path.display());
         println!("  Data:   {}", data_dir.display());
         println!();
-        println!("Note: embedding models will be downloaded on first index.");
+        println!(
+            "Note: when using 'local-onnx' provider, the ONNX model is downloaded on first index."
+        );
+        println!("      Hosted providers (openai-compatible, perplexity, voyage) require an API key in config.");
         println!("Run `localdb store add <name>` to create a store.");
     }
 }
@@ -1068,7 +1071,6 @@ async fn run_index_async(ctx: &CliContext, source_id: Option<&str>) {
             run_ingestion_for_source, DocumentExtractor, DocumentIndex, ExtractionResult,
             IngestionConfig,
         },
-        FakeEmbedder,
     };
 
     let (config_loader, db) = load_app_db(ctx);
@@ -1153,7 +1155,16 @@ async fn run_index_async(ctx: &CliContext, source_id: Option<&str>) {
         chunker: ChunkerConfig::prose(),
     };
 
-    let embedder = FakeEmbedder::new(128);
+    let embed_policy = &config_loader.config.defaults.indexing.embedding;
+    let models_dir = config_loader.paths.models_dir.clone();
+    let embedder = match embed::create_embedder(
+        embed_policy,
+        &config_loader.config.providers,
+        Some(&models_dir),
+    ) {
+        Ok(e) => e,
+        Err(e) => exit_err(&Error::from(e), ctx.json),
+    };
 
     // Extraction bridge between extract crate and core's DocumentExtractor trait.
     struct ExtractBridge;
@@ -1180,10 +1191,11 @@ async fn run_index_async(ctx: &CliContext, source_id: Option<&str>) {
     }
 
     let lance_path = store_data_dir.to_string_lossy().to_string();
-    let lancedb_store = match store_lancedb::LanceDbStore::open(&lance_path, 128).await {
-        Ok(s) => s,
-        Err(e) => exit_err(&e, ctx.json),
-    };
+    let lancedb_store =
+        match store_lancedb::LanceDbStore::open(&lance_path, embedder.embedding_dim()).await {
+            Ok(s) => s,
+            Err(e) => exit_err(&e, ctx.json),
+        };
 
     let mut doc_index = DocumentIndex::new();
     let (mut indexed, mut skipped, mut chunks, mut errors) = (0u64, 0u64, 0u64, 0u64);
@@ -1203,7 +1215,7 @@ async fn run_index_async(ctx: &CliContext, source_id: Option<&str>) {
             &source,
             &mut doc_index,
             &lancedb_store,
-            &embedder,
+            embedder.as_ref(),
             &ingestion_cfg,
             &ExtractBridge,
             None,
@@ -1254,10 +1266,7 @@ pub fn run_search(ctx: &CliContext, query: &str, limit: usize) {
 }
 
 async fn run_search_async(ctx: &CliContext, query: &str, limit: usize) {
-    use localdb_core::{
-        search::{QueryRequest, SearchOrchestrator, StoreHandle},
-        FakeEmbedder,
-    };
+    use localdb_core::search::{QueryRequest, SearchOrchestrator, StoreHandle};
 
     let (config_loader, db) = load_app_db(ctx);
     let data_dir = config_loader.paths.data_dir.clone();
@@ -1346,6 +1355,17 @@ async fn run_search_async(ctx: &CliContext, query: &str, limit: usize) {
         return;
     }
 
+    let embed_policy = &config_loader.config.defaults.indexing.embedding;
+    let models_dir = config_loader.paths.models_dir.clone();
+    let embedder = match embed::create_embedder(
+        embed_policy,
+        &config_loader.config.providers,
+        Some(&models_dir),
+    ) {
+        Ok(e) => e,
+        Err(e) => exit_err(&Error::from(e), ctx.json),
+    };
+
     // Build store handles.
     let mut store_handles: Vec<StoreHandle> = Vec::new();
     for name in &store_names {
@@ -1360,7 +1380,7 @@ async fn run_search_async(ctx: &CliContext, query: &str, limit: usize) {
             .unwrap_or_else(|| name.clone());
 
         let lance_path = store_data_dir.to_string_lossy().to_string();
-        match store_lancedb::LanceDbStore::open(&lance_path, 128).await {
+        match store_lancedb::LanceDbStore::open(&lance_path, embedder.embedding_dim()).await {
             Ok(s) => store_handles.push(StoreHandle {
                 id: store_id,
                 name: name.clone(),
@@ -1378,8 +1398,6 @@ async fn run_search_async(ctx: &CliContext, query: &str, limit: usize) {
         }
         return;
     }
-
-    let embedder = FakeEmbedder::new(128);
     let request = QueryRequest {
         query: query.to_string(),
         leg_k: None,
@@ -1387,7 +1405,7 @@ async fn run_search_async(ctx: &CliContext, query: &str, limit: usize) {
         filters: vec![],
     };
 
-    match SearchOrchestrator::query(&store_handles, &embedder, &request).await {
+    match SearchOrchestrator::query(&store_handles, embedder.as_ref(), &request).await {
         Ok(response) => {
             let json_citations: Vec<serde_json::Value> = response
                 .citations
@@ -1475,7 +1493,6 @@ pub fn run_mcp(ctx: &CliContext, allow_write: bool) {
 }
 
 async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
-    use localdb_core::FakeEmbedder;
     use mcp::{AvailableStore, McpServer, StoreDescriptor};
 
     let (config_loader, db) = load_app_db(ctx);
@@ -1511,6 +1528,17 @@ async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
         ctx.stores.clone()
     };
 
+    let embed_policy = &config_loader.config.defaults.indexing.embedding;
+    let models_dir = config_loader.paths.models_dir.clone();
+    let embedder = match embed::create_embedder(
+        embed_policy,
+        &config_loader.config.providers,
+        Some(&models_dir),
+    ) {
+        Ok(e) => e,
+        Err(e) => exit_err(&Error::from(e), ctx.json),
+    };
+
     let mut available: Vec<AvailableStore> = Vec::new();
     for name in &store_names {
         let store_data_dir = data_dir.join("stores").join(name);
@@ -1528,13 +1556,13 @@ async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
                 .unwrap_or_else(|| "private".to_string()),
         };
         let lance_path = store_data_dir.to_string_lossy().to_string();
-        match store_lancedb::LanceDbStore::open(&lance_path, 128).await {
+        match store_lancedb::LanceDbStore::open(&lance_path, embedder.embedding_dim()).await {
             Ok(s) => available.push(AvailableStore::new(descriptor, Box::new(s))),
             Err(e) => eprintln!("warning: cannot open store '{}': {}", name, e),
         }
     }
 
-    let mut mcp_server = McpServer::new(available, Box::new(FakeEmbedder::new(128)));
+    let mut mcp_server = McpServer::new(available, embedder);
     mcp_server.allow_write = allow_write;
 
     if let Err(e) = mcp::run_stdio_loop(&mcp_server).await {
