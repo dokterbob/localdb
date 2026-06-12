@@ -252,3 +252,19 @@ The default config, data, and model-cache locations on macOS all live under the 
 from `ProjectDirs::from("com.localdb", "localdb", "localdb")` in
 `core/src/config/platform.rs`; specs/03 shows shorter `localdb/` paths. Cosmetic; override
 with `paths.*` in config for cleaner locations.
+
+---
+
+## Deferred design decisions {#design-decisions}
+
+Several items surfaced during the v0.1.0 issue sweep require cross-cutting design decisions
+before code can be written. They are documented (with options and recommendations) in
+[docs/design-decisions.md](design-decisions.md):
+
+- **A7** — `policy_version` does not hash resolved per-source chunking parameters.
+- **A8 / B4** — Pagination offset computed but never applied; `total_candidates` is pre-dedup.
+- **B2** — Cross-store deduplication semantics (collapse vs. distinct citations).
+- **B3** — Rerank seam re-attaches store metadata by index position (safe today, unsafe with real reranker).
+- **E1** — Structured MCP tool results (spec-decided, implementation deferred to v0.2.0).
+- **A9-charset** — Allowed character set for store names beyond traversal-safety.
+- **A6-atomicity** — True crash-atomic upsert in LanceDB (embed-before-delete ships in v0.1.0).
