@@ -83,27 +83,27 @@ impl PerplexityEmbedder {
         model: Option<String>,
         embedding_dim: Option<usize>,
         retry: RetryPolicy,
-    ) -> Self {
+    ) -> Result<Self, EmbedError> {
         let model = model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
         let embedding_dim = embedding_dim.unwrap_or(DEFAULT_DIM);
         let client = Client::builder()
             .timeout(retry.request_timeout)
             .build()
-            .expect("failed to build HTTP client");
-        Self {
+            .map_err(|e| EmbedError::Internal(format!("failed to build HTTP client: {e}")))?;
+        Ok(Self {
             client,
             base_url: DEFAULT_BASE_URL.to_string(),
             api_key: api_key.into(),
             model,
             embedding_dim,
             retry,
-        }
+        })
     }
 
     /// Create from environment variable for the API key.
     ///
     /// Returns `None` if the environment variable is not set.
-    pub fn from_env(api_key_env: &str) -> Option<Self> {
+    pub fn from_env(api_key_env: &str) -> Option<Result<Self, EmbedError>> {
         std::env::var(api_key_env)
             .ok()
             .map(|key| Self::new(key, None, None, RetryPolicy::default()))
@@ -301,6 +301,7 @@ mod tests {
                 batch_size: 32,
             },
         )
+        .expect("failed to construct embedder")
         .with_base_url(server_uri)
     }
 
@@ -400,6 +401,7 @@ mod tests {
                 batch_size: 32,
             },
         )
+        .expect("failed to construct embedder")
         .with_base_url(server.uri());
 
         let docs = vec![DocumentChunks {
@@ -472,6 +474,7 @@ mod tests {
                 batch_size: 32,
             },
         )
+        .expect("failed to construct embedder")
         .with_base_url(server.uri());
 
         let docs = vec![DocumentChunks {
@@ -498,8 +501,20 @@ mod tests {
 
     #[test]
     fn perplexity_embedder_model_id() {
-        let embedder = PerplexityEmbedder::new("key", None, None, RetryPolicy::default());
+        let embedder = PerplexityEmbedder::new("key", None, None, RetryPolicy::default())
+            .expect("failed to construct embedder");
         assert_eq!(embedder.model_id(), DEFAULT_MODEL);
         assert_eq!(embedder.embedding_dim(), DEFAULT_DIM);
+    }
+
+    #[test]
+    fn perplexity_embedder_construction_does_not_panic() {
+        let retry = RetryPolicy::default();
+        let result = PerplexityEmbedder::new("test-api-key", None, None, retry);
+        assert!(
+            result.is_ok(),
+            "should be able to construct embedder: {:?}",
+            result.err()
+        );
     }
 }

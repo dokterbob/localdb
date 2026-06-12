@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult, DebouncedEventKind, Debouncer};
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// A file change event from the watcher.
 #[derive(Debug, Clone)]
@@ -40,10 +40,26 @@ pub fn watch_path(
         move |result: DebounceEventResult| match result {
             Ok(events) => {
                 for event in events {
-                    let _ = tx_clone.try_send(FileChangeEvent {
+                    let path = event.path.clone();
+                    if let Err(e) = tx_clone.try_send(FileChangeEvent {
                         path: event.path,
                         kind: event.kind,
-                    });
+                    }) {
+                        // F3: log a warning instead of silently dropping events.
+                        // The channel is bounded (capacity 64); a full channel
+                        // typically means the consumer is slow or stopped.
+                        match e {
+                            tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                                warn!(
+                                    "file-watcher event channel full — dropping event for {:?}",
+                                    path
+                                );
+                            }
+                            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                                // Receiver dropped — stop silently.
+                            }
+                        }
+                    }
                 }
             }
             Err(e) => {

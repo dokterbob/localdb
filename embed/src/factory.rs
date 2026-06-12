@@ -73,14 +73,15 @@ pub fn create_embedder(
                 .base_url
                 .as_deref()
                 .unwrap_or("https://api.openai.com");
-            Ok(Box::new(crate::OpenAiEmbedder::new(
+            let e = crate::OpenAiEmbedder::new(
                 base_url,
                 api_key,
                 policy.model.as_str(),
                 1536,
                 None,
                 crate::RetryPolicy::default(),
-            )))
+            )?;
+            Ok(Box::new(e))
         }
 
         "perplexity" => {
@@ -99,12 +100,9 @@ pub fn create_embedder(
                 .as_deref()
                 .and_then(|env| std::env::var(env).ok())
                 .unwrap_or_default();
-            Ok(Box::new(crate::PerplexityEmbedder::new(
-                api_key,
-                None,
-                None,
-                crate::RetryPolicy::default(),
-            )))
+            let e =
+                crate::PerplexityEmbedder::new(api_key, None, None, crate::RetryPolicy::default())?;
+            Ok(Box::new(e))
         }
 
         "voyage" => {
@@ -123,12 +121,8 @@ pub fn create_embedder(
                 .as_deref()
                 .and_then(|env| std::env::var(env).ok())
                 .unwrap_or_default();
-            Ok(Box::new(crate::VoyageEmbedder::new(
-                api_key,
-                None,
-                None,
-                crate::RetryPolicy::default(),
-            )))
+            let e = crate::VoyageEmbedder::new(api_key, None, None, crate::RetryPolicy::default())?;
+            Ok(Box::new(e))
         }
 
         unknown => Err(EmbedError::Internal(format!(

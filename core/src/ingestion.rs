@@ -181,12 +181,21 @@ pub async fn is_store_stale(
 ) -> Result<bool, Error> {
     let stats = store.stats().await?;
     if stats.chunk_count == 0 {
+        // An empty store is never stale — there is nothing to reindex.
         return Ok(false);
     }
 
-    // Get a sample chunk to check its policy version
-    // We use dense_search with an empty query to get any chunk
-    let results = store.dense_search(&[], 1, &[]).await?;
+    // Sample one chunk via BM25 to check its policy version.
+    //
+    // We avoid dense_search here because it requires a query vector whose
+    // dimension must match the index.  An empty (&[]) or zero-length vector
+    // causes real LanceDB implementations to return an error.
+    //
+    // The BM25 query uses very common single-character substrings ("e t a")
+    // so that any chunk containing typical text will produce a match.  If the
+    // store contains only numeric or symbolic content and no result is returned,
+    // we conservatively return `false` (not stale) to avoid a spurious reindex.
+    let results = store.bm25_search("e t a", 1, &[]).await?;
     if results.is_empty() {
         return Ok(false);
     }
@@ -370,6 +379,7 @@ pub struct DocumentInput {
 }
 
 /// Output of indexing a single document.
+#[derive(Debug)]
 pub struct DocumentIndexOutput {
     /// Number of chunks written.
     pub chunks_written: usize,
@@ -384,6 +394,11 @@ pub struct DocumentIndexOutput {
 /// If the document's content hash matches an existing record, returns early
 /// (incremental skip). If changed, deletes old chunks before inserting new ones.
 ///
+/// The order of operations is carefully chosen to be crash-safe (A6):
+///   1. Extract, chunk, embed — all read-only / reversible.
+///   2. Delete old chunks — only after embedding succeeds.
+///   3. Upsert new chunks — last, so failure leaves old data intact.
+///
 /// Returns the `DocumentIndexOutput` with chunk counts and the new record.
 pub async fn index_document(
     input: &DocumentInput,
@@ -393,42 +408,46 @@ pub async fn index_document(
     config: &IngestionConfig,
     extractor: &dyn DocumentExtractor,
 ) -> Result<DocumentIndexOutput, Error> {
-    // Extract text and blocks
+    // Extract text and blocks.
     let extraction = extractor.extract(&input.bytes, input.filename.as_deref())?;
 
-    // Compute content hash
+    // Compute content hash.
     let hash = content_hash(&extraction.text);
 
-    // Content-addressed document ID
+    // Content-addressed document ID.
     let doc_id = document_id(&input.uri, &hash);
 
-    // Check for incremental skip: same hash, same policy → skip
+    // Check for incremental skip: same hash, same policy → skip.
     if let Some(existing) = doc_index.get(&input.uri) {
         if existing.content_hash == hash && existing.policy_version == config.policy_version {
-            // Unchanged — nothing to do
+            // Unchanged — nothing to do.
             return Ok(DocumentIndexOutput {
                 chunks_written: 0,
                 was_indexed: false,
                 record: existing.clone(),
             });
         }
-
-        // Content or policy changed: delete old chunks
-        store.delete_by_document(&existing.document_id).await?;
+        // Content or policy changed — fall through to re-index.
+        // Old chunks are deleted *after* embedding succeeds (A6).
     }
 
-    // Set document_id on blocks
+    // Set document_id on blocks.
     let mut blocks: Vec<Block> = extraction.blocks.clone();
     for block in &mut blocks {
         block.document_id = doc_id.clone();
     }
 
-    // Chunk the document
+    // Chunk the document.
     let chunker_cfg = config.chunker.clone();
     let chunk_outputs = chunk_document(&doc_id, &extraction.text, &blocks, &chunker_cfg)?;
 
     if chunk_outputs.is_empty() {
-        // No chunks produced (empty doc) — still record it as indexed
+        // No chunks produced (empty doc) — delete old chunks if any and record as indexed.
+        if let Some(existing) = doc_index.get(&input.uri) {
+            if existing.content_hash != hash || existing.policy_version != config.policy_version {
+                store.delete_by_document(&existing.document_id).await?;
+            }
+        }
         let record = DocumentRecord {
             uri: input.uri.clone(),
             document_id: doc_id,
@@ -442,16 +461,48 @@ pub async fn index_document(
         });
     }
 
-    // Embed the chunks (document-aware interface)
+    // Embed the chunks (document-aware interface).
+    // This must happen BEFORE deleting old chunks (A6): if embedding fails,
+    // the store is left untouched.
     let doc_chunks = DocumentChunks {
         document_context: extraction.text.clone(),
         chunks: chunk_outputs.iter().map(|c| c.text.clone()).collect(),
     };
 
     let embedded = embedder.embed_documents(vec![doc_chunks]).await?;
-    let embeddings = &embedded[0];
 
-    // Build Chunk and ChunkRecord structures
+    // Guard: the embedder must return exactly one EmbeddedDocument (one per
+    // input document), and that document must have exactly one vector per chunk.
+    // A length mismatch indicates a malformed embedder response (F4).
+    if embedded.len() != 1 {
+        return Err(Error::Internal {
+            message: format!(
+                "embedder returned {} EmbeddedDocuments for 1 input document",
+                embedded.len()
+            ),
+            correlation_id: "embed_count_mismatch".to_string(),
+        });
+    }
+    let embeddings = &embedded[0];
+    if embeddings.len() != chunk_outputs.len() {
+        return Err(Error::Internal {
+            message: format!(
+                "embedder returned {} vectors for {} chunks",
+                embeddings.len(),
+                chunk_outputs.len()
+            ),
+            correlation_id: "embed_chunk_count_mismatch".to_string(),
+        });
+    }
+
+    // Embedding succeeded — now it is safe to delete the old document chunks (A6).
+    if let Some(existing) = doc_index.get(&input.uri) {
+        if existing.content_hash != hash || existing.policy_version != config.policy_version {
+            store.delete_by_document(&existing.document_id).await?;
+        }
+    }
+
+    // Build Chunk and ChunkRecord structures.
     let provenance = Provenance {
         origin_store: config.store_id.clone(),
         source_ref: SourceRef {
@@ -2214,5 +2265,258 @@ mod tests {
     #[test]
     fn detect_mime_no_extension() {
         assert_eq!(detect_mime(Path::new("Makefile")), None);
+    }
+
+    // ---------------------------------------------------------------------------
+    // A3 — is_store_stale works on an empty FakeStore without panicking
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn is_store_stale_empty_store_does_not_panic() {
+        let store = FakeStore::new();
+        // Must not panic or return an error even though the store is empty.
+        let result = is_store_stale(&store, "policy-v1").await;
+        assert!(
+            result.is_ok(),
+            "is_store_stale must not error on empty store"
+        );
+        assert!(
+            !result.unwrap(),
+            "empty store must be reported as not stale"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // A6 / F4 — embed-before-delete ordering and short embedder guard
+    // ---------------------------------------------------------------------------
+
+    /// An embedder that always fails with an internal error.
+    struct FailingEmbedder;
+
+    #[async_trait::async_trait]
+    impl crate::embedder::Embedder for FailingEmbedder {
+        async fn embed_documents(
+            &self,
+            _docs: Vec<crate::embedder::DocumentChunks>,
+        ) -> Result<Vec<crate::embedder::EmbeddedDocument>, Error> {
+            Err(Error::Internal {
+                message: "intentional embedder failure for testing".to_string(),
+                correlation_id: "failing_embedder".to_string(),
+            })
+        }
+
+        fn embedding_dim(&self) -> usize {
+            4
+        }
+
+        fn model_id(&self) -> &str {
+            "failing-embedder"
+        }
+    }
+
+    /// An embedder that returns fewer vectors than input chunks.
+    struct ShortEmbedder {
+        dim: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::embedder::Embedder for ShortEmbedder {
+        async fn embed_documents(
+            &self,
+            docs: Vec<crate::embedder::DocumentChunks>,
+        ) -> Result<Vec<crate::embedder::EmbeddedDocument>, Error> {
+            // Return one EmbeddedDocument but with fewer vectors than there are chunks.
+            let result = docs
+                .iter()
+                .map(|doc| {
+                    // Return at most 0 vectors regardless of how many chunks there are.
+                    let _ = &doc.chunks;
+                    vec![] // always empty — guarantees a length mismatch
+                })
+                .collect();
+            Ok(result)
+        }
+
+        fn embedding_dim(&self) -> usize {
+            self.dim
+        }
+
+        fn model_id(&self) -> &str {
+            "short-embedder"
+        }
+    }
+
+    /// A6: if embedding fails, the store must still contain the original chunks.
+    #[tokio::test]
+    async fn index_document_embed_failure_preserves_original_chunks() {
+        let store = FakeStore::new();
+        let good_embedder = FakeEmbedder::new(4);
+        let extractor = FakeExtractor;
+        let store_id = "store-1";
+        let config = make_ingestion_config(store_id);
+        let source = make_path_source(store_id, "/docs", vec![]);
+
+        // Index the document successfully first.
+        let input_v1 = DocumentInput {
+            uri: "file:///docs/doc.md".to_string(),
+            bytes: b"Original content for the document.".to_vec(),
+            filename: Some("doc.md".to_string()),
+            mime: Some("text/markdown".to_string()),
+            fetched_at: "2026-06-10T12:00:00Z".to_string(),
+            source: source.clone(),
+        };
+
+        let mut doc_index = DocumentIndex::new();
+        let out1 = index_document(
+            &input_v1,
+            &doc_index,
+            &store,
+            &good_embedder,
+            &config,
+            &extractor,
+        )
+        .await
+        .unwrap();
+        assert!(out1.was_indexed);
+        doc_index.upsert(out1.record);
+
+        let original_doc_id = doc_index
+            .get("file:///docs/doc.md")
+            .unwrap()
+            .document_id
+            .clone();
+        let chunks_before = store
+            .get_chunks_for_document(&original_doc_id)
+            .await
+            .unwrap();
+        assert!(
+            !chunks_before.is_empty(),
+            "original chunks must be present after first index"
+        );
+
+        // Now attempt to re-index with changed content but a failing embedder.
+        let failing_embedder = FailingEmbedder;
+        let input_v2 = DocumentInput {
+            uri: "file:///docs/doc.md".to_string(),
+            bytes: b"Changed content that triggers re-indexing.".to_vec(),
+            filename: Some("doc.md".to_string()),
+            mime: Some("text/markdown".to_string()),
+            fetched_at: "2026-06-11T12:00:00Z".to_string(),
+            source: source.clone(),
+        };
+
+        let result = index_document(
+            &input_v2,
+            &doc_index,
+            &store,
+            &failing_embedder,
+            &config,
+            &extractor,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "indexing must fail when the embedder fails"
+        );
+
+        // Original chunks must still be in the store (embed-before-delete ordering).
+        let chunks_after = store
+            .get_chunks_for_document(&original_doc_id)
+            .await
+            .unwrap();
+        assert!(
+            !chunks_after.is_empty(),
+            "original chunks must survive an embedder failure (A6: embed before delete)"
+        );
+    }
+
+    /// F4: a short embedder response (fewer vectors than chunks) returns Internal error.
+    #[tokio::test]
+    async fn index_document_short_embedder_returns_error() {
+        let store = FakeStore::new();
+        let short_embedder = ShortEmbedder { dim: 4 };
+        let extractor = FakeExtractor;
+        let store_id = "store-1";
+        let config = make_ingestion_config(store_id);
+        let source = make_path_source(store_id, "/docs", vec![]);
+
+        let input = DocumentInput {
+            uri: "file:///docs/short.md".to_string(),
+            bytes: b"Content that produces at least one chunk.".to_vec(),
+            filename: Some("short.md".to_string()),
+            mime: Some("text/markdown".to_string()),
+            fetched_at: "2026-06-10T12:00:00Z".to_string(),
+            source,
+        };
+
+        let doc_index = DocumentIndex::new();
+        let result = index_document(
+            &input,
+            &doc_index,
+            &store,
+            &short_embedder,
+            &config,
+            &extractor,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "must return an error when embedder returns fewer vectors than chunks"
+        );
+        assert!(
+            matches!(result.unwrap_err(), Error::Internal { .. }),
+            "error must be Internal"
+        );
+    }
+
+    /// A2: DocumentIndex hydrated via from_chunk_records enables incremental skip
+    ///     even when starting from a fresh in-memory index.
+    #[tokio::test]
+    async fn document_index_hydration_enables_incremental_skip() {
+        use crate::store::ChunkRecord;
+        use std::collections::HashMap;
+
+        // Simulate a previous run: build chunk records as if already indexed.
+        let uri = "file:///docs/existing.md";
+        let content = "Already indexed content.";
+        let hash = content_hash(content);
+        let doc_id = document_id(uri, &hash);
+
+        let existing_chunk = ChunkRecord {
+            id: "chunk-existing".to_string(),
+            document_id: doc_id.clone(),
+            store_id: "store-1".to_string(),
+            text: content.to_string(),
+            span: Span::new(0, content.len()),
+            heading_path: vec![],
+            embedding: vec![0.1, 0.2, 0.3, 0.4],
+            policy_version: "policy-v1".to_string(),
+            fetched_at: "2026-06-10T12:00:00Z".to_string(),
+            content_hash: hash.clone(),
+            origin_store: "store-1".to_string(),
+            source_id: "src-1".to_string(),
+            source_kind: "path".to_string(),
+            mime: None,
+            uri: uri.to_string(),
+            title: None,
+            meta: HashMap::new(),
+        };
+
+        // Hydrate a fresh DocumentIndex from the stored chunk records.
+        let doc_index = DocumentIndex::from_chunk_records(&[existing_chunk]);
+        assert_eq!(
+            doc_index.len(),
+            1,
+            "index should have one record after hydration"
+        );
+
+        let record = doc_index
+            .get(uri)
+            .expect("record must be present after hydration");
+        assert_eq!(record.content_hash, hash);
+        assert_eq!(record.policy_version, "policy-v1");
+        assert_eq!(record.document_id, doc_id);
     }
 }

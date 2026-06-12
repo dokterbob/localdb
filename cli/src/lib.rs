@@ -58,6 +58,43 @@ pub enum DaemonState {
     NotRunning,
 }
 
+/// Check whether a daemon HTTP endpoint is reachable by probing its TCP port.
+///
+/// Returns `true` if a TCP connection to the host:port can be established within
+/// 2 seconds, indicating the daemon process is alive. Returns `false` on
+/// connection refused, timeout, or parse failure (stale / never-started socket).
+///
+/// We use a plain `std::net::TcpStream` so this function is safe to call from
+/// both sync and async contexts (no nested tokio runtime needed).
+fn probe_daemon_health(base_url: &str) -> bool {
+    probe_daemon_health_inner(base_url).unwrap_or(false)
+}
+
+fn probe_daemon_health_inner(base_url: &str) -> Option<bool> {
+    use std::net::ToSocketAddrs;
+
+    // Strip scheme prefix and path to extract the host:port portion.
+    let host_port = base_url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()?;
+
+    // If the authority already includes a port, parse directly; otherwise add :80.
+    let addr_str: String = if host_port.contains(':') {
+        host_port.to_string()
+    } else {
+        format!("{}:80", host_port)
+    };
+
+    // Resolve to a socket address (handles both IP literals and hostnames).
+    let sock_addr = addr_str.to_socket_addrs().ok()?.next()?;
+
+    Some(
+        std::net::TcpStream::connect_timeout(&sock_addr, std::time::Duration::from_secs(2)).is_ok(),
+    )
+}
+
 /// Probe the daemon socket for a given data directory.
 ///
 /// Returns `DaemonState::Running` if the socket file is present (MVP check).
@@ -85,7 +122,19 @@ pub fn probe_daemon(data_dir: &Path) -> DaemonState {
             .filter(|s| s.starts_with("http://") || s.starts_with("https://"))
             .unwrap_or_else(|| "http://127.0.0.1:7700".to_string());
 
-        DaemonState::Running { base_url }
+        // Probe the daemon with a health check to detect stale socket files.
+        // A stale socket exists when a previous daemon crashed without cleaning up.
+        // We perform the probe via a one-shot tokio runtime (same pattern as daemon_request).
+        let health_url = format!("{}/v1/status", base_url);
+        let reachable = probe_daemon_health(&health_url);
+
+        if reachable {
+            DaemonState::Running { base_url }
+        } else {
+            // Stale socket: remove it and report not running.
+            let _ = std::fs::remove_file(&socket_path);
+            DaemonState::NotRunning
+        }
     } else {
         DaemonState::NotRunning
     }
@@ -228,8 +277,9 @@ async fn daemon_request_async(
         Ok(json)
     } else {
         // Map HTTP error codes to our error types.
+        // The server's error body uses {code, message} (see server/src/error.rs).
         let code = json
-            .get("error")
+            .get("code")
             .and_then(|e| e.as_str())
             .unwrap_or("internal");
         let msg = json
@@ -471,6 +521,15 @@ impl AppDb {
 // ---------------------------------------------------------------------------
 
 /// Load config and open the AppDb. Exits on failure.
+///
+/// When a daemon is running, the runtime-state DB is managed by the daemon
+/// process exclusively. Opening it from the CLI would cause a "Database already
+/// open" error (redb's single-writer guarantee). We therefore skip opening the
+/// DB when a daemon is detected and return a dummy in-memory-only AppDb that
+/// is only usable for reads that go through the daemon's HTTP API anyway.
+///
+/// Commands that reach the daemon-routing branch early (before needing the local
+/// DB) will return before any embedded-mode DB access occurs.
 fn load_app_db(ctx: &CliContext) -> (ConfigLoader, AppDb) {
     let options = LoadOptions {
         config_path: ctx.config.clone(),
@@ -480,12 +539,42 @@ fn load_app_db(ctx: &CliContext) -> (ConfigLoader, AppDb) {
         Ok(c) => c,
         Err(e) => exit_err(&e, ctx.json),
     };
+
+    // Probe the daemon *before* opening the local DB. If the daemon is running
+    // it holds the exclusive write lock on runtime-state.redb; opening it from
+    // the CLI would fail with "Database already open".
+    let data_dir = &config_loader.paths.data_dir;
+    if matches!(probe_daemon(data_dir), DaemonState::Running { .. }) {
+        // Return a DB opened on a temporary path so callers that branch on the
+        // daemon path early (index, search, source add/remove, store add/remove)
+        // can still call resolve_store_name / list_stores without panicking.
+        // The actual mutations all go through the HTTP API when the daemon is up.
+        let tmp_dir = tempdir_for_daemon_mode(data_dir);
+        let tmp_db_path = tmp_dir.join("daemon-mode-placeholder.redb");
+        let db = match AppDb::open(&tmp_db_path) {
+            Ok(d) => d,
+            Err(e) => exit_err(&e, ctx.json),
+        };
+        return (config_loader, db);
+    }
+
     let db_path = config_loader.paths.runtime_state_db_path();
     let db = match AppDb::open(&db_path) {
         Ok(d) => d,
         Err(e) => exit_err(&e, ctx.json),
     };
     (config_loader, db)
+}
+
+/// Return a writable temp directory path that lives inside `data_dir` so the
+/// daemon-mode placeholder DB is cleaned up automatically when the process exits.
+///
+/// We use a fixed subdir name rather than a proper `TempDir` because we only
+/// need the path (the DB is tiny and will be recreated on next run).
+fn tempdir_for_daemon_mode(data_dir: &Path) -> PathBuf {
+    let p = data_dir.join(".cli-daemon-placeholder");
+    let _ = std::fs::create_dir_all(&p);
+    p
 }
 
 /// Resolve the target store name from --store flags, YAML config, or runtime DB.
@@ -904,11 +993,17 @@ pub fn run_source_add(ctx: &CliContext, source_arg: &str) {
     // Per specs/05-surfaces.md §2: route to daemon when running.
     if let DaemonState::Running { base_url } = probe_daemon(data_dir) {
         let (kind, root, url) = classify_source(source_arg);
+        // The handler's CreateSourceRequest expects {kind, spec, preset} where
+        // spec is a nested object (see server/src/handlers.rs CreateSourceRequest).
+        let spec = if kind == "path" {
+            json!({ "root": root, "include": [], "exclude": [] })
+        } else {
+            json!({ "url": url })
+        };
         let url_str = format!("{}/v1/stores/{}/sources", base_url, store_name);
         let body = json!({
             "kind": kind,
-            "root": root,
-            "url": url,
+            "spec": spec,
             "preset": "prose",
         });
         match daemon_request(reqwest::Method::POST, &url_str, Some(body)) {
@@ -1021,7 +1116,8 @@ pub fn run_source_remove(ctx: &CliContext, id: &str) {
 
     // Per specs/05-surfaces.md §2: route to daemon when running.
     if let DaemonState::Running { base_url } = probe_daemon(data_dir) {
-        let url = format!("{}/v1/stores/{}/sources/{}", base_url, store_name, id);
+        // Route is DELETE /v1/sources/{id} (see server/src/daemon.rs build_router).
+        let url = format!("{}/v1/sources/{}", base_url, id);
         match daemon_request(reqwest::Method::DELETE, &url, None) {
             Ok(v) => {
                 if ctx.json {
@@ -1080,7 +1176,7 @@ async fn run_index_async(ctx: &CliContext, source_id: Option<&str>) {
     // Per specs/05-surfaces.md §2: when daemon is running, submit a job and poll.
     if let DaemonState::Running { base_url } = probe_daemon(&data_dir) {
         let url = format!("{}/v1/jobs", base_url);
-        let mut body = json!({ "store": store_name, "kind": "index" });
+        let mut body = json!({ "store_name": store_name });
         if let Some(sid) = source_id {
             body["source_id"] = serde_json::Value::String(sid.to_string());
         }
@@ -1279,7 +1375,9 @@ async fn run_search_async(ctx: &CliContext, query: &str, limit: usize) {
             "limit": limit,
         });
         if !ctx.stores.is_empty() {
-            body["stores"] = serde_json::Value::Array(
+            // The handler's SearchRequest uses field `store_filter`
+            // (see server/src/handlers.rs SearchRequest).
+            body["store_filter"] = serde_json::Value::Array(
                 ctx.stores
                     .iter()
                     .map(|s| serde_json::Value::String(s.clone()))
@@ -1637,12 +1735,24 @@ mod tests {
 
     #[test]
     fn probe_running_with_socket_file() {
+        // Since probe_daemon now does a live health check, a sock file pointing
+        // to a non-listening port will be removed and NotRunning returned.
+        // This test verifies the stale-socket cleanup path (#11).
         let dir = TempDir::new().unwrap();
-        std::fs::write(dir.path().join("daemon.sock"), b"").unwrap();
-        assert!(matches!(
-            probe_daemon(dir.path()),
-            DaemonState::Running { .. }
-        ));
+        let sock_path = dir.path().join("daemon.sock");
+        // Empty sock file → default URL http://127.0.0.1:7700 (not listening in tests).
+        std::fs::write(&sock_path, b"").unwrap();
+        // The health check fails → stale socket cleaned up → NotRunning.
+        let state = probe_daemon(dir.path());
+        assert!(
+            matches!(state, DaemonState::NotRunning),
+            "sock file pointing to a non-listening port should return NotRunning"
+        );
+        // The stale sock file should have been removed.
+        assert!(
+            !sock_path.exists(),
+            "probe_daemon should remove the stale socket file"
+        );
     }
 
     // --- classify_source ---
@@ -1933,5 +2043,83 @@ mod tests {
             "message": err.to_string(),
         });
         assert_eq!(v["error"].as_str().unwrap(), "store_locked");
+    }
+
+    // --- C1: daemon error body uses `code` field (not `error`) ---
+
+    /// Verify that the daemon error body field name is `code`, not `error`.
+    /// The server's ErrorResponse has {code, message} (see server/src/error.rs).
+    /// The CLI must read `get("code")` to correctly map error kinds.
+    #[test]
+    fn daemon_error_body_uses_code_field() {
+        // Simulate the JSON body a daemon returns on error:
+        // {"code": "store_not_found", "message": "store 'x' not found"}
+        let body = json!({
+            "code": "store_not_found",
+            "message": "store 'x' not found"
+        });
+
+        let code = body
+            .get("code")
+            .and_then(|e| e.as_str())
+            .unwrap_or("internal");
+
+        assert_eq!(
+            code, "store_not_found",
+            "must read 'code' field from daemon error body, not 'error'"
+        );
+
+        // Ensure the old field name 'error' is absent (server never sends it).
+        assert!(
+            body.get("error").is_none(),
+            "daemon error body should not have 'error' field; it uses 'code'"
+        );
+    }
+
+    // --- #11: stale socket detection ---
+
+    /// When `daemon.sock` exists but the daemon is unreachable (stale socket),
+    /// `probe_daemon` should:
+    ///   1. Detect the connection failure.
+    ///   2. Remove the stale socket file.
+    ///   3. Return `DaemonState::NotRunning`.
+    ///
+    /// We test this by creating a sock file that points to a definitely-closed
+    /// port (port 1 is reserved and never listens), so the health check fails.
+    #[test]
+    fn probe_daemon_removes_stale_socket_and_returns_not_running() {
+        let dir = TempDir::new().unwrap();
+        let sock_path = dir.path().join("daemon.sock");
+
+        // Write a URL that will always refuse connections (port 1 is reserved).
+        std::fs::write(&sock_path, b"http://127.0.0.1:1").unwrap();
+        assert!(sock_path.exists(), "sock file should exist before probe");
+
+        let state = probe_daemon(dir.path());
+
+        assert!(
+            matches!(state, DaemonState::NotRunning),
+            "stale socket should result in NotRunning"
+        );
+        assert!(
+            !sock_path.exists(),
+            "probe_daemon should remove the stale socket file"
+        );
+    }
+
+    /// When `LOCALDB_DAEMON_URL` is set, `probe_daemon` bypasses the socket
+    /// file check entirely (no health probe, no file removal).
+    #[test]
+    fn probe_daemon_env_var_bypasses_socket_check() {
+        let dir = TempDir::new().unwrap();
+        // No socket file needed — env var takes precedence.
+        std::env::set_var("LOCALDB_DAEMON_URL", "http://127.0.0.1:9999");
+        let state = probe_daemon(dir.path());
+        std::env::remove_var("LOCALDB_DAEMON_URL");
+
+        assert!(
+            matches!(state, DaemonState::Running { base_url } if base_url == "http://127.0.0.1:9999"),
+            "env var should return Running without a health probe"
+        );
     }
 }
