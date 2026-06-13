@@ -8,8 +8,8 @@ description = "Embedder implementations: local ONNX, OpenAI-compatible, and cont
 
 [features]
 default = []
-# Enable local ONNX inference via fastembed
-local-onnx = ["dep:fastembed"]
+# Enable local ONNX inference via fastembed + direct ORT (pplx-embed-v1-0.6b)
+local-onnx = ["dep:fastembed", "dep:ort", "dep:tokenizers", "dep:ndarray"]
 # Enable all providers (for tests/CI)
 all-providers = ["local-onnx"]
 
@@ -38,17 +38,15 @@ dirs = "5"
 sha2 = "0.10"
 hex = "0.4"
 
+# Streaming HTTP download support (also needed by pplx_onnx; no load-dynamic — fastembed's
+# ort-download-binaries-rustls-tls already provides ORT via ort-sys build scripts)
+futures-util = "0.3"
+ort = { version = "=2.0.0-rc.12", features = ["ndarray"], optional = true }
+tokenizers = { version = "0.22", optional = true }
+ndarray = { version = "0.17", optional = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # Mock HTTP server for testing hosted providers
 wiremock = "0.6"
 tempfile = "3"
-# Slow integration tests: pplx-embed-v1 int8 (same versions already locked by fastembed).
-# We do NOT use load-dynamic here: fastembed's ort-download-binaries-rustls-tls feature
-# already downloads ORT and wires up linking via ort-sys build scripts, so the test
-# binary finds ORT through the same mechanism fastembed uses.  The pplx_embed_v1_int8
-# test is `#[ignore]` so it never runs in CI.
-ort = { version = "=2.0.0-rc.12", features = ["ndarray"] }
-tokenizers = "0.22"
-ndarray = "0.17"
-futures-util = "0.3"
