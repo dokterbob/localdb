@@ -714,6 +714,73 @@ fn resolve_store_name(ctx: &CliContext, config_loader: &ConfigLoader, db: &AppDb
     }
 }
 
+/// Reconcile YAML-declared stores (and their sources) into the runtime-state DB.
+///
+/// This is the resolution for issue #12: YAML-declared stores were invisible to
+/// `localdb index` because that command looked up stores only in the runtime DB.
+///
+/// For each store declared in `config.stores`:
+/// - If the runtime DB does not already have a record for that store name, insert
+///   a shadow `RuntimeStore` so that the index command can find it.
+/// - For each source declared under that store, if the runtime DB does not already
+///   have an entry with the same root/url, insert a shadow `RuntimeSource`.
+///
+/// Shadow records are functionally identical to runtime-owned records. YAML ownership
+/// is still determined at runtime by `check_yaml_owned` (name lookup in config), so
+/// mutations on YAML-named stores continue to return `Error::ConfigReadonly`.
+///
+/// This function is intentionally idempotent: re-running it never overwrites existing
+/// runtime-DB records (it only inserts when the name/key is absent).
+pub fn reconcile_yaml_stores(
+    db: &AppDb,
+    config: &localdb_core::config::schema::RawConfig,
+) -> Result<(), Error> {
+    for yaml_store in &config.stores {
+        // Only insert a shadow if the store is not already in the runtime DB.
+        if db.get_store(&yaml_store.name)?.is_none() {
+            let shadow = RuntimeStore {
+                id: new_ulid(),
+                name: yaml_store.name.clone(),
+                visibility: yaml_store.visibility.clone(),
+                backend: yaml_store.backend.clone(),
+                indexing: yaml_store.indexing.clone(),
+            };
+            db.upsert_store(&shadow)?;
+        }
+
+        // Reconcile sources declared in this YAML store.
+        for yaml_src in &yaml_store.sources {
+            let root_or_url: Option<&str> = yaml_src.root.as_deref().or(yaml_src.url.as_deref());
+
+            // Skip if we can't identify this source by root/url (shouldn't happen
+            // in practice — a source always has one of them).
+            let key = match root_or_url {
+                Some(k) => k,
+                None => continue,
+            };
+
+            // Only insert if not already present.
+            if db
+                .find_source_by_root_or_url(key, Some(&yaml_store.name))?
+                .is_none()
+            {
+                let src = RuntimeSource {
+                    id: new_ulid(),
+                    store_name: yaml_store.name.clone(),
+                    kind: yaml_src.kind.clone(),
+                    root: yaml_src.root.clone(),
+                    url: yaml_src.url.clone(),
+                    include: yaml_src.include.clone(),
+                    exclude: yaml_src.exclude.clone(),
+                    preset: yaml_src.preset.clone(),
+                };
+                db.upsert_source(&src)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Classify a source argument as "path" or "url".
 ///
 /// Returns `(kind, root, url)`.
@@ -1073,6 +1140,11 @@ pub fn run_store_add(ctx: &CliContext, name: &str) {
 pub fn run_store_list(ctx: &CliContext) {
     // F1-cli: use lenient loader so store list works even with malformed config.
     let (config_loader, db) = load_app_db_lenient(ctx);
+
+    // #12: Reconcile YAML-declared stores into the runtime DB so that commands
+    // that look up stores by name (e.g. source list, source add) find them.
+    // Failures here are non-fatal for the list display path.
+    let _ = reconcile_yaml_stores(&db, &config_loader.config);
 
     let runtime_stores = match db.list_stores() {
         Ok(s) => s,
@@ -1721,6 +1793,12 @@ async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, dir: Option<
         Ok(l) => l,
         Err(e) => exit_err(&e, ctx.json),
     };
+
+    // #12: Reconcile YAML-declared stores into the runtime DB so that YAML stores
+    // are findable by the index command without requiring `localdb store add` first.
+    if let Err(e) = reconcile_yaml_stores(&db, &config_loader.config) {
+        exit_err(&e, ctx.json);
+    }
 
     // #13: Validate --store exists in runtime DB.
     let rt_store = match db.get_store(&store_name) {
@@ -2851,5 +2929,166 @@ mod tests {
             .find_source_by_root_or_url("/my/docs", Some("my-store"))
             .unwrap();
         assert!(found.is_none());
+    }
+
+    // --- #12: reconcile_yaml_stores ---
+
+    fn make_raw_config_with_store(
+        store_name: &str,
+        sources: Vec<localdb_core::config::schema::SourceConfig>,
+    ) -> localdb_core::config::schema::RawConfig {
+        use localdb_core::config::schema::{
+            DefaultsConfig, PathsConfig, RawConfig, ServerConfig, StoreConfig,
+        };
+        RawConfig {
+            version: 1,
+            server: ServerConfig::default(),
+            paths: PathsConfig::default(),
+            defaults: DefaultsConfig::default(),
+            stores: vec![StoreConfig {
+                name: store_name.to_string(),
+                visibility: "private".to_string(),
+                backend: "lancedb".to_string(),
+                indexing: None,
+                sources,
+            }],
+            providers: vec![],
+        }
+    }
+
+    /// After reconciliation, a YAML-declared store must be findable by
+    /// `get_store_by_name` (i.e. `db.get_store`), which is what `run_index_async`
+    /// uses to locate the store before indexing.
+    #[test]
+    fn reconcile_yaml_store_makes_store_findable() {
+        let dir = TempDir::new().unwrap();
+        let db = tmp_app_db(&dir);
+
+        // Precondition: the store does not exist in the runtime DB yet.
+        assert!(db.get_store("notes").unwrap().is_none());
+
+        let config = make_raw_config_with_store("notes", vec![]);
+        reconcile_yaml_stores(&db, &config).unwrap();
+
+        // After reconciliation, the store must be findable.
+        let found = db.get_store("notes").unwrap();
+        assert!(
+            found.is_some(),
+            "YAML store should be findable after reconciliation"
+        );
+        assert_eq!(found.unwrap().name, "notes");
+    }
+
+    /// Reconciliation is idempotent: calling it twice must not produce duplicate
+    /// records or return an error.
+    #[test]
+    fn reconcile_yaml_store_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let db = tmp_app_db(&dir);
+
+        let config = make_raw_config_with_store("docs", vec![]);
+        reconcile_yaml_stores(&db, &config).unwrap();
+        reconcile_yaml_stores(&db, &config).unwrap(); // second call — must not fail
+
+        let stores = db.list_stores().unwrap();
+        let matching: Vec<_> = stores.iter().filter(|s| s.name == "docs").collect();
+        assert_eq!(matching.len(), 1, "must not create duplicate store records");
+    }
+
+    /// Reconciliation must not overwrite an existing runtime-DB record (e.g. one
+    /// created by `store add`) with a YAML shadow — the existing record wins.
+    #[test]
+    fn reconcile_does_not_overwrite_existing_runtime_store() {
+        let dir = TempDir::new().unwrap();
+        let db = tmp_app_db(&dir);
+
+        // Pre-existing runtime store (e.g. created by `store add`).
+        let existing_id = new_ulid();
+        let existing = RuntimeStore {
+            id: existing_id.clone(),
+            name: "shared".to_string(),
+            visibility: "shared".to_string(), // different from YAML's "private"
+            backend: "lancedb".to_string(),
+            indexing: None,
+        };
+        db.upsert_store(&existing).unwrap();
+
+        // YAML config declares the same store name with "private" visibility.
+        let config = make_raw_config_with_store("shared", vec![]);
+        reconcile_yaml_stores(&db, &config).unwrap();
+
+        // The existing record should be unchanged.
+        let found = db.get_store("shared").unwrap().unwrap();
+        assert_eq!(
+            found.id, existing_id,
+            "existing store id must not be replaced"
+        );
+        assert_eq!(
+            found.visibility, "shared",
+            "existing store visibility must not be overwritten"
+        );
+    }
+
+    /// YAML-declared sources are reconciled into the runtime sources DB.
+    #[test]
+    fn reconcile_yaml_sources_into_db() {
+        use localdb_core::config::schema::SourceConfig;
+
+        let dir = TempDir::new().unwrap();
+        let db = tmp_app_db(&dir);
+
+        let sources = vec![SourceConfig {
+            kind: "path".to_string(),
+            root: Some("/home/user/notes".to_string()),
+            include: vec!["**/*.md".to_string()],
+            exclude: vec![],
+            preset: "prose".to_string(),
+            url: None,
+            refresh: None,
+        }];
+        let config = make_raw_config_with_store("notes", sources);
+        reconcile_yaml_stores(&db, &config).unwrap();
+
+        // The source must be findable.
+        let found = db
+            .find_source_by_root_or_url("/home/user/notes", Some("notes"))
+            .unwrap();
+        assert!(
+            found.is_some(),
+            "YAML source should be findable after reconciliation"
+        );
+        let src = found.unwrap();
+        assert_eq!(src.store_name, "notes");
+        assert_eq!(src.kind, "path");
+        assert_eq!(src.include, vec!["**/*.md".to_string()]);
+    }
+
+    /// Source reconciliation is also idempotent.
+    #[test]
+    fn reconcile_yaml_sources_is_idempotent() {
+        use localdb_core::config::schema::SourceConfig;
+
+        let dir = TempDir::new().unwrap();
+        let db = tmp_app_db(&dir);
+
+        let sources = vec![SourceConfig {
+            kind: "path".to_string(),
+            root: Some("/tmp/docs".to_string()),
+            include: vec![],
+            exclude: vec![],
+            preset: "prose".to_string(),
+            url: None,
+            refresh: None,
+        }];
+        let config = make_raw_config_with_store("mystore", sources);
+        reconcile_yaml_stores(&db, &config).unwrap();
+        reconcile_yaml_stores(&db, &config).unwrap(); // second call
+
+        let sources_in_db = db.list_sources("mystore").unwrap();
+        assert_eq!(
+            sources_in_db.len(),
+            1,
+            "must not create duplicate source records"
+        );
     }
 }
