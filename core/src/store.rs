@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::ids::{ContentId, UlidId};
+use crate::parser::DocumentMetadata;
 use crate::types::{Chunk, Span};
 use crate::Error;
 
@@ -84,6 +85,14 @@ pub struct ChunkRecord {
     /// should not populate `meta` until a schema migration adds the column.
     #[serde(default)]
     pub meta: HashMap<String, String>,
+
+    /// Document metadata extracted from the document.
+    ///
+    /// Persisted as a single JSON-encoded `Utf8` column in LanceDB. Read
+    /// defensively: tables created before this schema migration return
+    /// `DocumentMetadata::default()` on read.
+    #[serde(default)]
+    pub metadata: DocumentMetadata,
 }
 
 impl ChunkRecord {
@@ -94,6 +103,7 @@ impl ChunkRecord {
         uri: String,
         title: Option<String>,
         mime: Option<String>,
+        metadata: DocumentMetadata,
     ) -> Self {
         Self {
             id: chunk.id.clone(),
@@ -113,6 +123,7 @@ impl ChunkRecord {
             uri,
             title,
             meta: HashMap::new(),
+            metadata,
         }
     }
 }
@@ -498,6 +509,7 @@ pub mod conformance {
             uri: "file:///test.md".to_string(),
             title: Some("Test Document".to_string()),
             meta: HashMap::new(),
+            metadata: crate::parser::DocumentMetadata::default(),
         }
     }
 
@@ -853,6 +865,7 @@ mod tests {
             uri: "file:///test.md".to_string(),
             title: Some("Test".to_string()),
             meta: HashMap::new(),
+            metadata: crate::parser::DocumentMetadata::default(),
         }
     }
 
@@ -1009,6 +1022,7 @@ mod tests {
             "file:///test.md".to_string(),
             Some("Test Title".to_string()),
             Some("text/markdown".to_string()),
+            crate::parser::DocumentMetadata::default(),
         );
 
         assert_eq!(record.id, "chunk-id");

@@ -60,6 +60,7 @@ const COL_SOURCE_KIND: &str = "source_kind";
 const COL_MIME: &str = "mime";
 const COL_URI: &str = "uri";
 const COL_TITLE: &str = "title";
+const COL_DC: &str = "metadata";
 
 /// The special LanceDB `_distance` column added to vector search results.
 const COL_DISTANCE: &str = "_distance";
@@ -223,6 +224,7 @@ fn make_schema(embedding_dim: usize) -> Arc<Schema> {
         Field::new(COL_MIME, DataType::Utf8, true), // nullable
         Field::new(COL_URI, DataType::Utf8, false),
         Field::new(COL_TITLE, DataType::Utf8, true), // nullable
+        Field::new(COL_DC, DataType::Utf8, true),    // nullable; JSON-encoded DocumentMetadata
     ]))
 }
 
@@ -259,6 +261,7 @@ fn make_empty_batch(schema: &Arc<Schema>) -> RecordBatch {
             Arc::new(StringArray::from(Vec::<Option<String>>::new())) as _,
             Arc::new(StringArray::from(Vec::<Option<&str>>::new())) as _,
             Arc::new(StringArray::from(Vec::<Option<String>>::new())) as _,
+            Arc::new(StringArray::from(Vec::<Option<String>>::new())) as _, // metadata
         ],
     )
     .expect("empty batch construction failed")
@@ -289,6 +292,10 @@ fn records_to_batch(records: &[ChunkRecord], embedding_dim: usize) -> Result<Rec
     let mimes: Vec<Option<&str>> = records.iter().map(|r| r.mime.as_deref()).collect();
     let uris: Vec<&str> = records.iter().map(|r| r.uri.as_str()).collect();
     let titles: Vec<Option<&str>> = records.iter().map(|r| r.title.as_deref()).collect();
+    let metadata_jsons: Vec<Option<String>> = records
+        .iter()
+        .map(|r| serde_json::to_string(&r.metadata).ok())
+        .collect();
 
     // A4: validate all embedding dimensions match before building the batch.
     for (i, r) in records.iter().enumerate() {
@@ -334,6 +341,7 @@ fn records_to_batch(records: &[ChunkRecord], embedding_dim: usize) -> Result<Rec
             Arc::new(StringArray::from(mimes)) as _,
             Arc::new(StringArray::from(uris)) as _,
             Arc::new(StringArray::from(titles)) as _,
+            Arc::new(StringArray::from(metadata_jsons)) as _,
         ],
     )
     .map_err(|e| Error::Internal {
@@ -413,6 +421,11 @@ fn row_to_chunk_record(batch: &RecordBatch, row: usize) -> ChunkRecord {
     let heading_path_json = get_str(batch, COL_HEADING_PATH, row);
     let heading_path: Vec<String> = serde_json::from_str(&heading_path_json).unwrap_or_default();
 
+    // Read metadata defensively: pre-migration tables lack the column → default.
+    let metadata = get_opt_str(batch, COL_DC, row)
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
     ChunkRecord {
         id: get_str(batch, COL_ID, row),
         document_id: get_str(batch, COL_DOCUMENT_ID, row),
@@ -434,6 +447,7 @@ fn row_to_chunk_record(batch: &RecordBatch, row: usize) -> ChunkRecord {
         uri: get_str(batch, COL_URI, row),
         title: get_opt_str(batch, COL_TITLE, row),
         meta: HashMap::new(),
+        metadata,
     }
 }
 
@@ -814,6 +828,7 @@ mod tests {
             uri: "file:///test.md".to_string(),
             title: Some("Test".to_string()),
             meta: HashMap::new(),
+            metadata: localdb_core::parser::DocumentMetadata::default(),
         }
     }
 
@@ -846,6 +861,44 @@ mod tests {
     async fn lancedb_upsert_replaces_existing() {
         let (store, _dir) = fresh_conformance_store().await;
         conformance::test_upsert_replaces_existing(&store).await;
+    }
+
+    #[tokio::test]
+    async fn lancedb_metadata_round_trip() {
+        let (store, _dir) = fresh_store().await;
+
+        let dc = localdb_core::parser::DocumentMetadata {
+            title: Some("Test Document".to_string()),
+            creator: vec!["Alice".to_string(), "Bob".to_string()],
+            date: Some("2026-06-13".to_string()),
+            language: Some("en".to_string()),
+            ..Default::default()
+        };
+
+        let mut record = make_record(
+            "dc-chunk-1",
+            "doc-dc-1",
+            "store-1",
+            "Dublin Core test text",
+            vec![0.1, 0.2, 0.3, 0.4],
+        );
+        record.metadata = dc.clone();
+
+        store.upsert_chunks(vec![record]).await.unwrap();
+        store.create_fts_index().await.unwrap();
+
+        let stats = store.stats().await.unwrap();
+        assert_eq!(stats.chunk_count, 1);
+
+        let results = store
+            .bm25_search("Dublin Core test", 10, &[])
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].chunk.metadata, dc,
+            "Dublin Core must round-trip through LanceDB"
+        );
     }
 
     #[tokio::test]

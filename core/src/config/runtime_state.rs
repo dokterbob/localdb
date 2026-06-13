@@ -310,8 +310,7 @@ fn map_redb_err(e: impl std::fmt::Display) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::schema::{ChunkingPolicy, EmbeddingPolicy, StoreConfig};
-    use std::collections::HashMap;
+    use crate::config::schema::{EmbeddingPolicy, StoreConfig};
     use tempfile::TempDir;
 
     fn tmp_db() -> (TempDir, RuntimeStateDb) {
@@ -447,13 +446,11 @@ mod tests {
             visibility: "private".to_string(),
             backend: "lancedb".to_string(),
             indexing: Some(IndexingPolicyConfig {
-                chunking: ChunkingPolicy {
-                    preset_overrides: HashMap::new(),
-                },
                 embedding: EmbeddingPolicy {
                     model: "bge-small".to_string(),
                     provider: "local-onnx".to_string(),
                 },
+                ..Default::default()
             }),
         };
         db.upsert_store(&store).unwrap();
@@ -549,13 +546,11 @@ mod tests {
         let (_dir, db) = tmp_db();
 
         let custom_default = IndexingPolicyConfig {
-            chunking: ChunkingPolicy {
-                preset_overrides: HashMap::new(),
-            },
             embedding: EmbeddingPolicy {
                 model: "custom-model".to_string(),
                 provider: "openai-compatible".to_string(),
             },
+            ..Default::default()
         };
 
         let yaml = make_yaml_config_with_stores(&["my-store"]);
@@ -578,13 +573,11 @@ mod tests {
                 visibility: "private".to_string(),
                 backend: "lancedb".to_string(),
                 indexing: Some(IndexingPolicyConfig {
-                    chunking: ChunkingPolicy {
-                        preset_overrides: HashMap::new(),
-                    },
                     embedding: EmbeddingPolicy {
                         model: "store-specific-model".to_string(),
                         provider: "local-onnx".to_string(),
                     },
+                    ..Default::default()
                 }),
                 sources: vec![],
             }],

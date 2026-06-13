@@ -113,11 +113,11 @@ pub struct DefaultsConfig {
     pub indexing: IndexingPolicyConfig,
 }
 
-/// Indexing policy config — chunking + embedding as one unit.
+/// Indexing policy config — chunking + embedding + parsers as one unit.
 ///
-/// A change to either triggers a reindex (policy_version changes).
+/// A change to any field triggers a reindex (policy_version changes).
 /// See specs/03-config.md §2 and specs/04-search-pipeline.md §4.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IndexingPolicyConfig {
     /// Chunking settings.
@@ -127,6 +127,34 @@ pub struct IndexingPolicyConfig {
     /// Embedding settings.
     #[serde(default)]
     pub embedding: EmbeddingPolicy,
+
+    /// Ordered list of parser IDs to try (first match wins).
+    ///
+    /// Empty or absent defaults to `["pdf", "html", "markdown", "plaintext"]`.
+    /// Unknown IDs are rejected at config validation time.
+    /// Order is load-bearing: placing `plaintext` before `html` would cause
+    /// HTML files with a `.html` extension to be parsed as plain text.
+    #[serde(default = "default_parser_ids")]
+    pub parsers: Vec<String>,
+}
+
+impl Default for IndexingPolicyConfig {
+    fn default() -> Self {
+        Self {
+            chunking: ChunkingPolicy::default(),
+            embedding: EmbeddingPolicy::default(),
+            parsers: default_parser_ids(),
+        }
+    }
+}
+
+fn default_parser_ids() -> Vec<String> {
+    vec![
+        "pdf".to_string(),
+        "html".to_string(),
+        "markdown".to_string(),
+        "plaintext".to_string(),
+    ]
 }
 
 /// Chunking policy configuration.

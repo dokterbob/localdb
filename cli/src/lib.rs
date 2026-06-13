@@ -1469,6 +1469,7 @@ async fn run_index_for_source_async(
     source_id: Option<&str>,
     rt_store: &RuntimeStore,
 ) {
+    use extract::Parser as _;
     use localdb_core::{
         chunker::ChunkerConfig,
         ingestion::{
@@ -1529,17 +1530,36 @@ async fn run_index_for_source_async(
         }
     };
 
-    struct ExtractBridge;
+    let parser_ids = policy.parsers.clone();
+    let chain = match extract::build_chain(&parser_ids) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("warning: cannot build parser chain for auto-index: {}", e);
+            return;
+        }
+    };
+
+    struct ExtractBridge {
+        chain: extract::ChainParser,
+    }
     impl DocumentExtractor for ExtractBridge {
         fn extract(&self, bytes: &[u8], filename: Option<&str>) -> Result<ExtractionResult, Error> {
-            let out = extract::extract(bytes, filename)?;
-            Ok(ExtractionResult {
-                text: out.text,
-                blocks: out.blocks,
-                title: out.title,
-            })
+            let sniffed = extract::sniff_mime(bytes, filename);
+            let probe = extract::Probe::new(bytes, filename, sniffed.as_deref());
+            match self.chain.parse(&probe)? {
+                Some(doc) => Ok(ExtractionResult {
+                    text: doc.text,
+                    blocks: doc.blocks,
+                    title: doc.title,
+                    metadata: doc.metadata,
+                }),
+                None => Err(Error::UnsupportedFormat {
+                    format: "no parser matched the file".to_string(),
+                }),
+            }
         }
     }
+    let extractor = ExtractBridge { chain };
 
     let store_data_dir = data_dir.join("stores").join(&rt_store.name);
     if let Err(e) = std::fs::create_dir_all(&store_data_dir) {
@@ -1568,7 +1588,7 @@ async fn run_index_for_source_async(
             &lancedb_store,
             embedder.as_ref(),
             &ingestion_cfg,
-            &ExtractBridge,
+            &extractor,
             None,
         )
         .await
@@ -1779,6 +1799,7 @@ pub fn run_index(ctx: &CliContext, source_id: Option<&str>, dir: Option<&str>) {
 }
 
 async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, dir: Option<&str>) {
+    use extract::Parser as _;
     use localdb_core::{
         chunker::ChunkerConfig,
         ingestion::{
@@ -1927,18 +1948,33 @@ async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, dir: Option<
         Err(e) => exit_err(&Error::from(e), ctx.json),
     };
 
-    // Extraction bridge between extract crate and core's DocumentExtractor trait.
-    struct ExtractBridge;
+    let parser_ids = policy.parsers.clone();
+    let chain = match extract::build_chain(&parser_ids) {
+        Ok(c) => c,
+        Err(e) => exit_err(&e, ctx.json),
+    };
+
+    struct ExtractBridge {
+        chain: extract::ChainParser,
+    }
     impl DocumentExtractor for ExtractBridge {
         fn extract(&self, bytes: &[u8], filename: Option<&str>) -> Result<ExtractionResult, Error> {
-            let out = extract::extract(bytes, filename)?;
-            Ok(ExtractionResult {
-                text: out.text,
-                blocks: out.blocks,
-                title: out.title,
-            })
+            let sniffed = extract::sniff_mime(bytes, filename);
+            let probe = extract::Probe::new(bytes, filename, sniffed.as_deref());
+            match self.chain.parse(&probe)? {
+                Some(doc) => Ok(ExtractionResult {
+                    text: doc.text,
+                    blocks: doc.blocks,
+                    title: doc.title,
+                    metadata: doc.metadata,
+                }),
+                None => Err(Error::UnsupportedFormat {
+                    format: "no parser matched the file".to_string(),
+                }),
+            }
         }
     }
+    let extractor = ExtractBridge { chain };
 
     let store_data_dir = data_dir.join("stores").join(&store_name);
     if let Err(e) = std::fs::create_dir_all(&store_data_dir) {
@@ -1978,7 +2014,7 @@ async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, dir: Option<
             &lancedb_store,
             embedder.as_ref(),
             &ingestion_cfg,
-            &ExtractBridge,
+            &extractor,
             None,
         )
         .await

@@ -522,6 +522,7 @@ mod tests {
             uri: format!("file:///docs/{document_id}.md"),
             title: Some(format!("Title for {document_id}")),
             meta: HashMap::new(),
+            metadata: localdb_core::parser::DocumentMetadata::default(),
         }
     }
 

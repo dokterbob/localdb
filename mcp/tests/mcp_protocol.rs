@@ -73,6 +73,7 @@ async fn make_server_with_seeded_store() -> (McpServer, String, String) {
         uri: uri.to_string(),
         title: Some("Test Document".to_string()),
         meta: std::collections::HashMap::new(),
+        metadata: localdb_core::DocumentMetadata::default(),
     };
 
     store.upsert_chunks(vec![record]).await.expect("seed chunk");
@@ -540,6 +541,7 @@ async fn test_search_limit_respected() {
             uri,
             title: Some(format!("Doc {i}")),
             meta: std::collections::HashMap::new(),
+            metadata: localdb_core::DocumentMetadata::default(),
         });
     }
     store.upsert_chunks(records).await.unwrap();

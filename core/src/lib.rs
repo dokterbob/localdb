@@ -10,6 +10,7 @@ pub mod embedder;
 pub mod error;
 pub mod ids;
 pub mod ingestion;
+pub mod parser;
 pub mod search;
 pub mod store;
 pub mod types;
@@ -26,14 +27,15 @@ pub use ingestion::{
     DocumentInput, DocumentRecord, ExtractionResult, FetchMetadata, FetchResult, FoundFile,
     IngestionConfig, IngestionResult, UrlFetcher,
 };
+pub use parser::{ChainParser, DocumentMetadata, ParsedDocument, Parser, Probe, PROBE_HEADER_LEN};
 pub use search::{
     rerank_noop, rrf_fuse, rrf_score, shape_citation, FusedChunkEntry, QueryRequest, QueryResponse,
     SearchOrchestrator, StoreHandle,
 };
 pub use store::{ChunkRecord, FakeStore, MetadataFilter, RetrievalStore, SearchResult, StoreStats};
 pub use types::{
-    validate_msg_meta_key, AclEntry, BackendConfig, Block, BlockKind, Chunk, ChunkingConfig,
-    Document, EmbeddingConfig, FederationHop, IndexJob, IndexJobScope, IndexJobState,
-    IndexJobStats, IndexingPolicy, Provenance, Source, SourceKind, SourceRef, SourceSpec, Span,
-    Store, StoreVisibility,
+    validate_dc_meta_key, validate_msg_meta_key, AclEntry, BackendConfig, Block, BlockKind, Chunk,
+    ChunkingConfig, Document, EmbeddingConfig, FederationHop, IndexJob, IndexJobScope,
+    IndexJobState, IndexJobStats, IndexingPolicy, Provenance, Source, SourceKind, SourceRef,
+    SourceSpec, Span, Store, StoreVisibility,
 };
