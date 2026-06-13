@@ -106,13 +106,40 @@ impl LanceDbStore {
             })?;
 
         let table = if table_names.contains(&TABLE_NAME.to_string()) {
-            db.open_table(TABLE_NAME)
+            let table = db
+                .open_table(TABLE_NAME)
                 .execute()
                 .await
                 .map_err(|e| Error::Internal {
                     message: format!("LanceDB open table failed: {e}"),
                     correlation_id: "lancedb-open-table".to_string(),
-                })?
+                })?;
+
+            // A5: validate embedding dim matches what is stored in the table schema.
+            let schema = table.schema().await.map_err(|e| Error::Internal {
+                message: format!("LanceDB schema read failed: {e}"),
+                correlation_id: "lancedb-schema".to_string(),
+            })?;
+            let stored_dim = schema.field_with_name(COL_EMBEDDING).ok().and_then(|f| {
+                if let DataType::FixedSizeList(_, dim) = f.data_type() {
+                    Some(*dim as usize)
+                } else {
+                    None
+                }
+            });
+            if let Some(dim) = stored_dim {
+                if dim != embedding_dim {
+                    return Err(Error::InvalidConfig {
+                        message: format!(
+                            "embedding dimension mismatch: store at '{path}' was created with \
+                             dim={dim} but the current embedder produces dim={embedding_dim}. \
+                             Update your embedding config to match the stored dimension, or \
+                             delete the store and re-run `localdb index` to rebuild it.",
+                        ),
+                    });
+                }
+            }
+            table
         } else {
             // Create the table with the schema
             let schema = make_schema(embedding_dim);
@@ -263,15 +290,25 @@ fn records_to_batch(records: &[ChunkRecord], embedding_dim: usize) -> Result<Rec
     let uris: Vec<&str> = records.iter().map(|r| r.uri.as_str()).collect();
     let titles: Vec<Option<&str>> = records.iter().map(|r| r.title.as_deref()).collect();
 
+    // A4: validate all embedding dimensions match before building the batch.
+    for (i, r) in records.iter().enumerate() {
+        if r.embedding.len() != embedding_dim {
+            return Err(Error::Internal {
+                message: format!(
+                    "embedding dimension mismatch at record {i}: expected {embedding_dim}, \
+                     got {}. Ensure the embedder dimension matches the store schema.",
+                    r.embedding.len()
+                ),
+                correlation_id: "dim-mismatch".to_string(),
+            });
+        }
+    }
+
     // Build the FixedSizeList embedding column
     let embeddings = FixedSizeListArray::from_iter_primitive::<arrow_array::types::Float32Type, _, _>(
-        records.iter().map(|r| {
-            if r.embedding.len() != embedding_dim {
-                None
-            } else {
-                Some(r.embedding.iter().map(|&v| Some(v)).collect::<Vec<_>>())
-            }
-        }),
+        records
+            .iter()
+            .map(|r| Some(r.embedding.iter().map(|&v| Some(v)).collect::<Vec<_>>())),
         embedding_dim as i32,
     );
 
@@ -1233,5 +1270,50 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(id_col.value(0), "chunk-1");
+    }
+
+    // A4: dim mismatch in records_to_batch returns an error.
+    #[test]
+    fn records_to_batch_dim_mismatch_is_error() {
+        let records = vec![make_record(
+            "chunk-1",
+            "doc-1",
+            "store-1",
+            "hello",
+            vec![1.0, 0.0, 0.0, 0.0], // dim=4
+        )];
+        // Request dim=8 but embedding has dim=4 → error
+        let result = records_to_batch(&records, 8);
+        assert!(
+            result.is_err(),
+            "dim mismatch in records_to_batch must return Err, not NULL embedding"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("dimension mismatch"),
+            "error should mention dimension mismatch: {msg}"
+        );
+    }
+
+    // A5: opening an existing table with the wrong dim is rejected.
+    #[tokio::test]
+    async fn open_rejects_mismatched_dim() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+
+        // Create store with dim=4
+        LanceDbStore::open(&path, 4).await.unwrap();
+
+        // Attempt to reopen with dim=8 → should fail
+        let result = LanceDbStore::open(&path, 8).await;
+        assert!(
+            result.is_err(),
+            "opening an existing store with wrong dim must fail"
+        );
+        let msg = result.err().unwrap().to_string();
+        assert!(
+            msg.contains("dimension mismatch") || msg.contains("dim="),
+            "error should mention dimension mismatch: {msg}"
+        );
     }
 }

@@ -78,13 +78,13 @@ impl OpenAiEmbedder {
         embedding_dim: usize,
         dimensions: Option<usize>,
         retry: RetryPolicy,
-    ) -> Self {
+    ) -> Result<Self, EmbedError> {
         let client = Client::builder()
             .timeout(retry.request_timeout)
             .build()
-            .expect("failed to build HTTP client");
+            .map_err(|e| EmbedError::Internal(format!("failed to build HTTP client: {e}")))?;
 
-        Self {
+        Ok(Self {
             client,
             base_url: base_url.into(),
             api_key,
@@ -92,7 +92,7 @@ impl OpenAiEmbedder {
             dimensions,
             embedding_dim,
             retry,
-        }
+        })
     }
 
     /// Build from the standard `providers` config entry.
@@ -104,7 +104,7 @@ impl OpenAiEmbedder {
         api_key_env: Option<&str>,
         model: impl Into<String>,
         embedding_dim: usize,
-    ) -> Self {
+    ) -> Result<Self, EmbedError> {
         let api_key = api_key_env.and_then(|env| std::env::var(env).ok());
         Self::new(
             base_url,
@@ -322,7 +322,8 @@ mod tests {
             1536,
             None,
             RetryPolicy::default(),
-        );
+        )
+        .expect("failed to construct embedder");
 
         let docs = vec![DocumentChunks {
             document_context: "ctx".to_string(),
@@ -350,7 +351,8 @@ mod tests {
             batch_size: 32,
             ..Default::default()
         };
-        let embedder = OpenAiEmbedder::new(server.uri(), None, "test-model", 64, None, policy);
+        let embedder = OpenAiEmbedder::new(server.uri(), None, "test-model", 64, None, policy)
+            .expect("failed to construct embedder");
 
         let docs = vec![
             DocumentChunks {
@@ -393,7 +395,8 @@ mod tests {
             request_timeout: std::time::Duration::from_secs(5),
             batch_size: 32,
         };
-        let embedder = OpenAiEmbedder::new(server.uri(), None, "test-model", 64, None, policy);
+        let embedder = OpenAiEmbedder::new(server.uri(), None, "test-model", 64, None, policy)
+            .expect("failed to construct embedder");
 
         let docs = vec![DocumentChunks {
             document_context: "ctx".to_string(),
@@ -419,7 +422,8 @@ mod tests {
             request_timeout: std::time::Duration::from_secs(5),
             batch_size: 32,
         };
-        let embedder = OpenAiEmbedder::new(server.uri(), None, "test-model", 64, None, policy);
+        let embedder = OpenAiEmbedder::new(server.uri(), None, "test-model", 64, None, policy)
+            .expect("failed to construct embedder");
 
         let docs = vec![DocumentChunks {
             document_context: "ctx".to_string(),
@@ -447,7 +451,8 @@ mod tests {
             request_timeout: std::time::Duration::from_secs(5),
             batch_size: 32,
         };
-        let embedder = OpenAiEmbedder::new(server.uri(), None, "test-model", 64, None, policy);
+        let embedder = OpenAiEmbedder::new(server.uri(), None, "test-model", 64, None, policy)
+            .expect("failed to construct embedder");
 
         let docs = vec![DocumentChunks {
             document_context: "ctx".to_string(),
@@ -470,7 +475,8 @@ mod tests {
             64,
             None,
             RetryPolicy::default(),
-        );
+        )
+        .expect("failed to construct embedder");
         let result = embedder.embed_documents(vec![]).await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
@@ -485,7 +491,8 @@ mod tests {
             3072,
             None,
             RetryPolicy::default(),
-        );
+        )
+        .expect("failed to construct embedder");
         assert_eq!(embedder.model_id(), "text-embedding-3-large");
         assert_eq!(embedder.embedding_dim(), 3072);
     }
@@ -511,7 +518,8 @@ mod tests {
             64,
             None,
             RetryPolicy::default(),
-        );
+        )
+        .expect("failed to construct embedder");
 
         let docs = vec![DocumentChunks {
             document_context: "ctx".to_string(),
@@ -546,7 +554,8 @@ mod tests {
             request_timeout: std::time::Duration::from_millis(50),
             batch_size: 32,
         };
-        let embedder = OpenAiEmbedder::new(server.uri(), None, "test-model", 64, None, policy);
+        let embedder = OpenAiEmbedder::new(server.uri(), None, "test-model", 64, None, policy)
+            .expect("failed to construct embedder");
 
         let docs = vec![DocumentChunks {
             document_context: "ctx".to_string(),
@@ -585,7 +594,8 @@ mod tests {
             initial_backoff: std::time::Duration::from_millis(10),
             request_timeout: std::time::Duration::from_secs(5),
         };
-        let embedder = OpenAiEmbedder::new(server.uri(), None, "test-model", 64, None, policy);
+        let embedder = OpenAiEmbedder::new(server.uri(), None, "test-model", 64, None, policy)
+            .expect("failed to construct embedder");
 
         let docs = vec![
             DocumentChunks {
@@ -606,5 +616,23 @@ mod tests {
         let embedded = result.unwrap();
         assert_eq!(embedded[0].len(), 2);
         assert_eq!(embedded[1].len(), 1);
+    }
+
+    #[test]
+    fn openai_embedder_construction_does_not_panic() {
+        let retry = RetryPolicy::default();
+        let result = OpenAiEmbedder::new(
+            "https://api.openai.com",
+            None,
+            "text-embedding-3-small",
+            1536,
+            None,
+            retry,
+        );
+        assert!(
+            result.is_ok(),
+            "should be able to construct embedder: {:?}",
+            result.err()
+        );
     }
 }

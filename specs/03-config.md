@@ -24,8 +24,10 @@ defaults:                 # global indexing policy; stores inherit
     chunking:
       preset_overrides: {}     # per-source-kind tweaks, see §2
     embedding:
-      model: pplx-embed-context-v1-0.6b   # pending benchmark, 04-search-pipeline.md §4
-      provider: local-onnx                # local-onnx | openai-compatible | perplexity | voyage
+      model: pplx-embed-context-v1        # see 04-search-pipeline.md §4
+      provider: perplexity                # local-onnx | openai-compatible | perplexity | voyage
+      # Note: perplexity requires a providers: entry with kind: perplexity and api_key_env set.
+      # For offline/local use, set provider: local-onnx, model: bge-small-en-v1.5 (no API key needed).
 
 stores:
   - name: notes

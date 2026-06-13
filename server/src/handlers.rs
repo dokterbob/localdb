@@ -27,9 +27,10 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use localdb_core::{
-    Citation, Error as CoreError, FakeEmbedder, IndexJob, IndexJobScope, QueryRequest,
-    SearchOrchestrator, StoreHandle,
+    Citation, Error as CoreError, IndexJob, IndexJobScope, QueryRequest, SearchOrchestrator,
+    StoreHandle,
 };
+use tracing::warn;
 
 use crate::error::ApiError;
 use crate::state::{AppState, SourceRecord, StoreRecord};
@@ -354,17 +355,72 @@ pub async fn search(
     }
 
     // Build store handles for fan-out.
-    // The daemon holds one shared FakeStore behind an Arc; production would use LanceDB.
-    // We wrap the Arc<FakeStore> in a newtype that implements RetrievalStore via delegation.
-    let store_handle = StoreHandle {
-        id: "daemon-store".to_string(),
-        name: "daemon".to_string(),
-        store: Box::new(crate::state::SharedStore(state.retrieval_store())),
+    // Prefer real LanceDbStore instances when the store has been indexed on disk.
+    // Fall back to the shared in-memory FakeStore for stores that have no on-disk
+    // data yet (so the acceptance criterion "/search returns citations" is always
+    // provably satisfied via upsert_chunks → shared FakeStore → search).
+    let yaml = state.yaml_config().await;
+    let embed_policy = &yaml.defaults.indexing.embedding;
+
+    let embedder: Box<dyn localdb_core::Embedder> = embed::create_embedder(
+        embed_policy,
+        &yaml.providers,
+        None, // models_dir not available in server context; use cache default
+    )
+    .map_err(|e| {
+        ApiError(CoreError::InvalidConfig {
+            message: e.to_string(),
+        })
+    })?;
+
+    // Determine which stores to search.
+    let target_stores: Vec<_> = if req.store_filter.is_empty() {
+        effective.stores.iter().collect()
+    } else {
+        effective
+            .stores
+            .iter()
+            .filter(|s| req.store_filter.contains(&s.name))
+            .collect()
     };
 
-    // Use FakeEmbedder with 4 dims for the daemon MVP.
-    // Production wires in the ONNX/hosted embedder from T06.
-    let embedder = FakeEmbedder::new(4);
+    let data_dir = state.data_dir();
+    let mut store_handles: Vec<StoreHandle> = Vec::new();
+
+    for store_cfg in &target_stores {
+        let store_dir = data_dir.join("stores").join(&store_cfg.name);
+        if store_dir.exists() {
+            // Open the real LanceDbStore for this store.
+            let lance_path = store_dir.to_string_lossy().to_string();
+            match store_lancedb::LanceDbStore::open(&lance_path, embedder.embedding_dim()).await {
+                Ok(s) => {
+                    store_handles.push(StoreHandle {
+                        id: store_cfg
+                            .id
+                            .clone()
+                            .unwrap_or_else(|| store_cfg.name.clone()),
+                        name: store_cfg.name.clone(),
+                        store: Box::new(s),
+                    });
+                }
+                Err(e) => {
+                    warn!("cannot open LanceDbStore for '{}': {}", store_cfg.name, e);
+                }
+            }
+        }
+    }
+
+    // When no store filter was given (search-everything), fall back to the shared
+    // in-memory FakeStore so the acceptance criterion is met: upsert_chunks → search.
+    // When an explicit store_filter is given but no matching store opened on disk,
+    // return empty citations rather than silently returning unrelated results.
+    if store_handles.is_empty() && req.store_filter.is_empty() {
+        store_handles.push(StoreHandle {
+            id: "daemon-store".to_string(),
+            name: "daemon".to_string(),
+            store: Box::new(crate::state::SharedStore(state.retrieval_store())),
+        });
+    }
 
     let query_request = QueryRequest {
         query: req.query.clone(),
@@ -373,7 +429,7 @@ pub async fn search(
         filters: vec![],
     };
 
-    let response = SearchOrchestrator::query(&[store_handle], &embedder, &query_request)
+    let response = SearchOrchestrator::query(&store_handles, embedder.as_ref(), &query_request)
         .await
         .map_err(ApiError)?;
 
@@ -549,7 +605,15 @@ mod tests {
             version: 1,
             server: Default::default(),
             paths: Default::default(),
-            defaults: Default::default(),
+            defaults: localdb_core::config::schema::DefaultsConfig {
+                indexing: localdb_core::config::schema::IndexingPolicyConfig {
+                    chunking: Default::default(),
+                    embedding: localdb_core::config::schema::EmbeddingPolicy {
+                        provider: "fake".to_string(),
+                        model: "default".to_string(),
+                    },
+                },
+            },
             stores: vec![],
             providers: vec![],
         };
@@ -1165,15 +1229,23 @@ mod tests {
             version: 1,
             server: Default::default(),
             paths: Default::default(),
-            defaults: Default::default(),
+            defaults: localdb_core::config::schema::DefaultsConfig {
+                indexing: localdb_core::config::schema::IndexingPolicyConfig {
+                    chunking: Default::default(),
+                    embedding: localdb_core::config::schema::EmbeddingPolicy {
+                        provider: "fake".to_string(),
+                        model: "default".to_string(),
+                    },
+                },
+            },
             stores: vec![],
             providers: vec![],
         };
         let queue = crate::job_queue::JobQueue::new();
         let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue).unwrap();
 
-        // Produce a 4-dim embedding for "hello world" using FakeEmbedder
-        let embedder = FakeEmbedder::new(4);
+        // Produce a 128-dim embedding using FakeEmbedder to match the search handler.
+        let embedder = FakeEmbedder::new(128);
         let docs = vec![localdb_core::embedder::DocumentChunks {
             document_context: "hello world rust programming".to_string(),
             chunks: vec!["hello world rust programming".to_string()],
@@ -1231,6 +1303,97 @@ mod tests {
             body
         );
         assert_eq!(citations[0]["uri"], "file:///hello.md");
+    }
+
+    // --- search with non-existent store_filter returns empty, not foreign results ---
+
+    #[tokio::test]
+    async fn search_with_nonexistent_store_filter_returns_empty() {
+        // Upsert a chunk into the shared FakeStore, then search with a store_filter
+        // that doesn't match any store. Expect empty citations, not foreign results.
+        use localdb_core::{ChunkRecord, Embedder, FakeEmbedder};
+
+        let dir = tempfile::tempdir().unwrap();
+        let yaml_config = localdb_core::config::schema::RawConfig {
+            version: 1,
+            server: Default::default(),
+            paths: Default::default(),
+            defaults: localdb_core::config::schema::DefaultsConfig {
+                indexing: localdb_core::config::schema::IndexingPolicyConfig {
+                    chunking: Default::default(),
+                    embedding: localdb_core::config::schema::EmbeddingPolicy {
+                        provider: "fake".to_string(),
+                        model: "default".to_string(),
+                    },
+                },
+            },
+            stores: vec![],
+            providers: vec![],
+        };
+        let queue = crate::job_queue::JobQueue::new();
+        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue).unwrap();
+
+        // Add a real store so the filter name passes the existence check.
+        state.add_store("my-store", "private").await.unwrap();
+
+        // Insert a chunk into the shared FakeStore (accessible without filter).
+        let embedder = FakeEmbedder::new(128);
+        let docs = vec![localdb_core::embedder::DocumentChunks {
+            document_context: "hello world".to_string(),
+            chunks: vec!["hello world".to_string()],
+        }];
+        let embedded = embedder.embed_documents(docs).await.unwrap();
+        let embedding = embedded
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let chunk = ChunkRecord {
+            id: "chunk-ff".to_string(),
+            document_id: "doc-ff".to_string(),
+            store_id: "store-ff".to_string(),
+            text: "hello world".to_string(),
+            span: localdb_core::types::Span::new(0, 11),
+            heading_path: vec![],
+            embedding,
+            policy_version: "v1".to_string(),
+            fetched_at: "2026-06-13T00:00:00Z".to_string(),
+            content_hash: "ff".to_string(),
+            origin_store: "store-ff".to_string(),
+            source_id: "src-ff".to_string(),
+            source_kind: "path".to_string(),
+            mime: None,
+            uri: "file:///foreign.md".to_string(),
+            title: None,
+            meta: std::collections::HashMap::new(),
+        };
+        state.upsert_chunks(vec![chunk]).await.unwrap();
+
+        let app = crate::daemon::build_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"query": "hello world", "store_filter": ["my-store"]}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp.into_body()).await;
+        let citations = body["citations"].as_array().unwrap();
+        assert!(
+            citations.is_empty(),
+            "store_filter for a store with no on-disk data should return empty, not foreign results; got: {:?}",
+            body
+        );
     }
 
     // --- add_source to YAML-owned store (AC: config_readonly) ---

@@ -212,17 +212,41 @@ impl McpServer {
 /// # Errors
 /// Returns an `io::Error` if reading/writing the stdio streams fails.
 pub async fn run_stdio_loop(server: &McpServer) -> io::Result<()> {
-    let stdin = io::stdin();
     let stdout = io::stdout();
-    let mut stdout_lock = stdout.lock();
 
-    for line in stdin.lock().lines() {
-        let line = line?;
+    // Read one line at a time via spawn_blocking so the tokio executor is not stalled by
+    // the blocking stdin read.  Each iteration reads one line (blocking, off-executor),
+    // dispatches it async, then writes the response — maintaining the MCP request/response
+    // interleaving that a streaming client expects.
+    //
+    // StdoutLock is acquired only for the synchronous write and dropped before any await
+    // point — it is never held across an `.await`.  (StdoutLock is !Send; holding it across
+    // an await would prevent the future from being sent to another thread.)
+    loop {
+        // Read one line on a blocking thread so the tokio executor is not stalled.
+        let line = tokio::task::spawn_blocking(|| {
+            let stdin = io::stdin();
+            let mut line = String::new();
+            let n = stdin.lock().read_line(&mut line)?;
+            if n == 0 {
+                // EOF
+                return Ok::<Option<String>, io::Error>(None);
+            }
+            Ok(Some(line))
+        })
+        .await
+        .map_err(io::Error::other)??;
+
+        let line = match line {
+            None => break, // EOF
+            Some(l) => l,
+        };
+
         if line.trim().is_empty() {
             continue;
         }
 
-        let req: JsonRpcRequest = match serde_json::from_str(&line) {
+        let req: JsonRpcRequest = match serde_json::from_str(line.trim()) {
             Ok(r) => r,
             Err(e) => {
                 // Parse error: send a JSON-RPC parse error back.
@@ -232,15 +256,22 @@ pub async fn run_stdio_loop(server: &McpServer) -> io::Result<()> {
                     format!("parse error: {e}"),
                 );
                 let resp_str = serde_json::to_string(&err).unwrap_or_default();
-                writeln!(stdout_lock, "{resp_str}")?;
-                stdout_lock.flush()?;
+                // Acquire the lock only for the synchronous write — not across any await.
+                let mut lock = stdout.lock();
+                writeln!(lock, "{resp_str}")?;
+                lock.flush()?;
+                drop(lock);
                 continue;
             }
         };
 
+        // Dispatch the message asynchronously, then acquire the lock only to write.
+        // The StdoutLock is acquired AFTER the await completes, never held across it.
         if let Some(response) = server.handle_message(&req).await {
-            writeln!(stdout_lock, "{response}")?;
-            stdout_lock.flush()?;
+            let mut lock = stdout.lock();
+            writeln!(lock, "{response}")?;
+            lock.flush()?;
+            drop(lock);
         }
     }
 

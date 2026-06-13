@@ -3,8 +3,8 @@
 //! # Providers
 //!
 //! - **Local ONNX** (`OnnxEmbedder`, feature `local-onnx`): runs models in-process via
-//!   fastembed/ONNX Runtime. Default model: `pplx-embed-context-v1-0.6b` (pending benchmark);
-//!   fallback: `bge-small-en-v1.5` for weak hardware. Downloads and caches models on first use.
+//!   fastembed/ONNX Runtime. Default model: `bge-small-en-v1.5` (384 dims). Downloads and
+//!   caches models on first use.
 //! - **OpenAI-compatible** (`OpenAiEmbedder`): flat (context-free) HTTP provider targeting any
 //!   `/v1/embeddings`-compatible endpoint (OpenAI, Ollama, etc.).
 //! - **Perplexity** (`PerplexityEmbedder`): contextualized provider using
@@ -29,6 +29,7 @@
 //! See specs/04-search-pipeline.md §4.
 
 pub mod error;
+pub mod factory;
 pub mod model_cache;
 pub mod openai;
 pub mod perplexity;
@@ -39,6 +40,7 @@ pub mod voyage;
 pub mod onnx;
 
 pub use error::EmbedError;
+pub use factory::create_embedder;
 pub use model_cache::{ModelCache, ModelSpec};
 pub use openai::OpenAiEmbedder;
 pub use perplexity::PerplexityEmbedder;

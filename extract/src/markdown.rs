@@ -42,7 +42,8 @@ pub fn extract_markdown(input: &str) -> Result<ExtractionOutput, Error> {
         InParagraph,
         InCode,
         InList,
-        InListItem,
+        /// depth: nesting depth (0 = top-level item, 1+ = inside a sub-list).
+        InListItem(usize),
         InBlockquote,
     }
 
@@ -195,8 +196,8 @@ pub fn extract_markdown(input: &str) -> Result<ExtractionOutput, Error> {
 
             State::InList => match event {
                 Event::Start(Tag::Item) => {
-                    // nested list items — accumulate text
-                    state = State::InListItem;
+                    // top-level list item — start accumulating
+                    state = State::InListItem(0);
                     text_buf.clear();
                 }
                 Event::End(TagEnd::List(_)) => {
@@ -205,37 +206,60 @@ pub fn extract_markdown(input: &str) -> Result<ExtractionOutput, Error> {
                 _ => {}
             },
 
-            State::InListItem => match event {
-                Event::Text(t) => text_buf.push_str(&t),
-                Event::SoftBreak => text_buf.push(' '),
-                Event::Start(Tag::Paragraph) => {}
-                Event::End(TagEnd::Paragraph) => {
-                    // don't flush yet — wait for item end
-                }
-                Event::End(TagEnd::Item) => {
-                    let item_text = std::mem::take(&mut text_buf);
-                    if !item_text.trim().is_empty() {
-                        let start = normalized.len();
-                        normalized.push_str(&item_text);
-                        normalized.push('\n');
-                        let end = normalized.len();
-
-                        let heading_path = current_heading_path(&heading_levels);
-                        let block = make_block(
-                            ordinal,
-                            BlockKind::ListItem,
-                            item_text,
-                            Span::new(start, end),
-                            heading_path,
-                        );
-                        blocks.push(block);
-                        ordinal += 1;
+            State::InListItem(depth) => {
+                let depth = *depth;
+                match event {
+                    Event::Text(t) => text_buf.push_str(&t),
+                    Event::SoftBreak => text_buf.push(' '),
+                    Event::Start(Tag::Paragraph) => {}
+                    Event::End(TagEnd::Paragraph) => {
+                        // don't flush yet — wait for item end
                     }
-                    // Back to InList state
-                    state = State::InList;
+                    // Entering a nested sub-list: increase depth
+                    Event::Start(Tag::List(_)) => {
+                        state = State::InListItem(depth + 1);
+                    }
+                    // Entering a nested item: append indented prefix to text_buf
+                    Event::Start(Tag::Item) if depth > 0 => {
+                        let indent = "  ".repeat(depth);
+                        if !text_buf.is_empty() && !text_buf.ends_with('\n') {
+                            text_buf.push('\n');
+                        }
+                        text_buf.push_str(&indent);
+                        text_buf.push_str("- ");
+                    }
+                    Event::Start(Tag::Item) => {} // depth == 0: prefix added by InList handler
+                    // End of top-level item at depth == 0: emit block
+                    Event::End(TagEnd::Item) if depth == 0 => {
+                        let item_text = std::mem::take(&mut text_buf);
+                        if !item_text.trim().is_empty() {
+                            let start = normalized.len();
+                            normalized.push_str(&item_text);
+                            normalized.push('\n');
+                            let end = normalized.len();
+
+                            let heading_path = current_heading_path(&heading_levels);
+                            let block = make_block(
+                                ordinal,
+                                BlockKind::ListItem,
+                                item_text,
+                                Span::new(start, end),
+                                heading_path,
+                            );
+                            blocks.push(block);
+                            ordinal += 1;
+                        }
+                        // Back to InList state
+                        state = State::InList;
+                    }
+                    Event::End(TagEnd::Item) => {} // depth > 0: text already in text_buf
+                    // End of a nested sub-list: decrease depth
+                    Event::End(TagEnd::List(_)) => {
+                        state = State::InListItem(depth.saturating_sub(1));
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
 
             State::InBlockquote => match event {
                 Event::Text(t) => text_buf.push_str(&t),
@@ -484,6 +508,39 @@ mod tests {
         assert_eq!(
             deep.heading_path,
             vec!["Level 1", "Level 1.1", "Level 1.1.1"]
+        );
+    }
+
+    #[test]
+    fn markdown_nested_lists_are_included() {
+        let md = "- Top item\n  - Nested item\n  - Another nested\n- Second top\n";
+        let out = extract_markdown(md).unwrap();
+
+        // All text should be present somewhere in the output
+        let all_text: String = out
+            .blocks
+            .iter()
+            .map(|b| b.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all_text.contains("Nested item"),
+            "nested list items should be included, got blocks: {:?}",
+            out.blocks.iter().map(|b| &b.text).collect::<Vec<_>>()
+        );
+        assert!(
+            all_text.contains("Another nested"),
+            "all nested items should be included, got blocks: {:?}",
+            out.blocks.iter().map(|b| &b.text).collect::<Vec<_>>()
+        );
+        // Top-level items should also be present
+        assert!(
+            all_text.contains("Top item"),
+            "top-level items should be included"
+        );
+        assert!(
+            all_text.contains("Second top"),
+            "second top-level item should be included"
         );
     }
 }

@@ -48,12 +48,20 @@ pub enum EmbedError {
     /// Generic internal error.
     #[error("internal embed error: {0}")]
     Internal(String),
+
+    /// A required provider block is missing from the config (e.g. no `providers:` entry
+    /// matching the configured `provider:` kind). Maps to exit code 2 (`InvalidConfig`).
+    #[error("provider not configured: {0}")]
+    ProviderNotConfigured(String),
 }
 
 impl From<EmbedError> for localdb_core::Error {
     fn from(e: EmbedError) -> localdb_core::Error {
         match e {
             EmbedError::ModelMissing(msg) => localdb_core::Error::ModelMissing { message: msg },
+            EmbedError::ProviderNotConfigured(msg) => {
+                localdb_core::Error::InvalidConfig { message: msg }
+            }
             EmbedError::ChecksumMismatch {
                 model,
                 expected,

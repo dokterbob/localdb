@@ -57,9 +57,39 @@ fn extract_page_title(document: &Html) -> Option<String> {
 
 /// Extract the inner HTML of the main content element.
 ///
-/// Priority: `<article>` > `<main>` > `[role="main"]` > `<body>`.
+/// Priority: `<header>` + all `<article>` elements (concatenated) > `<main>` >
+/// `[role="main"]` > `<body>`.
+///
+/// If one or more `<article>` elements are present, their inner HTML is
+/// concatenated (optionally preceded by any `<header>` inner HTML found at the
+/// top level).  This ensures every article is included, not just the first.
 fn extract_main_content_html(document: &Html) -> String {
-    let candidates = ["article", "main", "[role=\"main\"]", "body"];
+    // Collect all <article> elements.
+    let article_sel = Selector::parse("article").unwrap();
+    let articles: Vec<_> = document.select(&article_sel).collect();
+
+    if !articles.is_empty() {
+        // Optionally prepend top-level <header> content.
+        let mut combined = String::new();
+
+        if let Ok(header_sel) = Selector::parse("header") {
+            if let Some(header_el) = document.select(&header_sel).next() {
+                let header_html = header_el.inner_html();
+                if !header_html.trim().is_empty() {
+                    combined.push_str(&header_html);
+                }
+            }
+        }
+
+        for article in &articles {
+            combined.push_str(&article.inner_html());
+        }
+
+        return combined;
+    }
+
+    // Fall through to <main>, [role="main"], <body>.
+    let candidates = ["main", "[role=\"main\"]", "body"];
 
     for selector_str in &candidates {
         if let Ok(sel) = Selector::parse(selector_str) {
@@ -132,7 +162,6 @@ fn should_skip_tag(tag: &str) -> bool {
         "script"
             | "style"
             | "nav"
-            | "header"
             | "footer"
             | "aside"
             | "noscript"
@@ -226,8 +255,8 @@ fn walk_element(element: &scraper::ElementRef, state: &mut HtmlExtractState) {
             }
         }
 
-        "div" | "section" | "article" | "main" | "figure" | "details" | "summary" | "address"
-        | "body" | "html" => {
+        "div" | "section" | "article" | "main" | "header" | "figure" | "details" | "summary"
+        | "address" | "body" | "html" => {
             // Container elements — recurse into children
             for child in element.children() {
                 if let Some(child_el) = scraper::ElementRef::wrap(child) {
@@ -366,6 +395,35 @@ mod tests {
             .find(|b| b.kind == BlockKind::Paragraph && b.text.contains("Under H2b"))
             .expect("Expected 'Under H2b' paragraph");
         assert_eq!(under_h2b.heading_path, vec!["H1a", "H2b"]);
+    }
+
+    #[test]
+    fn html_extracts_all_articles_and_header() {
+        let html = r#"<html><body>
+          <header><h1>Site Title</h1><p>Tagline</p></header>
+          <article><h2>First Article</h2><p>First content.</p></article>
+          <article><h2>Second Article</h2><p>Second content.</p></article>
+        </body></html>"#;
+        let out = extract_html(html).unwrap();
+
+        // Header content should be included
+        assert!(
+            out.blocks
+                .iter()
+                .any(|b| b.text.contains("Site Title") || b.text.contains("Tagline")),
+            "header content should be extracted, got blocks: {:?}",
+            out.blocks.iter().map(|b| &b.text).collect::<Vec<_>>()
+        );
+
+        // Both articles should be present
+        assert!(
+            out.blocks.iter().any(|b| b.text.contains("First content")),
+            "first article should be extracted"
+        );
+        assert!(
+            out.blocks.iter().any(|b| b.text.contains("Second content")),
+            "second article should be extracted"
+        );
     }
 
     #[test]

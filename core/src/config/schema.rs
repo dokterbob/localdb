@@ -161,11 +161,11 @@ impl Default for EmbeddingPolicy {
 }
 
 fn default_embedding_model() -> String {
-    "pplx-embed-context-v1-0.6b".to_string()
+    "pplx-embed-context-v1".to_string()
 }
 
 fn default_embedding_provider() -> String {
-    "local-onnx".to_string()
+    "perplexity".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -297,8 +297,8 @@ mod tests {
     #[test]
     fn embedding_policy_defaults() {
         let p = EmbeddingPolicy::default();
-        assert_eq!(p.model, "pplx-embed-context-v1-0.6b");
-        assert_eq!(p.provider, "local-onnx");
+        assert_eq!(p.model, "pplx-embed-context-v1");
+        assert_eq!(p.provider, "perplexity");
     }
 
     #[test]

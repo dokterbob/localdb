@@ -75,6 +75,10 @@ pub enum Command {
         /// Limit to a specific source (by ID).
         #[arg(long, value_name = "SOURCE_ID")]
         source: Option<String>,
+
+        /// Index an arbitrary directory (creates a temporary anonymous source).
+        #[arg(long, value_name = "PATH")]
+        dir: Option<String>,
     },
 
     /// Hybrid search with citations.
@@ -82,8 +86,8 @@ pub enum Command {
         /// Natural language query.
         query: String,
 
-        /// Maximum number of results to return.
-        #[arg(long, default_value = "10")]
+        /// Maximum number of results to return (must be >= 1).
+        #[arg(long, default_value = "10", value_parser = clap::value_parser!(usize))]
         limit: usize,
     },
 }
@@ -110,15 +114,17 @@ pub enum StoreCommand {
 pub enum SourceCommand {
     /// Add a new source to a store.
     Add {
-        /// Source path or URL.
-        source: String,
+        /// Source paths or URLs (one or more).
+        #[arg(required = true, num_args = 1..)]
+        sources: Vec<String>,
     },
     /// List sources on a store.
     List,
     /// Remove a source from a store.
     Remove {
-        /// Source ID.
-        id: String,
+        /// Source IDs, paths, or URLs (one or more).
+        #[arg(required = true, num_args = 1..)]
+        ids: Vec<String>,
     },
 }
 
@@ -151,11 +157,21 @@ fn main() {
             StoreCommand::Remove { name } => cli::run_store_remove(&ctx, name),
         },
         Command::Source(cmd) => match cmd {
-            SourceCommand::Add { source } => cli::run_source_add(&ctx, source),
+            SourceCommand::Add { sources } => {
+                // #5: loop over multiple arguments.
+                for source in sources {
+                    cli::run_source_add(&ctx, source);
+                }
+            }
             SourceCommand::List => cli::run_source_list(&ctx),
-            SourceCommand::Remove { id } => cli::run_source_remove(&ctx, id),
+            SourceCommand::Remove { ids } => {
+                // #5: loop over multiple arguments.
+                for id in ids {
+                    cli::run_source_remove(&ctx, id);
+                }
+            }
         },
-        Command::Index { source } => cli::run_index(&ctx, source.as_deref()),
+        Command::Index { source, dir } => cli::run_index(&ctx, source.as_deref(), dir.as_deref()),
         Command::Search { query, limit } => cli::run_search(&ctx, query, *limit),
     }
 }

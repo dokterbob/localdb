@@ -12,6 +12,18 @@ use crate::ids::{chunk_id, ContentId};
 use crate::types::{Block, BlockKind, Span};
 use crate::Error;
 
+/// Returns the largest byte index ≤ `index` that is a valid UTF-8 char boundary.
+/// MSRV-safe replacement for `str::floor_char_boundary` (stable since 1.91).
+#[inline]
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    let index = index.min(s.len());
+    let mut i = index;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 // ---------------------------------------------------------------------------
 // ChunkOutput — one chunk produced by a chunker
 // ---------------------------------------------------------------------------
@@ -175,10 +187,20 @@ fn chunk_prose(
 
     let mut chunks = Vec::new();
 
-    // Accumulator: span start/end + heading path
+    // Accumulator: span start/end + heading path.
+    //
+    // `buf_heading` tracks the heading path at the time the *first* block was
+    // added to the current buffer.  We must record this separately so that
+    // overlap content carried forward from a previous section does not inherit
+    // the *new* section's heading path.
     let mut buf_start: usize = blocks[0].span.start.min(full_text.len());
     let mut buf_end: usize = buf_start;
+    // heading of the first block added to the current buffer
     let mut buf_heading: Vec<String> = blocks[0].heading_path.clone();
+    // heading that the next block (or overlap start) should inherit
+    let mut current_heading: Vec<String> = blocks[0].heading_path.clone();
+    // whether the buffer is currently empty (no block content added yet)
+    let mut buf_empty: bool = true;
 
     for block in blocks {
         let blk_start = block.span.start.min(full_text.len());
@@ -188,11 +210,12 @@ fn chunk_prose(
             continue;
         }
 
-        // Heading starts a new section — flush if buffer is non-trivially large
+        // Heading starts a new section — flush if buffer is non-trivially large.
         if block.kind == BlockKind::Heading && buf_end > buf_start {
             let current_size = buf_end - buf_start;
             if current_size >= target / 2 {
-                // Flush current buffer
+                // Flush current buffer using the heading recorded when this
+                // buffer started being filled.
                 emit_span_chunks(
                     document_id,
                     full_text,
@@ -203,21 +226,33 @@ fn chunk_prose(
                     overlap,
                     &mut chunks,
                 );
-                // Start new buffer with overlap from previous
+                // Start new buffer with overlap from previous section.
+                // The overlap content logically belongs to the *new* section,
+                // so buf_heading will be updated when the first real block is
+                // added below.
                 let overlap_start = buf_end.saturating_sub(overlap);
+                let overlap_start = floor_char_boundary(full_text, overlap_start);
                 buf_start = overlap_start;
                 buf_end = overlap_start;
+                buf_empty = true;
             }
-            buf_heading = block.heading_path.clone();
+            // Update the heading that will be applied to the next buffer fill.
+            current_heading = block.heading_path.clone();
         }
 
-        // Extend buffer
+        // Extend buffer.
+        if buf_empty {
+            // First content block added to this buffer: record the heading path
+            // that was active when this buffer was started.
+            buf_heading = current_heading.clone();
+            buf_empty = false;
+        }
         if buf_start > blk_start {
             buf_start = blk_start;
         }
         buf_end = blk_end.max(buf_end);
 
-        // Flush if buffer exceeds target
+        // Flush if buffer exceeds target.
         if buf_end - buf_start >= target {
             emit_span_chunks(
                 document_id,
@@ -230,12 +265,14 @@ fn chunk_prose(
                 &mut chunks,
             );
             let overlap_start = buf_end.saturating_sub(overlap);
+            let overlap_start = floor_char_boundary(full_text, overlap_start);
             buf_start = overlap_start;
             buf_end = overlap_start;
+            buf_empty = true;
         }
     }
 
-    // Flush remaining
+    // Flush remaining.
     if buf_end > buf_start {
         emit_span_chunks(
             document_id,
@@ -292,8 +329,10 @@ fn emit_span_chunks_inner(
     end: usize,
     chunks: &mut Vec<ChunkOutput>,
 ) {
-    let start = start.min(params.full_text.len());
-    let end = end.min(params.full_text.len());
+    // Clamp to text length and align to char boundaries to avoid panics on
+    // multi-byte UTF-8 sequences (A1 fix).
+    let start = floor_char_boundary(params.full_text, start.min(params.full_text.len()));
+    let end = floor_char_boundary(params.full_text, end.min(params.full_text.len()));
     if start >= end {
         return;
     }
@@ -311,13 +350,14 @@ fn emit_span_chunks_inner(
         return;
     }
 
-    // Split into sub-chunks with overlap
+    // Split into sub-chunks with overlap.
     let mut pos = start;
     while pos < end {
         let remaining = end - pos;
         let split_len = remaining.min(params.target);
         let split_end = find_split_point(params.full_text, pos, split_len);
-        let split_end = split_end.min(end);
+        // Align split_end to a char boundary (A1 fix).
+        let split_end = floor_char_boundary(params.full_text, split_end.min(end));
 
         if split_end <= pos {
             break;
@@ -336,11 +376,12 @@ fn emit_span_chunks_inner(
             break;
         }
 
-        // Advance with overlap
+        // Advance with overlap; align to char boundary (A1 fix).
         let next_start = split_end.saturating_sub(params.overlap);
+        let next_start = floor_char_boundary(params.full_text, next_start);
         let next_start = find_word_boundary_forward(params.full_text, next_start);
         if next_start >= split_end {
-            // Avoid infinite loop
+            // Avoid infinite loop.
             pos = split_end;
         } else {
             pos = next_start.max(pos + 1);
@@ -350,7 +391,10 @@ fn emit_span_chunks_inner(
 
 /// Find a good split point at or before `start + target`, preferring sentence/paragraph breaks.
 fn find_split_point(text: &str, start: usize, target: usize) -> usize {
-    let end = (start + target).min(text.len());
+    // Align both start and end to char boundaries to avoid panics on multi-byte
+    // UTF-8 sequences (A1 fix).
+    let start = floor_char_boundary(text, start.min(text.len()));
+    let end = floor_char_boundary(text, (start + target).min(text.len()));
     if end == text.len() {
         return end;
     }
@@ -385,13 +429,15 @@ fn find_split_point(text: &str, start: usize, target: usize) -> usize {
 
 /// Find a word boundary at or after `pos` in `text`.
 fn find_word_boundary_forward(text: &str, pos: usize) -> usize {
+    // Align to char boundary first to avoid panics on multi-byte sequences (A1).
+    let pos = floor_char_boundary(text, pos.min(text.len()));
     if pos >= text.len() {
         return pos;
     }
     if text.as_bytes().get(pos) == Some(&b' ') {
         return pos + 1;
     }
-    // Walk forward to find a space
+    // Walk forward to find a space.
     text[pos..].find(' ').map(|i| pos + i + 1).unwrap_or(pos)
 }
 
@@ -439,11 +485,14 @@ fn chunk_code(
 
         let current_size = current_end.saturating_sub(current_start);
 
-        // Flush if adding this block would exceed target
+        // Flush if adding this block would exceed target.
         if current_size > 0 && current_size + (block_end - block_start) > target {
-            let span = Span::new(current_start, current_end);
-            let chunk_text = &full_text[current_start..current_end];
-            let id = chunk_id(document_id, chunk_text, current_start, current_end);
+            // Align to char boundaries (A1 fix).
+            let cs = floor_char_boundary(full_text, current_start);
+            let ce = floor_char_boundary(full_text, current_end);
+            let span = Span::new(cs, ce);
+            let chunk_text = &full_text[cs..ce];
+            let id = chunk_id(document_id, chunk_text, cs, ce);
             chunks.push(ChunkOutput {
                 id,
                 text: chunk_text.to_string(),
@@ -460,11 +509,14 @@ fn chunk_code(
         }
     }
 
-    // Flush remaining
+    // Flush remaining.
     if current_end > current_start {
-        let span = Span::new(current_start, current_end);
-        let chunk_text = &full_text[current_start..current_end];
-        let id = chunk_id(document_id, chunk_text, current_start, current_end);
+        // Align to char boundaries (A1 fix).
+        let cs = floor_char_boundary(full_text, current_start);
+        let ce = floor_char_boundary(full_text, current_end);
+        let span = Span::new(cs, ce);
+        let chunk_text = &full_text[cs..ce];
+        let id = chunk_id(document_id, chunk_text, cs, ce);
         chunks.push(ChunkOutput {
             id,
             text: chunk_text.to_string(),
@@ -773,5 +825,120 @@ mod tests {
         // Should split at \n\n
         assert!(result <= 20, "should split before second paragraph");
         assert!(result > 0);
+    }
+
+    // ---------------------------------------------------------------------------
+    // A1 — Multi-byte UTF-8 must not panic
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn chunk_document_with_multibyte_utf8_does_not_panic() {
+        // Japanese, Cyrillic, and em-dash — all multi-byte characters.
+        let text = "こんにちは world — это тест";
+        let doc_id = "doc-multibyte";
+        let blocks = vec![make_block(0, BlockKind::Paragraph, text, 0)];
+        let result = chunk_document(doc_id, text, &blocks, &ChunkerConfig::prose());
+        assert!(
+            result.is_ok(),
+            "chunking multi-byte text should not panic: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn chunk_document_multibyte_code_preset_does_not_panic() {
+        // Long repeated multi-byte text to force splitting within multi-byte sequences.
+        let unit = "日本語テキスト: これはテストです。 ";
+        let text = unit.repeat(200); // large enough to trigger splits
+        let doc_id = "doc-multibyte-code";
+        // Build blocks that reference the text by byte offsets.
+        // All boundaries are aligned to char boundaries to build valid input.
+        let block_size_approx = text.len() / 4;
+        let mut blocks = Vec::new();
+        let mut prev_end = 0usize;
+        for i in 0..4 {
+            let raw_end = if i < 3 {
+                (i + 1) * block_size_approx
+            } else {
+                text.len()
+            };
+            let start = floor_char_boundary(text.as_str(), prev_end);
+            let end = floor_char_boundary(text.as_str(), raw_end.min(text.len()));
+            if start >= end {
+                continue;
+            }
+            blocks.push(Block {
+                document_id: String::new(),
+                ordinal: i,
+                kind: BlockKind::Code,
+                text: text[start..end].to_string(),
+                span: Span::new(start, end),
+                heading_path: vec![],
+            });
+            prev_end = end;
+        }
+        let result = chunk_document(doc_id, &text, &blocks, &ChunkerConfig::code());
+        assert!(
+            result.is_ok(),
+            "code chunking multi-byte text should not panic: {:?}",
+            result.err()
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // B1 — heading_path must reflect the section the chunk content belongs to,
+    //       not the heading that was current when the buffer was flushed.
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn prose_chunk_heading_path_correct_after_section_flush() {
+        // Build a document large enough to force a flush at the heading boundary.
+        // Section A has enough content to trigger a flush; section B should then
+        // get its own heading path.
+        let section_a_para = "A".repeat(900); // enough to push buf_end > target/2 (800)
+        let section_b_para = "B".repeat(100);
+
+        // Manually build full_text with offsets matching the block spans.
+        //   "# Section A\n" + section_a_para + "\n# Section B\n" + section_b_para
+        let heading_a = "# Section A\n";
+        let heading_b = "\n# Section B\n";
+        let full_text = format!(
+            "{}{}{}{}",
+            heading_a, section_a_para, heading_b, section_b_para
+        );
+
+        let ha_end = heading_a.len();
+        let pa_end = ha_end + section_a_para.len();
+        let hb_end = pa_end + heading_b.len();
+        let _pb_end = hb_end + section_b_para.len();
+
+        let blocks = vec![
+            make_heading_block(0, "Section A", 0, vec!["Section A".to_string()]),
+            make_para_block(1, &section_a_para, ha_end, vec!["Section A".to_string()]),
+            make_heading_block(2, "Section B", pa_end, vec!["Section B".to_string()]),
+            make_para_block(3, &section_b_para, hb_end, vec!["Section B".to_string()]),
+        ];
+
+        let doc_id = "doc-heading-path";
+        let cfg = ChunkerConfig {
+            preset: "prose".to_string(),
+            target_chars: Some(1600),
+            overlap_chars: Some(0), // no overlap to simplify assertions
+        };
+
+        let chunks = chunk_document(doc_id, &full_text, &blocks, &cfg).unwrap();
+        assert!(!chunks.is_empty(), "should produce at least one chunk");
+
+        // The last chunk should contain section B content and carry "Section B".
+        let last = chunks.last().unwrap();
+        assert!(
+            last.text.contains('B'),
+            "last chunk should contain section B content"
+        );
+        assert_eq!(
+            last.heading_path,
+            vec!["Section B".to_string()],
+            "last chunk heading_path must be 'Section B', not a stale heading"
+        );
     }
 }
