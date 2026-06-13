@@ -40,7 +40,7 @@ impl PlatformPaths {
     /// Returns `None` if the platform cannot determine home directory
     /// (unusual; only happens in no-home-dir environments).
     pub fn resolve() -> Option<Self> {
-        Self::resolve_with_qualifier("com.localdb", "localdb", "localdb")
+        Self::resolve_with_qualifier("", "", "localdb")
     }
 
     /// Resolve platform paths with explicit qualifier/organization/application.
