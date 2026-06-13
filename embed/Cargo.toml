@@ -27,9 +27,9 @@ async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 
 # Local ONNX inference (optional)
-# hf-hub-native-tls enables model downloading via HuggingFace Hub (includes hf-hub + native-tls)
-# ort-download-binaries-native-tls downloads the ONNX Runtime binary automatically
-fastembed = { version = "5", default-features = false, features = ["hf-hub-native-tls", "ort-download-binaries-native-tls"], optional = true }
+# hf-hub-rustls-tls enables model downloading via HuggingFace Hub (includes hf-hub + rustls)
+# ort-download-binaries-rustls-tls downloads the ONNX Runtime binary automatically, over rustls
+fastembed = { version = "5", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"], optional = true }
 
 # For model cache path management
 dirs = "5"

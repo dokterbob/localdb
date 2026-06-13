@@ -138,6 +138,7 @@ jobs:
     name: Cross-compile check (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: macos-latest
