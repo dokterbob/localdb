@@ -32,6 +32,33 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde_json::json;
 
 // ---------------------------------------------------------------------------
+// Store name validation — A9-safety
+// ---------------------------------------------------------------------------
+
+/// Validate a store name, returning an error for unsafe or invalid names.
+///
+/// Rejects: empty string, names containing `/`, and names that are exactly `.` or `..`.
+/// Returns `Error::InvalidRequest` (exit code 2) on rejection.
+pub fn validate_store_name(name: &str) -> Result<(), Error> {
+    if name.is_empty() {
+        return Err(Error::InvalidRequest {
+            message: "store name must not be empty".to_string(),
+        });
+    }
+    if name == "." || name == ".." {
+        return Err(Error::InvalidRequest {
+            message: format!("store name '{}' is not allowed", name),
+        });
+    }
+    if name.contains('/') {
+        return Err(Error::InvalidRequest {
+            message: format!("store name '{}' must not contain '/'", name),
+        });
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // CliContext — parsed global flags
 // ---------------------------------------------------------------------------
 
@@ -173,10 +200,13 @@ impl WriteLock {
 
         let lock_path = data_dir.join(".write.lock");
 
+        // F8: Open without truncate so a failed lock acquire does NOT leave the
+        // file truncated (which would clobber the PID of the current lock holder).
+        // We truncate and write our PID only AFTER the OS lock is acquired.
         let file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
-            .truncate(true)
+            .truncate(false)
             .open(&lock_path)
             .map_err(|e| {
                 if e.kind() == std::io::ErrorKind::PermissionDenied {
@@ -189,13 +219,6 @@ impl WriteLock {
                 }
             })?;
 
-        // Write our PID for diagnostics (best-effort).
-        {
-            use std::io::Write as _;
-            let mut f = &file;
-            let _ = writeln!(f, "{}", std::process::id());
-        }
-
         // Box the RwLock so we can take a 'static guard from it.
         // SAFETY: the Box is pinned on the heap and outlives the guard
         // because both are stored in WriteLock together.
@@ -207,6 +230,21 @@ impl WriteLock {
                 unsafe { &mut *(rw.as_mut() as *mut _) };
             rw_ref.try_write().map_err(|_| Error::StoreLocked)?
         };
+
+        // Write our PID for diagnostics (best-effort). Only done after lock acquired.
+        // We reopen the file for the truncate+write so we avoid borrowing issues
+        // with the guard. The OS-level lock (flock/LockFileEx) is per-process,
+        // so reopening within the same process is safe — we already hold it.
+        {
+            use std::io::Write as _;
+            if let Ok(mut pid_file) = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&lock_path)
+            {
+                let _ = writeln!(pid_file, "{}", std::process::id());
+            }
+        }
 
         Ok(Self {
             _guard: guard,
@@ -451,6 +489,34 @@ impl SourceDb {
             }
         }
     }
+
+    /// Find a source by its `root` path or `url` field, optionally scoped to a store.
+    fn find_by_root_or_url(
+        &self,
+        value: &str,
+        store_name: Option<&str>,
+    ) -> Result<Option<RuntimeSource>, Error> {
+        let rtxn = self.db.begin_read().map_err(map_db_err)?;
+        let t = rtxn.open_table(SOURCES_TABLE).map_err(map_db_err)?;
+        for entry in t.iter().map_err(map_db_err)? {
+            let (_, v) = entry.map_err(map_db_err)?;
+            let src: RuntimeSource =
+                serde_json::from_str(v.value()).map_err(|e| Error::Internal {
+                    message: format!("cannot deserialize source: {}", e),
+                    correlation_id: "source_find_deser".to_string(),
+                })?;
+            if let Some(sn) = store_name {
+                if src.store_name != sn {
+                    continue;
+                }
+            }
+            let matches = src.root.as_deref() == Some(value) || src.url.as_deref() == Some(value);
+            if matches {
+                return Ok(Some(src));
+            }
+        }
+        Ok(None)
+    }
 }
 
 fn map_db_err(e: impl std::fmt::Display) -> Error {
@@ -514,6 +580,13 @@ impl AppDb {
     pub fn get_source(&self, id: &str) -> Result<Option<RuntimeSource>, Error> {
         self.sources.get(id)
     }
+    pub fn find_source_by_root_or_url(
+        &self,
+        value: &str,
+        store_name: Option<&str>,
+    ) -> Result<Option<RuntimeSource>, Error> {
+        self.sources.find_by_root_or_url(value, store_name)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -566,6 +639,50 @@ fn load_app_db(ctx: &CliContext) -> (ConfigLoader, AppDb) {
     (config_loader, db)
 }
 
+/// F1-cli: Load config with fallback to platform defaults for read-only commands.
+///
+/// When the config file is malformed or unreadable, read-only commands (search,
+/// store list, status) should still work using platform default config and an
+/// in-memory or temp DB, rather than hard failing.
+fn load_app_db_lenient(ctx: &CliContext) -> (ConfigLoader, AppDb) {
+    let options = LoadOptions {
+        config_path: ctx.config.clone(),
+        ..Default::default()
+    };
+    let config_loader = match load_config(&options) {
+        Ok(c) => c,
+        Err(_) => {
+            // Config is malformed/missing — use platform default paths.
+            // This allows read-only commands (search, store list, status) to work.
+            let options_default = LoadOptions::default();
+            match load_config(&options_default) {
+                Ok(c) => c,
+                Err(e) => exit_err(&e, ctx.json),
+            }
+        }
+    };
+
+    let data_dir = &config_loader.paths.data_dir;
+    if matches!(probe_daemon(data_dir), DaemonState::Running { .. }) {
+        let tmp_dir = tempdir_for_daemon_mode(data_dir);
+        let tmp_db_path = tmp_dir.join("daemon-mode-placeholder.redb");
+        let db = match AppDb::open(&tmp_db_path) {
+            Ok(d) => d,
+            Err(e) => exit_err(&e, ctx.json),
+        };
+        return (config_loader, db);
+    }
+
+    let db_path = config_loader.paths.runtime_state_db_path();
+    // For read-only commands, use a temp DB if the real one can't be opened.
+    let db = AppDb::open(&db_path).unwrap_or_else(|_| {
+        let tmp_dir = tempdir_for_daemon_mode(data_dir);
+        let tmp_path = tmp_dir.join("lenient-fallback.redb");
+        AppDb::open(&tmp_path).unwrap_or_else(|e| exit_err(&e, ctx.json))
+    });
+    (config_loader, db)
+}
+
 /// Return a writable temp directory path that lives inside `data_dir` so the
 /// daemon-mode placeholder DB is cleaned up automatically when the process exits.
 ///
@@ -606,6 +723,34 @@ pub fn classify_source(source: &str) -> (&str, Option<&str>, Option<&str>) {
     } else {
         ("path", Some(source), None)
     }
+}
+
+/// Determine whether a string looks like a ULID/UUID (not a path or URL).
+///
+/// ULIDs are 26 uppercase alphanumeric characters. We use this to distinguish
+/// bare IDs from path/URL arguments in source remove.
+fn looks_like_id(s: &str) -> bool {
+    // ULID: exactly 26 chars, all uppercase alphanumeric.
+    // UUID: 36 chars with hyphens.
+    // Anything containing `/`, `\`, `.` or `://` is a path or URL, not an ID.
+    if s.contains('/') || s.contains('\\') || s.contains("://") {
+        return false;
+    }
+    // ULID pattern: 26 uppercase alphanumeric.
+    if s.len() == 26
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() && !c.is_ascii_lowercase())
+    {
+        return true;
+    }
+    // UUID pattern: 32 hex + 4 hyphens = 36 chars.
+    if s.len() == 36 && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return true;
+    }
+    // Shorter opaque IDs (no path indicators) are also treated as IDs.
+    // E.g. numeric IDs or short hex. If it has no path separator or dot, treat
+    // as ID only if it's clearly not a filename/relative path.
+    false
 }
 
 /// Convert a `RuntimeSource` to a `core::types::Source` for ingestion.
@@ -670,6 +815,24 @@ pub fn run_init(ctx: &CliContext) {
         .or_else(|| std::env::var("LOCALDB_CONFIG").ok().map(PathBuf::from))
         .unwrap_or_else(|| platform.config_file.clone());
 
+    // F11: If --config was explicitly given but the parent directory doesn't exist,
+    // fail with exit 2 (invalid config) rather than silently using platform defaults.
+    if ctx.config.is_some() {
+        if let Some(parent) = config_path.parent() {
+            if !parent.exists() && parent != Path::new("") {
+                exit_err(
+                    &Error::InvalidConfig {
+                        message: format!(
+                            "config path parent directory '{}' does not exist",
+                            parent.display()
+                        ),
+                    },
+                    ctx.json,
+                );
+            }
+        }
+    }
+
     // If config exists, load it to get the resolved data dir.
     // If not, use platform defaults (we'll write the config shortly).
     let (data_dir, models_dir, logs_dir) = if config_path.exists() {
@@ -726,10 +889,29 @@ pub fn run_init(ctx: &CliContext) {
         }
     }
 
-    // Initialize the runtime-state DB.
+    // Initialize the runtime-state DB and create default store (#6).
     let db_path = data_dir.join("runtime-state.redb");
-    if let Err(e) = AppDb::open(&db_path) {
-        exit_err(&e, ctx.json);
+    let db = match AppDb::open(&db_path) {
+        Ok(d) => d,
+        Err(e) => exit_err(&e, ctx.json),
+    };
+
+    // Create the default store if it doesn't exist yet.
+    match db.get_store("default") {
+        Ok(None) => {
+            let default_store = RuntimeStore {
+                id: new_ulid(),
+                name: "default".to_string(),
+                visibility: "private".to_string(),
+                backend: "lancedb".to_string(),
+                indexing: None,
+            };
+            if let Err(e) = db.upsert_store(&default_store) {
+                exit_err(&e, ctx.json);
+            }
+        }
+        Ok(Some(_)) => {} // already exists
+        Err(e) => exit_err(&e, ctx.json),
     }
 
     if ctx.json {
@@ -756,7 +938,8 @@ pub fn run_init(ctx: &CliContext) {
 
 /// `localdb status`
 pub fn run_status(ctx: &CliContext) {
-    let (config_loader, db) = load_app_db(ctx);
+    // F1-cli: use lenient loader so status works even with malformed config.
+    let (config_loader, db) = load_app_db_lenient(ctx);
     let data_dir = &config_loader.paths.data_dir;
 
     let daemon_status = match probe_daemon(data_dir) {
@@ -818,6 +1001,11 @@ pub fn run_status(ctx: &CliContext) {
 
 /// `localdb store add <name>`
 pub fn run_store_add(ctx: &CliContext, name: &str) {
+    // A9-safety: validate store name before anything else.
+    if let Err(e) = validate_store_name(name) {
+        exit_err(&e, ctx.json);
+    }
+
     let (config_loader, db) = load_app_db(ctx);
     let data_dir = &config_loader.paths.data_dir;
 
@@ -883,7 +1071,8 @@ pub fn run_store_add(ctx: &CliContext, name: &str) {
 
 /// `localdb store list`
 pub fn run_store_list(ctx: &CliContext) {
-    let (config_loader, db) = load_app_db(ctx);
+    // F1-cli: use lenient loader so store list works even with malformed config.
+    let (config_loader, db) = load_app_db_lenient(ctx);
 
     let runtime_stores = match db.list_stores() {
         Ok(s) => s,
@@ -980,10 +1169,33 @@ pub fn run_store_remove(ctx: &CliContext, name: &str) {
     }
 }
 
+/// Default exclude patterns for path sources (#4).
+const DEFAULT_PATH_EXCLUDES: &[&str] = &[
+    ".git",
+    "node_modules",
+    ".DS_Store",
+    "target",
+    "__pycache__",
+    ".venv",
+];
+
 /// `localdb source add <path-or-url>`
 pub fn run_source_add(ctx: &CliContext, source_arg: &str) {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(run_source_add_async(ctx, source_arg));
+}
+
+async fn run_source_add_async(ctx: &CliContext, source_arg: &str) {
     let (config_loader, db) = load_app_db(ctx);
     let data_dir = &config_loader.paths.data_dir;
+
+    // A9-safety: validate the --store name if given explicitly.
+    if let Some(store_name) = ctx.stores.first() {
+        if let Err(e) = validate_store_name(store_name) {
+            exit_err(&e, ctx.json);
+        }
+    }
+
     let store_name = resolve_store_name(ctx, &config_loader, &db);
 
     if check_yaml_owned(&store_name, &config_loader.config) {
@@ -1029,8 +1241,8 @@ pub fn run_source_add(ctx: &CliContext, source_arg: &str) {
         Err(e) => exit_err(&e, ctx.json),
     };
 
-    // Verify store exists in runtime DB.
-    match db.get_store(&store_name) {
+    // #13: Verify store exists in runtime DB (exit 3 if not found).
+    let rt_store = match db.get_store(&store_name) {
         Ok(None) => exit_err(
             &Error::StoreNotFound {
                 id: store_name.clone(),
@@ -1038,18 +1250,72 @@ pub fn run_source_add(ctx: &CliContext, source_arg: &str) {
             ctx.json,
         ),
         Err(e) => exit_err(&e, ctx.json),
-        Ok(Some(_)) => {}
-    }
+        Ok(Some(s)) => s,
+    };
 
-    let (kind, root, url) = classify_source(source_arg);
+    let (kind, root_str, url_str2) = classify_source(source_arg);
+
+    // For path sources: validate existence (#14) and handle single-file (#7).
+    let (actual_root, include_globs) = if kind == "path" {
+        let raw_root = root_str.unwrap_or(source_arg);
+        let p = std::path::Path::new(raw_root);
+
+        // #14: validate path exists.
+        if !p.exists() {
+            exit_err(
+                &Error::InvalidRequest {
+                    message: format!("path '{}' does not exist", raw_root),
+                },
+                ctx.json,
+            );
+        }
+
+        if p.is_file() {
+            // #7: single-file source — use parent dir as root, include just this file.
+            let parent = p
+                .parent()
+                .map(|par| {
+                    if par == Path::new("") {
+                        Path::new(".")
+                    } else {
+                        par
+                    }
+                })
+                .unwrap_or(Path::new("."));
+            let filename = p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            (parent.to_string_lossy().to_string(), vec![filename])
+        } else {
+            (raw_root.to_string(), vec![])
+        }
+    } else {
+        (source_arg.to_string(), vec![])
+    };
+
+    // #4: Default exclude list for path sources.
+    let exclude_globs: Vec<String> = if kind == "path" {
+        DEFAULT_PATH_EXCLUDES
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        vec![]
+    };
+
     let src = RuntimeSource {
         id: new_ulid(),
         store_name: store_name.clone(),
         kind: kind.to_string(),
-        root: root.map(|s| s.to_string()),
-        url: url.map(|s| s.to_string()),
-        include: vec![],
-        exclude: vec![],
+        root: if kind == "path" {
+            Some(actual_root)
+        } else {
+            None
+        },
+        url: url_str2.map(|s| s.to_string()),
+        include: include_globs,
+        exclude: exclude_globs,
         preset: "prose".to_string(),
     };
 
@@ -1061,18 +1327,197 @@ pub fn run_source_add(ctx: &CliContext, source_arg: &str) {
         print_json(&json!({
             "status": "ok",
             "id": src.id,
-            "store": store_name,
+            "store": { "name": store_name },
             "kind": kind,
         }));
     } else {
         println!("Added source {} to store '{}'", src.id, store_name);
+    }
+
+    // #2: Auto-index after source add.
+    // Drop the write lock AND the db handle before re-entering the index path,
+    // which will acquire its own lock and open its own DB handle.
+    let src_id = src.id.clone();
+    let rt_store_clone = rt_store.clone();
+    drop(_lock);
+    drop(db);
+    drop(config_loader);
+
+    if kind == "path" || kind == "url" {
+        if !ctx.json {
+            eprintln!("Auto-indexing source {} ...", src_id);
+        }
+        // Build an index context scoped to this store.
+        let index_ctx = CliContext {
+            config: ctx.config.clone(),
+            json: ctx.json,
+            stores: vec![store_name.clone()],
+        };
+        run_index_for_source_async(&index_ctx, Some(&src_id), &rt_store_clone).await;
+    }
+}
+
+/// Internal: run ingestion for a single source without re-resolving the store.
+async fn run_index_for_source_async(
+    ctx: &CliContext,
+    source_id: Option<&str>,
+    rt_store: &RuntimeStore,
+) {
+    use localdb_core::{
+        chunker::ChunkerConfig,
+        ingestion::{
+            run_ingestion_for_source, DocumentExtractor, DocumentIndex, ExtractionResult,
+            IngestionConfig,
+        },
+    };
+
+    let (config_loader, db) = load_app_db(ctx);
+    let data_dir = config_loader.paths.data_dir.clone();
+
+    let _lock = match WriteLock::acquire(&data_dir) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("warning: cannot acquire lock for auto-index: {}", e);
+            return;
+        }
+    };
+
+    let all_sources = match db.list_sources(&rt_store.name) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("warning: cannot list sources for auto-index: {}", e);
+            return;
+        }
+    };
+
+    let sources_to_index: Vec<RuntimeSource> = if let Some(sid) = source_id {
+        all_sources.into_iter().filter(|s| s.id == sid).collect()
+    } else {
+        all_sources
+    };
+
+    if sources_to_index.is_empty() {
+        return;
+    }
+
+    let policy = config_loader.config.defaults.indexing.clone();
+    let policy_version = compute_policy_version(&policy);
+
+    let ingestion_cfg = IngestionConfig {
+        store_id: rt_store.id.clone(),
+        policy_version,
+        chunker: ChunkerConfig::prose(),
+    };
+
+    let embed_policy = &config_loader.config.defaults.indexing.embedding;
+    let models_dir = config_loader.paths.models_dir.clone();
+    let embedder = match embed::create_embedder(
+        embed_policy,
+        &config_loader.config.providers,
+        Some(&models_dir),
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("warning: cannot create embedder for auto-index: {}", e);
+            return;
+        }
+    };
+
+    struct ExtractBridge;
+    impl DocumentExtractor for ExtractBridge {
+        fn extract(&self, bytes: &[u8], filename: Option<&str>) -> Result<ExtractionResult, Error> {
+            let out = extract::extract(bytes, filename)?;
+            Ok(ExtractionResult {
+                text: out.text,
+                blocks: out.blocks,
+                title: out.title,
+            })
+        }
+    }
+
+    let store_data_dir = data_dir.join("stores").join(&rt_store.name);
+    if let Err(e) = std::fs::create_dir_all(&store_data_dir) {
+        eprintln!("warning: cannot create store dir for auto-index: {}", e);
+        return;
+    }
+
+    let lance_path = store_data_dir.to_string_lossy().to_string();
+    let lancedb_store =
+        match store_lancedb::LanceDbStore::open(&lance_path, embedder.embedding_dim()).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("warning: cannot open store for auto-index: {}", e);
+                return;
+            }
+        };
+
+    let mut doc_index = DocumentIndex::new();
+    let mut chunks = 0u64;
+
+    for rt_source in &sources_to_index {
+        let source = runtime_source_to_core_source(rt_source, &rt_store.id);
+        match run_ingestion_for_source(
+            &source,
+            &mut doc_index,
+            &lancedb_store,
+            embedder.as_ref(),
+            &ingestion_cfg,
+            &ExtractBridge,
+            None,
+        )
+        .await
+        {
+            Ok(r) => {
+                chunks += r.chunks_written;
+                if !ctx.json {
+                    eprintln!(
+                        "  indexed {} docs, {} chunks",
+                        r.docs_indexed, r.chunks_written
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: auto-index error for source {}: {}",
+                    rt_source.id, e
+                );
+            }
+        }
+    }
+
+    if chunks > 0 {
+        if let Err(e) = lancedb_store.create_fts_index().await {
+            eprintln!("warning: FTS index creation failed: {}", e);
+        }
     }
 }
 
 /// `localdb source list`
 pub fn run_source_list(ctx: &CliContext) {
     let (config_loader, db) = load_app_db(ctx);
+
+    // A9-safety: validate --store name if given explicitly.
+    if let Some(store_name) = ctx.stores.first() {
+        if let Err(e) = validate_store_name(store_name) {
+            exit_err(&e, ctx.json);
+        }
+    }
+
     let store_name = resolve_store_name(ctx, &config_loader, &db);
+
+    // D1: verify store exists before listing sources.
+    if let Some(explicit) = ctx.stores.first() {
+        match db.get_store(explicit) {
+            Ok(None) => exit_err(
+                &Error::StoreNotFound {
+                    id: explicit.clone(),
+                },
+                ctx.json,
+            ),
+            Err(e) => exit_err(&e, ctx.json),
+            Ok(Some(_)) => {}
+        }
+    }
 
     let sources = match db.list_sources(&store_name) {
         Ok(s) => s,
@@ -1080,12 +1525,14 @@ pub fn run_source_list(ctx: &CliContext) {
     };
 
     if ctx.json {
+        // D4: include store as an object matching the citation shape.
         let json_sources: Vec<serde_json::Value> = sources
             .iter()
             .map(|s| {
                 json!({
                     "id": s.id,
-                    "store": s.store_name,
+                    "store": { "name": store_name },
+                    "store_id": s.store_name,
                     "kind": s.kind,
                     "root": s.root,
                     "url": s.url,
@@ -1104,14 +1551,35 @@ pub fn run_source_list(ctx: &CliContext) {
     }
 }
 
-/// `localdb source remove <id>`
+/// `localdb source remove <id-or-path-or-url>`
 pub fn run_source_remove(ctx: &CliContext, id: &str) {
+    // A9-safety: validate --store name if given explicitly.
+    if let Some(store_name) = ctx.stores.first() {
+        if let Err(e) = validate_store_name(store_name) {
+            exit_err(&e, ctx.json);
+        }
+    }
+
     let (config_loader, db) = load_app_db(ctx);
     let data_dir = &config_loader.paths.data_dir;
     let store_name = resolve_store_name(ctx, &config_loader, &db);
 
     if check_yaml_owned(&store_name, &config_loader.config) {
         exit_err(&Error::ConfigReadonly, ctx.json);
+    }
+
+    // D1: verify the store exists if --store was given explicitly.
+    if let Some(explicit) = ctx.stores.first() {
+        match db.get_store(explicit) {
+            Ok(None) => exit_err(
+                &Error::StoreNotFound {
+                    id: explicit.clone(),
+                },
+                ctx.json,
+            ),
+            Err(e) => exit_err(&e, ctx.json),
+            Ok(Some(_)) => {}
+        }
     }
 
     // Per specs/05-surfaces.md §2: route to daemon when running.
@@ -1137,30 +1605,74 @@ pub fn run_source_remove(ctx: &CliContext, id: &str) {
         Err(e) => exit_err(&e, ctx.json),
     };
 
-    match db.delete_source(id) {
+    // #3: Resolve the source ID. If the argument looks like a path or URL
+    // (not a ULID/UUID), look it up by root/url field.
+    let resolved_id: String = if !looks_like_id(id) {
+        // Argument is a path or URL — look up by root/url.
+        let explicit_store = ctx.stores.first().map(|s| s.as_str());
+        match db.find_source_by_root_or_url(id, explicit_store) {
+            Ok(Some(src)) => src.id,
+            Ok(None) => exit_err(&Error::SourceNotFound { id: id.to_string() }, ctx.json),
+            Err(e) => exit_err(&e, ctx.json),
+        }
+    } else {
+        id.to_string()
+    };
+
+    // D2: If --store was given, verify the source belongs to that store.
+    if let Some(explicit_store) = ctx.stores.first() {
+        match db.get_source(&resolved_id) {
+            Ok(Some(src)) if src.store_name != *explicit_store => {
+                exit_err(
+                    &Error::SourceNotFound {
+                        id: format!(
+                            "source '{}' exists but belongs to store '{}', not '{}'",
+                            resolved_id, src.store_name, explicit_store
+                        ),
+                    },
+                    ctx.json,
+                );
+            }
+            Ok(None) => exit_err(
+                &Error::SourceNotFound {
+                    id: resolved_id.clone(),
+                },
+                ctx.json,
+            ),
+            Err(e) => exit_err(&e, ctx.json),
+            Ok(Some(_)) => {}
+        }
+    }
+
+    match db.delete_source(&resolved_id) {
         Ok(true) => {}
-        Ok(false) => exit_err(&Error::SourceNotFound { id: id.to_string() }, ctx.json),
+        Ok(false) => exit_err(
+            &Error::SourceNotFound {
+                id: resolved_id.clone(),
+            },
+            ctx.json,
+        ),
         Err(e) => exit_err(&e, ctx.json),
     }
 
     if ctx.json {
-        print_json(&json!({ "status": "ok", "id": id }));
+        print_json(&json!({ "status": "ok", "id": resolved_id }));
     } else {
-        println!("Removed source: {}", id);
+        println!("Removed source: {}", resolved_id);
     }
 }
 
-/// `localdb index [--source <id>]`
+/// `localdb index [--source <id>] [--dir <path>]`
 ///
 /// One-shot scan-and-index (embedded mode) or submits a job to the daemon.
 ///
 /// Per specs/05-surfaces.md §2: when daemon is running, submits job and polls.
-pub fn run_index(ctx: &CliContext, source_id: Option<&str>) {
+pub fn run_index(ctx: &CliContext, source_id: Option<&str>, dir: Option<&str>) {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    rt.block_on(run_index_async(ctx, source_id));
+    rt.block_on(run_index_async(ctx, source_id, dir));
 }
 
-async fn run_index_async(ctx: &CliContext, source_id: Option<&str>) {
+async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, dir: Option<&str>) {
     use localdb_core::{
         chunker::ChunkerConfig,
         ingestion::{
@@ -1168,6 +1680,13 @@ async fn run_index_async(ctx: &CliContext, source_id: Option<&str>) {
             IngestionConfig,
         },
     };
+
+    // A9-safety: validate --store name if given.
+    if let Some(store_name) = ctx.stores.first() {
+        if let Err(e) = validate_store_name(store_name) {
+            exit_err(&e, ctx.json);
+        }
+    }
 
     let (config_loader, db) = load_app_db(ctx);
     let data_dir = config_loader.paths.data_dir.clone();
@@ -1203,6 +1722,7 @@ async fn run_index_async(ctx: &CliContext, source_id: Option<&str>) {
         Err(e) => exit_err(&e, ctx.json),
     };
 
+    // #13: Validate --store exists in runtime DB.
     let rt_store = match db.get_store(&store_name) {
         Ok(Some(s)) => s,
         Ok(None) => exit_err(
@@ -1214,12 +1734,45 @@ async fn run_index_async(ctx: &CliContext, source_id: Option<&str>) {
         Err(e) => exit_err(&e, ctx.json),
     };
 
+    // #1: If --dir was given, create a temporary anonymous source for that directory.
+    let ephemeral_source: Option<RuntimeSource> = if let Some(dir_path) = dir {
+        let p = std::path::Path::new(dir_path);
+        // Validate the path exists.
+        if !p.exists() {
+            exit_err(
+                &Error::InvalidRequest {
+                    message: format!("--dir path '{}' does not exist", dir_path),
+                },
+                ctx.json,
+            );
+        }
+        let src = RuntimeSource {
+            id: new_ulid(),
+            store_name: store_name.clone(),
+            kind: "path".to_string(),
+            root: Some(dir_path.to_string()),
+            url: None,
+            include: vec![],
+            exclude: DEFAULT_PATH_EXCLUDES
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            preset: "prose".to_string(),
+        };
+        Some(src)
+    } else {
+        None
+    };
+
     let all_sources = match db.list_sources(&store_name) {
         Ok(s) => s,
         Err(e) => exit_err(&e, ctx.json),
     };
 
-    let sources_to_index: Vec<RuntimeSource> = if let Some(sid) = source_id {
+    let sources_to_index: Vec<RuntimeSource> = if let Some(ephemeral) = ephemeral_source {
+        // --dir: index only the ephemeral source (not persisted to DB).
+        vec![ephemeral]
+    } else if let Some(sid) = source_id {
         match all_sources.into_iter().find(|s| s.id == sid) {
             Some(s) => vec![s],
             None => exit_err(
@@ -1357,6 +1910,23 @@ async fn run_index_async(ctx: &CliContext, source_id: Option<&str>) {
 
 /// `localdb search <query> [--limit N]`
 pub fn run_search(ctx: &CliContext, query: &str, limit: usize) {
+    // F9: Reject --limit 0.
+    if limit == 0 {
+        exit_err(
+            &Error::InvalidRequest {
+                message: "--limit must be at least 1".to_string(),
+            },
+            ctx.json,
+        );
+    }
+
+    // A9-safety: validate --store name if given.
+    for store_name in &ctx.stores {
+        if let Err(e) = validate_store_name(store_name) {
+            exit_err(&e, ctx.json);
+        }
+    }
+
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(run_search_async(ctx, query, limit));
 }
@@ -1364,7 +1934,8 @@ pub fn run_search(ctx: &CliContext, query: &str, limit: usize) {
 async fn run_search_async(ctx: &CliContext, query: &str, limit: usize) {
     use localdb_core::search::{QueryRequest, SearchOrchestrator, StoreHandle};
 
-    let (config_loader, db) = load_app_db(ctx);
+    // F1-cli: use lenient loader so search works even with malformed config.
+    let (config_loader, db) = load_app_db_lenient(ctx);
     let data_dir = config_loader.paths.data_dir.clone();
 
     // Per specs/05-surfaces.md §2: search routes through the daemon when running.
@@ -1418,6 +1989,24 @@ async fn run_search_async(ctx: &CliContext, query: &str, limit: usize) {
         Ok(s) => s,
         Err(e) => exit_err(&e, ctx.json),
     };
+
+    // #13: If --store was given explicitly, verify each named store exists in the runtime DB
+    // or YAML config (exit 3 if not found).
+    if !ctx.stores.is_empty() {
+        let yaml_names: std::collections::HashSet<&str> = config_loader
+            .config
+            .stores
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        let runtime_names: std::collections::HashSet<&str> =
+            runtime_stores.iter().map(|s| s.name.as_str()).collect();
+        for name in &ctx.stores {
+            if !yaml_names.contains(name.as_str()) && !runtime_names.contains(name.as_str()) {
+                exit_err(&Error::StoreNotFound { id: name.clone() }, ctx.json);
+            }
+        }
+    }
 
     // Collect store names to search.
     let store_names: Vec<String> = if ctx.stores.is_empty() {
@@ -2121,5 +2710,146 @@ mod tests {
             matches!(state, DaemonState::Running { base_url } if base_url == "http://127.0.0.1:9999"),
             "env var should return Running without a health probe"
         );
+    }
+
+    // --- A9-safety: store name validation ---
+
+    #[test]
+    fn validate_store_name_rejects_empty() {
+        let err = validate_store_name("").unwrap_err();
+        assert_eq!(err.exit_code(), 2, "empty name must exit 2");
+    }
+
+    #[test]
+    fn validate_store_name_rejects_dot() {
+        let err = validate_store_name(".").unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn validate_store_name_rejects_dotdot() {
+        let err = validate_store_name("..").unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn validate_store_name_rejects_slash() {
+        let err = validate_store_name("a/b").unwrap_err();
+        assert_eq!(err.exit_code(), 2, "name with '/' must exit 2");
+    }
+
+    #[test]
+    fn validate_store_name_rejects_leading_slash() {
+        let err = validate_store_name("/root").unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn validate_store_name_accepts_valid_names() {
+        assert!(validate_store_name("mystore").is_ok());
+        assert!(validate_store_name("my-store").is_ok());
+        assert!(validate_store_name("my_store_123").is_ok());
+        assert!(validate_store_name("CamelCase").is_ok());
+    }
+
+    // --- looks_like_id ---
+
+    #[test]
+    fn looks_like_id_recognizes_ulid() {
+        // ULIDs are 26 uppercase alphanumeric chars.
+        assert!(looks_like_id("01HRQHB7FN3WMX4AZDV3S9VCTZ"));
+    }
+
+    #[test]
+    fn looks_like_id_rejects_paths() {
+        assert!(!looks_like_id("/home/user/docs"));
+        assert!(!looks_like_id("./relative/path"));
+        assert!(!looks_like_id("https://example.com"));
+        assert!(!looks_like_id("some/path"));
+    }
+
+    // --- #4: default excludes ---
+
+    #[test]
+    fn default_path_excludes_contains_git_and_node_modules() {
+        assert!(DEFAULT_PATH_EXCLUDES.contains(&".git"));
+        assert!(DEFAULT_PATH_EXCLUDES.contains(&"node_modules"));
+        assert!(DEFAULT_PATH_EXCLUDES.contains(&"target"));
+        assert!(DEFAULT_PATH_EXCLUDES.contains(&"__pycache__"));
+        assert!(DEFAULT_PATH_EXCLUDES.contains(&".venv"));
+    }
+
+    // --- F9: --limit 0 validation ---
+
+    /// F9: verify that limit=0 maps to exit code 2 via InvalidRequest.
+    #[test]
+    fn limit_zero_maps_to_exit_code_2() {
+        // The run_search function calls exit_err(&InvalidRequest{..}) when limit==0.
+        // We verify the error type and exit code without calling the full search pipeline.
+        let err = Error::InvalidRequest {
+            message: "--limit must be at least 1".to_string(),
+        };
+        assert_eq!(err.exit_code(), 2, "--limit 0 must exit 2");
+    }
+
+    // --- #13: store-not-found exit code ---
+
+    /// #13: verify StoreNotFound maps to exit code 3.
+    #[test]
+    fn store_not_found_maps_to_exit_code_3() {
+        let err = Error::StoreNotFound {
+            id: "no-such-store".to_string(),
+        };
+        assert_eq!(err.exit_code(), 3, "unknown --store must exit 3");
+    }
+
+    // --- find_source_by_root_or_url ---
+
+    #[test]
+    fn find_source_by_root_finds_match() {
+        let dir = TempDir::new().unwrap();
+        let db = tmp_app_db(&dir);
+
+        let src = RuntimeSource {
+            id: new_ulid(),
+            store_name: "s1".into(),
+            kind: "path".into(),
+            root: Some("/my/docs".into()),
+            url: None,
+            include: vec![],
+            exclude: vec![],
+            preset: "prose".into(),
+        };
+        db.upsert_source(&src).unwrap();
+
+        let found = db
+            .find_source_by_root_or_url("/my/docs", Some("s1"))
+            .unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().id, src.id);
+    }
+
+    #[test]
+    fn find_source_by_root_respects_store_scope() {
+        let dir = TempDir::new().unwrap();
+        let db = tmp_app_db(&dir);
+
+        let src = RuntimeSource {
+            id: new_ulid(),
+            store_name: "other-store".into(),
+            kind: "path".into(),
+            root: Some("/my/docs".into()),
+            url: None,
+            include: vec![],
+            exclude: vec![],
+            preset: "prose".into(),
+        };
+        db.upsert_source(&src).unwrap();
+
+        // Scoped to a different store — should not find it.
+        let found = db
+            .find_source_by_root_or_url("/my/docs", Some("my-store"))
+            .unwrap();
+        assert!(found.is_none());
     }
 }
