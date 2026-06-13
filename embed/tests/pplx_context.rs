@@ -40,12 +40,8 @@ fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "slow: downloads ~706 MB of quantized ONNX model files on first run; run with --ignored"]
 async fn pplx_embed_context_late_chunking_four_chunks() {
-    let test_cache = dirs::cache_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-        .join("localdb")
-        .join("test-models");
-    let embedder = PplxContextOnnxEmbedder::new(Some(test_cache), true)
-        .expect("create PplxContextOnnxEmbedder");
+    let embedder =
+        PplxContextOnnxEmbedder::new(None, true).expect("create PplxContextOnnxEmbedder");
 
     assert_eq!(embedder.embedding_dim(), 1024);
     assert_eq!(embedder.model_id(), "pplx-embed-context-v1-0.6b");

@@ -42,14 +42,8 @@ fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "slow: downloads ~2.4 GB of ONNX model files on first run; run with --ignored"]
 async fn pplx_embed_v1_int8_two_documents_retrieval() {
-    // Use the test-models cache dir so CI-adjacent runs share the same download.
-    // Production runs use None (→ ~/Library/Caches/localdb/models/).
-    let test_cache = dirs::cache_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-        .join("localdb")
-        .join("test-models");
-    let embedder = PplxOnnxEmbedder::new(Some(test_cache), true)
-        .expect("create PplxOnnxEmbedder (set HF_TOKEN if 401)");
+    let embedder =
+        PplxOnnxEmbedder::new(None, true).expect("create PplxOnnxEmbedder (set HF_TOKEN if 401)");
 
     assert_eq!(embedder.embedding_dim(), 1024);
     assert_eq!(embedder.model_id(), "pplx-embed-v1-0.6b");
