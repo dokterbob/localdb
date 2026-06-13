@@ -95,11 +95,24 @@ pub fn create_embedder(
                             .to_string(),
                     )
                 })?;
-            let api_key = provider
-                .api_key_env
-                .as_deref()
-                .and_then(|env| std::env::var(env).ok())
-                .unwrap_or_default();
+            let api_key = match &provider.api_key_env {
+                None => {
+                    return Err(EmbedError::ProviderNotConfigured(
+                        "perplexity provider requires 'api_key_env' to be set in config"
+                            .to_string(),
+                    ))
+                }
+                Some(env) => {
+                    let key = std::env::var(env).unwrap_or_default();
+                    if key.is_empty() {
+                        return Err(EmbedError::ProviderNotConfigured(format!(
+                            "perplexity API key env var '{}' is unset or empty",
+                            env
+                        )));
+                    }
+                    key
+                }
+            };
             let e =
                 crate::PerplexityEmbedder::new(api_key, None, None, crate::RetryPolicy::default())?;
             Ok(Box::new(e))
@@ -116,11 +129,23 @@ pub fn create_embedder(
                             .to_string(),
                     )
                 })?;
-            let api_key = provider
-                .api_key_env
-                .as_deref()
-                .and_then(|env| std::env::var(env).ok())
-                .unwrap_or_default();
+            let api_key = match &provider.api_key_env {
+                None => {
+                    return Err(EmbedError::ProviderNotConfigured(
+                        "voyage provider requires 'api_key_env' to be set in config".to_string(),
+                    ))
+                }
+                Some(env) => {
+                    let key = std::env::var(env).unwrap_or_default();
+                    if key.is_empty() {
+                        return Err(EmbedError::ProviderNotConfigured(format!(
+                            "voyage API key env var '{}' is unset or empty",
+                            env
+                        )));
+                    }
+                    key
+                }
+            };
             let e = crate::VoyageEmbedder::new(api_key, None, None, crate::RetryPolicy::default())?;
             Ok(Box::new(e))
         }
@@ -163,5 +188,81 @@ mod tests {
         let policy = fake_policy("does-not-exist", "some-model");
         let result = create_embedder(&policy, &[], None);
         assert!(result.is_err(), "unknown provider should return Err");
+    }
+
+    #[test]
+    fn perplexity_missing_api_key_env_returns_error() {
+        use localdb_core::config::schema::ProviderConfig;
+        let policy = fake_policy("perplexity", "pplx-embed-context-v1");
+        let provider = ProviderConfig {
+            name: "pplx".to_string(),
+            kind: "perplexity".to_string(),
+            base_url: None,
+            api_key_env: None,
+        };
+        let result = create_embedder(&policy, &[provider], None);
+        assert!(
+            matches!(result, Err(EmbedError::ProviderNotConfigured(_))),
+            "missing api_key_env should return ProviderNotConfigured, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn perplexity_empty_api_key_returns_error() {
+        use localdb_core::config::schema::ProviderConfig;
+        let policy = fake_policy("perplexity", "pplx-embed-context-v1");
+        // Use an env var that is guaranteed to be unset.
+        let provider = ProviderConfig {
+            name: "pplx".to_string(),
+            kind: "perplexity".to_string(),
+            base_url: None,
+            api_key_env: Some("LOCALDB_TEST_UNSET_VAR_PERPLEXITY_XYZ".to_string()),
+        };
+        // Ensure it's not set.
+        std::env::remove_var("LOCALDB_TEST_UNSET_VAR_PERPLEXITY_XYZ");
+        let result = create_embedder(&policy, &[provider], None);
+        assert!(
+            matches!(result, Err(EmbedError::ProviderNotConfigured(_))),
+            "unset api key env var should return ProviderNotConfigured, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn voyage_missing_api_key_env_returns_error() {
+        use localdb_core::config::schema::ProviderConfig;
+        let policy = fake_policy("voyage", "voyage-3");
+        let provider = ProviderConfig {
+            name: "voy".to_string(),
+            kind: "voyage".to_string(),
+            base_url: None,
+            api_key_env: None,
+        };
+        let result = create_embedder(&policy, &[provider], None);
+        assert!(
+            matches!(result, Err(EmbedError::ProviderNotConfigured(_))),
+            "missing api_key_env should return ProviderNotConfigured, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn voyage_empty_api_key_returns_error() {
+        use localdb_core::config::schema::ProviderConfig;
+        let policy = fake_policy("voyage", "voyage-3");
+        let provider = ProviderConfig {
+            name: "voy".to_string(),
+            kind: "voyage".to_string(),
+            base_url: None,
+            api_key_env: Some("LOCALDB_TEST_UNSET_VAR_VOYAGE_XYZ".to_string()),
+        };
+        std::env::remove_var("LOCALDB_TEST_UNSET_VAR_VOYAGE_XYZ");
+        let result = create_embedder(&policy, &[provider], None);
+        assert!(
+            matches!(result, Err(EmbedError::ProviderNotConfigured(_))),
+            "unset api key env var should return ProviderNotConfigured, got: {:?}",
+            result.err()
+        );
     }
 }

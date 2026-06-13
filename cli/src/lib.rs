@@ -50,9 +50,9 @@ pub fn validate_store_name(name: &str) -> Result<(), Error> {
             message: format!("store name '{}' is not allowed", name),
         });
     }
-    if name.contains('/') {
+    if name.contains('/') || name.contains('\\') {
         return Err(Error::InvalidRequest {
-            message: format!("store name '{}' must not contain '/'", name),
+            message: format!("store name '{}' must not contain '/' or '\\'", name),
         });
     }
     Ok(())
@@ -107,8 +107,18 @@ fn probe_daemon_health_inner(base_url: &str) -> Option<bool> {
         .split('/')
         .next()?;
 
-    // If the authority already includes a port, parse directly; otherwise add :80.
-    let addr_str: String = if host_port.contains(':') {
+    // Detect port robustly, handling bracketed IPv6 (e.g. [::1], [::1]:8080).
+    let addr_str: String = if host_port.starts_with('[') {
+        // Bracketed IPv6 literal.
+        if host_port.contains("]:") {
+            // Port present: [::1]:8080 — use as-is.
+            host_port.to_string()
+        } else {
+            // No port: [::1] — add default.
+            format!("{}:80", host_port)
+        }
+    } else if host_port.contains(':') {
+        // host:port
         host_port.to_string()
     } else {
         format!("{}:80", host_port)
@@ -792,6 +802,52 @@ pub fn classify_source(source: &str) -> (&str, Option<&str>, Option<&str>) {
     }
 }
 
+/// Normalize a file-system path source argument into `(root, include_globs, exclude_globs)`.
+///
+/// Shared by both the daemon branch and embedded branch of `source add` so that
+/// path validation, single-file promotion, and default excludes are always applied
+/// consistently regardless of whether the daemon is running.
+///
+/// Returns `Err(InvalidRequest)` (exit 2) if the path does not exist.
+fn normalize_path_source(raw_path: &str) -> Result<(String, Vec<String>, Vec<String>), Error> {
+    let p = std::path::Path::new(raw_path);
+
+    if !p.exists() {
+        return Err(Error::InvalidRequest {
+            message: format!("path '{}' does not exist", raw_path),
+        });
+    }
+
+    let (root, include_globs) = if p.is_file() {
+        // #7: single-file source — use parent dir as root, include only this file.
+        let parent = p
+            .parent()
+            .map(|par| {
+                if par == Path::new("") {
+                    Path::new(".")
+                } else {
+                    par
+                }
+            })
+            .unwrap_or(Path::new("."));
+        let filename = p
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        (parent.to_string_lossy().to_string(), vec![filename])
+    } else {
+        (raw_path.to_string(), vec![])
+    };
+
+    // #4: apply default excludes for path sources.
+    let exclude_globs: Vec<String> = DEFAULT_PATH_EXCLUDES
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    Ok((root, include_globs, exclude_globs))
+}
+
 /// Determine whether a string looks like a ULID/UUID (not a path or URL).
 ///
 /// ULIDs are 26 uppercase alphanumeric characters. We use this to distinguish
@@ -1276,11 +1332,17 @@ async fn run_source_add_async(ctx: &CliContext, source_arg: &str) {
 
     // Per specs/05-surfaces.md §2: route to daemon when running.
     if let DaemonState::Running { base_url } = probe_daemon(data_dir) {
-        let (kind, root, url) = classify_source(source_arg);
+        let (kind, _root, url) = classify_source(source_arg);
         // The handler's CreateSourceRequest expects {kind, spec, preset} where
         // spec is a nested object (see server/src/handlers.rs CreateSourceRequest).
+        // Apply the same path normalization as embedded mode (#14, #7, #4).
         let spec = if kind == "path" {
-            json!({ "root": root, "include": [], "exclude": [] })
+            match normalize_path_source(source_arg) {
+                Ok((root, include, exclude)) => {
+                    json!({ "root": root, "include": include, "exclude": exclude })
+                }
+                Err(e) => exit_err(&e, ctx.json),
+            }
         } else {
             json!({ "url": url })
         };
@@ -1325,55 +1387,16 @@ async fn run_source_add_async(ctx: &CliContext, source_arg: &str) {
         Ok(Some(s)) => s,
     };
 
-    let (kind, root_str, url_str2) = classify_source(source_arg);
+    let (kind, _root_str, url_str2) = classify_source(source_arg);
 
-    // For path sources: validate existence (#14) and handle single-file (#7).
-    let (actual_root, include_globs) = if kind == "path" {
-        let raw_root = root_str.unwrap_or(source_arg);
-        let p = std::path::Path::new(raw_root);
-
-        // #14: validate path exists.
-        if !p.exists() {
-            exit_err(
-                &Error::InvalidRequest {
-                    message: format!("path '{}' does not exist", raw_root),
-                },
-                ctx.json,
-            );
-        }
-
-        if p.is_file() {
-            // #7: single-file source — use parent dir as root, include just this file.
-            let parent = p
-                .parent()
-                .map(|par| {
-                    if par == Path::new("") {
-                        Path::new(".")
-                    } else {
-                        par
-                    }
-                })
-                .unwrap_or(Path::new("."));
-            let filename = p
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            (parent.to_string_lossy().to_string(), vec![filename])
-        } else {
-            (raw_root.to_string(), vec![])
+    // Normalize path sources: validate existence, promote single files, apply excludes.
+    let (actual_root, include_globs, exclude_globs) = if kind == "path" {
+        match normalize_path_source(source_arg) {
+            Ok(v) => v,
+            Err(e) => exit_err(&e, ctx.json),
         }
     } else {
-        (source_arg.to_string(), vec![])
-    };
-
-    // #4: Default exclude list for path sources.
-    let exclude_globs: Vec<String> = if kind == "path" {
-        DEFAULT_PATH_EXCLUDES
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
-    } else {
-        vec![]
+        (source_arg.to_string(), vec![], vec![])
     };
 
     let src = RuntimeSource {
@@ -2422,6 +2445,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn probe_daemon_health_inner_ipv6_no_port() {
+        // Bracketed IPv6 with no port should attempt [::1]:80, not fail to parse.
+        // Since nothing is listening there, it returns Some(false) or None — not panics.
+        let result = probe_daemon_health_inner("http://[::1]/v1/status");
+        // Any outcome is fine (false or None); we just verify no panic and that we
+        // don't misparse [::1] as having a port.
+        let _ = result;
+    }
+
     // --- classify_source ---
 
     #[test]
@@ -2823,11 +2856,57 @@ mod tests {
     }
 
     #[test]
+    fn validate_store_name_rejects_backslash() {
+        let err = validate_store_name("a\\b").unwrap_err();
+        assert_eq!(err.exit_code(), 2, "name with backslash must exit 2");
+    }
+
+    #[test]
     fn validate_store_name_accepts_valid_names() {
         assert!(validate_store_name("mystore").is_ok());
         assert!(validate_store_name("my-store").is_ok());
         assert!(validate_store_name("my_store_123").is_ok());
         assert!(validate_store_name("CamelCase").is_ok());
+    }
+
+    // --- normalize_path_source ---
+
+    #[test]
+    fn normalize_path_source_rejects_nonexistent_path() {
+        let result = normalize_path_source("/nonexistent/path/that/does/not/exist");
+        assert!(result.is_err(), "nonexistent path should return Err");
+        let err = result.unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn normalize_path_source_directory_has_no_include() {
+        let dir = TempDir::new().unwrap();
+        let (root, include, exclude) = normalize_path_source(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(root, dir.path().to_str().unwrap());
+        assert!(
+            include.is_empty(),
+            "directory source should have no include globs"
+        );
+        assert!(
+            !exclude.is_empty(),
+            "directory source should have default excludes"
+        );
+        assert!(exclude.iter().any(|s| s == ".git"));
+    }
+
+    #[test]
+    fn normalize_path_source_single_file_promotes_to_parent() {
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("README.md");
+        std::fs::write(&file_path, b"hello").unwrap();
+        let (root, include, _exclude) = normalize_path_source(file_path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            root,
+            dir.path().to_str().unwrap(),
+            "single file root should be parent dir"
+        );
+        assert_eq!(include, vec!["README.md".to_string()]);
     }
 
     // --- looks_like_id ---

@@ -477,7 +477,15 @@ mod tests {
             version: 1,
             server: Default::default(),
             paths: Default::default(),
-            defaults: Default::default(),
+            defaults: localdb_core::config::schema::DefaultsConfig {
+                indexing: localdb_core::config::schema::IndexingPolicyConfig {
+                    chunking: Default::default(),
+                    embedding: localdb_core::config::schema::EmbeddingPolicy {
+                        provider: "fake".to_string(),
+                        model: "default".to_string(),
+                    },
+                },
+            },
             stores: vec![],
             providers: vec![],
         };
@@ -513,7 +521,7 @@ mod tests {
         // Simulate what the daemon's watcher loop would do: submit an index job.
         // In production this would run the full ingestion pipeline. Here we
         // directly upsert a chunk to the retrieval store (representing the indexed content).
-        let embedder = FakeEmbedder::new(4);
+        let embedder = FakeEmbedder::new(128);
         let docs = vec![localdb_core::embedder::DocumentChunks {
             document_context: updated_text.to_string(),
             chunks: vec![updated_text.to_string()],

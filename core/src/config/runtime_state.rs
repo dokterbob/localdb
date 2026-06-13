@@ -222,6 +222,9 @@ pub struct EffectiveStore {
     /// Store name.
     pub name: String,
 
+    /// ULID for runtime-owned stores; `None` for YAML-owned stores (no ULID exists).
+    pub id: Option<String>,
+
     /// Who owns this store.
     pub ownership: ConfigOwnership,
 
@@ -254,6 +257,7 @@ pub fn build_effective_config(
 
         stores.push(EffectiveStore {
             name: yaml_store.name.clone(),
+            id: None,
             ownership: ConfigOwnership::Yaml,
             visibility: yaml_store.visibility.clone(),
             backend: yaml_store.backend.clone(),
@@ -274,6 +278,7 @@ pub fn build_effective_config(
         let indexing = rt_store.indexing.unwrap_or_else(|| global_default.clone());
         stores.push(EffectiveStore {
             name: rt_store.name,
+            id: Some(rt_store.id),
             ownership: ConfigOwnership::Runtime,
             visibility: rt_store.visibility,
             backend: rt_store.backend,
