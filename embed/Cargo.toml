@@ -43,3 +43,12 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # Mock HTTP server for testing hosted providers
 wiremock = "0.6"
 tempfile = "3"
+# Slow integration tests: pplx-embed-v1 int8 (same versions already locked by fastembed).
+# We do NOT use load-dynamic here: fastembed's ort-download-binaries-rustls-tls feature
+# already downloads ORT and wires up linking via ort-sys build scripts, so the test
+# binary finds ORT through the same mechanism fastembed uses.  The pplx_embed_v1_int8
+# test is `#[ignore]` so it never runs in CI.
+ort = { version = "=2.0.0-rc.12", features = ["ndarray"] }
+tokenizers = "0.22"
+ndarray = "0.17"
+futures-util = "0.3"
