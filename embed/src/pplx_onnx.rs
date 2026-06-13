@@ -33,7 +33,10 @@ use std::{
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use ndarray::{Array2, ArrayViewD, Axis};
-use tokenizers::{Tokenizer, TruncationDirection, TruncationParams, TruncationStrategy};
+use tokenizers::{
+    PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer, TruncationDirection,
+    TruncationParams, TruncationStrategy,
+};
 use tracing::info;
 
 use localdb_core::{DocumentChunks, EmbeddedDocument, Embedder, Error as CoreError};
@@ -44,6 +47,7 @@ const HF_REPO: &str = "perplexity-ai/pplx-embed-v1-0.6b";
 const EMBED_DIM: usize = 1024;
 const INT8_OUTPUT_IDX: usize = 2;
 const MAX_SEQ_LEN: usize = 512;
+const HF_REVISION: &str = "2c4d510dd4a732063c31a0f70193e35067b51fd8";
 
 // Required files to download (path inside the HF repo → relative dest under model_dir).
 const REQUIRED_FILES: &[&str] = &[
@@ -73,7 +77,7 @@ async fn download_hf_file(
     }
     std::fs::create_dir_all(dest.parent().unwrap()).map_err(EmbedError::Io)?;
 
-    let url = format!("https://huggingface.co/{HF_REPO}/resolve/main/{remote_path}");
+    let url = format!("https://huggingface.co/{HF_REPO}/resolve/{HF_REVISION}/{remote_path}");
     info!("downloading {url}");
 
     let mut req = client.get(&url).header("user-agent", "localdb/0.1");
@@ -142,32 +146,50 @@ async fn ensure_model_files(model_dir: &Path, show_progress: bool) -> Result<(),
 }
 
 fn download_model_blocking(model_dir: &Path, show_progress: bool) -> Result<(), EmbedError> {
-    // Fast path: model already cached.
     if model_dir.join("onnx").join("model.onnx").exists() {
         return Ok(());
     }
 
-    let fut = ensure_model_files(model_dir, show_progress);
     match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            // Called from within a tokio runtime — use block_in_place so we don't
-            // block the async executor thread directly.
-            tokio::task::block_in_place(|| handle.block_on(fut))
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| {
+                handle.block_on(ensure_model_files(model_dir, show_progress))
+            })
         }
-        Err(_) => {
-            // No current runtime — spin up a one-shot runtime.
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| EmbedError::Internal(format!("create tokio runtime: {e}")))?
-                .block_on(fut)
+        Ok(_) => {
+            // current-thread runtime: can't block_in_place from within it.
+            let model_dir = model_dir.to_path_buf();
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| EmbedError::Internal(format!("create tokio runtime: {e}")))?
+                    .block_on(ensure_model_files(&model_dir, show_progress))
+            })
+            .join()
+            .map_err(|_| EmbedError::Internal("download thread panicked".into()))?
         }
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| EmbedError::Internal(format!("create tokio runtime: {e}")))?
+            .block_on(ensure_model_files(model_dir, show_progress)),
     }
 }
 
 // ---------------------------------------------------------------------------
 // Embedder
 // ---------------------------------------------------------------------------
+
+fn run_blocking<T>(f: impl FnOnce() -> T) -> T {
+    use tokio::runtime::RuntimeFlavor;
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
 
 /// Local pplx-embed-v1-0.6b embedder using direct ORT inference.
 ///
@@ -209,6 +231,14 @@ impl PplxOnnxEmbedder {
                 direction: TruncationDirection::Right,
             }))
             .map_err(|e| EmbedError::Internal(format!("configure tokenizer truncation: {e}")))?;
+        tokenizer.with_padding(Some(PaddingParams {
+            strategy: PaddingStrategy::BatchLongest,
+            direction: PaddingDirection::Right,
+            pad_to_multiple_of: None,
+            pad_id: 0,
+            pad_type_id: 0,
+            pad_token: "<pad>".to_string(),
+        }));
 
         let model_onnx = model_dir.join("onnx").join("model.onnx");
         info!(model = "pplx-embed-v1-0.6b", "loading ORT session");
@@ -233,47 +263,50 @@ impl PplxOnnxEmbedder {
         if texts.is_empty() {
             return Ok(vec![]);
         }
+
+        let encodings = self
+            .tokenizer
+            .encode_batch(texts.iter().map(|s| s.as_str()).collect::<Vec<_>>(), false)
+            .map_err(|e| EmbedError::Internal(format!("tokenize batch: {e}")))?;
+
+        let batch_size = encodings.len();
+        let seq_len = encodings[0].get_ids().len();
+
+        let mut input_ids_flat: Vec<i64> = Vec::with_capacity(batch_size * seq_len);
+        let mut attention_mask_flat: Vec<i64> = Vec::with_capacity(batch_size * seq_len);
+        for enc in &encodings {
+            input_ids_flat.extend(enc.get_ids().iter().map(|&x| x as i64));
+            attention_mask_flat.extend(enc.get_attention_mask().iter().map(|&x| x as i64));
+        }
+
+        let ids_arr = Array2::from_shape_vec((batch_size, seq_len), input_ids_flat)
+            .map_err(|e| EmbedError::Internal(format!("shape ids: {e}")))?;
+        let mask_arr = Array2::from_shape_vec((batch_size, seq_len), attention_mask_flat)
+            .map_err(|e| EmbedError::Internal(format!("shape mask: {e}")))?;
+
+        let ids_tensor = ort::value::Tensor::from_array(ids_arr)
+            .map_err(|e| EmbedError::Internal(format!("ids tensor: {e}")))?;
+        let mask_tensor = ort::value::Tensor::from_array(mask_arr)
+            .map_err(|e| EmbedError::Internal(format!("mask tensor: {e}")))?;
+
         let mut session = self
             .session
             .lock()
             .map_err(|e| EmbedError::Internal(format!("session mutex poisoned: {e}")))?;
 
-        texts
-            .iter()
-            .map(|text| {
-                let encoding = self
-                    .tokenizer
-                    .encode(text.as_str(), false)
-                    .map_err(|e| EmbedError::Internal(format!("tokenize: {e}")))?;
+        let outputs = session
+            .run(ort::inputs![ids_tensor, mask_tensor])
+            .map_err(|e| EmbedError::Internal(format!("ORT run: {e}")))?;
 
-                let ids: Vec<i64> = encoding.get_ids().iter().map(|&x| x as i64).collect();
-                let mask: Vec<i64> = encoding
-                    .get_attention_mask()
-                    .iter()
-                    .map(|&x| x as i64)
-                    .collect();
-                let seq_len = ids.len();
+        let view: ArrayViewD<i8> = outputs[INT8_OUTPUT_IDX]
+            .try_extract_array()
+            .map_err(|e| EmbedError::Internal(format!("extract int8 array: {e}")))?;
 
-                let ids_arr = Array2::from_shape_vec((1_usize, seq_len), ids)
-                    .map_err(|e| EmbedError::Internal(format!("shape ids: {e}")))?;
-                let mask_arr = Array2::from_shape_vec((1_usize, seq_len), mask)
-                    .map_err(|e| EmbedError::Internal(format!("shape mask: {e}")))?;
-
-                let ids_tensor = ort::value::Tensor::from_array(ids_arr)
-                    .map_err(|e| EmbedError::Internal(format!("ids tensor: {e}")))?;
-                let mask_tensor = ort::value::Tensor::from_array(mask_arr)
-                    .map_err(|e| EmbedError::Internal(format!("mask tensor: {e}")))?;
-
-                let outputs = session
-                    .run(ort::inputs![ids_tensor, mask_tensor])
-                    .map_err(|e| EmbedError::Internal(format!("ORT run: {e}")))?;
-
-                let view: ArrayViewD<i8> = outputs[INT8_OUTPUT_IDX]
-                    .try_extract_array()
-                    .map_err(|e| EmbedError::Internal(format!("extract int8 array: {e}")))?;
-
+        // Shape: [B, 1024] — one row per text.
+        (0..batch_size)
+            .map(|b| {
                 Ok(view
-                    .index_axis(Axis(0), 0)
+                    .index_axis(Axis(0), b)
                     .iter()
                     .map(|&x| x as f32)
                     .collect())
@@ -305,9 +338,8 @@ impl Embedder for PplxOnnxEmbedder {
             return Ok(docs.iter().map(|_| vec![]).collect());
         }
 
-        let all_embeddings: Vec<Vec<f32>> = tokio::task::block_in_place(|| {
-            self.embed_texts_sync(&all_texts).map_err(CoreError::from)
-        })?;
+        let all_embeddings: Vec<Vec<f32>> =
+            run_blocking(|| self.embed_texts_sync(&all_texts).map_err(CoreError::from))?;
 
         Ok(doc_offsets
             .into_iter()

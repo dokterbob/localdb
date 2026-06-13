@@ -44,6 +44,7 @@ const EMBED_DIM: usize = 1024;
 // Model supports 32K tokens; cap at 8 192 to bound CPU cost per document.
 const MAX_SEQ_LEN: usize = 8192;
 const MODEL_DIRNAME: &str = "pplx-embed-context-v1-0.6b";
+const HF_REVISION: &str = "c2fe8bee1aee42534425a1dfa7f976f6c1a5d16b";
 
 const REQUIRED_FILES: &[&str] = &[
     "onnx/model_quantized.onnx",
@@ -72,7 +73,7 @@ async fn download_hf_file(
     }
     std::fs::create_dir_all(dest.parent().unwrap()).map_err(EmbedError::Io)?;
 
-    let url = format!("https://huggingface.co/{HF_REPO}/resolve/main/{remote_path}");
+    let url = format!("https://huggingface.co/{HF_REPO}/resolve/{HF_REVISION}/{remote_path}");
     info!("downloading {url}");
 
     let mut req = client.get(&url).header("user-agent", "localdb/0.1");
@@ -92,7 +93,7 @@ async fn download_hf_file(
                 "HTTP {} downloading {remote_path} from {HF_REPO}. \
                  The repo is public — check your network connection and retry. \
                  Alternatively use provider: local-onnx, model: bge-small-en-v1.5 \
-                 (384-dim, no download required beyond the small model).",
+                 (384-dim, smaller download, no credentials).",
                 resp.status()
             ),
         });
@@ -142,19 +143,34 @@ async fn ensure_model_files(model_dir: &Path, show_progress: bool) -> Result<(),
 }
 
 fn download_model_blocking(model_dir: &Path, show_progress: bool) -> Result<(), EmbedError> {
-    // Fast path: quantized model already cached.
     if model_dir.join("onnx").join("model_quantized.onnx").exists() {
         return Ok(());
     }
 
-    let fut = ensure_model_files(model_dir, show_progress);
     match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| {
+                handle.block_on(ensure_model_files(model_dir, show_progress))
+            })
+        }
+        Ok(_) => {
+            // current-thread runtime: can't block_in_place from within it.
+            let model_dir = model_dir.to_path_buf();
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| EmbedError::Internal(format!("create tokio runtime: {e}")))?
+                    .block_on(ensure_model_files(&model_dir, show_progress))
+            })
+            .join()
+            .map_err(|_| EmbedError::Internal("download thread panicked".into()))?
+        }
         Err(_) => tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| EmbedError::Internal(format!("create tokio runtime: {e}")))?
-            .block_on(fut),
+            .block_on(ensure_model_files(model_dir, show_progress)),
     }
 }
 
@@ -221,6 +237,49 @@ fn apply_quantize_int8_tanh(v: Vec<f32>) -> Vec<f32> {
     v.into_iter()
         .map(|x| (x.tanh() * 127.0).round().clamp(-128.0, 127.0))
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Runtime helpers
+// ---------------------------------------------------------------------------
+
+fn run_blocking<T>(f: impl FnOnce() -> T) -> T {
+    use tokio::runtime::RuntimeFlavor;
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
+/// Partition N chunks into windows that each fit within `max_seq_len` tokens.
+///
+/// A window of w chunks uses sum(chunk_tokens[window]) + (w-1) SEP tokens.
+/// A single oversized chunk (count >= max_seq_len) occupies its own window;
+/// the tokenizer truncates it during inference.
+/// Returns a Vec of half-open index ranges, one per window, covering 0..N.
+fn plan_windows(chunk_tok_counts: &[usize], max_seq_len: usize) -> Vec<std::ops::Range<usize>> {
+    if chunk_tok_counts.is_empty() {
+        return vec![];
+    }
+    let mut windows = Vec::new();
+    let mut window_start = 0usize;
+    let mut window_tokens = 0usize;
+
+    for (i, &tok_count) in chunk_tok_counts.iter().enumerate() {
+        let sep_cost = if i > window_start { 1 } else { 0 };
+        let added = tok_count + sep_cost;
+        if window_tokens + added > max_seq_len && i > window_start {
+            windows.push(window_start..i);
+            window_start = i;
+            window_tokens = tok_count;
+        } else {
+            window_tokens += added;
+        }
+    }
+    windows.push(window_start..chunk_tok_counts.len());
+    windows
 }
 
 // ---------------------------------------------------------------------------
@@ -292,6 +351,33 @@ impl PplxContextOnnxEmbedder {
     }
 
     fn embed_doc_sync(&self, chunks: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        if chunks.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Tokenize each chunk individually (no add_special_tokens) to get its token count.
+        let chunk_tok_counts: Vec<usize> = chunks
+            .iter()
+            .map(|c| {
+                self.tokenizer
+                    .encode(c.as_str(), false)
+                    .map(|enc| enc.get_ids().len())
+                    .map_err(|e| EmbedError::Internal(format!("tokenize: {e}")))
+            })
+            .collect::<Result<_, _>>()?;
+
+        let windows = plan_windows(&chunk_tok_counts, MAX_SEQ_LEN);
+
+        let mut all_embeddings: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
+        for window in &windows {
+            let window_embeddings = self.embed_window(&chunks[window.clone()])?;
+            all_embeddings.extend(window_embeddings);
+        }
+
+        Ok(all_embeddings)
+    }
+
+    fn embed_window(&self, chunks: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
         if chunks.is_empty() {
             return Ok(vec![]);
         }
@@ -407,9 +493,8 @@ impl Embedder for PplxContextOnnxEmbedder {
                 results.push(vec![]);
                 continue;
             }
-            let embeddings = tokio::task::block_in_place(|| {
-                self.embed_doc_sync(&doc.chunks).map_err(CoreError::from)
-            })?;
+            let embeddings =
+                run_blocking(|| self.embed_doc_sync(&doc.chunks).map_err(CoreError::from))?;
             results.push(embeddings);
         }
         Ok(results)
@@ -421,5 +506,74 @@ impl Embedder for PplxContextOnnxEmbedder {
 
     fn model_id(&self) -> &str {
         "pplx-embed-context-v1-0.6b"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::plan_windows;
+
+    #[test]
+    fn plan_windows_empty() {
+        assert!(plan_windows(&[], 8192).is_empty());
+    }
+
+    #[test]
+    fn plan_windows_single_fits() {
+        let windows = plan_windows(&[100], 8192);
+        assert_eq!(windows, vec![0..1]);
+    }
+
+    #[test]
+    fn plan_windows_single_oversized() {
+        // A chunk larger than max_seq_len gets its own window (tokenizer truncates).
+        let windows = plan_windows(&[10_000], 8192);
+        assert_eq!(windows, vec![0..1]);
+    }
+
+    #[test]
+    fn plan_windows_all_fit() {
+        // 3 × 100 tokens + 2 SEP = 302, well under 8192
+        let windows = plan_windows(&[100, 100, 100], 8192);
+        assert_eq!(windows, vec![0..3]);
+    }
+
+    #[test]
+    fn plan_windows_splits_at_boundary() {
+        // 4096 + 4096 + 1 SEP = 8193 > 8192 → two windows
+        let windows = plan_windows(&[4096, 4096], 8192);
+        assert_eq!(windows, vec![0..1, 1..2]);
+    }
+
+    #[test]
+    fn plan_windows_exact_fit() {
+        // 4095 + 4096 + 1 SEP = 8192 exactly → one window
+        let windows = plan_windows(&[4095, 4096], 8192);
+        assert_eq!(windows, vec![0..2]);
+    }
+
+    #[test]
+    fn plan_windows_multi_window_coverage() {
+        // Three chunks: [4000, 4000, 100]
+        // 4000 + (4000+1) = 8001 <= 8192 → chunks 0+1 fit together
+        // 8001 + (100+1) = 8102 <= 8192 → chunk 2 also fits in the same window
+        // So all three fit in one window: [0..3]
+        let windows = plan_windows(&[4000, 4000, 100], 8192);
+        assert_eq!(windows, vec![0..3]);
+    }
+
+    #[test]
+    fn plan_windows_covers_all_chunks() {
+        let counts = vec![500, 600, 700, 800, 4000, 4000, 200];
+        let windows = plan_windows(&counts, 8192);
+        // Verify coverage: ranges are non-overlapping and union is 0..7
+        let mut covered = vec![false; counts.len()];
+        for w in &windows {
+            for i in w.clone() {
+                assert!(!covered[i], "chunk {i} covered by multiple windows");
+                covered[i] = true;
+            }
+        }
+        assert!(covered.iter().all(|&c| c), "not all chunks covered");
     }
 }

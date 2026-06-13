@@ -38,7 +38,7 @@ use crate::error::EmbedError;
 
 /// Model choice for the fastembed-backed local ONNX embedder.
 ///
-/// For pplx-embed-v1-0.6b (the default), use `PplxOnnxEmbedder` instead —
+/// For pplx models, use [`PplxOnnxEmbedder`] or [`PplxContextOnnxEmbedder`] instead —
 /// it uses direct ORT inference to support the model's split external data files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelChoice {

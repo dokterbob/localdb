@@ -29,6 +29,40 @@ fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+/// Validate chunk-group windowing: a document whose chunks sum to > MAX_SEQ_LEN (8192 tokens)
+/// must still return exactly one embedding per chunk without error.
+///
+/// **Slow — requires the locally-cached model.**
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "slow: downloads ~706 MB of quantized ONNX model files on first run; run with --ignored"]
+async fn pplx_embed_context_oversized_document_windowed() {
+    let embedder =
+        PplxContextOnnxEmbedder::new(None, false).expect("create PplxContextOnnxEmbedder");
+
+    // Each repetition of this sentence is ~10 tokens; 500 reps ≈ 5 000 tokens per chunk.
+    // Two such chunks sum to ~10 001 tokens + 1 SEP > 8 192 → windowing splits them.
+    let long_chunk = "The quick brown fox jumps over the lazy dog. ".repeat(500);
+    let n_chunks = 3usize;
+    let chunks: Vec<String> = (0..n_chunks).map(|_| long_chunk.clone()).collect();
+
+    let result = embedder
+        .embed_documents(vec![DocumentChunks {
+            document_context: String::new(),
+            chunks,
+        }])
+        .await
+        .expect("oversized document must not error with windowing enabled");
+
+    assert_eq!(
+        result[0].len(),
+        n_chunks,
+        "windowing must produce exactly one embedding per chunk"
+    );
+    for emb in &result[0] {
+        assert_eq!(emb.len(), 1024, "embedding dim should be 1024");
+    }
+}
+
 /// Validate pplx-embed-context-v1-0.6b late-chunking via `PplxContextOnnxEmbedder`.
 ///
 /// **Slow — downloads ~706 MB on first run.**  Skip in CI (the default).
