@@ -388,11 +388,10 @@ Walks every registered source for the targeted store(s), extracts and chunks
 documents, and writes them to the LanceDB store on disk. Progress is printed to
 stdout.
 
-**Embeddings in v0.1.0:** the current build uses a hash-based internal embedder
-(no model download, no network call). `dense` scores in search results are
-placeholder values (`1.0`); ranking is effectively BM25-driven. See
-[specs/04-search-pipeline.md](../specs/04-search-pipeline.md) for the intended
-hybrid pipeline.
+**Embeddings:** the CLI calls `embed::create_embedder` from the config policy.
+The default embedder (`pplx-embed-context-v1-0.6b`, local ONNX) is downloaded
+automatically on first run (~706 MB). See
+[specs/04-search-pipeline.md](../specs/04-search-pipeline.md) for the pipeline.
 
 ```
 $ localdb index --store notes
@@ -434,9 +433,8 @@ Runs hybrid BM25 + dense-vector search across the targeted stores and returns
 ranked citations. The Citation JSON shape is documented in
 [specs/02-domain-model.md](../specs/02-domain-model.md) §6.
 
-**Ranking note (v0.1.0):** dense scores are placeholder values (`1.0`) because
-the build uses a hash-based internal embedder. Effective ranking is BM25-driven;
-the `fused` score reflects reciprocal rank fusion over BM25 results.
+**Ranking:** hybrid BM25 + dense (RRF fusion). The `dense` score is the cosine
+similarity from the configured ONNX embedder; `fused` is the final RRF score.
 
 **Examples:**
 
