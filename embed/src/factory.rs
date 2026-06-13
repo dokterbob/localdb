@@ -34,6 +34,11 @@ pub fn create_embedder(
         "local-onnx" => {
             let cache_dir = models_dir.map(|p| p.to_path_buf());
             match policy.model.as_str() {
+                "pplx-embed-context-v1-0.6b" => {
+                    let embedder =
+                        crate::pplx_context_onnx::PplxContextOnnxEmbedder::new(cache_dir, true)?;
+                    Ok(Box::new(embedder))
+                }
                 "pplx-embed-v1-0.6b" => {
                     let embedder = crate::pplx_onnx::PplxOnnxEmbedder::new(cache_dir, true)?;
                     Ok(Box::new(embedder))
@@ -45,7 +50,7 @@ pub fn create_embedder(
                 }
                 unknown => Err(EmbedError::Internal(format!(
                     "unknown local-onnx model: '{unknown}'. \
-                     Supported: 'pplx-embed-v1-0.6b', 'bge-small-en-v1.5'."
+                     Supported: 'pplx-embed-context-v1-0.6b', 'pplx-embed-v1-0.6b', 'bge-small-en-v1.5'."
                 ))),
             }
         }

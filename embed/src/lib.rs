@@ -42,6 +42,9 @@ pub mod onnx;
 #[cfg(feature = "local-onnx")]
 pub mod pplx_onnx;
 
+#[cfg(feature = "local-onnx")]
+pub mod pplx_context_onnx;
+
 pub use error::EmbedError;
 pub use factory::create_embedder;
 pub use model_cache::{ModelCache, ModelSpec};
@@ -55,3 +58,6 @@ pub use onnx::OnnxEmbedder;
 
 #[cfg(feature = "local-onnx")]
 pub use pplx_onnx::PplxOnnxEmbedder;
+
+#[cfg(feature = "local-onnx")]
+pub use pplx_context_onnx::PplxContextOnnxEmbedder;
