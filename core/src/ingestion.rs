@@ -264,9 +264,21 @@ fn enumerate_dir(
         let relative = path.strip_prefix(root).unwrap_or(&path);
         let relative_str = relative.to_string_lossy();
 
-        // Apply exclude globs first
-        if !exclude.is_empty() && matches_any_glob(&relative_str, exclude) {
-            continue;
+        // Apply exclude globs first. Match the root-relative path (so anchored
+        // patterns like `**/node_modules/**` work) AND the bare file/dir name (so
+        // a bare pattern like `.DS_Store` matches at any depth, e.g.
+        // `Call/.DS_Store`). The include check below intentionally stays
+        // path-anchored.
+        if !exclude.is_empty() {
+            if let Some(name) = path.file_name() {
+                let basename = name.to_string_lossy();
+                if matches_any_glob(&relative_str, exclude) || matches_any_glob(&basename, exclude)
+                {
+                    continue;
+                }
+            } else if matches_any_glob(&relative_str, exclude) {
+                continue;
+            }
         }
 
         if path.is_dir() {
@@ -1395,6 +1407,121 @@ mod tests {
                 .all(|f| !f.path.to_str().unwrap().contains("node_modules")),
             "node_modules files should be excluded"
         );
+    }
+
+    #[test]
+    fn enumerate_excludes_nested_ds_store_by_basename() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("Call")).unwrap();
+        std::fs::write(dir.path().join("Call").join(".DS_Store"), b"\x00\x01junk").unwrap();
+        std::fs::write(dir.path().join("Call").join("note.md"), b"# Note").unwrap();
+        std::fs::write(dir.path().join(".DS_Store"), b"\x00root").unwrap();
+
+        let root = dir.path().to_str().unwrap();
+        let files = enumerate_path_source(root, &[], &[".DS_Store".to_string()]).unwrap();
+        assert!(
+            files
+                .iter()
+                .all(|f| !f.path.to_string_lossy().ends_with(".DS_Store")),
+            "no .DS_Store at any depth should be enumerated"
+        );
+        assert!(files
+            .iter()
+            .any(|f| f.path.to_string_lossy().ends_with("note.md")));
+    }
+
+    #[test]
+    fn enumerate_prunes_nested_junk_dirs_by_basename() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a").join(".git")).unwrap();
+        std::fs::write(dir.path().join("a").join(".git").join("config"), b"x").unwrap();
+        std::fs::create_dir_all(dir.path().join("a").join("node_modules").join("pkg")).unwrap();
+        std::fs::write(
+            dir.path()
+                .join("a")
+                .join("node_modules")
+                .join("pkg")
+                .join("i.js"),
+            b"j",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("a").join("keep.md"), b"# Keep").unwrap();
+
+        let root = dir.path().to_str().unwrap();
+        let files =
+            enumerate_path_source(root, &[], &[".git".to_string(), "node_modules".to_string()])
+                .unwrap();
+        assert!(
+            files.iter().all(|f| {
+                let p = f.path.to_string_lossy();
+                !p.contains("/.git/") && !p.contains("/node_modules/")
+            }),
+            "nested .git and node_modules subtrees must be pruned"
+        );
+        assert_eq!(files.len(), 1);
+    }
+
+    #[test]
+    fn enumerate_exclude_double_star_pattern_still_works() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub").join(".DS_Store"), b"x").unwrap();
+        std::fs::write(dir.path().join("sub").join("a.md"), b"# A").unwrap();
+
+        let root = dir.path().to_str().unwrap();
+        let files = enumerate_path_source(root, &[], &["**/.DS_Store".to_string()]).unwrap();
+        assert!(files
+            .iter()
+            .all(|f| !f.path.to_string_lossy().ends_with(".DS_Store")));
+    }
+
+    #[test]
+    fn enumerate_include_semantics_unchanged_after_exclude_basename_fix() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("docs")).unwrap();
+        std::fs::write(dir.path().join("docs").join("notes.md"), b"# N").unwrap();
+        std::fs::write(dir.path().join("docs").join("data.bin"), b"\x00").unwrap();
+
+        let root = dir.path().to_str().unwrap();
+        // Bare `*.md` include must NOT match nested docs/notes.md (path-anchored).
+        let files = enumerate_path_source(root, &["*.md".to_string()], &[]).unwrap();
+        assert!(
+            files.is_empty(),
+            "bare *.md include must not match at depth"
+        );
+        // `**/*.md` does match.
+        let files = enumerate_path_source(root, &["**/*.md".to_string()], &[]).unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].path.to_string_lossy().ends_with("notes.md"));
+    }
+
+    #[test]
+    fn enumerate_exclude_double_star_prunes_nested_dir_before_recursing() {
+        // `**/X` (no trailing `/**`) matches the X entry itself, so the dir is
+        // excluded before we recurse into it — O(1) prune rather than
+        // walk-and-filter. This exercises the shipped DEFAULT_PATH_EXCLUDES form.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a").join("node_modules").join("big")).unwrap();
+        std::fs::write(
+            dir.path()
+                .join("a")
+                .join("node_modules")
+                .join("big")
+                .join("lib.js"),
+            b"module",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("a").join("keep.rs"), b"fn main() {}").unwrap();
+
+        let root = dir.path().to_str().unwrap();
+        let files = enumerate_path_source(root, &[], &["**/node_modules".to_string()]).unwrap();
+        assert!(
+            files
+                .iter()
+                .all(|f| !f.path.to_string_lossy().contains("node_modules")),
+            "`**/node_modules` must exclude the dir and its contents at any depth"
+        );
+        assert_eq!(files.len(), 1);
     }
 
     #[test]

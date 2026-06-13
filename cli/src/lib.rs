@@ -1298,13 +1298,24 @@ pub fn run_store_remove(ctx: &CliContext, name: &str) {
 }
 
 /// Default exclude patterns for path sources (#4).
+/// Default exclude patterns for path sources (#4).
+///
+/// These patterns are matched against both the root-relative path and the bare
+/// basename of each entry (see `enumerate_dir` in `core`), so a pattern like
+/// `**/.git` prunes a `.git` directory at any depth before recursing into it.
+/// Using `**/X` (without a trailing `/**`) matches the entry itself; the subtree
+/// is never walked.  For single-file junk (`.DS_Store`) the same form works as a
+/// file-pattern.
+///
+/// **Include** globs are still anchored to the source root and NOT affected by
+/// this floating-basename rule.
 const DEFAULT_PATH_EXCLUDES: &[&str] = &[
-    ".git",
-    "node_modules",
-    ".DS_Store",
-    "target",
-    "__pycache__",
-    ".venv",
+    "**/.git",
+    "**/node_modules",
+    "**/.DS_Store",
+    "**/target",
+    "**/__pycache__",
+    "**/.venv",
 ];
 
 /// `localdb source add <path-or-url>`
@@ -2892,7 +2903,7 @@ mod tests {
             !exclude.is_empty(),
             "directory source should have default excludes"
         );
-        assert!(exclude.iter().any(|s| s == ".git"));
+        assert!(exclude.iter().any(|s| s == "**/.git"));
     }
 
     #[test]
@@ -2929,11 +2940,12 @@ mod tests {
 
     #[test]
     fn default_path_excludes_contains_git_and_node_modules() {
-        assert!(DEFAULT_PATH_EXCLUDES.contains(&".git"));
-        assert!(DEFAULT_PATH_EXCLUDES.contains(&"node_modules"));
-        assert!(DEFAULT_PATH_EXCLUDES.contains(&"target"));
-        assert!(DEFAULT_PATH_EXCLUDES.contains(&"__pycache__"));
-        assert!(DEFAULT_PATH_EXCLUDES.contains(&".venv"));
+        assert!(DEFAULT_PATH_EXCLUDES.contains(&"**/.git"));
+        assert!(DEFAULT_PATH_EXCLUDES.contains(&"**/node_modules"));
+        assert!(DEFAULT_PATH_EXCLUDES.contains(&"**/.DS_Store"));
+        assert!(DEFAULT_PATH_EXCLUDES.contains(&"**/target"));
+        assert!(DEFAULT_PATH_EXCLUDES.contains(&"**/__pycache__"));
+        assert!(DEFAULT_PATH_EXCLUDES.contains(&"**/.venv"));
     }
 
     // --- F9: --limit 0 validation ---
