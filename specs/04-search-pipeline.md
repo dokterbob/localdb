@@ -37,6 +37,20 @@ single mature Rust extraction stack covers these well; shipping a sharp matrix
 beats shipping a ragged one. Unsupported files are skipped and counted in IndexJob stats, not
 errors. Roadmap: [06-roadmap.md](06-roadmap.md) §5.
 
+**Three-way per-document classification:**
+
+| Outcome | Error variant | Counter | Behavior |
+|---|---|---|---|
+| Format not handled (e.g. scanned PDF, binary `.html`) | `UnsupportedFormat` | `unsupported_format_count` | Silent; no WARN. |
+| Supported format, broken instance (e.g. corrupt DOCX) | `ExtractionFailed` | `error_count` | WARN logged per file; counted as failure. |
+| Unexpected panic in parser/chunker | `Internal` (via `catch_unwind`) | `error_count` | WARN logged per file; counted as failure. |
+
+In all three cases the ingestion loop continues with the next file; the process does **not** abort.
+
+**`--strict` opt-in:** by default `index` is best-effort (exits `0` regardless of per-file
+failures). Pass `--strict` to exit `2` after the run completes when `error_count > 0`. Unsupported
+files do not trigger `--strict`; only `ExtractionFailed` / `Internal` errors do.
+
 **Binary / non-UTF-8 input:** All parser implementations (`MarkdownParser`, `HtmlParser`,
 `PlaintextParser`) decline non-UTF-8 bytes by returning `Ok(None)` rather than
 `Err(InvalidRequest)`. A file with a recognized extension that contains binary or

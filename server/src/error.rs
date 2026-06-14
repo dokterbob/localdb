@@ -58,9 +58,9 @@ pub fn http_status_for(err: &CoreError) -> StatusCode {
             StatusCode::BAD_GATEWAY
         }
 
-        CoreError::InvalidConfig { .. } | CoreError::UnsupportedFormat { .. } => {
-            StatusCode::UNPROCESSABLE_ENTITY
-        }
+        CoreError::InvalidConfig { .. }
+        | CoreError::UnsupportedFormat { .. }
+        | CoreError::ExtractionFailed { .. } => StatusCode::UNPROCESSABLE_ENTITY,
 
         CoreError::InvalidRequest { .. } => StatusCode::BAD_REQUEST,
 
@@ -139,6 +139,17 @@ mod tests {
         assert_eq!(
             http_status_for(&Error::UnsupportedFormat {
                 format: "application/octet-stream".into()
+            }),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    #[test]
+    fn extraction_failed_maps_to_422() {
+        assert_eq!(
+            http_status_for(&Error::ExtractionFailed {
+                format: "office/docx".into(),
+                reason: "zip error".into(),
             }),
             StatusCode::UNPROCESSABLE_ENTITY
         );

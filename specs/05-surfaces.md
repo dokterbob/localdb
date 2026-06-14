@@ -22,7 +22,7 @@ Single binary, subcommand tree. Global flags: `--config`, `--json`, `--store <na
 | `status` | Stores, doc/chunk counts, policy staleness, daemon state, config ownership (YAML- vs runtime-owned) | reads directly | queries daemon |
 | `store add/list/remove` | Manage runtime-owned stores | direct write (takes write lock) | routed to daemon |
 | `source add/list/remove` | Manage sources on a store | direct write | routed to daemon |
-| `index [--store S] [--source ID]` | One-shot scan & index; creates IndexJob | runs job synchronously, progress to stderr | submits job, polls, streams progress |
+| `index [--store S] [--source ID] [--strict]` | One-shot scan & index; creates IndexJob | runs job synchronously, progress to stderr | submits job, polls, streams progress |
 | `search <query>` | Hybrid search with citations | embedded read | via API |
 
 Output: human-readable by default (citations as `uri:heading_path` + snippet), `--json` emits the
@@ -81,7 +81,8 @@ MCP tool error). Codes are stable API:
 | `config_readonly` | Attempted API write to a YAML-owned object ([03-config.md](03-config.md) §3) | 409 |
 | `invalid_config` | Config failed validation (path-precise message) | 422 |
 | `invalid_request` | Bad arguments/body | 400 |
-| `unsupported_format` | Extraction can't handle the file (informational in job stats) | 422 |
+| `unsupported_format` | Extraction can't handle the file type (informational in job stats) | 422 |
+| `extraction_failed` | Recognized, supported format whose contents could not be extracted (corrupt/truncated). Counted in `error_count` in job stats; produces a WARN per file. | 422 |
 | `provider_unavailable` | External embedding endpoint down/misconfigured | 502 |
 | `model_missing` | Local model not yet downloaded; message includes the fix | 503 |
 | `index_in_progress` | Conflicting job already running for the scope | 409 |
@@ -89,3 +90,10 @@ MCP tool error). Codes are stable API:
 
 CLI exit codes: `0` ok, `1` internal, `2` invalid usage/config, `3` not found, `4` conflict/locked,
 `5` unavailable (daemon/provider/model).
+
+### `localdb index --strict`
+
+By default `index` is **best-effort**: unsupported files are silently counted; extraction failures
+produce a per-file WARN but the run continues and exits `0`. Pass `--strict` to exit `2` when any
+document failed (`error_count > 0`). The run always completes — `--strict` never aborts mid-run;
+it only affects the final exit code and JSON `"status"` field.

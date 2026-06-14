@@ -349,52 +349,6 @@ pub fn validate_msg_meta_key(key: &str) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// Block
-// ---------------------------------------------------------------------------
-
-/// Intermediate structural unit from extraction.
-///
-/// Blocks preserve document structure so chunkers can respect it.
-/// Blocks are NOT stored in the retrieval backend — only chunks are.
-///
-/// See specs/02-domain-model.md §2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Block {
-    /// Parent document ID.
-    pub document_id: ContentId,
-
-    /// Position in the document (0-indexed).
-    pub ordinal: usize,
-
-    /// Block kind (e.g. "heading", "paragraph", "code", "list").
-    pub kind: BlockKind,
-
-    /// Block text content.
-    pub text: String,
-
-    /// Byte/char range in the normalized document text.
-    pub span: Span,
-
-    /// Heading path, e.g. `["API", "Auth"]`.
-    #[serde(default)]
-    pub heading_path: Vec<String>,
-}
-
-/// Block kind from extraction.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BlockKind {
-    Heading,
-    Paragraph,
-    Code,
-    List,
-    ListItem,
-    Blockquote,
-    Table,
-    Other,
-}
-
-// ---------------------------------------------------------------------------
 // Chunk
 // ---------------------------------------------------------------------------
 
@@ -752,30 +706,6 @@ mod tests {
         assert!(validate_msg_meta_key("msg.foo").is_err());
         assert!(validate_msg_meta_key("msg.").is_err());
         assert!(validate_msg_meta_key("msg.THREAD_ID").is_err()); // case sensitive
-    }
-
-    // --- Block tests ---
-
-    #[test]
-    fn block_serializes_roundtrip() {
-        let block = Block {
-            document_id: document_id("file:///docs/api.md", &content_hash("content")),
-            ordinal: 0,
-            kind: BlockKind::Heading,
-            text: "# Introduction".to_string(),
-            span: Span::new(0, 14),
-            heading_path: vec!["Introduction".to_string()],
-        };
-        let json = serde_json::to_string(&block).unwrap();
-        let block2: Block = serde_json::from_str(&json).unwrap();
-        assert_eq!(block, block2);
-    }
-
-    #[test]
-    fn block_kind_serializes_snake_case() {
-        let k = BlockKind::ListItem;
-        let json = serde_json::to_value(&k).unwrap();
-        assert_eq!(json, serde_json::json!("list_item"));
     }
 
     // --- Chunk tests ---

@@ -8,7 +8,7 @@
 //! `ChainParser` implements the chain-of-responsibility pattern and is itself
 //! a `Parser`, enabling nesting and swappable selection strategies.
 
-use crate::{Block, Error};
+use crate::Error;
 
 /// Leading bytes exposed for cheap format sniffing without seeking.
 pub const PROBE_HEADER_LEN: usize = 8192;
@@ -67,13 +67,14 @@ impl<'a> Probe<'a> {
 // ParsedDocument + DocumentMetadata
 // ---------------------------------------------------------------------------
 
-/// A parsed document: normalized text, structural blocks, and metadata.
+/// A parsed document: Markdown-normalized content and metadata.
+///
+/// `markdown` is the universal normalized representation — real Markdown fed
+/// directly to `MarkdownSplitter`. All chunk spans index into it.
 #[derive(Debug, Clone, Default)]
 pub struct ParsedDocument {
-    /// Normalized document text. All block spans index into this.
-    pub text: String,
-    /// Structural blocks in document order.
-    pub blocks: Vec<Block>,
+    /// Normalized document text as Markdown. Chunk spans index into this.
+    pub markdown: String,
     /// Title from extraction (kept as a typed fast-path).
     pub title: Option<String>,
     /// Document metadata extracted from the document.
@@ -205,7 +206,7 @@ mod tests {
         }
         fn parse(&self, _: &Probe) -> Result<Option<ParsedDocument>, Error> {
             Ok(Some(ParsedDocument {
-                text: self.tag.to_string(),
+                markdown: self.tag.to_string(),
                 ..Default::default()
             }))
         }
@@ -250,7 +251,7 @@ mod tests {
             ],
         );
         let doc = chain.parse(&probe_bytes(b"data")).unwrap().unwrap();
-        assert_eq!(doc.text, "first");
+        assert_eq!(doc.markdown, "first");
     }
 
     #[test]
@@ -263,7 +264,7 @@ mod tests {
             ],
         );
         let doc = chain.parse(&probe_bytes(b"data")).unwrap().unwrap();
-        assert_eq!(doc.text, "found");
+        assert_eq!(doc.markdown, "found");
     }
 
     #[test]
@@ -358,8 +359,7 @@ mod tests {
     #[test]
     fn parsed_document_default() {
         let doc = ParsedDocument::default();
-        assert!(doc.text.is_empty());
-        assert!(doc.blocks.is_empty());
+        assert!(doc.markdown.is_empty());
         assert!(doc.title.is_none());
         assert_eq!(doc.metadata, DocumentMetadata::default());
     }
@@ -369,6 +369,6 @@ mod tests {
         let inner = ChainParser::new("inner", vec![Box::new(AlwaysMatch { tag: "nested" })]);
         let outer = ChainParser::new("outer", vec![Box::new(inner)]);
         let doc = outer.parse(&probe_bytes(b"data")).unwrap().unwrap();
-        assert_eq!(doc.text, "nested");
+        assert_eq!(doc.markdown, "nested");
     }
 }
