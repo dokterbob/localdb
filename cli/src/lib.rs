@@ -1584,12 +1584,18 @@ async fn run_index_for_source_async(
 
     for rt_source in &sources_to_index {
         let source = runtime_source_to_core_source(rt_source, &rt_store.id);
+        let chunker = ChunkerConfig::from_preset(&source.source_kind_preset)
+            .unwrap_or_else(|_| ChunkerConfig::prose());
+        let cfg = IngestionConfig {
+            chunker,
+            ..ingestion_cfg.clone()
+        };
         match run_ingestion_for_source(
             &source,
             &mut doc_index,
             &lancedb_store,
             embedder.as_ref(),
-            &ingestion_cfg,
+            &cfg,
             &extractor,
             Some(&url_fetcher),
         )
@@ -2011,12 +2017,18 @@ async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, dir: Option<
             eprintln!("Indexing source {} ({})", rt_source.id, loc);
         }
 
+        let chunker = ChunkerConfig::from_preset(&source.source_kind_preset)
+            .unwrap_or_else(|_| ChunkerConfig::prose());
+        let cfg = IngestionConfig {
+            chunker,
+            ..ingestion_cfg.clone()
+        };
         match run_ingestion_for_source(
             &source,
             &mut doc_index,
             &lancedb_store,
             embedder.as_ref(),
-            &ingestion_cfg,
+            &cfg,
             &extractor,
             Some(&url_fetcher),
         )
