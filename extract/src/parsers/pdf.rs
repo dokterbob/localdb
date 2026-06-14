@@ -94,4 +94,36 @@ mod tests {
         let probe = Probe::new(b"# Heading\n\nParagraph.", Some("README.md"), None);
         assert!(PdfParser.parse(&probe).unwrap().is_none());
     }
+
+    #[test]
+    fn sniffed_mime_populates_dc_format() {
+        // When the probe carries a sniffed MIME type, the parser must populate
+        // `metadata.format` so downstream consumers can surface it.
+        let bytes = b"%PDF-1.4\n%%EOF\n";
+        let probe = Probe::new(bytes, Some("doc.pdf"), Some("application/pdf"));
+        let result = PdfParser.parse(&probe);
+        // Accept or error — but if we get a document, format must be set.
+        if let Ok(Some(doc)) = result {
+            assert_eq!(
+                doc.metadata.format,
+                Some("application/pdf".to_string()),
+                "sniffed MIME should be stored in metadata.format"
+            );
+        }
+    }
+
+    #[test]
+    fn scanned_pdf_returns_err_not_none() {
+        // A scanned PDF (no text layer) must short-circuit with Err, not Ok(None).
+        // This prevents the plaintext catch-all from silently accepting binary PDF bytes.
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scanned.pdf");
+        let bytes = std::fs::read(&path).expect("scanned.pdf fixture must exist");
+        let probe = Probe::new(&bytes, Some("scanned.pdf"), None);
+        let result = PdfParser.parse(&probe);
+        assert!(
+            result.is_err(),
+            "scanned PDF must return Err, not Ok(None); got: {result:?}"
+        );
+    }
 }

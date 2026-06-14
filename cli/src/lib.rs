@@ -1556,13 +1556,9 @@ async fn run_index_for_source_async(
     source_id: Option<&str>,
     rt_store: &RuntimeStore,
 ) {
-    use extract::Parser as _;
     use localdb_core::{
         chunker::ChunkerConfig,
-        ingestion::{
-            run_ingestion_for_source, DocumentExtractor, DocumentIndex, ExtractionResult,
-            IngestionConfig,
-        },
+        ingestion::{run_ingestion_for_source, DocumentIndex, IngestionConfig},
     };
 
     let (config_loader, db) = load_app_db(ctx);
@@ -1617,36 +1613,13 @@ async fn run_index_for_source_async(
         }
     };
 
-    let parser_ids = policy.parsers.clone();
-    let chain = match extract::build_chain(&parser_ids) {
-        Ok(c) => c,
+    let extractor = match extract::ChainExtractor::from_ids(&policy.parsers) {
+        Ok(e) => e,
         Err(e) => {
             eprintln!("warning: cannot build parser chain for auto-index: {}", e);
             return;
         }
     };
-
-    struct ExtractBridge {
-        chain: extract::ChainParser,
-    }
-    impl DocumentExtractor for ExtractBridge {
-        fn extract(&self, bytes: &[u8], filename: Option<&str>) -> Result<ExtractionResult, Error> {
-            let sniffed = extract::sniff_mime(bytes, filename);
-            let probe = extract::Probe::new(bytes, filename, sniffed.as_deref());
-            match self.chain.parse(&probe)? {
-                Some(doc) => Ok(ExtractionResult {
-                    text: doc.text,
-                    blocks: doc.blocks,
-                    title: doc.title,
-                    metadata: doc.metadata,
-                }),
-                None => Err(Error::UnsupportedFormat {
-                    format: "no parser matched the file".to_string(),
-                }),
-            }
-        }
-    }
-    let extractor = ExtractBridge { chain };
 
     let store_data_dir = data_dir.join("stores").join(&rt_store.name);
     if let Err(e) = std::fs::create_dir_all(&store_data_dir) {
@@ -1889,13 +1862,9 @@ pub fn run_index(ctx: &CliContext, source_id: Option<&str>, dir: Option<&str>) {
 }
 
 async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, dir: Option<&str>) {
-    use extract::Parser as _;
     use localdb_core::{
         chunker::ChunkerConfig,
-        ingestion::{
-            run_ingestion_for_source, DocumentExtractor, DocumentIndex, ExtractionResult,
-            IngestionConfig,
-        },
+        ingestion::{run_ingestion_for_source, DocumentIndex, IngestionConfig},
     };
 
     // A9-safety: validate --store name if given.
@@ -2038,33 +2007,10 @@ async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, dir: Option<
         Err(e) => exit_err(&Error::from(e), ctx.json),
     };
 
-    let parser_ids = policy.parsers.clone();
-    let chain = match extract::build_chain(&parser_ids) {
-        Ok(c) => c,
+    let extractor = match extract::ChainExtractor::from_ids(&policy.parsers) {
+        Ok(e) => e,
         Err(e) => exit_err(&e, ctx.json),
     };
-
-    struct ExtractBridge {
-        chain: extract::ChainParser,
-    }
-    impl DocumentExtractor for ExtractBridge {
-        fn extract(&self, bytes: &[u8], filename: Option<&str>) -> Result<ExtractionResult, Error> {
-            let sniffed = extract::sniff_mime(bytes, filename);
-            let probe = extract::Probe::new(bytes, filename, sniffed.as_deref());
-            match self.chain.parse(&probe)? {
-                Some(doc) => Ok(ExtractionResult {
-                    text: doc.text,
-                    blocks: doc.blocks,
-                    title: doc.title,
-                    metadata: doc.metadata,
-                }),
-                None => Err(Error::UnsupportedFormat {
-                    format: "no parser matched the file".to_string(),
-                }),
-            }
-        }
-    }
-    let extractor = ExtractBridge { chain };
 
     let store_data_dir = data_dir.join("stores").join(&store_name);
     if let Err(e) = std::fs::create_dir_all(&store_data_dir) {

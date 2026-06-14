@@ -15,6 +15,7 @@
 //! - [`ExtractionOutput`] — the old output type.
 //! - [`Format`] — the old format enum.
 
+pub mod chain_extractor;
 pub mod detect;
 pub mod html;
 pub mod markdown;
@@ -27,6 +28,7 @@ pub mod registry;
 use localdb_core::{Block, BlockKind, Error, Span};
 
 // Re-export chain types for consumers that wire ExtractBridge.
+pub use chain_extractor::ChainExtractor;
 pub use localdb_core::parser::{ChainParser, DocumentMetadata, ParsedDocument, Parser, Probe};
 pub use mime::sniff_mime;
 pub use registry::{build_chain, default_parser_ids};
@@ -111,5 +113,22 @@ pub(crate) fn make_block(
         text,
         span,
         heading_path,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_shim_unsupported_format_on_binary() {
+        // Non-UTF-8 binary with no recognisable magic bytes declines every
+        // parser in the default chain, hitting the `None => UnsupportedFormat` arm.
+        let binary = b"\xFF\xFE\x00\x01some binary garbage that is not utf-8";
+        let err = extract(binary, None).unwrap_err();
+        assert!(
+            matches!(err, Error::UnsupportedFormat { .. }),
+            "expected UnsupportedFormat, got: {err:?}"
+        );
     }
 }
