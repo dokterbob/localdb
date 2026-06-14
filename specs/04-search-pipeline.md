@@ -37,6 +37,17 @@ single mature Rust extraction stack covers these well; shipping a sharp matrix
 beats shipping a ragged one. Unsupported files are skipped and counted in IndexJob stats, not
 errors. Roadmap: [06-roadmap.md](06-roadmap.md) §5.
 
+**Binary / non-UTF-8 input:** All parser implementations (`MarkdownParser`, `HtmlParser`,
+`PlaintextParser`) decline non-UTF-8 bytes by returning `Ok(None)` rather than
+`Err(InvalidRequest)`. A file with a recognized extension that contains binary or
+mis-encoded bytes therefore falls through the entire parser chain and is counted as
+`unsupported_format` in `IndexJobStats`, not as an error.
+
+**Per-document panic isolation:** `index_document` wraps the synchronous extraction and
+chunking calls in `std::panic::catch_unwind`. Any unexpected panic in a parser or chunker
+is caught, converted to `Err(Error::Internal)`, logged as a per-file WARN, and counted in
+`error_count`. The ingestion loop continues with the next file; the process does not abort.
+
 ## 3. Chunking
 
 Chunking is half of the per-store `indexing` policy ([03-config.md](03-config.md) §2).
