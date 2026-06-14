@@ -123,11 +123,12 @@ defaults:
       model: pplx-embed-context-v1-0.6b
 ```
 
-> **Current state:** the embedding provider and model fields are parsed and stored, but
-> localdb 0.1.0 uses a hash-based placeholder embedder internally. No model is downloaded.
-> Search ranking is driven by BM25; the `dense` score in search results is a placeholder
-> value (`1.0`). Real embedding support is on the roadmap
-> ([specs/06-roadmap.md](../specs/06-roadmap.md)).
+> **Default embedder:** `provider: local-onnx`, `model: pplx-embed-context-v1-0.6b`. The first
+> `localdb index` or `localdb search` downloads the model (~706 MB) from the public HuggingFace
+> repo `perplexity-ai/pplx-embed-context-v1-0.6b` — no API key required. The model is cached
+> under `paths.models` for subsequent runs. Alternative local model: `bge-small-en-v1.5`
+> (384-dim, much smaller). Hosted alternatives: `provider: perplexity` (requires API key) or
+> `provider: openai-compatible`.
 
 ---
 
@@ -308,8 +309,7 @@ paths:
   logs: ~/localdb/logs
 
 # --- Global indexing defaults (inherited by all stores) ---
-# Note: embedding provider/model are parsed but localdb 0.1.0 uses a hash-based
-# placeholder. Real embedding support is forthcoming.
+# The default local-onnx model is downloaded (~706 MB) on first index/search.
 defaults:
   indexing:
     chunking:

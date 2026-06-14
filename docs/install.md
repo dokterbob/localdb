@@ -77,13 +77,13 @@ cargo install --git https://github.com/dokterbob/localdb localdb
 Note: embedding models will be downloaded on first index.
 ```
 
-**This message does not reflect the current state of v0.1.0.** Embeddings are currently
-implemented with a hash-based placeholder (FakeEmbedder) — no model is downloaded when you
-run `localdb index`. Search ranking is driven by BM25; the dense score field is a placeholder
-value. Real ONNX embedding support is on the roadmap but is not wired in this release.
+**This message is accurate.** The default embedder (`pplx-embed-context-v1-0.6b`) is
+downloaded from the public HuggingFace repo `perplexity-ai/pplx-embed-context-v1-0.6b`
+(~706 MB) the first time `localdb index` or `localdb search` runs. No API key or license
+click-through is required. The model is cached under `paths.models` for subsequent runs.
 
-For details on the current gap and the planned embedding architecture, see
-[architecture.md#known-gaps](architecture.md#known-gaps) and
+For details on the embedding pipeline and alternative model options, see
+[architecture.md](architecture.md) and
 [../specs/04-search-pipeline.md](../specs/04-search-pipeline.md).
 
 ## Next step

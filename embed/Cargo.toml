@@ -8,8 +8,8 @@ description = "Embedder implementations: local ONNX, OpenAI-compatible, and cont
 
 [features]
 default = []
-# Enable local ONNX inference via fastembed
-local-onnx = ["dep:fastembed"]
+# Enable local ONNX inference via fastembed + direct ORT (pplx-embed-v1-0.6b)
+local-onnx = ["dep:fastembed", "dep:ort", "dep:tokenizers", "dep:ndarray"]
 # Enable all providers (for tests/CI)
 all-providers = ["local-onnx"]
 
@@ -37,6 +37,13 @@ dirs = "5"
 # SHA2 for checksum verification
 sha2 = "0.10"
 hex = "0.4"
+
+# Streaming HTTP download support (also needed by pplx_onnx; no load-dynamic — fastembed's
+# ort-download-binaries-rustls-tls already provides ORT via ort-sys build scripts)
+futures-util = "0.3"
+ort = { version = "=2.0.0-rc.12", features = ["ndarray"], optional = true }
+tokenizers = { version = "0.22", optional = true }
+ndarray = { version = "0.17", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

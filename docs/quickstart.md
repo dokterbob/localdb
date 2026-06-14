@@ -36,8 +36,10 @@ version: 1
 # Add stores and sources below.
 ```
 
-> **Note on the "embedding models will be downloaded" message:** This does not happen in v0.1.0.
-> Embeddings use a local hash-based placeholder; no download occurs. See
+> **Note on the "embedding models will be downloaded" message:** This is accurate. The default
+> embedder (`pplx-embed-context-v1-0.6b`) is downloaded from HuggingFace (~706 MB) the first
+> time `localdb index` or `localdb search` runs. No API key or license click-through is required.
+> Subsequent runs use the cached model. See
 > [install.md#a-note-on-embedding-models](install.md#a-note-on-embedding-models).
 
 ## Step 2 — (Optional) Override data paths
@@ -220,12 +222,12 @@ localdb search "hybrid search" --store notes --json
 }
 ```
 
-(Output truncated to one result; paths shown from a scratch run.)
+(Output truncated to one result; paths shown from a scratch run. The `dense: 1.0` value in
+this example reflects a prior placeholder run; real runs show a cosine similarity score.)
 
-**Score fields:** `bm25` is the BM25 full-text score; `dense` is currently a placeholder
-(`1.0`) because v0.1.0 uses a hash-based FakeEmbedder rather than a real vector model.
-`fused` is the Reciprocal Rank Fusion score used for final ranking. In practice, ranking is
-driven by BM25 in this release.
+**Score fields:** `bm25` is the BM25 full-text score; `dense` is the cosine similarity score
+from the local ONNX embedder (`pplx-embed-context-v1-0.6b` by default). `fused` is the
+Reciprocal Rank Fusion score used for final ranking, combining both components.
 
 ## Step 8 — Verify status after indexing
 

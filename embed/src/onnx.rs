@@ -36,37 +36,35 @@ use tracing::info;
 
 use crate::error::EmbedError;
 
-/// Model choice for the local ONNX embedder.
+/// Model choice for the fastembed-backed local ONNX embedder.
+///
+/// For pplx models, use [`PplxOnnxEmbedder`] or [`PplxContextOnnxEmbedder`] instead —
+/// it uses direct ORT inference to support the model's split external data files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelChoice {
-    /// Default model: BGE Small EN v1.5 (384 dims, English, fast).
-    ///
-    /// Will be replaced by `pplx-embed-context-v1-0.6b` pending benchmark
-    /// (see specs/04-search-pipeline.md §4).
+    /// BGE Small EN v1.5 (384 dims, English, fast). Available without HF credentials.
     BgeSmallEnV15,
-    /// Alias for the current default (same as `BgeSmallEnV15` for now).
-    Default,
 }
 
 impl ModelChoice {
     /// Convert to the fastembed `EmbeddingModel` variant.
     pub fn to_fastembed_model(self) -> EmbeddingModel {
         match self {
-            ModelChoice::BgeSmallEnV15 | ModelChoice::Default => EmbeddingModel::BGESmallENV15,
+            ModelChoice::BgeSmallEnV15 => EmbeddingModel::BGESmallENV15,
         }
     }
 
     /// Expected embedding dimension for this model.
     pub fn embedding_dim(self) -> usize {
         match self {
-            ModelChoice::BgeSmallEnV15 | ModelChoice::Default => 384,
+            ModelChoice::BgeSmallEnV15 => 384,
         }
     }
 
     /// Model ID string used in policy versioning.
     pub fn model_id(self) -> &'static str {
         match self {
-            ModelChoice::BgeSmallEnV15 | ModelChoice::Default => "bge-small-en-v1.5",
+            ModelChoice::BgeSmallEnV15 => "bge-small-en-v1.5",
         }
     }
 }
@@ -349,12 +347,10 @@ mod tests {
     #[test]
     fn model_choice_dim() {
         assert_eq!(ModelChoice::BgeSmallEnV15.embedding_dim(), 384);
-        assert_eq!(ModelChoice::Default.embedding_dim(), 384);
     }
 
     #[test]
     fn model_choice_id() {
         assert_eq!(ModelChoice::BgeSmallEnV15.model_id(), "bge-small-en-v1.5");
-        assert_eq!(ModelChoice::Default.model_id(), "bge-small-en-v1.5");
     }
 }
