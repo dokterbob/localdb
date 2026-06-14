@@ -756,4 +756,84 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&text).expect("must be JSON");
         assert_eq!(parsed["error"]["code"].as_str().unwrap(), "store_not_found");
     }
+
+    // -----------------------------------------------------------------------
+    // render_citations_text — creator · date formatting
+    // -----------------------------------------------------------------------
+
+    fn make_citation_with_metadata(
+        uri: &str,
+        creator: Vec<String>,
+        date: Option<String>,
+    ) -> localdb_core::citation::Citation {
+        use localdb_core::{
+            citation::{CitationProvenance, CitationStore, Score},
+            parser::DocumentMetadata,
+            types::Span,
+        };
+        localdb_core::citation::Citation {
+            chunk_id: "c1".to_string(),
+            document_id: "d1".to_string(),
+            store: CitationStore {
+                id: "s1".to_string(),
+                name: "store".to_string(),
+            },
+            uri: uri.to_string(),
+            title: None,
+            heading_path: vec![],
+            span: Span::new(0, 4),
+            snippet: "text".to_string(),
+            score: Score {
+                fused: 0.5,
+                dense: None,
+                bm25: None,
+            },
+            provenance: CitationProvenance {
+                fetched_at: "2026-01-01T00:00:00Z".to_string(),
+                content_hash: "abc".to_string(),
+            },
+            metadata: DocumentMetadata {
+                creator,
+                date,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn render_citations_text_shows_creator_and_date() {
+        let c = make_citation_with_metadata(
+            "file:///a.md",
+            vec!["Alice".to_string()],
+            Some("2026-03-01".to_string()),
+        );
+        let text = render_citations_text(&[c]);
+        assert!(
+            text.contains("Alice · 2026-03-01"),
+            "should show creator · date, got: {text}"
+        );
+    }
+
+    #[test]
+    fn render_citations_text_date_only() {
+        let c = make_citation_with_metadata("file:///a.md", vec![], Some("2026-03-01".to_string()));
+        let text = render_citations_text(&[c]);
+        assert!(text.contains("2026-03-01"), "should show date, got: {text}");
+        assert!(!text.contains('·'), "should not show · with no creator");
+    }
+
+    #[test]
+    fn render_citations_text_creator_only() {
+        let c = make_citation_with_metadata("file:///a.md", vec!["Bob".to_string()], None);
+        let text = render_citations_text(&[c]);
+        assert!(text.contains("Bob"), "should show creator, got: {text}");
+        assert!(!text.contains('·'), "should not show · with no date");
+    }
+
+    #[test]
+    fn render_citations_text_no_metadata() {
+        let c = make_citation_with_metadata("file:///a.md", vec![], None);
+        let text = render_citations_text(&[c]);
+        assert!(!text.contains('·'), "no metadata — no · separator");
+    }
 }
