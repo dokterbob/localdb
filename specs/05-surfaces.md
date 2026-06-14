@@ -42,7 +42,8 @@ later if a consumer demands it).
   [06-roadmap.md](06-roadmap.md) §1, which arrives together with real auth).
 - **Resources** (`/v1`): `GET/POST /stores`, `GET/PATCH/DELETE /stores/{id}`,
   `GET/POST /stores/{id}/sources`, `POST /search` (body: query, store filter, metadata filters,
-  limit), `GET /documents/{id}`, `POST /jobs` (index requests), `GET /jobs/{id}`, `GET /status`,
+  limit; citations carry full `DocumentMetadata`), `GET /documents/{id}` (response includes
+  `metadata: DocumentMetadata`), `POST /jobs` (index requests), `GET /jobs/{id}`, `GET /status`,
   `GET /config` (resolved, with ownership annotations; YAML-owned objects are read-only —
   `config_readonly` on write).
 - **Long-running work:** indexing is a **job resource**: `POST /jobs` → `202` + job; clients poll
@@ -53,7 +54,8 @@ later if a consumer demands it).
 ## 4. MCP
 
 **Decision:** v1 MCP is **read-only**: tools `search` (args: query, optional store names, limit →
-Citation list as structured content), `get_document` (id or uri → normalized text + metadata),
+Citation list as structured content; each citation carries full `DocumentMetadata`),
+`get_document` (id or uri → normalized text + `metadata: DocumentMetadata`),
 `list_stores` (names, visibility, counts). **Mutating tools** (`add_source`, `reindex`, …) are a
 follow-up behind an explicit opt-in flag (`localdb mcp --allow-write`), never on by default.
 
@@ -63,7 +65,8 @@ auditable blast radius, and write semantics through agents deserve their own des
 
 Citations cross MCP as structured tool results (the JSON shape from
 [02-domain-model.md](02-domain-model.md) §6), with a short text rendering alongside for
-non-structured clients. Resources/prompts: none in v1; documents are reachable via `get_document`.
+non-structured clients (text rendering includes `creator · date` where present).
+Resources/prompts: none in v1; documents are reachable via `get_document`.
 
 ## 5. Shared error taxonomy
 
