@@ -302,12 +302,23 @@ pub fn render_citations_text(citations: &[Citation]) -> String {
                 format!(" > {}", c.heading_path.join(" > "))
             };
             let title = c.title.as_deref().unwrap_or("");
+            let creator_date = {
+                let creator = c.metadata.creator.first().map(|s| s.as_str()).unwrap_or("");
+                let date = c.metadata.date.as_deref().unwrap_or("");
+                match (creator, date) {
+                    ("", "") => String::new(),
+                    (cr, "") => format!("\n   {cr}"),
+                    ("", dt) => format!("\n   {dt}"),
+                    (cr, dt) => format!("\n   {cr} · {dt}"),
+                }
+            };
             format!(
-                "{}. {}{}{}\n   Score: {:.4}\n   {}\n",
+                "{}. {}{}{}{}\n   Score: {:.4}\n   {}\n",
                 i + 1,
                 title,
                 c.uri,
                 heading,
+                creator_date,
                 c.score.fused,
                 c.snippet.chars().take(200).collect::<String>()
             )
@@ -413,6 +424,7 @@ pub async fn tool_get_document(
                     "fetched_at": first.fetched_at,
                     "content_hash": first.content_hash,
                 },
+                "metadata": first.metadata,
                 "chunk_count": chunks.len(),
                 "text": full_text,
             });
@@ -637,6 +649,41 @@ mod tests {
         };
         let parsed: serde_json::Value = serde_json::from_str(&text).expect("success body is JSON");
         assert_eq!(parsed["document_id"].as_str().unwrap(), "doc-1");
+        assert!(
+            parsed.get("metadata").is_some(),
+            "metadata field must be present"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_document_metadata_carries_through() {
+        let fake = FakeStore::new();
+        let mut chunk = make_chunk("chunk-1", "doc-meta", "store-A", "text content");
+        chunk.metadata = localdb_core::parser::DocumentMetadata {
+            title: Some("Rich Doc".to_string()),
+            creator: vec!["Carol".to_string()],
+            date: Some("2026-05-01".to_string()),
+            ..Default::default()
+        };
+        fake.upsert_chunks(vec![chunk]).await.unwrap();
+
+        let av = AvailableStore::new(make_descriptor("store-A", "store-a"), Box::new(fake));
+
+        let params = build_params(serde_json::json!({ "id": "doc-meta" }));
+        let result = tool_get_document(&[av], Some(&params)).await;
+
+        assert!(!result.is_error);
+        let text = match result.content.first().unwrap() {
+            crate::protocol::ContentItem::Text { text } => text.clone(),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let meta = &parsed["metadata"];
+        assert_eq!(meta["title"].as_str().unwrap(), "Rich Doc");
+        assert_eq!(
+            meta["creator"].as_array().unwrap()[0].as_str().unwrap(),
+            "Carol"
+        );
+        assert_eq!(meta["date"].as_str().unwrap(), "2026-05-01");
     }
 
     // -----------------------------------------------------------------------

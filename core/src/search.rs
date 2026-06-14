@@ -192,6 +192,7 @@ pub fn shape_citation(fused: FusedChunkEntry, store_id: String, store_name: Stri
             fetched_at: fused.chunk.fetched_at.clone(),
             content_hash: fused.chunk.content_hash.clone(),
         },
+        metadata: fused.chunk.metadata.clone(),
     }
 }
 
@@ -806,6 +807,27 @@ mod tests {
         assert!(v["score"].get("bm25").is_some());
         assert!(v["span"].get("start").is_some());
         assert!(v["span"].get("end").is_some());
+    }
+
+    #[test]
+    fn shape_citation_carries_metadata() {
+        let mut chunk = make_chunk("c1", "d1", "s1", "text", vec![], "file:///a.md", vec![1.0]);
+        chunk.metadata = crate::parser::DocumentMetadata {
+            title: Some("My Title".to_string()),
+            creator: vec!["Bob".to_string()],
+            date: Some("2026-03-01".to_string()),
+            ..Default::default()
+        };
+        let entry = FusedChunkEntry {
+            chunk,
+            fused_score: 0.5,
+            dense_score: None,
+            bm25_score: Some(4.0),
+        };
+        let citation = shape_citation(entry, "s1".to_string(), "store-one".to_string());
+        assert_eq!(citation.metadata.title.as_deref(), Some("My Title"));
+        assert_eq!(citation.metadata.creator, vec!["Bob".to_string()]);
+        assert_eq!(citation.metadata.date.as_deref(), Some("2026-03-01"));
     }
 
     // -----------------------------------------------------------------------

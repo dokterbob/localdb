@@ -129,7 +129,8 @@ Citation {
   span: {start, end},   // range in normalized text
   snippet,              // chunk text (possibly trimmed)
   score: {fused, dense, bm25},
-  provenance: {fetched_at, content_hash}
+  provenance: {fetched_at, content_hash},
+  metadata              // full DCMES DocumentMetadata per §7; always present, empty when none extracted
 }
 ```
 
