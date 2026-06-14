@@ -1,5 +1,4 @@
-//! Markdown parser: chain-of-responsibility wrapper around
-//! `crate::markdown::extract_markdown`.
+//! Markdown parser: chain-of-responsibility wrapper around `crate::markdown::extract_markdown`.
 
 use localdb_core::parser::{DocumentMetadata, ParsedDocument, Parser, Probe};
 use localdb_core::Error;
@@ -37,18 +36,17 @@ impl Parser for MarkdownParser {
             Err(_) => return Ok(None),
         };
 
-        let out = crate::markdown::extract_markdown(text)?;
+        let (markdown, title) = crate::markdown::extract_markdown(text)?;
 
         let dc = DocumentMetadata {
-            title: out.title.clone(),
+            title: title.clone(),
             format: probe.sniffed_mime.map(|s| s.to_string()),
             ..DocumentMetadata::default()
         };
 
         Ok(Some(ParsedDocument {
-            text: out.text,
-            blocks: out.blocks,
-            title: out.title,
+            markdown,
+            title,
             metadata: dc,
         }))
     }
@@ -81,7 +79,10 @@ mod tests {
     fn accepts_md_extension() {
         let probe = Probe::new(b"# Hello\n\nParagraph.", Some("README.md"), None);
         let doc = MarkdownParser.parse(&probe).unwrap().unwrap();
-        assert!(doc.text.contains("Hello"));
+        assert!(
+            doc.markdown.contains("# Hello"),
+            "markdown must contain heading marker"
+        );
     }
 
     #[test]
@@ -122,9 +123,20 @@ mod tests {
     }
 
     #[test]
-    fn h1_heading_populates_dc_title() {
+    fn h1_heading_populates_title_and_dc_title() {
         let probe = Probe::new(b"# My Document\n\nSome content.", Some("doc.md"), None);
         let doc = MarkdownParser.parse(&probe).unwrap().unwrap();
+        assert_eq!(doc.title, Some("My Document".to_string()));
         assert_eq!(doc.metadata.title, Some("My Document".to_string()));
+    }
+
+    #[test]
+    fn markdown_heading_preserved_in_output() {
+        let probe = Probe::new(b"# Section\n\nContent.", Some("doc.md"), None);
+        let doc = MarkdownParser.parse(&probe).unwrap().unwrap();
+        assert!(
+            doc.markdown.contains("# Section"),
+            "heading marker must be in output markdown"
+        );
     }
 }

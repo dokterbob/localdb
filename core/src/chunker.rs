@@ -2,17 +2,19 @@
 //!
 //! Implements the per-source-kind presets from specs/04-search-pipeline.md §3:
 //! - `prose` (default): Markdown-structure-aware split (via `text-splitter`),
-//!   token-accurate to the model tokenizer, target ~512 tokens with ~64 overlap
-//! - `code`: structural (function/item-level) or line blocks, target ~60 lines
+//!   token-accurate to the model tokenizer, target ~512 tokens with ~64 overlap.
+//!   The splitter now receives REAL Markdown (headings, fences, bullets preserved).
+//! - `code` (interim): simple line-based text packer; the future AST chunker
+//!   (text-splitter::CodeSplitter) will supersede this. See specs/04-search-pipeline.md §2.
 //! - `messages` (reserved): not implemented in v1
 //!
-//! Chunks reference spans in the normalized document text (as produced by the
-//! `extract` crate).
+//! Heading-path attribution uses `heading_index::build_heading_index` over the
+//! real Markdown string, replacing the old Block-based sidecar.
 
 use std::sync::Arc;
 
 use crate::ids::{chunk_id, ContentId};
-use crate::types::{Block, Span};
+use crate::types::Span;
 use crate::Error;
 
 // ---------------------------------------------------------------------------
@@ -83,16 +85,16 @@ fn floor_char_boundary(s: &str, index: usize) -> usize {
 /// A single chunk produced by the chunker.
 ///
 /// The `id` is content-addressed; the `text` and `span` refer to the normalized
-/// document text. `heading_path` is inherited from the blocks that compose the chunk.
+/// Markdown string. `heading_path` is derived from the Markdown heading structure.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChunkOutput {
     /// Content-addressed chunk ID: `blake3(document_id || text || span)`.
     pub id: ContentId,
-    /// Chunk text.
+    /// Chunk text (a slice of the Markdown string).
     pub text: String,
-    /// Byte range in the normalized document text.
+    /// Byte range in the Markdown string.
     pub span: Span,
-    /// Heading path inherited from the first block in this chunk.
+    /// Heading path at the chunk's start offset.
     pub heading_path: Vec<String>,
 }
 
@@ -109,7 +111,7 @@ pub struct ChunkerConfig {
     ///
     /// For the `prose` preset this is interpreted by the active `ChunkSizer`
     /// (tokens for `TokenSizer`, chars for `CharSizer`). For the `code` preset
-    /// it is still interpreted as a character budget (hand-rolled splitter).
+    /// it is still interpreted as a character budget (interim line packer).
     pub target_tokens: Option<usize>,
     /// Overlap in tokens. `None` = preset default.
     pub overlap_tokens: Option<usize>,
@@ -175,10 +177,10 @@ impl ChunkerConfig {
 // Main chunk function
 // ---------------------------------------------------------------------------
 
-/// Chunk a document's blocks into `ChunkOutput` records.
+/// Chunk a Markdown document string into `ChunkOutput` records.
 ///
 /// The `document_id` is used to derive chunk IDs (content-addressed).
-/// The `full_text` is the normalized document text returned by the extractor.
+/// `markdown` is the normalized Markdown string returned by the extractor.
 ///
 /// Respects preset and per-document configuration. The `sizer` measures chunk
 /// sizes for the `prose` preset (the `code` preset uses its own char budget).
@@ -187,14 +189,13 @@ impl ChunkerConfig {
 /// - Returns `Error::InvalidRequest` if the preset is unknown or reserved.
 pub fn chunk_document(
     document_id: &str,
-    full_text: &str,
-    blocks: &[Block],
+    markdown: &str,
     config: &ChunkerConfig,
     sizer: &dyn ChunkSizer,
 ) -> Result<Vec<ChunkOutput>, Error> {
     match config.preset.as_str() {
-        "prose" => chunk_prose(document_id, full_text, blocks, config, sizer),
-        "code" => chunk_code(document_id, full_text, blocks, config),
+        "prose" => chunk_prose(document_id, markdown, config, sizer),
+        "code" => chunk_code(document_id, markdown, config),
         "messages" => Err(Error::InvalidRequest {
             message: "chunking preset 'messages' is reserved and not implemented in v1; \
                       use 'prose' or 'code'"
@@ -215,56 +216,36 @@ pub fn chunk_document(
 
 /// Prose chunker: Markdown-structure-aware split via `text-splitter`.
 ///
-/// Strategy:
-/// 1. Degenerate cases (empty text → no chunks; non-empty text with no blocks →
-///    single whole-text chunk) are handled up front to match historical behaviour.
-/// 2. Otherwise a `MarkdownSplitter` packs the document into chunks sized by the
-///    active `ChunkSizer` (token-accurate when a model tokenizer is available),
-///    with a capacity range for better packing and best-effort overlap.
-/// 3. Each chunk's byte span is taken directly from the splitter; its
-///    `heading_path` is inherited from the block containing the chunk's start.
+/// Feeds REAL Markdown (with `#`, fences, bullets) to `MarkdownSplitter`,
+/// fixing the latent smell where stripped text was passed before.
+/// Heading-path attribution uses `heading_index::build_heading_index` over the
+/// same Markdown string — no Block sidecar needed.
 fn chunk_prose(
     document_id: &str,
-    full_text: &str,
-    blocks: &[Block],
+    markdown: &str,
     config: &ChunkerConfig,
     sizer: &dyn ChunkSizer,
 ) -> Result<Vec<ChunkOutput>, Error> {
+    if markdown.is_empty() {
+        return Ok(vec![]);
+    }
+
     let target = config.resolved_target_tokens();
     let overlap = config.resolved_overlap_tokens();
 
-    if blocks.is_empty() {
-        // If no blocks but there is text, make a single chunk of the whole text.
-        if !full_text.is_empty() {
-            let span = Span::new(0, full_text.len());
-            let id = chunk_id(document_id, full_text, 0, full_text.len());
-            return Ok(vec![ChunkOutput {
-                id,
-                text: full_text.to_string(),
-                span,
-                heading_path: vec![],
-            }]);
-        }
-        return Ok(vec![]);
-    }
-
-    if full_text.is_empty() {
-        return Ok(vec![]);
-    }
+    let heading_idx = crate::heading_index::build_heading_index(markdown);
 
     // Capacity range enables better packing: aim between 3/4 target and target.
-    // Use inclusive range so the effective max is exactly `target` (exclusive `..target` gives max = target-1).
     let cap_start = target * 3 / 4;
     let cap = cap_start..=target;
 
     let ts_sizer = TsSizer(sizer);
     let mut cfg = text_splitter::ChunkConfig::new(cap).with_sizer(ts_sizer);
-    // Overlap is best-effort; only apply when valid (0 < overlap < cap.start).
+    // Overlap is best-effort; only apply when valid (0 < overlap < cap_start).
     if overlap > 0 && overlap < cap_start {
         match cfg.with_overlap(overlap) {
             Ok(c) => cfg = c,
             Err(_) => {
-                // Rebuild without overlap (with_overlap consumed cfg).
                 let ts_sizer = TsSizer(sizer);
                 cfg = text_splitter::ChunkConfig::new(cap_start..=target).with_sizer(ts_sizer);
             }
@@ -274,21 +255,11 @@ fn chunk_prose(
     let splitter = text_splitter::MarkdownSplitter::new(cfg);
 
     let mut chunks = Vec::new();
-    for (byte_off, chunk) in splitter.chunk_indices(full_text) {
+    for (byte_off, chunk) in splitter.chunk_indices(markdown) {
         let start = byte_off;
         let end = byte_off + chunk.len();
         let span = Span::new(start, end);
-
-        // Inherit heading_path from the block whose span contains the chunk start,
-        // else the last block starting at or before it.
-        let heading_path = blocks
-            .iter()
-            .rev()
-            .find(|b| b.span.start <= start && start < b.span.end)
-            .or_else(|| blocks.iter().rev().find(|b| b.span.start <= start))
-            .map(|b| b.heading_path.clone())
-            .unwrap_or_default();
-
+        let heading_path = crate::heading_index::heading_path_at(&heading_idx, start);
         let id = chunk_id(document_id, chunk, start, end);
         chunks.push(ChunkOutput {
             id,
@@ -302,140 +273,100 @@ fn chunk_prose(
 }
 
 // ---------------------------------------------------------------------------
-// Code chunker
+// Code chunker (interim)
 // ---------------------------------------------------------------------------
 
-/// Code chunker: line-based chunking targeting ~60 lines per chunk.
+/// Code chunker: interim line-based text packer over the Markdown string.
 ///
-/// Splits at blank lines or after `target_tokens` (interpreted as chars) of content.
+/// NOTE: This is a temporary downgrade from the old block-driven code chunker.
+/// It will be superseded by `text-splitter::CodeSplitter` (tree-sitter) when
+/// code sources become a focus. See specs/04-search-pipeline.md §2.
 fn chunk_code(
     document_id: &str,
-    full_text: &str,
-    blocks: &[Block],
+    markdown: &str,
     config: &ChunkerConfig,
 ) -> Result<Vec<ChunkOutput>, Error> {
-    let target = config.resolved_target_tokens();
-
-    if blocks.is_empty() {
-        if !full_text.is_empty() {
-            let id = chunk_id(document_id, full_text, 0, full_text.len());
-            return Ok(vec![ChunkOutput {
-                id,
-                text: full_text.to_string(),
-                span: Span::new(0, full_text.len()),
-                heading_path: vec![],
-            }]);
-        }
+    if markdown.is_empty() {
         return Ok(vec![]);
     }
 
-    // For code: group by code-block boundaries, then by size
+    let target = config.resolved_target_tokens();
     let mut chunks = Vec::new();
-    let mut current_start = blocks[0].span.start;
-    let mut current_end = blocks[0].span.start;
-    let mut current_heading = blocks[0].heading_path.clone();
+    let mut current_start = 0usize;
+    let mut current_end = 0usize;
 
-    for block in blocks {
-        let block_end = block.span.end.min(full_text.len());
-        let block_start = block.span.start.min(full_text.len());
-
-        if block_start >= block_end {
-            continue;
-        }
-
+    for (line_start, line) in line_offsets(markdown) {
+        let line_end = line_start + line.len();
         let current_size = current_end.saturating_sub(current_start);
 
-        // Flush if adding this block would exceed target.
-        if current_size > 0 && current_size + (block_end - block_start) > target {
-            // Align to char boundaries (A1 fix).
-            let cs = floor_char_boundary(full_text, current_start);
-            let ce = floor_char_boundary(full_text, current_end);
-            let span = Span::new(cs, ce);
-            let chunk_text = &full_text[cs..ce];
+        if current_size > 0 && current_size + (line_end - line_start) > target {
+            let cs = floor_char_boundary(markdown, current_start);
+            let ce = floor_char_boundary(markdown, current_end);
+            if cs < ce {
+                let chunk_text = &markdown[cs..ce];
+                let id = chunk_id(document_id, chunk_text, cs, ce);
+                chunks.push(ChunkOutput {
+                    id,
+                    text: chunk_text.to_string(),
+                    span: Span::new(cs, ce),
+                    heading_path: vec![],
+                });
+            }
+            current_start = line_start;
+        }
+
+        if current_size == 0 {
+            current_start = line_start;
+        }
+        current_end = line_end;
+    }
+
+    // Flush remaining content.
+    if current_end > current_start {
+        let cs = floor_char_boundary(markdown, current_start);
+        let ce = floor_char_boundary(markdown, current_end);
+        if cs < ce {
+            let chunk_text = &markdown[cs..ce];
             let id = chunk_id(document_id, chunk_text, cs, ce);
             chunks.push(ChunkOutput {
                 id,
                 text: chunk_text.to_string(),
-                span,
-                heading_path: current_heading.clone(),
+                span: Span::new(cs, ce),
+                heading_path: vec![],
             });
-            current_start = block_start;
-            current_heading = block.heading_path.clone();
         }
-
-        current_end = block_end;
-        if current_start > block_start {
-            current_start = block_start;
-        }
-    }
-
-    // Flush remaining.
-    if current_end > current_start {
-        // Align to char boundaries (A1 fix).
-        let cs = floor_char_boundary(full_text, current_start);
-        let ce = floor_char_boundary(full_text, current_end);
-        let span = Span::new(cs, ce);
-        let chunk_text = &full_text[cs..ce];
-        let id = chunk_id(document_id, chunk_text, cs, ce);
-        chunks.push(ChunkOutput {
-            id,
-            text: chunk_text.to_string(),
-            span,
-            heading_path: current_heading,
-        });
     }
 
     Ok(chunks)
 }
 
+/// Iterate over lines in `s`, yielding `(byte_offset_of_line_start, line_slice)`.
+///
+/// `split_inclusive('\n')` keeps the newline at the end of each slice, so
+/// `line_start + line.len()` == start of the next line.
+fn line_offsets(s: &str) -> impl Iterator<Item = (usize, &str)> {
+    let mut offset = 0;
+    s.split_inclusive('\n').map(move |line| {
+        let start = offset;
+        offset += line.len();
+        (start, line)
+    })
+}
+
 // ---------------------------------------------------------------------------
-// Tests (TDD: failing first)
+// Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ids::document_id;
-    use crate::types::{Block, BlockKind, Span};
 
     /// Word-count sizer for tests — no model download required.
     struct WordSizer;
     impl ChunkSizer for WordSizer {
         fn size(&self, t: &str) -> usize {
             t.split_whitespace().count()
-        }
-    }
-
-    fn make_block(ordinal: usize, kind: BlockKind, text: &str, start: usize) -> Block {
-        Block {
-            document_id: String::new(),
-            ordinal,
-            kind,
-            text: text.to_string(),
-            span: Span::new(start, start + text.len()),
-            heading_path: vec![],
-        }
-    }
-
-    fn make_heading_block(ordinal: usize, text: &str, start: usize, path: Vec<String>) -> Block {
-        Block {
-            document_id: String::new(),
-            ordinal,
-            kind: BlockKind::Heading,
-            text: text.to_string(),
-            span: Span::new(start, start + text.len()),
-            heading_path: path,
-        }
-    }
-
-    fn make_para_block(ordinal: usize, text: &str, start: usize, path: Vec<String>) -> Block {
-        Block {
-            document_id: String::new(),
-            ordinal,
-            kind: BlockKind::Paragraph,
-            text: text.to_string(),
-            span: Span::new(start, start + text.len()),
-            heading_path: path,
         }
     }
 
@@ -492,18 +423,17 @@ mod tests {
     fn prose_chunk_empty_document_returns_empty() {
         let doc_id = document_id("file:///test.md", "abc123");
         let cfg = ChunkerConfig::prose();
-        let result = chunk_document(&doc_id, "", &[], &cfg, &CharSizer).unwrap();
+        let result = chunk_document(&doc_id, "", &cfg, &CharSizer).unwrap();
         assert!(result.is_empty(), "empty doc should produce no chunks");
     }
 
     #[test]
-    fn prose_chunk_single_block() {
+    fn prose_chunk_single_paragraph() {
         let full_text = "Hello, this is a paragraph.";
-        let blocks = vec![make_block(0, BlockKind::Paragraph, full_text, 0)];
         let doc_id = document_id("file:///test.md", "abc");
         let cfg = ChunkerConfig::prose();
 
-        let chunks = chunk_document(&doc_id, full_text, &blocks, &cfg, &CharSizer).unwrap();
+        let chunks = chunk_document(&doc_id, full_text, &cfg, &CharSizer).unwrap();
         assert!(!chunks.is_empty(), "should produce at least one chunk");
         assert!(
             chunks.iter().any(|c| c.text.contains("Hello")),
@@ -512,21 +442,12 @@ mod tests {
     }
 
     #[test]
-    fn prose_chunk_span_references_full_text() {
+    fn prose_chunk_span_references_markdown() {
         let full_text = "# Introduction\n\nThis is the intro paragraph.";
-        let blocks = vec![
-            make_heading_block(0, "Introduction", 0, vec!["Introduction".to_string()]),
-            make_para_block(
-                1,
-                "This is the intro paragraph.",
-                16,
-                vec!["Introduction".to_string()],
-            ),
-        ];
         let doc_id = document_id("file:///test.md", "abc");
         let cfg = ChunkerConfig::prose();
 
-        let chunks = chunk_document(&doc_id, full_text, &blocks, &cfg, &CharSizer).unwrap();
+        let chunks = chunk_document(&doc_id, full_text, &cfg, &CharSizer).unwrap();
         assert!(!chunks.is_empty());
         for chunk in &chunks {
             assert!(
@@ -543,18 +464,9 @@ mod tests {
     fn prose_spans_round_trip() {
         let full_text =
             "# Heading One\n\nParagraph one with some words.\n\n## Heading Two\n\nParagraph two here.";
-        let blocks = vec![
-            make_heading_block(0, "Heading One", 0, vec!["Heading One".to_string()]),
-            make_para_block(
-                1,
-                "Paragraph one with some words.",
-                15,
-                vec!["Heading One".to_string()],
-            ),
-        ];
         let doc_id = document_id("file:///rt.md", "abc");
         let cfg = ChunkerConfig::prose();
-        let chunks = chunk_document(&doc_id, full_text, &blocks, &cfg, &WordSizer).unwrap();
+        let chunks = chunk_document(&doc_id, full_text, &cfg, &WordSizer).unwrap();
         assert!(!chunks.is_empty());
         for c in &chunks {
             assert_eq!(
@@ -567,21 +479,18 @@ mod tests {
 
     #[test]
     fn prose_respects_token_target_with_word_sizer() {
-        // Build a long multi-paragraph markdown doc.
-        let para = "word ".repeat(40); // 40 "words" per paragraph
+        let para = "word ".repeat(40);
         let mut full_text = String::new();
         for i in 0..10 {
             full_text.push_str(&format!("## Section {i}\n\n{para}\n\n"));
         }
-        let blocks = vec![make_para_block(0, &full_text, 0, vec![])];
         let doc_id = document_id("file:///long.md", "abc");
-        // Generous target so the assertion is robust.
         let cfg = ChunkerConfig {
             preset: "prose".to_string(),
             target_tokens: Some(60),
             overlap_tokens: Some(8),
         };
-        let chunks = chunk_document(&doc_id, &full_text, &blocks, &cfg, &WordSizer).unwrap();
+        let chunks = chunk_document(&doc_id, &full_text, &cfg, &WordSizer).unwrap();
         assert!(
             chunks.len() >= 2,
             "long doc should produce multiple chunks, got {}",
@@ -603,14 +512,13 @@ mod tests {
         for i in 0..6 {
             full_text.push_str(&format!("## Section {i}\n\n{para}\n\n"));
         }
-        let blocks = vec![make_para_block(0, &full_text, 0, vec![])];
         let doc_id = document_id("file:///order.md", "abc");
         let cfg = ChunkerConfig {
             preset: "prose".to_string(),
             target_tokens: Some(60),
             overlap_tokens: Some(0),
         };
-        let chunks = chunk_document(&doc_id, &full_text, &blocks, &cfg, &WordSizer).unwrap();
+        let chunks = chunk_document(&doc_id, &full_text, &cfg, &WordSizer).unwrap();
         for w in chunks.windows(2) {
             assert!(
                 w[0].span.start <= w[1].span.start,
@@ -622,10 +530,9 @@ mod tests {
     #[test]
     fn prose_char_sizer_fallback_produces_chunks() {
         let full_text = "# Title\n\nSome prose content here for the char sizer fallback path.";
-        let blocks = vec![make_para_block(0, full_text, 0, vec![])];
         let doc_id = document_id("file:///char.md", "abc");
         let cfg = ChunkerConfig::prose();
-        let chunks = chunk_document(&doc_id, full_text, &blocks, &cfg, &CharSizer).unwrap();
+        let chunks = chunk_document(&doc_id, full_text, &cfg, &CharSizer).unwrap();
         assert!(
             !chunks.is_empty(),
             "char sizer fallback should produce chunks"
@@ -639,14 +546,13 @@ mod tests {
         for i in 0..8 {
             full_text.push_str(&format!("## Para {i}\n\n{para}\n\n"));
         }
-        let blocks = vec![make_para_block(0, &full_text, 0, vec![])];
         let doc_id = document_id("file:///large.md", "hash");
         let cfg = ChunkerConfig {
             preset: "prose".to_string(),
             target_tokens: Some(80),
             overlap_tokens: Some(0),
         };
-        let chunks = chunk_document(&doc_id, &full_text, &blocks, &cfg, &WordSizer).unwrap();
+        let chunks = chunk_document(&doc_id, &full_text, &cfg, &WordSizer).unwrap();
         assert!(
             chunks.len() >= 2,
             "large document should produce multiple chunks, got {}",
@@ -657,12 +563,11 @@ mod tests {
     #[test]
     fn prose_chunk_ids_are_content_addressed() {
         let full_text = "Hello world this is content.";
-        let blocks = vec![make_block(0, BlockKind::Paragraph, full_text, 0)];
         let doc_id = document_id("file:///test.md", "abc");
         let cfg = ChunkerConfig::prose();
 
-        let chunks1 = chunk_document(&doc_id, full_text, &blocks, &cfg, &CharSizer).unwrap();
-        let chunks2 = chunk_document(&doc_id, full_text, &blocks, &cfg, &CharSizer).unwrap();
+        let chunks1 = chunk_document(&doc_id, full_text, &cfg, &CharSizer).unwrap();
+        let chunks2 = chunk_document(&doc_id, full_text, &cfg, &CharSizer).unwrap();
 
         assert_eq!(chunks1.len(), chunks2.len());
         for (c1, c2) in chunks1.iter().zip(chunks2.iter()) {
@@ -671,14 +576,10 @@ mod tests {
     }
 
     #[test]
-    fn prose_chunk_heading_path_inherited() {
+    fn prose_chunk_heading_path_inherited_from_markdown() {
+        // The splitter now sees real Markdown — heading_path is derived from the
+        // Markdown heading structure, not from a Block sidecar.
         let full_text = "# API\n\nAPI documentation.\n\n# Auth\n\nAuth documentation.";
-        let blocks = vec![
-            make_heading_block(0, "API", 0, vec!["API".to_string()]),
-            make_para_block(1, "API documentation.", 7, vec!["API".to_string()]),
-            make_heading_block(2, "Auth", 27, vec!["Auth".to_string()]),
-            make_para_block(3, "Auth documentation.", 34, vec!["Auth".to_string()]),
-        ];
         let doc_id = document_id("file:///api.md", "abc");
         let cfg = ChunkerConfig {
             preset: "prose".to_string(),
@@ -686,7 +587,7 @@ mod tests {
             overlap_tokens: Some(0),
         };
 
-        let chunks = chunk_document(&doc_id, full_text, &blocks, &cfg, &WordSizer).unwrap();
+        let chunks = chunk_document(&doc_id, full_text, &cfg, &WordSizer).unwrap();
         assert!(!chunks.is_empty());
         let with_path: Vec<_> = chunks
             .iter()
@@ -701,7 +602,6 @@ mod tests {
     #[test]
     fn prose_chunk_messages_preset_errors() {
         let full_text = "Hello.";
-        let blocks = vec![make_block(0, BlockKind::Paragraph, full_text, 0)];
         let doc_id = document_id("file:///test.md", "abc");
         let cfg = ChunkerConfig {
             preset: "messages".to_string(),
@@ -709,7 +609,7 @@ mod tests {
             overlap_tokens: None,
         };
 
-        let result = chunk_document(&doc_id, full_text, &blocks, &cfg, &CharSizer);
+        let result = chunk_document(&doc_id, full_text, &cfg, &CharSizer);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code(), "invalid_request");
     }
@@ -718,8 +618,7 @@ mod tests {
     fn prose_multibyte_utf8_no_panic() {
         let text = "こんにちは world — это тест";
         let doc_id = "doc-multibyte";
-        let blocks = vec![make_block(0, BlockKind::Paragraph, text, 0)];
-        let result = chunk_document(doc_id, text, &blocks, &ChunkerConfig::prose(), &CharSizer);
+        let result = chunk_document(doc_id, text, &ChunkerConfig::prose(), &CharSizer);
         assert!(
             result.is_ok(),
             "chunking multi-byte text should not panic: {:?}",
@@ -729,28 +628,22 @@ mod tests {
 
     #[test]
     fn prose_overlap_skipped_when_at_or_above_cap_start() {
-        // When overlap >= cap_start (target * 3/4), the guard disables overlap
-        // rather than passing an invalid value to text-splitter. The splitter must
-        // still produce valid, ordered chunks.
         let para = "word ".repeat(50);
         let mut full_text = String::new();
         for i in 0..4 {
             full_text.push_str(&format!("## Section {i}\n\n{para}\n\n"));
         }
-        let blocks = vec![make_para_block(0, &full_text, 0, vec![])];
         let doc_id = document_id("file:///overlap_guard.md", "abc");
-        // overlap (60) == cap_start (target*3/4 = 60 when target=80): guard blocks it.
         let cfg = ChunkerConfig {
             preset: "prose".to_string(),
             target_tokens: Some(80),
-            overlap_tokens: Some(60), // == cap_start → guard prevents passing to library
+            overlap_tokens: Some(60),
         };
-        let chunks = chunk_document(&doc_id, &full_text, &blocks, &cfg, &WordSizer).unwrap();
+        let chunks = chunk_document(&doc_id, &full_text, &cfg, &WordSizer).unwrap();
         assert!(
             !chunks.is_empty(),
             "should produce chunks even with skipped overlap"
         );
-        // Chunks must be in document order.
         for w in chunks.windows(2) {
             assert!(
                 w[0].span.start <= w[1].span.start,
@@ -761,22 +654,15 @@ mod tests {
 
     #[test]
     fn prose_oversized_single_atomic_unit_no_panic() {
-        // A single "word" (no whitespace) longer than the target must be emitted as
-        // an over-max chunk without panicking, and its span must round-trip.
-        let long_word = "a".repeat(2000); // 2000 chars, way above default char target
+        let long_word = "a".repeat(2000);
         let full_text = format!("# Title\n\n{long_word}");
-        let blocks = vec![
-            make_heading_block(0, "Title", 0, vec!["Title".to_string()]),
-            make_para_block(1, &long_word, 9, vec!["Title".to_string()]),
-        ];
         let doc_id = document_id("file:///oversized.md", "abc");
-        // Small target ensures the long word exceeds it.
         let cfg = ChunkerConfig {
             preset: "prose".to_string(),
             target_tokens: Some(20),
             overlap_tokens: Some(0),
         };
-        let result = chunk_document(&doc_id, &full_text, &blocks, &cfg, &CharSizer);
+        let result = chunk_document(&doc_id, &full_text, &cfg, &CharSizer);
         assert!(
             result.is_ok(),
             "oversized atomic unit should not panic: {:?}",
@@ -784,7 +670,6 @@ mod tests {
         );
         let chunks = result.unwrap();
         assert!(!chunks.is_empty());
-        // Span round-trip.
         for c in &chunks {
             assert_eq!(
                 &full_text[c.span.start..c.span.end],
@@ -794,18 +679,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn prose_splitter_sees_real_markdown_structure() {
+        // Verify the splitter actually receives real Markdown (the `#` heading marker
+        // must be present in chunk text so MarkdownSplitter can split on structure).
+        let md =
+            "# Section One\n\nContent of section one.\n\n# Section Two\n\nContent of section two.";
+        let doc_id = document_id("file:///structure.md", "abc");
+        let cfg = ChunkerConfig {
+            preset: "prose".to_string(),
+            target_tokens: Some(8),
+            overlap_tokens: Some(0),
+        };
+        let chunks = chunk_document(&doc_id, md, &cfg, &WordSizer).unwrap();
+        // At least one chunk should contain the `#` character (real Markdown, not stripped).
+        assert!(
+            chunks.iter().any(|c| c.text.contains('#')),
+            "at least one chunk should contain the # heading marker; got: {:?}",
+            chunks.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+    }
+
     // ---------------------------------------------------------------------------
-    // Code chunker tests
+    // Code chunker tests (interim line packer)
     // ---------------------------------------------------------------------------
+
+    #[test]
+    fn code_chunk_empty_returns_empty() {
+        let doc_id = document_id("file:///lib.rs", "abc");
+        let cfg = ChunkerConfig::code();
+        let chunks = chunk_document(&doc_id, "", &cfg, &CharSizer).unwrap();
+        assert!(chunks.is_empty());
+    }
 
     #[test]
     fn code_chunk_single_block() {
         let full_text = "fn hello() {\n    println!(\"hi\");\n}";
-        let blocks = vec![make_block(0, BlockKind::Code, full_text, 0)];
         let doc_id = document_id("file:///lib.rs", "abc");
         let cfg = ChunkerConfig::code();
 
-        let chunks = chunk_document(&doc_id, full_text, &blocks, &cfg, &CharSizer).unwrap();
+        let chunks = chunk_document(&doc_id, full_text, &cfg, &CharSizer).unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].text, full_text);
     }
@@ -814,25 +727,10 @@ mod tests {
     fn code_chunk_large_splits() {
         let line = "let x = some_function_with_long_name(arg1, arg2, arg3);\n";
         let full_text = line.repeat(100); // ~5600 chars
-        let blocks: Vec<Block> = (0..10)
-            .map(|i| {
-                let start = i * (full_text.len() / 10);
-                let end = ((i + 1) * (full_text.len() / 10)).min(full_text.len());
-                Block {
-                    document_id: String::new(),
-                    ordinal: i,
-                    kind: BlockKind::Code,
-                    text: full_text[start..end].to_string(),
-                    span: Span::new(start, end),
-                    heading_path: vec![],
-                }
-            })
-            .collect();
-
         let doc_id = document_id("file:///lib.rs", "hash");
         let cfg = ChunkerConfig::code();
 
-        let chunks = chunk_document(&doc_id, &full_text, &blocks, &cfg, &CharSizer).unwrap();
+        let chunks = chunk_document(&doc_id, &full_text, &cfg, &CharSizer).unwrap();
         assert!(
             chunks.len() >= 2,
             "large code file should produce multiple chunks"
@@ -840,35 +738,27 @@ mod tests {
     }
 
     #[test]
+    fn code_chunk_spans_round_trip() {
+        let line = "let x = 1;\n";
+        let full_text = line.repeat(200);
+        let doc_id = document_id("file:///lib.rs", "hash");
+        let cfg = ChunkerConfig::code();
+        let chunks = chunk_document(&doc_id, &full_text, &cfg, &CharSizer).unwrap();
+        for c in &chunks {
+            assert_eq!(
+                &full_text[c.span.start..c.span.end],
+                c.text,
+                "code chunk span must round-trip"
+            );
+        }
+    }
+
+    #[test]
     fn chunk_document_multibyte_code_preset_does_not_panic() {
         let unit = "日本語テキスト: これはテストです。 ";
-        let text = unit.repeat(200); // large enough to trigger splits
+        let text = unit.repeat(200);
         let doc_id = "doc-multibyte-code";
-        let block_size_approx = text.len() / 4;
-        let mut blocks = Vec::new();
-        let mut prev_end = 0usize;
-        for i in 0..4 {
-            let raw_end = if i < 3 {
-                (i + 1) * block_size_approx
-            } else {
-                text.len()
-            };
-            let start = floor_char_boundary(text.as_str(), prev_end);
-            let end = floor_char_boundary(text.as_str(), raw_end.min(text.len()));
-            if start >= end {
-                continue;
-            }
-            blocks.push(Block {
-                document_id: String::new(),
-                ordinal: i,
-                kind: BlockKind::Code,
-                text: text[start..end].to_string(),
-                span: Span::new(start, end),
-                heading_path: vec![],
-            });
-            prev_end = end;
-        }
-        let result = chunk_document(doc_id, &text, &blocks, &ChunkerConfig::code(), &CharSizer);
+        let result = chunk_document(doc_id, &text, &ChunkerConfig::code(), &CharSizer);
         assert!(
             result.is_ok(),
             "code chunking multi-byte text should not panic: {:?}",

@@ -23,8 +23,8 @@ use crate::error::Error;
 use crate::ids::{content_hash, document_id, new_ulid};
 use crate::store::{ChunkRecord, RetrievalStore};
 use crate::types::{
-    Block, Chunk, IndexJob, IndexJobScope, IndexJobState, IndexJobStats, Provenance, Source,
-    SourceKind, SourceRef, SourceSpec,
+    Chunk, IndexJob, IndexJobScope, IndexJobState, IndexJobStats, Provenance, Source, SourceKind,
+    SourceRef, SourceSpec,
 };
 
 // ---------------------------------------------------------------------------
@@ -469,7 +469,7 @@ pub async fn index_document(
     )?;
 
     // Compute content hash.
-    let hash = content_hash(&extraction.text);
+    let hash = content_hash(&extraction.markdown);
 
     // Content-addressed document ID.
     let doc_id = document_id(&input.uri, &hash);
@@ -486,12 +486,6 @@ pub async fn index_document(
         }
         // Content or policy changed — fall through to re-index.
         // Old chunks are deleted *after* embedding succeeds (A6).
-    }
-
-    // Set document_id on blocks.
-    let mut blocks: Vec<Block> = extraction.blocks.clone();
-    for block in &mut blocks {
-        block.document_id = doc_id.clone();
     }
 
     // Chunk the document.
@@ -513,13 +507,7 @@ pub async fn index_document(
     let chunk_outputs = catch_panic(
         "chunk",
         std::panic::AssertUnwindSafe(|| {
-            chunk_document(
-                &doc_id,
-                &extraction.text,
-                &blocks,
-                &chunker_cfg,
-                sizer.as_ref(),
-            )
+            chunk_document(&doc_id, &extraction.markdown, &chunker_cfg, sizer.as_ref())
         }),
     )?;
 
@@ -547,7 +535,7 @@ pub async fn index_document(
     // This must happen BEFORE deleting old chunks (A6): if embedding fails,
     // the store is left untouched.
     let doc_chunks = DocumentChunks {
-        document_context: extraction.text.clone(),
+        document_context: extraction.markdown.clone(),
         chunks: chunk_outputs.iter().map(|c| c.text.clone()).collect(),
     };
 
@@ -660,10 +648,8 @@ pub trait DocumentExtractor: Send + Sync {
 /// The output of a document extraction, used within the ingestion pipeline.
 #[derive(Debug, Clone)]
 pub struct ExtractionResult {
-    /// Normalized document text.
-    pub text: String,
-    /// Structural blocks.
-    pub blocks: Vec<Block>,
+    /// Normalized Markdown string. Chunk spans index into this.
+    pub markdown: String,
     /// Optional document title.
     pub title: Option<String>,
     /// Document metadata extracted from the document.
@@ -1222,7 +1208,7 @@ mod tests {
     use super::*;
     use crate::embedder::FakeEmbedder;
     use crate::store::FakeStore;
-    use crate::types::{BlockKind, SourceKind, SourceSpec};
+    use crate::types::{SourceKind, SourceSpec};
     use crate::Span;
 
     // ---------------------------------------------------------------------------
@@ -1233,7 +1219,7 @@ mod tests {
 
     impl DocumentExtractor for FakeExtractor {
         fn extract(&self, bytes: &[u8], filename: Option<&str>) -> Result<ExtractionResult, Error> {
-            let text = std::str::from_utf8(bytes)
+            let markdown = std::str::from_utf8(bytes)
                 .map_err(|_| Error::UnsupportedFormat {
                     format: "binary".to_string(),
                 })?
@@ -1246,22 +1232,8 @@ mod tests {
                 });
             }
 
-            let blocks = if text.is_empty() {
-                vec![]
-            } else {
-                vec![Block {
-                    document_id: String::new(),
-                    ordinal: 0,
-                    kind: BlockKind::Paragraph,
-                    text: text.clone(),
-                    span: Span::new(0, text.len()),
-                    heading_path: vec![],
-                }]
-            };
-
             Ok(ExtractionResult {
-                text,
-                blocks,
+                markdown,
                 title: None,
                 metadata: crate::parser::DocumentMetadata::default(),
             })

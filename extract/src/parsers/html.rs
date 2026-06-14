@@ -40,18 +40,17 @@ impl Parser for HtmlParser {
             Err(_) => return Ok(None),
         };
 
-        let out = crate::html::extract_html(text)?;
+        let (markdown, title) = crate::html::extract_html(text)?;
 
         let dc = DocumentMetadata {
-            title: out.title.clone(),
+            title: title.clone(),
             format: probe.sniffed_mime.map(|s| s.to_string()),
             ..DocumentMetadata::default()
         };
 
         Ok(Some(ParsedDocument {
-            text: out.text,
-            blocks: out.blocks,
-            title: out.title,
+            markdown,
+            title,
             metadata: dc,
         }))
     }
@@ -82,7 +81,7 @@ mod tests {
             None,
         );
         let doc = HtmlParser.parse(&probe).unwrap().unwrap();
-        assert!(doc.text.contains("Hello"));
+        assert!(doc.markdown.contains("Hello"));
     }
 
     #[test]
@@ -155,7 +154,6 @@ mod tests {
 
     #[test]
     fn declines_binary_non_utf8_by_heuristic() {
-        // Bytes that start with '<' but are not valid UTF-8 after the first byte.
         let binary = b"<\xFF\xFE not utf8";
         let probe = Probe::new(binary, None, None);
         assert!(HtmlParser.parse(&probe).unwrap().is_none());
