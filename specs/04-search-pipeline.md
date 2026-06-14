@@ -92,11 +92,14 @@ default and the 0.6b model the opt-in quality preset. Either outcome is config, 
 
 ### Policy versioning
 
-`policy_version = hash(canonical serialization of the store's effective {chunking, embedding})`.
+`policy_version = hash(canonical serialization of the store's effective {chunking, embedding, parsers})`.
 Stored on every chunk. On store open / config change, if the effective policy hash differs from
 the indexed one, the store is marked stale and a reindex job is created (daemon: automatic;
-embedded: on next `localdb index`, with a warning from `status`). Chunker and embedder change
-**together** — there is no partial invalidation ([03-config.md](03-config.md) §2).
+embedded: on next `localdb index`, with a warning from `status`). Chunker, embedder, and parser
+list change **together** — there is no partial invalidation ([03-config.md](03-config.md) §2).
+The `parsers` list is hashed **order-sensitively** (unlike `chunking`/`embedding`, which use
+order-independent key serialization), so reordering parsers alone marks the store stale and
+schedules a reindex.
 
 ## 5. Retrieval
 

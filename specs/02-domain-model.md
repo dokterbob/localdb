@@ -22,7 +22,7 @@ A named knowledge base. Unit of sharing, ACLs, indexing policy, and federation.
 | `name` | Human-readable, unique per instance. |
 | `visibility` | `private` \| `shared`. MVP: only `private` functional; field exists from day one ([01-architecture.md](01-architecture.md) §5). |
 | `backend` | Backend kind + connection info; default `lancedb`. |
-| `indexing` | Indexing policy: `{chunking, embedding}` as one unit ([03-config.md](03-config.md) §2). |
+| `indexing` | Indexing policy: `{chunking, embedding, parsers}` as one unit ([03-config.md](03-config.md) §2). |
 | `acl` | Reserved; empty in MVP. |
 
 ### Source
@@ -140,3 +140,97 @@ prose-only text, so agents can cite mechanically.
 
 The `span` refers to the **normalized extracted text**, not raw bytes of the original file;
 original-file line mapping is a roadmap item ([06-roadmap.md](06-roadmap.md) §5).
+
+## 7. Extraction & parsing
+
+### Parser chain (chain of responsibility)
+
+The `Parser` trait (`core/src/parser.rs`) is the abstraction for format-specific text
+extraction. Each `Parser` is `Send + Sync` and runs synchronously (CPU-bound); callers run it
+under `spawn_blocking`. Two methods:
+
+| Method | Signature | Notes |
+|---|---|---|
+| `id` | `(&self) -> &'static str` | Stable string used in the `parsers:` config list and diagnostics. |
+| `parse` | `(&self, &Probe) -> Result<Option<ParsedDocument>, Error>` | See contract below. |
+
+**Contract — three outcomes:**
+
+- `Ok(None)` — decline; this parser does not handle the input. Control passes to the next
+  parser in the chain.
+- `Ok(Some(doc))` — handled successfully. First match wins; remaining parsers are not tried.
+- `Err(e)` — the format was recognized but parsing failed (e.g. a scanned/corrupt PDF).
+  **Short-circuits the chain** — remaining parsers are NOT tried, because the failure is
+  definitive, not a format mismatch.
+
+`ChainParser` implements this same `Parser` trait (Composite pattern), holding an ordered
+`Vec<Box<dyn Parser>>`. It is itself a `Parser` and can be nested. `build_chain(ids)` in
+`extract/src/registry.rs` maps the config `parsers:` strings to concrete `Parser` instances.
+Parser order and the four valid IDs are configured in [03-config.md](03-config.md) §2.
+
+### Probe
+
+`Probe` is the fully-buffered input presented to each parser. The streaming or HTTPS read
+happens once at the ingestion boundary; parsers never seek or re-fetch.
+
+| Field / method | Notes |
+|---|---|
+| `bytes` | Full document bytes. |
+| `path_hint: Option<&str>` | Original filename or URL path — used for file-extension hints. Advisory; may be absent. |
+| `sniffed_mime: Option<&str>` | MIME type inferred before parsing. Advisory; may be wrong or `None`. Real format decisions happen inside `parse`, not here. |
+| `header()` | Up to `PROBE_HEADER_LEN` (8 192) leading bytes for cheap magic-byte sniffing without reading the full document. |
+
+### ParsedDocument
+
+The successful output of a `parse` call.
+
+| Field | Notes |
+|---|---|
+| `text` | Normalized document text. All block spans index into this string. |
+| `blocks` | Structural `Block`s (§2) in document order. |
+| `title` | Title from extraction (typed fast-path; also available via `metadata.title`). |
+| `metadata` | `DocumentMetadata` — Dublin Core elements (see below). |
+
+### DocumentMetadata
+
+Dublin Core Metadata Element Set 1.1 (DCMES), all 15 elements. Repeatable elements
+(multi-valued) use `Vec<String>`; singleton elements use `Option<String>`.
+
+| Element | Type | Notes |
+|---|---|---|
+| `title` | `Option<String>` | Title of the resource. |
+| `creator` | `Vec<String>` | Repeatable: authors, creators. |
+| `subject` | `Vec<String>` | Repeatable: topics, keywords. |
+| `description` | `Option<String>` | Summary or abstract. |
+| `publisher` | `Option<String>` | Entity responsible for making the resource available. |
+| `contributor` | `Vec<String>` | Repeatable: additional contributors. |
+| `date` | `Option<String>` | Date of creation or publication (ISO 8601 recommended). |
+| `type` | `Option<String>` | Nature or genre of the resource. |
+| `format` | `Option<String>` | File format or media type. |
+| `identifier` | `Option<String>` | Unambiguous reference (URL, DOI, ISBN, …). |
+| `source` | `Option<String>` | Source resource this document is derived from. |
+| `language` | `Option<String>` | Language of the resource (BCP 47 recommended). |
+| `relation` | `Vec<String>` | Repeatable: related resources. |
+| `coverage` | `Option<String>` | Spatial or temporal extent. |
+| `rights` | `Option<String>` | Rights statement or license. |
+
+**Persistence:** `DocumentMetadata` is JSON-encoded into a single nullable `Utf8` column named
+`metadata` on each chunk record in LanceDB. Threading path:
+`Parser` → `ParsedDocument.metadata` → `ExtractionResult.metadata` → `ChunkRecord.metadata` →
+LanceDB `metadata` column.
+
+**Defensive read:** tables created before this column was added (pre-migration) may have a
+missing column, a `NULL` value, or an unparseable payload. All three cases resolve to
+`DocumentMetadata::default()` (all fields empty/`None`).
+
+**Decision/Rationale:** a single structured column for all 15 DC elements keeps the schema
+stable as parsers populate more fields over time; JSON encoding avoids a 15-column explosion
+while remaining human-readable in the store. **Rejected:** one nullable column per DC element —
+schema churn every time a new element is populated; flat string bag — loses type information
+and makes the repeatable/singleton distinction invisible.
+
+**Cross-reference:** `Document.meta` (§2, `meta` row) accepts open key-value pairs; 15 `dc.*`
+keys are validated when present (`validate_dc_meta_key` in `core/src/types.rs`). These mirror
+the 15 DCMES elements in `DocumentMetadata` and are the untyped extension point for surfaces
+that need to set DC fields without going through a full `Parser`. The live ingestion path
+populates `DocumentMetadata` (typed) rather than `meta` (untyped).
