@@ -940,6 +940,7 @@ dependencies = [
  "embed",
  "extract",
  "fd-lock",
+ "fetch",
  "localdb-core",
  "mcp",
  "redb",
@@ -2356,6 +2357,18 @@ dependencies = [
  "cfg-if",
  "rustix 1.1.4",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "fetch"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "localdb-core",
+ "reqwest",
+ "tokio",
+ "tracing",
+ "wiremock",
 ]
 
 [[package]]

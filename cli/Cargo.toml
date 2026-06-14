@@ -11,6 +11,7 @@ localdb-core = { path = "../core" }
 store-lancedb = { path = "../store-lancedb" }
 extract = { path = "../extract" }
 embed = { path = "../embed", features = ["local-onnx"] }
+fetch = { path = "../fetch" }
 mcp = { path = "../mcp" }
 server = { path = "../server" }
 clap = { workspace = true }

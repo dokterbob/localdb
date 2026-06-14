@@ -2,6 +2,7 @@
 members = [
     "core",
     "extract",
+    "fetch",
     "store-lancedb",
     "embed",
     "server",
@@ -68,6 +69,7 @@ tempfile = "3"
 # Internal crates
 localdb-core = { path = "core" }
 extract = { path = "extract" }
+fetch = { path = "fetch" }
 store-lancedb = { path = "store-lancedb" }
 embed = { path = "embed" }
 server = { path = "server" }
