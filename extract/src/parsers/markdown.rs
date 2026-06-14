@@ -8,6 +8,8 @@ use localdb_core::Error;
 ///
 /// Recognized extensions: `.md`, `.markdown`, `.mdown`, `.mkd`, `.mkdn`.
 /// Declines all other inputs (no content heuristic — Markdown has no magic).
+/// Also declines non-UTF-8 bytes (binary / mis-encoded files) with `Ok(None)`
+/// so they fall through to `UnsupportedFormat`, not an error.
 pub struct MarkdownParser;
 
 impl Parser for MarkdownParser {
@@ -30,9 +32,10 @@ impl Parser for MarkdownParser {
             return Ok(None);
         }
 
-        let text = std::str::from_utf8(probe.bytes()).map_err(|e| Error::InvalidRequest {
-            message: format!("Markdown is not valid UTF-8: {e}"),
-        })?;
+        let text = match std::str::from_utf8(probe.bytes()) {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        };
 
         let out = crate::markdown::extract_markdown(text)?;
 
@@ -109,6 +112,13 @@ mod tests {
     fn extension_check_is_case_insensitive() {
         let probe = Probe::new(b"# Hello", Some("README.MD"), None);
         assert!(MarkdownParser.parse(&probe).unwrap().is_some());
+    }
+
+    #[test]
+    fn declines_binary_non_utf8() {
+        let binary = b"\xFF\xFE\x00\x01binary content";
+        let probe = Probe::new(binary, Some("file.md"), None);
+        assert!(MarkdownParser.parse(&probe).unwrap().is_none());
     }
 
     #[test]
