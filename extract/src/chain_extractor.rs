@@ -116,4 +116,26 @@ mod tests {
             "expected InvalidConfig, got: {err:?}"
         );
     }
+
+    #[test]
+    fn binary_md_yields_unsupported_format() {
+        let ex = ChainExtractor::with_defaults().unwrap();
+        let binary = b"\xFF\xFE\x00\x01binary content";
+        let err = ex.extract(binary, Some("file.md")).unwrap_err();
+        assert!(
+            matches!(err, Error::UnsupportedFormat { .. }),
+            "binary .md should yield UnsupportedFormat, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn binary_html_yields_unsupported_format() {
+        let ex = ChainExtractor::with_defaults().unwrap();
+        let binary = b"\xFF\xFE\x00\x01binary content";
+        let err = ex.extract(binary, Some("page.html")).unwrap_err();
+        assert!(
+            matches!(err, Error::UnsupportedFormat { .. }),
+            "binary .html should yield UnsupportedFormat, got: {err:?}"
+        );
+    }
 }
