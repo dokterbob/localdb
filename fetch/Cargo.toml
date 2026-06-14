@@ -1,0 +1,17 @@
+[package]
+name = "fetch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "HTTP URL fetcher implementation for localdb ingestion"
+
+[dependencies]
+localdb-core = { path = "../core" }
+async-trait = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+wiremock = "0.6"

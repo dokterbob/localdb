@@ -19,6 +19,7 @@
 
 use std::path::{Path, PathBuf};
 
+use fetch::HttpUrlFetcher;
 use localdb_core::{
     config::{
         loader::{load_config, ConfigLoader, LoadOptions},
@@ -1663,6 +1664,7 @@ async fn run_index_for_source_async(
 
     let mut doc_index = DocumentIndex::new();
     let mut chunks = 0u64;
+    let url_fetcher = HttpUrlFetcher::new();
 
     for rt_source in &sources_to_index {
         let source = runtime_source_to_core_source(rt_source, &rt_store.id);
@@ -1679,7 +1681,7 @@ async fn run_index_for_source_async(
             embedder.as_ref(),
             &cfg,
             &extractor,
-            None,
+            Some(&url_fetcher),
         )
         .await
         {
@@ -2086,6 +2088,7 @@ async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, dir: Option<
 
     let mut doc_index = DocumentIndex::new();
     let (mut indexed, mut skipped, mut chunks, mut errors) = (0u64, 0u64, 0u64, 0u64);
+    let url_fetcher = HttpUrlFetcher::new();
 
     for rt_source in &sources_to_index {
         let source = runtime_source_to_core_source(rt_source, &rt_store.id);
@@ -2111,7 +2114,7 @@ async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, dir: Option<
             embedder.as_ref(),
             &cfg,
             &extractor,
-            None,
+            Some(&url_fetcher),
         )
         .await
         {
