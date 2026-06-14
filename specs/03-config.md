@@ -33,12 +33,15 @@ defaults:                 # global indexing policy; stores inherit
       #   HF_TOKEN, ~2.4 GB); model: bge-small-en-v1.5 (384-dim, no creds).
       # Hosted alternative: provider: perplexity, model: pplx-embed-context-v1
       #   (requires providers: entry with kind: perplexity and api_key_env set).
+    parsers: [pdf, html, markdown, plaintext]  # tried in order, first match wins;
+                                               #   ids: pdf|html|markdown|plaintext; order is
+                                               #   load-bearing (affects policy_version, §2)
 
 stores:
   - name: notes
     visibility: private   # private | shared (shared non-functional in MVP)
     backend: lancedb
-    indexing: ~           # null = inherit defaults; or override {chunking, embedding}
+    indexing: ~           # null = inherit defaults; or override {chunking, embedding, parsers}
     sources:
       - kind: path
         root: ~/Documents/notes
@@ -58,9 +61,10 @@ providers:                # optional external endpoints, OpenAI-compatible
 
 ## 2. Indexing policy: one unit per store
 
-**Decision:** `indexing: {chunking, embedding}` is configured **as a single unit, per store**,
-with global defaults and per-source-kind presets (`prose`: split by headings; `messages`:
-thread/turn windows; `code`: structural). Defaults live in [04-search-pipeline.md](04-search-pipeline.md) §3.
+**Decision:** `indexing: {chunking, embedding, parsers}` is configured **as a single unit, per
+store**, with global defaults and per-source-kind presets (`prose`: split by headings;
+`messages`: thread/turn windows; `code`: structural). Defaults live in
+[04-search-pipeline.md](04-search-pipeline.md) §3.
 
 **Rationale:** under contextualized/late chunking the chunker and embedder are coupled — chunk
 boundaries are an input to the embedding pass. Changing either invalidates the other's output, so
@@ -68,6 +72,15 @@ they version together: any change to a store's effective `indexing` policy chang
 `policy_version` hash and **triggers a reindex of that store**
 ([04-search-pipeline.md](04-search-pipeline.md) §4). **Rejected:** independent global chunking
 and embedding knobs — allows silently incoherent combinations and unclear reindex semantics.
+
+`parsers` is an ordered list of parser IDs tried in sequence; the first parser to return a
+document wins (chain of responsibility). The four valid IDs are `pdf`, `html`, `markdown`, and
+`plaintext`; any unknown ID is a hard error at config load (consistent with §5 strict
+unknown-key rejection). Order is load-bearing — placing `plaintext` before `html` would cause
+`.html` files to be parsed as plain text — and **parser order is part of the `policy_version`
+hash** (unlike `chunking`/`embedding` keys, which are hashed order-independently; see
+[04-search-pipeline.md](04-search-pipeline.md) §4). Reordering the list therefore triggers a
+store reindex.
 
 ## 3. The two-writer problem: bootstrap config vs. runtime state
 
