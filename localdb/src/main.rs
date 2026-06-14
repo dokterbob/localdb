@@ -34,6 +34,10 @@ pub struct Cli {
     #[arg(long = "store", global = true, value_name = "NAME")]
     pub stores: Vec<String>,
 
+    /// Skip confirmation prompts for destructive operations.
+    #[arg(long, short = 'y', global = true)]
+    pub yes: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -144,6 +148,7 @@ fn main() {
         config: cli.config,
         json: cli.json,
         stores: cli.stores,
+        yes: cli.yes,
     };
 
     match &cli.command {
@@ -262,5 +267,6 @@ mod tests {
         assert!(arg_names.contains(&"config"), "missing --config flag");
         assert!(arg_names.contains(&"json"), "missing --json flag");
         assert!(arg_names.contains(&"stores"), "missing --store flag");
+        assert!(arg_names.contains(&"yes"), "missing --yes/-y flag");
     }
 }
