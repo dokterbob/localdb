@@ -11,6 +11,7 @@ pub mod error;
 pub mod ids;
 pub mod ingestion;
 pub mod parser;
+pub mod progress;
 pub mod search;
 pub mod store;
 pub mod types;
@@ -28,6 +29,7 @@ pub use ingestion::{
     IngestionConfig, IngestionResult, UrlFetcher,
 };
 pub use parser::{ChainParser, DocumentMetadata, ParsedDocument, Parser, Probe, PROBE_HEADER_LEN};
+pub use progress::{DocOutcome, ProgressEvent, ProgressSink};
 pub use search::{
     rerank_noop, rrf_fuse, rrf_score, shape_citation, FusedChunkEntry, QueryRequest, QueryResponse,
     SearchOrchestrator, StoreHandle,

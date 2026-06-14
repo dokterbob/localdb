@@ -17,6 +17,8 @@
 //! - 4 conflict/locked
 //! - 5 unavailable (daemon/provider/model)
 
+pub mod progress;
+
 use std::path::{Path, PathBuf};
 
 use fetch::HttpUrlFetcher;
@@ -1674,6 +1676,7 @@ async fn run_index_for_source_async(
             chunker,
             ..ingestion_cfg.clone()
         };
+        let sink = crate::progress::build_progress_sink(ctx.json);
         match run_ingestion_for_source(
             &source,
             &mut doc_index,
@@ -1682,17 +1685,12 @@ async fn run_index_for_source_async(
             &cfg,
             &extractor,
             Some(&url_fetcher),
+            sink,
         )
         .await
         {
             Ok(r) => {
                 chunks += r.chunks_written;
-                if !ctx.json {
-                    eprintln!(
-                        "  indexed {} docs, {} chunks",
-                        r.docs_indexed, r.chunks_written
-                    );
-                }
             }
             Err(e) => {
                 eprintln!(
@@ -2092,14 +2090,6 @@ async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, dir: Option<
 
     for rt_source in &sources_to_index {
         let source = runtime_source_to_core_source(rt_source, &rt_store.id);
-        if !ctx.json {
-            let loc = rt_source
-                .root
-                .as_deref()
-                .or(rt_source.url.as_deref())
-                .unwrap_or("?");
-            eprintln!("Indexing source {} ({})", rt_source.id, loc);
-        }
 
         let chunker = ChunkerConfig::from_preset(&source.source_kind_preset)
             .unwrap_or_else(|_| ChunkerConfig::prose());
@@ -2107,6 +2097,7 @@ async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, dir: Option<
             chunker,
             ..ingestion_cfg.clone()
         };
+        let sink = crate::progress::build_progress_sink(ctx.json);
         match run_ingestion_for_source(
             &source,
             &mut doc_index,
@@ -2115,6 +2106,7 @@ async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, dir: Option<
             &cfg,
             &extractor,
             Some(&url_fetcher),
+            sink,
         )
         .await
         {

@@ -787,6 +787,7 @@ struct PipelineCtx<'a> {
     embedder: &'a dyn Embedder,
     config: &'a IngestionConfig,
     extractor: &'a dyn DocumentExtractor,
+    progress: Option<crate::progress::ProgressSink>,
 }
 
 /// Run the ingestion pipeline for a single source.
@@ -797,6 +798,7 @@ struct PipelineCtx<'a> {
 /// # One-shot semantics
 /// This function runs synchronously in embedded mode. The daemon (T11) wraps
 /// it in a job queue and adds file watching.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_ingestion_for_source(
     source: &Source,
     doc_index: &mut DocumentIndex,
@@ -805,6 +807,7 @@ pub async fn run_ingestion_for_source(
     config: &IngestionConfig,
     extractor: &dyn DocumentExtractor,
     url_fetcher: Option<&dyn UrlFetcher>,
+    progress: Option<crate::progress::ProgressSink>,
 ) -> Result<IngestionResult, Error> {
     let mut result = IngestionResult::default();
     let mut ctx = PipelineCtx {
@@ -814,6 +817,7 @@ pub async fn run_ingestion_for_source(
         embedder,
         config,
         extractor,
+        progress,
     };
 
     match &source.spec {
@@ -837,6 +841,12 @@ pub async fn run_ingestion_for_source(
         }
     }
 
+    if let Some(sink) = &ctx.progress {
+        sink(crate::progress::ProgressEvent::SourceFinished {
+            result: result.clone(),
+        });
+    }
+
     Ok(result)
 }
 
@@ -848,19 +858,46 @@ async fn run_path_source(
     exclude: &[String],
     result: &mut IngestionResult,
 ) -> Result<(), Error> {
+    let location = root.to_string();
+    if let Some(sink) = &ctx.progress {
+        sink(crate::progress::ProgressEvent::SourceStarted {
+            source_id: ctx.source.id.clone(),
+            location: location.clone(),
+        });
+    }
+
     let files = enumerate_path_source(root, include, exclude)?;
+    let total = files.len();
     let seen_uris: std::collections::HashSet<String> =
         files.iter().map(|f| f.uri.clone()).collect();
 
+    if let Some(sink) = &ctx.progress {
+        sink(crate::progress::ProgressEvent::Discovered { total });
+    }
+
     // Process each file
-    for file in &files {
+    for (index, file) in files.iter().enumerate() {
         result.docs_seen += 1;
+
+        if let Some(sink) = &ctx.progress {
+            sink(crate::progress::ProgressEvent::DocumentStarted {
+                uri: file.uri.clone(),
+                index,
+                total,
+            });
+        }
 
         let bytes = match std::fs::read(&file.path) {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!("cannot read file '{}': {}", file.path.display(), e);
                 result.error_count += 1;
+                if let Some(sink) = &ctx.progress {
+                    sink(crate::progress::ProgressEvent::DocumentFinished {
+                        uri: file.uri.clone(),
+                        outcome: crate::progress::DocOutcome::Error,
+                    });
+                }
                 continue;
             }
         };
@@ -907,17 +944,43 @@ async fn run_path_source(
                 if output.was_indexed {
                     result.docs_indexed += 1;
                     result.chunks_written += output.chunks_written as u64;
+                    if let Some(sink) = &ctx.progress {
+                        sink(crate::progress::ProgressEvent::DocumentFinished {
+                            uri: file.uri.clone(),
+                            outcome: crate::progress::DocOutcome::Indexed {
+                                chunks: output.chunks_written,
+                            },
+                        });
+                    }
                 } else {
                     result.docs_skipped += 1;
+                    if let Some(sink) = &ctx.progress {
+                        sink(crate::progress::ProgressEvent::DocumentFinished {
+                            uri: file.uri.clone(),
+                            outcome: crate::progress::DocOutcome::Skipped,
+                        });
+                    }
                 }
                 ctx.doc_index.upsert(output.record);
             }
             Err(Error::UnsupportedFormat { .. }) => {
                 result.unsupported_format_count += 1;
+                if let Some(sink) = &ctx.progress {
+                    sink(crate::progress::ProgressEvent::DocumentFinished {
+                        uri: file.uri.clone(),
+                        outcome: crate::progress::DocOutcome::Unsupported,
+                    });
+                }
             }
             Err(e) => {
                 tracing::warn!("error indexing '{}': {}", file.uri, e);
                 result.error_count += 1;
+                if let Some(sink) = &ctx.progress {
+                    sink(crate::progress::ProgressEvent::DocumentFinished {
+                        uri: file.uri.clone(),
+                        outcome: crate::progress::DocOutcome::Error,
+                    });
+                }
             }
         }
     }
@@ -952,6 +1015,13 @@ async fn run_url_source(
     fetcher: &dyn UrlFetcher,
     result: &mut IngestionResult,
 ) -> Result<(), Error> {
+    if let Some(sink) = &ctx.progress {
+        sink(crate::progress::ProgressEvent::SourceStarted {
+            source_id: ctx.source.id.clone(),
+            location: url.to_string(),
+        });
+    }
+
     result.docs_seen += 1;
 
     // Build fetch metadata from existing record
@@ -969,7 +1039,7 @@ async fn run_url_source(
             let uri = url.to_string();
 
             let input = DocumentInput {
-                uri,
+                uri: uri.clone(),
                 bytes,
                 filename,
                 mime: content_type,
@@ -991,17 +1061,43 @@ async fn run_url_source(
                     if output.was_indexed {
                         result.docs_indexed += 1;
                         result.chunks_written += output.chunks_written as u64;
+                        if let Some(sink) = &ctx.progress {
+                            sink(crate::progress::ProgressEvent::DocumentFinished {
+                                uri,
+                                outcome: crate::progress::DocOutcome::Indexed {
+                                    chunks: output.chunks_written,
+                                },
+                            });
+                        }
                     } else {
                         result.docs_skipped += 1;
+                        if let Some(sink) = &ctx.progress {
+                            sink(crate::progress::ProgressEvent::DocumentFinished {
+                                uri,
+                                outcome: crate::progress::DocOutcome::Skipped,
+                            });
+                        }
                     }
                     ctx.doc_index.upsert(output.record);
                 }
                 Err(Error::UnsupportedFormat { .. }) => {
                     result.unsupported_format_count += 1;
+                    if let Some(sink) = &ctx.progress {
+                        sink(crate::progress::ProgressEvent::DocumentFinished {
+                            uri,
+                            outcome: crate::progress::DocOutcome::Unsupported,
+                        });
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("error indexing URL '{}': {}", url, e);
                     result.error_count += 1;
+                    if let Some(sink) = &ctx.progress {
+                        sink(crate::progress::ProgressEvent::DocumentFinished {
+                            uri,
+                            outcome: crate::progress::DocOutcome::Error,
+                        });
+                    }
                 }
             }
         }
@@ -1855,6 +1951,7 @@ mod tests {
             &config,
             &extractor,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1892,6 +1989,7 @@ mod tests {
             &config,
             &extractor,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1907,6 +2005,7 @@ mod tests {
             &embedder,
             &config,
             &extractor,
+            None,
             None,
         )
         .await
@@ -1943,6 +2042,7 @@ mod tests {
             &config,
             &extractor,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1968,6 +2068,7 @@ mod tests {
             &embedder,
             &config,
             &extractor,
+            None,
             None,
         )
         .await
@@ -2009,6 +2110,7 @@ mod tests {
             &config,
             &extractor,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2025,6 +2127,7 @@ mod tests {
             &embedder,
             &config,
             &extractor,
+            None,
             None,
         )
         .await
@@ -2059,6 +2162,7 @@ mod tests {
             &embedder,
             &config,
             &extractor,
+            None,
             None,
         )
         .await
@@ -2097,6 +2201,7 @@ mod tests {
             &config,
             &extractor,
             Some(&fetcher),
+            None,
         )
         .await
         .unwrap();
@@ -2126,6 +2231,7 @@ mod tests {
             &config,
             &extractor,
             Some(&fetcher),
+            None,
         )
         .await
         .unwrap();
@@ -2191,6 +2297,7 @@ mod tests {
             &config,
             &extractor,
             Some(&fetcher),
+            None,
         )
         .await
         .unwrap();
@@ -2279,6 +2386,7 @@ mod tests {
             &config_v1,
             &extractor,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2309,6 +2417,7 @@ mod tests {
             &embedder,
             &config_v2,
             &extractor,
+            None,
             None,
         )
         .await
@@ -2387,6 +2496,7 @@ mod tests {
             &config,
             &extractor,
             None, // no fetcher provided
+            None,
         )
         .await;
 
@@ -2749,5 +2859,208 @@ mod tests {
         // Default prose target is 512; scaled = 512 * 4 = 2048.
         assert_eq!(scaled.resolved_target_tokens(), 512 * 4);
         assert_eq!(scaled.resolved_overlap_tokens(), 64 * 4);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Progress event tests
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn progress_sink_receives_all_events_for_path_source() {
+        use crate::progress::{DocOutcome, ProgressEvent};
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), b"Alpha content for testing.").unwrap();
+        std::fs::write(dir.path().join("b.md"), b"Beta content for testing.").unwrap();
+        std::fs::write(dir.path().join("c.bin"), b"\x00\x01binary").unwrap(); // unsupported
+
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let extractor = FakeExtractor;
+        let store_id = "store-progress";
+        let source = make_path_source(store_id, dir.path().to_str().unwrap(), vec![]);
+        let config = make_ingestion_config(store_id);
+        let mut doc_index = DocumentIndex::new();
+
+        let events: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(vec![]));
+        let events_clone = Arc::clone(&events);
+        let sink: crate::progress::ProgressSink = Arc::new(move |e| {
+            events_clone.lock().unwrap().push(e);
+        });
+
+        run_ingestion_for_source(
+            &source,
+            &mut doc_index,
+            &store,
+            &embedder,
+            &config,
+            &extractor,
+            None,
+            Some(sink),
+        )
+        .await
+        .unwrap();
+
+        let captured = events.lock().unwrap();
+
+        // SourceStarted is first
+        assert!(
+            matches!(&captured[0], ProgressEvent::SourceStarted { .. }),
+            "first event must be SourceStarted"
+        );
+
+        // Discovered with total 3
+        let discovered = captured
+            .iter()
+            .find(|e| matches!(e, ProgressEvent::Discovered { .. }));
+        assert!(discovered.is_some(), "Discovered event must be emitted");
+        if let Some(ProgressEvent::Discovered { total }) = discovered {
+            assert_eq!(*total, 3, "Discovered total must be 3");
+        }
+
+        // 3 DocumentStarted events
+        let started_count = captured
+            .iter()
+            .filter(|e| matches!(e, ProgressEvent::DocumentStarted { .. }))
+            .count();
+        assert_eq!(started_count, 3, "must emit DocumentStarted for each file");
+
+        // 3 DocumentFinished events
+        let finished: Vec<_> = captured
+            .iter()
+            .filter_map(|e| {
+                if let ProgressEvent::DocumentFinished { outcome, .. } = e {
+                    Some(outcome)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            finished.len(),
+            3,
+            "must emit DocumentFinished for each file"
+        );
+
+        // At least 2 indexed, 1 unsupported
+        let indexed_count = finished
+            .iter()
+            .filter(|o| matches!(o, DocOutcome::Indexed { .. }))
+            .count();
+        let unsupported_count = finished
+            .iter()
+            .filter(|o| matches!(o, DocOutcome::Unsupported))
+            .count();
+        assert_eq!(indexed_count, 2, "2 supported files should be Indexed");
+        assert_eq!(unsupported_count, 1, "1 .bin file should be Unsupported");
+
+        // SourceFinished is last
+        assert!(
+            matches!(captured.last(), Some(ProgressEvent::SourceFinished { .. })),
+            "last event must be SourceFinished"
+        );
+    }
+
+    #[tokio::test]
+    async fn progress_sink_skip_on_rerun() {
+        use crate::progress::{DocOutcome, ProgressEvent};
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("doc.md"), b"Some content.").unwrap();
+
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let extractor = FakeExtractor;
+        let store_id = "store-rerun";
+        let source = make_path_source(store_id, dir.path().to_str().unwrap(), vec![]);
+        let config = make_ingestion_config(store_id);
+        let mut doc_index = DocumentIndex::new();
+
+        // First run — indexed
+        run_ingestion_for_source(
+            &source,
+            &mut doc_index,
+            &store,
+            &embedder,
+            &config,
+            &extractor,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Second run — should get Skipped outcome
+        let events: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(vec![]));
+        let events_clone = Arc::clone(&events);
+        let sink: crate::progress::ProgressSink = Arc::new(move |e| {
+            events_clone.lock().unwrap().push(e);
+        });
+
+        run_ingestion_for_source(
+            &source,
+            &mut doc_index,
+            &store,
+            &embedder,
+            &config,
+            &extractor,
+            None,
+            Some(sink),
+        )
+        .await
+        .unwrap();
+
+        let captured = events.lock().unwrap();
+        let skipped = captured
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    ProgressEvent::DocumentFinished {
+                        outcome: DocOutcome::Skipped,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            skipped, 1,
+            "unchanged file must emit Skipped outcome on rerun"
+        );
+    }
+
+    #[tokio::test]
+    async fn progress_none_leaves_counters_unchanged() {
+        // Sanity: no sink still returns correct IngestionResult.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("p.md"), b"Plain content.").unwrap();
+        std::fs::write(dir.path().join("q.md"), b"More content.").unwrap();
+
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let extractor = FakeExtractor;
+        let store_id = "store-no-progress";
+        let source = make_path_source(store_id, dir.path().to_str().unwrap(), vec![]);
+        let config = make_ingestion_config(store_id);
+        let mut doc_index = DocumentIndex::new();
+
+        let result = run_ingestion_for_source(
+            &source,
+            &mut doc_index,
+            &store,
+            &embedder,
+            &config,
+            &extractor,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.docs_indexed, 2);
+        assert_eq!(result.docs_seen, 2);
+        assert_eq!(result.docs_skipped, 0);
     }
 }

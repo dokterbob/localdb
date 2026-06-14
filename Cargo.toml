@@ -63,6 +63,9 @@ redb = "4"
 # Hashing for policy_version
 hex = "0.4"
 
+# Progress bars and spinners
+indicatif = "0.17"
+
 # Test utilities
 tempfile = "3"
 
