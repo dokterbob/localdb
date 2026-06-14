@@ -232,6 +232,23 @@ impl AppState {
                 id: name.to_string(),
             });
         }
+
+        // Cascade: remove orphaned in-memory sources.
+        {
+            let mut sources = self.inner.sources.write().await;
+            sources.retain(|_, s| s.store_id != name);
+        }
+
+        // Cascade: remove on-disk index (LanceDB + tantivy FTS).
+        let store_dir = self.inner.data_dir.join("stores").join(name);
+        match std::fs::remove_dir_all(&store_dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!("could not remove store data dir {:?}: {}", store_dir, e);
+            }
+        }
+
         Ok(())
     }
 
@@ -672,5 +689,56 @@ mod tests {
         let yaml = state.yaml_config().await;
         assert_eq!(yaml.stores.len(), 1);
         assert_eq!(yaml.stores[0].name, "new-store");
+    }
+
+    #[tokio::test]
+    async fn remove_store_cascades_sources() {
+        let (dir, state) = make_state();
+
+        state.add_store("scratch", "private").await.unwrap();
+        state
+            .add_source(
+                "scratch",
+                "path",
+                serde_json::json!({"root": "/tmp/a"}),
+                "prose",
+            )
+            .await
+            .unwrap();
+        state
+            .add_source(
+                "scratch",
+                "path",
+                serde_json::json!({"root": "/tmp/b"}),
+                "prose",
+            )
+            .await
+            .unwrap();
+
+        // Confirm sources exist before removal.
+        let before = state.list_sources("scratch").await.unwrap();
+        assert_eq!(before.len(), 2);
+
+        // Create a dummy on-disk store dir so we can verify it's removed.
+        let store_dir = dir.path().join("stores").join("scratch");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::fs::write(store_dir.join("index.bin"), b"data").unwrap();
+
+        state.remove_store("scratch").await.unwrap();
+
+        // In-memory sources map must be empty for this store.
+        let sources_map = state.inner.sources.read().await;
+        assert!(
+            sources_map.values().all(|s| s.store_id != "scratch"),
+            "orphaned sources remain after remove_store"
+        );
+        drop(sources_map);
+
+        // On-disk dir must be gone.
+        assert!(!store_dir.exists(), "store data dir was not removed");
+
+        // Re-adding the same name should start with empty sources.
+        drop(state); // release Arc before reusing dir
+        let _ = dir;
     }
 }

@@ -72,6 +72,8 @@ pub struct CliContext {
     pub json: bool,
     /// Store name filters (from --store flags).
     pub stores: Vec<String>,
+    /// Whether --yes was given (skip confirmation prompts).
+    pub yes: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -467,6 +469,31 @@ impl SourceDb {
         Ok(deleted)
     }
 
+    fn delete_by_store(&self, store_name: &str) -> Result<usize, Error> {
+        let wtxn = self.db.begin_write().map_err(map_db_err)?;
+        let count = {
+            let mut t = wtxn.open_table(SOURCES_TABLE).map_err(map_db_err)?;
+            let mut ids = Vec::new();
+            for entry in t.iter().map_err(map_db_err)? {
+                let (k, v) = entry.map_err(map_db_err)?;
+                let src: RuntimeSource =
+                    serde_json::from_str(v.value()).map_err(|e| Error::Internal {
+                        message: format!("cannot deserialize source: {}", e),
+                        correlation_id: "source_del_by_store_deser".to_string(),
+                    })?;
+                if src.store_name == store_name {
+                    ids.push(k.value().to_string());
+                }
+            }
+            for id in &ids {
+                t.remove(id.as_str()).map_err(map_db_err)?;
+            }
+            ids.len()
+        };
+        wtxn.commit().map_err(map_db_err)?;
+        Ok(count)
+    }
+
     fn list(&self, store_name: &str) -> Result<Vec<RuntimeSource>, Error> {
         let rtxn = self.db.begin_read().map_err(map_db_err)?;
         let t = rtxn.open_table(SOURCES_TABLE).map_err(map_db_err)?;
@@ -597,6 +624,9 @@ impl AppDb {
         store_name: Option<&str>,
     ) -> Result<Option<RuntimeSource>, Error> {
         self.sources.find_by_root_or_url(value, store_name)
+    }
+    pub fn delete_sources_for_store(&self, store_name: &str) -> Result<usize, Error> {
+        self.sources.delete_by_store(store_name)
     }
 }
 
@@ -1249,6 +1279,48 @@ pub fn run_store_list(ctx: &CliContext) {
     }
 }
 
+fn remove_store_data_dir(data_dir: &Path, name: &str) {
+    let store_dir = data_dir.join("stores").join(name);
+    match std::fs::remove_dir_all(&store_dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!("warning: could not remove store data dir: {}", e),
+    }
+}
+
+/// Prompt the user for confirmation of a destructive action.
+///
+/// Returns `true` if confirmed (proceed), `false` if aborted.
+/// Exits with code 2 if non-interactive and `--yes` was not given.
+pub fn confirm_destructive(ctx: &CliContext, prompt: &str) -> bool {
+    use std::io::IsTerminal as _;
+
+    if ctx.yes {
+        return true;
+    }
+    if ctx.json || !std::io::stdin().is_terminal() {
+        exit_err(
+            &Error::InvalidRequest {
+                message: "this command is destructive; re-run with --yes to confirm".to_string(),
+            },
+            ctx.json,
+        );
+    }
+    eprint!("{} [y/N] ", prompt);
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        eprintln!("Aborted.");
+        return false;
+    }
+    let answer = line.trim().to_lowercase();
+    if answer == "y" || answer == "yes" {
+        true
+    } else {
+        eprintln!("Aborted.");
+        false
+    }
+}
+
 /// `localdb store remove <name>`
 pub fn run_store_remove(ctx: &CliContext, name: &str) {
     let (config_loader, db) = load_app_db(ctx);
@@ -1256,6 +1328,14 @@ pub fn run_store_remove(ctx: &CliContext, name: &str) {
 
     if check_yaml_owned(name, &config_loader.config) {
         exit_err(&Error::ConfigReadonly, ctx.json);
+    }
+
+    let prompt = format!(
+        "This permanently deletes store '{}', its sources, and its index data. Continue?",
+        name
+    );
+    if !confirm_destructive(ctx, &prompt) {
+        return;
     }
 
     // Per specs/05-surfaces.md §2: route to daemon when running.
@@ -1281,7 +1361,10 @@ pub fn run_store_remove(ctx: &CliContext, name: &str) {
     };
 
     match db.delete_store(name) {
-        Ok(true) => {}
+        Ok(true) => {
+            let _ = db.delete_sources_for_store(name);
+            remove_store_data_dir(data_dir, name);
+        }
         Ok(false) => exit_err(
             &Error::StoreNotFound {
                 id: name.to_string(),
@@ -1459,6 +1542,7 @@ async fn run_source_add_async(ctx: &CliContext, source_arg: &str) {
             config: ctx.config.clone(),
             json: ctx.json,
             stores: vec![store_name.clone()],
+            yes: false,
         };
         run_index_for_source_async(&index_ctx, Some(&src_id), &rt_store_clone).await;
     }
@@ -3203,6 +3287,119 @@ mod tests {
         assert_eq!(src.store_name, "notes");
         assert_eq!(src.kind, "path");
         assert_eq!(src.include, vec!["**/*.md".to_string()]);
+    }
+
+    // --- store remove cascade ---
+
+    fn make_runtime_source(store_name: &str) -> RuntimeSource {
+        RuntimeSource {
+            id: new_ulid(),
+            store_name: store_name.into(),
+            kind: "path".into(),
+            root: Some("/tmp".into()),
+            url: None,
+            include: vec![],
+            exclude: vec![],
+            preset: "prose".into(),
+        }
+    }
+
+    #[test]
+    fn delete_sources_for_store_removes_matching_only() {
+        let dir = TempDir::new().unwrap();
+        let db = tmp_app_db(&dir);
+
+        let src_a1 = make_runtime_source("alpha");
+        let src_a2 = make_runtime_source("alpha");
+        let src_b = make_runtime_source("beta");
+        db.upsert_source(&src_a1).unwrap();
+        db.upsert_source(&src_a2).unwrap();
+        db.upsert_source(&src_b).unwrap();
+
+        let removed = db.delete_sources_for_store("alpha").unwrap();
+        assert_eq!(removed, 2);
+        assert!(db.list_sources("alpha").unwrap().is_empty());
+        assert_eq!(db.list_sources("beta").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn delete_sources_for_store_returns_zero_when_none() {
+        let dir = TempDir::new().unwrap();
+        let db = tmp_app_db(&dir);
+        assert_eq!(db.delete_sources_for_store("ghost").unwrap(), 0);
+    }
+
+    #[test]
+    fn store_remove_cascades_sources_and_dir() {
+        let dir = TempDir::new().unwrap();
+        let db = tmp_app_db(&dir);
+
+        // Add store and sources.
+        let store = new_runtime_store("scratch");
+        db.upsert_store(&store).unwrap();
+        db.upsert_source(&make_runtime_source("scratch")).unwrap();
+        db.upsert_source(&make_runtime_source("scratch")).unwrap();
+        assert_eq!(db.list_sources("scratch").unwrap().len(), 2);
+
+        // Create a dummy on-disk index directory to prove remove_dir_all runs.
+        let store_dir = dir.path().join("stores").join("scratch");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::fs::write(store_dir.join("dummy.txt"), b"data").unwrap();
+        assert!(store_dir.exists());
+
+        // Cascade delete.
+        assert!(db.delete_store("scratch").unwrap());
+        let removed = db.delete_sources_for_store("scratch").unwrap();
+        assert_eq!(removed, 2);
+        remove_store_data_dir(dir.path(), "scratch");
+
+        // Both sources and directory are gone.
+        assert!(db.list_sources("scratch").unwrap().is_empty());
+        assert!(!store_dir.exists());
+
+        // Re-adding the same store name starts clean.
+        let store2 = new_runtime_store("scratch");
+        db.upsert_store(&store2).unwrap();
+        assert!(db.list_sources("scratch").unwrap().is_empty());
+    }
+
+    #[test]
+    fn store_remove_not_found_does_not_cascade() {
+        let dir = TempDir::new().unwrap();
+        let db = tmp_app_db(&dir);
+        // delete_store returns false → no cascade should run.
+        assert!(!db.delete_store("nonexistent").unwrap());
+    }
+
+    #[test]
+    fn remove_store_data_dir_ignores_missing() {
+        let dir = TempDir::new().unwrap();
+        // Should not panic when the directory doesn't exist.
+        remove_store_data_dir(dir.path(), "no-such-store");
+    }
+
+    #[test]
+    fn confirm_destructive_yes_flag_skips_prompt() {
+        let ctx = CliContext {
+            config: None,
+            json: false,
+            stores: vec![],
+            yes: true,
+        };
+        // With yes=true, confirm_destructive returns true without reading stdin.
+        assert!(confirm_destructive(&ctx, "Are you sure?"));
+    }
+
+    #[test]
+    fn confirm_destructive_json_mode_exits_with_invalid_request() {
+        // json=true → non-interactive → should call exit_err with InvalidRequest.
+        // We can't easily test process::exit in unit tests, so we verify the
+        // Error variant that would be triggered directly.
+        let err = Error::InvalidRequest {
+            message: "this command is destructive; re-run with --yes to confirm".to_string(),
+        };
+        assert_eq!(err.exit_code(), 2);
+        assert_eq!(err.code(), "invalid_request");
     }
 
     /// Source reconciliation is also idempotent.

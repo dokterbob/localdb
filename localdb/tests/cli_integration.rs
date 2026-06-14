@@ -306,7 +306,7 @@ fn store_remove_success() {
         .success();
 
     cmd_with_dir(&dir)
-        .args(["store", "remove", "removeme"])
+        .args(["store", "remove", "--yes", "removeme"])
         .assert()
         .success()
         .stdout(predicate::str::contains("removeme"));
@@ -328,7 +328,7 @@ fn store_remove_not_found_exits_3() {
     write_default_config(&dir);
 
     let output = cmd_with_dir(&dir)
-        .args(["store", "remove", "nosuchstore"])
+        .args(["store", "remove", "--yes", "nosuchstore"])
         .output()
         .unwrap();
 
@@ -870,7 +870,7 @@ fn store_remove_routes_to_daemon_when_running() {
 
     let output = cmd_with_dir(&dir)
         .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
-        .args(["--json", "store", "remove", "mystore"])
+        .args(["--json", "--yes", "store", "remove", "mystore"])
         .output()
         .unwrap();
 
