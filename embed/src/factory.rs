@@ -32,19 +32,27 @@ pub fn create_embedder(
 
         #[cfg(feature = "local-onnx")]
         "local-onnx" => {
-            use crate::onnx::{ModelChoice, OnnxEmbedder};
-            let model_choice = match policy.model.as_str() {
-                "bge-small-en-v1.5" | "default" => ModelChoice::Default,
-                unknown => {
-                    return Err(EmbedError::Internal(format!(
-                        "unknown local-onnx model: '{unknown}'. \
-                         Supported: 'bge-small-en-v1.5', 'default'."
-                    )))
-                }
-            };
             let cache_dir = models_dir.map(|p| p.to_path_buf());
-            let embedder = OnnxEmbedder::new(model_choice, cache_dir, true)?;
-            Ok(Box::new(embedder))
+            match policy.model.as_str() {
+                "pplx-embed-context-v1-0.6b" => {
+                    let embedder =
+                        crate::pplx_context_onnx::PplxContextOnnxEmbedder::new(cache_dir, true)?;
+                    Ok(Box::new(embedder))
+                }
+                "pplx-embed-v1-0.6b" => {
+                    let embedder = crate::pplx_onnx::PplxOnnxEmbedder::new(cache_dir, true)?;
+                    Ok(Box::new(embedder))
+                }
+                "bge-small-en-v1.5" => {
+                    use crate::onnx::{ModelChoice, OnnxEmbedder};
+                    let embedder = OnnxEmbedder::new(ModelChoice::BgeSmallEnV15, cache_dir, true)?;
+                    Ok(Box::new(embedder))
+                }
+                unknown => Err(EmbedError::Internal(format!(
+                    "unknown local-onnx model: '{unknown}'. \
+                     Supported: 'pplx-embed-context-v1-0.6b', 'pplx-embed-v1-0.6b', 'bge-small-en-v1.5'."
+                ))),
+            }
         }
 
         #[cfg(not(feature = "local-onnx"))]

@@ -38,8 +38,8 @@ are counted as skipped in `IndexJob` stats, not treated as errors. See
 (`OpenAiEmbedder`), Perplexity contextualized embeddings (`PerplexityEmbedder`), and Voyage
 (`VoyageEmbedder`). All implement the document-aware `Embedder` trait from `core`, which
 groups chunks by document so contextualized/late-chunking models can use the surrounding
-document as context. **Note:** none of these providers are wired into the running binary yet
-— see [Known gaps §1](#known-gaps). See [specs/04-search-pipeline.md](../specs/04-search-pipeline.md) §4.
+document as context. The CLI wires the embedder via `embed::create_embedder` from the config
+policy; the default is `local-onnx` / `pplx-embed-context-v1-0.6b`. See [specs/04-search-pipeline.md](../specs/04-search-pipeline.md) §4.
 
 ### `store-lancedb`
 
@@ -55,7 +55,8 @@ _not_ done here — the trait returns raw ranked lists and `core` fuses them. Se
 Command implementations. A thin layer on `core` and the daemon client; no business logic.
 Each command handler acquires config and runtime state, probes the daemon socket, then either
 delegates to the HTTP API (thin-client mode) or opens the store in-process (embedded mode).
-Also holds the `FakeEmbedder` wiring that is active today — see [Known gaps §1](#known-gaps).
+Calls `embed::create_embedder` from the config policy to obtain the embedder for `index` and
+`search`; `FakeEmbedder` is used only in unit tests.
 
 ### `server`
 
@@ -95,7 +96,7 @@ to the appropriate crate. No logic of its own. Subcommands: `init`, `serve`, `mc
  │  chunker  →  Chunks  (heading-aware, ~400-token prose)  │
  │       │                                                 │
  │       ▼                                                 │
- │  Embedder  →  dense vectors  [currently: FakeEmbedder]  │
+ │  Embedder  →  dense vectors  [default: local-onnx ONNX]  │
  │       │                                                 │
  │       ▼                                                 │
  │  store-lancedb  →  chunks.lance  (BM25 index + vectors) │
@@ -146,8 +147,8 @@ return the same structure. See [specs/02-domain-model.md](../specs/02-domain-mod
 
 On every invocation, CLI and MCP probe a unix socket at `<data_dir>/daemon.sock`. If a
 daemon is running and responsive, the command routes over HTTP. If not, the store is opened
-in-process (mmapped LanceDB; embeddings come from the placeholder `FakeEmbedder` in v0.1.0 —
-see [Known gaps §1](#known-gaps)). No configuration is needed for the common case. See [specs/01-architecture.md](../specs/01-architecture.md) §3.
+in-process (mmapped LanceDB; embeddings come from the configured embedder, defaulting to the
+local ONNX model). No configuration is needed for the common case. See [specs/01-architecture.md](../specs/01-architecture.md) §3.
 
 **Important:** the thin-client routing is not reachable today because CLI commands open the
 runtime-state database before completing the probe — see [Known gaps §3](#known-gaps).
@@ -177,8 +178,9 @@ The default `data_dir` on macOS is `~/Library/Application Support/com.localdb.lo
 (the bundle ID is intentionally verbose — see [Known gaps §7](#known-gaps)).
 Override with `paths.data` in `config.yaml` or point to a custom config with `--config`.
 
-The `models/` directory (configured via `paths.models`) is created only when a real embedder
-downloads a model. With the current `FakeEmbedder`, no model files are written.
+The `models/` directory (configured via `paths.models`) is populated on first `localdb index`
+or `localdb search` when the default `local-onnx` embedder downloads `pplx-embed-context-v1-0.6b`
+(~706 MB) from HuggingFace. Subsequent runs use the cached model.
 
 ---
 
@@ -201,13 +203,13 @@ This section documents verified divergences between the specs and the v0.1.0 imp
 They are listed honestly so contributors know where work remains. Each item names the
 responsible code area.
 
-**1. Embeddings are hash-based placeholders (`FakeEmbedder`).** ([#8](https://github.com/dokterbob/localdb/issues/8), [#16](https://github.com/dokterbob/localdb/issues/16))
-The `embed` crate contains real provider implementations (ONNX, OpenAI-compatible,
-Perplexity, Voyage), but `cli/src/lib.rs` wires `FakeEmbedder::new(128)` for both index
-and search. No model download occurs; the `init` message "embedding models will be downloaded
-on first index" does not apply yet. Dense scores in search results are a constant placeholder
-(`dense: 1.0`); ranking is driven entirely by BM25. The `embed` crate and `RetrievalStore`
-trait are ready — the wiring in the CLI command handlers is the remaining work.
+**1. CLI embedding wiring is complete.** ([#8](https://github.com/dokterbob/localdb/issues/8), [#16](https://github.com/dokterbob/localdb/issues/16))
+The CLI calls `embed::create_embedder` from the config policy. The default embedder is
+`provider: local-onnx`, `model: pplx-embed-context-v1-0.6b` — a context-aware late-chunking
+model (MIT-licensed, public HuggingFace repo `perplexity-ai/pplx-embed-context-v1-0.6b`,
+~706 MB quantized). The model is downloaded automatically on first `localdb index` or
+`localdb search`; no API key is required. `FakeEmbedder` remains available for unit tests
+only.
 
 **2. The HTTP daemon uses an in-memory `FakeStore`.** ([#9](https://github.com/dokterbob/localdb/issues/9))
 `server/src/handlers.rs` holds one shared in-memory store behind an `Arc`. All API routes

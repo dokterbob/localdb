@@ -6,10 +6,7 @@ they become a searchable knowledge layer available everywhere you work: CLI, MCP
 machine. Built for technical users, self-hosters, and AI agent workflows that need reliable,
 citeable retrieval of local documents.
 
-**Status: v0.1.0 pre-release.** Hybrid search is currently BM25-driven — dense vector scoring
-uses a placeholder embedder and always returns 1.0; local ONNX embedding models are not yet
-wired. The HTTP daemon is experimental (in-memory store, does not see CLI-indexed data). See
-[Honest status](#honest-status) below.
+**Status: v0.1.0 pre-release.** Hybrid search uses real dense embeddings via the default local ONNX model (`pplx-embed-context-v1-0.6b`); the first `localdb index` or `localdb search` downloads ~706 MB from HuggingFace (no API key required). The HTTP daemon is experimental (in-memory store, does not see CLI-indexed data). See [Honest status](#honest-status) below.
 
 **License:** [AGPL-3.0-or-later](LICENSE).
 
@@ -122,8 +119,8 @@ limitations.
 
 | Area | What is true today |
 |---|---|
-| Search ranking | BM25-driven. Dense scores are placeholder (always `1.0`). RRF fusion runs but is BM25-weighted in practice. |
-| Embedding models | No model download happens. `init` mentions a future model download; this is not yet wired. |
+| Search ranking | Hybrid BM25 + dense (RRF fusion). Default embedder is `pplx-embed-context-v1-0.6b` (local ONNX, ~706 MB download on first use). |
+| Embedding models | Downloaded automatically on first `localdb index` or `localdb search` from the public HuggingFace repo `perplexity-ai/pplx-embed-context-v1-0.6b`. No API key required. |
 | HTTP daemon | Experimental preview. Uses an in-memory store; does not share data with CLI-indexed stores. |
 | YAML-declared stores | Appear in `store list` but **cannot be indexed** (`localdb index` only resolves runtime stores). Use `localdb store add` + `localdb source add` instead. |
 | CLI while daemon runs | Every CLI command fails with a DB lock error while a daemon is running on the same data directory. Stop the daemon before CLI use. |

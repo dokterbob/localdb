@@ -24,10 +24,15 @@ defaults:                 # global indexing policy; stores inherit
     chunking:
       preset_overrides: {}     # per-source-kind tweaks, see §2
     embedding:
-      model: pplx-embed-context-v1        # see 04-search-pipeline.md §4
-      provider: perplexity                # local-onnx | openai-compatible | perplexity | voyage
-      # Note: perplexity requires a providers: entry with kind: perplexity and api_key_env set.
-      # For offline/local use, set provider: local-onnx, model: bge-small-en-v1.5 (no API key needed).
+      model: pplx-embed-context-v1-0.6b  # see 04-search-pipeline.md §4
+      provider: local-onnx               # local-onnx | openai-compatible | perplexity | voyage
+      # pplx-embed-context-v1-0.6b (default): context-aware late-chunking, runs locally,
+      #   MIT-licensed public repo — no API key or token required. Downloads ~706 MB
+      #   (quantized ONNX) from HuggingFace on first use.
+      # Local alternatives: model: pplx-embed-v1-0.6b (1024-dim, non-context, gated — needs
+      #   HF_TOKEN, ~2.4 GB); model: bge-small-en-v1.5 (384-dim, no creds).
+      # Hosted alternative: provider: perplexity, model: pplx-embed-context-v1
+      #   (requires providers: entry with kind: perplexity and api_key_env set).
 
 stores:
   - name: notes

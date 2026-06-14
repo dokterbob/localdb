@@ -64,11 +64,9 @@ forward-compatibility but all mutating operations are rejected in v1.
 Hybrid search (BM25 + dense vector) across indexed stores. Returns a ranked list
 of citations in the canonical localdb Citation JSON shape.
 
-> **Note:** in v0.1.0 the dense component uses a placeholder embedder (scores
-> appear as `dense: 1.0`). Ranking is effectively BM25-driven. See
-> [../specs/04-search-pipeline.md](../specs/04-search-pipeline.md) for the
-> intended pipeline and [../specs/06-roadmap.md](../specs/06-roadmap.md) for the
-> real-embedder milestone.
+> **Note:** the dense component uses the configured embedder (default: `pplx-embed-context-v1-0.6b`
+> local ONNX). The model is downloaded automatically on first use (~706 MB). See
+> [../specs/04-search-pipeline.md](../specs/04-search-pipeline.md) for the pipeline details.
 
 **Input schema:**
 
