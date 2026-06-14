@@ -272,16 +272,52 @@ pub struct Document {
 }
 
 impl Document {
-    /// Validate `meta` keys: reserved `msg.*` keys must conform to the allowed set.
+    /// Validate `meta` keys: reserved `msg.*` and `dc.*` keys must conform to
+    /// the allowed sets.
     ///
     /// Returns `Err` with a description if any reserved key is invalid.
     pub fn validate_meta(&self) -> Result<(), String> {
         for key in self.meta.keys() {
             if key.starts_with("msg.") {
                 validate_msg_meta_key(key)?;
+            } else if key.starts_with("dc.") {
+                validate_dc_meta_key(key)?;
             }
         }
         Ok(())
+    }
+}
+
+/// Validate a `dc.*` meta key (Dublin Core extension point on `Document.meta`).
+///
+/// Mirrors the DCMES 1.1 element names. Status: defined and validated, not
+/// yet populated in live ingestion (Document isn't constructed in the live path).
+pub fn validate_dc_meta_key(key: &str) -> Result<(), String> {
+    const ALLOWED_DC_KEYS: &[&str] = &[
+        "dc.title",
+        "dc.creator",
+        "dc.subject",
+        "dc.description",
+        "dc.publisher",
+        "dc.contributor",
+        "dc.date",
+        "dc.type",
+        "dc.format",
+        "dc.identifier",
+        "dc.source",
+        "dc.language",
+        "dc.relation",
+        "dc.coverage",
+        "dc.rights",
+    ];
+    if ALLOWED_DC_KEYS.contains(&key) {
+        Ok(())
+    } else {
+        Err(format!(
+            "unknown reserved meta key '{}'; allowed dc.* keys are: {}",
+            key,
+            ALLOWED_DC_KEYS.join(", ")
+        ))
     }
 }
 

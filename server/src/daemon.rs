@@ -479,11 +479,11 @@ mod tests {
             paths: Default::default(),
             defaults: localdb_core::config::schema::DefaultsConfig {
                 indexing: localdb_core::config::schema::IndexingPolicyConfig {
-                    chunking: Default::default(),
                     embedding: localdb_core::config::schema::EmbeddingPolicy {
                         provider: "fake".to_string(),
                         model: "default".to_string(),
                     },
+                    ..Default::default()
                 },
             },
             stores: vec![],
@@ -554,6 +554,7 @@ mod tests {
             uri: format!("file://{}", watched_file.display()),
             title: Some("Watcher Doc".to_string()),
             meta: std::collections::HashMap::new(),
+            metadata: localdb_core::DocumentMetadata::default(),
         }];
 
         // Submit a job that upserts the chunk (simulating real ingestion).

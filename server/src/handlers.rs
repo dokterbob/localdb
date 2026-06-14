@@ -612,6 +612,7 @@ mod tests {
                         provider: "fake".to_string(),
                         model: "default".to_string(),
                     },
+                    ..Default::default()
                 },
             },
             stores: vec![],
@@ -1236,6 +1237,7 @@ mod tests {
                         provider: "fake".to_string(),
                         model: "default".to_string(),
                     },
+                    ..Default::default()
                 },
             },
             stores: vec![],
@@ -1277,6 +1279,7 @@ mod tests {
             uri: "file:///hello.md".to_string(),
             title: Some("Hello Doc".to_string()),
             meta: std::collections::HashMap::new(),
+            metadata: localdb_core::DocumentMetadata::default(),
         };
 
         state.upsert_chunks(vec![chunk]).await.unwrap();
@@ -1325,6 +1328,7 @@ mod tests {
                         provider: "fake".to_string(),
                         model: "default".to_string(),
                     },
+                    ..Default::default()
                 },
             },
             stores: vec![],
@@ -1368,6 +1372,7 @@ mod tests {
             uri: "file:///foreign.md".to_string(),
             title: None,
             meta: std::collections::HashMap::new(),
+            metadata: localdb_core::DocumentMetadata::default(),
         };
         state.upsert_chunks(vec![chunk]).await.unwrap();
 

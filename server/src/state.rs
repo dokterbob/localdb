@@ -640,6 +640,7 @@ mod tests {
             uri: "file:///test.md".to_string(),
             title: Some("Test Doc".to_string()),
             meta: std::collections::HashMap::new(),
+            metadata: localdb_core::DocumentMetadata::default(),
         };
 
         state.upsert_chunks(vec![chunk]).await.unwrap();

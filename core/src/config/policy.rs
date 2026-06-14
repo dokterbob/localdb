@@ -25,6 +25,8 @@ pub fn compute_policy_version(policy: &IndexingPolicyConfig) -> String {
 /// Produce a canonical JSON string from the policy.
 ///
 /// Uses sorted keys for determinism regardless of insertion order.
+/// All three sub-policies (chunking, embedding, parsers) are included so that
+/// a change to any of them changes the hash and triggers a reindex.
 fn canonical_policy_json(policy: &IndexingPolicyConfig) -> String {
     use std::collections::BTreeMap;
 
@@ -48,6 +50,8 @@ fn canonical_policy_json(policy: &IndexingPolicyConfig) -> String {
     let mut root: BTreeMap<&str, serde_json::Value> = BTreeMap::new();
     root.insert("chunking", serde_json::to_value(&chunking_map).unwrap());
     root.insert("embedding", serde_json::to_value(&embedding_map).unwrap());
+    // parsers list is order-sensitive (first-match), so preserve insertion order
+    root.insert("parsers", serde_json::to_value(&policy.parsers).unwrap());
 
     serde_json::to_string(&root).expect("canonical policy JSON serialization should not fail")
 }
@@ -64,13 +68,11 @@ mod tests {
 
     fn make_policy(model: &str, provider: &str) -> IndexingPolicyConfig {
         IndexingPolicyConfig {
-            chunking: ChunkingPolicy {
-                preset_overrides: HashMap::new(),
-            },
             embedding: EmbeddingPolicy {
                 model: model.to_string(),
                 provider: provider.to_string(),
             },
+            ..Default::default()
         }
     }
 
@@ -112,17 +114,12 @@ mod tests {
         let mut overrides = HashMap::new();
         overrides.insert("prose".to_string(), "custom".to_string());
 
-        let p1 = IndexingPolicyConfig {
-            chunking: ChunkingPolicy {
-                preset_overrides: HashMap::new(),
-            },
-            embedding: EmbeddingPolicy::default(),
-        };
+        let p1 = IndexingPolicyConfig::default();
         let p2 = IndexingPolicyConfig {
             chunking: ChunkingPolicy {
                 preset_overrides: overrides,
             },
-            embedding: EmbeddingPolicy::default(),
+            ..Default::default()
         };
         assert_ne!(
             compute_policy_version(&p1),
@@ -155,6 +152,40 @@ mod tests {
     }
 
     #[test]
+    fn different_parsers_list_different_hash() {
+        let p1 = IndexingPolicyConfig {
+            parsers: vec!["pdf".to_string(), "html".to_string()],
+            ..Default::default()
+        };
+        let p2 = IndexingPolicyConfig {
+            parsers: vec!["markdown".to_string(), "plaintext".to_string()],
+            ..Default::default()
+        };
+        assert_ne!(
+            compute_policy_version(&p1),
+            compute_policy_version(&p2),
+            "different parsers lists should produce different policy hashes"
+        );
+    }
+
+    #[test]
+    fn parsers_order_affects_hash() {
+        let p1 = IndexingPolicyConfig {
+            parsers: vec!["pdf".to_string(), "html".to_string()],
+            ..Default::default()
+        };
+        let p2 = IndexingPolicyConfig {
+            parsers: vec!["html".to_string(), "pdf".to_string()],
+            ..Default::default()
+        };
+        assert_ne!(
+            compute_policy_version(&p1),
+            compute_policy_version(&p2),
+            "parser order is load-bearing and must affect the policy hash"
+        );
+    }
+
+    #[test]
     fn preset_override_key_order_does_not_affect_hash() {
         // Two policies with the same overrides in different insertion order should hash the same
         let mut overrides1 = HashMap::new();
@@ -169,13 +200,13 @@ mod tests {
             chunking: ChunkingPolicy {
                 preset_overrides: overrides1,
             },
-            embedding: EmbeddingPolicy::default(),
+            ..Default::default()
         };
         let p2 = IndexingPolicyConfig {
             chunking: ChunkingPolicy {
                 preset_overrides: overrides2,
             },
-            embedding: EmbeddingPolicy::default(),
+            ..Default::default()
         };
         assert_eq!(
             compute_policy_version(&p1),

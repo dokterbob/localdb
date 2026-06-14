@@ -382,6 +382,7 @@ mod tests {
             uri: uri.to_string(),
             title: Some("Test Doc".to_string()),
             meta: HashMap::new(),
+            metadata: crate::parser::DocumentMetadata::default(),
         }
     }
 

@@ -545,6 +545,7 @@ pub async fn index_document(
             input.uri.clone(),
             extraction.title.clone(),
             input.mime.clone(),
+            extraction.metadata.clone(),
         );
         records.push(record);
     }
@@ -595,6 +596,8 @@ pub struct ExtractionResult {
     pub blocks: Vec<Block>,
     /// Optional document title.
     pub title: Option<String>,
+    /// Document metadata extracted from the document.
+    pub metadata: crate::parser::DocumentMetadata,
 }
 
 // ---------------------------------------------------------------------------
@@ -1094,6 +1097,7 @@ mod tests {
                 text,
                 blocks,
                 title: None,
+                metadata: crate::parser::DocumentMetadata::default(),
             })
         }
     }
@@ -1264,6 +1268,7 @@ mod tests {
             uri: "file:///doc1.md".to_string(),
             title: None,
             meta: HashMap::new(),
+            metadata: crate::parser::DocumentMetadata::default(),
         }];
 
         let idx = DocumentIndex::from_chunk_records(&records);
@@ -2128,6 +2133,7 @@ mod tests {
             uri: url.to_string(),
             title: None,
             meta: HashMap::new(),
+            metadata: crate::parser::DocumentMetadata::default(),
         };
         store.upsert_chunks(vec![chunk]).await.unwrap();
 
@@ -2629,6 +2635,7 @@ mod tests {
             uri: uri.to_string(),
             title: None,
             meta: HashMap::new(),
+            metadata: crate::parser::DocumentMetadata::default(),
         };
 
         // Hydrate a fresh DocumentIndex from the stored chunk records.
