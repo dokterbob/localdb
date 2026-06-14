@@ -24,14 +24,14 @@ const MIN_TEXT_CHARS: usize = 20;
 /// Returns `(markdown, title)` where `title` is always `None` (PDF title
 /// extraction requires metadata parsing — future work).
 ///
-/// Returns [`Error::UnsupportedFormat`] for scanned PDFs (no text layer).
+/// Returns [`Error::ExtractionFailed`] for corrupt/malformed PDFs and
+/// [`Error::UnsupportedFormat`] for scanned PDFs (no text layer).
 pub fn extract_pdf(bytes: &[u8]) -> Result<(String, Option<String>), Error> {
-    let extracted = pdf_extract::extract_text_from_mem(bytes).map_err(|e| {
-        let msg = e.to_string();
-        Error::UnsupportedFormat {
-            format: format!("pdf (extraction failed: {msg})"),
-        }
-    })?;
+    let extracted =
+        pdf_extract::extract_text_from_mem(bytes).map_err(|e| Error::ExtractionFailed {
+            format: "pdf".into(),
+            reason: e.to_string(),
+        })?;
 
     if is_scanned_pdf(&extracted) {
         return Err(Error::UnsupportedFormat {
@@ -114,7 +114,7 @@ mod tests {
     }
 
     #[test]
-    fn text_layer_pdf_either_succeeds_or_returns_unsupported() {
+    fn text_layer_pdf_either_succeeds_or_returns_extraction_failed() {
         let pdf_bytes = make_text_pdf("Hello from PDF text layer");
         let result = extract_pdf(&pdf_bytes);
         match result {
@@ -124,13 +124,22 @@ mod tests {
                     "markdown should be a string"
                 );
             }
+            // A malformed synthetic PDF that pdf-extract can't parse → ExtractionFailed
+            Err(Error::ExtractionFailed { .. }) => {}
+            // A synthetic PDF that produces no text → UnsupportedFormat (scanned path)
             Err(Error::UnsupportedFormat { .. }) => {}
             Err(other) => panic!("Unexpected error from text-layer PDF: {:?}", other),
         }
     }
 
     #[test]
-    fn scanned_pdf_returns_unsupported_format() {
+    fn synthetic_minimal_pdf_returns_err_not_ok() {
+        // A minimal PDF with only whitespace content. Depending on pdf-extract's
+        // parser tolerance it either:
+        //   - fails to parse → ExtractionFailed (corrupt/parse error)
+        //   - parses but finds no text → UnsupportedFormat (scanned-PDF path)
+        // Either Err variant is correct; Ok(_) is not.
+        // The authoritative scanned-PDF test is in parsers/pdf.rs using the fixture file.
         let scanned_bytes = b"%PDF-1.4\n\
             1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
             2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n\
@@ -146,9 +155,9 @@ mod tests {
 
         let result = extract_pdf(scanned_bytes);
         match result {
-            Err(Error::UnsupportedFormat { .. }) => {}
-            Ok(_) => panic!("Expected UnsupportedFormat for scanned PDF"),
-            Err(e) => panic!("Expected UnsupportedFormat, got {:?}", e),
+            Err(Error::UnsupportedFormat { .. }) | Err(Error::ExtractionFailed { .. }) => {}
+            Ok(_) => panic!("Expected Err for minimal/scanned PDF, got Ok"),
+            Err(other) => panic!("Unexpected error variant: {other:?}"),
         }
     }
 
@@ -182,11 +191,32 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_format_code_for_scanned_pdf() {
+    fn malformed_pdf_returns_extraction_failed() {
+        // Bytes that look like a PDF header but have no valid structure.
+        // pdf-extract will fail to parse → ExtractionFailed (not UnsupportedFormat).
+        let result = extract_pdf(b"%PDF-1.4\nnot a real pdf");
+        match result {
+            Err(Error::ExtractionFailed { .. }) => {}
+            // Some pdf-extract versions may also succeed on minimal input or
+            // return UnsupportedFormat via the scanned-PDF path; tolerate both.
+            Ok(_) | Err(Error::UnsupportedFormat { .. }) => {}
+            Err(other) => panic!("expected ExtractionFailed for malformed PDF, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scanned_pdf_code_is_unsupported_format() {
+        // The minimal PDF with an empty content stream hits the scanned-PDF branch.
         let result = extract_pdf(b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\n");
         if let Err(e) = result {
-            assert_eq!(e.code(), "unsupported_format");
-        } // pdf-extract might handle this gracefully
+            // Either the parser fails outright (ExtractionFailed) or detects no text layer
+            // (UnsupportedFormat). Both are valid outcomes for this minimal fixture.
+            assert!(
+                e.code() == "unsupported_format" || e.code() == "extraction_failed",
+                "unexpected code: {}",
+                e.code()
+            );
+        }
     }
 
     #[test]

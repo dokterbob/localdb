@@ -1851,17 +1851,23 @@ pub fn run_source_remove(ctx: &CliContext, id: &str) {
     }
 }
 
-/// `localdb index [--source <id>] [--dir <path>]`
+/// `localdb index [--source <id>] [--dir <path>] [--strict]`
 ///
 /// One-shot scan-and-index (embedded mode) or submits a job to the daemon.
 ///
 /// Per specs/05-surfaces.md §2: when daemon is running, submits job and polls.
-pub fn run_index(ctx: &CliContext, source_id: Option<&str>, dir: Option<&str>) {
+/// With `--strict`, exits 2 if any document failed extraction (run always completes).
+pub fn run_index(ctx: &CliContext, source_id: Option<&str>, dir: Option<&str>, strict: bool) {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    rt.block_on(run_index_async(ctx, source_id, dir));
+    rt.block_on(run_index_async(ctx, source_id, dir, strict));
 }
 
-async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, dir: Option<&str>) {
+async fn run_index_async(
+    ctx: &CliContext,
+    source_id: Option<&str>,
+    dir: Option<&str>,
+    strict: bool,
+) {
     use localdb_core::{
         chunker::ChunkerConfig,
         ingestion::{run_ingestion_for_source, DocumentIndex, IngestionConfig},
@@ -2031,7 +2037,8 @@ async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, dir: Option<
         };
 
     let mut doc_index = DocumentIndex::new();
-    let (mut indexed, mut skipped, mut chunks, mut errors) = (0u64, 0u64, 0u64, 0u64);
+    let (mut indexed, mut skipped, mut chunks, mut errors, mut unsupported) =
+        (0u64, 0u64, 0u64, 0u64, 0u64);
     let url_fetcher = HttpUrlFetcher::new();
 
     for rt_source in &sources_to_index {
@@ -2061,6 +2068,7 @@ async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, dir: Option<
                 skipped += r.docs_skipped;
                 chunks += r.chunks_written;
                 errors += r.error_count;
+                unsupported += r.unsupported_format_count;
             }
             Err(e) => {
                 errors += 1;
@@ -2077,19 +2085,24 @@ async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, dir: Option<
         }
     }
 
+    let status = if strict && errors > 0 { "error" } else { "ok" };
     if ctx.json {
         print_json(&json!({
-            "status": "ok",
+            "status": status,
             "docs_indexed": indexed,
             "docs_skipped": skipped,
             "chunks_written": chunks,
+            "unsupported": unsupported,
             "errors": errors,
         }));
     } else {
         println!(
-            "Index complete: {} indexed, {} skipped, {} chunks written, {} errors",
-            indexed, skipped, chunks, errors
+            "Index complete: {} indexed, {} skipped, {} chunks written, {} unsupported, {} errors",
+            indexed, skipped, chunks, unsupported, errors
         );
+    }
+    if strict && errors > 0 {
+        std::process::exit(2);
     }
 }
 

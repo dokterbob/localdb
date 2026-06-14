@@ -2266,6 +2266,61 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
+    // ExtractionFailed classification test
+    // ---------------------------------------------------------------------------
+
+    struct ExtractionFailedExtractor;
+
+    impl DocumentExtractor for ExtractionFailedExtractor {
+        fn extract(
+            &self,
+            _bytes: &[u8],
+            _filename: Option<&str>,
+        ) -> Result<ExtractionResult, Error> {
+            Err(Error::ExtractionFailed {
+                format: "office/docx".into(),
+                reason: "zip error: invalid header".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn run_ingestion_extraction_failed_lands_in_error_count() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("doc.docx"), b"not a real docx").unwrap();
+
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let extractor = ExtractionFailedExtractor;
+        let store_id = "store-1";
+        let source = make_path_source(store_id, dir.path().to_str().unwrap(), vec![]);
+        let config = make_ingestion_config(store_id);
+        let mut doc_index = DocumentIndex::new();
+
+        let result = run_ingestion_for_source(
+            &source,
+            &mut doc_index,
+            &store,
+            &embedder,
+            &config,
+            &extractor,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.error_count, 1,
+            "ExtractionFailed must land in error_count"
+        );
+        assert_eq!(
+            result.unsupported_format_count, 0,
+            "ExtractionFailed must not be counted as unsupported"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
     // URL source pipeline tests
     // ---------------------------------------------------------------------------
 

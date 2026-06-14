@@ -37,9 +37,9 @@ fn html_to_markdown(html: &str) -> Result<String, Error> {
     let opts = ConversionOptions::default();
     match convert_bytes(html.as_bytes(), "html", &opts) {
         Ok(result) => Ok(result.markdown),
-        Err(e) => Err(Error::Internal {
-            message: format!("HTML→Markdown conversion failed: {e}"),
-            correlation_id: "html_to_md".to_string(),
+        Err(e) => Err(Error::ExtractionFailed {
+            format: "html".into(),
+            reason: e.to_string(),
         }),
     }
 }

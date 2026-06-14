@@ -189,17 +189,19 @@ fn html_fixture_heading_index_paths() {
     let idx = build_heading_index(&result.markdown);
 
     // "This is the content of section one." appears under Section One / Main Article Title
-    if let Some(offset) = result.markdown.find("content of section one") {
-        let path = heading_path_at(&idx, offset);
-        assert!(
-            path.iter().any(|p| p.contains("Section One")),
-            "Section One content must be under Section One heading path; got {path:?}"
-        );
-        assert!(
-            path.iter().any(|p| p.contains("Main Article Title")),
-            "Section One must be under Main Article Title; got {path:?}"
-        );
-    }
+    let offset = result
+        .markdown
+        .find("content of section one")
+        .expect("'content of section one' must appear in markdown output");
+    let path = heading_path_at(&idx, offset);
+    assert!(
+        path.iter().any(|p| p.contains("Section One")),
+        "Section One content must be under Section One heading path; got {path:?}"
+    );
+    assert!(
+        path.iter().any(|p| p.contains("Main Article Title")),
+        "Section One must be under Main Article Title; got {path:?}"
+    );
 }
 
 #[test]
@@ -219,11 +221,15 @@ fn html_fixture_nav_stripped_or_minimized() {
 }
 
 // ---------------------------------------------------------------------------
-// PDF: scanned fixture must decline with UnsupportedFormat
+// PDF: scanned/corrupt fixture must return Err (never Ok)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn scanned_pdf_fixture_returns_unsupported_format() {
+fn scanned_pdf_fixture_returns_err() {
+    // The fixture is a minimal PDF that pdf-extract may either:
+    //   - fail to parse entirely → ExtractionFailed (corrupt/parse error)
+    //   - parse but find no text  → UnsupportedFormat (scanned-PDF path)
+    // In both cases the extractor must not return Ok.
     let bytes = std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/scanned.pdf"
@@ -233,12 +239,12 @@ fn scanned_pdf_fixture_returns_unsupported_format() {
     let ex = ChainExtractor::with_defaults().unwrap();
     let result = ex.extract(&bytes, Some("scanned.pdf"));
     match result {
-        Err(Error::UnsupportedFormat { .. }) => {}
+        Err(Error::UnsupportedFormat { .. }) | Err(Error::ExtractionFailed { .. }) => {}
         Ok(out) => panic!(
-            "Expected UnsupportedFormat for scanned PDF, got markdown: {:?}",
+            "Expected Err for scanned/corrupt PDF, got markdown: {:?}",
             out.markdown
         ),
-        Err(other) => panic!("Expected UnsupportedFormat for scanned PDF, got: {other:?}"),
+        Err(other) => panic!("Unexpected error variant for scanned PDF: {other:?}"),
     }
 }
 

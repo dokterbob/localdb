@@ -27,8 +27,9 @@ impl Parser for OfficeParser {
 
         let opts = anytomd::ConversionOptions::default();
         let result = anytomd::convert_bytes(probe.bytes(), &ext, &opts).map_err(|e| {
-            Error::UnsupportedFormat {
-                format: format!("office/{ext} (anytomd: {e})"),
+            Error::ExtractionFailed {
+                format: format!("office/{ext}"),
+                reason: e.to_string(),
             }
         })?;
 
@@ -91,5 +92,33 @@ mod tests {
     fn declines_html_extension() {
         let probe = Probe::new(b"<html>...</html>", Some("page.html"), None);
         assert!(OfficeParser.parse(&probe).unwrap().is_none());
+    }
+
+    #[test]
+    fn garbage_docx_returns_extraction_failed() {
+        let probe = Probe::new(b"this is not a zip file at all!", Some("doc.docx"), None);
+        match OfficeParser.parse(&probe) {
+            Err(Error::ExtractionFailed { format, .. }) => {
+                assert!(
+                    format.starts_with("office/docx"),
+                    "unexpected format: {format}"
+                );
+            }
+            other => panic!("expected ExtractionFailed, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn garbage_xlsx_returns_extraction_failed() {
+        let probe = Probe::new(b"\x00\x01\x02\x03garbage", Some("sheet.xlsx"), None);
+        match OfficeParser.parse(&probe) {
+            Err(Error::ExtractionFailed { format, .. }) => {
+                assert!(
+                    format.starts_with("office/xlsx"),
+                    "unexpected format: {format}"
+                );
+            }
+            other => panic!("expected ExtractionFailed, got: {other:?}"),
+        }
     }
 }
