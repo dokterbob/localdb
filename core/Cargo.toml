@@ -21,6 +21,7 @@ directories = { workspace = true }
 dirs = { workspace = true }
 redb = { workspace = true }
 hex = { workspace = true }
+text-splitter = { version = "0.31", features = ["markdown"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }

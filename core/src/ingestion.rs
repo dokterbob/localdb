@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::chunker::{chunk_document, ChunkerConfig};
+use crate::chunker::{chunk_document, CharSizer, ChunkSizer, ChunkerConfig, TokenSizer};
 use crate::embedder::{DocumentChunks, Embedder};
 use crate::error::Error;
 use crate::ids::{content_hash, document_id, new_ulid};
@@ -401,6 +401,23 @@ pub struct DocumentIndexOutput {
     pub record: DocumentRecord,
 }
 
+/// Scale a prose token budget to a character budget (×4) for `CharSizer`.
+///
+/// Used when the embedder has no local tokenizer: the prose preset's
+/// token-denominated `target`/`overlap` are reinterpreted as ~4 chars/token so
+/// the character-based splitter approximates the intended token budget. Only the
+/// `prose` preset is scaled; `code` already uses a char budget.
+fn scale_to_chars(config: &ChunkerConfig) -> ChunkerConfig {
+    if config.preset != "prose" {
+        return config.clone();
+    }
+    ChunkerConfig {
+        preset: config.preset.clone(),
+        target_tokens: Some(config.resolved_target_tokens() * 4),
+        overlap_tokens: Some(config.resolved_overlap_tokens() * 4),
+    }
+}
+
 /// Index a single document: extract → chunk → embed → upsert.
 ///
 /// If the document's content hash matches an existing record, returns early
@@ -450,8 +467,28 @@ pub async fn index_document(
     }
 
     // Chunk the document.
-    let chunker_cfg = config.chunker.clone();
-    let chunk_outputs = chunk_document(&doc_id, &extraction.text, &blocks, &chunker_cfg)?;
+    //
+    // Build the chunk sizer from the embedder's tokenizer if it has one
+    // (token-accurate chunking); otherwise fall back to character sizing and
+    // scale the prose token budget to chars (*4) so behaviour approximates the
+    // model token budget for hosted/Fake embedders.
+    let token_counter = embedder.token_counter();
+    let sizer: Box<dyn ChunkSizer> = match &token_counter {
+        Some(f) => Box::new(TokenSizer::new(f.clone())),
+        None => Box::new(CharSizer),
+    };
+    let chunker_cfg = if token_counter.is_none() {
+        scale_to_chars(&config.chunker)
+    } else {
+        config.chunker.clone()
+    };
+    let chunk_outputs = chunk_document(
+        &doc_id,
+        &extraction.text,
+        &blocks,
+        &chunker_cfg,
+        sizer.as_ref(),
+    )?;
 
     if chunk_outputs.is_empty() {
         // No chunks produced (empty doc) — delete old chunks if any and record as indexed.
@@ -2652,5 +2689,65 @@ mod tests {
         assert_eq!(record.content_hash, hash);
         assert_eq!(record.policy_version, "policy-v1");
         assert_eq!(record.document_id, doc_id);
+    }
+
+    // ---------------------------------------------------------------------------
+    // scale_to_chars tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn scale_to_chars_scales_prose_budget_by_four() {
+        let cfg = ChunkerConfig {
+            preset: "prose".to_string(),
+            target_tokens: Some(512),
+            overlap_tokens: Some(64),
+        };
+        let scaled = scale_to_chars(&cfg);
+        assert_eq!(scaled.preset, "prose");
+        assert_eq!(
+            scaled.resolved_target_tokens(),
+            512 * 4,
+            "prose target should be scaled ×4 for CharSizer"
+        );
+        assert_eq!(
+            scaled.resolved_overlap_tokens(),
+            64 * 4,
+            "prose overlap should be scaled ×4 for CharSizer"
+        );
+    }
+
+    #[test]
+    fn scale_to_chars_does_not_change_code_preset() {
+        let cfg = ChunkerConfig {
+            preset: "code".to_string(),
+            target_tokens: Some(3000),
+            overlap_tokens: Some(0),
+        };
+        let scaled = scale_to_chars(&cfg);
+        assert_eq!(scaled.preset, "code");
+        assert_eq!(
+            scaled.resolved_target_tokens(),
+            3000,
+            "code preset must not be scaled"
+        );
+        assert_eq!(
+            scaled.resolved_overlap_tokens(),
+            0,
+            "code overlap must not be scaled"
+        );
+    }
+
+    #[test]
+    fn scale_to_chars_uses_preset_defaults_when_none() {
+        // Verify None values resolve through resolved_* before scaling.
+        let cfg = ChunkerConfig {
+            preset: "prose".to_string(),
+            target_tokens: None,
+            overlap_tokens: None,
+        };
+        let scaled = scale_to_chars(&cfg);
+        // Default prose target is 512; scaled = 512 * 4 = 2048.
+        assert_eq!(scaled.resolved_target_tokens(), 512 * 4);
+        assert_eq!(scaled.resolved_overlap_tokens(), 64 * 4);
     }
 }

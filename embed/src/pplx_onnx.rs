@@ -27,7 +27,7 @@
 use std::{
     io::Write,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 use async_trait::async_trait;
@@ -39,7 +39,7 @@ use tokenizers::{
 };
 use tracing::info;
 
-use localdb_core::{DocumentChunks, EmbeddedDocument, Embedder, Error as CoreError};
+use localdb_core::{DocumentChunks, EmbeddedDocument, Embedder, Error as CoreError, TokenCounter};
 
 use crate::error::EmbedError;
 
@@ -353,5 +353,12 @@ impl Embedder for PplxOnnxEmbedder {
 
     fn model_id(&self) -> &str {
         "pplx-embed-v1-0.6b"
+    }
+
+    fn token_counter(&self) -> Option<TokenCounter> {
+        let tok = self.tokenizer.clone();
+        Some(Arc::new(move |t: &str| {
+            tok.encode(t, false).map(|e| e.get_ids().len()).unwrap_or(0)
+        }))
     }
 }

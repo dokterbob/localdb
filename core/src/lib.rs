@@ -15,10 +15,10 @@ pub mod search;
 pub mod store;
 pub mod types;
 
-pub use chunker::{chunk_document, ChunkOutput, ChunkerConfig};
+pub use chunker::{chunk_document, CharSizer, ChunkOutput, ChunkSizer, ChunkerConfig, TokenSizer};
 /// Re-export key types at the crate root for convenience.
 pub use citation::Citation;
-pub use embedder::{DocumentChunks, EmbeddedDocument, Embedder, FakeEmbedder};
+pub use embedder::{DocumentChunks, EmbeddedDocument, Embedder, FakeEmbedder, TokenCounter};
 pub use error::Error;
 pub use ids::{chunk_id, content_hash, document_id, new_ulid};
 pub use ingestion::{

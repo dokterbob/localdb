@@ -9,7 +9,15 @@
 //!
 //! See specs/04-search-pipeline.md §4.
 
+use std::sync::Arc;
+
 use crate::error::Error;
+
+/// A token-counting closure: maps a text to its token count.
+///
+/// Returned by [`Embedder::token_counter`] when the embedder has a local
+/// tokenizer, and consumed by the chunker as a `TokenSizer`.
+pub type TokenCounter = Arc<dyn Fn(&str) -> usize + Send + Sync>;
 
 /// One document's worth of chunks for embedding.
 ///
@@ -67,6 +75,16 @@ pub trait Embedder: Send + Sync {
 
     /// Return a human-readable name for the model/provider (for logging and policy versioning).
     fn model_id(&self) -> &str;
+
+    /// Return a token-counting function if this embedder has a local tokenizer.
+    ///
+    /// When present, the ingestion pipeline uses it to size chunks in tokens
+    /// (token-accurate chunking). Embedders without a local tokenizer (hosted
+    /// providers, `FakeEmbedder`) return `None`, and the pipeline falls back to
+    /// character-based sizing.
+    fn token_counter(&self) -> Option<TokenCounter> {
+        None
+    }
 }
 
 /// A deterministic fake embedder for testing.
