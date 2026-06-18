@@ -29,7 +29,7 @@ fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// Validate chunk-group windowing: a document whose chunks sum to > MAX_SEQ_LEN (8192 tokens)
+/// Validate chunk-group windowing: a document whose chunks sum to > MAX_SEQ_LEN (4096 tokens)
 /// must still return exactly one embedding per chunk without error.
 ///
 /// **Slow — requires the locally-cached model.**
@@ -40,7 +40,7 @@ async fn pplx_embed_context_oversized_document_windowed() {
         PplxContextOnnxEmbedder::new(None, false).expect("create PplxContextOnnxEmbedder");
 
     // Each repetition of this sentence is ~10 tokens; 500 reps ≈ 5 000 tokens per chunk.
-    // Two such chunks sum to ~10 001 tokens + 1 SEP > 8 192 → windowing splits them.
+    // A single such chunk already exceeds 4 096 → windowing splits the chunks apart.
     let long_chunk = "The quick brown fox jumps over the lazy dog. ".repeat(500);
     let n_chunks = 3usize;
     let chunks: Vec<String> = (0..n_chunks).map(|_| long_chunk.clone()).collect();

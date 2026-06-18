@@ -41,8 +41,11 @@ use crate::error::EmbedError;
 
 const HF_REPO: &str = "perplexity-ai/pplx-embed-context-v1-0.6b";
 const EMBED_DIM: usize = 1024;
-// Model supports 32K tokens; cap at 8 192 to bound CPU cost per document.
-const MAX_SEQ_LEN: usize = 8192;
+// Model supports 32K tokens; cap at 4 096 = 16 × 256-token chunks, matching the
+// contextual-training regime (and the 4096-token pretraining sequence length),
+// and running efficiently on common hardware. Raising the window to 8K (more
+// cross-chunk context, higher CPU/memory cost) is a tracked follow-up.
+const MAX_SEQ_LEN: usize = 4096;
 const MODEL_DIRNAME: &str = "pplx-embed-context-v1-0.6b";
 const HF_REVISION: &str = "c2fe8bee1aee42534425a1dfa7f976f6c1a5d16b";
 

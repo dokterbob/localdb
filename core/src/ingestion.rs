@@ -2952,20 +2952,20 @@ mod tests {
     fn scale_to_chars_scales_prose_budget_by_four() {
         let cfg = ChunkerConfig {
             preset: "prose".to_string(),
-            target_tokens: Some(512),
-            overlap_tokens: Some(64),
+            target_tokens: Some(256),
+            overlap_tokens: Some(0),
         };
         let scaled = scale_to_chars(&cfg);
         assert_eq!(scaled.preset, "prose");
         assert_eq!(
             scaled.resolved_target_tokens(),
-            512 * 4,
+            256 * 4,
             "prose target should be scaled ×4 for CharSizer"
         );
         assert_eq!(
             scaled.resolved_overlap_tokens(),
-            64 * 4,
-            "prose overlap should be scaled ×4 for CharSizer"
+            0,
+            "prose overlap should be scaled ×4 for CharSizer (0 × 4 = 0)"
         );
     }
 
@@ -2999,9 +2999,9 @@ mod tests {
             overlap_tokens: None,
         };
         let scaled = scale_to_chars(&cfg);
-        // Default prose target is 512; scaled = 512 * 4 = 2048.
-        assert_eq!(scaled.resolved_target_tokens(), 512 * 4);
-        assert_eq!(scaled.resolved_overlap_tokens(), 64 * 4);
+        // Default prose target is 256; scaled = 256 * 4 = 1024. Overlap 0 → 0.
+        assert_eq!(scaled.resolved_target_tokens(), 256 * 4);
+        assert_eq!(scaled.resolved_overlap_tokens(), 0);
     }
 
     // ---------------------------------------------------------------------------

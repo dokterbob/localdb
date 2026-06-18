@@ -69,18 +69,21 @@ Per-source-kind presets, applied per source:
 
 | Preset | Strategy | Defaults |
 |---|---|---|
-| `prose` (default) | `MarkdownSplitter` (`benbrandt/text-splitter`) on Markdown semantic boundaries — headings, code blocks, lists, paragraphs, sentences, words; preserves document order; `heading_path` attributed per chunk | target ≈ 512 tokens, overlap ≈ 64 tokens |
+| `prose` (default) | `MarkdownSplitter` (`benbrandt/text-splitter`) on Markdown semantic boundaries — headings, code blocks, lists, paragraphs, sentences, words; preserves document order; `heading_path` attributed per chunk | target ≈ 256 tokens, overlap ≈ 0 tokens |
 | `messages` (reserved for connectors) | Thread/turn windows: N consecutive messages per chunk, sliding | window 6 turns, stride 3 |
 | `code` | Structural (function/item-level) where parseable, else line blocks | target ≈ 60 lines |
 
 Chunk sizing for `prose` is **token-accurate**, measured using the embedding model's own tokenizer
-(the default model `pplx-embed-context-v1-0.6b` has an 8192-token context). When no local
+(the default model `pplx-embed-context-v1-0.6b` supports up to 32K tokens; localdb caps its
+late-chunking window at 4096 tokens = 16 × 256-token chunks). When no local
 tokenizer is available (e.g. hosted/API embedders), it falls back to a character approximation
-(~4 chars/token). The 512-token / 64-overlap defaults are sized for the contextual late-chunking
-model: Perplexity's contextualized-embeddings model shares context across chunks from the same
-document (chunks must be sent in source-document order), so minimal overlap is sufficient —
-smaller, precise chunks give better citation granularity while the model handles cross-chunk
-context. These are defaults to beat with evaluation, not dogma.
+(~4 chars/token). The 256-token / 0-overlap defaults mirror the contextual late-chunking
+model's training regime: Perplexity's contextualized-embeddings model is trained on documents
+partitioned into 256-token chunks (16 chunks per 4096-token document) with **no** intra-document
+overlap, because late chunking shares context across chunks from the same document (chunks must be
+sent in source-document order) and so supplies cross-chunk context itself. Aligning the chunker to
+that regime gives smaller, precise chunks — better citation granularity — while the model handles
+cross-chunk context, with no overlap needed. These are defaults to beat with evaluation, not dogma.
 
 ## 4. Embedding
 

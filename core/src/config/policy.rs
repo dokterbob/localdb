@@ -46,7 +46,7 @@ fn canonical_policy_json(policy: &IndexingPolicyConfig) -> String {
     // implementation changes in a way that alters chunk boundaries.
     chunking_map.insert(
         "algorithm",
-        serde_json::Value::String("textsplitter-md-v2".into()),
+        serde_json::Value::String("textsplitter-md-v3".into()),
     );
 
     let mut embedding_map: BTreeMap<&str, &str> = BTreeMap::new();
