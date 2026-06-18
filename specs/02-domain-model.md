@@ -129,7 +129,8 @@ Citation {
   span: {start, end},   // range in normalized text
   snippet,              // chunk text (possibly trimmed)
   score: {fused, dense, bm25},
-  provenance: {fetched_at, content_hash}
+  provenance: {fetched_at, content_hash},
+  metadata              // full DCMES DocumentMetadata per §7; always present, empty when none extracted
 }
 ```
 
@@ -159,9 +160,13 @@ under `spawn_blocking`. Two methods:
 - `Ok(None)` — decline; this parser does not handle the input. Control passes to the next
   parser in the chain.
 - `Ok(Some(doc))` — handled successfully. First match wins; remaining parsers are not tried.
-- `Err(e)` — the format was recognized but parsing failed (e.g. a scanned/corrupt PDF).
-  **Short-circuits the chain** — remaining parsers are NOT tried, because the failure is
-  definitive, not a format mismatch.
+- `Err(e)` — the format was recognized but parsing failed. **Short-circuits the chain** —
+  remaining parsers are NOT tried, because the failure is definitive, not a format mismatch.
+  Two sub-cases, distinguished by the error variant:
+  - `Error::ExtractionFailed` — the format is *supported* but this specific instance is broken
+    (e.g. a corrupt or truncated DOCX/PDF). Counted in `error_count`; produces a WARN per file.
+  - `Error::UnsupportedFormat` — the format is *not handled* by any parser in scope (e.g. a
+    scanned PDF with no text layer). Counted in `unsupported_format_count`; silent.
 
 `ChainParser` implements this same `Parser` trait (Composite pattern), holding an ordered
 `Vec<Box<dyn Parser>>`. It is itself a `Parser` and can be nested. `build_chain(ids)` in

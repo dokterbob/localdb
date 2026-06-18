@@ -1,5 +1,4 @@
-//! Markdown parser: chain-of-responsibility wrapper around
-//! `crate::markdown::extract_markdown`.
+//! Markdown parser: chain-of-responsibility wrapper around `crate::markdown::extract_markdown`.
 
 use localdb_core::parser::{DocumentMetadata, ParsedDocument, Parser, Probe};
 use localdb_core::Error;
@@ -8,6 +7,8 @@ use localdb_core::Error;
 ///
 /// Recognized extensions: `.md`, `.markdown`, `.mdown`, `.mkd`, `.mkdn`.
 /// Declines all other inputs (no content heuristic — Markdown has no magic).
+/// Also declines non-UTF-8 bytes (binary / mis-encoded files) with `Ok(None)`
+/// so they fall through to `UnsupportedFormat`, not an error.
 pub struct MarkdownParser;
 
 impl Parser for MarkdownParser {
@@ -30,22 +31,22 @@ impl Parser for MarkdownParser {
             return Ok(None);
         }
 
-        let text = std::str::from_utf8(probe.bytes()).map_err(|e| Error::InvalidRequest {
-            message: format!("Markdown is not valid UTF-8: {e}"),
-        })?;
+        let text = match std::str::from_utf8(probe.bytes()) {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        };
 
-        let out = crate::markdown::extract_markdown(text)?;
+        let (markdown, title) = crate::markdown::extract_markdown(text)?;
 
         let dc = DocumentMetadata {
-            title: out.title.clone(),
+            title: title.clone(),
             format: probe.sniffed_mime.map(|s| s.to_string()),
             ..DocumentMetadata::default()
         };
 
         Ok(Some(ParsedDocument {
-            text: out.text,
-            blocks: out.blocks,
-            title: out.title,
+            markdown,
+            title,
             metadata: dc,
         }))
     }
@@ -78,7 +79,10 @@ mod tests {
     fn accepts_md_extension() {
         let probe = Probe::new(b"# Hello\n\nParagraph.", Some("README.md"), None);
         let doc = MarkdownParser.parse(&probe).unwrap().unwrap();
-        assert!(doc.text.contains("Hello"));
+        assert!(
+            doc.markdown.contains("# Hello"),
+            "markdown must contain heading marker"
+        );
     }
 
     #[test]
@@ -112,9 +116,27 @@ mod tests {
     }
 
     #[test]
-    fn h1_heading_populates_dc_title() {
+    fn declines_binary_non_utf8() {
+        let binary = b"\xFF\xFE\x00\x01binary content";
+        let probe = Probe::new(binary, Some("file.md"), None);
+        assert!(MarkdownParser.parse(&probe).unwrap().is_none());
+    }
+
+    #[test]
+    fn h1_heading_populates_title_and_dc_title() {
         let probe = Probe::new(b"# My Document\n\nSome content.", Some("doc.md"), None);
         let doc = MarkdownParser.parse(&probe).unwrap().unwrap();
+        assert_eq!(doc.title, Some("My Document".to_string()));
         assert_eq!(doc.metadata.title, Some("My Document".to_string()));
+    }
+
+    #[test]
+    fn markdown_heading_preserved_in_output() {
+        let probe = Probe::new(b"# Section\n\nContent.", Some("doc.md"), None);
+        let doc = MarkdownParser.parse(&probe).unwrap().unwrap();
+        assert!(
+            doc.markdown.contains("# Section"),
+            "heading marker must be in output markdown"
+        );
     }
 }

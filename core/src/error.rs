@@ -67,6 +67,12 @@ pub enum Error {
     #[error("unsupported format: {format}")]
     UnsupportedFormat { format: String },
 
+    /// A recognized, supported format whose contents could not be extracted
+    /// (e.g. a corrupt or truncated DOCX/PDF). Distinct from `UnsupportedFormat`
+    /// (format not handled) and `Internal` (a bug in our code).
+    #[error("extraction failed for {format}: {reason}")]
+    ExtractionFailed { format: String, reason: String },
+
     /// External embedding endpoint is down or misconfigured.
     ///
     /// CLI exit code: 5
@@ -111,6 +117,7 @@ impl Error {
             Error::InvalidConfig { .. } => "invalid_config",
             Error::InvalidRequest { .. } => "invalid_request",
             Error::UnsupportedFormat { .. } => "unsupported_format",
+            Error::ExtractionFailed { .. } => "extraction_failed",
             Error::ProviderUnavailable { .. } => "provider_unavailable",
             Error::ModelMissing { .. } => "model_missing",
             Error::IndexInProgress => "index_in_progress",
@@ -134,7 +141,7 @@ impl Error {
             Error::DaemonUnreachable
             | Error::ProviderUnavailable { .. }
             | Error::ModelMissing { .. } => 5,
-            Error::UnsupportedFormat { .. } => 2,
+            Error::UnsupportedFormat { .. } | Error::ExtractionFailed { .. } => 2,
         }
     }
 }
@@ -186,6 +193,14 @@ mod tests {
                     format: "pdf".into(),
                 },
                 "unsupported_format",
+                2,
+            ),
+            (
+                Error::ExtractionFailed {
+                    format: "office/docx".into(),
+                    reason: "zip error".into(),
+                },
+                "extraction_failed",
                 2,
             ),
             (

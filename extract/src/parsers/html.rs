@@ -8,6 +8,8 @@ use localdb_core::Error;
 ///
 /// Declines inputs that show no HTML signal. Does NOT short-circuit on error —
 /// HTML parsing is lenient (scraper never fails on malformed input).
+/// Also declines non-UTF-8 bytes (binary / mis-encoded files) with `Ok(None)`
+/// so they fall through to `UnsupportedFormat`, not an error.
 pub struct HtmlParser;
 
 impl Parser for HtmlParser {
@@ -33,22 +35,22 @@ impl Parser for HtmlParser {
             return Ok(None);
         }
 
-        let text = std::str::from_utf8(probe.bytes()).map_err(|e| Error::InvalidRequest {
-            message: format!("HTML is not valid UTF-8: {e}"),
-        })?;
+        let text = match std::str::from_utf8(probe.bytes()) {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        };
 
-        let out = crate::html::extract_html(text)?;
+        let (markdown, title) = crate::html::extract_html(text)?;
 
         let dc = DocumentMetadata {
-            title: out.title.clone(),
+            title: title.clone(),
             format: probe.sniffed_mime.map(|s| s.to_string()),
             ..DocumentMetadata::default()
         };
 
         Ok(Some(ParsedDocument {
-            text: out.text,
-            blocks: out.blocks,
-            title: out.title,
+            markdown,
+            title,
             metadata: dc,
         }))
     }
@@ -79,7 +81,7 @@ mod tests {
             None,
         );
         let doc = HtmlParser.parse(&probe).unwrap().unwrap();
-        assert!(doc.text.contains("Hello"));
+        assert!(doc.markdown.contains("Hello"));
     }
 
     #[test]
@@ -140,6 +142,20 @@ mod tests {
     #[test]
     fn declines_whitespace_only_input_no_hint() {
         let probe = Probe::new(b"   \n   ", None, None);
+        assert!(HtmlParser.parse(&probe).unwrap().is_none());
+    }
+
+    #[test]
+    fn declines_binary_non_utf8_by_extension() {
+        let binary = b"\xFF\xFE\x00\x01binary content";
+        let probe = Probe::new(binary, Some("page.html"), None);
+        assert!(HtmlParser.parse(&probe).unwrap().is_none());
+    }
+
+    #[test]
+    fn declines_binary_non_utf8_by_heuristic() {
+        let binary = b"<\xFF\xFE not utf8";
+        let probe = Probe::new(binary, None, None);
         assert!(HtmlParser.parse(&probe).unwrap().is_none());
     }
 }

@@ -26,6 +26,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use localdb_core::parser::DocumentMetadata;
 use localdb_core::{
     Citation, Error as CoreError, IndexJob, IndexJobScope, QueryRequest, SearchOrchestrator,
     StoreHandle,
@@ -209,6 +210,7 @@ pub struct DocumentRecord {
     pub content_hash: String,
     pub fetched_at: String,
     pub normalized_text: String,
+    pub metadata: DocumentMetadata,
 }
 
 pub async fn get_document(
@@ -1202,6 +1204,12 @@ mod tests {
                 content_hash: "deadbeef".to_string(),
                 fetched_at: "2026-06-10T12:00:00Z".to_string(),
                 normalized_text: "hello world".to_string(),
+                metadata: localdb_core::parser::DocumentMetadata {
+                    title: Some("Test Doc".to_string()),
+                    creator: vec!["Test Author".to_string()],
+                    date: Some("2026-06-10".to_string()),
+                    ..Default::default()
+                },
             })
             .await;
 
@@ -1221,6 +1229,16 @@ mod tests {
         assert_eq!(body["id"], "doc-abc123");
         assert_eq!(body["uri"], "file:///test.md");
         assert_eq!(body["title"], "Test Doc");
+        assert!(
+            body.get("metadata").is_some(),
+            "metadata field must be present"
+        );
+        assert_eq!(
+            body["metadata"]["creator"].as_array().unwrap()[0]
+                .as_str()
+                .unwrap(),
+            "Test Author"
+        );
     }
 
     // --- /search returns citations (AC) ---

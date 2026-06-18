@@ -7,12 +7,13 @@
 use localdb_core::parser::{ChainParser, Parser};
 use localdb_core::Error;
 
-use crate::parsers::{HtmlParser, MarkdownParser, PdfParser, PlaintextParser};
+use crate::parsers::{HtmlParser, MarkdownParser, OfficeParser, PdfParser, PlaintextParser};
 
 /// The canonical ordered list of parser IDs used when the config omits `parsers`.
 pub fn default_parser_ids() -> Vec<String> {
     vec![
         "pdf".to_string(),
+        "office".to_string(),
         "html".to_string(),
         "markdown".to_string(),
         "plaintext".to_string(),
@@ -33,12 +34,13 @@ pub fn build_chain(enabled_ids: &[String]) -> Result<ChainParser, Error> {
         .map(|id| -> Result<Box<dyn Parser>, Error> {
             match id.as_str() {
                 "pdf" => Ok(Box::new(PdfParser)),
+                "office" => Ok(Box::new(OfficeParser)),
                 "html" => Ok(Box::new(HtmlParser)),
                 "markdown" => Ok(Box::new(MarkdownParser)),
                 "plaintext" => Ok(Box::new(PlaintextParser)),
                 other => Err(Error::InvalidConfig {
                     message: format!(
-                        "unknown parser id '{other}'; known ids are: pdf, html, markdown, plaintext"
+                        "unknown parser id '{other}'; known ids are: pdf, office, html, markdown, plaintext"
                     ),
                 }),
             }
@@ -54,9 +56,9 @@ mod tests {
     use localdb_core::parser::Probe;
 
     #[test]
-    fn default_ids_are_four() {
+    fn default_ids_are_five() {
         let ids = default_parser_ids();
-        assert_eq!(ids, vec!["pdf", "html", "markdown", "plaintext"]);
+        assert_eq!(ids, vec!["pdf", "office", "html", "markdown", "plaintext"]);
     }
 
     #[test]

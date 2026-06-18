@@ -25,7 +25,7 @@ impl Parser for PdfParser {
             return Ok(None);
         }
 
-        let out = crate::pdf::extract_pdf(probe.bytes())?;
+        let (markdown, title) = crate::pdf::extract_pdf(probe.bytes())?;
 
         let mut dc = DocumentMetadata::default();
         if let Some(mime) = probe.sniffed_mime {
@@ -33,9 +33,8 @@ impl Parser for PdfParser {
         }
 
         Ok(Some(ParsedDocument {
-            text: out.text,
-            blocks: out.blocks,
-            title: out.title,
+            markdown,
+            title,
             metadata: dc,
         }))
     }
@@ -60,12 +59,9 @@ mod tests {
 
     #[test]
     fn accepts_pdf_magic() {
-        // A minimal valid-looking PDF header triggers acceptance (actual parse
-        // may fail or succeed depending on content).
         let bytes = b"%PDF-1.4\n%%EOF\n";
-        let probe = Probe::new(bytes, Some("doc.txt"), None); // wrong ext, magic wins
+        let probe = Probe::new(bytes, Some("doc.txt"), None);
         let result = PdfParser.parse(&probe);
-        // Either Ok(Some) or Err (scanned), but NOT Ok(None)
         assert!(result.is_ok() || result.is_err());
         if let Ok(v) = result {
             assert!(v.is_some(), "magic-matched PDF should not return Ok(None)");
@@ -97,12 +93,9 @@ mod tests {
 
     #[test]
     fn sniffed_mime_populates_dc_format() {
-        // When the probe carries a sniffed MIME type, the parser must populate
-        // `metadata.format` so downstream consumers can surface it.
         let bytes = b"%PDF-1.4\n%%EOF\n";
         let probe = Probe::new(bytes, Some("doc.pdf"), Some("application/pdf"));
         let result = PdfParser.parse(&probe);
-        // Accept or error — but if we get a document, format must be set.
         if let Ok(Some(doc)) = result {
             assert_eq!(
                 doc.metadata.format,
@@ -114,8 +107,6 @@ mod tests {
 
     #[test]
     fn scanned_pdf_returns_err_not_none() {
-        // A scanned PDF (no text layer) must short-circuit with Err, not Ok(None).
-        // This prevents the plaintext catch-all from silently accepting binary PDF bytes.
         let path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scanned.pdf");
         let bytes = std::fs::read(&path).expect("scanned.pdf fixture must exist");

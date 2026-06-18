@@ -130,7 +130,7 @@ pub struct IndexingPolicyConfig {
 
     /// Ordered list of parser IDs to try (first match wins).
     ///
-    /// Empty or absent defaults to `["pdf", "html", "markdown", "plaintext"]`.
+    /// Empty or absent defaults to `["pdf", "office", "html", "markdown", "plaintext"]`.
     /// Unknown IDs are rejected at config validation time.
     /// Order is load-bearing: placing `plaintext` before `html` would cause
     /// HTML files with a `.html` extension to be parsed as plain text.
@@ -151,6 +151,7 @@ impl Default for IndexingPolicyConfig {
 fn default_parser_ids() -> Vec<String> {
     vec![
         "pdf".to_string(),
+        "office".to_string(),
         "html".to_string(),
         "markdown".to_string(),
         "plaintext".to_string(),

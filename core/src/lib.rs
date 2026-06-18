@@ -8,6 +8,7 @@ pub mod citation;
 pub mod config;
 pub mod embedder;
 pub mod error;
+pub mod heading_index;
 pub mod ids;
 pub mod ingestion;
 pub mod parser;
@@ -38,8 +39,8 @@ pub use search::{
 };
 pub use store::{ChunkRecord, FakeStore, MetadataFilter, RetrievalStore, SearchResult, StoreStats};
 pub use types::{
-    validate_dc_meta_key, validate_msg_meta_key, AclEntry, BackendConfig, Block, BlockKind, Chunk,
-    ChunkingConfig, Document, EmbeddingConfig, FederationHop, IndexJob, IndexJobScope,
-    IndexJobState, IndexJobStats, IndexingPolicy, Provenance, Source, SourceKind, SourceRef,
-    SourceSpec, Span, Store, StoreVisibility,
+    validate_dc_meta_key, validate_msg_meta_key, AclEntry, BackendConfig, Chunk, ChunkingConfig,
+    Document, EmbeddingConfig, FederationHop, IndexJob, IndexJobScope, IndexJobState,
+    IndexJobStats, IndexingPolicy, Provenance, Source, SourceKind, SourceRef, SourceSpec, Span,
+    Store, StoreVisibility,
 };

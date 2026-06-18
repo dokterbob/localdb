@@ -83,6 +83,10 @@ pub enum Command {
         /// Index an arbitrary directory (creates a temporary anonymous source).
         #[arg(long, value_name = "PATH")]
         dir: Option<String>,
+
+        /// Exit with code 2 if any document failed extraction (never aborts mid-run).
+        #[arg(long)]
+        strict: bool,
     },
 
     /// Hybrid search with citations.
@@ -176,7 +180,11 @@ fn main() {
                 }
             }
         },
-        Command::Index { source, dir } => cli::run_index(&ctx, source.as_deref(), dir.as_deref()),
+        Command::Index {
+            source,
+            dir,
+            strict,
+        } => cli::run_index(&ctx, source.as_deref(), dir.as_deref(), *strict),
         Command::Search { query, limit } => cli::run_search(&ctx, query, *limit),
     }
 }

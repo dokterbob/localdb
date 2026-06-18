@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{ContentId, UlidId};
+use crate::parser::DocumentMetadata;
 use crate::types::Span;
 
 /// A store reference embedded in a citation.
@@ -78,6 +79,10 @@ pub struct Citation {
 
     /// Provenance summary.
     pub provenance: CitationProvenance,
+
+    /// Document metadata (Dublin Core); empty/`None` fields when none was extracted.
+    #[serde(default)]
+    pub metadata: DocumentMetadata,
 }
 
 #[cfg(test)]
@@ -111,6 +116,12 @@ mod tests {
             provenance: CitationProvenance {
                 fetched_at: "2026-06-10T12:00:00Z".to_string(),
                 content_hash: content_hash("some content"),
+            },
+            metadata: DocumentMetadata {
+                title: Some("API Documentation".to_string()),
+                creator: vec!["Alice Example".to_string()],
+                date: Some("2026-01-15".to_string()),
+                ..Default::default()
             },
         }
     }
@@ -168,6 +179,16 @@ mod tests {
             prov.get("content_hash").is_some(),
             "provenance.content_hash missing"
         );
+
+        // Metadata shape
+        assert!(v.get("metadata").is_some(), "metadata missing");
+        let meta = &v["metadata"];
+        assert_eq!(
+            meta["creator"].as_array().unwrap()[0].as_str().unwrap(),
+            "Alice Example"
+        );
+        assert_eq!(meta["date"].as_str().unwrap(), "2026-01-15");
+        assert_eq!(meta["title"].as_str().unwrap(), "API Documentation");
     }
 
     #[test]

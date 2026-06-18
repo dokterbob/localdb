@@ -41,8 +41,7 @@ impl DocumentExtractor for ChainExtractor {
         let probe = Probe::new(bytes, filename, sniffed.as_deref());
         match self.chain.parse(&probe)? {
             Some(doc) => Ok(ExtractionResult {
-                text: doc.text,
-                blocks: doc.blocks,
+                markdown: doc.markdown,
                 title: doc.title,
                 metadata: doc.metadata,
             }),
@@ -62,7 +61,7 @@ mod tests {
         let ex = ChainExtractor::with_defaults().unwrap();
         let md = b"# My Title\n\nSome body text here.";
         let result = ex.extract(md, Some("doc.md")).unwrap();
-        assert!(!result.text.is_empty());
+        assert!(!result.markdown.is_empty());
         assert!(result.title.is_some());
     }
 
@@ -72,7 +71,7 @@ mod tests {
         // Feed Markdown with a .md extension so the mime sniffer returns text/markdown.
         let md = b"# Title\n\nParagraph.";
         let result = ex.extract(md, Some("doc.md")).unwrap();
-        assert!(!result.text.is_empty());
+        assert!(!result.markdown.is_empty());
     }
 
     #[test]
@@ -114,6 +113,28 @@ mod tests {
         assert!(
             format!("{err}").contains("unknown parser id"),
             "expected InvalidConfig, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn binary_md_yields_unsupported_format() {
+        let ex = ChainExtractor::with_defaults().unwrap();
+        let binary = b"\xFF\xFE\x00\x01binary content";
+        let err = ex.extract(binary, Some("file.md")).unwrap_err();
+        assert!(
+            matches!(err, Error::UnsupportedFormat { .. }),
+            "binary .md should yield UnsupportedFormat, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn binary_html_yields_unsupported_format() {
+        let ex = ChainExtractor::with_defaults().unwrap();
+        let binary = b"\xFF\xFE\x00\x01binary content";
+        let err = ex.extract(binary, Some("page.html")).unwrap_err();
+        assert!(
+            matches!(err, Error::UnsupportedFormat { .. }),
+            "binary .html should yield UnsupportedFormat, got: {err:?}"
         );
     }
 }

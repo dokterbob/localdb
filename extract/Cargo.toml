@@ -19,6 +19,9 @@ scraper = "0.27"
 # PDF text extraction
 pdf-extract = "0.10"
 
+# Office format conversion (DOCX, PPTX, XLSX, XLS, CSV → Markdown)
+anytomd = { version = "1.3.0", default-features = false }
+
 # MIME type sniffing
 infer = "0.16"
 mime_guess = "2"
