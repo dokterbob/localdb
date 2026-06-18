@@ -51,8 +51,8 @@ localdb search "your query" --store notes --json \
 | `snippet` | string | Extracted text passage matching the query |
 | `span` | `{start, end}` | Byte offsets of the snippet within the document |
 | `score.fused` | float | Reciprocal-rank-fusion score (higher = more relevant) |
-| `score.bm25` | float | BM25 component (primary driver in v0.1.0) |
-| `score.dense` | float | Dense vector component — cosine similarity (binary Hamming approximation) from local ONNX embedder |
+| `score.bm25` | float | BM25 component |
+| `score.dense` | float | Dense vector component — normalized Hamming similarity (`1 − dist/bits`) from the binary-quantized local ONNX embedder |
 | `document_id` | string | Blake3 content hash — pass to `get_document` MCP tool |
 | `heading_path` | array | Markdown heading breadcrumbs (may be empty) |
 | `metadata` | object | Dublin Core document metadata extracted from frontmatter: `title`, `creator`, `date`, `description`, etc. Fields are `null` when not present. |
@@ -99,9 +99,9 @@ Pass it to any command with `--config /path/to/config.yaml`.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `error: store not found: handbook` on `localdb index` | Store was declared in YAML config — YAML-declared stores cannot be indexed in v0.1.0 | Use `localdb store add handbook` to create a runtime store, then `localdb source add` |
+| `error: store not found: handbook` on `localdb index` | Store was declared in YAML config — YAML-declared stores cannot be indexed | Use `localdb store add handbook` to create a runtime store, then `localdb source add` |
 | `Database already open. Cannot acquire lock.` | `localdb serve` (HTTP daemon) is running and holds the DB lock | Stop the daemon; CLI and MCP work in embedded mode without it |
 | `error: daemon is unreachable` (exit 5) | Stale `daemon.sock` left after daemon crash or `SIGKILL` | `rm <data_dir>/daemon.sock` |
 | Empty search results | Store has not been indexed yet | Run `localdb index --store <name>` |
 | `error: invalid request: store 'X' already exists` (exit 2) | `store add` called for a store that already exists | Use the existing store; list stores with `localdb store list` |
-| `source add` on a non-existent path succeeds | Path existence is not validated at add time (v0.1.0) | The error will surface at index time |
+| `source add` on a non-existent path succeeds | Path existence is not validated at add time | The error will surface at index time |

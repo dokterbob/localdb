@@ -224,9 +224,10 @@ localdb search "hybrid search" --store notes --json
 
 (Output truncated to one result; paths shown from a scratch run.)
 
-**Score fields:** `bm25` is the BM25 full-text score; `dense` is the cosine similarity score
-from the local ONNX embedder (`pplx-embed-context-v1-0.6b` by default). `fused` is the
-Reciprocal Rank Fusion score used for final ranking, combining both components.
+**Score fields:** `bm25` is the BM25 full-text score; `dense` is the normalized Hamming
+similarity (`1.0 − hamming_dist / nbits`) from the binary-quantized local ONNX embedder
+(`pplx-embed-context-v1-0.6b` by default). `fused` is the Reciprocal Rank Fusion score
+used for final ranking, combining both components.
 
 ## Step 8 — Verify status after indexing
 

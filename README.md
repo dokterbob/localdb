@@ -32,13 +32,13 @@ provenance, and stores as first-class shareable units. See [VISION.md](VISION.md
 - **Multiple stores** — each store is isolated; query one or all with `--store`.
 - **Context-aware dense search** — the default embedder (`pplx-embed-context-v1-0.6b`) is a
   late-chunking model from Perplexity AI that encodes each chunk in the context of its full
-  document, producing state-of-the-art retrieval quality. Stored as binary-quantized 128-byte
+  document, producing strong retrieval quality. Stored as binary-quantized 128-byte
   vectors (Hamming / IVF_FLAT), keeping index size small and search fast without a GPU.
   Alternative: any OpenAI-compatible embedding endpoint, including local private models via
-  llama.cpp or mlx.
+  llama.cpp or MLX (Apple Silicon, SSD-backed KV cache).
 - **LanceDB backend** — columnar vector + BM25 index, embedded, no separate server.
 - **`--json` everywhere** — machine-readable output on every command.
-- **`localdb status`** — shows indexed stores, document/chunk counts, and daemon state at a glance.
+- **`localdb status`** — shows indexed stores and daemon state at a glance.
 
 ---
 

@@ -48,8 +48,9 @@ The `RetrievalStore` trait implementation backed by LanceDB embedded. One LanceD
 per logical store, stored under `{data_dir}/stores/{store_name}/`, with a single `chunks`
 table. BM25 full-text search uses LanceDB's built-in FTS index (tantivy underneath); dense
 search uses binary-quantized IVF_FLAT (Hamming distance) or flat Hamming scan for smaller
-tables; encoding is determined by the embedder's `vector_encoding()` return value. RRF fusion is intentionally
-_not_ done here — the trait returns raw ranked lists and `core` fuses them. See
+tables; encoding is determined by the embedder's `vector_encoding()` return value.
+RRF fusion is intentionally _not_ done here — the trait returns raw ranked lists and
+`core` fuses them. See
 [specs/01-architecture.md](../specs/01-architecture.md) §2.
 
 ### `cli`
@@ -92,7 +93,7 @@ to the appropriate crate. No logic of its own. Subcommands: `init`, `serve`, `mc
  │  path / URL source                                      │
  │       │                                                 │
  │       ▼                                                 │
- │  extract  →  normalized text + Blocks                   │
+ │  extract  →  normalized Markdown + DocumentMetadata      │
  │       │                                                 │
  │       ▼                                                 │
  │  chunker  →  Chunks  (heading-aware, ~400-token prose)  │
