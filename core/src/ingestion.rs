@@ -628,7 +628,7 @@ pub async fn index_document(
 /// This trait allows the ingestion pipeline to be tested without a full
 /// extraction stack.
 pub trait DocumentExtractor: Send + Sync {
-    /// Extract normalized text + blocks from raw bytes.
+    /// Extract a normalized Markdown document from raw bytes.
     ///
     /// # Errors
     /// Returns `Error::UnsupportedFormat` if the format is not recognized.

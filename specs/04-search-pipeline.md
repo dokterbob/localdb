@@ -2,8 +2,13 @@
 
 > Status: accepted draft, 2026-06-10.
 
-Pipeline: **acquire → extract → markdown → chunks → embed → index** (write side), and
+Pipeline: **acquire → extract → chunks → embed → index** (write side), and
 **query → BM25 + dense → RRF fuse → filter → citations** (read side).
+
+> The historical "blocks" stage between extract and chunks is **vestigial**: since the
+> Markdown-native migration (commit `3da56d0`), extraction emits a single Markdown string and the
+> chunker indexes it directly. `heading_path` is derived from Markdown headings
+> (`core/src/heading_index.rs`); there is no separate block-building pass.
 
 ## 1. Acquisition
 
@@ -22,23 +27,25 @@ Pipeline: **acquire → extract → markdown → chunks → embed → index** (w
 
 ## 2. Extraction (v1 matrix)
 
-**Decision:** v1 extracts **Markdown, plain text, HTML, and text-layer PDF** into a normalized
-Markdown string plus `DocumentMetadata` extracted from frontmatter (Dublin Core fields).
+**Decision:** v1 extraction normalizes every supported format to a single **Markdown string**
+(`ParsedDocument.markdown`, [02-domain-model.md](02-domain-model.md) §2) plus a structured
+`DocumentMetadata` carrying Dublin Core elements (from OPF for EPUB, frontmatter for Markdown).
+`heading_path` and spans are derived from that string downstream; there is no nested block IR.
 
 | Format | Approach | Notes |
 |---|---|---|
-| Markdown | pulldown-cmark parser | Passed through as-is after normalization; headings and code fences preserved as Markdown. |
-| Plain text | direct | Rendered as plain Markdown paragraphs. |
-| HTML | readability-style main-content + DOM walk | Used for both `url` fetches and `.html` files; converted to Markdown. |
-| PDF (text layer) | Rust PDF text extraction | Converted to Markdown; page structure preserved where detectable. |
+| Markdown | pulldown-cmark parser (passthrough) | Headings → `heading_path`; code fences preserved. |
+| Plain text | direct passthrough | Treated as Markdown verbatim. |
+| HTML | readability-style main-content selection → Markdown | Used for both `url` fetches and `.html` files. |
+| PDF (text layer) | Rust PDF text extraction | Scanned/text-less PDFs are rejected (no OCR). |
+| Office (DOCX/PPTX/CSV) | `anytomd` (v1.3.0) → Markdown | Production-ready. XLSX/XLS disabled (see below). |
+| EPUB | `rbook` spine walk → per-chapter XHTML → Markdown via the internal HTML converter | Reading order preserved; OPF Dublin Core → `DocumentMetadata`. Extension-gated (`.epub`). DRM'd / image-only books → `ExtractionFailed`. |
 
-**Additional formats via `anytomd`:** DOCX, PPTX, and CSV are supported by the `OfficeParser`
-using the `anytomd` crate (v1.3.0), which converts them to Markdown. These are production-ready.
-
-**Out of scope for v1 (explicit):** OCR, scanned PDFs, images. Rationale: no
-single mature Rust extraction stack covers these well; shipping a sharp matrix
-beats shipping a ragged one. Unsupported files are skipped and counted in IndexJob stats, not
-errors. Roadmap: [06-roadmap.md](06-roadmap.md) §5.
+**Out of scope (explicit):** OCR / scanned PDFs and images. EPUB is the only ebook format
+supported; **MOBI/AZW/AZW3** (PalmDOC/KF8 compression, frequent DRM — realistically need a
+Calibre shell-out) and **FB2/CBZ** (on `rbook`'s roadmap, not yet implemented) are deferred.
+Rationale and the full deferred list: [06-roadmap.md](06-roadmap.md) §5. Unsupported files are
+skipped and counted in IndexJob stats, not errors.
 
 **XLSX/XLS explicitly disabled:** Despite anytomd supporting XLSX/XLS in principle, extraction
 for these formats is disabled in `OfficeParser` pending an upstream performance fix.

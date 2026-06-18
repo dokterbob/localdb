@@ -54,7 +54,23 @@ Linux; web UI assets embedded in the binary at Phase 2. Model files are never bu
 ## 5. Consolidated "later" list
 
 Deferred items referenced by other specs, in one place: reranking stage; SSE job streaming;
-original-file line mapping for citations; OCR / scanned PDFs / DOCX-family extraction; OS keychain
-secret storage; interactive CLI browse; gRPC (if demanded); entities/graph; backup/export/import
-strategy (with Phase 3); metrics/tracing endpoints (structured logs ship in MVP; Prometheus
-metrics arrive with the daemon-centric Phase 3).
+original-file line mapping for citations; OCR / scanned PDFs; additional ebook formats (see
+below); OS keychain secret storage; interactive CLI browse; gRPC (if demanded); entities/graph;
+backup/export/import strategy (with Phase 3); metrics/tracing endpoints (structured logs ship in
+MVP; Prometheus metrics arrive with the daemon-centric Phase 3).
+
+### Document & ebook formats
+
+**Shipped:** Markdown, plain text, HTML, text-layer PDF, Office (DOCX/PPTX/XLSX/XLS/CSV via
+`anytomd`), and **EPUB** (EPUB 2 & 3 via the pure-Rust `rbook` crate; OPF Dublin Core maps 1:1
+onto `DocumentMetadata`). See [04-search-pipeline.md](04-search-pipeline.md) §2.
+
+**Deferred ebook formats:**
+- **MOBI / AZW / AZW3** — PalmDOC/KF8 compression and frequent DRM mean these realistically
+  require shelling out to Calibre; the only Rust crate (`mobi`) is stale (Dec 2022). Not worth a
+  dependency now.
+- **FB2 / CBZ** — on `rbook`'s roadmap but not yet implemented; a clean on-ramp when `rbook`
+  ships them.
+- **Kreuzberg** (broad-surface extractor) — capable but **Elastic License 2.0**
+  (source-available, not OSI-permissive); the project stays on its permissive (Apache/MIT)
+  small-crate stack. Revisit only if its license changes.

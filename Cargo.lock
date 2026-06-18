@@ -156,7 +156,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "ureq",
- "zip",
+ "zip 2.4.2",
 ]
 
 [[package]]
@@ -887,7 +887,7 @@ dependencies = [
  "log",
  "quick-xml 0.31.0",
  "serde",
- "zip",
+ "zip 2.4.2",
 ]
 
 [[package]]
@@ -2691,6 +2691,7 @@ dependencies = [
  "mime_guess",
  "pdf-extract",
  "pulldown-cmark",
+ "rbook",
  "scraper 0.27.0",
  "thiserror 2.0.18",
 ]
@@ -6395,6 +6396,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "quick-xml"
+version = "0.40.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2474bd2e5029e7ccb6abb2ba48cf2383a333851dedf495901544281590c7da7f"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "quinn"
 version = "0.11.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6636,6 +6646,19 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
+]
+
+[[package]]
+name = "rbook"
+version = "0.7.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27704c60b69971656c5621e8523cbab07fee538d61d7ab21719da49546e13630"
+dependencies = [
+ "indexmap 2.14.0",
+ "percent-encoding",
+ "quick-xml 0.40.1",
+ "thiserror 2.0.18",
+ "zip 8.6.0",
 ]
 
 [[package]]
@@ -8513,6 +8536,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "typed-path"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9681,6 +9710,19 @@ dependencies = [
  "memchr",
  "thiserror 2.0.18",
  "zopfli",
+]
+
+[[package]]
+name = "zip"
+version = "8.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
+dependencies = [
+ "crc32fast",
+ "flate2",
+ "indexmap 2.14.0",
+ "memchr",
+ "typed-path",
 ]
 
 [[package]]
