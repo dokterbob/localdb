@@ -120,12 +120,15 @@ pub struct ChunkerConfig {
 impl ChunkerConfig {
     /// Create a config for the `prose` preset with the spec defaults.
     ///
-    /// Default target ≈ 512 tokens, overlap ≈ 64 tokens.
+    /// Default target ≈ 256 tokens, overlap ≈ 0 tokens. These match the
+    /// contextual training regime of `pplx-embed-context-v1` (256-token chunks,
+    /// no intra-document overlap — late chunking supplies cross-chunk context).
+    /// See specs/04-search-pipeline.md §3.
     pub fn prose() -> Self {
         Self {
             preset: "prose".to_string(),
-            target_tokens: Some(512),
-            overlap_tokens: Some(64),
+            target_tokens: Some(256),
+            overlap_tokens: Some(0),
         }
     }
 
@@ -164,12 +167,12 @@ impl ChunkerConfig {
 
     /// Resolved target tokens (uses preset default if not overridden).
     pub fn resolved_target_tokens(&self) -> usize {
-        self.target_tokens.unwrap_or(512)
+        self.target_tokens.unwrap_or(256)
     }
 
     /// Resolved overlap tokens (uses preset default if not overridden).
     pub fn resolved_overlap_tokens(&self) -> usize {
-        self.overlap_tokens.unwrap_or(64)
+        self.overlap_tokens.unwrap_or(0)
     }
 }
 
@@ -378,8 +381,8 @@ mod tests {
     fn chunker_config_prose_defaults() {
         let cfg = ChunkerConfig::prose();
         assert_eq!(cfg.preset, "prose");
-        assert_eq!(cfg.resolved_target_tokens(), 512);
-        assert_eq!(cfg.resolved_overlap_tokens(), 64);
+        assert_eq!(cfg.resolved_target_tokens(), 256);
+        assert_eq!(cfg.resolved_overlap_tokens(), 0);
     }
 
     #[test]
