@@ -13,6 +13,20 @@ use std::sync::Arc;
 
 use crate::error::Error;
 
+/// Describes how embedding vectors should be stored in the backend.
+///
+/// The embedder signals the encoding; the store binarizes at index time for `Binary`.
+/// `FakeEmbedder` always returns `Float32`; pplx local-ONNX models return `Binary`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VectorEncoding {
+    /// Raw 32-bit float vectors. Default for all embedders.
+    #[default]
+    Float32,
+    /// Binary-quantized: `(x ≥ 0.0)` → 1, packed MSB-first into bytes.
+    /// A 1024-dim vector becomes 128 bytes/vector.
+    Binary,
+}
+
 /// A token-counting closure: maps a text to its token count.
 ///
 /// Returned by [`Embedder::token_counter`] when the embedder has a local
@@ -75,6 +89,14 @@ pub trait Embedder: Send + Sync {
 
     /// Return a human-readable name for the model/provider (for logging and policy versioning).
     fn model_id(&self) -> &str;
+
+    /// Describes how vectors from this embedder should be stored in the backend.
+    ///
+    /// Most embedders return `Float32`. Perplexity local-ONNX models return `Binary` —
+    /// the store binarizes at `(x ≥ 0.0)` and packs MSB-first at index time.
+    fn vector_encoding(&self) -> VectorEncoding {
+        VectorEncoding::Float32
+    }
 
     /// Return a token-counting function if this embedder has a local tokenizer.
     ///

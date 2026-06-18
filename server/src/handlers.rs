@@ -392,7 +392,13 @@ pub async fn search(
         if store_dir.exists() {
             // Open the real LanceDbStore for this store.
             let lance_path = store_dir.to_string_lossy().to_string();
-            match store_lancedb::LanceDbStore::open(&lance_path, embedder.embedding_dim()).await {
+            match store_lancedb::LanceDbStore::open(
+                &lance_path,
+                embedder.embedding_dim(),
+                embedder.vector_encoding(),
+            )
+            .await
+            {
                 Ok(s) => {
                     store_handles.push(StoreHandle {
                         id: store_cfg
