@@ -1628,14 +1628,19 @@ async fn run_index_for_source_async(
     }
 
     let lance_path = store_data_dir.to_string_lossy().to_string();
-    let lancedb_store =
-        match store_lancedb::LanceDbStore::open(&lance_path, embedder.embedding_dim()).await {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("warning: cannot open store for auto-index: {}", e);
-                return;
-            }
-        };
+    let lancedb_store = match store_lancedb::LanceDbStore::open(
+        &lance_path,
+        embedder.embedding_dim(),
+        embedder.vector_encoding(),
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("warning: cannot open store for auto-index: {}", e);
+            return;
+        }
+    };
 
     let mut doc_index = DocumentIndex::new();
     let mut chunks = 0u64;
@@ -1677,6 +1682,9 @@ async fn run_index_for_source_async(
     if chunks > 0 {
         if let Err(e) = lancedb_store.create_fts_index().await {
             eprintln!("warning: FTS index creation failed: {}", e);
+        }
+        if let Err(e) = lancedb_store.create_vector_index().await {
+            eprintln!("warning: vector index creation failed: {}", e);
         }
     }
 }
@@ -2030,11 +2038,16 @@ async fn run_index_async(
     }
 
     let lance_path = store_data_dir.to_string_lossy().to_string();
-    let lancedb_store =
-        match store_lancedb::LanceDbStore::open(&lance_path, embedder.embedding_dim()).await {
-            Ok(s) => s,
-            Err(e) => exit_err(&e, ctx.json),
-        };
+    let lancedb_store = match store_lancedb::LanceDbStore::open(
+        &lance_path,
+        embedder.embedding_dim(),
+        embedder.vector_encoding(),
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => exit_err(&e, ctx.json),
+    };
 
     let mut doc_index = DocumentIndex::new();
     let (mut indexed, mut skipped, mut chunks, mut errors, mut unsupported) =
@@ -2077,11 +2090,14 @@ async fn run_index_async(
         }
     }
 
-    // Create FTS index so BM25 search works. Safe to call after every index run.
+    // Create FTS and vector indices. Safe to call after every index run.
     if chunks > 0 {
         if let Err(e) = lancedb_store.create_fts_index().await {
             // Non-fatal — log and continue. BM25 leg will be skipped by search.
             eprintln!("warning: FTS index creation failed: {}", e);
+        }
+        if let Err(e) = lancedb_store.create_vector_index().await {
+            eprintln!("warning: vector index creation failed: {}", e);
         }
     }
 
@@ -2265,7 +2281,13 @@ async fn run_search_async(ctx: &CliContext, query: &str, limit: usize) {
             .unwrap_or_else(|| name.clone());
 
         let lance_path = store_data_dir.to_string_lossy().to_string();
-        match store_lancedb::LanceDbStore::open(&lance_path, embedder.embedding_dim()).await {
+        match store_lancedb::LanceDbStore::open(
+            &lance_path,
+            embedder.embedding_dim(),
+            embedder.vector_encoding(),
+        )
+        .await
+        {
             Ok(s) => store_handles.push(StoreHandle {
                 id: store_id,
                 name: name.clone(),
@@ -2441,7 +2463,13 @@ async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
                 .unwrap_or_else(|| "private".to_string()),
         };
         let lance_path = store_data_dir.to_string_lossy().to_string();
-        match store_lancedb::LanceDbStore::open(&lance_path, embedder.embedding_dim()).await {
+        match store_lancedb::LanceDbStore::open(
+            &lance_path,
+            embedder.embedding_dim(),
+            embedder.vector_encoding(),
+        )
+        .await
+        {
             Ok(s) => available.push(AvailableStore::new(descriptor, Box::new(s))),
             Err(e) => eprintln!("warning: cannot open store '{}': {}", name, e),
         }

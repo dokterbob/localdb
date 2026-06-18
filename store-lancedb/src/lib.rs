@@ -21,19 +21,19 @@ use std::sync::Arc;
 
 use arrow_array::{
     Array, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray,
-    UInt64Array,
+    UInt64Array, UInt8Array,
 };
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use lance_index::scalar::FullTextSearchQuery;
-use lancedb::index::{scalar::BTreeIndexBuilder, Index};
+use lancedb::index::{scalar::BTreeIndexBuilder, vector::IvfFlatIndexBuilder, Index};
 use lancedb::query::{ExecutableQuery, QueryBase};
-use lancedb::{connect, Table};
+use lancedb::{connect, DistanceType, Table};
 
 use localdb_core::store::{ChunkRecord, MetadataFilter, RetrievalStore, SearchResult, StoreStats};
 use localdb_core::types::Span;
-use localdb_core::Error;
+use localdb_core::{Error, VectorEncoding};
 
 // ---------------------------------------------------------------------------
 // Schema constants
@@ -79,6 +79,7 @@ const COL_SCORE: &str = "_score";
 pub struct LanceDbStore {
     table: Table,
     embedding_dim: usize,
+    encoding: VectorEncoding,
 }
 
 impl LanceDbStore {
@@ -87,10 +88,16 @@ impl LanceDbStore {
     /// # Arguments
     /// * `path` - Directory path for this store's LanceDB database.
     /// * `embedding_dim` - Dimension of the embedding vectors. Must be consistent.
+    /// * `encoding` - How vectors are stored: `Float32` or `Binary`.
     ///
     /// # Errors
-    /// Returns an error if the database cannot be opened or the table cannot be created.
-    pub async fn open(path: &str, embedding_dim: usize) -> Result<Self, Error> {
+    /// Returns an error if the database cannot be opened or the table cannot be created,
+    /// or if the stored schema's encoding or dimension doesn't match.
+    pub async fn open(
+        path: &str,
+        embedding_dim: usize,
+        encoding: VectorEncoding,
+    ) -> Result<Self, Error> {
         let db = connect(path).execute().await.map_err(|e| Error::Internal {
             message: format!("LanceDB connect failed: {e}"),
             correlation_id: "lancedb-open".to_string(),
@@ -116,34 +123,56 @@ impl LanceDbStore {
                     correlation_id: "lancedb-open-table".to_string(),
                 })?;
 
-            // A5: validate embedding dim matches what is stored in the table schema.
+            // Validate stored encoding and dim match what the embedder expects.
             let schema = table.schema().await.map_err(|e| Error::Internal {
                 message: format!("LanceDB schema read failed: {e}"),
                 correlation_id: "lancedb-schema".to_string(),
             })?;
-            let stored_dim = schema.field_with_name(COL_EMBEDDING).ok().and_then(|f| {
-                if let DataType::FixedSizeList(_, dim) = f.data_type() {
-                    Some(*dim as usize)
-                } else {
-                    None
-                }
-            });
-            if let Some(dim) = stored_dim {
-                if dim != embedding_dim {
-                    return Err(Error::InvalidConfig {
-                        message: format!(
-                            "embedding dimension mismatch: store at '{path}' was created with \
-                             dim={dim} but the current embedder produces dim={embedding_dim}. \
-                             Update your embedding config to match the stored dimension, or \
-                             delete the store and re-run `localdb index` to rebuild it.",
-                        ),
-                    });
+            if let Ok(field) = schema.field_with_name(COL_EMBEDDING) {
+                if let DataType::FixedSizeList(item_field, col_dim) = field.data_type() {
+                    let stored_encoding = match item_field.data_type() {
+                        DataType::Float32 => VectorEncoding::Float32,
+                        DataType::UInt8 => VectorEncoding::Binary,
+                        other => {
+                            return Err(Error::Internal {
+                                message: format!(
+                                    "unexpected embedding item type in store at '{path}': {other:?}"
+                                ),
+                                correlation_id: "lancedb-schema".to_string(),
+                            });
+                        }
+                    };
+                    let stored_orig_dim = if stored_encoding == VectorEncoding::Binary {
+                        *col_dim as usize * 8
+                    } else {
+                        *col_dim as usize
+                    };
+                    if stored_encoding != encoding {
+                        return Err(Error::InvalidConfig {
+                            message: format!(
+                                "vector encoding mismatch: store at '{path}' uses {stored_encoding:?} \
+                                 encoding but the current embedder requires {encoding:?}. \
+                                 Delete the store directory and re-run `localdb index` to rebuild it.",
+                            ),
+                        });
+                    }
+                    if stored_orig_dim != embedding_dim {
+                        return Err(Error::InvalidConfig {
+                            message: format!(
+                                "embedding dimension mismatch: store at '{path}' was created with \
+                                 dim={stored_orig_dim} but the current embedder produces \
+                                 dim={embedding_dim}. Update your embedding config to match the \
+                                 stored dimension, or delete the store and re-run `localdb index` \
+                                 to rebuild it.",
+                            ),
+                        });
+                    }
                 }
             }
             table
         } else {
             // Create the table with the schema
-            let schema = make_schema(embedding_dim);
+            let schema = make_schema(embedding_dim, encoding);
             // Create an empty batch to initialize the table
             let empty_batch = make_empty_batch(&schema);
             let reader = RecordBatchIterator::new(vec![Ok(empty_batch)], Arc::clone(&schema));
@@ -159,6 +188,7 @@ impl LanceDbStore {
         Ok(Self {
             table,
             embedding_dim,
+            encoding,
         })
     }
 
@@ -191,6 +221,44 @@ impl LanceDbStore {
                 correlation_id: "lancedb-btree-index".to_string(),
             })
     }
+
+    /// Create an IVF_FLAT/Hamming vector index on the binary embedding column.
+    ///
+    /// No-op for Float32 stores (flat KNN is used instead).
+    /// Skipped when the table has fewer than 256 rows (flat Hamming scan is correct
+    /// and IVF training needs a minimum sample set).
+    /// Safe to call multiple times (LanceDB replaces the existing index).
+    pub async fn create_vector_index(&self) -> Result<(), Error> {
+        if self.encoding != VectorEncoding::Binary {
+            return Ok(());
+        }
+
+        let row_count = self
+            .table
+            .count_rows(None)
+            .await
+            .map_err(|e| Error::Internal {
+                message: format!("row count for vector index check failed: {e}"),
+                correlation_id: "lancedb-vector-index-count".to_string(),
+            })?;
+
+        // Need enough rows for meaningful IVF centroid training.
+        if row_count < 256 {
+            return Ok(());
+        }
+
+        self.table
+            .create_index(
+                &[COL_EMBEDDING],
+                Index::IvfFlat(IvfFlatIndexBuilder::default().distance_type(DistanceType::Hamming)),
+            )
+            .execute()
+            .await
+            .map_err(|e| Error::Internal {
+                message: format!("IVF_FLAT/Hamming index creation failed: {e}"),
+                correlation_id: "lancedb-vector-index".to_string(),
+            })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -198,7 +266,25 @@ impl LanceDbStore {
 // ---------------------------------------------------------------------------
 
 /// Build the Arrow schema for the chunks table.
-fn make_schema(embedding_dim: usize) -> Arc<Schema> {
+fn make_schema(embedding_dim: usize, encoding: VectorEncoding) -> Arc<Schema> {
+    let embedding_field = match encoding {
+        VectorEncoding::Float32 => Field::new(
+            COL_EMBEDDING,
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                embedding_dim as i32,
+            ),
+            false,
+        ),
+        VectorEncoding::Binary => Field::new(
+            COL_EMBEDDING,
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::UInt8, true)),
+                (embedding_dim / 8) as i32,
+            ),
+            false,
+        ),
+    };
     Arc::new(Schema::new(vec![
         Field::new(COL_ID, DataType::Utf8, false),
         Field::new(COL_DOCUMENT_ID, DataType::Utf8, false),
@@ -207,14 +293,7 @@ fn make_schema(embedding_dim: usize) -> Arc<Schema> {
         Field::new(COL_SPAN_START, DataType::UInt64, false),
         Field::new(COL_SPAN_END, DataType::UInt64, false),
         Field::new(COL_HEADING_PATH, DataType::Utf8, false), // JSON-encoded
-        Field::new(
-            COL_EMBEDDING,
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, true)),
-                embedding_dim as i32,
-            ),
-            false,
-        ),
+        embedding_field,
         Field::new(COL_POLICY_VERSION, DataType::Utf8, false),
         Field::new(COL_FETCHED_AT, DataType::Utf8, false),
         Field::new(COL_CONTENT_HASH, DataType::Utf8, false),
@@ -230,9 +309,27 @@ fn make_schema(embedding_dim: usize) -> Arc<Schema> {
 
 /// Build an empty RecordBatch for table initialization.
 fn make_empty_batch(schema: &Arc<Schema>) -> RecordBatch {
-    let embedding_dim = match schema.field_with_name(COL_EMBEDDING).unwrap().data_type() {
-        DataType::FixedSizeList(_, dim) => *dim as usize,
+    let emb_field = schema.field_with_name(COL_EMBEDDING).unwrap();
+    let (col_dim, is_binary) = match emb_field.data_type() {
+        DataType::FixedSizeList(item, dim) => (*dim, matches!(item.data_type(), DataType::UInt8)),
         _ => panic!("unexpected embedding type"),
+    };
+    let embedding_col: Arc<dyn Array> = if is_binary {
+        Arc::new(FixedSizeListArray::from_iter_primitive::<
+            arrow_array::types::UInt8Type,
+            _,
+            _,
+        >(
+            std::iter::empty::<Option<Vec<Option<u8>>>>(), col_dim
+        ))
+    } else {
+        Arc::new(FixedSizeListArray::from_iter_primitive::<
+            arrow_array::types::Float32Type,
+            _,
+            _,
+        >(
+            std::iter::empty::<Option<Vec<Option<f32>>>>(), col_dim
+        ))
     };
     RecordBatch::try_new(
         Arc::clone(schema),
@@ -244,14 +341,7 @@ fn make_empty_batch(schema: &Arc<Schema>) -> RecordBatch {
             Arc::new(UInt64Array::from(Vec::<u64>::new())) as _,
             Arc::new(UInt64Array::from(Vec::<u64>::new())) as _,
             Arc::new(StringArray::from(Vec::<Option<&str>>::new())) as _,
-            Arc::new(FixedSizeListArray::from_iter_primitive::<
-                arrow_array::types::Float32Type,
-                _,
-                _,
-            >(
-                std::iter::empty::<Option<Vec<Option<f32>>>>(),
-                embedding_dim as i32,
-            )) as _,
+            embedding_col,
             Arc::new(StringArray::from(Vec::<Option<&str>>::new())) as _,
             Arc::new(StringArray::from(Vec::<Option<&str>>::new())) as _,
             Arc::new(StringArray::from(Vec::<Option<&str>>::new())) as _,
@@ -267,11 +357,34 @@ fn make_empty_batch(schema: &Arc<Schema>) -> RecordBatch {
     .expect("empty batch construction failed")
 }
 
+/// Pack an f32 slice to binary bytes, MSB-first.
+///
+/// Each float is thresholded at zero: `x ≥ 0.0` → bit 1, `x < 0.0` → bit 0.
+/// Packing order: dim 0 → bit 7 of byte 0, dim 1 → bit 6 of byte 0, ..., dim 7 → bit 0.
+/// This matches `np.packbits(x >= 0, axis=-1)` (NumPy MSB-first, the paper standard).
+fn binarize_msb(v: &[f32]) -> Vec<u8> {
+    v.chunks(8)
+        .map(|chunk| {
+            let mut byte = 0u8;
+            for (i, &val) in chunk.iter().enumerate() {
+                if val >= 0.0 {
+                    byte |= 1 << (7 - i);
+                }
+            }
+            byte
+        })
+        .collect()
+}
+
 /// Build a RecordBatch from a slice of ChunkRecords.
 ///
 /// All records must have the same embedding dimension, and it must match `embedding_dim`.
-fn records_to_batch(records: &[ChunkRecord], embedding_dim: usize) -> Result<RecordBatch, Error> {
-    let schema = make_schema(embedding_dim);
+fn records_to_batch(
+    records: &[ChunkRecord],
+    embedding_dim: usize,
+    encoding: VectorEncoding,
+) -> Result<RecordBatch, Error> {
+    let schema = make_schema(embedding_dim, encoding);
 
     let ids: Vec<&str> = records.iter().map(|r| r.id.as_str()).collect();
     let doc_ids: Vec<&str> = records.iter().map(|r| r.document_id.as_str()).collect();
@@ -312,12 +425,32 @@ fn records_to_batch(records: &[ChunkRecord], embedding_dim: usize) -> Result<Rec
     }
 
     // Build the FixedSizeList embedding column
-    let embeddings = FixedSizeListArray::from_iter_primitive::<arrow_array::types::Float32Type, _, _>(
-        records
-            .iter()
-            .map(|r| Some(r.embedding.iter().map(|&v| Some(v)).collect::<Vec<_>>())),
-        embedding_dim as i32,
-    );
+    let embeddings: Arc<dyn Array> = match encoding {
+        VectorEncoding::Float32 => Arc::new(FixedSizeListArray::from_iter_primitive::<
+            arrow_array::types::Float32Type,
+            _,
+            _,
+        >(
+            records
+                .iter()
+                .map(|r| Some(r.embedding.iter().map(|&v| Some(v)).collect::<Vec<_>>())),
+            embedding_dim as i32,
+        )),
+        VectorEncoding::Binary => {
+            let binary_dim = (embedding_dim / 8) as i32;
+            Arc::new(FixedSizeListArray::from_iter_primitive::<
+                arrow_array::types::UInt8Type,
+                _,
+                _,
+            >(
+                records.iter().map(|r| {
+                    let bytes = binarize_msb(&r.embedding);
+                    Some(bytes.into_iter().map(Some).collect::<Vec<_>>())
+                }),
+                binary_dim,
+            ))
+        }
+    };
 
     let heading_path_strs: Vec<&str> = heading_paths.iter().map(|s| s.as_str()).collect();
 
@@ -331,7 +464,7 @@ fn records_to_batch(records: &[ChunkRecord], embedding_dim: usize) -> Result<Rec
             Arc::new(UInt64Array::from(span_starts)) as _,
             Arc::new(UInt64Array::from(span_ends)) as _,
             Arc::new(StringArray::from(heading_path_strs)) as _,
-            Arc::new(embeddings) as _,
+            embeddings,
             Arc::new(StringArray::from(policy_versions)) as _,
             Arc::new(StringArray::from(fetched_ats)) as _,
             Arc::new(StringArray::from(content_hashes)) as _,
@@ -546,7 +679,7 @@ impl RetrievalStore for LanceDbStore {
         let count = records.len();
 
         // Build the record batch
-        let batch = records_to_batch(&records, self.embedding_dim)?;
+        let batch = records_to_batch(&records, self.embedding_dim, self.encoding)?;
         let schema = Arc::clone(batch.schema_ref());
 
         // For each record, delete the existing chunk with the same id first,
@@ -635,26 +768,13 @@ impl RetrievalStore for LanceDbStore {
         limit: usize,
         filters: &[MetadataFilter],
     ) -> Result<Vec<SearchResult>, Error> {
-        let mut query = self
-            .table
-            .query()
-            .nearest_to(query_vector)
-            .map_err(|e| Error::Internal {
-                message: format!("LanceDB nearest_to failed: {e}"),
-                correlation_id: "dense-search".to_string(),
-            })?
-            .limit(limit);
-
-        if let Some(predicate) = filters_to_predicate(filters) {
-            query = query.only_if(predicate);
+        match self.encoding {
+            VectorEncoding::Float32 => {
+                self.float32_dense_search(query_vector, limit, filters)
+                    .await
+            }
+            VectorEncoding::Binary => self.binary_dense_search(query_vector, limit, filters).await,
         }
-
-        let stream = query.execute().await.map_err(|e| Error::Internal {
-            message: format!("LanceDB dense search execute failed: {e}"),
-            correlation_id: "dense-execute".to_string(),
-        })?;
-
-        collect_search_results(stream, COL_DISTANCE, true).await
     }
 
     async fn bm25_search(
@@ -789,6 +909,114 @@ impl RetrievalStore for LanceDbStore {
 }
 
 // ---------------------------------------------------------------------------
+// Dense search helpers
+// ---------------------------------------------------------------------------
+
+impl LanceDbStore {
+    /// Dense search using the standard `nearest_to` path (Float32 stores).
+    async fn float32_dense_search(
+        &self,
+        query_vector: &[f32],
+        limit: usize,
+        filters: &[MetadataFilter],
+    ) -> Result<Vec<SearchResult>, Error> {
+        let mut query = self
+            .table
+            .query()
+            .nearest_to(query_vector)
+            .map_err(|e| Error::Internal {
+                message: format!("LanceDB nearest_to failed: {e}"),
+                correlation_id: "dense-nearest".to_string(),
+            })?
+            .limit(limit);
+
+        if let Some(predicate) = filters_to_predicate(filters) {
+            query = query.only_if(predicate);
+        }
+
+        let stream = query.execute().await.map_err(|e| Error::Internal {
+            message: format!("LanceDB dense search execute failed: {e}"),
+            correlation_id: "dense-execute".to_string(),
+        })?;
+
+        collect_search_results(stream, COL_DISTANCE, true).await
+    }
+
+    /// Dense search via the lance `dataset()` bypass for binary (UInt8) stores.
+    ///
+    /// `nearest_to` hard-codes Float32 (`lancedb/src/query.rs`), so we go through
+    /// `Table::dataset()` → `Dataset::scan()` → `Scanner::nearest()`, which accepts
+    /// any `Array` type and auto-selects Hamming for UInt8.
+    ///
+    /// Score formula: `1.0 - hamming_dist / nbits` maps raw Hamming distance (0..nbits)
+    /// into [0, 1] with 1.0 = identical vectors.
+    async fn binary_dense_search(
+        &self,
+        query_vector: &[f32],
+        limit: usize,
+        filters: &[MetadataFilter],
+    ) -> Result<Vec<SearchResult>, Error> {
+        let query_bytes = binarize_msb(query_vector);
+        let nbits = query_vector.len();
+        let query_array = UInt8Array::from(query_bytes);
+
+        let dataset_wrapper = self.table.dataset().ok_or_else(|| Error::Internal {
+            message: "binary_dense_search: Table::dataset() returned None (remote table?)".into(),
+            correlation_id: "binary-dataset".to_string(),
+        })?;
+
+        let guard = dataset_wrapper.get().await.map_err(|e| Error::Internal {
+            message: format!("binary_dense_search: dataset get failed: {e}"),
+            correlation_id: "binary-dataset-get".to_string(),
+        })?;
+
+        // Scanner clones Arc<Dataset> internally, so it outlives the guard.
+        let mut scanner = guard.scan();
+
+        if let Some(predicate) = filters_to_predicate(filters) {
+            scanner.filter(&predicate).map_err(|e| Error::Internal {
+                message: format!("binary_dense_search: scanner filter failed: {e}"),
+                correlation_id: "binary-filter".to_string(),
+            })?;
+        }
+
+        scanner
+            .nearest(COL_EMBEDDING, &query_array, limit)
+            .map_err(|e| Error::Internal {
+                message: format!("binary_dense_search: scanner nearest failed: {e}"),
+                correlation_id: "binary-nearest".to_string(),
+            })?;
+
+        let stream = scanner
+            .try_into_stream()
+            .await
+            .map_err(|e| Error::Internal {
+                message: format!("binary_dense_search: try_into_stream failed: {e}"),
+                correlation_id: "binary-stream".to_string(),
+            })?;
+
+        futures::pin_mut!(stream);
+        let mut results = Vec::new();
+        while let Some(item) = stream.next().await {
+            let batch = item.map_err(|e| Error::Internal {
+                message: format!("binary_dense_search: stream item failed: {e}"),
+                correlation_id: "binary-stream-item".to_string(),
+            })?;
+            for row in 0..batch.num_rows() {
+                let record = row_to_chunk_record(&batch, row);
+                let hamming_dist = get_f32(&batch, COL_DISTANCE, row).unwrap_or(0.0);
+                let score = 1.0 - hamming_dist / nbits as f32;
+                results.push(SearchResult {
+                    chunk: record,
+                    score,
+                });
+            }
+        }
+        Ok(results)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Integration tests (run against real LanceDB with tmpdir)
 // ---------------------------------------------------------------------------
 
@@ -836,7 +1064,9 @@ mod tests {
     async fn fresh_store() -> (LanceDbStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_str().unwrap().to_string();
-        let store = LanceDbStore::open(&path, DIM).await.unwrap();
+        let store = LanceDbStore::open(&path, DIM, VectorEncoding::Float32)
+            .await
+            .unwrap();
         (store, dir)
     }
 
@@ -844,7 +1074,9 @@ mod tests {
     async fn fresh_conformance_store() -> (LanceDbStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_str().unwrap().to_string();
-        let store = LanceDbStore::open(&path, CONFORMANCE_DIM).await.unwrap();
+        let store = LanceDbStore::open(&path, CONFORMANCE_DIM, VectorEncoding::Float32)
+            .await
+            .unwrap();
         (store, dir)
     }
 
@@ -1225,7 +1457,7 @@ mod tests {
 
     #[test]
     fn schema_has_correct_columns() {
-        let schema = make_schema(128);
+        let schema = make_schema(128, VectorEncoding::Float32);
         assert!(schema.field_with_name(COL_ID).is_ok());
         assert!(schema.field_with_name(COL_DOCUMENT_ID).is_ok());
         assert!(schema.field_with_name(COL_EMBEDDING).is_ok());
@@ -1272,7 +1504,9 @@ mod tests {
     async fn open_creates_table_if_missing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_str().unwrap().to_string();
-        let store = LanceDbStore::open(&path, DIM).await.unwrap();
+        let store = LanceDbStore::open(&path, DIM, VectorEncoding::Float32)
+            .await
+            .unwrap();
         let stats = store.stats().await.unwrap();
         assert_eq!(stats.chunk_count, 0);
     }
@@ -1284,7 +1518,9 @@ mod tests {
 
         // First open: create table and insert
         {
-            let store = LanceDbStore::open(&path, DIM).await.unwrap();
+            let store = LanceDbStore::open(&path, DIM, VectorEncoding::Float32)
+                .await
+                .unwrap();
             let records = vec![make_record(
                 "chunk-1",
                 "doc-1",
@@ -1297,7 +1533,9 @@ mod tests {
 
         // Second open: should see existing data
         {
-            let store = LanceDbStore::open(&path, DIM).await.unwrap();
+            let store = LanceDbStore::open(&path, DIM, VectorEncoding::Float32)
+                .await
+                .unwrap();
             let stats = store.stats().await.unwrap();
             assert_eq!(stats.chunk_count, 1, "data should persist after reopen");
         }
@@ -1312,7 +1550,7 @@ mod tests {
             "hello world",
             vec![1.0, 0.0, 0.0, 0.0],
         )];
-        let batch = records_to_batch(&records, DIM).unwrap();
+        let batch = records_to_batch(&records, DIM, VectorEncoding::Float32).unwrap();
         assert_eq!(batch.num_rows(), 1);
 
         // Check the id column
@@ -1336,7 +1574,7 @@ mod tests {
             vec![1.0, 0.0, 0.0, 0.0], // dim=4
         )];
         // Request dim=8 but embedding has dim=4 → error
-        let result = records_to_batch(&records, 8);
+        let result = records_to_batch(&records, 8, VectorEncoding::Float32);
         assert!(
             result.is_err(),
             "dim mismatch in records_to_batch must return Err, not NULL embedding"
@@ -1355,10 +1593,12 @@ mod tests {
         let path = dir.path().to_str().unwrap().to_string();
 
         // Create store with dim=4
-        LanceDbStore::open(&path, 4).await.unwrap();
+        LanceDbStore::open(&path, 4, VectorEncoding::Float32)
+            .await
+            .unwrap();
 
         // Attempt to reopen with dim=8 → should fail
-        let result = LanceDbStore::open(&path, 8).await;
+        let result = LanceDbStore::open(&path, 8, VectorEncoding::Float32).await;
         assert!(
             result.is_err(),
             "opening an existing store with wrong dim must fail"
@@ -1367,6 +1607,134 @@ mod tests {
         assert!(
             msg.contains("dimension mismatch") || msg.contains("dim="),
             "error should mention dimension mismatch: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Binary encoding tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn binarize_msb_known_vectors() {
+        // All positive → all ones → 0xFF per byte
+        let all_pos = vec![1.0f32; 8];
+        assert_eq!(binarize_msb(&all_pos), vec![0xFF]);
+
+        // All negative → all zeros → 0x00 per byte
+        let all_neg = vec![-1.0f32; 8];
+        assert_eq!(binarize_msb(&all_neg), vec![0x00]);
+
+        // First positive, rest negative → bit 7 set → 0x80
+        let first_pos = vec![1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0];
+        assert_eq!(binarize_msb(&first_pos), vec![0x80]);
+
+        // Last positive, rest negative → bit 0 set → 0x01
+        let last_pos = vec![-1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, 1.0];
+        assert_eq!(binarize_msb(&last_pos), vec![0x01]);
+
+        // Zero is treated as positive (x >= 0.0)
+        let zero = vec![0.0f32; 8];
+        assert_eq!(binarize_msb(&zero), vec![0xFF]);
+
+        // 16-dim: two bytes
+        let v16: Vec<f32> = (0..16)
+            .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        // even dims positive: bits 7,5,3,1 set in each byte → 0b10101010 = 0xAA
+        assert_eq!(binarize_msb(&v16), vec![0xAA, 0xAA]);
+    }
+
+    #[test]
+    fn binarize_msb_output_length() {
+        assert_eq!(binarize_msb(&[1.0f32; 8]).len(), 1);
+        assert_eq!(binarize_msb(&[1.0f32; 16]).len(), 2);
+        assert_eq!(binarize_msb(&[1.0f32; 1024]).len(), 128);
+    }
+
+    #[tokio::test]
+    async fn binary_store_write_and_search() {
+        // DIM=8: binary column will be 1 byte per vector.
+        const BDIM: usize = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        let store = LanceDbStore::open(&path, BDIM, VectorEncoding::Binary)
+            .await
+            .unwrap();
+
+        // Two records: one all-positive embedding, one all-negative.
+        let rec_pos = make_record(
+            "bin-pos",
+            "doc-bin",
+            "store-bin",
+            "all positive",
+            vec![1.0f32; BDIM],
+        );
+        let rec_neg = make_record(
+            "bin-neg",
+            "doc-bin",
+            "store-bin",
+            "all negative",
+            vec![-1.0f32; BDIM],
+        );
+        store.upsert_chunks(vec![rec_pos, rec_neg]).await.unwrap();
+        store.create_fts_index().await.unwrap();
+        // No create_vector_index: only 2 rows, flat fallback is correct.
+
+        let stats = store.stats().await.unwrap();
+        assert_eq!(stats.chunk_count, 2);
+
+        // Query with all-positive vector — should rank "bin-pos" first.
+        let query = vec![1.0f32; BDIM];
+        let results = store.dense_search(&query, 2, &[]).await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].chunk.id, "bin-pos",
+            "all-positive query should rank all-positive doc first"
+        );
+        assert!(
+            results[0].score > results[1].score,
+            "first result should have higher score"
+        );
+    }
+
+    #[tokio::test]
+    async fn binary_store_small_flat_fallback() {
+        // With fewer than 256 rows, create_vector_index is a no-op (flat scan used).
+        const BDIM: usize = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        let store = LanceDbStore::open(&path, BDIM, VectorEncoding::Binary)
+            .await
+            .unwrap();
+
+        let rec = make_record("b1", "d1", "s1", "hello", vec![1.0f32; BDIM]);
+        store.upsert_chunks(vec![rec]).await.unwrap();
+
+        // Should complete without error even though row count < 256.
+        let result = store.create_vector_index().await;
+        assert!(
+            result.is_ok(),
+            "create_vector_index should be a no-op on small stores: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn encoding_mismatch_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+
+        // Create store as Float32
+        LanceDbStore::open(&path, 8, VectorEncoding::Float32)
+            .await
+            .unwrap();
+
+        // Attempt to reopen as Binary → must fail
+        let result = LanceDbStore::open(&path, 8, VectorEncoding::Binary).await;
+        assert!(result.is_err(), "encoding mismatch must be rejected");
+        let msg = result.err().unwrap().to_string();
+        assert!(
+            msg.contains("encoding mismatch") || msg.contains("Float32") || msg.contains("Binary"),
+            "error should describe the encoding mismatch: {msg}"
         );
     }
 }

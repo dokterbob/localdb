@@ -508,6 +508,10 @@ impl Embedder for PplxContextOnnxEmbedder {
         "pplx-embed-context-v1-0.6b"
     }
 
+    fn vector_encoding(&self) -> localdb_core::VectorEncoding {
+        localdb_core::VectorEncoding::Binary
+    }
+
     fn token_counter(&self) -> Option<TokenCounter> {
         let tok = self.tokenizer.clone();
         Some(Arc::new(move |t: &str| {
