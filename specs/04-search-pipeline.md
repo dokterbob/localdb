@@ -2,7 +2,7 @@
 
 > Status: accepted draft, 2026-06-10.
 
-Pipeline: **acquire → extract → blocks → chunks → embed → index** (write side), and
+Pipeline: **acquire → extract → markdown → chunks → embed → index** (write side), and
 **query → BM25 + dense → RRF fuse → filter → citations** (read side).
 
 ## 1. Acquisition
@@ -23,14 +23,14 @@ Pipeline: **acquire → extract → blocks → chunks → embed → index** (wri
 ## 2. Extraction (v1 matrix)
 
 **Decision:** v1 extracts **Markdown, plain text, HTML, and text-layer PDF** into a normalized
-document (text + Blocks with heading paths and spans, [02-domain-model.md](02-domain-model.md)).
+Markdown string plus `DocumentMetadata` extracted from frontmatter (Dublin Core fields).
 
 | Format | Approach | Notes |
 |---|---|---|
-| Markdown | pulldown-cmark-class parser | Headings → `heading_path`; code fences kept as blocks. |
-| Plain text | direct | Paragraph blocks by blank lines. |
-| HTML | readability-style main-content + DOM walk | Used for both `url` fetches and `.html` files. |
-| PDF (text layer) | Rust PDF text extraction | Page numbers recorded in block metadata for citations. |
+| Markdown | pulldown-cmark parser | Passed through as-is after normalization; headings and code fences preserved as Markdown. |
+| Plain text | direct | Rendered as plain Markdown paragraphs. |
+| HTML | readability-style main-content + DOM walk | Used for both `url` fetches and `.html` files; converted to Markdown. |
+| PDF (text layer) | Rust PDF text extraction | Converted to Markdown; page structure preserved where detectable. |
 
 **Out of scope for v1 (explicit):** OCR, scanned PDFs, DOCX/PPTX/XLSX, images. Rationale: no
 single mature Rust extraction stack covers these well; shipping a sharp matrix
@@ -108,7 +108,7 @@ embedding.
 
 | Role | Choice | Notes |
 |---|---|---|
-| **Default (headline)** | `pplx-embed-context-v1-0.6b`, local via ONNX | Open-weight, MIT, explicit late-chunking support (verified mid-2026). **Pending the benchmark below.** |
+| **Default (headline)** | `pplx-embed-context-v1-0.6b`, local via ONNX | Open-weight, MIT, explicit late-chunking support (verified mid-2026). Confirmed as default; see benchmark section for performance gates. |
 | Lightweight preset / fallback | bge-small-class dense model | For weak hardware; classic per-chunk path. |
 | Hosted contextualized | Perplexity `/v1/contextualizedembeddings`; Voyage `voyage-context-3` | Same nested API shape as the trait — direct mapping. |
 | Generic hosted | Any OpenAI-compatible `/v1/embeddings` endpoint | Degenerate (flat) path; one provider abstraction for embeddings, LLMs stay out of the core process entirely. |

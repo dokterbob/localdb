@@ -203,7 +203,7 @@ localdb search "hybrid search" --store notes --json
       },
       "score": {
         "bm25": 1.9203118085861206,
-        "dense": 1.0,
+        "dense": 0.64,
         "fused": 0.032266458495966696
       },
       "snippet": "LanceDB notes\nLanceDB is an embedded vector database built on the Lance columnar format. It supports hybrid search combining vector similarity with BM25 full-text scoring.\n",
@@ -222,12 +222,12 @@ localdb search "hybrid search" --store notes --json
 }
 ```
 
-(Output truncated to one result; paths shown from a scratch run. The `dense: 1.0` value in
-this example reflects a prior placeholder run; real runs show a cosine similarity score.)
+(Output truncated to one result; paths shown from a scratch run.)
 
-**Score fields:** `bm25` is the BM25 full-text score; `dense` is the cosine similarity score
-from the local ONNX embedder (`pplx-embed-context-v1-0.6b` by default). `fused` is the
-Reciprocal Rank Fusion score used for final ranking, combining both components.
+**Score fields:** `bm25` is the BM25 full-text score; `dense` is the normalized Hamming
+similarity (`1.0 − hamming_dist / nbits`) from the binary-quantized local ONNX embedder
+(`pplx-embed-context-v1-0.6b` by default). `fused` is the Reciprocal Rank Fusion score
+used for final ranking, combining both components.
 
 ## Step 8 — Verify status after indexing
 

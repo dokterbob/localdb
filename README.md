@@ -1,10 +1,14 @@
 # localdb
 
-A **local-first document index with hybrid search and citations** — point it at your files and
-they become a searchable knowledge layer available everywhere you work: CLI, MCP agents, and
-(experimentally) an HTTP API. One binary, no daemon required for search, works entirely on your
-machine. Built for technical users, self-hosters, and AI agent workflows that need reliable,
-citeable retrieval of local documents.
+**localdb** is a personal knowledge server. Point it at your notes, bookmarks, specs, and
+documentation — then search them instantly from the command line or let any MCP-capable AI
+assistant retrieve cited, verifiable excerpts from your own corpus. Everything runs on your
+machine: one binary, no cloud, no daemon required for search, no API key.
+
+The long-horizon goal is larger: a private, trust-weighted alternative to the feed — your
+knowledge enriched by what the people you trust have found, with provenance at every hop.
+The foundation for that is built in from day one: content-addressed documents, per-chunk
+provenance, and stores as first-class shareable units. See [VISION.md](VISION.md).
 
 **Status: v0.1.0 pre-release.** Hybrid search uses real dense embeddings via the default local ONNX model (`pplx-embed-context-v1-0.6b`); the first `localdb index` or `localdb search` downloads ~706 MB from HuggingFace (no API key required). The HTTP daemon is experimental (in-memory store, does not see CLI-indexed data). See [Honest status](#honest-status) below.
 
@@ -14,14 +18,27 @@ citeable retrieval of local documents.
 
 ## Feature highlights
 
-- **Hybrid search with citations** — BM25 + dense (RRF fusion) returning structured
-  `Citation` objects with URI, heading path, snippet, span, content hash, and per-component scores.
+- **Citeable hybrid search** — BM25 + dense vector (RRF fusion) returning structured `Citation`
+  objects: file URI, heading path, exact text snippet, byte span, content hash, per-component
+  scores, and full document metadata. Every result is verifiable.
+- **Document metadata** — `DocumentMetadata` (Dublin Core: title, creator, date, description, …)
+  extracted from frontmatter and carried on every citation, so agents can attribute sources properly.
+- **Local files and URLs** — `localdb source add ~/notes` or
+  `localdb source add https://example.com/page`; incremental re-index skips unchanged content.
 - **Embedded-first** — `localdb search` opens the store in-process; nothing needs to be running.
+  The MCP server works the same way.
 - **MCP server** — `localdb mcp` exposes three read-only tools (`search`, `list_stores`,
-  `get_document`) directly to Claude and other MCP clients.
+  `get_document`) to any MCP-capable AI assistant. Connect once, search forever.
 - **Multiple stores** — each store is isolated; query one or all with `--store`.
+- **Context-aware dense search** — the default embedder (`pplx-embed-context-v1-0.6b`) is a
+  late-chunking model from Perplexity AI that encodes each chunk in the context of its full
+  document, producing strong retrieval quality. Stored as binary-quantized 128-byte
+  vectors (Hamming / IVF_FLAT), keeping index size small and search fast without a GPU.
+  Alternative: any OpenAI-compatible embedding endpoint, including local private models via
+  llama.cpp or MLX (Apple Silicon, SSD-backed KV cache).
 - **LanceDB backend** — columnar vector + BM25 index, embedded, no separate server.
 - **`--json` everywhere** — machine-readable output on every command.
+- **`localdb status`** — shows indexed stores and daemon state at a glance.
 
 ---
 
@@ -54,17 +71,21 @@ localdb init
 # 2. Create a store
 localdb store add notes
 
-# 3. Point it at a directory of files
+# 3. Add sources — local directories and/or URLs
 localdb source add ~/notes --store notes
+localdb source add https://example.com/page --store notes   # optional
 
 # 4. Index
 localdb index --store notes
 
-# 5. Search
+# 5. Check what got indexed
+localdb status
+
+# 6. Search
 localdb search "how does rust handle errors" --store notes
 ```
 
-Example output from step 5 (paths shown from a scratch run):
+Example output from step 6 (paths shown from a scratch run):
 
 ```
 1. file:///private/tmp/.../notes/rust-error-handling.md > Error handling in Rust
@@ -80,7 +101,7 @@ LanceDB is an embedded vector database built on the Lance columnar format. It su
 ```
 
 Add `--json` to get structured `Citation` objects with chunk IDs, document IDs, provenance
-hashes, and per-component scores:
+hashes, per-component scores, and document `metadata` fields (title, creator, date, etc.):
 
 ```bash
 localdb search "hybrid search" --store notes --json
@@ -97,6 +118,10 @@ claude mcp add localdb -- localdb mcp
 This registers `localdb` as a local MCP server over stdio. Three read-only tools are exposed:
 `search` (hybrid search returning Citation JSON), `list_stores` (store names, document counts,
 chunk counts), and `get_document` (full document text and metadata by document ID).
+
+Once connected, any MCP-capable AI assistant can call `search` against your indexed stores
+and return cited excerpts with source URI, heading path, and document metadata — grounded
+in actual passages from your files.
 
 See [docs/mcp.md](docs/mcp.md) for full tool schemas and example calls.
 
@@ -150,6 +175,7 @@ Design rationale and planned behavior live in the [specs/](specs/) directory.
 | [PLAN.md](PLAN.md) | MVP implementation tickets (T01–T12) |
 | [skills/localdb/SKILL.md](skills/localdb/SKILL.md) | Agent skill definition for localdb-aware AI assistants |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Development setup, test gates, contribution guidelines |
+| [docs/design-decisions.md](docs/design-decisions.md) | Open design questions with options and recommendations |
 
 ---
 

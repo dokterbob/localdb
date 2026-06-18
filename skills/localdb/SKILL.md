@@ -5,13 +5,11 @@ description: Search and index local document collections with the localdb CLI or
 
 ## When to use
 
-Use localdb when you need to search a local corpus of files (Markdown, plain text,
-PDF) and get back cited excerpts with source locations. It supports hybrid search
-(BM25 + dense vector) and returns structured citations that include the file URI,
-a text snippet, byte span, and a relevance score.
-
-> **v0.1.0 note:** the dense vector component uses a placeholder embedder; ranking
-> is effectively BM25-driven. `score.dense` will always read `1.0` for now.
+Use localdb when you need to retrieve passages from a local corpus (Markdown, plain text,
+PDF, or indexed URLs) with verifiable citations. It returns structured `Citation` objects
+with the source URI, exact text snippet, byte span, relevance scores (BM25, dense, fused),
+and document metadata extracted from frontmatter. Hybrid search (BM25 + binary-quantized
+dense) runs entirely in-process — no daemon or GPU needed.
 
 ---
 
@@ -26,6 +24,9 @@ localdb store add notes
 
 # 3. Register a directory as a source on that store
 localdb source add ~/notes --store notes
+
+# 3a. Or index a URL source
+localdb source add https://example.com/doc --store notes
 
 # 4. Index all sources in the store
 localdb index --store notes
@@ -50,10 +51,11 @@ localdb search "your query" --store notes --json \
 | `snippet` | string | Extracted text passage matching the query |
 | `span` | `{start, end}` | Byte offsets of the snippet within the document |
 | `score.fused` | float | Reciprocal-rank-fusion score (higher = more relevant) |
-| `score.bm25` | float | BM25 component (primary driver in v0.1.0) |
-| `score.dense` | float | Dense vector component (placeholder `1.0` in v0.1.0) |
+| `score.bm25` | float | BM25 component |
+| `score.dense` | float | Dense vector component — normalized Hamming similarity (`1 − dist/bits`) from the binary-quantized local ONNX embedder |
 | `document_id` | string | Blake3 content hash — pass to `get_document` MCP tool |
 | `heading_path` | array | Markdown heading breadcrumbs (may be empty) |
+| `metadata` | object | Dublin Core document metadata extracted from frontmatter: `title`, `creator`, `date`, `description`, etc. Fields are `null` when not present. |
 
 ---
 
@@ -67,7 +69,7 @@ search(query: string, stores?: string[], limit?: int)
   → citations array (same shape as CLI --json)
 
 get_document(id: string)
-  → { document_id, uri, text, title, chunk_count, provenance, store }
+  → { document_id, uri, text, title, chunk_count, provenance, store, metadata }
   Note: uri-based lookup is NOT supported in v1; use document_id from a search result.
 
 list_stores()
@@ -97,9 +99,9 @@ Pass it to any command with `--config /path/to/config.yaml`.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `error: store not found: handbook` on `localdb index` | Store was declared in YAML config — YAML-declared stores cannot be indexed in v0.1.0 | Use `localdb store add handbook` to create a runtime store, then `localdb source add` |
+| `error: store not found: handbook` on `localdb index` | Store was declared in YAML config — YAML-declared stores cannot be indexed | Use `localdb store add handbook` to create a runtime store, then `localdb source add` |
 | `Database already open. Cannot acquire lock.` | `localdb serve` (HTTP daemon) is running and holds the DB lock | Stop the daemon; CLI and MCP work in embedded mode without it |
 | `error: daemon is unreachable` (exit 5) | Stale `daemon.sock` left after daemon crash or `SIGKILL` | `rm <data_dir>/daemon.sock` |
 | Empty search results | Store has not been indexed yet | Run `localdb index --store <name>` |
 | `error: invalid request: store 'X' already exists` (exit 2) | `store add` called for a store that already exists | Use the existing store; list stores with `localdb store list` |
-| `source add` on a non-existent path succeeds | Path existence is not validated at add time (v0.1.0) | The error will surface at index time |
+| `source add` on a non-existent path succeeds | Path existence is not validated at add time | The error will surface at index time |

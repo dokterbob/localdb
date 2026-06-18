@@ -25,10 +25,11 @@ lives in other crates. This is the crate everything else imports.
 
 ### `extract`
 
-Format detection and extraction. Accepts raw bytes and returns a normalized text string plus
-a `Vec<Block>` (heading sections, paragraph groups, code fences). Supported in v1: Markdown
-(pulldown-cmark), plain text, HTML (readability-style), and text-layer PDF. Unsupported files
-are counted as skipped in `IndexJob` stats, not treated as errors. See
+Format detection and extraction. Accepts raw bytes and returns a normalized Markdown string
+plus `DocumentMetadata` extracted from frontmatter (Dublin Core fields). Supported in v1:
+Markdown (pulldown-cmark), plain text, HTML (readability-style), and text-layer PDF. Binary
+files and non-UTF-8 content are declined gracefully. Unsupported or unreadable files are
+counted as skipped/errored in `IndexJob` stats, never fatal. See
 [specs/04-search-pipeline.md](../specs/04-search-pipeline.md) §2.
 
 ### `embed`
@@ -46,8 +47,10 @@ policy; the default is `local-onnx` / `pplx-embed-context-v1-0.6b`. See [specs/0
 The `RetrievalStore` trait implementation backed by LanceDB embedded. One LanceDB database
 per logical store, stored under `{data_dir}/stores/{store_name}/`, with a single `chunks`
 table. BM25 full-text search uses LanceDB's built-in FTS index (tantivy underneath); dense
-search uses IVF-PQ or exact KNN (auto-selected by row count). RRF fusion is intentionally
-_not_ done here — the trait returns raw ranked lists and `core` fuses them. See
+search uses binary-quantized IVF_FLAT (Hamming distance) or flat Hamming scan for smaller
+tables; encoding is determined by the embedder's `vector_encoding()` return value.
+RRF fusion is intentionally _not_ done here — the trait returns raw ranked lists and
+`core` fuses them. See
 [specs/01-architecture.md](../specs/01-architecture.md) §2.
 
 ### `cli`
@@ -90,7 +93,7 @@ to the appropriate crate. No logic of its own. Subcommands: `init`, `serve`, `mc
  │  path / URL source                                      │
  │       │                                                 │
  │       ▼                                                 │
- │  extract  →  normalized text + Blocks                   │
+ │  extract  →  normalized Markdown + DocumentMetadata      │
  │       │                                                 │
  │       ▼                                                 │
  │  chunker  →  Chunks  (heading-aware, ~400-token prose)  │
