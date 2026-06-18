@@ -244,6 +244,15 @@ impl PplxOnnxEmbedder {
         info!(model = "pplx-embed-v1-0.6b", "loading ORT session");
         let session = ort::session::Session::builder()
             .map_err(|e| EmbedError::Internal(format!("ORT SessionBuilder: {e}")))?
+            // ORT defaults its intra-op pool to physical core count; pin it to logical
+            // cores so all of them engage during embedding. (Relies on the non-OpenMP
+            // pyke prebuilt binary — OpenMP builds ignore this and need OMP_NUM_THREADS.)
+            .with_intra_threads(
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1),
+            )
+            .map_err(|e| EmbedError::Internal(format!("ORT with_intra_threads: {e}")))?
             .commit_from_file(&model_onnx)
             .map_err(|e| {
                 EmbedError::ModelMissing(format!(
