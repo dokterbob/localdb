@@ -499,10 +499,22 @@ pub async fn index_document(
         Some(f) => Box::new(TokenSizer::new(f.clone())),
         None => Box::new(CharSizer),
     };
+
+    // Layer A: per-file preset routing — override config.chunker if file is code/data.
+    let effective_chunker = {
+        use crate::chunker::preset_for;
+        let file_preset = preset_for(input.filename.as_deref(), input.mime.as_deref());
+        if file_preset == "code" {
+            ChunkerConfig::code()
+        } else {
+            config.chunker.clone()
+        }
+    };
+
     let chunker_cfg = if token_counter.is_none() {
-        scale_to_chars(&config.chunker)
+        scale_to_chars(&effective_chunker)
     } else {
-        config.chunker.clone()
+        effective_chunker.clone()
     };
     let chunk_outputs = catch_panic(
         "chunk",
