@@ -238,7 +238,11 @@ fn chunk_prose(
     // Layer D: backstop for structureless files misclassified as prose.
     // If the longest line exceeds 8× the char target, delegate to chunk_code.
     {
-        let max_line_len = markdown.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+        let max_line_len = markdown
+            .lines()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(0);
         if max_line_len > 8 * target {
             return chunk_code(document_id, markdown, config);
         }
@@ -422,13 +426,17 @@ fn line_offsets(s: &str) -> impl Iterator<Item = (usize, &str)> {
 /// Falls back to `"prose"` if nothing matches.
 pub fn preset_for(filename: Option<&str>, mime: Option<&str>) -> &'static str {
     const CODE_EXTS: &[&str] = &[
-        "rs", "py", "js", "mjs", "ts", "tsx", "json", "yaml", "yml", "toml", "lock",
-        "c", "h", "cpp", "hpp", "go", "java", "rb", "php", "sh", "css", "scss",
-        "sql", "csv", "xml", "ini", "cfg",
+        "rs", "py", "js", "mjs", "ts", "tsx", "json", "yaml", "yml", "toml", "lock", "c", "h",
+        "cpp", "hpp", "go", "java", "rb", "php", "sh", "css", "scss", "sql", "csv", "xml", "ini",
+        "cfg",
     ];
     const PROSE_EXTS: &[&str] = &["md", "markdown", "html", "htm", "pdf", "txt", "text"];
     const LOCKFILE_BASENAMES: &[&str] = &[
-        "Cargo.lock", "package-lock.json", "yarn.lock", "poetry.lock", "Gemfile.lock",
+        "Cargo.lock",
+        "package-lock.json",
+        "yarn.lock",
+        "poetry.lock",
+        "Gemfile.lock",
     ];
 
     // Check MIME first.

@@ -12,14 +12,17 @@ const PROSE_EXTS: &[&str] = &["txt", "text"];
 
 /// Recognized extensions for the plaintext parser (code/data files).
 const CODE_EXTS: &[&str] = &[
-    "rs", "py", "js", "mjs", "ts", "tsx", "json", "yaml", "yml", "toml", "lock",
-    "c", "h", "cpp", "hpp", "go", "java", "rb", "php", "sh", "css", "scss",
-    "sql", "csv", "xml", "ini", "cfg",
+    "rs", "py", "js", "mjs", "ts", "tsx", "json", "yaml", "yml", "toml", "lock", "c", "h", "cpp",
+    "hpp", "go", "java", "rb", "php", "sh", "css", "scss", "sql", "csv", "xml", "ini", "cfg",
 ];
 
 /// Lockfile basenames that are always accepted regardless of extension.
 const LOCKFILE_BASENAMES: &[&str] = &[
-    "Cargo.lock", "package-lock.json", "yarn.lock", "poetry.lock", "Gemfile.lock",
+    "Cargo.lock",
+    "package-lock.json",
+    "yarn.lock",
+    "poetry.lock",
+    "Gemfile.lock",
 ];
 
 /// Returns `true` if the filename has a recognized extension or is a known lockfile basename.

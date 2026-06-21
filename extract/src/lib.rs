@@ -30,21 +30,57 @@ pub use registry::{build_chain, default_parser_ids};
 pub fn supported_extensions() -> &'static [&'static str] {
     &[
         // Markdown
-        "md", "markdown",
+        "md",
+        "markdown",
         // HTML
-        "html", "htm",
+        "html",
+        "htm",
         // PDF
         "pdf",
         // Office (docx, xlsx, pptx, odt, etc.) — representative
-        "docx", "xlsx", "pptx", "odt", "ods", "odp",
+        "docx",
+        "xlsx",
+        "pptx",
+        "odt",
+        "ods",
+        "odp",
         // Plaintext prose
-        "txt", "text",
+        "txt",
+        "text",
         // Code/data (from plaintext parser)
-        "rs", "py", "js", "mjs", "ts", "tsx", "json", "yaml", "yml", "toml", "lock",
-        "c", "h", "cpp", "hpp", "go", "java", "rb", "php", "sh", "css", "scss",
-        "sql", "csv", "xml", "ini", "cfg",
+        "rs",
+        "py",
+        "js",
+        "mjs",
+        "ts",
+        "tsx",
+        "json",
+        "yaml",
+        "yml",
+        "toml",
+        "lock",
+        "c",
+        "h",
+        "cpp",
+        "hpp",
+        "go",
+        "java",
+        "rb",
+        "php",
+        "sh",
+        "css",
+        "scss",
+        "sql",
+        "csv",
+        "xml",
+        "ini",
+        "cfg",
         // Lockfile basenames
-        "Cargo.lock", "package-lock.json", "yarn.lock", "poetry.lock", "Gemfile.lock",
+        "Cargo.lock",
+        "package-lock.json",
+        "yarn.lock",
+        "poetry.lock",
+        "Gemfile.lock",
     ]
 }
 
