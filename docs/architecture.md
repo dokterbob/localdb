@@ -258,6 +258,17 @@ from `ProjectDirs::from("com.localdb", "localdb", "localdb")` in
 `core/src/config/platform.rs`; specs/03 shows shorter `localdb/` paths. Cosmetic; override
 with `paths.*` in config for cleaner locations.
 
+**8. Sources added before the include-allowlist change keep empty `include` globs.**
+As of the `only-index-supported-files` branch, `cli` automatically sets
+`DEFAULT_PATH_INCLUDES` (an extension-based allowlist) on new directory sources that have no
+explicit `include` globs. Sources that were added before this change already have an empty
+`include` list recorded in the runtime-state database and will continue to index all files
+they enumerate until they are removed and re-added with `localdb source add`. There is no
+automatic migration, and this change is intentionally **not** folded into `policy_version`:
+the per-file chunk preset is determined deterministically from the filename/MIME type at
+index time, so re-indexing existing content with the new code produces correct results
+without a policy-hash change.
+
 ---
 
 ## Deferred design decisions {#design-decisions}

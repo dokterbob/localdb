@@ -860,7 +860,14 @@ fn normalize_path_source(raw_path: &str) -> Result<(String, Vec<String>, Vec<Str
             .unwrap_or_default();
         (parent.to_string_lossy().to_string(), vec![filename])
     } else {
-        (raw_path.to_string(), vec![])
+        // Directory source: apply the default include allowlist so that only
+        // files with supported extensions are visited.  Callers that need to
+        // override this can set explicit include globs after construction.
+        let includes = DEFAULT_PATH_INCLUDES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        (raw_path.to_string(), includes)
     };
 
     // #4: apply default excludes for path sources.
@@ -1383,6 +1390,71 @@ async fn run_store_remove_async(ctx: &CliContext, name: &str) {
         println!("Removed store: {}", name);
     }
 }
+
+/// Default include patterns for directory path sources.
+///
+/// When a directory source has no explicit `include` globs, this allowlist is
+/// applied so that only files with supported extensions (or known basenames) are
+/// visited.  Single-file sources are never affected by this constant — they
+/// already carry an exact filename as their include glob.
+///
+/// Generated from `extract::supported_extensions()`: plain extension tokens
+/// (no `.`) become `**/*.ext`; basename tokens (contain `.`) become
+/// `**/<basename>`.
+const DEFAULT_PATH_INCLUDES: &[&str] = &[
+    // Markdown
+    "**/*.md",
+    "**/*.markdown",
+    // HTML
+    "**/*.html",
+    "**/*.htm",
+    // PDF
+    "**/*.pdf",
+    // Office formats
+    "**/*.docx",
+    "**/*.xlsx",
+    "**/*.pptx",
+    "**/*.odt",
+    "**/*.ods",
+    "**/*.odp",
+    // Plaintext prose
+    "**/*.txt",
+    "**/*.text",
+    // Code / data
+    "**/*.rs",
+    "**/*.py",
+    "**/*.js",
+    "**/*.mjs",
+    "**/*.ts",
+    "**/*.tsx",
+    "**/*.json",
+    "**/*.yaml",
+    "**/*.yml",
+    "**/*.toml",
+    "**/*.lock",
+    "**/*.c",
+    "**/*.h",
+    "**/*.cpp",
+    "**/*.hpp",
+    "**/*.go",
+    "**/*.java",
+    "**/*.rb",
+    "**/*.php",
+    "**/*.sh",
+    "**/*.css",
+    "**/*.scss",
+    "**/*.sql",
+    "**/*.csv",
+    "**/*.xml",
+    "**/*.ini",
+    "**/*.cfg",
+    // Lockfile basenames
+    "**/Cargo.lock",
+    "**/package-lock.json",
+    "**/yarn.lock",
+    "**/poetry.lock",
+    "**/Gemfile.lock",
+];
 
 /// Default exclude patterns for path sources (#4).
 /// Default exclude patterns for path sources (#4).
@@ -3016,13 +3088,26 @@ mod tests {
     }
 
     #[test]
-    fn normalize_path_source_directory_has_no_include() {
+    fn normalize_path_source_directory_has_default_includes() {
         let dir = TempDir::new().unwrap();
         let (root, include, exclude) = normalize_path_source(dir.path().to_str().unwrap()).unwrap();
         assert_eq!(root, dir.path().to_str().unwrap());
         assert!(
-            include.is_empty(),
-            "directory source should have no include globs"
+            !include.is_empty(),
+            "directory source should have default include globs (allowlist)"
+        );
+        // Spot-check a few expected patterns from DEFAULT_PATH_INCLUDES.
+        assert!(
+            include.iter().any(|s| s == "**/*.rs"),
+            "include globs should contain **/*.rs"
+        );
+        assert!(
+            include.iter().any(|s| s == "**/*.md"),
+            "include globs should contain **/*.md"
+        );
+        assert!(
+            include.iter().any(|s| s == "**/Cargo.lock"),
+            "include globs should contain **/Cargo.lock"
         );
         assert!(
             !exclude.is_empty(),

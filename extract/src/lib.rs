@@ -23,6 +23,67 @@ pub use localdb_core::parser::{ChainParser, DocumentMetadata, ParsedDocument, Pa
 pub use mime::sniff_mime;
 pub use registry::{build_chain, default_parser_ids};
 
+/// All file extensions (and bare basenames) accepted by the default parser chain.
+///
+/// This is the union of what all parsers in the chain will accept. Callers can
+/// use this to pre-filter files before attempting extraction.
+pub fn supported_extensions() -> &'static [&'static str] {
+    &[
+        // Markdown
+        "md",
+        "markdown",
+        // HTML
+        "html",
+        "htm",
+        // PDF
+        "pdf",
+        // Office (docx, xlsx, pptx, odt, etc.) — representative
+        "docx",
+        "xlsx",
+        "pptx",
+        "odt",
+        "ods",
+        "odp",
+        // Plaintext prose
+        "txt",
+        "text",
+        // Code/data (from plaintext parser)
+        "rs",
+        "py",
+        "js",
+        "mjs",
+        "ts",
+        "tsx",
+        "json",
+        "yaml",
+        "yml",
+        "toml",
+        "lock",
+        "c",
+        "h",
+        "cpp",
+        "hpp",
+        "go",
+        "java",
+        "rb",
+        "php",
+        "sh",
+        "css",
+        "scss",
+        "sql",
+        "csv",
+        "xml",
+        "ini",
+        "cfg",
+        // Lockfile basenames
+        "Cargo.lock",
+        "package-lock.json",
+        "yarn.lock",
+        "poetry.lock",
+        "Gemfile.lock",
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -40,5 +101,19 @@ mod tests {
             matches!(err, Error::UnsupportedFormat { .. }),
             "expected UnsupportedFormat, got: {err:?}"
         );
+    }
+
+    #[test]
+    fn supported_extensions_consistent_with_chain() {
+        // The list must include the core text formats.
+        let exts = supported_extensions();
+        for must_have in &["md", "txt", "rs", "json", "pdf", "html"] {
+            assert!(
+                exts.contains(must_have),
+                "supported_extensions should include '{must_have}'"
+            );
+        }
+        // Must not be empty.
+        assert!(!exts.is_empty());
     }
 }

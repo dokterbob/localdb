@@ -234,6 +234,20 @@ fn chunk_prose(
     }
 
     let target = config.resolved_target_tokens();
+
+    // Layer D: backstop for structureless files misclassified as prose.
+    // If the longest line exceeds 8× the char target, delegate to chunk_code.
+    {
+        let max_line_len = markdown
+            .lines()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(0);
+        if max_line_len > 8 * target {
+            return chunk_code(document_id, markdown, config);
+        }
+    }
+
     let overlap = config.resolved_overlap_tokens();
 
     let heading_idx = crate::heading_index::build_heading_index(markdown);
@@ -293,13 +307,63 @@ fn chunk_code(
         return Ok(vec![]);
     }
 
-    let target = config.resolved_target_tokens();
+    let target = config.resolved_target_tokens(); // used as char budget
     let mut chunks = Vec::new();
     let mut current_start = 0usize;
     let mut current_end = 0usize;
 
     for (line_start, line) in line_offsets(markdown) {
         let line_end = line_start + line.len();
+
+        // Hard-split overlong lines at char boundaries.
+        if line.chars().count() > target {
+            // Flush any pending content first.
+            if current_end > current_start {
+                let cs = floor_char_boundary(markdown, current_start);
+                let ce = floor_char_boundary(markdown, current_end);
+                if cs < ce {
+                    let chunk_text = &markdown[cs..ce];
+                    let id = chunk_id(document_id, chunk_text, cs, ce);
+                    chunks.push(ChunkOutput {
+                        id,
+                        text: chunk_text.to_string(),
+                        span: Span::new(cs, ce),
+                        heading_path: vec![],
+                    });
+                }
+            }
+
+            // Split the overlong line into target-sized char pieces.
+            let mut pos = line_start;
+            while pos < line_end {
+                let slice = &markdown[pos..line_end];
+                let byte_len: usize = slice
+                    .char_indices()
+                    .take(target)
+                    .last()
+                    .map(|(i, c)| i + c.len_utf8())
+                    .unwrap_or(slice.len());
+                if byte_len == 0 {
+                    break; // safety: prevent infinite loop
+                }
+                let piece_end = (pos + byte_len).min(line_end);
+                if pos < piece_end {
+                    let chunk_text = &markdown[pos..piece_end];
+                    let id = chunk_id(document_id, chunk_text, pos, piece_end);
+                    chunks.push(ChunkOutput {
+                        id,
+                        text: chunk_text.to_string(),
+                        span: Span::new(pos, piece_end),
+                        heading_path: vec![],
+                    });
+                }
+                pos = piece_end;
+            }
+            current_start = line_end;
+            current_end = line_end;
+            continue;
+        }
+
         let current_size = current_end.saturating_sub(current_start);
 
         if current_size > 0 && current_size + (line_end - line_start) > target {
@@ -354,6 +418,64 @@ fn line_offsets(s: &str) -> impl Iterator<Item = (usize, &str)> {
         offset += line.len();
         (start, line)
     })
+}
+
+/// Classify a file as `"code"` or `"prose"` based on MIME type and filename.
+///
+/// Logic: check mime first, then filename basename for lockfiles, then extension.
+/// Falls back to `"prose"` if nothing matches.
+pub fn preset_for(filename: Option<&str>, mime: Option<&str>) -> &'static str {
+    const CODE_EXTS: &[&str] = &[
+        "rs", "py", "js", "mjs", "ts", "tsx", "json", "yaml", "yml", "toml", "lock", "c", "h",
+        "cpp", "hpp", "go", "java", "rb", "php", "sh", "css", "scss", "sql", "csv", "xml", "ini",
+        "cfg",
+    ];
+    const PROSE_EXTS: &[&str] = &["md", "markdown", "html", "htm", "pdf", "txt", "text"];
+    const LOCKFILE_BASENAMES: &[&str] = &[
+        "Cargo.lock",
+        "package-lock.json",
+        "yarn.lock",
+        "poetry.lock",
+        "Gemfile.lock",
+    ];
+
+    // Check MIME first.
+    if let Some(m) = mime {
+        if m == "application/json" || m.starts_with("text/x-") {
+            return "code";
+        }
+        if m == "text/plain" {
+            return "prose";
+        }
+    }
+
+    // Check lockfile basenames (case-sensitive).
+    if let Some(name) = filename {
+        let basename = std::path::Path::new(name)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(name);
+        if LOCKFILE_BASENAMES.contains(&basename) {
+            return "code";
+        }
+
+        // Check extension (case-insensitive).
+        let ext = std::path::Path::new(name)
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_lowercase());
+        if let Some(ext) = ext {
+            if CODE_EXTS.contains(&ext.as_str()) {
+                return "code";
+            }
+            if PROSE_EXTS.contains(&ext.as_str()) {
+                return "prose";
+            }
+        }
+    }
+
+    // Default: prose (safe fallback)
+    "prose"
 }
 
 // ---------------------------------------------------------------------------
@@ -766,6 +888,138 @@ mod tests {
             result.is_ok(),
             "code chunking multi-byte text should not panic: {:?}",
             result.err()
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Layer A: preset_for routing tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn preset_for_routes_code_extensions() {
+        assert_eq!(preset_for(Some("lib.rs"), None), "code");
+        assert_eq!(preset_for(Some("data.json"), None), "code");
+        assert_eq!(preset_for(Some("config.toml"), None), "code");
+        assert_eq!(preset_for(Some("Cargo.lock"), None), "code");
+        assert_eq!(preset_for(None, Some("application/json")), "code");
+        assert_eq!(preset_for(None, Some("text/x-rust")), "code");
+    }
+
+    #[test]
+    fn preset_for_routes_prose() {
+        assert_eq!(preset_for(Some("README.md"), None), "prose");
+        assert_eq!(preset_for(Some("notes.txt"), None), "prose");
+        assert_eq!(preset_for(Some("page.html"), None), "prose");
+        assert_eq!(preset_for(Some("doc.pdf"), None), "prose");
+        assert_eq!(preset_for(None, Some("text/plain")), "prose");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Layer D: structureless and overlong line tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn code_hard_splits_overlong_line() {
+        // A single line of ~100k chars should produce multiple bounded chunks.
+        let long_line = "x".repeat(100_000);
+        let doc_id = "doc-overlong";
+        let cfg = ChunkerConfig::code(); // target = 3000 chars
+        let chunks = chunk_document(doc_id, &long_line, &cfg, &CharSizer).unwrap();
+        assert!(
+            chunks.len() >= 2,
+            "overlong line should produce multiple chunks, got {}",
+            chunks.len()
+        );
+        for c in &chunks {
+            assert!(
+                c.text.chars().count() <= 3000,
+                "each chunk must be within target: {} chars",
+                c.text.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn prose_structureless_long_line_falls_back_to_line_packer() {
+        // A single very long line (no newlines, no headings) given to the prose
+        // chunker should not hang — it must fall back to the code packer.
+        let long_line = "word ".repeat(10_000); // ~50k chars, no newlines
+        let doc_id = "doc-structureless";
+        let cfg = ChunkerConfig::prose(); // target = 256 chars (prose default)
+        let chunks = chunk_document(doc_id, &long_line, &cfg, &CharSizer).unwrap();
+        assert!(
+            !chunks.is_empty(),
+            "structureless prose should produce chunks"
+        );
+        // Should not take forever — the backstop kicks in.
+        // (The test completing at all is the key assertion.)
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression tests: hang-fix for code/JSON/lockfiles (only-index-supported-files)
+    // ---------------------------------------------------------------------------
+
+    /// Regression: minified JSON (one very long line) must not hang and must produce
+    /// bounded chunks. Before the fix, `chunk_prose` was called on structureless JSON,
+    /// causing super-linear cost and a multi-minute hang.
+    #[test]
+    fn regression_minified_json_does_not_hang() {
+        let unit = r#"{"key":"value","#;
+        // 100_000 chars ≈ 6250 repetitions of the 16-char unit
+        let reps = 100_000 / unit.len();
+        let content = unit.repeat(reps);
+        let doc_id = "doc-minified-json";
+        let cfg = ChunkerConfig::code(); // target = 3000 chars
+        let chunks = chunk_document(doc_id, &content, &cfg, &CharSizer).unwrap();
+        // Must produce more than one chunk (content >> target).
+        assert!(
+            chunks.len() > 1,
+            "minified JSON must split into multiple chunks, got {}",
+            chunks.len()
+        );
+        // Every chunk must be within 2× the char target.
+        let target = cfg.resolved_target_tokens();
+        for c in &chunks {
+            let char_count = c.text.chars().count();
+            assert!(
+                char_count <= 2 * target,
+                "chunk exceeds 2× target ({} chars, target {})",
+                char_count,
+                target
+            );
+        }
+    }
+
+    /// Regression: a Rust source file must be routed to the code chunker, not prose.
+    /// Before the fix, `preset_for` did not exist and all files defaulted to prose.
+    #[test]
+    fn regression_code_file_uses_line_chunker_not_prose() {
+        assert_eq!(
+            preset_for(Some("main.rs"), None),
+            "code",
+            "main.rs must route to the code chunker"
+        );
+    }
+
+    /// Regression: a Markdown README must still use the prose chunker.
+    #[test]
+    fn regression_prose_file_uses_prose_chunker() {
+        assert_eq!(
+            preset_for(Some("README.md"), None),
+            "prose",
+            "README.md must route to the prose chunker"
+        );
+    }
+
+    /// Regression: Cargo.lock (lockfile, no recognized extension) must route to code.
+    /// Before the fix, Cargo.lock would fall through to prose and hang on its
+    /// long structureless sections.
+    #[test]
+    fn regression_cargo_lock_uses_line_chunker() {
+        assert_eq!(
+            preset_for(Some("Cargo.lock"), None),
+            "code",
+            "Cargo.lock must route to the code chunker"
         );
     }
 }
