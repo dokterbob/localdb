@@ -285,24 +285,6 @@ impl Drop for WriteLock {
 // writing directly to the embedded store. This thin client issues the
 // appropriate HTTP requests and maps responses to exit codes.
 
-/// Issue a synchronous HTTP request to the daemon via a one-shot tokio runtime.
-///
-/// Returns the JSON response body on success (2xx), or an `Error` on failure.
-fn daemon_request(
-    method: reqwest::Method,
-    url: &str,
-    body: Option<serde_json::Value>,
-) -> Result<serde_json::Value, Error> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| Error::Internal {
-            message: format!("cannot build tokio runtime for daemon request: {}", e),
-            correlation_id: "daemon_rt".to_string(),
-        })?;
-    rt.block_on(daemon_request_async(method, url, body))
-}
-
 async fn daemon_request_async(
     method: reqwest::Method,
     url: &str,
@@ -1157,6 +1139,11 @@ pub fn run_status(ctx: &CliContext) {
 
 /// `localdb store add <name>`
 pub fn run_store_add(ctx: &CliContext, name: &str) {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(run_store_add_async(ctx, name));
+}
+
+async fn run_store_add_async(ctx: &CliContext, name: &str) {
     // A9-safety: validate store name before anything else.
     if let Err(e) = validate_store_name(name) {
         exit_err(&e, ctx.json);
@@ -1173,7 +1160,7 @@ pub fn run_store_add(ctx: &CliContext, name: &str) {
     if let DaemonState::Running { base_url } = probe_daemon(data_dir) {
         let url = format!("{}/v1/stores", base_url);
         let body = json!({ "name": name, "visibility": "private", "backend": "lancedb" });
-        match daemon_request(reqwest::Method::POST, &url, Some(body)) {
+        match daemon_request_async(reqwest::Method::POST, &url, Some(body)).await {
             Ok(v) => {
                 if ctx.json {
                     print_json(&v);
@@ -1325,6 +1312,11 @@ pub fn confirm_destructive(ctx: &CliContext, prompt: &str) -> bool {
 
 /// `localdb store remove <name>`
 pub fn run_store_remove(ctx: &CliContext, name: &str) {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(run_store_remove_async(ctx, name));
+}
+
+async fn run_store_remove_async(ctx: &CliContext, name: &str) {
     let (config_loader, db) = load_app_db(ctx);
     let data_dir = &config_loader.paths.data_dir;
 
@@ -1343,7 +1335,7 @@ pub fn run_store_remove(ctx: &CliContext, name: &str) {
     // Per specs/05-surfaces.md §2: route to daemon when running.
     if let DaemonState::Running { base_url } = probe_daemon(data_dir) {
         let url = format!("{}/v1/stores/{}", base_url, name);
-        match daemon_request(reqwest::Method::DELETE, &url, None) {
+        match daemon_request_async(reqwest::Method::DELETE, &url, None).await {
             Ok(v) => {
                 if ctx.json {
                     print_json(&v);
@@ -1449,7 +1441,7 @@ async fn run_source_add_async(ctx: &CliContext, source_arg: &str) {
             "spec": spec,
             "preset": "prose",
         });
-        match daemon_request(reqwest::Method::POST, &url_str, Some(body)) {
+        match daemon_request_async(reqwest::Method::POST, &url_str, Some(body)).await {
             Ok(v) => {
                 if ctx.json {
                     print_json(&v);
@@ -1750,6 +1742,11 @@ pub fn run_source_list(ctx: &CliContext) {
 
 /// `localdb source remove <id-or-path-or-url>`
 pub fn run_source_remove(ctx: &CliContext, id: &str) {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(run_source_remove_async(ctx, id));
+}
+
+async fn run_source_remove_async(ctx: &CliContext, id: &str) {
     // A9-safety: validate --store name if given explicitly.
     if let Some(store_name) = ctx.stores.first() {
         if let Err(e) = validate_store_name(store_name) {
@@ -1783,7 +1780,7 @@ pub fn run_source_remove(ctx: &CliContext, id: &str) {
     if let DaemonState::Running { base_url } = probe_daemon(data_dir) {
         // Route is DELETE /v1/sources/{id} (see server/src/daemon.rs build_router).
         let url = format!("{}/v1/sources/{}", base_url, id);
-        match daemon_request(reqwest::Method::DELETE, &url, None) {
+        match daemon_request_async(reqwest::Method::DELETE, &url, None).await {
             Ok(v) => {
                 if ctx.json {
                     print_json(&v);
