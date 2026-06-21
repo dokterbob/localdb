@@ -37,6 +37,9 @@ pub mod retry;
 pub mod voyage;
 
 #[cfg(feature = "local-onnx")]
+pub mod hf_download;
+
+#[cfg(feature = "local-onnx")]
 pub mod onnx;
 
 #[cfg(feature = "local-onnx")]
@@ -44,6 +47,12 @@ pub mod pplx_onnx;
 
 #[cfg(feature = "local-onnx")]
 pub mod pplx_context_onnx;
+
+#[cfg(all(target_os = "macos", feature = "local-coreml"))]
+mod coreml;
+
+#[cfg(all(target_os = "macos", feature = "local-coreml"))]
+pub mod pplx_context_coreml;
 
 pub use error::EmbedError;
 pub use factory::create_embedder;
@@ -61,3 +70,6 @@ pub use pplx_onnx::PplxOnnxEmbedder;
 
 #[cfg(feature = "local-onnx")]
 pub use pplx_context_onnx::PplxContextOnnxEmbedder;
+
+#[cfg(all(target_os = "macos", feature = "local-coreml"))]
+pub use pplx_context_coreml::PplxContextCoreMLEmbedder;

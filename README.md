@@ -10,7 +10,7 @@ knowledge enriched by what the people you trust have found, with provenance at e
 The foundation for that is built in from day one: content-addressed documents, per-chunk
 provenance, and stores as first-class shareable units. See [VISION.md](VISION.md).
 
-**Status: v0.1.0 pre-release.** Hybrid search uses real dense embeddings via the default local ONNX model (`pplx-embed-context-v1-0.6b`); the first `localdb index` or `localdb search` downloads ~706 MB from HuggingFace (no API key required). The HTTP daemon is experimental (in-memory store, does not see CLI-indexed data). See [Honest status](#honest-status) below.
+**Status: v0.1.0 pre-release.** Hybrid search uses real dense embeddings via the default local model (`pplx-embed-context-v1-0.6b`, ONNX on CPU by default; CoreML ANE/GPU on Apple Silicon macOS with `--features local-coreml`); the first `localdb index` or `localdb search` downloads ~706 MB from HuggingFace (no API key required). The HTTP daemon is experimental (in-memory store, does not see CLI-indexed data). See [Honest status](#honest-status) below.
 
 **License:** [AGPL-3.0-or-later](LICENSE).
 
@@ -34,6 +34,10 @@ provenance, and stores as first-class shareable units. See [VISION.md](VISION.md
   late-chunking model from Perplexity AI that encodes each chunk in the context of its full
   document, producing strong retrieval quality. Stored as binary-quantized 128-byte
   vectors (Hamming / IVF_FLAT), keeping index size small and search fast without a GPU.
+  On Apple Silicon macOS, build with `--features local-coreml` to run the model on the
+  Neural Engine / GPU via CoreML — the default `local` provider auto-selects it and falls
+  back to ONNX (CPU) otherwise; both produce index-interchangeable vectors. The model is a
+  public MIT release, so no API key or license click-through is needed.
   Alternative: any OpenAI-compatible embedding endpoint, including local private models via
   llama.cpp or MLX (Apple Silicon, SSD-backed KV cache).
 - **LanceDB backend** — columnar vector + BM25 index, embedded, no separate server.
@@ -46,7 +50,8 @@ provenance, and stores as first-class shareable units. See [VISION.md](VISION.md
 
 ### From source (works today)
 
-Requires a Rust toolchain (1.82 or later). Install via [rustup](https://rustup.rs/).
+Requires a Rust toolchain (1.82 or later; **1.85 or later** if you build the optional
+`local-coreml` feature). Install via [rustup](https://rustup.rs/).
 
 ```bash
 git clone https://github.com/dokterbob/localdb
@@ -54,6 +59,17 @@ cd localdb
 cargo install --path localdb
 localdb --version
 ```
+
+On Apple Silicon macOS, opt into the CoreML (ANE/GPU) embedding backend with the
+`local-coreml` feature:
+
+```bash
+cargo build -p localdb --features local-coreml
+```
+
+The default `local` embedding provider auto-selects CoreML when this feature is built and
+transparently falls back to ONNX (CPU) otherwise; no code or config change is needed to
+switch, and indexes built by either backend are queryable by the other.
 
 ### Pre-built tarballs
 
@@ -146,6 +162,7 @@ limitations.
 |---|---|
 | Search ranking | Hybrid BM25 + dense (RRF fusion). Default embedder is `pplx-embed-context-v1-0.6b` (local ONNX, ~706 MB download on first use). |
 | Embedding models | Downloaded automatically on first `localdb index` or `localdb search` from the public HuggingFace repo `perplexity-ai/pplx-embed-context-v1-0.6b`. No API key required. |
+| Embedding backend | Default provider `local` runs ONNX on CPU. On Apple Silicon macOS built with `--features local-coreml` (Rust ≥1.85), it auto-selects the CoreML ANE/GPU backend, falling back to ONNX otherwise. CoreML/ONNX indexes are interchangeable. Force a backend with `local-coreml` / `local-onnx`. |
 | HTTP daemon | Experimental preview. Uses an in-memory store; does not share data with CLI-indexed stores. |
 | YAML-declared stores | Appear in `store list` but **cannot be indexed** (`localdb index` only resolves runtime stores). Use `localdb store add` + `localdb source add` instead. |
 | CLI while daemon runs | Every CLI command fails with a DB lock error while a daemon is running on the same data directory. Stop the daemon before CLI use. |

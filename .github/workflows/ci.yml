@@ -131,6 +131,37 @@ jobs:
           files: lcov.info
           fail_ci_if_error: false
 
+  coreml:
+    name: CoreML backend (macOS)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable with clippy
+        # @stable satisfies the local-coreml MSRV of Rust 1.85.
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-coreml-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-coreml-
+      - name: Build embed with local-coreml
+        run: cargo build -p embed --features local-coreml
+      - name: Run embed tests with local-coreml
+        # Pure logic/unit tests run without a model. Device/network/parity tests
+        # are #[ignore]d, so plain `cargo test` does not hit the network or load a
+        # CoreML bundle; run those manually against a cached bundle.
+        run: cargo test -p embed --features local-coreml
+      - name: Run clippy with local-coreml (deny warnings)
+        run: cargo clippy -p embed --features local-coreml --all-targets -- -D warnings
+
   # Demonstrate the coverage gate: this job has a dummy function with a test.
   # The function and test live in the core crate (error.rs / tests).
   # If tests are removed, coverage will drop and the coverage job will fail.

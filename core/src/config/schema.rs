@@ -175,7 +175,12 @@ pub struct EmbeddingPolicy {
     #[serde(default = "default_embedding_model")]
     pub model: String,
 
-    /// Provider kind: "local-onnx", "openai-compatible", "perplexity", "voyage".
+    /// Provider kind. Local options:
+    /// - `"local"` — auto: on macOS with CoreML support use CoreML, else ONNX.
+    /// - `"local-coreml"` — force in-process CoreML (macOS/Apple Silicon only).
+    /// - `"local-onnx"` — force in-process ONNX inference.
+    ///
+    /// Hosted options: `"openai-compatible"`, `"perplexity"`, `"voyage"`.
     #[serde(default = "default_embedding_provider")]
     pub provider: String,
 }
@@ -194,7 +199,7 @@ fn default_embedding_model() -> String {
 }
 
 fn default_embedding_provider() -> String {
-    "local-onnx".to_string()
+    "local".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -327,7 +332,7 @@ mod tests {
     fn embedding_policy_defaults() {
         let p = EmbeddingPolicy::default();
         assert_eq!(p.model, "pplx-embed-context-v1-0.6b");
-        assert_eq!(p.provider, "local-onnx");
+        assert_eq!(p.provider, "local");
     }
 
     #[test]

@@ -12,7 +12,10 @@ use crate::error::EmbedError;
 ///
 /// Provider dispatch:
 /// - `"fake"` — in-process `FakeEmbedder`; no I/O, no model download.
-/// - `"local-onnx"` — in-process ONNX inference via fastembed (requires feature `local-onnx`).
+/// - `"local"` — auto: on macOS with the `local-coreml` feature, use CoreML for
+///   the pplx context model (falling back to ONNX on error); otherwise ONNX.
+/// - `"local-coreml"` — force in-process CoreML (macOS + `local-coreml` only).
+/// - `"local-onnx"` — in-process ONNX inference (requires feature `local-onnx`).
 /// - `"openai-compatible"` — flat HTTP provider targeting any `/v1/embeddings` endpoint.
 /// - `"perplexity"` — contextualized HTTP provider.
 /// - `"voyage"` — contextualized HTTP provider.
@@ -30,30 +33,43 @@ pub fn create_embedder(
             Ok(Box::new(localdb_core::FakeEmbedder::new(dim)))
         }
 
-        #[cfg(feature = "local-onnx")]
-        "local-onnx" => {
+        // -------------------------------------------------------------------
+        // "local" — AUTO: prefer CoreML on macOS, else ONNX.
+        // -------------------------------------------------------------------
+        "local" => create_local_auto(policy, models_dir),
+
+        // -------------------------------------------------------------------
+        // "local-coreml" — FORCE CoreML (no fallback).
+        // -------------------------------------------------------------------
+        #[cfg(all(target_os = "macos", feature = "local-coreml"))]
+        "local-coreml" => {
             let cache_dir = models_dir.map(|p| p.to_path_buf());
             match policy.model.as_str() {
                 "pplx-embed-context-v1-0.6b" => {
-                    let embedder =
-                        crate::pplx_context_onnx::PplxContextOnnxEmbedder::new(cache_dir, true)?;
-                    Ok(Box::new(embedder))
-                }
-                "pplx-embed-v1-0.6b" => {
-                    let embedder = crate::pplx_onnx::PplxOnnxEmbedder::new(cache_dir, true)?;
-                    Ok(Box::new(embedder))
-                }
-                "bge-small-en-v1.5" => {
-                    use crate::onnx::{ModelChoice, OnnxEmbedder};
-                    let embedder = OnnxEmbedder::new(ModelChoice::BgeSmallEnV15, cache_dir, true)?;
+                    let embedder = crate::pplx_context_coreml::PplxContextCoreMLEmbedder::new(
+                        cache_dir, true,
+                    )?;
                     Ok(Box::new(embedder))
                 }
                 unknown => Err(EmbedError::Internal(format!(
-                    "unknown local-onnx model: '{unknown}'. \
-                     Supported: 'pplx-embed-context-v1-0.6b', 'pplx-embed-v1-0.6b', 'bge-small-en-v1.5'."
+                    "unknown local-coreml model: '{unknown}'. \
+                     Supported: 'pplx-embed-context-v1-0.6b'."
                 ))),
             }
         }
+
+        #[cfg(not(all(target_os = "macos", feature = "local-coreml")))]
+        "local-coreml" => Err(EmbedError::Internal(
+            "provider 'local-coreml' requires macOS with the 'local-coreml' feature. \
+             Use provider 'local-onnx' or a hosted provider instead."
+                .to_string(),
+        )),
+
+        // -------------------------------------------------------------------
+        // "local-onnx" — FORCE ONNX.
+        // -------------------------------------------------------------------
+        #[cfg(feature = "local-onnx")]
+        "local-onnx" => create_onnx(policy, models_dir),
 
         #[cfg(not(feature = "local-onnx"))]
         "local-onnx" => Err(EmbedError::Internal(
@@ -160,8 +176,110 @@ pub fn create_embedder(
 
         unknown => Err(EmbedError::Internal(format!(
             "unknown provider: '{unknown}'. \
-             Supported: 'fake', 'local-onnx', 'openai-compatible', 'perplexity', 'voyage'."
+             Supported: 'fake', 'local', 'local-coreml', 'local-onnx', \
+             'openai-compatible', 'perplexity', 'voyage'."
         ))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Local provider helpers
+// ---------------------------------------------------------------------------
+
+/// Build the in-process ONNX embedder for `policy.model` (requires `local-onnx`).
+#[cfg(feature = "local-onnx")]
+fn create_onnx(
+    policy: &EmbeddingPolicy,
+    models_dir: Option<&std::path::Path>,
+) -> Result<Box<dyn Embedder>, EmbedError> {
+    let cache_dir = models_dir.map(|p| p.to_path_buf());
+    match policy.model.as_str() {
+        "pplx-embed-context-v1-0.6b" => {
+            let embedder = crate::pplx_context_onnx::PplxContextOnnxEmbedder::new(cache_dir, true)?;
+            Ok(Box::new(embedder))
+        }
+        "pplx-embed-v1-0.6b" => {
+            let embedder = crate::pplx_onnx::PplxOnnxEmbedder::new(cache_dir, true)?;
+            Ok(Box::new(embedder))
+        }
+        "bge-small-en-v1.5" => {
+            use crate::onnx::{ModelChoice, OnnxEmbedder};
+            let embedder = OnnxEmbedder::new(ModelChoice::BgeSmallEnV15, cache_dir, true)?;
+            Ok(Box::new(embedder))
+        }
+        unknown => Err(EmbedError::Internal(format!(
+            "unknown local-onnx model: '{unknown}'. \
+             Supported: 'pplx-embed-context-v1-0.6b', 'pplx-embed-v1-0.6b', 'bge-small-en-v1.5'."
+        ))),
+    }
+}
+
+/// AUTO local provider: prefer CoreML on macOS (falling back to ONNX on error),
+/// else use ONNX. Returns a clear error if no local backend is compiled in.
+//
+// `return` is used throughout so the cfg-gated branches compose across every
+// feature/platform combination; the trailing position differs per config.
+#[allow(clippy::needless_return)]
+fn create_local_auto(
+    policy: &EmbeddingPolicy,
+    models_dir: Option<&std::path::Path>,
+) -> Result<Box<dyn Embedder>, EmbedError> {
+    // macOS + CoreML: try CoreML for the context model, fall back to ONNX.
+    #[cfg(all(target_os = "macos", feature = "local-coreml"))]
+    {
+        if policy.model == "pplx-embed-context-v1-0.6b" {
+            let cache_dir = models_dir.map(|p| p.to_path_buf());
+            match crate::pplx_context_coreml::PplxContextCoreMLEmbedder::new(cache_dir, true) {
+                Ok(embedder) => return Ok(Box::new(embedder)),
+                Err(e) => {
+                    #[cfg(feature = "local-onnx")]
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            "CoreML embedder unavailable; falling back to ONNX"
+                        );
+                        return create_onnx(policy, models_dir);
+                    }
+                    #[cfg(not(feature = "local-onnx"))]
+                    {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        // Non-context models: go straight to ONNX when available.
+        #[cfg(feature = "local-onnx")]
+        {
+            return create_onnx(policy, models_dir);
+        }
+        #[cfg(not(feature = "local-onnx"))]
+        {
+            return Err(EmbedError::Internal(format!(
+                "provider 'local' with model '{}' needs the 'local-onnx' feature \
+                 (only 'pplx-embed-context-v1-0.6b' is available via CoreML). \
+                 Rebuild with `--features local-onnx`.",
+                policy.model
+            )));
+        }
+    }
+
+    // Non-macOS or no CoreML: ONNX if available, else a clear error.
+    #[cfg(not(all(target_os = "macos", feature = "local-coreml")))]
+    {
+        #[cfg(feature = "local-onnx")]
+        {
+            return create_onnx(policy, models_dir);
+        }
+        #[cfg(not(feature = "local-onnx"))]
+        {
+            let _ = (policy, models_dir);
+            return Err(EmbedError::Internal(
+                "provider 'local' requires a local backend: rebuild with \
+                 `--features local-onnx` (all platforms) or `--features local-coreml` \
+                 (macOS), or choose a hosted provider."
+                    .to_string(),
+            ));
+        }
     }
 }
 

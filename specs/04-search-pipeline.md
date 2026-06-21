@@ -116,6 +116,34 @@ embedding.
 Models are **downloaded on first run** (with progress UI, checksum verification, resumable) into
 the model cache ([03-config.md](03-config.md) §4) — never bundled into the binary.
 
+### Local backends: ONNX (CPU) and CoreML (ANE/GPU)
+
+The default `pplx-embed-context-v1-0.6b` runs on two interchangeable local backends, selected by
+the `local` / `local-coreml` / `local-onnx` provider values ([03-config.md](03-config.md) §7).
+
+- **ONNX (CPU):** the reference path. Late-chunking is run in `embed`: the model emits token
+  embeddings, then Rust does mean-pooling over each chunk's token span and `tanh` int8
+  quantization before binarization.
+- **CoreML (ANE/GPU):** macOS-only, behind the opt-in `local-coreml` cargo feature
+  (requires Rust ≥ 1.85). Executes on Apple Silicon's ANE/GPU via `objc2-core-ml`. Pooling and
+  `tanh` int8 quantization happen **inside the model** — it consumes a `pool_matrix` input and
+  outputs int8 `(32, 1024)` directly, so the in-Rust mean-pool + quant of the ONNX path is not
+  needed. The CoreML bundle is the context (late-chunking) variant, downloaded from HF repo
+  `dokterbob/pplx-embed-coreml` (pinned revision) via `hf-hub` 1.0, whose built-in XET transfers
+  deduplicate the shared ~1.15 GB encoder weights across sequence-length buckets. Buckets are
+  fixed ANE sequence lengths `L ∈ {512, 1024, 2048, 4096}` (whichever are published — currently
+  only `context/L512-int8`) plus an optional dynamic GPU catch-all.
+
+Both backends are **index-interchangeable**: same `model_id`, 1024-dim, `Binary` encoding,
+sign-compatible vectors. Measured on Apple Silicon (CoreML fp16/ANE vs ONNX fp32/CPU on identical
+chunks): **cosine parity ~0.995–0.9995** (the full-precision direction is essentially identical),
+and **per-dimension sign/Hamming agreement ~98–99%** (0.982–0.994 observed). The few flips (~5–11 of
+1024 dims) are dimensions whose pre-tanh value sits within fp16-rounding distance of zero and so
+round to a different int8 sign at the tie point — they carry negligible magnitude. An index built by
+one backend is queryable by the other with no reindex (the choice of backend does not affect
+`policy_version`); cross-backend Hamming distances carry ~1–2% backend-induced bit noise on near-zero
+dimensions, which is small relative to inter-document distances.
+
 ### Gating benchmark for the default model
 
 Before `pplx-embed-context-v1-0.6b` is confirmed as default, measure on a mid-range laptop
