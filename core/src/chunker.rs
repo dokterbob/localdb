@@ -954,4 +954,72 @@ mod tests {
         // Should not take forever — the backstop kicks in.
         // (The test completing at all is the key assertion.)
     }
+
+    // ---------------------------------------------------------------------------
+    // Regression tests: hang-fix for code/JSON/lockfiles (only-index-supported-files)
+    // ---------------------------------------------------------------------------
+
+    /// Regression: minified JSON (one very long line) must not hang and must produce
+    /// bounded chunks. Before the fix, `chunk_prose` was called on structureless JSON,
+    /// causing super-linear cost and a multi-minute hang.
+    #[test]
+    fn regression_minified_json_does_not_hang() {
+        let unit = r#"{"key":"value","#;
+        // 100_000 chars ≈ 6250 repetitions of the 16-char unit
+        let reps = 100_000 / unit.len();
+        let content = unit.repeat(reps);
+        let doc_id = "doc-minified-json";
+        let cfg = ChunkerConfig::code(); // target = 3000 chars
+        let chunks = chunk_document(doc_id, &content, &cfg, &CharSizer).unwrap();
+        // Must produce more than one chunk (content >> target).
+        assert!(
+            chunks.len() > 1,
+            "minified JSON must split into multiple chunks, got {}",
+            chunks.len()
+        );
+        // Every chunk must be within 2× the char target.
+        let target = cfg.resolved_target_tokens();
+        for c in &chunks {
+            let char_count = c.text.chars().count();
+            assert!(
+                char_count <= 2 * target,
+                "chunk exceeds 2× target ({} chars, target {})",
+                char_count,
+                target
+            );
+        }
+    }
+
+    /// Regression: a Rust source file must be routed to the code chunker, not prose.
+    /// Before the fix, `preset_for` did not exist and all files defaulted to prose.
+    #[test]
+    fn regression_code_file_uses_line_chunker_not_prose() {
+        assert_eq!(
+            preset_for(Some("main.rs"), None),
+            "code",
+            "main.rs must route to the code chunker"
+        );
+    }
+
+    /// Regression: a Markdown README must still use the prose chunker.
+    #[test]
+    fn regression_prose_file_uses_prose_chunker() {
+        assert_eq!(
+            preset_for(Some("README.md"), None),
+            "prose",
+            "README.md must route to the prose chunker"
+        );
+    }
+
+    /// Regression: Cargo.lock (lockfile, no recognized extension) must route to code.
+    /// Before the fix, Cargo.lock would fall through to prose and hang on its
+    /// long structureless sections.
+    #[test]
+    fn regression_cargo_lock_uses_line_chunker() {
+        assert_eq!(
+            preset_for(Some("Cargo.lock"), None),
+            "code",
+            "Cargo.lock must route to the code chunker"
+        );
+    }
 }

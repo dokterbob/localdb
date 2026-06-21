@@ -179,4 +179,51 @@ mod tests {
         let probe = Probe::new(b"[[package]]", Some("Cargo.lock"), None);
         assert!(PlaintextParser.parse(&probe).unwrap().is_some());
     }
+
+    // ---------------------------------------------------------------------------
+    // Regression tests: unknown/binary extensions must be declined (UnsupportedFormat)
+    // ---------------------------------------------------------------------------
+
+    /// Regression: a `.bin` file with valid UTF-8 must be declined (Ok(None)) by
+    /// PlaintextParser, not accepted. Before the fix, PlaintextParser accepted any
+    /// UTF-8 content regardless of extension, causing unknown files to be indexed
+    /// via the slow prose chunker.
+    #[test]
+    fn regression_unknown_extension_is_unsupported() {
+        let probe = Probe::new(b"some utf-8 content here", Some("data.bin"), None);
+        let result = PlaintextParser.parse(&probe).unwrap();
+        assert!(
+            result.is_none(),
+            "data.bin must be declined (Ok(None)) by PlaintextParser"
+        );
+    }
+
+    /// Regression: a file with no extension must also be declined (Ok(None)).
+    /// Before the fix, extensionless files with valid UTF-8 were accepted and
+    /// sent to the prose chunker.
+    #[test]
+    fn regression_no_extension_is_unsupported() {
+        let probe = Probe::new(b"#!/usr/bin/env bash\necho hello", Some("somefile"), None);
+        let result = PlaintextParser.parse(&probe).unwrap();
+        assert!(
+            result.is_none(),
+            "extensionless 'somefile' must be declined (Ok(None)) by PlaintextParser"
+        );
+    }
+
+    /// Regression: a `.rs` file must be accepted — supported Rust source files
+    /// should still be indexed after the extension-gating fix.
+    #[test]
+    fn regression_rs_file_is_supported() {
+        let probe = Probe::new(
+            b"fn main() {\n    println!(\"hello\");\n}\n",
+            Some("main.rs"),
+            None,
+        );
+        let result = PlaintextParser.parse(&probe).unwrap();
+        assert!(
+            result.is_some(),
+            "main.rs must be accepted (Ok(Some(_))) by PlaintextParser"
+        );
+    }
 }
