@@ -50,6 +50,7 @@ pub fn http_status_for(err: &CoreError) -> StatusCode {
         | CoreError::JobNotFound { .. } => StatusCode::NOT_FOUND,
 
         CoreError::StoreLocked
+        | CoreError::RuntimeStateLocked
         | CoreError::DaemonRunning
         | CoreError::ConfigReadonly
         | CoreError::IndexInProgress => StatusCode::CONFLICT,
@@ -99,6 +100,10 @@ mod tests {
     #[test]
     fn conflict_errors_map_to_409() {
         assert_eq!(http_status_for(&Error::StoreLocked), StatusCode::CONFLICT);
+        assert_eq!(
+            http_status_for(&Error::RuntimeStateLocked),
+            StatusCode::CONFLICT
+        );
         assert_eq!(http_status_for(&Error::DaemonRunning), StatusCode::CONFLICT);
         assert_eq!(
             http_status_for(&Error::ConfigReadonly),

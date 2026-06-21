@@ -37,6 +37,16 @@ pub enum Error {
     #[error("store is locked by another process")]
     StoreLocked,
 
+    /// The runtime-state database is locked by another process (an index may be
+    /// in progress). Try again shortly.
+    ///
+    /// CLI exit code: 4
+    #[error(
+        "runtime-state database is locked by another process (an index may be in progress); \
+         try again shortly"
+    )]
+    RuntimeStateLocked,
+
     /// A daemon is already running when one is not expected.
     ///
     /// CLI exit code: 4
@@ -111,6 +121,7 @@ impl Error {
             Error::DocumentNotFound { .. } => "document_not_found",
             Error::JobNotFound { .. } => "job_not_found",
             Error::StoreLocked => "store_locked",
+            Error::RuntimeStateLocked => "runtime_state_locked",
             Error::DaemonRunning => "daemon_running",
             Error::DaemonUnreachable => "daemon_unreachable",
             Error::ConfigReadonly => "config_readonly",
@@ -135,6 +146,7 @@ impl Error {
             | Error::DocumentNotFound { .. }
             | Error::JobNotFound { .. } => 3,
             Error::StoreLocked
+            | Error::RuntimeStateLocked
             | Error::DaemonRunning
             | Error::ConfigReadonly
             | Error::IndexInProgress => 4,
@@ -171,6 +183,7 @@ mod tests {
             ),
             (Error::JobNotFound { id: "x".into() }, "job_not_found", 3),
             (Error::StoreLocked, "store_locked", 4),
+            (Error::RuntimeStateLocked, "runtime_state_locked", 4),
             (Error::DaemonRunning, "daemon_running", 4),
             (Error::DaemonUnreachable, "daemon_unreachable", 5),
             (Error::ConfigReadonly, "config_readonly", 4),
@@ -265,6 +278,7 @@ mod tests {
     #[test]
     fn conflict_errors_exit_4() {
         assert_eq!(Error::StoreLocked.exit_code(), 4);
+        assert_eq!(Error::RuntimeStateLocked.exit_code(), 4);
         assert_eq!(Error::DaemonRunning.exit_code(), 4);
         assert_eq!(Error::ConfigReadonly.exit_code(), 4);
         assert_eq!(Error::IndexInProgress.exit_code(), 4);
