@@ -962,3 +962,257 @@ fn search_routes_to_daemon_when_running() {
         paths
     );
 }
+
+/// Daemon-routing: `source add` routes to daemon without panicking.
+///
+/// Regression test for issue #53: `source add` used the sync `daemon_request`
+/// wrapper from inside an already-running tokio runtime, causing a nested
+/// `block_on` panic. This test verifies that the command reaches the mock
+/// daemon (proving the async path is exercised) and does NOT panic.
+#[test]
+fn source_add_routes_to_daemon_without_panic() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let (listener, port) = start_mock_daemon();
+    let received_paths: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let received_paths_clone = received_paths.clone();
+
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).is_ok() {
+                received_paths_clone
+                    .lock()
+                    .unwrap()
+                    .push(request_line.trim().to_string());
+            }
+
+            // Drain headers.
+            loop {
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+
+            // Respond with a plausible source-created payload.
+            let body = r#"{"id":"01ABCDEFGHIJKLMNOPQRSTUVWX","store":"mystore","kind":"path"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    std::fs::write(
+        data_dir.join("daemon.sock"),
+        format!("http://127.0.0.1:{}", port),
+    )
+    .unwrap();
+
+    // First create a store so that store-validation passes in the CLI before
+    // the daemon probe (store-add itself will also be routed, that's fine).
+    // We use the mock daemon for everything — no real DB needed.
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["--json", "source", "add", "--store", "mystore", "."])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // The critical invariant: the process must NOT have panicked.
+    // A panic exits with a non-zero status AND prints "panicked at" to stderr.
+    assert!(
+        !stderr.contains("panicked at"),
+        "source add must not panic (nested block_on regression); stderr: {}",
+        stderr
+    );
+
+    // The mock returned 200 with a valid source-like body, so the CLI should
+    // have succeeded (or possibly exited non-zero for other reasons, e.g.
+    // the store validation happening client-side, but it must have reached the
+    // daemon without panicking).
+    let paths = received_paths.lock().unwrap();
+    assert!(
+        !paths.is_empty(),
+        "mock HTTP daemon should have received a request from 'source add'; \
+         exit={:?} stdout={} stderr={}",
+        output.status.code(),
+        stdout,
+        stderr
+    );
+    assert!(
+        paths.iter().any(|p| p.contains("/v1/stores")),
+        "daemon routing from 'source add' must target /v1/stores/{{name}}/sources; \
+         received: {:?}",
+        paths
+    );
+}
+
+/// Daemon-routing: `source remove` converted to async does not panic.
+///
+/// Regression test for issue #53: `source remove` was refactored from sync
+/// (calling the sync `daemon_request` wrapper) to async (calling
+/// `daemon_request_async(..).await`).  When `source remove` is invoked with a
+/// daemon running and `--store` given but the store is not in the runtime DB,
+/// the CLI should exit with a structured error (exit 3), NOT with a panic.
+///
+/// Note: `source remove` exits before reaching the daemon in this scenario due
+/// to the D1 store-existence check (the temp placeholder DB opened in daemon
+/// mode is empty).  The key invariant is no panic.
+#[test]
+fn source_remove_with_daemon_running_exits_cleanly_without_panic() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    // Create daemon.sock sentinel pointing to a (potentially non-existent) port.
+    // probe_daemon_health will return false (no listener), so probe_daemon()
+    // falls back to DaemonState::NotRunning after removing the stale sock.
+    // We use LOCALDB_DAEMON_URL to force daemon-mode detection instead.
+    std::fs::write(data_dir.join("daemon.sock"), "http://127.0.0.1:19999").unwrap();
+
+    // With LOCALDB_DAEMON_URL set and no default store, source remove must exit
+    // with a non-panic error (exit 2 "no stores" because the placeholder DB is
+    // empty).  It must NOT panic with "Cannot start a runtime from within a
+    // runtime."
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", "http://127.0.0.1:19999")
+        .args(["--json", "source", "remove", "01ABCDEFGHIJKLMNOPQRSTUVWX"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Must not panic — this is the regression guard for issue #53.
+    assert!(
+        !stderr.contains("panicked at"),
+        "source remove must not panic even when daemon is running; \
+         exit={:?} stdout={} stderr={}",
+        output.status.code(),
+        stdout,
+        stderr
+    );
+
+    // The process must exit non-zero (structured error, not panic/abort).
+    assert!(
+        !output.status.success(),
+        "source remove with no stores and daemon running should not succeed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Runtime-state lock contention tests (regression guard for #46 and #56)
+//
+// These tests hold the runtime-state redb lock in-process, then run CLI
+// commands as subprocesses to verify they get exit 4 + runtime_state_locked
+// rather than empty results (#46) or an opaque internal error (#56).
+// ---------------------------------------------------------------------------
+
+/// Regression guard for #46: read-only commands (store list, search, status)
+/// must exit 4 with `runtime_state_locked` when the redb lock is held,
+/// NOT silently show empty results from a temp DB.
+#[test]
+fn runtime_state_locked_read_commands_exit_4() {
+    use redb::Database;
+
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    // Pre-create the data dir and the runtime-state DB path so our lock-holder
+    // and the CLI agree on the same file.
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    // Open the runtime-state redb to hold the exclusive lock.
+    let state_db_path = data_dir.join("runtime-state.redb");
+    let _lock_holder = Database::create(&state_db_path)
+        .expect("should be able to create runtime-state.redb in test");
+
+    // `store list --json` must exit 4 with runtime_state_locked, not empty JSON.
+    let output = cmd_with_dir(&dir)
+        .args(["--json", "store", "list"])
+        .output()
+        .unwrap();
+
+    let exit_code = output.status.code().unwrap_or(-1);
+    assert_eq!(
+        exit_code,
+        4,
+        "store list while runtime-state DB is locked must exit 4; \
+         stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout),
+    );
+
+    // Verify the JSON error code.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for s in &[stderr.as_ref(), stdout.as_ref()] {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+            if let Some(code) = v.get("error").and_then(|e| e.as_str()) {
+                assert_eq!(
+                    code, "runtime_state_locked",
+                    "JSON error code must be 'runtime_state_locked', got '{}'; combined: {}{}",
+                    code, stdout, stderr
+                );
+                return;
+            }
+        }
+    }
+    // Exit code 4 is the key guarantee; JSON parsing may vary.
+}
+
+/// Regression guard for #56: strict callers (mcp) must exit 4 with a clear
+/// message when the runtime-state redb lock is held, not an opaque internal error.
+#[test]
+fn runtime_state_locked_mcp_exits_4() {
+    use redb::Database;
+
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    // Hold the runtime-state redb lock.
+    let state_db_path = data_dir.join("runtime-state.redb");
+    let _lock_holder = Database::create(&state_db_path)
+        .expect("should be able to create runtime-state.redb in test");
+
+    // `mcp` (strict) must exit 4, not 1.
+    let output = cmd_with_dir(&dir)
+        .arg("mcp")
+        .write_stdin("")
+        .output()
+        .unwrap();
+
+    let exit_code = output.status.code().unwrap_or(-1);
+    assert_eq!(
+        exit_code,
+        4,
+        "mcp while runtime-state DB is locked must exit 4; \
+         stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout),
+    );
+}

@@ -13,7 +13,7 @@
 
 use std::path::Path;
 
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, DatabaseError, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -99,13 +99,16 @@ impl RuntimeStateDb {
             })?;
         }
 
-        let db = Database::create(path).map_err(|e| Error::Internal {
-            message: format!(
-                "cannot open runtime-state DB at '{}': {}",
-                path.display(),
-                e
-            ),
-            correlation_id: "runtime_state_open".to_string(),
+        let db = Database::create(path).map_err(|e| match e {
+            DatabaseError::DatabaseAlreadyOpen => Error::RuntimeStateLocked,
+            _ => Error::Internal {
+                message: format!(
+                    "cannot open runtime-state DB at '{}': {}",
+                    path.display(),
+                    e
+                ),
+                correlation_id: "runtime_state_open".to_string(),
+            },
         })?;
 
         // Ensure tables exist
@@ -367,6 +370,29 @@ mod tests {
         let path = dir.path().join("subdir").join("runtime-state.redb");
         let _db = RuntimeStateDb::open(&path).unwrap();
         assert!(path.exists(), "DB file should be created in new directory");
+    }
+
+    #[test]
+    fn second_open_returns_runtime_state_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime-state.redb");
+
+        // First open holds the exclusive lock.
+        let _db = RuntimeStateDb::open(&path).unwrap();
+
+        // A second open on the same path must return RuntimeStateLocked.
+        let result = RuntimeStateDb::open(&path);
+        match result {
+            Err(Error::RuntimeStateLocked) => {}
+            Err(other) => panic!("expected RuntimeStateLocked, got: {:?}", other),
+            Ok(_) => panic!("expected RuntimeStateLocked, but got Ok"),
+        }
+    }
+
+    #[test]
+    fn runtime_state_locked_exit_code_is_4() {
+        assert_eq!(Error::RuntimeStateLocked.exit_code(), 4);
+        assert_eq!(Error::RuntimeStateLocked.code(), "runtime_state_locked");
     }
 
     #[test]

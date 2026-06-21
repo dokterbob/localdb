@@ -4816,6 +4816,7 @@ dependencies = [
  "fd-lock",
  "localdb-core",
  "predicates",
+ "redb",
  "serde",
  "serde_json",
  "tempfile",

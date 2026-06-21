@@ -77,6 +77,7 @@ MCP tool error). Codes are stable API:
 |---|---|---|
 | `store_not_found` / `source_not_found` / `document_not_found` / `job_not_found` | Unknown entity | 404 |
 | `store_locked` | Write lock held elsewhere and no daemon to route through | 409 |
+| `runtime_state_locked` | Runtime-state DB locked by another process (index in progress) | 409 |
 | `daemon_running` / `daemon_unreachable` | Process-model conflicts | 409 / 502 |
 | `config_readonly` | Attempted API write to a YAML-owned object ([03-config.md](03-config.md) §3) | 409 |
 | `invalid_config` | Config failed validation (path-precise message) | 422 |
