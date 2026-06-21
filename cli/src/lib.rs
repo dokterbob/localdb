@@ -31,7 +31,7 @@ use localdb_core::{
     ids::new_ulid,
     Error,
 };
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, DatabaseError, ReadableDatabase, ReadableTable, TableDefinition};
 use serde_json::json;
 
 // ---------------------------------------------------------------------------
@@ -345,6 +345,7 @@ async fn daemon_request_async(
             "store_not_found" => Error::StoreNotFound { id: msg },
             "source_not_found" => Error::SourceNotFound { id: msg },
             "store_locked" => Error::StoreLocked,
+            "runtime_state_locked" => Error::RuntimeStateLocked,
             "config_readonly" => Error::ConfigReadonly,
             "daemon_unreachable" => Error::DaemonUnreachable,
             _ => Error::Internal {
@@ -431,9 +432,12 @@ impl SourceDb {
             })?;
         }
 
-        let db = Database::create(path).map_err(|e| Error::Internal {
-            message: format!("cannot open source DB: {}", e),
-            correlation_id: "source_db_open".to_string(),
+        let db = Database::create(path).map_err(|e| match e {
+            DatabaseError::DatabaseAlreadyOpen => Error::RuntimeStateLocked,
+            _ => Error::Internal {
+                message: format!("cannot open source DB: {}", e),
+                correlation_id: "source_db_open".to_string(),
+            },
         })?;
 
         {
@@ -717,12 +721,17 @@ fn load_app_db_lenient(ctx: &CliContext) -> (ConfigLoader, AppDb) {
     }
 
     let db_path = config_loader.paths.runtime_state_db_path();
-    // For read-only commands, use a temp DB if the real one can't be opened.
-    let db = AppDb::open(&db_path).unwrap_or_else(|_| {
-        let tmp_dir = tempdir_for_daemon_mode(data_dir);
-        let tmp_path = tmp_dir.join("lenient-fallback.redb");
-        AppDb::open(&tmp_path).unwrap_or_else(|e| exit_err(&e, ctx.json))
-    });
+    // For read-only commands: propagate RuntimeStateLocked (exit 4), but fall
+    // back to a temp DB for a genuinely absent/malformed DB.
+    let db = match AppDb::open(&db_path) {
+        Ok(d) => d,
+        Err(Error::RuntimeStateLocked) => exit_err(&Error::RuntimeStateLocked, ctx.json),
+        Err(_) => {
+            let tmp_dir = tempdir_for_daemon_mode(data_dir);
+            let tmp_path = tmp_dir.join("lenient-fallback.redb");
+            AppDb::open(&tmp_path).unwrap_or_else(|e| exit_err(&e, ctx.json))
+        }
+    };
     (config_loader, db)
 }
 
@@ -2000,6 +2009,11 @@ async fn run_index_async(
         }
         return;
     }
+
+    // Narrow the redb lock window: all DB reads are done. Drop the handle now
+    // so concurrent readers (store list, search, status) can open the DB while
+    // the ingestion loop runs. The WriteLock (_lock) is separate and stays held.
+    drop(db);
 
     let policy = config_loader.config.defaults.indexing.clone();
     let policy_version = compute_policy_version(&policy);
