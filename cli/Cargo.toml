@@ -25,5 +25,11 @@ fd-lock = "4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 indicatif = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# On macOS, auto-enable CoreML so any localdb build (release tarball or cargo install)
+# picks up ANE/GPU acceleration without needing --features. Cargo unions this with the
+# local-onnx feature above; Linux never pulls objc2/block2/etc.
+embed = { path = "../embed", features = ["local-coreml"] }
+
 [dev-dependencies]
 tempfile = { workspace = true }
