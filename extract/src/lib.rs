@@ -37,9 +37,10 @@ pub fn supported_extensions() -> &'static [&'static str] {
         "htm",
         // PDF
         "pdf",
-        // Office (docx, xlsx, pptx, odt, etc.) — representative
+        // Office (docx, pptx, odt, ods, odp, csv via anytomd)
+        // Note: xlsx and xls are intentionally excluded — anytomd hangs on large
+        // spreadsheets; see https://github.com/developer0hye/anytomd-rs/issues/94
         "docx",
-        "xlsx",
         "pptx",
         "odt",
         "ods",

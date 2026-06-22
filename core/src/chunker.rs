@@ -243,7 +243,16 @@ fn chunk_prose(
             .map(|l| l.chars().count())
             .max()
             .unwrap_or(0);
+        tracing::debug!(
+            max_line_len,
+            threshold = 8 * target,
+            "chunk_prose backstop probe"
+        );
         if max_line_len > 8 * target {
+            tracing::debug!(
+                max_line_len,
+                "chunk_prose backstop: delegating to chunk_code"
+            );
             return chunk_code(document_id, markdown, config);
         }
     }
@@ -428,7 +437,7 @@ pub fn preset_for(filename: Option<&str>, mime: Option<&str>) -> &'static str {
     const CODE_EXTS: &[&str] = &[
         "rs", "py", "js", "mjs", "ts", "tsx", "json", "yaml", "yml", "toml", "lock", "c", "h",
         "cpp", "hpp", "go", "java", "rb", "php", "sh", "css", "scss", "sql", "csv", "xml", "ini",
-        "cfg",
+        "cfg", "xlsx", "xls",
     ];
     const PROSE_EXTS: &[&str] = &["md", "markdown", "html", "htm", "pdf", "txt", "text"];
     const LOCKFILE_BASENAMES: &[&str] = &[
@@ -1021,5 +1030,26 @@ mod tests {
             "code",
             "Cargo.lock must route to the code chunker"
         );
+    }
+
+    #[test]
+    fn preset_for_spreadsheet_exts_is_code() {
+        assert_eq!(preset_for(Some("sheet.xlsx"), None), "code");
+        assert_eq!(preset_for(Some("sheet.xls"), None), "code");
+        // Case-insensitive
+        assert_eq!(preset_for(Some("SHEET.XLSX"), None), "code");
+    }
+
+    #[test]
+    fn preset_for_docx_pptx_is_prose() {
+        // DOCX and PPTX are prose documents, not tabular/code data.
+        assert_eq!(preset_for(Some("report.docx"), None), "prose");
+        assert_eq!(preset_for(Some("slides.pptx"), None), "prose");
+    }
+
+    #[test]
+    fn preset_for_csv_is_code() {
+        // Regression: CSV was already code, should still be.
+        assert_eq!(preset_for(Some("data.csv"), None), "code");
     }
 }
