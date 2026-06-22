@@ -209,7 +209,6 @@ impl CoreMlModel {
             _keep_alive: (provider, inputs, block),
         })
     }
-
 }
 
 /// Build an `MLDictionaryFeatureProvider` from named [`MlArray`] inputs.
