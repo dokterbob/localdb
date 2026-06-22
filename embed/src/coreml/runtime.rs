@@ -53,6 +53,7 @@ use crate::error::EmbedError;
 
 /// Which hardware back-ends CoreML may use when running the model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum ComputeUnits {
     /// CPU only (predictable latency, works everywhere).
     CpuOnly,
@@ -132,16 +133,6 @@ impl CoreMlModel {
         Ok(Self { inner: model })
     }
 
-    /// Run a synchronous prediction from a set of named input arrays.
-    ///
-    /// Builds an `MLDictionaryFeatureProvider` internally from the `(name,
-    /// array)` pairs, so callers never touch the Obj-C feature-provider types.
-    /// Returns an [`Outputs`] wrapping the result feature provider.
-    pub fn predict(&self, inputs: &[(&str, MlArray)]) -> Result<Outputs, EmbedError> {
-        let provider = build_feature_provider(inputs)?;
-        self.predict_provider(&provider)
-    }
-
     /// Dispatch an async prediction to the ANE/GPU and return a future.
     ///
     /// The prediction is eagerly dispatched to CoreML's internal queue before this
@@ -210,7 +201,7 @@ impl CoreMlModel {
             let input_prot: &ProtocolObject<dyn MLFeatureProvider> =
                 ProtocolObject::from_ref(&*provider);
             self.inner
-                .predictionFromFeatures_completionHandler(input_prot, &*block);
+                .predictionFromFeatures_completionHandler(input_prot, &block);
         }
 
         Ok(PendingPrediction {
@@ -219,22 +210,6 @@ impl CoreMlModel {
         })
     }
 
-    /// Run a synchronous prediction from a pre-built feature provider.
-    fn predict_provider(&self, input: &MLDictionaryFeatureProvider) -> Result<Outputs, EmbedError> {
-        // SAFETY: predictionFromFeatures:error: is a synchronous Obj-C method
-        // that takes a reference to an MLFeatureProvider. MLDictionaryFeatureProvider
-        // is a concrete Obj-C class (implements Message) that conforms to the
-        // MLFeatureProvider protocol, so ProtocolObject::from_ref succeeds.
-        // The returned feature provider is retained for the lifetime of Outputs.
-        let output = unsafe {
-            let input_prot: &ProtocolObject<dyn MLFeatureProvider> =
-                ProtocolObject::from_ref(input);
-            self.inner
-                .predictionFromFeatures_error(input_prot)
-                .map_err(|e| EmbedError::Internal(format!("CoreML prediction error: {e:?}")))?
-        };
-        Ok(Outputs { inner: output })
-    }
 }
 
 /// Build an `MLDictionaryFeatureProvider` from named [`MlArray`] inputs.
@@ -489,6 +464,12 @@ unsafe impl Send for Outputs {}
 // PendingPrediction — future wrapping an in-flight async CoreML prediction
 // ---------------------------------------------------------------------------
 
+type KeepAlive = (
+    Retained<MLDictionaryFeatureProvider>,
+    Vec<(&'static str, MlArray)>,
+    RcBlock<dyn Fn(*mut ProtocolObject<dyn MLFeatureProvider>, *mut NSError)>,
+);
+
 /// A future that resolves when an async CoreML prediction completes.
 ///
 /// Created by [`CoreMlModel::start_prediction`]. The prediction is dispatched
@@ -499,11 +480,7 @@ unsafe impl Send for Outputs {}
 /// `predictionFromFeatures_completionHandler` returns).
 pub struct PendingPrediction {
     rx: oneshot::Receiver<Result<Outputs, EmbedError>>,
-    _keep_alive: (
-        objc2::rc::Retained<objc2_core_ml::MLDictionaryFeatureProvider>,
-        Vec<(&'static str, MlArray)>,
-        RcBlock<dyn Fn(*mut ProtocolObject<dyn MLFeatureProvider>, *mut NSError)>,
-    ),
+    _keep_alive: KeepAlive,
 }
 
 // SAFETY: `PendingPrediction` exclusively owns all of its CoreML Obj-C objects

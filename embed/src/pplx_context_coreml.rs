@@ -1021,12 +1021,12 @@ mod tests {
         // Scatter doc 1, window 0..3
         let rows1 = vec![vec![1.0f32; 4], vec![2.0; 4], vec![3.0; 4]];
         for (j, v) in rows1.into_iter().enumerate() {
-            results[1][0 + j] = v;
+            results[1][j] = v;
         }
         // Scatter doc 0, window 0..2
         let rows0 = vec![vec![10.0f32; 4], vec![20.0; 4]];
         for (j, v) in rows0.into_iter().enumerate() {
-            results[0][0 + j] = v;
+            results[0][j] = v;
         }
 
         assert_eq!(results[0][0], vec![10.0f32; 4]);
@@ -1048,12 +1048,12 @@ mod tests {
             results[0][32 + j] = vec![(32 + j) as f32; 4];
         }
         // First window (0..32) arrives second.
-        for j in 0..32usize {
-            results[0][0 + j] = vec![j as f32; 4];
+        for (j, slot) in results[0].iter_mut().enumerate().take(32) {
+            *slot = vec![j as f32; 4];
         }
 
-        for i in 0..40usize {
-            assert_eq!(results[0][i], vec![i as f32; 4], "slot {i} wrong");
+        for (i, slot) in results[0].iter().enumerate() {
+            assert_eq!(*slot, vec![i as f32; 4], "slot {i} wrong");
         }
     }
 
