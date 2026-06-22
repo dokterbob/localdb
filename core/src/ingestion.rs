@@ -1180,6 +1180,7 @@ fn detect_mime(path: &Path) -> Option<String> {
             "txt" => "text/plain",
             "html" | "htm" => "text/html",
             "pdf" => "application/pdf",
+            "epub" => "application/epub+zip",
             "rs" => "text/x-rust",
             "py" => "text/x-python",
             "js" | "mjs" => "text/javascript",
