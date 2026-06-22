@@ -155,7 +155,7 @@ data/
 Run a plain-text search across the indexed store:
 
 ```bash
-localdb search "how does rust handle errors"
+localdb search how does rust handle errors
 ```
 
 ```
@@ -176,7 +176,7 @@ LanceDB is an embedded vector database built on the Lance columnar format. It su
 Limit results with `--limit`:
 
 ```bash
-localdb search "rank fusion" --limit 2
+localdb search --limit 2 rank fusion
 ```
 
 ### JSON output
@@ -185,7 +185,7 @@ Pass `--json` to get machine-readable citations. The citation shape is the canon
 `localdb` Citation object (see [../specs/02-domain-model.md](../specs/02-domain-model.md) §6):
 
 ```bash
-localdb search "hybrid search" --store notes --json
+localdb search -s notes --json hybrid search
 ```
 
 ```json
