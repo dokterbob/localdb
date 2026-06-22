@@ -35,12 +35,18 @@ counted as skipped/errored in `IndexJob` stats, never fatal. See
 ### `embed`
 
 `Embedder` implementations. Declares providers for local ONNX inference
-(`OnnxEmbedder`, feature-gated `local-onnx`), OpenAI-compatible flat HTTP endpoints
+(`OnnxEmbedder`, feature-gated `local-onnx`), local CoreML inference on Apple Silicon
+(feature-gated `local-coreml`, macOS-only), OpenAI-compatible flat HTTP endpoints
 (`OpenAiEmbedder`), Perplexity contextualized embeddings (`PerplexityEmbedder`), and Voyage
 (`VoyageEmbedder`). All implement the document-aware `Embedder` trait from `core`, which
 groups chunks by document so contextualized/late-chunking models can use the surrounding
 document as context. The CLI wires the embedder via `embed::create_embedder` from the config
-policy; the default is `local-onnx` / `pplx-embed-context-v1-0.6b`. See [specs/04-search-pipeline.md](../specs/04-search-pipeline.md) §4.
+policy; the default is `local` / `pplx-embed-context-v1-0.6b`. The `local` provider auto-selects
+the CoreML (ANE/GPU) backend on Apple Silicon macOS when built with `--features local-coreml`,
+falling back to ONNX (CPU) otherwise; `local-coreml` / `local-onnx` force a backend. The two
+backends emit index-interchangeable vectors. See
+[specs/04-search-pipeline.md](../specs/04-search-pipeline.md) §4 and the
+[Platform notes](#platform-notes) below.
 
 ### `store-lancedb`
 
@@ -99,7 +105,7 @@ to the appropriate crate. No logic of its own. Subcommands: `init`, `serve`, `mc
  │  chunker  →  Chunks  (heading-aware, ~400-token prose)  │
  │       │                                                 │
  │       ▼                                                 │
- │  Embedder  →  dense vectors  [default: local-onnx ONNX]  │
+ │  Embedder  →  dense vectors  [default: local; CoreML/ONNX]│
  │       │                                                 │
  │       ▼                                                 │
  │  store-lancedb  →  chunks.lance  (BM25 index + vectors) │
@@ -182,8 +188,10 @@ The default `data_dir` on macOS is `~/Library/Application Support/com.localdb.lo
 Override with `paths.data` in `config.yaml` or point to a custom config with `--config`.
 
 The `models/` directory (configured via `paths.models`) is populated on first `localdb index`
-or `localdb search` when the default `local-onnx` embedder downloads `pplx-embed-context-v1-0.6b`
-(~706 MB) from HuggingFace. Subsequent runs use the cached model.
+or `localdb search` when the default `local` embedder downloads `pplx-embed-context-v1-0.6b`
+(~706 MB ONNX) from HuggingFace. On Apple Silicon macOS built with `--features local-coreml`,
+the CoreML bundle is additionally fetched from `dokterbob/pplx-embed-coreml` (XET-deduped via
+`hf-hub` 1.0). Subsequent runs use the cached model.
 
 ---
 
@@ -197,6 +205,26 @@ or `localdb search` when the default `local-onnx` embedder downloads `pplx-embed
 | 3 | Not found (unknown store, unknown source) |
 | 4 | Conflict / already running (duplicate store, second daemon) |
 | 5 | Unavailable (daemon unreachable, model missing) |
+
+---
+
+## Platform notes {#platform-notes}
+
+**CoreML embedding backend (macOS / Apple Silicon).** The default `pplx-embed-context-v1-0.6b`
+model can run on Apple's ANE/GPU via a CoreML backend in `embed`, behind the opt-in
+`local-coreml` cargo feature (macOS-only; every code path is
+`#[cfg(all(target_os = "macos", feature = "local-coreml"))]`). Build it with
+`cargo build -p localdb --features local-coreml`. Because the feature pulls edition-2024
+dependencies (`hf-hub` 1.0), it requires **Rust ≥ 1.85**; the workspace `rust-version` is `1.85`.
+Default builds (feature off) are unaffected and remain ONNX-only — Linux and CI default builds
+never touch any CoreML code.
+
+The default `local` provider auto-selects CoreML on Apple Silicon when the feature is built and
+the bundle loads, otherwise falls back to ONNX (CPU). `local-coreml` forces CoreML (hard error if
+unavailable); `local-onnx` forces ONNX. CoreML and ONNX vectors are index-interchangeable
+(same `model_id`, 1024-dim, `Binary`; measured ~0.995–0.9995 cosine parity, ~98–99% per-dimension
+sign agreement), so switching backends needs no reindex. See [specs/03-config.md](../specs/03-config.md) §7 and
+[specs/04-search-pipeline.md](../specs/04-search-pipeline.md) §4.
 
 ---
 
@@ -258,7 +286,14 @@ from `ProjectDirs::from("com.localdb", "localdb", "localdb")` in
 `core/src/config/platform.rs`; specs/03 shows shorter `localdb/` paths. Cosmetic; override
 with `paths.*` in config for cleaner locations.
 
-**8. Sources added before the include-allowlist change keep empty `include` globs.**
+**8. The CoreML context bundle ships only the L512 sequence-length bucket.**
+The CoreML backend (`local-coreml` feature; see [Platform notes](#platform-notes)) reads its
+bucket manifest from HF repo `dokterbob/pplx-embed-coreml`. Today only the `context/L512-int8`
+bucket is published; the larger context buckets (`L ∈ {1024, 2048, 4096}`) are picked up
+automatically from the manifest once published — no code change needed. The XET-deduped download
+that shares the ~1.15 GB encoder weights across buckets relies on the `hf-hub` 1.0 pre-release.
+
+**9. Sources added before the include-allowlist change keep empty `include` globs.**
 As of the `only-index-supported-files` branch, `cli` automatically sets
 `DEFAULT_PATH_INCLUDES` (an extension-based allowlist) on new directory sources that have no
 explicit `include` globs. Sources that were added before this change already have an empty

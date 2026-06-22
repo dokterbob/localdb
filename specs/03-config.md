@@ -25,10 +25,16 @@ defaults:                 # global indexing policy; stores inherit
       preset_overrides: {}     # per-source-kind tweaks, see §2
     embedding:
       model: pplx-embed-context-v1-0.6b  # see 04-search-pipeline.md §4
-      provider: local-onnx               # local-onnx | openai-compatible | perplexity | voyage
+      provider: local                    # local | local-coreml | local-onnx |
+                                         #   openai-compatible | perplexity | voyage
       # pplx-embed-context-v1-0.6b (default): context-aware late-chunking, runs locally,
       #   MIT-licensed public repo — no API key or token required. Downloads ~706 MB
       #   (quantized ONNX) from HuggingFace on first use.
+      # Local provider variants (see §7):
+      #   local (default): AUTO — on Apple Silicon macOS built with the local-coreml
+      #     feature, uses the CoreML ANE/GPU backend; otherwise falls back to ONNX (CPU).
+      #   local-coreml: force CoreML; hard error if unavailable (no fallback).
+      #   local-onnx: force ONNX (CPU). Existing local-onnx configs keep working unchanged.
       # Local alternatives: model: pplx-embed-v1-0.6b (1024-dim, non-context, gated — needs
       #   HF_TOKEN, ~2.4 GB); model: bge-small-en-v1.5 (384-dim, no creds).
       # Hosted alternative: provider: perplexity, model: pplx-embed-context-v1
@@ -134,3 +140,24 @@ path; `paths.*` in config override the rest.
 Never inline in YAML. Provider credentials are referenced by environment variable name
 (`api_key_env`) in MVP; OS keychain integration is a roadmap item
 ([06-roadmap.md](06-roadmap.md) §5).
+
+## 7. Local embedding provider selection (`local` / `local-coreml` / `local-onnx`)
+
+The default local model `pplx-embed-context-v1-0.6b` can run on two backends; three `provider`
+values select between them:
+
+| Provider | Backend | Behavior |
+|---|---|---|
+| `local` (default) | auto | On Apple Silicon macOS built with the `local-coreml` cargo feature, when the CoreML bundle is loadable, runs on the **CoreML (ANE/GPU)** backend. Otherwise — non-macOS, feature not built, or a CoreML load failure — transparently falls back to **ONNX (CPU)**. |
+| `local-coreml` | CoreML (ANE/GPU) | Forces CoreML. **Hard error** if unavailable (non-macOS, feature off, or load failure) — there is no fallback. |
+| `local-onnx` | ONNX (CPU) | Forces ONNX. Existing `local-onnx` configs keep working unchanged. |
+
+The CoreML backend is macOS-only and gated behind the opt-in `local-coreml` cargo feature; default
+builds are ONNX-only and unaffected. Building `--features local-coreml` requires **Rust ≥ 1.85**.
+
+**Index interchangeability.** Both backends share `model_id = pplx-embed-context-v1-0.6b`, are
+1024-dim, and emit binary-quantized vectors (`VectorEncoding::Binary`). Only the sign survives
+binarization; measured cosine parity is ~0.995–0.9995 and per-dimension sign agreement ~98–99%
+(the ~1–2% of flips are near-zero dimensions that round to a different int8 sign under fp16). An
+index built by one backend is queryable by the other — switching providers requires **no reindex**
+and does not change the `policy_version` ([04-search-pipeline.md](04-search-pipeline.md) §4).

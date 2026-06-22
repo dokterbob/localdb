@@ -10,6 +10,8 @@ description = "Embedder implementations: local ONNX, OpenAI-compatible, and cont
 default = []
 # Enable local ONNX inference via fastembed + direct ORT (pplx-embed-v1-0.6b)
 local-onnx = ["dep:fastembed", "dep:ort", "dep:tokenizers", "dep:ndarray"]
+# Enable local CoreML inference (macOS/Apple Silicon only)
+local-coreml = ["dep:objc2", "dep:objc2-core-ml", "dep:objc2-foundation", "dep:half", "dep:tokenizers", "dep:hf-hub"]
 # Enable all providers (for tests/CI)
 all-providers = ["local-onnx"]
 
@@ -44,6 +46,15 @@ futures-util = "0.3"
 ort = { version = "=2.0.0-rc.12", features = ["ndarray"], optional = true }
 tokenizers = { version = "0.22", optional = true }
 ndarray = { version = "0.17", optional = true }
+
+# CoreML inference (macOS only, optional)
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", optional = true }
+objc2-core-ml = { version = "0.3", optional = true }
+objc2-foundation = { version = "0.3", optional = true }
+half = { version = "2", optional = true }
+# Async HF Hub client for CoreML bundle download (XET-deduped, pinned revisions)
+hf-hub = { version = "1.0.0-rc.1", default-features = false, features = ["rustls-tls"], optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

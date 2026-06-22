@@ -24,13 +24,11 @@
 //! the geometry bit-exact with Perplexity's published int8 vectors.
 
 use std::{
-    io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
 use async_trait::async_trait;
-use futures_util::StreamExt;
 use ndarray::{Array2, ArrayView2, ArrayViewD, Axis, Ix3};
 use tokenizers::{Tokenizer, TruncationDirection, TruncationParams, TruncationStrategy};
 use tracing::info;
@@ -60,121 +58,30 @@ const REQUIRED_FILES: &[&str] = &[
 // The external data shard may or may not be present in the quantized variant.
 const OPTIONAL_FILES: &[&str] = &["onnx/model_quantized.onnx_data"];
 
-// ---------------------------------------------------------------------------
-// Download helpers
-// ---------------------------------------------------------------------------
-
-async fn download_hf_file(
-    client: &reqwest::Client,
-    remote_path: &str,
-    dest: &Path,
-    optional: bool,
-    show_progress: bool,
-) -> Result<(), EmbedError> {
-    if dest.exists() {
-        return Ok(());
-    }
-    std::fs::create_dir_all(dest.parent().unwrap()).map_err(EmbedError::Io)?;
-
-    let url = format!("https://huggingface.co/{HF_REPO}/resolve/{HF_REVISION}/{remote_path}");
-    info!("downloading {url}");
-
-    let mut req = client.get(&url).header("user-agent", "localdb/0.1");
-    if let Ok(token) = std::env::var("HF_TOKEN") {
-        req = req.header("Authorization", format!("Bearer {token}"));
-    }
-    let resp = req.send().await.map_err(EmbedError::Http)?;
-
-    if resp.status() == reqwest::StatusCode::NOT_FOUND && optional {
-        info!("skip {remote_path}: 404 (optional file absent)");
-        return Ok(());
-    }
-    if !resp.status().is_success() {
-        return Err(EmbedError::ProviderError {
-            provider: "huggingface".into(),
-            message: format!(
-                "HTTP {} downloading {remote_path} from {HF_REPO}. \
+// Static HfSpec for this model.  The err_suffix is preserved verbatim from the
+// original download_hf_file so that error messages remain byte-identical.
+// Format: " from {repo}. {actionable guidance}"
+static HF_SPEC: crate::hf_download::HfSpec = crate::hf_download::HfSpec {
+    repo: HF_REPO,
+    revision: HF_REVISION,
+    required: REQUIRED_FILES,
+    optional: OPTIONAL_FILES,
+    err_suffix: " from perplexity-ai/pplx-embed-context-v1-0.6b. \
                  The repo is public — check your network connection and retry. \
                  Alternatively use provider: local-onnx, model: bge-small-en-v1.5 \
                  (384-dim, smaller download, no credentials).",
-                resp.status()
-            ),
-        });
-    }
+};
 
-    let total_mb = resp.content_length().map(|n| n / 1_048_576);
-    let tmp = dest.with_extension("part");
-    let mut file = std::fs::File::create(&tmp).map_err(EmbedError::Io)?;
-    let mut stream = resp.bytes_stream();
-    let mut downloaded: u64 = 0;
-    let mut last_reported: u64 = 0;
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(EmbedError::Http)?;
-        file.write_all(&chunk).map_err(EmbedError::Io)?;
-        downloaded += chunk.len() as u64;
-        if show_progress {
-            let mb = downloaded / 1_048_576;
-            if mb >= last_reported + 50 {
-                match total_mb {
-                    Some(t) => info!("{remote_path}: {mb}/{t} MB"),
-                    None => info!("{remote_path}: {mb} MB"),
-                }
-                last_reported = mb;
-            }
-        }
-    }
-    drop(file);
-    std::fs::rename(&tmp, dest).map_err(EmbedError::Io)?;
-    info!("saved {} ({} MB)", dest.display(), downloaded / 1_048_576);
-    Ok(())
-}
-
-async fn ensure_model_files(model_dir: &Path, show_progress: bool) -> Result<(), EmbedError> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(600))
-        .build()
-        .map_err(EmbedError::Http)?;
-
-    for &f in REQUIRED_FILES {
-        download_hf_file(&client, f, &model_dir.join(f), false, show_progress).await?;
-    }
-    for &f in OPTIONAL_FILES {
-        download_hf_file(&client, f, &model_dir.join(f), true, show_progress).await?;
-    }
-    Ok(())
-}
-
-fn download_model_blocking(model_dir: &Path, show_progress: bool) -> Result<(), EmbedError> {
-    if model_dir.join("onnx").join("model_quantized.onnx").exists() {
-        return Ok(());
-    }
-
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(|| {
-                handle.block_on(ensure_model_files(model_dir, show_progress))
-            })
-        }
-        Ok(_) => {
-            // current-thread runtime: can't block_in_place from within it.
-            let model_dir = model_dir.to_path_buf();
-            std::thread::spawn(move || {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| EmbedError::Internal(format!("create tokio runtime: {e}")))?
-                    .block_on(ensure_model_files(&model_dir, show_progress))
-            })
-            .join()
-            .map_err(|_| EmbedError::Internal("download thread panicked".into()))?
-        }
-        Err(_) => tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| EmbedError::Internal(format!("create tokio runtime: {e}")))?
-            .block_on(ensure_model_files(model_dir, show_progress)),
-    }
+fn download_model_blocking(
+    model_dir: &std::path::Path,
+    show_progress: bool,
+) -> Result<(), EmbedError> {
+    crate::hf_download::download_blocking(
+        model_dir,
+        "onnx/model_quantized.onnx",
+        &HF_SPEC,
+        show_progress,
+    )
 }
 
 // ---------------------------------------------------------------------------
