@@ -948,11 +948,7 @@ async fn run_store_add_async(ctx: &CliContext, name: &str) {
         }
     }
 
-    // Embedded mode: acquire write lock and write directly.
-    let _lock = match WriteLock::acquire(data_dir) {
-        Ok(l) => l,
-        Err(e) => exit_err(&e, ctx.json),
-    };
+    // Embedded mode: SQLite serialises the metadata write; no WriteLock needed here.
 
     // Duplicate check.
     match db.get_store(name) {
@@ -1120,15 +1116,15 @@ async fn run_store_remove_async(ctx: &CliContext, name: &str) {
         }
     }
 
-    // Embedded mode.
-    let _lock = match WriteLock::acquire(data_dir) {
-        Ok(l) => l,
-        Err(e) => exit_err(&e, ctx.json),
-    };
-
+    // Embedded mode: SQLite serialises the metadata writes. WriteLock is acquired only
+    // around the LanceDB data directory deletion (remove_store_data_dir).
     match db.delete_store(name) {
         Ok(true) => {
             let _ = db.delete_sources_for_store(name);
+            let _lock = match WriteLock::acquire(data_dir) {
+                Ok(l) => l,
+                Err(e) => exit_err(&e, ctx.json),
+            };
             remove_store_data_dir(data_dir, name);
         }
         Ok(false) => exit_err(
@@ -1627,11 +1623,7 @@ async fn run_source_remove_async(ctx: &CliContext, id: &str) {
         }
     }
 
-    // Embedded mode.
-    let _lock = match WriteLock::acquire(data_dir) {
-        Ok(l) => l,
-        Err(e) => exit_err(&e, ctx.json),
-    };
+    // Embedded mode: SQLite serialises all ops here; no WriteLock needed.
 
     // #3: Resolve the source ID. If the argument looks like a path or URL
     // (not a ULID/UUID), look it up by root/url field.

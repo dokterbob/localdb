@@ -612,24 +612,20 @@ fn yaml_owned_store_mutation_exits_4() {
 }
 
 // ---------------------------------------------------------------------------
-// Real store_locked path — OS-level write lock contention (acceptance criterion)
-//
-// The test proves that Error::StoreLocked is raised from ACTUAL write-lock
-// contention between two concurrent processes, not just config_readonly.
-// We hold the .write.lock file with an fd-lock in this process (via a helper
-// binary invocation that holds the lock and signals via a file), then attempt
-// a `store add` from another process. The second process must exit 4 with
-// the `store_locked` error code in its JSON output.
+// Regression test for #67 — store add / source add must not be blocked by
+// the LanceDB write lock (.write.lock). The WriteLock is now held only
+// around actual LanceDB writes (run_index_async); metadata-only operations
+// use SQLite WAL and serialise themselves without fd-lock.
 // ---------------------------------------------------------------------------
 
-/// Prove the real `store_locked` path: a second writer process exits 4 when
-/// the OS-level write lock is held by another process.
+/// Regression test for #67: `store add` succeeds (exit 0) even when the
+/// OS-level write lock is held exclusively by another process.
 ///
-/// Strategy: create the data dir and take the OS advisory lock on `.write.lock`
-/// using the same mechanism as WriteLock (fd-lock), hold it for the duration
-/// of the test, then run `store add` in a subprocess. The subprocess must exit 4.
+/// Before the fix, `store add` acquired WriteLock before its SQLite upsert,
+/// so any concurrently held write lock (e.g. from `localdb mcp`) returned
+/// exit 4 (store_locked). This test proves that no longer happens.
 #[test]
-fn real_store_locked_exits_4() {
+fn store_add_succeeds_while_write_lock_held() {
     use std::fs::OpenOptions;
 
     let dir = TempDir::new().unwrap();
@@ -647,49 +643,27 @@ fn real_store_locked_exits_4() {
         .open(&lock_path)
         .expect("cannot create lock file");
 
-    // Acquire an OS-level exclusive advisory lock on the file.
-    // This mirrors what WriteLock::acquire() does internally.
+    // Acquire an OS-level exclusive advisory lock on the file — simulating
+    // another process holding the LanceDB write gate (e.g. an active index run).
     use fd_lock::RwLock;
     let mut rw = RwLock::new(lock_file);
     let _guard = rw.try_write().expect("should acquire lock in test process");
 
-    // Now run `store add` — it must fail to acquire the write lock and exit 4.
+    // `store add` must succeed: it uses SQLite for metadata, not the fd-lock.
     let output = cmd_with_dir(&dir)
-        .args(["--json", "store", "add", "locked-store"])
+        .args(["--json", "store", "add", "new-store"])
         .output()
         .unwrap();
 
     let exit_code = output.status.code().unwrap_or(-1);
     assert_eq!(
         exit_code,
-        4,
-        "store add while lock held by another process must exit 4 (store_locked); \
+        0,
+        "store add must exit 0 even while .write.lock is held (regression for #67); \
          stderr: {}\nstdout: {}",
         String::from_utf8_lossy(&output.stderr),
         String::from_utf8_lossy(&output.stdout),
     );
-
-    // Also verify the JSON error code is specifically `store_locked`.
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{}{}", stdout, stderr);
-    // The --json flag routes errors to stderr as JSON.
-    // Try to parse either stream as JSON to find the error code.
-    for s in &[stdout.as_ref(), stderr.as_ref()] {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
-            if let Some(code) = v.get("error").and_then(|e| e.as_str()) {
-                assert_eq!(
-                    code, "store_locked",
-                    "JSON error code must be 'store_locked', got '{}'; combined: {}",
-                    code, combined
-                );
-                return; // found and verified
-            }
-        }
-    }
-    // If we couldn't parse JSON, the exit code 4 check above is sufficient.
-    // (Some platforms may write the error to stderr without JSON wrapper.)
-    // The key assertion is exit code 4 with the correct lock path.
 }
 
 // ---------------------------------------------------------------------------
@@ -1170,18 +1144,19 @@ fn two_concurrent_store_list_calls_both_succeed() {
     write_default_config(&dir);
 
     // Run two store-list commands at the same time (non-blocking spawn).
-    let dir_path = dir.path().to_path_buf();
+    // Both must point at the same temp config so they share the same runtime-state.db.
+    let config_path = dir.path().join("config.yaml");
     let binary = env!("CARGO_BIN_EXE_localdb");
 
     let mut child1 = std::process::Command::new(binary)
-        .current_dir(&dir_path)
+        .env("LOCALDB_CONFIG", &config_path)
         .args(["store", "list"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawn child1");
     let mut child2 = std::process::Command::new(binary)
-        .current_dir(&dir_path)
+        .env("LOCALDB_CONFIG", &config_path)
         .args(["store", "list"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
