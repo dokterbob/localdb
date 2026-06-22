@@ -1632,6 +1632,7 @@ async fn run_index_for_source_async(
     use localdb_core::{
         chunker::ChunkerConfig,
         ingestion::{run_ingestion_for_source, DocumentIndex, IngestionConfig},
+        store::RetrievalStore,
     };
 
     let (config_loader, db) = load_app_db(ctx);
@@ -1715,7 +1716,11 @@ async fn run_index_for_source_async(
         }
     };
 
-    let mut doc_index = DocumentIndex::new();
+    let existing = lancedb_store
+        .list_indexed_documents()
+        .await
+        .unwrap_or_default();
+    let mut doc_index = DocumentIndex::from_records(existing);
     let mut chunks = 0u64;
     let url_fetcher = HttpUrlFetcher::new();
 
@@ -1957,6 +1962,7 @@ async fn run_index_async(
     use localdb_core::{
         chunker::ChunkerConfig,
         ingestion::{run_ingestion_for_source, DocumentIndex, IngestionConfig},
+        store::RetrievalStore,
     };
 
     // A9-safety: validate --store name if given.
@@ -2132,7 +2138,11 @@ async fn run_index_async(
         Err(e) => exit_err(&e, ctx.json),
     };
 
-    let mut doc_index = DocumentIndex::new();
+    let existing = lancedb_store
+        .list_indexed_documents()
+        .await
+        .unwrap_or_default();
+    let mut doc_index = DocumentIndex::from_records(existing);
     let (mut indexed, mut skipped, mut chunks, mut errors, mut unsupported) =
         (0u64, 0u64, 0u64, 0u64, 0u64);
     let url_fetcher = HttpUrlFetcher::new();

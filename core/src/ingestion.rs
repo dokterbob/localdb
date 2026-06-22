@@ -86,6 +86,14 @@ impl DocumentIndex {
         Self { records }
     }
 
+    /// Pre-populate the index from lightweight `DocumentRecord`s returned by
+    /// `RetrievalStore::list_indexed_documents`. Use this to rehydrate the
+    /// incremental-skip index across process runs without loading embeddings.
+    pub fn from_records(records: Vec<DocumentRecord>) -> Self {
+        let map = records.into_iter().map(|r| (r.uri.clone(), r)).collect();
+        Self { records: map }
+    }
+
     /// Look up a document record by URI.
     pub fn get(&self, uri: &str) -> Option<&DocumentRecord> {
         self.records.get(uri)
@@ -3275,5 +3283,186 @@ mod tests {
              got {} chunks — prose preset would produce ~3",
             output.chunks_written
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Cross-process rehydration tests
+    // Verify that DocumentIndex::from_records + list_indexed_documents skips
+    // unchanged documents on a simulated second process invocation.
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn rehydrated_index_skips_unchanged_documents() {
+        use crate::store::RetrievalStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), b"Document A content.").unwrap();
+        std::fs::write(dir.path().join("b.md"), b"Document B content.").unwrap();
+        std::fs::write(dir.path().join("c.md"), b"Document C content.").unwrap();
+
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let extractor = FakeExtractor;
+        let store_id = "store-1";
+        let source = make_path_source(store_id, dir.path().to_str().unwrap(), vec![]);
+        let config = make_ingestion_config(store_id);
+
+        // First "process": full index.
+        let mut doc_index1 = DocumentIndex::new();
+        let result1 = run_ingestion_for_source(
+            &source,
+            &mut doc_index1,
+            &store,
+            &embedder,
+            &config,
+            &extractor,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result1.docs_indexed, 3);
+        assert_eq!(result1.docs_skipped, 0);
+
+        // Simulate a new process: rehydrate DocumentIndex from the store.
+        let records = store.list_indexed_documents().await.unwrap();
+        assert_eq!(records.len(), 3, "store must have 3 distinct documents");
+        let mut doc_index2 = DocumentIndex::from_records(records);
+
+        // Second "process": re-run with the rehydrated index — nothing changed.
+        let result2 = run_ingestion_for_source(
+            &source,
+            &mut doc_index2,
+            &store,
+            &embedder,
+            &config,
+            &extractor,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result2.docs_indexed, 0, "no docs should be re-indexed");
+        assert_eq!(result2.docs_skipped, 3, "all docs should be skipped");
+        assert_eq!(result2.chunks_written, 0, "no chunks should be written");
+    }
+
+    #[tokio::test]
+    async fn rehydrated_index_reindexes_changed_document() {
+        use crate::store::RetrievalStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("stable.md"), b"Stable document content.").unwrap();
+        std::fs::write(dir.path().join("changing.md"), b"Original content.").unwrap();
+
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let extractor = FakeExtractor;
+        let store_id = "store-1";
+        let source = make_path_source(store_id, dir.path().to_str().unwrap(), vec![]);
+        let config = make_ingestion_config(store_id);
+
+        // First "process": full index.
+        let mut doc_index1 = DocumentIndex::new();
+        run_ingestion_for_source(
+            &source,
+            &mut doc_index1,
+            &store,
+            &embedder,
+            &config,
+            &extractor,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let chunks_after_first = store.stats().await.unwrap().chunk_count;
+
+        // Mutate one file before the second "process".
+        std::fs::write(dir.path().join("changing.md"), b"Completely new content.").unwrap();
+
+        // Simulate new process: rehydrate from store.
+        let records = store.list_indexed_documents().await.unwrap();
+        let mut doc_index2 = DocumentIndex::from_records(records);
+
+        let result2 = run_ingestion_for_source(
+            &source,
+            &mut doc_index2,
+            &store,
+            &embedder,
+            &config,
+            &extractor,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result2.docs_indexed, 1,
+            "only the changed doc should be re-indexed"
+        );
+        assert_eq!(result2.docs_skipped, 1, "stable doc should be skipped");
+
+        // Chunk count should be the same: old chunks deleted, new ones added.
+        assert_eq!(
+            store.stats().await.unwrap().chunk_count,
+            chunks_after_first,
+            "total chunk count must be stable after replace-by-URI"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_records_deduplicates_by_uri() {
+        use crate::store::RetrievalStore;
+
+        let store = FakeStore::new();
+        // Insert two chunks for the same URI with the same document metadata.
+        let chunk_a = make_chunk_record("chunk-1", "doc-1", "store-1", "file:///a.md", "hash1");
+        let chunk_b = make_chunk_record("chunk-2", "doc-1", "store-1", "file:///a.md", "hash1");
+        let chunk_c = make_chunk_record("chunk-3", "doc-2", "store-1", "file:///b.md", "hash2");
+        store
+            .upsert_chunks(vec![chunk_a, chunk_b, chunk_c])
+            .await
+            .unwrap();
+
+        let records = store.list_indexed_documents().await.unwrap();
+        assert_eq!(records.len(), 2, "two distinct URIs → two records");
+
+        let idx = DocumentIndex::from_records(records);
+        assert_eq!(idx.len(), 2);
+        assert!(idx.get("file:///a.md").is_some());
+        assert!(idx.get("file:///b.md").is_some());
+    }
+
+    fn make_chunk_record(
+        id: &str,
+        doc_id: &str,
+        store_id: &str,
+        uri: &str,
+        content_hash: &str,
+    ) -> crate::store::ChunkRecord {
+        use crate::types::Span;
+        crate::store::ChunkRecord {
+            id: id.to_string(),
+            document_id: doc_id.to_string(),
+            store_id: store_id.to_string(),
+            text: "test text".to_string(),
+            span: Span::new(0, 9),
+            heading_path: vec![],
+            embedding: vec![0.0, 0.0, 0.0, 0.0],
+            policy_version: "v1".to_string(),
+            fetched_at: "2026-06-22T00:00:00Z".to_string(),
+            content_hash: content_hash.to_string(),
+            origin_store: store_id.to_string(),
+            source_id: "src-1".to_string(),
+            source_kind: "path".to_string(),
+            mime: None,
+            uri: uri.to_string(),
+            title: None,
+            meta: std::collections::HashMap::new(),
+            metadata: crate::parser::DocumentMetadata::default(),
+        }
     }
 }
