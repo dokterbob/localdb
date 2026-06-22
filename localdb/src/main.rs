@@ -97,7 +97,7 @@ pub enum Command {
         query: Vec<String>,
 
         /// Maximum number of results to return (must be >= 1).
-        #[arg(long, default_value = "10", value_parser = clap::value_parser!(usize))]
+        #[arg(long, default_value = "3", value_parser = clap::value_parser!(usize))]
         limit: usize,
     },
 }
@@ -273,7 +273,7 @@ mod tests {
         let cli = Cli::try_parse_from(["localdb", "search", "machine", "learning"]).unwrap();
         if let Command::Search { query, limit } = cli.command {
             assert_eq!(query.join(" "), "machine learning");
-            assert_eq!(limit, 10);
+            assert_eq!(limit, 3);
         } else {
             panic!("expected Search command");
         }
