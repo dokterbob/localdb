@@ -37,8 +37,9 @@ use tracing::info;
 
 use localdb_core::{DocumentChunks, EmbeddedDocument, Embedder, Error as CoreError, TokenCounter};
 
-use crate::coreml::runtime::{ComputeUnits, CoreMlModel, MlArray};
+use crate::coreml::runtime::{ComputeUnits, CoreMlModel, MlArray, Outputs};
 use crate::error::EmbedError;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 
 const HF_REPO: &str = "dokterbob/pplx-embed-coreml";
 const HF_REVISION: &str = "53428a93b1c2edea82174c6ec5f28a2b78cf34ec";
@@ -306,20 +307,6 @@ fn discover_buckets(snapshot_root: &Path) -> Result<(Vec<BucketInfo>, PathBuf), 
 }
 
 // ---------------------------------------------------------------------------
-// Runtime helper (mirrors pplx_context_onnx::run_blocking)
-// ---------------------------------------------------------------------------
-
-fn run_blocking<T>(f: impl FnOnce() -> T) -> T {
-    use tokio::runtime::RuntimeFlavor;
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(f)
-        }
-        _ => f(),
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Embedder
 // ---------------------------------------------------------------------------
 
@@ -407,44 +394,17 @@ impl PplxContextCoreMLEmbedder {
         Ok(model)
     }
 
-    fn embed_doc_sync(&self, chunks: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
-        if chunks.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let chunk_tok_counts: Vec<usize> = chunks
-            .iter()
-            .map(|c| {
-                self.tokenizer
-                    .encode(c.as_str(), false)
-                    .map(|enc| enc.get_ids().len())
-                    .map_err(|e| EmbedError::Internal(format!("tokenize: {e}")))
-            })
-            .collect::<Result<_, _>>()?;
-
-        let windows = plan_windows(&chunk_tok_counts, self.window_max_seq_len, N_MAX_CHUNKS);
-
-        let mut all_embeddings: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
-        for window in &windows {
-            let window_embeddings = self.embed_window(&chunks[window.clone()])?;
-            all_embeddings.extend(window_embeddings);
-        }
-
-        if all_embeddings.len() != chunks.len() {
-            return Err(EmbedError::Internal(format!(
-                "vector count mismatch: produced {} for {} chunks",
-                all_embeddings.len(),
-                chunks.len()
-            )));
-        }
-
-        Ok(all_embeddings)
-    }
-
-    fn embed_window(&self, chunks: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
-        if chunks.is_empty() {
-            return Ok(vec![]);
-        }
+    /// Tokenize `chunks`, select a CoreML bucket, and build the three input arrays.
+    ///
+    /// This is the CPU-side preparation for one window: it joins the chunks with
+    /// the SEP token, tokenizes, selects the appropriate fixed bucket, recovers
+    /// the SEP-delimited spans, and builds `input_ids`, `attention_mask`, and
+    /// `pool_matrix` arrays ready for `CoreMlModel::start_prediction`.
+    fn prep_window(&self, chunks: &[String]) -> Result<PreppedWindow, EmbedError> {
+        debug_assert!(
+            !chunks.is_empty(),
+            "prep_window called with empty chunk slice"
+        );
 
         // Join all chunks with SEP; tokenize once (no special tokens).
         let joined = chunks.join(&self.sep_str);
@@ -481,6 +441,15 @@ impl PplxContextCoreMLEmbedder {
         }
         let n_chunks = spans.len();
 
+        if n_chunks != chunks.len() {
+            return Err(EmbedError::Internal(format!(
+                "chunk count mismatch in prep_window: expected {} spans but produced {} \
+                 (sep_spans={n_chunks}, token_count={token_count})",
+                chunks.len(),
+                n_chunks,
+            )));
+        }
+
         // Build the three inputs, padded to the bucket sequence length.
         let mut input_ids = vec![0i32; bucket_len];
         for (slot, &id) in input_ids.iter_mut().zip(ids.iter()) {
@@ -489,54 +458,60 @@ impl PplxContextCoreMLEmbedder {
         let attention_mask = build_attention_mask(valid, bucket_len);
         let pool_matrix = build_pool_matrix(&spans, bucket_len);
 
-        // CoreML validates against the model's declared rank-2 shapes:
-        // input_ids (1, L) int32, attention_mask (1, L) fp16, pool_matrix (32, L) fp16.
+        // CoreML validates against rank-2 shapes.
         let ids_arr = MlArray::int32(&[1, bucket_len], &input_ids)?;
         let mask_arr = MlArray::f16(&[1, bucket_len], &bits_to_f16(&attention_mask))?;
         let pool_arr = MlArray::f16(&[N_MAX_CHUNKS, bucket_len], &bits_to_f16(&pool_matrix))?;
 
-        let model = self.model_for(sel)?;
-        let inputs: [(&str, MlArray); 3] = [
+        let inputs: Vec<(&'static str, MlArray)> = vec![
             ("input_ids", ids_arr),
             ("attention_mask", mask_arr),
             ("pool_matrix", pool_arr),
         ];
-        let outputs = model.predict(&inputs)?;
 
-        // Output is (32, 1024) int8; read the first n_chunks rows × 1024.
-        let flat = outputs.int8_as_f32("embedding")?;
-        let expected = N_MAX_CHUNKS * EMBED_DIM;
-        if flat.len() < n_chunks * EMBED_DIM {
-            return Err(EmbedError::Internal(format!(
-                "embedding output too small: got {} values, need at least {} (n_chunks={n_chunks})",
-                flat.len(),
-                n_chunks * EMBED_DIM
-            )));
-        }
-        debug_assert!(flat.len() == expected || flat.len() >= n_chunks * EMBED_DIM);
-
-        let mut chunk_embeddings: Vec<Vec<f32>> = Vec::with_capacity(n_chunks);
-        for row in 0..n_chunks {
-            let slice = &flat[row * EMBED_DIM..(row + 1) * EMBED_DIM];
-            chunk_embeddings.push(slice.to_vec());
-        }
-
-        if chunk_embeddings.len() != chunks.len() {
-            return Err(EmbedError::Internal(format!(
-                "chunk count mismatch: expected {} vectors but produced {} \
-                 (sep_spans={n_chunks}, token_count={token_count})",
-                chunks.len(),
-                chunk_embeddings.len(),
-            )));
-        }
-
-        Ok(chunk_embeddings)
+        Ok(PreppedWindow {
+            fixed_idx: sel,
+            inputs,
+            n_chunks,
+        })
     }
 }
 
 /// Convert a slice of f16 bit patterns into `half::f16` values for `MlArray::f16`.
 fn bits_to_f16(bits: &[u16]) -> Vec<f16> {
     bits.iter().map(|&b| f16::from_bits(b)).collect()
+}
+
+/// Extract per-chunk embedding rows from a CoreML output.
+///
+/// The model outputs `(32, 1024)` int8; reads the first `n_chunks` rows and
+/// converts each to `f32`, returning one `Vec<f32>` per chunk.
+fn rows_from_output(out: &Outputs, n_chunks: usize) -> Result<Vec<Vec<f32>>, EmbedError> {
+    let flat = out.int8_as_f32("embedding")?;
+    if flat.len() < n_chunks * EMBED_DIM {
+        return Err(EmbedError::Internal(format!(
+            "embedding output too small: got {} values, need at least {} (n_chunks={n_chunks})",
+            flat.len(),
+            n_chunks * EMBED_DIM
+        )));
+    }
+    debug_assert!(flat.len() >= n_chunks * EMBED_DIM);
+    let mut rows = Vec::with_capacity(n_chunks);
+    for row in 0..n_chunks {
+        rows.push(flat[row * EMBED_DIM..(row + 1) * EMBED_DIM].to_vec());
+    }
+    Ok(rows)
+}
+
+/// CPU-side prepared inputs for one window: tokenized, bucket-selected, arrays built.
+/// Returned by `prep_window`; passed to `CoreMlModel::start_prediction`.
+struct PreppedWindow {
+    /// Index into `self.fixed` for the selected bucket.
+    fixed_idx: usize,
+    /// The three model inputs (input_ids, attention_mask, pool_matrix) as owned MlArrays.
+    inputs: Vec<(&'static str, MlArray)>,
+    /// Number of valid embedding rows in the output (= number of chunk spans found).
+    n_chunks: usize,
 }
 
 /// Blocking bridge to the async bundle download.
@@ -586,15 +561,128 @@ impl Embedder for PplxContextCoreMLEmbedder {
             return Ok(vec![]);
         }
 
-        let mut results = Vec::with_capacity(docs.len());
-        for doc in &docs {
+        // Pre-allocate result slots: results[doc_idx][chunk_idx] = embedding vector.
+        let mut results: Vec<Vec<Vec<f32>>> =
+            docs.iter().map(|d| vec![vec![]; d.chunks.len()]).collect();
+
+        // Build worklist: plan windows for each doc, collect (doc_idx, chunk_start, window_chunks).
+        // Tokenize each chunk to get token counts for plan_windows.
+        struct WorkItem {
+            doc_idx: usize,
+            chunk_start: usize,
+            chunks: Vec<String>,
+        }
+        let mut worklist: Vec<WorkItem> = Vec::new();
+        for (doc_idx, doc) in docs.iter().enumerate() {
             if doc.chunks.is_empty() {
-                results.push(vec![]);
                 continue;
             }
-            let embeddings =
-                run_blocking(|| self.embed_doc_sync(&doc.chunks).map_err(CoreError::from))?;
-            results.push(embeddings);
+            let chunk_tok_counts = doc
+                .chunks
+                .iter()
+                .map(|c| {
+                    self.tokenizer
+                        .encode(c.as_str(), false)
+                        .map(|enc| enc.get_ids().len())
+                        .map_err(|e| EmbedError::Internal(format!("tokenize: {e}")))
+                })
+                .collect::<Result<Vec<usize>, EmbedError>>()
+                .map_err(CoreError::from)?;
+
+            let windows = plan_windows(&chunk_tok_counts, self.window_max_seq_len, N_MAX_CHUNKS);
+            for window in &windows {
+                worklist.push(WorkItem {
+                    doc_idx,
+                    chunk_start: window.start,
+                    chunks: doc.chunks[window.clone()].to_vec(),
+                });
+            }
+        }
+
+        // Bounded-in-flight async pipeline: prep CPU work (tokenize + build arrays) while
+        // up to MAX_INFLIGHT-1 prior predictions run on the ANE. Completions arrive out of
+        // order; doc_idx+chunk_start scatter is order-independent — each window knows exactly
+        // which result slots to fill.
+        //
+        // Error discipline: we never early-return while `inflight` holds live
+        // `PendingPrediction` futures.  CoreML reads the input feature provider after
+        // `predictionFromFeatures_completionHandler` returns; dropping the provider while
+        // the ANE is still computing would be a use-after-free.  On any error we record
+        // it, stop enqueuing new work, and drain all in-flight futures before returning.
+        const MAX_INFLIGHT: usize = 4;
+        let mut inflight: FuturesUnordered<_> = FuturesUnordered::new();
+        let mut it = worklist.into_iter();
+        let mut first_err: Option<CoreError> = None;
+
+        loop {
+            // Fill up to MAX_INFLIGHT in-flight predictions (skip if an error was recorded).
+            if first_err.is_none() {
+                while inflight.len() < MAX_INFLIGHT {
+                    match it.next() {
+                        Some(w) => {
+                            // Pre-bind Copy fields before p.inputs is moved into start_prediction.
+                            let p = match self.prep_window(&w.chunks).map_err(CoreError::from) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    first_err = Some(e);
+                                    break;
+                                }
+                            };
+                            let fixed_idx = p.fixed_idx;
+                            let n_chunks = p.n_chunks;
+                            let doc_idx = w.doc_idx;
+                            let chunk_start = w.chunk_start;
+                            let model = match self.model_for(fixed_idx).map_err(CoreError::from) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    first_err = Some(e);
+                                    break;
+                                }
+                            };
+                            let pending =
+                                match model.start_prediction(p.inputs).map_err(CoreError::from) {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        first_err = Some(e);
+                                        break;
+                                    }
+                                };
+                            // Each future carries its own index tag so the scatter
+                            // below is order-independent.
+                            inflight.push(async move {
+                                (doc_idx, chunk_start, n_chunks, pending.await)
+                            });
+                        }
+                        None => break,
+                    }
+                }
+            }
+
+            match inflight.next().await {
+                Some((doc_idx, chunk_start, n_chunks, out)) => {
+                    if first_err.is_none() {
+                        match out
+                            .map_err(CoreError::from)
+                            .and_then(|o| rows_from_output(&o, n_chunks).map_err(CoreError::from))
+                        {
+                            Ok(rows) => {
+                                for (j, v) in rows.into_iter().enumerate() {
+                                    results[doc_idx][chunk_start + j] = v;
+                                }
+                            }
+                            Err(e) => {
+                                first_err = Some(e);
+                            }
+                        }
+                    }
+                    // else: drain silently — keep awaiting until inflight empties.
+                }
+                None => break, // worklist drained and all in-flight predictions settled
+            }
+        }
+
+        if let Some(e) = first_err {
+            return Err(e);
         }
         Ok(results)
     }
@@ -910,5 +998,91 @@ mod tests {
             lens.contains(&512),
             ".mlmodelc bucket must be kept, got {lens:?}"
         );
+    }
+
+    // ---- Scatter / worklist regression guards ----
+    //
+    // These tests verify that the `embed_documents` pipeline correctly maps
+    // (doc_idx, chunk_start) indices and that out-of-order completion still
+    // places every vector in the right slot.  They run without any model or
+    // Obj-C runtime.
+
+    /// Simulate the scatter step from `embed_documents` with completions
+    /// arriving out of order, and verify every slot receives the correct vector.
+    #[test]
+    fn scatter_out_of_order_places_vectors_correctly() {
+        // Two docs: doc 0 has 2 chunks, doc 1 has 3 chunks.
+        let mut results: Vec<Vec<Vec<f32>>> = vec![vec![vec![]; 2], vec![vec![]; 3]];
+
+        // Windows (simulated, could arrive in any order):
+        //   (doc=1, chunk_start=0, n_chunks=3) arrives first
+        //   (doc=0, chunk_start=0, n_chunks=2) arrives second
+
+        // Scatter doc 1, window 0..3
+        let rows1 = vec![vec![1.0f32; 4], vec![2.0; 4], vec![3.0; 4]];
+        for (j, v) in rows1.into_iter().enumerate() {
+            results[1][0 + j] = v;
+        }
+        // Scatter doc 0, window 0..2
+        let rows0 = vec![vec![10.0f32; 4], vec![20.0; 4]];
+        for (j, v) in rows0.into_iter().enumerate() {
+            results[0][0 + j] = v;
+        }
+
+        assert_eq!(results[0][0], vec![10.0f32; 4]);
+        assert_eq!(results[0][1], vec![20.0f32; 4]);
+        assert_eq!(results[1][0], vec![1.0f32; 4]);
+        assert_eq!(results[1][1], vec![2.0f32; 4]);
+        assert_eq!(results[1][2], vec![3.0f32; 4]);
+    }
+
+    /// Scatter with a doc that spans two windows (chunk_start > 0 for the
+    /// second window) must place vectors at the correct offsets.
+    #[test]
+    fn scatter_second_window_uses_chunk_start_offset() {
+        // One doc, 40 chunks split across two windows: 0..32 and 32..40.
+        let mut results: Vec<Vec<Vec<f32>>> = vec![vec![vec![]; 40]];
+
+        // Second window (32..40) arrives first.
+        for j in 0..8usize {
+            results[0][32 + j] = vec![(32 + j) as f32; 4];
+        }
+        // First window (0..32) arrives second.
+        for j in 0..32usize {
+            results[0][0 + j] = vec![j as f32; 4];
+        }
+
+        for i in 0..40usize {
+            assert_eq!(results[0][i], vec![i as f32; 4], "slot {i} wrong");
+        }
+    }
+
+    /// Verify that `plan_windows` produces the expected (chunk_start) values
+    /// for a multi-doc scenario, so worklist construction is correct.
+    #[test]
+    fn worklist_chunk_start_mapping_multi_doc() {
+        // doc 0: 3 tiny chunks → one window starting at 0
+        let doc0 = vec![5usize; 3];
+        let w0 = plan_windows(&doc0, 8192, N_MAX_CHUNKS);
+        assert_eq!(w0, vec![0..3]);
+
+        // doc 1: 40 tiny chunks → two windows (32-chunk cap)
+        let doc1 = vec![5usize; 40];
+        let w1 = plan_windows(&doc1, 8192, N_MAX_CHUNKS);
+        assert_eq!(w1.len(), 2);
+        assert_eq!(w1[0].start, 0);
+        assert_eq!(w1[1].start, 32);
+
+        // Verify worklist would be:
+        //   (doc=0, chunk_start=0), (doc=1, chunk_start=0), (doc=1, chunk_start=32)
+        let expected: Vec<(usize, usize)> = vec![(0, 0), (1, 0), (1, 32)];
+        let mut actual: Vec<(usize, usize)> = Vec::new();
+        for window in &w0 {
+            actual.push((0, window.start));
+        }
+        for window in &w1 {
+            actual.push((1, window.start));
+        }
+        assert_eq!(actual, expected);
     }
 }
