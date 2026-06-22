@@ -4884,6 +4884,7 @@ dependencies = [
  "dirs 6.0.0",
  "extract",
  "futures",
+ "globset",
  "hex",
  "pulldown-cmark",
  "rusqlite",

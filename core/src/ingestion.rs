@@ -17,6 +17,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+
 use crate::chunker::{chunk_document, CharSizer, ChunkSizer, ChunkerConfig, TokenSizer};
 use crate::embedder::{DocumentChunks, Embedder};
 use crate::error::Error;
@@ -243,8 +245,19 @@ pub fn enumerate_path_source(
         return Ok(vec![]);
     }
 
+    let include_set = build_glob_set(include)?;
+    let exclude_set = build_glob_set(exclude)?;
+    let include_empty = include.is_empty();
+
     let mut found = Vec::new();
-    enumerate_dir(root_path, root_path, include, exclude, &mut found)?;
+    enumerate_dir(
+        root_path,
+        root_path,
+        &include_set,
+        include_empty,
+        &exclude_set,
+        &mut found,
+    )?;
     found.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(found)
 }
@@ -253,8 +266,9 @@ pub fn enumerate_path_source(
 fn enumerate_dir(
     root: &Path,
     dir: &Path,
-    include: &[String],
-    exclude: &[String],
+    include_set: &GlobSet,
+    include_empty: bool,
+    exclude_set: &GlobSet,
     found: &mut Vec<FoundFile>,
 ) -> Result<(), Error> {
     let entries = std::fs::read_dir(dir).map_err(|e| Error::Internal {
@@ -277,23 +291,22 @@ fn enumerate_dir(
         // a bare pattern like `.DS_Store` matches at any depth, e.g.
         // `Call/.DS_Store`). The include check below intentionally stays
         // path-anchored.
-        if !exclude.is_empty() {
-            if let Some(name) = path.file_name() {
-                let basename = name.to_string_lossy();
-                if matches_any_glob(&relative_str, exclude) || matches_any_glob(&basename, exclude)
-                {
-                    continue;
-                }
-            } else if matches_any_glob(&relative_str, exclude) {
+        if let Some(name) = path.file_name() {
+            let basename = name.to_string_lossy();
+            if exclude_set.is_match(relative_str.as_ref())
+                || exclude_set.is_match(basename.as_ref())
+            {
                 continue;
             }
+        } else if exclude_set.is_match(relative_str.as_ref()) {
+            continue;
         }
 
         if path.is_dir() {
-            enumerate_dir(root, &path, include, exclude, found)?;
+            enumerate_dir(root, &path, include_set, include_empty, exclude_set, found)?;
         } else if path.is_file() {
             // Apply include globs: if any are specified, file must match one
-            if !include.is_empty() && !matches_any_glob(&relative_str, include) {
+            if !include_empty && !include_set.is_match(relative_str.as_ref()) {
                 continue;
             }
 
@@ -309,73 +322,34 @@ fn enumerate_dir(
     Ok(())
 }
 
-/// Check if a path matches any of the given glob patterns.
-fn matches_any_glob(path: &str, globs: &[String]) -> bool {
-    globs.iter().any(|g| glob_match(g, path))
-}
-
-/// Simple glob matching supporting `*`, `**`, and `?`.
+/// Build a compiled `GlobSet` from a slice of glob pattern strings.
 ///
-/// Uses a recursive descent implementation.
-fn glob_match(pattern: &str, path: &str) -> bool {
-    glob_match_parts(pattern, path)
+/// Each pattern is compiled with `literal_separator(true)` so that `*` and `?`
+/// do not cross `/`, while `**` still matches across directory boundaries —
+/// matching the pre-existing semantics exactly.
+fn build_glob_set(patterns: &[String]) -> Result<GlobSet, Error> {
+    let mut b = GlobSetBuilder::new();
+    for pat in patterns {
+        let glob = GlobBuilder::new(pat)
+            .literal_separator(true)
+            .build()
+            .map_err(|e| Error::InvalidConfig {
+                message: format!("invalid glob pattern '{pat}': {e}"),
+            })?;
+        b.add(glob);
+    }
+    b.build().map_err(|e| Error::InvalidConfig {
+        message: format!("failed to build glob set: {e}"),
+    })
 }
 
-fn glob_match_parts(pattern: &str, path: &str) -> bool {
-    if pattern.is_empty() {
-        return path.is_empty();
-    }
-
-    // Handle ** — matches any path segment(s) including path separators
-    if let Some(rest) = pattern.strip_prefix("**/") {
-        // Try matching with zero or more path components consumed
-        if glob_match_parts(rest, path) {
-            return true;
-        }
-        // Try consuming one path component
-        if let Some(pos) = path.find('/') {
-            return glob_match_parts(pattern, &path[pos + 1..]);
-        }
+/// Thin wrapper used only by unit tests: match a single pattern against a path.
+#[cfg(test)]
+fn glob_match(pattern: &str, path: &str) -> bool {
+    let Ok(set) = build_glob_set(&[pattern.to_string()]) else {
         return false;
-    }
-
-    if pattern == "**" {
-        return true; // matches everything remaining
-    }
-
-    // Handle * — matches anything except /
-    if let Some(rest) = pattern.strip_prefix('*') {
-        // Try at each position
-        for i in 0..=path.len() {
-            if i > 0 && path.as_bytes()[i - 1] == b'/' {
-                break; // * doesn't cross directory boundaries
-            }
-            if glob_match_parts(rest, &path[i..]) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    // Handle ? — matches any single character except /
-    if let Some(rest) = pattern.strip_prefix('?') {
-        if path.is_empty() || path.starts_with('/') {
-            return false;
-        }
-        let first_char_len = path.chars().next().map(|c| c.len_utf8()).unwrap_or(0);
-        return glob_match_parts(rest, &path[first_char_len..]);
-    }
-
-    // Literal character
-    let p = pattern.chars().next().unwrap();
-    let c = path.chars().next();
-    if c == Some(p) {
-        let pat_next = &pattern[p.len_utf8()..];
-        let path_next = &path[c.unwrap().len_utf8()..];
-        return glob_match_parts(pat_next, path_next);
-    }
-
-    false
+    };
+    set.is_match(path)
 }
 
 // ---------------------------------------------------------------------------
@@ -1521,6 +1495,18 @@ mod tests {
         assert!(!glob_match("file?.md", "file10.md"));
     }
 
+    #[test]
+    fn glob_match_non_ascii_does_not_panic() {
+        // Regression: en-dash (3-byte char) used to land mid-char in `&path[i..]`.
+        assert!(glob_match("*.md", "Notes \u{2013} draft.md"));
+        assert!(glob_match(
+            "**/*.md",
+            "caf\u{e9}/r\u{e9}sum\u{e9} \u{2013} v2.md"
+        ));
+        assert!(glob_match("*", "\u{dc}n\u{ef}c\u{f6}d\u{eb}.txt"));
+        assert!(!glob_match("*.pdf", "Notes \u{2013} draft.md"));
+    }
+
     // ---------------------------------------------------------------------------
     // Path source enumeration tests
     // ---------------------------------------------------------------------------
@@ -1696,6 +1682,16 @@ mod tests {
         let files = enumerate_path_source(root, &[], &[]).unwrap();
         assert_eq!(files.len(), 1);
         assert!(files[0].uri.starts_with("file://"));
+    }
+
+    #[test]
+    fn enumerate_path_source_handles_non_ascii_filenames() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Notes \u{2013} draft.md"), b"# hi").unwrap();
+        std::fs::write(dir.path().join("r\u{e9}sum\u{e9}.txt"), b"x").unwrap();
+        let root = dir.path().to_str().unwrap();
+        let files = enumerate_path_source(root, &["*.md".to_string()], &[]).unwrap();
+        assert_eq!(files.len(), 1); // only the .md, no panic
     }
 
     // ---------------------------------------------------------------------------
