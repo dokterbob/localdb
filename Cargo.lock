@@ -2580,6 +2580,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "block2",
  "dirs 5.0.1",
  "fastembed",
  "futures-util",

@@ -14,29 +14,26 @@
 //! # Unsafe budget
 //!
 //! All `unsafe` in this file is in clearly-labelled blocks with `// SAFETY:`
-//! comments. The three categories are:
+//! comments. The four categories are:
 //! 1. Obj-C message sends (every `objc2` method is `unsafe`).
 //! 2. Raw pointer cast from `dataPointer()` to write I32 / F16 scalars into
 //!    the uninitialized `MLMultiArray` backing buffer.
 //! 3. `Send + Sync` impl for `CoreMlModel`.
-//!
-//! # Stage note
-//!
-//! This module is Stage 2 of the CoreML backend: it provides the safe wrapper
-//! layer only. The embedder that consumes these types will be added in Stage 3,
-//! at which point the dead-code allowances below can be removed.
+//! 4. `Send` impls for `PendingPrediction` and `Outputs` (see SAFETY comments at
+//!    each impl site).
 
 // dataPointer() is deprecated upstream in favour of getMutableBytesWithHandler:
 // (which requires block2). We keep dataPointer() because it avoids the block2
 // closure machinery and is simpler for this bulk-write use case. A follow-up
 // can migrate to getMutableBytesWithHandler: if block2 is added as a dep.
 #![allow(deprecated)]
-// Stage 2: types are defined here and consumed in Stage 3. Suppress dead-code
-// noise until the consumer (CoreMlEmbedder) is wired up.
-#![allow(dead_code)]
 
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
+use block2::RcBlock;
 use half::f16;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
@@ -45,7 +42,8 @@ use objc2_core_ml::{
     MLComputeUnits, MLDictionaryFeatureProvider, MLFeatureProvider, MLFeatureValue, MLModel,
     MLModelConfiguration, MLMultiArray, MLMultiArrayDataType,
 };
-use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString, NSURL};
+use objc2_foundation::{NSArray, NSDictionary, NSError, NSNumber, NSString, NSURL};
+use tokio::sync::oneshot;
 
 use crate::error::EmbedError;
 
@@ -55,6 +53,7 @@ use crate::error::EmbedError;
 
 /// Which hardware back-ends CoreML may use when running the model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum ComputeUnits {
     /// CPU only (predictable latency, works everywhere).
     CpuOnly,
@@ -134,44 +133,81 @@ impl CoreMlModel {
         Ok(Self { inner: model })
     }
 
-    /// Run a synchronous prediction from a set of named input arrays.
+    /// Dispatch an async prediction to the ANE/GPU and return a future.
     ///
-    /// Builds an `MLDictionaryFeatureProvider` internally from the `(name,
-    /// array)` pairs, so callers never touch the Obj-C feature-provider types.
-    /// Returns an [`Outputs`] wrapping the result feature provider.
-    pub fn predict(&self, inputs: &[(&str, MlArray)]) -> Result<Outputs, EmbedError> {
-        let provider = build_feature_provider(inputs)?;
-        self.predict_provider(&provider)
-    }
-
-    /// Run predictions for several input sets, returning one [`Outputs`] each.
+    /// The prediction is eagerly dispatched to CoreML's internal queue before this
+    /// function returns, so the ANE starts computing immediately. The caller can
+    /// prepare the next window's inputs while awaiting the returned future.
     ///
-    /// Falls back to a sequential loop over [`predict`][Self::predict] because
-    /// the `MLArrayBatchProvider` batch API requires constructing a concrete
-    /// `MLArrayBatchProvider` that is complex and adds overhead for small
-    /// batches typical in embedding workloads.
-    pub fn predict_batch(
+    /// `inputs` must contain exactly the named arrays the model expects. The
+    /// `&'static str` keys are required so the inputs can be kept alive in the
+    /// returned future without lifetime complications.
+    pub fn start_prediction(
         &self,
-        batches: &[Vec<(&str, MlArray)>],
-    ) -> Result<Vec<Outputs>, EmbedError> {
-        batches.iter().map(|inp| self.predict(inp)).collect()
-    }
+        inputs: Vec<(&'static str, MlArray)>,
+    ) -> Result<PendingPrediction, EmbedError> {
+        let provider = build_feature_provider(&inputs)?;
+        let (tx, rx) = oneshot::channel::<Result<Outputs, EmbedError>>();
+        let tx_mutex = std::sync::Mutex::new(Some(tx));
 
-    /// Run a synchronous prediction from a pre-built feature provider.
-    fn predict_provider(&self, input: &MLDictionaryFeatureProvider) -> Result<Outputs, EmbedError> {
-        // SAFETY: predictionFromFeatures:error: is a synchronous Obj-C method
-        // that takes a reference to an MLFeatureProvider. MLDictionaryFeatureProvider
-        // is a concrete Obj-C class (implements Message) that conforms to the
-        // MLFeatureProvider protocol, so ProtocolObject::from_ref succeeds.
-        // The returned feature provider is retained for the lifetime of Outputs.
-        let output = unsafe {
+        // Build the completion block. Captures tx_mutex (Mutex<Option<Sender>>)
+        // for the one-shot send; Fn is required by RcBlock, so we use Mutex+Option
+        // to allow the take() even though CoreML only calls this once.
+        let block: RcBlock<dyn Fn(*mut ProtocolObject<dyn MLFeatureProvider>, *mut NSError)> =
+            RcBlock::new(
+                move |output: *mut ProtocolObject<dyn MLFeatureProvider>, error: *mut NSError| {
+                    let result = if !error.is_null() {
+                        // SAFETY: error is non-null and valid for the duration of this
+                        // block invocation. We retain it temporarily to format it, then
+                        // send only a String across the channel (not the NSError itself).
+                        let err_str = unsafe {
+                            match Retained::<NSError>::retain(error) {
+                                Some(e) => format!("CoreML async prediction error: {e:?}"),
+                                None => "CoreML async prediction error (nil NSError)".to_string(),
+                            }
+                        };
+                        Err(EmbedError::Internal(err_str))
+                    } else if output.is_null() {
+                        Err(EmbedError::Internal(
+                            "CoreML async prediction: nil output and nil error".to_string(),
+                        ))
+                    } else {
+                        // SAFETY: output is non-null and valid for this block invocation.
+                        // We retain it to extend its lifetime into the Outputs wrapper.
+                        match unsafe { Retained::retain(output) } {
+                            Some(retained) => Ok(Outputs { inner: retained }),
+                            None => Err(EmbedError::Internal(
+                                "CoreML async prediction: retain of output returned nil"
+                                    .to_string(),
+                            )),
+                        }
+                    };
+                    if let Ok(mut guard) = tx_mutex.lock() {
+                        if let Some(sender) = guard.take() {
+                            let _ = sender.send(result);
+                        }
+                    }
+                },
+            );
+
+        // SAFETY: predictionFromFeatures_completionHandler dispatches to CoreML's
+        // internal queue and returns immediately; the block is called exactly once
+        // when the prediction finishes. `provider` and `inputs` are kept alive in
+        // `_keep_alive` until `PendingPrediction` drops (after the future resolves),
+        // because CoreML reads the input feature provider after this call returns.
+        // CoreML retains the block internally, so it stays alive even if
+        // `PendingPrediction` is dropped early (though we avoid that in practice).
+        unsafe {
             let input_prot: &ProtocolObject<dyn MLFeatureProvider> =
-                ProtocolObject::from_ref(input);
+                ProtocolObject::from_ref(&*provider);
             self.inner
-                .predictionFromFeatures_error(input_prot)
-                .map_err(|e| EmbedError::Internal(format!("CoreML prediction error: {e:?}")))?
-        };
-        Ok(Outputs { inner: output })
+                .predictionFromFeatures_completionHandler(input_prot, &block);
+        }
+
+        Ok(PendingPrediction {
+            rx,
+            _keep_alive: (provider, inputs, block),
+        })
     }
 }
 
@@ -415,6 +451,61 @@ impl Outputs {
     }
 }
 
+// SAFETY: After prediction completes, the CoreML output feature provider is
+// exclusively owned by `Outputs` and effectively immutable — no mutation
+// occurs after the completion handler returns it. `MLModel` prediction outputs
+// are safe to access from any thread (same rationale as `CoreMlModel`). We
+// assert `Send` so `Outputs` can be moved across the oneshot channel boundary
+// inside `PendingPrediction`.
+unsafe impl Send for Outputs {}
+
+// ---------------------------------------------------------------------------
+// PendingPrediction — future wrapping an in-flight async CoreML prediction
+// ---------------------------------------------------------------------------
+
+type KeepAlive = (
+    Retained<MLDictionaryFeatureProvider>,
+    Vec<(&'static str, MlArray)>,
+    RcBlock<dyn Fn(*mut ProtocolObject<dyn MLFeatureProvider>, *mut NSError)>,
+);
+
+/// A future that resolves when an async CoreML prediction completes.
+///
+/// Created by [`CoreMlModel::start_prediction`]. The prediction is dispatched
+/// eagerly — the ANE starts computing before this future is first polled.
+///
+/// The `_keep_alive` tuple holds the input provider, arrays, and completion
+/// block alive until the future resolves (CoreML reads the provider after
+/// `predictionFromFeatures_completionHandler` returns).
+pub struct PendingPrediction {
+    rx: oneshot::Receiver<Result<Outputs, EmbedError>>,
+    _keep_alive: KeepAlive,
+}
+
+// SAFETY: `PendingPrediction` exclusively owns all of its CoreML Obj-C objects
+// (`MLDictionaryFeatureProvider`, `MLMultiArray` via `MlArray`, and the
+// completion `RcBlock`). The only cross-thread event is CoreML invoking the
+// completion block once on its internal queue; the sole shared state inside
+// that block is the `oneshot::Sender` wrapped in `Mutex<Option<...>>`, which
+// is internally synchronized. `MLModel` prediction is documented thread-safe
+// (see the `CoreMlModel Send + Sync` justification above). This mirrors the
+// existing `unsafe impl Send for CoreMlModel`.
+unsafe impl Send for PendingPrediction {}
+
+impl Future for PendingPrediction {
+    type Output = Result<Outputs, EmbedError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut self.rx).poll(cx) {
+            Poll::Ready(Ok(result)) => Poll::Ready(result),
+            Poll::Ready(Err(_cancelled)) => Poll::Ready(Err(EmbedError::Internal(
+                "CoreML async prediction: internal channel cancelled".to_string(),
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pure helpers (no unsafe, tested in unit tests below)
 // ---------------------------------------------------------------------------
@@ -423,6 +514,7 @@ impl Outputs {
 ///
 /// Used in tests to roundtrip F16 values through the MLMultiArray backing
 /// buffer without relying on `half`'s `from_bits` being inlined.
+#[cfg(test)]
 #[inline]
 pub(crate) fn f16_from_bits(bits: u16) -> f16 {
     f16::from_bits(bits)

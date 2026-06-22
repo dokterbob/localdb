@@ -78,6 +78,79 @@ async fn coreml_context_device_smoke() {
     }
 }
 
+/// Multi-doc async pipeline: embed two documents simultaneously and verify that
+/// each document's vectors are placed in the correct slots (tests scatter logic).
+///
+/// **Slow — downloads the CoreML bundle on first run; requires Apple Silicon.**
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "device: downloads the CoreML bundle and needs Apple Silicon; run with --ignored"]
+async fn coreml_context_multi_doc_async_scatter() {
+    let embedder =
+        PplxContextCoreMLEmbedder::new(None, false).expect("create PplxContextCoreMLEmbedder");
+
+    let doc0_chunks = vec![
+        "Rust ownership prevents data races at compile time.".to_string(),
+        "The borrow checker is Rust's secret weapon for safety.".to_string(),
+    ];
+    let doc1_chunks = vec![
+        "Caramelise onions slowly over low heat for 40 minutes.".to_string(),
+        "Deglaze the pan with white wine and reduce by half.".to_string(),
+        "Season generously and finish with fresh thyme.".to_string(),
+    ];
+
+    let result = embedder
+        .embed_documents(vec![
+            DocumentChunks {
+                document_context: String::new(),
+                chunks: doc0_chunks.clone(),
+            },
+            DocumentChunks {
+                document_context: String::new(),
+                chunks: doc1_chunks.clone(),
+            },
+        ])
+        .await
+        .expect("embed two documents");
+
+    assert_eq!(result.len(), 2, "two documents in, two documents out");
+    assert_eq!(
+        result[0].len(),
+        doc0_chunks.len(),
+        "doc 0: wrong chunk count"
+    );
+    assert_eq!(
+        result[1].len(),
+        doc1_chunks.len(),
+        "doc 1: wrong chunk count"
+    );
+
+    for (doc_i, doc_embs) in result.iter().enumerate() {
+        for (chunk_i, emb) in doc_embs.iter().enumerate() {
+            assert_eq!(
+                emb.len(),
+                1024,
+                "doc {doc_i} chunk {chunk_i}: expected dim 1024"
+            );
+            for &v in emb {
+                assert!(
+                    (-128.0..=127.0).contains(&v),
+                    "doc {doc_i} chunk {chunk_i}: value {v} out of int8 range"
+                );
+            }
+        }
+    }
+
+    // Vectors for different documents must not be identical (scatter correctness
+    // check: wrong slot assignment would produce identical vectors).
+    let doc0_first = &result[0][0];
+    let doc1_first = &result[1][0];
+    assert_ne!(
+        doc0_first, doc1_first,
+        "doc 0 chunk 0 and doc 1 chunk 0 must not be identical \
+         (likely a scatter bug if they are)"
+    );
+}
+
 /// Fraction of dimensions where `sign(a_i) == sign(b_i)`, treating `0` as
 /// positive to match the binarization tie-rule (`x >= 0 -> +1`).
 #[cfg(feature = "local-onnx")]
