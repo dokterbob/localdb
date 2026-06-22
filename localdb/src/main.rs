@@ -273,7 +273,7 @@ mod tests {
         let cli = Cli::try_parse_from(["localdb", "search", "machine", "learning"]).unwrap();
         if let Command::Search { query, limit } = cli.command {
             assert_eq!(query.join(" "), "machine learning");
-            assert_eq!(limit, 10);
+            assert_eq!(limit, 3);
         } else {
             panic!("expected Search command");
         }
