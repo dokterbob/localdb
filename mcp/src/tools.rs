@@ -12,6 +12,7 @@ use serde_json::Value;
 use localdb_core::{
     citation::Citation,
     error::Error,
+    ingestion::DocumentRecord,
     search::{QueryRequest, QueryResponse, SearchOrchestrator, StoreHandle},
     store::{ChunkRecord, MetadataFilter, RetrievalStore, SearchResult, StoreStats},
     Embedder,
@@ -490,6 +491,10 @@ impl RetrievalStore for ArcStore {
 
     async fn get_chunks_for_document(&self, document_id: &str) -> Result<Vec<ChunkRecord>, Error> {
         self.0.get_chunks_for_document(document_id).await
+    }
+
+    async fn list_indexed_documents(&self) -> Result<Vec<DocumentRecord>, Error> {
+        self.0.list_indexed_documents().await
     }
 }
 

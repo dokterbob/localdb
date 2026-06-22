@@ -77,6 +77,12 @@ impl RetrievalStore for SharedStore {
     async fn get_chunks_for_document(&self, document_id: &str) -> Result<Vec<ChunkRecord>, Error> {
         self.0.get_chunks_for_document(document_id).await
     }
+
+    async fn list_indexed_documents(
+        &self,
+    ) -> Result<Vec<localdb_core::ingestion::DocumentRecord>, Error> {
+        self.0.list_indexed_documents().await
+    }
 }
 
 /// A source record stored in the runtime-state DB (simplified, in-memory for now).
