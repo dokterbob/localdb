@@ -125,7 +125,7 @@ impl AppState {
         data_dir: PathBuf,
         job_queue: JobQueue,
     ) -> Result<Self, Error> {
-        let runtime_db_path = data_dir.join("runtime-state.redb");
+        let runtime_db_path = data_dir.join("runtime-state.db");
         let runtime_db = RuntimeStateDb::open(&runtime_db_path)?;
 
         Ok(Self {

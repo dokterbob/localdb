@@ -37,12 +37,13 @@ pub enum Error {
     #[error("store is locked by another process")]
     StoreLocked,
 
-    /// The runtime-state database is locked by another process (an index may be
-    /// in progress). Try again shortly.
+    /// The runtime-state database write lock could not be acquired within the
+    /// busy timeout (2 s). Another writer held the lock longer than expected.
+    /// Try again shortly.
     ///
     /// CLI exit code: 4
     #[error(
-        "runtime-state database is locked by another process (an index may be in progress); \
+        "runtime-state database write lock could not be acquired within the busy timeout; \
          try again shortly"
     )]
     RuntimeStateLocked,

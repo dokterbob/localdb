@@ -19,7 +19,7 @@ futures = { workspace = true }
 async-trait = { workspace = true }
 directories = { workspace = true }
 dirs = { workspace = true }
-redb = { workspace = true }
+rusqlite = { workspace = true }
 hex = { workspace = true }
 text-splitter = { version = "0.31", features = ["markdown"] }
 pulldown-cmark = "0.13"

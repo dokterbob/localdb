@@ -107,9 +107,9 @@ impl PlatformPaths {
         self.data_dir.join(".write.lock")
     }
 
-    /// Path to the runtime-state DB (`<data_dir>/runtime-state.redb`).
+    /// Path to the runtime-state DB (`<data_dir>/runtime-state.db`).
     pub fn runtime_state_db_path(&self) -> PathBuf {
-        self.data_dir.join("runtime-state.redb")
+        self.data_dir.join("runtime-state.db")
     }
 }
 
@@ -160,7 +160,7 @@ mod tests {
         let paths = PlatformPaths::resolve().expect("should resolve");
         let db = paths.runtime_state_db_path();
         assert!(db.starts_with(&paths.data_dir));
-        assert_eq!(db.file_name().unwrap(), "runtime-state.redb");
+        assert_eq!(db.file_name().unwrap(), "runtime-state.db");
     }
 
     #[test]

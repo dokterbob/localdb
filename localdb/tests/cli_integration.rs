@@ -1121,98 +1121,76 @@ fn source_remove_with_daemon_running_exits_cleanly_without_panic() {
 }
 
 // ---------------------------------------------------------------------------
-// Runtime-state lock contention tests (regression guard for #46 and #56)
+// Regression guard for #67 — concurrent DB access no longer fails
 //
-// These tests hold the runtime-state redb lock in-process, then run CLI
-// commands as subprocesses to verify they get exit 4 + runtime_state_locked
-// rather than empty results (#46) or an opaque internal error (#56).
+// Previously, holding the redb handle open in-process (e.g. by a daemon or
+// MCP server) would prevent the CLI from opening the same DB file, causing
+// exit 4 with `runtime_state_locked`. With SQLite WAL mode each operation
+// opens a short-lived connection; multiple concurrent openers are fine.
 // ---------------------------------------------------------------------------
 
-/// Regression guard for #46: read-only commands (store list, search, status)
-/// must exit 4 with `runtime_state_locked` when the redb lock is held,
-/// NOT silently show empty results from a temp DB.
+/// Regression guard for #67: CLI commands succeed even when another rusqlite
+/// connection is already open on the same DB file.
 #[test]
-fn runtime_state_locked_read_commands_exit_4() {
-    use redb::Database;
+fn store_list_succeeds_while_db_held_open_by_another_connection() {
+    use rusqlite::Connection;
 
     let dir = TempDir::new().unwrap();
     write_default_config(&dir);
 
-    // Pre-create the data dir and the runtime-state DB path so our lock-holder
-    // and the CLI agree on the same file.
     let data_dir = dir.path().join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
 
-    // Open the runtime-state redb to hold the exclusive lock.
-    let state_db_path = data_dir.join("runtime-state.redb");
-    let _lock_holder = Database::create(&state_db_path)
-        .expect("should be able to create runtime-state.redb in test");
+    // Open a raw rusqlite connection and keep it alive (simulates another
+    // process — e.g. the MCP server — that has the DB open).
+    let state_db_path = data_dir.join("runtime-state.db");
+    let _holder =
+        Connection::open(&state_db_path).expect("should be able to open runtime-state.db");
 
-    // `store list --json` must exit 4 with runtime_state_locked, not empty JSON.
+    // `store list --json` must exit 0 (success), not 4 (locked).
     let output = cmd_with_dir(&dir)
         .args(["--json", "store", "list"])
         .output()
         .unwrap();
 
-    let exit_code = output.status.code().unwrap_or(-1);
-    assert_eq!(
-        exit_code,
-        4,
-        "store list while runtime-state DB is locked must exit 4; \
-         stderr: {}\nstdout: {}",
+    assert!(
+        output.status.success(),
+        "store list should succeed while DB is held open by another connection; \
+         exit={:?} stderr={} stdout={}",
+        output.status.code(),
         String::from_utf8_lossy(&output.stderr),
         String::from_utf8_lossy(&output.stdout),
     );
-
-    // Verify the JSON error code.
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for s in &[stderr.as_ref(), stdout.as_ref()] {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
-            if let Some(code) = v.get("error").and_then(|e| e.as_str()) {
-                assert_eq!(
-                    code, "runtime_state_locked",
-                    "JSON error code must be 'runtime_state_locked', got '{}'; combined: {}{}",
-                    code, stdout, stderr
-                );
-                return;
-            }
-        }
-    }
-    // Exit code 4 is the key guarantee; JSON parsing may vary.
 }
 
-/// Regression guard for #56: strict callers (mcp) must exit 4 with a clear
-/// message when the runtime-state redb lock is held, not an opaque internal error.
+/// Regression guard for #67: two concurrent `store list` CLI processes both exit 0.
 #[test]
-fn runtime_state_locked_mcp_exits_4() {
-    use redb::Database;
-
+fn two_concurrent_store_list_calls_both_succeed() {
     let dir = TempDir::new().unwrap();
     write_default_config(&dir);
 
-    let data_dir = dir.path().join("data");
-    std::fs::create_dir_all(&data_dir).unwrap();
+    // Run two store-list commands at the same time (non-blocking spawn).
+    let dir_path = dir.path().to_path_buf();
+    let binary = env!("CARGO_BIN_EXE_localdb");
 
-    // Hold the runtime-state redb lock.
-    let state_db_path = data_dir.join("runtime-state.redb");
-    let _lock_holder = Database::create(&state_db_path)
-        .expect("should be able to create runtime-state.redb in test");
+    let mut child1 = std::process::Command::new(binary)
+        .current_dir(&dir_path)
+        .args(["store", "list"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn child1");
+    let mut child2 = std::process::Command::new(binary)
+        .current_dir(&dir_path)
+        .args(["store", "list"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn child2");
 
-    // `mcp` (strict) must exit 4, not 1.
-    let output = cmd_with_dir(&dir)
-        .arg("mcp")
-        .write_stdin("")
-        .output()
-        .unwrap();
+    let s1 = child1.wait().expect("wait child1");
+    let s2 = child2.wait().expect("wait child2");
 
-    let exit_code = output.status.code().unwrap_or(-1);
-    assert_eq!(
-        exit_code,
-        4,
-        "mcp while runtime-state DB is locked must exit 4; \
-         stderr: {}\nstdout: {}",
-        String::from_utf8_lossy(&output.stderr),
-        String::from_utf8_lossy(&output.stdout),
-    );
+    assert!(s1.success(), "first store list failed: {:?}", s1.code());
+    assert!(s2.success(), "second store list failed: {:?}", s2.code());
 }

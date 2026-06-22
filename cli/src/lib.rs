@@ -26,12 +26,11 @@ use localdb_core::{
     config::{
         loader::{load_config, ConfigLoader, LoadOptions},
         policy::compute_policy_version,
-        runtime_state::{check_yaml_owned, RuntimeStateDb, RuntimeStore},
+        runtime_state::{check_yaml_owned, RuntimeSource, RuntimeStateDb, RuntimeStore},
     },
     ids::new_ulid,
     Error,
 };
-use redb::{Database, DatabaseError, ReadableDatabase, ReadableTable, TableDefinition};
 use serde_json::json;
 
 // ---------------------------------------------------------------------------
@@ -365,256 +364,59 @@ pub fn exit_err(err: &Error, json_mode: bool) -> ! {
 }
 
 // ---------------------------------------------------------------------------
-// Source CRUD — stored in the same redb file as runtime-state
-// ---------------------------------------------------------------------------
-//
-// `RuntimeStateDb` in `core` (T03) manages only runtime-owned stores.
-// T09 adds source CRUD using an additional table in the same redb file.
-// We open the file independently with `redb::Database` (redb supports multiple
-// openers on the same file in the same process; between processes the WAL guards
-// consistency). The sources table is separate from the stores table owned by core.
-
-/// A source record persisted in the runtime-state DB.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct RuntimeSource {
-    /// Source ULID.
-    pub id: String,
-    /// Owning store name.
-    pub store_name: String,
-    /// Source kind: "path" or "url".
-    pub kind: String,
-    /// Root path (for path sources).
-    pub root: Option<String>,
-    /// URL (for url sources).
-    pub url: Option<String>,
-    /// Include globs.
-    #[serde(default)]
-    pub include: Vec<String>,
-    /// Exclude globs.
-    #[serde(default)]
-    pub exclude: Vec<String>,
-    /// Chunking preset.
-    pub preset: String,
-}
-
-/// Sources table: source_id → JSON `RuntimeSource`.
-const SOURCES_TABLE: TableDefinition<&str, &str> = TableDefinition::new("cli_sources");
-
-/// Thin DB for source CRUD, backed by the same redb file as stores.
-struct SourceDb {
-    db: Database,
-}
-
-impl SourceDb {
-    fn open(path: &Path) -> Result<Self, Error> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| Error::Internal {
-                message: format!("cannot create DB directory: {}", e),
-                correlation_id: "source_db_mkdir".to_string(),
-            })?;
-        }
-
-        let db = Database::create(path).map_err(|e| match e {
-            DatabaseError::DatabaseAlreadyOpen => Error::RuntimeStateLocked,
-            _ => Error::Internal {
-                message: format!("cannot open source DB: {}", e),
-                correlation_id: "source_db_open".to_string(),
-            },
-        })?;
-
-        {
-            let wtxn = db.begin_write().map_err(map_db_err)?;
-            wtxn.open_table(SOURCES_TABLE).map_err(map_db_err)?;
-            wtxn.commit().map_err(map_db_err)?;
-        }
-
-        Ok(Self { db })
-    }
-
-    fn upsert(&self, source: &RuntimeSource) -> Result<(), Error> {
-        let json = serde_json::to_string(source).map_err(|e| Error::Internal {
-            message: format!("cannot serialize source: {}", e),
-            correlation_id: "source_upsert_ser".to_string(),
-        })?;
-        let wtxn = self.db.begin_write().map_err(map_db_err)?;
-        {
-            let mut t = wtxn.open_table(SOURCES_TABLE).map_err(map_db_err)?;
-            t.insert(source.id.as_str(), json.as_str())
-                .map_err(map_db_err)?;
-        }
-        wtxn.commit().map_err(map_db_err)?;
-        Ok(())
-    }
-
-    fn delete(&self, id: &str) -> Result<bool, Error> {
-        let wtxn = self.db.begin_write().map_err(map_db_err)?;
-        let deleted = {
-            let mut t = wtxn.open_table(SOURCES_TABLE).map_err(map_db_err)?;
-            let had = t.remove(id).map_err(map_db_err)?.is_some();
-            had
-        };
-        wtxn.commit().map_err(map_db_err)?;
-        Ok(deleted)
-    }
-
-    fn delete_by_store(&self, store_name: &str) -> Result<usize, Error> {
-        let wtxn = self.db.begin_write().map_err(map_db_err)?;
-        let count = {
-            let mut t = wtxn.open_table(SOURCES_TABLE).map_err(map_db_err)?;
-            let mut ids = Vec::new();
-            for entry in t.iter().map_err(map_db_err)? {
-                let (k, v) = entry.map_err(map_db_err)?;
-                let src: RuntimeSource =
-                    serde_json::from_str(v.value()).map_err(|e| Error::Internal {
-                        message: format!("cannot deserialize source: {}", e),
-                        correlation_id: "source_del_by_store_deser".to_string(),
-                    })?;
-                if src.store_name == store_name {
-                    ids.push(k.value().to_string());
-                }
-            }
-            for id in &ids {
-                t.remove(id.as_str()).map_err(map_db_err)?;
-            }
-            ids.len()
-        };
-        wtxn.commit().map_err(map_db_err)?;
-        Ok(count)
-    }
-
-    fn list(&self, store_name: &str) -> Result<Vec<RuntimeSource>, Error> {
-        let rtxn = self.db.begin_read().map_err(map_db_err)?;
-        let t = rtxn.open_table(SOURCES_TABLE).map_err(map_db_err)?;
-        let mut sources = Vec::new();
-        for entry in t.iter().map_err(map_db_err)? {
-            let (_, v) = entry.map_err(map_db_err)?;
-            let src: RuntimeSource =
-                serde_json::from_str(v.value()).map_err(|e| Error::Internal {
-                    message: format!("cannot deserialize source: {}", e),
-                    correlation_id: "source_list_deser".to_string(),
-                })?;
-            if src.store_name == store_name {
-                sources.push(src);
-            }
-        }
-        Ok(sources)
-    }
-
-    fn get(&self, id: &str) -> Result<Option<RuntimeSource>, Error> {
-        let rtxn = self.db.begin_read().map_err(map_db_err)?;
-        let t = rtxn.open_table(SOURCES_TABLE).map_err(map_db_err)?;
-        match t.get(id).map_err(map_db_err)? {
-            None => Ok(None),
-            Some(v) => {
-                let src: RuntimeSource =
-                    serde_json::from_str(v.value()).map_err(|e| Error::Internal {
-                        message: format!("cannot deserialize source: {}", e),
-                        correlation_id: "source_get_deser".to_string(),
-                    })?;
-                Ok(Some(src))
-            }
-        }
-    }
-
-    /// Find a source by its `root` path or `url` field, optionally scoped to a store.
-    fn find_by_root_or_url(
-        &self,
-        value: &str,
-        store_name: Option<&str>,
-    ) -> Result<Option<RuntimeSource>, Error> {
-        let rtxn = self.db.begin_read().map_err(map_db_err)?;
-        let t = rtxn.open_table(SOURCES_TABLE).map_err(map_db_err)?;
-        for entry in t.iter().map_err(map_db_err)? {
-            let (_, v) = entry.map_err(map_db_err)?;
-            let src: RuntimeSource =
-                serde_json::from_str(v.value()).map_err(|e| Error::Internal {
-                    message: format!("cannot deserialize source: {}", e),
-                    correlation_id: "source_find_deser".to_string(),
-                })?;
-            if let Some(sn) = store_name {
-                if src.store_name != sn {
-                    continue;
-                }
-            }
-            let matches = src.root.as_deref() == Some(value) || src.url.as_deref() == Some(value);
-            if matches {
-                return Ok(Some(src));
-            }
-        }
-        Ok(None)
-    }
-}
-
-fn map_db_err(e: impl std::fmt::Display) -> Error {
-    Error::Internal {
-        message: format!("DB error: {}", e),
-        correlation_id: "db_err".to_string(),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// AppDb — combined stores + sources
+// AppDb — thin wrapper over RuntimeStateDb (stores + sources in one SQLite file)
 // ---------------------------------------------------------------------------
 
-/// Combined DB handle for the CLI: stores (via core's RuntimeStateDb) +
-/// sources (via SourceDb, which uses a separate redb file to avoid
-/// exclusive-lock conflicts with RuntimeStateDb).
+/// Combined DB handle for the CLI: stores + sources, both in the same SQLite file
+/// via `RuntimeStateDb` from core. SQLite WAL mode serialises writes automatically
+/// so no extra locking is needed for metadata operations.
 pub struct AppDb {
-    stores: RuntimeStateDb,
-    sources: SourceDb,
+    db: RuntimeStateDb,
 }
 
 impl AppDb {
-    /// Open the combined DB.
-    ///
-    /// `state_path` is the path used by `RuntimeStateDb` (runtime-state.redb).
-    /// A sibling file `cli-sources.redb` is used for the sources table.
+    /// Open the combined DB at `state_path`.
     pub fn open(state_path: &Path) -> Result<Self, Error> {
-        let stores = RuntimeStateDb::open(state_path)?;
-        let sources_path = state_path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join("cli-sources.redb");
-        let sources = SourceDb::open(&sources_path)?;
-        Ok(Self { stores, sources })
+        let db = RuntimeStateDb::open(state_path)?;
+        Ok(Self { db })
     }
 
     // --- store delegates ---
     pub fn get_store(&self, name: &str) -> Result<Option<RuntimeStore>, Error> {
-        self.stores.get_store(name)
+        self.db.get_store(name)
     }
     pub fn upsert_store(&self, store: &RuntimeStore) -> Result<(), Error> {
-        self.stores.upsert_store(store)
+        self.db.upsert_store(store)
     }
     pub fn delete_store(&self, name: &str) -> Result<bool, Error> {
-        self.stores.delete_store(name)
+        self.db.delete_store(name)
     }
     pub fn list_stores(&self) -> Result<Vec<RuntimeStore>, Error> {
-        self.stores.list_stores()
+        self.db.list_stores()
     }
 
     // --- source delegates ---
     pub fn upsert_source(&self, source: &RuntimeSource) -> Result<(), Error> {
-        self.sources.upsert(source)
+        self.db.upsert_source(source)
     }
     pub fn delete_source(&self, id: &str) -> Result<bool, Error> {
-        self.sources.delete(id)
+        self.db.delete_source(id)
     }
     pub fn list_sources(&self, store_name: &str) -> Result<Vec<RuntimeSource>, Error> {
-        self.sources.list(store_name)
+        self.db.list_sources(store_name)
     }
     pub fn get_source(&self, id: &str) -> Result<Option<RuntimeSource>, Error> {
-        self.sources.get(id)
+        self.db.get_source(id)
     }
     pub fn find_source_by_root_or_url(
         &self,
         value: &str,
         store_name: Option<&str>,
     ) -> Result<Option<RuntimeSource>, Error> {
-        self.sources.find_by_root_or_url(value, store_name)
+        self.db.find_source_by_root_or_url(value, store_name)
     }
     pub fn delete_sources_for_store(&self, store_name: &str) -> Result<usize, Error> {
-        self.sources.delete_by_store(store_name)
+        self.db.delete_sources_for_store(store_name)
     }
 }
 
@@ -624,14 +426,10 @@ impl AppDb {
 
 /// Load config and open the AppDb. Exits on failure.
 ///
-/// When a daemon is running, the runtime-state DB is managed by the daemon
-/// process exclusively. Opening it from the CLI would cause a "Database already
-/// open" error (redb's single-writer guarantee). We therefore skip opening the
-/// DB when a daemon is detected and return a dummy in-memory-only AppDb that
-/// is only usable for reads that go through the daemon's HTTP API anyway.
-///
-/// Commands that reach the daemon-routing branch early (before needing the local
-/// DB) will return before any embedded-mode DB access occurs.
+/// SQLite WAL mode allows concurrent readers and writers, so the DB can be
+/// opened directly regardless of whether the daemon is also running. Commands
+/// that detect a running daemon will route mutations through the HTTP API;
+/// they still open the real DB for read operations (store list, etc.).
 fn load_app_db(ctx: &CliContext) -> (ConfigLoader, AppDb) {
     let options = LoadOptions {
         config_path: ctx.config.clone(),
@@ -641,24 +439,6 @@ fn load_app_db(ctx: &CliContext) -> (ConfigLoader, AppDb) {
         Ok(c) => c,
         Err(e) => exit_err(&e, ctx.json),
     };
-
-    // Probe the daemon *before* opening the local DB. If the daemon is running
-    // it holds the exclusive write lock on runtime-state.redb; opening it from
-    // the CLI would fail with "Database already open".
-    let data_dir = &config_loader.paths.data_dir;
-    if matches!(probe_daemon(data_dir), DaemonState::Running { .. }) {
-        // Return a DB opened on a temporary path so callers that branch on the
-        // daemon path early (index, search, source add/remove, store add/remove)
-        // can still call resolve_store_name / list_stores without panicking.
-        // The actual mutations all go through the HTTP API when the daemon is up.
-        let tmp_dir = tempdir_for_daemon_mode(data_dir);
-        let tmp_db_path = tmp_dir.join("daemon-mode-placeholder.redb");
-        let db = match AppDb::open(&tmp_db_path) {
-            Ok(d) => d,
-            Err(e) => exit_err(&e, ctx.json),
-        };
-        return (config_loader, db);
-    }
 
     let db_path = config_loader.paths.runtime_state_db_path();
     let db = match AppDb::open(&db_path) {
@@ -672,7 +452,7 @@ fn load_app_db(ctx: &CliContext) -> (ConfigLoader, AppDb) {
 ///
 /// When the config file is malformed or unreadable, read-only commands (search,
 /// store list, status) should still work using platform default config and an
-/// in-memory or temp DB, rather than hard failing.
+/// empty temp DB, rather than hard failing.
 fn load_app_db_lenient(ctx: &CliContext) -> (ConfigLoader, AppDb) {
     let options = LoadOptions {
         config_path: ctx.config.clone(),
@@ -682,7 +462,6 @@ fn load_app_db_lenient(ctx: &CliContext) -> (ConfigLoader, AppDb) {
         Ok(c) => c,
         Err(_) => {
             // Config is malformed/missing — use platform default paths.
-            // This allows read-only commands (search, store list, status) to work.
             let options_default = LoadOptions::default();
             match load_config(&options_default) {
                 Ok(c) => c,
@@ -691,41 +470,18 @@ fn load_app_db_lenient(ctx: &CliContext) -> (ConfigLoader, AppDb) {
         }
     };
 
-    let data_dir = &config_loader.paths.data_dir;
-    if matches!(probe_daemon(data_dir), DaemonState::Running { .. }) {
-        let tmp_dir = tempdir_for_daemon_mode(data_dir);
-        let tmp_db_path = tmp_dir.join("daemon-mode-placeholder.redb");
-        let db = match AppDb::open(&tmp_db_path) {
-            Ok(d) => d,
-            Err(e) => exit_err(&e, ctx.json),
-        };
-        return (config_loader, db);
-    }
-
     let db_path = config_loader.paths.runtime_state_db_path();
-    // For read-only commands: propagate RuntimeStateLocked (exit 4), but fall
-    // back to a temp DB for a genuinely absent/malformed DB.
     let db = match AppDb::open(&db_path) {
         Ok(d) => d,
         Err(Error::RuntimeStateLocked) => exit_err(&Error::RuntimeStateLocked, ctx.json),
         Err(_) => {
-            let tmp_dir = tempdir_for_daemon_mode(data_dir);
-            let tmp_path = tmp_dir.join("lenient-fallback.redb");
+            // DB absent or unreadable: use a temp path so read-only commands
+            // show empty results rather than hard failing.
+            let tmp_path = config_loader.paths.data_dir.join(".lenient-fallback.db");
             AppDb::open(&tmp_path).unwrap_or_else(|e| exit_err(&e, ctx.json))
         }
     };
     (config_loader, db)
-}
-
-/// Return a writable temp directory path that lives inside `data_dir` so the
-/// daemon-mode placeholder DB is cleaned up automatically when the process exits.
-///
-/// We use a fixed subdir name rather than a proper `TempDir` because we only
-/// need the path (the DB is tiny and will be recreated on next run).
-fn tempdir_for_daemon_mode(data_dir: &Path) -> PathBuf {
-    let p = data_dir.join(".cli-daemon-placeholder");
-    let _ = std::fs::create_dir_all(&p);
-    p
 }
 
 /// Resolve the target store name from --store flags, YAML config, or runtime DB.
@@ -1044,7 +800,7 @@ pub fn run_init(ctx: &CliContext) {
     }
 
     // Initialize the runtime-state DB and create default store (#6).
-    let db_path = data_dir.join("runtime-state.redb");
+    let db_path = data_dir.join("runtime-state.db");
     let db = match AppDb::open(&db_path) {
         Ok(d) => d,
         Err(e) => exit_err(&e, ctx.json),
@@ -1539,11 +1295,8 @@ async fn run_source_add_async(ctx: &CliContext, source_arg: &str) {
         }
     }
 
-    // Embedded mode.
-    let _lock = match WriteLock::acquire(data_dir) {
-        Ok(l) => l,
-        Err(e) => exit_err(&e, ctx.json),
-    };
+    // Embedded mode — SQLite serialises the metadata write; no WriteLock needed here.
+    // The auto-index step below acquires its own WriteLock for LanceDB writes.
 
     // #13: Verify store exists in runtime DB (exit 3 if not found).
     let rt_store = match db.get_store(&store_name) {
@@ -1600,11 +1353,9 @@ async fn run_source_add_async(ctx: &CliContext, source_arg: &str) {
     }
 
     // #2: Auto-index after source add.
-    // Drop the write lock AND the db handle before re-entering the index path,
-    // which will acquire its own lock and open its own DB handle.
+    // Drop the db handle before re-entering the index path, which opens its own.
     let src_id = src.id.clone();
     let rt_store_clone = rt_store.clone();
-    drop(_lock);
     drop(db);
     drop(config_loader);
 
@@ -1636,14 +1387,6 @@ async fn run_index_for_source_async(
 
     let (config_loader, db) = load_app_db(ctx);
     let data_dir = config_loader.paths.data_dir.clone();
-
-    let _lock = match WriteLock::acquire(&data_dir) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("warning: cannot acquire lock for auto-index: {}", e);
-            return;
-        }
-    };
 
     let all_sources = match db.list_sources(&rt_store.name) {
         Ok(s) => s,
@@ -1699,6 +1442,16 @@ async fn run_index_for_source_async(
         eprintln!("warning: cannot create store dir for auto-index: {}", e);
         return;
     }
+
+    // Acquire the LanceDB single-writer gate only for the actual write phase.
+    // Embedder creation (above) is intentionally outside the lock window.
+    let _lock = match WriteLock::acquire(&data_dir) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("warning: cannot acquire lock for auto-index: {}", e);
+            return;
+        }
+    };
 
     let lance_path = store_data_dir.to_string_lossy().to_string();
     let lancedb_store = match store_lancedb::LanceDbStore::open(
@@ -1994,12 +1747,7 @@ async fn run_index_async(
         }
     }
 
-    // Embedded mode: acquire write lock and run inline.
-    let _lock = match WriteLock::acquire(&data_dir) {
-        Ok(l) => l,
-        Err(e) => exit_err(&e, ctx.json),
-    };
-
+    // Embedded mode: metadata ops run without the write lock (SQLite serialises them).
     // #12: Reconcile YAML-declared stores into the runtime DB so that YAML stores
     // are findable by the index command without requiring `localdb store add` first.
     if let Err(e) = reconcile_yaml_stores(&db, &config_loader.config) {
@@ -2079,9 +1827,7 @@ async fn run_index_async(
         return;
     }
 
-    // Narrow the redb lock window: all DB reads are done. Drop the handle now
-    // so concurrent readers (store list, search, status) can open the DB while
-    // the ingestion loop runs. The WriteLock (_lock) is separate and stays held.
+    // All metadata reads done; drop the DB handle.
     drop(db);
 
     let policy = config_loader.config.defaults.indexing.clone();
@@ -2119,6 +1865,13 @@ async fn run_index_async(
             ctx.json,
         );
     }
+
+    // Acquire the LanceDB single-writer gate only for the write phase.
+    // Embedder creation and metadata reads (above) are intentionally outside the lock.
+    let _lock = match WriteLock::acquire(&data_dir) {
+        Ok(l) => l,
+        Err(e) => exit_err(&e, ctx.json),
+    };
 
     let lance_path = store_data_dir.to_string_lossy().to_string();
     let lancedb_store = match store_lancedb::LanceDbStore::open(
@@ -2492,6 +2245,8 @@ async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
         Ok(s) => s,
         Err(e) => exit_err(&e, ctx.json),
     };
+    // Snapshot taken; drop the DB handle so it doesn't persist across the stdio loop.
+    drop(db);
 
     // Same store resolution as `localdb search`: YAML stores + runtime stores,
     // narrowed by --store flags when given.
@@ -2582,7 +2337,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn tmp_app_db(dir: &TempDir) -> AppDb {
-        AppDb::open(&dir.path().join("state.redb")).unwrap()
+        AppDb::open(&dir.path().join("state.db")).unwrap()
     }
 
     fn new_runtime_store(name: &str) -> RuntimeStore {
