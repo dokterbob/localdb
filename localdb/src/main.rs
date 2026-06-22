@@ -97,7 +97,7 @@ pub enum Command {
         query: Vec<String>,
 
         /// Maximum number of results to return (must be >= 1).
-        #[arg(long, default_value = "10", value_parser = clap::value_parser!(usize))]
+        #[arg(long, default_value = "3", value_parser = clap::value_parser!(usize))]
         limit: usize,
     },
 }
