@@ -1,18 +1,23 @@
-//! Office document parser: DOCX, PPTX, XLSX, XLS, CSV → Markdown via `anytomd`.
+//! Office document parser: DOCX, PPTX, CSV → Markdown via `anytomd`.
 //!
-//! anytomd emits GFM tables for spreadsheets; `MarkdownSplitter` handles them.
+//! XLSX and XLS are intentionally excluded: anytomd's spreadsheet-to-Markdown
+//! conversion is extremely slow on files with thousands of rows (measured at
+//! over 16 minutes in production for an 87K-row file; use CSV export instead).
+//! Tracking issue: <https://github.com/developer0hye/anytomd-rs/issues/94>
 
 use localdb_core::parser::{DocumentMetadata, ParsedDocument, Parser, Probe};
 use localdb_core::Error;
 
 /// Handles office document formats via `anytomd`.
 ///
-/// Supported extensions: `.docx`, `.pptx`, `.xlsx`, `.xls`, `.csv`.
-/// Declines all other inputs.
+/// Supported extensions: `.docx`, `.pptx`, `.csv`.
+/// Declines all other inputs, including `.xlsx` and `.xls` (disabled — see module docs).
 pub struct OfficeParser;
 
 /// Office file extensions handled by this parser.
-const OFFICE_EXTS: &[&str] = &["docx", "pptx", "xlsx", "xls", "csv"];
+///
+/// `.xlsx` and `.xls` are intentionally absent — see module-level doc comment.
+const OFFICE_EXTS: &[&str] = &["docx", "pptx", "csv"];
 
 impl Parser for OfficeParser {
     fn id(&self) -> &'static str {
@@ -109,16 +114,24 @@ mod tests {
     }
 
     #[test]
-    fn garbage_xlsx_returns_extraction_failed() {
+    fn xlsx_returns_none_disabled() {
+        // XLSX is intentionally disabled (anytomd performance bug #94).
+        // The parser must return Ok(None) so the file is counted as
+        // unsupported_format, not as an extraction error.
         let probe = Probe::new(b"\x00\x01\x02\x03garbage", Some("sheet.xlsx"), None);
-        match OfficeParser.parse(&probe) {
-            Err(Error::ExtractionFailed { format, .. }) => {
-                assert!(
-                    format.starts_with("office/xlsx"),
-                    "unexpected format: {format}"
-                );
-            }
-            other => panic!("expected ExtractionFailed, got: {other:?}"),
-        }
+        assert!(
+            OfficeParser.parse(&probe).unwrap().is_none(),
+            "xlsx is disabled and should return Ok(None)"
+        );
+    }
+
+    #[test]
+    fn xls_returns_none_disabled() {
+        // XLS is intentionally disabled for the same reason as XLSX.
+        let probe = Probe::new(b"\xd0\xcf\x11\xe0garbage", Some("sheet.xls"), None);
+        assert!(
+            OfficeParser.parse(&probe).unwrap().is_none(),
+            "xls is disabled and should return Ok(None)"
+        );
     }
 }

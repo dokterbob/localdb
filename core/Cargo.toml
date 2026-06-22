@@ -27,3 +27,4 @@ pulldown-cmark = "0.13"
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
 tempfile = "3"
+extract = { path = "../extract" }

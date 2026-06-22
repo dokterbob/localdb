@@ -4882,6 +4882,7 @@ dependencies = [
  "blake3",
  "directories",
  "dirs 6.0.0",
+ "extract",
  "futures",
  "hex",
  "pulldown-cmark",

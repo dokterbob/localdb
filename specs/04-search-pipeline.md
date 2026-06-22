@@ -32,10 +32,19 @@ Markdown string plus `DocumentMetadata` extracted from frontmatter (Dublin Core 
 | HTML | readability-style main-content + DOM walk | Used for both `url` fetches and `.html` files; converted to Markdown. |
 | PDF (text layer) | Rust PDF text extraction | Converted to Markdown; page structure preserved where detectable. |
 
-**Out of scope for v1 (explicit):** OCR, scanned PDFs, DOCX/PPTX/XLSX, images. Rationale: no
+**Additional formats via `anytomd`:** DOCX, PPTX, and CSV are supported by the `OfficeParser`
+using the `anytomd` crate (v1.3.0), which converts them to Markdown. These are production-ready.
+
+**Out of scope for v1 (explicit):** OCR, scanned PDFs, images. Rationale: no
 single mature Rust extraction stack covers these well; shipping a sharp matrix
 beats shipping a ragged one. Unsupported files are skipped and counted in IndexJob stats, not
 errors. Roadmap: [06-roadmap.md](06-roadmap.md) §5.
+
+**XLSX/XLS explicitly disabled:** Despite anytomd supporting XLSX/XLS in principle, extraction
+for these formats is disabled in `OfficeParser` pending an upstream performance fix.
+`anytomd::convert_bytes` on an 87K-row XLSX (6.9 MB) took >16 minutes in production (vs. <1 s
+for the equivalent CSV). The file is counted as `unsupported_format`, not an error. Use CSV
+export as a workaround. Tracking: https://github.com/developer0hye/anytomd-rs/issues/94
 
 **Extension-gated acceptance:** The `PlaintextParser` (and by extension the full parser chain)
 only accepts files whose extension or basename matches the list published by
@@ -94,6 +103,10 @@ across all files in a source, `index_document` in `core` selects the chunk prese
 
 - Markdown, HTML, PDF, and plain-text prose files → `prose` preset (`MarkdownSplitter`).
 - Code, data, and lockfiles (`.rs`, `.py`, `.json`, `.toml`, `Cargo.lock`, etc.) → `code` preset.
+- Spreadsheet formats (`.xlsx`, `.xls`) → `code` preset. These files produce extracted text
+  that is dense tabular content (similar to CSV), so the fast line-based chunker is used
+  instead of the prose splitter to avoid hangs on large tables. Note: XLSX/XLS extraction
+  is currently disabled (see §2), so this routing is moot until the upstream fix lands.
 
 The source-level preset (from config or the `--preset` CLI flag) acts as a default/override:
 if it is explicitly set to something other than `prose`, the source preset takes precedence.
