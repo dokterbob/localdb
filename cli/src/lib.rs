@@ -348,6 +348,19 @@ fn print_json(value: &serde_json::Value) {
     );
 }
 
+/// Format a chunk snippet for terminal display: collapse internal runs of
+/// whitespace into single spaces, then cap at ~500 chars, appending `…` if cut.
+fn format_snippet(snippet: &str) -> String {
+    const MAX_CHARS: usize = 500;
+    let normalized = snippet.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() > MAX_CHARS {
+        let truncated: String = normalized.chars().take(MAX_CHARS).collect();
+        format!("{truncated}…")
+    } else {
+        normalized
+    }
+}
+
 /// Print an error and exit with the correct exit code.
 pub fn exit_err(err: &Error, json_mode: bool) -> ! {
     let code = err.exit_code();
@@ -2023,9 +2036,8 @@ async fn run_search_async(ctx: &CliContext, query: &str, limit: usize) {
                         for (i, cit) in citations.iter().enumerate() {
                             let uri = cit.get("uri").and_then(|u| u.as_str()).unwrap_or("?");
                             let snippet = cit.get("snippet").and_then(|s| s.as_str()).unwrap_or("");
-                            let snippet_short: String = snippet.chars().take(120).collect();
                             println!("{}. {}", i + 1, uri);
-                            println!("   {}", snippet_short.trim());
+                            println!("   {}", format_snippet(snippet));
                             println!();
                         }
                     }
@@ -2170,8 +2182,7 @@ async fn run_search_async(ctx: &CliContext, query: &str, limit: usize) {
                         format!(" > {}", citation.heading_path.join(" > "))
                     };
                     println!("{}. {}{}", i + 1, citation.uri, heading);
-                    let snippet: String = citation.snippet.chars().take(120).collect();
-                    println!("   {}", snippet.trim());
+                    println!("   {}", format_snippet(&citation.snippet));
                     println!();
                 }
             }
@@ -2350,6 +2361,23 @@ mod tests {
             backend: "lancedb".to_string(),
             indexing: None,
         }
+    }
+
+    // --- format_snippet ---
+
+    #[test]
+    fn format_snippet_collapses_whitespace() {
+        assert_eq!(format_snippet("a\n\n  b   c"), "a b c");
+    }
+
+    #[test]
+    fn format_snippet_truncates_long_input() {
+        // Build a string > 500 chars with a multi-byte char near the cut point.
+        let base: String = "a".repeat(498);
+        let input = format!("{base}é extra text that should be cut");
+        let result = format_snippet(&input);
+        assert!(result.ends_with('…'), "should end with ellipsis");
+        assert_eq!(result.chars().count(), 501, "500 chars + ellipsis char");
     }
 
     // --- WriteLock ---
