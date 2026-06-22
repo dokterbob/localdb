@@ -23,6 +23,7 @@ rusqlite = { workspace = true }
 hex = { workspace = true }
 text-splitter = { version = "0.31", features = ["markdown"] }
 pulldown-cmark = "0.13"
+globset = "0.4"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
