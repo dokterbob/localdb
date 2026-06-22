@@ -21,9 +21,7 @@ fn anytomd_xlsx_hangs_on_large_file() {
             break handle.join();
         }
         if t.elapsed() > Duration::from_secs(30) {
-            eprintln!(
-                "TIMED OUT after 30s — anytomd XLSX is confirmed broken for large files"
-            );
+            eprintln!("TIMED OUT after 30s — anytomd XLSX is confirmed broken for large files");
             return; // test passes: we confirmed the bug
         }
         std::thread::sleep(Duration::from_millis(500));
