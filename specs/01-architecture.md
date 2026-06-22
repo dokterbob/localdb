@@ -52,11 +52,18 @@ optional; when one is running, CLI and MCP become thin clients of its HTTP API.
 - **Discovery:** a unix socket at a well-known path in the data dir
   ([03-config.md](03-config.md) §4). Socket present and responsive → route through daemon;
   otherwise → embedded mode. No configuration needed for the common case.
-- **Single-writer rule:** an advisory file lock per data directory. Exactly one process may hold
-  the write lock (the daemon when running, else the first embedded writer). Readers are
-  unrestricted. Embedded processes that want to write while a daemon holds the lock route the
-  write through the daemon instead. Lock acquisition failure surfaces as error
-  `store_locked` ([05-surfaces.md](05-surfaces.md) §5).
+- **Single-writer rule (LanceDB gate):** an advisory file lock (`<data_dir>/.write.lock`)
+  guards concurrent LanceDB vector-index writes. Exactly one process may hold this lock
+  during a write (the daemon when running, else the first embedded writer). It is held only
+  for the duration of an actual LanceDB write — not during embedding or reads. Pure-metadata
+  operations (`store add`, `source add/remove`, `store list`) do not hold this lock; `store
+  remove` acquires it only for the LanceDB data-directory deletion.
+  Lock acquisition failure surfaces as error `store_locked`
+  ([05-surfaces.md](05-surfaces.md) §5).
+- **Runtime-state concurrency:** the runtime-state registry (`runtime-state.db`) is backed by
+  SQLite in WAL mode with a 2 s busy-timeout. Multiple processes (MCP server, CLI, daemon) can
+  read simultaneously; writers serialise automatically. A write that cannot acquire the SQLite
+  write lock within 2 s surfaces as `runtime_state_locked` (exit 4).
 - **Daemon-exclusive capabilities:** continuous file watching, scheduled URL refresh, the HTTP
   API and (later) web UI, background job queue. Embedded mode does one-shot equivalents
   (`localdb index` = scan now; no watching).

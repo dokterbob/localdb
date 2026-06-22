@@ -74,7 +74,7 @@ impl ResolvedPaths {
 
     /// Runtime-state DB path.
     pub fn runtime_state_db_path(&self) -> PathBuf {
-        self.data_dir.join("runtime-state.redb")
+        self.data_dir.join("runtime-state.db")
     }
 }
 

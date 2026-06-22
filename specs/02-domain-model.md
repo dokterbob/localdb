@@ -36,6 +36,13 @@ Where a store's content comes from.
 | `spec` | Kind-specific: root path + include/exclude globs, or URL + refresh interval. |
 | `source_kind_preset` | Which indexing preset applies (`prose`, `messages`, `code`) — see [03-config.md](03-config.md) §2. |
 
+**Runtime representation:** `RuntimeSource` in `core::config::runtime_state` is the concrete
+Rust type for sources persisted in the runtime-state DB (`runtime-state.db`). It is a core
+domain type — not a CLI type — and includes fields `id`, `store_name`, `kind`, `root`,
+`url`, `include`, `exclude`, and `preset`. Source CRUD is exposed via `RuntimeStateDb`
+methods (`upsert_source`, `delete_source`, `list_sources`, `get_source`,
+`find_source_by_root_or_url`).
+
 ### Document
 One logical content unit produced from a source: a file, a fetched page, later one message/thread.
 

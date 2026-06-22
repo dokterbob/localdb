@@ -15,7 +15,9 @@ pub mod schema;
 pub use loader::{load_config, load_config_from_str, ConfigLoader, LoadOptions};
 pub use platform::PlatformPaths;
 pub use policy::compute_policy_version;
-pub use runtime_state::{ConfigOwnership, EffectiveConfig, RuntimeStateDb};
+pub use runtime_state::{
+    ConfigOwnership, EffectiveConfig, EffectiveStore, RuntimeSource, RuntimeStateDb, RuntimeStore,
+};
 pub use schema::{
     ChunkingPolicy, DefaultsConfig, EmbeddingPolicy, IndexingPolicyConfig, PathsConfig,
     ProviderConfig, RawConfig, ServerConfig, SourceConfig, StoreConfig,

@@ -21,7 +21,6 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
-redb = "4"
 fd-lock = "4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 indicatif = { workspace = true }

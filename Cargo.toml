@@ -58,7 +58,7 @@ directories = "6"
 dirs = "6"
 
 # Embedded runtime-state DB
-redb = "4"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Hashing for policy_version
 hex = "0.4"

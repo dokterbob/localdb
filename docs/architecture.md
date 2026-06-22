@@ -159,8 +159,8 @@ daemon is running and responsive, the command routes over HTTP. If not, the stor
 in-process (mmapped LanceDB; embeddings come from the configured embedder, defaulting to the
 local ONNX model). No configuration is needed for the common case. See [specs/01-architecture.md](../specs/01-architecture.md) §3.
 
-**Important:** the thin-client routing is not reachable today because CLI commands open the
-runtime-state database before completing the probe — see [Known gaps §3](#known-gaps).
+**Note:** thin-client routing to the daemon is partially implemented; the daemon's in-memory
+store is not yet backed by LanceDB — see [Known gaps §2](#known-gaps).
 
 ---
 
@@ -175,8 +175,8 @@ The config file and the data directory are independent paths (`--config` /
   config.yaml                  # YAML config (version: 1)
 
 <data_dir>/
-  cli-sources.redb             # redb: source records created via CLI
-  runtime-state.redb           # redb: runtime stores, daemon state
+  runtime-state.db             # SQLite (WAL): runtime stores + source records
+  .write.lock                  # advisory fd-lock: LanceDB single-writer gate
   stores/
     <store_name>/
       chunks.lance             # LanceDB table: chunks + BM25 FTS + vectors
@@ -249,15 +249,14 @@ operates on the in-memory store regardless of what the CLI has indexed into Lanc
 The daemon is an experimental preview; do not rely on it for search correctness today.
 Plumbing the `LanceDbStore` into `AppState` is the remaining work.
 
-**3. CLI commands are blocked while the daemon runs.** ([#10](https://github.com/dokterbob/localdb/issues/10), [#11](https://github.com/dokterbob/localdb/issues/11))
-Every CLI command opens `runtime-state.redb` before completing the daemon probe, so running
-any CLI command while `localdb serve` is active returns `error: internal error ... Database
-already open. Cannot acquire lock.` (exit 1). The spec's thin-client routing path
-(`cli/src/lib.rs`, daemon probe) exists in the code but is unreachable. Additionally, the
-probe falls back to `http://127.0.0.1:7700` (cannot read the URL from the real unix socket),
-so it assumes the default port. A stale `daemon.sock` left by a killed daemon causes CLI to
-report "daemon running" and `search` to exit with 5 "daemon is unreachable"; fix by removing
-the socket file manually.
+**3. CLI commands can run while the MCP server or daemon is active.** ([#67](https://github.com/dokterbob/localdb/issues/67) — fixed)
+The runtime-state registry is now backed by SQLite in WAL mode (`runtime-state.db`). Multiple
+processes (MCP server, CLI, daemon) can read simultaneously; writers serialise via SQLite's
+2 s busy-timeout. The former `redb` backing (which held an exclusive OS file lock for the
+entire lifetime of the handle) has been removed. **Clean break:** existing `*.redb` files are
+abandoned — re-add stores with `localdb store add` and sources with `localdb source add`.
+A stale `daemon.sock` left by a killed daemon still causes CLI to report "daemon running" and
+`search` to exit 5 "daemon is unreachable"; fix by removing the socket file manually.
 
 **4. YAML-declared stores cannot be indexed.** ([#12](https://github.com/dokterbob/localdb/issues/12))
 Stores declared in `config.yaml` under the `stores:` key appear in `localdb store list` as
