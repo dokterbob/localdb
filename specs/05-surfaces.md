@@ -23,7 +23,7 @@ Single binary, subcommand tree. Global flags: `--config`, `--json`, `--store <na
 | `store add/list/remove` | Manage runtime-owned stores | direct write (takes write lock) | routed to daemon |
 | `source add/list/remove` | Manage sources on a store | direct write | routed to daemon |
 | `index [--store S] [--source ID] [--strict]` | One-shot scan & index; creates IndexJob | runs job synchronously, progress to stderr | submits job, polls, streams progress |
-| `search <query>` | Hybrid search with citations | embedded read | via API |
+| `search <query>...` | Hybrid search with citations (options-first: flags must precede query words; trailing tokens are captured verbatim as the query) | embedded read | via API |
 
 Output: human-readable by default (citations as `uri:heading_path` + snippet), `--json` emits the
 canonical structures for scripting. The CLI is **command-oriented**; interactive browse is a

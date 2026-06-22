@@ -415,19 +415,24 @@ Hybrid search with citations.
 ```
 Hybrid search with citations
 
-Usage: localdb search [OPTIONS] <QUERY>
+Usage: localdb search [OPTIONS] <QUERY>...
 
 Arguments:
-  <QUERY>  Natural language query
+  <QUERY>...  Natural language query (no quotes needed; flags must precede the query)
 
 Options:
-      --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
-      --limit <LIMIT>  Maximum number of results to return [default: 10]
-      --json           Emit JSON output instead of human-readable text
-      --store <NAME>   Operate on this store (repeatable; defaults to all stores)
-  -h, --help           Print help
-  -V, --version        Print version
+      --config <PATH>   Path to config file (default: platform data dir / localdb / config.yaml)
+      --limit <LIMIT>   Maximum number of results to return [default: 10]
+      --json            Emit JSON output instead of human-readable text
+  -s, --store <NAME>    Operate on this store (repeatable; defaults to all stores)
+  -h, --help            Print help
+  -V, --version         Print version
 ```
+
+> **Options-first:** flags (`--limit`, `--store`, `-s`, `--json`) must appear
+> **before** the query words. Anything after the first query word is captured
+> verbatim as query text — so `localdb search --limit 5 rank fusion` works, but
+> `localdb search rank fusion --limit 5` treats `--limit 5` as part of the query.
 
 Runs hybrid BM25 + dense-vector search across the targeted stores and returns
 ranked citations. The Citation JSON shape is documented in
@@ -439,7 +444,7 @@ similarity from the configured ONNX embedder; `fused` is the final RRF score.
 **Examples:**
 
 ```
-$ localdb search "how does rust handle errors"
+$ localdb search how does rust handle errors
 1. file:///home/user/notes/rust-error-handling.md > Error handling in Rust
    Error handling in Rust
 Rust uses the Result type for recoverable errors and panic! for unrecoverable ones. The question-
@@ -455,7 +460,7 @@ LanceDB is an embedded vector database built on the Lance columnar format. It su
 (paths shown from a scratch run)
 
 ```
-$ localdb search "rank fusion" --limit 2
+$ localdb search --limit 2 rank fusion
 1. file:///home/user/notes/meeting.txt
    Meeting 2026-06-02: decided to adopt reciprocal rank fusion for combining dense and sparse retrieval results. Aardvark c
 
@@ -467,7 +472,7 @@ Rust uses the Result type for recoverable errors and panic! for unrecoverable on
 JSON output (full citation shape):
 
 ```
-$ localdb search "hybrid search" --store notes --json
+$ localdb search -s notes --json hybrid search
 {
   "citations": [
     {

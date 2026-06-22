@@ -31,7 +31,7 @@ pub struct Cli {
     pub json: bool,
 
     /// Operate on this store (repeatable; defaults to all stores).
-    #[arg(long = "store", global = true, value_name = "NAME")]
+    #[arg(long = "store", short = 's', global = true, value_name = "NAME")]
     pub stores: Vec<String>,
 
     /// Skip confirmation prompts for destructive operations.
@@ -91,8 +91,10 @@ pub enum Command {
 
     /// Hybrid search with citations.
     Search {
-        /// Natural language query.
-        query: String,
+        /// Natural language query (no quotes needed; everything after the
+        /// options is treated as the query).
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+        query: Vec<String>,
 
         /// Maximum number of results to return (must be >= 1).
         #[arg(long, default_value = "10", value_parser = clap::value_parser!(usize))]
@@ -185,7 +187,7 @@ fn main() {
             dir,
             strict,
         } => cli::run_index(&ctx, source.as_deref(), dir.as_deref(), *strict),
-        Command::Search { query, limit } => cli::run_search(&ctx, query, *limit),
+        Command::Search { query, limit } => cli::run_search(&ctx, &query.join(" "), *limit),
     }
 }
 
@@ -262,6 +264,38 @@ mod tests {
                 sub_names.contains(expected),
                 "source {expected} subcommand missing; found: {sub_names:?}",
             );
+        }
+    }
+
+    /// Unquoted multi-word query is joined into a single string.
+    #[test]
+    fn search_query_trailing_var_arg() {
+        let cli = Cli::try_parse_from(["localdb", "search", "machine", "learning"]).unwrap();
+        if let Command::Search { query, limit } = cli.command {
+            assert_eq!(query.join(" "), "machine learning");
+            assert_eq!(limit, 10);
+        } else {
+            panic!("expected Search command");
+        }
+    }
+
+    /// `-s` short flag populates `stores`.
+    #[test]
+    fn short_store_flag() {
+        let cli = Cli::try_parse_from(["localdb", "-s", "notes", "search", "foo"]).unwrap();
+        assert_eq!(cli.stores, vec!["notes"]);
+    }
+
+    /// `-s` short flag works as a subcommand-level option too.
+    #[test]
+    fn short_store_flag_after_subcommand() {
+        let cli = Cli::try_parse_from(["localdb", "search", "-s", "notes", "neural", "networks"])
+            .unwrap();
+        assert_eq!(cli.stores, vec!["notes"]);
+        if let Command::Search { query, .. } = cli.command {
+            assert_eq!(query.join(" "), "neural networks");
+        } else {
+            panic!("expected Search command");
         }
     }
 
