@@ -37,6 +37,21 @@ single mature Rust extraction stack covers these well; shipping a sharp matrix
 beats shipping a ragged one. Unsupported files are skipped and counted in IndexJob stats, not
 errors. Roadmap: [06-roadmap.md](06-roadmap.md) §5.
 
+**Extension-gated acceptance:** The `PlaintextParser` (and by extension the full parser chain)
+only accepts files whose extension or basename matches the list published by
+`extract::supported_extensions()` (text and code/data extensions, plus known lockfile
+basenames such as `Cargo.lock`).  Files with unknown or binary extensions — `.exe`, `.png`,
+`.bin`, etc. — are declined at the parser level and counted as `unsupported_format` in
+`IndexJobStats` without ever entering the chunker or embedder.  This prevents indexing
+hangs caused by chunkers receiving arbitrarily large binary blobs.
+
+**Default include allowlist for directory sources:** When a `path` source points to a
+directory and no explicit `include` globs have been set, `cli` automatically applies
+`DEFAULT_PATH_INCLUDES` — a glob list derived from `extract::supported_extensions()` —
+so that file-system enumeration skips unsupported files before they ever reach the
+extraction layer.  Single-file sources are not affected (they carry an exact filename
+glob).  Sources added via explicit `include` override this default entirely.
+
 **Three-way per-document classification:**
 
 | Outcome | Error variant | Counter | Behavior |
@@ -72,6 +87,26 @@ Per-source-kind presets, applied per source:
 | `prose` (default) | `MarkdownSplitter` (`benbrandt/text-splitter`) on Markdown semantic boundaries — headings, code blocks, lists, paragraphs, sentences, words; preserves document order; `heading_path` attributed per chunk | target ≈ 256 tokens, overlap ≈ 0 tokens |
 | `messages` (reserved for connectors) | Thread/turn windows: N consecutive messages per chunk, sliding | window 6 turns, stride 3 |
 | `code` | Structural (function/item-level) where parseable, else line blocks | target ≈ 60 lines |
+
+**Per-file auto-selection of chunk preset:** Rather than applying one preset uniformly
+across all files in a source, `index_document` in `core` selects the chunk preset
+**per file** based on the detected file type:
+
+- Markdown, HTML, PDF, and plain-text prose files → `prose` preset (`MarkdownSplitter`).
+- Code, data, and lockfiles (`.rs`, `.py`, `.json`, `.toml`, `Cargo.lock`, etc.) → `code` preset.
+
+The source-level preset (from config or the `--preset` CLI flag) acts as a default/override:
+if it is explicitly set to something other than `prose`, the source preset takes precedence.
+This per-file routing avoids feeding large minified JSON or source files into the prose
+splitter (which can hang on structureless, line-free content).
+
+**`chunk_prose` structureless fallback:** When `MarkdownSplitter` produces a single chunk
+covering the whole document (a sign that the content lacks Markdown structure), `chunk_prose`
+falls back to the `code` chunker so that the file is still indexed in bounded chunks.
+
+**`chunk_code` long-line split:** `chunk_code` enforces a per-line byte limit. Lines
+exceeding the limit are split into fixed-width sub-segments before chunking, preventing
+single-line binary or minified content from producing unbounded chunk sizes.
 
 Chunk sizing for `prose` is **token-accurate**, measured using the embedding model's own tokenizer
 (the default model `pplx-embed-context-v1-0.6b` supports up to 32K tokens; localdb caps its

@@ -499,10 +499,22 @@ pub async fn index_document(
         Some(f) => Box::new(TokenSizer::new(f.clone())),
         None => Box::new(CharSizer),
     };
+
+    // Layer A: per-file preset routing — override config.chunker if file is code/data.
+    let effective_chunker = {
+        use crate::chunker::preset_for;
+        let file_preset = preset_for(input.filename.as_deref(), input.mime.as_deref());
+        if file_preset == "code" {
+            ChunkerConfig::code()
+        } else {
+            config.chunker.clone()
+        }
+    };
+
     let chunker_cfg = if token_counter.is_none() {
-        scale_to_chars(&config.chunker)
+        scale_to_chars(&effective_chunker)
     } else {
-        config.chunker.clone()
+        effective_chunker.clone()
     };
     let chunk_outputs = catch_panic(
         "chunk",
@@ -3205,5 +3217,63 @@ mod tests {
         assert_eq!(result.docs_indexed, 2);
         assert_eq!(result.docs_seen, 2);
         assert_eq!(result.docs_skipped, 0);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression tests: per-file preset routing (only-index-supported-files)
+    // ---------------------------------------------------------------------------
+
+    /// Regression: a JSON document must be routed to the code chunker, not prose.
+    ///
+    /// Before the fix, `index_document` always used `config.chunker` (prose by
+    /// default) for every file regardless of extension. For a ~2600-char JSON
+    /// file, the prose chunker (CharSizer, target 256×4 = 1024 chars) produces
+    /// ~3 chunks, while the code chunker (target 3000 chars) fits it into 1 chunk.
+    /// Asserting `chunks_written == 1` proves the code preset was applied.
+    #[tokio::test]
+    async fn regression_json_document_uses_code_preset() {
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let extractor = FakeExtractor;
+        let store_id = "store-json-preset";
+        // IngestionConfig deliberately uses prose so any code-preset behaviour
+        // must come from preset_for routing inside index_document.
+        let config = make_ingestion_config(store_id);
+        let source = make_path_source(store_id, "/data", vec![]);
+
+        // ~100 lines × 26 chars ≈ 2600 chars total.
+        // Code target (3000) → 1 chunk; prose target (1024 with CharSizer) → ~3 chunks.
+        let line = "{\"key\":\"value\",\"foo\":123}\n";
+        let content = line.repeat(100);
+        assert!(
+            content.chars().count() > 1024,
+            "content must exceed prose target to distinguish presets"
+        );
+        assert!(
+            content.chars().count() < 3000,
+            "content must fit within code target to produce exactly 1 chunk"
+        );
+
+        let input = DocumentInput {
+            uri: "file:///data/config.json".to_string(),
+            bytes: content.into_bytes(),
+            filename: Some("data.json".to_string()),
+            mime: None,
+            fetched_at: "2026-06-21T00:00:00Z".to_string(),
+            source,
+        };
+
+        let doc_index = DocumentIndex::new();
+        let output = index_document(&input, &doc_index, &store, &embedder, &config, &extractor)
+            .await
+            .unwrap();
+
+        assert!(output.was_indexed, "JSON document must be indexed");
+        assert_eq!(
+            output.chunks_written, 1,
+            "JSON document must use code preset (1 chunk for ~2600 chars, target 3000); \
+             got {} chunks — prose preset would produce ~3",
+            output.chunks_written
+        );
     }
 }

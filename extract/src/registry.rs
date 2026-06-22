@@ -106,10 +106,9 @@ mod tests {
         let ids = vec!["markdown".to_string(), "plaintext".to_string()];
         let chain = build_chain(&ids).unwrap();
         let probe = Probe::new(b"%PDF-1.4\n%%EOF", Some("report.pdf"), None);
-        // PdfParser is not in the chain, so even though magic matches, it returns None
-        // from MarkdownParser and PlaintextParser (plaintext accepts UTF-8, but this
-        // is valid ASCII so plaintext WILL accept it).
-        // Let's just check it doesn't crash.
+        // PdfParser is not in the chain. MarkdownParser declines .pdf extension.
+        // PlaintextParser now also declines .pdf (not in its recognized list).
+        // Result: chain returns Ok(None) — no crash.
         let result = chain.parse(&probe);
         assert!(result.is_ok());
     }
