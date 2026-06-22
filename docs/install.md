@@ -4,7 +4,9 @@
 
 ## Prerequisites
 
-localdb requires **Rust 1.82 or later**. The easiest way to install and manage Rust is
+localdb requires **Rust 1.82 or later** (Linux) or **Rust 1.85 or later** (macOS, because
+CoreML is built automatically and pulls edition-2024 `hf-hub` 1.0). The easiest way to
+install and manage Rust is
 [rustup](https://rustup.rs/):
 
 ```bash
@@ -18,11 +20,14 @@ Linux and links only system libraries on macOS.
 
 The release workflow produces binaries for:
 
-| Platform | Target triple |
-|---|---|
-| macOS Apple Silicon | `aarch64-apple-darwin` |
-| Linux x86_64 | `x86_64-unknown-linux-gnu` |
-| Linux arm64 | `aarch64-unknown-linux-gnu` |
+| Platform | Target triple | Embedding backend |
+|---|---|---|
+| macOS Apple Silicon | `aarch64-apple-darwin` | CoreML (ANE/GPU) built in, ONNX fallback |
+| Linux x86_64 | `x86_64-unknown-linux-gnu` | ONNX CPU |
+| Linux arm64 | `aarch64-unknown-linux-gnu` | ONNX CPU |
+
+The macOS binary includes CoreML acceleration automatically — no `--features` flag or config
+change is required. See [release-engineering.md](release-engineering.md) for pipeline details.
 
 ## Install from a pre-built tarball
 

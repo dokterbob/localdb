@@ -69,6 +69,9 @@ jobs:
             ${{ runner.os }}-${{ matrix.target }}-release-
 
       - name: Build release binary
+        # CoreML is auto-enabled on aarch64-apple-darwin via cli/Cargo.toml's
+        # [target.'cfg(target_os = "macos")'.dependencies] — no --features flag needed.
+        # Linux targets build ONNX-only; the macOS target-dep is ignored on Linux.
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: |
