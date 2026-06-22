@@ -31,6 +31,7 @@ use lancedb::index::{scalar::BTreeIndexBuilder, vector::IvfFlatIndexBuilder, Ind
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::{connect, DistanceType, Table};
 
+use localdb_core::ingestion::DocumentRecord;
 use localdb_core::store::{ChunkRecord, MetadataFilter, RetrievalStore, SearchResult, StoreStats};
 use localdb_core::types::Span;
 use localdb_core::{Error, VectorEncoding};
@@ -906,6 +907,91 @@ impl RetrievalStore for LanceDbStore {
         }
         Ok(records)
     }
+
+    async fn list_indexed_documents(&self) -> Result<Vec<DocumentRecord>, Error> {
+        let chunk_count = self
+            .table
+            .count_rows(None)
+            .await
+            .map_err(|e| Error::Internal {
+                message: format!("LanceDB count_rows failed: {e}"),
+                correlation_id: "list-docs-count".to_string(),
+            })?;
+
+        if chunk_count == 0 {
+            return Ok(vec![]);
+        }
+
+        let stream = self
+            .table
+            .query()
+            .select(lancedb::query::Select::columns(&[
+                COL_URI,
+                COL_DOCUMENT_ID,
+                COL_CONTENT_HASH,
+                COL_POLICY_VERSION,
+            ]))
+            .execute()
+            .await
+            .map_err(|e| Error::Internal {
+                message: format!("LanceDB list_indexed_documents query failed: {e}"),
+                correlation_id: "list-docs-query".to_string(),
+            })?;
+
+        let batches: Vec<RecordBatch> =
+            stream.try_collect().await.map_err(|e| Error::Internal {
+                message: format!("LanceDB list_indexed_documents stream failed: {e}"),
+                correlation_id: "list-docs-stream".to_string(),
+            })?;
+
+        let mut seen: std::collections::HashMap<String, DocumentRecord> =
+            std::collections::HashMap::new();
+        for batch in &batches {
+            let uri_col = batch
+                .column_by_name(COL_URI)
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let doc_id_col = batch
+                .column_by_name(COL_DOCUMENT_ID)
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let hash_col = batch
+                .column_by_name(COL_CONTENT_HASH)
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let policy_col = batch
+                .column_by_name(COL_POLICY_VERSION)
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+
+            if let (Some(uris), Some(doc_ids), Some(hashes), Some(policies)) =
+                (uri_col, doc_id_col, hash_col, policy_col)
+            {
+                for row in 0..batch.num_rows() {
+                    if uris.is_null(row) {
+                        continue;
+                    }
+                    let uri = uris.value(row).to_string();
+                    seen.entry(uri.clone()).or_insert(DocumentRecord {
+                        uri,
+                        document_id: if doc_ids.is_null(row) {
+                            String::new()
+                        } else {
+                            doc_ids.value(row).to_string()
+                        },
+                        content_hash: if hashes.is_null(row) {
+                            String::new()
+                        } else {
+                            hashes.value(row).to_string()
+                        },
+                        policy_version: if policies.is_null(row) {
+                            String::new()
+                        } else {
+                            policies.value(row).to_string()
+                        },
+                    });
+                }
+            }
+        }
+
+        Ok(seen.into_values().collect())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1736,5 +1822,116 @@ mod tests {
             msg.contains("encoding mismatch") || msg.contains("Float32") || msg.contains("Binary"),
             "error should describe the encoding mismatch: {msg}"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // list_indexed_documents tests
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn list_indexed_documents_empty_store() {
+        let (store, _dir) = fresh_store().await;
+        let records = store.list_indexed_documents().await.unwrap();
+        assert!(records.is_empty(), "empty store must return empty vec");
+    }
+
+    #[tokio::test]
+    async fn list_indexed_documents_returns_one_record_per_document() {
+        let (store, _dir) = fresh_store().await;
+
+        // Two documents, two chunks each.
+        let doc1_chunk1 = make_record(
+            "c1",
+            "doc-1",
+            "store-1",
+            "first chunk of doc1",
+            vec![1.0, 0.0, 0.0, 0.0],
+        );
+        let mut doc1_chunk2 = make_record(
+            "c2",
+            "doc-1",
+            "store-1",
+            "second chunk of doc1",
+            vec![0.9, 0.1, 0.0, 0.0],
+        );
+        doc1_chunk2.uri = doc1_chunk1.uri.clone();
+        doc1_chunk2.content_hash = doc1_chunk1.content_hash.clone();
+        doc1_chunk2.policy_version = doc1_chunk1.policy_version.clone();
+
+        let mut doc2_chunk1 = make_record(
+            "c3",
+            "doc-2",
+            "store-1",
+            "first chunk of doc2",
+            vec![0.0, 1.0, 0.0, 0.0],
+        );
+        doc2_chunk1.uri = "file:///doc2.md".to_string();
+        doc2_chunk1.content_hash = "hash-doc2".to_string();
+
+        let mut doc2_chunk2 = make_record(
+            "c4",
+            "doc-2",
+            "store-1",
+            "second chunk of doc2",
+            vec![0.0, 0.9, 0.1, 0.0],
+        );
+        doc2_chunk2.uri = doc2_chunk1.uri.clone();
+        doc2_chunk2.content_hash = doc2_chunk1.content_hash.clone();
+        doc2_chunk2.policy_version = doc2_chunk1.policy_version.clone();
+        doc2_chunk2.document_id = doc2_chunk1.document_id.clone();
+
+        store
+            .upsert_chunks(vec![
+                doc1_chunk1.clone(),
+                doc1_chunk2,
+                doc2_chunk1,
+                doc2_chunk2,
+            ])
+            .await
+            .unwrap();
+
+        let records = store.list_indexed_documents().await.unwrap();
+        assert_eq!(records.len(), 2, "two documents → two records");
+
+        // Look up by URI for deterministic assertions regardless of order.
+        let rec1 = records
+            .iter()
+            .find(|r| r.uri == doc1_chunk1.uri)
+            .expect("doc1 record missing");
+        let rec2 = records
+            .iter()
+            .find(|r| r.uri == "file:///doc2.md")
+            .expect("doc2 record missing");
+
+        assert_eq!(rec1.document_id, "doc-1");
+        assert_eq!(rec1.content_hash, doc1_chunk1.content_hash);
+        assert_eq!(rec1.policy_version, "v1");
+        assert_eq!(rec2.document_id, "doc-2");
+        assert_eq!(rec2.content_hash, "hash-doc2");
+    }
+
+    #[tokio::test]
+    async fn list_indexed_documents_correct_hashes_and_policy() {
+        let (store, _dir) = fresh_store().await;
+
+        let mut record = make_record(
+            "chunk-1",
+            "doc-abc",
+            "store-1",
+            "some text",
+            vec![0.5, 0.5, 0.0, 0.0],
+        );
+        record.uri = "file:///unique.md".to_string();
+        record.content_hash = "deadbeef123".to_string();
+        record.policy_version = "policy-v2".to_string();
+
+        store.upsert_chunks(vec![record]).await.unwrap();
+
+        let records = store.list_indexed_documents().await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].uri, "file:///unique.md");
+        assert_eq!(records[0].document_id, "doc-abc");
+        assert_eq!(records[0].content_hash, "deadbeef123");
+        assert_eq!(records[0].policy_version, "policy-v2");
     }
 }

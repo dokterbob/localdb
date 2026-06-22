@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::ids::{ContentId, UlidId};
+use crate::ingestion::DocumentRecord;
 use crate::parser::DocumentMetadata;
 use crate::types::{Chunk, Span};
 use crate::Error;
@@ -254,6 +255,13 @@ pub trait RetrievalStore: Send + Sync + 'static {
 
     /// Retrieve all chunks for a given document.
     async fn get_chunks_for_document(&self, document_id: &str) -> Result<Vec<ChunkRecord>, Error>;
+
+    /// Enumerate per-document indexing identity for every distinct document in the
+    /// store. Used to rehydrate the incremental-skip index across process runs.
+    ///
+    /// One record per distinct URI (first chunk wins). Implementations must NOT
+    /// return the embedding column to avoid loading vectors for the entire store.
+    async fn list_indexed_documents(&self) -> Result<Vec<DocumentRecord>, Error>;
 }
 
 // ---------------------------------------------------------------------------
@@ -470,6 +478,20 @@ impl RetrievalStore for FakeStore {
             .filter(|c| c.document_id == document_id)
             .cloned()
             .collect())
+    }
+
+    async fn list_indexed_documents(&self) -> Result<Vec<DocumentRecord>, Error> {
+        let chunks = self.chunks.read().await;
+        let mut seen: HashMap<String, DocumentRecord> = HashMap::new();
+        for chunk in chunks.iter() {
+            seen.entry(chunk.uri.clone()).or_insert(DocumentRecord {
+                uri: chunk.uri.clone(),
+                document_id: chunk.document_id.clone(),
+                content_hash: chunk.content_hash.clone(),
+                policy_version: chunk.policy_version.clone(),
+            });
+        }
+        Ok(seen.into_values().collect())
     }
 }
 
