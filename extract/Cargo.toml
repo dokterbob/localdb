@@ -27,3 +27,9 @@ infer = "0.16"
 mime_guess = "2"
 # EPUB parsing — read-only, so default features (write/threadsafe/prelude) are off.
 rbook = { version = "0.7", default-features = false }
+
+tracing = { workspace = true }
+
+[dev-dependencies]
+# Used in tests to build synthetic EPUBs (already in the lockfile via rbook).
+zip = { version = "2", default-features = false, features = ["deflate"] }
