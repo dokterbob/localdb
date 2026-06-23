@@ -44,6 +44,24 @@ fn html_to_markdown(html: &str) -> Result<String, Error> {
     }
 }
 
+/// Convert a full XHTML/HTML document or fragment to Markdown **without**
+/// readability main-content selection.
+///
+/// `extract_html` prunes to the main content (`<article>`/`<main>`), which is
+/// correct for web pages but over-strips simple EPUB chapter XHTML, where the
+/// whole `<body>` is the content. This sibling converts the bytes verbatim.
+/// Keeping it here ensures all HTML→Markdown conversion lives in one module.
+pub(crate) fn xhtml_to_markdown(bytes: &[u8]) -> Result<String, Error> {
+    let opts = ConversionOptions::default();
+    match convert_bytes(bytes, "html", &opts) {
+        Ok(result) => Ok(result.markdown),
+        Err(e) => Err(Error::ExtractionFailed {
+            format: "xhtml".into(),
+            reason: e.to_string(),
+        }),
+    }
+}
+
 /// Extract the text content of the `<title>` element.
 fn extract_page_title(document: &Html) -> Option<String> {
     let selector = Selector::parse("title").ok()?;
@@ -198,6 +216,25 @@ mod tests {
         assert!(
             md.contains("Second content") || md.contains("Second Article"),
             "second article should be extracted"
+        );
+    }
+
+    #[test]
+    fn xhtml_to_markdown_keeps_full_body_no_readability_stripping() {
+        // A page where readability WOULD drop the <nav>; xhtml_to_markdown must keep it.
+        let xhtml = br#"<html><body>
+            <nav>Sidebar link</nav>
+            <h1>Chapter Title</h1>
+            <p>Body paragraph text.</p>
+        </body></html>"#;
+        let md = xhtml_to_markdown(xhtml).unwrap();
+        assert!(
+            md.contains("Body paragraph text"),
+            "body content must be present: {md}"
+        );
+        assert!(
+            md.contains("Sidebar link"),
+            "no readability pruning — nav content must be retained: {md}"
         );
     }
 

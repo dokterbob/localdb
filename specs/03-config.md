@@ -39,9 +39,9 @@ defaults:                 # global indexing policy; stores inherit
       #   HF_TOKEN, ~2.4 GB); model: bge-small-en-v1.5 (384-dim, no creds).
       # Hosted alternative: provider: perplexity, model: pplx-embed-context-v1
       #   (requires providers: entry with kind: perplexity and api_key_env set).
-    parsers: [pdf, html, markdown, plaintext]  # tried in order, first match wins;
-                                               #   ids: pdf|html|markdown|plaintext; order is
-                                               #   load-bearing (affects policy_version, §2)
+    parsers: [pdf, epub, office, html, markdown, plaintext]  # tried in order, first match wins;
+                                               #   ids: pdf|epub|office|html|markdown|plaintext;
+                                               #   order is load-bearing (affects policy_version, §2)
 
 stores:
   - name: notes
@@ -80,8 +80,8 @@ they version together: any change to a store's effective `indexing` policy chang
 and embedding knobs — allows silently incoherent combinations and unclear reindex semantics.
 
 `parsers` is an ordered list of parser IDs tried in sequence; the first parser to return a
-document wins (chain of responsibility). The four valid IDs are `pdf`, `html`, `markdown`, and
-`plaintext`; any unknown ID is a hard error at config load (consistent with §5 strict
+document wins (chain of responsibility). The valid IDs are `pdf`, `epub`, `office`, `html`,
+`markdown`, and `plaintext`; any unknown ID is a hard error at config load (consistent with §5 strict
 unknown-key rejection). Order is load-bearing — placing `plaintext` before `html` would cause
 `.html` files to be parsed as plain text — and **parser order is part of the `policy_version`
 hash** (unlike `chunking`/`embedding` keys, which are hashed order-independently; see

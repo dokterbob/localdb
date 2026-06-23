@@ -6,10 +6,16 @@
 ## 1. Entity overview
 
 ```
-Store 1──* Source 1──* Document 1──* Block 1──* Chunk
-                            │                      │
-                       IndexJob               Citation (view over Chunk + Document)
+Store 1──* Source 1──* Document 1──* Chunk
+                            │            │
+                       IndexJob     Citation (view over Chunk + Document)
 ```
+
+Extraction produces a single normalized **Markdown string** per document, not a nested
+structural tree. The chunker (`MarkdownSplitter`) consumes that string directly, and per-chunk
+`heading_path` is *derived* from the Markdown heading structure (`core/src/heading_index.rs`),
+not from a stored intermediate. The older `Block`/`BlockKind` representation was removed in the
+Markdown-native migration (commit `3da56d0`).
 
 ## 2. Entities
 
@@ -56,11 +62,12 @@ One logical content unit produced from a source: a file, a fetched page, later o
 | `provenance` | See §4. |
 | `meta` | Open key-value extension point (string → JSON). Message fields live here later (§5). |
 
-### Block
-An intermediate structural unit from extraction (heading section, paragraph group, code block,
-list). Blocks preserve document structure so chunkers can respect it; they are **not stored in the
-retrieval backend**, only chunks are. Fields: `document_id`, `ordinal`, `kind`, `text`,
-`span` (byte/char range in the normalized text), `heading_path` (e.g. `["API", "Auth"]`).
+### Normalized Markdown (intermediate representation)
+Extraction normalizes every format to a single **Markdown string** (`ParsedDocument.markdown`).
+This string is the document's intermediate representation: the chunker indexes spans directly
+into it, and `heading_path` (e.g. `["API", "Auth"]`) is derived on demand from the Markdown
+heading structure via `core/src/heading_index.rs`. There is no stored block tree — the former
+`Block`/`BlockKind` type was deleted in the Markdown-native migration (commit `3da56d0`).
 
 ### Chunk
 The retrieval unit: what gets embedded and indexed.
@@ -71,7 +78,7 @@ The retrieval unit: what gets embedded and indexed.
 | `document_id`, `store_id` | Ownership. |
 | `text` | Chunk text (also feeds BM25). |
 | `span` | Range in the normalized document text — the citation anchor. |
-| `heading_path` | Inherited from blocks; shown in citations. |
+| `heading_path` | Derived from the Markdown heading structure (`core/src/heading_index.rs`); shown in citations. |
 | `embedding` | Dense vector (in backend, not in core serialization). |
 | `policy_version` | Hash of the indexing policy that produced it ([04-search-pipeline.md](04-search-pipeline.md) §4). |
 | `provenance` | Copied from document (§4) — chunks must be self-describing for federation. |
@@ -116,8 +123,8 @@ Every document and every chunk carries:
 MVP defines **no** message connectors, but the mapping is fixed now so `meta` doesn't ossify:
 
 - One **thread** = one Document (URI = e.g. `imap://acct/folder;uid=...` or connector-defined);
-  one **message** = one Block (later chunked by thread/turn windows, see preset `messages` in
-  [03-config.md](03-config.md) §2).
+  one **message** = one Markdown section (later chunked by thread/turn windows, see preset
+  `messages` in [03-config.md](03-config.md) §2).
 - Reserved `meta` keys (namespaced, validated when present): `msg.thread_id`,
   `msg.participants` (list), `msg.sent_at`, `msg.in_reply_to`, `msg.channel`.
 - Thread context is exactly what contextualized embeddings consume
@@ -178,7 +185,8 @@ under `spawn_blocking`. Two methods:
 `ChainParser` implements this same `Parser` trait (Composite pattern), holding an ordered
 `Vec<Box<dyn Parser>>`. It is itself a `Parser` and can be nested. `build_chain(ids)` in
 `extract/src/registry.rs` maps the config `parsers:` strings to concrete `Parser` instances.
-Parser order and the four valid IDs are configured in [03-config.md](03-config.md) §2.
+Parser order and the valid IDs (`pdf`, `epub`, `office`, `html`, `markdown`, `plaintext`) are
+configured in [03-config.md](03-config.md) §2.
 
 ### Probe
 
@@ -198,8 +206,7 @@ The successful output of a `parse` call.
 
 | Field | Notes |
 |---|---|
-| `text` | Normalized document text. All block spans index into this string. |
-| `blocks` | Structural `Block`s (§2) in document order. |
+| `markdown` | Normalized document text as a Markdown string (§2). All chunk spans index into this string; it is the sole content IR — there is no separate block list. |
 | `title` | Title from extraction (typed fast-path; also available via `metadata.title`). |
 | `metadata` | `DocumentMetadata` — Dublin Core elements (see below). |
 

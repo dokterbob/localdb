@@ -249,6 +249,50 @@ fn scanned_pdf_fixture_returns_err() {
 }
 
 // ---------------------------------------------------------------------------
+// EPUB golden tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn epub_fixture_chapters_in_reading_order() {
+    let bytes = include_bytes!("fixtures/sample.epub");
+    let ex = ChainExtractor::with_defaults().unwrap();
+    let result = ex.extract(bytes, Some("sample.epub")).unwrap();
+
+    let one = result
+        .markdown
+        .find("bright cold day")
+        .expect("chapter one text must appear in markdown");
+    let two = result
+        .markdown
+        .find("second chapter continues")
+        .expect("chapter two text must appear in markdown");
+    assert!(
+        one < two,
+        "spine reading order must be preserved (chapter one before chapter two)"
+    );
+}
+
+#[test]
+fn epub_fixture_title_and_metadata() {
+    let bytes = include_bytes!("fixtures/sample.epub");
+    let ex = ChainExtractor::with_defaults().unwrap();
+    let result = ex.extract(bytes, Some("sample.epub")).unwrap();
+
+    assert_eq!(result.title.as_deref(), Some("The Great Adventure"));
+    assert_eq!(
+        result.metadata.creator,
+        vec!["Jane Author".to_string()],
+        "OPF dc:creator must populate metadata.creator"
+    );
+    assert_eq!(result.metadata.language.as_deref(), Some("en"));
+    assert_eq!(
+        result.metadata.identifier.as_deref(),
+        Some("urn:isbn:9781234567890"),
+        "OPF dc:identifier (ISBN) must populate metadata.identifier"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Cross-format: all formats produce non-empty markdown
 // ---------------------------------------------------------------------------
 

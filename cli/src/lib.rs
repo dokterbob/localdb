@@ -1175,6 +1175,8 @@ const DEFAULT_PATH_INCLUDES: &[&str] = &[
     "**/*.htm",
     // PDF
     "**/*.pdf",
+    // EPUB / ebook
+    "**/*.epub",
     // Office formats
     "**/*.docx",
     "**/*.xlsx",
@@ -2895,10 +2897,41 @@ mod tests {
             "include globs should contain **/Cargo.lock"
         );
         assert!(
+            include.iter().any(|s| s == "**/*.epub"),
+            "include globs should contain **/*.epub"
+        );
+        assert!(
             !exclude.is_empty(),
             "directory source should have default excludes"
         );
         assert!(exclude.iter().any(|s| s == "**/.git"));
+    }
+
+    #[test]
+    fn epub_in_folder_is_enumerated_by_default_includes() {
+        // Regression: EPUBs in a directory source were silently skipped because
+        // **/*.epub was missing from DEFAULT_PATH_INCLUDES.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("book.epub"), b"fake epub content").unwrap();
+        std::fs::write(dir.path().join("notes.md"), b"# notes").unwrap();
+
+        let (root, include, exclude) = normalize_path_source(dir.path().to_str().unwrap()).unwrap();
+
+        let found =
+            localdb_core::ingestion::enumerate_path_source(&root, &include, &exclude).unwrap();
+
+        let names: Vec<_> = found
+            .iter()
+            .map(|f| f.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "book.epub"),
+            "book.epub should be enumerated from a directory source; got: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "notes.md"),
+            "notes.md should also be enumerated; got: {names:?}"
+        );
     }
 
     #[test]

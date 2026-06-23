@@ -130,7 +130,7 @@ pub struct IndexingPolicyConfig {
 
     /// Ordered list of parser IDs to try (first match wins).
     ///
-    /// Empty or absent defaults to `["pdf", "office", "html", "markdown", "plaintext"]`.
+    /// Empty or absent defaults to `["pdf", "epub", "office", "html", "markdown", "plaintext"]`.
     /// Unknown IDs are rejected at config validation time.
     /// Order is load-bearing: placing `plaintext` before `html` would cause
     /// HTML files with a `.html` extension to be parsed as plain text.
@@ -151,6 +151,7 @@ impl Default for IndexingPolicyConfig {
 fn default_parser_ids() -> Vec<String> {
     vec![
         "pdf".to_string(),
+        "epub".to_string(),
         "office".to_string(),
         "html".to_string(),
         "markdown".to_string(),
@@ -340,5 +341,18 @@ mod tests {
         let s = ServerConfig::default();
         assert_eq!(s.bind, "127.0.0.1");
         assert_eq!(s.port, 7700);
+    }
+
+    /// This list is duplicated in `extract::registry::default_parser_ids`
+    /// (core cannot depend on extract). The two must stay byte-for-byte
+    /// identical: the order feeds the policy-version hash and the chain's
+    /// first-match priority. Update both lists together.
+    #[test]
+    fn default_parser_ids_match_extract_registry() {
+        assert_eq!(
+            default_parser_ids(),
+            vec!["pdf", "epub", "office", "html", "markdown", "plaintext"],
+            "schema default_parser_ids must match extract::registry::default_parser_ids"
+        );
     }
 }

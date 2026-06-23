@@ -37,6 +37,8 @@ pub fn supported_extensions() -> &'static [&'static str] {
         "htm",
         // PDF
         "pdf",
+        // EPUB / ebook
+        "epub",
         // Office (docx, pptx, odt, ods, odp, csv via anytomd)
         // Note: xlsx and xls are intentionally excluded — anytomd hangs on large
         // spreadsheets; see https://github.com/developer0hye/anytomd-rs/issues/94
@@ -106,9 +108,10 @@ mod tests {
 
     #[test]
     fn supported_extensions_consistent_with_chain() {
-        // The list must include the core text formats.
+        // The list must include the core text formats and every parser that has
+        // a registered default parser id (epub omission caused a folder-walk bug).
         let exts = supported_extensions();
-        for must_have in &["md", "txt", "rs", "json", "pdf", "html"] {
+        for must_have in &["md", "txt", "rs", "json", "pdf", "html", "epub"] {
             assert!(
                 exts.contains(must_have),
                 "supported_extensions should include '{must_have}'"
