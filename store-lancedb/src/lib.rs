@@ -27,7 +27,7 @@ use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt};
 use lance_index::scalar::FullTextSearchQuery;
-use lancedb::index::{scalar::BTreeIndexBuilder, vector::IvfFlatIndexBuilder, Index};
+use lancedb::index::{scalar::BTreeIndexBuilder, vector::IvfFlatIndexBuilder, Index, IndexType};
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::{connect, DistanceType, Table};
 
@@ -206,9 +206,12 @@ impl LanceDbStore {
                 message: format!("LanceDB list_indices failed: {e}"),
                 correlation_id: "lancedb-list-indices".to_string(),
             })?;
-        Ok(indices
-            .iter()
-            .any(|cfg| cfg.columns.iter().any(|c| c == COL_TEXT)))
+        // Match the FTS type explicitly, not just the column: a future scalar
+        // index on `text` must not be mistaken for the full-text index (that would
+        // resurface the "INVERTED index required" failure this guard prevents).
+        Ok(indices.iter().any(|cfg| {
+            cfg.index_type == IndexType::FTS && cfg.columns.iter().any(|c| c == COL_TEXT)
+        }))
     }
 
     /// Create a full-text search index on the `text` column.
@@ -1371,6 +1374,15 @@ mod tests {
             !store.has_fts_index().await.unwrap(),
             "no FTS index before creation"
         );
+
+        // A non-FTS index (BTree on document_id) must not be mistaken for the FTS
+        // index — has_fts_index discriminates on index type, not just column.
+        store.create_document_id_index().await.unwrap();
+        assert!(
+            !store.has_fts_index().await.unwrap(),
+            "BTree index must not count as an FTS index"
+        );
+
         store.create_fts_index().await.unwrap();
         assert!(
             store.has_fts_index().await.unwrap(),
