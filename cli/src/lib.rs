@@ -75,6 +75,10 @@ pub struct CliContext {
     pub stores: Vec<String>,
     /// Whether --yes was given (skip confirmation prompts).
     pub yes: bool,
+    /// Daemon URL override, read once from `LOCALDB_DAEMON_URL` at startup.
+    pub daemon_url: Option<String>,
+    /// Config file path from `LOCALDB_CONFIG` env var, read once at startup.
+    pub config_env: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -140,18 +144,17 @@ fn probe_daemon_health_inner(base_url: &str) -> Option<bool> {
 ///
 /// Returns `DaemonState::Running` if the socket file is present (MVP check).
 /// The base_url is resolved in priority order:
-///   1. `LOCALDB_DAEMON_URL` environment variable (for testing and overrides)
+///   1. `daemon_url_override` (from `LOCALDB_DAEMON_URL`, read once at startup)
 ///   2. Content of `daemon.sock` file (if it contains a URL)
 ///   3. Default `http://127.0.0.1:7700`
 ///
-/// Returns `DaemonState::NotRunning` if neither the env var is set nor the
+/// Returns `DaemonState::NotRunning` if neither the override is set nor the
 /// socket file exists.
-pub fn probe_daemon(data_dir: &Path) -> DaemonState {
-    // Allow tests (and users) to override the daemon URL via env var.
-    if let Ok(url) = std::env::var("LOCALDB_DAEMON_URL") {
-        if !url.is_empty() {
-            return DaemonState::Running { base_url: url };
-        }
+pub fn probe_daemon(data_dir: &Path, daemon_url_override: Option<&str>) -> DaemonState {
+    if let Some(url) = daemon_url_override {
+        return DaemonState::Running {
+            base_url: url.to_string(),
+        };
     }
 
     let socket_path = data_dir.join("daemon.sock");
@@ -448,7 +451,7 @@ fn load_app_db(ctx: &CliContext) -> (ConfigLoader, AppDb) {
         config_path: ctx.config.clone(),
         ..Default::default()
     };
-    let config_loader = match load_config(&options) {
+    let config_loader = match load_config(&options, ctx.config_env.as_deref()) {
         Ok(c) => c,
         Err(e) => exit_err(&e, ctx.json),
     };
@@ -471,12 +474,12 @@ fn load_app_db_lenient(ctx: &CliContext) -> (ConfigLoader, AppDb) {
         config_path: ctx.config.clone(),
         ..Default::default()
     };
-    let config_loader = match load_config(&options) {
+    let config_loader = match load_config(&options, ctx.config_env.as_deref()) {
         Ok(c) => c,
         Err(_) => {
             // Config is malformed/missing — use platform default paths.
             let options_default = LoadOptions::default();
-            match load_config(&options_default) {
+            match load_config(&options_default, None) {
                 Ok(c) => c,
                 Err(e) => exit_err(&e, ctx.json),
             }
@@ -735,7 +738,7 @@ pub fn run_init(ctx: &CliContext) {
     let config_path = ctx
         .config
         .clone()
-        .or_else(|| std::env::var("LOCALDB_CONFIG").ok().map(PathBuf::from))
+        .or_else(|| ctx.config_env.clone())
         .unwrap_or_else(|| platform.config_file.clone());
 
     // F11: If --config was explicitly given but the parent directory doesn't exist,
@@ -763,7 +766,7 @@ pub fn run_init(ctx: &CliContext) {
             config_path: Some(config_path.clone()),
             ..Default::default()
         };
-        match load_config(&options) {
+        match load_config(&options, ctx.config_env.as_deref()) {
             Ok(cl) => (cl.paths.data_dir, cl.paths.models_dir, cl.paths.logs_dir),
             Err(_) => (
                 platform.data_dir.clone(),
@@ -865,7 +868,7 @@ pub fn run_status(ctx: &CliContext) {
     let (config_loader, db) = load_app_db_lenient(ctx);
     let data_dir = &config_loader.paths.data_dir;
 
-    let daemon_status = match probe_daemon(data_dir) {
+    let daemon_status = match probe_daemon(data_dir, ctx.daemon_url.as_deref()) {
         DaemonState::Running { base_url } => format!("running ({})", base_url),
         DaemonState::NotRunning => "not running (embedded mode)".to_string(),
     };
@@ -942,7 +945,7 @@ async fn run_store_add_async(ctx: &CliContext, name: &str) {
     }
 
     // Per specs/05-surfaces.md §2: route to daemon when running.
-    if let DaemonState::Running { base_url } = probe_daemon(data_dir) {
+    if let DaemonState::Running { base_url } = probe_daemon(data_dir, ctx.daemon_url.as_deref()) {
         let url = format!("{}/v1/stores", base_url);
         let body = json!({ "name": name, "visibility": "private", "backend": "lancedb" });
         match daemon_request_async(reqwest::Method::POST, &url, Some(body)).await {
@@ -1114,7 +1117,7 @@ async fn run_store_remove_async(ctx: &CliContext, name: &str) {
     }
 
     // Per specs/05-surfaces.md §2: route to daemon when running.
-    if let DaemonState::Running { base_url } = probe_daemon(data_dir) {
+    if let DaemonState::Running { base_url } = probe_daemon(data_dir, ctx.daemon_url.as_deref()) {
         let url = format!("{}/v1/stores/{}", base_url, name);
         match daemon_request_async(reqwest::Method::DELETE, &url, None).await {
             Ok(v) => {
@@ -1268,7 +1271,7 @@ async fn run_source_add_async(ctx: &CliContext, source_arg: &str) {
     }
 
     // Per specs/05-surfaces.md §2: route to daemon when running.
-    if let DaemonState::Running { base_url } = probe_daemon(data_dir) {
+    if let DaemonState::Running { base_url } = probe_daemon(data_dir, ctx.daemon_url.as_deref()) {
         let (kind, _root, url) = classify_source(source_arg);
         // The handler's CreateSourceRequest expects {kind, spec, preset} where
         // spec is a nested object (see server/src/handlers.rs CreateSourceRequest).
@@ -1380,6 +1383,8 @@ async fn run_source_add_async(ctx: &CliContext, source_arg: &str) {
             json: ctx.json,
             stores: vec![store_name.clone()],
             yes: false,
+            daemon_url: ctx.daemon_url.clone(),
+            config_env: ctx.config_env.clone(),
         };
         run_index_for_source_async(&index_ctx, Some(&src_id), &rt_store_clone).await;
     }
@@ -1632,7 +1637,7 @@ async fn run_source_remove_async(ctx: &CliContext, id: &str) {
     }
 
     // Per specs/05-surfaces.md §2: route to daemon when running.
-    if let DaemonState::Running { base_url } = probe_daemon(data_dir) {
+    if let DaemonState::Running { base_url } = probe_daemon(data_dir, ctx.daemon_url.as_deref()) {
         // Route is DELETE /v1/sources/{id} (see server/src/daemon.rs build_router).
         let url = format!("{}/v1/sources/{}", base_url, id);
         match daemon_request_async(reqwest::Method::DELETE, &url, None).await {
@@ -1742,7 +1747,7 @@ async fn run_index_async(
     let store_name = resolve_store_name(ctx, &config_loader, &db);
 
     // Per specs/05-surfaces.md §2: when daemon is running, submit a job and poll.
-    if let DaemonState::Running { base_url } = probe_daemon(&data_dir) {
+    if let DaemonState::Running { base_url } = probe_daemon(&data_dir, ctx.daemon_url.as_deref()) {
         let url = format!("{}/v1/jobs", base_url);
         let mut body = json!({ "store_name": store_name });
         if let Some(sid) = source_id {
@@ -2016,7 +2021,7 @@ async fn run_search_async(ctx: &CliContext, query: &str, limit: usize) {
     let data_dir = config_loader.paths.data_dir.clone();
 
     // Per specs/05-surfaces.md §2: search routes through the daemon when running.
-    if let DaemonState::Running { base_url } = probe_daemon(&data_dir) {
+    if let DaemonState::Running { base_url } = probe_daemon(&data_dir, ctx.daemon_url.as_deref()) {
         let url = format!("{}/v1/search", base_url);
         let mut body = json!({
             "query": query,
@@ -2230,7 +2235,7 @@ async fn run_serve_async(ctx: &CliContext) {
         config_path: ctx.config.clone(),
         ..Default::default()
     };
-    let config_loader = match load_config(&options) {
+    let config_loader = match load_config(&options, ctx.config_env.as_deref()) {
         Ok(c) => c,
         Err(e) => exit_err(&e, ctx.json),
     };
@@ -2441,7 +2446,10 @@ mod tests {
     #[test]
     fn probe_not_running_without_socket() {
         let dir = TempDir::new().unwrap();
-        assert!(matches!(probe_daemon(dir.path()), DaemonState::NotRunning));
+        assert!(matches!(
+            probe_daemon(dir.path(), None),
+            DaemonState::NotRunning
+        ));
     }
 
     #[test]
@@ -2454,7 +2462,7 @@ mod tests {
         // Empty sock file → default URL http://127.0.0.1:7700 (not listening in tests).
         std::fs::write(&sock_path, b"").unwrap();
         // The health check fails → stale socket cleaned up → NotRunning.
-        let state = probe_daemon(dir.path());
+        let state = probe_daemon(dir.path(), None);
         assert!(
             matches!(state, DaemonState::NotRunning),
             "sock file pointing to a non-listening port should return NotRunning"
@@ -2816,7 +2824,7 @@ mod tests {
         std::fs::write(&sock_path, b"http://127.0.0.1:1").unwrap();
         assert!(sock_path.exists(), "sock file should exist before probe");
 
-        let state = probe_daemon(dir.path());
+        let state = probe_daemon(dir.path(), None);
 
         assert!(
             matches!(state, DaemonState::NotRunning),
@@ -2828,19 +2836,16 @@ mod tests {
         );
     }
 
-    /// When `LOCALDB_DAEMON_URL` is set, `probe_daemon` bypasses the socket
-    /// file check entirely (no health probe, no file removal).
+    /// When a daemon URL override is provided, `probe_daemon` bypasses the
+    /// socket file check entirely (no health probe, no file removal).
     #[test]
     fn probe_daemon_env_var_bypasses_socket_check() {
         let dir = TempDir::new().unwrap();
-        // No socket file needed — env var takes precedence.
-        std::env::set_var("LOCALDB_DAEMON_URL", "http://127.0.0.1:9999");
-        let state = probe_daemon(dir.path());
-        std::env::remove_var("LOCALDB_DAEMON_URL");
+        let state = probe_daemon(dir.path(), Some("http://127.0.0.1:9999"));
 
         assert!(
             matches!(state, DaemonState::Running { base_url } if base_url == "http://127.0.0.1:9999"),
-            "env var should return Running without a health probe"
+            "override should return Running without a health probe"
         );
     }
 
@@ -3304,6 +3309,8 @@ mod tests {
             json: false,
             stores: vec![],
             yes: true,
+            daemon_url: None,
+            config_env: None,
         };
         // With yes=true, confirm_destructive returns true without reading stdin.
         assert!(confirm_destructive(&ctx, "Are you sure?"));
