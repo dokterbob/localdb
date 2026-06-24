@@ -2694,6 +2694,8 @@ dependencies = [
  "rbook",
  "scraper 0.27.0",
  "thiserror 2.0.18",
+ "tracing",
+ "zip 2.4.2",
 ]
 
 [[package]]
