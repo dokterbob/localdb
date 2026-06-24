@@ -4,6 +4,7 @@ members = [
     "extract",
     "fetch",
     "store-lancedb",
+    "store-libsql",
     "embed",
     "server",
     "mcp",
@@ -60,6 +61,9 @@ dirs = "6"
 # Embedded runtime-state DB
 rusqlite = { version = "0.32", features = ["bundled"] }
 
+# libSQL (Turso's SQLite fork) — async, DiskANN vectors, FTS5
+libsql = "=0.10.0-pre.4"
+
 # Hashing for policy_version
 hex = "0.4"
 
@@ -74,6 +78,7 @@ localdb-core = { path = "core" }
 extract = { path = "extract" }
 fetch = { path = "fetch" }
 store-lancedb = { path = "store-lancedb" }
+store-libsql = { path = "store-libsql" }
 embed = { path = "embed" }
 server = { path = "server" }
 mcp = { path = "mcp" }
