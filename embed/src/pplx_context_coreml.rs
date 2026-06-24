@@ -40,6 +40,7 @@ use localdb_core::{DocumentChunks, EmbeddedDocument, Embedder, Error as CoreErro
 use crate::coreml::runtime::{ComputeUnits, CoreMlModel, MlArray, Outputs};
 use crate::error::EmbedError;
 use futures_util::stream::{FuturesUnordered, StreamExt};
+use objc2::rc::autoreleasepool;
 
 const HF_REPO: &str = "dokterbob/pplx-embed-coreml";
 const HF_REVISION: &str = "53428a93b1c2edea82174c6ec5f28a2b78cf34ec";
@@ -620,38 +621,35 @@ impl Embedder for PplxContextCoreMLEmbedder {
                 while inflight.len() < MAX_INFLIGHT {
                     match it.next() {
                         Some(w) => {
-                            // Pre-bind Copy fields before p.inputs is moved into start_prediction.
-                            let p = match self.prep_window(&w.chunks).map_err(CoreError::from) {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    first_err = Some(e);
-                                    break;
-                                }
-                            };
-                            let fixed_idx = p.fixed_idx;
-                            let n_chunks = p.n_chunks;
-                            let doc_idx = w.doc_idx;
-                            let chunk_start = w.chunk_start;
-                            let model = match self.model_for(fixed_idx).map_err(CoreError::from) {
-                                Ok(m) => m,
-                                Err(e) => {
-                                    first_err = Some(e);
-                                    break;
-                                }
-                            };
-                            let pending =
-                                match model.start_prediction(p.inputs).map_err(CoreError::from) {
-                                    Ok(p) => p,
-                                    Err(e) => {
-                                        first_err = Some(e);
-                                        break;
-                                    }
-                                };
-                            // Each future carries its own index tag so the scatter
-                            // below is order-independent.
-                            inflight.push(async move {
-                                (doc_idx, chunk_start, n_chunks, pending.await)
+                            // Drain per-window autoreleased Obj-C temporaries (NSString,
+                            // NSNumber, MLFeatureValue, transient MLMultiArrays) that
+                            // accumulate in prep_window / build_feature_provider /
+                            // start_prediction.  PendingPrediction holds only Retained<>
+                            // objects, so it survives the pool drain.
+                            let window_result = autoreleasepool(|_| -> Result<_, CoreError> {
+                                let p = self.prep_window(&w.chunks).map_err(CoreError::from)?;
+                                let fixed_idx = p.fixed_idx;
+                                let n_chunks = p.n_chunks;
+                                let doc_idx = w.doc_idx;
+                                let chunk_start = w.chunk_start;
+                                let model = self.model_for(fixed_idx).map_err(CoreError::from)?;
+                                let pending =
+                                    model.start_prediction(p.inputs).map_err(CoreError::from)?;
+                                Ok((doc_idx, chunk_start, n_chunks, pending))
                             });
+                            match window_result {
+                                Ok((doc_idx, chunk_start, n_chunks, pending)) => {
+                                    // Each future carries its own index tag so the
+                                    // scatter below is order-independent.
+                                    inflight.push(async move {
+                                        (doc_idx, chunk_start, n_chunks, pending.await)
+                                    });
+                                }
+                                Err(e) => {
+                                    first_err = Some(e);
+                                    break;
+                                }
+                            }
                         }
                         None => break,
                     }
@@ -661,10 +659,15 @@ impl Embedder for PplxContextCoreMLEmbedder {
             match inflight.next().await {
                 Some((doc_idx, chunk_start, n_chunks, out)) => {
                     if first_err.is_none() {
-                        match out
-                            .map_err(CoreError::from)
-                            .and_then(|o| rows_from_output(&o, n_chunks).map_err(CoreError::from))
-                        {
+                        // Drain per-completion autoreleased temporaries (NSString /
+                        // MLFeatureValue / transient MLMultiArray) created while
+                        // reading the output feature provider.
+                        let rows_result = autoreleasepool(|_| {
+                            out.map_err(CoreError::from).and_then(|o| {
+                                rows_from_output(&o, n_chunks).map_err(CoreError::from)
+                            })
+                        });
+                        match rows_result {
                             Ok(rows) => {
                                 for (j, v) in rows.into_iter().enumerate() {
                                     results[doc_idx][chunk_start + j] = v;
@@ -1055,6 +1058,45 @@ mod tests {
         for (i, slot) in results[0].iter().enumerate() {
             assert_eq!(*slot, vec![i as f32; 4], "slot {i} wrong");
         }
+    }
+
+    // ---- Autorelease pool soak (Apple Silicon only, #[ignore]) ----
+    //
+    // Exercises the per-window and per-completion autoreleasepool drain with the
+    // real CoreML model.  Without the fix, IOSurface handles accumulate and the
+    // process eventually aborts with an NSGenericException; with the fix the
+    // live-handle count stays flat across all windows.
+    //
+    // Run manually: cargo test -p localdb-embed -- --ignored
+    // Skipped in CI (no Apple Silicon / no model bundle).
+    #[test]
+    #[ignore = "requires Apple Silicon and the downloaded model bundle (~706 MB)"]
+    fn autorelease_pool_soak_many_windows() {
+        let embedder = match PplxContextCoreMLEmbedder::new(None, false) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("skip: model unavailable ({e})");
+                return;
+            }
+        };
+        // 300 short chunks → ~10 windows of 32 chunks (N_MAX_CHUNKS cap).
+        let chunks: Vec<String> = (0..300)
+            .map(|i| format!("chunk {i} the quick brown fox jumps over the lazy dog"))
+            .collect();
+        let docs = vec![DocumentChunks {
+            document_context: String::new(),
+            chunks,
+        }];
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            embedder
+                .embed_documents(docs)
+                .await
+                .expect("embedding must complete without aborting or erroring");
+        });
     }
 
     /// Verify that `plan_windows` produces the expected (chunk_start) values
