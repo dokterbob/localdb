@@ -16,7 +16,6 @@
 //! RRF fusion is NOT done here — the trait exposes raw ranked result lists.
 //! Fusion lives in `core` (T08).
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{
@@ -405,7 +404,7 @@ fn records_to_batch(
     let source_kinds: Vec<&str> = records.iter().map(|r| r.source_kind.as_str()).collect();
     let mimes: Vec<Option<&str>> = records.iter().map(|r| r.mime.as_deref()).collect();
     let uris: Vec<&str> = records.iter().map(|r| r.uri.as_str()).collect();
-    let titles: Vec<Option<&str>> = records.iter().map(|r| r.title.as_deref()).collect();
+    let titles: Vec<Option<&str>> = records.iter().map(|r| r.metadata.title.as_deref()).collect();
     let metadata_jsons: Vec<Option<String>> = records
         .iter()
         .map(|r| serde_json::to_string(&r.metadata).ok())
@@ -579,8 +578,6 @@ fn row_to_chunk_record(batch: &RecordBatch, row: usize) -> ChunkRecord {
         source_kind: get_str(batch, COL_SOURCE_KIND, row),
         mime: get_opt_str(batch, COL_MIME, row),
         uri: get_str(batch, COL_URI, row),
-        title: get_opt_str(batch, COL_TITLE, row),
-        meta: HashMap::new(),
         metadata,
     }
 }
@@ -1140,8 +1137,6 @@ mod tests {
             source_kind: "path".to_string(),
             mime: Some("text/plain".to_string()),
             uri: "file:///test.md".to_string(),
-            title: Some("Test".to_string()),
-            meta: HashMap::new(),
             metadata: localdb_core::parser::DocumentMetadata::default(),
         }
     }

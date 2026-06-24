@@ -176,7 +176,7 @@ pub fn shape_citation(fused: FusedChunkEntry, store_id: String, store_name: Stri
             name: store_name,
         },
         uri: fused.chunk.uri.clone(),
-        title: fused.chunk.title.clone(),
+        title: fused.chunk.metadata.title.clone(),
         heading_path: fused.chunk.heading_path.clone(),
         span: Span {
             start: fused.chunk.span.start,
@@ -350,7 +350,6 @@ mod tests {
     use crate::embedder::{DocumentChunks, FakeEmbedder};
     use crate::store::{ChunkRecord, FakeStore, SearchResult};
     use crate::types::Span;
-    use std::collections::HashMap;
 
     // -----------------------------------------------------------------------
     // Helper: make a ChunkRecord for tests
@@ -381,8 +380,6 @@ mod tests {
             source_kind: "path".to_string(),
             mime: Some("text/markdown".to_string()),
             uri: uri.to_string(),
-            title: Some("Test Doc".to_string()),
-            meta: HashMap::new(),
             metadata: crate::parser::DocumentMetadata::default(),
         }
     }

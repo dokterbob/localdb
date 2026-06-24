@@ -552,8 +552,6 @@ mod tests {
             source_kind: "path".to_string(),
             mime: Some("text/markdown".to_string()),
             uri: format!("file://{}", watched_file.display()),
-            title: Some("Watcher Doc".to_string()),
-            meta: std::collections::HashMap::new(),
             metadata: localdb_core::DocumentMetadata::default(),
         }];
 

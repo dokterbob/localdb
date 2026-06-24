@@ -1301,8 +1301,6 @@ mod tests {
             source_kind: "path".to_string(),
             mime: Some("text/plain".to_string()),
             uri: "file:///hello.md".to_string(),
-            title: Some("Hello Doc".to_string()),
-            meta: std::collections::HashMap::new(),
             metadata: localdb_core::DocumentMetadata::default(),
         };
 
@@ -1394,8 +1392,6 @@ mod tests {
             source_kind: "path".to_string(),
             mime: None,
             uri: "file:///foreign.md".to_string(),
-            title: None,
-            meta: std::collections::HashMap::new(),
             metadata: localdb_core::DocumentMetadata::default(),
         };
         state.upsert_chunks(vec![chunk]).await.unwrap();

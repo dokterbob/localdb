@@ -74,19 +74,6 @@ pub struct ChunkRecord {
     /// Document URI (e.g. `file:///path/to/file` or URL).
     pub uri: String,
 
-    /// Document title.
-    #[serde(default)]
-    pub title: Option<String>,
-
-    /// Open key-value metadata (string → string for indexable fields).
-    ///
-    /// **Note:** The LanceDB backend does not currently persist this field.
-    /// Values stored here survive in-memory round-trips (FakeStore) but are
-    /// silently discarded on LanceDB serialization/deserialization.  T07/T08
-    /// should not populate `meta` until a schema migration adds the column.
-    #[serde(default)]
-    pub meta: HashMap<String, String>,
-
     /// Document metadata extracted from the document.
     ///
     /// Persisted as a single JSON-encoded `Utf8` column in LanceDB. Read
@@ -102,7 +89,6 @@ impl ChunkRecord {
         chunk: &Chunk,
         embedding: Vec<f32>,
         uri: String,
-        title: Option<String>,
         mime: Option<String>,
         metadata: DocumentMetadata,
     ) -> Self {
@@ -122,8 +108,6 @@ impl ChunkRecord {
             source_kind: chunk.provenance.source_ref.kind.clone(),
             mime,
             uri,
-            title,
-            meta: HashMap::new(),
             metadata,
         }
     }
@@ -529,8 +513,6 @@ pub mod conformance {
             source_kind: "path".to_string(),
             mime: Some("text/plain".to_string()),
             uri: "file:///test.md".to_string(),
-            title: Some("Test Document".to_string()),
-            meta: HashMap::new(),
             metadata: crate::parser::DocumentMetadata::default(),
         }
     }
@@ -885,8 +867,6 @@ mod tests {
             source_kind: "path".to_string(),
             mime: Some("text/plain".to_string()),
             uri: "file:///test.md".to_string(),
-            title: Some("Test".to_string()),
-            meta: HashMap::new(),
             metadata: crate::parser::DocumentMetadata::default(),
         }
     }
@@ -1042,7 +1022,6 @@ mod tests {
             &chunk,
             vec![0.1, 0.2, 0.3],
             "file:///test.md".to_string(),
-            Some("Test Title".to_string()),
             Some("text/markdown".to_string()),
             crate::parser::DocumentMetadata::default(),
         );
@@ -1053,7 +1032,6 @@ mod tests {
         assert_eq!(record.text, "Some text");
         assert_eq!(record.embedding, vec![0.1, 0.2, 0.3]);
         assert_eq!(record.uri, "file:///test.md");
-        assert_eq!(record.title, Some("Test Title".to_string()));
         assert_eq!(record.mime, Some("text/markdown".to_string()));
         assert_eq!(record.source_id, "source-id");
         assert_eq!(record.source_kind, "path");

@@ -71,8 +71,6 @@ async fn make_server_with_seeded_store() -> (McpServer, String, String) {
         source_kind: "path".to_string(),
         mime: Some("text/markdown".to_string()),
         uri: uri.to_string(),
-        title: Some("Test Document".to_string()),
-        meta: std::collections::HashMap::new(),
         metadata: localdb_core::DocumentMetadata::default(),
     };
 
@@ -539,8 +537,6 @@ async fn test_search_limit_respected() {
             source_kind: "path".to_string(),
             mime: Some("text/markdown".to_string()),
             uri,
-            title: Some(format!("Doc {i}")),
-            meta: std::collections::HashMap::new(),
             metadata: localdb_core::DocumentMetadata::default(),
         });
     }

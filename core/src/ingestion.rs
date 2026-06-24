@@ -595,7 +595,6 @@ pub async fn index_document(
             &chunk,
             embedding.clone(),
             input.uri.clone(),
-            extraction.title.clone(),
             input.mime.clone(),
             extraction.metadata.clone(),
         );
@@ -1381,7 +1380,6 @@ mod tests {
     #[test]
     fn document_index_from_chunk_records() {
         use crate::store::ChunkRecord;
-        use std::collections::HashMap;
 
         let records = vec![ChunkRecord {
             id: "chunk-1".to_string(),
@@ -1399,8 +1397,6 @@ mod tests {
             source_kind: "path".to_string(),
             mime: None,
             uri: "file:///doc1.md".to_string(),
-            title: None,
-            meta: HashMap::new(),
             metadata: crate::parser::DocumentMetadata::default(),
         }];
 
@@ -2417,7 +2413,6 @@ mod tests {
 
         // Insert some chunks for this document
         use crate::store::ChunkRecord;
-        use std::collections::HashMap;
         let chunk = ChunkRecord {
             id: "old-chunk".to_string(),
             document_id: existing_doc_id.clone(),
@@ -2434,8 +2429,6 @@ mod tests {
             source_kind: "url".to_string(),
             mime: None,
             uri: url.to_string(),
-            title: None,
-            meta: HashMap::new(),
             metadata: crate::parser::DocumentMetadata::default(),
         };
         store.upsert_chunks(vec![chunk]).await.unwrap();
@@ -2916,7 +2909,6 @@ mod tests {
     #[tokio::test]
     async fn document_index_hydration_enables_incremental_skip() {
         use crate::store::ChunkRecord;
-        use std::collections::HashMap;
 
         // Simulate a previous run: build chunk records as if already indexed.
         let uri = "file:///docs/existing.md";
@@ -2940,8 +2932,6 @@ mod tests {
             source_kind: "path".to_string(),
             mime: None,
             uri: uri.to_string(),
-            title: None,
-            meta: HashMap::new(),
             metadata: crate::parser::DocumentMetadata::default(),
         };
 
@@ -3457,8 +3447,6 @@ mod tests {
             source_kind: "path".to_string(),
             mime: None,
             uri: uri.to_string(),
-            title: None,
-            meta: std::collections::HashMap::new(),
             metadata: crate::parser::DocumentMetadata::default(),
         }
     }

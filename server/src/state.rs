@@ -661,8 +661,6 @@ mod tests {
             source_kind: "path".to_string(),
             mime: Some("text/plain".to_string()),
             uri: "file:///test.md".to_string(),
-            title: Some("Test Doc".to_string()),
-            meta: std::collections::HashMap::new(),
             metadata: localdb_core::DocumentMetadata::default(),
         };
 
