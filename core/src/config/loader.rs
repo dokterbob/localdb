@@ -82,12 +82,15 @@ impl ResolvedPaths {
 ///
 /// Resolves the config file path from (in priority order):
 /// 1. `options.config_path`
-/// 2. `LOCALDB_CONFIG` env var
+/// 2. `env_config_path` (from `LOCALDB_CONFIG`, read once at startup)
 /// 3. Platform default
 ///
 /// Returns `Error::InvalidConfig` on parse or validation failure.
-pub fn load_config(options: &LoadOptions) -> Result<ConfigLoader, Error> {
-    let config_path = resolve_config_path(options)?;
+pub fn load_config(
+    options: &LoadOptions,
+    env_config_path: Option<&Path>,
+) -> Result<ConfigLoader, Error> {
+    let config_path = resolve_config_path(options, env_config_path)?;
 
     let yaml_bytes = std::fs::read(&config_path).map_err(|e| Error::InvalidConfig {
         message: format!("cannot read config file '{}': {}", config_path.display(), e),
@@ -271,15 +274,18 @@ pub fn parse_duration(s: &str) -> Result<u64, String> {
 }
 
 /// Resolve the config file path.
-fn resolve_config_path(options: &LoadOptions) -> Result<PathBuf, Error> {
+fn resolve_config_path(
+    options: &LoadOptions,
+    env_config_path: Option<&Path>,
+) -> Result<PathBuf, Error> {
     // 1. Explicit flag
     if let Some(p) = &options.config_path {
         return Ok(p.clone());
     }
 
-    // 2. LOCALDB_CONFIG env var
-    if let Ok(env_path) = std::env::var("LOCALDB_CONFIG") {
-        return Ok(PathBuf::from(env_path));
+    // 2. LOCALDB_CONFIG env var (read once at startup, passed in)
+    if let Some(env_path) = env_config_path {
+        return Ok(env_path.to_path_buf());
     }
 
     // 3. Platform default
@@ -750,24 +756,20 @@ stores:
             config_path: Some(std::path::PathBuf::from(path)),
             ..Default::default()
         };
-        let loader = load_config(&options).expect("load_config with explicit path should succeed");
+        let loader =
+            load_config(&options, None).expect("load_config with explicit path should succeed");
         assert_eq!(loader.config.version, 1);
         assert_eq!(loader.paths.config_file, std::path::PathBuf::from(path));
     }
 
     #[test]
     fn load_config_env_var_override() {
-        // LOCALDB_CONFIG env var points to a valid fixture.
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/config/valid.yaml"
         );
-        // Use a temp env var set; restore after test.
-        // Note: env vars are process-global; use a unique name to avoid cross-test pollution.
-        std::env::set_var("LOCALDB_CONFIG", path);
-        let result = load_config(&LoadOptions::default());
-        std::env::remove_var("LOCALDB_CONFIG");
-        let loader = result.expect("load_config via LOCALDB_CONFIG env var should succeed");
+        let loader = load_config(&LoadOptions::default(), Some(Path::new(path)))
+            .expect("load_config via env config path should succeed");
         assert_eq!(loader.config.version, 1);
     }
 
@@ -813,7 +815,7 @@ stores:
             config_path: Some(std::path::PathBuf::from(path_str)),
             ..Default::default()
         };
-        let _loader = load_config(&options).expect("should load");
+        let _loader = load_config(&options, None).expect("should load");
         let after = std::fs::read(path_str).expect("fixture must still exist");
         assert_eq!(
             before, after,
