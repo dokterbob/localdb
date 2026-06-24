@@ -8,7 +8,7 @@ description = "HTTP API daemon: axum REST API, file watching, job queue, unix so
 
 [dependencies]
 localdb-core = { path = "../core" }
-store-lancedb = { path = "../store-lancedb" }
+store-libsql = { path = "../store-libsql" }
 embed = { path = "../embed" }
 axum = { workspace = true }
 tokio = { workspace = true }

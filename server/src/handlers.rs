@@ -357,7 +357,7 @@ pub async fn search(
     }
 
     // Build store handles for fan-out.
-    // Prefer real LanceDbStore instances when the store has been indexed on disk.
+    // Prefer real LibsqlStore instances when the store has been indexed on disk.
     // Fall back to the shared in-memory FakeStore for stores that have no on-disk
     // data yet (so the acceptance criterion "/search returns citations" is always
     // provably satisfied via upsert_chunks → shared FakeStore → search).
@@ -392,10 +392,10 @@ pub async fn search(
     for store_cfg in &target_stores {
         let store_dir = data_dir.join("stores").join(&store_cfg.name);
         if store_dir.exists() {
-            // Open the real LanceDbStore for this store.
-            let lance_path = store_dir.to_string_lossy().to_string();
-            match store_lancedb::LanceDbStore::open(
-                &lance_path,
+            // Open the real LibsqlStore for this store.
+            let db_path = store_dir.join("store.db");
+            match store_libsql::LibsqlStore::open(
+                &db_path,
                 embedder.embedding_dim(),
                 embedder.vector_encoding(),
             )
@@ -412,7 +412,7 @@ pub async fn search(
                     });
                 }
                 Err(e) => {
-                    warn!("cannot open LanceDbStore for '{}': {}", store_cfg.name, e);
+                    warn!("cannot open store '{}': {}", store_cfg.name, e);
                 }
             }
         }

@@ -1478,7 +1478,7 @@ async fn run_index_for_source_async(
         return;
     }
 
-    // Acquire the LanceDB single-writer gate only for the actual write phase.
+    // Acquire the single-writer gate only for the actual write phase.
     // Embedder creation (above) is intentionally outside the lock window.
     let _lock = match WriteLock::acquire(&data_dir) {
         Ok(l) => l,
@@ -1488,9 +1488,9 @@ async fn run_index_for_source_async(
         }
     };
 
-    let lance_path = store_data_dir.to_string_lossy().to_string();
-    let lancedb_store = match store_lancedb::LanceDbStore::open(
-        &lance_path,
+    let db_path = store_data_dir.join("store.db");
+    let libsql_store = match store_libsql::LibsqlStore::open(
+        &db_path,
         embedder.embedding_dim(),
         embedder.vector_encoding(),
     )
@@ -1503,12 +1503,11 @@ async fn run_index_for_source_async(
         }
     };
 
-    let existing = lancedb_store
+    let existing = libsql_store
         .list_indexed_documents()
         .await
         .unwrap_or_default();
     let mut doc_index = DocumentIndex::from_records(existing);
-    let mut chunks = 0u64;
     let url_fetcher = HttpUrlFetcher::new();
 
     for rt_source in &sources_to_index {
@@ -1523,7 +1522,7 @@ async fn run_index_for_source_async(
         match run_ingestion_for_source(
             &source,
             &mut doc_index,
-            &lancedb_store,
+            &libsql_store,
             embedder.as_ref(),
             &cfg,
             &extractor,
@@ -1533,7 +1532,7 @@ async fn run_index_for_source_async(
         .await
         {
             Ok(r) => {
-                chunks += r.chunks_written;
+                let _ = r.chunks_written;
             }
             Err(e) => {
                 eprintln!(
@@ -1541,20 +1540,6 @@ async fn run_index_for_source_async(
                     rt_source.id, e
                 );
             }
-        }
-    }
-
-    // Ensure the FTS index exists (repairing a cancelled run), and rebuild it when
-    // new chunks were written so they are covered.
-    let needs_fts = chunks > 0 || !lancedb_store.has_fts_index().await.unwrap_or(true);
-    if needs_fts {
-        if let Err(e) = lancedb_store.create_fts_index().await {
-            eprintln!("warning: FTS index creation failed: {}", e);
-        }
-    }
-    if chunks > 0 {
-        if let Err(e) = lancedb_store.create_vector_index().await {
-            eprintln!("warning: vector index creation failed: {}", e);
         }
     }
 }
@@ -1912,16 +1897,16 @@ async fn run_index_async(
         );
     }
 
-    // Acquire the LanceDB single-writer gate only for the write phase.
+    // Acquire the single-writer gate only for the write phase.
     // Embedder creation and metadata reads (above) are intentionally outside the lock.
     let _lock = match WriteLock::acquire(&data_dir) {
         Ok(l) => l,
         Err(e) => exit_err(&e, ctx.json),
     };
 
-    let lance_path = store_data_dir.to_string_lossy().to_string();
-    let lancedb_store = match store_lancedb::LanceDbStore::open(
-        &lance_path,
+    let db_path = store_data_dir.join("store.db");
+    let libsql_store = match store_libsql::LibsqlStore::open(
+        &db_path,
         embedder.embedding_dim(),
         embedder.vector_encoding(),
     )
@@ -1931,7 +1916,7 @@ async fn run_index_async(
         Err(e) => exit_err(&e, ctx.json),
     };
 
-    let existing = lancedb_store
+    let existing = libsql_store
         .list_indexed_documents()
         .await
         .unwrap_or_default();
@@ -1953,7 +1938,7 @@ async fn run_index_async(
         match run_ingestion_for_source(
             &source,
             &mut doc_index,
-            &lancedb_store,
+            &libsql_store,
             embedder.as_ref(),
             &cfg,
             &extractor,
@@ -1973,22 +1958,6 @@ async fn run_index_async(
                 errors += 1;
                 eprintln!("error indexing source {}: {}", rt_source.id, e);
             }
-        }
-    }
-
-    // Ensure the FTS index exists; rebuild it when new chunks were written so they
-    // are covered. The `has_fts_index` check repairs a store left without an index
-    // by a cancelled run (where all docs now skip, so `chunks == 0`). Until it is
-    // (re)built, search degrades to dense-only rather than failing.
-    let needs_fts = chunks > 0 || !lancedb_store.has_fts_index().await.unwrap_or(true);
-    if needs_fts {
-        if let Err(e) = lancedb_store.create_fts_index().await {
-            eprintln!("warning: FTS index creation failed: {}", e);
-        }
-    }
-    if chunks > 0 {
-        if let Err(e) = lancedb_store.create_vector_index().await {
-            eprintln!("warning: vector index creation failed: {}", e);
         }
     }
 
@@ -2159,7 +2128,6 @@ async fn run_search_async(ctx: &CliContext, query: &str, limit: usize) {
 
     // Build store handles.
     let mut store_handles: Vec<StoreHandle> = Vec::new();
-    let mut stores_missing_fts: Vec<String> = Vec::new();
     for name in &store_names {
         let store_data_dir = data_dir.join("stores").join(name);
         if !store_data_dir.exists() {
@@ -2171,20 +2139,15 @@ async fn run_search_async(ctx: &CliContext, query: &str, limit: usize) {
             .map(|s| s.id.clone())
             .unwrap_or_else(|| name.clone());
 
-        let lance_path = store_data_dir.to_string_lossy().to_string();
-        match store_lancedb::LanceDbStore::open(
-            &lance_path,
+        let db_path = store_data_dir.join("store.db");
+        match store_libsql::LibsqlStore::open(
+            &db_path,
             embedder.embedding_dim(),
             embedder.vector_encoding(),
         )
         .await
         {
             Ok(s) => {
-                // A missing FTS index means the BM25 leg is skipped (dense-only
-                // results); warn so the user knows to repair it with a re-index.
-                if !s.has_fts_index().await.unwrap_or(true) {
-                    stores_missing_fts.push(name.clone());
-                }
                 store_handles.push(StoreHandle {
                     id: store_id,
                     name: name.clone(),
@@ -2193,14 +2156,6 @@ async fn run_search_async(ctx: &CliContext, query: &str, limit: usize) {
             }
             Err(e) => eprintln!("warning: cannot open store '{}': {}", name, e),
         }
-    }
-
-    if !stores_missing_fts.is_empty() {
-        eprintln!(
-            "warning: no full-text index for store(s) {} — keyword (BM25) ranking is \
-             disabled, showing semantic results only. Run `localdb index` to build it.",
-            stores_missing_fts.join(", ")
-        );
     }
 
     if store_handles.is_empty() {
@@ -2369,9 +2324,9 @@ async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
                 .map(|s| s.visibility.clone())
                 .unwrap_or_else(|| "private".to_string()),
         };
-        let lance_path = store_data_dir.to_string_lossy().to_string();
-        match store_lancedb::LanceDbStore::open(
-            &lance_path,
+        let db_path = store_data_dir.join("store.db");
+        match store_libsql::LibsqlStore::open(
+            &db_path,
             embedder.embedding_dim(),
             embedder.vector_encoding(),
         )

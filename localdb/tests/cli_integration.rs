@@ -1103,23 +1103,24 @@ fn source_remove_with_daemon_running_exits_cleanly_without_panic() {
 // opens a short-lived connection; multiple concurrent openers are fine.
 // ---------------------------------------------------------------------------
 
-/// Regression guard for #67: CLI commands succeed even when another rusqlite
+/// Regression guard for #67: CLI commands succeed even when another libsql
 /// connection is already open on the same DB file.
-#[test]
-fn store_list_succeeds_while_db_held_open_by_another_connection() {
-    use rusqlite::Connection;
-
+#[tokio::test]
+async fn store_list_succeeds_while_db_held_open_by_another_connection() {
     let dir = TempDir::new().unwrap();
     write_default_config(&dir);
 
     let data_dir = dir.path().join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
 
-    // Open a raw rusqlite connection and keep it alive (simulates another
+    // Open a libsql connection and keep it alive (simulates another
     // process — e.g. the MCP server — that has the DB open).
     let state_db_path = data_dir.join("runtime-state.db");
-    let _holder =
-        Connection::open(&state_db_path).expect("should be able to open runtime-state.db");
+    let _holder_db = libsql::Builder::new_local(&state_db_path)
+        .build()
+        .await
+        .expect("should be able to open runtime-state.db");
+    let _holder_conn = _holder_db.connect().expect("should be able to connect");
 
     // `store list --json` must exit 0 (success), not 4 (locked).
     let output = cmd_with_dir(&dir)

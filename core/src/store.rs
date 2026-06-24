@@ -1,7 +1,7 @@
 //! The `RetrievalStore` trait and related types.
 //!
 //! This is the abstraction layer between `core` domain logic and the physical
-//! storage backend. The default implementation is in `store-lancedb`.
+//! storage backend. The default implementation is in `store-libsql`.
 //!
 //! Fusion (RRF) happens **above** this trait in `core` — the trait exposes raw
 //! BM25 and dense search legs separately.
@@ -76,9 +76,8 @@ pub struct ChunkRecord {
 
     /// Document metadata extracted from the document.
     ///
-    /// Persisted as a single JSON-encoded `Utf8` column in LanceDB. Read
-    /// defensively: tables created before this schema migration return
-    /// `DocumentMetadata::default()` on read.
+    /// Persisted as a JSON-encoded column. Read defensively: stores created
+    /// before this schema migration return `DocumentMetadata::default()` on read.
     #[serde(default)]
     pub metadata: DocumentMetadata,
 }
@@ -173,7 +172,7 @@ pub struct StoreStats {
 
 /// The storage abstraction for a single knowledge base.
 ///
-/// Implementations: `store-lancedb` (embedded, production), `FakeStore` (in-memory, tests).
+/// Implementations: `store-libsql` (embedded, production), `FakeStore` (in-memory, tests).
 ///
 /// This trait is object-safe and `Send + Sync` so it can be boxed and shared across async tasks.
 ///
@@ -480,13 +479,13 @@ impl RetrievalStore for FakeStore {
 }
 
 // ---------------------------------------------------------------------------
-// Trait conformance test suite (runs against both FakeStore and LanceDB)
+// Trait conformance test suite (runs against both FakeStore and libsql)
 // ---------------------------------------------------------------------------
 
 /// A shared test suite exercising the `RetrievalStore` contract.
 ///
-/// Call this with any concrete implementation. Integration tests in `store-lancedb`
-/// run this same suite against the real LanceDB backend.
+/// Call this with any concrete implementation. Integration tests in `store-libsql`
+/// run this same suite against the real libsql backend.
 pub mod conformance {
     use super::*;
 
@@ -827,8 +826,8 @@ pub mod conformance {
     /// Run a subset of the conformance suite that does not require a pre-built FTS index.
     ///
     /// The store must be freshly created (empty) when this is called.
-    /// Tests that require an FTS index (BM25 search) must be called separately after
-    /// `create_fts_index()` (LanceDB) or can run directly on FakeStore.
+    /// Tests that require an FTS index (BM25 search) can run directly on both
+    /// libsql (auto-maintained FTS triggers) and FakeStore.
     ///
     /// Note: because each conformance function leaves data in the store, this helper
     /// is only useful for backends that can provide a fresh store per call.  For
