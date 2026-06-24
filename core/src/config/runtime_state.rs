@@ -1,13 +1,12 @@
-//! Runtime-state DB backed by SQLite in WAL mode.
+//! Runtime-state DB backed by libsql (async) in WAL mode.
 //!
 //! Stores runtime-owned objects (stores/sources added via API/CLI)
 //! separately from the YAML config. Never touches the YAML file.
 //!
-//! Concurrency model: each method opens a fresh `rusqlite::Connection`,
-//! runs its statement, and drops it — so no connection (and thus no write
-//! lock) is held between operations. SQLite WAL mode allows multiple
-//! concurrent readers and serialises writers with a 5 s busy-timeout,
-//! mapping to `Error::RuntimeStateLocked` only if contention lasts longer.
+//! Concurrency model: a single `libsql::Connection` is held behind a
+//! `tokio::sync::Mutex` for the lifetime of the `RuntimeStateDb`. SQLite
+//! WAL mode allows concurrent readers; writers are serialised by the mutex
+//! and the internal busy-timeout.
 //!
 //! Ownership model (specs/03-config.md §3):
 //! - YAML-owned: object appears in the YAML config (matched by name).
@@ -18,9 +17,7 @@
 //! over runtime-owned objects with the same name.
 
 use std::path::Path;
-use std::time::Duration;
 
-use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -107,28 +104,24 @@ pub struct RuntimeSource {
 
 /// Mutable runtime-state DB for runtime-owned objects.
 ///
-/// Backed by SQLite in WAL mode. Holds only the DB path; each method opens a
-/// fresh connection, runs its statement, and drops it. No connection is held
-/// between calls, so no write lock persists between operations.
+/// Backed by libsql (async) in WAL mode. Holds a `Database` and a shared
+/// `Connection` behind a `tokio::sync::Mutex`.
 ///
 /// Schema (two tables, key → JSON blob):
 /// - `runtime_stores(name TEXT PRIMARY KEY, json TEXT NOT NULL)`
 /// - `cli_sources(id TEXT PRIMARY KEY, store_name TEXT NOT NULL, json TEXT NOT NULL)`
 pub struct RuntimeStateDb {
-    path: std::path::PathBuf,
+    #[allow(dead_code)]
+    db: libsql::Database,
+    conn: tokio::sync::Mutex<libsql::Connection>,
 }
 
 impl RuntimeStateDb {
     /// Open (or create) the runtime-state DB at the given path.
     ///
     /// Ensures the parent directory exists, creates the SQLite file and
-    /// tables if necessary, and enables WAL mode. Drops the connection
-    /// immediately — subsequent calls open fresh short-lived connections.
-    ///
-    /// Retries up to 3 times with backoff on `SQLITE_BUSY` — the WAL mode
-    /// change requires an exclusive lock that can collide when multiple
-    /// processes start against a fresh database simultaneously.
-    pub fn open(path: &Path) -> Result<Self, Error> {
+    /// tables if necessary, and enables WAL mode.
+    pub async fn open(path: &Path) -> Result<Self, Error> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| Error::Internal {
                 message: format!(
@@ -140,52 +133,53 @@ impl RuntimeStateDb {
             })?;
         }
 
-        let mut last_err = None;
-        for attempt in 0..3 {
-            if attempt > 0 {
-                std::thread::sleep(Duration::from_millis(100 * (1 << attempt)));
-            }
-            match Self::open_inner(path) {
-                Ok(db) => return Ok(db),
-                Err(Error::RuntimeStateLocked) => {
-                    last_err = Some(Error::RuntimeStateLocked);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Err(last_err.unwrap())
-    }
+        let db = libsql::Builder::new_local(path)
+            .build()
+            .await
+            .map_err(|e| Error::Internal {
+                message: format!("cannot open runtime-state DB: {e}"),
+                correlation_id: "runtime_state_open".to_string(),
+            })?;
 
-    fn open_inner(path: &Path) -> Result<Self, Error> {
-        let c = Connection::open(path).map_err(map_sqlite_err)?;
-        c.busy_timeout(Duration::from_secs(5))
-            .map_err(map_sqlite_err)?;
-        c.pragma_update(None, "journal_mode", "WAL")
-            .map_err(map_sqlite_err)?;
-        c.execute_batch(
+        let conn = db.connect().map_err(|e| Error::Internal {
+            message: format!("cannot connect to runtime-state DB: {e}"),
+            correlation_id: "runtime_state_connect".to_string(),
+        })?;
+
+        // WAL mode — use query() not execute() (PRAGMAs return rows)
+        conn.query("PRAGMA journal_mode=WAL", ())
+            .await
+            .map_err(map_libsql_err)?;
+        conn.query("PRAGMA busy_timeout=5000", ())
+            .await
+            .map_err(map_libsql_err)?;
+
+        // Create tables
+        conn.execute(
             "CREATE TABLE IF NOT EXISTS runtime_stores (
                 name TEXT PRIMARY KEY NOT NULL,
                 json TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS cli_sources (
+            )",
+            (),
+        )
+        .await
+        .map_err(map_libsql_err)?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS cli_sources (
                 id   TEXT PRIMARY KEY NOT NULL,
                 store_name TEXT NOT NULL,
                 json TEXT NOT NULL
-            );",
+            )",
+            (),
         )
-        .map_err(map_sqlite_err)?;
-        drop(c);
+        .await
+        .map_err(map_libsql_err)?;
 
         Ok(Self {
-            path: path.to_path_buf(),
+            db,
+            conn: tokio::sync::Mutex::new(conn),
         })
-    }
-
-    fn conn(&self) -> Result<Connection, Error> {
-        let c = Connection::open(&self.path).map_err(map_sqlite_err)?;
-        c.busy_timeout(Duration::from_secs(5))
-            .map_err(map_sqlite_err)?;
-        Ok(c)
     }
 
     // --- Store operations ---
@@ -193,18 +187,19 @@ impl RuntimeStateDb {
     /// Insert or update a runtime-owned store.
     ///
     /// If a store with the same name already exists in the DB, it is replaced.
-    pub fn upsert_store(&self, store: &RuntimeStore) -> Result<(), Error> {
+    pub async fn upsert_store(&self, store: &RuntimeStore) -> Result<(), Error> {
         let json = serde_json::to_string(store).map_err(|e| Error::Internal {
             message: format!("cannot serialize store: {}", e),
             correlation_id: "runtime_state_upsert".to_string(),
         })?;
-        let c = self.conn()?;
-        c.execute(
-            "INSERT INTO runtime_stores (name, json) VALUES (?1, ?2)
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO runtime_stores (name, json) VALUES (?, ?)
              ON CONFLICT(name) DO UPDATE SET json = excluded.json",
-            rusqlite::params![store.name, json],
+            libsql::params![store.name.clone(), json],
         )
-        .map_err(map_sqlite_err)?;
+        .await
+        .map_err(map_libsql_err)?;
         Ok(())
     }
 
@@ -212,27 +207,31 @@ impl RuntimeStateDb {
     ///
     /// Returns `Ok(true)` if the store existed and was deleted,
     /// `Ok(false)` if it did not exist.
-    pub fn delete_store(&self, name: &str) -> Result<bool, Error> {
-        let c = self.conn()?;
-        let n = c
+    pub async fn delete_store(&self, name: &str) -> Result<bool, Error> {
+        let conn = self.conn.lock().await;
+        let n = conn
             .execute(
-                "DELETE FROM runtime_stores WHERE name = ?1",
-                rusqlite::params![name],
+                "DELETE FROM runtime_stores WHERE name = ?",
+                libsql::params![name.to_string()],
             )
-            .map_err(map_sqlite_err)?;
+            .await
+            .map_err(map_libsql_err)?;
         Ok(n > 0)
     }
 
     /// Get a runtime-owned store by name.
-    pub fn get_store(&self, name: &str) -> Result<Option<RuntimeStore>, Error> {
-        let c = self.conn()?;
-        let result = c.query_row(
-            "SELECT json FROM runtime_stores WHERE name = ?1",
-            rusqlite::params![name],
-            |row| row.get::<_, String>(0),
-        );
-        match result {
-            Ok(json) => {
+    pub async fn get_store(&self, name: &str) -> Result<Option<RuntimeStore>, Error> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT json FROM runtime_stores WHERE name = ?",
+                libsql::params![name.to_string()],
+            )
+            .await
+            .map_err(map_libsql_err)?;
+        match rows.next().await.map_err(map_libsql_err)? {
+            Some(row) => {
+                let json: String = row.get(0).map_err(map_libsql_err)?;
                 let store: RuntimeStore =
                     serde_json::from_str(&json).map_err(|e| Error::Internal {
                         message: format!("cannot deserialize store '{}': {}", name, e),
@@ -240,23 +239,20 @@ impl RuntimeStateDb {
                     })?;
                 Ok(Some(store))
             }
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(map_sqlite_err(e)),
+            None => Ok(None),
         }
     }
 
     /// List all runtime-owned stores.
-    pub fn list_stores(&self) -> Result<Vec<RuntimeStore>, Error> {
-        let c = self.conn()?;
-        let mut stmt = c
-            .prepare("SELECT json FROM runtime_stores")
-            .map_err(map_sqlite_err)?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(map_sqlite_err)?;
+    pub async fn list_stores(&self) -> Result<Vec<RuntimeStore>, Error> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query("SELECT json FROM runtime_stores", ())
+            .await
+            .map_err(map_libsql_err)?;
         let mut stores = Vec::new();
-        for row in rows {
-            let json = row.map_err(map_sqlite_err)?;
+        while let Some(row) = rows.next().await.map_err(map_libsql_err)? {
+            let json: String = row.get(0).map_err(map_libsql_err)?;
             let store: RuntimeStore = serde_json::from_str(&json).map_err(|e| Error::Internal {
                 message: format!("cannot deserialize store from DB: {}", e),
                 correlation_id: "runtime_state_list".to_string(),
@@ -269,56 +265,62 @@ impl RuntimeStateDb {
     // --- Source operations ---
 
     /// Insert or update a source record.
-    pub fn upsert_source(&self, source: &RuntimeSource) -> Result<(), Error> {
+    pub async fn upsert_source(&self, source: &RuntimeSource) -> Result<(), Error> {
         let json = serde_json::to_string(source).map_err(|e| Error::Internal {
             message: format!("cannot serialize source: {}", e),
             correlation_id: "source_upsert_ser".to_string(),
         })?;
-        let c = self.conn()?;
-        c.execute(
-            "INSERT INTO cli_sources (id, store_name, json) VALUES (?1, ?2, ?3)
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO cli_sources (id, store_name, json) VALUES (?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET store_name = excluded.store_name,
                                            json = excluded.json",
-            rusqlite::params![source.id, source.store_name, json],
+            libsql::params![source.id.clone(), source.store_name.clone(), json],
         )
-        .map_err(map_sqlite_err)?;
+        .await
+        .map_err(map_libsql_err)?;
         Ok(())
     }
 
     /// Delete a source by ID. Returns `true` if it existed.
-    pub fn delete_source(&self, id: &str) -> Result<bool, Error> {
-        let c = self.conn()?;
-        let n = c
+    pub async fn delete_source(&self, id: &str) -> Result<bool, Error> {
+        let conn = self.conn.lock().await;
+        let n = conn
             .execute(
-                "DELETE FROM cli_sources WHERE id = ?1",
-                rusqlite::params![id],
+                "DELETE FROM cli_sources WHERE id = ?",
+                libsql::params![id.to_string()],
             )
-            .map_err(map_sqlite_err)?;
+            .await
+            .map_err(map_libsql_err)?;
         Ok(n > 0)
     }
 
     /// Delete all sources belonging to a store. Returns the count removed.
-    pub fn delete_sources_for_store(&self, store_name: &str) -> Result<usize, Error> {
-        let c = self.conn()?;
-        let n = c
+    pub async fn delete_sources_for_store(&self, store_name: &str) -> Result<u64, Error> {
+        let conn = self.conn.lock().await;
+        let n = conn
             .execute(
-                "DELETE FROM cli_sources WHERE store_name = ?1",
-                rusqlite::params![store_name],
+                "DELETE FROM cli_sources WHERE store_name = ?",
+                libsql::params![store_name.to_string()],
             )
-            .map_err(map_sqlite_err)?;
+            .await
+            .map_err(map_libsql_err)?;
         Ok(n)
     }
 
     /// Get a source by ID.
-    pub fn get_source(&self, id: &str) -> Result<Option<RuntimeSource>, Error> {
-        let c = self.conn()?;
-        let result = c.query_row(
-            "SELECT json FROM cli_sources WHERE id = ?1",
-            rusqlite::params![id],
-            |row| row.get::<_, String>(0),
-        );
-        match result {
-            Ok(json) => {
+    pub async fn get_source(&self, id: &str) -> Result<Option<RuntimeSource>, Error> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT json FROM cli_sources WHERE id = ?",
+                libsql::params![id.to_string()],
+            )
+            .await
+            .map_err(map_libsql_err)?;
+        match rows.next().await.map_err(map_libsql_err)? {
+            Some(row) => {
+                let json: String = row.get(0).map_err(map_libsql_err)?;
                 let src: RuntimeSource =
                     serde_json::from_str(&json).map_err(|e| Error::Internal {
                         message: format!("cannot deserialize source '{}': {}", id, e),
@@ -326,23 +328,23 @@ impl RuntimeStateDb {
                     })?;
                 Ok(Some(src))
             }
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(map_sqlite_err(e)),
+            None => Ok(None),
         }
     }
 
     /// List all sources for a given store.
-    pub fn list_sources(&self, store_name: &str) -> Result<Vec<RuntimeSource>, Error> {
-        let c = self.conn()?;
-        let mut stmt = c
-            .prepare("SELECT json FROM cli_sources WHERE store_name = ?1")
-            .map_err(map_sqlite_err)?;
-        let rows = stmt
-            .query_map(rusqlite::params![store_name], |row| row.get::<_, String>(0))
-            .map_err(map_sqlite_err)?;
+    pub async fn list_sources(&self, store_name: &str) -> Result<Vec<RuntimeSource>, Error> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT json FROM cli_sources WHERE store_name = ?",
+                libsql::params![store_name.to_string()],
+            )
+            .await
+            .map_err(map_libsql_err)?;
         let mut sources = Vec::new();
-        for row in rows {
-            let json = row.map_err(map_sqlite_err)?;
+        while let Some(row) = rows.next().await.map_err(map_libsql_err)? {
+            let json: String = row.get(0).map_err(map_libsql_err)?;
             let src: RuntimeSource = serde_json::from_str(&json).map_err(|e| Error::Internal {
                 message: format!("cannot deserialize source from DB: {}", e),
                 correlation_id: "source_list_deser".to_string(),
@@ -353,20 +355,18 @@ impl RuntimeStateDb {
     }
 
     /// Find a source by its `root` path or `url` field, optionally scoped to a store.
-    pub fn find_source_by_root_or_url(
+    pub async fn find_source_by_root_or_url(
         &self,
         value: &str,
         store_name: Option<&str>,
     ) -> Result<Option<RuntimeSource>, Error> {
-        let c = self.conn()?;
-        let mut stmt = c
-            .prepare("SELECT json FROM cli_sources")
-            .map_err(map_sqlite_err)?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(map_sqlite_err)?;
-        for row in rows {
-            let json = row.map_err(map_sqlite_err)?;
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query("SELECT json FROM cli_sources", ())
+            .await
+            .map_err(map_libsql_err)?;
+        while let Some(row) = rows.next().await.map_err(map_libsql_err)? {
+            let json: String = row.get(0).map_err(map_libsql_err)?;
             let src: RuntimeSource = serde_json::from_str(&json).map_err(|e| Error::Internal {
                 message: format!("cannot deserialize source: {}", e),
                 correlation_id: "source_find_deser".to_string(),
@@ -424,7 +424,7 @@ pub struct EffectiveStore {
 /// Build the effective config from a YAML config and the runtime-state DB.
 ///
 /// YAML-owned objects are listed first.
-pub fn build_effective_config(
+pub async fn build_effective_config(
     yaml_config: &RawConfig,
     runtime_db: &RuntimeStateDb,
     global_default: &IndexingPolicyConfig,
@@ -453,7 +453,7 @@ pub fn build_effective_config(
         yaml_config.stores.iter().map(|s| s.name.clone()).collect();
 
     // Runtime-owned stores (those not in YAML)
-    for rt_store in runtime_db.list_stores()? {
+    for rt_store in runtime_db.list_stores().await? {
         if yaml_names.contains(&rt_store.name) {
             continue;
         }
@@ -482,18 +482,14 @@ pub fn check_yaml_owned(name: &str, yaml_config: &RawConfig) -> bool {
 // Error mapping helper
 // ---------------------------------------------------------------------------
 
-fn map_sqlite_err(e: rusqlite::Error) -> Error {
-    if let rusqlite::Error::SqliteFailure(ref sqlite_err, _) = e {
-        if matches!(
-            sqlite_err.code,
-            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-        ) {
-            return Error::RuntimeStateLocked;
-        }
+fn map_libsql_err(e: libsql::Error) -> Error {
+    let msg = format!("{e}");
+    if msg.contains("database is locked") || msg.contains("SQLITE_BUSY") {
+        return Error::RuntimeStateLocked;
     }
     Error::Internal {
-        message: format!("runtime-state DB error: {}", e),
-        correlation_id: "sqlite".to_string(),
+        message: format!("runtime-state DB error: {e}"),
+        correlation_id: "libsql".to_string(),
     }
 }
 
@@ -503,10 +499,10 @@ mod tests {
     use crate::config::schema::{EmbeddingPolicy, StoreConfig};
     use tempfile::TempDir;
 
-    fn tmp_db() -> (TempDir, RuntimeStateDb) {
+    async fn tmp_db() -> (TempDir, RuntimeStateDb) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("runtime-state.db");
-        let db = RuntimeStateDb::open(&path).unwrap();
+        let db = RuntimeStateDb::open(&path).await.unwrap();
         (dir, db)
     }
 
@@ -555,130 +551,134 @@ mod tests {
 
     // --- RuntimeStateDb tests ---
 
-    #[test]
-    fn open_creates_db() {
+    #[tokio::test]
+    async fn open_creates_db() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("runtime-state.db");
         assert!(!path.exists());
-        let _db = RuntimeStateDb::open(&path).unwrap();
+        let _db = RuntimeStateDb::open(&path).await.unwrap();
         assert!(path.exists(), "DB file should be created");
     }
 
-    #[test]
-    fn open_creates_parent_directory() {
+    #[tokio::test]
+    async fn open_creates_parent_directory() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("subdir").join("runtime-state.db");
-        let _db = RuntimeStateDb::open(&path).unwrap();
+        let _db = RuntimeStateDb::open(&path).await.unwrap();
         assert!(path.exists(), "DB file should be created in new directory");
     }
 
-    #[test]
-    fn second_open_succeeds() {
+    #[tokio::test]
+    async fn second_open_succeeds() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("runtime-state.db");
 
-        let _db1 = RuntimeStateDb::open(&path).unwrap();
+        let _db1 = RuntimeStateDb::open(&path).await.unwrap();
         // SQLite WAL mode: a second open on the same path must also succeed.
-        let result = RuntimeStateDb::open(&path);
+        let result = RuntimeStateDb::open(&path).await;
         assert!(result.is_ok(), "second open should succeed with SQLite WAL");
     }
 
-    #[test]
-    fn two_handles_same_file_both_usable() {
+    #[tokio::test]
+    async fn two_handles_same_file_both_usable() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("runtime-state.db");
 
-        let db1 = RuntimeStateDb::open(&path).unwrap();
-        let db2 = RuntimeStateDb::open(&path).unwrap();
+        let db1 = RuntimeStateDb::open(&path).await.unwrap();
+        let db2 = RuntimeStateDb::open(&path).await.unwrap();
 
-        db1.upsert_store(&make_runtime_store("from-db1")).unwrap();
-        db2.upsert_store(&make_runtime_store("from-db2")).unwrap();
+        db1.upsert_store(&make_runtime_store("from-db1"))
+            .await
+            .unwrap();
+        db2.upsert_store(&make_runtime_store("from-db2"))
+            .await
+            .unwrap();
 
-        let stores1 = db1.list_stores().unwrap();
-        let stores2 = db2.list_stores().unwrap();
+        let stores1 = db1.list_stores().await.unwrap();
+        let stores2 = db2.list_stores().await.unwrap();
 
         assert_eq!(stores1.len(), 2);
         assert_eq!(stores2.len(), 2);
     }
 
-    #[test]
-    fn busy_timeout_exhaustion_maps_to_runtime_state_locked() {
-        // Verify the error-mapping logic: DatabaseBusy/DatabaseLocked → RuntimeStateLocked.
-        use rusqlite::ffi;
-        let busy = rusqlite::Error::SqliteFailure(ffi::Error::new(ffi::SQLITE_BUSY), None);
-        assert_eq!(map_sqlite_err(busy), Error::RuntimeStateLocked);
+    #[tokio::test]
+    async fn busy_timeout_exhaustion_maps_to_runtime_state_locked() {
+        // Verify the error-mapping logic: "database is locked" → RuntimeStateLocked.
+        let busy_err = libsql::Error::SqliteFailure(5, "database is locked".to_string());
+        assert_eq!(map_libsql_err(busy_err), Error::RuntimeStateLocked);
 
-        let locked = rusqlite::Error::SqliteFailure(ffi::Error::new(ffi::SQLITE_LOCKED), None);
-        assert_eq!(map_sqlite_err(locked), Error::RuntimeStateLocked);
+        // Verify SQLITE_BUSY string also maps correctly.
+        let busy_err2 = libsql::Error::SqliteFailure(5, "SQLITE_BUSY".to_string());
+        assert_eq!(map_libsql_err(busy_err2), Error::RuntimeStateLocked);
     }
 
-    #[test]
-    fn runtime_state_locked_exit_code_is_4() {
+    #[tokio::test]
+    async fn runtime_state_locked_exit_code_is_4() {
         assert_eq!(Error::RuntimeStateLocked.exit_code(), 4);
         assert_eq!(Error::RuntimeStateLocked.code(), "runtime_state_locked");
     }
 
-    #[test]
-    fn upsert_and_get_store() {
-        let (_dir, db) = tmp_db();
+    #[tokio::test]
+    async fn upsert_and_get_store() {
+        let (_dir, db) = tmp_db().await;
         let store = make_runtime_store("my-notes");
-        db.upsert_store(&store).unwrap();
-        let retrieved = db.get_store("my-notes").unwrap().unwrap();
+        db.upsert_store(&store).await.unwrap();
+        let retrieved = db.get_store("my-notes").await.unwrap().unwrap();
         assert_eq!(retrieved.name, "my-notes");
         assert_eq!(retrieved.visibility, "private");
         assert_eq!(retrieved.backend, "lancedb");
     }
 
-    #[test]
-    fn get_nonexistent_store_returns_none() {
-        let (_dir, db) = tmp_db();
-        let result = db.get_store("not-exist").unwrap();
+    #[tokio::test]
+    async fn get_nonexistent_store_returns_none() {
+        let (_dir, db) = tmp_db().await;
+        let result = db.get_store("not-exist").await.unwrap();
         assert!(result.is_none());
     }
 
-    #[test]
-    fn upsert_overwrites_existing_store() {
-        let (_dir, db) = tmp_db();
+    #[tokio::test]
+    async fn upsert_overwrites_existing_store() {
+        let (_dir, db) = tmp_db().await;
         let mut store = make_runtime_store("notes");
-        db.upsert_store(&store).unwrap();
+        db.upsert_store(&store).await.unwrap();
 
         store.visibility = "shared".to_string();
-        db.upsert_store(&store).unwrap();
+        db.upsert_store(&store).await.unwrap();
 
-        let retrieved = db.get_store("notes").unwrap().unwrap();
+        let retrieved = db.get_store("notes").await.unwrap().unwrap();
         assert_eq!(retrieved.visibility, "shared");
     }
 
-    #[test]
-    fn delete_existing_store_returns_true() {
-        let (_dir, db) = tmp_db();
+    #[tokio::test]
+    async fn delete_existing_store_returns_true() {
+        let (_dir, db) = tmp_db().await;
         let store = make_runtime_store("to-delete");
-        db.upsert_store(&store).unwrap();
-        assert!(db.delete_store("to-delete").unwrap());
-        assert!(db.get_store("to-delete").unwrap().is_none());
+        db.upsert_store(&store).await.unwrap();
+        assert!(db.delete_store("to-delete").await.unwrap());
+        assert!(db.get_store("to-delete").await.unwrap().is_none());
     }
 
-    #[test]
-    fn delete_nonexistent_store_returns_false() {
-        let (_dir, db) = tmp_db();
-        assert!(!db.delete_store("not-exist").unwrap());
+    #[tokio::test]
+    async fn delete_nonexistent_store_returns_false() {
+        let (_dir, db) = tmp_db().await;
+        assert!(!db.delete_store("not-exist").await.unwrap());
     }
 
-    #[test]
-    fn list_stores_empty() {
-        let (_dir, db) = tmp_db();
-        let stores = db.list_stores().unwrap();
+    #[tokio::test]
+    async fn list_stores_empty() {
+        let (_dir, db) = tmp_db().await;
+        let stores = db.list_stores().await.unwrap();
         assert!(stores.is_empty());
     }
 
-    #[test]
-    fn list_stores_returns_all() {
-        let (_dir, db) = tmp_db();
-        db.upsert_store(&make_runtime_store("alpha")).unwrap();
-        db.upsert_store(&make_runtime_store("beta")).unwrap();
-        db.upsert_store(&make_runtime_store("gamma")).unwrap();
+    #[tokio::test]
+    async fn list_stores_returns_all() {
+        let (_dir, db) = tmp_db().await;
+        db.upsert_store(&make_runtime_store("alpha")).await.unwrap();
+        db.upsert_store(&make_runtime_store("beta")).await.unwrap();
+        db.upsert_store(&make_runtime_store("gamma")).await.unwrap();
 
-        let mut stores = db.list_stores().unwrap();
+        let mut stores = db.list_stores().await.unwrap();
         stores.sort_by(|a, b| a.name.cmp(&b.name));
         assert_eq!(stores.len(), 3);
         assert_eq!(stores[0].name, "alpha");
@@ -686,9 +686,9 @@ mod tests {
         assert_eq!(stores[2].name, "gamma");
     }
 
-    #[test]
-    fn store_with_indexing_policy_round_trips() {
-        let (_dir, db) = tmp_db();
+    #[tokio::test]
+    async fn store_with_indexing_policy_round_trips() {
+        let (_dir, db) = tmp_db().await;
         let store = RuntimeStore {
             name: "code-store".to_string(),
             id: "ulid-code".to_string(),
@@ -702,8 +702,8 @@ mod tests {
                 ..Default::default()
             }),
         };
-        db.upsert_store(&store).unwrap();
-        let retrieved = db.get_store("code-store").unwrap().unwrap();
+        db.upsert_store(&store).await.unwrap();
+        let retrieved = db.get_store("code-store").await.unwrap().unwrap();
         assert!(retrieved.indexing.is_some());
         assert_eq!(
             retrieved.indexing.as_ref().unwrap().embedding.model,
@@ -713,117 +713,132 @@ mod tests {
 
     // --- Source CRUD tests ---
 
-    #[test]
-    fn upsert_and_get_source() {
-        let (_dir, db) = tmp_db();
+    #[tokio::test]
+    async fn upsert_and_get_source() {
+        let (_dir, db) = tmp_db().await;
         let src = make_runtime_source("src-1", "mystore", "/tmp/docs");
-        db.upsert_source(&src).unwrap();
-        let retrieved = db.get_source("src-1").unwrap().unwrap();
+        db.upsert_source(&src).await.unwrap();
+        let retrieved = db.get_source("src-1").await.unwrap().unwrap();
         assert_eq!(retrieved.id, "src-1");
         assert_eq!(retrieved.store_name, "mystore");
         assert_eq!(retrieved.root.as_deref(), Some("/tmp/docs"));
     }
 
-    #[test]
-    fn get_nonexistent_source_returns_none() {
-        let (_dir, db) = tmp_db();
-        assert!(db.get_source("no-such-id").unwrap().is_none());
+    #[tokio::test]
+    async fn get_nonexistent_source_returns_none() {
+        let (_dir, db) = tmp_db().await;
+        assert!(db.get_source("no-such-id").await.unwrap().is_none());
     }
 
-    #[test]
-    fn upsert_source_overwrites_existing() {
-        let (_dir, db) = tmp_db();
+    #[tokio::test]
+    async fn upsert_source_overwrites_existing() {
+        let (_dir, db) = tmp_db().await;
         let mut src = make_runtime_source("src-1", "mystore", "/tmp/docs");
-        db.upsert_source(&src).unwrap();
+        db.upsert_source(&src).await.unwrap();
         src.root = Some("/tmp/new".to_string());
-        db.upsert_source(&src).unwrap();
-        let r = db.get_source("src-1").unwrap().unwrap();
+        db.upsert_source(&src).await.unwrap();
+        let r = db.get_source("src-1").await.unwrap().unwrap();
         assert_eq!(r.root.as_deref(), Some("/tmp/new"));
     }
 
-    #[test]
-    fn delete_source_returns_true_then_false() {
-        let (_dir, db) = tmp_db();
+    #[tokio::test]
+    async fn delete_source_returns_true_then_false() {
+        let (_dir, db) = tmp_db().await;
         let src = make_runtime_source("src-del", "mystore", "/tmp");
-        db.upsert_source(&src).unwrap();
-        assert!(db.delete_source("src-del").unwrap());
-        assert!(!db.delete_source("src-del").unwrap());
+        db.upsert_source(&src).await.unwrap();
+        assert!(db.delete_source("src-del").await.unwrap());
+        assert!(!db.delete_source("src-del").await.unwrap());
     }
 
-    #[test]
-    fn list_sources_filters_by_store() {
-        let (_dir, db) = tmp_db();
+    #[tokio::test]
+    async fn list_sources_filters_by_store() {
+        let (_dir, db) = tmp_db().await;
         db.upsert_source(&make_runtime_source("s1", "store-a", "/a"))
+            .await
             .unwrap();
         db.upsert_source(&make_runtime_source("s2", "store-b", "/b"))
+            .await
             .unwrap();
         db.upsert_source(&make_runtime_source("s3", "store-a", "/c"))
+            .await
             .unwrap();
 
-        let mut a = db.list_sources("store-a").unwrap();
+        let mut a = db.list_sources("store-a").await.unwrap();
         a.sort_by(|x, y| x.id.cmp(&y.id));
         assert_eq!(a.len(), 2);
         assert_eq!(a[0].id, "s1");
         assert_eq!(a[1].id, "s3");
 
-        let b = db.list_sources("store-b").unwrap();
+        let b = db.list_sources("store-b").await.unwrap();
         assert_eq!(b.len(), 1);
         assert_eq!(b[0].id, "s2");
     }
 
-    #[test]
-    fn delete_sources_for_store_removes_all() {
-        let (_dir, db) = tmp_db();
+    #[tokio::test]
+    async fn delete_sources_for_store_removes_all() {
+        let (_dir, db) = tmp_db().await;
         db.upsert_source(&make_runtime_source("s1", "target", "/1"))
+            .await
             .unwrap();
         db.upsert_source(&make_runtime_source("s2", "target", "/2"))
+            .await
             .unwrap();
         db.upsert_source(&make_runtime_source("s3", "other", "/3"))
+            .await
             .unwrap();
 
-        let removed = db.delete_sources_for_store("target").unwrap();
+        let removed = db.delete_sources_for_store("target").await.unwrap();
         assert_eq!(removed, 2);
-        assert!(db.list_sources("target").unwrap().is_empty());
-        assert_eq!(db.list_sources("other").unwrap().len(), 1);
+        assert!(db.list_sources("target").await.unwrap().is_empty());
+        assert_eq!(db.list_sources("other").await.unwrap().len(), 1);
     }
 
-    #[test]
-    fn find_source_by_root_or_url_found() {
-        let (_dir, db) = tmp_db();
+    #[tokio::test]
+    async fn find_source_by_root_or_url_found() {
+        let (_dir, db) = tmp_db().await;
         db.upsert_source(&make_runtime_source("s1", "store-x", "/docs/notes"))
+            .await
             .unwrap();
-        let found = db.find_source_by_root_or_url("/docs/notes", None).unwrap();
+        let found = db
+            .find_source_by_root_or_url("/docs/notes", None)
+            .await
+            .unwrap();
         assert!(found.is_some());
         assert_eq!(found.unwrap().id, "s1");
     }
 
-    #[test]
-    fn find_source_by_root_or_url_scoped_to_store() {
-        let (_dir, db) = tmp_db();
+    #[tokio::test]
+    async fn find_source_by_root_or_url_scoped_to_store() {
+        let (_dir, db) = tmp_db().await;
         db.upsert_source(&make_runtime_source("s1", "store-a", "/shared"))
+            .await
             .unwrap();
         db.upsert_source(&make_runtime_source("s2", "store-b", "/shared"))
+            .await
             .unwrap();
 
         let found_a = db
             .find_source_by_root_or_url("/shared", Some("store-a"))
+            .await
             .unwrap();
         assert_eq!(found_a.unwrap().id, "s1");
 
         let found_b = db
             .find_source_by_root_or_url("/shared", Some("store-b"))
+            .await
             .unwrap();
         assert_eq!(found_b.unwrap().id, "s2");
 
         let not_found = db
             .find_source_by_root_or_url("/shared", Some("store-c"))
+            .await
             .unwrap();
         assert!(not_found.is_none());
     }
 
-    #[test]
-    fn find_source_by_url() {
-        let (_dir, db) = tmp_db();
+    #[tokio::test]
+    async fn find_source_by_url() {
+        let (_dir, db) = tmp_db().await;
         let src = RuntimeSource {
             id: "url-src".to_string(),
             store_name: "mystore".to_string(),
@@ -834,9 +849,10 @@ mod tests {
             exclude: vec![],
             preset: "prose".to_string(),
         };
-        db.upsert_source(&src).unwrap();
+        db.upsert_source(&src).await.unwrap();
         let found = db
             .find_source_by_root_or_url("https://example.com/docs", None)
+            .await
             .unwrap();
         assert!(found.is_some());
         assert_eq!(found.unwrap().id, "url-src");
@@ -844,12 +860,14 @@ mod tests {
 
     // --- EffectiveConfig tests ---
 
-    #[test]
-    fn effective_config_yaml_only() {
-        let (_dir, db) = tmp_db();
+    #[tokio::test]
+    async fn effective_config_yaml_only() {
+        let (_dir, db) = tmp_db().await;
         let yaml = make_yaml_config_with_stores(&["notes", "code"]);
         let default_policy = IndexingPolicyConfig::default();
-        let effective = build_effective_config(&yaml, &db, &default_policy).unwrap();
+        let effective = build_effective_config(&yaml, &db, &default_policy)
+            .await
+            .unwrap();
         assert_eq!(effective.stores.len(), 2);
         assert!(effective
             .stores
@@ -857,23 +875,26 @@ mod tests {
             .all(|s| s.ownership == ConfigOwnership::Yaml));
     }
 
-    #[test]
-    fn effective_config_runtime_only() {
-        let (_dir, db) = tmp_db();
+    #[tokio::test]
+    async fn effective_config_runtime_only() {
+        let (_dir, db) = tmp_db().await;
         db.upsert_store(&make_runtime_store("runtime-store"))
+            .await
             .unwrap();
 
         let yaml = make_yaml_config_with_stores(&[]);
         let default_policy = IndexingPolicyConfig::default();
-        let effective = build_effective_config(&yaml, &db, &default_policy).unwrap();
+        let effective = build_effective_config(&yaml, &db, &default_policy)
+            .await
+            .unwrap();
         assert_eq!(effective.stores.len(), 1);
         assert_eq!(effective.stores[0].ownership, ConfigOwnership::Runtime);
         assert_eq!(effective.stores[0].name, "runtime-store");
     }
 
-    #[test]
-    fn effective_config_yaml_takes_precedence_over_runtime() {
-        let (_dir, db) = tmp_db();
+    #[tokio::test]
+    async fn effective_config_yaml_takes_precedence_over_runtime() {
+        let (_dir, db) = tmp_db().await;
 
         db.upsert_store(&RuntimeStore {
             name: "notes".to_string(),
@@ -882,27 +903,33 @@ mod tests {
             backend: "lancedb".to_string(),
             indexing: None,
         })
+        .await
         .unwrap();
 
         let yaml = make_yaml_config_with_stores(&["notes"]);
 
         let default_policy = IndexingPolicyConfig::default();
-        let effective = build_effective_config(&yaml, &db, &default_policy).unwrap();
+        let effective = build_effective_config(&yaml, &db, &default_policy)
+            .await
+            .unwrap();
 
         assert_eq!(effective.stores.len(), 1);
         assert_eq!(effective.stores[0].ownership, ConfigOwnership::Yaml);
         assert_eq!(effective.stores[0].visibility, "private");
     }
 
-    #[test]
-    fn effective_config_mixed_ownership() {
-        let (_dir, db) = tmp_db();
+    #[tokio::test]
+    async fn effective_config_mixed_ownership() {
+        let (_dir, db) = tmp_db().await;
         db.upsert_store(&make_runtime_store("runtime-notes"))
+            .await
             .unwrap();
 
         let yaml = make_yaml_config_with_stores(&["yaml-notes"]);
         let default_policy = IndexingPolicyConfig::default();
-        let effective = build_effective_config(&yaml, &db, &default_policy).unwrap();
+        let effective = build_effective_config(&yaml, &db, &default_policy)
+            .await
+            .unwrap();
 
         assert_eq!(effective.stores.len(), 2);
         let yaml_store = effective
@@ -919,9 +946,9 @@ mod tests {
         assert_eq!(rt_store.ownership, ConfigOwnership::Runtime);
     }
 
-    #[test]
-    fn effective_config_store_inherits_global_default() {
-        let (_dir, db) = tmp_db();
+    #[tokio::test]
+    async fn effective_config_store_inherits_global_default() {
+        let (_dir, db) = tmp_db().await;
 
         let custom_default = IndexingPolicyConfig {
             embedding: EmbeddingPolicy {
@@ -932,14 +959,16 @@ mod tests {
         };
 
         let yaml = make_yaml_config_with_stores(&["my-store"]);
-        let effective = build_effective_config(&yaml, &db, &custom_default).unwrap();
+        let effective = build_effective_config(&yaml, &db, &custom_default)
+            .await
+            .unwrap();
 
         assert_eq!(effective.stores[0].indexing.embedding.model, "custom-model");
     }
 
-    #[test]
-    fn effective_config_store_uses_own_policy_over_default() {
-        let (_dir, db) = tmp_db();
+    #[tokio::test]
+    async fn effective_config_store_uses_own_policy_over_default() {
+        let (_dir, db) = tmp_db().await;
 
         let yaml = RawConfig {
             version: 1,
@@ -963,7 +992,9 @@ mod tests {
         };
 
         let global_default = IndexingPolicyConfig::default();
-        let effective = build_effective_config(&yaml, &db, &global_default).unwrap();
+        let effective = build_effective_config(&yaml, &db, &global_default)
+            .await
+            .unwrap();
 
         assert_eq!(
             effective.stores[0].indexing.embedding.model,
@@ -1019,49 +1050,52 @@ mod tests {
 
     // --- Persistence tests ---
 
-    #[test]
-    fn runtime_state_persists_across_reopen() {
+    #[tokio::test]
+    async fn runtime_state_persists_across_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("runtime-state.db");
 
         {
-            let db = RuntimeStateDb::open(&path).unwrap();
-            db.upsert_store(&make_runtime_store("persisted")).unwrap();
-        }
-
-        let db2 = RuntimeStateDb::open(&path).unwrap();
-        let store = db2.get_store("persisted").unwrap().unwrap();
-        assert_eq!(store.name, "persisted");
-    }
-
-    #[test]
-    fn deleted_store_not_found_after_reopen() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("runtime-state.db");
-
-        {
-            let db = RuntimeStateDb::open(&path).unwrap();
-            db.upsert_store(&make_runtime_store("temp")).unwrap();
-            db.delete_store("temp").unwrap();
-        }
-
-        let db2 = RuntimeStateDb::open(&path).unwrap();
-        assert!(db2.get_store("temp").unwrap().is_none());
-    }
-
-    #[test]
-    fn source_persists_across_reopen() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("runtime-state.db");
-
-        {
-            let db = RuntimeStateDb::open(&path).unwrap();
-            db.upsert_source(&make_runtime_source("persist-src", "mystore", "/data"))
+            let db = RuntimeStateDb::open(&path).await.unwrap();
+            db.upsert_store(&make_runtime_store("persisted"))
+                .await
                 .unwrap();
         }
 
-        let db2 = RuntimeStateDb::open(&path).unwrap();
-        let src = db2.get_source("persist-src").unwrap().unwrap();
+        let db2 = RuntimeStateDb::open(&path).await.unwrap();
+        let store = db2.get_store("persisted").await.unwrap().unwrap();
+        assert_eq!(store.name, "persisted");
+    }
+
+    #[tokio::test]
+    async fn deleted_store_not_found_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime-state.db");
+
+        {
+            let db = RuntimeStateDb::open(&path).await.unwrap();
+            db.upsert_store(&make_runtime_store("temp")).await.unwrap();
+            db.delete_store("temp").await.unwrap();
+        }
+
+        let db2 = RuntimeStateDb::open(&path).await.unwrap();
+        assert!(db2.get_store("temp").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn source_persists_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime-state.db");
+
+        {
+            let db = RuntimeStateDb::open(&path).await.unwrap();
+            db.upsert_source(&make_runtime_source("persist-src", "mystore", "/data"))
+                .await
+                .unwrap();
+        }
+
+        let db2 = RuntimeStateDb::open(&path).await.unwrap();
+        let src = db2.get_source("persist-src").await.unwrap().unwrap();
         assert_eq!(src.root.as_deref(), Some("/data"));
     }
 }

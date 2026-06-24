@@ -134,7 +134,10 @@ pub async fn create_schema(
 /// Check the current schema version. Returns None if table doesn't exist.
 #[allow(dead_code)] // used in Wave 4 (migrations) and tests
 pub async fn get_schema_version(conn: &Connection) -> Result<Option<i64>, libsql::Error> {
-    let mut rows = match conn.query("SELECT version FROM schema_version LIMIT 1", ()).await {
+    let mut rows = match conn
+        .query("SELECT version FROM schema_version LIMIT 1", ())
+        .await
+    {
         Ok(rows) => rows,
         Err(_) => return Ok(None),
     };

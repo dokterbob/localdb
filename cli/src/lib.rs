@@ -392,47 +392,47 @@ pub struct AppDb {
 
 impl AppDb {
     /// Open the combined DB at `state_path`.
-    pub fn open(state_path: &Path) -> Result<Self, Error> {
-        let db = RuntimeStateDb::open(state_path)?;
+    pub async fn open(state_path: &Path) -> Result<Self, Error> {
+        let db = RuntimeStateDb::open(state_path).await?;
         Ok(Self { db })
     }
 
     // --- store delegates ---
-    pub fn get_store(&self, name: &str) -> Result<Option<RuntimeStore>, Error> {
-        self.db.get_store(name)
+    pub async fn get_store(&self, name: &str) -> Result<Option<RuntimeStore>, Error> {
+        self.db.get_store(name).await
     }
-    pub fn upsert_store(&self, store: &RuntimeStore) -> Result<(), Error> {
-        self.db.upsert_store(store)
+    pub async fn upsert_store(&self, store: &RuntimeStore) -> Result<(), Error> {
+        self.db.upsert_store(store).await
     }
-    pub fn delete_store(&self, name: &str) -> Result<bool, Error> {
-        self.db.delete_store(name)
+    pub async fn delete_store(&self, name: &str) -> Result<bool, Error> {
+        self.db.delete_store(name).await
     }
-    pub fn list_stores(&self) -> Result<Vec<RuntimeStore>, Error> {
-        self.db.list_stores()
+    pub async fn list_stores(&self) -> Result<Vec<RuntimeStore>, Error> {
+        self.db.list_stores().await
     }
 
     // --- source delegates ---
-    pub fn upsert_source(&self, source: &RuntimeSource) -> Result<(), Error> {
-        self.db.upsert_source(source)
+    pub async fn upsert_source(&self, source: &RuntimeSource) -> Result<(), Error> {
+        self.db.upsert_source(source).await
     }
-    pub fn delete_source(&self, id: &str) -> Result<bool, Error> {
-        self.db.delete_source(id)
+    pub async fn delete_source(&self, id: &str) -> Result<bool, Error> {
+        self.db.delete_source(id).await
     }
-    pub fn list_sources(&self, store_name: &str) -> Result<Vec<RuntimeSource>, Error> {
-        self.db.list_sources(store_name)
+    pub async fn list_sources(&self, store_name: &str) -> Result<Vec<RuntimeSource>, Error> {
+        self.db.list_sources(store_name).await
     }
-    pub fn get_source(&self, id: &str) -> Result<Option<RuntimeSource>, Error> {
-        self.db.get_source(id)
+    pub async fn get_source(&self, id: &str) -> Result<Option<RuntimeSource>, Error> {
+        self.db.get_source(id).await
     }
-    pub fn find_source_by_root_or_url(
+    pub async fn find_source_by_root_or_url(
         &self,
         value: &str,
         store_name: Option<&str>,
     ) -> Result<Option<RuntimeSource>, Error> {
-        self.db.find_source_by_root_or_url(value, store_name)
+        self.db.find_source_by_root_or_url(value, store_name).await
     }
-    pub fn delete_sources_for_store(&self, store_name: &str) -> Result<usize, Error> {
-        self.db.delete_sources_for_store(store_name)
+    pub async fn delete_sources_for_store(&self, store_name: &str) -> Result<u64, Error> {
+        self.db.delete_sources_for_store(store_name).await
     }
 }
 
@@ -446,7 +446,7 @@ impl AppDb {
 /// opened directly regardless of whether the daemon is also running. Commands
 /// that detect a running daemon will route mutations through the HTTP API;
 /// they still open the real DB for read operations (store list, etc.).
-fn load_app_db(ctx: &CliContext) -> (ConfigLoader, AppDb) {
+async fn load_app_db(ctx: &CliContext) -> (ConfigLoader, AppDb) {
     let options = LoadOptions {
         config_path: ctx.config.clone(),
         ..Default::default()
@@ -457,7 +457,7 @@ fn load_app_db(ctx: &CliContext) -> (ConfigLoader, AppDb) {
     };
 
     let db_path = config_loader.paths.runtime_state_db_path();
-    let db = match AppDb::open(&db_path) {
+    let db = match AppDb::open(&db_path).await {
         Ok(d) => d,
         Err(e) => exit_err(&e, ctx.json),
     };
@@ -469,7 +469,7 @@ fn load_app_db(ctx: &CliContext) -> (ConfigLoader, AppDb) {
 /// When the config file is malformed or unreadable, read-only commands (search,
 /// store list, status) should still work using platform default config and an
 /// empty temp DB, rather than hard failing.
-fn load_app_db_lenient(ctx: &CliContext) -> (ConfigLoader, AppDb) {
+async fn load_app_db_lenient(ctx: &CliContext) -> (ConfigLoader, AppDb) {
     let options = LoadOptions {
         config_path: ctx.config.clone(),
         ..Default::default()
@@ -487,28 +487,30 @@ fn load_app_db_lenient(ctx: &CliContext) -> (ConfigLoader, AppDb) {
     };
 
     let db_path = config_loader.paths.runtime_state_db_path();
-    let db = match AppDb::open(&db_path) {
+    let db = match AppDb::open(&db_path).await {
         Ok(d) => d,
         Err(Error::RuntimeStateLocked) => exit_err(&Error::RuntimeStateLocked, ctx.json),
         Err(_) => {
             // DB absent or unreadable: use a temp path so read-only commands
             // show empty results rather than hard failing.
             let tmp_path = config_loader.paths.data_dir.join(".lenient-fallback.db");
-            AppDb::open(&tmp_path).unwrap_or_else(|e| exit_err(&e, ctx.json))
+            AppDb::open(&tmp_path)
+                .await
+                .unwrap_or_else(|e| exit_err(&e, ctx.json))
         }
     };
     (config_loader, db)
 }
 
 /// Resolve the target store name from --store flags, YAML config, or runtime DB.
-fn resolve_store_name(ctx: &CliContext, config_loader: &ConfigLoader, db: &AppDb) -> String {
+async fn resolve_store_name(ctx: &CliContext, config_loader: &ConfigLoader, db: &AppDb) -> String {
     if let Some(name) = ctx.stores.first() {
         return name.clone();
     }
     if let Some(s) = config_loader.config.stores.first() {
         return s.name.clone();
     }
-    match db.list_stores() {
+    match db.list_stores().await {
         Ok(stores) if !stores.is_empty() => stores[0].name.clone(),
         Ok(_) => exit_err(
             &Error::InvalidRequest {
@@ -537,13 +539,13 @@ fn resolve_store_name(ctx: &CliContext, config_loader: &ConfigLoader, db: &AppDb
 ///
 /// This function is intentionally idempotent: re-running it never overwrites existing
 /// runtime-DB records (it only inserts when the name/key is absent).
-pub fn reconcile_yaml_stores(
+pub async fn reconcile_yaml_stores(
     db: &AppDb,
     config: &localdb_core::config::schema::RawConfig,
 ) -> Result<(), Error> {
     for yaml_store in &config.stores {
         // Only insert a shadow if the store is not already in the runtime DB.
-        if db.get_store(&yaml_store.name)?.is_none() {
+        if db.get_store(&yaml_store.name).await?.is_none() {
             let shadow = RuntimeStore {
                 id: new_ulid(),
                 name: yaml_store.name.clone(),
@@ -551,7 +553,7 @@ pub fn reconcile_yaml_stores(
                 backend: yaml_store.backend.clone(),
                 indexing: yaml_store.indexing.clone(),
             };
-            db.upsert_store(&shadow)?;
+            db.upsert_store(&shadow).await?;
         }
 
         // Reconcile sources declared in this YAML store.
@@ -567,7 +569,8 @@ pub fn reconcile_yaml_stores(
 
             // Only insert if not already present.
             if db
-                .find_source_by_root_or_url(key, Some(&yaml_store.name))?
+                .find_source_by_root_or_url(key, Some(&yaml_store.name))
+                .await?
                 .is_none()
             {
                 let src = RuntimeSource {
@@ -580,7 +583,7 @@ pub fn reconcile_yaml_stores(
                     exclude: yaml_src.exclude.clone(),
                     preset: yaml_src.preset.clone(),
                 };
-                db.upsert_source(&src)?;
+                db.upsert_source(&src).await?;
             }
         }
     }
@@ -729,6 +732,11 @@ pub fn runtime_source_to_core_source(
 /// 5. Create all directories.
 /// 6. Initialize the runtime-state DB.
 pub fn run_init(ctx: &CliContext) {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(run_init_async(ctx));
+}
+
+async fn run_init_async(ctx: &CliContext) {
     let platform = localdb_core::config::PlatformPaths::resolve().unwrap_or_else(|| {
         eprintln!("error: cannot determine platform paths");
         std::process::exit(1);
@@ -817,13 +825,13 @@ pub fn run_init(ctx: &CliContext) {
 
     // Initialize the runtime-state DB and create default store (#6).
     let db_path = data_dir.join("runtime-state.db");
-    let db = match AppDb::open(&db_path) {
+    let db = match AppDb::open(&db_path).await {
         Ok(d) => d,
         Err(e) => exit_err(&e, ctx.json),
     };
 
     // Create the default store if it doesn't exist yet.
-    match db.get_store("default") {
+    match db.get_store("default").await {
         Ok(None) => {
             let default_store = RuntimeStore {
                 id: new_ulid(),
@@ -832,7 +840,7 @@ pub fn run_init(ctx: &CliContext) {
                 backend: "lancedb".to_string(),
                 indexing: None,
             };
-            if let Err(e) = db.upsert_store(&default_store) {
+            if let Err(e) = db.upsert_store(&default_store).await {
                 exit_err(&e, ctx.json);
             }
         }
@@ -864,8 +872,13 @@ pub fn run_init(ctx: &CliContext) {
 
 /// `localdb status`
 pub fn run_status(ctx: &CliContext) {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(run_status_async(ctx));
+}
+
+async fn run_status_async(ctx: &CliContext) {
     // F1-cli: use lenient loader so status works even with malformed config.
-    let (config_loader, db) = load_app_db_lenient(ctx);
+    let (config_loader, db) = load_app_db_lenient(ctx).await;
     let data_dir = &config_loader.paths.data_dir;
 
     let daemon_status = match probe_daemon(data_dir, ctx.daemon_url.as_deref()) {
@@ -873,7 +886,7 @@ pub fn run_status(ctx: &CliContext) {
         DaemonState::NotRunning => "not running (embedded mode)".to_string(),
     };
 
-    let runtime_stores = match db.list_stores() {
+    let runtime_stores = match db.list_stores().await {
         Ok(s) => s,
         Err(e) => exit_err(&e, ctx.json),
     };
@@ -937,7 +950,7 @@ async fn run_store_add_async(ctx: &CliContext, name: &str) {
         exit_err(&e, ctx.json);
     }
 
-    let (config_loader, db) = load_app_db(ctx);
+    let (config_loader, db) = load_app_db(ctx).await;
     let data_dir = &config_loader.paths.data_dir;
 
     if check_yaml_owned(name, &config_loader.config) {
@@ -967,7 +980,7 @@ async fn run_store_add_async(ctx: &CliContext, name: &str) {
     // Embedded mode: SQLite serialises the metadata write; no WriteLock needed here.
 
     // Duplicate check.
-    match db.get_store(name) {
+    match db.get_store(name).await {
         Ok(Some(_)) => exit_err(
             &Error::InvalidRequest {
                 message: format!("store '{}' already exists", name),
@@ -985,7 +998,7 @@ async fn run_store_add_async(ctx: &CliContext, name: &str) {
         backend: "lancedb".to_string(),
         indexing: None,
     };
-    if let Err(e) = db.upsert_store(&store) {
+    if let Err(e) = db.upsert_store(&store).await {
         exit_err(&e, ctx.json);
     }
 
@@ -998,15 +1011,20 @@ async fn run_store_add_async(ctx: &CliContext, name: &str) {
 
 /// `localdb store list`
 pub fn run_store_list(ctx: &CliContext) {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(run_store_list_async(ctx));
+}
+
+async fn run_store_list_async(ctx: &CliContext) {
     // F1-cli: use lenient loader so store list works even with malformed config.
-    let (config_loader, db) = load_app_db_lenient(ctx);
+    let (config_loader, db) = load_app_db_lenient(ctx).await;
 
     // #12: Reconcile YAML-declared stores into the runtime DB so that commands
     // that look up stores by name (e.g. source list, source add) find them.
     // Failures here are non-fatal for the list display path.
-    let _ = reconcile_yaml_stores(&db, &config_loader.config);
+    let _ = reconcile_yaml_stores(&db, &config_loader.config).await;
 
-    let runtime_stores = match db.list_stores() {
+    let runtime_stores = match db.list_stores().await {
         Ok(s) => s,
         Err(e) => exit_err(&e, ctx.json),
     };
@@ -1101,7 +1119,7 @@ pub fn run_store_remove(ctx: &CliContext, name: &str) {
 }
 
 async fn run_store_remove_async(ctx: &CliContext, name: &str) {
-    let (config_loader, db) = load_app_db(ctx);
+    let (config_loader, db) = load_app_db(ctx).await;
     let data_dir = &config_loader.paths.data_dir;
 
     if check_yaml_owned(name, &config_loader.config) {
@@ -1134,9 +1152,9 @@ async fn run_store_remove_async(ctx: &CliContext, name: &str) {
 
     // Embedded mode: SQLite serialises the metadata writes. WriteLock is acquired only
     // around the LanceDB data directory deletion (remove_store_data_dir).
-    match db.delete_store(name) {
+    match db.delete_store(name).await {
         Ok(true) => {
-            let _ = db.delete_sources_for_store(name);
+            let _ = db.delete_sources_for_store(name).await;
             let _lock = match WriteLock::acquire(data_dir) {
                 Ok(l) => l,
                 Err(e) => exit_err(&e, ctx.json),
@@ -1254,7 +1272,7 @@ pub fn run_source_add(ctx: &CliContext, source_arg: &str) {
 }
 
 async fn run_source_add_async(ctx: &CliContext, source_arg: &str) {
-    let (config_loader, db) = load_app_db(ctx);
+    let (config_loader, db) = load_app_db(ctx).await;
     let data_dir = &config_loader.paths.data_dir;
 
     // A9-safety: validate the --store name if given explicitly.
@@ -1264,7 +1282,7 @@ async fn run_source_add_async(ctx: &CliContext, source_arg: &str) {
         }
     }
 
-    let store_name = resolve_store_name(ctx, &config_loader, &db);
+    let store_name = resolve_store_name(ctx, &config_loader, &db).await;
 
     if check_yaml_owned(&store_name, &config_loader.config) {
         exit_err(&Error::ConfigReadonly, ctx.json);
@@ -1313,7 +1331,7 @@ async fn run_source_add_async(ctx: &CliContext, source_arg: &str) {
     // The auto-index step below acquires its own WriteLock for LanceDB writes.
 
     // #13: Verify store exists in runtime DB (exit 3 if not found).
-    let rt_store = match db.get_store(&store_name) {
+    let rt_store = match db.get_store(&store_name).await {
         Ok(None) => exit_err(
             &Error::StoreNotFound {
                 id: store_name.clone(),
@@ -1351,7 +1369,7 @@ async fn run_source_add_async(ctx: &CliContext, source_arg: &str) {
         preset: "prose".to_string(),
     };
 
-    if let Err(e) = db.upsert_source(&src) {
+    if let Err(e) = db.upsert_source(&src).await {
         exit_err(&e, ctx.json);
     }
 
@@ -1402,10 +1420,10 @@ async fn run_index_for_source_async(
         store::RetrievalStore,
     };
 
-    let (config_loader, db) = load_app_db(ctx);
+    let (config_loader, db) = load_app_db(ctx).await;
     let data_dir = config_loader.paths.data_dir.clone();
 
-    let all_sources = match db.list_sources(&rt_store.name) {
+    let all_sources = match db.list_sources(&rt_store.name).await {
         Ok(s) => s,
         Err(e) => {
             eprintln!("warning: cannot list sources for auto-index: {}", e);
@@ -1543,7 +1561,12 @@ async fn run_index_for_source_async(
 
 /// `localdb source list`
 pub fn run_source_list(ctx: &CliContext) {
-    let (config_loader, db) = load_app_db(ctx);
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(run_source_list_async(ctx));
+}
+
+async fn run_source_list_async(ctx: &CliContext) {
+    let (config_loader, db) = load_app_db(ctx).await;
 
     // A9-safety: validate --store name if given explicitly.
     if let Some(store_name) = ctx.stores.first() {
@@ -1552,11 +1575,11 @@ pub fn run_source_list(ctx: &CliContext) {
         }
     }
 
-    let store_name = resolve_store_name(ctx, &config_loader, &db);
+    let store_name = resolve_store_name(ctx, &config_loader, &db).await;
 
     // D1: verify store exists before listing sources.
     if let Some(explicit) = ctx.stores.first() {
-        match db.get_store(explicit) {
+        match db.get_store(explicit).await {
             Ok(None) => exit_err(
                 &Error::StoreNotFound {
                     id: explicit.clone(),
@@ -1568,7 +1591,7 @@ pub fn run_source_list(ctx: &CliContext) {
         }
     }
 
-    let sources = match db.list_sources(&store_name) {
+    let sources = match db.list_sources(&store_name).await {
         Ok(s) => s,
         Err(e) => exit_err(&e, ctx.json),
     };
@@ -1614,9 +1637,9 @@ async fn run_source_remove_async(ctx: &CliContext, id: &str) {
         }
     }
 
-    let (config_loader, db) = load_app_db(ctx);
+    let (config_loader, db) = load_app_db(ctx).await;
     let data_dir = &config_loader.paths.data_dir;
-    let store_name = resolve_store_name(ctx, &config_loader, &db);
+    let store_name = resolve_store_name(ctx, &config_loader, &db).await;
 
     if check_yaml_owned(&store_name, &config_loader.config) {
         exit_err(&Error::ConfigReadonly, ctx.json);
@@ -1624,7 +1647,7 @@ async fn run_source_remove_async(ctx: &CliContext, id: &str) {
 
     // D1: verify the store exists if --store was given explicitly.
     if let Some(explicit) = ctx.stores.first() {
-        match db.get_store(explicit) {
+        match db.get_store(explicit).await {
             Ok(None) => exit_err(
                 &Error::StoreNotFound {
                     id: explicit.clone(),
@@ -1660,7 +1683,7 @@ async fn run_source_remove_async(ctx: &CliContext, id: &str) {
     let resolved_id: String = if !looks_like_id(id) {
         // Argument is a path or URL — look up by root/url.
         let explicit_store = ctx.stores.first().map(|s| s.as_str());
-        match db.find_source_by_root_or_url(id, explicit_store) {
+        match db.find_source_by_root_or_url(id, explicit_store).await {
             Ok(Some(src)) => src.id,
             Ok(None) => exit_err(&Error::SourceNotFound { id: id.to_string() }, ctx.json),
             Err(e) => exit_err(&e, ctx.json),
@@ -1671,7 +1694,7 @@ async fn run_source_remove_async(ctx: &CliContext, id: &str) {
 
     // D2: If --store was given, verify the source belongs to that store.
     if let Some(explicit_store) = ctx.stores.first() {
-        match db.get_source(&resolved_id) {
+        match db.get_source(&resolved_id).await {
             Ok(Some(src)) if src.store_name != *explicit_store => {
                 exit_err(
                     &Error::SourceNotFound {
@@ -1694,7 +1717,7 @@ async fn run_source_remove_async(ctx: &CliContext, id: &str) {
         }
     }
 
-    match db.delete_source(&resolved_id) {
+    match db.delete_source(&resolved_id).await {
         Ok(true) => {}
         Ok(false) => exit_err(
             &Error::SourceNotFound {
@@ -1742,9 +1765,9 @@ async fn run_index_async(
         }
     }
 
-    let (config_loader, db) = load_app_db(ctx);
+    let (config_loader, db) = load_app_db(ctx).await;
     let data_dir = config_loader.paths.data_dir.clone();
-    let store_name = resolve_store_name(ctx, &config_loader, &db);
+    let store_name = resolve_store_name(ctx, &config_loader, &db).await;
 
     // Per specs/05-surfaces.md §2: when daemon is running, submit a job and poll.
     if let DaemonState::Running { base_url } = probe_daemon(&data_dir, ctx.daemon_url.as_deref()) {
@@ -1773,12 +1796,12 @@ async fn run_index_async(
     // Embedded mode: metadata ops run without the write lock (SQLite serialises them).
     // #12: Reconcile YAML-declared stores into the runtime DB so that YAML stores
     // are findable by the index command without requiring `localdb store add` first.
-    if let Err(e) = reconcile_yaml_stores(&db, &config_loader.config) {
+    if let Err(e) = reconcile_yaml_stores(&db, &config_loader.config).await {
         exit_err(&e, ctx.json);
     }
 
     // #13: Validate --store exists in runtime DB.
-    let rt_store = match db.get_store(&store_name) {
+    let rt_store = match db.get_store(&store_name).await {
         Ok(Some(s)) => s,
         Ok(None) => exit_err(
             &Error::StoreNotFound {
@@ -1819,7 +1842,7 @@ async fn run_index_async(
         None
     };
 
-    let all_sources = match db.list_sources(&store_name) {
+    let all_sources = match db.list_sources(&store_name).await {
         Ok(s) => s,
         Err(e) => exit_err(&e, ctx.json),
     };
@@ -2017,7 +2040,7 @@ async fn run_search_async(ctx: &CliContext, query: &str, limit: usize) {
     use localdb_core::search::{QueryRequest, SearchOrchestrator, StoreHandle};
 
     // F1-cli: use lenient loader so search works even with malformed config.
-    let (config_loader, db) = load_app_db_lenient(ctx);
+    let (config_loader, db) = load_app_db_lenient(ctx).await;
     let data_dir = config_loader.paths.data_dir.clone();
 
     // Per specs/05-surfaces.md §2: search routes through the daemon when running.
@@ -2066,7 +2089,7 @@ async fn run_search_async(ctx: &CliContext, query: &str, limit: usize) {
     }
 
     // Embedded mode.
-    let runtime_stores = match db.list_stores() {
+    let runtime_stores = match db.list_stores().await {
         Ok(s) => s,
         Err(e) => exit_err(&e, ctx.json),
     };
@@ -2284,10 +2307,10 @@ pub fn run_mcp(ctx: &CliContext, allow_write: bool) {
 async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
     use mcp::{AvailableStore, McpServer, StoreDescriptor};
 
-    let (config_loader, db) = load_app_db(ctx);
+    let (config_loader, db) = load_app_db(ctx).await;
     let data_dir = config_loader.paths.data_dir.clone();
 
-    let runtime_stores = match db.list_stores() {
+    let runtime_stores = match db.list_stores().await {
         Ok(s) => s,
         Err(e) => exit_err(&e, ctx.json),
     };
@@ -2382,8 +2405,8 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn tmp_app_db(dir: &TempDir) -> AppDb {
-        AppDb::open(&dir.path().join("state.db")).unwrap()
+    async fn tmp_app_db(dir: &TempDir) -> AppDb {
+        AppDb::open(&dir.path().join("state.db")).await.unwrap()
     }
 
     fn new_runtime_store(name: &str) -> RuntimeStore {
@@ -2560,54 +2583,54 @@ mod tests {
 
     // --- AppDb store CRUD ---
 
-    #[test]
-    fn app_db_store_add_list_remove() {
+    #[tokio::test]
+    async fn app_db_store_add_list_remove() {
         let dir = TempDir::new().unwrap();
-        let db = tmp_app_db(&dir);
+        let db = tmp_app_db(&dir).await;
 
         // Empty initially.
-        assert!(db.list_stores().unwrap().is_empty());
+        assert!(db.list_stores().await.unwrap().is_empty());
 
         // Add.
         let store = new_runtime_store("mystore");
-        db.upsert_store(&store).unwrap();
+        db.upsert_store(&store).await.unwrap();
 
-        let stores = db.list_stores().unwrap();
+        let stores = db.list_stores().await.unwrap();
         assert_eq!(stores.len(), 1);
         assert_eq!(stores[0].name, "mystore");
 
         // Remove.
-        assert!(db.delete_store("mystore").unwrap());
-        assert!(db.list_stores().unwrap().is_empty());
+        assert!(db.delete_store("mystore").await.unwrap());
+        assert!(db.list_stores().await.unwrap().is_empty());
 
         // Remove again returns false.
-        assert!(!db.delete_store("mystore").unwrap());
+        assert!(!db.delete_store("mystore").await.unwrap());
     }
 
-    #[test]
-    fn app_db_get_store_by_name() {
+    #[tokio::test]
+    async fn app_db_get_store_by_name() {
         let dir = TempDir::new().unwrap();
-        let db = tmp_app_db(&dir);
+        let db = tmp_app_db(&dir).await;
         let store = new_runtime_store("s1");
-        db.upsert_store(&store).unwrap();
+        db.upsert_store(&store).await.unwrap();
 
-        let found = db.get_store("s1").unwrap();
+        let found = db.get_store("s1").await.unwrap();
         assert!(found.is_some());
         assert_eq!(found.unwrap().name, "s1");
 
-        let missing = db.get_store("nonexistent").unwrap();
+        let missing = db.get_store("nonexistent").await.unwrap();
         assert!(missing.is_none());
     }
 
     // --- AppDb source CRUD ---
 
-    #[test]
-    fn app_db_source_upsert_list_delete() {
+    #[tokio::test]
+    async fn app_db_source_upsert_list_delete() {
         let dir = TempDir::new().unwrap();
-        let db = tmp_app_db(&dir);
+        let db = tmp_app_db(&dir).await;
 
         let store = new_runtime_store("s1");
-        db.upsert_store(&store).unwrap();
+        db.upsert_store(&store).await.unwrap();
 
         let src = RuntimeSource {
             id: new_ulid(),
@@ -2619,22 +2642,22 @@ mod tests {
             exclude: vec![],
             preset: "prose".into(),
         };
-        db.upsert_source(&src).unwrap();
+        db.upsert_source(&src).await.unwrap();
 
-        let list = db.list_sources("s1").unwrap();
+        let list = db.list_sources("s1").await.unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].id, src.id);
 
         // Delete.
-        assert!(db.delete_source(&src.id).unwrap());
-        assert!(!db.delete_source(&src.id).unwrap()); // idempotent false
-        assert!(db.list_sources("s1").unwrap().is_empty());
+        assert!(db.delete_source(&src.id).await.unwrap());
+        assert!(!db.delete_source(&src.id).await.unwrap()); // idempotent false
+        assert!(db.list_sources("s1").await.unwrap().is_empty());
     }
 
-    #[test]
-    fn app_db_source_list_filters_by_store() {
+    #[tokio::test]
+    async fn app_db_source_list_filters_by_store() {
         let dir = TempDir::new().unwrap();
-        let db = tmp_app_db(&dir);
+        let db = tmp_app_db(&dir).await;
 
         for name in &["sa", "sb"] {
             let src = RuntimeSource {
@@ -2647,18 +2670,18 @@ mod tests {
                 exclude: vec![],
                 preset: "prose".into(),
             };
-            db.upsert_source(&src).unwrap();
+            db.upsert_source(&src).await.unwrap();
         }
 
-        assert_eq!(db.list_sources("sa").unwrap().len(), 1);
-        assert_eq!(db.list_sources("sb").unwrap().len(), 1);
-        assert!(db.list_sources("sc").unwrap().is_empty());
+        assert_eq!(db.list_sources("sa").await.unwrap().len(), 1);
+        assert_eq!(db.list_sources("sb").await.unwrap().len(), 1);
+        assert!(db.list_sources("sc").await.unwrap().is_empty());
     }
 
-    #[test]
-    fn app_db_source_get_by_id() {
+    #[tokio::test]
+    async fn app_db_source_get_by_id() {
         let dir = TempDir::new().unwrap();
-        let db = tmp_app_db(&dir);
+        let db = tmp_app_db(&dir).await;
 
         let src = RuntimeSource {
             id: new_ulid(),
@@ -2670,11 +2693,11 @@ mod tests {
             exclude: vec![],
             preset: "prose".into(),
         };
-        db.upsert_source(&src).unwrap();
+        db.upsert_source(&src).await.unwrap();
 
-        let found = db.get_source(&src.id).unwrap();
+        let found = db.get_source(&src.id).await.unwrap();
         assert!(found.is_some());
-        let missing = db.get_source("no-such-id").unwrap();
+        let missing = db.get_source("no-such-id").await.unwrap();
         assert!(missing.is_none());
     }
 
@@ -2715,17 +2738,17 @@ mod tests {
 
     // --- JSON output shape ---
 
-    #[test]
-    fn json_store_list_shape() {
+    #[tokio::test]
+    async fn json_store_list_shape() {
         // Verify that the stores list JSON shape contains the required fields on each entry.
         // Tests against actual AppDb data, not a tautological construct.
         let dir = TempDir::new().unwrap();
-        let db = tmp_app_db(&dir);
+        let db = tmp_app_db(&dir).await;
 
         let store = new_runtime_store("shape-store");
-        db.upsert_store(&store).unwrap();
+        db.upsert_store(&store).await.unwrap();
 
-        let stores = db.list_stores().unwrap();
+        let stores = db.list_stores().await.unwrap();
         let json_stores: Vec<serde_json::Value> = stores
             .iter()
             .map(|s| {
@@ -3033,10 +3056,10 @@ mod tests {
 
     // --- find_source_by_root_or_url ---
 
-    #[test]
-    fn find_source_by_root_finds_match() {
+    #[tokio::test]
+    async fn find_source_by_root_finds_match() {
         let dir = TempDir::new().unwrap();
-        let db = tmp_app_db(&dir);
+        let db = tmp_app_db(&dir).await;
 
         let src = RuntimeSource {
             id: new_ulid(),
@@ -3048,19 +3071,20 @@ mod tests {
             exclude: vec![],
             preset: "prose".into(),
         };
-        db.upsert_source(&src).unwrap();
+        db.upsert_source(&src).await.unwrap();
 
         let found = db
             .find_source_by_root_or_url("/my/docs", Some("s1"))
+            .await
             .unwrap();
         assert!(found.is_some());
         assert_eq!(found.unwrap().id, src.id);
     }
 
-    #[test]
-    fn find_source_by_root_respects_store_scope() {
+    #[tokio::test]
+    async fn find_source_by_root_respects_store_scope() {
         let dir = TempDir::new().unwrap();
-        let db = tmp_app_db(&dir);
+        let db = tmp_app_db(&dir).await;
 
         let src = RuntimeSource {
             id: new_ulid(),
@@ -3072,11 +3096,12 @@ mod tests {
             exclude: vec![],
             preset: "prose".into(),
         };
-        db.upsert_source(&src).unwrap();
+        db.upsert_source(&src).await.unwrap();
 
         // Scoped to a different store — should not find it.
         let found = db
             .find_source_by_root_or_url("/my/docs", Some("my-store"))
+            .await
             .unwrap();
         assert!(found.is_none());
     }
@@ -3109,19 +3134,19 @@ mod tests {
     /// After reconciliation, a YAML-declared store must be findable by
     /// `get_store_by_name` (i.e. `db.get_store`), which is what `run_index_async`
     /// uses to locate the store before indexing.
-    #[test]
-    fn reconcile_yaml_store_makes_store_findable() {
+    #[tokio::test]
+    async fn reconcile_yaml_store_makes_store_findable() {
         let dir = TempDir::new().unwrap();
-        let db = tmp_app_db(&dir);
+        let db = tmp_app_db(&dir).await;
 
         // Precondition: the store does not exist in the runtime DB yet.
-        assert!(db.get_store("notes").unwrap().is_none());
+        assert!(db.get_store("notes").await.unwrap().is_none());
 
         let config = make_raw_config_with_store("notes", vec![]);
-        reconcile_yaml_stores(&db, &config).unwrap();
+        reconcile_yaml_stores(&db, &config).await.unwrap();
 
         // After reconciliation, the store must be findable.
-        let found = db.get_store("notes").unwrap();
+        let found = db.get_store("notes").await.unwrap();
         assert!(
             found.is_some(),
             "YAML store should be findable after reconciliation"
@@ -3131,26 +3156,26 @@ mod tests {
 
     /// Reconciliation is idempotent: calling it twice must not produce duplicate
     /// records or return an error.
-    #[test]
-    fn reconcile_yaml_store_is_idempotent() {
+    #[tokio::test]
+    async fn reconcile_yaml_store_is_idempotent() {
         let dir = TempDir::new().unwrap();
-        let db = tmp_app_db(&dir);
+        let db = tmp_app_db(&dir).await;
 
         let config = make_raw_config_with_store("docs", vec![]);
-        reconcile_yaml_stores(&db, &config).unwrap();
-        reconcile_yaml_stores(&db, &config).unwrap(); // second call — must not fail
+        reconcile_yaml_stores(&db, &config).await.unwrap();
+        reconcile_yaml_stores(&db, &config).await.unwrap(); // second call — must not fail
 
-        let stores = db.list_stores().unwrap();
+        let stores = db.list_stores().await.unwrap();
         let matching: Vec<_> = stores.iter().filter(|s| s.name == "docs").collect();
         assert_eq!(matching.len(), 1, "must not create duplicate store records");
     }
 
     /// Reconciliation must not overwrite an existing runtime-DB record (e.g. one
     /// created by `store add`) with a YAML shadow — the existing record wins.
-    #[test]
-    fn reconcile_does_not_overwrite_existing_runtime_store() {
+    #[tokio::test]
+    async fn reconcile_does_not_overwrite_existing_runtime_store() {
         let dir = TempDir::new().unwrap();
-        let db = tmp_app_db(&dir);
+        let db = tmp_app_db(&dir).await;
 
         // Pre-existing runtime store (e.g. created by `store add`).
         let existing_id = new_ulid();
@@ -3161,14 +3186,14 @@ mod tests {
             backend: "lancedb".to_string(),
             indexing: None,
         };
-        db.upsert_store(&existing).unwrap();
+        db.upsert_store(&existing).await.unwrap();
 
         // YAML config declares the same store name with "private" visibility.
         let config = make_raw_config_with_store("shared", vec![]);
-        reconcile_yaml_stores(&db, &config).unwrap();
+        reconcile_yaml_stores(&db, &config).await.unwrap();
 
         // The existing record should be unchanged.
-        let found = db.get_store("shared").unwrap().unwrap();
+        let found = db.get_store("shared").await.unwrap().unwrap();
         assert_eq!(
             found.id, existing_id,
             "existing store id must not be replaced"
@@ -3180,12 +3205,12 @@ mod tests {
     }
 
     /// YAML-declared sources are reconciled into the runtime sources DB.
-    #[test]
-    fn reconcile_yaml_sources_into_db() {
+    #[tokio::test]
+    async fn reconcile_yaml_sources_into_db() {
         use localdb_core::config::schema::SourceConfig;
 
         let dir = TempDir::new().unwrap();
-        let db = tmp_app_db(&dir);
+        let db = tmp_app_db(&dir).await;
 
         let sources = vec![SourceConfig {
             kind: "path".to_string(),
@@ -3197,11 +3222,12 @@ mod tests {
             refresh: None,
         }];
         let config = make_raw_config_with_store("notes", sources);
-        reconcile_yaml_stores(&db, &config).unwrap();
+        reconcile_yaml_stores(&db, &config).await.unwrap();
 
         // The source must be findable.
         let found = db
             .find_source_by_root_or_url("/home/user/notes", Some("notes"))
+            .await
             .unwrap();
         assert!(
             found.is_some(),
@@ -3228,42 +3254,46 @@ mod tests {
         }
     }
 
-    #[test]
-    fn delete_sources_for_store_removes_matching_only() {
+    #[tokio::test]
+    async fn delete_sources_for_store_removes_matching_only() {
         let dir = TempDir::new().unwrap();
-        let db = tmp_app_db(&dir);
+        let db = tmp_app_db(&dir).await;
 
         let src_a1 = make_runtime_source("alpha");
         let src_a2 = make_runtime_source("alpha");
         let src_b = make_runtime_source("beta");
-        db.upsert_source(&src_a1).unwrap();
-        db.upsert_source(&src_a2).unwrap();
-        db.upsert_source(&src_b).unwrap();
+        db.upsert_source(&src_a1).await.unwrap();
+        db.upsert_source(&src_a2).await.unwrap();
+        db.upsert_source(&src_b).await.unwrap();
 
-        let removed = db.delete_sources_for_store("alpha").unwrap();
+        let removed = db.delete_sources_for_store("alpha").await.unwrap();
         assert_eq!(removed, 2);
-        assert!(db.list_sources("alpha").unwrap().is_empty());
-        assert_eq!(db.list_sources("beta").unwrap().len(), 1);
+        assert!(db.list_sources("alpha").await.unwrap().is_empty());
+        assert_eq!(db.list_sources("beta").await.unwrap().len(), 1);
     }
 
-    #[test]
-    fn delete_sources_for_store_returns_zero_when_none() {
+    #[tokio::test]
+    async fn delete_sources_for_store_returns_zero_when_none() {
         let dir = TempDir::new().unwrap();
-        let db = tmp_app_db(&dir);
-        assert_eq!(db.delete_sources_for_store("ghost").unwrap(), 0);
+        let db = tmp_app_db(&dir).await;
+        assert_eq!(db.delete_sources_for_store("ghost").await.unwrap(), 0);
     }
 
-    #[test]
-    fn store_remove_cascades_sources_and_dir() {
+    #[tokio::test]
+    async fn store_remove_cascades_sources_and_dir() {
         let dir = TempDir::new().unwrap();
-        let db = tmp_app_db(&dir);
+        let db = tmp_app_db(&dir).await;
 
         // Add store and sources.
         let store = new_runtime_store("scratch");
-        db.upsert_store(&store).unwrap();
-        db.upsert_source(&make_runtime_source("scratch")).unwrap();
-        db.upsert_source(&make_runtime_source("scratch")).unwrap();
-        assert_eq!(db.list_sources("scratch").unwrap().len(), 2);
+        db.upsert_store(&store).await.unwrap();
+        db.upsert_source(&make_runtime_source("scratch"))
+            .await
+            .unwrap();
+        db.upsert_source(&make_runtime_source("scratch"))
+            .await
+            .unwrap();
+        assert_eq!(db.list_sources("scratch").await.unwrap().len(), 2);
 
         // Create a dummy on-disk index directory to prove remove_dir_all runs.
         let store_dir = dir.path().join("stores").join("scratch");
@@ -3272,27 +3302,27 @@ mod tests {
         assert!(store_dir.exists());
 
         // Cascade delete.
-        assert!(db.delete_store("scratch").unwrap());
-        let removed = db.delete_sources_for_store("scratch").unwrap();
+        assert!(db.delete_store("scratch").await.unwrap());
+        let removed = db.delete_sources_for_store("scratch").await.unwrap();
         assert_eq!(removed, 2);
         remove_store_data_dir(dir.path(), "scratch");
 
         // Both sources and directory are gone.
-        assert!(db.list_sources("scratch").unwrap().is_empty());
+        assert!(db.list_sources("scratch").await.unwrap().is_empty());
         assert!(!store_dir.exists());
 
         // Re-adding the same store name starts clean.
         let store2 = new_runtime_store("scratch");
-        db.upsert_store(&store2).unwrap();
-        assert!(db.list_sources("scratch").unwrap().is_empty());
+        db.upsert_store(&store2).await.unwrap();
+        assert!(db.list_sources("scratch").await.unwrap().is_empty());
     }
 
-    #[test]
-    fn store_remove_not_found_does_not_cascade() {
+    #[tokio::test]
+    async fn store_remove_not_found_does_not_cascade() {
         let dir = TempDir::new().unwrap();
-        let db = tmp_app_db(&dir);
+        let db = tmp_app_db(&dir).await;
         // delete_store returns false → no cascade should run.
-        assert!(!db.delete_store("nonexistent").unwrap());
+        assert!(!db.delete_store("nonexistent").await.unwrap());
     }
 
     #[test]
@@ -3329,12 +3359,12 @@ mod tests {
     }
 
     /// Source reconciliation is also idempotent.
-    #[test]
-    fn reconcile_yaml_sources_is_idempotent() {
+    #[tokio::test]
+    async fn reconcile_yaml_sources_is_idempotent() {
         use localdb_core::config::schema::SourceConfig;
 
         let dir = TempDir::new().unwrap();
-        let db = tmp_app_db(&dir);
+        let db = tmp_app_db(&dir).await;
 
         let sources = vec![SourceConfig {
             kind: "path".to_string(),
@@ -3346,10 +3376,10 @@ mod tests {
             refresh: None,
         }];
         let config = make_raw_config_with_store("mystore", sources);
-        reconcile_yaml_stores(&db, &config).unwrap();
-        reconcile_yaml_stores(&db, &config).unwrap(); // second call
+        reconcile_yaml_stores(&db, &config).await.unwrap();
+        reconcile_yaml_stores(&db, &config).await.unwrap(); // second call
 
-        let sources_in_db = db.list_sources("mystore").unwrap();
+        let sources_in_db = db.list_sources("mystore").await.unwrap();
         assert_eq!(
             sources_in_db.len(),
             1,

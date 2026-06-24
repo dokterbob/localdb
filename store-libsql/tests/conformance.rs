@@ -1,6 +1,6 @@
-use store_libsql::LibsqlStore;
-use localdb_core::VectorEncoding;
 use localdb_core::store::conformance;
+use localdb_core::VectorEncoding;
+use store_libsql::LibsqlStore;
 
 const DIM: usize = 2; // conformance tests use 2-dim embeddings
 

@@ -607,7 +607,7 @@ mod tests {
     use tempfile::TempDir;
     use tower::ServiceExt; // for `oneshot`
 
-    fn make_app() -> (TempDir, Router) {
+    async fn make_app() -> (TempDir, Router) {
         let dir = tempfile::tempdir().unwrap();
         let yaml_config = localdb_core::config::schema::RawConfig {
             version: 1,
@@ -627,7 +627,9 @@ mod tests {
             providers: vec![],
         };
         let queue = crate::job_queue::JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue).unwrap();
+        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
+            .await
+            .unwrap();
 
         let router = Router::new()
             .route("/v1/stores", get(list_stores).post(create_store))
@@ -660,7 +662,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_stores_empty() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -679,7 +681,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_store_returns_201() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -698,7 +700,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_store_empty_name_returns_400() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -717,7 +719,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_store_not_found_returns_404() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -734,7 +736,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_store_not_found_returns_409_or_404() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -769,7 +771,9 @@ mod tests {
             providers: vec![],
         };
         let queue = crate::job_queue::JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue).unwrap();
+        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
+            .await
+            .unwrap();
 
         let app = Router::new()
             .route("/v1/stores", get(list_stores).post(create_store))
@@ -802,7 +806,7 @@ mod tests {
 
     #[tokio::test]
     async fn source_crud_roundtrip() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
 
         // Create store
         let resp = app
@@ -866,7 +870,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_empty_query_returns_400() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -883,7 +887,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_with_nonexistent_store_filter_returns_404() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -902,7 +906,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_returns_citations_shape() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -924,7 +928,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_job_returns_202() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
 
         // Create store first
         app.clone()
@@ -957,7 +961,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_job_not_found_returns_404() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -972,7 +976,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_and_poll_job() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
 
         // Create store
         app.clone()
@@ -1033,7 +1037,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_status_returns_daemon_true() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1052,7 +1056,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_config_returns_yaml_config() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1072,7 +1076,7 @@ mod tests {
 
     #[tokio::test]
     async fn patch_store_updates_visibility() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
 
         // Create a runtime-owned store
         app.clone()
@@ -1107,7 +1111,7 @@ mod tests {
 
     #[tokio::test]
     async fn patch_store_not_found_returns_404() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
 
         let resp = app
             .oneshot(
@@ -1141,7 +1145,9 @@ mod tests {
             providers: vec![],
         };
         let queue = crate::job_queue::JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue).unwrap();
+        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
+            .await
+            .unwrap();
         let app = crate::daemon::build_router(state);
 
         let resp = app
@@ -1164,7 +1170,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_document_not_found_returns_404() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1191,7 +1197,9 @@ mod tests {
             providers: vec![],
         };
         let queue = crate::job_queue::JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue).unwrap();
+        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
+            .await
+            .unwrap();
 
         // Insert a document record directly
         state
@@ -1268,7 +1276,9 @@ mod tests {
             providers: vec![],
         };
         let queue = crate::job_queue::JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue).unwrap();
+        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
+            .await
+            .unwrap();
 
         // Produce a 128-dim embedding using FakeEmbedder to match the search handler.
         let embedder = FakeEmbedder::new(128);
@@ -1357,7 +1367,9 @@ mod tests {
             providers: vec![],
         };
         let queue = crate::job_queue::JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue).unwrap();
+        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
+            .await
+            .unwrap();
 
         // Add a real store so the filter name passes the existence check.
         state.add_store("my-store", "private").await.unwrap();
@@ -1441,7 +1453,9 @@ mod tests {
             providers: vec![],
         };
         let queue = crate::job_queue::JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue).unwrap();
+        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
+            .await
+            .unwrap();
         let app = crate::daemon::build_router(state);
 
         let resp = app
@@ -1487,7 +1501,9 @@ mod tests {
             providers: vec![],
         };
         let queue = crate::job_queue::JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue).unwrap();
+        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
+            .await
+            .unwrap();
         let app = crate::daemon::build_router(state);
 
         let resp = app
@@ -1509,7 +1525,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_source_removes_it() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
 
         // Create store and source
         app.clone()
@@ -1577,7 +1593,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_nonexistent_source_returns_404() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1597,7 +1613,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_job_nonexistent_store_returns_404() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1620,7 +1636,7 @@ mod tests {
 
     #[tokio::test]
     async fn pagination_cursor_works() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
 
         // Create 3 stores
         for name in &["alpha", "beta", "gamma"] {

@@ -422,7 +422,10 @@ fn records_to_batch(
     let source_kinds: Vec<&str> = records.iter().map(|r| r.source_kind.as_str()).collect();
     let mimes: Vec<Option<&str>> = records.iter().map(|r| r.mime.as_deref()).collect();
     let uris: Vec<&str> = records.iter().map(|r| r.uri.as_str()).collect();
-    let titles: Vec<Option<&str>> = records.iter().map(|r| r.metadata.title.as_deref()).collect();
+    let titles: Vec<Option<&str>> = records
+        .iter()
+        .map(|r| r.metadata.title.as_deref())
+        .collect();
     let metadata_jsons: Vec<Option<String>> = records
         .iter()
         .map(|r| serde_json::to_string(&r.metadata).ok())

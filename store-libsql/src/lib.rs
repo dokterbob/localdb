@@ -9,9 +9,7 @@ use tokio::sync::Mutex;
 
 use localdb_core::ingestion::DocumentRecord;
 use localdb_core::parser::DocumentMetadata;
-use localdb_core::store::{
-    ChunkRecord, MetadataFilter, RetrievalStore, SearchResult, StoreStats,
-};
+use localdb_core::store::{ChunkRecord, MetadataFilter, RetrievalStore, SearchResult, StoreStats};
 use localdb_core::types::Span;
 use localdb_core::{Error, VectorEncoding};
 
@@ -176,11 +174,7 @@ impl RetrievalStore for LibsqlStore {
         let conn = self.conn.lock().await;
 
         let qvec_sql = crate::vectors::query_vector_sql(query_vector, self.encoding);
-        let fetch_k = if filters.is_empty() {
-            limit
-        } else {
-            limit * 3
-        };
+        let fetch_k = if filters.is_empty() { limit } else { limit * 3 };
         let filter_clauses = build_filter_clauses(filters);
         let where_sql = if filter_clauses.is_empty() {
             String::new()
@@ -203,13 +197,10 @@ impl RetrievalStore for LibsqlStore {
              LIMIT {limit}"
         );
 
-        let mut rows = conn
-            .query(&sql, ())
-            .await
-            .map_err(|e| Error::Internal {
-                message: format!("dense_search query: {e}"),
-                correlation_id: "libsql_dense_search".to_string(),
-            })?;
+        let mut rows = conn.query(&sql, ()).await.map_err(|e| Error::Internal {
+            message: format!("dense_search query: {e}"),
+            correlation_id: "libsql_dense_search".to_string(),
+        })?;
 
         let encoding = self.encoding;
         let dim = self.embedding_dim;
@@ -224,12 +215,8 @@ impl RetrievalStore for LibsqlStore {
                 correlation_id: "libsql_dense_dist".to_string(),
             })?;
             let score = match encoding {
-                VectorEncoding::Float32 => {
-                    crate::vectors::cosine_distance_to_score(distance)
-                }
-                VectorEncoding::Binary => {
-                    crate::vectors::hamming_distance_to_score(distance, dim)
-                }
+                VectorEncoding::Float32 => crate::vectors::cosine_distance_to_score(distance),
+                VectorEncoding::Binary => crate::vectors::hamming_distance_to_score(distance, dim),
             };
             results.push(SearchResult { chunk, score });
         }
@@ -263,13 +250,13 @@ impl RetrievalStore for LibsqlStore {
              LIMIT {limit}"
         );
 
-        let mut rows = conn
-            .query(&sql, params![query_text])
-            .await
-            .map_err(|e| Error::Internal {
-                message: format!("bm25_search query: {e}"),
-                correlation_id: "libsql_bm25_search".to_string(),
-            })?;
+        let mut rows =
+            conn.query(&sql, params![query_text])
+                .await
+                .map_err(|e| Error::Internal {
+                    message: format!("bm25_search query: {e}"),
+                    correlation_id: "libsql_bm25_search".to_string(),
+                })?;
 
         let mut results = Vec::new();
         while let Some(row) = rows.next().await.map_err(|e| Error::Internal {
@@ -365,10 +352,7 @@ impl RetrievalStore for LibsqlStore {
         }
     }
 
-    async fn get_chunks_for_document(
-        &self,
-        document_id: &str,
-    ) -> Result<Vec<ChunkRecord>, Error> {
+    async fn get_chunks_for_document(&self, document_id: &str) -> Result<Vec<ChunkRecord>, Error> {
         let conn = self.conn.lock().await;
 
         let mut rows = conn
@@ -509,12 +493,8 @@ impl LibsqlStore {
 
             // Build the embedding SQL literal
             let vector_sql = match self.encoding {
-                VectorEncoding::Float32 => {
-                    crate::vectors::f32_to_vector32_sql(&record.embedding)
-                }
-                VectorEncoding::Binary => {
-                    crate::vectors::f32_to_vector1bit_sql(&record.embedding)
-                }
+                VectorEncoding::Float32 => crate::vectors::f32_to_vector32_sql(&record.embedding),
+                VectorEncoding::Binary => crate::vectors::f32_to_vector1bit_sql(&record.embedding),
             };
 
             let heading_path_json =
@@ -679,11 +659,9 @@ fn row_to_chunk_record(row: &libsql::Row) -> Result<ChunkRecord, Error> {
         correlation_id: "libsql_row_metadata".to_string(),
     })?;
 
-    let heading_path: Vec<String> =
-        serde_json::from_str(&heading_path_str).unwrap_or_default();
+    let heading_path: Vec<String> = serde_json::from_str(&heading_path_str).unwrap_or_default();
     let embedding: Vec<f32> = serde_json::from_str(&embedding_str).unwrap_or_default();
-    let mut metadata: DocumentMetadata =
-        serde_json::from_str(&metadata_str).unwrap_or_default();
+    let mut metadata: DocumentMetadata = serde_json::from_str(&metadata_str).unwrap_or_default();
 
     // Fill in title from the documents table if metadata.title is not set
     if metadata.title.is_none() {

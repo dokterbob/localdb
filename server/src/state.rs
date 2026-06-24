@@ -126,13 +126,13 @@ struct Inner {
 
 impl AppState {
     /// Create a new `AppState`.
-    pub fn new(
+    pub async fn new(
         yaml_config: RawConfig,
         data_dir: PathBuf,
         job_queue: JobQueue,
     ) -> Result<Self, Error> {
         let runtime_db_path = data_dir.join("runtime-state.db");
-        let runtime_db = RuntimeStateDb::open(&runtime_db_path)?;
+        let runtime_db = RuntimeStateDb::open(&runtime_db_path).await?;
 
         Ok(Self {
             inner: Arc::new(Inner {
@@ -156,7 +156,7 @@ impl AppState {
     pub async fn effective_config(&self) -> Result<EffectiveConfig, Error> {
         let yaml = self.inner.yaml_config.read().await;
         let default = localdb_core::config::schema::IndexingPolicyConfig::default();
-        build_effective_config(&yaml, &self.inner.runtime_db, &default)
+        build_effective_config(&yaml, &self.inner.runtime_db, &default).await
     }
 
     /// Check whether a named store is YAML-owned.
@@ -194,7 +194,7 @@ impl AppState {
             indexing: None,
         };
 
-        self.inner.runtime_db.upsert_store(&rt_store)?;
+        self.inner.runtime_db.upsert_store(&rt_store).await?;
 
         Ok(Store {
             id,
@@ -232,7 +232,7 @@ impl AppState {
             return Err(Error::ConfigReadonly);
         }
 
-        let deleted = self.inner.runtime_db.delete_store(name)?;
+        let deleted = self.inner.runtime_db.delete_store(name).await?;
         if !deleted {
             return Err(Error::StoreNotFound {
                 id: name.to_string(),
@@ -385,7 +385,7 @@ impl AppState {
         }
 
         // Fetch the current runtime store record, update, re-upsert.
-        let stores = self.inner.runtime_db.list_stores()?;
+        let stores = self.inner.runtime_db.list_stores().await?;
         let current =
             stores
                 .into_iter()
@@ -399,7 +399,7 @@ impl AppState {
             ..current
         };
 
-        self.inner.runtime_db.upsert_store(&updated)?;
+        self.inner.runtime_db.upsert_store(&updated).await?;
         Ok(())
     }
 
@@ -444,7 +444,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn make_state() -> (TempDir, AppState) {
+    async fn make_state() -> (TempDir, AppState) {
         let dir = tempfile::tempdir().unwrap();
         let yaml_config = RawConfig {
             version: 1,
@@ -455,13 +455,15 @@ mod tests {
             providers: vec![],
         };
         let queue = JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue).unwrap();
+        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
+            .await
+            .unwrap();
         (dir, state)
     }
 
     #[tokio::test]
     async fn add_and_list_stores() {
-        let (_dir, state) = make_state();
+        let (_dir, state) = make_state().await;
         state.add_store("notes", "private").await.unwrap();
         let effective = state.effective_config().await.unwrap();
         assert_eq!(effective.stores.len(), 1);
@@ -486,7 +488,9 @@ mod tests {
             providers: vec![],
         };
         let queue = JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue).unwrap();
+        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
+            .await
+            .unwrap();
 
         let result = state.add_store("yaml-store", "private").await;
         assert_eq!(result, Err(Error::ConfigReadonly));
@@ -494,14 +498,14 @@ mod tests {
 
     #[tokio::test]
     async fn remove_store_not_found() {
-        let (_dir, state) = make_state();
+        let (_dir, state) = make_state().await;
         let result = state.remove_store("non-existent").await;
         assert!(matches!(result, Err(Error::StoreNotFound { .. })));
     }
 
     #[tokio::test]
     async fn remove_store_succeeds() {
-        let (_dir, state) = make_state();
+        let (_dir, state) = make_state().await;
         state.add_store("notes", "private").await.unwrap();
         state.remove_store("notes").await.unwrap();
         let effective = state.effective_config().await.unwrap();
@@ -510,7 +514,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_source_to_nonexistent_store_fails() {
-        let (_dir, state) = make_state();
+        let (_dir, state) = make_state().await;
         let result = state
             .add_source(
                 "no-such-store",
@@ -524,7 +528,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_and_list_sources() {
-        let (_dir, state) = make_state();
+        let (_dir, state) = make_state().await;
         state.add_store("notes", "private").await.unwrap();
         let source = state
             .add_source(
@@ -543,14 +547,14 @@ mod tests {
 
     #[tokio::test]
     async fn remove_source_not_found() {
-        let (_dir, state) = make_state();
+        let (_dir, state) = make_state().await;
         let result = state.remove_source("no-such-source").await;
         assert!(matches!(result, Err(Error::SourceNotFound { .. })));
     }
 
     #[tokio::test]
     async fn remove_source_succeeds() {
-        let (_dir, state) = make_state();
+        let (_dir, state) = make_state().await;
         state.add_store("notes", "private").await.unwrap();
         let source = state
             .add_source(
@@ -586,7 +590,9 @@ mod tests {
             providers: vec![],
         };
         let queue = JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue).unwrap();
+        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
+            .await
+            .unwrap();
 
         let result = state
             .add_source(
@@ -622,7 +628,9 @@ mod tests {
             providers: vec![],
         };
         let queue = JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue).unwrap();
+        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
+            .await
+            .unwrap();
 
         let result = state.update_store("yaml-store", Some("shared")).await;
         assert_eq!(
@@ -634,7 +642,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_store_updates_visibility() {
-        let (_dir, state) = make_state();
+        let (_dir, state) = make_state().await;
         state.add_store("notes", "private").await.unwrap();
         state.update_store("notes", Some("shared")).await.unwrap();
         let record = state.get_store_by_name("notes").await.unwrap();
@@ -643,7 +651,7 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_and_search_chunks_roundtrip() {
-        let (_dir, state) = make_state();
+        let (_dir, state) = make_state().await;
 
         let chunk = localdb_core::ChunkRecord {
             id: "chunk-1".to_string(),
@@ -674,7 +682,7 @@ mod tests {
 
     #[tokio::test]
     async fn yaml_config_reload() {
-        let (_dir, state) = make_state();
+        let (_dir, state) = make_state().await;
         let new_config = RawConfig {
             version: 1,
             server: Default::default(),
@@ -697,7 +705,7 @@ mod tests {
 
     #[tokio::test]
     async fn remove_store_cascades_sources() {
-        let (dir, state) = make_state();
+        let (dir, state) = make_state().await;
 
         state.add_store("scratch", "private").await.unwrap();
         state
