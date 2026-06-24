@@ -8,9 +8,11 @@ use std::path::Path;
 use tokio::sync::Mutex;
 
 use localdb_core::ingestion::DocumentRecord;
+use localdb_core::parser::DocumentMetadata;
 use localdb_core::store::{
     ChunkRecord, MetadataFilter, RetrievalStore, SearchResult, StoreStats,
 };
+use localdb_core::types::Span;
 use localdb_core::{Error, VectorEncoding};
 
 /// A `RetrievalStore` backed by libSQL (Turso's SQLite fork).
@@ -167,39 +169,282 @@ impl RetrievalStore for LibsqlStore {
 
     async fn dense_search(
         &self,
-        _query_vector: &[f32],
-        _limit: usize,
-        _filters: &[MetadataFilter],
+        query_vector: &[f32],
+        limit: usize,
+        filters: &[MetadataFilter],
     ) -> Result<Vec<SearchResult>, Error> {
-        todo!("vector_top_k + vector_distance_cos + metadata filters")
+        let conn = self.conn.lock().await;
+
+        let qvec_sql = crate::vectors::query_vector_sql(query_vector, self.encoding);
+        let fetch_k = if filters.is_empty() {
+            limit
+        } else {
+            limit * 3
+        };
+        let filter_clauses = build_filter_clauses(filters);
+        let where_sql = if filter_clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE 1=1 {filter_clauses}")
+        };
+
+        let sql = format!(
+            "SELECT c.id, c.document_id, c.seq, c.text, c.span_start, c.span_end,
+                    c.heading_path, vector_extract(c.embedding) AS embedding_json,
+                    d.store_id, d.source_id, d.source_kind, d.uri, d.title, d.mime,
+                    d.policy_version, d.fetched_at, d.content_hash, d.origin_store,
+                    d.metadata,
+                    vector_distance_cos(c.embedding, {qvec_sql}) AS distance
+             FROM vector_top_k('chunks_vec_idx', {qvec_sql}, {fetch_k}) AS v
+             JOIN chunks c ON c.rowid = v.id
+             JOIN documents d ON d.id = c.document_id
+             {where_sql}
+             ORDER BY distance ASC
+             LIMIT {limit}"
+        );
+
+        let mut rows = conn
+            .query(&sql, ())
+            .await
+            .map_err(|e| Error::Internal {
+                message: format!("dense_search query: {e}"),
+                correlation_id: "libsql_dense_search".to_string(),
+            })?;
+
+        let encoding = self.encoding;
+        let dim = self.embedding_dim;
+        let mut results = Vec::new();
+        while let Some(row) = rows.next().await.map_err(|e| Error::Internal {
+            message: format!("dense_search next: {e}"),
+            correlation_id: "libsql_dense_next".to_string(),
+        })? {
+            let chunk = row_to_chunk_record(&row)?;
+            let distance: f64 = row.get(19).map_err(|e| Error::Internal {
+                message: format!("dense_search distance: {e}"),
+                correlation_id: "libsql_dense_dist".to_string(),
+            })?;
+            let score = match encoding {
+                VectorEncoding::Float32 => {
+                    crate::vectors::cosine_distance_to_score(distance)
+                }
+                VectorEncoding::Binary => {
+                    crate::vectors::hamming_distance_to_score(distance, dim)
+                }
+            };
+            results.push(SearchResult { chunk, score });
+        }
+
+        Ok(results)
     }
 
     async fn bm25_search(
         &self,
-        _query_text: &str,
-        _limit: usize,
-        _filters: &[MetadataFilter],
+        query_text: &str,
+        limit: usize,
+        filters: &[MetadataFilter],
     ) -> Result<Vec<SearchResult>, Error> {
-        todo!("FTS5 MATCH + bm25() + metadata filters")
+        let conn = self.conn.lock().await;
+
+        let filter_clauses = build_filter_clauses(filters);
+
+        let sql = format!(
+            "SELECT c.id, c.document_id, c.seq, c.text, c.span_start, c.span_end,
+                    c.heading_path, vector_extract(c.embedding) AS embedding_json,
+                    d.store_id, d.source_id, d.source_kind, d.uri, d.title, d.mime,
+                    d.policy_version, d.fetched_at, d.content_hash, d.origin_store,
+                    d.metadata,
+                    bm25(chunks_fts) AS score
+             FROM chunks_fts f
+             JOIN chunks c ON c.rowid = f.rowid
+             JOIN documents d ON d.id = c.document_id
+             WHERE chunks_fts MATCH ?
+             {filter_clauses}
+             ORDER BY score ASC
+             LIMIT {limit}"
+        );
+
+        let mut rows = conn
+            .query(&sql, params![query_text])
+            .await
+            .map_err(|e| Error::Internal {
+                message: format!("bm25_search query: {e}"),
+                correlation_id: "libsql_bm25_search".to_string(),
+            })?;
+
+        let mut results = Vec::new();
+        while let Some(row) = rows.next().await.map_err(|e| Error::Internal {
+            message: format!("bm25_search next: {e}"),
+            correlation_id: "libsql_bm25_next".to_string(),
+        })? {
+            let chunk = row_to_chunk_record(&row)?;
+            let raw_score: f64 = row.get(19).map_err(|e| Error::Internal {
+                message: format!("bm25_search score: {e}"),
+                correlation_id: "libsql_bm25_score".to_string(),
+            })?;
+            // FTS5 bm25() returns negative scores (more negative = better).
+            // Negate to make positive (higher = better).
+            let score = -raw_score as f32;
+            results.push(SearchResult { chunk, score });
+        }
+
+        Ok(results)
     }
 
     async fn stats(&self) -> Result<StoreStats, Error> {
-        todo!("SELECT COUNT(*) from chunks + documents")
+        let conn = self.conn.lock().await;
+
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM chunks", ())
+            .await
+            .map_err(|e| Error::Internal {
+                message: format!("stats chunks: {e}"),
+                correlation_id: "libsql_stats_chunks".to_string(),
+            })?;
+        let chunk_count = match rows.next().await.map_err(|e| Error::Internal {
+            message: format!("stats chunks next: {e}"),
+            correlation_id: "libsql_stats_chunks_next".to_string(),
+        })? {
+            Some(row) => row.get::<u64>(0).map_err(|e| Error::Internal {
+                message: format!("stats chunks get: {e}"),
+                correlation_id: "libsql_stats_chunks_get".to_string(),
+            })?,
+            None => 0,
+        };
+
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM documents", ())
+            .await
+            .map_err(|e| Error::Internal {
+                message: format!("stats documents: {e}"),
+                correlation_id: "libsql_stats_docs".to_string(),
+            })?;
+        let document_count = match rows.next().await.map_err(|e| Error::Internal {
+            message: format!("stats documents next: {e}"),
+            correlation_id: "libsql_stats_docs_next".to_string(),
+        })? {
+            Some(row) => row.get::<u64>(0).map_err(|e| Error::Internal {
+                message: format!("stats documents get: {e}"),
+                correlation_id: "libsql_stats_docs_get".to_string(),
+            })?,
+            None => 0,
+        };
+
+        Ok(StoreStats {
+            chunk_count,
+            document_count,
+        })
     }
 
-    async fn get_chunk(&self, _chunk_id: &str) -> Result<Option<ChunkRecord>, Error> {
-        todo!("SELECT ... FROM chunks JOIN documents WHERE chunks.id = ?")
+    async fn get_chunk(&self, chunk_id: &str) -> Result<Option<ChunkRecord>, Error> {
+        let conn = self.conn.lock().await;
+
+        let mut rows = conn
+            .query(
+                "SELECT c.id, c.document_id, c.seq, c.text, c.span_start, c.span_end,
+                        c.heading_path, vector_extract(c.embedding) AS embedding_json,
+                        d.store_id, d.source_id, d.source_kind, d.uri, d.title, d.mime,
+                        d.policy_version, d.fetched_at, d.content_hash, d.origin_store,
+                        d.metadata
+                 FROM chunks c
+                 JOIN documents d ON d.id = c.document_id
+                 WHERE c.id = ?",
+                params![chunk_id],
+            )
+            .await
+            .map_err(|e| Error::Internal {
+                message: format!("get_chunk query: {e}"),
+                correlation_id: "libsql_get_chunk".to_string(),
+            })?;
+
+        match rows.next().await.map_err(|e| Error::Internal {
+            message: format!("get_chunk next: {e}"),
+            correlation_id: "libsql_get_chunk_next".to_string(),
+        })? {
+            Some(row) => Ok(Some(row_to_chunk_record(&row)?)),
+            None => Ok(None),
+        }
     }
 
     async fn get_chunks_for_document(
         &self,
-        _document_id: &str,
+        document_id: &str,
     ) -> Result<Vec<ChunkRecord>, Error> {
-        todo!("SELECT ... FROM chunks JOIN documents WHERE document_id = ? ORDER BY seq")
+        let conn = self.conn.lock().await;
+
+        let mut rows = conn
+            .query(
+                "SELECT c.id, c.document_id, c.seq, c.text, c.span_start, c.span_end,
+                        c.heading_path, vector_extract(c.embedding) AS embedding_json,
+                        d.store_id, d.source_id, d.source_kind, d.uri, d.title, d.mime,
+                        d.policy_version, d.fetched_at, d.content_hash, d.origin_store,
+                        d.metadata
+                 FROM chunks c
+                 JOIN documents d ON d.id = c.document_id
+                 WHERE c.document_id = ?
+                 ORDER BY c.seq",
+                params![document_id],
+            )
+            .await
+            .map_err(|e| Error::Internal {
+                message: format!("get_chunks_for_document query: {e}"),
+                correlation_id: "libsql_get_doc_chunks".to_string(),
+            })?;
+
+        let mut records = Vec::new();
+        while let Some(row) = rows.next().await.map_err(|e| Error::Internal {
+            message: format!("get_chunks_for_document next: {e}"),
+            correlation_id: "libsql_get_doc_chunks_next".to_string(),
+        })? {
+            records.push(row_to_chunk_record(&row)?);
+        }
+
+        Ok(records)
     }
 
     async fn list_indexed_documents(&self) -> Result<Vec<DocumentRecord>, Error> {
-        todo!("SELECT id, uri, content_hash, policy_version FROM documents")
+        let conn = self.conn.lock().await;
+
+        let mut rows = conn
+            .query(
+                "SELECT id, uri, content_hash, policy_version FROM documents",
+                (),
+            )
+            .await
+            .map_err(|e| Error::Internal {
+                message: format!("list_indexed_documents query: {e}"),
+                correlation_id: "libsql_list_docs".to_string(),
+            })?;
+
+        let mut records = Vec::new();
+        while let Some(row) = rows.next().await.map_err(|e| Error::Internal {
+            message: format!("list_indexed_documents next: {e}"),
+            correlation_id: "libsql_list_docs_next".to_string(),
+        })? {
+            let document_id: String = row.get(0).map_err(|e| Error::Internal {
+                message: format!("list_indexed_documents id: {e}"),
+                correlation_id: "libsql_list_docs_id".to_string(),
+            })?;
+            let uri: String = row.get(1).map_err(|e| Error::Internal {
+                message: format!("list_indexed_documents uri: {e}"),
+                correlation_id: "libsql_list_docs_uri".to_string(),
+            })?;
+            let content_hash: String = row.get(2).map_err(|e| Error::Internal {
+                message: format!("list_indexed_documents hash: {e}"),
+                correlation_id: "libsql_list_docs_hash".to_string(),
+            })?;
+            let policy_version: String = row.get(3).map_err(|e| Error::Internal {
+                message: format!("list_indexed_documents policy: {e}"),
+                correlation_id: "libsql_list_docs_policy".to_string(),
+            })?;
+            records.push(DocumentRecord {
+                document_id,
+                uri,
+                content_hash,
+                policy_version,
+            });
+        }
+
+        Ok(records)
     }
 }
 
@@ -306,6 +551,166 @@ impl LibsqlStore {
 
         Ok(())
     }
+}
+
+/// Build SQL filter clauses from `MetadataFilter` variants.
+///
+/// Returns a string of `AND ...` clauses suitable for appending after a `WHERE`
+/// or `WHERE 1=1`. Empty string if no filters.
+fn build_filter_clauses(filters: &[MetadataFilter]) -> String {
+    let mut clauses = String::new();
+    for filter in filters {
+        match filter {
+            MetadataFilter::Mime(v) => {
+                let escaped = v.replace('\'', "''");
+                clauses.push_str(&format!(" AND d.mime = '{escaped}'"));
+            }
+            MetadataFilter::UriPrefix(v) => {
+                let escaped = v.replace('\'', "''");
+                clauses.push_str(&format!(" AND d.uri LIKE '{escaped}%'"));
+            }
+            MetadataFilter::FetchedAfter(v) => {
+                let escaped = v.replace('\'', "''");
+                clauses.push_str(&format!(" AND d.fetched_at >= '{escaped}'"));
+            }
+            MetadataFilter::FetchedBefore(v) => {
+                let escaped = v.replace('\'', "''");
+                clauses.push_str(&format!(" AND d.fetched_at <= '{escaped}'"));
+            }
+            MetadataFilter::SourceId(v) => {
+                let escaped = v.replace('\'', "''");
+                clauses.push_str(&format!(" AND d.source_id = '{escaped}'"));
+            }
+            MetadataFilter::DocumentId(v) => {
+                let escaped = v.replace('\'', "''");
+                clauses.push_str(&format!(" AND c.document_id = '{escaped}'"));
+            }
+            MetadataFilter::PolicyVersion(v) => {
+                let escaped = v.replace('\'', "''");
+                clauses.push_str(&format!(" AND d.policy_version = '{escaped}'"));
+            }
+        }
+    }
+    clauses
+}
+
+/// Extract a `ChunkRecord` from a row with columns in the standard SELECT order:
+///
+/// 0: c.id, 1: c.document_id, 2: c.seq, 3: c.text, 4: c.span_start, 5: c.span_end,
+/// 6: c.heading_path, 7: vector_extract(c.embedding) AS embedding_json,
+/// 8: d.store_id, 9: d.source_id, 10: d.source_kind, 11: d.uri, 12: d.title, 13: d.mime,
+/// 14: d.policy_version, 15: d.fetched_at, 16: d.content_hash, 17: d.origin_store,
+/// 18: d.metadata
+fn row_to_chunk_record(row: &libsql::Row) -> Result<ChunkRecord, Error> {
+    let id: String = row.get(0).map_err(|e| Error::Internal {
+        message: format!("row_to_chunk id: {e}"),
+        correlation_id: "libsql_row_id".to_string(),
+    })?;
+    let document_id: String = row.get(1).map_err(|e| Error::Internal {
+        message: format!("row_to_chunk document_id: {e}"),
+        correlation_id: "libsql_row_doc_id".to_string(),
+    })?;
+    let _seq: i64 = row.get(2).map_err(|e| Error::Internal {
+        message: format!("row_to_chunk seq: {e}"),
+        correlation_id: "libsql_row_seq".to_string(),
+    })?;
+    let text: String = row.get(3).map_err(|e| Error::Internal {
+        message: format!("row_to_chunk text: {e}"),
+        correlation_id: "libsql_row_text".to_string(),
+    })?;
+    let span_start: i64 = row.get(4).map_err(|e| Error::Internal {
+        message: format!("row_to_chunk span_start: {e}"),
+        correlation_id: "libsql_row_span_start".to_string(),
+    })?;
+    let span_end: i64 = row.get(5).map_err(|e| Error::Internal {
+        message: format!("row_to_chunk span_end: {e}"),
+        correlation_id: "libsql_row_span_end".to_string(),
+    })?;
+    let heading_path_str: String = row.get(6).map_err(|e| Error::Internal {
+        message: format!("row_to_chunk heading_path: {e}"),
+        correlation_id: "libsql_row_heading".to_string(),
+    })?;
+    let embedding_str: String = row.get(7).map_err(|e| Error::Internal {
+        message: format!("row_to_chunk embedding: {e}"),
+        correlation_id: "libsql_row_embedding".to_string(),
+    })?;
+    let store_id: String = row.get(8).map_err(|e| Error::Internal {
+        message: format!("row_to_chunk store_id: {e}"),
+        correlation_id: "libsql_row_store_id".to_string(),
+    })?;
+    let source_id: String = row.get(9).map_err(|e| Error::Internal {
+        message: format!("row_to_chunk source_id: {e}"),
+        correlation_id: "libsql_row_source_id".to_string(),
+    })?;
+    let source_kind: String = row.get(10).map_err(|e| Error::Internal {
+        message: format!("row_to_chunk source_kind: {e}"),
+        correlation_id: "libsql_row_source_kind".to_string(),
+    })?;
+    let uri: String = row.get(11).map_err(|e| Error::Internal {
+        message: format!("row_to_chunk uri: {e}"),
+        correlation_id: "libsql_row_uri".to_string(),
+    })?;
+    let title: Option<String> = row.get(12).map_err(|e| Error::Internal {
+        message: format!("row_to_chunk title: {e}"),
+        correlation_id: "libsql_row_title".to_string(),
+    })?;
+    let mime: Option<String> = row.get(13).map_err(|e| Error::Internal {
+        message: format!("row_to_chunk mime: {e}"),
+        correlation_id: "libsql_row_mime".to_string(),
+    })?;
+    let policy_version: String = row.get(14).map_err(|e| Error::Internal {
+        message: format!("row_to_chunk policy_version: {e}"),
+        correlation_id: "libsql_row_policy".to_string(),
+    })?;
+    let fetched_at: String = row.get(15).map_err(|e| Error::Internal {
+        message: format!("row_to_chunk fetched_at: {e}"),
+        correlation_id: "libsql_row_fetched".to_string(),
+    })?;
+    let content_hash: String = row.get(16).map_err(|e| Error::Internal {
+        message: format!("row_to_chunk content_hash: {e}"),
+        correlation_id: "libsql_row_hash".to_string(),
+    })?;
+    let origin_store: String = row.get(17).map_err(|e| Error::Internal {
+        message: format!("row_to_chunk origin_store: {e}"),
+        correlation_id: "libsql_row_origin".to_string(),
+    })?;
+    let metadata_str: String = row.get(18).map_err(|e| Error::Internal {
+        message: format!("row_to_chunk metadata: {e}"),
+        correlation_id: "libsql_row_metadata".to_string(),
+    })?;
+
+    let heading_path: Vec<String> =
+        serde_json::from_str(&heading_path_str).unwrap_or_default();
+    let embedding: Vec<f32> = serde_json::from_str(&embedding_str).unwrap_or_default();
+    let mut metadata: DocumentMetadata =
+        serde_json::from_str(&metadata_str).unwrap_or_default();
+
+    // Fill in title from the documents table if metadata.title is not set
+    if metadata.title.is_none() {
+        metadata.title = title;
+    }
+
+    Ok(ChunkRecord {
+        id,
+        document_id,
+        store_id,
+        text,
+        span: Span {
+            start: span_start as usize,
+            end: span_end as usize,
+        },
+        heading_path,
+        embedding,
+        policy_version,
+        fetched_at,
+        content_hash,
+        origin_store,
+        source_id,
+        source_kind,
+        mime,
+        uri,
+        metadata,
+    })
 }
 
 #[cfg(test)]
