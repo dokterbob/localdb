@@ -193,6 +193,24 @@ impl LanceDbStore {
         })
     }
 
+    /// Return true if a full-text (INVERTED) index exists on the `text` column.
+    ///
+    /// Cheap metadata lookup (`list_indices`). Used both to repair a missing FTS
+    /// index on re-index and to let `bm25_search` degrade gracefully when absent.
+    pub async fn has_fts_index(&self) -> Result<bool, Error> {
+        let indices = self
+            .table
+            .list_indices()
+            .await
+            .map_err(|e| Error::Internal {
+                message: format!("LanceDB list_indices failed: {e}"),
+                correlation_id: "lancedb-list-indices".to_string(),
+            })?;
+        Ok(indices
+            .iter()
+            .any(|cfg| cfg.columns.iter().any(|c| c == COL_TEXT)))
+    }
+
     /// Create a full-text search index on the `text` column.
     ///
     /// Should be called after initial bulk ingest and periodically thereafter.
@@ -784,6 +802,15 @@ impl RetrievalStore for LanceDbStore {
         limit: usize,
         filters: &[MetadataFilter],
     ) -> Result<Vec<SearchResult>, Error> {
+        // Degrade gracefully when no INVERTED index exists yet (e.g. a cancelled
+        // index run committed chunks but never reached the FTS build). LanceDB has
+        // no flat fallback for full-text search, so without this the whole hybrid
+        // query would abort; instead the BM25 leg contributes nothing and dense
+        // search carries the result.
+        if !self.has_fts_index().await? {
+            return Ok(Vec::new());
+        }
+
         let mut query = self
             .table
             .query()
@@ -1326,6 +1353,58 @@ mod tests {
 
         let results = store.bm25_search("search term", 2, &[]).await.unwrap();
         assert_eq!(results.len(), 2, "limit should be respected");
+    }
+
+    #[tokio::test]
+    async fn lancedb_has_fts_index_reflects_creation() {
+        let (store, _dir) = fresh_store().await;
+        let records = vec![make_record(
+            "chunk-1",
+            "doc-1",
+            "store-1",
+            "indexable text",
+            vec![1.0, 0.0, 0.0, 0.0],
+        )];
+        store.upsert_chunks(records).await.unwrap();
+
+        assert!(
+            !store.has_fts_index().await.unwrap(),
+            "no FTS index before creation"
+        );
+        store.create_fts_index().await.unwrap();
+        assert!(
+            store.has_fts_index().await.unwrap(),
+            "FTS index present after creation"
+        );
+    }
+
+    #[tokio::test]
+    async fn lancedb_bm25_degrades_without_index() {
+        // Reproduces the cancelled-run state: chunks committed, no FTS index built.
+        // bm25_search must degrade to an empty result rather than erroring.
+        let (store, _dir) = fresh_store().await;
+        let records = vec![make_record(
+            "chunk-1",
+            "doc-1",
+            "store-1",
+            "The quick brown fox",
+            vec![1.0, 0.0, 0.0, 0.0],
+        )];
+        store.upsert_chunks(records).await.unwrap();
+
+        let results = store
+            .bm25_search("fox", 10, &[])
+            .await
+            .expect("bm25_search must not error when FTS index is missing");
+        assert!(
+            results.is_empty(),
+            "BM25 leg degrades to empty without an FTS index"
+        );
+
+        // And once the index exists, BM25 returns results again.
+        store.create_fts_index().await.unwrap();
+        let results = store.bm25_search("fox", 10, &[]).await.unwrap();
+        assert!(!results.is_empty(), "BM25 works after the index is built");
     }
 
     // --- Metadata filter tests ---

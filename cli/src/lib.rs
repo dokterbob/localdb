@@ -1521,10 +1521,15 @@ async fn run_index_for_source_async(
         }
     }
 
-    if chunks > 0 {
+    // Ensure the FTS index exists (repairing a cancelled run), and rebuild it when
+    // new chunks were written so they are covered.
+    let needs_fts = chunks > 0 || !lancedb_store.has_fts_index().await.unwrap_or(true);
+    if needs_fts {
         if let Err(e) = lancedb_store.create_fts_index().await {
             eprintln!("warning: FTS index creation failed: {}", e);
         }
+    }
+    if chunks > 0 {
         if let Err(e) = lancedb_store.create_vector_index().await {
             eprintln!("warning: vector index creation failed: {}", e);
         }
@@ -1943,12 +1948,17 @@ async fn run_index_async(
         }
     }
 
-    // Create FTS and vector indices. Safe to call after every index run.
-    if chunks > 0 {
+    // Ensure the FTS index exists; rebuild it when new chunks were written so they
+    // are covered. The `has_fts_index` check repairs a store left without an index
+    // by a cancelled run (where all docs now skip, so `chunks == 0`). Until it is
+    // (re)built, search degrades to dense-only rather than failing.
+    let needs_fts = chunks > 0 || !lancedb_store.has_fts_index().await.unwrap_or(true);
+    if needs_fts {
         if let Err(e) = lancedb_store.create_fts_index().await {
-            // Non-fatal — log and continue. BM25 leg will be skipped by search.
             eprintln!("warning: FTS index creation failed: {}", e);
         }
+    }
+    if chunks > 0 {
         if let Err(e) = lancedb_store.create_vector_index().await {
             eprintln!("warning: vector index creation failed: {}", e);
         }
@@ -2121,6 +2131,7 @@ async fn run_search_async(ctx: &CliContext, query: &str, limit: usize) {
 
     // Build store handles.
     let mut store_handles: Vec<StoreHandle> = Vec::new();
+    let mut stores_missing_fts: Vec<String> = Vec::new();
     for name in &store_names {
         let store_data_dir = data_dir.join("stores").join(name);
         if !store_data_dir.exists() {
@@ -2140,13 +2151,28 @@ async fn run_search_async(ctx: &CliContext, query: &str, limit: usize) {
         )
         .await
         {
-            Ok(s) => store_handles.push(StoreHandle {
-                id: store_id,
-                name: name.clone(),
-                store: Box::new(s),
-            }),
+            Ok(s) => {
+                // A missing FTS index means the BM25 leg is skipped (dense-only
+                // results); warn so the user knows to repair it with a re-index.
+                if !s.has_fts_index().await.unwrap_or(true) {
+                    stores_missing_fts.push(name.clone());
+                }
+                store_handles.push(StoreHandle {
+                    id: store_id,
+                    name: name.clone(),
+                    store: Box::new(s),
+                });
+            }
             Err(e) => eprintln!("warning: cannot open store '{}': {}", name, e),
         }
+    }
+
+    if !stores_missing_fts.is_empty() {
+        eprintln!(
+            "warning: no full-text index for store(s) {} — keyword (BM25) ranking is \
+             disabled, showing semantic results only. Run `localdb index` to build it.",
+            stores_missing_fts.join(", ")
+        );
     }
 
     if store_handles.is_empty() {
