@@ -26,11 +26,11 @@ Default workflow is **TDD** — write the failing test first.
 | `core` | Domain model, traits (`RetrievalStore`, `Embedder`), error taxonomy — no I/O frameworks |
 | `cli` | Thin surface over `core`; `init`, `store`, `source`, `index`, `search` commands |
 | `embed` | Embedder implementations: ONNX (local), OpenAI-compatible, Perplexity, Voyage |
-| `extract` | Format detection and text extraction (Markdown, plain text, HTML, PDF → `Block`) |
+| `extract` | Format detection and text extraction (Markdown, plain text, HTML, PDF → Markdown) |
 | `localdb` | Binary entry point; wires all subcommands |
 | `mcp` | Stdio MCP server (JSON-RPC 2.0); tools: `search`, `get_document`, `list_stores` |
 | `server` | HTTP daemon (`/v1` axum routes), background jobs, file-watch, write-lock lifecycle |
-| `store-lancedb` | `RetrievalStore` impl: LanceDB + tantivy BM25; RRF fusion lives in `core`, not here |
+| `store-libsql` | `RetrievalStore` impl: libsql (DiskANN vectors + FTS5 BM25); RRF fusion lives in `core`, not here |
 
 **Design authority is `specs/`** — read the relevant spec before changing behavior; fix the spec first if it is wrong.
 
@@ -51,7 +51,7 @@ Default workflow is **TDD** — write the failing test first.
 - **Exit codes are stable API**: 0 ok, 1 internal, 2 invalid usage/config, 3 not found, 4 conflict/locked, 5 unavailable — see `specs/05-surfaces.md §5`. Do not add new codes without a spec change.
 - **Async**: the project's async model is documented in `specs/01-architecture.md §6` — follow it for all new async code.
 - **CLI uses real embeddings via config policy**: `cli` calls `embed::create_embedder` from the config; `FakeEmbedder` is only used in unit tests. The default embedder is `provider: local` (auto), `model: pplx-embed-context-v1-0.6b` — a context-aware late-chunking model (MIT-licensed, public HuggingFace repo `perplexity-ai/pplx-embed-context-v1-0.6b`). On macOS the `local` provider auto-selects CoreML (ANE/GPU) automatically — the macOS binary enables `embed`'s `local-coreml` feature by default via `cli/Cargo.toml`'s `[target.'cfg(target_os = "macos")'.dependencies]`, so no `--features` flag is needed. It falls back to ONNX otherwise; CoreML/ONNX vectors are index-interchangeable (force a backend with `local-coreml` / `local-onnx`). The first `localdb index` or `localdb search` triggers a one-time ~706 MB download; no API key or license click-through is required. Alternative local model: `model: bge-small-en-v1.5` (384-dim, much smaller). Hosted alternatives: `provider: perplexity` with `model: pplx-embed-context-v1` (requires API key), or `provider: openai-compatible`.
-- **HTTP daemon is experimental**: it uses an in-memory store — CLI-indexed LanceDB data is invisible to it. CLI commands also fail while the daemon is running (write-lock contention). See `specs/05-surfaces.md §3` and `docs/architecture.md#known-gaps`.
+- **HTTP daemon is experimental**: it uses an in-memory store — CLI-indexed libsql data is invisible to it. CLI commands also fail while the daemon is running (write-lock contention). See `specs/05-surfaces.md §3` and `docs/architecture.md#known-gaps`.
 - **YAML-declared stores cannot be indexed yet**: `store list` shows them as `(yaml)`, but `index` resolves stores from the runtime-state DB only. Use `localdb store add` + `localdb source add` for all working examples and tests.
 
 ## Commit style
