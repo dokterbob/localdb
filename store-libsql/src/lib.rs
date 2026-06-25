@@ -1,5 +1,13 @@
+mod db;
+mod runtime_state;
 mod schema;
+mod store_handle;
+mod unified_schema;
 mod vectors;
+
+pub use db::LibsqlDb;
+pub use runtime_state::{RuntimeStateApi, SourceRow, StoreRow};
+pub use store_handle::StoreHandle;
 
 use async_trait::async_trait;
 use libsql::{params, Builder, Connection, Database};
@@ -624,7 +632,7 @@ impl LibsqlStore {
 /// `/` has special meaning. Wrapping each token in double-quotes forces literal
 /// matching per-token while preserving the implicit AND between tokens.
 /// Any embedded double-quotes are escaped by doubling them (`"` → `""`).
-fn escape_fts5_query(input: &str) -> String {
+pub(crate) fn escape_fts5_query(input: &str) -> String {
     input
         .split_whitespace()
         .map(|token| {
@@ -639,7 +647,7 @@ fn escape_fts5_query(input: &str) -> String {
 ///
 /// Returns a string of `AND ...` clauses suitable for appending after a `WHERE`
 /// or `WHERE 1=1`. Empty string if no filters.
-fn build_filter_clauses(filters: &[MetadataFilter]) -> String {
+pub(crate) fn build_filter_clauses(filters: &[MetadataFilter]) -> String {
     let mut clauses = String::new();
     for filter in filters {
         match filter {
@@ -683,7 +691,7 @@ fn build_filter_clauses(filters: &[MetadataFilter]) -> String {
 /// 8: d.store_id, 9: d.source_id, 10: d.source_kind, 11: d.uri, 12: d.title, 13: d.mime,
 /// 14: d.policy_version, 15: d.fetched_at, 16: d.content_hash, 17: d.origin_store,
 /// 18: d.metadata
-fn row_to_chunk_record(row: &libsql::Row) -> Result<ChunkRecord, Error> {
+pub(crate) fn row_to_chunk_record(row: &libsql::Row) -> Result<ChunkRecord, Error> {
     let id: String = row.get(0).map_err(|e| Error::Internal {
         message: format!("row_to_chunk id: {e}"),
         correlation_id: "libsql_row_id".to_string(),

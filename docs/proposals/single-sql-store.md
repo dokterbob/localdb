@@ -92,7 +92,7 @@ CREATE TABLE documents (
     fetched_at      TEXT    NOT NULL,
     origin_store    TEXT    NOT NULL,                 -- ≠ store_id after federation
     policy_version  TEXT    NOT NULL,
-    metadata        TEXT    NOT NULL DEFAULT '{}',
+    metadata        TEXT    NOT NULL,
     share_path      TEXT,                             -- reserved, empty in MVP
     UNIQUE (store_id, id)
 );
@@ -230,12 +230,16 @@ Three reviewable PRs stacked on `single-sql-store`:
    reconciliation shadow-write go away. HTTP daemon's `FakeStore` and in-memory source
    map are deleted (Decision 2 sets whether YAML-store indexability also lands here).
 3. **Cleanup + lock removal + spec sync.** Delete the old `RuntimeStateDb`, old
-   `LibsqlStore::open(path)`, old per-store `schema.rs`. Add the "refuse to start with
-   legacy layout" guard (detect `runtime-state.db` or `stores/` → log re-add
-   instructions → exit 2). Drop the `.write.lock` file (Decision 3): remove the lock
-   acquisition in CLI/daemon, collapse `store_locked` into `runtime_state_locked`,
-   simplify `localdb serve` startup. Update specs [01](../../specs/01-architecture.md)
-   §3 §6, [03](../../specs/03-config.md) §4, [05](../../specs/05-surfaces.md) §3 §5,
+   `LibsqlStore::open(path)`, old per-store `schema.rs`. Rename the survivors to drop
+   the now-meaningless transition prefix: `unified_schema.rs` → `schema.rs`,
+   `create_unified_schema` → `create_schema`, `UNIFIED_SCHEMA_VERSION` →
+   `SCHEMA_VERSION`, `get_unified_schema_version` → `get_schema_version`. Add the
+   "refuse to start with legacy layout" guard (detect `runtime-state.db` or `stores/`
+   → log re-add instructions → exit 2). Drop the `.write.lock` file (Decision 3):
+   remove the lock acquisition in CLI/daemon, collapse `store_locked` into
+   `runtime_state_locked`, simplify `localdb serve` startup. Update specs
+   [01](../../specs/01-architecture.md) §3 §6, [03](../../specs/03-config.md) §4,
+   [05](../../specs/05-surfaces.md) §3 §5,
    [docs/architecture.md](../architecture.md). **Delete this proposal file.**
 
 ## 5. What this enables
