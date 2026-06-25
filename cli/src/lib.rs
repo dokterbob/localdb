@@ -837,7 +837,7 @@ async fn run_init_async(ctx: &CliContext) {
                 id: new_ulid(),
                 name: "default".to_string(),
                 visibility: "private".to_string(),
-                backend: "lancedb".to_string(),
+                backend: "libsql".to_string(),
                 indexing: None,
             };
             if let Err(e) = db.upsert_store(&default_store).await {
@@ -960,7 +960,7 @@ async fn run_store_add_async(ctx: &CliContext, name: &str) {
     // Per specs/05-surfaces.md §2: route to daemon when running.
     if let DaemonState::Running { base_url } = probe_daemon(data_dir, ctx.daemon_url.as_deref()) {
         let url = format!("{}/v1/stores", base_url);
-        let body = json!({ "name": name, "visibility": "private", "backend": "lancedb" });
+        let body = json!({ "name": name, "visibility": "private", "backend": "libsql" });
         match daemon_request_async(reqwest::Method::POST, &url, Some(body)).await {
             Ok(v) => {
                 if ctx.json {
@@ -995,7 +995,7 @@ async fn run_store_add_async(ctx: &CliContext, name: &str) {
         id: new_ulid(),
         name: name.to_string(),
         visibility: "private".to_string(),
-        backend: "lancedb".to_string(),
+        backend: "libsql".to_string(),
         indexing: None,
     };
     if let Err(e) = db.upsert_store(&store).await {
@@ -2369,7 +2369,7 @@ mod tests {
             id: new_ulid(),
             name: name.to_string(),
             visibility: "private".to_string(),
-            backend: "lancedb".to_string(),
+            backend: "libsql".to_string(),
             indexing: None,
         }
     }
@@ -3078,7 +3078,7 @@ mod tests {
             stores: vec![StoreConfig {
                 name: store_name.to_string(),
                 visibility: "private".to_string(),
-                backend: "lancedb".to_string(),
+                backend: "libsql".to_string(),
                 indexing: None,
                 sources,
             }],
@@ -3138,7 +3138,7 @@ mod tests {
             id: existing_id.clone(),
             name: "shared".to_string(),
             visibility: "shared".to_string(), // different from YAML's "private"
-            backend: "lancedb".to_string(),
+            backend: "libsql".to_string(),
             indexing: None,
         };
         db.upsert_store(&existing).await.unwrap();

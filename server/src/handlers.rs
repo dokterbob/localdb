@@ -764,7 +764,7 @@ mod tests {
             stores: vec![localdb_core::config::schema::StoreConfig {
                 name: "yaml-store".to_string(),
                 visibility: "private".to_string(),
-                backend: "lancedb".to_string(),
+                backend: "libsql".to_string(),
                 indexing: None,
                 sources: vec![],
             }],
@@ -1138,7 +1138,7 @@ mod tests {
             stores: vec![localdb_core::config::schema::StoreConfig {
                 name: "yaml-store".to_string(),
                 visibility: "private".to_string(),
-                backend: "lancedb".to_string(),
+                backend: "libsql".to_string(),
                 indexing: None,
                 sources: vec![],
             }],
@@ -1446,7 +1446,7 @@ mod tests {
             stores: vec![localdb_core::config::schema::StoreConfig {
                 name: "yaml-store".to_string(),
                 visibility: "private".to_string(),
-                backend: "lancedb".to_string(),
+                backend: "libsql".to_string(),
                 indexing: None,
                 sources: vec![],
             }],
@@ -1494,7 +1494,7 @@ mod tests {
             stores: vec![localdb_core::config::schema::StoreConfig {
                 name: "yaml-store".to_string(),
                 visibility: "private".to_string(),
-                backend: "lancedb".to_string(),
+                backend: "libsql".to_string(),
                 indexing: None,
                 sources: vec![],
             }],

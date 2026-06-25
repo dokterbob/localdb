@@ -66,7 +66,7 @@ fn default_visibility() -> String {
 }
 
 fn default_backend() -> String {
-    "lancedb".to_string()
+    "libsql".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -511,7 +511,7 @@ mod tests {
             name: name.to_string(),
             id: format!("ulid-{}", name),
             visibility: "private".to_string(),
-            backend: "lancedb".to_string(),
+            backend: "libsql".to_string(),
             indexing: None,
         }
     }
@@ -540,7 +540,7 @@ mod tests {
                 .map(|n| StoreConfig {
                     name: n.to_string(),
                     visibility: "private".to_string(),
-                    backend: "lancedb".to_string(),
+                    backend: "libsql".to_string(),
                     indexing: None,
                     sources: vec![],
                 })
@@ -626,7 +626,7 @@ mod tests {
         let retrieved = db.get_store("my-notes").await.unwrap().unwrap();
         assert_eq!(retrieved.name, "my-notes");
         assert_eq!(retrieved.visibility, "private");
-        assert_eq!(retrieved.backend, "lancedb");
+        assert_eq!(retrieved.backend, "libsql");
     }
 
     #[tokio::test]
@@ -693,7 +693,7 @@ mod tests {
             name: "code-store".to_string(),
             id: "ulid-code".to_string(),
             visibility: "private".to_string(),
-            backend: "lancedb".to_string(),
+            backend: "libsql".to_string(),
             indexing: Some(IndexingPolicyConfig {
                 embedding: EmbeddingPolicy {
                     model: "bge-small".to_string(),
@@ -900,7 +900,7 @@ mod tests {
             name: "notes".to_string(),
             id: "rt-id".to_string(),
             visibility: "shared".to_string(),
-            backend: "lancedb".to_string(),
+            backend: "libsql".to_string(),
             indexing: None,
         })
         .await
@@ -978,7 +978,7 @@ mod tests {
             stores: vec![StoreConfig {
                 name: "special".to_string(),
                 visibility: "private".to_string(),
-                backend: "lancedb".to_string(),
+                backend: "libsql".to_string(),
                 indexing: Some(IndexingPolicyConfig {
                     embedding: EmbeddingPolicy {
                         model: "store-specific-model".to_string(),

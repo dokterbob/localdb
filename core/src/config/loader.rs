@@ -166,10 +166,10 @@ fn validate_config(config: &RawConfig) -> Result<(), Error> {
         }
 
         // Validate backend
-        if store.backend != "lancedb" {
+        if store.backend != "libsql" {
             return Err(Error::InvalidConfig {
                 message: format!(
-                    "stores[{}].backend: unknown backend '{}'; supported: lancedb",
+                    "stores[{}].backend: unknown backend '{}'; supported: libsql",
                     i, store.backend
                 ),
             });
@@ -570,7 +570,7 @@ defaults:
 stores:
   - name: notes
     visibility: private
-    backend: lancedb
+    backend: libsql
     indexing: ~
     sources:
       - kind: path

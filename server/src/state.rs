@@ -190,7 +190,7 @@ impl AppState {
             name: name.to_string(),
             id: id.clone(),
             visibility: visibility.to_string(),
-            backend: "lancedb".to_string(),
+            backend: "libsql".to_string(),
             indexing: None,
         };
 
@@ -205,7 +205,7 @@ impl AppState {
                 StoreVisibility::Private
             },
             backend: localdb_core::BackendConfig {
-                kind: "lancedb".to_string(),
+                kind: "libsql".to_string(),
                 connection: Default::default(),
             },
             indexing: localdb_core::IndexingPolicy {
@@ -481,7 +481,7 @@ mod tests {
             stores: vec![localdb_core::config::schema::StoreConfig {
                 name: "yaml-store".to_string(),
                 visibility: "private".to_string(),
-                backend: "lancedb".to_string(),
+                backend: "libsql".to_string(),
                 indexing: None,
                 sources: vec![],
             }],
@@ -583,7 +583,7 @@ mod tests {
             stores: vec![localdb_core::config::schema::StoreConfig {
                 name: "yaml-store".to_string(),
                 visibility: "private".to_string(),
-                backend: "lancedb".to_string(),
+                backend: "libsql".to_string(),
                 indexing: None,
                 sources: vec![],
             }],
@@ -621,7 +621,7 @@ mod tests {
             stores: vec![localdb_core::config::schema::StoreConfig {
                 name: "yaml-store".to_string(),
                 visibility: "private".to_string(),
-                backend: "lancedb".to_string(),
+                backend: "libsql".to_string(),
                 indexing: None,
                 sources: vec![],
             }],
@@ -691,7 +691,7 @@ mod tests {
             stores: vec![localdb_core::config::schema::StoreConfig {
                 name: "new-store".to_string(),
                 visibility: "private".to_string(),
-                backend: "lancedb".to_string(),
+                backend: "libsql".to_string(),
                 indexing: None,
                 sources: vec![],
             }],
