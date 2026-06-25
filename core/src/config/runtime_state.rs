@@ -6,7 +6,7 @@
 //! Concurrency model: each method opens a fresh `rusqlite::Connection`,
 //! runs its statement, and drops it — so no connection (and thus no write
 //! lock) is held between operations. SQLite WAL mode allows multiple
-//! concurrent readers and serialises writers with a 2 s busy-timeout,
+//! concurrent readers and serialises writers with a 5 s busy-timeout,
 //! mapping to `Error::RuntimeStateLocked` only if contention lasts longer.
 //!
 //! Ownership model (specs/03-config.md §3):
@@ -124,6 +124,10 @@ impl RuntimeStateDb {
     /// Ensures the parent directory exists, creates the SQLite file and
     /// tables if necessary, and enables WAL mode. Drops the connection
     /// immediately — subsequent calls open fresh short-lived connections.
+    ///
+    /// Retries up to 3 times with backoff on `SQLITE_BUSY` — the WAL mode
+    /// change requires an exclusive lock that can collide when multiple
+    /// processes start against a fresh database simultaneously.
     pub fn open(path: &Path) -> Result<Self, Error> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| Error::Internal {
@@ -136,8 +140,25 @@ impl RuntimeStateDb {
             })?;
         }
 
+        let mut last_err = None;
+        for attempt in 0..3 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(100 * (1 << attempt)));
+            }
+            match Self::open_inner(path) {
+                Ok(db) => return Ok(db),
+                Err(Error::RuntimeStateLocked) => {
+                    last_err = Some(Error::RuntimeStateLocked);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err.unwrap())
+    }
+
+    fn open_inner(path: &Path) -> Result<Self, Error> {
         let c = Connection::open(path).map_err(map_sqlite_err)?;
-        c.busy_timeout(Duration::from_secs(2))
+        c.busy_timeout(Duration::from_secs(5))
             .map_err(map_sqlite_err)?;
         c.pragma_update(None, "journal_mode", "WAL")
             .map_err(map_sqlite_err)?;
@@ -162,9 +183,7 @@ impl RuntimeStateDb {
 
     fn conn(&self) -> Result<Connection, Error> {
         let c = Connection::open(&self.path).map_err(map_sqlite_err)?;
-        c.busy_timeout(Duration::from_secs(2))
-            .map_err(map_sqlite_err)?;
-        c.pragma_update(None, "journal_mode", "WAL")
+        c.busy_timeout(Duration::from_secs(5))
             .map_err(map_sqlite_err)?;
         Ok(c)
     }

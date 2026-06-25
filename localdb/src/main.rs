@@ -160,6 +160,12 @@ fn main() {
         json: cli.json,
         stores: cli.stores,
         yes: cli.yes,
+        daemon_url: std::env::var("LOCALDB_DAEMON_URL")
+            .ok()
+            .filter(|s| !s.is_empty()),
+        config_env: std::env::var("LOCALDB_CONFIG")
+            .ok()
+            .map(std::path::PathBuf::from),
     };
 
     match &cli.command {
