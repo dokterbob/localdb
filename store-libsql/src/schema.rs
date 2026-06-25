@@ -117,7 +117,7 @@ pub async fn create_schema(
 
     // -- Schema version
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY NOT NULL)",
         (),
     )
     .await?;

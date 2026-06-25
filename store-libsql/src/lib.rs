@@ -73,6 +73,39 @@ impl LibsqlStore {
                 correlation_id: "libsql_schema".to_string(),
             })?;
 
+        // Validate that the existing embedding column type matches what was requested.
+        // This catches attempts to reopen a store with a different encoding or dimension.
+        let expected_col_type = vectors::embedding_column_type(embedding_dim, encoding);
+        let mut rows = conn
+            .query(
+                "SELECT type FROM pragma_table_info('chunks') WHERE name = 'embedding'",
+                (),
+            )
+            .await
+            .map_err(|e| Error::Internal {
+                message: format!("schema validation: {e}"),
+                correlation_id: "libsql_schema_validate".to_string(),
+            })?;
+
+        if let Some(row) = rows.next().await.map_err(|e| Error::Internal {
+            message: format!("schema validation read: {e}"),
+            correlation_id: "libsql_schema_validate_read".to_string(),
+        })? {
+            let stored_type: String = row.get(0).map_err(|e| Error::Internal {
+                message: format!("schema validation get: {e}"),
+                correlation_id: "libsql_schema_validate_get".to_string(),
+            })?;
+            if !stored_type.eq_ignore_ascii_case(&expected_col_type) {
+                return Err(Error::InvalidConfig {
+                    message: format!(
+                        "store embedding schema mismatch: expected {expected_col_type} \
+                         but found {stored_type}. Delete and re-index the store to change \
+                         embedding model/encoding."
+                    ),
+                });
+            }
+        }
+
         Ok(Self {
             db,
             conn: Mutex::new(conn),
@@ -173,55 +206,72 @@ impl RetrievalStore for LibsqlStore {
     ) -> Result<Vec<SearchResult>, Error> {
         let conn = self.conn.lock().await;
 
-        let qvec_sql = crate::vectors::query_vector_sql(query_vector, self.encoding);
-        let fetch_k = if filters.is_empty() { limit } else { limit * 3 };
         let filter_clauses = build_filter_clauses(filters);
+        let has_filters = !filters.is_empty();
         let where_sql = if filter_clauses.is_empty() {
             String::new()
         } else {
             format!("WHERE 1=1 {filter_clauses}")
         };
 
-        let sql = format!(
-            "SELECT c.id, c.document_id, c.seq, c.text, c.span_start, c.span_end,
-                    c.heading_path, vector_extract(c.embedding) AS embedding_json,
-                    d.store_id, d.source_id, d.source_kind, d.uri, d.title, d.mime,
-                    d.policy_version, d.fetched_at, d.content_hash, d.origin_store,
-                    d.metadata,
-                    vector_distance_cos(c.embedding, {qvec_sql}) AS distance
-             FROM vector_top_k('chunks_vec_idx', {qvec_sql}, {fetch_k}) AS v
-             JOIN chunks c ON c.rowid = v.id
-             JOIN documents d ON d.id = c.document_id
-             {where_sql}
-             ORDER BY distance ASC
-             LIMIT {limit}"
-        );
-
-        let mut rows = conn.query(&sql, ()).await.map_err(|e| Error::Internal {
-            message: format!("dense_search query: {e}"),
-            correlation_id: "libsql_dense_search".to_string(),
-        })?;
+        // Without filters, fetch exactly `limit`. With filters, start at 3x and
+        // widen until we have enough results or exhaust the index.
+        let mut fetch_k = if has_filters { limit * 3 } else { limit };
+        let max_fetch = limit * 20; // ceiling to prevent full-table scan
 
         let encoding = self.encoding;
         let dim = self.embedding_dim;
-        let mut results = Vec::new();
-        while let Some(row) = rows.next().await.map_err(|e| Error::Internal {
-            message: format!("dense_search next: {e}"),
-            correlation_id: "libsql_dense_next".to_string(),
-        })? {
-            let chunk = row_to_chunk_record(&row)?;
-            let distance: f64 = row.get(19).map_err(|e| Error::Internal {
-                message: format!("dense_search distance: {e}"),
-                correlation_id: "libsql_dense_dist".to_string(),
-            })?;
-            let score = match encoding {
-                VectorEncoding::Float32 => crate::vectors::cosine_distance_to_score(distance),
-                VectorEncoding::Binary => crate::vectors::hamming_distance_to_score(distance, dim),
-            };
-            results.push(SearchResult { chunk, score });
-        }
 
-        Ok(results)
+        loop {
+            let qvec_sql = crate::vectors::query_vector_sql(query_vector, self.encoding);
+
+            let sql = format!(
+                "SELECT c.id, c.document_id, c.seq, c.text, c.span_start, c.span_end,
+                        c.heading_path, vector_extract(c.embedding) AS embedding_json,
+                        d.store_id, d.source_id, d.source_kind, d.uri, d.title, d.mime,
+                        d.policy_version, d.fetched_at, d.content_hash, d.origin_store,
+                        d.metadata,
+                        vector_distance_cos(c.embedding, {qvec_sql}) AS distance
+                 FROM vector_top_k('chunks_vec_idx', {qvec_sql}, {fetch_k}) AS v
+                 JOIN chunks c ON c.rowid = v.id
+                 JOIN documents d ON d.id = c.document_id
+                 {where_sql}
+                 ORDER BY distance ASC
+                 LIMIT {limit}"
+            );
+
+            let mut rows = conn.query(&sql, ()).await.map_err(|e| Error::Internal {
+                message: format!("dense_search query: {e}"),
+                correlation_id: "libsql_dense_search".to_string(),
+            })?;
+
+            let mut results = Vec::new();
+            while let Some(row) = rows.next().await.map_err(|e| Error::Internal {
+                message: format!("dense_search next: {e}"),
+                correlation_id: "libsql_dense_next".to_string(),
+            })? {
+                let chunk = row_to_chunk_record(&row)?;
+                let distance: f64 = row.get(19).map_err(|e| Error::Internal {
+                    message: format!("dense_search distance: {e}"),
+                    correlation_id: "libsql_dense_dist".to_string(),
+                })?;
+                let score = match encoding {
+                    VectorEncoding::Float32 => crate::vectors::cosine_distance_to_score(distance),
+                    VectorEncoding::Binary => {
+                        crate::vectors::hamming_distance_to_score(distance, dim)
+                    }
+                };
+                results.push(SearchResult { chunk, score });
+            }
+
+            // If we got enough results, or we're not filtering, or we've hit the ceiling, return.
+            if results.len() >= limit || !has_filters || fetch_k >= max_fetch {
+                return Ok(results);
+            }
+
+            // Widen the window and retry.
+            fetch_k = (fetch_k * 2).min(max_fetch);
+        }
     }
 
     async fn bm25_search(
@@ -230,8 +280,14 @@ impl RetrievalStore for LibsqlStore {
         limit: usize,
         filters: &[MetadataFilter],
     ) -> Result<Vec<SearchResult>, Error> {
+        // Empty or all-whitespace queries can't match anything in FTS.
+        if query_text.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
         let conn = self.conn.lock().await;
 
+        let escaped_query = escape_fts5_query(query_text);
         let filter_clauses = build_filter_clauses(filters);
 
         let sql = format!(
@@ -251,7 +307,7 @@ impl RetrievalStore for LibsqlStore {
         );
 
         let mut rows =
-            conn.query(&sql, params![query_text])
+            conn.query(&sql, params![escaped_query])
                 .await
                 .map_err(|e| Error::Internal {
                     message: format!("bm25_search query: {e}"),
@@ -457,9 +513,21 @@ impl LibsqlStore {
                 let title = record.metadata.title.as_deref();
 
                 conn.execute(
-                    "INSERT OR REPLACE INTO documents (id, store_id, source_id, source_kind, uri, title, mime,
+                    "INSERT INTO documents (id, store_id, source_id, source_kind, uri, title, mime,
                         content_hash, fetched_at, origin_store, policy_version, metadata)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        store_id = excluded.store_id,
+                        source_id = excluded.source_id,
+                        source_kind = excluded.source_kind,
+                        uri = excluded.uri,
+                        title = excluded.title,
+                        mime = excluded.mime,
+                        content_hash = excluded.content_hash,
+                        fetched_at = excluded.fetched_at,
+                        origin_store = excluded.origin_store,
+                        policy_version = excluded.policy_version,
+                        metadata = excluded.metadata",
                     params![
                         record.document_id.as_str(),
                         record.store_id.as_str(),
@@ -506,8 +574,16 @@ impl LibsqlStore {
             // The vector literal must be inlined in the SQL string because
             // vector32()/vector1bit() are SQL functions that need the literal.
             let sql = format!(
-                "INSERT OR REPLACE INTO chunks (id, document_id, seq, text, span_start, span_end, heading_path, embedding)
-                VALUES (?, ?, ?, ?, ?, ?, ?, {vector_sql})"
+                "INSERT INTO chunks (id, document_id, seq, text, span_start, span_end, heading_path, embedding)
+                VALUES (?, ?, ?, ?, ?, ?, ?, {vector_sql})
+                ON CONFLICT(id) DO UPDATE SET
+                    document_id = excluded.document_id,
+                    seq = excluded.seq,
+                    text = excluded.text,
+                    span_start = excluded.span_start,
+                    span_end = excluded.span_end,
+                    heading_path = excluded.heading_path,
+                    embedding = excluded.embedding"
             );
 
             conn.execute(
@@ -531,6 +607,23 @@ impl LibsqlStore {
 
         Ok(())
     }
+}
+
+/// Escape a user query for FTS5 MATCH by wrapping each token in double-quotes.
+///
+/// FTS5 treats unquoted input as an expression where punctuation like `-`, `+`,
+/// `/` has special meaning. Wrapping each token in double-quotes forces literal
+/// matching per-token while preserving the implicit AND between tokens.
+/// Any embedded double-quotes are escaped by doubling them (`"` → `""`).
+fn escape_fts5_query(input: &str) -> String {
+    input
+        .split_whitespace()
+        .map(|token| {
+            let escaped = token.replace('"', "\"\"");
+            format!("\"{escaped}\"")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Build SQL filter clauses from `MetadataFilter` variants.
@@ -694,6 +787,31 @@ fn row_to_chunk_record(row: &libsql::Row) -> Result<ChunkRecord, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use localdb_core::store::RetrievalStore;
+
+    fn make_test_record(id: &str, doc_id: &str, text: &str, embedding: Vec<f32>) -> ChunkRecord {
+        ChunkRecord {
+            id: id.to_string(),
+            document_id: doc_id.to_string(),
+            store_id: "store-1".to_string(),
+            text: text.to_string(),
+            span: Span {
+                start: 0,
+                end: text.len(),
+            },
+            heading_path: vec![],
+            embedding,
+            policy_version: "v1".to_string(),
+            fetched_at: "2026-06-10T12:00:00Z".to_string(),
+            content_hash: "abc123".to_string(),
+            origin_store: "store-1".to_string(),
+            source_id: "src-1".to_string(),
+            source_kind: "path".to_string(),
+            mime: Some("text/plain".to_string()),
+            uri: "file:///test.md".to_string(),
+            metadata: DocumentMetadata::default(),
+        }
+    }
 
     #[tokio::test]
     async fn test_open_creates_schema() {
@@ -708,5 +826,99 @@ mod tests {
         assert_eq!(version, Some(1));
         drop(conn);
         drop(store);
+    }
+
+    #[tokio::test]
+    async fn test_bm25_search_punctuation_does_not_crash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test.db");
+        let store = LibsqlStore::open(&path, 4, VectorEncoding::Float32)
+            .await
+            .unwrap();
+
+        // Searching for punctuated queries should not cause FTS5 syntax errors.
+        let results = store.bm25_search("foo-bar", 10, &[]).await.unwrap();
+        assert!(results.is_empty());
+
+        let results = store.bm25_search("C++", 10, &[]).await.unwrap();
+        assert!(results.is_empty());
+
+        let results = store.bm25_search("path/to/file", 10, &[]).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_bm25_search_empty_query_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test.db");
+        let store = LibsqlStore::open(&path, 4, VectorEncoding::Float32)
+            .await
+            .unwrap();
+
+        let results = store.bm25_search("", 10, &[]).await.unwrap();
+        assert!(results.is_empty());
+
+        let results = store.bm25_search("   ", 10, &[]).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_open_rejects_mismatched_encoding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test.db");
+
+        // Open with Float32 dim=4
+        let store = LibsqlStore::open(&path, 4, VectorEncoding::Float32)
+            .await
+            .unwrap();
+        drop(store);
+
+        // Reopen with Binary dim=4 — should fail with InvalidConfig
+        let result = LibsqlStore::open(&path, 4, VectorEncoding::Binary).await;
+
+        match result {
+            Err(Error::InvalidConfig { message }) => {
+                assert!(
+                    message.contains("mismatch"),
+                    "error should mention mismatch: {message}"
+                );
+            }
+            Err(other) => panic!("expected InvalidConfig, got: {other:?}"),
+            Ok(_) => panic!("expected InvalidConfig error, but open succeeded"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_upsert_updates_fts_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test.db");
+        let store = LibsqlStore::open(&path, 4, VectorEncoding::Float32)
+            .await
+            .unwrap();
+
+        // Insert a chunk with text "hello"
+        let record = make_test_record("chunk-1", "doc-1", "hello", vec![1.0, 0.0, 0.0, 0.0]);
+        store.upsert_chunks(vec![record]).await.unwrap();
+
+        // BM25 search for "hello" should find it
+        let results = store.bm25_search("hello", 10, &[]).await.unwrap();
+        assert_eq!(results.len(), 1);
+
+        // Upsert the same chunk id with text "world"
+        let record = make_test_record("chunk-1", "doc-1", "world", vec![1.0, 0.0, 0.0, 0.0]);
+        store.upsert_chunks(vec![record]).await.unwrap();
+
+        // Search for "hello" should now return empty (stale term removed)
+        let results = store.bm25_search("hello", 10, &[]).await.unwrap();
+        assert!(
+            results.is_empty(),
+            "expected empty results for stale term 'hello', got {} results",
+            results.len()
+        );
+
+        // Search for "world" should return the updated chunk
+        let results = store.bm25_search("world", 10, &[]).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].chunk.text, "world");
     }
 }
