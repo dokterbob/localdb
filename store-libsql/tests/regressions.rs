@@ -133,7 +133,10 @@ async fn dense_search_with_filter_returns_matching_chunks() {
 
     // Dense search with source_id filter for "target", limit 2.
     let filter = vec![MetadataFilter::SourceId("target".to_string())];
-    let results = store.dense_search(&[1.0, 0.0, 0.0, 0.0], 2, &filter).await.unwrap();
+    let results = store
+        .dense_search(&[1.0, 0.0, 0.0, 0.0], 2, &filter)
+        .await
+        .unwrap();
 
     assert_eq!(
         results.len(),
@@ -210,10 +213,7 @@ async fn reopen_with_same_encoding_succeeds() {
 
     // Verify data is still there
     let stats = store2.stats().await.unwrap();
-    assert_eq!(
-        stats.chunk_count, 1,
-        "chunk should persist across reopen"
-    );
+    assert_eq!(stats.chunk_count, 1, "chunk should persist across reopen");
 }
 
 // ---------------------------------------------------------------------------
@@ -241,10 +241,7 @@ async fn schema_version_stays_single_row_across_reopens() {
         .unwrap();
 
     // Open a separate connection to query schema_version directly.
-    let db = libsql::Builder::new_local(&path)
-        .build()
-        .await
-        .unwrap();
+    let db = libsql::Builder::new_local(&path).build().await.unwrap();
     let conn = db.connect().unwrap();
 
     let mut rows = conn
@@ -281,11 +278,7 @@ async fn upsert_updated_text_updates_fts_index() {
 
     // BM25 search for "alpha" should find it
     let results = store.bm25_search("alpha", 10, &[]).await.unwrap();
-    assert_eq!(
-        results.len(),
-        1,
-        "should find 'alpha' in original text"
-    );
+    assert_eq!(results.len(), 1, "should find 'alpha' in original text");
     assert_eq!(results[0].chunk.id, "c1");
 
     // Upsert same chunk ID with new text "delta echo foxtrot"
@@ -309,10 +302,6 @@ async fn upsert_updated_text_updates_fts_index() {
 
     // BM25 search for "delta" should find the updated chunk
     let results = store.bm25_search("delta", 10, &[]).await.unwrap();
-    assert_eq!(
-        results.len(),
-        1,
-        "should find 'delta' in updated text"
-    );
+    assert_eq!(results.len(), 1, "should find 'delta' in updated text");
     assert_eq!(results[0].chunk.id, "c1");
 }

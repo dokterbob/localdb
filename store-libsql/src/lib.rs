@@ -306,13 +306,13 @@ impl RetrievalStore for LibsqlStore {
              LIMIT {limit}"
         );
 
-        let mut rows =
-            conn.query(&sql, params![escaped_query])
-                .await
-                .map_err(|e| Error::Internal {
-                    message: format!("bm25_search query: {e}"),
-                    correlation_id: "libsql_bm25_search".to_string(),
-                })?;
+        let mut rows = conn
+            .query(&sql, params![escaped_query])
+            .await
+            .map_err(|e| Error::Internal {
+                message: format!("bm25_search query: {e}"),
+                correlation_id: "libsql_bm25_search".to_string(),
+            })?;
 
         let mut results = Vec::new();
         while let Some(row) = rows.next().await.map_err(|e| Error::Internal {
