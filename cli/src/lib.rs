@@ -489,10 +489,10 @@ async fn load_app_db_lenient(ctx: &CliContext) -> (ConfigLoader, AppDb) {
     let db_path = config_loader.paths.runtime_state_db_path();
     let db = match AppDb::open(&db_path).await {
         Ok(d) => d,
-        Err(Error::RuntimeStateLocked) => exit_err(&Error::RuntimeStateLocked, ctx.json),
         Err(_) => {
-            // DB absent or unreadable: use a temp path so read-only commands
-            // show empty results rather than hard failing.
+            // DB absent, unreadable, or temporarily locked by another process:
+            // use a temp path so read-only commands show empty results rather
+            // than hard failing.
             let tmp_path = config_loader.paths.data_dir.join(".lenient-fallback.db");
             AppDb::open(&tmp_path)
                 .await
