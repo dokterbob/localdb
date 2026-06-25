@@ -416,7 +416,7 @@ pub async fn tool_get_document(
             let v = serde_json::json!({
                 "document_id": first.document_id,
                 "uri": first.uri,
-                "title": first.title,
+                "title": first.metadata.title,
                 "store": {
                     "id": s.descriptor.id,
                     "name": s.descriptor.name,
@@ -506,7 +506,6 @@ impl RetrievalStore for ArcStore {
 mod tests {
     use super::*;
     use localdb_core::{embedder::FakeEmbedder, store::FakeStore, types::Span};
-    use std::collections::HashMap;
 
     // -----------------------------------------------------------------------
     // Helpers
@@ -537,8 +536,6 @@ mod tests {
             source_kind: "path".to_string(),
             mime: Some("text/plain".to_string()),
             uri: format!("file:///docs/{document_id}.md"),
-            title: Some(format!("Title for {document_id}")),
-            meta: HashMap::new(),
             metadata: localdb_core::parser::DocumentMetadata::default(),
         }
     }

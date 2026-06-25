@@ -578,6 +578,15 @@ pub async fn index_document(
         share_path: vec![],
     };
 
+    // Merge extraction-level title into metadata when metadata has no title.
+    // Some parsers (e.g. PDF, plain-text) surface the title on
+    // `ExtractionResult.title` rather than inside `metadata.title`; this
+    // ensures the stored chunk always carries the best available title.
+    let mut metadata = extraction.metadata.clone();
+    if metadata.title.is_none() {
+        metadata.title = extraction.title.clone();
+    }
+
     let mut records = Vec::new();
     for (chunk_out, embedding) in chunk_outputs.iter().zip(embeddings.iter()) {
         let chunk = Chunk {
@@ -595,9 +604,8 @@ pub async fn index_document(
             &chunk,
             embedding.clone(),
             input.uri.clone(),
-            extraction.title.clone(),
             input.mime.clone(),
-            extraction.metadata.clone(),
+            metadata.clone(),
         );
         records.push(record);
     }
@@ -1381,7 +1389,6 @@ mod tests {
     #[test]
     fn document_index_from_chunk_records() {
         use crate::store::ChunkRecord;
-        use std::collections::HashMap;
 
         let records = vec![ChunkRecord {
             id: "chunk-1".to_string(),
@@ -1399,8 +1406,6 @@ mod tests {
             source_kind: "path".to_string(),
             mime: None,
             uri: "file:///doc1.md".to_string(),
-            title: None,
-            meta: HashMap::new(),
             metadata: crate::parser::DocumentMetadata::default(),
         }];
 
@@ -2030,6 +2035,132 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
+    // Title merge regression tests (ExtractionResult.title → metadata.title)
+    // ---------------------------------------------------------------------------
+
+    /// A custom extractor that returns a title on `ExtractionResult.title` but
+    /// leaves `metadata.title` as `None`, simulating PDF/plain-text parsers.
+    struct TitledExtractor {
+        title: Option<String>,
+        metadata_title: Option<String>,
+    }
+
+    impl DocumentExtractor for TitledExtractor {
+        fn extract(
+            &self,
+            bytes: &[u8],
+            _filename: Option<&str>,
+        ) -> Result<ExtractionResult, Error> {
+            let markdown = std::str::from_utf8(bytes)
+                .map_err(|_| Error::UnsupportedFormat {
+                    format: "binary".to_string(),
+                })?
+                .to_string();
+            let metadata = crate::parser::DocumentMetadata {
+                title: self.metadata_title.clone(),
+                ..Default::default()
+            };
+            Ok(ExtractionResult {
+                markdown,
+                title: self.title.clone(),
+                metadata,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn index_document_extraction_title_propagates_to_chunk_metadata() {
+        // When ExtractionResult.title is Some and metadata.title is None,
+        // the stored chunk's metadata.title must equal the extraction title.
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let extractor = TitledExtractor {
+            title: Some("PDF Title".to_string()),
+            metadata_title: None,
+        };
+        let store_id = "store-1";
+        let config = make_ingestion_config(store_id);
+        let source = make_path_source(store_id, "/docs", vec![]);
+
+        let input = DocumentInput {
+            uri: "file:///docs/paper.pdf".to_string(),
+            bytes: b"Some PDF extracted text content.".to_vec(),
+            filename: Some("paper.pdf".to_string()),
+            mime: Some("application/pdf".to_string()),
+            fetched_at: "2026-06-10T12:00:00Z".to_string(),
+            source,
+        };
+
+        let doc_index = DocumentIndex::new();
+        let output = index_document(&input, &doc_index, &store, &embedder, &config, &extractor)
+            .await
+            .unwrap();
+
+        assert!(output.was_indexed);
+        assert!(output.chunks_written > 0);
+
+        // All written chunks must carry the extraction title.
+        let chunks = store
+            .get_chunks_for_document(&output.record.document_id)
+            .await
+            .unwrap();
+        assert!(!chunks.is_empty());
+        for chunk in &chunks {
+            assert_eq!(
+                chunk.metadata.title.as_deref(),
+                Some("PDF Title"),
+                "chunk metadata.title must equal ExtractionResult.title when metadata.title was None"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn index_document_existing_metadata_title_not_overwritten() {
+        // When metadata.title is already Some, ExtractionResult.title must NOT
+        // overwrite it — the metadata title wins.
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let extractor = TitledExtractor {
+            title: Some("Other Title".to_string()),
+            metadata_title: Some("Existing".to_string()),
+        };
+        let store_id = "store-1";
+        let config = make_ingestion_config(store_id);
+        let source = make_path_source(store_id, "/docs", vec![]);
+
+        let input = DocumentInput {
+            uri: "file:///docs/doc.txt".to_string(),
+            bytes: b"Plain text document content here.".to_vec(),
+            filename: Some("doc.txt".to_string()),
+            mime: Some("text/plain".to_string()),
+            fetched_at: "2026-06-10T12:00:00Z".to_string(),
+            source,
+        };
+
+        let doc_index = DocumentIndex::new();
+        let output = index_document(&input, &doc_index, &store, &embedder, &config, &extractor)
+            .await
+            .unwrap();
+
+        assert!(output.was_indexed);
+        assert!(output.chunks_written > 0);
+
+        // All written chunks must keep the original metadata title.
+        let chunks = store
+            .get_chunks_for_document(&output.record.document_id)
+            .await
+            .unwrap();
+        assert!(!chunks.is_empty());
+        for chunk in &chunks {
+            assert_eq!(
+                chunk.metadata.title.as_deref(),
+                Some("Existing"),
+                "chunk metadata.title must not be overwritten when it already had a value"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------------
     // Path source pipeline integration tests
     // ---------------------------------------------------------------------------
 
@@ -2417,7 +2548,6 @@ mod tests {
 
         // Insert some chunks for this document
         use crate::store::ChunkRecord;
-        use std::collections::HashMap;
         let chunk = ChunkRecord {
             id: "old-chunk".to_string(),
             document_id: existing_doc_id.clone(),
@@ -2434,8 +2564,6 @@ mod tests {
             source_kind: "url".to_string(),
             mime: None,
             uri: url.to_string(),
-            title: None,
-            meta: HashMap::new(),
             metadata: crate::parser::DocumentMetadata::default(),
         };
         store.upsert_chunks(vec![chunk]).await.unwrap();
@@ -2916,7 +3044,6 @@ mod tests {
     #[tokio::test]
     async fn document_index_hydration_enables_incremental_skip() {
         use crate::store::ChunkRecord;
-        use std::collections::HashMap;
 
         // Simulate a previous run: build chunk records as if already indexed.
         let uri = "file:///docs/existing.md";
@@ -2940,8 +3067,6 @@ mod tests {
             source_kind: "path".to_string(),
             mime: None,
             uri: uri.to_string(),
-            title: None,
-            meta: HashMap::new(),
             metadata: crate::parser::DocumentMetadata::default(),
         };
 
@@ -3457,8 +3582,6 @@ mod tests {
             source_kind: "path".to_string(),
             mime: None,
             uri: uri.to_string(),
-            title: None,
-            meta: std::collections::HashMap::new(),
             metadata: crate::parser::DocumentMetadata::default(),
         }
     }

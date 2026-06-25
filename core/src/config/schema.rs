@@ -218,7 +218,7 @@ pub struct StoreConfig {
     #[serde(default = "default_visibility")]
     pub visibility: String,
 
-    /// Backend kind: "lancedb" (default).
+    /// Backend kind: "libsql" (default).
     #[serde(default = "default_backend")]
     pub backend: String,
 
@@ -236,7 +236,7 @@ fn default_visibility() -> String {
 }
 
 fn default_backend() -> String {
-    "lancedb".to_string()
+    "libsql".to_string()
 }
 
 /// A source attached to a store (YAML-declared).

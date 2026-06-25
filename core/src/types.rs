@@ -99,7 +99,7 @@ pub struct Store {
     /// Visibility: "private" | "shared". MVP: only "private" functional.
     pub visibility: StoreVisibility,
 
-    /// Backend kind + connection info; default "lancedb".
+    /// Backend kind + connection info; default "libsql".
     pub backend: BackendConfig,
 
     /// Indexing policy: `{chunking, embedding}` as one unit.
@@ -121,7 +121,7 @@ pub enum StoreVisibility {
 /// Backend configuration for a store.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BackendConfig {
-    /// Backend kind, e.g. "lancedb".
+    /// Backend kind, e.g. "libsql".
     pub kind: String,
     /// Connection info, backend-specific.
     #[serde(default)]
@@ -518,7 +518,7 @@ mod tests {
             name: "test-store".to_string(),
             visibility: StoreVisibility::Private,
             backend: BackendConfig {
-                kind: "lancedb".to_string(),
+                kind: "libsql".to_string(),
                 connection: HashMap::new(),
             },
             indexing: IndexingPolicy {

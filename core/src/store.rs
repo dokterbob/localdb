@@ -1,7 +1,7 @@
 //! The `RetrievalStore` trait and related types.
 //!
 //! This is the abstraction layer between `core` domain logic and the physical
-//! storage backend. The default implementation is in `store-lancedb`.
+//! storage backend. The default implementation is in `store-libsql`.
 //!
 //! Fusion (RRF) happens **above** this trait in `core` — the trait exposes raw
 //! BM25 and dense search legs separately.
@@ -74,24 +74,10 @@ pub struct ChunkRecord {
     /// Document URI (e.g. `file:///path/to/file` or URL).
     pub uri: String,
 
-    /// Document title.
-    #[serde(default)]
-    pub title: Option<String>,
-
-    /// Open key-value metadata (string → string for indexable fields).
-    ///
-    /// **Note:** The LanceDB backend does not currently persist this field.
-    /// Values stored here survive in-memory round-trips (FakeStore) but are
-    /// silently discarded on LanceDB serialization/deserialization.  T07/T08
-    /// should not populate `meta` until a schema migration adds the column.
-    #[serde(default)]
-    pub meta: HashMap<String, String>,
-
     /// Document metadata extracted from the document.
     ///
-    /// Persisted as a single JSON-encoded `Utf8` column in LanceDB. Read
-    /// defensively: tables created before this schema migration return
-    /// `DocumentMetadata::default()` on read.
+    /// Persisted as a JSON-encoded column. Read defensively: stores created
+    /// before this schema migration return `DocumentMetadata::default()` on read.
     #[serde(default)]
     pub metadata: DocumentMetadata,
 }
@@ -102,7 +88,6 @@ impl ChunkRecord {
         chunk: &Chunk,
         embedding: Vec<f32>,
         uri: String,
-        title: Option<String>,
         mime: Option<String>,
         metadata: DocumentMetadata,
     ) -> Self {
@@ -122,8 +107,6 @@ impl ChunkRecord {
             source_kind: chunk.provenance.source_ref.kind.clone(),
             mime,
             uri,
-            title,
-            meta: HashMap::new(),
             metadata,
         }
     }
@@ -189,7 +172,7 @@ pub struct StoreStats {
 
 /// The storage abstraction for a single knowledge base.
 ///
-/// Implementations: `store-lancedb` (embedded, production), `FakeStore` (in-memory, tests).
+/// Implementations: `store-libsql` (embedded, production), `FakeStore` (in-memory, tests).
 ///
 /// This trait is object-safe and `Send + Sync` so it can be boxed and shared across async tasks.
 ///
@@ -496,13 +479,13 @@ impl RetrievalStore for FakeStore {
 }
 
 // ---------------------------------------------------------------------------
-// Trait conformance test suite (runs against both FakeStore and LanceDB)
+// Trait conformance test suite (runs against both FakeStore and libsql)
 // ---------------------------------------------------------------------------
 
 /// A shared test suite exercising the `RetrievalStore` contract.
 ///
-/// Call this with any concrete implementation. Integration tests in `store-lancedb`
-/// run this same suite against the real LanceDB backend.
+/// Call this with any concrete implementation. Integration tests in `store-libsql`
+/// run this same suite against the real libsql backend.
 pub mod conformance {
     use super::*;
 
@@ -529,8 +512,6 @@ pub mod conformance {
             source_kind: "path".to_string(),
             mime: Some("text/plain".to_string()),
             uri: "file:///test.md".to_string(),
-            title: Some("Test Document".to_string()),
-            meta: HashMap::new(),
             metadata: crate::parser::DocumentMetadata::default(),
         }
     }
@@ -845,8 +826,8 @@ pub mod conformance {
     /// Run a subset of the conformance suite that does not require a pre-built FTS index.
     ///
     /// The store must be freshly created (empty) when this is called.
-    /// Tests that require an FTS index (BM25 search) must be called separately after
-    /// `create_fts_index()` (LanceDB) or can run directly on FakeStore.
+    /// Tests that require an FTS index (BM25 search) can run directly on both
+    /// libsql (auto-maintained FTS triggers) and FakeStore.
     ///
     /// Note: because each conformance function leaves data in the store, this helper
     /// is only useful for backends that can provide a fresh store per call.  For
@@ -885,8 +866,6 @@ mod tests {
             source_kind: "path".to_string(),
             mime: Some("text/plain".to_string()),
             uri: "file:///test.md".to_string(),
-            title: Some("Test".to_string()),
-            meta: HashMap::new(),
             metadata: crate::parser::DocumentMetadata::default(),
         }
     }
@@ -1042,7 +1021,6 @@ mod tests {
             &chunk,
             vec![0.1, 0.2, 0.3],
             "file:///test.md".to_string(),
-            Some("Test Title".to_string()),
             Some("text/markdown".to_string()),
             crate::parser::DocumentMetadata::default(),
         );
@@ -1053,7 +1031,6 @@ mod tests {
         assert_eq!(record.text, "Some text");
         assert_eq!(record.embedding, vec![0.1, 0.2, 0.3]);
         assert_eq!(record.uri, "file:///test.md");
-        assert_eq!(record.title, Some("Test Title".to_string()));
         assert_eq!(record.mime, Some("text/markdown".to_string()));
         assert_eq!(record.source_id, "source-id");
         assert_eq!(record.source_kind, "path");

@@ -8,7 +8,7 @@ description = "CLI command implementations, thin layer on core / daemon client"
 
 [dependencies]
 localdb-core = { path = "../core" }
-store-lancedb = { path = "../store-lancedb" }
+store-libsql = { path = "../store-libsql" }
 extract = { path = "../extract" }
 embed = { path = "../embed", features = ["local-onnx"] }
 fetch = { path = "../fetch" }

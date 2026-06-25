@@ -357,7 +357,7 @@ pub async fn search(
     }
 
     // Build store handles for fan-out.
-    // Prefer real LanceDbStore instances when the store has been indexed on disk.
+    // Prefer real LibsqlStore instances when the store has been indexed on disk.
     // Fall back to the shared in-memory FakeStore for stores that have no on-disk
     // data yet (so the acceptance criterion "/search returns citations" is always
     // provably satisfied via upsert_chunks → shared FakeStore → search).
@@ -392,10 +392,13 @@ pub async fn search(
     for store_cfg in &target_stores {
         let store_dir = data_dir.join("stores").join(&store_cfg.name);
         if store_dir.exists() {
-            // Open the real LanceDbStore for this store.
-            let lance_path = store_dir.to_string_lossy().to_string();
-            match store_lancedb::LanceDbStore::open(
-                &lance_path,
+            // Open the real LibsqlStore for this store.
+            let db_path = store_dir.join("store.db");
+            if !db_path.exists() {
+                continue;
+            }
+            match store_libsql::LibsqlStore::open(
+                &db_path,
                 embedder.embedding_dim(),
                 embedder.vector_encoding(),
             )
@@ -412,7 +415,7 @@ pub async fn search(
                     });
                 }
                 Err(e) => {
-                    warn!("cannot open LanceDbStore for '{}': {}", store_cfg.name, e);
+                    warn!("cannot open store '{}': {}", store_cfg.name, e);
                 }
             }
         }
@@ -607,7 +610,7 @@ mod tests {
     use tempfile::TempDir;
     use tower::ServiceExt; // for `oneshot`
 
-    fn make_app() -> (TempDir, Router) {
+    async fn make_app() -> (TempDir, Router) {
         let dir = tempfile::tempdir().unwrap();
         let yaml_config = localdb_core::config::schema::RawConfig {
             version: 1,
@@ -627,7 +630,9 @@ mod tests {
             providers: vec![],
         };
         let queue = crate::job_queue::JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue).unwrap();
+        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
+            .await
+            .unwrap();
 
         let router = Router::new()
             .route("/v1/stores", get(list_stores).post(create_store))
@@ -660,7 +665,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_stores_empty() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -679,7 +684,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_store_returns_201() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -698,7 +703,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_store_empty_name_returns_400() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -717,7 +722,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_store_not_found_returns_404() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -734,7 +739,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_store_not_found_returns_409_or_404() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -762,14 +767,16 @@ mod tests {
             stores: vec![localdb_core::config::schema::StoreConfig {
                 name: "yaml-store".to_string(),
                 visibility: "private".to_string(),
-                backend: "lancedb".to_string(),
+                backend: "libsql".to_string(),
                 indexing: None,
                 sources: vec![],
             }],
             providers: vec![],
         };
         let queue = crate::job_queue::JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue).unwrap();
+        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
+            .await
+            .unwrap();
 
         let app = Router::new()
             .route("/v1/stores", get(list_stores).post(create_store))
@@ -802,7 +809,7 @@ mod tests {
 
     #[tokio::test]
     async fn source_crud_roundtrip() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
 
         // Create store
         let resp = app
@@ -866,7 +873,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_empty_query_returns_400() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -883,7 +890,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_with_nonexistent_store_filter_returns_404() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -902,7 +909,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_returns_citations_shape() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -924,7 +931,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_job_returns_202() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
 
         // Create store first
         app.clone()
@@ -957,7 +964,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_job_not_found_returns_404() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -972,7 +979,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_and_poll_job() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
 
         // Create store
         app.clone()
@@ -1033,7 +1040,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_status_returns_daemon_true() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1052,7 +1059,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_config_returns_yaml_config() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1072,7 +1079,7 @@ mod tests {
 
     #[tokio::test]
     async fn patch_store_updates_visibility() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
 
         // Create a runtime-owned store
         app.clone()
@@ -1107,7 +1114,7 @@ mod tests {
 
     #[tokio::test]
     async fn patch_store_not_found_returns_404() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
 
         let resp = app
             .oneshot(
@@ -1134,14 +1141,16 @@ mod tests {
             stores: vec![localdb_core::config::schema::StoreConfig {
                 name: "yaml-store".to_string(),
                 visibility: "private".to_string(),
-                backend: "lancedb".to_string(),
+                backend: "libsql".to_string(),
                 indexing: None,
                 sources: vec![],
             }],
             providers: vec![],
         };
         let queue = crate::job_queue::JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue).unwrap();
+        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
+            .await
+            .unwrap();
         let app = crate::daemon::build_router(state);
 
         let resp = app
@@ -1164,7 +1173,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_document_not_found_returns_404() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1191,7 +1200,9 @@ mod tests {
             providers: vec![],
         };
         let queue = crate::job_queue::JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue).unwrap();
+        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
+            .await
+            .unwrap();
 
         // Insert a document record directly
         state
@@ -1268,7 +1279,9 @@ mod tests {
             providers: vec![],
         };
         let queue = crate::job_queue::JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue).unwrap();
+        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
+            .await
+            .unwrap();
 
         // Produce a 128-dim embedding using FakeEmbedder to match the search handler.
         let embedder = FakeEmbedder::new(128);
@@ -1301,8 +1314,6 @@ mod tests {
             source_kind: "path".to_string(),
             mime: Some("text/plain".to_string()),
             uri: "file:///hello.md".to_string(),
-            title: Some("Hello Doc".to_string()),
-            meta: std::collections::HashMap::new(),
             metadata: localdb_core::DocumentMetadata::default(),
         };
 
@@ -1359,7 +1370,9 @@ mod tests {
             providers: vec![],
         };
         let queue = crate::job_queue::JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue).unwrap();
+        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
+            .await
+            .unwrap();
 
         // Add a real store so the filter name passes the existence check.
         state.add_store("my-store", "private").await.unwrap();
@@ -1394,8 +1407,6 @@ mod tests {
             source_kind: "path".to_string(),
             mime: None,
             uri: "file:///foreign.md".to_string(),
-            title: None,
-            meta: std::collections::HashMap::new(),
             metadata: localdb_core::DocumentMetadata::default(),
         };
         state.upsert_chunks(vec![chunk]).await.unwrap();
@@ -1438,14 +1449,16 @@ mod tests {
             stores: vec![localdb_core::config::schema::StoreConfig {
                 name: "yaml-store".to_string(),
                 visibility: "private".to_string(),
-                backend: "lancedb".to_string(),
+                backend: "libsql".to_string(),
                 indexing: None,
                 sources: vec![],
             }],
             providers: vec![],
         };
         let queue = crate::job_queue::JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue).unwrap();
+        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
+            .await
+            .unwrap();
         let app = crate::daemon::build_router(state);
 
         let resp = app
@@ -1484,14 +1497,16 @@ mod tests {
             stores: vec![localdb_core::config::schema::StoreConfig {
                 name: "yaml-store".to_string(),
                 visibility: "private".to_string(),
-                backend: "lancedb".to_string(),
+                backend: "libsql".to_string(),
                 indexing: None,
                 sources: vec![],
             }],
             providers: vec![],
         };
         let queue = crate::job_queue::JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue).unwrap();
+        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
+            .await
+            .unwrap();
         let app = crate::daemon::build_router(state);
 
         let resp = app
@@ -1513,7 +1528,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_source_removes_it() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
 
         // Create store and source
         app.clone()
@@ -1581,7 +1596,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_nonexistent_source_returns_404() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1601,7 +1616,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_job_nonexistent_store_returns_404() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1624,7 +1639,7 @@ mod tests {
 
     #[tokio::test]
     async fn pagination_cursor_works() {
-        let (_dir, app) = make_app();
+        let (_dir, app) = make_app().await;
 
         // Create 3 stores
         for name in &["alpha", "beta", "gamma"] {

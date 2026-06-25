@@ -27,7 +27,7 @@ A named knowledge base. Unit of sharing, ACLs, indexing policy, and federation.
 | `id` | Stable ULID, minted at creation; never reused. |
 | `name` | Human-readable, unique per instance. |
 | `visibility` | `private` \| `shared`. MVP: only `private` functional; field exists from day one ([01-architecture.md](01-architecture.md) §5). |
-| `backend` | Backend kind + connection info; default `lancedb`. |
+| `backend` | Backend kind + connection info; default `libsql`. |
 | `indexing` | Indexing policy: `{chunking, embedding, parsers}` as one unit ([03-config.md](03-config.md) §2). |
 | `acl` | Reserved; empty in MVP. |
 
@@ -233,10 +233,10 @@ Dublin Core Metadata Element Set 1.1 (DCMES), all 15 elements. Repeatable elemen
 | `coverage` | `Option<String>` | Spatial or temporal extent. |
 | `rights` | `Option<String>` | Rights statement or license. |
 
-**Persistence:** `DocumentMetadata` is JSON-encoded into a single nullable `Utf8` column named
-`metadata` on each chunk record in LanceDB. Threading path:
+**Persistence:** `DocumentMetadata` is JSON-encoded into a single nullable `TEXT` column named
+`metadata` on each chunk record in libsql. Threading path:
 `Parser` → `ParsedDocument.metadata` → `ExtractionResult.metadata` → `ChunkRecord.metadata` →
-LanceDB `metadata` column.
+libsql `metadata` column.
 
 **Defensive read:** tables created before this column was added (pre-migration) may have a
 missing column, a `NULL` value, or an unparseable payload. All three cases resolve to

@@ -3,7 +3,7 @@ version: 1
 stores:
   - name: web
     visibility: private
-    backend: lancedb
+    backend: libsql
     sources:
       - kind: url
         url: https://example.com/docs
