@@ -27,7 +27,7 @@ use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt};
 use lance_index::scalar::FullTextSearchQuery;
-use lancedb::index::{scalar::BTreeIndexBuilder, vector::IvfFlatIndexBuilder, Index};
+use lancedb::index::{scalar::BTreeIndexBuilder, vector::IvfFlatIndexBuilder, Index, IndexType};
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::{connect, DistanceType, Table};
 
@@ -99,10 +99,14 @@ impl LanceDbStore {
         embedding_dim: usize,
         encoding: VectorEncoding,
     ) -> Result<Self, Error> {
-        let db = connect(path).execute().await.map_err(|e| Error::Internal {
-            message: format!("LanceDB connect failed: {e}"),
-            correlation_id: "lancedb-open".to_string(),
-        })?;
+        let db = connect(path)
+            .read_consistency_interval(std::time::Duration::ZERO)
+            .execute()
+            .await
+            .map_err(|e| Error::Internal {
+                message: format!("LanceDB connect failed: {e}"),
+                correlation_id: "lancedb-open".to_string(),
+            })?;
 
         // Check if table exists
         let table_names = db
@@ -206,9 +210,12 @@ impl LanceDbStore {
                 message: format!("LanceDB list_indices failed: {e}"),
                 correlation_id: "lancedb-list-indices".to_string(),
             })?;
-        Ok(indices
-            .iter()
-            .any(|cfg| cfg.columns.iter().any(|c| c == COL_TEXT)))
+        // Match the FTS type explicitly, not just the column: a future scalar
+        // index on `text` must not be mistaken for the full-text index (that would
+        // resurface the "INVERTED index required" failure this guard prevents).
+        Ok(indices.iter().any(|cfg| {
+            cfg.index_type == IndexType::FTS && cfg.columns.iter().any(|c| c == COL_TEXT)
+        }))
     }
 
     /// Create a full-text search index on the `text` column.
@@ -1371,6 +1378,15 @@ mod tests {
             !store.has_fts_index().await.unwrap(),
             "no FTS index before creation"
         );
+
+        // A non-FTS index (BTree on document_id) must not be mistaken for the FTS
+        // index — has_fts_index discriminates on index type, not just column.
+        store.create_document_id_index().await.unwrap();
+        assert!(
+            !store.has_fts_index().await.unwrap(),
+            "BTree index must not count as an FTS index"
+        );
+
         store.create_fts_index().await.unwrap();
         assert!(
             store.has_fts_index().await.unwrap(),
@@ -2012,5 +2028,58 @@ mod tests {
         assert_eq!(records[0].document_id, "doc-abc");
         assert_eq!(records[0].content_hash, "deadbeef123");
         assert_eq!(records[0].policy_version, "policy-v2");
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-handle consistency (MCP scenario)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn cross_handle_sees_fts_index_and_data() {
+        // Simulates the MCP server scenario: handle A is opened first (long-lived),
+        // then handle B inserts data and creates the FTS index. Handle A must see
+        // the new index and be able to BM25 search — this fails without
+        // `read_consistency_interval(Duration::ZERO)`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+
+        let handle_a = LanceDbStore::open(&path, DIM, VectorEncoding::Float32)
+            .await
+            .unwrap();
+
+        let handle_b = LanceDbStore::open(&path, DIM, VectorEncoding::Float32)
+            .await
+            .unwrap();
+
+        let records = vec![
+            make_record(
+                "cross-1",
+                "doc-cross",
+                "store-cross",
+                "The quick brown fox jumps over the lazy dog",
+                vec![1.0, 0.0, 0.0, 0.0],
+            ),
+            make_record(
+                "cross-2",
+                "doc-cross",
+                "store-cross",
+                "A lazy dog slept in the afternoon sun",
+                vec![0.0, 1.0, 0.0, 0.0],
+            ),
+        ];
+        handle_b.upsert_chunks(records).await.unwrap();
+        handle_b.create_fts_index().await.unwrap();
+
+        assert!(
+            handle_a.has_fts_index().await.unwrap(),
+            "stale handle must see the FTS index created by another handle"
+        );
+
+        let results = handle_a.bm25_search("fox", 10, &[]).await.unwrap();
+        assert!(
+            !results.is_empty(),
+            "stale handle must return BM25 results for data written by another handle"
+        );
+        assert_eq!(results[0].chunk.id, "cross-1");
     }
 }
