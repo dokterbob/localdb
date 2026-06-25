@@ -146,11 +146,13 @@ impl RuntimeStateDb {
             correlation_id: "runtime_state_connect".to_string(),
         })?;
 
-        // WAL mode — use query() not execute() (PRAGMAs return rows)
-        conn.query("PRAGMA journal_mode=WAL", ())
+        // Set busy_timeout first so the WAL switch waits on contention
+        // instead of failing immediately with SQLITE_BUSY.
+        // Use query() not execute() (PRAGMAs return rows).
+        conn.query("PRAGMA busy_timeout=5000", ())
             .await
             .map_err(map_libsql_err)?;
-        conn.query("PRAGMA busy_timeout=5000", ())
+        conn.query("PRAGMA journal_mode=WAL", ())
             .await
             .map_err(map_libsql_err)?;
 

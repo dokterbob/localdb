@@ -72,8 +72,12 @@ pub async fn create_schema(
     .await?;
 
     // -- DiskANN vector index
+    // metric=cosine works for both encodings:
+    // for F1BIT_BLOB, libSQL's cosine distance returns Hamming distance
+    // (number of differing bits), per Turso docs.
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS chunks_vec_idx ON chunks(libsql_vector_idx(embedding, 'metric=cosine'))",
+        "CREATE INDEX IF NOT EXISTS chunks_vec_idx ON chunks(\
+         libsql_vector_idx(embedding, 'metric=cosine', 'max_neighbors=64', 'compress_neighbors=float8'))",
         (),
     )
     .await?;

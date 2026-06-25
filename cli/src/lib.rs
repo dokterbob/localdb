@@ -489,14 +489,28 @@ async fn load_app_db_lenient(ctx: &CliContext) -> (ConfigLoader, AppDb) {
     let db_path = config_loader.paths.runtime_state_db_path();
     let db = match AppDb::open(&db_path).await {
         Ok(d) => d,
+        Err(ref e) if matches!(e, Error::RuntimeStateLocked) => {
+            // Lock contention — retry once after a brief delay.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            match AppDb::open(&db_path).await {
+                Ok(d) => d,
+                Err(_) => {
+                    tracing::warn!(
+                        "runtime-state DB locked after retry; read-only results may be incomplete"
+                    );
+                    let tmp_path = config_loader.paths.data_dir.join(".lenient-fallback.db");
+                    AppDb::open(&tmp_path)
+                        .await
+                        .unwrap_or_else(|e2| exit_err(&e2, ctx.json))
+                }
+            }
+        }
         Err(_) => {
-            // DB absent, unreadable, or temporarily locked by another process:
-            // use a temp path so read-only commands show empty results rather
-            // than hard failing.
+            // DB absent or unreadable — use fallback for read-only commands.
             let tmp_path = config_loader.paths.data_dir.join(".lenient-fallback.db");
             AppDb::open(&tmp_path)
                 .await
-                .unwrap_or_else(|e| exit_err(&e, ctx.json))
+                .unwrap_or_else(|e2| exit_err(&e2, ctx.json))
         }
     };
     (config_loader, db)
@@ -2140,6 +2154,9 @@ async fn run_search_async(ctx: &CliContext, query: &str, limit: usize) {
             .unwrap_or_else(|| name.clone());
 
         let db_path = store_data_dir.join("store.db");
+        if !db_path.exists() {
+            continue;
+        }
         match store_libsql::LibsqlStore::open(
             &db_path,
             embedder.embedding_dim(),
@@ -2325,6 +2342,9 @@ async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
                 .unwrap_or_else(|| "private".to_string()),
         };
         let db_path = store_data_dir.join("store.db");
+        if !db_path.exists() {
+            continue;
+        }
         match store_libsql::LibsqlStore::open(
             &db_path,
             embedder.embedding_dim(),

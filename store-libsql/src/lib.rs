@@ -50,6 +50,14 @@ impl LibsqlStore {
             correlation_id: "libsql_connect".to_string(),
         })?;
 
+        // Set busy_timeout first so the WAL switch waits on contention.
+        conn.query("PRAGMA busy_timeout=5000", ())
+            .await
+            .map_err(|e| Error::Internal {
+                message: format!("busy_timeout: {e}"),
+                correlation_id: "libsql_busy_timeout".to_string(),
+            })?;
+
         // WAL mode — use query() not execute() because PRAGMA returns a row
         conn.query("PRAGMA journal_mode=WAL", ())
             .await
@@ -225,6 +233,7 @@ impl RetrievalStore for LibsqlStore {
         loop {
             let qvec_sql = crate::vectors::query_vector_sql(query_vector, self.encoding);
 
+            // vector_distance_cos returns Hamming distance for F1BIT_BLOB columns
             let sql = format!(
                 "SELECT c.id, c.document_id, c.seq, c.text, c.span_start, c.span_end,
                         c.heading_path, vector_extract(c.embedding) AS embedding_json,

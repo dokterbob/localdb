@@ -394,6 +394,9 @@ pub async fn search(
         if store_dir.exists() {
             // Open the real LibsqlStore for this store.
             let db_path = store_dir.join("store.db");
+            if !db_path.exists() {
+                continue;
+            }
             match store_libsql::LibsqlStore::open(
                 &db_path,
                 embedder.embedding_dim(),
