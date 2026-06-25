@@ -99,10 +99,14 @@ impl LanceDbStore {
         embedding_dim: usize,
         encoding: VectorEncoding,
     ) -> Result<Self, Error> {
-        let db = connect(path).execute().await.map_err(|e| Error::Internal {
-            message: format!("LanceDB connect failed: {e}"),
-            correlation_id: "lancedb-open".to_string(),
-        })?;
+        let db = connect(path)
+            .read_consistency_interval(std::time::Duration::ZERO)
+            .execute()
+            .await
+            .map_err(|e| Error::Internal {
+                message: format!("LanceDB connect failed: {e}"),
+                correlation_id: "lancedb-open".to_string(),
+            })?;
 
         // Check if table exists
         let table_names = db
@@ -2024,5 +2028,58 @@ mod tests {
         assert_eq!(records[0].document_id, "doc-abc");
         assert_eq!(records[0].content_hash, "deadbeef123");
         assert_eq!(records[0].policy_version, "policy-v2");
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-handle consistency (MCP scenario)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn cross_handle_sees_fts_index_and_data() {
+        // Simulates the MCP server scenario: handle A is opened first (long-lived),
+        // then handle B inserts data and creates the FTS index. Handle A must see
+        // the new index and be able to BM25 search — this fails without
+        // `read_consistency_interval(Duration::ZERO)`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+
+        let handle_a = LanceDbStore::open(&path, DIM, VectorEncoding::Float32)
+            .await
+            .unwrap();
+
+        let handle_b = LanceDbStore::open(&path, DIM, VectorEncoding::Float32)
+            .await
+            .unwrap();
+
+        let records = vec![
+            make_record(
+                "cross-1",
+                "doc-cross",
+                "store-cross",
+                "The quick brown fox jumps over the lazy dog",
+                vec![1.0, 0.0, 0.0, 0.0],
+            ),
+            make_record(
+                "cross-2",
+                "doc-cross",
+                "store-cross",
+                "A lazy dog slept in the afternoon sun",
+                vec![0.0, 1.0, 0.0, 0.0],
+            ),
+        ];
+        handle_b.upsert_chunks(records).await.unwrap();
+        handle_b.create_fts_index().await.unwrap();
+
+        assert!(
+            handle_a.has_fts_index().await.unwrap(),
+            "stale handle must see the FTS index created by another handle"
+        );
+
+        let results = handle_a.bm25_search("fox", 10, &[]).await.unwrap();
+        assert!(
+            !results.is_empty(),
+            "stale handle must return BM25 results for data written by another handle"
+        );
+        assert_eq!(results[0].chunk.id, "cross-1");
     }
 }
