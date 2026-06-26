@@ -20,7 +20,7 @@ defaults:
 stores:
   - name: notes
     visibility: private
-    backend: lancedb
+    backend: libsql
     indexing: ~
     sources:
       - kind: path

@@ -17,7 +17,7 @@ things to version and install instead of one).
 |---|---|
 | `core` | Domain model (stores, sources, documents, blocks, chunks, citations, index jobs), search orchestration, indexing policy, the `RetrievalStore` trait, the `Embedder` trait, error taxonomy. No I/O frameworks. |
 | `extract` | Format detection and extraction → normalized document (Markdown, plain text, HTML, text-layer PDF in v1). |
-| `store-lancedb` | LanceDB implementation of `RetrievalStore`. |
+| `store-libsql` | libsql implementation of `RetrievalStore` (DiskANN vectors + FTS5). |
 | `embed` | `Embedder` implementations: local ONNX (fastembed-class), OpenAI-compatible HTTP provider, contextualized-embedding providers. Model download/cache management. |
 | `server` | HTTP API (axum or similar), daemon runtime: file watching, URL refresh scheduling, job queue, unix socket. |
 | `mcp` | MCP server over stdio, thin layer on `core` (or on the daemon client, see §3). |
@@ -34,35 +34,36 @@ domain logic is implemented in a surface crate — one shared core beats duplica
    build, and the embedded-first process model (§3) makes them usable with zero daemon setup.
    **Rejected:** web-UI-first — front-loads a frontend build and a daemon before the core has
    proven users.
-2. **LanceDB embedded is the local default, behind a trait.** Storage goes behind the
-   `RetrievalStore` trait in `core`; the default implementation is **LanceDB embedded**
-   (in-process, Apache 2.0, tantivy BM25 + dense vectors). Qdrant server becomes the remote-mode
-   adapter on the roadmap; **Qdrant Edge** (in-process, pre-GA ~0.6.x as of early 2026) is a
-   watch-item ([06-roadmap.md](06-roadmap.md) §3). Known cost: the LanceDB Rust API trails Python,
-   so hybrid fusion (RRF) is done in our code, not delegated ([04-search-pipeline.md](04-search-pipeline.md) §5).
-   **Rejected:** Qdrant as local default — Qdrant has no embedded mode (server-only), which would
-   force a daemon-always model and contradict §3.
+2. **libsql embedded is the local default, behind a trait.** Storage goes behind the
+   `RetrievalStore` trait in `core`; the default implementation is **libsql** (Turso's SQLite
+   fork, in-process, MIT-licensed) — a single engine providing DiskANN vector search, FTS5 for
+   BM25, and relational metadata in one file. Qdrant server becomes the remote-mode adapter on the
+   roadmap; **Qdrant Edge** (in-process, pre-GA ~0.6.x as of early 2026) is a watch-item
+   ([06-roadmap.md](06-roadmap.md) §3). Hybrid fusion (RRF) is done in our code above the trait,
+   not delegated ([04-search-pipeline.md](04-search-pipeline.md) §5). **Rejected:** Qdrant as
+   local default — Qdrant has no embedded mode (server-only), which would force a daemon-always
+   model and contradict §3.
 
 ## 3. Process model: embedded-first, daemon-optional
 
-**Decision:** CLI and MCP link `core` directly and open the store **in-process** (mmapped LanceDB
-index + ONNX models). No daemon is required for any MVP function. A daemon (`localdb serve`) is
+**Decision:** CLI and MCP link `core` directly and open the store **in-process** (libsql database
+\+ ONNX models). No daemon is required for any MVP function. A daemon (`localdb serve`) is
 optional; when one is running, CLI and MCP become thin clients of its HTTP API.
 
 - **Discovery:** a unix socket at a well-known path in the data dir
   ([03-config.md](03-config.md) §4). Socket present and responsive → route through daemon;
   otherwise → embedded mode. No configuration needed for the common case.
-- **Single-writer rule (LanceDB gate):** an advisory file lock (`<data_dir>/.write.lock`)
-  guards concurrent LanceDB vector-index writes. Exactly one process may hold this lock
+- **Single-writer rule:** an advisory file lock (`<data_dir>/.write.lock`)
+  guards concurrent write operations. Exactly one process may hold this lock
   during a write (the daemon when running, else the first embedded writer). It is held only
-  for the duration of an actual LanceDB write — not during embedding or reads. Pure-metadata
+  for the duration of an actual write — not during embedding or reads. Pure-metadata
   operations (`store add`, `source add/remove`, `store list`) do not hold this lock; `store
-  remove` acquires it only for the LanceDB data-directory deletion.
+  remove` acquires it only for the store data deletion.
   Lock acquisition failure surfaces as error `store_locked`
   ([05-surfaces.md](05-surfaces.md) §5).
 - **Runtime-state concurrency:** the runtime-state registry (`runtime-state.db`) is backed by
-  SQLite in WAL mode with a 2 s busy-timeout. Multiple processes (MCP server, CLI, daemon) can
-  read simultaneously; writers serialise automatically. A write that cannot acquire the SQLite
+  libsql in WAL mode with a 2 s busy-timeout. Multiple processes (MCP server, CLI, daemon) can
+  read simultaneously; writers serialise automatically. A write that cannot acquire the
   write lock within 2 s surfaces as `runtime_state_locked` (exit 4).
 - **Daemon-exclusive capabilities:** continuous file watching, scheduled URL refresh, the HTTP
   API and (later) web UI, background job queue. Embedded mode does one-shot equivalents
@@ -83,8 +84,9 @@ Two concepts, deliberately separated:
   vs. bookmarks vs. (later) email. Stores are the unit of sharing and federation
   ([VISION.md](../VISION.md)).
 - A **backend** (physical): an implementation of `RetrievalStore` that holds a store's index.
-  MVP: `lancedb` (embedded). Roadmap: `qdrant` (remote server), possibly Qdrant Edge. A store
-  declares its backend in config; default is `lancedb`.
+  MVP: `libsql` (embedded, single engine with DiskANN vectors and FTS5). Roadmap: `qdrant`
+  (remote server), possibly Qdrant Edge. A store declares its backend in config; default is
+  `libsql`.
 
 `RetrievalStore` (trait sketch — normative surface, not final signatures): upsert chunks (dense
 vector + text for BM25 + metadata), delete by document, dense search, BM25 search, metadata
@@ -105,7 +107,7 @@ component must respect:
 **Decision:** async on **tokio** for all I/O and orchestration — but not literally everything.
 
 - **Async:** the daemon (HTTP API, file watching, schedulers, job queue), the `RetrievalStore`
-  and `Embedder` traits (their backends are inherently async: LanceDB's Rust API is async, hosted
+  and `Embedder` traits (their backends are inherently async: libsql's Rust API is async, hosted
   providers are HTTP), URL fetching, and surface plumbing.
 - **Not async:** CPU-bound work — ONNX inference, extraction/parsing, chunking, blake3 hashing —
   runs on a blocking/rayon pool via `spawn_blocking`-style handoff, never on the async executor.
@@ -117,7 +119,7 @@ component must respect:
 **Rationale:** the daemon needs real concurrency (watchers + jobs + HTTP) regardless, and the
 storage/embedding dependencies are async-native — one execution model everywhere beats a sync
 core wrapped in adapter shims. **Rejected:** fully synchronous core with hand-rolled threads
-(fights LanceDB's async API, reinvents the daemon's scheduling); async-everything including CPU
+(fights the storage backend's async API, reinvents the daemon's scheduling); async-everything including CPU
 work (starves the executor during indexing).
 
 ## 7. Development practices: TDD and coverage gates
@@ -131,6 +133,6 @@ test first, then the implementation. Coverage gates, enforced in CI (e.g. `cargo
   document/chunk writes, config/state mutation, migrations, the write-lock path.
 
 Trait-based seams (`RetrievalStore`, `Embedder`) exist partly to make this practical: core logic
-is tested against in-memory fakes; adapter crates are tested against the real backend (LanceDB
+is tested against in-memory fakes; adapter crates are tested against the real backend (libsql
 tmpdir, ONNX tiny model) in integration tests. Every ticket in [PLAN.md](../PLAN.md) carries test
 expectations; a ticket is not done below its gate.

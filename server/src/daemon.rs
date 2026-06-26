@@ -106,7 +106,8 @@ pub async fn start_daemon(
         options.config.clone(),
         options.paths.data_dir.clone(),
         queue.clone(),
-    )?;
+    )
+    .await?;
 
     // Build router.
     let router = build_router(state.clone());
@@ -490,7 +491,9 @@ mod tests {
             providers: vec![],
         };
         let queue = JobQueue::new();
-        let state = AppState::new(yaml_config, dir_real.to_path_buf(), queue.clone()).unwrap();
+        let state = AppState::new(yaml_config, dir_real.to_path_buf(), queue.clone())
+            .await
+            .unwrap();
 
         // Create initial file.
         let watched_file = dir_real.join("doc.md");
@@ -552,8 +555,6 @@ mod tests {
             source_kind: "path".to_string(),
             mime: Some("text/markdown".to_string()),
             uri: format!("file://{}", watched_file.display()),
-            title: Some("Watcher Doc".to_string()),
-            meta: std::collections::HashMap::new(),
             metadata: localdb_core::DocumentMetadata::default(),
         }];
 
@@ -660,7 +661,9 @@ mod tests {
             providers: vec![],
         };
         let queue = JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue).unwrap();
+        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
+            .await
+            .unwrap();
         let app = build_router(state);
 
         use axum::body::Body;

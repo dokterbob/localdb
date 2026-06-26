@@ -224,8 +224,7 @@ the `RetrievalStore` trait: query both legs (top-K each, default K = 50), fuse, 
 results.
 
 **Rationale:** hybrid-by-default is a day-one requirement; RRF is robust, parameter-light,
-and score-scale-free. The LanceDB Rust API does not reliably provide server-side hybrid fusion
-(trails the Python API), and owning fusion keeps it identical across future backends.
+and score-scale-free. Owning fusion keeps it identical across future backends.
 **Rejected:** score interpolation (needs per-model calibration); backend-native fusion (backend-dependent
 behavior).
 
@@ -239,22 +238,27 @@ behavior).
 - Query rewriting and answer generation are **not** backend-core concerns — they belong to
   downstream consumers (agents, future UI). URL/image as *query* modes: out of scope v1.
 
-### Binary dense search (IVF_FLAT / Hamming)
+### Dense search (DiskANN / libsql)
 
-**Decision:** when the embedder's `vector_encoding()` returns `Binary`, the store writes
-a `FixedSizeList<UInt8>` column instead of `FixedSizeList<Float32>`:
+**Decision:** the store backend is libsql (Turso's SQLite fork) with built-in vector search.
+Dense vectors are stored as `F32_BLOB` (float32) or `F1BIT_BLOB` (binary) column types, with
+DiskANN indexing via `libsql_vector_idx`.
 
-- **Binarization:** `bit = (x ≥ 0.0)`, packed MSB-first (dim 0 → bit 7 of byte 0), matching
-  `np.packbits(x >= 0, axis=-1)`. A 1024-dim float vector becomes 128 bytes.
-- **Storage:** `embedding` column is `FixedSizeList<UInt8>(dim/8)`. Existing f32 stores are
-  rejected on open with an `InvalidConfig` error (mismatch guard in `open()`).
-- **Index:** `IVF_FLAT` with `DistanceType::Hamming` via the normal lancedb API. No-op when
-  the table has fewer than 256 rows (flat Hamming scan is used instead).
-- **Query bypass:** `nearest_to` hard-codes Float32, so the binary path goes through
-  `Table::dataset()` → `Dataset::scan()` → `Scanner::nearest(col, &UInt8Array, k)`, which
-  auto-selects Hamming distance. Score formula: `1.0 − hamming_dist / nbits ∈ [0, 1]`.
+- **Float32 path:** embedding column is `F32_BLOB(dim)`. Search via `vector_top_k(table, col,
+  query_blob, k)` which uses the DiskANN index automatically. Score conversion: cosine
+  distance → score via `1.0 - distance / 2.0 ∈ [0, 1]`.
+- **Binary path:** when the embedder's `vector_encoding()` returns `Binary`, the store writes
+  an `F1BIT_BLOB(dim)` column. Binarization: `bit = (x ≥ 0.0)`, packed MSB-first (dim 0 →
+  bit 7 of byte 0). A 1024-dim float vector becomes 128 bytes. Search uses Hamming distance.
+  Score formula: `1.0 − hamming_dist / nbits ∈ [0, 1]`.
+- **Index maintenance:** DiskANN indexes are auto-maintained by libsql — no manual
+  `create_vector_index` calls are needed. The index is created implicitly when
+  `vector_top_k` is first used.
+- **BM25 via FTS5:** full-text search uses libsql's FTS5 extension with `bm25()` scoring.
+  FTS5 indexes are auto-maintained — no manual `create_fts_index` calls. The FTS5 virtual
+  table is created alongside the chunks table and kept in sync via triggers.
 - **Supported embedders:** pplx local-ONNX models (`pplx-embed-context-v1-0.6b`,
   `pplx-embed-v1-0.6b`) override `vector_encoding()` to return `Binary`.
   `FakeEmbedder` keeps `Float32`.
-- **Expected recall drop:** ~2–4 pts on MTEB-ML vs float32 at 1024 dim; cushioned by the
-  BM25+RRF hybrid. Future rerank via an int8 copy can recover the gap.
+- **Expected recall drop (binary):** ~2–4 pts on MTEB-ML vs float32 at 1024 dim; cushioned by
+  the BM25+RRF hybrid. Future rerank via an int8 copy can recover the gap.
