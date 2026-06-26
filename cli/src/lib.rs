@@ -25,9 +25,9 @@ use std::sync::Arc;
 use fetch::HttpUrlFetcher;
 use localdb_core::{
     config::{
+        check_yaml_owned,
         loader::{load_config, ConfigLoader, LoadOptions, ResolvedPaths},
         policy::compute_policy_version,
-        runtime_state::check_yaml_owned,
         schema::{EmbeddingPolicy, IndexingPolicyConfig, ProviderConfig},
     },
     ids::new_ulid,
@@ -190,101 +190,6 @@ pub fn probe_daemon(data_dir: &Path, daemon_url_override: Option<&str>) -> Daemo
 }
 
 // ---------------------------------------------------------------------------
-// Write-lock — specs/01-architecture.md §3
-// ---------------------------------------------------------------------------
-
-/// Advisory write lock for the data directory.
-///
-/// Uses `fd-lock` for OS-level exclusive advisory locking (flock(2)/LockFileEx).
-/// This guarantees that exactly one process holds the lock at a time — a second
-/// concurrent `acquire()` call will fail immediately with `Error::StoreLocked`.
-///
-/// Holds the OS lock for its entire lifetime; releases and removes on `Drop`.
-/// Returns `Error::StoreLocked` if the lock cannot be acquired.
-pub struct WriteLock {
-    /// The locked file descriptor, held for the duration of the lock.
-    _guard: fd_lock::RwLockWriteGuard<'static, std::fs::File>,
-    /// The `RwLock` wrapper — kept alive so the guard remains valid.
-    _rw: Box<fd_lock::RwLock<std::fs::File>>,
-    path: PathBuf,
-}
-
-impl WriteLock {
-    /// Attempt to acquire the OS-level advisory write lock for `data_dir`.
-    ///
-    /// The lock file is `<data_dir>/.write.lock`.  A second process calling
-    /// `acquire()` on the same path will receive `Error::StoreLocked`.
-    pub fn acquire(data_dir: &Path) -> Result<Self, Error> {
-        std::fs::create_dir_all(data_dir).map_err(|e| Error::Internal {
-            message: format!("cannot create data dir '{}': {}", data_dir.display(), e),
-            correlation_id: "write_lock_mkdir".to_string(),
-        })?;
-
-        let lock_path = data_dir.join(".write.lock");
-
-        // F8: Open without truncate so a failed lock acquire does NOT leave the
-        // file truncated (which would clobber the PID of the current lock holder).
-        // We truncate and write our PID only AFTER the OS lock is acquired.
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::PermissionDenied {
-                    Error::StoreLocked
-                } else {
-                    Error::Internal {
-                        message: format!("cannot open lock file: {}", e),
-                        correlation_id: "write_lock_open".to_string(),
-                    }
-                }
-            })?;
-
-        // Box the RwLock so we can take a 'static guard from it.
-        // SAFETY: the Box is pinned on the heap and outlives the guard
-        // because both are stored in WriteLock together.
-        let mut rw = Box::new(fd_lock::RwLock::new(file));
-        let guard = {
-            // Extend lifetime: the guard borrows from *rw which lives in the
-            // same struct, so the lifetime is sound.
-            let rw_ref: &mut fd_lock::RwLock<std::fs::File> =
-                unsafe { &mut *(rw.as_mut() as *mut _) };
-            rw_ref.try_write().map_err(|_| Error::StoreLocked)?
-        };
-
-        // Write our PID for diagnostics (best-effort). Only done after lock acquired.
-        // We reopen the file for the truncate+write so we avoid borrowing issues
-        // with the guard. The OS-level lock (flock/LockFileEx) is per-process,
-        // so reopening within the same process is safe — we already hold it.
-        {
-            use std::io::Write as _;
-            if let Ok(mut pid_file) = std::fs::OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .open(&lock_path)
-            {
-                let _ = writeln!(pid_file, "{}", std::process::id());
-            }
-        }
-
-        Ok(Self {
-            _guard: guard,
-            _rw: rw,
-            path: lock_path,
-        })
-    }
-}
-
-impl Drop for WriteLock {
-    fn drop(&mut self) {
-        // The guard is dropped first (releases the OS lock), then the file.
-        // Remove the lock file as a courtesy (non-fatal if it fails).
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Daemon HTTP client — specs/05-surfaces.md §2, specs/01-architecture.md §3
 // ---------------------------------------------------------------------------
 //
@@ -333,7 +238,6 @@ async fn daemon_request_async(
         Err(match code {
             "store_not_found" => Error::StoreNotFound { id: msg },
             "source_not_found" => Error::SourceNotFound { id: msg },
-            "store_locked" => Error::StoreLocked,
             "runtime_state_locked" => Error::RuntimeStateLocked,
             "config_readonly" => Error::ConfigReadonly,
             "daemon_unreachable" => Error::DaemonUnreachable,
@@ -403,7 +307,7 @@ impl AppDb {
                     message: format!("cannot determine embedding shape: {e}"),
                 }
             })?;
-        let config = StoreBackendConfig::local_path(paths.unified_db_path(), dim, encoding);
+        let config = StoreBackendConfig::local_path(paths.db_path(), dim, encoding);
         let backend = Arc::new(SqliteBackend::open(config).await?) as Arc<dyn StoreBackend>;
         let default_policy_version = compute_policy_version(&default_indexing_policy);
         Ok(Self {
@@ -933,8 +837,6 @@ async fn run_store_add_async(ctx: &CliContext, name: &str) {
         }
     }
 
-    // Embedded mode: SQLite serialises the metadata write; no WriteLock needed here.
-
     // Duplicate check.
     match db.backend().get_store_by_name(name).await {
         Ok(Some(_)) => exit_err(
@@ -1260,9 +1162,6 @@ async fn run_source_add_async(ctx: &CliContext, source_arg: &str) {
         }
     }
 
-    // Embedded mode — SQLite serialises the metadata write; no WriteLock needed here.
-    // The auto-index step below acquires its own WriteLock for LanceDB writes.
-
     // #13: Verify store exists in runtime DB (exit 3 if not found).
     let rt_store = match db.backend().get_store_by_name(&store_name).await {
         Ok(None) => exit_err(
@@ -1359,8 +1258,6 @@ async fn run_index_for_source_async(
     };
 
     let (config_loader, db) = load_app_db(ctx).await;
-    let data_dir = config_loader.paths.data_dir.clone();
-
     let all_sources = match db.backend().list_sources(&store_row.id).await {
         Ok(s) => s,
         Err(e) => {
@@ -1404,14 +1301,6 @@ async fn run_index_for_source_async(
         Ok(e) => e,
         Err(e) => {
             eprintln!("warning: cannot build parser chain for auto-index: {}", e);
-            return;
-        }
-    };
-
-    let _lock = match WriteLock::acquire(&data_dir) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("warning: cannot acquire lock for auto-index: {}", e);
             return;
         }
     };
@@ -1603,8 +1492,6 @@ async fn run_source_remove_async(ctx: &CliContext, id: &str) {
             Err(e) => exit_err(&e, ctx.json),
         }
     }
-
-    // Embedded mode: SQLite serialises all ops here; no WriteLock needed.
 
     // #3: Resolve the source ID. If the argument looks like a path or URL
     // (not a ULID/UUID), look it up by root/url field.
@@ -1838,11 +1725,6 @@ async fn run_index_async(
 
     let extractor = match extract::ChainExtractor::from_ids(&policy.parsers) {
         Ok(e) => e,
-        Err(e) => exit_err(&e, ctx.json),
-    };
-
-    let _lock = match WriteLock::acquire(&data_dir) {
-        Ok(l) => l,
         Err(e) => exit_err(&e, ctx.json),
     };
 
@@ -2339,30 +2221,6 @@ mod tests {
     }
 
     #[test]
-    fn write_lock_creates_data_dir_and_file() {
-        let dir = TempDir::new().unwrap();
-        let sub = dir.path().join("sub");
-        let _lock = WriteLock::acquire(&sub).unwrap();
-        assert!(sub.join(".write.lock").exists());
-    }
-
-    #[test]
-    fn write_lock_removes_lock_file_on_drop() {
-        let dir = TempDir::new().unwrap();
-        {
-            let _lock = WriteLock::acquire(dir.path()).unwrap();
-            assert!(dir.path().join(".write.lock").exists());
-        }
-        assert!(!dir.path().join(".write.lock").exists());
-    }
-
-    #[test]
-    fn write_lock_exit_code_for_store_locked() {
-        assert_eq!(Error::StoreLocked.exit_code(), 4);
-        assert_eq!(Error::StoreLocked.code(), "store_locked");
-    }
-
-    #[test]
     fn probe_not_running_without_socket() {
         let dir = TempDir::new().unwrap();
         assert!(matches!(
@@ -2604,7 +2462,7 @@ mod tests {
         assert_eq!(Error::SourceNotFound { id: "".into() }.exit_code(), 3);
         assert_eq!(Error::DocumentNotFound { id: "".into() }.exit_code(), 3);
         assert_eq!(Error::JobNotFound { id: "".into() }.exit_code(), 3);
-        assert_eq!(Error::StoreLocked.exit_code(), 4);
+        assert_eq!(Error::RuntimeStateLocked.exit_code(), 4);
         assert_eq!(Error::DaemonRunning.exit_code(), 4);
         assert_eq!(Error::ConfigReadonly.exit_code(), 4);
         assert_eq!(Error::IndexInProgress.exit_code(), 4);
@@ -2647,9 +2505,9 @@ mod tests {
 
     #[test]
     fn json_error_shape() {
-        let err = Error::StoreLocked;
+        let err = Error::RuntimeStateLocked;
         let v = json!({ "error": err.code(), "message": err.to_string() });
-        assert_eq!(v["error"].as_str().unwrap(), "store_locked");
+        assert_eq!(v["error"].as_str().unwrap(), "runtime_state_locked");
     }
 
     #[test]

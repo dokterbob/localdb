@@ -156,7 +156,7 @@ pub async fn create_store(
         name: store.name.clone(),
         visibility,
         backend: store.backend.kind.clone(),
-        ownership: localdb_core::config::runtime_state::ConfigOwnership::Runtime,
+        ownership: localdb_core::config::ConfigOwnership::Runtime,
     };
     Ok((StatusCode::CREATED, Json(record)))
 }

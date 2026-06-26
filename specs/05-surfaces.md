@@ -20,7 +20,7 @@ Single binary, subcommand tree. Global flags: `--config`, `--json`, `--store <na
 | `serve` | Run the daemon (HTTP API, watching, refresh, socket) | becomes the daemon | error `daemon_running` |
 | `mcp` | Run MCP server on stdio | embedded core | thin client |
 | `status` | Stores, doc/chunk counts, policy staleness, daemon state, config ownership (YAML- vs runtime-owned) | reads directly | queries daemon |
-| `store add/list/remove` | Manage runtime-owned stores | direct write (takes write lock) | routed to daemon |
+| `store add/list/remove` | Manage runtime-owned stores | direct write | routed to daemon |
 | `source add/list/remove` | Manage sources on a store | direct write | routed to daemon |
 | `index [--store S] [--source ID] [--strict]` | One-shot scan & index; creates IndexJob | runs job synchronously, progress to stderr | submits job, polls, streams progress |
 | `search <query>...` | Hybrid search with citations (options-first: flags must precede query words; trailing tokens are captured verbatim as the query) | embedded read | via API |
@@ -76,8 +76,7 @@ MCP tool error). Codes are stable API:
 | Code | Meaning | HTTP |
 |---|---|---|
 | `store_not_found` / `source_not_found` / `document_not_found` / `job_not_found` | Unknown entity | 404 |
-| `store_locked` | Write lock held elsewhere and no daemon to route through | 409 |
-| `runtime_state_locked` | Runtime-state DB locked by another process (index in progress) | 409 |
+| `runtime_state_locked` | Unified database locked by another process (busy timeout exceeded) | 409 |
 | `daemon_running` / `daemon_unreachable` | Process-model conflicts | 409 / 502 |
 | `config_readonly` | Attempted API write to a YAML-owned object ([03-config.md](03-config.md) §3) | 409 |
 | `invalid_config` | Config failed validation (path-precise message) | 422 |

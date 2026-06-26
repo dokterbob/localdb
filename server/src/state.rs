@@ -6,9 +6,10 @@ use tokio::sync::RwLock;
 
 use localdb_core::{
     config::{
+        check_yaml_owned,
         policy::compute_policy_version,
-        runtime_state::{check_yaml_owned, ConfigOwnership, EffectiveConfig, EffectiveStore},
         schema::{IndexingPolicyConfig, RawConfig},
+        ConfigOwnership, EffectiveConfig, EffectiveStore,
     },
     ingestion::now_rfc3339,
     Error, SourceRow, Store, StoreBackend, StoreBackendConfig, StoreRow, StoreVisibility,
@@ -516,7 +517,7 @@ pub struct StoreRecord {
     pub name: String,
     pub visibility: String,
     pub backend: String,
-    pub ownership: localdb_core::config::runtime_state::ConfigOwnership,
+    pub ownership: localdb_core::config::ConfigOwnership,
 }
 
 #[cfg(test)]

@@ -18,9 +18,6 @@ pub struct PlatformPaths {
     /// Linux: `$XDG_CONFIG_HOME/localdb/config.yaml`
     pub config_file: PathBuf,
 
-    /// Data directory (indexes, runtime-state DB, lock, socket).
-    /// macOS: `~/Library/Application Support/localdb/data/`
-    /// Linux: `$XDG_DATA_HOME/localdb/`
     pub data_dir: PathBuf,
 
     /// Model cache directory.
@@ -102,18 +99,12 @@ impl PlatformPaths {
         self.data_dir.join("daemon.sock")
     }
 
-    /// Path to the write lock file (`<data_dir>/.write.lock`).
-    pub fn write_lock_path(&self) -> PathBuf {
-        self.data_dir.join(".write.lock")
-    }
-
     /// Path to the runtime-state DB (`<data_dir>/runtime-state.db`).
     pub fn runtime_state_db_path(&self) -> PathBuf {
         self.data_dir.join("runtime-state.db")
     }
 
-    /// Path to the unified single-file DB (`<data_dir>/localdb.db`).
-    pub fn unified_db_path(&self) -> PathBuf {
+    pub fn db_path(&self) -> PathBuf {
         self.data_dir.join("localdb.db")
     }
 }
@@ -150,14 +141,6 @@ mod tests {
         let sock = paths.socket_path();
         assert!(sock.starts_with(&paths.data_dir));
         assert_eq!(sock.file_name().unwrap(), "daemon.sock");
-    }
-
-    #[test]
-    fn write_lock_path_is_inside_data_dir() {
-        let paths = PlatformPaths::resolve().expect("should resolve");
-        let lock = paths.write_lock_path();
-        assert!(lock.starts_with(&paths.data_dir));
-        assert_eq!(lock.file_name().unwrap(), ".write.lock");
     }
 
     #[test]

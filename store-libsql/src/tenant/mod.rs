@@ -10,6 +10,7 @@ use crate::connection::LibsqlDb;
 
 pub(crate) mod read;
 pub(crate) mod rows;
+pub(crate) mod sql;
 pub(crate) mod write;
 
 pub(crate) struct TenantStore {

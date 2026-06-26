@@ -3,9 +3,10 @@ use localdb_core::ingestion::DocumentRecord;
 use localdb_core::{ChunkRecord, Error, MetadataFilter, SearchResult, StoreStats, VectorEncoding};
 
 use super::rows::row_to_chunk_record_strict;
+use super::sql::{build_filter_clauses, escape_fts5_query};
 use super::TenantStore;
 use crate::connection::map_libsql_err;
-use crate::{build_filter_clauses, escape_fts5_query, vectors};
+use crate::vectors;
 
 pub(crate) async fn dense_search(
     store: &TenantStore,

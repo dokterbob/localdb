@@ -10,7 +10,7 @@ knowledge enriched by what the people you trust have found, with provenance at e
 The foundation for that is built in from day one: content-addressed documents, per-chunk
 provenance, and stores as first-class shareable units. See [VISION.md](VISION.md).
 
-**Status: v0.1.0 pre-release.** Hybrid search uses real dense embeddings via the default local model (`pplx-embed-context-v1-0.6b`, ONNX on CPU by default; CoreML ANE/GPU on Apple Silicon macOS automatically); the first `localdb index` or `localdb search` downloads ~706 MB from HuggingFace (no API key required). The HTTP daemon is experimental (in-memory store, does not see CLI-indexed data). See [Honest status](#honest-status) below.
+**Status: v0.1.0 pre-release.** Hybrid search uses real dense embeddings via the default local model (`pplx-embed-context-v1-0.6b`, ONNX on CPU by default; CoreML ANE/GPU on Apple Silicon macOS automatically); the first `localdb index` or `localdb search` downloads ~706 MB from HuggingFace (no API key required). The HTTP daemon reads from and writes to the same unified database as the CLI; ingestion via `POST /v1/jobs` is currently a no-op. See [Honest status](#honest-status) below.
 
 **License:** [AGPL-3.0-or-later](LICENSE).
 
@@ -41,7 +41,7 @@ provenance, and stores as first-class shareable units. See [VISION.md](VISION.md
   license click-through is needed.
   Alternative: any OpenAI-compatible embedding endpoint, including local private models via
   llama.cpp or MLX (Apple Silicon, SSD-backed KV cache).
-- **LanceDB backend** — columnar vector + BM25 index, embedded, no separate server.
+- **libsql backend**: embedded database with DiskANN vector index and FTS5 full-text search, no separate server.
 - **`--json` everywhere** — machine-readable output on every command.
 - **`localdb status`** — shows indexed stores and daemon state at a glance.
 
@@ -160,10 +160,7 @@ See [docs/mcp.md](docs/mcp.md) for full tool schemas and example calls.
 localdb serve   # binds http://127.0.0.1:7700 by default
 ```
 
-The daemon exposes a REST API. It is **experimental**: it uses an in-memory store and does not
-see data indexed via the CLI. CLI commands also fail while the daemon is running on the same
-data directory. See [docs/http-api.md](docs/http-api.md) for endpoint reference and known
-limitations.
+The daemon exposes a REST API. It is **experimental**: ingestion via `POST /v1/jobs` is currently a no-op. The daemon reads and writes the same unified database as the CLI, so CLI-indexed data is visible to it. See [docs/http-api.md](docs/http-api.md) for endpoint reference and known limitations.
 
 ---
 
@@ -174,9 +171,9 @@ limitations.
 | Search ranking | Hybrid BM25 + dense (RRF fusion). Default embedder is `pplx-embed-context-v1-0.6b` (local ONNX, ~706 MB download on first use). |
 | Embedding models | Downloaded automatically on first `localdb index` or `localdb search` from the public HuggingFace repo `perplexity-ai/pplx-embed-context-v1-0.6b`. No API key required. |
 | Embedding backend | Default provider `local` runs ONNX on CPU. On Apple Silicon macOS (Rust ≥1.85), the macOS binary includes CoreML by default and auto-selects the ANE/GPU backend at runtime, falling back to ONNX otherwise. CoreML/ONNX indexes are interchangeable. Force a backend with `local-coreml` / `local-onnx`. |
-| HTTP daemon | Experimental preview. Uses an in-memory store; does not share data with CLI-indexed stores. |
+| HTTP daemon | Experimental preview. Ingestion via POST /v1/jobs is a no-op; reads and writes the unified database. |
 | YAML-declared stores | Appear in `store list` but **cannot be indexed** (`localdb index` only resolves runtime stores). Use `localdb store add` + `localdb source add` instead. |
-| CLI while daemon runs | Every CLI command fails with a DB lock error while a daemon is running on the same data directory. Stop the daemon before CLI use. |
+| CLI while daemon runs | CLI and daemon can run concurrently. SQLite WAL and busy_timeout serialise concurrent writes. |
 
 Design rationale and planned behavior live in the [specs/](specs/) directory.
 

@@ -31,12 +31,6 @@ pub enum Error {
     #[error("job not found: {id}")]
     JobNotFound { id: String },
 
-    /// Write lock held elsewhere and no daemon to route through.
-    ///
-    /// CLI exit code: 4
-    #[error("store is locked by another process")]
-    StoreLocked,
-
     /// The runtime-state database write lock could not be acquired within the
     /// busy timeout (2 s). Another writer held the lock longer than expected.
     /// Try again shortly.
@@ -121,7 +115,6 @@ impl Error {
             Error::SourceNotFound { .. } => "source_not_found",
             Error::DocumentNotFound { .. } => "document_not_found",
             Error::JobNotFound { .. } => "job_not_found",
-            Error::StoreLocked => "store_locked",
             Error::RuntimeStateLocked => "runtime_state_locked",
             Error::DaemonRunning => "daemon_running",
             Error::DaemonUnreachable => "daemon_unreachable",
@@ -146,8 +139,7 @@ impl Error {
             | Error::SourceNotFound { .. }
             | Error::DocumentNotFound { .. }
             | Error::JobNotFound { .. } => 3,
-            Error::StoreLocked
-            | Error::RuntimeStateLocked
+            Error::RuntimeStateLocked
             | Error::DaemonRunning
             | Error::ConfigReadonly
             | Error::IndexInProgress => 4,
@@ -183,7 +175,6 @@ mod tests {
                 3,
             ),
             (Error::JobNotFound { id: "x".into() }, "job_not_found", 3),
-            (Error::StoreLocked, "store_locked", 4),
             (Error::RuntimeStateLocked, "runtime_state_locked", 4),
             (Error::DaemonRunning, "daemon_running", 4),
             (Error::DaemonUnreachable, "daemon_unreachable", 5),
@@ -278,7 +269,6 @@ mod tests {
 
     #[test]
     fn conflict_errors_exit_4() {
-        assert_eq!(Error::StoreLocked.exit_code(), 4);
         assert_eq!(Error::RuntimeStateLocked.exit_code(), 4);
         assert_eq!(Error::DaemonRunning.exit_code(), 4);
         assert_eq!(Error::ConfigReadonly.exit_code(), 4);

@@ -566,16 +566,8 @@ fn search_json_citations_canonical_shape() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Store-locked exit code (acceptance criterion)
-// ---------------------------------------------------------------------------
-
-/// Verify that `Error::StoreLocked` maps to exit code 4.
-///
-/// We simulate "locked" by attempting to remove a yaml-owned store (which returns
-/// config_readonly / exit code 4).
 #[test]
-fn store_locked_exit_code_is_4() {
+fn config_readonly_exit_code_is_4() {
     let dir = TempDir::new().unwrap();
     write_config_with_data_dir(&dir, "stores:\n  - name: yaml-store");
 
@@ -611,21 +603,8 @@ fn yaml_owned_store_mutation_exits_4() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Regression test for #67 — store add / source add must not be blocked by
-// the LanceDB write lock (.write.lock). The WriteLock is now held only
-// around actual LanceDB writes (run_index_async); metadata-only operations
-// use SQLite WAL and serialise themselves without fd-lock.
-// ---------------------------------------------------------------------------
-
-/// Regression test for #67: `store add` succeeds (exit 0) even when the
-/// OS-level write lock is held exclusively by another process.
-///
-/// Before the fix, `store add` acquired WriteLock before its SQLite upsert,
-/// so any concurrently held write lock (e.g. from `localdb mcp`) returned
-/// exit 4 (store_locked). This test proves that no longer happens.
 #[test]
-fn store_add_succeeds_while_write_lock_held() {
+fn store_add_ignores_stray_write_lock_file() {
     use std::fs::OpenOptions;
 
     let dir = TempDir::new().unwrap();
@@ -643,13 +622,10 @@ fn store_add_succeeds_while_write_lock_held() {
         .open(&lock_path)
         .expect("cannot create lock file");
 
-    // Acquire an OS-level exclusive advisory lock on the file — simulating
-    // another process holding the LanceDB write gate (e.g. an active index run).
     use fd_lock::RwLock;
     let mut rw = RwLock::new(lock_file);
     let _guard = rw.try_write().expect("should acquire lock in test process");
 
-    // `store add` must succeed: it uses SQLite for metadata, not the fd-lock.
     let output = cmd_with_dir(&dir)
         .args(["--json", "store", "add", "new-store"])
         .output()
@@ -659,7 +635,7 @@ fn store_add_succeeds_while_write_lock_held() {
     assert_eq!(
         exit_code,
         0,
-        "store add must exit 0 even while .write.lock is held (regression for #67); \
+        "store add must exit 0 even while .write.lock exists; \
          stderr: {}\nstdout: {}",
         String::from_utf8_lossy(&output.stderr),
         String::from_utf8_lossy(&output.stdout),
@@ -1115,11 +1091,11 @@ async fn store_list_succeeds_while_db_held_open_by_another_connection() {
 
     // Open a libsql connection and keep it alive (simulates another
     // process — e.g. the MCP server — that has the DB open).
-    let state_db_path = data_dir.join("runtime-state.db");
+    let state_db_path = data_dir.join("localdb.db");
     let _holder_db = libsql::Builder::new_local(&state_db_path)
         .build()
         .await
-        .expect("should be able to open runtime-state.db");
+        .expect("should be able to open localdb.db");
     let _holder_conn = _holder_db.connect().expect("should be able to connect");
 
     // `store list --json` must exit 0 (success), not 4 (locked).
@@ -1145,7 +1121,7 @@ fn two_concurrent_store_list_calls_both_succeed() {
     write_default_config(&dir);
 
     // Run two store-list commands at the same time (non-blocking spawn).
-    // Both must point at the same temp config so they share the same runtime-state.db.
+    // Both must point at the same temp config so they share the same localdb.db.
     let config_path = dir.path().join("config.yaml");
     let binary = env!("CARGO_BIN_EXE_localdb");
 

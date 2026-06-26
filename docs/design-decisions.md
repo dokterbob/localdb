@@ -152,26 +152,10 @@ users request it.
 
 ---
 
-## A6-atomicity — True crash-atomic upsert in LanceDB
+## A6-atomicity — True crash-atomic upsert (resolved)
 
-**Note.** The immediate risk (embed failure wiping an existing doc) was fixed in Wave 3 by
-reordering to embed-before-delete. The deeper atomicity question remains.
-
-**Problem.** `store-lancedb/src/lib.rs` implements `upsert_chunks` as delete-old-rows then
-append-new-rows. If the process crashes between delete and append, the document is partially
-removed from the store. LanceDB's underlying Lance format supports transactions, but the Rust
-client does not yet expose a `BEGIN/COMMIT` API.
-
-**Options.**
-1. **Shadow write + atomic rename.** Write new chunks to a staging fragment, delete old chunks,
-   then commit. Requires LanceDB's `merge_insert` / fragment API to be available for the chunk
-   table.
-2. **Tombstone pattern.** Keep old chunks but mark them with a `deleted` flag; compact on a
-   background sweep. Increases query complexity (filter tombstones on every read).
-3. **Accept current semantics + document.** Crash during indexing leaves the store in a
-   recoverable state: re-running `localdb index` re-ingests the affected document. No partial
-   data is served because the delete runs before the append. Low real-world risk.
-
-**Recommendation.** Option 3 for v1, with a `localdb repair` command (see `specs/06-roadmap.md`)
-for the long tail. Revisit Option 1 when LanceDB's Rust client exposes transactional fragment
-operations.
+**Status: resolved.** The LanceDB backend that motivated this design question was retired in
+PR #92 in favour of libsql. The unified libsql backend wraps `upsert_chunks` in a SQLite
+transaction (`BEGIN ... COMMIT / ROLLBACK`) with WAL durability, so the delete-then-append
+sequence is now crash-atomic at the database level. The original concern — partial removal
+on crash between delete and append — no longer applies.

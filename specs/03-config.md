@@ -15,7 +15,7 @@ server:
   port: 7700
 
 paths:                    # all optional; platform defaults in §4
-  data: ~                 # index data, locks, socket
+  data: ~                 # index data, socket
   models: ~               # embedding model cache
   logs: ~
 
@@ -46,7 +46,7 @@ defaults:                 # global indexing policy; stores inherit
 stores:
   - name: notes
     visibility: private   # private | shared (shared non-functional in MVP)
-    backend: lancedb
+    backend: libsql
     indexing: ~           # null = inherit defaults; or override {chunking, embedding, parsers}
     sources:
       - kind: path
@@ -117,11 +117,11 @@ more states.
 | Item | macOS | Linux |
 |---|---|---|
 | Config | `~/Library/Application Support/localdb/config.yaml` | `$XDG_CONFIG_HOME/localdb/config.yaml` |
-| Data (indexes, runtime-state DB, lock, socket) | `~/Library/Application Support/localdb/data/` | `$XDG_DATA_HOME/localdb/` |
+| Data (unified database, socket) | `~/Library/Application Support/localdb/data/` | `$XDG_DATA_HOME/localdb/` |
 | Model cache | `~/Library/Caches/localdb/models/` | `$XDG_CACHE_HOME/localdb/models/` |
 | Logs | `~/Library/Logs/localdb/` | `$XDG_STATE_HOME/localdb/logs/` |
 
-Unix socket: `<data>/daemon.sock`; write lock: `<data>/.write.lock`
+Unix socket: `<data>/daemon.sock`
 ([01-architecture.md](01-architecture.md) §3). `--config` / `LOCALDB_CONFIG` override the config
 path; `paths.*` in config override the rest.
 

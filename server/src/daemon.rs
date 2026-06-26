@@ -1,12 +1,3 @@
-//! Daemon startup: acquire lock, bind socket, start HTTP server.
-//!
-//! Entry point for `localdb serve`. Validates the bind address (loopback-only
-//! by default), acquires the write lock, binds the unix socket for discovery,
-//! starts the axum HTTP server, sets up file watchers, and spawns URL refresh
-//! schedulers.
-//!
-//! See specs/05-surfaces.md §3 and specs/01-architecture.md §3.
-
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -23,14 +14,13 @@ use localdb_core::{
 };
 
 use crate::{
-    handlers, job_queue::JobQueue, lock::WriteLock, scheduler::UrlRefreshScheduler,
-    socket::SocketGuard, state::AppState,
+    handlers, job_queue::JobQueue, scheduler::UrlRefreshScheduler, socket::SocketGuard,
+    state::AppState,
 };
 
 /// Options for starting the daemon.
 #[derive(Debug, Clone)]
 pub struct DaemonOptions {
-    /// Resolved paths (data dir, socket, lock, etc.).
     pub paths: ResolvedPaths,
     /// The loaded YAML config.
     pub config: RawConfig,
@@ -38,11 +28,7 @@ pub struct DaemonOptions {
 
 /// A running daemon instance.
 ///
-/// Holds the write lock and socket guard for their lifetimes.
-/// Stopping this struct (or dropping it) releases both.
 pub struct DaemonHandle {
-    /// The write lock (released on drop).
-    pub _lock: WriteLock,
     /// The socket guard (cleans up socket file on drop).
     pub _socket: SocketGuard,
     /// The bind address.
@@ -59,10 +45,6 @@ impl std::fmt::Debug for DaemonHandle {
 ///
 /// Steps:
 /// 1. Validate bind address: refuse non-loopback without auth.
-/// 2. Acquire the write lock; error `DaemonRunning` if already held.
-/// 3. Create the unix socket file for discovery.
-/// 4. Build the axum router with all routes.
-/// 5. Bind TCP and return the handle; the caller awaits the server future.
 pub async fn start_daemon(
     options: DaemonOptions,
 ) -> Result<(DaemonHandle, impl std::future::Future<Output = ()>), Error> {
@@ -72,33 +54,20 @@ pub async fn start_daemon(
     // Guard: refuse non-loopback bind without auth.
     validate_bind_address(bind_addr)?;
 
-    // Acquire write lock.
-    // If the lock is already held by another process, return DaemonRunning (not
-    // StoreLocked) to signal that a daemon is already running on this data dir.
-    // See PLAN.md T11 acceptance criterion: 'second daemon fails with daemon_running'.
-    let lock = WriteLock::try_acquire(&options.paths.write_lock_path()).map_err(|e| {
-        if matches!(e, Error::StoreLocked) {
+    let socket_guard = SocketGuard::new(&options.paths.socket_path()).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AddrInUse {
             Error::DaemonRunning
         } else {
-            e
+            Error::Internal {
+                message: format!(
+                    "cannot bind unix socket at '{}': {}",
+                    options.paths.socket_path().display(),
+                    e
+                ),
+                correlation_id: "socket_bind".to_string(),
+            }
         }
     })?;
-    info!(
-        "write lock acquired: {}",
-        options.paths.write_lock_path().display()
-    );
-
-    // Bind the Unix domain socket for daemon discovery.
-    // See specs/01-architecture.md §3: "a unix socket at a well-known path in the data dir".
-    let socket_guard =
-        SocketGuard::new(&options.paths.socket_path()).map_err(|e| Error::Internal {
-            message: format!(
-                "cannot bind unix socket at '{}': {}",
-                options.paths.socket_path().display(),
-                e
-            ),
-            correlation_id: "socket_bind".to_string(),
-        })?;
 
     // Build shared application state.
     let queue = JobQueue::new();
@@ -176,7 +145,6 @@ pub async fn start_daemon(
     };
 
     let handle = DaemonHandle {
-        _lock: lock,
         _socket: socket_guard,
         addr: bound_addr,
     };
@@ -382,8 +350,6 @@ mod tests {
 
     #[tokio::test]
     async fn second_daemon_fails_with_daemon_running() {
-        // Per PLAN.md T11: 'second daemon on same data dir fails with daemon_running'.
-        // The lock is acquired by the first daemon; the second maps StoreLocked → DaemonRunning.
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("data")).unwrap();
 
@@ -410,7 +376,6 @@ mod tests {
         assert!(result1.is_ok(), "first daemon should start");
         let (_handle1, _fut1) = result1.unwrap();
 
-        // Try to start second daemon — should fail with DaemonRunning (not StoreLocked).
         let options2 = DaemonOptions {
             paths: paths.clone(),
             config: config.clone(),

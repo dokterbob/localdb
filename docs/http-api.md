@@ -2,12 +2,7 @@
 
 > **EXPERIMENTAL — do not rely on this surface for production use.**
 >
-> The daemon currently serves an **in-memory store**. Data you have indexed with the CLI is not
-> visible to the daemon, and search will return empty results. Additionally, CLI commands on the
-> same data directory **fail while the daemon is running** because both processes compete for the
-> runtime-state database lock. The HTTP API exists today to preview the API surface and exercise
-> the endpoint shapes; production behaviour (shared LanceDB store, CLI→daemon routing) is tracked
-> in [specs/06-roadmap.md](../specs/06-roadmap.md).
+> The daemon opens the same unified database (`<data_dir>/localdb.db`) as the CLI, so CLI-indexed data IS visible via `/v1/search`, `/v1/documents/{id}`, and `/v1/status`. The one open limitation in v0.1.0 is that ingestion via `POST /v1/jobs` is a no-op — to actually index, run `localdb index` from the CLI (which works concurrently with the daemon via SQLite WAL).
 >
 > For design rationale see [specs/05-surfaces.md](../specs/05-surfaces.md) §3.
 
@@ -93,7 +88,7 @@ curl -s http://127.0.0.1:7700/v1/stores
         {
             "name": "notes",
             "visibility": "private",
-            "backend": "lancedb",
+            "backend": "libsql",
             "ownership": "runtime"
         }
     ],
@@ -116,7 +111,7 @@ curl -s http://127.0.0.1:7700/v1/stores/notes
 {
     "name": "notes",
     "visibility": "private",
-    "backend": "lancedb",
+    "backend": "libsql",
     "ownership": "runtime"
 }
 ```
@@ -141,9 +136,6 @@ curl -s http://127.0.0.1:7700/v1/stores/notes/sources
     "total": 0
 }
 ```
-
-> Note: because the daemon uses an in-memory store (see the EXPERIMENTAL callout above), sources
-> added with `localdb source add` are not reflected here.
 
 ---
 
@@ -188,7 +180,7 @@ curl -s http://127.0.0.1:7700/v1/config
             "name": "notes",
             "ownership": "runtime",
             "visibility": "private",
-            "backend": "lancedb"
+            "backend": "libsql"
         }
     ]
 }
@@ -202,8 +194,8 @@ curl -s http://127.0.0.1:7700/v1/config
 
 ### `POST /v1/search`
 
-Hybrid search across stores. Returns a ranked citation list. Because the daemon currently uses an
-in-memory store, this endpoint returns empty results even when CLI-indexed data exists on disk.
+Hybrid search across stores. Returns a ranked citation list over the same data the CLI indexes —
+the daemon and the CLI share `<data_dir>/localdb.db`.
 
 **Request body:**
 
@@ -354,7 +346,7 @@ HTTP status codes follow the shared error taxonomy in [specs/05-surfaces.md](../
 | Code | HTTP status | Meaning |
 |---|---|---|
 | `store_not_found` / `source_not_found` / `document_not_found` / `job_not_found` | 404 | Unknown entity |
-| `store_locked` | 409 | Write lock held elsewhere |
+| `runtime_state_locked` | 409 | Unified database locked by another process (SQLite `busy_timeout` exceeded) |
 | `daemon_running` | 409 | A second daemon was started against the same data dir |
 | `daemon_unreachable` | 502 | Daemon socket exists but is not responding |
 | `config_readonly` | 409 | Attempted write to a YAML-owned object |
@@ -381,19 +373,6 @@ exit: 4
 ```
 
 there is already a daemon process running. Stop it before starting a new one.
-
-### CLI commands fail while the daemon is running
-
-Every CLI command opens the runtime-state database before it can probe the daemon socket. Because
-the daemon holds that database open, the CLI exits with an internal error:
-
-```
-error: internal error (correlation_id=runtime_state_open): cannot open runtime-state DB at
-'<data_dir>/runtime-state.redb': Database already open. Cannot acquire lock.
-exit: 1
-```
-
-Workaround: stop the daemon before running CLI commands against the same data directory.
 
 ### Stale `daemon.sock` after an ungraceful shutdown
 

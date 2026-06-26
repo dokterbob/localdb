@@ -67,18 +67,12 @@ impl ResolvedPaths {
         self.data_dir.join("daemon.sock")
     }
 
-    /// Write-lock path.
-    pub fn write_lock_path(&self) -> PathBuf {
-        self.data_dir.join(".write.lock")
-    }
-
     /// Runtime-state DB path.
     pub fn runtime_state_db_path(&self) -> PathBuf {
         self.data_dir.join("runtime-state.db")
     }
 
-    /// Unified single-file DB path (`<data_dir>/localdb.db`).
-    pub fn unified_db_path(&self) -> PathBuf {
+    pub fn db_path(&self) -> PathBuf {
         self.data_dir.join("localdb.db")
     }
 }
@@ -113,6 +107,24 @@ pub fn load_config(
     let paths = resolve_paths(&config, &config_path, options)?;
 
     Ok(ConfigLoader { config, paths })
+}
+
+pub fn refuse_legacy_layout(data_dir: &Path) -> Result<(), Error> {
+    let runtime_db = data_dir.join("runtime-state.db");
+    let stores_dir = data_dir.join("stores");
+    if runtime_db.exists() || stores_dir.exists() {
+        return Err(Error::InvalidConfig {
+            message: format!(
+                "data dir '{}' contains a legacy layout from before v0.1.0 ({}, {}). \
+                 There is no migration path; remove the legacy files and re-add stores with \
+                 `localdb store add` and `localdb source add`.",
+                data_dir.display(),
+                runtime_db.display(),
+                stores_dir.display()
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Load and validate config from a YAML string.
@@ -826,5 +838,31 @@ stores:
             before, after,
             "config file must not be modified by load_config"
         );
+    }
+
+    #[test]
+    fn refuses_to_open_with_legacy_runtime_state_db() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("runtime-state.db"), b"legacy").unwrap();
+        let result = refuse_legacy_layout(dir.path());
+        match result {
+            Err(Error::InvalidConfig { message }) => {
+                assert!(message.contains("legacy") || message.contains("runtime-state.db"));
+            }
+            other => panic!("expected InvalidConfig, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refuses_to_open_with_legacy_stores_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("stores").join("notes")).unwrap();
+        let result = refuse_legacy_layout(dir.path());
+        match result {
+            Err(Error::InvalidConfig { message }) => {
+                assert!(message.contains("legacy") || message.contains("stores"));
+            }
+            other => panic!("expected InvalidConfig, got: {other:?}"),
+        }
     }
 }

@@ -14,7 +14,7 @@ use tokio::sync::{Mutex, MutexGuard};
 
 use localdb_core::{Error, VectorEncoding};
 
-use crate::unified_schema;
+use crate::schema;
 use crate::vectors::embedding_column_type;
 
 /// A shared libsql handle to the unified single-file store.
@@ -43,6 +43,7 @@ impl LibsqlDb {
     ) -> Result<Self, Error> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
+                localdb_core::config::refuse_legacy_layout(parent)?;
                 std::fs::create_dir_all(parent).map_err(|e| Error::Internal {
                     message: format!("cannot create data directory '{}': {}", parent.display(), e),
                     correlation_id: "libsql_db_mkdir".to_string(),
@@ -76,10 +77,10 @@ impl LibsqlDb {
             .await
             .map_err(map_libsql_err)?;
 
-        unified_schema::create_unified_schema(&conn, embedding_dim, encoding)
+        schema::create_schema(&conn, embedding_dim, encoding)
             .await
             .map_err(|e| Error::Internal {
-                message: format!("create_unified_schema: {e}"),
+                message: format!("create_schema: {e}"),
                 correlation_id: "libsql_db_schema".to_string(),
             })?;
 
@@ -211,6 +212,36 @@ mod tests {
             }
             Err(other) => panic!("expected InvalidConfig, got: {other:?}"),
             Ok(_) => panic!("expected InvalidConfig, but reopen succeeded"),
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_to_open_with_legacy_runtime_state_db() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("runtime-state.db"), b"legacy").unwrap();
+        let result =
+            LibsqlDb::open(&dir.path().join("localdb.db"), 4, VectorEncoding::Float32).await;
+        match result {
+            Err(Error::InvalidConfig { message }) => {
+                assert!(message.contains("legacy") || message.contains("runtime-state.db"));
+            }
+            Err(other) => panic!("expected InvalidConfig, got: {other:?}"),
+            Ok(_) => panic!("expected InvalidConfig"),
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_to_open_with_legacy_stores_dir() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("stores").join("notes")).unwrap();
+        let result =
+            LibsqlDb::open(&dir.path().join("localdb.db"), 4, VectorEncoding::Float32).await;
+        match result {
+            Err(Error::InvalidConfig { message }) => {
+                assert!(message.contains("legacy") || message.contains("stores"));
+            }
+            Err(other) => panic!("expected InvalidConfig, got: {other:?}"),
+            Ok(_) => panic!("expected InvalidConfig"),
         }
     }
 

@@ -247,19 +247,6 @@ Troubleshooting below.
 ### MCP server cannot open the database
 
 ```
-error: internal error: cannot open runtime-state DB: Database already open. Cannot acquire lock.
-```
-
-The HTTP daemon (`localdb serve`) is running and holds the database lock. Stop it
-before running `localdb mcp` in embedded mode. The two processes cannot share the
-same data directory simultaneously in v0.1.0.
-
-### `localdb search` / MCP search returns no results after `serve` was running
-
-The daemon uses an in-memory store that does not see CLI-indexed LanceDB data
-(experimental limitation — see [../specs/06-roadmap.md](../specs/06-roadmap.md)).
-Stop the daemon, run `localdb index`, then re-run the MCP server.
-
 ### `daemon is unreachable` (exit 5) / stale socket
 
 If the daemon was killed with `SIGKILL` (or crashed), it may leave a stale
