@@ -133,11 +133,14 @@ pub struct SearchArgs {
     pub store_names: Vec<String>,
     /// Maximum results to return.
     pub limit: usize,
+    /// Max characters of snippet text per result in the text rendering.
+    pub content_length: usize,
 }
 
 impl SearchArgs {
     const DEFAULT_LIMIT: usize = 10;
     const MAX_LIMIT: usize = 100;
+    const DEFAULT_CONTENT_LENGTH: usize = 400;
 
     /// Parse from raw JSON params (the outer `params` object from JSON-RPC,
     /// which contains `name` and `arguments` fields for `tools/call`).
@@ -172,10 +175,17 @@ impl SearchArgs {
             .map(|n| (n as usize).min(Self::MAX_LIMIT))
             .unwrap_or(Self::DEFAULT_LIMIT);
 
+        let content_length = args
+            .get("content_length")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+            .unwrap_or(Self::DEFAULT_CONTENT_LENGTH);
+
         Ok(SearchArgs {
             query,
             store_names,
             limit,
+            content_length,
         })
     }
 }
@@ -275,7 +285,7 @@ pub async fn tool_search(
     });
 
     // Also build a short text rendering for non-structured clients.
-    let text_rendering = render_citations_text(&response.citations);
+    let text_rendering = render_citations_text(&response.citations, args.content_length);
 
     // Return both structured JSON and text rendering in the same text content item.
     let json_str = serde_json::to_string_pretty(&v).unwrap_or_default();
@@ -288,7 +298,7 @@ pub async fn tool_search(
 }
 
 /// Render citations as human-readable text for non-structured clients.
-pub fn render_citations_text(citations: &[Citation]) -> String {
+pub fn render_citations_text(citations: &[Citation], max_chars: usize) -> String {
     if citations.is_empty() {
         return "No results found.".to_string();
     }
@@ -321,7 +331,7 @@ pub fn render_citations_text(citations: &[Citation]) -> String {
                 heading,
                 creator_date,
                 c.score.fused,
-                c.snippet.chars().take(200).collect::<String>()
+                c.snippet.chars().take(max_chars).collect::<String>()
             )
         })
         .collect::<Vec<_>>()
@@ -809,7 +819,7 @@ mod tests {
             vec!["Alice".to_string()],
             Some("2026-03-01".to_string()),
         );
-        let text = render_citations_text(&[c]);
+        let text = render_citations_text(&[c], 400);
         assert!(
             text.contains("Alice · 2026-03-01"),
             "should show creator · date, got: {text}"
@@ -819,7 +829,7 @@ mod tests {
     #[test]
     fn render_citations_text_date_only() {
         let c = make_citation_with_metadata("file:///a.md", vec![], Some("2026-03-01".to_string()));
-        let text = render_citations_text(&[c]);
+        let text = render_citations_text(&[c], 400);
         assert!(text.contains("2026-03-01"), "should show date, got: {text}");
         assert!(!text.contains('·'), "should not show · with no creator");
     }
@@ -827,7 +837,7 @@ mod tests {
     #[test]
     fn render_citations_text_creator_only() {
         let c = make_citation_with_metadata("file:///a.md", vec!["Bob".to_string()], None);
-        let text = render_citations_text(&[c]);
+        let text = render_citations_text(&[c], 400);
         assert!(text.contains("Bob"), "should show creator, got: {text}");
         assert!(!text.contains('·'), "should not show · with no date");
     }
@@ -835,7 +845,45 @@ mod tests {
     #[test]
     fn render_citations_text_no_metadata() {
         let c = make_citation_with_metadata("file:///a.md", vec![], None);
-        let text = render_citations_text(&[c]);
+        let text = render_citations_text(&[c], 400);
         assert!(!text.contains('·'), "no metadata — no · separator");
+    }
+
+    #[test]
+    fn render_citations_text_respects_custom_content_length() {
+        let mut c = make_citation_with_metadata("file:///a.md", vec![], None);
+        c.snippet = "word ".repeat(200);
+        let text = render_citations_text(&[c], 50);
+        let snippet_line = text
+            .lines()
+            .find(|l| l.trim_start().starts_with("word"))
+            .unwrap();
+        assert!(
+            snippet_line.trim().chars().count() <= 50,
+            "snippet should be capped at 50 chars, got: {snippet_line}"
+        );
+    }
+
+    #[test]
+    fn search_args_default_content_length() {
+        let params = serde_json::json!({
+            "name": "search",
+            "arguments": { "query": "hello" }
+        });
+        let args = SearchArgs::from_value(Some(&params)).unwrap();
+        assert_eq!(
+            args.content_length, 400,
+            "default content_length should be 400"
+        );
+    }
+
+    #[test]
+    fn search_args_custom_content_length() {
+        let params = serde_json::json!({
+            "name": "search",
+            "arguments": { "query": "hello", "content_length": 50 }
+        });
+        let args = SearchArgs::from_value(Some(&params)).unwrap();
+        assert_eq!(args.content_length, 50);
     }
 }

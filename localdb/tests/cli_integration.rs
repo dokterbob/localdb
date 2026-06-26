@@ -417,6 +417,32 @@ fn source_remove_not_found_exits_3() {
     assert_eq!(output.status.code().unwrap(), 3);
 }
 
+/// `localdb add <path>` is an alias for `localdb source add`.
+#[test]
+fn add_alias_works_like_source_add() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "alias-store"])
+        .assert()
+        .success();
+
+    let fixture = dir.path().join("docs-alias");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    cmd_with_dir(&dir)
+        .args(["--store", "alias-store", "add", fixture.to_str().unwrap()])
+        .assert()
+        .success();
+
+    cmd_with_dir(&dir)
+        .args(["--store", "alias-store", "source", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("path"));
+}
+
 // ---------------------------------------------------------------------------
 // End-to-end: init → store add → source add → index → search
 //
