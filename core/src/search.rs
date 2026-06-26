@@ -9,6 +9,7 @@
 //! See specs/04-search-pipeline.md §5 and specs/02-domain-model.md §6.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::citation::{Citation, CitationProvenance, CitationStore, Score};
 use crate::embedder::{DocumentChunks, Embedder};
@@ -43,7 +44,7 @@ pub struct StoreHandle {
     /// Store name.
     pub name: String,
     /// The underlying store.
-    pub store: Box<dyn RetrievalStore>,
+    pub store: Arc<dyn RetrievalStore>,
 }
 
 /// Query request for the search orchestrator.
@@ -867,7 +868,7 @@ mod tests {
         let handle = StoreHandle {
             id: "store-A".to_string(),
             name: "Animals Store".to_string(),
-            store: Box::new(store),
+            store: Arc::new(store),
         };
 
         let request = QueryRequest {
@@ -941,12 +942,12 @@ mod tests {
             StoreHandle {
                 id: "store-A".to_string(),
                 name: "Store A".to_string(),
-                store: Box::new(store_a),
+                store: Arc::new(store_a),
             },
             StoreHandle {
                 id: "store-B".to_string(),
                 name: "Store B".to_string(),
-                store: Box::new(store_b),
+                store: Arc::new(store_b),
             },
         ];
 
@@ -998,7 +999,7 @@ mod tests {
         let handle = StoreHandle {
             id: "store-A".to_string(),
             name: "Store A".to_string(),
-            store: Box::new(store),
+            store: Arc::new(store),
         };
 
         let request = QueryRequest {
@@ -1053,7 +1054,7 @@ mod tests {
         let handle = StoreHandle {
             id: "store-A".to_string(),
             name: "Store A".to_string(),
-            store: Box::new(store),
+            store: Arc::new(store),
         };
 
         let request = QueryRequest {
@@ -1098,7 +1099,7 @@ mod tests {
         let handle = StoreHandle {
             id: "store-A".to_string(),
             name: "Store A".to_string(),
-            store: Box::new(store),
+            store: Arc::new(store),
         };
 
         let request = QueryRequest {
@@ -1192,7 +1193,7 @@ mod tests {
         let handle = StoreHandle {
             id: "s".to_string(),
             name: "Test Store".to_string(),
-            store: Box::new(store),
+            store: Arc::new(store),
         };
 
         let request = QueryRequest {

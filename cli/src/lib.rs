@@ -32,12 +32,11 @@ use localdb_core::{
     },
     ids::new_ulid,
     ingestion::now_rfc3339,
-    store::RetrievalStore,
     types::{SourceKind, StoreVisibility},
-    Error,
+    Error, SourceRow, StoreBackend, StoreBackendConfig, StoreRow,
 };
 use serde_json::json;
-use store_libsql::{LibsqlDb, RuntimeStateApi, SourceRow, StoreHandle, StoreRow};
+use store_libsql::SqliteBackend;
 
 // ---------------------------------------------------------------------------
 // Store name validation — A9-safety
@@ -386,8 +385,7 @@ pub fn exit_err(err: &Error, json_mode: bool) -> ! {
 }
 
 pub struct AppDb {
-    db: Arc<LibsqlDb>,
-    runtime: RuntimeStateApi,
+    backend: Arc<dyn StoreBackend>,
     default_indexing_policy: IndexingPolicyConfig,
     default_policy_version: String,
 }
@@ -405,23 +403,22 @@ impl AppDb {
                     message: format!("cannot determine embedding shape: {e}"),
                 }
             })?;
-        let db = Arc::new(LibsqlDb::open(&paths.unified_db_path(), dim, encoding).await?);
-        let runtime = RuntimeStateApi::new(db.clone());
+        let config = StoreBackendConfig::local_path(paths.unified_db_path(), dim, encoding);
+        let backend = Arc::new(SqliteBackend::open(config).await?) as Arc<dyn StoreBackend>;
         let default_policy_version = compute_policy_version(&default_indexing_policy);
         Ok(Self {
-            db,
-            runtime,
+            backend,
             default_indexing_policy,
             default_policy_version,
         })
     }
 
-    pub fn db(&self) -> &Arc<LibsqlDb> {
-        &self.db
+    pub fn backend(&self) -> &dyn StoreBackend {
+        self.backend.as_ref()
     }
 
-    pub fn runtime(&self) -> &RuntimeStateApi {
-        &self.runtime
+    pub fn backend_arc(&self) -> Arc<dyn StoreBackend> {
+        self.backend.clone()
     }
 
     pub fn default_indexing_policy(&self) -> &IndexingPolicyConfig {
@@ -433,7 +430,7 @@ impl AppDb {
     }
 
     pub async fn resolve_store_id(&self, name: &str) -> Result<String, Error> {
-        match self.runtime.get_store_by_name(name).await? {
+        match self.backend.get_store_by_name(name).await? {
             Some(row) => Ok(row.id),
             None => Err(Error::StoreNotFound {
                 id: name.to_string(),
@@ -556,7 +553,7 @@ async fn resolve_store_name(ctx: &CliContext, config_loader: &ConfigLoader, db: 
     if let Some(s) = config_loader.config.stores.first() {
         return s.name.clone();
     }
-    match db.runtime().list_stores().await {
+    match db.backend().list_stores().await {
         Ok(stores) if !stores.is_empty() => stores[0].name.clone(),
         Ok(_) => exit_err(
             &Error::InvalidRequest {
@@ -793,13 +790,13 @@ async fn run_init_async(ctx: &CliContext) {
 
     let (_config_loader, db) = load_app_db_lenient(ctx).await;
 
-    match db.runtime().get_store_by_name("default").await {
+    match db.backend().get_store_by_name("default").await {
         Ok(None) => {
             let default_store = match default_store_row("default", &db) {
                 Ok(store) => store,
                 Err(e) => exit_err(&e, ctx.json),
             };
-            if let Err(e) = db.runtime().upsert_store(&default_store).await {
+            if let Err(e) = db.backend().upsert_store(&default_store).await {
                 exit_err(&e, ctx.json);
             }
         }
@@ -845,7 +842,7 @@ async fn run_status_async(ctx: &CliContext) {
         DaemonState::NotRunning => "not running (embedded mode)".to_string(),
     };
 
-    let runtime_stores = match db.runtime().list_stores().await {
+    let runtime_stores = match db.backend().list_stores().await {
         Ok(s) => s,
         Err(e) => exit_err(&e, ctx.json),
     };
@@ -939,7 +936,7 @@ async fn run_store_add_async(ctx: &CliContext, name: &str) {
     // Embedded mode: SQLite serialises the metadata write; no WriteLock needed here.
 
     // Duplicate check.
-    match db.runtime().get_store_by_name(name).await {
+    match db.backend().get_store_by_name(name).await {
         Ok(Some(_)) => exit_err(
             &Error::InvalidRequest {
                 message: format!("store '{}' already exists", name),
@@ -954,7 +951,7 @@ async fn run_store_add_async(ctx: &CliContext, name: &str) {
         Ok(store) => store,
         Err(e) => exit_err(&e, ctx.json),
     };
-    if let Err(e) = db.runtime().upsert_store(&store).await {
+    if let Err(e) = db.backend().upsert_store(&store).await {
         exit_err(&e, ctx.json);
     }
 
@@ -975,7 +972,7 @@ async fn run_store_list_async(ctx: &CliContext) {
     // F1-cli: use lenient loader so store list works even with malformed config.
     let (config_loader, db) = load_app_db_lenient(ctx).await;
 
-    let runtime_stores = match db.runtime().list_stores().await {
+    let runtime_stores = match db.backend().list_stores().await {
         Ok(s) => s,
         Err(e) => exit_err(&e, ctx.json),
     };
@@ -1096,7 +1093,7 @@ async fn run_store_remove_async(ctx: &CliContext, name: &str) {
         Ok(id) => id,
         Err(e) => exit_err(&e, ctx.json),
     };
-    match db.runtime().delete_store(&store_id).await {
+    match db.backend().delete_store(&store_id).await {
         Ok(true) => {}
         Ok(false) => exit_err(
             &Error::StoreNotFound {
@@ -1267,7 +1264,7 @@ async fn run_source_add_async(ctx: &CliContext, source_arg: &str) {
     // The auto-index step below acquires its own WriteLock for LanceDB writes.
 
     // #13: Verify store exists in runtime DB (exit 3 if not found).
-    let rt_store = match db.runtime().get_store_by_name(&store_name).await {
+    let rt_store = match db.backend().get_store_by_name(&store_name).await {
         Ok(None) => exit_err(
             &Error::StoreNotFound {
                 id: store_name.clone(),
@@ -1311,7 +1308,7 @@ async fn run_source_add_async(ctx: &CliContext, source_arg: &str) {
         created_at: now_rfc3339(),
     };
 
-    if let Err(e) = db.runtime().upsert_source(&src).await {
+    if let Err(e) = db.backend().upsert_source(&src).await {
         exit_err(&e, ctx.json);
     }
 
@@ -1364,7 +1361,7 @@ async fn run_index_for_source_async(
     let (config_loader, db) = load_app_db(ctx).await;
     let data_dir = config_loader.paths.data_dir.clone();
 
-    let all_sources = match db.runtime().list_sources(&store_row.id).await {
+    let all_sources = match db.backend().list_sources(&store_row.id).await {
         Ok(s) => s,
         Err(e) => {
             eprintln!("warning: cannot list sources for auto-index: {}", e);
@@ -1419,7 +1416,13 @@ async fn run_index_for_source_async(
         }
     };
 
-    let handle = StoreHandle::new(db.db().clone(), store_row.id.clone());
+    let handle = match db.backend().retrieval_store(&store_row.id).await {
+        Ok(handle) => handle,
+        Err(e) => {
+            eprintln!("warning: cannot open store handle for auto-index: {e}");
+            return;
+        }
+    };
 
     let existing = match handle.list_indexed_documents().await {
         Ok(records) => records,
@@ -1451,7 +1454,7 @@ async fn run_index_for_source_async(
         match run_ingestion_for_source(
             &source,
             &mut doc_index,
-            &handle,
+            handle.as_ref(),
             embedder.as_ref(),
             &cfg,
             &extractor,
@@ -1493,7 +1496,7 @@ async fn run_source_list_async(ctx: &CliContext) {
 
     // D1: verify store exists before listing sources.
     if let Some(explicit) = ctx.stores.first() {
-        match db.runtime().get_store_by_name(explicit).await {
+        match db.backend().get_store_by_name(explicit).await {
             Ok(None) => exit_err(
                 &Error::StoreNotFound {
                     id: explicit.clone(),
@@ -1505,7 +1508,7 @@ async fn run_source_list_async(ctx: &CliContext) {
         }
     }
 
-    let store_row = match db.runtime().get_store_by_name(&store_name).await {
+    let store_row = match db.backend().get_store_by_name(&store_name).await {
         Ok(Some(s)) => s,
         Ok(None) => exit_err(
             &Error::StoreNotFound {
@@ -1516,7 +1519,7 @@ async fn run_source_list_async(ctx: &CliContext) {
         Err(e) => exit_err(&e, ctx.json),
     };
 
-    let sources = match db.runtime().list_sources(&store_row.id).await {
+    let sources = match db.backend().list_sources(&store_row.id).await {
         Ok(s) => s,
         Err(e) => exit_err(&e, ctx.json),
     };
@@ -1572,7 +1575,7 @@ async fn run_source_remove_async(ctx: &CliContext, id: &str) {
 
     // D1: verify the store exists if --store was given explicitly.
     if let Some(explicit) = ctx.stores.first() {
-        match db.runtime().get_store_by_name(explicit).await {
+        match db.backend().get_store_by_name(explicit).await {
             Ok(None) => exit_err(
                 &Error::StoreNotFound {
                     id: explicit.clone(),
@@ -1630,7 +1633,7 @@ async fn run_source_remove_async(ctx: &CliContext, id: &str) {
                 ctx.json,
             );
         };
-        match db.runtime().find_source_by_root_or_url(id, store_id).await {
+        match db.backend().find_source_by_root_or_url(id, store_id).await {
             Ok(Some(src)) => src.id,
             Ok(None) => exit_err(&Error::SourceNotFound { id: id.to_string() }, ctx.json),
             Err(e) => exit_err(&e, ctx.json),
@@ -1641,7 +1644,7 @@ async fn run_source_remove_async(ctx: &CliContext, id: &str) {
 
     // D2: If --store was given, verify the source belongs to that store.
     if let Some(expected_store_id) = resolved_store_id.as_deref() {
-        match db.runtime().get_source(&resolved_id).await {
+        match db.backend().get_source(&resolved_id).await {
             Ok(Some(src)) if src.store_id != expected_store_id => {
                 exit_err(
                     &Error::SourceNotFound {
@@ -1661,7 +1664,7 @@ async fn run_source_remove_async(ctx: &CliContext, id: &str) {
         }
     }
 
-    match db.runtime().delete_source(&resolved_id).await {
+    match db.backend().delete_source(&resolved_id).await {
         Ok(true) => {}
         Ok(false) => exit_err(
             &Error::SourceNotFound {
@@ -1740,7 +1743,7 @@ async fn run_index_async(
         Ok(id) => id,
         Err(e) => exit_err(&e, ctx.json),
     };
-    let rt_store = match db.runtime().get_store(&store_id).await {
+    let rt_store = match db.backend().get_store(&store_id).await {
         Ok(Some(s)) => s,
         Ok(None) => exit_err(
             &Error::StoreNotFound {
@@ -1783,7 +1786,7 @@ async fn run_index_async(
         None
     };
 
-    let all_sources = match db.runtime().list_sources(&store_id).await {
+    let all_sources = match db.backend().list_sources(&store_id).await {
         Ok(s) => s,
         Err(e) => exit_err(&e, ctx.json),
     };
@@ -1843,7 +1846,10 @@ async fn run_index_async(
         Err(e) => exit_err(&e, ctx.json),
     };
 
-    let handle = StoreHandle::new(db.db().clone(), store_id.clone());
+    let handle = match db.backend().retrieval_store(&store_id).await {
+        Ok(handle) => handle,
+        Err(e) => exit_err(&e, ctx.json),
+    };
 
     let existing = match handle.list_indexed_documents().await {
         Ok(records) => records,
@@ -1876,7 +1882,7 @@ async fn run_index_async(
         match run_ingestion_for_source(
             &source,
             &mut doc_index,
-            &handle,
+            handle.as_ref(),
             embedder.as_ref(),
             &cfg,
             &extractor,
@@ -1996,7 +2002,7 @@ async fn run_search_async(ctx: &CliContext, query: &str, limit: usize) {
     }
 
     // Embedded mode.
-    let runtime_stores = match db.runtime().list_stores().await {
+    let runtime_stores = match db.backend().list_stores().await {
         Ok(s) => s,
         Err(e) => exit_err(&e, ctx.json),
     };
@@ -2067,11 +2073,14 @@ async fn run_search_async(ctx: &CliContext, query: &str, limit: usize) {
     let mut store_handles: Vec<StoreHandle> = Vec::new();
     for name in &store_names {
         if let Some(store_row) = runtime_stores.iter().find(|s| s.name == *name) {
-            let handle = store_libsql::StoreHandle::new(db.db().clone(), store_row.id.clone());
+            let handle = match db.backend().retrieval_store(&store_row.id).await {
+                Ok(handle) => handle,
+                Err(e) => exit_err(&e, ctx.json),
+            };
             store_handles.push(StoreHandle {
                 id: store_row.id.clone(),
                 name: store_row.name.clone(),
-                store: Box::new(handle),
+                store: handle,
             });
         }
     }
@@ -2182,7 +2191,7 @@ async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
 
     let (config_loader, db) = load_app_db(ctx).await;
 
-    let runtime_stores = match db.runtime().list_stores().await {
+    let runtime_stores = match db.backend().list_stores().await {
         Ok(s) => s,
         Err(e) => exit_err(&e, ctx.json),
     };
@@ -2231,8 +2240,11 @@ async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
                 name: store_row.name.clone(),
                 visibility: visibility_to_string(&store_row.visibility).to_string(),
             };
-            let handle = store_libsql::StoreHandle::new(db.db().clone(), store_row.id.clone());
-            available.push(AvailableStore::new(descriptor, Box::new(handle)));
+            let handle = match db.backend().retrieval_store(&store_row.id).await {
+                Ok(handle) => handle,
+                Err(e) => exit_err(&e, ctx.json),
+            };
+            available.push(AvailableStore::from_arc(descriptor, handle));
         }
     }
 
@@ -2473,16 +2485,16 @@ mod tests {
     async fn app_db_store_add_list_remove() {
         let dir = TempDir::new().unwrap();
         let db = tmp_app_db(&dir).await;
-        assert!(db.runtime().list_stores().await.unwrap().is_empty());
+        assert!(db.backend().list_stores().await.unwrap().is_empty());
         let store = test_store_row("mystore", &db);
         let id = store.id.clone();
-        db.runtime().upsert_store(&store).await.unwrap();
-        let stores = db.runtime().list_stores().await.unwrap();
+        db.backend().upsert_store(&store).await.unwrap();
+        let stores = db.backend().list_stores().await.unwrap();
         assert_eq!(stores.len(), 1);
         assert_eq!(stores[0].name, "mystore");
-        assert!(db.runtime().delete_store(&id).await.unwrap());
-        assert!(db.runtime().list_stores().await.unwrap().is_empty());
-        assert!(!db.runtime().delete_store(&id).await.unwrap());
+        assert!(db.backend().delete_store(&id).await.unwrap());
+        assert!(db.backend().list_stores().await.unwrap().is_empty());
+        assert!(!db.backend().delete_store(&id).await.unwrap());
     }
 
     #[tokio::test]
@@ -2490,11 +2502,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = tmp_app_db(&dir).await;
         let store = test_store_row("s1", &db);
-        db.runtime().upsert_store(&store).await.unwrap();
-        let found = db.runtime().get_store_by_name("s1").await.unwrap();
+        db.backend().upsert_store(&store).await.unwrap();
+        let found = db.backend().get_store_by_name("s1").await.unwrap();
         assert_eq!(found.unwrap().name, "s1");
         assert!(db
-            .runtime()
+            .backend()
             .get_store_by_name("nonexistent")
             .await
             .unwrap()
@@ -2506,17 +2518,17 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = tmp_app_db(&dir).await;
         let store = test_store_row("s1", &db);
-        db.runtime().upsert_store(&store).await.unwrap();
+        db.backend().upsert_store(&store).await.unwrap();
         let store_id = db.resolve_store_id("s1").await.unwrap();
         let src = test_source_row(&store_id, "/tmp");
-        db.runtime().upsert_source(&src).await.unwrap();
-        let list = db.runtime().list_sources(&store_id).await.unwrap();
+        db.backend().upsert_source(&src).await.unwrap();
+        let list = db.backend().list_sources(&store_id).await.unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].id, src.id);
-        assert!(db.runtime().delete_source(&src.id).await.unwrap());
-        assert!(!db.runtime().delete_source(&src.id).await.unwrap());
+        assert!(db.backend().delete_source(&src.id).await.unwrap());
+        assert!(!db.backend().delete_source(&src.id).await.unwrap());
         assert!(db
-            .runtime()
+            .backend()
             .list_sources(&store_id)
             .await
             .unwrap()
@@ -2529,26 +2541,26 @@ mod tests {
         let db = tmp_app_db(&dir).await;
         let store_a = test_store_row("sa", &db);
         let store_b = test_store_row("sb", &db);
-        db.runtime().upsert_store(&store_a).await.unwrap();
-        db.runtime().upsert_store(&store_b).await.unwrap();
-        db.runtime()
+        db.backend().upsert_store(&store_a).await.unwrap();
+        db.backend().upsert_store(&store_b).await.unwrap();
+        db.backend()
             .upsert_source(&test_source_row(&store_a.id, "/a"))
             .await
             .unwrap();
-        db.runtime()
+        db.backend()
             .upsert_source(&test_source_row(&store_b.id, "/b"))
             .await
             .unwrap();
         assert_eq!(
-            db.runtime().list_sources(&store_a.id).await.unwrap().len(),
+            db.backend().list_sources(&store_a.id).await.unwrap().len(),
             1
         );
         assert_eq!(
-            db.runtime().list_sources(&store_b.id).await.unwrap().len(),
+            db.backend().list_sources(&store_b.id).await.unwrap().len(),
             1
         );
         assert!(db
-            .runtime()
+            .backend()
             .list_sources("missing")
             .await
             .unwrap()
@@ -2560,12 +2572,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = tmp_app_db(&dir).await;
         let store = test_store_row("s", &db);
-        db.runtime().upsert_store(&store).await.unwrap();
+        db.backend().upsert_store(&store).await.unwrap();
         let src = test_source_row(&store.id, "/tmp");
-        db.runtime().upsert_source(&src).await.unwrap();
-        assert!(db.runtime().get_source(&src.id).await.unwrap().is_some());
+        db.backend().upsert_source(&src).await.unwrap();
+        assert!(db.backend().get_source(&src.id).await.unwrap().is_some());
         assert!(db
-            .runtime()
+            .backend()
             .get_source("no-such-id")
             .await
             .unwrap()
@@ -2609,8 +2621,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = tmp_app_db(&dir).await;
         let store = test_store_row("shape-store", &db);
-        db.runtime().upsert_store(&store).await.unwrap();
-        let stores = db.runtime().list_stores().await.unwrap();
+        db.backend().upsert_store(&store).await.unwrap();
+        let stores = db.backend().list_stores().await.unwrap();
         let json_stores: Vec<serde_json::Value> = stores
             .iter()
             .map(|s| {
@@ -2771,12 +2783,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = tmp_app_db(&dir).await;
         let store = test_store_row("s1", &db);
-        db.runtime().upsert_store(&store).await.unwrap();
+        db.backend().upsert_store(&store).await.unwrap();
         let store_id = db.resolve_store_id("s1").await.unwrap();
         let src = test_source_row(&store_id, "/my/docs");
-        db.runtime().upsert_source(&src).await.unwrap();
+        db.backend().upsert_source(&src).await.unwrap();
         let found = db
-            .runtime()
+            .backend()
             .find_source_by_root_or_url("/my/docs", &store_id)
             .await
             .unwrap();
@@ -2789,12 +2801,12 @@ mod tests {
         let db = tmp_app_db(&dir).await;
         let store_a = test_store_row("my-store", &db);
         let store_b = test_store_row("other-store", &db);
-        db.runtime().upsert_store(&store_a).await.unwrap();
-        db.runtime().upsert_store(&store_b).await.unwrap();
+        db.backend().upsert_store(&store_a).await.unwrap();
+        db.backend().upsert_store(&store_b).await.unwrap();
         let src = test_source_row(&store_b.id, "/my/docs");
-        db.runtime().upsert_source(&src).await.unwrap();
+        db.backend().upsert_source(&src).await.unwrap();
         let found = db
-            .runtime()
+            .backend()
             .find_source_by_root_or_url("/my/docs", &store_a.id)
             .await
             .unwrap();

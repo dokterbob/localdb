@@ -11,9 +11,9 @@ use localdb_core::{
         schema::{IndexingPolicyConfig, RawConfig},
     },
     ingestion::now_rfc3339,
-    Error, Store, StoreVisibility,
+    Error, SourceRow, Store, StoreBackend, StoreBackendConfig, StoreRow, StoreVisibility,
 };
-use store_libsql::{LibsqlDb, RuntimeStateApi, SourceRow, StoreRow};
+use store_libsql::SqliteBackend;
 
 use crate::job_queue::JobQueue;
 
@@ -35,8 +35,7 @@ pub struct AppState {
 struct Inner {
     yaml_config: RwLock<RawConfig>,
     data_dir: PathBuf,
-    db: Arc<LibsqlDb>,
-    runtime: RuntimeStateApi,
+    backend: Arc<dyn StoreBackend>,
     default_indexing_policy: IndexingPolicyConfig,
     default_policy_version: String,
     job_queue: JobQueue,
@@ -58,8 +57,8 @@ impl AppState {
                 }
             })?;
         let db_path = data_dir.join("localdb.db");
-        let db = Arc::new(LibsqlDb::open(&db_path, dim, encoding).await?);
-        let runtime = RuntimeStateApi::new(db.clone());
+        let config = StoreBackendConfig::local_path(db_path, dim, encoding);
+        let backend = Arc::new(SqliteBackend::open(config).await?) as Arc<dyn StoreBackend>;
         let default_indexing_policy = yaml_config.defaults.indexing.clone();
         let default_policy_version = compute_policy_version(&default_indexing_policy);
 
@@ -67,8 +66,7 @@ impl AppState {
             inner: Arc::new(Inner {
                 yaml_config: RwLock::new(yaml_config),
                 data_dir,
-                db,
-                runtime,
+                backend,
                 default_indexing_policy,
                 default_policy_version,
                 job_queue,
@@ -85,18 +83,18 @@ impl AppState {
         &self.inner.data_dir
     }
 
-    pub fn db(&self) -> &Arc<LibsqlDb> {
-        &self.inner.db
+    pub fn backend(&self) -> &dyn StoreBackend {
+        self.inner.backend.as_ref()
     }
 
-    pub fn runtime(&self) -> &RuntimeStateApi {
-        &self.inner.runtime
+    pub fn backend_arc(&self) -> Arc<dyn StoreBackend> {
+        self.inner.backend.clone()
     }
 
     /// Get the effective config (YAML + runtime merged).
     pub async fn effective_config(&self) -> Result<EffectiveConfig, Error> {
         let yaml = self.inner.yaml_config.read().await;
-        let runtime_stores = self.inner.runtime.list_stores().await?;
+        let runtime_stores = self.inner.backend.list_stores().await?;
         let default_policy = &self.inner.default_indexing_policy;
         let mut stores = Vec::new();
         let yaml_names: HashSet<&str> = yaml.stores.iter().map(|s| s.name.as_str()).collect();
@@ -198,7 +196,7 @@ impl AppState {
             created_at: now_rfc3339(),
         };
 
-        self.inner.runtime.upsert_store(&row).await?;
+        self.inner.backend.upsert_store(&row).await?;
 
         Ok(Store {
             id,
@@ -234,13 +232,13 @@ impl AppState {
 
         let row = self
             .inner
-            .runtime
+            .backend
             .get_store_by_name(name)
             .await?
             .ok_or_else(|| Error::StoreNotFound {
                 id: name.to_string(),
             })?;
-        let deleted = self.inner.runtime.delete_store(&row.id).await?;
+        let deleted = self.inner.backend.delete_store(&row.id).await?;
         if !deleted {
             return Err(Error::StoreNotFound {
                 id: name.to_string(),
@@ -293,7 +291,7 @@ impl AppState {
 
         let store_row = self
             .inner
-            .runtime
+            .backend
             .get_store_by_name(store_name)
             .await?
             .ok_or_else(|| Error::StoreNotFound {
@@ -315,7 +313,7 @@ impl AppState {
             refresh: None,
             created_at: now_rfc3339(),
         };
-        self.inner.runtime.upsert_source(&source_row).await?;
+        self.inner.backend.upsert_source(&source_row).await?;
 
         Ok(SourceRecord {
             id,
@@ -330,14 +328,14 @@ impl AppState {
     pub async fn list_sources(&self, store_name: &str) -> Result<Vec<SourceRecord>, Error> {
         let store = self
             .inner
-            .runtime
+            .backend
             .get_store_by_name(store_name)
             .await?
             .ok_or_else(|| Error::StoreNotFound {
                 id: store_name.to_string(),
             })?;
         self.inner
-            .runtime
+            .backend
             .list_sources(&store.id)
             .await?
             .into_iter()
@@ -349,7 +347,7 @@ impl AppState {
     ///
     /// Returns `Error::SourceNotFound` if the source doesn't exist.
     pub async fn remove_source(&self, source_id: &str) -> Result<(), Error> {
-        let deleted = self.inner.runtime.delete_source(source_id).await?;
+        let deleted = self.inner.backend.delete_source(source_id).await?;
         if !deleted {
             return Err(Error::SourceNotFound {
                 id: source_id.to_string(),
@@ -362,7 +360,7 @@ impl AppState {
     pub async fn get_source(&self, source_id: &str) -> Result<SourceRecord, Error> {
         let source = self
             .inner
-            .runtime
+            .backend
             .get_source(source_id)
             .await?
             .ok_or_else(|| Error::SourceNotFound {
@@ -382,7 +380,7 @@ impl AppState {
 
         let row = self
             .inner
-            .runtime
+            .backend
             .get_store_by_name(name)
             .await?
             .ok_or_else(|| Error::StoreNotFound {
@@ -402,7 +400,7 @@ impl AppState {
             visibility: vis_new,
             ..row
         };
-        self.inner.runtime.upsert_store(&updated).await?;
+        self.inner.backend.upsert_store(&updated).await?;
         Ok(())
     }
 }
@@ -775,12 +773,9 @@ mod tests {
     #[tokio::test]
     async fn upsert_and_search_chunks_roundtrip() {
         let (_dir, state) = make_state().await;
-        use localdb_core::store::RetrievalStore;
-        use store_libsql::StoreHandle;
-
         state.add_store("notes", "private").await.unwrap();
         let store_id = state
-            .runtime()
+            .backend()
             .get_store_by_name("notes")
             .await
             .unwrap()
@@ -815,7 +810,7 @@ mod tests {
             metadata: localdb_core::DocumentMetadata::default(),
         };
 
-        let handle = StoreHandle::new(state.db().clone(), store_id);
+        let handle = state.backend().retrieval_store(&store_id).await.unwrap();
         handle.upsert_chunks(vec![chunk]).await.unwrap();
         let stats = handle.stats().await.unwrap();
         assert_eq!(stats.chunk_count, 1, "one chunk should be indexed");
@@ -879,6 +874,6 @@ mod tests {
             ),
             "removed store should not list sources"
         );
-        assert!(state.runtime().list_stores().await.unwrap().is_empty());
+        assert!(state.backend().list_stores().await.unwrap().is_empty());
     }
 }

@@ -1,21 +1,20 @@
-use std::sync::Arc;
-
 use localdb_core::types::{SourceKind, StoreVisibility};
-use localdb_core::VectorEncoding;
+use localdb_core::{SourceRow, StoreBackend, StoreBackendConfig, StoreRow, VectorEncoding};
 use tempfile::tempdir;
 
-use crate::db::LibsqlDb;
+use crate::SqliteBackend;
 
-use super::{RuntimeStateApi, SourceRow, StoreRow};
-
-async fn make_api() -> (tempfile::TempDir, RuntimeStateApi) {
+async fn make_api() -> (tempfile::TempDir, SqliteBackend) {
     let dir = tempdir().unwrap();
     let path = dir.path().join("localdb.db");
-    let db = LibsqlDb::open(&path, 4, VectorEncoding::Float32)
-        .await
-        .unwrap();
-    let api = RuntimeStateApi::new(Arc::new(db));
-    (dir, api)
+    let backend = SqliteBackend::open(StoreBackendConfig::local_path(
+        path,
+        4,
+        VectorEncoding::Float32,
+    ))
+    .await
+    .unwrap();
+    (dir, backend)
 }
 
 fn make_store(id: &str, name: &str) -> StoreRow {
@@ -257,7 +256,9 @@ async fn delete_sources_for_store_returns_removed_count() {
     api.upsert_source(&make_path_source("src-2", "store-1", "/b"))
         .await
         .unwrap();
-    let n = api.delete_sources_for_store("store-1").await.unwrap();
+    let n = super::delete_sources_for_store(&api.conn, "store-1")
+        .await
+        .unwrap();
     assert_eq!(n, 2);
 }
 

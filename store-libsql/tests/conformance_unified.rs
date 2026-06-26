@@ -8,144 +8,145 @@
 //! cross-tenant count) — that semantic doesn't fit a single-handle view, so
 //! we replace it with `delete_by_store_cross_handle` below.
 
-use std::sync::Arc;
-
 use tempfile::tempdir;
 
 use localdb_core::store::conformance;
-use localdb_core::store::{ChunkRecord, RetrievalStore};
+use localdb_core::store::ChunkRecord;
 use localdb_core::types::{SourceKind, Span, StoreVisibility};
-use localdb_core::{Error, VectorEncoding};
-use store_libsql::{LibsqlDb, RuntimeStateApi, SourceRow, StoreHandle, StoreRow};
+use localdb_core::{Error, SourceRow, StoreBackend, StoreBackendConfig, StoreRow, VectorEncoding};
+use store_libsql::SqliteBackend;
 
 /// Open a fresh DB and register the stores/source the conformance records
 /// depend on. The conformance helpers hard-code `source_id="src-1"` and use
 /// `store_id` values `store-1`, `store-A`, `store-B`.
-async fn setup() -> (tempfile::TempDir, Arc<LibsqlDb>) {
+async fn setup() -> (tempfile::TempDir, SqliteBackend) {
     let dir = tempdir().unwrap();
     let path = dir.path().join("localdb.db");
-    let db = Arc::new(
-        LibsqlDb::open(&path, 2, VectorEncoding::Float32)
-            .await
-            .unwrap(),
-    );
-    let api = RuntimeStateApi::new(db.clone());
+    let backend = SqliteBackend::open(StoreBackendConfig::local_path(
+        path,
+        2,
+        VectorEncoding::Float32,
+    ))
+    .await
+    .unwrap();
 
     for store_id in ["store-1", "store-A", "store-B"] {
-        api.upsert_store(&StoreRow {
-            id: store_id.to_string(),
-            name: store_id.to_string(),
-            visibility: StoreVisibility::Private,
-            backend: "libsql".to_string(),
-            indexing_policy: "{}".to_string(),
-            policy_version: "v1".to_string(),
-            acl: "{}".to_string(),
+        backend
+            .upsert_store(&StoreRow {
+                id: store_id.to_string(),
+                name: store_id.to_string(),
+                visibility: StoreVisibility::Private,
+                backend: "libsql".to_string(),
+                indexing_policy: "{}".to_string(),
+                policy_version: "v1".to_string(),
+                acl: "{}".to_string(),
+                created_at: "2026-06-25T12:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+    }
+
+    backend
+        .upsert_source(&SourceRow {
+            id: "src-1".to_string(),
+            store_id: "store-1".to_string(),
+            kind: SourceKind::Path,
+            root: Some("/test/conformance".to_string()),
+            url: None,
+            include: vec![],
+            exclude: vec![],
+            preset: "prose".to_string(),
+            refresh: None,
             created_at: "2026-06-25T12:00:00Z".to_string(),
         })
         .await
         .unwrap();
-    }
 
-    api.upsert_source(&SourceRow {
-        id: "src-1".to_string(),
-        store_id: "store-1".to_string(),
-        kind: SourceKind::Path,
-        root: Some("/test/conformance".to_string()),
-        url: None,
-        include: vec![],
-        exclude: vec![],
-        preset: "prose".to_string(),
-        refresh: None,
-        created_at: "2026-06-25T12:00:00Z".to_string(),
-    })
-    .await
-    .unwrap();
-
-    (dir, db)
+    (dir, backend)
 }
 
 #[tokio::test]
 async fn upsert_and_stats() {
     let (_dir, db) = setup().await;
-    let handle = StoreHandle::new(db, "store-1");
-    conformance::test_upsert_and_stats(&handle).await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+    conformance::test_upsert_and_stats(handle.as_ref()).await;
 }
 
 #[tokio::test]
 async fn upsert_replaces_existing() {
     let (_dir, db) = setup().await;
-    let handle = StoreHandle::new(db, "store-1");
-    conformance::test_upsert_replaces_existing(&handle).await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+    conformance::test_upsert_replaces_existing(handle.as_ref()).await;
 }
 
 #[tokio::test]
 async fn delete_by_document() {
     let (_dir, db) = setup().await;
-    let handle = StoreHandle::new(db, "store-1");
-    conformance::test_delete_by_document(&handle).await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+    conformance::test_delete_by_document(handle.as_ref()).await;
 }
 
 #[tokio::test]
 async fn delete_nonexistent_document() {
     let (_dir, db) = setup().await;
-    let handle = StoreHandle::new(db, "store-1");
-    conformance::test_delete_nonexistent_document(&handle).await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+    conformance::test_delete_nonexistent_document(handle.as_ref()).await;
 }
 
 #[tokio::test]
 async fn dense_search_round_trip() {
     let (_dir, db) = setup().await;
-    let handle = StoreHandle::new(db, "store-1");
-    conformance::test_dense_search_round_trip(&handle).await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+    conformance::test_dense_search_round_trip(handle.as_ref()).await;
 }
 
 #[tokio::test]
 async fn bm25_search_round_trip() {
     let (_dir, db) = setup().await;
-    let handle = StoreHandle::new(db, "store-1");
-    conformance::test_bm25_search_round_trip(&handle).await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+    conformance::test_bm25_search_round_trip(handle.as_ref()).await;
 }
 
 #[tokio::test]
 async fn metadata_filter_mime() {
     let (_dir, db) = setup().await;
-    let handle = StoreHandle::new(db, "store-1");
-    conformance::test_metadata_filter_mime(&handle).await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+    conformance::test_metadata_filter_mime(handle.as_ref()).await;
 }
 
 #[tokio::test]
 async fn metadata_filter_uri_prefix() {
     let (_dir, db) = setup().await;
-    let handle = StoreHandle::new(db, "store-1");
-    conformance::test_metadata_filter_uri_prefix(&handle).await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+    conformance::test_metadata_filter_uri_prefix(handle.as_ref()).await;
 }
 
 #[tokio::test]
 async fn get_chunk() {
     let (_dir, db) = setup().await;
-    let handle = StoreHandle::new(db, "store-1");
-    conformance::test_get_chunk(&handle).await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+    conformance::test_get_chunk(handle.as_ref()).await;
 }
 
 #[tokio::test]
 async fn get_chunks_for_document() {
     let (_dir, db) = setup().await;
-    let handle = StoreHandle::new(db, "store-1");
-    conformance::test_get_chunks_for_document(&handle).await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+    conformance::test_get_chunks_for_document(handle.as_ref()).await;
 }
 
 #[tokio::test]
 async fn dense_search_limit() {
     let (_dir, db) = setup().await;
-    let handle = StoreHandle::new(db, "store-1");
-    conformance::test_dense_search_limit(&handle).await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+    conformance::test_dense_search_limit(handle.as_ref()).await;
 }
 
 #[tokio::test]
 async fn bm25_search_limit() {
     let (_dir, db) = setup().await;
-    let handle = StoreHandle::new(db, "store-1");
-    conformance::test_bm25_search_limit(&handle).await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+    conformance::test_bm25_search_limit(handle.as_ref()).await;
 }
 
 /// Replacement for `test_delete_by_store`: the trait-level conformance
@@ -154,8 +155,8 @@ async fn bm25_search_limit() {
 #[tokio::test]
 async fn delete_by_store_cross_handle() {
     let (_dir, db) = setup().await;
-    let handle_a = StoreHandle::new(db.clone(), "store-A");
-    let handle_b = StoreHandle::new(db.clone(), "store-B");
+    let handle_a = db.retrieval_store("store-A").await.unwrap();
+    let handle_b = db.retrieval_store("store-B").await.unwrap();
 
     let records_a = vec![
         make_record("chunk-1", "doc-1", "store-A", vec![1.0, 0.0]),
@@ -183,7 +184,7 @@ async fn delete_by_store_cross_handle() {
 #[tokio::test]
 async fn upsert_chunks_rejects_cross_tenant_record() {
     let (_dir, db) = setup().await;
-    let handle = StoreHandle::new(db, "store-A");
+    let handle = db.retrieval_store("store-A").await.unwrap();
     let result = handle
         .upsert_chunks(vec![make_record(
             "chunk-cross",
@@ -202,10 +203,24 @@ async fn upsert_chunks_rejects_cross_tenant_record() {
 }
 
 #[tokio::test]
+async fn tenant_delete_by_store_rejects_foreign_store_id() {
+    let (_dir, backend) = setup().await;
+    let handle_a = backend.retrieval_store("store-A").await.unwrap();
+    let result = handle_a.delete_by_store("store-B").await;
+    assert!(matches!(
+        result,
+        Err(Error::Internal {
+            correlation_id,
+            ..
+        }) if correlation_id == "store_handle_tenant_violation"
+    ));
+}
+
+#[tokio::test]
 async fn find_document_errors_when_id_exists_in_multiple_stores() {
     let (_dir, db) = setup().await;
-    let handle_a = StoreHandle::new(db.clone(), "store-A");
-    let handle_b = StoreHandle::new(db.clone(), "store-B");
+    let handle_a = db.retrieval_store("store-A").await.unwrap();
+    let handle_b = db.retrieval_store("store-B").await.unwrap();
     handle_a
         .upsert_chunks(vec![make_record(
             "chunk-a",
@@ -225,8 +240,7 @@ async fn find_document_errors_when_id_exists_in_multiple_stores() {
         .await
         .unwrap();
 
-    let api = RuntimeStateApi::new(db);
-    let result = api.find_document("doc-shared").await;
+    let result = db.find_document("doc-shared").await;
     assert!(matches!(
         result,
         Err(Error::Internal {

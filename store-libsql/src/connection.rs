@@ -1,10 +1,6 @@
 //! Single libsql connection over the unified schema.
 //!
 //! Holds a `Database` + `Connection` behind a `tokio::sync::Mutex`. Every
-//! surface in the binary (CLI, MCP, daemon) opens **one** `LibsqlDb` per
-//! process and shares it via `Arc<LibsqlDb>` between a `RuntimeStateApi`
-//! (registry CRUD) and N `StoreHandle`s (one per active store, each
-//! implementing `RetrievalStore` with a `store_id` filter).
 //!
 //! Cross-process serialisation is SQLite's job: WAL admits one writer at a
 //! time per file, `busy_timeout=5000` makes contenders wait, and an
@@ -25,13 +21,11 @@ use crate::vectors::embedding_column_type;
 ///
 /// Cheap to keep behind `Arc`. All writes go through the single mutex-guarded
 /// connection.
-pub struct LibsqlDb {
+pub(crate) struct LibsqlDb {
     /// The owning `Database`. Kept alive for the `Connection`'s lifetime.
     #[allow(dead_code)]
     db: Database,
     conn: Mutex<Connection>,
-    embedding_dim: usize,
-    encoding: VectorEncoding,
 }
 
 impl LibsqlDb {
@@ -42,7 +36,7 @@ impl LibsqlDb {
     /// schema DDL, and validates that the existing `chunks.embedding` column
     /// type matches the requested `(embedding_dim, encoding)`. Rejecting a
     /// mismatched reopen prevents silently corrupting an existing index.
-    pub async fn open(
+    pub(crate) async fn open(
         path: &Path,
         embedding_dim: usize,
         encoding: VectorEncoding,
@@ -94,27 +88,13 @@ impl LibsqlDb {
         Ok(Self {
             db,
             conn: Mutex::new(conn),
-            embedding_dim,
-            encoding,
         })
     }
 
     /// Acquire the underlying connection mutex.
     ///
-    /// Scoped to the crate: only `RuntimeStateApi` and `StoreHandle` reach in
-    /// here. External callers go through those APIs.
     pub(crate) async fn conn(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().await
-    }
-
-    /// Embedding dimension this database was opened with.
-    pub fn embedding_dim(&self) -> usize {
-        self.embedding_dim
-    }
-
-    /// Vector encoding this database was opened with.
-    pub fn encoding(&self) -> VectorEncoding {
-        self.encoding
     }
 }
 
@@ -254,17 +234,6 @@ mod tests {
             Err(other) => panic!("expected InvalidConfig, got: {other:?}"),
             Ok(_) => panic!("expected InvalidConfig, but reopen with different dim succeeded"),
         }
-    }
-
-    #[tokio::test]
-    async fn accessors_return_construction_values() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("localdb.db");
-        let db = LibsqlDb::open(&path, 1024, VectorEncoding::Binary)
-            .await
-            .unwrap();
-        assert_eq!(db.embedding_dim(), 1024);
-        assert_eq!(db.encoding(), VectorEncoding::Binary);
     }
 
     #[tokio::test]

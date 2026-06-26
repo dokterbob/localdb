@@ -1,13 +1,12 @@
-mod db;
-mod runtime_state;
+mod backend;
+mod connection;
+mod registry;
 mod schema;
-mod store_handle;
+mod tenant;
 mod unified_schema;
 mod vectors;
 
-pub use db::LibsqlDb;
-pub use runtime_state::{DocumentInfo, RuntimeStateApi, SourceRow, StoreRow};
-pub use store_handle::StoreHandle;
+pub use backend::SqliteBackend;
 
 use async_trait::async_trait;
 use libsql::{params, Builder, Connection, Database};

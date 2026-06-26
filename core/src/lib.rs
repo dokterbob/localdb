@@ -3,6 +3,7 @@
 //! This crate contains no I/O frameworks. All domain types, the `RetrievalStore`
 //! trait, the `Embedder` trait, and the shared error taxonomy live here.
 
+pub mod backend;
 pub mod chunker;
 pub mod citation;
 pub mod config;
@@ -17,6 +18,9 @@ pub mod search;
 pub mod store;
 pub mod types;
 
+pub use backend::{
+    DocumentInfo, SourceRow, StoreBackend, StoreBackendConfig, StoreBackendConnection, StoreRow,
+};
 pub use chunker::{chunk_document, CharSizer, ChunkOutput, ChunkSizer, ChunkerConfig, TokenSizer};
 /// Re-export key types at the crate root for convenience.
 pub use citation::Citation;

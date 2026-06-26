@@ -27,12 +27,11 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use localdb_core::parser::DocumentMetadata;
+use localdb_core::StoreVisibility;
 use localdb_core::{
     Citation, Error as CoreError, IndexJob, IndexJobScope, QueryRequest, SearchOrchestrator,
     StoreHandle as CoreStoreHandle,
 };
-use localdb_core::{RetrievalStore, StoreVisibility};
-use store_libsql::StoreHandle as LibsqlStoreHandle;
 
 use crate::error::ApiError;
 use crate::state::{AppState, SourceRecord, StoreRecord};
@@ -232,12 +231,16 @@ pub async fn get_document(
     Path(doc_id): Path<String>,
 ) -> Result<Json<DocumentRecord>, ApiError> {
     let info = state
-        .runtime()
+        .backend()
         .find_document(&doc_id)
         .await
         .map_err(ApiError)?
         .ok_or(ApiError(CoreError::DocumentNotFound { id: doc_id.clone() }))?;
-    let handle = LibsqlStoreHandle::new(state.db().clone(), info.store_id.clone());
+    let handle = state
+        .backend()
+        .retrieval_store(&info.store_id)
+        .await
+        .map_err(ApiError)?;
     let chunks = handle
         .get_chunks_for_document(&info.id)
         .await
@@ -406,11 +409,15 @@ pub async fn search(
         let Some(store_id) = store_cfg.id.clone() else {
             continue;
         };
-        let handle = LibsqlStoreHandle::new(state.db().clone(), store_id.clone());
+        let handle = state
+            .backend()
+            .retrieval_store(&store_id)
+            .await
+            .map_err(ApiError)?;
         store_handles.push(CoreStoreHandle {
             id: store_id,
             name: store_cfg.name.clone(),
-            store: Box::new(handle),
+            store: handle,
         });
     }
 
@@ -688,8 +695,7 @@ mod tests {
     }
 
     async fn seed_store_a_chunk(state: &AppState, input: SeedChunkInput) {
-        use localdb_core::{Embedder, RetrievalStore};
-        use store_libsql::StoreHandle;
+        use localdb_core::Embedder;
 
         state.add_store("store-A", "private").await.unwrap();
         let source = state
@@ -730,7 +736,11 @@ mod tests {
             uri: input.uri.to_string(),
             metadata: input.metadata,
         };
-        StoreHandle::new(state.db().clone(), store_id)
+        state
+            .backend()
+            .retrieval_store(&store_id)
+            .await
+            .unwrap()
             .upsert_chunks(vec![chunk])
             .await
             .unwrap();

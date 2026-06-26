@@ -12,30 +12,29 @@
 //! - Vector index entries surviving a row deletion (would surface as
 //!   dangling rowids returned by `vector_top_k`).
 
-use std::sync::Arc;
-
 use tempfile::tempdir;
 
 use localdb_core::parser::DocumentMetadata;
-use localdb_core::store::{ChunkRecord, RetrievalStore};
+use localdb_core::store::ChunkRecord;
 use localdb_core::types::{SourceKind, Span, StoreVisibility};
-use localdb_core::VectorEncoding;
-use store_libsql::{LibsqlDb, RuntimeStateApi, SourceRow, StoreHandle, StoreRow};
+use localdb_core::{SourceRow, StoreBackend, StoreBackendConfig, StoreRow, VectorEncoding};
+use store_libsql::SqliteBackend;
 
-async fn open_db() -> (tempfile::TempDir, Arc<LibsqlDb>) {
+async fn open_db() -> (tempfile::TempDir, SqliteBackend) {
     let dir = tempdir().unwrap();
     let path = dir.path().join("localdb.db");
-    let db = Arc::new(
-        LibsqlDb::open(&path, 4, VectorEncoding::Float32)
-            .await
-            .unwrap(),
-    );
-    (dir, db)
+    let backend = SqliteBackend::open(StoreBackendConfig::local_path(
+        path,
+        4,
+        VectorEncoding::Float32,
+    ))
+    .await
+    .unwrap();
+    (dir, backend)
 }
 
-async fn seed_store(db: Arc<LibsqlDb>, store_id: &str, n_chunks: usize) {
-    let api = RuntimeStateApi::new(db.clone());
-    api.upsert_store(&StoreRow {
+async fn seed_store(db: &SqliteBackend, store_id: &str, n_chunks: usize) {
+    db.upsert_store(&StoreRow {
         id: store_id.to_string(),
         name: store_id.to_string(),
         visibility: StoreVisibility::Private,
@@ -49,7 +48,7 @@ async fn seed_store(db: Arc<LibsqlDb>, store_id: &str, n_chunks: usize) {
     .unwrap();
 
     let source_id = format!("src-{store_id}");
-    api.upsert_source(&SourceRow {
+    db.upsert_source(&SourceRow {
         id: source_id.clone(),
         store_id: store_id.to_string(),
         kind: SourceKind::Path,
@@ -64,7 +63,7 @@ async fn seed_store(db: Arc<LibsqlDb>, store_id: &str, n_chunks: usize) {
     .await
     .unwrap();
 
-    let handle = StoreHandle::new(db, store_id);
+    let handle = db.retrieval_store(store_id).await.unwrap();
     let records: Vec<ChunkRecord> = (0..n_chunks)
         .map(|i| make_record(store_id, &source_id, i))
         .collect();
@@ -96,11 +95,11 @@ fn make_record(store_id: &str, source_id: &str, idx: usize) -> ChunkRecord {
 #[tokio::test]
 async fn delete_store_cascades_to_sources_documents_chunks_fts_and_vec() {
     let (_dir, db) = open_db().await;
-    seed_store(db.clone(), "tenant-a", 5).await;
-    seed_store(db.clone(), "tenant-b", 3).await;
+    seed_store(&db, "tenant-a", 5).await;
+    seed_store(&db, "tenant-b", 3).await;
 
-    let handle_a = StoreHandle::new(db.clone(), "tenant-a");
-    let handle_b = StoreHandle::new(db.clone(), "tenant-b");
+    let handle_a = db.retrieval_store("tenant-a").await.unwrap();
+    let handle_b = db.retrieval_store("tenant-b").await.unwrap();
 
     let stats_a = handle_a.stats().await.unwrap();
     assert_eq!(stats_a.chunk_count, 5);
@@ -123,8 +122,7 @@ async fn delete_store_cascades_to_sources_documents_chunks_fts_and_vec() {
         "vector index should return seeded chunks"
     );
 
-    let api = RuntimeStateApi::new(db.clone());
-    assert!(api.delete_store("tenant-a").await.unwrap());
+    assert!(db.delete_store("tenant-a").await.unwrap());
 
     let stats_a = handle_a.stats().await.unwrap();
     assert_eq!(stats_a.chunk_count, 0, "chunks should cascade from store");
@@ -133,7 +131,7 @@ async fn delete_store_cascades_to_sources_documents_chunks_fts_and_vec() {
         "documents should cascade from store"
     );
     assert!(
-        api.list_sources("tenant-a").await.unwrap().is_empty(),
+        db.list_sources("tenant-a").await.unwrap().is_empty(),
         "sources should cascade from store"
     );
     assert!(
@@ -171,13 +169,12 @@ async fn delete_store_cascades_to_sources_documents_chunks_fts_and_vec() {
 #[tokio::test]
 async fn delete_source_cascades_to_documents_and_chunks() {
     let (_dir, db) = open_db().await;
-    seed_store(db.clone(), "tenant-c", 4).await;
+    seed_store(&db, "tenant-c", 4).await;
 
-    let handle = StoreHandle::new(db.clone(), "tenant-c");
+    let handle = db.retrieval_store("tenant-c").await.unwrap();
     assert_eq!(handle.stats().await.unwrap().chunk_count, 4);
 
-    let api = RuntimeStateApi::new(db.clone());
-    assert!(api.delete_source("src-tenant-c").await.unwrap());
+    assert!(db.delete_source("src-tenant-c").await.unwrap());
 
     let stats = handle.stats().await.unwrap();
     assert_eq!(

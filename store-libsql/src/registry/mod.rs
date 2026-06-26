@@ -11,28 +11,21 @@
 //! `unified_schema::create_sources`); `delete_sources_for_store` is a
 //! convenience for partial cleanup.
 
-use std::sync::Arc;
+#[cfg(test)]
+use crate::connection::LibsqlDb;
 
-use crate::db::LibsqlDb;
-
-mod documents;
-mod rows;
-mod sources;
-mod sql;
-mod stores;
+pub(crate) mod documents;
+pub(crate) mod sources;
+pub(crate) mod sql;
+pub(crate) mod stores;
 
 #[cfg(test)]
 mod tests;
 
-pub use documents::DocumentInfo;
-pub use rows::{SourceRow, StoreRow};
-
-pub struct RuntimeStateApi {
-    db: Arc<LibsqlDb>,
-}
-
-impl RuntimeStateApi {
-    pub fn new(db: Arc<LibsqlDb>) -> Self {
-        Self { db }
-    }
+#[cfg(test)]
+pub(crate) async fn delete_sources_for_store(
+    db: &LibsqlDb,
+    store_id: &str,
+) -> Result<u64, localdb_core::Error> {
+    sources::delete_sources_for_store(db, store_id).await
 }

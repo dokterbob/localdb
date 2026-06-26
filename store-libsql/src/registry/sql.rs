@@ -2,11 +2,9 @@
 //! `sources` modules.
 
 use localdb_core::types::{SourceKind, StoreVisibility};
-use localdb_core::Error;
+use localdb_core::{Error, SourceRow, StoreRow};
 
-use crate::db::map_libsql_err;
-
-use super::rows::{SourceRow, StoreRow};
+use crate::connection::map_libsql_err;
 
 pub(super) fn visibility_to_sql(v: &StoreVisibility) -> &'static str {
     match v {

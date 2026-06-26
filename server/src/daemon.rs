@@ -305,8 +305,6 @@ fn reload_config_file(path: &Path) -> Result<RawConfig, Box<dyn std::error::Erro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use localdb_core::RetrievalStore as _;
-
     fn make_resolved_paths(dir: &Path) -> ResolvedPaths {
         ResolvedPaths {
             config_file: dir.join("config.yaml"),
@@ -577,7 +575,10 @@ mod tests {
                 // In real ingestion, this would call run_ingestion_for_source.
                 tokio::runtime::Handle::current()
                     .block_on(async {
-                        store_libsql::StoreHandle::new(job_state_clone.db().clone(), job_store_id)
+                        job_state_clone
+                            .backend()
+                            .retrieval_store(&job_store_id)
+                            .await?
                             .upsert_chunks(chunks)
                             .await
                     })
@@ -611,7 +612,7 @@ mod tests {
         }
 
         // Verify: search now returns the updated content.
-        let store = store_libsql::StoreHandle::new(state.db().clone(), store_id);
+        let store = state.backend().retrieval_store(&store_id).await.unwrap();
         let stats = store.stats().await.unwrap();
         assert_eq!(
             stats.chunk_count, 1,
