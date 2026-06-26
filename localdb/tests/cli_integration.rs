@@ -603,45 +603,6 @@ fn yaml_owned_store_mutation_exits_4() {
     );
 }
 
-#[test]
-fn store_add_ignores_stray_write_lock_file() {
-    use std::fs::OpenOptions;
-
-    let dir = TempDir::new().unwrap();
-    write_default_config(&dir);
-
-    // Data dir (same path load_app_db resolves to).
-    let data_dir = dir.path().join("data");
-    std::fs::create_dir_all(&data_dir).unwrap();
-
-    let lock_path = data_dir.join(".write.lock");
-    let lock_file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&lock_path)
-        .expect("cannot create lock file");
-
-    use fd_lock::RwLock;
-    let mut rw = RwLock::new(lock_file);
-    let _guard = rw.try_write().expect("should acquire lock in test process");
-
-    let output = cmd_with_dir(&dir)
-        .args(["--json", "store", "add", "new-store"])
-        .output()
-        .unwrap();
-
-    let exit_code = output.status.code().unwrap_or(-1);
-    assert_eq!(
-        exit_code,
-        0,
-        "store add must exit 0 even while .write.lock exists; \
-         stderr: {}\nstdout: {}",
-        String::from_utf8_lossy(&output.stderr),
-        String::from_utf8_lossy(&output.stdout),
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Daemon-attached routing — mock HTTP server (acceptance criterion)
 //

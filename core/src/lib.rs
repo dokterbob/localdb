@@ -41,7 +41,9 @@ pub use search::{
     rerank_noop, rrf_fuse, rrf_score, shape_citation, FusedChunkEntry, QueryRequest, QueryResponse,
     SearchOrchestrator, StoreHandle,
 };
-pub use store::{ChunkRecord, FakeStore, MetadataFilter, RetrievalStore, SearchResult, StoreStats};
+#[cfg(any(test, feature = "test-support"))]
+pub use store::FakeStore;
+pub use store::{ChunkRecord, MetadataFilter, RetrievalStore, SearchResult, StoreStats};
 pub use types::{
     validate_dc_meta_key, validate_msg_meta_key, AclEntry, BackendConfig, Chunk, ChunkingConfig,
     Document, EmbeddingConfig, FederationHop, IndexJob, IndexJobScope, IndexJobState,

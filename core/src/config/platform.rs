@@ -99,11 +99,6 @@ impl PlatformPaths {
         self.data_dir.join("daemon.sock")
     }
 
-    /// Path to the runtime-state DB (`<data_dir>/runtime-state.db`).
-    pub fn runtime_state_db_path(&self) -> PathBuf {
-        self.data_dir.join("runtime-state.db")
-    }
-
     pub fn db_path(&self) -> PathBuf {
         self.data_dir.join("localdb.db")
     }
@@ -141,14 +136,6 @@ mod tests {
         let sock = paths.socket_path();
         assert!(sock.starts_with(&paths.data_dir));
         assert_eq!(sock.file_name().unwrap(), "daemon.sock");
-    }
-
-    #[test]
-    fn runtime_state_db_path_is_inside_data_dir() {
-        let paths = PlatformPaths::resolve().expect("should resolve");
-        let db = paths.runtime_state_db_path();
-        assert!(db.starts_with(&paths.data_dir));
-        assert_eq!(db.file_name().unwrap(), "runtime-state.db");
     }
 
     #[test]

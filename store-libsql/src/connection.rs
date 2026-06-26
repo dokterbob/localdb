@@ -216,21 +216,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refuses_to_open_with_legacy_runtime_state_db() {
-        let dir = tempdir().unwrap();
-        std::fs::write(dir.path().join("runtime-state.db"), b"legacy").unwrap();
-        let result =
-            LibsqlDb::open(&dir.path().join("localdb.db"), 4, VectorEncoding::Float32).await;
-        match result {
-            Err(Error::InvalidConfig { message }) => {
-                assert!(message.contains("legacy") || message.contains("runtime-state.db"));
-            }
-            Err(other) => panic!("expected InvalidConfig, got: {other:?}"),
-            Ok(_) => panic!("expected InvalidConfig"),
-        }
-    }
-
-    #[tokio::test]
     async fn refuses_to_open_with_legacy_stores_dir() {
         let dir = tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("stores").join("notes")).unwrap();

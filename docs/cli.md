@@ -39,10 +39,6 @@ Exit codes are stable API. See [specs/05-surfaces.md §5](../specs/05-surfaces.m
 | `4` | Conflict / locked | `serve` when a daemon is already running on the same data dir |
 | `5` | Unavailable | Daemon unreachable (stale socket) |
 
-**Quirk:** `search --store <unknown-store>` currently exits `0` and prints
-`No indexed stores found.` rather than `exit 3`. This is a known divergence from
-the spec; `store remove <name>` correctly exits `3`.
-
 ---
 
 ## `localdb init`
@@ -507,11 +503,6 @@ $ localdb search -s notes --json hybrid search
 ```
 
 (paths shown from a scratch run)
-
-**Quirk:** `search --store <unknown>` exits `0` with an empty result set and the
-message `No indexed stores found. Run 'localdb index' first.` rather than
-`exit 3`. This matches neither the spec nor the behavior of `store remove` (which
-correctly exits `3`).
 
 ---
 

@@ -67,11 +67,6 @@ impl ResolvedPaths {
         self.data_dir.join("daemon.sock")
     }
 
-    /// Runtime-state DB path.
-    pub fn runtime_state_db_path(&self) -> PathBuf {
-        self.data_dir.join("runtime-state.db")
-    }
-
     pub fn db_path(&self) -> PathBuf {
         self.data_dir.join("localdb.db")
     }

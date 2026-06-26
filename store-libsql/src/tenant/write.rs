@@ -153,6 +153,12 @@ async fn upsert_chunks_inner(
                 message: format!("upsert_chunks heading_path serialize: {e}"),
                 correlation_id: "store_handle_upsert_heading".to_string(),
             })?;
+        let span_start = i64::try_from(record.span.start).map_err(|_| Error::InvalidRequest {
+            message: format!("span value {} does not fit in i64", record.span.start),
+        })?;
+        let span_end = i64::try_from(record.span.end).map_err(|_| Error::InvalidRequest {
+            message: format!("span value {} does not fit in i64", record.span.end),
+        })?;
         let sql = format!(
             "INSERT INTO chunks (store_id, id, document_id, seq, text, span_start, span_end, heading_path, embedding)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, {vector_sql})
@@ -173,8 +179,8 @@ async fn upsert_chunks_inner(
                 record.document_id.as_str(),
                 current_seq,
                 record.text.as_str(),
-                record.span.start as i64,
-                record.span.end as i64,
+                span_start,
+                span_end,
                 heading_path_json.as_str(),
             ],
         )

@@ -32,7 +32,7 @@ pub enum Error {
     JobNotFound { id: String },
 
     /// The runtime-state database write lock could not be acquired within the
-    /// busy timeout (2 s). Another writer held the lock longer than expected.
+    /// busy timeout (5 s). Another writer held the lock longer than expected.
     /// Try again shortly.
     ///
     /// CLI exit code: 4
