@@ -99,6 +99,17 @@ pub enum Command {
         /// Maximum number of results to return (must be >= 1).
         #[arg(long, default_value = "3", value_parser = clap::value_parser!(usize))]
         limit: usize,
+
+        /// Max characters of snippet text shown per result in human-readable output.
+        #[arg(long, default_value = "1000", value_parser = clap::value_parser!(usize))]
+        content_length: usize,
+    },
+
+    /// Alias for `source add`: add one or more sources to a store.
+    Add {
+        /// Source paths or URLs (one or more).
+        #[arg(required = true, num_args = 1..)]
+        sources: Vec<String>,
     },
 }
 
@@ -198,7 +209,16 @@ fn main() {
             dir,
             strict,
         } => cli::run_index(&ctx, source.as_deref(), dir.as_deref(), *strict),
-        Command::Search { query, limit } => cli::run_search(&ctx, &query.join(" "), *limit),
+        Command::Search {
+            query,
+            limit,
+            content_length,
+        } => cli::run_search(&ctx, &query.join(" "), *limit, *content_length),
+        Command::Add { sources } => {
+            for source in sources {
+                cli::run_source_add(&ctx, source);
+            }
+        }
     }
 }
 
@@ -221,7 +241,7 @@ mod tests {
         let subcommand_names: Vec<&str> = cmd.get_subcommands().map(|sc| sc.get_name()).collect();
 
         for expected in &[
-            "init", "serve", "mcp", "status", "store", "source", "index", "search",
+            "init", "serve", "mcp", "status", "store", "source", "index", "search", "add",
         ] {
             assert!(
                 subcommand_names.contains(expected),
@@ -282,11 +302,28 @@ mod tests {
     #[test]
     fn search_query_trailing_var_arg() {
         let cli = Cli::try_parse_from(["localdb", "search", "machine", "learning"]).unwrap();
-        if let Command::Search { query, limit } = cli.command {
+        if let Command::Search {
+            query,
+            limit,
+            content_length,
+        } = cli.command
+        {
             assert_eq!(query.join(" "), "machine learning");
             assert_eq!(limit, 3);
+            assert_eq!(content_length, 1000);
         } else {
             panic!("expected Search command");
+        }
+    }
+
+    /// `localdb add <path>` parses to Command::Add.
+    #[test]
+    fn add_alias_parses() {
+        let cli = Cli::try_parse_from(["localdb", "add", "/some/path"]).unwrap();
+        if let Command::Add { sources } = cli.command {
+            assert_eq!(sources, vec!["/some/path"]);
+        } else {
+            panic!("expected Add command");
         }
     }
 
