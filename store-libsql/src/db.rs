@@ -71,9 +71,7 @@ impl LibsqlDb {
 
         // PRAGMA ordering matters. Setting `busy_timeout` first ensures the
         // subsequent `journal_mode=WAL` switch waits on a contended writer
-        // instead of failing with `SQLITE_BUSY`. Matches the PR #92 review
-        // feedback that landed for both `RuntimeStateDb` and the legacy
-        // `LibsqlStore::open` paths on main.
+        // instead of failing with `SQLITE_BUSY`.
         conn.query("PRAGMA busy_timeout=5000", ())
             .await
             .map_err(map_libsql_err)?;

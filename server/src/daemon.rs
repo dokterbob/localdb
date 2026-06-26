@@ -494,6 +494,17 @@ mod tests {
         let state = AppState::new(yaml_config, dir_real.to_path_buf(), queue.clone())
             .await
             .unwrap();
+        state.add_store("store-A", "private").await.unwrap();
+        let source = state
+            .add_source(
+                "store-A",
+                "path",
+                serde_json::json!({"root": "/tmp"}),
+                "prose",
+            )
+            .await
+            .unwrap();
+        let store_id = source.store_id.clone();
 
         // Create initial file.
         let watched_file = dir_real.join("doc.md");
@@ -539,10 +550,11 @@ mod tests {
             .unwrap();
 
         let job_state_clone = state.clone();
+        let job_store_id = store_id.clone();
         let chunks = vec![ChunkRecord {
             id: "watcher-chunk-1".to_string(),
             document_id: "watcher-doc-1".to_string(),
-            store_id: "store-A".to_string(),
+            store_id: store_id.clone(),
             text: updated_text.to_string(),
             span: localdb_core::types::Span::new(0, updated_text.len()),
             heading_path: vec![],
@@ -550,8 +562,8 @@ mod tests {
             policy_version: "v1".to_string(),
             fetched_at: "2026-06-10T12:00:00Z".to_string(),
             content_hash: "watcher-hash-1".to_string(),
-            origin_store: "store-A".to_string(),
-            source_id: "src-watcher".to_string(),
+            origin_store: store_id.clone(),
+            source_id: source.id,
             source_kind: "path".to_string(),
             mime: Some("text/markdown".to_string()),
             uri: format!("file://{}", watched_file.display()),
@@ -564,7 +576,11 @@ mod tests {
                 // This closure runs on a blocking thread and produces the chunk data.
                 // In real ingestion, this would call run_ingestion_for_source.
                 tokio::runtime::Handle::current()
-                    .block_on(job_state_clone.upsert_chunks(chunks))
+                    .block_on(async {
+                        store_libsql::StoreHandle::new(job_state_clone.db().clone(), job_store_id)
+                            .upsert_chunks(chunks)
+                            .await
+                    })
                     .map_err(|e| format!("upsert failed: {}", e))?;
                 Ok(localdb_core::IndexJobStats {
                     docs_indexed: 1,
@@ -595,7 +611,7 @@ mod tests {
         }
 
         // Verify: search now returns the updated content.
-        let store = state.retrieval_store();
+        let store = store_libsql::StoreHandle::new(state.db().clone(), store_id);
         let stats = store.stats().await.unwrap();
         assert_eq!(
             stats.chunk_count, 1,

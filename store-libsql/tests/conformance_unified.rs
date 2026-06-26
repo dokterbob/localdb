@@ -15,7 +15,7 @@ use tempfile::tempdir;
 use localdb_core::store::conformance;
 use localdb_core::store::{ChunkRecord, RetrievalStore};
 use localdb_core::types::{SourceKind, Span, StoreVisibility};
-use localdb_core::VectorEncoding;
+use localdb_core::{Error, VectorEncoding};
 use store_libsql::{LibsqlDb, RuntimeStateApi, SourceRow, StoreHandle, StoreRow};
 
 /// Open a fresh DB and register the stores/source the conformance records
@@ -178,6 +178,62 @@ async fn delete_by_store_cross_handle() {
         1,
         "store-B should be untouched"
     );
+}
+
+#[tokio::test]
+async fn upsert_chunks_rejects_cross_tenant_record() {
+    let (_dir, db) = setup().await;
+    let handle = StoreHandle::new(db, "store-A");
+    let result = handle
+        .upsert_chunks(vec![make_record(
+            "chunk-cross",
+            "doc-cross",
+            "store-B",
+            vec![0.5, 0.5],
+        )])
+        .await;
+    assert!(matches!(
+        result,
+        Err(Error::Internal {
+            correlation_id,
+            ..
+        }) if correlation_id == "store_handle_tenant_violation"
+    ));
+}
+
+#[tokio::test]
+async fn find_document_errors_when_id_exists_in_multiple_stores() {
+    let (_dir, db) = setup().await;
+    let handle_a = StoreHandle::new(db.clone(), "store-A");
+    let handle_b = StoreHandle::new(db.clone(), "store-B");
+    handle_a
+        .upsert_chunks(vec![make_record(
+            "chunk-a",
+            "doc-shared",
+            "store-A",
+            vec![1.0, 0.0],
+        )])
+        .await
+        .unwrap();
+    handle_b
+        .upsert_chunks(vec![make_record(
+            "chunk-b",
+            "doc-shared",
+            "store-B",
+            vec![0.0, 1.0],
+        )])
+        .await
+        .unwrap();
+
+    let api = RuntimeStateApi::new(db);
+    let result = api.find_document("doc-shared").await;
+    assert!(matches!(
+        result,
+        Err(Error::Internal {
+            correlation_id,
+            ..
+        }) if correlation_id == "runtime_state_find_doc_ambiguous"
+    ));
 }
 
 fn make_record(id: &str, doc_id: &str, store_id: &str, embedding: Vec<f32>) -> ChunkRecord {

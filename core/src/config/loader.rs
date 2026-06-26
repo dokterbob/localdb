@@ -76,6 +76,11 @@ impl ResolvedPaths {
     pub fn runtime_state_db_path(&self) -> PathBuf {
         self.data_dir.join("runtime-state.db")
     }
+
+    /// Unified single-file DB path (`<data_dir>/localdb.db`).
+    pub fn unified_db_path(&self) -> PathBuf {
+        self.data_dir.join("localdb.db")
+    }
 }
 
 /// Load config from a file, with options for overrides.

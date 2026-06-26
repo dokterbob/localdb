@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use crate::db::LibsqlDb;
 
+mod documents;
 mod rows;
 mod sources;
 mod sql;
@@ -23,6 +24,7 @@ mod stores;
 #[cfg(test)]
 mod tests;
 
+pub use documents::DocumentInfo;
 pub use rows::{SourceRow, StoreRow};
 
 pub struct RuntimeStateApi {

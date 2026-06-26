@@ -110,27 +110,17 @@ impl RuntimeStateApi {
     pub async fn find_source_by_root_or_url(
         &self,
         value: &str,
-        store_id: Option<&str>,
+        store_id: &str,
     ) -> Result<Option<SourceRow>, Error> {
         let conn = self.db.conn().await;
-        let mut rows = match store_id {
-            Some(sid) => conn
-                .query(
-                    "SELECT id, store_id, kind, root, url, include, exclude, preset, refresh, created_at
-                     FROM sources WHERE store_id = ? AND (root = ? OR url = ?) LIMIT 1",
-                    libsql::params![sid.to_string(), value.to_string(), value.to_string()],
-                )
-                .await
-                .map_err(map_libsql_err)?,
-            None => conn
-                .query(
-                    "SELECT id, store_id, kind, root, url, include, exclude, preset, refresh, created_at
-                     FROM sources WHERE root = ? OR url = ? LIMIT 1",
-                    libsql::params![value.to_string(), value.to_string()],
-                )
-                .await
-                .map_err(map_libsql_err)?,
-        };
+        let mut rows = conn
+            .query(
+                "SELECT id, store_id, kind, root, url, include, exclude, preset, refresh, created_at
+                 FROM sources WHERE store_id = ? AND (root = ? OR url = ?) LIMIT 1",
+                libsql::params![store_id.to_string(), value.to_string(), value.to_string()],
+            )
+            .await
+            .map_err(map_libsql_err)?;
         match rows.next().await.map_err(map_libsql_err)? {
             Some(row) => row_to_source(&row).map(Some),
             None => Ok(None),

@@ -111,6 +111,11 @@ impl PlatformPaths {
     pub fn runtime_state_db_path(&self) -> PathBuf {
         self.data_dir.join("runtime-state.db")
     }
+
+    /// Path to the unified single-file DB (`<data_dir>/localdb.db`).
+    pub fn unified_db_path(&self) -> PathBuf {
+        self.data_dir.join("localdb.db")
+    }
 }
 
 #[cfg(test)]

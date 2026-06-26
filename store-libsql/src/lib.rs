@@ -6,7 +6,7 @@ mod unified_schema;
 mod vectors;
 
 pub use db::LibsqlDb;
-pub use runtime_state::{RuntimeStateApi, SourceRow, StoreRow};
+pub use runtime_state::{DocumentInfo, RuntimeStateApi, SourceRow, StoreRow};
 pub use store_handle::StoreHandle;
 
 use async_trait::async_trait;

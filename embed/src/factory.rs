@@ -3,9 +3,40 @@
 //! See specs/03-config.md §6 for provider configuration details.
 
 use localdb_core::config::schema::{EmbeddingPolicy, ProviderConfig};
-use localdb_core::Embedder;
+use localdb_core::{Embedder, VectorEncoding};
 
 use crate::error::EmbedError;
+
+/// Statically map an `EmbeddingPolicy` to `(embedding_dim, encoding)` without
+/// constructing an embedder. The unified DB needs these at open time even for
+/// metadata-only commands; constructing the embedder there would trigger a
+/// ~706 MB model download for the default `local` provider. Values mirror the
+/// concrete `Embedder` impls; round-trip parity is asserted in unit tests.
+pub fn infer_dim_encoding(
+    policy: &EmbeddingPolicy,
+    _providers: &[ProviderConfig],
+) -> Result<(usize, VectorEncoding), EmbedError> {
+    match (policy.provider.as_str(), policy.model.as_str()) {
+        ("fake", "bge-small-en-v1.5") => Ok((384, VectorEncoding::Float32)),
+        ("fake", _) => Ok((128, VectorEncoding::Float32)),
+
+        ("local" | "local-coreml" | "local-onnx", "pplx-embed-context-v1-0.6b") => {
+            Ok((1024, VectorEncoding::Binary))
+        }
+        ("local" | "local-onnx", "pplx-embed-v1-0.6b") => Ok((1024, VectorEncoding::Binary)),
+        ("local" | "local-onnx", "bge-small-en-v1.5") => Ok((384, VectorEncoding::Float32)),
+
+        ("openai-compatible", _) => Ok((1536, VectorEncoding::Float32)),
+        ("perplexity", _) => Ok((1024, VectorEncoding::Float32)),
+        ("voyage", _) => Ok((1024, VectorEncoding::Float32)),
+
+        (provider, model) => Err(EmbedError::Internal(format!(
+            "cannot infer embedding shape for provider '{provider}' model '{model}'. \
+             Supported providers: 'fake', 'local', 'local-coreml', 'local-onnx', \
+             'openai-compatible', 'perplexity', 'voyage'."
+        ))),
+    }
+}
 
 /// Construct a boxed `Embedder` from an `EmbeddingPolicy` and the list of
 /// provider configs declared in the YAML config.
@@ -389,6 +420,89 @@ mod tests {
             matches!(result, Err(EmbedError::ProviderNotConfigured(_))),
             "unset api key env var should return ProviderNotConfigured, got: {:?}",
             result.err()
+        );
+    }
+
+    #[test]
+    fn infer_dim_encoding_matches_fake_default() {
+        let policy = fake_policy("fake", "unknown-model");
+        let (dim, encoding) = infer_dim_encoding(&policy, &[]).unwrap();
+        let embedder = create_embedder(&policy, &[], None).unwrap();
+        assert_eq!(dim, embedder.embedding_dim());
+        assert_eq!(encoding, embedder.vector_encoding());
+    }
+
+    #[test]
+    fn infer_dim_encoding_matches_fake_bge_dim() {
+        let policy = fake_policy("fake", "bge-small-en-v1.5");
+        let (dim, encoding) = infer_dim_encoding(&policy, &[]).unwrap();
+        let embedder = create_embedder(&policy, &[], None).unwrap();
+        assert_eq!(dim, embedder.embedding_dim());
+        assert_eq!(encoding, embedder.vector_encoding());
+    }
+
+    #[test]
+    fn infer_dim_encoding_known_hosted_pairs() {
+        let cases = [
+            ("openai-compatible", "text-embedding-3-small", 1536),
+            ("perplexity", "pplx-embed-context-v1", 1024),
+            ("voyage", "voyage-context-3", 1024),
+        ];
+        for (provider, model, expected_dim) in cases {
+            let policy = fake_policy(provider, model);
+            let (dim, encoding) = infer_dim_encoding(&policy, &[]).unwrap();
+            assert_eq!(dim, expected_dim, "{provider}/{model} dim");
+            assert_eq!(
+                encoding,
+                VectorEncoding::Float32,
+                "{provider}/{model} encoding"
+            );
+        }
+    }
+
+    #[test]
+    fn infer_dim_encoding_known_local_pairs() {
+        let cases = [
+            (
+                "local",
+                "pplx-embed-context-v1-0.6b",
+                1024,
+                VectorEncoding::Binary,
+            ),
+            (
+                "local-onnx",
+                "pplx-embed-context-v1-0.6b",
+                1024,
+                VectorEncoding::Binary,
+            ),
+            (
+                "local-coreml",
+                "pplx-embed-context-v1-0.6b",
+                1024,
+                VectorEncoding::Binary,
+            ),
+            (
+                "local-onnx",
+                "bge-small-en-v1.5",
+                384,
+                VectorEncoding::Float32,
+            ),
+        ];
+        for (provider, model, expected_dim, expected_encoding) in cases {
+            let policy = fake_policy(provider, model);
+            let (dim, encoding) = infer_dim_encoding(&policy, &[]).unwrap();
+            assert_eq!(dim, expected_dim, "{provider}/{model} dim");
+            assert_eq!(encoding, expected_encoding, "{provider}/{model} encoding");
+        }
+    }
+
+    #[test]
+    fn infer_dim_encoding_rejects_unknown_provider() {
+        let policy = fake_policy("nonexistent", "model");
+        let err = infer_dim_encoding(&policy, &[]).unwrap_err();
+        assert!(
+            matches!(err, EmbedError::Internal(_)),
+            "unknown provider should fail, got: {err:?}"
         );
     }
 }

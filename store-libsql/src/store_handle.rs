@@ -47,6 +47,19 @@ impl StoreHandle {
 #[async_trait]
 impl RetrievalStore for StoreHandle {
     async fn upsert_chunks(&self, records: Vec<ChunkRecord>) -> Result<usize, Error> {
+        for record in &records {
+            if record.store_id != self.store_id {
+                return Err(Error::Internal {
+                    message: format!(
+                        "chunk '{id}' has store_id '{rec}' but handle owns store_id '{handle}'",
+                        id = record.id,
+                        rec = record.store_id,
+                        handle = self.store_id
+                    ),
+                    correlation_id: "store_handle_tenant_violation".to_string(),
+                });
+            }
+        }
         let conn = self.db.conn().await;
         let count = records.len();
         let encoding = self.db.encoding();

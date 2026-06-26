@@ -291,7 +291,7 @@ async fn find_source_by_root_finds_it() {
         .await
         .unwrap();
     let found = api
-        .find_source_by_root_or_url("/docs/notes", None)
+        .find_source_by_root_or_url("/docs/notes", "store-1")
         .await
         .unwrap();
     assert_eq!(found.unwrap().id, "src-1");
@@ -307,7 +307,7 @@ async fn find_source_by_url_finds_it() {
         .await
         .unwrap();
     let found = api
-        .find_source_by_root_or_url("https://example.com", None)
+        .find_source_by_root_or_url("https://example.com", "store-1")
         .await
         .unwrap();
     assert_eq!(found.unwrap().id, "src-1");
@@ -325,12 +325,12 @@ async fn find_source_scoped_to_store() {
         .await
         .unwrap();
     let f1 = api
-        .find_source_by_root_or_url("/shared", Some("s1"))
+        .find_source_by_root_or_url("/shared", "s1")
         .await
         .unwrap();
     assert_eq!(f1.unwrap().id, "src-a");
     let f2 = api
-        .find_source_by_root_or_url("/shared", Some("s2"))
+        .find_source_by_root_or_url("/shared", "s2")
         .await
         .unwrap();
     assert_eq!(f2.unwrap().id, "src-b");
