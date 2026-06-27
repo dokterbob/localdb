@@ -38,7 +38,7 @@ capability-delegation-without-relay.
 ## 3. Qdrant Edge watch-item
 
 Qdrant Edge (in-process Qdrant) was pre-GA (~0.6.x, unstable) as of early 2026. It becomes a
-candidate to join — not necessarily replace — LanceDB as an embedded backend when **all** hold:
+candidate to join — not necessarily replace — libsql as an embedded backend when **all** hold:
 
 1. GA / 1.0 release with a stability commitment.
 2. Hybrid (dense + sparse) query API confirmed working from the **Rust** crate.

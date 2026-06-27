@@ -91,11 +91,11 @@ localdb store list
 ```
 
 ```
-notes [lancedb] (runtime)
+notes [libsql] (runtime)
 ```
 
-The `(runtime)` label means the store was created via `store add` and lives in the runtime
-state database. The `[lancedb]` label is the storage backend.
+The `(runtime)` label means the store was created via `store add` and lives in the unified
+database. The `[libsql]` label is the storage backend.
 
 > **YAML-declared stores:** Stores declared in `config.yaml` under the `stores:` key appear in
 > `store list` as `(yaml)` but cannot be indexed yet — `localdb index` will return
@@ -143,11 +143,9 @@ After indexing, the on-disk layout under the data directory looks like:
 
 ```
 data/
-  cli-sources.redb
-  runtime-state.redb
-  stores/
-    notes/
-      chunks.lance
+  localdb.db            # unified SQLite database (stores, sources, documents, chunks, FTS5, vectors)
+  localdb.db-wal        # WAL sidecar (libsql managed)
+  localdb.db-shm        # shared-memory sidecar (libsql managed)
 ```
 
 ## Step 7 — Search
@@ -238,7 +236,7 @@ localdb status
 ```
 daemon: not running (embedded mode)
 stores (1):
-  notes [lancedb] (runtime)
+  notes [libsql] (runtime)
 ```
 
 ## What's next

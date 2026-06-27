@@ -11,10 +11,8 @@ use serde_json::Value;
 
 use localdb_core::{
     citation::Citation,
-    error::Error,
-    ingestion::DocumentRecord,
     search::{QueryRequest, QueryResponse, SearchOrchestrator, StoreHandle},
-    store::{ChunkRecord, MetadataFilter, RetrievalStore, SearchResult, StoreStats},
+    store::{RetrievalStore, StoreStats},
     Embedder,
 };
 
@@ -249,14 +247,12 @@ pub async fn tool_search(
         return CallToolResult::success_json(&v);
     }
 
-    // Build StoreHandle list for the orchestrator.
-    // ArcStore wraps an Arc so it satisfies Box<dyn RetrievalStore> (RetrievalStore: 'static).
     let store_handles: Vec<StoreHandle> = selected_arcs
         .into_iter()
         .map(|(id, name, arc)| StoreHandle {
             id,
             name,
-            store: Box::new(ArcStore(arc)),
+            store: arc,
         })
         .collect();
 
@@ -451,71 +447,13 @@ pub async fn tool_get_document(
 }
 
 // ---------------------------------------------------------------------------
-// ArcStore wrapper — allows using Arc<dyn RetrievalStore> as Box<dyn RetrievalStore>
-// ---------------------------------------------------------------------------
-
-/// Wraps an `Arc<dyn RetrievalStore>` so it can be placed in a `Box<dyn RetrievalStore>`.
-///
-/// `Box<dyn RetrievalStore>` requires `'static`, but `Arc` satisfies that constraint.
-struct ArcStore(Arc<dyn RetrievalStore>);
-
-#[async_trait::async_trait]
-impl RetrievalStore for ArcStore {
-    async fn upsert_chunks(&self, records: Vec<ChunkRecord>) -> Result<usize, Error> {
-        self.0.upsert_chunks(records).await
-    }
-
-    async fn delete_by_document(&self, document_id: &str) -> Result<usize, Error> {
-        self.0.delete_by_document(document_id).await
-    }
-
-    async fn delete_by_store(&self, store_id: &str) -> Result<usize, Error> {
-        self.0.delete_by_store(store_id).await
-    }
-
-    async fn dense_search(
-        &self,
-        query_vector: &[f32],
-        limit: usize,
-        filters: &[MetadataFilter],
-    ) -> Result<Vec<SearchResult>, Error> {
-        self.0.dense_search(query_vector, limit, filters).await
-    }
-
-    async fn bm25_search(
-        &self,
-        query_text: &str,
-        limit: usize,
-        filters: &[MetadataFilter],
-    ) -> Result<Vec<SearchResult>, Error> {
-        self.0.bm25_search(query_text, limit, filters).await
-    }
-
-    async fn stats(&self) -> Result<StoreStats, Error> {
-        self.0.stats().await
-    }
-
-    async fn get_chunk(&self, chunk_id: &str) -> Result<Option<ChunkRecord>, Error> {
-        self.0.get_chunk(chunk_id).await
-    }
-
-    async fn get_chunks_for_document(&self, document_id: &str) -> Result<Vec<ChunkRecord>, Error> {
-        self.0.get_chunks_for_document(document_id).await
-    }
-
-    async fn list_indexed_documents(&self) -> Result<Vec<DocumentRecord>, Error> {
-        self.0.list_indexed_documents().await
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use localdb_core::{embedder::FakeEmbedder, store::FakeStore, types::Span};
+    use localdb_core::{embedder::FakeEmbedder, store::FakeStore, types::Span, ChunkRecord};
 
     // -----------------------------------------------------------------------
     // Helpers

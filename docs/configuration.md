@@ -81,8 +81,9 @@ server:
 | `bind` | `127.0.0.1` | Set to `0.0.0.0` to listen on all interfaces |
 | `port` | `7700` | Set to `0` to let the OS assign an ephemeral port |
 
-> **Experimental:** the HTTP daemon is an early preview. It uses an in-memory store and
-> does **not** see data indexed via the CLI. See [Daemon limitations](#daemon-limitations).
+> **Experimental:** the HTTP daemon is an early preview. It opens the same unified database
+> (`<data_dir>/localdb.db`) as the CLI, so CLI-indexed data IS visible. The one open limitation
+> is that ingestion via `POST /v1/jobs` is a no-op. See [Daemon limitations](#daemon-limitations).
 
 ---
 
@@ -92,7 +93,7 @@ All path overrides are optional. Platform defaults apply to any key you omit.
 
 ```yaml
 paths:
-  data: ~/localdb/data      # index data, runtime-state DB, unix socket
+  data: ~/localdb/data      # unified database (localdb.db), unix socket
   models: ~/localdb/models  # embedding model cache
   logs: ~/localdb/logs      # structured log output
 ```
@@ -101,7 +102,7 @@ paths:
 
 | Item | macOS | Linux |
 |------|-------|-------|
-| Data (indexes, DB, socket) | `~/Library/Application Support/com.localdb.localdb.localdb/data/` | `$XDG_DATA_HOME/localdb/` |
+| Data (unified database, socket) | `~/Library/Application Support/com.localdb.localdb.localdb/data/` | `$XDG_DATA_HOME/localdb/` |
 | Model cache | `~/Library/Caches/com.localdb.localdb.localdb/models/` | `$XDG_CACHE_HOME/localdb/models/` |
 | Logs | `~/Library/Logs/localdb/` | `$XDG_STATE_HOME/localdb/logs/` |
 
@@ -140,7 +141,7 @@ A list of YAML-declared stores. Each store entry can carry inline sources.
 stores:
   - name: handbook
     visibility: private      # private (default) | shared (not yet functional)
-    backend: lancedb         # only lancedb is supported in v1
+    backend: libsql          # only libsql is supported in v1
     indexing:                # optional; null = inherit defaults
       chunking:
         preset_overrides: {}
@@ -164,7 +165,7 @@ stores:
 |-------|---------|-------------|
 | `name` | — (required) | Unique store name |
 | `visibility` | `private` | `private` or `shared` (`shared` not functional in v1) |
-| `backend` | `lancedb` | Storage backend; only `lancedb` in v1 |
+| `backend` | `libsql` | Storage backend; only `libsql` in v1 |
 | `indexing` | `null` (inherit) | Override the global `defaults.indexing` block |
 | `sources` | `[]` | Inline source declarations |
 
@@ -222,7 +223,7 @@ localdb splits configuration ownership into two layers:
 | Layer | Owner | Storage | Mutated by |
 |-------|-------|---------|-----------|
 | **Declarative bootstrap config** | User | YAML file | Text editor only; never rewritten by the machine |
-| **Mutable runtime state** | Machine | `<data>/runtime-state.redb` | `store add`, `source add`, HTTP API |
+| **Mutable runtime state** | Machine | `<data>/localdb.db` (unified SQLite database) | `store add`, `source add`, HTTP API |
 
 YAML wins for any object it declares (matched by store name / source identity). YAML-owned
 objects are read-only via the API. Objects created via CLI or API are runtime-owned and never
@@ -274,15 +275,14 @@ No such file or directory (os error 2)
 
 The HTTP daemon (`localdb serve`) is an **experimental preview** in v1. Key limitations:
 
-- The daemon uses an in-memory store. It does not read from or write to the LanceDB indexes
-  created by CLI indexing (`localdb index`). Search via the HTTP API returns empty results
-  even when CLI-indexed data exists.
-- While the daemon is running, CLI commands on the same data directory fail with
-  `error: internal error ... cannot open runtime-state DB ... Database already open` (exit 1)
-  because the CLI opens the redb database before attempting to route to the daemon.
-  Stop the daemon before using CLI commands.
-- If the daemon process is killed (not stopped cleanly), the unix socket
-  `<data_dir>/daemon.sock` is not cleaned up. Subsequent CLI commands report
+- **Ingestion via `POST /v1/jobs` is a no-op.** The endpoint accepts the request, transitions
+  the job state machine (`pending → done`), and reports `chunks_written: 0`. To actually index,
+  run `localdb index` from the CLI — this works while the daemon is running because both
+  processes share the same unified database and concurrent writers serialise via SQLite WAL
+  + `busy_timeout=5000`. Daemon-side reads (`/v1/search`, `/v1/documents/{id}`, `/v1/status`)
+  see CLI-indexed data correctly.
+- **Stale socket after a crash.** If the daemon process is killed (not stopped cleanly), the
+  unix socket `<data_dir>/daemon.sock` is not cleaned up. Subsequent CLI commands report
   `daemon: running` and searches exit with `error: daemon is unreachable` (exit 5).
   Fix: `rm <data_dir>/daemon.sock`.
 
@@ -324,7 +324,7 @@ defaults:
 stores:
   - name: handbook
     visibility: private
-    backend: lancedb
+    backend: libsql
     sources:
       - kind: path
         root: ~/docs/handbook

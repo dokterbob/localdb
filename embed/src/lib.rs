@@ -55,7 +55,7 @@ mod coreml;
 pub mod pplx_context_coreml;
 
 pub use error::EmbedError;
-pub use factory::create_embedder;
+pub use factory::{create_embedder, infer_dim_encoding};
 pub use model_cache::{ModelCache, ModelSpec};
 pub use openai::OpenAiEmbedder;
 pub use perplexity::PerplexityEmbedder;

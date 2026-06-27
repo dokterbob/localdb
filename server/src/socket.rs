@@ -21,19 +21,20 @@ pub struct SocketGuard {
 impl SocketGuard {
     /// Bind a Unix domain socket at `socket_path` and return a guard.
     ///
-    /// This creates the socket file on disk. Any previous (stale) socket at
-    /// the same path is removed first so bind always succeeds.
-    ///
     /// Returns an error if the bind fails (permissions, path issues, etc.).
     pub fn new(socket_path: &Path) -> Result<Self, std::io::Error> {
-        // Ensure parent directory exists.
         if let Some(parent) = socket_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
-        // Remove any stale socket file from a previous run.
         if socket_path.exists() {
-            let _ = std::fs::remove_file(socket_path);
+            if probe_daemon(socket_path) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    format!("socket already bound at {}", socket_path.display()),
+                ));
+            }
+            std::fs::remove_file(socket_path)?;
         }
 
         let listener = tokio::net::UnixListener::bind(socket_path)?;
