@@ -261,12 +261,11 @@ fn print_json(value: &serde_json::Value) {
 }
 
 /// Format a chunk snippet for terminal display: collapse internal runs of
-/// whitespace into single spaces, then cap at ~500 chars, appending `…` if cut.
-fn format_snippet(snippet: &str) -> String {
-    const MAX_CHARS: usize = 500;
+/// whitespace into single spaces, then cap at `max_chars`, appending `…` if cut.
+fn format_snippet(snippet: &str, max_chars: usize) -> String {
     let normalized = snippet.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.chars().count() > MAX_CHARS {
-        let truncated: String = normalized.chars().take(MAX_CHARS).collect();
+    if normalized.chars().count() > max_chars {
+        let truncated: String = normalized.chars().take(max_chars).collect();
         format!("{truncated}…")
     } else {
         normalized
@@ -1808,8 +1807,8 @@ async fn run_index_async(
     }
 }
 
-/// `localdb search <query> [--limit N]`
-pub fn run_search(ctx: &CliContext, query: &str, limit: usize) {
+/// `localdb search <query> [--limit N] [--content-length N]`
+pub fn run_search(ctx: &CliContext, query: &str, limit: usize, content_length: usize) {
     // F9: Reject --limit 0.
     if limit == 0 {
         exit_err(
@@ -1828,10 +1827,10 @@ pub fn run_search(ctx: &CliContext, query: &str, limit: usize) {
     }
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    rt.block_on(run_search_async(ctx, query, limit));
+    rt.block_on(run_search_async(ctx, query, limit, content_length));
 }
 
-async fn run_search_async(ctx: &CliContext, query: &str, limit: usize) {
+async fn run_search_async(ctx: &CliContext, query: &str, limit: usize, content_length: usize) {
     use localdb_core::search::{QueryRequest, SearchOrchestrator, StoreHandle};
 
     // F1-cli: use lenient loader so search works even with malformed config.
@@ -1872,7 +1871,7 @@ async fn run_search_async(ctx: &CliContext, query: &str, limit: usize) {
                             let uri = cit.get("uri").and_then(|u| u.as_str()).unwrap_or("?");
                             let snippet = cit.get("snippet").and_then(|s| s.as_str()).unwrap_or("");
                             println!("{}. {}", i + 1, uri);
-                            println!("   {}", format_snippet(snippet));
+                            println!("   {}", format_snippet(snippet, content_length));
                             println!();
                         }
                     }
@@ -2002,7 +2001,7 @@ async fn run_search_async(ctx: &CliContext, query: &str, limit: usize) {
                         format!(" > {}", citation.heading_path.join(" > "))
                     };
                     println!("{}. {}{}", i + 1, citation.uri, heading);
-                    println!("   {}", format_snippet(&citation.snippet));
+                    println!("   {}", format_snippet(&citation.snippet, content_length));
                     println!();
                 }
             }
@@ -2208,16 +2207,24 @@ mod tests {
 
     #[test]
     fn format_snippet_collapses_whitespace() {
-        assert_eq!(format_snippet("a\n\n  b   c"), "a b c");
+        assert_eq!(format_snippet("a\n\n  b   c", 500), "a b c");
     }
 
     #[test]
     fn format_snippet_truncates_long_input() {
         let base: String = "a".repeat(498);
         let input = format!("{base}é extra text that should be cut");
-        let result = format_snippet(&input);
-        assert!(result.ends_with('…'));
-        assert_eq!(result.chars().count(), 501);
+        let result = format_snippet(&input, 500);
+        assert!(result.ends_with('…'), "should end with ellipsis");
+        assert_eq!(result.chars().count(), 501, "500 chars + ellipsis char");
+    }
+
+    #[test]
+    fn format_snippet_respects_custom_max_chars() {
+        let input = "word ".repeat(100);
+        let result = format_snippet(input.trim(), 50);
+        assert!(result.ends_with('…'), "should end with ellipsis");
+        assert_eq!(result.chars().count(), 51, "50 chars + ellipsis char");
     }
 
     #[test]

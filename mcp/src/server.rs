@@ -49,6 +49,11 @@ fn search_schema() -> Value {
                 "description": "Maximum number of results to return (default: 10, max: 100)",
                 "minimum": 1,
                 "maximum": 100
+            },
+            "content_length": {
+                "type": "integer",
+                "description": "Max characters of snippet text per result in the text rendering (default: 400)",
+                "minimum": 1
             }
         },
         "required": ["query"]

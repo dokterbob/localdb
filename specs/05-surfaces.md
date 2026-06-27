@@ -22,8 +22,9 @@ Single binary, subcommand tree. Global flags: `--config`, `--json`, `--store <na
 | `status` | Stores, doc/chunk counts, policy staleness, daemon state, config ownership (YAML- vs runtime-owned) | reads directly | queries daemon |
 | `store add/list/remove` | Manage runtime-owned stores | direct write | routed to daemon |
 | `source add/list/remove` | Manage sources on a store | direct write | routed to daemon |
+| `add <path|url>...` | Alias for `source add` — add one or more sources to a store | direct write | routed to daemon |
 | `index [--store S] [--source ID] [--strict]` | One-shot scan & index; creates IndexJob | runs job synchronously, progress to stderr | submits job, polls, streams progress |
-| `search <query>...` | Hybrid search with citations (options-first: flags must precede query words; trailing tokens are captured verbatim as the query) | embedded read | via API |
+| `search <query>... [--limit N] [--content-length N]` | Hybrid search with citations; `--content-length` caps human-readable snippet chars (default 1000, JSON output always full text) | embedded read | via API |
 
 Output: human-readable by default (citations as `uri:heading_path` + snippet), `--json` emits the
 canonical structures for scripting. The CLI is **command-oriented**; interactive browse is a
@@ -53,7 +54,7 @@ later if a consumer demands it).
 
 ## 4. MCP
 
-**Decision:** v1 MCP is **read-only**: tools `search` (args: query, optional store names, limit →
+**Decision:** v1 MCP is **read-only**: tools `search` (args: query, optional store names, limit, optional content_length →
 Citation list as structured content; each citation carries full `DocumentMetadata`),
 `get_document` (id or uri → normalized text + `metadata: DocumentMetadata`),
 `list_stores` (names, visibility, counts). **Mutating tools** (`add_source`, `reindex`, …) are a

@@ -841,6 +841,6 @@ fn test_search_args_default_limit() {
 /// T27: render_citations_text with empty list returns "No results found."
 #[test]
 fn test_render_citations_empty() {
-    let text = mcp::tools::render_citations_text(&[]);
+    let text = mcp::tools::render_citations_text(&[], 400);
     assert_eq!(text, "No results found.");
 }
