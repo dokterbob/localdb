@@ -411,13 +411,11 @@ async fn find_document_errors_when_id_exists_in_multiple_stores() {
         .unwrap();
 
     let result = db.find_document("doc-shared").await;
-    assert!(matches!(
-        result,
-        Err(Error::Internal {
-            correlation_id,
-            ..
-        }) if correlation_id == "runtime_state_find_doc_ambiguous"
-    ));
+    assert!(
+        matches!(result, Err(Error::InvalidRequest { .. })),
+        "expected InvalidRequest for ambiguous cross-store document; got: {:?}",
+        result.err()
+    );
 }
 
 fn make_record(id: &str, doc_id: &str, store_id: &str, embedding: Vec<f32>) -> ChunkRecord {

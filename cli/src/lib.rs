@@ -237,8 +237,16 @@ async fn daemon_request_async(
         Err(match code {
             "store_not_found" => Error::StoreNotFound { id: msg },
             "source_not_found" => Error::SourceNotFound { id: msg },
+            "document_not_found" => Error::DocumentNotFound { id: msg },
+            "job_not_found" => Error::JobNotFound { id: msg },
             "runtime_state_locked" => Error::RuntimeStateLocked,
+            "daemon_running" => Error::DaemonRunning,
             "daemon_unreachable" => Error::DaemonUnreachable,
+            "invalid_config" => Error::InvalidConfig { message: msg },
+            "invalid_request" => Error::InvalidRequest { message: msg },
+            "index_in_progress" => Error::IndexInProgress,
+            "provider_unavailable" => Error::ProviderUnavailable { message: msg },
+            "model_missing" => Error::ModelMissing { message: msg },
             _ => Error::Internal {
                 message: format!("daemon returned {}: {}", status.as_u16(), msg),
                 correlation_id: "daemon_http".to_string(),
@@ -1057,12 +1065,12 @@ const DEFAULT_PATH_EXCLUDES: &[&str] = &[
 ];
 
 /// `localdb source add <path-or-url>`
-pub fn run_source_add(ctx: &CliContext, source_arg: &str) {
+pub fn run_source_add(ctx: &CliContext, source_arg: &str, refresh: Option<&str>) {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    rt.block_on(run_source_add_async(ctx, source_arg));
+    rt.block_on(run_source_add_async(ctx, source_arg, refresh));
 }
 
-async fn run_source_add_async(ctx: &CliContext, source_arg: &str) {
+async fn run_source_add_async(ctx: &CliContext, source_arg: &str, refresh: Option<&str>) {
     let (config_loader, db) = load_app_db(ctx).await;
     let data_dir = &config_loader.paths.data_dir;
 
@@ -1096,6 +1104,7 @@ async fn run_source_add_async(ctx: &CliContext, source_arg: &str) {
             "kind": kind,
             "spec": spec,
             "preset": "prose",
+            "refresh": refresh,
         });
         match daemon_request_async(reqwest::Method::POST, &url_str, Some(body)).await {
             Ok(v) => {
@@ -1155,7 +1164,7 @@ async fn run_source_add_async(ctx: &CliContext, source_arg: &str) {
         include: include_globs,
         exclude: exclude_globs,
         preset: "prose".to_string(),
-        refresh: None,
+        refresh: refresh.map(|s| s.to_string()),
         created_at: now_rfc3339(),
     };
 
@@ -1614,10 +1623,13 @@ async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, strict: bool
     let policy = config_loader.config.defaults.indexing.clone();
 
     let current_policy_version = compute_policy_version(&config_loader.config.defaults.indexing);
-    // Persist updated policy_version back to the store so `status` shows the current value.
+    // Persist updated policy_version and indexing_policy back to the store.
     if rt_store.policy_version != current_policy_version {
+        let new_indexing_policy =
+            serde_json::to_string(&policy).unwrap_or_else(|_| rt_store.indexing_policy.clone());
         let updated_store = StoreRow {
             policy_version: current_policy_version.clone(),
+            indexing_policy: new_indexing_policy,
             ..rt_store.clone()
         };
         if let Err(e) = db.backend().upsert_store(&updated_store).await {

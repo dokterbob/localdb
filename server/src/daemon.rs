@@ -71,10 +71,12 @@ pub async fn start_daemon(
 
     // Build shared application state.
     let queue = JobQueue::new();
+    let url_scheduler = UrlRefreshScheduler::new(queue.clone());
     let state = AppState::new(
         options.config.clone(),
         options.paths.data_dir.clone(),
         queue.clone(),
+        url_scheduler.clone(),
     )
     .await?;
 
@@ -111,8 +113,9 @@ pub async fn start_daemon(
     // Per T11 scope: "URL refresh scheduling" — daemon-exclusive capability.
     // The scheduler polls every 60 seconds by default; each URL source with a
     // configured refresh_interval_secs will be re-indexed when due.
-    let url_scheduler = UrlRefreshScheduler::new(queue.clone());
-    // Register URL sources from the DB at startup.
+    //
+    // Register pre-existing URL sources from the DB at startup. Sources created
+    // after startup are registered dynamically in AppState::add_source.
     // Uses persisted source IDs (not fresh ULIDs) so refresh history survives restarts.
     let backend_for_url = state.backend_arc();
     let sched_for_url = url_scheduler.clone();
@@ -464,9 +467,14 @@ mod tests {
             providers: vec![],
         };
         let queue = JobQueue::new();
-        let state = AppState::new(yaml_config, dir_real.to_path_buf(), queue.clone())
-            .await
-            .unwrap();
+        let state = AppState::new(
+            yaml_config,
+            dir_real.to_path_buf(),
+            queue.clone(),
+            UrlRefreshScheduler::new(queue.clone()),
+        )
+        .await
+        .unwrap();
         state.add_store("store-A", "private").await.unwrap();
         let source = state
             .add_source(
@@ -474,6 +482,7 @@ mod tests {
                 "path",
                 serde_json::json!({"root": "/tmp"}),
                 "prose",
+                None,
             )
             .await
             .unwrap();
@@ -652,9 +661,14 @@ mod tests {
             providers: vec![],
         };
         let queue = JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
-            .await
-            .unwrap();
+        let state = AppState::new(
+            yaml_config,
+            dir.path().to_path_buf(),
+            queue.clone(),
+            UrlRefreshScheduler::new(queue),
+        )
+        .await
+        .unwrap();
         let app = build_router(state);
 
         use axum::body::Body;

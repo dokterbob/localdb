@@ -106,6 +106,9 @@ pub enum Command {
         /// Source paths or URLs (one or more).
         #[arg(required = true, num_args = 1..)]
         sources: Vec<String>,
+        /// Refresh interval for URL sources (e.g. "1h", "30m", "3600").
+        #[arg(long)]
+        refresh: Option<String>,
     },
 }
 
@@ -134,6 +137,9 @@ pub enum SourceCommand {
         /// Source paths or URLs (one or more).
         #[arg(required = true, num_args = 1..)]
         sources: Vec<String>,
+        /// Refresh interval for URL sources (e.g. "1h", "30m", "3600").
+        #[arg(long)]
+        refresh: Option<String>,
     },
     /// List sources on a store.
     List,
@@ -186,10 +192,10 @@ fn main() {
             StoreCommand::Remove { name } => cli::run_store_remove(&ctx, name),
         },
         Command::Source(cmd) => match cmd {
-            SourceCommand::Add { sources } => {
+            SourceCommand::Add { sources, refresh } => {
                 // #5: loop over multiple arguments.
                 for source in sources {
-                    cli::run_source_add(&ctx, source);
+                    cli::run_source_add(&ctx, source, refresh.as_deref());
                 }
             }
             SourceCommand::List => cli::run_source_list(&ctx),
@@ -206,9 +212,9 @@ fn main() {
             limit,
             content_length,
         } => cli::run_search(&ctx, &query.join(" "), *limit, *content_length),
-        Command::Add { sources } => {
+        Command::Add { sources, refresh } => {
             for source in sources {
-                cli::run_source_add(&ctx, source);
+                cli::run_source_add(&ctx, source, refresh.as_deref());
             }
         }
     }
@@ -312,7 +318,7 @@ mod tests {
     #[test]
     fn add_alias_parses() {
         let cli = Cli::try_parse_from(["localdb", "add", "/some/path"]).unwrap();
-        if let Command::Add { sources } = cli.command {
+        if let Command::Add { sources, .. } = cli.command {
             assert_eq!(sources, vec!["/some/path"]);
         } else {
             panic!("expected Add command");

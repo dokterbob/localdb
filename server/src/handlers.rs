@@ -293,6 +293,7 @@ pub struct CreateSourceRequest {
     pub spec: serde_json::Value,
     #[serde(default = "default_prose")]
     pub preset: String,
+    pub refresh: Option<String>,
 }
 
 fn default_prose() -> String {
@@ -314,7 +315,13 @@ pub async fn create_source(
     }
 
     let source = state
-        .add_source(&store_name, &req.kind, req.spec, &req.preset)
+        .add_source(
+            &store_name,
+            &req.kind,
+            req.spec,
+            &req.preset,
+            req.refresh.as_deref(),
+        )
         .await?;
     Ok((StatusCode::CREATED, Json(source)))
 }
@@ -619,9 +626,14 @@ mod tests {
             providers: vec![],
         };
         let queue = crate::job_queue::JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
-            .await
-            .unwrap();
+        let state = AppState::new(
+            yaml_config,
+            dir.path().to_path_buf(),
+            queue.clone(),
+            crate::scheduler::UrlRefreshScheduler::new(queue),
+        )
+        .await
+        .unwrap();
 
         let router = Router::new()
             .route("/v1/stores", get(list_stores).post(create_store))
@@ -669,9 +681,14 @@ mod tests {
             providers: vec![],
         };
         let queue = crate::job_queue::JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
-            .await
-            .unwrap();
+        let state = AppState::new(
+            yaml_config,
+            dir.path().to_path_buf(),
+            queue.clone(),
+            crate::scheduler::UrlRefreshScheduler::new(queue),
+        )
+        .await
+        .unwrap();
         (dir, state)
     }
 
@@ -688,7 +705,7 @@ mod tests {
 
         state.add_store("store-A", "private").await.unwrap();
         let source = state
-            .add_source("store-A", "path", json!({"root": "/tmp"}), "prose")
+            .add_source("store-A", "path", json!({"root": "/tmp"}), "prose", None)
             .await
             .unwrap();
         let store_id = source.store_id.clone();

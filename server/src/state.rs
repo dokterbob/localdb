@@ -13,7 +13,7 @@ use localdb_core::{
 };
 use store_libsql::SqliteBackend;
 
-use crate::job_queue::JobQueue;
+use crate::{daemon::parse_refresh_interval, job_queue::JobQueue, scheduler::UrlRefreshScheduler};
 
 /// Effective config built from the DB.
 #[derive(Debug, Clone)]
@@ -53,6 +53,7 @@ struct Inner {
     default_indexing_policy: IndexingPolicyConfig,
     default_policy_version: String,
     job_queue: JobQueue,
+    url_scheduler: UrlRefreshScheduler,
 }
 
 impl AppState {
@@ -61,6 +62,7 @@ impl AppState {
         yaml_config: RawConfig,
         data_dir: PathBuf,
         job_queue: JobQueue,
+        url_scheduler: UrlRefreshScheduler,
     ) -> Result<Self, Error> {
         let embedding_policy = &yaml_config.defaults.indexing.embedding;
         let providers = &yaml_config.providers;
@@ -84,6 +86,7 @@ impl AppState {
                 default_indexing_policy,
                 default_policy_version,
                 job_queue,
+                url_scheduler,
             }),
         })
     }
@@ -252,6 +255,7 @@ impl AppState {
         kind: &str,
         spec: serde_json::Value,
         preset: &str,
+        refresh: Option<&str>,
     ) -> Result<SourceRecord, Error> {
         let store_row = self
             .inner
@@ -268,16 +272,27 @@ impl AppState {
         let source_row = SourceRow {
             id: id.clone(),
             store_id: store_id.clone(),
-            kind: kind_enum,
+            kind: kind_enum.clone(),
             root,
-            url,
+            url: url.clone(),
             include,
             exclude,
             preset: preset.to_string(),
-            refresh: None,
+            refresh: refresh.map(|s| s.to_string()),
             created_at: now_rfc3339(),
         };
         self.inner.backend.upsert_source(&source_row).await?;
+
+        // Register URL sources with the scheduler so refresh runs without a restart.
+        if kind_enum == localdb_core::types::SourceKind::Url {
+            if let Some(u) = url {
+                let interval_secs = refresh.and_then(parse_refresh_interval);
+                self.inner
+                    .url_scheduler
+                    .register(id.clone(), store_name.to_string(), u, interval_secs)
+                    .await;
+            }
+        }
 
         Ok(SourceRecord {
             id,
@@ -496,9 +511,14 @@ mod tests {
             model: "default".to_string(),
         };
         let queue = JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
-            .await
-            .unwrap();
+        let state = AppState::new(
+            yaml_config,
+            dir.path().to_path_buf(),
+            queue.clone(),
+            UrlRefreshScheduler::new(queue),
+        )
+        .await
+        .unwrap();
         (dir, state)
     }
 
@@ -543,6 +563,7 @@ mod tests {
                 "path",
                 serde_json::json!({"root": "/tmp"}),
                 "prose",
+                None,
             )
             .await;
         assert!(matches!(result, Err(Error::StoreNotFound { .. })));
@@ -558,6 +579,7 @@ mod tests {
                 "path",
                 serde_json::json!({"root": "/tmp/notes", "include": [], "exclude": []}),
                 "prose",
+                None,
             )
             .await
             .unwrap();
@@ -577,6 +599,7 @@ mod tests {
                 "path",
                 serde_json::json!({"root": "/tmp/notes", "include": "**/*.md"}),
                 "prose",
+                None,
             )
             .await;
         assert!(matches!(result, Err(Error::InvalidRequest { .. })));
@@ -592,6 +615,7 @@ mod tests {
                 "path",
                 serde_json::json!({"root": "/tmp/notes", "exclude": [42]}),
                 "prose",
+                None,
             )
             .await;
         assert!(matches!(result, Err(Error::InvalidRequest { .. })));
@@ -614,6 +638,7 @@ mod tests {
                 "path",
                 serde_json::json!({"root": "/tmp"}),
                 "prose",
+                None,
             )
             .await
             .unwrap();
@@ -648,6 +673,7 @@ mod tests {
                 "path",
                 serde_json::json!({"root": "/tmp/notes"}),
                 "prose",
+                None,
             )
             .await
             .unwrap();
@@ -700,6 +726,7 @@ mod tests {
                 "path",
                 serde_json::json!({"root": "/tmp/a"}),
                 "prose",
+                None,
             )
             .await
             .unwrap();
@@ -709,6 +736,7 @@ mod tests {
                 "path",
                 serde_json::json!({"root": "/tmp/b"}),
                 "prose",
+                None,
             )
             .await
             .unwrap();
