@@ -5,12 +5,13 @@ use indicatif::{ProgressBar, ProgressStyle};
 use localdb_core::progress::{DocOutcome, ProgressEvent, ProgressSink};
 
 fn lock_or_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn spinner_style(template: &str) -> ProgressStyle {
-    ProgressStyle::with_template(template)
-        .unwrap_or_else(|_| ProgressStyle::default_spinner())
+    ProgressStyle::with_template(template).unwrap_or_else(|_| ProgressStyle::default_spinner())
 }
 
 fn bar_style(template: &str) -> ProgressStyle {
@@ -43,11 +44,13 @@ fn tty_sink() -> ProgressSink {
     sink
 }
 
-fn tty_sink_parts() -> (
+type TtySinkParts = (
     ProgressSink,
     Arc<Mutex<Option<ProgressBar>>>,
     Arc<Mutex<usize>>,
-) {
+);
+
+fn tty_sink_parts() -> TtySinkParts {
     let pb: Arc<Mutex<Option<ProgressBar>>> = Arc::new(Mutex::new(None));
 
     // Chunk count accumulator shown in the message slot.
@@ -59,9 +62,10 @@ fn tty_sink_parts() -> (
     let sink = Arc::new(move |event: ProgressEvent| match event {
         ProgressEvent::SourceStarted { location, .. } => {
             let spinner = ProgressBar::new_spinner();
-            spinner.set_style(spinner_style("{spinner} {msg}").tick_strings(&[
-                "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
-            ]));
+            spinner.set_style(
+                spinner_style("{spinner} {msg}")
+                    .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+            );
             spinner.set_message(format!("Indexing {location}…"));
             spinner.enable_steady_tick(std::time::Duration::from_millis(80));
             *lock_or_poison(&pb_for_sink) = Some(spinner);
@@ -73,7 +77,10 @@ fn tty_sink_parts() -> (
                 old.finish_and_clear();
             }
             let bar = ProgressBar::new(total as u64);
-            bar.set_style(bar_style("{spinner} [{wide_bar}] {pos}/{len} (eta {eta}) {msg}").progress_chars("=>-"));
+            bar.set_style(
+                bar_style("{spinner} [{wide_bar}] {pos}/{len} (eta {eta}) {msg}")
+                    .progress_chars("=>-"),
+            );
             bar.enable_steady_tick(std::time::Duration::from_millis(80));
             *guard = Some(bar);
         }
@@ -142,9 +149,7 @@ fn plain_sink() -> ProgressSink {
     }))
 }
 
-fn plain_sink_with_emitter(
-    writer: Arc<dyn Fn(String) + Send + Sync>,
-) -> ProgressSink {
+fn plain_sink_with_emitter(writer: Arc<dyn Fn(String) + Send + Sync>) -> ProgressSink {
     let state: Arc<Mutex<PlainState>> = Arc::new(Mutex::new(PlainState::new()));
 
     Arc::new(move |event: ProgressEvent| {
@@ -170,7 +175,10 @@ fn plain_sink_with_emitter(
                     PLAIN_REPORT_INTERVAL
                 };
                 if s.done - s.last_reported_done >= interval {
-                    writer(format!("  {}", format_plain_progress(s.done, s.total, s.chunks)));
+                    writer(format!(
+                        "  {}",
+                        format_plain_progress(s.done, s.total, s.chunks)
+                    ));
                     s.last_reported_done = s.done;
                 }
             }
@@ -267,12 +275,12 @@ mod tests {
         });
 
         let output = lock_or_poison(&writer).clone();
-        assert!(output.iter().any(|line| line.contains("Indexing /tmp/test")));
-        assert!(
-            output
-                .iter()
-                .any(|line| line.contains("chunks_written: 6") || line.contains("6 chunk"))
-        );
+        assert!(output
+            .iter()
+            .any(|line| line.contains("Indexing /tmp/test")));
+        assert!(output
+            .iter()
+            .any(|line| line.contains("chunks_written: 6") || line.contains("6 chunk")));
         assert_eq!(
             output,
             vec![

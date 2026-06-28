@@ -217,23 +217,19 @@ pub fn validate_bind_address(bind: &str) -> Result<(), Error> {
 /// Watch the config file for changes and reload the YAML config snapshot.
 ///
 /// Non-fatal: logs errors but does not stop the daemon.
-async fn run_config_watcher(
-    config_file: PathBuf,
-    state: AppState,
-) -> Result<(), Error> {
-    let parent = config_file
-        .parent()
-        .ok_or_else(|| Error::InvalidConfig {
-            message: "config file has no parent directory".to_string(),
-        })?;
-
-    let (mut rx, _handle) = crate::watcher::watch_path(parent, 300).map_err(|e| Error::Internal {
-        message: format!(
-            "cannot start config watcher for '{}': {e}",
-            config_file.display()
-        ),
-        correlation_id: "daemon_config_reload".into(),
+async fn run_config_watcher(config_file: PathBuf, state: AppState) -> Result<(), Error> {
+    let parent = config_file.parent().ok_or_else(|| Error::InvalidConfig {
+        message: "config file has no parent directory".to_string(),
     })?;
+
+    let (mut rx, _handle) =
+        crate::watcher::watch_path(parent, 300).map_err(|e| Error::Internal {
+            message: format!(
+                "cannot start config watcher for '{}': {e}",
+                config_file.display()
+            ),
+            correlation_id: "daemon_config_reload".into(),
+        })?;
 
     info!("config watcher started for: {}", config_file.display());
 
@@ -366,9 +362,7 @@ mod tests {
     async fn run_config_watcher_returns_invalid_config_when_path_has_no_parent() {
         let (_dir, state) = make_state().await;
 
-        let err = run_config_watcher(PathBuf::new(), state)
-            .await
-            .unwrap_err();
+        let err = run_config_watcher(PathBuf::new(), state).await.unwrap_err();
 
         assert!(
             matches!(err, Error::InvalidConfig { .. }),

@@ -101,7 +101,10 @@ mod tests {
     #[test]
     fn http_url_fetcher_new_returns_err() {
         let result = HttpUrlFetcher::new();
-        assert!(result.is_ok(), "HttpUrlFetcher::new() should return Ok in normal conditions");
+        assert!(
+            result.is_ok(),
+            "HttpUrlFetcher::new() should return Ok in normal conditions"
+        );
     }
 
     #[tokio::test]
