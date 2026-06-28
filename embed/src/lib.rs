@@ -30,6 +30,7 @@
 
 pub mod error;
 pub mod factory;
+pub mod http_helper;
 pub mod model_cache;
 pub mod openai;
 pub mod perplexity;
