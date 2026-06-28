@@ -175,6 +175,8 @@ The daemon exposes a REST API. It is **experimental**: ingestion via `POST /v1/j
 | YAML-declared stores | Appear in `store list` but **cannot be indexed** (`localdb index` only resolves runtime stores). Use `localdb store add` + `localdb source add` instead. |
 | CLI while daemon runs | CLI and daemon can run concurrently. SQLite WAL and busy_timeout serialise concurrent writes. |
 
+Docs sync: the old Known Gaps entries for source path validation and the macOS bundle ID are resolved in code and reflected in `docs/architecture.md`.
+
 Design rationale and planned behavior live in the [specs/](specs/) directory.
 
 ---
