@@ -1345,7 +1345,10 @@ async fn run_index_for_source_async(
         }
     };
     let mut doc_index = DocumentIndex::from_records(existing);
-    let url_fetcher = HttpUrlFetcher::new();
+    let url_fetcher = match HttpUrlFetcher::new() {
+        Ok(fetcher) => fetcher,
+        Err(e) => exit_err(&e, ctx.json),
+    };
 
     for rt_source in &sources_to_index {
         let source = source_row_to_core_source(rt_source);
@@ -1734,7 +1737,10 @@ async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, strict: bool
     let mut doc_index = DocumentIndex::from_records(existing);
     let (mut indexed, mut skipped, mut chunks, mut errors, mut unsupported) =
         (0u64, 0u64, 0u64, 0u64, 0u64);
-    let url_fetcher = HttpUrlFetcher::new();
+    let url_fetcher = match HttpUrlFetcher::new() {
+        Ok(fetcher) => fetcher,
+        Err(e) => exit_err(&e, ctx.json),
+    };
 
     for rt_source in &sources_to_index {
         let source = source_row_to_core_source(rt_source);

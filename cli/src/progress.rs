@@ -79,7 +79,7 @@ fn tty_sink() -> ProgressSink {
             }
         }
         ProgressEvent::SourceFinished { result } => {
-            let mut guard = pb.lock().unwrap();
+            let mut guard = lock_or_poison(&pb_for_sink);
             if let Some(bar) = guard.take() {
                 bar.finish_and_clear();
             }
@@ -88,7 +88,9 @@ fn tty_sink() -> ProgressSink {
                 result.docs_indexed, result.docs_skipped, result.chunks_written
             );
         }
-    })
+    });
+
+    (sink, pb, chunks)
 }
 
 // ---------------------------------------------------------------------------
