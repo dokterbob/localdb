@@ -60,7 +60,7 @@ Options:
 
 Creates the config file and data directory if they do not exist. Prints the
 paths it created. The generated config file contains only `version: 1`; add
-`paths`, `stores`, and other keys as needed (see
+`paths` and other keys as needed (see
 [specs/03-config.md](../specs/03-config.md)).
 
 **Note on embedding models:** `init` prints `embedding models will be downloaded
@@ -119,7 +119,6 @@ $ localdb status --json
     {
       "backend": "libsql",
       "name": "notes",
-      "ownership": "runtime",
       "visibility": "private"
     }
   ]
@@ -169,9 +168,8 @@ Options:
   -V, --version        Print version
 ```
 
-Creates a runtime-owned store backed by libsql. Runtime stores are persisted in
-the unified database (`<data_dir>/localdb.db`) and survive restarts; they are
-distinct from YAML-declared stores (see note below).
+Creates a store backed by libsql. Stores are persisted in
+the unified database (`<data_dir>/localdb.db`) and survive restarts.
 
 Exits `2` (`invalid_request`) if a store with that name already exists:
 
@@ -199,12 +197,11 @@ Options:
   -V, --version        Print version
 ```
 
-Lists both runtime stores (created with `store add`) and YAML-declared stores.
-The ownership label is `runtime` or `yaml`.
+Lists stores created with `store add`.
 
 ```
 $ localdb store list
-notes [libsql] (runtime)
+notes [libsql]
 
 $ localdb store list --json
 {
@@ -212,7 +209,6 @@ $ localdb store list --json
     {
       "backend": "libsql",
       "name": "notes",
-      "ownership": "runtime",
       "visibility": "private"
     }
   ]
@@ -244,11 +240,6 @@ $ localdb store remove nope
 error: store not found: nope
 exit: 3
 ```
-
-**YAML-declared stores:** stores declared in `config.yaml` under `stores:` appear
-in `store list` with ownership `yaml` but cannot be indexed in v0.1.0 (see
-[YAML-declared stores](#yaml-declared-stores-limitation) below). Use
-`localdb store add` for stores you intend to index.
 
 ---
 
@@ -397,10 +388,6 @@ Index complete: 3 indexed, 0 skipped, 3 chunks written, 0 errors
 
 Use `--source <ID>` to re-index a single source without touching others in the
 same store.
-
-YAML-declared stores cannot be indexed in v0.1.0; use `localdb store add` +
-`localdb source add` instead (see
-[YAML-declared stores](#yaml-declared-stores-limitation)).
 
 ---
 
@@ -641,38 +628,13 @@ localdb search "hybrid search" --store notes --json
 
 ---
 
-## YAML-declared stores (limitation)
-
-Stores declared in `config.yaml` under `stores:` appear in `store list` with
-ownership `yaml` and are visible to `search`, but `localdb index --store
-<yaml-store>` exits `3` (`store not found`) in v0.1.0 because the indexer
-resolves stores only from the unified database (runtime-created stores):
-
-```
-$ localdb store list          # shows yaml-declared store
-handbook [libsql] (yaml)
-
-$ localdb index --store handbook
-error: store not found: handbook
-exit: 3
-```
-
-**Working path today:** use `localdb store add` (runtime store) + `localdb source
-add` for any stores you intend to index. YAML store indexing is planned; see
-[specs/06-roadmap.md](../specs/06-roadmap.md).
-
-YAML store/source schema reference is in
-[specs/03-config.md](../specs/03-config.md).
-
----
-
 ## Config validation errors
 
 Bad config files exit `2` with a path-precise message. Common cases:
 
 | Config problem | Error message |
 |---|---|
-| Unknown top-level key | `invalid config: unknown field 'bogus_key', expected one of 'version', 'server', 'paths', 'defaults', 'stores', 'providers'` |
+| Unknown top-level key | `invalid config: unknown field 'bogus_key', expected one of 'version', 'server', 'paths', 'defaults', 'providers'` |
 | Wrong version | `invalid config: unsupported config version 2; only version 1 is supported. Hint: add 'version: 1' at the top of your config file.` |
 | Source missing required field | `invalid config: stores[0].sources[0].root: required for kind 'path'` |
 | Config file not found | `invalid config: cannot read config file '/path/to/config.yaml': No such file or directory` |

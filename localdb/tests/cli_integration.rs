@@ -287,10 +287,9 @@ fn store_list_json_has_stores_array() {
         serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
     let stores = v["stores"].as_array().expect("stores must be an array");
     assert!(!stores.is_empty());
-    // Each store has name, ownership, visibility, backend.
+    // Each store has name, visibility, backend (ownership removed — DB-only now).
     let store = &stores[0];
     assert!(store.get("name").is_some());
-    assert!(store.get("ownership").is_some());
     assert!(store.get("visibility").is_some());
     assert!(store.get("backend").is_some());
 }
@@ -592,40 +591,44 @@ fn search_json_citations_canonical_shape() {
     }
 }
 
+/// `stores:` key in config is now rejected (DB is the single source of truth).
 #[test]
-fn config_readonly_exit_code_is_4() {
+fn config_with_stores_key_exits_2() {
     let dir = TempDir::new().unwrap();
     write_config_with_data_dir(&dir, "stores:\n  - name: yaml-store");
 
-    let output = cmd_with_dir(&dir)
-        .args(["store", "remove", "yaml-store"])
-        .output()
-        .unwrap();
+    let output = cmd_with_dir(&dir).args(["store", "list"]).output().unwrap();
 
-    // config_readonly → exit code 4.
+    // deny_unknown_fields rejects stores: → invalid config → exit 2.
     assert_eq!(
         output.status.code().unwrap(),
-        4,
-        "config_readonly should exit 4; stderr: {}",
+        2,
+        "stores: key should be rejected with exit 2; stderr: {}",
         String::from_utf8_lossy(&output.stderr),
     );
 }
 
-/// Verify `store add` on a YAML-owned store returns exit code 4.
+/// Adding a duplicate store name exits 2 (invalid request).
 #[test]
-fn yaml_owned_store_mutation_exits_4() {
+fn duplicate_store_name_exits_2() {
     let dir = TempDir::new().unwrap();
-    write_config_with_data_dir(&dir, "stores:\n  - name: yaml-store");
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "dup-store"])
+        .assert()
+        .success();
 
     let output = cmd_with_dir(&dir)
-        .args(["store", "add", "yaml-store"])
+        .args(["store", "add", "dup-store"])
         .output()
         .unwrap();
 
     assert_eq!(
         output.status.code().unwrap(),
-        4,
-        "should exit 4 (config_readonly) when adding a YAML-owned store"
+        2,
+        "duplicate store name should exit 2; stderr: {}",
+        String::from_utf8_lossy(&output.stderr),
     );
 }
 

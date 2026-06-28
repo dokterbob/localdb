@@ -34,10 +34,6 @@ pub struct RawConfig {
     #[serde(default)]
     pub defaults: DefaultsConfig,
 
-    /// Declarative (YAML-owned) stores.
-    #[serde(default)]
-    pub stores: Vec<StoreConfig>,
-
     /// External embedding / LLM providers.
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
@@ -204,81 +200,6 @@ fn default_embedding_provider() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Stores
-// ---------------------------------------------------------------------------
-
-/// A declarative (YAML-owned) store definition.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StoreConfig {
-    /// Human-readable store name (unique per instance).
-    pub name: String,
-
-    /// Visibility: "private" or "shared". MVP: only private functional.
-    #[serde(default = "default_visibility")]
-    pub visibility: String,
-
-    /// Backend kind: "libsql" (default).
-    #[serde(default = "default_backend")]
-    pub backend: String,
-
-    /// Indexing policy override, or null to inherit defaults.
-    #[serde(default)]
-    pub indexing: Option<IndexingPolicyConfig>,
-
-    /// Sources attached to this store.
-    #[serde(default)]
-    pub sources: Vec<SourceConfig>,
-}
-
-fn default_visibility() -> String {
-    "private".to_string()
-}
-
-fn default_backend() -> String {
-    "libsql".to_string()
-}
-
-/// A source attached to a store (YAML-declared).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SourceConfig {
-    /// Source kind: "path" or "url".
-    pub kind: String,
-
-    // Path source fields
-    /// Root path (for `kind: path`).
-    #[serde(default)]
-    pub root: Option<String>,
-
-    /// Include globs (for `kind: path`).
-    #[serde(default)]
-    pub include: Vec<String>,
-
-    /// Exclude globs (for `kind: path`).
-    #[serde(default)]
-    pub exclude: Vec<String>,
-
-    /// Chunking preset: "prose", "code", or "messages" (for `kind: path`).
-    #[serde(default = "default_preset")]
-    pub preset: String,
-
-    // URL source fields
-    /// URL to fetch (for `kind: url`).
-    #[serde(default)]
-    pub url: Option<String>,
-
-    /// Refresh interval as a human-readable string (e.g. "24h", "30m").
-    /// Validated to be a valid duration.
-    #[serde(default)]
-    pub refresh: Option<String>,
-}
-
-fn default_preset() -> String {
-    "prose".to_string()
-}
-
-// ---------------------------------------------------------------------------
 // Providers
 // ---------------------------------------------------------------------------
 
@@ -311,7 +232,6 @@ mod tests {
         assert_eq!(cfg.version, 1);
         assert_eq!(cfg.server.bind, "127.0.0.1");
         assert_eq!(cfg.server.port, 7700);
-        assert!(cfg.stores.is_empty());
         assert!(cfg.providers.is_empty());
     }
 

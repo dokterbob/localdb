@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -6,10 +5,8 @@ use tokio::sync::RwLock;
 
 use localdb_core::{
     config::{
-        check_yaml_owned,
         policy::compute_policy_version,
         schema::{IndexingPolicyConfig, RawConfig},
-        ConfigOwnership, EffectiveConfig, EffectiveStore,
     },
     ingestion::now_rfc3339,
     Error, SourceRow, Store, StoreBackend, StoreBackendConfig, StoreRow, StoreVisibility,
@@ -17,6 +14,22 @@ use localdb_core::{
 use store_libsql::SqliteBackend;
 
 use crate::job_queue::JobQueue;
+
+/// Effective config built from the DB.
+#[derive(Debug, Clone)]
+pub struct EffectiveConfig {
+    pub stores: Vec<EffectiveStore>,
+}
+
+/// A DB-backed store record for search/status use.
+#[derive(Debug, Clone)]
+pub struct EffectiveStore {
+    pub name: String,
+    pub id: String,
+    pub visibility: String,
+    pub backend: String,
+    pub indexing: localdb_core::config::schema::IndexingPolicyConfig,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SourceRecord {
@@ -92,60 +105,28 @@ impl AppState {
         self.inner.backend.clone()
     }
 
-    /// Get the effective config (YAML + runtime merged).
+    /// Get the effective config (DB-backed stores only).
     pub async fn effective_config(&self) -> Result<EffectiveConfig, Error> {
-        let yaml = self.inner.yaml_config.read().await;
         let runtime_stores = self.inner.backend.list_stores().await?;
-        let default_policy = &self.inner.default_indexing_policy;
         let mut stores = Vec::new();
-        let yaml_names: HashSet<&str> = yaml.stores.iter().map(|s| s.name.as_str()).collect();
-
-        for yaml_store in &yaml.stores {
-            let indexing = yaml_store
-                .indexing
-                .clone()
-                .unwrap_or_else(|| default_policy.clone());
-            stores.push(EffectiveStore {
-                name: yaml_store.name.clone(),
-                id: None,
-                ownership: ConfigOwnership::Yaml,
-                visibility: yaml_store.visibility.clone(),
-                backend: yaml_store.backend.clone(),
-                indexing,
-            });
-        }
-
-        for runtime_store in runtime_stores {
-            if yaml_names.contains(runtime_store.name.as_str()) {
-                continue;
-            }
-            let indexing = serde_json::from_str(&runtime_store.indexing_policy).map_err(|e| {
-                Error::Internal {
+        for store in runtime_stores {
+            let indexing: localdb_core::config::schema::IndexingPolicyConfig =
+                serde_json::from_str(&store.indexing_policy).map_err(|e| Error::Internal {
                     message: format!(
-                        "invalid indexing_policy JSON for store '{name}': {e}",
-                        name = runtime_store.name
+                        "invalid indexing_policy JSON for store '{}': {e}",
+                        store.name
                     ),
                     correlation_id: "effective_config_policy_parse".into(),
-                }
-            })?;
-            let visibility = store_visibility_to_str(&runtime_store.visibility).to_string();
+                })?;
             stores.push(EffectiveStore {
-                name: runtime_store.name,
-                id: Some(runtime_store.id),
-                ownership: ConfigOwnership::Runtime,
-                visibility,
-                backend: runtime_store.backend,
+                name: store.name,
+                id: store.id,
+                visibility: store_visibility_to_str(&store.visibility).to_string(),
+                backend: store.backend,
                 indexing,
             });
         }
-
         Ok(EffectiveConfig { stores })
-    }
-
-    /// Check whether a named store is YAML-owned.
-    pub async fn is_yaml_owned_store(&self, name: &str) -> bool {
-        let yaml = self.inner.yaml_config.read().await;
-        check_yaml_owned(name, &yaml)
     }
 
     /// Get the current YAML config snapshot.
@@ -161,10 +142,12 @@ impl AppState {
 
     /// Add a runtime-owned store.
     ///
-    /// Returns `Error::ConfigReadonly` if the store name is YAML-owned.
+    /// Returns `Error::InvalidRequest` if a store with the same name already exists.
     pub async fn add_store(&self, name: &str, visibility: &str) -> Result<Store, Error> {
-        if self.is_yaml_owned_store(name).await {
-            return Err(Error::ConfigReadonly);
+        if self.inner.backend.get_store_by_name(name).await?.is_some() {
+            return Err(Error::InvalidRequest {
+                message: format!("store '{name}' already exists"),
+            });
         }
 
         let id = localdb_core::new_ulid();
@@ -224,13 +207,8 @@ impl AppState {
 
     /// Remove a runtime-owned store by name.
     ///
-    /// Returns `Error::ConfigReadonly` if the store is YAML-owned.
     /// Returns `Error::StoreNotFound` if the store doesn't exist.
     pub async fn remove_store(&self, name: &str) -> Result<(), Error> {
-        if self.is_yaml_owned_store(name).await {
-            return Err(Error::ConfigReadonly);
-        }
-
         let row = self
             .inner
             .backend
@@ -248,7 +226,7 @@ impl AppState {
         Ok(())
     }
 
-    /// Get a store by name (from effective config).
+    /// Get a store by name.
     pub async fn get_store_by_name(&self, name: &str) -> Result<StoreRecord, Error> {
         let effective = self.effective_config().await?;
         effective
@@ -259,7 +237,6 @@ impl AppState {
                 name: s.name.clone(),
                 visibility: s.visibility.clone(),
                 backend: s.backend.clone(),
-                ownership: s.ownership.clone(),
             })
             .ok_or_else(|| Error::StoreNotFound {
                 id: name.to_string(),
@@ -268,7 +245,6 @@ impl AppState {
 
     /// Add a source to a store.
     ///
-    /// Returns `Error::ConfigReadonly` if the store is YAML-owned.
     /// Returns `Error::StoreNotFound` if the store doesn't exist.
     pub async fn add_source(
         &self,
@@ -277,19 +253,6 @@ impl AppState {
         spec: serde_json::Value,
         preset: &str,
     ) -> Result<SourceRecord, Error> {
-        let effective = self.effective_config().await?;
-        let store = effective
-            .stores
-            .iter()
-            .find(|s| s.name == store_name)
-            .ok_or_else(|| Error::StoreNotFound {
-                id: store_name.to_string(),
-            })?;
-
-        if store.ownership == ConfigOwnership::Yaml {
-            return Err(Error::ConfigReadonly);
-        }
-
         let store_row = self
             .inner
             .backend
@@ -372,13 +335,8 @@ impl AppState {
 
     /// Update a runtime-owned store's mutable fields.
     ///
-    /// Returns `Error::ConfigReadonly` if the store is YAML-owned.
     /// Returns `Error::StoreNotFound` if the store doesn't exist.
     pub async fn update_store(&self, name: &str, visibility: Option<&str>) -> Result<(), Error> {
-        if self.is_yaml_owned_store(name).await {
-            return Err(Error::ConfigReadonly);
-        }
-
         let row = self
             .inner
             .backend
@@ -517,7 +475,6 @@ pub struct StoreRecord {
     pub name: String,
     pub visibility: String,
     pub backend: String,
-    pub ownership: localdb_core::config::ConfigOwnership,
 }
 
 #[cfg(test)]
@@ -532,7 +489,6 @@ mod tests {
             server: Default::default(),
             paths: Default::default(),
             defaults: Default::default(),
-            stores: vec![],
             providers: vec![],
         };
         yaml_config.defaults.indexing.embedding = localdb_core::config::schema::EmbeddingPolicy {
@@ -560,32 +516,6 @@ mod tests {
         let (_dir, state) = make_state().await;
         let result = state.add_store("notes", "public").await;
         assert!(matches!(result, Err(Error::InvalidRequest { .. })));
-    }
-
-    #[tokio::test]
-    async fn add_store_returns_config_readonly_for_yaml_owned() {
-        let dir = tempfile::tempdir().unwrap();
-        let yaml_config = RawConfig {
-            version: 1,
-            server: Default::default(),
-            paths: Default::default(),
-            defaults: Default::default(),
-            stores: vec![localdb_core::config::schema::StoreConfig {
-                name: "yaml-store".to_string(),
-                visibility: "private".to_string(),
-                backend: "libsql".to_string(),
-                indexing: None,
-                sources: vec![],
-            }],
-            providers: vec![],
-        };
-        let queue = JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
-            .await
-            .unwrap();
-
-        let result = state.add_store("yaml-store", "private").await;
-        assert_eq!(result, Err(Error::ConfigReadonly));
     }
 
     #[tokio::test]
@@ -693,76 +623,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_source_to_yaml_owned_store_returns_config_readonly() {
-        // Covers the ConfigReadonly branch in state.rs:add_source (line ~208).
-        // YAML-owned stores must not accept source mutations via the API.
-        let dir = tempfile::tempdir().unwrap();
-        let yaml_config = RawConfig {
-            version: 1,
-            server: Default::default(),
-            paths: Default::default(),
-            defaults: Default::default(),
-            stores: vec![localdb_core::config::schema::StoreConfig {
-                name: "yaml-store".to_string(),
-                visibility: "private".to_string(),
-                backend: "libsql".to_string(),
-                indexing: None,
-                sources: vec![],
-            }],
-            providers: vec![],
-        };
-        let queue = JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
-            .await
-            .unwrap();
-
-        let result = state
-            .add_source(
-                "yaml-store",
-                "path",
-                serde_json::json!({"root": "/tmp"}),
-                "prose",
-            )
-            .await;
-
-        assert!(
-            matches!(result, Err(Error::ConfigReadonly)),
-            "add_source to a YAML-owned store should return ConfigReadonly, got: {:?}",
-            result.err()
-        );
-    }
-
-    #[tokio::test]
-    async fn update_store_returns_config_readonly_for_yaml_owned() {
-        let dir = tempfile::tempdir().unwrap();
-        let yaml_config = RawConfig {
-            version: 1,
-            server: Default::default(),
-            paths: Default::default(),
-            defaults: Default::default(),
-            stores: vec![localdb_core::config::schema::StoreConfig {
-                name: "yaml-store".to_string(),
-                visibility: "private".to_string(),
-                backend: "libsql".to_string(),
-                indexing: None,
-                sources: vec![],
-            }],
-            providers: vec![],
-        };
-        let queue = JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
-            .await
-            .unwrap();
-
-        let result = state.update_store("yaml-store", Some("shared")).await;
-        assert_eq!(
-            result,
-            Err(Error::ConfigReadonly),
-            "update_store on YAML-owned store should return ConfigReadonly"
-        );
-    }
-
-    #[tokio::test]
     async fn update_store_updates_visibility() {
         let (_dir, state) = make_state().await;
         state.add_store("notes", "private").await.unwrap();
@@ -818,26 +678,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn yaml_config_reload() {
+    async fn add_store_duplicate_name_returns_invalid_request() {
         let (_dir, state) = make_state().await;
-        let new_config = RawConfig {
-            version: 1,
-            server: Default::default(),
-            paths: Default::default(),
-            defaults: Default::default(),
-            stores: vec![localdb_core::config::schema::StoreConfig {
-                name: "new-store".to_string(),
-                visibility: "private".to_string(),
-                backend: "libsql".to_string(),
-                indexing: None,
-                sources: vec![],
-            }],
-            providers: vec![],
-        };
-        state.reload_yaml_config(new_config).await;
-        let yaml = state.yaml_config().await;
-        assert_eq!(yaml.stores.len(), 1);
-        assert_eq!(yaml.stores[0].name, "new-store");
+        state.add_store("notes", "private").await.unwrap();
+        let result = state.add_store("notes", "private").await;
+        assert!(
+            matches!(result, Err(Error::InvalidRequest { .. })),
+            "duplicate store name should return InvalidRequest; got: {:?}",
+            result.err()
+        );
     }
 
     #[tokio::test]

@@ -133,66 +133,6 @@ defaults:
 
 ---
 
-### `stores`
-
-A list of YAML-declared stores. Each store entry can carry inline sources.
-
-```yaml
-stores:
-  - name: handbook
-    visibility: private      # private (default) | shared (not yet functional)
-    backend: libsql          # only libsql is supported in v1
-    indexing:                # optional; null = inherit defaults
-      chunking:
-        preset_overrides: {}
-      embedding:
-        provider: local-onnx
-        model: pplx-embed-context-v1-0.6b
-    sources:
-      - kind: path
-        root: ~/docs/handbook
-        include: ["**/*.md", "**/*.pdf"]
-        exclude: ["**/node_modules/**"]
-        preset: prose        # prose (default) | messages | code
-      - kind: url
-        url: https://example.com/api-docs
-        refresh: 24h
-```
-
-**Store fields:**
-
-| Field | Default | Description |
-|-------|---------|-------------|
-| `name` | — (required) | Unique store name |
-| `visibility` | `private` | `private` or `shared` (`shared` not functional in v1) |
-| `backend` | `libsql` | Storage backend; only `libsql` in v1 |
-| `indexing` | `null` (inherit) | Override the global `defaults.indexing` block |
-| `sources` | `[]` | Inline source declarations |
-
-**Source fields:**
-
-| Field | Applies to | Default | Description |
-|-------|-----------|---------|-------------|
-| `kind` | both | — (required) | `path` or `url` |
-| `root` | `path` | — (required for `path`) | Filesystem directory to scan |
-| `url` | `url` | — (required for `url`) | URL to fetch |
-| `include` | both | `["**/*"]` | Glob patterns; files must match at least one |
-| `exclude` | both | `[]` | Glob patterns; matching files are skipped |
-| `preset` | both | `prose` | Chunking preset: `prose`, `messages`, or `code` |
-| `refresh` | `url` | — | Refresh interval (e.g. `24h`, `30m`) |
-
-> **Important — YAML-declared stores cannot be indexed yet.**
->
-> Stores declared in the YAML file appear in `localdb store list` with ownership `(yaml)`, but
-> `localdb index --store <name>` returns `error: store not found: <name>` (exit 3) because the
-> indexer resolves stores only from the runtime-state database.
->
-> **Working path today:** create stores at runtime with `localdb store add <name>` and add
-> sources with `localdb source add <path> --store <name>`. Runtime stores are fully indexable.
-> YAML store indexing will be wired in a future release.
-
----
-
 ### `providers`
 
 Optional external embedding endpoints (OpenAI-compatible API).
@@ -216,21 +156,11 @@ Secrets must come from the environment. See [specs/03-config.md §6](../specs/03
 
 ---
 
-## Bootstrap config vs. runtime state
+## Config vs. runtime state
 
-localdb splits configuration ownership into two layers:
+The YAML config file covers static settings: paths, server bind, embedding defaults, and providers. Stores and sources are managed exclusively via the CLI (`localdb store add`, `localdb source add`) or HTTP API — no store declarations in YAML are supported. The unified database (`<data_dir>/localdb.db`) is the single source of truth for all stores and sources.
 
-| Layer | Owner | Storage | Mutated by |
-|-------|-------|---------|-----------|
-| **Declarative bootstrap config** | User | YAML file | Text editor only; never rewritten by the machine |
-| **Mutable runtime state** | Machine | `<data>/localdb.db` (unified SQLite database) | `store add`, `source add`, HTTP API |
-
-YAML wins for any object it declares (matched by store name / source identity). YAML-owned
-objects are read-only via the API. Objects created via CLI or API are runtime-owned and never
-appear in YAML. `localdb store list` and `localdb status` show each object's owner
-(`(yaml)` or `(runtime)`) so the split is always visible.
-
-For the full ownership design and rationale, see [specs/03-config.md §3](../specs/03-config.md#3-the-two-writer-problem-bootstrap-config-vs-runtime-state).
+For full details, see [specs/03-config.md §3](../specs/03-config.md#3-store-and-source-management).
 
 ---
 
@@ -242,7 +172,7 @@ messages include a precise location.
 **Unknown top-level key:**
 ```
 error: invalid config: unknown field `bogus_key`, expected one of `version`, `server`,
-`paths`, `defaults`, `stores`, `providers` at line 2 column 1
+`paths`, `defaults`, `providers` at line 2 column 1
 ```
 Unknown keys are a hard error, not a warning — they catch typos before they silently take
 no effect.
@@ -290,9 +220,7 @@ The HTTP daemon (`localdb serve`) is an **experimental preview** in v1. Key limi
 
 ## Annotated complete example
 
-The following config is a valid, verified example that localdb 0.1.0 will parse without
-error. Remember that the `handbook` store will appear in `store list` but cannot be indexed
-until YAML store indexing is wired (see note in [`stores`](#stores) above).
+The following config is a valid, verified example that localdb 0.1.0 will parse without error.
 
 ```yaml
 version: 1
@@ -317,23 +245,6 @@ defaults:
     embedding:
       provider: local-onnx
       model: pplx-embed-context-v1-0.6b
-
-# --- Declarative stores (visibility: yaml) ---
-# These stores are visible in `store list` but CANNOT be indexed yet.
-# Use `localdb store add` + `localdb source add` for a fully working store today.
-stores:
-  - name: handbook
-    visibility: private
-    backend: libsql
-    sources:
-      - kind: path
-        root: ~/docs/handbook
-        include: ["**/*.md"]
-        exclude: ["**/drafts/**"]
-        preset: prose
-      - kind: url
-        url: https://example.com/api-docs
-        refresh: 24h
 
 # --- External embedding providers (optional) ---
 # Secrets must come from environment variables, never be inlined.

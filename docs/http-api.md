@@ -141,8 +141,8 @@ curl -s http://127.0.0.1:7700/v1/stores/notes/sources
 
 ### `GET /v1/config`
 
-Returns the parsed configuration as localdb sees it, together with the effective store list (which
-merges YAML-declared stores and runtime-created stores).
+Returns the parsed configuration as localdb sees it, together with the effective store list (all
+runtime-created stores from the DB).
 
 ```
 curl -s http://127.0.0.1:7700/v1/config
@@ -178,7 +178,6 @@ curl -s http://127.0.0.1:7700/v1/config
     "effective_stores": [
         {
             "name": "notes",
-            "ownership": "runtime",
             "visibility": "private",
             "backend": "libsql"
         }
@@ -186,8 +185,8 @@ curl -s http://127.0.0.1:7700/v1/config
 }
 ```
 
-`effective_stores` is the merged view: YAML-declared stores (ownership `"yaml"`) and runtime stores
-(ownership `"runtime"`) appear side-by-side. Config schema details are in
+`effective_stores` lists all stores registered via `localdb store add` (or `POST /v1/stores`). The
+DB is the single source of truth — there is no YAML store declaration. Config schema details are in
 [specs/03-config.md](../specs/03-config.md).
 
 ---
@@ -349,7 +348,6 @@ HTTP status codes follow the shared error taxonomy in [specs/05-surfaces.md](../
 | `runtime_state_locked` | 409 | Unified database locked by another process (SQLite `busy_timeout` exceeded) |
 | `daemon_running` | 409 | A second daemon was started against the same data dir |
 | `daemon_unreachable` | 502 | Daemon socket exists but is not responding |
-| `config_readonly` | 409 | Attempted write to a YAML-owned object |
 | `invalid_config` | 422 | Config failed validation |
 | `invalid_request` | 400 | Bad request body or arguments |
 | `unsupported_format` | 422 | Extractor cannot handle the file |
