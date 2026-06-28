@@ -71,10 +71,12 @@ pub async fn start_daemon(
 
     // Build shared application state.
     let queue = JobQueue::new();
+    let url_scheduler = UrlRefreshScheduler::new(queue.clone());
     let state = AppState::new(
         options.config.clone(),
         options.paths.data_dir.clone(),
         queue.clone(),
+        url_scheduler.clone(),
     )
     .await?;
 
@@ -111,29 +113,44 @@ pub async fn start_daemon(
     // Per T11 scope: "URL refresh scheduling" — daemon-exclusive capability.
     // The scheduler polls every 60 seconds by default; each URL source with a
     // configured refresh_interval_secs will be re-indexed when due.
-    let url_scheduler = UrlRefreshScheduler::new(queue.clone());
-    // Register any URL sources from the YAML config at startup.
-    // Per T11 scope: "URL refresh scheduling" for `url` sources.
-    for store in &options.config.stores {
-        for source in &store.sources {
-            if source.kind == "url" {
-                if let Some(url) = &source.url {
-                    // Parse the refresh interval from the human-readable string (e.g. "24h").
-                    // MVP: only parse "Nh" (hours) and "Nm" (minutes) for simplicity.
-                    let interval_secs = source.refresh.as_deref().and_then(parse_refresh_interval);
-                    let sched = url_scheduler.clone();
-                    let source_id = localdb_core::new_ulid();
-                    let store_name = store.name.clone();
-                    let url_owned = url.clone();
-                    tokio::spawn(async move {
-                        sched
-                            .register(source_id, store_name, url_owned, interval_secs)
+    //
+    // Register pre-existing URL sources from the DB at startup. Sources created
+    // after startup are registered dynamically in AppState::add_source.
+    // Uses persisted source IDs (not fresh ULIDs) so refresh history survives restarts.
+    let backend_for_url = state.backend_arc();
+    let sched_for_url = url_scheduler.clone();
+    tokio::spawn(async move {
+        let stores = match backend_for_url.list_stores().await {
+            Ok(s) => s,
+            Err(e) => {
+                error!("URL scheduler: cannot list stores: {e}");
+                return;
+            }
+        };
+        for store in stores {
+            let sources = match backend_for_url.list_sources(&store.id).await {
+                Ok(s) => s,
+                Err(e) => {
+                    error!(
+                        "URL scheduler: cannot list sources for '{}': {e}",
+                        store.name
+                    );
+                    continue;
+                }
+            };
+            for source in sources {
+                if source.kind == localdb_core::types::SourceKind::Url {
+                    if let Some(url) = source.url {
+                        let interval_secs =
+                            source.refresh.as_deref().and_then(parse_refresh_interval);
+                        sched_for_url
+                            .register(source.id, store.name.clone(), url, interval_secs)
                             .await;
-                    });
+                    }
                 }
             }
         }
-    }
+    });
     // Start the scheduler loop in the background.
     tokio::spawn(url_scheduler.run(std::time::Duration::from_secs(60)));
 
@@ -333,7 +350,6 @@ mod tests {
             },
             paths: Default::default(),
             defaults: Default::default(),
-            stores: vec![],
             providers: vec![],
         };
 
@@ -362,7 +378,6 @@ mod tests {
             },
             paths: Default::default(),
             defaults: Default::default(),
-            stores: vec![],
             providers: vec![],
         };
 
@@ -399,7 +414,6 @@ mod tests {
             server: localdb_core::config::schema::ServerConfig::default(),
             paths: Default::default(),
             defaults: Default::default(),
-            stores: vec![],
             providers: vec![],
         };
         // Set non-loopback bind address
@@ -450,13 +464,17 @@ mod tests {
                     ..Default::default()
                 },
             },
-            stores: vec![],
             providers: vec![],
         };
         let queue = JobQueue::new();
-        let state = AppState::new(yaml_config, dir_real.to_path_buf(), queue.clone())
-            .await
-            .unwrap();
+        let state = AppState::new(
+            yaml_config,
+            dir_real.to_path_buf(),
+            queue.clone(),
+            UrlRefreshScheduler::new(queue.clone()),
+        )
+        .await
+        .unwrap();
         state.add_store("store-A", "private").await.unwrap();
         let source = state
             .add_source(
@@ -464,6 +482,7 @@ mod tests {
                 "path",
                 serde_json::json!({"root": "/tmp"}),
                 "prose",
+                None,
             )
             .await
             .unwrap();
@@ -639,13 +658,17 @@ mod tests {
             server: Default::default(),
             paths: Default::default(),
             defaults: Default::default(),
-            stores: vec![],
             providers: vec![],
         };
         let queue = JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
-            .await
-            .unwrap();
+        let state = AppState::new(
+            yaml_config,
+            dir.path().to_path_buf(),
+            queue.clone(),
+            UrlRefreshScheduler::new(queue),
+        )
+        .await
+        .unwrap();
         let app = build_router(state);
 
         use axum::body::Body;

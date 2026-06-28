@@ -94,13 +94,7 @@ localdb store list
 notes [libsql] (runtime)
 ```
 
-The `(runtime)` label means the store was created via `store add` and lives in the unified
-database. The `[libsql]` label is the storage backend.
-
-> **YAML-declared stores:** Stores declared in `config.yaml` under the `stores:` key appear in
-> `store list` as `(yaml)` but cannot be indexed yet — `localdb index` will return
-> `store not found` for them. Use `localdb store add` (runtime stores) for all indexing workflows
-> today. See [../specs/03-config.md](../specs/03-config.md) for the design intent.
+The `[libsql]` label is the storage backend.
 
 ## Step 5 — Add a source
 

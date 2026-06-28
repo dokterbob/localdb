@@ -33,21 +33,30 @@ async fn setup() -> (tempfile::TempDir, SqliteBackend) {
             .unwrap();
     }
 
-    backend
-        .upsert_source(&SourceRow {
-            id: "src-1".to_string(),
-            store_id: "store-1".to_string(),
-            kind: SourceKind::Path,
-            root: Some("/test/conformance".to_string()),
-            url: None,
-            include: vec![],
-            exclude: vec![],
-            preset: "prose".to_string(),
-            refresh: None,
-            created_at: "2026-06-25T12:00:00Z".to_string(),
-        })
-        .await
-        .unwrap();
+    // Each store needs its own source so the composite FK
+    // `FOREIGN KEY (store_id, source_id) REFERENCES sources(store_id, id)`
+    // is satisfied when chunks are upserted into any of the three stores.
+    for (src_id, store_id, root) in [
+        ("src-1", "store-1", "/test/conformance"),
+        ("src-A", "store-A", "/test/conformance-A"),
+        ("src-B", "store-B", "/test/conformance-B"),
+    ] {
+        backend
+            .upsert_source(&SourceRow {
+                id: src_id.to_string(),
+                store_id: store_id.to_string(),
+                kind: SourceKind::Path,
+                root: Some(root.to_string()),
+                url: None,
+                include: vec![],
+                exclude: vec![],
+                preset: "prose".to_string(),
+                refresh: None,
+                created_at: "2026-06-25T12:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+    }
 
     (dir, backend)
 }
@@ -402,17 +411,20 @@ async fn find_document_errors_when_id_exists_in_multiple_stores() {
         .unwrap();
 
     let result = db.find_document("doc-shared").await;
-    assert!(matches!(
-        result,
-        Err(Error::Internal {
-            correlation_id,
-            ..
-        }) if correlation_id == "runtime_state_find_doc_ambiguous"
-    ));
+    assert!(
+        matches!(result, Err(Error::InvalidRequest { .. })),
+        "expected InvalidRequest for ambiguous cross-store document; got: {:?}",
+        result.err()
+    );
 }
 
 fn make_record(id: &str, doc_id: &str, store_id: &str, embedding: Vec<f32>) -> ChunkRecord {
     let text = format!("text for {id}");
+    // Derive a source_id that belongs to this store:
+    //   store-1 → src-1,  store-A → src-A,  store-B → src-B.
+    // This matches the sources created in setup() and satisfies the composite
+    // FK  FOREIGN KEY (store_id, source_id) REFERENCES sources(store_id, id).
+    let source_id = store_id.replacen("store-", "src-", 1);
     ChunkRecord {
         id: id.to_string(),
         document_id: doc_id.to_string(),
@@ -425,7 +437,7 @@ fn make_record(id: &str, doc_id: &str, store_id: &str, embedding: Vec<f32>) -> C
         fetched_at: "2026-06-25T12:00:00Z".to_string(),
         content_hash: "abc123".to_string(),
         origin_store: store_id.to_string(),
-        source_id: "src-1".to_string(),
+        source_id,
         source_kind: "path".to_string(),
         mime: Some("text/plain".to_string()),
         uri: format!("file:///{store_id}/{doc_id}.md"),

@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -6,17 +5,31 @@ use tokio::sync::RwLock;
 
 use localdb_core::{
     config::{
-        check_yaml_owned,
         policy::compute_policy_version,
         schema::{IndexingPolicyConfig, RawConfig},
-        ConfigOwnership, EffectiveConfig, EffectiveStore,
     },
     ingestion::now_rfc3339,
     Error, SourceRow, Store, StoreBackend, StoreBackendConfig, StoreRow, StoreVisibility,
 };
 use store_libsql::SqliteBackend;
 
-use crate::job_queue::JobQueue;
+use crate::{job_queue::JobQueue, scheduler::UrlRefreshScheduler};
+
+/// Effective config built from the DB.
+#[derive(Debug, Clone)]
+pub struct EffectiveConfig {
+    pub stores: Vec<EffectiveStore>,
+}
+
+/// A DB-backed store record for search/status use.
+#[derive(Debug, Clone)]
+pub struct EffectiveStore {
+    pub name: String,
+    pub id: String,
+    pub visibility: String,
+    pub backend: String,
+    pub indexing: localdb_core::config::schema::IndexingPolicyConfig,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SourceRecord {
@@ -40,6 +53,7 @@ struct Inner {
     default_indexing_policy: IndexingPolicyConfig,
     default_policy_version: String,
     job_queue: JobQueue,
+    url_scheduler: UrlRefreshScheduler,
 }
 
 impl AppState {
@@ -48,6 +62,7 @@ impl AppState {
         yaml_config: RawConfig,
         data_dir: PathBuf,
         job_queue: JobQueue,
+        url_scheduler: UrlRefreshScheduler,
     ) -> Result<Self, Error> {
         let embedding_policy = &yaml_config.defaults.indexing.embedding;
         let providers = &yaml_config.providers;
@@ -71,6 +86,7 @@ impl AppState {
                 default_indexing_policy,
                 default_policy_version,
                 job_queue,
+                url_scheduler,
             }),
         })
     }
@@ -92,60 +108,28 @@ impl AppState {
         self.inner.backend.clone()
     }
 
-    /// Get the effective config (YAML + runtime merged).
+    /// Get the effective config (DB-backed stores only).
     pub async fn effective_config(&self) -> Result<EffectiveConfig, Error> {
-        let yaml = self.inner.yaml_config.read().await;
         let runtime_stores = self.inner.backend.list_stores().await?;
-        let default_policy = &self.inner.default_indexing_policy;
         let mut stores = Vec::new();
-        let yaml_names: HashSet<&str> = yaml.stores.iter().map(|s| s.name.as_str()).collect();
-
-        for yaml_store in &yaml.stores {
-            let indexing = yaml_store
-                .indexing
-                .clone()
-                .unwrap_or_else(|| default_policy.clone());
-            stores.push(EffectiveStore {
-                name: yaml_store.name.clone(),
-                id: None,
-                ownership: ConfigOwnership::Yaml,
-                visibility: yaml_store.visibility.clone(),
-                backend: yaml_store.backend.clone(),
-                indexing,
-            });
-        }
-
-        for runtime_store in runtime_stores {
-            if yaml_names.contains(runtime_store.name.as_str()) {
-                continue;
-            }
-            let indexing = serde_json::from_str(&runtime_store.indexing_policy).map_err(|e| {
-                Error::Internal {
+        for store in runtime_stores {
+            let indexing: localdb_core::config::schema::IndexingPolicyConfig =
+                serde_json::from_str(&store.indexing_policy).map_err(|e| Error::Internal {
                     message: format!(
-                        "invalid indexing_policy JSON for store '{name}': {e}",
-                        name = runtime_store.name
+                        "invalid indexing_policy JSON for store '{}': {e}",
+                        store.name
                     ),
                     correlation_id: "effective_config_policy_parse".into(),
-                }
-            })?;
-            let visibility = store_visibility_to_str(&runtime_store.visibility).to_string();
+                })?;
             stores.push(EffectiveStore {
-                name: runtime_store.name,
-                id: Some(runtime_store.id),
-                ownership: ConfigOwnership::Runtime,
-                visibility,
-                backend: runtime_store.backend,
+                name: store.name,
+                id: store.id,
+                visibility: store_visibility_to_str(&store.visibility).to_string(),
+                backend: store.backend,
                 indexing,
             });
         }
-
         Ok(EffectiveConfig { stores })
-    }
-
-    /// Check whether a named store is YAML-owned.
-    pub async fn is_yaml_owned_store(&self, name: &str) -> bool {
-        let yaml = self.inner.yaml_config.read().await;
-        check_yaml_owned(name, &yaml)
     }
 
     /// Get the current YAML config snapshot.
@@ -161,10 +145,12 @@ impl AppState {
 
     /// Add a runtime-owned store.
     ///
-    /// Returns `Error::ConfigReadonly` if the store name is YAML-owned.
+    /// Returns `Error::InvalidRequest` if a store with the same name already exists.
     pub async fn add_store(&self, name: &str, visibility: &str) -> Result<Store, Error> {
-        if self.is_yaml_owned_store(name).await {
-            return Err(Error::ConfigReadonly);
+        if self.inner.backend.get_store_by_name(name).await?.is_some() {
+            return Err(Error::InvalidRequest {
+                message: format!("store '{name}' already exists"),
+            });
         }
 
         let id = localdb_core::new_ulid();
@@ -224,13 +210,8 @@ impl AppState {
 
     /// Remove a runtime-owned store by name.
     ///
-    /// Returns `Error::ConfigReadonly` if the store is YAML-owned.
     /// Returns `Error::StoreNotFound` if the store doesn't exist.
     pub async fn remove_store(&self, name: &str) -> Result<(), Error> {
-        if self.is_yaml_owned_store(name).await {
-            return Err(Error::ConfigReadonly);
-        }
-
         let row = self
             .inner
             .backend
@@ -239,6 +220,11 @@ impl AppState {
             .ok_or_else(|| Error::StoreNotFound {
                 id: name.to_string(),
             })?;
+        // Unregister all sources before cascade delete.
+        let src_rows = self.inner.backend.list_sources(&row.id).await?;
+        for src in &src_rows {
+            self.inner.url_scheduler.unregister(&src.id).await;
+        }
         let deleted = self.inner.backend.delete_store(&row.id).await?;
         if !deleted {
             return Err(Error::StoreNotFound {
@@ -248,7 +234,7 @@ impl AppState {
         Ok(())
     }
 
-    /// Get a store by name (from effective config).
+    /// Get a store by name.
     pub async fn get_store_by_name(&self, name: &str) -> Result<StoreRecord, Error> {
         let effective = self.effective_config().await?;
         effective
@@ -259,7 +245,6 @@ impl AppState {
                 name: s.name.clone(),
                 visibility: s.visibility.clone(),
                 backend: s.backend.clone(),
-                ownership: s.ownership.clone(),
             })
             .ok_or_else(|| Error::StoreNotFound {
                 id: name.to_string(),
@@ -268,7 +253,6 @@ impl AppState {
 
     /// Add a source to a store.
     ///
-    /// Returns `Error::ConfigReadonly` if the store is YAML-owned.
     /// Returns `Error::StoreNotFound` if the store doesn't exist.
     pub async fn add_source(
         &self,
@@ -276,20 +260,8 @@ impl AppState {
         kind: &str,
         spec: serde_json::Value,
         preset: &str,
+        refresh: Option<&str>,
     ) -> Result<SourceRecord, Error> {
-        let effective = self.effective_config().await?;
-        let store = effective
-            .stores
-            .iter()
-            .find(|s| s.name == store_name)
-            .ok_or_else(|| Error::StoreNotFound {
-                id: store_name.to_string(),
-            })?;
-
-        if store.ownership == ConfigOwnership::Yaml {
-            return Err(Error::ConfigReadonly);
-        }
-
         let store_row = self
             .inner
             .backend
@@ -301,20 +273,42 @@ impl AppState {
         let store_id = store_row.id;
         let (kind_enum, root, url, include, exclude) = parse_source_spec(kind, &spec)?;
 
+        // Validate refresh interval before persisting anything.
+        let interval_secs = match refresh {
+            Some(r) => localdb_core::config::validate_refresh_interval(r)?,
+            None => None,
+        };
+
+        if refresh.is_some() && kind_enum != localdb_core::types::SourceKind::Url {
+            return Err(Error::InvalidRequest {
+                message: "refresh is only supported for URL sources".to_string(),
+            });
+        }
+
         let id = localdb_core::new_ulid();
         let source_row = SourceRow {
             id: id.clone(),
             store_id: store_id.clone(),
-            kind: kind_enum,
+            kind: kind_enum.clone(),
             root,
-            url,
+            url: url.clone(),
             include,
             exclude,
             preset: preset.to_string(),
-            refresh: None,
+            refresh: refresh.map(|s| s.to_string()),
             created_at: now_rfc3339(),
         };
         self.inner.backend.upsert_source(&source_row).await?;
+
+        // Register URL sources with the scheduler so refresh runs without a restart.
+        if kind_enum == localdb_core::types::SourceKind::Url {
+            if let Some(u) = url {
+                self.inner
+                    .url_scheduler
+                    .register(id.clone(), store_name.to_string(), u, interval_secs)
+                    .await;
+            }
+        }
 
         Ok(SourceRecord {
             id,
@@ -354,6 +348,7 @@ impl AppState {
                 id: source_id.to_string(),
             });
         }
+        self.inner.url_scheduler.unregister(source_id).await;
         Ok(())
     }
 
@@ -372,13 +367,8 @@ impl AppState {
 
     /// Update a runtime-owned store's mutable fields.
     ///
-    /// Returns `Error::ConfigReadonly` if the store is YAML-owned.
     /// Returns `Error::StoreNotFound` if the store doesn't exist.
     pub async fn update_store(&self, name: &str, visibility: Option<&str>) -> Result<(), Error> {
-        if self.is_yaml_owned_store(name).await {
-            return Err(Error::ConfigReadonly);
-        }
-
         let row = self
             .inner
             .backend
@@ -517,7 +507,13 @@ pub struct StoreRecord {
     pub name: String,
     pub visibility: String,
     pub backend: String,
-    pub ownership: localdb_core::config::ConfigOwnership,
+}
+
+#[cfg(test)]
+impl AppState {
+    async fn scheduler_source_count(&self) -> usize {
+        self.inner.url_scheduler.source_count().await
+    }
 }
 
 #[cfg(test)]
@@ -532,7 +528,6 @@ mod tests {
             server: Default::default(),
             paths: Default::default(),
             defaults: Default::default(),
-            stores: vec![],
             providers: vec![],
         };
         yaml_config.defaults.indexing.embedding = localdb_core::config::schema::EmbeddingPolicy {
@@ -540,9 +535,14 @@ mod tests {
             model: "default".to_string(),
         };
         let queue = JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
-            .await
-            .unwrap();
+        let state = AppState::new(
+            yaml_config,
+            dir.path().to_path_buf(),
+            queue.clone(),
+            UrlRefreshScheduler::new(queue),
+        )
+        .await
+        .unwrap();
         (dir, state)
     }
 
@@ -560,32 +560,6 @@ mod tests {
         let (_dir, state) = make_state().await;
         let result = state.add_store("notes", "public").await;
         assert!(matches!(result, Err(Error::InvalidRequest { .. })));
-    }
-
-    #[tokio::test]
-    async fn add_store_returns_config_readonly_for_yaml_owned() {
-        let dir = tempfile::tempdir().unwrap();
-        let yaml_config = RawConfig {
-            version: 1,
-            server: Default::default(),
-            paths: Default::default(),
-            defaults: Default::default(),
-            stores: vec![localdb_core::config::schema::StoreConfig {
-                name: "yaml-store".to_string(),
-                visibility: "private".to_string(),
-                backend: "libsql".to_string(),
-                indexing: None,
-                sources: vec![],
-            }],
-            providers: vec![],
-        };
-        let queue = JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
-            .await
-            .unwrap();
-
-        let result = state.add_store("yaml-store", "private").await;
-        assert_eq!(result, Err(Error::ConfigReadonly));
     }
 
     #[tokio::test]
@@ -613,6 +587,7 @@ mod tests {
                 "path",
                 serde_json::json!({"root": "/tmp"}),
                 "prose",
+                None,
             )
             .await;
         assert!(matches!(result, Err(Error::StoreNotFound { .. })));
@@ -628,6 +603,7 @@ mod tests {
                 "path",
                 serde_json::json!({"root": "/tmp/notes", "include": [], "exclude": []}),
                 "prose",
+                None,
             )
             .await
             .unwrap();
@@ -647,6 +623,7 @@ mod tests {
                 "path",
                 serde_json::json!({"root": "/tmp/notes", "include": "**/*.md"}),
                 "prose",
+                None,
             )
             .await;
         assert!(matches!(result, Err(Error::InvalidRequest { .. })));
@@ -662,6 +639,7 @@ mod tests {
                 "path",
                 serde_json::json!({"root": "/tmp/notes", "exclude": [42]}),
                 "prose",
+                None,
             )
             .await;
         assert!(matches!(result, Err(Error::InvalidRequest { .. })));
@@ -684,82 +662,13 @@ mod tests {
                 "path",
                 serde_json::json!({"root": "/tmp"}),
                 "prose",
+                None,
             )
             .await
             .unwrap();
         state.remove_source(&source.id).await.unwrap();
         let sources = state.list_sources("notes").await.unwrap();
         assert!(sources.is_empty());
-    }
-
-    #[tokio::test]
-    async fn add_source_to_yaml_owned_store_returns_config_readonly() {
-        // Covers the ConfigReadonly branch in state.rs:add_source (line ~208).
-        // YAML-owned stores must not accept source mutations via the API.
-        let dir = tempfile::tempdir().unwrap();
-        let yaml_config = RawConfig {
-            version: 1,
-            server: Default::default(),
-            paths: Default::default(),
-            defaults: Default::default(),
-            stores: vec![localdb_core::config::schema::StoreConfig {
-                name: "yaml-store".to_string(),
-                visibility: "private".to_string(),
-                backend: "libsql".to_string(),
-                indexing: None,
-                sources: vec![],
-            }],
-            providers: vec![],
-        };
-        let queue = JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
-            .await
-            .unwrap();
-
-        let result = state
-            .add_source(
-                "yaml-store",
-                "path",
-                serde_json::json!({"root": "/tmp"}),
-                "prose",
-            )
-            .await;
-
-        assert!(
-            matches!(result, Err(Error::ConfigReadonly)),
-            "add_source to a YAML-owned store should return ConfigReadonly, got: {:?}",
-            result.err()
-        );
-    }
-
-    #[tokio::test]
-    async fn update_store_returns_config_readonly_for_yaml_owned() {
-        let dir = tempfile::tempdir().unwrap();
-        let yaml_config = RawConfig {
-            version: 1,
-            server: Default::default(),
-            paths: Default::default(),
-            defaults: Default::default(),
-            stores: vec![localdb_core::config::schema::StoreConfig {
-                name: "yaml-store".to_string(),
-                visibility: "private".to_string(),
-                backend: "libsql".to_string(),
-                indexing: None,
-                sources: vec![],
-            }],
-            providers: vec![],
-        };
-        let queue = JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
-            .await
-            .unwrap();
-
-        let result = state.update_store("yaml-store", Some("shared")).await;
-        assert_eq!(
-            result,
-            Err(Error::ConfigReadonly),
-            "update_store on YAML-owned store should return ConfigReadonly"
-        );
     }
 
     #[tokio::test]
@@ -788,6 +697,7 @@ mod tests {
                 "path",
                 serde_json::json!({"root": "/tmp/notes"}),
                 "prose",
+                None,
             )
             .await
             .unwrap();
@@ -818,26 +728,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn yaml_config_reload() {
+    async fn add_store_duplicate_name_returns_invalid_request() {
         let (_dir, state) = make_state().await;
-        let new_config = RawConfig {
-            version: 1,
-            server: Default::default(),
-            paths: Default::default(),
-            defaults: Default::default(),
-            stores: vec![localdb_core::config::schema::StoreConfig {
-                name: "new-store".to_string(),
-                visibility: "private".to_string(),
-                backend: "libsql".to_string(),
-                indexing: None,
-                sources: vec![],
-            }],
-            providers: vec![],
-        };
-        state.reload_yaml_config(new_config).await;
-        let yaml = state.yaml_config().await;
-        assert_eq!(yaml.stores.len(), 1);
-        assert_eq!(yaml.stores[0].name, "new-store");
+        state.add_store("notes", "private").await.unwrap();
+        let result = state.add_store("notes", "private").await;
+        assert!(
+            matches!(result, Err(Error::InvalidRequest { .. })),
+            "duplicate store name should return InvalidRequest; got: {:?}",
+            result.err()
+        );
     }
 
     #[tokio::test]
@@ -851,6 +750,7 @@ mod tests {
                 "path",
                 serde_json::json!({"root": "/tmp/a"}),
                 "prose",
+                None,
             )
             .await
             .unwrap();
@@ -860,6 +760,7 @@ mod tests {
                 "path",
                 serde_json::json!({"root": "/tmp/b"}),
                 "prose",
+                None,
             )
             .await
             .unwrap();
@@ -876,5 +777,161 @@ mod tests {
             "removed store should not list sources"
         );
         assert!(state.backend().list_stores().await.unwrap().is_empty());
+    }
+
+    // --- WS2: Validate refresh interval before persisting ---
+
+    #[tokio::test]
+    async fn add_source_invalid_refresh_is_rejected() {
+        let (_dir, state) = make_state().await;
+        state.add_store("notes", "private").await.unwrap();
+        let result = state
+            .add_source(
+                "notes",
+                "url",
+                serde_json::json!({ "url": "https://example.com" }),
+                "prose",
+                Some("badvalue"),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(localdb_core::Error::InvalidRequest { .. })),
+            "expected InvalidRequest for invalid refresh, got: {:?}",
+            result
+        );
+        // Nothing should have been persisted.
+        let sources = state.list_sources("notes").await.unwrap();
+        assert!(
+            sources.is_empty(),
+            "no source should be stored after invalid refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_source_zero_refresh_is_rejected() {
+        let (_dir, state) = make_state().await;
+        state.add_store("notes", "private").await.unwrap();
+        for zero in &["0", "0s", "0m", "0h"] {
+            let result = state
+                .add_source(
+                    "notes",
+                    "url",
+                    serde_json::json!({ "url": "https://example.com" }),
+                    "prose",
+                    Some(zero),
+                )
+                .await;
+            assert!(
+                matches!(result, Err(localdb_core::Error::InvalidRequest { .. })),
+                "expected InvalidRequest for zero refresh '{zero}', got: {:?}",
+                result
+            );
+        }
+        let sources = state.list_sources("notes").await.unwrap();
+        assert!(
+            sources.is_empty(),
+            "no source should be stored after zero refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_source_refresh_on_path_source_is_rejected() {
+        let (_dir, state) = make_state().await;
+        state.add_store("notes", "private").await.unwrap();
+        let result = state
+            .add_source(
+                "notes",
+                "path",
+                serde_json::json!({"root": "/tmp/notes", "include": [], "exclude": []}),
+                "prose",
+                Some("1h"),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(localdb_core::Error::InvalidRequest { .. })),
+            "expected InvalidRequest for refresh on path source, got: {:?}",
+            result
+        );
+        let sources = state.list_sources("notes").await.unwrap();
+        assert!(
+            sources.is_empty(),
+            "no source should be stored when refresh on path source is rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_source_valid_refresh_is_accepted() {
+        let (_dir, state) = make_state().await;
+        state.add_store("notes", "private").await.unwrap();
+        state
+            .add_source(
+                "notes",
+                "url",
+                serde_json::json!({ "url": "https://example.com" }),
+                "prose",
+                Some("1h"),
+            )
+            .await
+            .unwrap();
+        let sources = state.list_sources("notes").await.unwrap();
+        assert_eq!(sources.len(), 1);
+    }
+
+    // --- WS3: Unregister scheduler records on delete ---
+
+    #[tokio::test]
+    async fn remove_source_unregisters_from_scheduler() {
+        let (_dir, state) = make_state().await;
+        state.add_store("notes", "private").await.unwrap();
+        let src = state
+            .add_source(
+                "notes",
+                "url",
+                serde_json::json!({ "url": "https://example.com" }),
+                "prose",
+                Some("1h"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(state.scheduler_source_count().await, 1);
+        state.remove_source(&src.id).await.unwrap();
+        assert_eq!(
+            state.scheduler_source_count().await,
+            0,
+            "url_scheduler should have 0 sources after remove_source"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_store_unregisters_all_sources() {
+        let (_dir, state) = make_state().await;
+        state.add_store("notes", "private").await.unwrap();
+        state
+            .add_source(
+                "notes",
+                "url",
+                serde_json::json!({ "url": "https://example.com/a" }),
+                "prose",
+                Some("1h"),
+            )
+            .await
+            .unwrap();
+        state
+            .add_source(
+                "notes",
+                "url",
+                serde_json::json!({ "url": "https://example.com/b" }),
+                "prose",
+                Some("2h"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(state.scheduler_source_count().await, 2);
+        state.remove_store("notes").await.unwrap();
+        assert_eq!(
+            state.scheduler_source_count().await,
+            0,
+            "url_scheduler should have 0 sources after remove_store"
+        );
     }
 }

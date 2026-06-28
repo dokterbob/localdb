@@ -80,10 +80,6 @@ pub enum Command {
         #[arg(long, value_name = "SOURCE_ID")]
         source: Option<String>,
 
-        /// Index an arbitrary directory (creates a temporary anonymous source).
-        #[arg(long, value_name = "PATH")]
-        dir: Option<String>,
-
         /// Exit with code 2 if any document failed extraction (never aborts mid-run).
         #[arg(long)]
         strict: bool,
@@ -110,6 +106,9 @@ pub enum Command {
         /// Source paths or URLs (one or more).
         #[arg(required = true, num_args = 1..)]
         sources: Vec<String>,
+        /// Refresh interval for URL sources (e.g. "1h", "30m", "3600").
+        #[arg(long)]
+        refresh: Option<String>,
     },
 }
 
@@ -138,6 +137,9 @@ pub enum SourceCommand {
         /// Source paths or URLs (one or more).
         #[arg(required = true, num_args = 1..)]
         sources: Vec<String>,
+        /// Refresh interval for URL sources (e.g. "1h", "30m", "3600").
+        #[arg(long)]
+        refresh: Option<String>,
     },
     /// List sources on a store.
     List,
@@ -190,10 +192,10 @@ fn main() {
             StoreCommand::Remove { name } => cli::run_store_remove(&ctx, name),
         },
         Command::Source(cmd) => match cmd {
-            SourceCommand::Add { sources } => {
+            SourceCommand::Add { sources, refresh } => {
                 // #5: loop over multiple arguments.
                 for source in sources {
-                    cli::run_source_add(&ctx, source);
+                    cli::run_source_add(&ctx, source, refresh.as_deref());
                 }
             }
             SourceCommand::List => cli::run_source_list(&ctx),
@@ -204,19 +206,15 @@ fn main() {
                 }
             }
         },
-        Command::Index {
-            source,
-            dir,
-            strict,
-        } => cli::run_index(&ctx, source.as_deref(), dir.as_deref(), *strict),
+        Command::Index { source, strict } => cli::run_index(&ctx, source.as_deref(), *strict),
         Command::Search {
             query,
             limit,
             content_length,
         } => cli::run_search(&ctx, &query.join(" "), *limit, *content_length),
-        Command::Add { sources } => {
+        Command::Add { sources, refresh } => {
             for source in sources {
-                cli::run_source_add(&ctx, source);
+                cli::run_source_add(&ctx, source, refresh.as_deref());
             }
         }
     }
@@ -320,7 +318,7 @@ mod tests {
     #[test]
     fn add_alias_parses() {
         let cli = Cli::try_parse_from(["localdb", "add", "/some/path"]).unwrap();
-        if let Command::Add { sources } = cli.command {
+        if let Command::Add { sources, .. } = cli.command {
             assert_eq!(sources, vec!["/some/path"]);
         } else {
             panic!("expected Add command");
@@ -332,6 +330,16 @@ mod tests {
     fn short_store_flag() {
         let cli = Cli::try_parse_from(["localdb", "-s", "notes", "search", "foo"]).unwrap();
         assert_eq!(cli.stores, vec!["notes"]);
+    }
+
+    /// `localdb index --dir` is rejected by clap (flag was removed; use `--source` instead).
+    #[test]
+    fn index_dir_arg_is_rejected_by_clap() {
+        let result = Cli::try_parse_from(["localdb", "index", "--dir", "/tmp/foo"]);
+        assert!(
+            result.is_err(),
+            "expected --dir to be rejected, but clap accepted it"
+        );
     }
 
     /// `-s` short flag works as a subcommand-level option too.

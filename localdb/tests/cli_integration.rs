@@ -287,10 +287,9 @@ fn store_list_json_has_stores_array() {
         serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
     let stores = v["stores"].as_array().expect("stores must be an array");
     assert!(!stores.is_empty());
-    // Each store has name, ownership, visibility, backend.
+    // Each store has name, visibility, backend (ownership removed — DB-only now).
     let store = &stores[0];
     assert!(store.get("name").is_some());
-    assert!(store.get("ownership").is_some());
     assert!(store.get("visibility").is_some());
     assert!(store.get("backend").is_some());
 }
@@ -592,40 +591,44 @@ fn search_json_citations_canonical_shape() {
     }
 }
 
+/// `stores:` key in config is now rejected (DB is the single source of truth).
 #[test]
-fn config_readonly_exit_code_is_4() {
+fn config_with_stores_key_exits_2() {
     let dir = TempDir::new().unwrap();
     write_config_with_data_dir(&dir, "stores:\n  - name: yaml-store");
 
-    let output = cmd_with_dir(&dir)
-        .args(["store", "remove", "yaml-store"])
-        .output()
-        .unwrap();
+    let output = cmd_with_dir(&dir).args(["store", "list"]).output().unwrap();
 
-    // config_readonly → exit code 4.
+    // deny_unknown_fields rejects stores: → invalid config → exit 2.
     assert_eq!(
         output.status.code().unwrap(),
-        4,
-        "config_readonly should exit 4; stderr: {}",
+        2,
+        "stores: key should be rejected with exit 2; stderr: {}",
         String::from_utf8_lossy(&output.stderr),
     );
 }
 
-/// Verify `store add` on a YAML-owned store returns exit code 4.
+/// Adding a duplicate store name exits 2 (invalid request).
 #[test]
-fn yaml_owned_store_mutation_exits_4() {
+fn duplicate_store_name_exits_2() {
     let dir = TempDir::new().unwrap();
-    write_config_with_data_dir(&dir, "stores:\n  - name: yaml-store");
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "dup-store"])
+        .assert()
+        .success();
 
     let output = cmd_with_dir(&dir)
-        .args(["store", "add", "yaml-store"])
+        .args(["store", "add", "dup-store"])
         .output()
         .unwrap();
 
     assert_eq!(
         output.status.code().unwrap(),
-        4,
-        "should exit 4 (config_readonly) when adding a YAML-owned store"
+        2,
+        "duplicate store name should exit 2; stderr: {}",
+        String::from_utf8_lossy(&output.stderr),
     );
 }
 
@@ -1132,4 +1135,147 @@ fn two_concurrent_store_list_calls_both_succeed() {
 
     assert!(s1.success(), "first store list failed: {:?}", s1.code());
     assert!(s2.success(), "second store list failed: {:?}", s2.code());
+}
+
+/// With a minimal valid config (version: 1 + temp data dir, no `stores:` key, no embedder
+/// policy), read-only commands like `store list` must still succeed (exit 0), returning an
+/// empty list.  This exercises the lenient loader path and is hermetic across machines
+/// (a fresh temp data dir avoids legacy-layout interference from developer installations).
+#[test]
+fn store_list_with_absent_config_exits_0() {
+    let dir = TempDir::new().unwrap();
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    // Minimal config: version + fresh data dir only — no `stores:` key, no embedder config.
+    let config = format!(
+        "version: 1\npaths:\n  data: {}\n",
+        data_dir.to_string_lossy()
+    );
+    std::fs::write(dir.path().join("config.yaml"), &config).unwrap();
+    let output = cmd_with_dir(&dir).args(["store", "list"]).output().unwrap();
+    assert_eq!(
+        output.status.code().unwrap(),
+        0,
+        "store list with minimal config should exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Finding B — Reject refresh intervals on path sources
+// ---------------------------------------------------------------------------
+
+#[test]
+fn source_add_refresh_on_path_exits_2() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "notes"])
+        .assert()
+        .success();
+
+    let fixture = dir.path().join("docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .args([
+            "--store",
+            "notes",
+            "source",
+            "add",
+            "--refresh",
+            "1h",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "source add --refresh on a path source should exit 2; stderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Finding A — Persist store policy on auto-index
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn source_add_auto_index_updates_store_policy_version() {
+    let dir = TempDir::new().unwrap();
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let config_d1 = format!(
+        "version: 1\npaths:\n  data: {}\ndefaults:\n  indexing:\n    embedding:\n      provider: fake\n      model: bge-small-en-v1.5\n",
+        data_dir.to_string_lossy()
+    );
+    std::fs::write(dir.path().join("config.yaml"), &config_d1).unwrap();
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "notes"])
+        .assert()
+        .success();
+
+    let docs1 = dir.path().join("docs1");
+    std::fs::create_dir_all(&docs1).unwrap();
+    std::fs::write(docs1.join("first.md"), "# First\n\nFirst document.\n").unwrap();
+
+    cmd_with_dir(&dir)
+        .args(["--store", "notes", "source", "add", docs1.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let db_path = data_dir.join("localdb.db");
+    let db = libsql::Builder::new_local(&db_path).build().await.unwrap();
+    let conn = db.connect().unwrap();
+    let mut rows = conn
+        .query(
+            "SELECT policy_version FROM stores WHERE name = ?",
+            libsql::params!["notes".to_string()],
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    let v1: String = row.get(0).unwrap();
+    drop(rows);
+    drop(conn);
+    drop(db);
+
+    let config_d2 = format!(
+        "version: 1\npaths:\n  data: {}\ndefaults:\n  indexing:\n    embedding:\n      provider: fake\n      model: bge-small-en-v1.5\n    parsers:\n      - pdf\n      - html\n      - markdown\n      - plaintext\n",
+        data_dir.to_string_lossy()
+    );
+    std::fs::write(dir.path().join("config.yaml"), &config_d2).unwrap();
+
+    let docs2 = dir.path().join("docs2");
+    std::fs::create_dir_all(&docs2).unwrap();
+    std::fs::write(docs2.join("second.md"), "# Second\n\nSecond document.\n").unwrap();
+
+    cmd_with_dir(&dir)
+        .args(["--store", "notes", "source", "add", docs2.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let db = libsql::Builder::new_local(&db_path).build().await.unwrap();
+    let conn = db.connect().unwrap();
+    let mut rows = conn
+        .query(
+            "SELECT policy_version FROM stores WHERE name = ?",
+            libsql::params!["notes".to_string()],
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    let v2: String = row.get(0).unwrap();
+    drop(rows);
+
+    assert_ne!(
+        v1,
+        v2,
+        "policy_version should be updated after source add with changed indexing policy; v1={v1}, v2={v2}"
+    );
 }

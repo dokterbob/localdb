@@ -25,11 +25,10 @@ pub(crate) async fn find_document(
     match found.len() {
             0 => Ok(None),
             1 => Ok(found.pop()),
-            _ => Err(Error::Internal {
+            _ => Err(Error::InvalidRequest {
                 message: format!(
-                    "document '{doc_id}' exists in multiple stores; cross-store dedup requires explicit store context"
+                    "document '{doc_id}' exists in multiple stores; use store-scoped search to disambiguate"
                 ),
-                correlation_id: "runtime_state_find_doc_ambiguous".to_string(),
             }),
         }
 }

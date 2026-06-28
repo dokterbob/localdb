@@ -108,7 +108,6 @@ pub async fn list_stores(
             name: s.name.clone(),
             visibility: s.visibility.clone(),
             backend: s.backend.clone(),
-            ownership: s.ownership.clone(),
         })
         .collect();
 
@@ -156,7 +155,6 @@ pub async fn create_store(
         name: store.name.clone(),
         visibility,
         backend: store.backend.kind.clone(),
-        ownership: localdb_core::config::ConfigOwnership::Runtime,
     };
     Ok((StatusCode::CREATED, Json(record)))
 }
@@ -295,6 +293,7 @@ pub struct CreateSourceRequest {
     pub spec: serde_json::Value,
     #[serde(default = "default_prose")]
     pub preset: String,
+    pub refresh: Option<String>,
 }
 
 fn default_prose() -> String {
@@ -316,7 +315,13 @@ pub async fn create_source(
     }
 
     let source = state
-        .add_source(&store_name, &req.kind, req.spec, &req.preset)
+        .add_source(
+            &store_name,
+            &req.kind,
+            req.spec,
+            &req.preset,
+            req.refresh.as_deref(),
+        )
         .await?;
     Ok((StatusCode::CREATED, Json(source)))
 }
@@ -394,21 +399,19 @@ pub async fn search(
     })?;
 
     let target_stores: Vec<_> = if req.store_filter.is_empty() {
-        effective.stores.iter().filter(|s| s.id.is_some()).collect()
+        effective.stores.iter().collect()
     } else {
         effective
             .stores
             .iter()
-            .filter(|s| req.store_filter.contains(&s.name) && s.id.is_some())
+            .filter(|s| req.store_filter.contains(&s.name))
             .collect()
     };
 
     let mut store_handles: Vec<CoreStoreHandle> = Vec::new();
 
     for store_cfg in target_stores {
-        let Some(store_id) = store_cfg.id.clone() else {
-            continue;
-        };
+        let store_id = store_cfg.id.clone();
         let handle = state
             .backend()
             .retrieval_store(&store_id)
@@ -533,9 +536,6 @@ pub async fn get_status(State(state): State<AppState>) -> Result<Json<StatusResp
 
     let mut source_count = 0;
     for store in &effective.stores {
-        if store.id.is_none() {
-            continue;
-        }
         let sources = state.list_sources(&store.name).await?;
         source_count += sources.len();
     }
@@ -563,7 +563,6 @@ pub struct ConfigResponse {
 #[derive(Debug, Serialize)]
 pub struct EffectiveStoreView {
     pub name: String,
-    pub ownership: String,
     pub visibility: String,
     pub backend: String,
 }
@@ -584,7 +583,6 @@ pub async fn get_config(State(state): State<AppState>) -> Result<Json<ConfigResp
         .iter()
         .map(|s| EffectiveStoreView {
             name: s.name.clone(),
-            ownership: format!("{:?}", s.ownership).to_lowercase(),
             visibility: s.visibility.clone(),
             backend: s.backend.clone(),
         })
@@ -625,13 +623,17 @@ mod tests {
                     ..Default::default()
                 },
             },
-            stores: vec![],
             providers: vec![],
         };
         let queue = crate::job_queue::JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
-            .await
-            .unwrap();
+        let state = AppState::new(
+            yaml_config,
+            dir.path().to_path_buf(),
+            queue.clone(),
+            crate::scheduler::UrlRefreshScheduler::new(queue),
+        )
+        .await
+        .unwrap();
 
         let router = Router::new()
             .route("/v1/stores", get(list_stores).post(create_store))
@@ -676,13 +678,17 @@ mod tests {
                     ..Default::default()
                 },
             },
-            stores: vec![],
             providers: vec![],
         };
         let queue = crate::job_queue::JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
-            .await
-            .unwrap();
+        let state = AppState::new(
+            yaml_config,
+            dir.path().to_path_buf(),
+            queue.clone(),
+            crate::scheduler::UrlRefreshScheduler::new(queue),
+        )
+        .await
+        .unwrap();
         (dir, state)
     }
 
@@ -699,7 +705,7 @@ mod tests {
 
         state.add_store("store-A", "private").await.unwrap();
         let source = state
-            .add_source("store-A", "path", json!({"root": "/tmp"}), "prose")
+            .add_source("store-A", "path", json!({"root": "/tmp"}), "prose", None)
             .await
             .unwrap();
         let store_id = source.store_id.clone();
@@ -856,57 +862,6 @@ mod tests {
             .unwrap();
         // StoreNotFound → 404
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    // --- YAML-owned config_readonly ---
-
-    #[tokio::test]
-    async fn yaml_owned_store_mutation_returns_409() {
-        let dir = tempfile::tempdir().unwrap();
-        let yaml_config = localdb_core::config::schema::RawConfig {
-            version: 1,
-            server: Default::default(),
-            paths: Default::default(),
-            defaults: Default::default(),
-            stores: vec![localdb_core::config::schema::StoreConfig {
-                name: "yaml-store".to_string(),
-                visibility: "private".to_string(),
-                backend: "libsql".to_string(),
-                indexing: None,
-                sources: vec![],
-            }],
-            providers: vec![],
-        };
-        let queue = crate::job_queue::JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
-            .await
-            .unwrap();
-
-        let app = Router::new()
-            .route("/v1/stores", get(list_stores).post(create_store))
-            .route(
-                "/v1/stores/{name}",
-                get(get_store).patch(patch_store).delete(delete_store),
-            )
-            .with_state(state);
-
-        // Try to create a store with the same name as a YAML-owned one
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/v1/stores")
-                    .header("content-type", "application/json")
-                    .body(Body::from(json!({"name": "yaml-store"}).to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        // ConfigReadonly → 409 Conflict
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
-        let body = json_body(resp.into_body()).await;
-        assert_eq!(body["code"], "config_readonly");
     }
 
     // --- Sources CRUD ---
@@ -1234,45 +1189,6 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-    #[tokio::test]
-    async fn patch_yaml_owned_store_returns_409() {
-        let dir = tempfile::tempdir().unwrap();
-        let yaml_config = localdb_core::config::schema::RawConfig {
-            version: 1,
-            server: Default::default(),
-            paths: Default::default(),
-            defaults: Default::default(),
-            stores: vec![localdb_core::config::schema::StoreConfig {
-                name: "yaml-store".to_string(),
-                visibility: "private".to_string(),
-                backend: "libsql".to_string(),
-                indexing: None,
-                sources: vec![],
-            }],
-            providers: vec![],
-        };
-        let queue = crate::job_queue::JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
-            .await
-            .unwrap();
-        let app = crate::daemon::build_router(state);
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method(Method::PATCH)
-                    .uri("/v1/stores/yaml-store")
-                    .header("content-type", "application/json")
-                    .body(Body::from(json!({"visibility": "shared"}).to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
-        let body = json_body(resp.into_body()).await;
-        assert_eq!(body["code"], "config_readonly");
-    }
-
     // --- GET /documents/{id} ---
 
     #[tokio::test]
@@ -1424,94 +1340,6 @@ mod tests {
             "store_filter for a store with no on-disk data should return empty, not foreign results; got: {:?}",
             body
         );
-    }
-
-    // --- add_source to YAML-owned store (AC: config_readonly) ---
-
-    #[tokio::test]
-    async fn add_source_to_yaml_owned_store_returns_409() {
-        let dir = tempfile::tempdir().unwrap();
-        let yaml_config = localdb_core::config::schema::RawConfig {
-            version: 1,
-            server: Default::default(),
-            paths: Default::default(),
-            defaults: Default::default(),
-            stores: vec![localdb_core::config::schema::StoreConfig {
-                name: "yaml-store".to_string(),
-                visibility: "private".to_string(),
-                backend: "libsql".to_string(),
-                indexing: None,
-                sources: vec![],
-            }],
-            providers: vec![],
-        };
-        let queue = crate::job_queue::JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
-            .await
-            .unwrap();
-        let app = crate::daemon::build_router(state);
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/v1/stores/yaml-store/sources")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "kind": "path",
-                            "spec": {"root": "/tmp/test", "include": [], "exclude": []},
-                            "preset": "prose"
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
-        let body = json_body(resp.into_body()).await;
-        assert_eq!(body["code"], "config_readonly");
-    }
-
-    // --- DELETE /stores/{name} for YAML-owned store ---
-
-    #[tokio::test]
-    async fn delete_yaml_owned_store_returns_409() {
-        let dir = tempfile::tempdir().unwrap();
-        let yaml_config = localdb_core::config::schema::RawConfig {
-            version: 1,
-            server: Default::default(),
-            paths: Default::default(),
-            defaults: Default::default(),
-            stores: vec![localdb_core::config::schema::StoreConfig {
-                name: "yaml-store".to_string(),
-                visibility: "private".to_string(),
-                backend: "libsql".to_string(),
-                indexing: None,
-                sources: vec![],
-            }],
-            providers: vec![],
-        };
-        let queue = crate::job_queue::JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
-            .await
-            .unwrap();
-        let app = crate::daemon::build_router(state);
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method(Method::DELETE)
-                    .uri("/v1/stores/yaml-store")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
-        let body = json_body(resp.into_body()).await;
-        assert_eq!(body["code"], "config_readonly");
     }
 
     // --- DELETE /sources/{id} ---

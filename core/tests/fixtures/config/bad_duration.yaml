@@ -1,10 +1,5 @@
 version: 1
 
+# This fixture previously tested YAML store sources; now tests stores: key rejection.
 stores:
   - name: web
-    visibility: private
-    backend: libsql
-    sources:
-      - kind: url
-        url: https://example.com/docs
-        refresh: not-a-duration

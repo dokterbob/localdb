@@ -16,15 +16,24 @@ pub(crate) async fn dense_search(
 ) -> Result<Vec<SearchResult>, Error> {
     let conn = store.conn().conn().await;
     let filter_clauses = build_filter_clauses(filters);
-    let has_filters = !filters.is_empty();
     let encoding = store.encoding();
     let dim = store.embedding_dim();
-    let mut fetch_k = if has_filters { limit * 3 } else { limit };
+    // Always start with an overfetch multiplier: the tenant predicate
+    // (WHERE c.store_id = '...') acts as a post-ANN filter even when the
+    // caller supplies no MetadataFilters.
+    let mut fetch_k = limit * 3;
     let max_fetch = limit * 20;
 
+    let mut results = Vec::new();
+    let mut ann_saturated = false;
     loop {
         let qvec_sql = vectors::query_vector_sql(query_vector, encoding);
         let escaped_store_id = store.store_id().replace('\'', "''");
+        // TODO(#issue): libsql has no partial vector indexes or ANN-level
+        // predicate pushdown, so we always overfetch at the global index and
+        // post-filter by store_id.  True per-store ANN partitioning would
+        // require per-store chunk tables — see the tracking issue.
+        // An exact-scan fallback below handles saturation by other tenants.
         let sql = format!(
             "SELECT c.id, c.document_id, c.seq, c.text, c.span_start, c.span_end,
                     c.heading_path, vector_extract(c.embedding) AS embedding_json,
@@ -41,7 +50,7 @@ pub(crate) async fn dense_search(
              LIMIT {limit}"
         );
         let mut rows = conn.query(&sql, ()).await.map_err(map_libsql_err)?;
-        let mut results = Vec::new();
+        results.clear();
         while let Some(row) = rows.next().await.map_err(map_libsql_err)? {
             let chunk = row_to_chunk_record_strict(&row)?;
             let distance: f64 = row.get(19).map_err(map_libsql_err)?;
@@ -51,11 +60,51 @@ pub(crate) async fn dense_search(
             };
             results.push(SearchResult { chunk, score });
         }
-        if results.len() >= limit || !has_filters || fetch_k >= max_fetch {
-            return Ok(results);
+        if results.len() >= limit {
+            break;
+        }
+        if fetch_k >= max_fetch {
+            ann_saturated = true;
+            break;
         }
         fetch_k = (fetch_k * 2).min(max_fetch);
     }
+
+    // Exact-scan fallback: only runs when ANN was truly saturated by other
+    // tenants (loop hit max_fetch without filling the tenant's quota). Skips
+    // stores that simply have fewer than `limit` chunks — those already got
+    // all their results from the ANN pass. Per-store ANN partitioning is the
+    // long-term fix (tracking issue).
+    if ann_saturated && results.len() < limit {
+        let qvec_sql = vectors::query_vector_sql(query_vector, encoding);
+        let escaped_store_id = store.store_id().replace('\'', "''");
+        let sql = format!(
+            "SELECT c.id, c.document_id, c.seq, c.text, c.span_start, c.span_end,
+                    c.heading_path, vector_extract(c.embedding) AS embedding_json,
+                    d.store_id, d.source_id, d.source_kind, d.uri, d.title, d.mime,
+                    d.policy_version, d.fetched_at, d.content_hash, d.origin_store,
+                    d.metadata,
+                    vector_distance_cos(c.embedding, {qvec_sql}) AS distance
+             FROM chunks c
+             JOIN documents d ON d.store_id = c.store_id AND d.id = c.document_id
+             WHERE c.store_id = '{escaped_store_id}'
+             {filter_clauses}
+             ORDER BY distance ASC
+             LIMIT {limit}"
+        );
+        let mut rows = conn.query(&sql, ()).await.map_err(map_libsql_err)?;
+        results.clear();
+        while let Some(row) = rows.next().await.map_err(map_libsql_err)? {
+            let chunk = row_to_chunk_record_strict(&row)?;
+            let distance: f64 = row.get(19).map_err(map_libsql_err)?;
+            let score = match encoding {
+                VectorEncoding::Float32 => vectors::cosine_distance_to_score(distance),
+                VectorEncoding::Binary => vectors::hamming_distance_to_score(distance, dim),
+            };
+            results.push(SearchResult { chunk, score });
+        }
+    }
+    Ok(results)
 }
 
 pub(crate) async fn bm25_search(

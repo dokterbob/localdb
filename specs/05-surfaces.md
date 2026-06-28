@@ -19,7 +19,7 @@ Single binary, subcommand tree. Global flags: `--config`, `--json`, `--store <na
 | `init` | Create config + data dir, first-run model download prompt | full | n/a (refuses if daemon running with different data dir) |
 | `serve` | Run the daemon (HTTP API, watching, refresh, socket) | becomes the daemon | error `daemon_running` |
 | `mcp` | Run MCP server on stdio | embedded core | thin client |
-| `status` | Stores, doc/chunk counts, policy staleness, daemon state, config ownership (YAML- vs runtime-owned) | reads directly | queries daemon |
+| `status` | Stores, doc/chunk counts, policy staleness, daemon state | reads directly | queries daemon |
 | `store add/list/remove` | Manage runtime-owned stores | direct write | routed to daemon |
 | `source add/list/remove` | Manage sources on a store | direct write | routed to daemon |
 | `add <path|url>...` | Alias for `source add` — add one or more sources to a store | direct write | routed to daemon |
@@ -45,8 +45,7 @@ later if a consumer demands it).
   `GET/POST /stores/{id}/sources`, `POST /search` (body: query, store filter, metadata filters,
   limit; citations carry full `DocumentMetadata`), `GET /documents/{id}` (response includes
   `metadata: DocumentMetadata`), `POST /jobs` (index requests), `GET /jobs/{id}`, `GET /status`,
-  `GET /config` (resolved, with ownership annotations; YAML-owned objects are read-only —
-  `config_readonly` on write).
+  `GET /config` (resolved config).
 - **Long-running work:** indexing is a **job resource**: `POST /jobs` → `202` + job; clients poll
   `GET /jobs/{id}`. SSE progress streaming is roadmap ([06-roadmap.md](06-roadmap.md) §5) — the
   job resource is designed so SSE adds a representation, not a new model.
@@ -79,7 +78,6 @@ MCP tool error). Codes are stable API:
 | `store_not_found` / `source_not_found` / `document_not_found` / `job_not_found` | Unknown entity | 404 |
 | `runtime_state_locked` | Unified database locked by another process (busy timeout exceeded) | 409 |
 | `daemon_running` / `daemon_unreachable` | Process-model conflicts | 409 / 502 |
-| `config_readonly` | Attempted API write to a YAML-owned object ([03-config.md](03-config.md) §3) | 409 |
 | `invalid_config` | Config failed validation (path-precise message) | 422 |
 | `invalid_request` | Bad arguments/body | 400 |
 | `unsupported_format` | Extraction can't handle the file type (informational in job stats) | 422 |

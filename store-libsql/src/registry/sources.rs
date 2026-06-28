@@ -42,7 +42,16 @@ pub(crate) async fn upsert_source(db: &LibsqlDb, source: &SourceRow) -> Result<(
         ],
     )
     .await
-    .map_err(map_libsql_err)?;
+    .map_err(|e| {
+        let msg = format!("{e}");
+        if msg.contains("UNIQUE constraint failed") {
+            Error::InvalidRequest {
+                message: "a source with the same path or URL already exists in this store".into(),
+            }
+        } else {
+            map_libsql_err(e)
+        }
+    })?;
     Ok(())
 }
 

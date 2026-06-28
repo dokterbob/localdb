@@ -77,6 +77,19 @@ impl LibsqlDb {
             .await
             .map_err(map_libsql_err)?;
 
+        let version = schema::get_schema_version(&conn)
+            .await
+            .map_err(map_libsql_err)?;
+        if version != 0 && version != schema::SCHEMA_VERSION {
+            return Err(Error::InvalidConfig {
+                message: format!(
+                    "DB schema version {version} is incompatible with this build \
+                     (expects {}); delete the .db file and re-index.",
+                    schema::SCHEMA_VERSION
+                ),
+            });
+        }
+
         schema::create_schema(&conn, embedding_dim, encoding)
             .await
             .map_err(|e| Error::Internal {
@@ -302,5 +315,39 @@ mod tests {
             }
             e => panic!("expected Internal, got {e:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn reopen_with_wrong_schema_version_errors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        // Stamp version 1 on a raw libsql DB (bypassing LibsqlDb::open).
+        {
+            let db = libsql::Builder::new_local(&path).build().await.unwrap();
+            let conn = db.connect().unwrap();
+            conn.query("PRAGMA user_version = 1", ()).await.unwrap();
+        }
+        // Opening via LibsqlDb::open must return InvalidConfig.
+        let result = LibsqlDb::open(&path, 4, localdb_core::VectorEncoding::Float32).await;
+        assert!(
+            matches!(result, Err(localdb_core::Error::InvalidConfig { .. })),
+            "expected InvalidConfig for wrong schema version, got: {}",
+            result
+                .as_ref()
+                .err()
+                .map_or("Ok(_)".to_string(), |e| format!("{e:?}"))
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_db_and_reopen_both_succeed() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        LibsqlDb::open(&path, 4, localdb_core::VectorEncoding::Float32)
+            .await
+            .unwrap();
+        LibsqlDb::open(&path, 4, localdb_core::VectorEncoding::Float32)
+            .await
+            .unwrap();
     }
 }

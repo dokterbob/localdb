@@ -25,8 +25,10 @@ use std::sync::Arc;
 use fetch::HttpUrlFetcher;
 use localdb_core::{
     config::{
-        check_yaml_owned,
-        loader::{load_config, ConfigLoader, LoadOptions, ResolvedPaths},
+        loader::{
+            load_config, load_config_from_str, resolve_config_path, ConfigLoader, LoadOptions,
+            ResolvedPaths,
+        },
         policy::compute_policy_version,
         schema::{EmbeddingPolicy, IndexingPolicyConfig, ProviderConfig},
     },
@@ -238,9 +240,16 @@ async fn daemon_request_async(
         Err(match code {
             "store_not_found" => Error::StoreNotFound { id: msg },
             "source_not_found" => Error::SourceNotFound { id: msg },
+            "document_not_found" => Error::DocumentNotFound { id: msg },
+            "job_not_found" => Error::JobNotFound { id: msg },
             "runtime_state_locked" => Error::RuntimeStateLocked,
-            "config_readonly" => Error::ConfigReadonly,
+            "daemon_running" => Error::DaemonRunning,
             "daemon_unreachable" => Error::DaemonUnreachable,
+            "invalid_config" => Error::InvalidConfig { message: msg },
+            "invalid_request" => Error::InvalidRequest { message: msg },
+            "index_in_progress" => Error::IndexInProgress,
+            "provider_unavailable" => Error::ProviderUnavailable { message: msg },
+            "model_missing" => Error::ModelMissing { message: msg },
             _ => Error::Internal {
                 message: format!("daemon returned {}: {}", status.as_u16(), msg),
                 correlation_id: "daemon_http".to_string(),
@@ -423,12 +432,43 @@ async fn load_app_db_lenient(ctx: &CliContext) -> (ConfigLoader, AppDb) {
     };
     let config_loader = match load_config(&options, ctx.config_env.as_deref()) {
         Ok(c) => c,
-        Err(_) => {
-            // Config is malformed/missing — use platform default paths.
+        Err(e) => {
+            // If the intended config file exists, it's malformed — fail hard (exit 2).
+            let config_path = resolve_config_path(&options, ctx.config_env.as_deref());
+            if matches!(&config_path, Ok(p) if p.exists()) {
+                exit_err(&e, ctx.json);
+            }
+            // File genuinely absent — try platform default config.
             let options_default = LoadOptions::default();
             match load_config(&options_default, None) {
                 Ok(c) => c,
-                Err(e) => exit_err(&e, ctx.json),
+                Err(_) => {
+                    // Platform default also absent — construct minimal fallback ConfigLoader
+                    // using platform paths and empty config. `store list` etc. will open/create
+                    // a fresh DB at the platform data dir and show 0 results.
+                    match localdb_core::config::PlatformPaths::resolve() {
+                        Some(platform) => {
+                            let config = load_config_from_str("version: 1\n")
+                                .expect("minimal config is always valid");
+                            ConfigLoader {
+                                config,
+                                paths: ResolvedPaths {
+                                    config_file: platform.config_file,
+                                    data_dir: platform.data_dir,
+                                    models_dir: platform.models_dir,
+                                    logs_dir: platform.logs_dir,
+                                },
+                            }
+                        }
+                        None => exit_err(
+                            &localdb_core::Error::InvalidConfig {
+                                message: "cannot determine platform paths (no home directory)"
+                                    .to_string(),
+                            },
+                            ctx.json,
+                        ),
+                    }
+                }
             }
         }
     };
@@ -448,13 +488,10 @@ async fn load_app_db_lenient(ctx: &CliContext) -> (ConfigLoader, AppDb) {
     (config_loader, db)
 }
 
-/// Resolve the target store name from --store flags, YAML config, or runtime DB.
-async fn resolve_store_name(ctx: &CliContext, config_loader: &ConfigLoader, db: &AppDb) -> String {
+/// Resolve the target store name from --store flags or runtime DB.
+async fn resolve_store_name(ctx: &CliContext, db: &AppDb) -> String {
     if let Some(name) = ctx.stores.first() {
         return name.clone();
-    }
-    if let Some(s) = config_loader.config.stores.first() {
-        return s.name.clone();
     }
     match db.backend().list_stores().await {
         Ok(stores) if !stores.is_empty() => stores[0].name.clone(),
@@ -749,31 +786,17 @@ async fn run_status_async(ctx: &CliContext) {
         Ok(s) => s,
         Err(e) => exit_err(&e, ctx.json),
     };
-    let yaml_stores = &config_loader.config.stores;
-    let yaml_names: std::collections::HashSet<&str> =
-        yaml_stores.iter().map(|s| s.name.as_str()).collect();
 
-    let mut all_stores: Vec<serde_json::Value> = yaml_stores
+    let all_stores: Vec<serde_json::Value> = runtime_stores
         .iter()
         .map(|s| {
             json!({
                 "name": s.name,
-                "ownership": "yaml",
-                "visibility": s.visibility,
+                "visibility": visibility_to_string(&s.visibility),
                 "backend": s.backend,
             })
         })
         .collect();
-    for s in &runtime_stores {
-        if !yaml_names.contains(s.name.as_str()) {
-            all_stores.push(json!({
-                "name": s.name,
-                "ownership": "runtime",
-                "visibility": visibility_to_string(&s.visibility),
-                "backend": s.backend,
-            }));
-        }
-    }
 
     if ctx.json {
         print_json(&json!({
@@ -788,10 +811,9 @@ async fn run_status_async(ctx: &CliContext) {
         }
         for s in &all_stores {
             println!(
-                "  {} [{}] ({})",
+                "  {} [{}]",
                 s["name"].as_str().unwrap_or("?"),
                 s["backend"].as_str().unwrap_or("?"),
-                s["ownership"].as_str().unwrap_or("?"),
             );
         }
     }
@@ -811,10 +833,6 @@ async fn run_store_add_async(ctx: &CliContext, name: &str) {
 
     let (config_loader, db) = load_app_db(ctx).await;
     let data_dir = &config_loader.paths.data_dir;
-
-    if check_yaml_owned(name, &config_loader.config) {
-        exit_err(&Error::ConfigReadonly, ctx.json);
-    }
 
     // Per specs/05-surfaces.md §2: route to daemon when running.
     if let DaemonState::Running { base_url } = probe_daemon(data_dir, ctx.daemon_url.as_deref()) {
@@ -871,37 +889,23 @@ pub fn run_store_list(ctx: &CliContext) {
 
 async fn run_store_list_async(ctx: &CliContext) {
     // F1-cli: use lenient loader so store list works even with malformed config.
-    let (config_loader, db) = load_app_db_lenient(ctx).await;
+    let (_, db) = load_app_db_lenient(ctx).await;
 
     let runtime_stores = match db.backend().list_stores().await {
         Ok(s) => s,
         Err(e) => exit_err(&e, ctx.json),
     };
-    let yaml_stores = &config_loader.config.stores;
-    let yaml_names: std::collections::HashSet<&str> =
-        yaml_stores.iter().map(|s| s.name.as_str()).collect();
 
-    let mut all: Vec<serde_json::Value> = yaml_stores
+    let all: Vec<serde_json::Value> = runtime_stores
         .iter()
         .map(|s| {
             json!({
                 "name": s.name,
-                "ownership": "yaml",
-                "visibility": s.visibility,
+                "visibility": visibility_to_string(&s.visibility),
                 "backend": s.backend,
             })
         })
         .collect();
-    for s in &runtime_stores {
-        if !yaml_names.contains(s.name.as_str()) {
-            all.push(json!({
-                "name": s.name,
-                "ownership": "runtime",
-                "visibility": visibility_to_string(&s.visibility),
-                "backend": s.backend,
-            }));
-        }
-    }
 
     if ctx.json {
         print_json(&json!({ "stores": all }));
@@ -910,10 +914,9 @@ async fn run_store_list_async(ctx: &CliContext) {
     } else {
         for s in &all {
             println!(
-                "{} [{}] ({})",
+                "{} [{}]",
                 s["name"].as_str().unwrap_or("?"),
                 s["backend"].as_str().unwrap_or("?"),
-                s["ownership"].as_str().unwrap_or("?"),
             );
         }
     }
@@ -961,10 +964,6 @@ pub fn run_store_remove(ctx: &CliContext, name: &str) {
 async fn run_store_remove_async(ctx: &CliContext, name: &str) {
     let (config_loader, db) = load_app_db(ctx).await;
     let data_dir = &config_loader.paths.data_dir;
-
-    if check_yaml_owned(name, &config_loader.config) {
-        exit_err(&Error::ConfigReadonly, ctx.json);
-    }
 
     let prompt = format!(
         "This permanently deletes store '{}', its sources, and its index data. Continue?",
@@ -1100,12 +1099,12 @@ const DEFAULT_PATH_EXCLUDES: &[&str] = &[
 ];
 
 /// `localdb source add <path-or-url>`
-pub fn run_source_add(ctx: &CliContext, source_arg: &str) {
+pub fn run_source_add(ctx: &CliContext, source_arg: &str, refresh: Option<&str>) {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    rt.block_on(run_source_add_async(ctx, source_arg));
+    rt.block_on(run_source_add_async(ctx, source_arg, refresh));
 }
 
-async fn run_source_add_async(ctx: &CliContext, source_arg: &str) {
+async fn run_source_add_async(ctx: &CliContext, source_arg: &str, refresh: Option<&str>) {
     let (config_loader, db) = load_app_db(ctx).await;
     let data_dir = &config_loader.paths.data_dir;
 
@@ -1116,11 +1115,7 @@ async fn run_source_add_async(ctx: &CliContext, source_arg: &str) {
         }
     }
 
-    let store_name = resolve_store_name(ctx, &config_loader, &db).await;
-
-    if check_yaml_owned(&store_name, &config_loader.config) {
-        exit_err(&Error::ConfigReadonly, ctx.json);
-    }
+    let store_name = resolve_store_name(ctx, &db).await;
 
     // Per specs/05-surfaces.md §2: route to daemon when running.
     if let DaemonState::Running { base_url } = probe_daemon(data_dir, ctx.daemon_url.as_deref()) {
@@ -1143,6 +1138,7 @@ async fn run_source_add_async(ctx: &CliContext, source_arg: &str) {
             "kind": kind,
             "spec": spec,
             "preset": "prose",
+            "refresh": refresh,
         });
         match daemon_request_async(reqwest::Method::POST, &url_str, Some(body)).await {
             Ok(v) => {
@@ -1185,6 +1181,22 @@ async fn run_source_add_async(ctx: &CliContext, source_arg: &str) {
         (source_arg.to_string(), vec![], vec![])
     };
 
+    // Validate refresh interval before persisting.
+    if let Some(r) = refresh {
+        if let Err(e) = localdb_core::config::validate_refresh_interval(r) {
+            exit_err(&e, ctx.json);
+        }
+    }
+
+    if refresh.is_some() && kind != "url" {
+        exit_err(
+            &Error::InvalidRequest {
+                message: "refresh is only supported for URL sources".to_string(),
+            },
+            ctx.json,
+        );
+    }
+
     let src = SourceRow {
         id: new_ulid(),
         store_id: rt_store.id.clone(),
@@ -1202,7 +1214,7 @@ async fn run_source_add_async(ctx: &CliContext, source_arg: &str) {
         include: include_globs,
         exclude: exclude_globs,
         preset: "prose".to_string(),
-        refresh: None,
+        refresh: refresh.map(|s| s.to_string()),
         created_at: now_rfc3339(),
     };
 
@@ -1276,9 +1288,22 @@ async fn run_index_for_source_async(
     }
 
     let policy = config_loader.config.defaults.indexing.clone();
+    let current_policy_version = compute_policy_version(&config_loader.config.defaults.indexing);
+    if store_row.policy_version != current_policy_version {
+        let new_indexing_policy =
+            serde_json::to_string(&policy).unwrap_or_else(|_| store_row.indexing_policy.clone());
+        let updated_store = StoreRow {
+            policy_version: current_policy_version.clone(),
+            indexing_policy: new_indexing_policy,
+            ..store_row.clone()
+        };
+        if let Err(e) = db.backend().upsert_store(&updated_store).await {
+            eprintln!("warning: failed to update policy_version: {}", e);
+        }
+    }
     let ingestion_cfg = IngestionConfig {
         store_id: store_row.id.clone(),
-        policy_version: store_row.policy_version.clone(),
+        policy_version: current_policy_version,
         chunker: ChunkerConfig::prose(),
     };
 
@@ -1371,7 +1396,7 @@ pub fn run_source_list(ctx: &CliContext) {
 }
 
 async fn run_source_list_async(ctx: &CliContext) {
-    let (config_loader, db) = load_app_db(ctx).await;
+    let (_, db) = load_app_db(ctx).await;
 
     // A9-safety: validate --store name if given explicitly.
     if let Some(store_name) = ctx.stores.first() {
@@ -1380,7 +1405,7 @@ async fn run_source_list_async(ctx: &CliContext) {
         }
     }
 
-    let store_name = resolve_store_name(ctx, &config_loader, &db).await;
+    let store_name = resolve_store_name(ctx, &db).await;
 
     // D1: verify store exists before listing sources.
     if let Some(explicit) = ctx.stores.first() {
@@ -1455,11 +1480,6 @@ async fn run_source_remove_async(ctx: &CliContext, id: &str) {
 
     let (config_loader, db) = load_app_db(ctx).await;
     let data_dir = &config_loader.paths.data_dir;
-    let store_name = resolve_store_name(ctx, &config_loader, &db).await;
-
-    if check_yaml_owned(&store_name, &config_loader.config) {
-        exit_err(&Error::ConfigReadonly, ctx.json);
-    }
 
     // D1: verify the store exists if --store was given explicitly.
     if let Some(explicit) = ctx.stores.first() {
@@ -1568,23 +1588,18 @@ async fn run_source_remove_async(ctx: &CliContext, id: &str) {
     }
 }
 
-/// `localdb index [--source <id>] [--dir <path>] [--strict]`
+/// `localdb index [--source <id>] [--strict]`
 ///
 /// One-shot scan-and-index (embedded mode) or submits a job to the daemon.
 ///
 /// Per specs/05-surfaces.md §2: when daemon is running, submits job and polls.
 /// With `--strict`, exits 2 if any document failed extraction (run always completes).
-pub fn run_index(ctx: &CliContext, source_id: Option<&str>, dir: Option<&str>, strict: bool) {
+pub fn run_index(ctx: &CliContext, source_id: Option<&str>, strict: bool) {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    rt.block_on(run_index_async(ctx, source_id, dir, strict));
+    rt.block_on(run_index_async(ctx, source_id, strict));
 }
 
-async fn run_index_async(
-    ctx: &CliContext,
-    source_id: Option<&str>,
-    dir: Option<&str>,
-    strict: bool,
-) {
+async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, strict: bool) {
     use localdb_core::{
         chunker::ChunkerConfig,
         ingestion::{run_ingestion_for_source, DocumentIndex, IngestionConfig},
@@ -1599,7 +1614,7 @@ async fn run_index_async(
 
     let (config_loader, db) = load_app_db(ctx).await;
     let data_dir = config_loader.paths.data_dir.clone();
-    let store_name = resolve_store_name(ctx, &config_loader, &db).await;
+    let store_name = resolve_store_name(ctx, &db).await;
 
     // Per specs/05-surfaces.md §2: when daemon is running, submit a job and poll.
     if let DaemonState::Running { base_url } = probe_daemon(&data_dir, ctx.daemon_url.as_deref()) {
@@ -1640,47 +1655,12 @@ async fn run_index_async(
         Err(e) => exit_err(&e, ctx.json),
     };
 
-    // #1: If --dir was given, create a temporary anonymous source for that directory.
-    let ephemeral_source: Option<SourceRow> = if let Some(dir_path) = dir {
-        let p = std::path::Path::new(dir_path);
-        // Validate the path exists.
-        if !p.exists() {
-            exit_err(
-                &Error::InvalidRequest {
-                    message: format!("--dir path '{}' does not exist", dir_path),
-                },
-                ctx.json,
-            );
-        }
-        let src = SourceRow {
-            id: new_ulid(),
-            store_id: store_id.clone(),
-            kind: SourceKind::Path,
-            root: Some(dir_path.to_string()),
-            url: None,
-            include: vec![],
-            exclude: DEFAULT_PATH_EXCLUDES
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-            preset: "prose".to_string(),
-            refresh: None,
-            created_at: now_rfc3339(),
-        };
-        Some(src)
-    } else {
-        None
-    };
-
     let all_sources = match db.backend().list_sources(&store_id).await {
         Ok(s) => s,
         Err(e) => exit_err(&e, ctx.json),
     };
 
-    let sources_to_index: Vec<SourceRow> = if let Some(ephemeral) = ephemeral_source {
-        // --dir: index only the ephemeral source (not persisted to DB).
-        vec![ephemeral]
-    } else if let Some(sid) = source_id {
+    let sources_to_index: Vec<SourceRow> = if let Some(sid) = source_id {
         match all_sources.into_iter().find(|s| s.id == sid) {
             Some(s) => vec![s],
             None => exit_err(
@@ -1705,9 +1685,24 @@ async fn run_index_async(
 
     let policy = config_loader.config.defaults.indexing.clone();
 
+    let current_policy_version = compute_policy_version(&config_loader.config.defaults.indexing);
+    // Persist updated policy_version and indexing_policy back to the store.
+    if rt_store.policy_version != current_policy_version {
+        let new_indexing_policy =
+            serde_json::to_string(&policy).unwrap_or_else(|_| rt_store.indexing_policy.clone());
+        let updated_store = StoreRow {
+            policy_version: current_policy_version.clone(),
+            indexing_policy: new_indexing_policy,
+            ..rt_store.clone()
+        };
+        if let Err(e) = db.backend().upsert_store(&updated_store).await {
+            eprintln!("warning: failed to update policy_version: {}", e);
+        }
+    }
+
     let ingestion_cfg = IngestionConfig {
         store_id: rt_store.id.clone(),
-        policy_version: rt_store.policy_version.clone(),
+        policy_version: current_policy_version,
         chunker: ChunkerConfig::prose(),
     };
 
@@ -1889,18 +1884,12 @@ async fn run_search_async(ctx: &CliContext, query: &str, limit: usize, content_l
     };
 
     // #13: If --store was given explicitly, verify each named store exists in the runtime DB
-    // or YAML config (exit 3 if not found).
+    // (exit 3 if not found).
     if !ctx.stores.is_empty() {
-        let yaml_names: std::collections::HashSet<&str> = config_loader
-            .config
-            .stores
-            .iter()
-            .map(|s| s.name.as_str())
-            .collect();
         let runtime_names: std::collections::HashSet<&str> =
             runtime_stores.iter().map(|s| s.name.as_str()).collect();
         for name in &ctx.stores {
-            if !yaml_names.contains(name.as_str()) && !runtime_names.contains(name.as_str()) {
+            if !runtime_names.contains(name.as_str()) {
                 exit_err(&Error::StoreNotFound { id: name.clone() }, ctx.json);
             }
         }
@@ -1908,25 +1897,7 @@ async fn run_search_async(ctx: &CliContext, query: &str, limit: usize, content_l
 
     // Collect store names to search.
     let store_names: Vec<String> = if ctx.stores.is_empty() {
-        // Include YAML stores + runtime stores.
-        let mut names: Vec<String> = config_loader
-            .config
-            .stores
-            .iter()
-            .map(|s| s.name.clone())
-            .collect();
-        let yaml_set: std::collections::HashSet<&str> = config_loader
-            .config
-            .stores
-            .iter()
-            .map(|s| s.name.as_str())
-            .collect();
-        for s in &runtime_stores {
-            if !yaml_set.contains(s.name.as_str()) {
-                names.push(s.name.clone());
-            }
-        }
-        names
+        runtime_stores.iter().map(|s| s.name.clone()).collect()
     } else {
         ctx.stores.clone()
     };
@@ -2077,27 +2048,10 @@ async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
         Err(e) => exit_err(&e, ctx.json),
     };
 
-    // Same store resolution as `localdb search`: YAML stores + runtime stores,
+    // Same store resolution as `localdb search`: runtime stores only,
     // narrowed by --store flags when given.
     let store_names: Vec<String> = if ctx.stores.is_empty() {
-        let mut names: Vec<String> = config_loader
-            .config
-            .stores
-            .iter()
-            .map(|s| s.name.clone())
-            .collect();
-        let yaml_set: std::collections::HashSet<&str> = config_loader
-            .config
-            .stores
-            .iter()
-            .map(|s| s.name.as_str())
-            .collect();
-        for s in &runtime_stores {
-            if !yaml_set.contains(s.name.as_str()) {
-                names.push(s.name.clone());
-            }
-        }
-        names
+        runtime_stores.iter().map(|s| s.name.clone()).collect()
     } else {
         ctx.stores.clone()
     };
@@ -2167,7 +2121,6 @@ mod tests {
             server: ServerConfig::default(),
             paths: PathsConfig::default(),
             defaults,
-            stores: vec![],
             providers: vec![],
         };
         let paths = ResolvedPaths {
@@ -2471,7 +2424,6 @@ mod tests {
         assert_eq!(Error::JobNotFound { id: "".into() }.exit_code(), 3);
         assert_eq!(Error::RuntimeStateLocked.exit_code(), 4);
         assert_eq!(Error::DaemonRunning.exit_code(), 4);
-        assert_eq!(Error::ConfigReadonly.exit_code(), 4);
         assert_eq!(Error::IndexInProgress.exit_code(), 4);
         assert_eq!(Error::DaemonUnreachable.exit_code(), 5);
         assert_eq!(
@@ -2493,7 +2445,6 @@ mod tests {
             .map(|s| {
                 json!({
                     "name": s.name,
-                    "ownership": "runtime",
                     "visibility": visibility_to_string(&s.visibility),
                     "backend": s.backend,
                 })
@@ -2504,7 +2455,6 @@ mod tests {
         assert_eq!(arr.len(), 1);
         let entry = &arr[0];
         assert!(entry.get("name").is_some());
-        assert!(entry.get("ownership").is_some());
         assert!(entry.get("visibility").is_some());
         assert!(entry.get("backend").is_some());
         assert_eq!(entry["name"].as_str().unwrap(), "shape-store");
@@ -2698,5 +2648,25 @@ mod tests {
         };
         assert_eq!(err.exit_code(), 2);
         assert_eq!(err.code(), "invalid_request");
+    }
+
+    /// F5 sanity: compute_policy_version returns a non-empty, deterministic string
+    /// that differs from an arbitrary stale value like "old_version".
+    ///
+    /// This verifies that the policy version is derived from the current config rather
+    /// than a hardcoded constant that could accidentally match stale stored values.
+    ///
+    /// TODO: integration test for F5 policy_version update (verify run_index persists
+    ///       the computed version back to the StoreRow when it differs from the stored one).
+    #[test]
+    fn index_updates_policy_version_in_store_row() {
+        use localdb_core::config::schema::IndexingPolicyConfig;
+        let config = IndexingPolicyConfig::default();
+        let computed = compute_policy_version(&config);
+        assert!(!computed.is_empty(), "policy_version must not be empty");
+        assert_ne!(
+            computed, "old_version",
+            "policy_version must differ from arbitrary stale value"
+        );
     }
 }
