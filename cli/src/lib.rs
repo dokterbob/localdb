@@ -1147,6 +1147,13 @@ async fn run_source_add_async(ctx: &CliContext, source_arg: &str, refresh: Optio
         (source_arg.to_string(), vec![], vec![])
     };
 
+    // Validate refresh interval before persisting.
+    if let Some(r) = refresh {
+        if let Err(e) = localdb_core::config::validate_refresh_interval(r) {
+            exit_err(&e, ctx.json);
+        }
+    }
+
     let src = SourceRow {
         id: new_ulid(),
         store_id: rt_store.id.clone(),

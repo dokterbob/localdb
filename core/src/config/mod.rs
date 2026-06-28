@@ -5,6 +5,7 @@
 pub mod loader;
 pub mod platform;
 pub mod policy;
+pub mod refresh;
 pub mod schema;
 
 pub use loader::{
@@ -12,6 +13,7 @@ pub use loader::{
 };
 pub use platform::PlatformPaths;
 pub use policy::compute_policy_version;
+pub use refresh::validate_refresh_interval;
 pub use schema::{
     ChunkingPolicy, DefaultsConfig, EmbeddingPolicy, IndexingPolicyConfig, PathsConfig,
     ProviderConfig, RawConfig, ServerConfig,

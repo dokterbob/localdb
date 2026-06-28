@@ -13,7 +13,7 @@ use localdb_core::{
 };
 use store_libsql::SqliteBackend;
 
-use crate::{daemon::parse_refresh_interval, job_queue::JobQueue, scheduler::UrlRefreshScheduler};
+use crate::{job_queue::JobQueue, scheduler::UrlRefreshScheduler};
 
 /// Effective config built from the DB.
 #[derive(Debug, Clone)]
@@ -220,6 +220,11 @@ impl AppState {
             .ok_or_else(|| Error::StoreNotFound {
                 id: name.to_string(),
             })?;
+        // Unregister all sources before cascade delete.
+        let src_rows = self.inner.backend.list_sources(&row.id).await?;
+        for src in &src_rows {
+            self.inner.url_scheduler.unregister(&src.id).await;
+        }
         let deleted = self.inner.backend.delete_store(&row.id).await?;
         if !deleted {
             return Err(Error::StoreNotFound {
@@ -268,6 +273,12 @@ impl AppState {
         let store_id = store_row.id;
         let (kind_enum, root, url, include, exclude) = parse_source_spec(kind, &spec)?;
 
+        // Validate refresh interval before persisting anything.
+        let interval_secs = match refresh {
+            Some(r) => localdb_core::config::validate_refresh_interval(r)?,
+            None => None,
+        };
+
         let id = localdb_core::new_ulid();
         let source_row = SourceRow {
             id: id.clone(),
@@ -286,7 +297,6 @@ impl AppState {
         // Register URL sources with the scheduler so refresh runs without a restart.
         if kind_enum == localdb_core::types::SourceKind::Url {
             if let Some(u) = url {
-                let interval_secs = refresh.and_then(parse_refresh_interval);
                 self.inner
                     .url_scheduler
                     .register(id.clone(), store_name.to_string(), u, interval_secs)
@@ -332,6 +342,7 @@ impl AppState {
                 id: source_id.to_string(),
             });
         }
+        self.inner.url_scheduler.unregister(source_id).await;
         Ok(())
     }
 
@@ -490,6 +501,13 @@ pub struct StoreRecord {
     pub name: String,
     pub visibility: String,
     pub backend: String,
+}
+
+#[cfg(test)]
+impl AppState {
+    async fn scheduler_source_count(&self) -> usize {
+        self.inner.url_scheduler.source_count().await
+    }
 }
 
 #[cfg(test)]
@@ -753,5 +771,94 @@ mod tests {
             "removed store should not list sources"
         );
         assert!(state.backend().list_stores().await.unwrap().is_empty());
+    }
+
+    // --- WS2: Validate refresh interval before persisting ---
+
+    #[tokio::test]
+    async fn add_source_invalid_refresh_is_rejected() {
+        let (_dir, state) = make_state().await;
+        state.add_store("notes", "private").await.unwrap();
+        let result = state
+            .add_source(
+                "notes",
+                "url",
+                serde_json::json!({ "url": "https://example.com" }),
+                "prose",
+                Some("badvalue"),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(localdb_core::Error::InvalidRequest { .. })),
+            "expected InvalidRequest for invalid refresh, got: {:?}",
+            result
+        );
+        // Nothing should have been persisted.
+        let sources = state.list_sources("notes").await.unwrap();
+        assert!(sources.is_empty(), "no source should be stored after invalid refresh");
+    }
+
+    #[tokio::test]
+    async fn add_source_valid_refresh_is_accepted() {
+        let (_dir, state) = make_state().await;
+        state.add_store("notes", "private").await.unwrap();
+        state
+            .add_source(
+                "notes",
+                "url",
+                serde_json::json!({ "url": "https://example.com" }),
+                "prose",
+                Some("1h"),
+            )
+            .await
+            .unwrap();
+        let sources = state.list_sources("notes").await.unwrap();
+        assert_eq!(sources.len(), 1);
+    }
+
+    // --- WS3: Unregister scheduler records on delete ---
+
+    #[tokio::test]
+    async fn remove_source_unregisters_from_scheduler() {
+        let (_dir, state) = make_state().await;
+        state.add_store("notes", "private").await.unwrap();
+        let src = state
+            .add_source(
+                "notes",
+                "url",
+                serde_json::json!({ "url": "https://example.com" }),
+                "prose",
+                Some("1h"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(state.scheduler_source_count().await, 1);
+        state.remove_source(&src.id).await.unwrap();
+        assert_eq!(
+            state.scheduler_source_count().await,
+            0,
+            "url_scheduler should have 0 sources after remove_source"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_store_unregisters_all_sources() {
+        let (_dir, state) = make_state().await;
+        state.add_store("notes", "private").await.unwrap();
+        state
+            .add_source("notes", "url", serde_json::json!({ "url": "https://example.com/a" }), "prose", Some("1h"))
+            .await
+            .unwrap();
+        state
+            .add_source("notes", "url", serde_json::json!({ "url": "https://example.com/b" }), "prose", Some("2h"))
+            .await
+            .unwrap();
+        assert_eq!(state.scheduler_source_count().await, 2);
+        state.remove_store("notes").await.unwrap();
+        assert_eq!(
+            state.scheduler_source_count().await,
+            0,
+            "url_scheduler should have 0 sources after remove_store"
+        );
     }
 }
