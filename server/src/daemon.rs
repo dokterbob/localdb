@@ -54,20 +54,7 @@ pub async fn start_daemon(
     // Guard: refuse non-loopback bind without auth.
     validate_bind_address(bind_addr)?;
 
-    let socket_guard = SocketGuard::new(&options.paths.socket_path()).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::AddrInUse {
-            Error::DaemonRunning
-        } else {
-            Error::Internal {
-                message: format!(
-                    "cannot bind unix socket at '{}': {}",
-                    options.paths.socket_path().display(),
-                    e
-                ),
-                correlation_id: "socket_bind".to_string(),
-            }
-        }
-    })?;
+    let socket_guard = SocketGuard::new(&options.paths.socket_path())?;
 
     // Build shared application state.
     let queue = JobQueue::new();
@@ -233,12 +220,20 @@ pub fn validate_bind_address(bind: &str) -> Result<(), Error> {
 async fn run_config_watcher(
     config_file: PathBuf,
     state: AppState,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), Error> {
     let parent = config_file
         .parent()
-        .ok_or("config file has no parent directory")?;
+        .ok_or_else(|| Error::InvalidConfig {
+            message: "config file has no parent directory".to_string(),
+        })?;
 
-    let (mut rx, _handle) = crate::watcher::watch_path(parent, 300)?;
+    let (mut rx, _handle) = crate::watcher::watch_path(parent, 300).map_err(|e| Error::Internal {
+        message: format!(
+            "cannot start config watcher for '{}': {e}",
+            config_file.display()
+        ),
+        correlation_id: "daemon_config_reload".into(),
+    })?;
 
     info!("config watcher started for: {}", config_file.display());
 
@@ -281,15 +276,48 @@ pub fn parse_refresh_interval(s: &str) -> Option<u64> {
 }
 
 /// Read and parse the config file.
-fn reload_config_file(path: &Path) -> Result<RawConfig, Box<dyn std::error::Error + Send + Sync>> {
-    let contents = std::fs::read_to_string(path)?;
-    let config: RawConfig = serde_yaml::from_str(&contents)?;
+fn reload_config_file(path: &Path) -> Result<RawConfig, Error> {
+    let contents = std::fs::read_to_string(path).map_err(|e| Error::Internal {
+        message: format!("cannot read config file '{}': {e}", path.display()),
+        correlation_id: "daemon_config_reload".into(),
+    })?;
+    let config: RawConfig = serde_yaml::from_str(&contents).map_err(|e| Error::Internal {
+        message: format!("cannot parse config file '{}': {e}", path.display()),
+        correlation_id: "daemon_config_reload".into(),
+    })?;
     Ok(config)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    async fn make_state() -> (TempDir, AppState) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut yaml_config = RawConfig {
+            version: 1,
+            server: Default::default(),
+            paths: Default::default(),
+            defaults: Default::default(),
+            providers: vec![],
+        };
+        yaml_config.defaults.indexing.embedding = localdb_core::config::schema::EmbeddingPolicy {
+            provider: "fake".to_string(),
+            model: "default".to_string(),
+        };
+        let queue = crate::job_queue::JobQueue::new();
+        let state = AppState::new(
+            yaml_config,
+            dir.path().to_path_buf(),
+            queue.clone(),
+            crate::scheduler::UrlRefreshScheduler::new(queue),
+        )
+        .await
+        .unwrap();
+        (dir, state)
+    }
+
     fn make_resolved_paths(dir: &Path) -> ResolvedPaths {
         ResolvedPaths {
             config_file: dir.join("config.yaml"),
@@ -331,6 +359,36 @@ mod tests {
             msg.contains("0.0.0.0") || msg.contains("non-loopback"),
             "error message should describe the problem: {}",
             msg
+        );
+    }
+
+    #[tokio::test]
+    async fn run_config_watcher_returns_invalid_config_when_path_has_no_parent() {
+        let (_dir, state) = make_state().await;
+
+        let err = run_config_watcher(PathBuf::new(), state)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, Error::InvalidConfig { .. }),
+            "expected InvalidConfig, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn reload_config_file_maps_parse_errors_to_internal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "::not-yaml::").unwrap();
+
+        let err = reload_config_file(&path).unwrap_err();
+
+        assert!(
+            matches!(err, Error::Internal { ref correlation_id, .. } if correlation_id == "daemon_config_reload"),
+            "expected Internal with daemon_config_reload correlation id, got: {:?}",
+            err
         );
     }
 

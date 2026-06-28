@@ -6,6 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 description = "HTTP API daemon: axum REST API, file watching, job queue, unix socket"
 
+[lib]
+test = false
+
 [dependencies]
 localdb-core = { path = "../core" }
 store-libsql = { path = "../store-libsql" }
@@ -13,29 +16,16 @@ embed = { path = "../embed" }
 axum = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true }
-tower-http = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-futures = { workspace = true }
-async-trait = { workspace = true }
 
 # File system notification (debounced file watching)
 # Use notify v6 since notify-debouncer-mini 0.4 depends on notify 6
-notify = { version = "6", features = ["serde"] }
 notify-debouncer-mini = "0.4"
 
 # YAML parsing for config reload
 serde_yaml = { workspace = true }
-
-# HTTP client for URL refresh
-reqwest = { version = "0.12", features = ["json"], default-features = false }
-
-# Unix socket and file locking
-# fslock is a cross-platform advisory file lock
-fslock = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -8,7 +8,6 @@ description = "Format detection and extraction to a normalized Markdown document
 
 [dependencies]
 localdb-core = { path = "../core" }
-thiserror = { workspace = true }
 
 # Markdown parsing
 pulldown-cmark = "0.13"

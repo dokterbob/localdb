@@ -1,0 +1,57 @@
+Task 1 workspace cleanup evidence
+
+cargo machete (before)
+----------------------
+localdb-core -- ./core/Cargo.toml:
+	futures
+	libsql
+embed -- ./embed/Cargo.toml:
+	anyhow
+store-libsql -- ./store-libsql/Cargo.toml:
+	serde
+	thiserror
+	tracing
+localdb -- ./localdb/Cargo.toml:
+	anyhow
+	localdb-core
+	serde
+	tracing
+server -- ./server/Cargo.toml:
+	async-trait
+	fslock
+	futures
+	notify
+	reqwest
+	thiserror
+	tower-http
+	tracing-subscriber
+mcp -- ./mcp/Cargo.toml:
+	async-trait
+	thiserror
+	tracing
+cli -- ./cli/Cargo.toml:
+	anyhow
+	clap
+	serde
+	thiserror
+	tracing
+fetch -- ./fetch/Cargo.toml:
+	tracing
+extract -- ./extract/Cargo.toml:
+	thiserror
+
+cargo machete (after)
+---------------------
+All manifests are clean!
+
+Removed dependencies by manifest
+-------------------------------
+core/Cargo.toml: futures, libsql
+embed/Cargo.toml: anyhow
+store-libsql/Cargo.toml: serde, thiserror, tracing
+localdb/Cargo.toml: anyhow, clap, localdb-core, serde, tracing
+server/Cargo.toml: async-trait, fslock, futures, notify, reqwest, thiserror, tower-http, tracing-subscriber
+mcp/Cargo.toml: async-trait, thiserror, tracing
+cli/Cargo.toml: anyhow, clap, serde, thiserror, tracing
+fetch/Cargo.toml: tracing
+extract/Cargo.toml: thiserror
