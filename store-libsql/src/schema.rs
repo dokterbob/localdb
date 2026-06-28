@@ -7,7 +7,7 @@ use crate::vectors::embedding_column_type;
 ///
 /// Survives `VACUUM` and doesn't require a separate table. Replaces the
 /// per-store `schema_version` table from the legacy schema.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Run the full DDL for the unified database.
 ///
@@ -227,8 +227,7 @@ async fn set_user_version(conn: &Connection) -> Result<(), libsql::Error> {
 ///
 /// Returns `0` on a freshly-created (un-touched) database. Returns the value
 /// last set by `set_user_version` (or any other writer) on an initialized one.
-#[cfg(test)]
-async fn get_schema_version(conn: &Connection) -> Result<i64, libsql::Error> {
+pub(crate) async fn get_schema_version(conn: &Connection) -> Result<i64, libsql::Error> {
     let mut rows = conn.query("PRAGMA user_version", ()).await?;
     match rows.next().await? {
         Some(row) => row.get::<i64>(0),

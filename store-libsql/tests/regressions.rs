@@ -147,3 +147,41 @@ async fn dense_search_no_user_filters_returns_results_when_dominated_by_other_st
         "the returned chunk should be the one belonging to store-A"
     );
 }
+
+/// Regression: WS4 — when another store has > limit*20 chunks all closer to
+/// the query vector, the ANN widen loop saturates without returning the target
+/// store's chunk. The exact-scan fallback must rescue it.
+///
+/// Bug: dense_search returned 0 results for store-A when store-B had 25 chunks
+/// (> limit*20 = 20) all ranked higher globally. Proven red→green.
+#[tokio::test]
+async fn dense_search_exact_fallback_when_ann_cap_saturated() {
+    let (_dir, db) = open_db_2d().await;
+
+    // Store-B: 25 chunks all very close to query [1.0, 0.0] — more than
+    // limit*20 = 20, so the widen loop can never surface store-A's chunk.
+    let b_chunks: Vec<ChunkRecord> = (0..25)
+        .map(|i| {
+            make_chunk(
+                &format!("b-chunk-{i}"),
+                &format!("b-doc-{i}"),
+                "store-B",
+                vec![1.0, 0.0001 * (i as f32 + 1.0)],
+            )
+        })
+        .collect();
+    seed_store(&db, "store-B", b_chunks).await;
+
+    // Store-A: 1 chunk farther from query — globally ranked below all store-B chunks.
+    seed_store(&db, "store-A", vec![make_chunk("a-chunk-0", "a-doc-0", "store-A", vec![0.7, 0.7])]).await;
+
+    let handle_a = db.retrieval_store("store-A").await.unwrap();
+    let results = handle_a.dense_search(&[1.0, 0.0], 1, &[]).await.unwrap();
+
+    assert_eq!(
+        results.len(), 1,
+        "dense_search must return store-A's chunk via exact-scan fallback \
+         when ANN is saturated by store-B's 25 chunks. Got: {results:?}"
+    );
+    assert_eq!(results[0].chunk.id, "a-chunk-0");
+}
