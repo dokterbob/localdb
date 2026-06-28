@@ -201,7 +201,7 @@ pub fn parse_duration(s: &str) -> Result<u64, String> {
 }
 
 /// Resolve the config file path.
-fn resolve_config_path(
+pub fn resolve_config_path(
     options: &LoadOptions,
     env_config_path: Option<&Path>,
 ) -> Result<PathBuf, Error> {

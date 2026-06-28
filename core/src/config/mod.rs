@@ -9,7 +9,8 @@ pub mod refresh;
 pub mod schema;
 
 pub use loader::{
-    load_config, load_config_from_str, refuse_legacy_layout, ConfigLoader, LoadOptions,
+    load_config, load_config_from_str, refuse_legacy_layout, resolve_config_path, ConfigLoader,
+    LoadOptions,
 };
 pub use platform::PlatformPaths;
 pub use policy::compute_policy_version;

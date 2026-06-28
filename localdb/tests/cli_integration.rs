@@ -1136,3 +1136,30 @@ fn two_concurrent_store_list_calls_both_succeed() {
     assert!(s1.success(), "first store list failed: {:?}", s1.code());
     assert!(s2.success(), "second store list failed: {:?}", s2.code());
 }
+
+/// With a minimal valid config (version: 1 + temp data dir, no `stores:` key, no embedder
+/// policy), read-only commands like `store list` must still succeed (exit 0), returning an
+/// empty list.  This exercises the lenient loader path and is hermetic across machines
+/// (a fresh temp data dir avoids legacy-layout interference from developer installations).
+#[test]
+fn store_list_with_absent_config_exits_0() {
+    let dir = TempDir::new().unwrap();
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    // Minimal config: version + fresh data dir only — no `stores:` key, no embedder config.
+    let config = format!(
+        "version: 1\npaths:\n  data: {}\n",
+        data_dir.to_string_lossy()
+    );
+    std::fs::write(dir.path().join("config.yaml"), &config).unwrap();
+    let output = cmd_with_dir(&dir)
+        .args(["store", "list"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code().unwrap(),
+        0,
+        "store list with minimal config should exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

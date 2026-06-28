@@ -25,7 +25,7 @@ use std::sync::Arc;
 use fetch::HttpUrlFetcher;
 use localdb_core::{
     config::{
-        loader::{load_config, ConfigLoader, LoadOptions, ResolvedPaths},
+        loader::{load_config, load_config_from_str, resolve_config_path, ConfigLoader, LoadOptions, ResolvedPaths},
         policy::compute_policy_version,
         schema::{EmbeddingPolicy, IndexingPolicyConfig, ProviderConfig},
     },
@@ -429,12 +429,43 @@ async fn load_app_db_lenient(ctx: &CliContext) -> (ConfigLoader, AppDb) {
     };
     let config_loader = match load_config(&options, ctx.config_env.as_deref()) {
         Ok(c) => c,
-        Err(_) => {
-            // Config is malformed/missing — use platform default paths.
+        Err(e) => {
+            // If the intended config file exists, it's malformed — fail hard (exit 2).
+            let config_path = resolve_config_path(&options, ctx.config_env.as_deref());
+            if matches!(&config_path, Ok(p) if p.exists()) {
+                exit_err(&e, ctx.json);
+            }
+            // File genuinely absent — try platform default config.
             let options_default = LoadOptions::default();
             match load_config(&options_default, None) {
                 Ok(c) => c,
-                Err(e) => exit_err(&e, ctx.json),
+                Err(_) => {
+                    // Platform default also absent — construct minimal fallback ConfigLoader
+                    // using platform paths and empty config. `store list` etc. will open/create
+                    // a fresh DB at the platform data dir and show 0 results.
+                    match localdb_core::config::PlatformPaths::resolve() {
+                        Some(platform) => {
+                            let config = load_config_from_str("version: 1\n")
+                                .expect("minimal config is always valid");
+                            ConfigLoader {
+                                config,
+                                paths: ResolvedPaths {
+                                    config_file: platform.config_file,
+                                    data_dir: platform.data_dir,
+                                    models_dir: platform.models_dir,
+                                    logs_dir: platform.logs_dir,
+                                },
+                            }
+                        }
+                        None => exit_err(
+                            &localdb_core::Error::InvalidConfig {
+                                message: "cannot determine platform paths (no home directory)"
+                                    .to_string(),
+                            },
+                            ctx.json,
+                        ),
+                    }
+                }
             }
         }
     };
