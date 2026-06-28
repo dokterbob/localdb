@@ -25,7 +25,10 @@ use std::sync::Arc;
 use fetch::HttpUrlFetcher;
 use localdb_core::{
     config::{
-        loader::{load_config, load_config_from_str, resolve_config_path, ConfigLoader, LoadOptions, ResolvedPaths},
+        loader::{
+            load_config, load_config_from_str, resolve_config_path, ConfigLoader, LoadOptions,
+            ResolvedPaths,
+        },
         policy::compute_policy_version,
         schema::{EmbeddingPolicy, IndexingPolicyConfig, ProviderConfig},
     },

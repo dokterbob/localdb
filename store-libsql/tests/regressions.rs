@@ -173,13 +173,24 @@ async fn dense_search_exact_fallback_when_ann_cap_saturated() {
     seed_store(&db, "store-B", b_chunks).await;
 
     // Store-A: 1 chunk farther from query — globally ranked below all store-B chunks.
-    seed_store(&db, "store-A", vec![make_chunk("a-chunk-0", "a-doc-0", "store-A", vec![0.7, 0.7])]).await;
+    seed_store(
+        &db,
+        "store-A",
+        vec![make_chunk(
+            "a-chunk-0",
+            "a-doc-0",
+            "store-A",
+            vec![0.7, 0.7],
+        )],
+    )
+    .await;
 
     let handle_a = db.retrieval_store("store-A").await.unwrap();
     let results = handle_a.dense_search(&[1.0, 0.0], 1, &[]).await.unwrap();
 
     assert_eq!(
-        results.len(), 1,
+        results.len(),
+        1,
         "dense_search must return store-A's chunk via exact-scan fallback \
          when ANN is saturated by store-B's 25 chunks. Got: {results:?}"
     );

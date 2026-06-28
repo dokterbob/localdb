@@ -77,7 +77,9 @@ impl LibsqlDb {
             .await
             .map_err(map_libsql_err)?;
 
-        let version = schema::get_schema_version(&conn).await.map_err(map_libsql_err)?;
+        let version = schema::get_schema_version(&conn)
+            .await
+            .map_err(map_libsql_err)?;
         if version != 0 && version != schema::SCHEMA_VERSION {
             return Err(Error::InvalidConfig {
                 message: format!(
@@ -330,7 +332,10 @@ mod tests {
         assert!(
             matches!(result, Err(localdb_core::Error::InvalidConfig { .. })),
             "expected InvalidConfig for wrong schema version, got: {}",
-            result.as_ref().err().map_or("Ok(_)".to_string(), |e| format!("{e:?}"))
+            result
+                .as_ref()
+                .err()
+                .map_or("Ok(_)".to_string(), |e| format!("{e:?}"))
         );
     }
 
@@ -338,7 +343,11 @@ mod tests {
     async fn fresh_db_and_reopen_both_succeed() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
-        LibsqlDb::open(&path, 4, localdb_core::VectorEncoding::Float32).await.unwrap();
-        LibsqlDb::open(&path, 4, localdb_core::VectorEncoding::Float32).await.unwrap();
+        LibsqlDb::open(&path, 4, localdb_core::VectorEncoding::Float32)
+            .await
+            .unwrap();
+        LibsqlDb::open(&path, 4, localdb_core::VectorEncoding::Float32)
+            .await
+            .unwrap();
     }
 }

@@ -1152,10 +1152,7 @@ fn store_list_with_absent_config_exits_0() {
         data_dir.to_string_lossy()
     );
     std::fs::write(dir.path().join("config.yaml"), &config).unwrap();
-    let output = cmd_with_dir(&dir)
-        .args(["store", "list"])
-        .output()
-        .unwrap();
+    let output = cmd_with_dir(&dir).args(["store", "list"]).output().unwrap();
     assert_eq!(
         output.status.code().unwrap(),
         0,

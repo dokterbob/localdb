@@ -795,7 +795,10 @@ mod tests {
         );
         // Nothing should have been persisted.
         let sources = state.list_sources("notes").await.unwrap();
-        assert!(sources.is_empty(), "no source should be stored after invalid refresh");
+        assert!(
+            sources.is_empty(),
+            "no source should be stored after invalid refresh"
+        );
     }
 
     #[tokio::test]
@@ -846,11 +849,23 @@ mod tests {
         let (_dir, state) = make_state().await;
         state.add_store("notes", "private").await.unwrap();
         state
-            .add_source("notes", "url", serde_json::json!({ "url": "https://example.com/a" }), "prose", Some("1h"))
+            .add_source(
+                "notes",
+                "url",
+                serde_json::json!({ "url": "https://example.com/a" }),
+                "prose",
+                Some("1h"),
+            )
             .await
             .unwrap();
         state
-            .add_source("notes", "url", serde_json::json!({ "url": "https://example.com/b" }), "prose", Some("2h"))
+            .add_source(
+                "notes",
+                "url",
+                serde_json::json!({ "url": "https://example.com/b" }),
+                "prose",
+                Some("2h"),
+            )
             .await
             .unwrap();
         assert_eq!(state.scheduler_source_count().await, 2);
