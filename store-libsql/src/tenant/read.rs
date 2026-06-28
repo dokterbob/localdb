@@ -25,6 +25,7 @@ pub(crate) async fn dense_search(
     let max_fetch = limit * 20;
 
     let mut results = Vec::new();
+    let mut ann_saturated = false;
     loop {
         let qvec_sql = vectors::query_vector_sql(query_vector, encoding);
         let escaped_store_id = store.store_id().replace('\'', "''");
@@ -59,16 +60,22 @@ pub(crate) async fn dense_search(
             };
             results.push(SearchResult { chunk, score });
         }
-        if results.len() >= limit || fetch_k >= max_fetch {
+        if results.len() >= limit {
+            break;
+        }
+        if fetch_k >= max_fetch {
+            ann_saturated = true;
             break;
         }
         fetch_k = (fetch_k * 2).min(max_fetch);
     }
 
-    // Exact-scan fallback: ANN may be saturated by other tenants. This only
-    // triggers for small stores (cheap scan). Per-store ANN partitioning is the
+    // Exact-scan fallback: only runs when ANN was truly saturated by other
+    // tenants (loop hit max_fetch without filling the tenant's quota). Skips
+    // stores that simply have fewer than `limit` chunks — those already got
+    // all their results from the ANN pass. Per-store ANN partitioning is the
     // long-term fix (tracking issue).
-    if results.len() < limit {
+    if ann_saturated && results.len() < limit {
         let qvec_sql = vectors::query_vector_sql(query_vector, encoding);
         let escaped_store_id = store.store_id().replace('\'', "''");
         let sql = format!(

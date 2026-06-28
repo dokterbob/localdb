@@ -18,11 +18,17 @@ pub fn validate_refresh_interval(s: &str) -> Result<Option<u64>, Error> {
     } else {
         s.parse::<u64>().ok()
     };
-    secs.map(Some).ok_or_else(|| Error::InvalidRequest {
-        message: format!(
-            "invalid refresh interval '{s}': expected a duration like '24h', '30m', or '3600s'"
-        ),
-    })
+    match secs {
+        None => Err(Error::InvalidRequest {
+            message: format!(
+                "invalid refresh interval '{s}': expected a duration like '24h', '30m', or '3600s'"
+            ),
+        }),
+        Some(0) => Err(Error::InvalidRequest {
+            message: format!("invalid refresh interval '{s}': duration must be greater than zero"),
+        }),
+        Some(n) => Ok(Some(n)),
+    }
 }
 
 #[cfg(test)]
@@ -66,5 +72,18 @@ mod tests {
             validate_refresh_interval("1x"),
             Err(Error::InvalidRequest { .. })
         ));
+    }
+
+    #[test]
+    fn zero_interval_returns_err() {
+        for s in &["0", "0s", "0m", "0h"] {
+            assert!(
+                matches!(
+                    validate_refresh_interval(s),
+                    Err(Error::InvalidRequest { .. })
+                ),
+                "expected Err for zero interval '{s}'"
+            );
+        }
     }
 }
