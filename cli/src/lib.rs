@@ -2662,7 +2662,7 @@ mod tests {
     /// This verifies that the policy version is derived from the current config rather
     /// than a hardcoded constant that could accidentally match stale stored values.
     ///
-    /// TODO: integration test for F5 policy_version update (verify run_index persists
+    /// TODO(#105): integration test for F5 policy_version update (verify run_index persists
     ///       the computed version back to the StoreRow when it differs from the stored one).
     #[test]
     fn index_updates_policy_version_in_store_row() {

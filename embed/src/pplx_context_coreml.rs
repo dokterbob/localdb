@@ -254,7 +254,7 @@ fn discover_buckets(snapshot_root: &Path) -> Result<(Vec<BucketInfo>, PathBuf), 
         // here: on-device compilation of `.mlpackage` is not yet supported.
         if !mlmodelc.is_dir() {
             if dir.join("encoder.mlpackage").is_dir() {
-                // TODO(coreml): compile .mlpackage on device via MLModel.compileModel
+                // TODO(#106): compile .mlpackage on device via MLModel.compileModel
                 tracing::warn!(
                     bucket = %dir.display(),
                     "skipping context bucket: only encoder.mlpackage present and \

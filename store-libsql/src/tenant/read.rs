@@ -29,7 +29,7 @@ pub(crate) async fn dense_search(
     loop {
         let qvec_sql = vectors::query_vector_sql(query_vector, encoding);
         let escaped_store_id = store.store_id().replace('\'', "''");
-        // TODO(#issue): libsql has no partial vector indexes or ANN-level
+        // TODO(#104): libsql has no partial vector indexes or ANN-level
         // predicate pushdown, so we always overfetch at the global index and
         // post-filter by store_id.  True per-store ANN partitioning would
         // require per-store chunk tables — see the tracking issue.

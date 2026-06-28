@@ -8,6 +8,8 @@
 
 use std::path::{Path, PathBuf};
 
+use localdb_core::Error;
+
 /// Guard for the daemon Unix socket.
 ///
 /// Binds a `UnixListener` on construction (creating the socket file) and
@@ -22,22 +24,19 @@ impl SocketGuard {
     /// Bind a Unix domain socket at `socket_path` and return a guard.
     ///
     /// Returns an error if the bind fails (permissions, path issues, etc.).
-    pub fn new(socket_path: &Path) -> Result<Self, std::io::Error> {
+    pub fn new(socket_path: &Path) -> Result<Self, Error> {
         if let Some(parent) = socket_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent).map_err(map_socket_io_error)?;
         }
 
         if socket_path.exists() {
             if probe_daemon(socket_path) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AddrInUse,
-                    format!("socket already bound at {}", socket_path.display()),
-                ));
+                return Err(Error::DaemonRunning);
             }
-            std::fs::remove_file(socket_path)?;
+            std::fs::remove_file(socket_path).map_err(map_socket_io_error)?;
         }
 
-        let listener = tokio::net::UnixListener::bind(socket_path)?;
+        let listener = tokio::net::UnixListener::bind(socket_path).map_err(map_socket_io_error)?;
         tracing::info!("daemon socket bound at: {}", socket_path.display());
 
         Ok(Self {
@@ -49,6 +48,17 @@ impl SocketGuard {
     /// Path of the socket file.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+fn map_socket_io_error(err: std::io::Error) -> Error {
+    if err.kind() == std::io::ErrorKind::AddrInUse {
+        Error::DaemonRunning
+    } else {
+        Error::Internal {
+            message: format!("socket error: {}", err),
+            correlation_id: "socket_bind".to_string(),
+        }
     }
 }
 
@@ -102,6 +112,20 @@ mod tests {
         assert_eq!(guard.path(), path.as_path());
         // The socket file must exist on disk after binding.
         assert!(path.exists(), "socket file should exist after binding");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn socket_guard_returns_daemon_running_when_path_is_already_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.sock");
+
+        let _guard = SocketGuard::new(&path).expect("should bind first socket");
+
+        match SocketGuard::new(&path) {
+            Ok(_) => panic!("second bind should fail"),
+            Err(err) => assert_eq!(err, localdb_core::Error::DaemonRunning),
+        }
     }
 
     #[tokio::test]
