@@ -1,0 +1,5 @@
+task-9 workspace cleanup pass
+
+- server/src/daemon.rs now returns localdb_core::Error for config watcher / reload helpers.
+- Added typed-error coverage for missing-parent config paths and config parse failures.
+- Verification: cargo test -p server (93 passed, 0 failed).
