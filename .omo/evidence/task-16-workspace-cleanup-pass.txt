@@ -1,0 +1,14 @@
+task: 16 workspace cleanup pass
+date: 2026-06-28
+
+changes:
+- Replaced infer_dim_encoding match logic in embed/src/factory.rs with a static SHAPES table lookup.
+- Added ShapeRule::matches() plus regression tests covering every current provider/model tuple and unknown-provider error behavior.
+
+verification:
+- cargo test -p embed ✅
+- cargo clippy -p embed -- -D warnings ✅
+
+notes:
+- No (dim, encoding) tuple changed.
+- create_embedder and core/src/ingestion.rs were left untouched.
