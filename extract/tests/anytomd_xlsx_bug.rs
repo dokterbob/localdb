@@ -3,7 +3,6 @@
 /// Run with:
 ///   cargo test -p extract --test anytomd_xlsx_bug -- --ignored --nocapture
 #[test]
-#[ignore]
 fn anytomd_xlsx_hangs_on_large_file() {
     use std::time::{Duration, Instant};
 
