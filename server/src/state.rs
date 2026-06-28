@@ -802,6 +802,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn add_source_zero_refresh_is_rejected() {
+        let (_dir, state) = make_state().await;
+        state.add_store("notes", "private").await.unwrap();
+        for zero in &["0", "0s", "0m", "0h"] {
+            let result = state
+                .add_source(
+                    "notes",
+                    "url",
+                    serde_json::json!({ "url": "https://example.com" }),
+                    "prose",
+                    Some(zero),
+                )
+                .await;
+            assert!(
+                matches!(result, Err(localdb_core::Error::InvalidRequest { .. })),
+                "expected InvalidRequest for zero refresh '{zero}', got: {:?}",
+                result
+            );
+        }
+        let sources = state.list_sources("notes").await.unwrap();
+        assert!(
+            sources.is_empty(),
+            "no source should be stored after zero refresh"
+        );
+    }
+
+    #[tokio::test]
     async fn add_source_valid_refresh_is_accepted() {
         let (_dir, state) = make_state().await;
         state.add_store("notes", "private").await.unwrap();

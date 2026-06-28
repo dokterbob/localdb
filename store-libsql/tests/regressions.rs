@@ -148,6 +148,38 @@ async fn dense_search_no_user_filters_returns_results_when_dominated_by_other_st
     );
 }
 
+/// Regression: fallback gating — a store with fewer chunks than `limit` and no
+/// competing tenants must return all its chunks without error and in distance
+/// order. Confirms the exact-scan fallback handles legitimate partial results
+/// gracefully (fires because ANN saturates at max_fetch, but returns correctly).
+#[tokio::test]
+async fn dense_search_small_store_returns_partial_results_correctly() {
+    let (_dir, db) = open_db_2d().await;
+
+    // Only 2 chunks in the store, searched with limit=5.
+    seed_store(
+        &db,
+        "small-store",
+        vec![
+            make_chunk("chunk-0", "doc-0", "small-store", vec![0.7, 0.7]),
+            make_chunk("chunk-1", "doc-1", "small-store", vec![0.9, 0.1]),
+        ],
+    )
+    .await;
+
+    let handle = db.retrieval_store("small-store").await.unwrap();
+    let results = handle.dense_search(&[1.0, 0.0], 5, &[]).await.unwrap();
+
+    assert_eq!(
+        results.len(),
+        2,
+        "should return all 2 chunks even though limit=5; got {results:?}"
+    );
+    // chunk-1 ([0.9, 0.1]) is closer to query [1.0, 0.0] than chunk-0 ([0.7, 0.7]).
+    assert_eq!(results[0].chunk.id, "chunk-1");
+    assert_eq!(results[1].chunk.id, "chunk-0");
+}
+
 /// Regression: WS4 — when another store has > limit*20 chunks all closer to
 /// the query vector, the ANN widen loop saturates without returning the target
 /// store's chunk. The exact-scan fallback must rescue it.
