@@ -43,21 +43,6 @@ defaults:                 # global indexing policy; stores inherit
                                                #   ids: pdf|epub|office|html|markdown|plaintext;
                                                #   order is load-bearing (affects policy_version, §2)
 
-stores:
-  - name: notes
-    visibility: private   # private | shared (shared non-functional in MVP)
-    backend: libsql
-    indexing: ~           # null = inherit defaults; or override {chunking, embedding, parsers}
-    sources:
-      - kind: path
-        root: ~/Documents/notes
-        include: ["**/*.md", "**/*.pdf"]
-        exclude: ["**/node_modules/**"]
-        preset: prose     # prose | messages | code  (source-kind preset, §2)
-      - kind: url
-        url: https://example.com/handbook
-        refresh: 24h
-
 providers:                # optional external endpoints, OpenAI-compatible
   - name: my-ollama
     kind: openai-compatible
@@ -88,29 +73,9 @@ hash** (unlike `chunking`/`embedding` keys, which are hashed order-independently
 [04-search-pipeline.md](04-search-pipeline.md) §4). Reordering the list therefore triggers a
 store reindex.
 
-## 3. The two-writer problem: bootstrap config vs. runtime state
+## 3. Store and source management
 
-The config must be editable both as a file and via API/GUI. Two writers on one YAML file means
-lost comments, lost ordering, and race conditions.
-
-**Decision: split the model.**
-
-- **Declarative bootstrap config (YAML):** owned by the user, read at startup and watched for
-  changes by the daemon. **Never rewritten by the machine.** Defines: paths, server bind,
-  defaults, providers, and any stores/sources the user chooses to manage declaratively.
-- **Mutable runtime state (DB-backed, in the data dir):** stores/sources/policy edits made via
-  API, CLI mutation commands, or future GUI land here, not in YAML.
-
-**Precedence:** YAML wins for any object it declares. An object is *YAML-owned* if it appears in
-the file (matched by store name / source identity); YAML-owned objects are read-only via the API
-(error `config_readonly`, [05-surfaces.md](05-surfaces.md) §5). Objects created via API/GUI are
-*runtime-owned* and never appear in YAML. `localdb status` reports each object's owner so the
-split is always inspectable.
-
-**Rejected:** round-trip YAML editing (machine rewrites the file) — loses comments/formatting,
-fights concurrent human edits, and turns a config file into a database with worse durability;
-"API writes a second YAML overlay file" — two files with merge semantics is the same problem with
-more states.
+Stores and sources are managed exclusively via the CLI (`localdb store add`, `localdb source add`) or HTTP API. No YAML store declarations are supported. The unified database (`<data_dir>/localdb.db`) is the single source of truth for all stores and sources.
 
 ## 4. File locations
 

@@ -80,10 +80,6 @@ pub enum Command {
         #[arg(long, value_name = "SOURCE_ID")]
         source: Option<String>,
 
-        /// Index an arbitrary directory (creates a temporary anonymous source).
-        #[arg(long, value_name = "PATH")]
-        dir: Option<String>,
-
         /// Exit with code 2 if any document failed extraction (never aborts mid-run).
         #[arg(long)]
         strict: bool,
@@ -204,11 +200,7 @@ fn main() {
                 }
             }
         },
-        Command::Index {
-            source,
-            dir,
-            strict,
-        } => cli::run_index(&ctx, source.as_deref(), dir.as_deref(), *strict),
+        Command::Index { source, strict } => cli::run_index(&ctx, source.as_deref(), *strict),
         Command::Search {
             query,
             limit,
@@ -332,6 +324,16 @@ mod tests {
     fn short_store_flag() {
         let cli = Cli::try_parse_from(["localdb", "-s", "notes", "search", "foo"]).unwrap();
         assert_eq!(cli.stores, vec!["notes"]);
+    }
+
+    /// `localdb index --dir` is rejected by clap (flag was removed; use `--source` instead).
+    #[test]
+    fn index_dir_arg_is_rejected_by_clap() {
+        let result = Cli::try_parse_from(["localdb", "index", "--dir", "/tmp/foo"]);
+        assert!(
+            result.is_err(),
+            "expected --dir to be rejected, but clap accepted it"
+        );
     }
 
     /// `-s` short flag works as a subcommand-level option too.

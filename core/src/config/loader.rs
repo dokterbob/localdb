@@ -12,10 +12,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::{
-    config::{
-        platform::PlatformPaths,
-        schema::{RawConfig, SourceConfig},
-    },
+    config::{platform::PlatformPaths, schema::RawConfig},
     Error,
 };
 
@@ -158,88 +155,6 @@ fn validate_config(config: &RawConfig) -> Result<(), Error> {
                 config.version
             ),
         });
-    }
-
-    // Validate stores
-    for (i, store) in config.stores.iter().enumerate() {
-        // Validate sources
-        for (j, source) in store.sources.iter().enumerate() {
-            validate_source(source, i, j)?;
-        }
-
-        // Validate visibility
-        if store.visibility != "private" && store.visibility != "shared" {
-            return Err(Error::InvalidConfig {
-                message: format!(
-                    "stores[{}].visibility: must be 'private' or 'shared', got '{}'",
-                    i, store.visibility
-                ),
-            });
-        }
-
-        // Validate backend
-        if store.backend != "libsql" {
-            return Err(Error::InvalidConfig {
-                message: format!(
-                    "stores[{}].backend: unknown backend '{}'; supported: libsql",
-                    i, store.backend
-                ),
-            });
-        }
-    }
-
-    Ok(())
-}
-
-/// Validate a source config entry.
-fn validate_source(
-    source: &SourceConfig,
-    store_idx: usize,
-    source_idx: usize,
-) -> Result<(), Error> {
-    let loc = format!("stores[{}].sources[{}]", store_idx, source_idx);
-
-    match source.kind.as_str() {
-        "path" => {
-            if source.root.is_none() {
-                return Err(Error::InvalidConfig {
-                    message: format!("{}.root: required for kind 'path'", loc),
-                });
-            }
-
-            // Validate preset
-            let preset = &source.preset;
-            if !["prose", "code", "messages"].contains(&preset.as_str()) {
-                return Err(Error::InvalidConfig {
-                    message: format!(
-                        "{}.preset: unknown preset '{}'; supported: prose, code, messages",
-                        loc, preset
-                    ),
-                });
-            }
-        }
-        "url" => {
-            if source.url.is_none() {
-                return Err(Error::InvalidConfig {
-                    message: format!("{}.url: required for kind 'url'", loc),
-                });
-            }
-
-            // Validate refresh duration if present
-            if let Some(refresh) = &source.refresh {
-                parse_duration(refresh).map_err(|e| Error::InvalidConfig {
-                    message: format!("{}.refresh: {}", loc, e),
-                })?;
-            }
-        }
-        other => {
-            return Err(Error::InvalidConfig {
-                message: format!(
-                    "{}.kind: unknown source kind '{}'; supported: path, url",
-                    loc, other
-                ),
-            });
-        }
     }
 
     Ok(())
@@ -488,73 +403,15 @@ defaults:
     }
 
     #[test]
-    fn load_rejects_bad_duration() {
-        let yaml = r#"
-version: 1
-stores:
-  - name: web
-    sources:
-      - kind: url
-        url: https://example.com
-        refresh: not-a-duration
-"#;
+    fn config_with_stores_key_is_rejected() {
+        // stores: is no longer a valid config key — DB is the single source of truth.
+        let yaml = "version: 1\nstores:\n  - name: notes\n";
         let err = load_config_from_str(yaml).unwrap_err();
-        match err {
-            Error::InvalidConfig { message } => {
-                assert!(
-                    message.contains("refresh"),
-                    "error should mention 'refresh', got: {}",
-                    message
-                );
-            }
-            other => panic!("expected InvalidConfig, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn load_rejects_path_source_without_root() {
-        let yaml = r#"
-version: 1
-stores:
-  - name: mystore
-    sources:
-      - kind: path
-        include: ["**/*.md"]
-"#;
-        let err = load_config_from_str(yaml).unwrap_err();
-        match err {
-            Error::InvalidConfig { message } => {
-                assert!(
-                    message.contains("root"),
-                    "error should mention 'root', got: {}",
-                    message
-                );
-            }
-            other => panic!("expected InvalidConfig, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn load_rejects_url_source_without_url() {
-        let yaml = r#"
-version: 1
-stores:
-  - name: mystore
-    sources:
-      - kind: url
-        refresh: 24h
-"#;
-        let err = load_config_from_str(yaml).unwrap_err();
-        match err {
-            Error::InvalidConfig { message } => {
-                assert!(
-                    message.contains("url"),
-                    "error should mention 'url', got: {}",
-                    message
-                );
-            }
-            other => panic!("expected InvalidConfig, got {:?}", other),
-        }
+        assert!(
+            matches!(err, Error::InvalidConfig { .. }),
+            "stores: key should be rejected by deny_unknown_fields: {:?}",
+            err
+        );
     }
 
     #[test]
@@ -579,21 +436,6 @@ defaults:
       model: pplx-embed-context-v1-0.6b
       provider: local-onnx
 
-stores:
-  - name: notes
-    visibility: private
-    backend: libsql
-    indexing: ~
-    sources:
-      - kind: path
-        root: ~/Documents/notes
-        include: ["**/*.md", "**/*.pdf"]
-        exclude: ["**/node_modules/**"]
-        preset: prose
-      - kind: url
-        url: https://example.com/handbook
-        refresh: 24h
-
 providers:
   - name: my-ollama
     kind: openai-compatible
@@ -602,89 +444,8 @@ providers:
 "#;
         let cfg = load_config_from_str(yaml).expect("valid full config should load");
         assert_eq!(cfg.version, 1);
-        assert_eq!(cfg.stores.len(), 1);
-        assert_eq!(cfg.stores[0].name, "notes");
-        assert_eq!(cfg.stores[0].sources.len(), 2);
         assert_eq!(cfg.providers.len(), 1);
         assert_eq!(cfg.providers[0].name, "my-ollama");
-    }
-
-    #[test]
-    fn load_valid_config_with_store_indexing_override() {
-        let yaml = r#"
-version: 1
-stores:
-  - name: code-store
-    sources:
-      - kind: path
-        root: ~/src
-        preset: code
-    indexing:
-      chunking:
-        preset_overrides: {}
-      embedding:
-        model: bge-small
-        provider: local-onnx
-"#;
-        let cfg =
-            load_config_from_str(yaml).expect("config with store indexing override should load");
-        let store = &cfg.stores[0];
-        assert!(store.indexing.is_some());
-        let indexing = store.indexing.as_ref().unwrap();
-        assert_eq!(indexing.embedding.model, "bge-small");
-    }
-
-    #[test]
-    fn load_error_has_path_context_for_store_source() {
-        let yaml = r#"
-version: 1
-stores:
-  - name: s1
-    sources:
-      - kind: path
-        root: /tmp
-  - name: s2
-    sources:
-      - kind: url
-        url: https://example.com
-      - kind: url
-        refresh: 5h
-"#;
-        let err = load_config_from_str(yaml).unwrap_err();
-        match err {
-            Error::InvalidConfig { message } => {
-                // Should mention the store/source index
-                assert!(
-                    message.contains("stores[1]") || message.contains("sources[1]"),
-                    "error '{}' should include location context",
-                    message
-                );
-            }
-            other => panic!("expected InvalidConfig, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn unknown_source_kind_rejected() {
-        let yaml = r#"
-version: 1
-stores:
-  - name: mystore
-    sources:
-      - kind: imap
-        url: imap://mail.example.com
-"#;
-        let err = load_config_from_str(yaml).unwrap_err();
-        match err {
-            Error::InvalidConfig { message } => {
-                assert!(
-                    message.contains("imap"),
-                    "error should mention the unknown kind, got: {}",
-                    message
-                );
-            }
-            other => panic!("expected InvalidConfig, got {:?}", other),
-        }
     }
 
     // --- fixture file tests ---
@@ -717,22 +478,18 @@ stores:
 
     #[test]
     fn fixture_bad_duration_rejected() {
+        // Fixture now tests that `stores:` key is rejected (unknown field).
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/config/bad_duration.yaml"
         );
         let yaml = std::fs::read_to_string(path).expect("fixture file should exist");
         let err = load_config_from_str(&yaml).unwrap_err();
-        match err {
-            Error::InvalidConfig { message } => {
-                assert!(
-                    message.contains("refresh") || message.contains("duration"),
-                    "bad_duration fixture error should mention 'refresh' or 'duration', got: {}",
-                    message
-                );
-            }
-            other => panic!("expected InvalidConfig, got {:?}", other),
-        }
+        assert!(
+            matches!(err, Error::InvalidConfig { .. }),
+            "bad_duration fixture should fail: {:?}",
+            err
+        );
     }
 
     #[test]

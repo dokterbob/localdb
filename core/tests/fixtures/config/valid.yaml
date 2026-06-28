@@ -17,21 +17,6 @@ defaults:
       model: pplx-embed-context-v1-0.6b
       provider: local-onnx
 
-stores:
-  - name: notes
-    visibility: private
-    backend: libsql
-    indexing: ~
-    sources:
-      - kind: path
-        root: ~/Documents/notes
-        include: ["**/*.md", "**/*.pdf"]
-        exclude: ["**/node_modules/**"]
-        preset: prose
-      - kind: url
-        url: https://example.com/handbook
-        refresh: 24h
-
 providers:
   - name: my-ollama
     kind: openai-compatible

@@ -35,14 +35,16 @@ connections, tickets), **UCAN** (delegated capability tokens), **Willow protocol
 **Matrix**. Evaluation criteria: maturity/audit status, Rust support, fit for
 capability-delegation-without-relay.
 
-## 3. Qdrant Edge watch-item
+## 3. Turso watch-item
 
-Qdrant Edge (in-process Qdrant) was pre-GA (~0.6.x, unstable) as of early 2026. It becomes a
-candidate to join — not necessarily replace — libsql as an embedded backend when **all** hold:
+Turso is the future embedded direction for libsql — the hosted/sync layer on top of the same
+engine already in use. It becomes a candidate to join — not necessarily replace — the current
+embedded-only libsql setup when **all** hold:
 
-1. GA / 1.0 release with a stability commitment.
-2. Hybrid (dense + sparse) query API confirmed working from the **Rust** crate.
-3. Server-sync story (Edge ↔ Qdrant server) documented, since that pairs with Phase 3.
+1. The Turso feature set relevant to localdb (e.g. vector sync, multi-db routing) reaches
+   production stability.
+2. Embedded ↔ Turso server sync story is documented and working from the **Rust** crate.
+3. Licensing and self-hosting story is confirmed compatible with the project's permissive stack.
 
 ## 4. Packaging roadmap
 

@@ -226,19 +226,16 @@ This section documents verified divergences between the specs and the v0.1.0 imp
 **1. HTTP daemon `POST /v1/jobs` is a no-op.**
 The daemon's job-submission endpoint accepts the request and reports the job state machine (`pending → done`) but does not run the ingestion pipeline; `chunks_written` stays `0`. Daemon-side reads (`/v1/search`, `/v1/documents/{id}`, `/v1/status`) DO see CLI-indexed data because the daemon now opens the same unified database as the CLI. To actually index, run `localdb index` from the CLI (which still works while the daemon runs — concurrent writers serialise via SQLite WAL).
 
-**2. YAML-declared stores cannot be indexed.** ([#12](https://github.com/dokterbob/localdb/issues/12))
-Stores declared in `config.yaml` under the `stores:` key appear in `localdb store list` as `(yaml)`, but `localdb index --store <name>` returns `error: store not found: <name>` (exit 3). The `run_index` function in `cli/src/lib.rs` resolves stores only from the unified database. Today's working path is to create stores at runtime with `localdb store add <name>` and add sources with `localdb source add`. YAML store declarations are config-only for now.
-
-**3. `source add` does not validate path existence.** ([#14](https://github.com/dokterbob/localdb/issues/14))
+**2. `source add` does not validate path existence.** ([#14](https://github.com/dokterbob/localdb/issues/14))
 `localdb source add /does/not/exist --store notes` succeeds (exit 0) even when the path does not exist on disk. Validation is deferred to index time. The source spec validation in `core/src/config/` or the CLI source-add handler is the place to add an existence check.
 
-**4. macOS default paths use a verbose bundle ID.** ([#15](https://github.com/dokterbob/localdb/issues/15))
+**3. macOS default paths use a verbose bundle ID.** ([#15](https://github.com/dokterbob/localdb/issues/15))
 The default config, data, and model-cache locations on macOS all live under the bundle ID `com.localdb.localdb.localdb` (e.g. data at `~/Library/Application Support/com.localdb.localdb.localdb/data`). The triple-repeat comes from `ProjectDirs::from("com.localdb", "localdb", "localdb")` in `core/src/config/platform.rs`. Specs/03 shows shorter `localdb/` paths. Cosmetic; override with `paths.*` in config for cleaner locations.
 
-**5. The CoreML context bundle ships only the L512 sequence-length bucket.**
+**4. The CoreML context bundle ships only the L512 sequence-length bucket.**
 The CoreML backend (`local-coreml` feature; see [Platform notes](#platform-notes)) reads its bucket manifest from HF repo `dokterbob/pplx-embed-coreml`. Today only the `context/L512-int8` bucket is published. The larger context buckets (`L ∈ {1024, 2048, 4096}`) are picked up automatically from the manifest once published, so no code change is needed. This XET-deduped download that shares the ~1.15 GB encoder weights across buckets relies on the `hf-hub` 1.0 pre-release.
 
-**6. Sources added before the include-allowlist change keep empty `include` globs.**
+**5. Sources added before the include-allowlist change keep empty `include` globs.**
 As of the `only-index-supported-files` branch, `cli` automatically sets `DEFAULT_PATH_INCLUDES` (an extension-based allowlist) on new directory sources that have no explicit `include` globs. Sources that were added before this change already have an empty `include` list recorded in the unified database and will continue to index all files they enumerate until they are removed and re-added with `localdb source add`. There is no automatic migration, and this change is intentionally not folded into `policy_version`. The per-file chunk preset is determined deterministically from the filename/MIME type at index time, so re-indexing existing content with the new code produces correct results without a policy-hash change.
 
 ---

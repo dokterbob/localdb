@@ -49,10 +49,9 @@ pub fn http_status_for(err: &CoreError) -> StatusCode {
         | CoreError::DocumentNotFound { .. }
         | CoreError::JobNotFound { .. } => StatusCode::NOT_FOUND,
 
-        CoreError::RuntimeStateLocked
-        | CoreError::DaemonRunning
-        | CoreError::ConfigReadonly
-        | CoreError::IndexInProgress => StatusCode::CONFLICT,
+        CoreError::RuntimeStateLocked | CoreError::DaemonRunning | CoreError::IndexInProgress => {
+            StatusCode::CONFLICT
+        }
 
         CoreError::DaemonUnreachable | CoreError::ProviderUnavailable { .. } => {
             StatusCode::BAD_GATEWAY
@@ -103,10 +102,6 @@ mod tests {
             StatusCode::CONFLICT
         );
         assert_eq!(http_status_for(&Error::DaemonRunning), StatusCode::CONFLICT);
-        assert_eq!(
-            http_status_for(&Error::ConfigReadonly),
-            StatusCode::CONFLICT
-        );
         assert_eq!(
             http_status_for(&Error::IndexInProgress),
             StatusCode::CONFLICT

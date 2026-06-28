@@ -2,13 +2,11 @@
 //!
 //! See specs/03-config.md for full specification.
 
-pub mod effective;
 pub mod loader;
 pub mod platform;
 pub mod policy;
 pub mod schema;
 
-pub use effective::{check_yaml_owned, ConfigOwnership, EffectiveConfig, EffectiveStore};
 pub use loader::{
     load_config, load_config_from_str, refuse_legacy_layout, ConfigLoader, LoadOptions,
 };
@@ -16,5 +14,5 @@ pub use platform::PlatformPaths;
 pub use policy::compute_policy_version;
 pub use schema::{
     ChunkingPolicy, DefaultsConfig, EmbeddingPolicy, IndexingPolicyConfig, PathsConfig,
-    ProviderConfig, RawConfig, ServerConfig, SourceConfig, StoreConfig,
+    ProviderConfig, RawConfig, ServerConfig,
 };

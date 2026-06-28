@@ -54,12 +54,6 @@ pub enum Error {
     #[error("daemon is unreachable")]
     DaemonUnreachable,
 
-    /// Attempted API write to a YAML-owned object.
-    ///
-    /// See specs/03-config.md §3 for ownership model.
-    #[error("this object is owned by the config file and cannot be mutated via the API")]
-    ConfigReadonly,
-
     /// Config failed validation; message contains path-precise error.
     #[error("invalid config: {message}")]
     InvalidConfig { message: String },
@@ -118,7 +112,6 @@ impl Error {
             Error::RuntimeStateLocked => "runtime_state_locked",
             Error::DaemonRunning => "daemon_running",
             Error::DaemonUnreachable => "daemon_unreachable",
-            Error::ConfigReadonly => "config_readonly",
             Error::InvalidConfig { .. } => "invalid_config",
             Error::InvalidRequest { .. } => "invalid_request",
             Error::UnsupportedFormat { .. } => "unsupported_format",
@@ -139,10 +132,7 @@ impl Error {
             | Error::SourceNotFound { .. }
             | Error::DocumentNotFound { .. }
             | Error::JobNotFound { .. } => 3,
-            Error::RuntimeStateLocked
-            | Error::DaemonRunning
-            | Error::ConfigReadonly
-            | Error::IndexInProgress => 4,
+            Error::RuntimeStateLocked | Error::DaemonRunning | Error::IndexInProgress => 4,
             Error::DaemonUnreachable
             | Error::ProviderUnavailable { .. }
             | Error::ModelMissing { .. } => 5,
@@ -178,7 +168,6 @@ mod tests {
             (Error::RuntimeStateLocked, "runtime_state_locked", 4),
             (Error::DaemonRunning, "daemon_running", 4),
             (Error::DaemonUnreachable, "daemon_unreachable", 5),
-            (Error::ConfigReadonly, "config_readonly", 4),
             (
                 Error::InvalidConfig {
                     message: "m".into(),
@@ -271,7 +260,6 @@ mod tests {
     fn conflict_errors_exit_4() {
         assert_eq!(Error::RuntimeStateLocked.exit_code(), 4);
         assert_eq!(Error::DaemonRunning.exit_code(), 4);
-        assert_eq!(Error::ConfigReadonly.exit_code(), 4);
         assert_eq!(Error::IndexInProgress.exit_code(), 4);
     }
 

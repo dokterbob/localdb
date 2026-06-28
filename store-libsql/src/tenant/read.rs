@@ -16,15 +16,21 @@ pub(crate) async fn dense_search(
 ) -> Result<Vec<SearchResult>, Error> {
     let conn = store.conn().conn().await;
     let filter_clauses = build_filter_clauses(filters);
-    let has_filters = !filters.is_empty();
     let encoding = store.encoding();
     let dim = store.embedding_dim();
-    let mut fetch_k = if has_filters { limit * 3 } else { limit };
+    // Always start with an overfetch multiplier: the tenant predicate
+    // (WHERE c.store_id = '...') acts as a post-ANN filter even when the
+    // caller supplies no MetadataFilters.
+    let mut fetch_k = limit * 3;
     let max_fetch = limit * 20;
 
     loop {
         let qvec_sql = vectors::query_vector_sql(query_vector, encoding);
         let escaped_store_id = store.store_id().replace('\'', "''");
+        // TODO(#issue): libsql has no partial vector indexes or ANN-level
+        // predicate pushdown, so we always overfetch at the global index and
+        // post-filter by store_id.  True per-store ANN partitioning would
+        // require per-store chunk tables — see the tracking issue.
         let sql = format!(
             "SELECT c.id, c.document_id, c.seq, c.text, c.span_start, c.span_end,
                     c.heading_path, vector_extract(c.embedding) AS embedding_json,
@@ -51,7 +57,7 @@ pub(crate) async fn dense_search(
             };
             results.push(SearchResult { chunk, score });
         }
-        if results.len() >= limit || !has_filters || fetch_k >= max_fetch {
+        if results.len() >= limit || fetch_k >= max_fetch {
             return Ok(results);
         }
         fetch_k = (fetch_k * 2).min(max_fetch);

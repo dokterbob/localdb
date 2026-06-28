@@ -61,7 +61,8 @@ async fn create_sources(conn: &Connection) -> Result<(), libsql::Error> {
             refresh    TEXT,
             created_at TEXT NOT NULL,
             CHECK ((kind = 'path' AND root IS NOT NULL AND url IS NULL)
-                OR (kind = 'url'  AND url  IS NOT NULL AND root IS NULL))
+                OR (kind = 'url'  AND url  IS NOT NULL AND root IS NULL)),
+            UNIQUE (store_id, id)
         )",
         (),
     )
@@ -94,9 +95,9 @@ async fn create_documents(conn: &Connection) -> Result<(), libsql::Error> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS documents (
             rowid          INTEGER PRIMARY KEY,
-            store_id       TEXT NOT NULL REFERENCES stores(id)  ON DELETE CASCADE,
+            store_id       TEXT NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
             id             TEXT NOT NULL,
-            source_id      TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+            source_id      TEXT NOT NULL,
             source_kind    TEXT NOT NULL,
             uri            TEXT NOT NULL,
             title          TEXT,
@@ -107,7 +108,8 @@ async fn create_documents(conn: &Connection) -> Result<(), libsql::Error> {
             policy_version TEXT NOT NULL,
             metadata       TEXT NOT NULL,
             share_path     TEXT,
-            UNIQUE (store_id, id)
+            UNIQUE (store_id, id),
+            FOREIGN KEY (store_id, source_id) REFERENCES sources(store_id, id) ON DELETE CASCADE
         )",
         (),
     )
@@ -420,5 +422,128 @@ mod tests {
         let row = rows.next().await.unwrap().unwrap();
         let col_type: String = row.get(0).unwrap();
         assert_eq!(col_type.to_ascii_uppercase(), "F32_BLOB(384)");
+    }
+
+    /// Insert fixtures shared by the store-isolation FK tests.
+    ///
+    /// Creates store-a and store-b, one source per store, and one document in
+    /// store-a that references store-a's source.  Returns early before the
+    /// document insert so callers can attempt their own insert and assert the
+    /// outcome.
+    async fn insert_two_stores_and_sources(conn: &Connection) {
+        for (id, name) in [("store-a", "Store A"), ("store-b", "Store B")] {
+            conn.execute(
+                &format!(
+                    "INSERT INTO stores \
+                     (id, name, indexing_policy, policy_version, created_at) \
+                     VALUES ('{id}', '{name}', '{{}}', '1', '2024-01-01T00:00:00Z')"
+                ),
+                (),
+            )
+            .await
+            .unwrap();
+        }
+        for (id, store_id, root) in [
+            ("src-a", "store-a", "/path/a"),
+            ("src-b", "store-b", "/path/b"),
+        ] {
+            conn.execute(
+                &format!(
+                    "INSERT INTO sources (id, store_id, kind, root, created_at) \
+                     VALUES ('{id}', '{store_id}', 'path', '{root}', '2024-01-01T00:00:00Z')"
+                ),
+                (),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    /// A document in store A must not be able to reference a source in store B.
+    ///
+    /// This guards against the cross-store contamination bug: with only a
+    /// simple `REFERENCES sources(id)` FK a document in store A could point to
+    /// a source in store B, and a cascade-delete of store B would then silently
+    /// remove store A's documents.  The composite FK
+    /// `FOREIGN KEY (store_id, source_id) REFERENCES sources(store_id, id)`
+    /// closes that gap.
+    #[tokio::test]
+    async fn cross_store_source_reference_is_rejected() {
+        let (_dir, conn) = open_test_db().await;
+        create_schema(&conn, 4, VectorEncoding::Float32)
+            .await
+            .unwrap();
+
+        insert_two_stores_and_sources(&conn).await;
+
+        // Attempt: document lives in store-a but references src-b (store-b).
+        let result = conn
+            .execute(
+                "INSERT INTO documents \
+                 (store_id, id, source_id, source_kind, uri, \
+                  content_hash, fetched_at, origin_store, policy_version, metadata) \
+                 VALUES \
+                 ('store-a', 'doc-x', 'src-b', 'path', 'file:///doc.md', \
+                  'abc', '2024-01-01T00:00:00Z', 'store-a', '1', '{}')",
+                (),
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "inserting a document in store-a that references a source in store-b \
+             should be rejected by the composite FK constraint"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("FOREIGN KEY"),
+            "expected a FOREIGN KEY constraint error, got: {err_msg}"
+        );
+    }
+
+    /// Deleting store B must not cascade-delete documents that belong to store A.
+    ///
+    /// With the old simple `REFERENCES sources(id)` FK, deleting store B would
+    /// cascade-delete its sources, which in turn (if a document in store A
+    /// somehow referenced a store-B source) would cascade-delete store A's
+    /// documents.  The composite FK makes cross-store references impossible
+    /// in the first place, and cascade deletions remain store-scoped.
+    #[tokio::test]
+    async fn deleting_store_b_does_not_cascade_to_store_a_documents() {
+        let (_dir, conn) = open_test_db().await;
+        create_schema(&conn, 4, VectorEncoding::Float32)
+            .await
+            .unwrap();
+
+        insert_two_stores_and_sources(&conn).await;
+
+        // Insert a document in store-a that references store-a's own source.
+        conn.execute(
+            "INSERT INTO documents \
+             (store_id, id, source_id, source_kind, uri, \
+              content_hash, fetched_at, origin_store, policy_version, metadata) \
+             VALUES \
+             ('store-a', 'doc-1', 'src-a', 'path', 'file:///doc.md', \
+              'abc', '2024-01-01T00:00:00Z', 'store-a', '1', '{}')",
+            (),
+        )
+        .await
+        .unwrap();
+
+        // Delete store B — should cascade only to store B's own rows.
+        conn.execute("DELETE FROM stores WHERE id = 'store-b'", ())
+            .await
+            .unwrap();
+
+        // Store A's document must still be present.
+        let mut rows = conn
+            .query("SELECT id FROM documents WHERE store_id = 'store-a'", ())
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap();
+        assert!(
+            row.is_some(),
+            "store A's document should still exist after deleting store B"
+        );
     }
 }
