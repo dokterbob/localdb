@@ -1160,3 +1160,122 @@ fn store_list_with_absent_config_exits_0() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+// ---------------------------------------------------------------------------
+// Finding B — Reject refresh intervals on path sources
+// ---------------------------------------------------------------------------
+
+#[test]
+fn source_add_refresh_on_path_exits_2() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "notes"])
+        .assert()
+        .success();
+
+    let fixture = dir.path().join("docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .args([
+            "--store",
+            "notes",
+            "source",
+            "add",
+            "--refresh",
+            "1h",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "source add --refresh on a path source should exit 2; stderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Finding A — Persist store policy on auto-index
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn source_add_auto_index_updates_store_policy_version() {
+    let dir = TempDir::new().unwrap();
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let config_d1 = format!(
+        "version: 1\npaths:\n  data: {}\ndefaults:\n  indexing:\n    embedding:\n      provider: fake\n      model: bge-small-en-v1.5\n",
+        data_dir.to_string_lossy()
+    );
+    std::fs::write(dir.path().join("config.yaml"), &config_d1).unwrap();
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "notes"])
+        .assert()
+        .success();
+
+    let docs1 = dir.path().join("docs1");
+    std::fs::create_dir_all(&docs1).unwrap();
+    std::fs::write(docs1.join("first.md"), "# First\n\nFirst document.\n").unwrap();
+
+    cmd_with_dir(&dir)
+        .args(["--store", "notes", "source", "add", docs1.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let db_path = data_dir.join("localdb.db");
+    let db = libsql::Builder::new_local(&db_path).build().await.unwrap();
+    let conn = db.connect().unwrap();
+    let mut rows = conn
+        .query(
+            "SELECT policy_version FROM stores WHERE name = ?",
+            libsql::params!["notes".to_string()],
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    let v1: String = row.get(0).unwrap();
+    drop(rows);
+    drop(conn);
+    drop(db);
+
+    let config_d2 = format!(
+        "version: 1\npaths:\n  data: {}\ndefaults:\n  indexing:\n    embedding:\n      provider: fake\n      model: bge-small-en-v1.5\n    parsers:\n      - pdf\n      - html\n      - markdown\n      - plaintext\n",
+        data_dir.to_string_lossy()
+    );
+    std::fs::write(dir.path().join("config.yaml"), &config_d2).unwrap();
+
+    let docs2 = dir.path().join("docs2");
+    std::fs::create_dir_all(&docs2).unwrap();
+    std::fs::write(docs2.join("second.md"), "# Second\n\nSecond document.\n").unwrap();
+
+    cmd_with_dir(&dir)
+        .args(["--store", "notes", "source", "add", docs2.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let db = libsql::Builder::new_local(&db_path).build().await.unwrap();
+    let conn = db.connect().unwrap();
+    let mut rows = conn
+        .query(
+            "SELECT policy_version FROM stores WHERE name = ?",
+            libsql::params!["notes".to_string()],
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    let v2: String = row.get(0).unwrap();
+    drop(rows);
+
+    assert_ne!(
+        v1,
+        v2,
+        "policy_version should be updated after source add with changed indexing policy; v1={v1}, v2={v2}"
+    );
+}

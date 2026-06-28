@@ -279,6 +279,12 @@ impl AppState {
             None => None,
         };
 
+        if refresh.is_some() && kind_enum != localdb_core::types::SourceKind::Url {
+            return Err(Error::InvalidRequest {
+                message: "refresh is only supported for URL sources".to_string(),
+            });
+        }
+
         let id = localdb_core::new_ulid();
         let source_row = SourceRow {
             id: id.clone(),
@@ -825,6 +831,31 @@ mod tests {
         assert!(
             sources.is_empty(),
             "no source should be stored after zero refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_source_refresh_on_path_source_is_rejected() {
+        let (_dir, state) = make_state().await;
+        state.add_store("notes", "private").await.unwrap();
+        let result = state
+            .add_source(
+                "notes",
+                "path",
+                serde_json::json!({"root": "/tmp/notes", "include": [], "exclude": []}),
+                "prose",
+                Some("1h"),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(localdb_core::Error::InvalidRequest { .. })),
+            "expected InvalidRequest for refresh on path source, got: {:?}",
+            result
+        );
+        let sources = state.list_sources("notes").await.unwrap();
+        assert!(
+            sources.is_empty(),
+            "no source should be stored when refresh on path source is rejected"
         );
     }
 

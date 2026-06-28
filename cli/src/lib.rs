@@ -1188,6 +1188,15 @@ async fn run_source_add_async(ctx: &CliContext, source_arg: &str, refresh: Optio
         }
     }
 
+    if refresh.is_some() && kind != "url" {
+        exit_err(
+            &Error::InvalidRequest {
+                message: "refresh is only supported for URL sources".to_string(),
+            },
+            ctx.json,
+        );
+    }
+
     let src = SourceRow {
         id: new_ulid(),
         store_id: rt_store.id.clone(),
@@ -1279,9 +1288,22 @@ async fn run_index_for_source_async(
     }
 
     let policy = config_loader.config.defaults.indexing.clone();
+    let current_policy_version = compute_policy_version(&config_loader.config.defaults.indexing);
+    if store_row.policy_version != current_policy_version {
+        let new_indexing_policy =
+            serde_json::to_string(&policy).unwrap_or_else(|_| store_row.indexing_policy.clone());
+        let updated_store = StoreRow {
+            policy_version: current_policy_version.clone(),
+            indexing_policy: new_indexing_policy,
+            ..store_row.clone()
+        };
+        if let Err(e) = db.backend().upsert_store(&updated_store).await {
+            eprintln!("warning: failed to update policy_version: {}", e);
+        }
+    }
     let ingestion_cfg = IngestionConfig {
         store_id: store_row.id.clone(),
-        policy_version: compute_policy_version(&config_loader.config.defaults.indexing),
+        policy_version: current_policy_version,
         chunker: ChunkerConfig::prose(),
     };
 
