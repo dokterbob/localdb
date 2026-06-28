@@ -26,5 +26,4 @@ assert_cmd = "2"
 predicates = "3"
 tempfile = { workspace = true }
 serde_json = { workspace = true }
-fd-lock = "4"
 libsql = { workspace = true }

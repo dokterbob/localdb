@@ -42,10 +42,10 @@ Where a store's content comes from.
 | `spec` | Kind-specific: root path + include/exclude globs, or URL + refresh interval. |
 | `source_kind_preset` | Which indexing preset applies (`prose`, `messages`, `code`) — see [03-config.md](03-config.md) §2. |
 
-**Runtime representation:** `RuntimeSource` in `core::config::runtime_state` is the concrete
-Rust type for sources persisted in the runtime-state DB (`runtime-state.db`). It is a core
-domain type — not a CLI type — and includes fields `id`, `store_name`, `kind`, `root`,
-`url`, `include`, `exclude`, and `preset`. Source CRUD is exposed via `RuntimeStateDb`
+**Runtime representation:** `SourceRow` in `core::backend` is the concrete
+Rust type for sources persisted in the unified database (`localdb.db`). It is a core
+domain type, not a CLI type, and includes fields `id`, `store_id`, `kind`, `root`,
+`url`, `include`, `exclude`, and `preset`. Source CRUD is exposed via `StoreBackend`
 methods (`upsert_source`, `delete_source`, `list_sources`, `get_source`,
 `find_source_by_root_or_url`).
 
@@ -233,9 +233,9 @@ Dublin Core Metadata Element Set 1.1 (DCMES), all 15 elements. Repeatable elemen
 | `coverage` | `Option<String>` | Spatial or temporal extent. |
 | `rights` | `Option<String>` | Rights statement or license. |
 
-**Persistence:** `DocumentMetadata` is JSON-encoded into a single nullable `TEXT` column named
-`metadata` on each chunk record in libsql. Threading path:
-`Parser` → `ParsedDocument.metadata` → `ExtractionResult.metadata` → `ChunkRecord.metadata` →
+**Persistence:** `DocumentMetadata` is JSON-encoded into a single `TEXT` column named
+`metadata` on each document record in libsql. Threading path:
+`Parser` -> `ParsedDocument.metadata` -> `DocumentInfo.metadata` ->
 libsql `metadata` column.
 
 **Defensive read:** tables created before this column was added (pre-migration) may have a
@@ -253,3 +253,13 @@ keys are validated when present (`validate_dc_meta_key` in `core/src/types.rs`).
 the 15 DCMES elements in `DocumentMetadata` and are the untyped extension point for surfaces
 that need to set DC fields without going through a full `Parser`. The live ingestion path
 populates `DocumentMetadata` (typed) rather than `meta` (untyped).
+
+## 8. Storage Schema Design Rationale
+
+The unified database schema uses several design patterns to ensure referential integrity and query performance:
+
+- **Composite Uniqueness:** The `documents` and `chunks` tables use composite `(store_id, id)` uniqueness. Content-addressed IDs can collide across stores by design. This allows each store to maintain its own rows. Cross-store deduplication is deferred to query-time `GROUP BY` operations.
+- **Denormalised Store ID:** The `store_id` column is denormalised onto the `chunks` table. This allows per-store filtering directly on the rowid lookup after vector or FTS5 searches, avoiding an extra join through the `documents` table.
+- **FTS5 Content Keying:** The FTS5 virtual table `chunks_fts` uses external content keying over `chunks.text`. Filtering by `store_id` is performed on the `chunks` join, which is highly efficient since FTS5 returns rowids and `chunks` is rowid-keyed.
+- **Cascade Chain:** Foreign keys are configured with `ON DELETE CASCADE` across the chain: `stores` to `sources` / `documents` to `chunks`. Deleting a store cleans up all associated sources, documents, chunks, FTS5 entries, and vector index rows in a single transaction.
+- **Schema Versioning:** The database uses `PRAGMA user_version` to track the schema version. This survives `VACUUM` operations and avoids the need for a separate metadata table.

@@ -10,6 +10,7 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+#[cfg(any(test, feature = "test-support"))]
 use std::collections::HashMap;
 
 use crate::ids::{ContentId, UlidId};
@@ -172,7 +173,7 @@ pub struct StoreStats {
 
 /// The storage abstraction for a single knowledge base.
 ///
-/// Implementations: `store-libsql` (embedded, production), `FakeStore` (in-memory, tests).
+/// Production storage is implemented by `store-libsql`.
 ///
 /// This trait is object-safe and `Send + Sync` so it can be boxed and shared across async tasks.
 ///
@@ -248,17 +249,18 @@ pub trait RetrievalStore: Send + Sync + 'static {
 }
 
 // ---------------------------------------------------------------------------
-// FakeStore — in-memory implementation for tests
 // ---------------------------------------------------------------------------
 
 /// An in-memory `RetrievalStore` for use in tests.
 ///
 /// No persistence, no actual vector index — linear scan for both legs.
 /// Dense search uses cosine similarity; BM25 uses simple term frequency scoring.
+#[cfg(any(test, feature = "test-support"))]
 pub struct FakeStore {
     chunks: tokio::sync::RwLock<Vec<ChunkRecord>>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl FakeStore {
     /// Create a new empty fake store.
     pub fn new() -> Self {
@@ -268,6 +270,7 @@ impl FakeStore {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Default for FakeStore {
     fn default() -> Self {
         Self::new()
@@ -275,6 +278,7 @@ impl Default for FakeStore {
 }
 
 /// Compute cosine similarity between two vectors.
+#[cfg(any(test, feature = "test-support"))]
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
@@ -291,6 +295,7 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// Simple term-frequency BM25 approximation for tests.
 ///
 /// Not a real BM25 implementation — just counts term matches for test purposes.
+#[cfg(any(test, feature = "test-support"))]
 fn simple_bm25_score(query: &str, text: &str) -> f32 {
     let query_terms: Vec<&str> = query.split_whitespace().collect();
     if query_terms.is_empty() {
@@ -305,6 +310,7 @@ fn simple_bm25_score(query: &str, text: &str) -> f32 {
 }
 
 /// Apply metadata filters to a chunk record. Returns `true` if the record passes.
+#[cfg(any(test, feature = "test-support"))]
 fn passes_filters(record: &ChunkRecord, filters: &[MetadataFilter]) -> bool {
     for filter in filters {
         match filter {
@@ -348,6 +354,7 @@ fn passes_filters(record: &ChunkRecord, filters: &[MetadataFilter]) -> bool {
     true
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[async_trait]
 impl RetrievalStore for FakeStore {
     async fn upsert_chunks(&self, records: Vec<ChunkRecord>) -> Result<usize, Error> {
@@ -479,7 +486,6 @@ impl RetrievalStore for FakeStore {
 }
 
 // ---------------------------------------------------------------------------
-// Trait conformance test suite (runs against both FakeStore and libsql)
 // ---------------------------------------------------------------------------
 
 /// A shared test suite exercising the `RetrievalStore` contract.
@@ -826,9 +832,6 @@ pub mod conformance {
     /// Run a subset of the conformance suite that does not require a pre-built FTS index.
     ///
     /// The store must be freshly created (empty) when this is called.
-    /// Tests that require an FTS index (BM25 search) can run directly on both
-    /// libsql (auto-maintained FTS triggers) and FakeStore.
-    ///
     /// Note: because each conformance function leaves data in the store, this helper
     /// is only useful for backends that can provide a fresh store per call.  For
     /// fine-grained control call each `test_*` function directly (as the per-backend
@@ -841,7 +844,6 @@ pub mod conformance {
 }
 
 // ---------------------------------------------------------------------------
-// Unit tests for FakeStore (TDD: failing → passing)
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -869,8 +871,6 @@ mod tests {
             metadata: crate::parser::DocumentMetadata::default(),
         }
     }
-
-    // --- TDD: conformance suite against FakeStore ---
 
     #[tokio::test]
     async fn fake_store_upsert_and_stats() {
@@ -949,8 +949,6 @@ mod tests {
         let store = FakeStore::new();
         test_bm25_search_limit(&store).await;
     }
-
-    // --- Additional unit tests for FakeStore internals ---
 
     #[tokio::test]
     async fn fake_store_empty_stats() {

@@ -1,94 +1,23 @@
-//! Shared application state for the axum server.
-//!
-//! `AppState` is injected into all handlers via `axum::Extension`.
-//! It holds the job queue, the config snapshot, and the runtime-state DB.
-
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use tokio::sync::RwLock;
 
 use localdb_core::{
     config::{
-        runtime_state::{
-            build_effective_config, check_yaml_owned, EffectiveConfig, RuntimeStateDb,
-        },
-        schema::RawConfig,
+        check_yaml_owned,
+        policy::compute_policy_version,
+        schema::{IndexingPolicyConfig, RawConfig},
+        ConfigOwnership, EffectiveConfig, EffectiveStore,
     },
-    store::{MetadataFilter, RetrievalStore, SearchResult, StoreStats},
-    ChunkRecord, Error, FakeStore, Store, StoreVisibility,
+    ingestion::now_rfc3339,
+    Error, SourceRow, Store, StoreBackend, StoreBackendConfig, StoreRow, StoreVisibility,
 };
+use store_libsql::SqliteBackend;
 
-use crate::handlers::DocumentRecord;
 use crate::job_queue::JobQueue;
 
-// ---------------------------------------------------------------------------
-// SharedStore — wraps Arc<FakeStore> as a Box<dyn RetrievalStore>
-// ---------------------------------------------------------------------------
-
-/// A newtype that delegates `RetrievalStore` to an `Arc<FakeStore>`.
-///
-/// This lets the daemon share a single in-memory store between the job queue
-/// (writes) and the HTTP search handler (reads).
-pub struct SharedStore(pub Arc<FakeStore>);
-
-#[async_trait]
-impl RetrievalStore for SharedStore {
-    async fn upsert_chunks(&self, chunks: Vec<ChunkRecord>) -> Result<usize, Error> {
-        self.0.upsert_chunks(chunks).await
-    }
-
-    async fn delete_by_document(&self, document_id: &str) -> Result<usize, Error> {
-        self.0.delete_by_document(document_id).await
-    }
-
-    async fn delete_by_store(&self, store_id: &str) -> Result<usize, Error> {
-        self.0.delete_by_store(store_id).await
-    }
-
-    async fn dense_search(
-        &self,
-        query_vector: &[f32],
-        k: usize,
-        filters: &[MetadataFilter],
-    ) -> Result<Vec<SearchResult>, Error> {
-        self.0.dense_search(query_vector, k, filters).await
-    }
-
-    async fn bm25_search(
-        &self,
-        query: &str,
-        k: usize,
-        filters: &[MetadataFilter],
-    ) -> Result<Vec<SearchResult>, Error> {
-        self.0.bm25_search(query, k, filters).await
-    }
-
-    async fn stats(&self) -> Result<StoreStats, Error> {
-        self.0.stats().await
-    }
-
-    async fn get_chunk(&self, chunk_id: &str) -> Result<Option<ChunkRecord>, Error> {
-        self.0.get_chunk(chunk_id).await
-    }
-
-    async fn get_chunks_for_document(&self, document_id: &str) -> Result<Vec<ChunkRecord>, Error> {
-        self.0.get_chunks_for_document(document_id).await
-    }
-
-    async fn list_indexed_documents(
-        &self,
-    ) -> Result<Vec<localdb_core::ingestion::DocumentRecord>, Error> {
-        self.0.list_indexed_documents().await
-    }
-}
-
-/// A source record stored in the runtime-state DB (simplified, in-memory for now).
-///
-/// Full DB-backed persistence is via the `RuntimeStateDb` + a sources table
-/// added in this ticket.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SourceRecord {
     pub id: String,
@@ -105,23 +34,12 @@ pub struct AppState {
 }
 
 struct Inner {
-    /// In-memory snapshot of the current YAML config.
     yaml_config: RwLock<RawConfig>,
-    /// Runtime-state DB path (for reopening after config reload).
     data_dir: PathBuf,
-    /// Runtime-state DB for stores/sources added via API.
-    runtime_db: RuntimeStateDb,
-    /// In-memory source records (persisted in runtime_db sources table).
-    sources: RwLock<HashMap<String, SourceRecord>>,
-    /// Job queue.
+    backend: Arc<dyn StoreBackend>,
+    default_indexing_policy: IndexingPolicyConfig,
+    default_policy_version: String,
     job_queue: JobQueue,
-    /// In-memory retrieval store for search (used by the daemon).
-    ///
-    /// In production this would be backed by LanceDB; here we use the FakeStore
-    /// so the search handler can call `SearchOrchestrator::query()` for real.
-    retrieval_store: Arc<FakeStore>,
-    /// In-memory document index: doc_id → DocumentRecord (for GET /documents/{id}).
-    documents: RwLock<HashMap<String, DocumentRecord>>,
 }
 
 impl AppState {
@@ -131,18 +49,28 @@ impl AppState {
         data_dir: PathBuf,
         job_queue: JobQueue,
     ) -> Result<Self, Error> {
-        let runtime_db_path = data_dir.join("runtime-state.db");
-        let runtime_db = RuntimeStateDb::open(&runtime_db_path).await?;
+        let embedding_policy = &yaml_config.defaults.indexing.embedding;
+        let providers = &yaml_config.providers;
+        let (dim, encoding) =
+            embed::infer_dim_encoding(embedding_policy, providers).map_err(|e| {
+                Error::InvalidConfig {
+                    message: format!("cannot determine embedding shape for daemon: {e}"),
+                }
+            })?;
+        let db_path = data_dir.join("localdb.db");
+        let config = StoreBackendConfig::local_path(db_path, dim, encoding);
+        let backend = Arc::new(SqliteBackend::open(config).await?) as Arc<dyn StoreBackend>;
+        let default_indexing_policy = yaml_config.defaults.indexing.clone();
+        let default_policy_version = compute_policy_version(&default_indexing_policy);
 
         Ok(Self {
             inner: Arc::new(Inner {
                 yaml_config: RwLock::new(yaml_config),
                 data_dir,
-                runtime_db,
-                sources: RwLock::new(HashMap::new()),
+                backend,
+                default_indexing_policy,
+                default_policy_version,
                 job_queue,
-                retrieval_store: Arc::new(FakeStore::new()),
-                documents: RwLock::new(HashMap::new()),
             }),
         })
     }
@@ -152,11 +80,66 @@ impl AppState {
         &self.inner.job_queue
     }
 
+    pub fn data_dir(&self) -> &PathBuf {
+        &self.inner.data_dir
+    }
+
+    pub fn backend(&self) -> &dyn StoreBackend {
+        self.inner.backend.as_ref()
+    }
+
+    pub fn backend_arc(&self) -> Arc<dyn StoreBackend> {
+        self.inner.backend.clone()
+    }
+
     /// Get the effective config (YAML + runtime merged).
     pub async fn effective_config(&self) -> Result<EffectiveConfig, Error> {
         let yaml = self.inner.yaml_config.read().await;
-        let default = localdb_core::config::schema::IndexingPolicyConfig::default();
-        build_effective_config(&yaml, &self.inner.runtime_db, &default).await
+        let runtime_stores = self.inner.backend.list_stores().await?;
+        let default_policy = &self.inner.default_indexing_policy;
+        let mut stores = Vec::new();
+        let yaml_names: HashSet<&str> = yaml.stores.iter().map(|s| s.name.as_str()).collect();
+
+        for yaml_store in &yaml.stores {
+            let indexing = yaml_store
+                .indexing
+                .clone()
+                .unwrap_or_else(|| default_policy.clone());
+            stores.push(EffectiveStore {
+                name: yaml_store.name.clone(),
+                id: None,
+                ownership: ConfigOwnership::Yaml,
+                visibility: yaml_store.visibility.clone(),
+                backend: yaml_store.backend.clone(),
+                indexing,
+            });
+        }
+
+        for runtime_store in runtime_stores {
+            if yaml_names.contains(runtime_store.name.as_str()) {
+                continue;
+            }
+            let indexing = serde_json::from_str(&runtime_store.indexing_policy).map_err(|e| {
+                Error::Internal {
+                    message: format!(
+                        "invalid indexing_policy JSON for store '{name}': {e}",
+                        name = runtime_store.name
+                    ),
+                    correlation_id: "effective_config_policy_parse".into(),
+                }
+            })?;
+            let visibility = store_visibility_to_str(&runtime_store.visibility).to_string();
+            stores.push(EffectiveStore {
+                name: runtime_store.name,
+                id: Some(runtime_store.id),
+                ownership: ConfigOwnership::Runtime,
+                visibility,
+                backend: runtime_store.backend,
+                indexing,
+            });
+        }
+
+        Ok(EffectiveConfig { stores })
     }
 
     /// Check whether a named store is YAML-owned.
@@ -180,30 +163,46 @@ impl AppState {
     ///
     /// Returns `Error::ConfigReadonly` if the store name is YAML-owned.
     pub async fn add_store(&self, name: &str, visibility: &str) -> Result<Store, Error> {
-        // Check YAML ownership
         if self.is_yaml_owned_store(name).await {
             return Err(Error::ConfigReadonly);
         }
 
         let id = localdb_core::new_ulid();
-        let rt_store = localdb_core::config::runtime_state::RuntimeStore {
-            name: name.to_string(),
+        let vis_enum = match visibility {
+            "shared" => StoreVisibility::Shared,
+            "private" => StoreVisibility::Private,
+            _ => {
+                return Err(Error::InvalidRequest {
+                    message: format!(
+                        "unknown visibility '{visibility}'; expected 'private' or 'shared'"
+                    ),
+                })
+            }
+        };
+        let indexing_policy =
+            serde_json::to_string(&self.inner.default_indexing_policy).map_err(|e| {
+                Error::Internal {
+                    message: format!("cannot serialize default indexing policy: {e}"),
+                    correlation_id: "appdb_serialize_default_policy".into(),
+                }
+            })?;
+        let row = StoreRow {
             id: id.clone(),
-            visibility: visibility.to_string(),
+            name: name.to_string(),
+            visibility: vis_enum.clone(),
             backend: "libsql".to_string(),
-            indexing: None,
+            indexing_policy,
+            policy_version: self.inner.default_policy_version.clone(),
+            acl: "{}".to_string(),
+            created_at: now_rfc3339(),
         };
 
-        self.inner.runtime_db.upsert_store(&rt_store).await?;
+        self.inner.backend.upsert_store(&row).await?;
 
         Ok(Store {
             id,
             name: name.to_string(),
-            visibility: if visibility == "shared" {
-                StoreVisibility::Shared
-            } else {
-                StoreVisibility::Private
-            },
+            visibility: vis_enum,
             backend: localdb_core::BackendConfig {
                 kind: "libsql".to_string(),
                 connection: Default::default(),
@@ -232,29 +231,20 @@ impl AppState {
             return Err(Error::ConfigReadonly);
         }
 
-        let deleted = self.inner.runtime_db.delete_store(name).await?;
+        let row = self
+            .inner
+            .backend
+            .get_store_by_name(name)
+            .await?
+            .ok_or_else(|| Error::StoreNotFound {
+                id: name.to_string(),
+            })?;
+        let deleted = self.inner.backend.delete_store(&row.id).await?;
         if !deleted {
             return Err(Error::StoreNotFound {
                 id: name.to_string(),
             });
         }
-
-        // Cascade: remove orphaned in-memory sources.
-        {
-            let mut sources = self.inner.sources.write().await;
-            sources.retain(|_, s| s.store_id != name);
-        }
-
-        // Cascade: remove on-disk index (LanceDB + tantivy FTS).
-        let store_dir = self.inner.data_dir.join("stores").join(name);
-        match std::fs::remove_dir_all(&store_dir) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                tracing::warn!("could not remove store data dir {:?}: {}", store_dir, e);
-            }
-        }
-
         Ok(())
     }
 
@@ -287,59 +277,79 @@ impl AppState {
         spec: serde_json::Value,
         preset: &str,
     ) -> Result<SourceRecord, Error> {
-        // Verify store exists
         let effective = self.effective_config().await?;
-        let store_opt = effective.stores.iter().find(|s| s.name == store_name);
-        let store = store_opt.ok_or_else(|| Error::StoreNotFound {
-            id: store_name.to_string(),
-        })?;
+        let store = effective
+            .stores
+            .iter()
+            .find(|s| s.name == store_name)
+            .ok_or_else(|| Error::StoreNotFound {
+                id: store_name.to_string(),
+            })?;
 
-        // Check if YAML-owned
-        if store.ownership == localdb_core::config::runtime_state::ConfigOwnership::Yaml {
+        if store.ownership == ConfigOwnership::Yaml {
             return Err(Error::ConfigReadonly);
         }
 
+        let store_row = self
+            .inner
+            .backend
+            .get_store_by_name(store_name)
+            .await?
+            .ok_or_else(|| Error::StoreNotFound {
+                id: store_name.to_string(),
+            })?;
+        let store_id = store_row.id;
+        let (kind_enum, root, url, include, exclude) = parse_source_spec(kind, &spec)?;
+
         let id = localdb_core::new_ulid();
-        let source = SourceRecord {
+        let source_row = SourceRow {
             id: id.clone(),
-            store_id: store_name.to_string(),
+            store_id: store_id.clone(),
+            kind: kind_enum,
+            root,
+            url,
+            include,
+            exclude,
+            preset: preset.to_string(),
+            refresh: None,
+            created_at: now_rfc3339(),
+        };
+        self.inner.backend.upsert_source(&source_row).await?;
+
+        Ok(SourceRecord {
+            id,
+            store_id,
             kind: kind.to_string(),
             spec,
             preset: preset.to_string(),
-        };
-
-        {
-            let mut sources = self.inner.sources.write().await;
-            sources.insert(id, source.clone());
-        }
-
-        Ok(source)
+        })
     }
 
     /// List sources for a store.
     pub async fn list_sources(&self, store_name: &str) -> Result<Vec<SourceRecord>, Error> {
-        // Verify store exists
-        let effective = self.effective_config().await?;
-        if !effective.stores.iter().any(|s| s.name == store_name) {
-            return Err(Error::StoreNotFound {
+        let store = self
+            .inner
+            .backend
+            .get_store_by_name(store_name)
+            .await?
+            .ok_or_else(|| Error::StoreNotFound {
                 id: store_name.to_string(),
-            });
-        }
-
-        let sources = self.inner.sources.read().await;
-        Ok(sources
-            .values()
-            .filter(|s| s.store_id == store_name)
-            .cloned()
-            .collect())
+            })?;
+        self.inner
+            .backend
+            .list_sources(&store.id)
+            .await?
+            .into_iter()
+            .map(source_row_to_record)
+            .collect()
     }
 
     /// Remove a source by ID.
     ///
     /// Returns `Error::SourceNotFound` if the source doesn't exist.
     pub async fn remove_source(&self, source_id: &str) -> Result<(), Error> {
-        let mut sources = self.inner.sources.write().await;
-        if sources.remove(source_id).is_none() {
+        let deleted = self.inner.backend.delete_source(source_id).await?;
+        if !deleted {
             return Err(Error::SourceNotFound {
                 id: source_id.to_string(),
             });
@@ -349,18 +359,15 @@ impl AppState {
 
     /// Get a source by ID.
     pub async fn get_source(&self, source_id: &str) -> Result<SourceRecord, Error> {
-        let sources = self.inner.sources.read().await;
-        sources
-            .get(source_id)
-            .cloned()
+        let source = self
+            .inner
+            .backend
+            .get_source(source_id)
+            .await?
             .ok_or_else(|| Error::SourceNotFound {
                 id: source_id.to_string(),
-            })
-    }
-
-    /// Get the data directory path.
-    pub fn data_dir(&self) -> &PathBuf {
-        &self.inner.data_dir
+            })?;
+        source_row_to_record(source)
     }
 
     /// Update a runtime-owned store's mutable fields.
@@ -372,62 +379,136 @@ impl AppState {
             return Err(Error::ConfigReadonly);
         }
 
-        // Check it exists in the effective config (YAML + runtime).
-        {
-            let effective = self.effective_config().await?;
-            effective
-                .stores
-                .iter()
-                .find(|s| s.name == name)
-                .ok_or_else(|| Error::StoreNotFound {
-                    id: name.to_string(),
-                })?;
-        }
-
-        // Fetch the current runtime store record, update, re-upsert.
-        let stores = self.inner.runtime_db.list_stores().await?;
-        let current =
-            stores
-                .into_iter()
-                .find(|s| s.name == name)
-                .ok_or_else(|| Error::StoreNotFound {
-                    id: name.to_string(),
-                })?;
-
-        let updated = localdb_core::config::runtime_state::RuntimeStore {
-            visibility: visibility.unwrap_or(&current.visibility).to_string(),
-            ..current
+        let row = self
+            .inner
+            .backend
+            .get_store_by_name(name)
+            .await?
+            .ok_or_else(|| Error::StoreNotFound {
+                id: name.to_string(),
+            })?;
+        let vis_new = match (visibility, &row.visibility) {
+            (Some("shared"), _) => StoreVisibility::Shared,
+            (Some("private"), _) => StoreVisibility::Private,
+            (Some(other), _) => {
+                return Err(Error::InvalidRequest {
+                    message: format!("unknown visibility '{other}'"),
+                })
+            }
+            (None, v) => v.clone(),
         };
-
-        self.inner.runtime_db.upsert_store(&updated).await?;
+        let updated = StoreRow {
+            visibility: vis_new,
+            ..row
+        };
+        self.inner.backend.upsert_store(&updated).await?;
         Ok(())
     }
+}
 
-    /// Get a document by its content-addressed ID.
-    ///
-    /// Returns `None` if the document is not indexed in the in-memory store.
-    pub async fn get_document_by_id(&self, doc_id: &str) -> Option<DocumentRecord> {
-        let docs = self.inner.documents.read().await;
-        docs.get(doc_id).cloned()
+fn store_visibility_to_str(visibility: &StoreVisibility) -> &'static str {
+    match visibility {
+        StoreVisibility::Private => "private",
+        StoreVisibility::Shared => "shared",
     }
+}
 
-    /// Insert or update a document record in the in-memory index.
-    pub async fn upsert_document(&self, record: DocumentRecord) {
-        let mut docs = self.inner.documents.write().await;
-        docs.insert(record.id.clone(), record);
-    }
+type ParsedSourceSpec = (
+    localdb_core::types::SourceKind,
+    Option<String>,
+    Option<String>,
+    Vec<String>,
+    Vec<String>,
+);
 
-    /// Access the in-memory retrieval store used by the search handler.
-    pub fn retrieval_store(&self) -> Arc<FakeStore> {
-        self.inner.retrieval_store.clone()
+fn parse_source_spec(kind: &str, spec: &serde_json::Value) -> Result<ParsedSourceSpec, Error> {
+    match kind {
+        "path" => {
+            let root = spec
+                .get("root")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .ok_or_else(|| Error::InvalidRequest {
+                    message: "path source requires 'root'".to_string(),
+                })?;
+            let include = string_array_field(spec, "include")?;
+            let exclude = string_array_field(spec, "exclude")?;
+            Ok((
+                localdb_core::types::SourceKind::Path,
+                Some(root),
+                None,
+                include,
+                exclude,
+            ))
+        }
+        "url" => {
+            let url = spec
+                .get("url")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .ok_or_else(|| Error::InvalidRequest {
+                    message: "url source requires 'url'".to_string(),
+                })?;
+            Ok((
+                localdb_core::types::SourceKind::Url,
+                None,
+                Some(url),
+                Vec::new(),
+                Vec::new(),
+            ))
+        }
+        other => Err(Error::InvalidRequest {
+            message: format!("unknown source kind '{other}'"),
+        }),
     }
+}
 
-    /// Upsert chunks into the in-memory retrieval store.
-    ///
-    /// Used by the job queue when ingestion produces new chunks.
-    pub async fn upsert_chunks(&self, chunks: Vec<ChunkRecord>) -> Result<usize, Error> {
-        self.inner.retrieval_store.upsert_chunks(chunks).await
-    }
+fn string_array_field(spec: &serde_json::Value, field: &str) -> Result<Vec<String>, Error> {
+    let Some(raw) = spec.get(field) else {
+        return Ok(Vec::new());
+    };
+    let arr = raw.as_array().ok_or_else(|| Error::InvalidRequest {
+        message: format!("source spec field '{field}' must be a JSON array of strings"),
+    })?;
+    arr.iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| Error::InvalidRequest {
+                    message: format!("source spec field '{field}' contains a non-string value"),
+                })
+        })
+        .collect()
+}
+
+fn source_row_to_record(row: SourceRow) -> Result<SourceRecord, Error> {
+    let (kind, spec) = match row.kind {
+        localdb_core::types::SourceKind::Path => {
+            let root = row.root.ok_or_else(|| Error::Internal {
+                message: format!("path source '{}' has no root", row.id),
+                correlation_id: "server_source_row_path".to_string(),
+            })?;
+            (
+                "path".to_string(),
+                serde_json::json!({"root": root, "include": row.include, "exclude": row.exclude}),
+            )
+        }
+        localdb_core::types::SourceKind::Url => {
+            let url = row.url.ok_or_else(|| Error::Internal {
+                message: format!("url source '{}' has no url", row.id),
+                correlation_id: "server_source_row_url".to_string(),
+            })?;
+            ("url".to_string(), serde_json::json!({"url": url}))
+        }
+    };
+    Ok(SourceRecord {
+        id: row.id,
+        store_id: row.store_id,
+        kind,
+        spec,
+        preset: row.preset,
+    })
 }
 
 /// A store record as returned by the API.
@@ -436,7 +517,7 @@ pub struct StoreRecord {
     pub name: String,
     pub visibility: String,
     pub backend: String,
-    pub ownership: localdb_core::config::runtime_state::ConfigOwnership,
+    pub ownership: localdb_core::config::ConfigOwnership,
 }
 
 #[cfg(test)]
@@ -446,13 +527,17 @@ mod tests {
 
     async fn make_state() -> (TempDir, AppState) {
         let dir = tempfile::tempdir().unwrap();
-        let yaml_config = RawConfig {
+        let mut yaml_config = RawConfig {
             version: 1,
             server: Default::default(),
             paths: Default::default(),
             defaults: Default::default(),
             stores: vec![],
             providers: vec![],
+        };
+        yaml_config.defaults.indexing.embedding = localdb_core::config::schema::EmbeddingPolicy {
+            provider: "fake".to_string(),
+            model: "default".to_string(),
         };
         let queue = JobQueue::new();
         let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
@@ -468,6 +553,13 @@ mod tests {
         let effective = state.effective_config().await.unwrap();
         assert_eq!(effective.stores.len(), 1);
         assert_eq!(effective.stores[0].name, "notes");
+    }
+
+    #[tokio::test]
+    async fn add_store_rejects_unknown_visibility() {
+        let (_dir, state) = make_state().await;
+        let result = state.add_store("notes", "public").await;
+        assert!(matches!(result, Err(Error::InvalidRequest { .. })));
     }
 
     #[tokio::test]
@@ -543,6 +635,36 @@ mod tests {
         let sources = state.list_sources("notes").await.unwrap();
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].id, source.id);
+    }
+
+    #[tokio::test]
+    async fn add_source_rejects_non_array_include() {
+        let (_dir, state) = make_state().await;
+        state.add_store("notes", "private").await.unwrap();
+        let result = state
+            .add_source(
+                "notes",
+                "path",
+                serde_json::json!({"root": "/tmp/notes", "include": "**/*.md"}),
+                "prose",
+            )
+            .await;
+        assert!(matches!(result, Err(Error::InvalidRequest { .. })));
+    }
+
+    #[tokio::test]
+    async fn add_source_rejects_non_string_exclude_entry() {
+        let (_dir, state) = make_state().await;
+        state.add_store("notes", "private").await.unwrap();
+        let result = state
+            .add_source(
+                "notes",
+                "path",
+                serde_json::json!({"root": "/tmp/notes", "exclude": [42]}),
+                "prose",
+            )
+            .await;
+        assert!(matches!(result, Err(Error::InvalidRequest { .. })));
     }
 
     #[tokio::test]
@@ -652,31 +774,46 @@ mod tests {
     #[tokio::test]
     async fn upsert_and_search_chunks_roundtrip() {
         let (_dir, state) = make_state().await;
+        state.add_store("notes", "private").await.unwrap();
+        let store_id = state
+            .backend()
+            .get_store_by_name("notes")
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        let source = state
+            .add_source(
+                "notes",
+                "path",
+                serde_json::json!({"root": "/tmp/notes"}),
+                "prose",
+            )
+            .await
+            .unwrap();
 
         let chunk = localdb_core::ChunkRecord {
             id: "chunk-1".to_string(),
             document_id: "doc-1".to_string(),
-            store_id: "store-A".to_string(),
+            store_id: store_id.clone(),
             text: "hello world rust programming".to_string(),
             span: localdb_core::types::Span::new(0, 30),
             heading_path: vec![],
-            embedding: vec![1.0, 0.0, 0.0, 0.0],
+            embedding: vec![1.0; 128],
             policy_version: "v1".to_string(),
             fetched_at: "2026-06-10T12:00:00Z".to_string(),
             content_hash: "abc".to_string(),
-            origin_store: "store-A".to_string(),
-            source_id: "src-1".to_string(),
+            origin_store: store_id.clone(),
+            source_id: source.id,
             source_kind: "path".to_string(),
             mime: Some("text/plain".to_string()),
             uri: "file:///test.md".to_string(),
             metadata: localdb_core::DocumentMetadata::default(),
         };
 
-        state.upsert_chunks(vec![chunk]).await.unwrap();
-
-        // Verify the chunk is searchable via the store
-        let store = state.retrieval_store();
-        let stats = store.stats().await.unwrap();
+        let handle = state.backend().retrieval_store(&store_id).await.unwrap();
+        handle.upsert_chunks(vec![chunk]).await.unwrap();
+        let stats = handle.stats().await.unwrap();
         assert_eq!(stats.chunk_count, 1, "one chunk should be indexed");
     }
 
@@ -705,7 +842,7 @@ mod tests {
 
     #[tokio::test]
     async fn remove_store_cascades_sources() {
-        let (dir, state) = make_state().await;
+        let (_dir, state) = make_state().await;
 
         state.add_store("scratch", "private").await.unwrap();
         state
@@ -727,30 +864,17 @@ mod tests {
             .await
             .unwrap();
 
-        // Confirm sources exist before removal.
         let before = state.list_sources("scratch").await.unwrap();
         assert_eq!(before.len(), 2);
 
-        // Create a dummy on-disk store dir so we can verify it's removed.
-        let store_dir = dir.path().join("stores").join("scratch");
-        std::fs::create_dir_all(&store_dir).unwrap();
-        std::fs::write(store_dir.join("index.bin"), b"data").unwrap();
-
         state.remove_store("scratch").await.unwrap();
-
-        // In-memory sources map must be empty for this store.
-        let sources_map = state.inner.sources.read().await;
         assert!(
-            sources_map.values().all(|s| s.store_id != "scratch"),
-            "orphaned sources remain after remove_store"
+            matches!(
+                state.list_sources("scratch").await,
+                Err(Error::StoreNotFound { .. })
+            ),
+            "removed store should not list sources"
         );
-        drop(sources_map);
-
-        // On-disk dir must be gone.
-        assert!(!store_dir.exists(), "store data dir was not removed");
-
-        // Re-adding the same name should start with empty sources.
-        drop(state); // release Arc before reusing dir
-        let _ = dir;
+        assert!(state.backend().list_stores().await.unwrap().is_empty());
     }
 }

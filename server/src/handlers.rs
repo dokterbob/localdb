@@ -27,11 +27,11 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use localdb_core::parser::DocumentMetadata;
+use localdb_core::StoreVisibility;
 use localdb_core::{
     Citation, Error as CoreError, IndexJob, IndexJobScope, QueryRequest, SearchOrchestrator,
-    StoreHandle,
+    StoreHandle as CoreStoreHandle,
 };
-use tracing::warn;
 
 use crate::error::ApiError;
 use crate::state::{AppState, SourceRecord, StoreRecord};
@@ -51,6 +51,19 @@ pub struct PaginationParams {
 
 fn default_limit() -> usize {
     20
+}
+
+fn parse_cursor(cursor: Option<&str>) -> Result<usize, ApiError> {
+    match cursor {
+        None => Ok(0),
+        Some(s) => s.parse::<usize>().map_err(|_| {
+            ApiError(CoreError::InvalidRequest {
+                message: format!(
+                    "invalid pagination cursor '{s}'; expected a non-negative integer"
+                ),
+            })
+        }),
+    }
 }
 
 /// A paginated list response.
@@ -86,11 +99,7 @@ pub async fn list_stores(
     Query(pagination): Query<PaginationParams>,
 ) -> Result<Json<PaginatedList<StoreRecord>>, ApiError> {
     let effective = state.effective_config().await?;
-    let offset = pagination
-        .cursor
-        .as_deref()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(0);
+    let offset = parse_cursor(pagination.cursor.as_deref())?;
 
     let all: Vec<StoreRecord> = effective
         .stores
@@ -139,11 +148,15 @@ pub async fn create_store(
     }
 
     let store = state.add_store(&req.name, &req.visibility).await?;
+    let visibility = match store.visibility {
+        StoreVisibility::Private => "private".to_string(),
+        StoreVisibility::Shared => "shared".to_string(),
+    };
     let record = StoreRecord {
         name: store.name.clone(),
-        visibility: format!("{:?}", store.visibility).to_lowercase(),
+        visibility,
         backend: store.backend.kind.clone(),
-        ownership: localdb_core::config::runtime_state::ConfigOwnership::Runtime,
+        ownership: localdb_core::config::ConfigOwnership::Runtime,
     };
     Ok((StatusCode::CREATED, Json(record)))
 }
@@ -217,11 +230,37 @@ pub async fn get_document(
     State(state): State<AppState>,
     Path(doc_id): Path<String>,
 ) -> Result<Json<DocumentRecord>, ApiError> {
-    let record = state
-        .get_document_by_id(&doc_id)
+    let info = state
+        .backend()
+        .find_document(&doc_id)
         .await
-        .ok_or(ApiError(CoreError::DocumentNotFound { id: doc_id }))?;
-    Ok(Json(record))
+        .map_err(ApiError)?
+        .ok_or(ApiError(CoreError::DocumentNotFound { id: doc_id.clone() }))?;
+    let handle = state
+        .backend()
+        .retrieval_store(&info.store_id)
+        .await
+        .map_err(ApiError)?;
+    let chunks = handle
+        .get_chunks_for_document(&info.id)
+        .await
+        .map_err(ApiError)?;
+    let normalized_text = chunks
+        .iter()
+        .map(|c| c.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(Json(DocumentRecord {
+        id: info.id,
+        uri: info.uri,
+        title: info.title,
+        store_id: info.store_id,
+        source_id: info.source_id,
+        content_hash: info.content_hash,
+        fetched_at: info.fetched_at,
+        normalized_text,
+        metadata: info.metadata,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -233,11 +272,7 @@ pub async fn list_sources(
     Path(store_name): Path<String>,
     Query(pagination): Query<PaginationParams>,
 ) -> Result<Json<PaginatedList<SourceRecord>>, ApiError> {
-    let offset = pagination
-        .cursor
-        .as_deref()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(0);
+    let offset = parse_cursor(pagination.cursor.as_deref())?;
 
     let all = state.list_sources(&store_name).await?;
     let total = all.len();
@@ -325,13 +360,6 @@ pub struct SearchResponse {
     pub next_cursor: Option<String>,
 }
 
-/// Search handler — calls `SearchOrchestrator::query()` with the daemon's
-/// in-memory retrieval store and a fake embedder.
-///
-/// In production the embedder would be backed by ONNX/hosted providers (T06).
-/// For the daemon MVP the in-memory `FakeStore` + `FakeEmbedder` provide a
-/// working search path so the acceptance criterion "/search returns citations"
-/// is provably satisfied: index chunks via `state.upsert_chunks()`, then search.
 pub async fn search(
     State(state): State<AppState>,
     Json(req): Json<SearchRequest>,
@@ -342,13 +370,8 @@ pub async fn search(
         }));
     }
 
-    let offset = req
-        .cursor
-        .as_deref()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(0);
+    let offset = parse_cursor(req.cursor.as_deref())?;
 
-    // Validate store filter names exist
     let effective = state.effective_config().await?;
     for name in &req.store_filter {
         if !effective.stores.iter().any(|s| s.name == *name) {
@@ -356,11 +379,6 @@ pub async fn search(
         }
     }
 
-    // Build store handles for fan-out.
-    // Prefer real LibsqlStore instances when the store has been indexed on disk.
-    // Fall back to the shared in-memory FakeStore for stores that have no on-disk
-    // data yet (so the acceptance criterion "/search returns citations" is always
-    // provably satisfied via upsert_chunks → shared FakeStore → search).
     let yaml = state.yaml_config().await;
     let embed_policy = &yaml.defaults.indexing.embedding;
 
@@ -375,62 +393,40 @@ pub async fn search(
         })
     })?;
 
-    // Determine which stores to search.
     let target_stores: Vec<_> = if req.store_filter.is_empty() {
-        effective.stores.iter().collect()
+        effective.stores.iter().filter(|s| s.id.is_some()).collect()
     } else {
         effective
             .stores
             .iter()
-            .filter(|s| req.store_filter.contains(&s.name))
+            .filter(|s| req.store_filter.contains(&s.name) && s.id.is_some())
             .collect()
     };
 
-    let data_dir = state.data_dir();
-    let mut store_handles: Vec<StoreHandle> = Vec::new();
+    let mut store_handles: Vec<CoreStoreHandle> = Vec::new();
 
-    for store_cfg in &target_stores {
-        let store_dir = data_dir.join("stores").join(&store_cfg.name);
-        if store_dir.exists() {
-            // Open the real LibsqlStore for this store.
-            let db_path = store_dir.join("store.db");
-            if !db_path.exists() {
-                continue;
-            }
-            match store_libsql::LibsqlStore::open(
-                &db_path,
-                embedder.embedding_dim(),
-                embedder.vector_encoding(),
-            )
+    for store_cfg in target_stores {
+        let Some(store_id) = store_cfg.id.clone() else {
+            continue;
+        };
+        let handle = state
+            .backend()
+            .retrieval_store(&store_id)
             .await
-            {
-                Ok(s) => {
-                    store_handles.push(StoreHandle {
-                        id: store_cfg
-                            .id
-                            .clone()
-                            .unwrap_or_else(|| store_cfg.name.clone()),
-                        name: store_cfg.name.clone(),
-                        store: Box::new(s),
-                    });
-                }
-                Err(e) => {
-                    warn!("cannot open store '{}': {}", store_cfg.name, e);
-                }
-            }
-        }
+            .map_err(ApiError)?;
+        store_handles.push(CoreStoreHandle {
+            id: store_id,
+            name: store_cfg.name.clone(),
+            store: handle,
+        });
     }
 
-    // When no store filter was given (search-everything), fall back to the shared
-    // in-memory FakeStore so the acceptance criterion is met: upsert_chunks → search.
-    // When an explicit store_filter is given but no matching store opened on disk,
-    // return empty citations rather than silently returning unrelated results.
-    if store_handles.is_empty() && req.store_filter.is_empty() {
-        store_handles.push(StoreHandle {
-            id: "daemon-store".to_string(),
-            name: "daemon".to_string(),
-            store: Box::new(crate::state::SharedStore(state.retrieval_store())),
-        });
+    if store_handles.is_empty() {
+        return Ok(Json(SearchResponse {
+            citations: vec![],
+            total_candidates: 0,
+            next_cursor: None,
+        }));
     }
 
     let query_request = QueryRequest {
@@ -537,7 +533,10 @@ pub async fn get_status(State(state): State<AppState>) -> Result<Json<StatusResp
 
     let mut source_count = 0;
     for store in &effective.stores {
-        let sources = state.list_sources(&store.name).await.unwrap_or_default();
+        if store.id.is_none() {
+            continue;
+        }
+        let sources = state.list_sources(&store.name).await?;
         source_count += sources.len();
     }
 
@@ -661,6 +660,92 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    async fn make_state_with_fake_config() -> (TempDir, AppState) {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml_config = localdb_core::config::schema::RawConfig {
+            version: 1,
+            server: Default::default(),
+            paths: Default::default(),
+            defaults: localdb_core::config::schema::DefaultsConfig {
+                indexing: localdb_core::config::schema::IndexingPolicyConfig {
+                    chunking: Default::default(),
+                    embedding: localdb_core::config::schema::EmbeddingPolicy {
+                        provider: "fake".to_string(),
+                        model: "default".to_string(),
+                    },
+                    ..Default::default()
+                },
+            },
+            stores: vec![],
+            providers: vec![],
+        };
+        let queue = crate::job_queue::JobQueue::new();
+        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
+            .await
+            .unwrap();
+        (dir, state)
+    }
+
+    struct SeedChunkInput {
+        chunk_id: &'static str,
+        doc_id: &'static str,
+        text: &'static str,
+        uri: &'static str,
+        metadata: localdb_core::DocumentMetadata,
+    }
+
+    async fn seed_store_a_chunk(state: &AppState, input: SeedChunkInput) {
+        use localdb_core::Embedder;
+
+        state.add_store("store-A", "private").await.unwrap();
+        let source = state
+            .add_source("store-A", "path", json!({"root": "/tmp"}), "prose")
+            .await
+            .unwrap();
+        let store_id = source.store_id.clone();
+        let embedder = localdb_core::FakeEmbedder::new(128);
+        let docs = vec![localdb_core::embedder::DocumentChunks {
+            document_context: input.text.to_string(),
+            chunks: vec![input.text.to_string()],
+        }];
+        let embedding = embedder
+            .embed_documents(docs)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let chunk = localdb_core::ChunkRecord {
+            id: input.chunk_id.to_string(),
+            document_id: input.doc_id.to_string(),
+            store_id: store_id.clone(),
+            text: input.text.to_string(),
+            span: localdb_core::types::Span::new(0, input.text.len()),
+            heading_path: vec![],
+            embedding,
+            policy_version: "v1".to_string(),
+            fetched_at: "2026-06-10T12:00:00Z".to_string(),
+            content_hash: "abc123".to_string(),
+            origin_store: store_id.clone(),
+            source_id: source.id,
+            source_kind: "path".to_string(),
+            mime: Some("text/plain".to_string()),
+            uri: input.uri.to_string(),
+            metadata: input.metadata,
+        };
+        state
+            .backend()
+            .retrieval_store(&store_id)
+            .await
+            .unwrap()
+            .upsert_chunks(vec![chunk])
+            .await
+            .unwrap();
+    }
+
     // --- List stores ---
 
     #[tokio::test]
@@ -711,6 +796,25 @@ mod tests {
                     .uri("/v1/stores")
                     .header("content-type", "application/json")
                     .body(Body::from(json!({"name": ""}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_store_invalid_visibility_returns_400() {
+        let (_dir, app) = make_app().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/stores")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"name": "my-notes", "visibility": "public"}).to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -1190,39 +1294,24 @@ mod tests {
 
     #[tokio::test]
     async fn get_document_returns_record_when_indexed() {
-        let dir = tempfile::tempdir().unwrap();
-        let yaml_config = localdb_core::config::schema::RawConfig {
-            version: 1,
-            server: Default::default(),
-            paths: Default::default(),
-            defaults: Default::default(),
-            stores: vec![],
-            providers: vec![],
+        let (_dir, state) = make_state_with_fake_config().await;
+        let metadata = localdb_core::parser::DocumentMetadata {
+            title: Some("Test Doc".to_string()),
+            creator: vec!["Test Author".to_string()],
+            date: Some("2026-06-10".to_string()),
+            ..Default::default()
         };
-        let queue = crate::job_queue::JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
-            .await
-            .unwrap();
-
-        // Insert a document record directly
-        state
-            .upsert_document(DocumentRecord {
-                id: "doc-abc123".to_string(),
-                uri: "file:///test.md".to_string(),
-                title: Some("Test Doc".to_string()),
-                store_id: "store-A".to_string(),
-                source_id: "src-1".to_string(),
-                content_hash: "deadbeef".to_string(),
-                fetched_at: "2026-06-10T12:00:00Z".to_string(),
-                normalized_text: "hello world".to_string(),
-                metadata: localdb_core::parser::DocumentMetadata {
-                    title: Some("Test Doc".to_string()),
-                    creator: vec!["Test Author".to_string()],
-                    date: Some("2026-06-10".to_string()),
-                    ..Default::default()
-                },
-            })
-            .await;
+        seed_store_a_chunk(
+            &state,
+            SeedChunkInput {
+                chunk_id: "chunk-doc-abc123",
+                doc_id: "doc-abc123",
+                text: "hello world",
+                uri: "file:///test.md",
+                metadata,
+            },
+        )
+        .await;
 
         let app = crate::daemon::build_router(state);
 
@@ -1240,6 +1329,7 @@ mod tests {
         assert_eq!(body["id"], "doc-abc123");
         assert_eq!(body["uri"], "file:///test.md");
         assert_eq!(body["title"], "Test Doc");
+        assert_eq!(body["normalized_text"], "hello world");
         assert!(
             body.get("metadata").is_some(),
             "metadata field must be present"
@@ -1256,68 +1346,18 @@ mod tests {
 
     #[tokio::test]
     async fn search_returns_citations_after_indexing() {
-        // Acceptance criterion: /search returns citations.
-        // We upsert a chunk into the shared FakeStore, then search for it.
-        use localdb_core::{ChunkRecord, Embedder, FakeEmbedder};
-
-        let dir = tempfile::tempdir().unwrap();
-        let yaml_config = localdb_core::config::schema::RawConfig {
-            version: 1,
-            server: Default::default(),
-            paths: Default::default(),
-            defaults: localdb_core::config::schema::DefaultsConfig {
-                indexing: localdb_core::config::schema::IndexingPolicyConfig {
-                    chunking: Default::default(),
-                    embedding: localdb_core::config::schema::EmbeddingPolicy {
-                        provider: "fake".to_string(),
-                        model: "default".to_string(),
-                    },
-                    ..Default::default()
-                },
+        let (_dir, state) = make_state_with_fake_config().await;
+        seed_store_a_chunk(
+            &state,
+            SeedChunkInput {
+                chunk_id: "chunk-1",
+                doc_id: "doc-1",
+                text: "hello world rust programming",
+                uri: "file:///hello.md",
+                metadata: localdb_core::DocumentMetadata::default(),
             },
-            stores: vec![],
-            providers: vec![],
-        };
-        let queue = crate::job_queue::JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
-            .await
-            .unwrap();
-
-        // Produce a 128-dim embedding using FakeEmbedder to match the search handler.
-        let embedder = FakeEmbedder::new(128);
-        let docs = vec![localdb_core::embedder::DocumentChunks {
-            document_context: "hello world rust programming".to_string(),
-            chunks: vec!["hello world rust programming".to_string()],
-        }];
-        let embedded = embedder.embed_documents(docs).await.unwrap();
-        let embedding = embedded
-            .into_iter()
-            .next()
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap();
-
-        let chunk = ChunkRecord {
-            id: "chunk-1".to_string(),
-            document_id: "doc-1".to_string(),
-            store_id: "store-A".to_string(),
-            text: "hello world rust programming".to_string(),
-            span: localdb_core::types::Span::new(0, 28),
-            heading_path: vec![],
-            embedding,
-            policy_version: "v1".to_string(),
-            fetched_at: "2026-06-10T12:00:00Z".to_string(),
-            content_hash: "abc123".to_string(),
-            origin_store: "store-A".to_string(),
-            source_id: "src-1".to_string(),
-            source_kind: "path".to_string(),
-            mime: Some("text/plain".to_string()),
-            uri: "file:///hello.md".to_string(),
-            metadata: localdb_core::DocumentMetadata::default(),
-        };
-
-        state.upsert_chunks(vec![chunk]).await.unwrap();
+        )
+        .await;
 
         let app = crate::daemon::build_router(state);
 
@@ -1347,69 +1387,19 @@ mod tests {
 
     #[tokio::test]
     async fn search_with_nonexistent_store_filter_returns_empty() {
-        // Upsert a chunk into the shared FakeStore, then search with a store_filter
-        // that doesn't match any store. Expect empty citations, not foreign results.
-        use localdb_core::{ChunkRecord, Embedder, FakeEmbedder};
-
-        let dir = tempfile::tempdir().unwrap();
-        let yaml_config = localdb_core::config::schema::RawConfig {
-            version: 1,
-            server: Default::default(),
-            paths: Default::default(),
-            defaults: localdb_core::config::schema::DefaultsConfig {
-                indexing: localdb_core::config::schema::IndexingPolicyConfig {
-                    chunking: Default::default(),
-                    embedding: localdb_core::config::schema::EmbeddingPolicy {
-                        provider: "fake".to_string(),
-                        model: "default".to_string(),
-                    },
-                    ..Default::default()
-                },
-            },
-            stores: vec![],
-            providers: vec![],
-        };
-        let queue = crate::job_queue::JobQueue::new();
-        let state = AppState::new(yaml_config, dir.path().to_path_buf(), queue)
-            .await
-            .unwrap();
-
-        // Add a real store so the filter name passes the existence check.
+        let (_dir, state) = make_state_with_fake_config().await;
         state.add_store("my-store", "private").await.unwrap();
-
-        // Insert a chunk into the shared FakeStore (accessible without filter).
-        let embedder = FakeEmbedder::new(128);
-        let docs = vec![localdb_core::embedder::DocumentChunks {
-            document_context: "hello world".to_string(),
-            chunks: vec!["hello world".to_string()],
-        }];
-        let embedded = embedder.embed_documents(docs).await.unwrap();
-        let embedding = embedded
-            .into_iter()
-            .next()
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap();
-        let chunk = ChunkRecord {
-            id: "chunk-ff".to_string(),
-            document_id: "doc-ff".to_string(),
-            store_id: "store-ff".to_string(),
-            text: "hello world".to_string(),
-            span: localdb_core::types::Span::new(0, 11),
-            heading_path: vec![],
-            embedding,
-            policy_version: "v1".to_string(),
-            fetched_at: "2026-06-13T00:00:00Z".to_string(),
-            content_hash: "ff".to_string(),
-            origin_store: "store-ff".to_string(),
-            source_id: "src-ff".to_string(),
-            source_kind: "path".to_string(),
-            mime: None,
-            uri: "file:///foreign.md".to_string(),
-            metadata: localdb_core::DocumentMetadata::default(),
-        };
-        state.upsert_chunks(vec![chunk]).await.unwrap();
+        seed_store_a_chunk(
+            &state,
+            SeedChunkInput {
+                chunk_id: "chunk-ff",
+                doc_id: "doc-ff",
+                text: "hello world",
+                uri: "file:///foreign.md",
+                metadata: localdb_core::DocumentMetadata::default(),
+            },
+        )
+        .await;
 
         let app = crate::daemon::build_router(state);
 
@@ -1687,5 +1677,20 @@ mod tests {
         let body = json_body(resp.into_body()).await;
         assert_eq!(body["items"].as_array().unwrap().len(), 1);
         assert!(body["next_cursor"].is_null());
+    }
+
+    #[tokio::test]
+    async fn list_stores_invalid_cursor_returns_400() {
+        let (_dir, app) = make_app().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/stores?cursor=abc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }

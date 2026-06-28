@@ -33,15 +33,11 @@ Exit codes are stable API. See [specs/05-surfaces.md §5](../specs/05-surfaces.m
 | Code | Meaning | Example trigger |
 |---|---|---|
 | `0` | OK | Successful command |
-| `1` | Internal error | Bug or locked redb database (see daemon note below) |
+| `1` | Internal error | Bug or unrecoverable runtime failure |
 | `2` | Invalid usage or config | Unknown subcommand, duplicate store, bad config file |
 | `3` | Not found | `store remove <name>` — store does not exist |
 | `4` | Conflict / locked | `serve` when a daemon is already running on the same data dir |
 | `5` | Unavailable | Daemon unreachable (stale socket) |
-
-**Quirk:** `search --store <unknown-store>` currently exits `0` and prints
-`No indexed stores found.` rather than `exit 3`. This is a known divergence from
-the spec; `store remove <name>` correctly exits `3`.
 
 ---
 
@@ -112,7 +108,7 @@ Options:
 $ localdb status
 daemon: not running (embedded mode)
 stores (1):
-  notes [lancedb] (runtime)
+  notes [libsql] (runtime)
 ```
 
 ```
@@ -121,7 +117,7 @@ $ localdb status --json
   "daemon": "not running (embedded mode)",
   "stores": [
     {
-      "backend": "lancedb",
+      "backend": "libsql",
       "name": "notes",
       "ownership": "runtime",
       "visibility": "private"
@@ -173,9 +169,9 @@ Options:
   -V, --version        Print version
 ```
 
-Creates a runtime-owned store backed by LanceDB. Runtime stores are persisted in
-the data directory and survive restarts; they are distinct from YAML-declared
-stores (see note below).
+Creates a runtime-owned store backed by libsql. Runtime stores are persisted in
+the unified database (`<data_dir>/localdb.db`) and survive restarts; they are
+distinct from YAML-declared stores (see note below).
 
 Exits `2` (`invalid_request`) if a store with that name already exists:
 
@@ -208,13 +204,13 @@ The ownership label is `runtime` or `yaml`.
 
 ```
 $ localdb store list
-notes [lancedb] (runtime)
+notes [libsql] (runtime)
 
 $ localdb store list --json
 {
   "stores": [
     {
-      "backend": "lancedb",
+      "backend": "libsql",
       "name": "notes",
       "ownership": "runtime",
       "visibility": "private"
@@ -385,8 +381,8 @@ Options:
 ```
 
 Walks every registered source for the targeted store(s), extracts and chunks
-documents, and writes them to the LanceDB store on disk. Progress is printed to
-stdout.
+documents, and writes them to the unified libsql database on disk
+(`<data_dir>/localdb.db`). Progress is printed to stdout.
 
 **Embeddings:** the CLI calls `embed::create_embedder` from the config policy.
 The default embedder (`pplx-embed-context-v1-0.6b`, local ONNX) is downloaded
@@ -508,11 +504,6 @@ $ localdb search -s notes --json hybrid search
 
 (paths shown from a scratch run)
 
-**Quirk:** `search --store <unknown>` exits `0` with an empty result set and the
-message `No indexed stores found. Run 'localdb index' first.` rather than
-`exit 3`. This matches neither the spec nor the behavior of `store remove` (which
-correctly exits `3`).
-
 ---
 
 ## `localdb serve`
@@ -557,15 +548,12 @@ For the full HTTP API reference see [docs/http-api.md](http-api.md).
 
 ### Known limitations (v0.1.0)
 
-- **In-memory store only.** The daemon uses a shared in-memory store. Data
-  indexed via the CLI (`localdb index`) is not visible to the daemon's
-  `/v1/search` endpoint, and vice versa. The HTTP API returns the correct
-  response shapes but operates on no real data.
-- **CLI is blocked while the daemon runs.** Every CLI command opens the
-  runtime-state database before probing the daemon socket. While the daemon
-  holds that lock, CLI commands fail with `exit 1` (`internal error: Database
-  already open`). Stop the daemon before using CLI commands against the same
-  data directory.
+- **Ingestion via `POST /v1/jobs` is a no-op.** The daemon's job endpoint accepts
+  the request, transitions the job state machine, and reports `chunks_written: 0`.
+  To actually index, run `localdb index` from the CLI — this works while the daemon
+  is running because both share the unified database (`<data_dir>/localdb.db`) and
+  concurrent writers serialise via SQLite WAL + `busy_timeout=5000`. Daemon-side
+  reads (`/v1/search`, `/v1/documents/{id}`, `/v1/status`) DO see CLI-indexed data.
 - **Stale socket after kill.** If the daemon process is killed without a clean
   shutdown, `daemon.sock` is not removed. Subsequent CLI commands report
   `daemon: running` but searches fail with `exit 5` (`daemon is unreachable`).
@@ -658,11 +646,11 @@ localdb search "hybrid search" --store notes --json
 Stores declared in `config.yaml` under `stores:` appear in `store list` with
 ownership `yaml` and are visible to `search`, but `localdb index --store
 <yaml-store>` exits `3` (`store not found`) in v0.1.0 because the indexer
-resolves stores only from the runtime-state database:
+resolves stores only from the unified database (runtime-created stores):
 
 ```
 $ localdb store list          # shows yaml-declared store
-handbook [lancedb] (yaml)
+handbook [libsql] (yaml)
 
 $ localdb index --store handbook
 error: store not found: handbook

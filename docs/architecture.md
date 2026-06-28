@@ -18,7 +18,7 @@ No retrieval, indexing, or domain logic lives in a surface crate — all surface
 ### `core`
 
 The domain model and shared logic. Defines every entity (`Store`, `Source`, `Document`,
-`Block`, `Chunk`, `IndexJob`, `Citation`), the two key traits (`RetrievalStore` and
+`Chunk`, `IndexJob`, `Citation`), the two key traits (`RetrievalStore` and
 `Embedder`), content-addressed ID derivation (blake3), the RRF fusion engine, indexing
 orchestration, and the error taxonomy. Contains no I/O framework; everything async-capable
 lives in other crates. This is the crate everything else imports.
@@ -48,16 +48,9 @@ backends emit index-interchangeable vectors. See
 [specs/04-search-pipeline.md](../specs/04-search-pipeline.md) §4 and the
 [Platform notes](#platform-notes) below.
 
-### `store-lancedb`
+### `store-libsql`
 
-The `RetrievalStore` trait implementation backed by LanceDB embedded. One LanceDB database
-per logical store, stored under `{data_dir}/stores/{store_name}/`, with a single `chunks`
-table. BM25 full-text search uses LanceDB's built-in FTS index (tantivy underneath); dense
-search uses binary-quantized IVF_FLAT (Hamming distance) or flat Hamming scan for smaller
-tables; encoding is determined by the embedder's `vector_encoding()` return value.
-RRF fusion is intentionally _not_ done here — the trait returns raw ranked lists and
-`core` fuses them. See
-[specs/01-architecture.md](../specs/01-architecture.md) §2.
+The `RetrievalStore` trait implementation backed by libsql (DiskANN vectors + FTS5 BM25). A single unified database file at `<data_dir>/localdb.db` holds everything. BM25 full-text search uses SQLite's FTS5 virtual table. Dense search uses the DiskANN vector index (`libsql_vector_idx`). RRF fusion is done in `core`. See [specs/01-architecture.md](../specs/01-architecture.md) §2.
 
 ### `cli`
 
@@ -70,9 +63,12 @@ Calls `embed::create_embedder` from the config policy to obtain the embedder for
 ### `server`
 
 The axum-based HTTP API daemon. Exposes the `/v1` REST surface, manages the daemon unix
-socket for discovery, holds the write lock, runs the file-watcher (`notify`), the URL
-refresh scheduler, and the background job queue. This is an **experimental** preview;
-see [Known gaps §2](#known-gaps). See [specs/05-surfaces.md](../specs/05-surfaces.md) §3.
+socket for discovery, runs the file-watcher (`notify`), the URL refresh scheduler, and the
+background job queue. Opens the same unified database (`<data_dir>/localdb.db`) as the CLI;
+CLI-indexed data is visible. Multi-process is the first-class concurrency model — the daemon
+is one writer among peers (CLI sessions, multiple stdio MCP servers); concurrent writers
+serialise via SQLite WAL + `busy_timeout=5000`. Ingestion via `POST /v1/jobs` is currently a
+no-op — see [Known gaps §1](#known-gaps). See [specs/05-surfaces.md](../specs/05-surfaces.md) §3.
 
 ### `mcp`
 
@@ -108,7 +104,7 @@ to the appropriate crate. No logic of its own. Subcommands: `init`, `serve`, `mc
  │  Embedder  →  dense vectors  [default: local; CoreML/ONNX]│
  │       │                                                 │
  │       ▼                                                 │
- │  store-lancedb  →  chunks.lance  (BM25 index + vectors) │
+ │  store-libsql  →  localdb.db  (BM25 index + vectors)    │
  └─────────────────────────────────────────────────────────┘
 
  ┌─────────────────────────────────────────────────────────┐
@@ -118,7 +114,7 @@ to the appropriate crate. No logic of its own. Subcommands: `init`, `serve`, `mc
  │       │                                                 │
  │       ├──────────────────────────────────┐              │
  │       ▼                                  ▼              │
- │  BM25 search (tantivy/LanceDB)    dense search (KNN)    │
+ │  BM25 search (FTS5)               dense search (KNN)    │
  │       │                                  │              │
  │       └──────────────┬───────────────────┘              │
  │                      ▼                                  │
@@ -156,11 +152,8 @@ return the same structure. See [specs/02-domain-model.md](../specs/02-domain-mod
 
 On every invocation, CLI and MCP probe a unix socket at `<data_dir>/daemon.sock`. If a
 daemon is running and responsive, the command routes over HTTP. If not, the store is opened
-in-process (mmapped LanceDB; embeddings come from the configured embedder, defaulting to the
+in-process (libsql database; embeddings come from the configured embedder, defaulting to the
 local ONNX model). No configuration is needed for the common case. See [specs/01-architecture.md](../specs/01-architecture.md) §3.
-
-**Note:** thin-client routing to the daemon is partially implemented; the daemon's in-memory
-store is not yet backed by LanceDB — see [Known gaps §2](#known-gaps).
 
 ---
 
@@ -175,16 +168,14 @@ The config file and the data directory are independent paths (`--config` /
   config.yaml                  # YAML config (version: 1)
 
 <data_dir>/
-  runtime-state.db             # SQLite (WAL): runtime stores + source records
-  .write.lock                  # advisory fd-lock: LanceDB single-writer gate
-  stores/
-    <store_name>/
-      chunks.lance             # LanceDB table: chunks + BM25 FTS + vectors
+  localdb.db                   # SQLite (WAL): unified database
+  localdb.db-wal               # WAL sidecar (libsql managed)
+  localdb.db-shm               # shared-memory sidecar (libsql managed)
   daemon.sock                  # unix socket (present only while daemon runs)
 ```
 
 The default `data_dir` on macOS is `~/Library/Application Support/com.localdb.localdb.localdb/data`
-(the bundle ID is intentionally verbose — see [Known gaps §7](#known-gaps)).
+(the bundle ID is intentionally verbose — see [Known gaps §4](#known-gaps)).
 Override with `paths.data` in `config.yaml` or point to a custom config with `--config`.
 
 The `models/` directory (configured via `paths.models`) is populated on first `localdb index`
@@ -230,91 +221,35 @@ sign agreement), so switching backends needs no reindex. See [specs/03-config.md
 
 ## Known gaps {#known-gaps}
 
-This section documents verified divergences between the specs and the v0.1.0 implementation.
-They are listed honestly so contributors know where work remains. Each item names the
-responsible code area.
+This section documents verified divergences between the specs and the v0.1.0 implementation. They are listed honestly so contributors know where work remains. Each item names the responsible code area.
 
-**1. CLI embedding wiring is complete.** ([#8](https://github.com/dokterbob/localdb/issues/8), [#16](https://github.com/dokterbob/localdb/issues/16))
-The CLI calls `embed::create_embedder` from the config policy. The default embedder is
-`provider: local-onnx`, `model: pplx-embed-context-v1-0.6b` — a context-aware late-chunking
-model (MIT-licensed, public HuggingFace repo `perplexity-ai/pplx-embed-context-v1-0.6b`,
-~706 MB quantized). The model is downloaded automatically on first `localdb index` or
-`localdb search`; no API key is required. `FakeEmbedder` remains available for unit tests
-only.
+**1. HTTP daemon `POST /v1/jobs` is a no-op.**
+The daemon's job-submission endpoint accepts the request and reports the job state machine (`pending → done`) but does not run the ingestion pipeline; `chunks_written` stays `0`. Daemon-side reads (`/v1/search`, `/v1/documents/{id}`, `/v1/status`) DO see CLI-indexed data because the daemon now opens the same unified database as the CLI. To actually index, run `localdb index` from the CLI (which still works while the daemon runs — concurrent writers serialise via SQLite WAL).
 
-**2. The HTTP daemon uses an in-memory `FakeStore`.** ([#9](https://github.com/dokterbob/localdb/issues/9))
-`server/src/handlers.rs` holds one shared in-memory store behind an `Arc`. All API routes
-return correct JSON shapes, but `POST /v1/search` returns empty citations and job indexing
-operates on the in-memory store regardless of what the CLI has indexed into LanceDB on disk.
-The daemon is an experimental preview; do not rely on it for search correctness today.
-Plumbing the `LanceDbStore` into `AppState` is the remaining work.
+**2. YAML-declared stores cannot be indexed.** ([#12](https://github.com/dokterbob/localdb/issues/12))
+Stores declared in `config.yaml` under the `stores:` key appear in `localdb store list` as `(yaml)`, but `localdb index --store <name>` returns `error: store not found: <name>` (exit 3). The `run_index` function in `cli/src/lib.rs` resolves stores only from the unified database. Today's working path is to create stores at runtime with `localdb store add <name>` and add sources with `localdb source add`. YAML store declarations are config-only for now.
 
-**3. CLI commands can run while the MCP server or daemon is active.** ([#67](https://github.com/dokterbob/localdb/issues/67) — fixed)
-The runtime-state registry is now backed by SQLite in WAL mode (`runtime-state.db`). Multiple
-processes (MCP server, CLI, daemon) can read simultaneously; writers serialise via SQLite's
-2 s busy-timeout. The former `redb` backing (which held an exclusive OS file lock for the
-entire lifetime of the handle) has been removed. **Clean break:** existing `*.redb` files are
-abandoned — re-add stores with `localdb store add` and sources with `localdb source add`.
-A stale `daemon.sock` left by a killed daemon still causes CLI to report "daemon running" and
-`search` to exit 5 "daemon is unreachable"; fix by removing the socket file manually.
+**3. `source add` does not validate path existence.** ([#14](https://github.com/dokterbob/localdb/issues/14))
+`localdb source add /does/not/exist --store notes` succeeds (exit 0) even when the path does not exist on disk. Validation is deferred to index time. The source spec validation in `core/src/config/` or the CLI source-add handler is the place to add an existence check.
 
-**4. YAML-declared stores cannot be indexed.** ([#12](https://github.com/dokterbob/localdb/issues/12))
-Stores declared in `config.yaml` under the `stores:` key appear in `localdb store list` as
-`(yaml)`, but `localdb index --store <name>` returns `error: store not found: <name>` (exit
-3). The `run_index` function in `cli/src/lib.rs` (~line 1108) resolves stores only from the
-runtime-state database. The working path today is to create stores at runtime with
-`localdb store add <name>` and add sources with `localdb source add`. YAML store
-declarations are config-only for now.
+**4. macOS default paths use a verbose bundle ID.** ([#15](https://github.com/dokterbob/localdb/issues/15))
+The default config, data, and model-cache locations on macOS all live under the bundle ID `com.localdb.localdb.localdb` (e.g. data at `~/Library/Application Support/com.localdb.localdb.localdb/data`). The triple-repeat comes from `ProjectDirs::from("com.localdb", "localdb", "localdb")` in `core/src/config/platform.rs`. Specs/03 shows shorter `localdb/` paths. Cosmetic; override with `paths.*` in config for cleaner locations.
 
-**5. `search --store <unknown>` exits 0 instead of 3.** ([#13](https://github.com/dokterbob/localdb/issues/13))
-When `--store` names an unknown store, `localdb search` prints "No indexed stores found.
-Run `localdb index` first." and exits 0 with `{"citations":[]}`, rather than returning exit
-code 3 as `store remove` and other not-found cases do. This inconsistency lives in the
-search command handler in `cli/src/lib.rs`.
+**5. The CoreML context bundle ships only the L512 sequence-length bucket.**
+The CoreML backend (`local-coreml` feature; see [Platform notes](#platform-notes)) reads its bucket manifest from HF repo `dokterbob/pplx-embed-coreml`. Today only the `context/L512-int8` bucket is published. The larger context buckets (`L ∈ {1024, 2048, 4096}`) are picked up automatically from the manifest once published, so no code change is needed. This XET-deduped download that shares the ~1.15 GB encoder weights across buckets relies on the `hf-hub` 1.0 pre-release.
 
-**6. `source add` does not validate path existence.** ([#14](https://github.com/dokterbob/localdb/issues/14))
-`localdb source add /does/not/exist --store notes` succeeds (exit 0) even when the path does
-not exist on disk. Validation is deferred to index time. The source spec validation in
-`core/src/config/` or the CLI source-add handler is the place to add an existence check.
-
-**7. macOS default paths use a verbose bundle ID.** ([#15](https://github.com/dokterbob/localdb/issues/15))
-The default config, data, and model-cache locations on macOS all live under the bundle ID
-`com.localdb.localdb.localdb` (e.g. data at
-`~/Library/Application Support/com.localdb.localdb.localdb/data`). The triple-repeat comes
-from `ProjectDirs::from("com.localdb", "localdb", "localdb")` in
-`core/src/config/platform.rs`; specs/03 shows shorter `localdb/` paths. Cosmetic; override
-with `paths.*` in config for cleaner locations.
-
-**8. The CoreML context bundle ships only the L512 sequence-length bucket.**
-The CoreML backend (`local-coreml` feature; see [Platform notes](#platform-notes)) reads its
-bucket manifest from HF repo `dokterbob/pplx-embed-coreml`. Today only the `context/L512-int8`
-bucket is published; the larger context buckets (`L ∈ {1024, 2048, 4096}`) are picked up
-automatically from the manifest once published — no code change needed. The XET-deduped download
-that shares the ~1.15 GB encoder weights across buckets relies on the `hf-hub` 1.0 pre-release.
-
-**9. Sources added before the include-allowlist change keep empty `include` globs.**
-As of the `only-index-supported-files` branch, `cli` automatically sets
-`DEFAULT_PATH_INCLUDES` (an extension-based allowlist) on new directory sources that have no
-explicit `include` globs. Sources that were added before this change already have an empty
-`include` list recorded in the runtime-state database and will continue to index all files
-they enumerate until they are removed and re-added with `localdb source add`. There is no
-automatic migration, and this change is intentionally **not** folded into `policy_version`:
-the per-file chunk preset is determined deterministically from the filename/MIME type at
-index time, so re-indexing existing content with the new code produces correct results
-without a policy-hash change.
+**6. Sources added before the include-allowlist change keep empty `include` globs.**
+As of the `only-index-supported-files` branch, `cli` automatically sets `DEFAULT_PATH_INCLUDES` (an extension-based allowlist) on new directory sources that have no explicit `include` globs. Sources that were added before this change already have an empty `include` list recorded in the unified database and will continue to index all files they enumerate until they are removed and re-added with `localdb source add`. There is no automatic migration, and this change is intentionally not folded into `policy_version`. The per-file chunk preset is determined deterministically from the filename/MIME type at index time, so re-indexing existing content with the new code produces correct results without a policy-hash change.
 
 ---
 
 ## Deferred design decisions {#design-decisions}
 
-Several items surfaced during the v0.1.0 issue sweep require cross-cutting design decisions
-before code can be written. They are documented (with options and recommendations) in
-[docs/design-decisions.md](design-decisions.md):
+Several items surfaced during the v0.1.0 issue sweep require cross-cutting design decisions before code can be written. They are documented (with options and recommendations) in [docs/design-decisions.md](design-decisions.md):
 
-- **A7** — `policy_version` does not hash resolved per-source chunking parameters.
-- **A8 / B4** — Pagination offset computed but never applied; `total_candidates` is pre-dedup.
-- **B2** — Cross-store deduplication semantics (collapse vs. distinct citations).
-- **B3** — Rerank seam re-attaches store metadata by index position (safe today, unsafe with real reranker).
-- **E1** — Structured MCP tool results (spec-decided, implementation deferred to v0.2.0).
-- **A9-charset** — Allowed character set for store names beyond traversal-safety.
-- **A6-atomicity** — True crash-atomic upsert in LanceDB (embed-before-delete ships in v0.1.0).
+- **A7**: `policy_version` does not hash resolved per-source chunking parameters.
+- **A8 / B4**: Pagination offset computed but never applied; `total_candidates` is pre-dedup.
+- **B2**: Cross-store deduplication semantics (collapse vs. distinct citations).
+- **B3**: Rerank seam re-attaches store metadata by index position (safe today, unsafe with real reranker).
+- **E1**: Structured MCP tool results (spec-decided, implementation deferred to v0.2.0).
+- **A9-charset**: Allowed character set for store names beyond traversal-safety.
