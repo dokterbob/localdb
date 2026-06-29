@@ -15,6 +15,7 @@ pub mod ingestion;
 pub mod parser;
 pub mod progress;
 pub mod search;
+pub mod source;
 pub mod store;
 pub mod store_factory;
 pub mod types;
