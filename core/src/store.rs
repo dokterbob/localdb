@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 #[cfg(any(test, feature = "test-support"))]
 use std::collections::HashMap;
 
-use crate::Error;
 use crate::ids::{ContentId, UlidId};
 use crate::ingestion::DocumentRecord;
 use crate::parser::DocumentMetadata;
 use crate::types::{Chunk, Span};
+use crate::Error;
 
 // ---------------------------------------------------------------------------
 // ChunkRecord — the unit stored in a backend
