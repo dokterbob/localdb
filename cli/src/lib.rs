@@ -1109,38 +1109,86 @@ async fn run_source_add_async(ctx: &CliContext, source_arg: &str, refresh: Optio
             daemon_url: ctx.daemon_url.clone(),
             config_env: ctx.config_env.clone(),
         };
-        run_index_for_source_async(&index_ctx, Some(&src_id), &rt_store_clone).await;
+        if let Err(e) = run_embedded_index(
+            &index_ctx,
+            &rt_store_clone,
+            Some(&src_id),
+            IndexErrorMode::WarnAndContinue,
+        )
+        .await
+        {
+            exit_err(&e, ctx.json);
+        }
     }
 }
 
-/// Internal: run ingestion for a single source without re-resolving the store.
-async fn run_index_for_source_async(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexErrorMode {
+    StrictExit,
+    WarnAndContinue,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct IndexSummary {
+    has_sources: bool,
+    indexed: u64,
+    skipped: u64,
+    chunks: u64,
+    errors: u64,
+    unsupported: u64,
+}
+
+impl IndexErrorMode {
+    fn warn(self) -> bool {
+        self == Self::WarnAndContinue
+    }
+}
+
+async fn run_embedded_index(
     ctx: &CliContext,
-    source_id: Option<&str>,
     store_row: &StoreRow,
-) {
+    source_id: Option<&str>,
+    mode: IndexErrorMode,
+) -> Result<IndexSummary, Error> {
     use localdb_core::{
         chunker::ChunkerConfig,
         ingestion::{run_ingestion_for_source, DocumentIndex, IngestionConfig},
     };
 
+    macro_rules! warn_or_default {
+        ($expr:expr, $fmt:literal) => {
+            match $expr {
+                Ok(value) => value,
+                Err(e) => {
+                    let error = Error::from(e);
+                    if mode.warn() {
+                        eprintln!($fmt, error);
+                        return Ok(IndexSummary::default());
+                    }
+                    return Err(error);
+                }
+            }
+        };
+    }
+
     let (config_loader, db) = load_app_db(ctx).await;
-    let all_sources = match db.backend().list_sources(&store_row.id).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("warning: cannot list sources for auto-index: {}", e);
-            return;
-        }
-    };
+    let all_sources = warn_or_default!(
+        db.backend().list_sources(&store_row.id).await,
+        "warning: cannot list sources for auto-index: {}"
+    );
 
     let sources_to_index: Vec<SourceRow> = if let Some(sid) = source_id {
-        all_sources.into_iter().filter(|s| s.id == sid).collect()
+        match all_sources.into_iter().find(|s| s.id == sid) {
+            Some(s) => vec![s],
+            None if mode.warn() => return Ok(IndexSummary::default()),
+            None => return Err(Error::SourceNotFound { id: sid.to_string() }),
+        }
     } else {
         all_sources
     };
 
     if sources_to_index.is_empty() {
-        return;
+        return Ok(IndexSummary::default());
     }
 
     let policy = config_loader.config.defaults.indexing.clone();
@@ -1163,47 +1211,31 @@ async fn run_index_for_source_async(
         chunker: ChunkerConfig::prose(),
     };
 
-    let embed_policy = &config_loader.config.defaults.indexing.embedding;
-    let models_dir = config_loader.paths.models_dir.clone();
-    let embedder = match embed::create_embedder(
-        embed_policy,
-        &config_loader.config.providers,
-        Some(&models_dir),
-    ) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("warning: cannot create embedder for auto-index: {}", e);
-            return;
-        }
-    };
-
-    let extractor = match extract::ChainExtractor::from_ids(&policy.parsers) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("warning: cannot build parser chain for auto-index: {}", e);
-            return;
-        }
-    };
-
-    let handle = match db.backend().retrieval_store(&store_row.id).await {
-        Ok(handle) => handle,
-        Err(e) => {
-            eprintln!("warning: cannot open store handle for auto-index: {e}");
-            return;
-        }
-    };
-
-    let existing = match handle.list_indexed_documents().await {
-        Ok(records) => records,
-        Err(e) => {
-            eprintln!("warning: cannot read existing documents for auto-index: {e}");
-            return;
-        }
-    };
+    let embedder = warn_or_default!(
+        embed::create_embedder(
+            &config_loader.config.defaults.indexing.embedding,
+            &config_loader.config.providers,
+            Some(&config_loader.paths.models_dir),
+        ),
+        "warning: cannot create embedder for auto-index: {}"
+    );
+    let extractor = warn_or_default!(
+        extract::ChainExtractor::from_ids(&policy.parsers),
+        "warning: cannot build parser chain for auto-index: {}"
+    );
+    let handle = warn_or_default!(
+        db.backend().retrieval_store(&store_row.id).await,
+        "warning: cannot open store handle for auto-index: {}"
+    );
+    let existing = warn_or_default!(
+        handle.list_indexed_documents().await,
+        "warning: cannot read existing documents for auto-index: {}"
+    );
     let mut doc_index = DocumentIndex::from_records(existing);
-    let url_fetcher = match HttpUrlFetcher::new() {
-        Ok(fetcher) => fetcher,
-        Err(e) => exit_err(&e, ctx.json),
+    let url_fetcher = HttpUrlFetcher::new()?;
+    let mut summary = IndexSummary {
+        has_sources: true,
+        ..IndexSummary::default()
     };
 
     for rt_source in &sources_to_index {
@@ -1211,10 +1243,18 @@ async fn run_index_for_source_async(
         let chunker = match ChunkerConfig::from_preset(&source.source_kind_preset) {
             Ok(chunker) => chunker,
             Err(e) => {
-                eprintln!(
-                    "warning: invalid chunker preset '{}' for source {}: {}",
-                    source.source_kind_preset, rt_source.id, e
-                );
+                summary.errors += 1;
+                if mode.warn() {
+                    eprintln!(
+                        "warning: invalid chunker preset '{}' for source {}: {}",
+                        source.source_kind_preset, rt_source.id, e
+                    );
+                } else {
+                    eprintln!(
+                        "error indexing source {}: invalid chunker preset '{}': {}",
+                        rt_source.id, source.source_kind_preset, e
+                    );
+                }
                 continue;
             }
         };
@@ -1236,16 +1276,24 @@ async fn run_index_for_source_async(
         .await
         {
             Ok(r) => {
-                let _ = r.chunks_written;
+                summary.indexed += r.docs_indexed;
+                summary.skipped += r.docs_skipped;
+                summary.chunks += r.chunks_written;
+                summary.errors += r.error_count;
+                summary.unsupported += r.unsupported_format_count;
             }
             Err(e) => {
-                eprintln!(
-                    "warning: auto-index error for source {}: {}",
-                    rt_source.id, e
-                );
+                summary.errors += 1;
+                if mode.warn() {
+                    eprintln!("warning: auto-index error for source {}: {}", rt_source.id, e);
+                } else {
+                    eprintln!("error indexing source {}: {}", rt_source.id, e);
+                }
             }
         }
     }
+
+    Ok(summary)
 }
 
 /// `localdb source list`
@@ -1459,11 +1507,6 @@ pub fn run_index(ctx: &CliContext, source_id: Option<&str>, strict: bool) {
 }
 
 async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, strict: bool) {
-    use localdb_core::{
-        chunker::ChunkerConfig,
-        ingestion::{run_ingestion_for_source, DocumentIndex, IngestionConfig},
-    };
-
     // A9-safety: validate --store name if given.
     if let Some(store_name) = ctx.stores.first() {
         if let Err(e) = validate_store_name(store_name) {
@@ -1499,11 +1542,7 @@ async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, strict: bool
         }
     }
 
-    let store_id = match db.resolve_store_id(&store_name).await {
-        Ok(id) => id,
-        Err(e) => exit_err(&e, ctx.json),
-    };
-    let rt_store = match db.backend().get_store(&store_id).await {
+    let store_row = match db.backend().get_store_by_name(&store_name).await {
         Ok(Some(s)) => s,
         Ok(None) => exit_err(
             &Error::StoreNotFound {
@@ -1514,26 +1553,12 @@ async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, strict: bool
         Err(e) => exit_err(&e, ctx.json),
     };
 
-    let all_sources = match db.backend().list_sources(&store_id).await {
-        Ok(s) => s,
+    let summary = match run_embedded_index(ctx, &store_row, source_id, IndexErrorMode::StrictExit).await {
+        Ok(summary) => summary,
         Err(e) => exit_err(&e, ctx.json),
     };
 
-    let sources_to_index: Vec<SourceRow> = if let Some(sid) = source_id {
-        match all_sources.into_iter().find(|s| s.id == sid) {
-            Some(s) => vec![s],
-            None => exit_err(
-                &Error::SourceNotFound {
-                    id: sid.to_string(),
-                },
-                ctx.json,
-            ),
-        }
-    } else {
-        all_sources
-    };
-
-    if sources_to_index.is_empty() {
+    if !summary.has_sources {
         if ctx.json {
             print_json(&json!({ "status": "ok", "message": "no sources to index" }));
         } else {
@@ -1542,124 +1567,23 @@ async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, strict: bool
         return;
     }
 
-    let policy = config_loader.config.defaults.indexing.clone();
-
-    let current_policy_version = compute_policy_version(&config_loader.config.defaults.indexing);
-    // Persist updated policy_version and indexing_policy back to the store.
-    if rt_store.policy_version != current_policy_version {
-        let new_indexing_policy =
-            serde_json::to_string(&policy).unwrap_or_else(|_| rt_store.indexing_policy.clone());
-        let updated_store = StoreRow {
-            policy_version: current_policy_version.clone(),
-            indexing_policy: new_indexing_policy,
-            ..rt_store.clone()
-        };
-        if let Err(e) = db.backend().upsert_store(&updated_store).await {
-            eprintln!("warning: failed to update policy_version: {}", e);
-        }
-    }
-
-    let ingestion_cfg = IngestionConfig {
-        store_id: rt_store.id.clone(),
-        policy_version: current_policy_version,
-        chunker: ChunkerConfig::prose(),
-    };
-
-    let embed_policy = &config_loader.config.defaults.indexing.embedding;
-    let models_dir = config_loader.paths.models_dir.clone();
-    let embedder = match embed::create_embedder(
-        embed_policy,
-        &config_loader.config.providers,
-        Some(&models_dir),
-    ) {
-        Ok(e) => e,
-        Err(e) => exit_err(&Error::from(e), ctx.json),
-    };
-
-    let extractor = match extract::ChainExtractor::from_ids(&policy.parsers) {
-        Ok(e) => e,
-        Err(e) => exit_err(&e, ctx.json),
-    };
-
-    let handle = match db.backend().retrieval_store(&store_id).await {
-        Ok(handle) => handle,
-        Err(e) => exit_err(&e, ctx.json),
-    };
-
-    let existing = match handle.list_indexed_documents().await {
-        Ok(records) => records,
-        Err(e) => exit_err(&e, ctx.json),
-    };
-    let mut doc_index = DocumentIndex::from_records(existing);
-    let (mut indexed, mut skipped, mut chunks, mut errors, mut unsupported) =
-        (0u64, 0u64, 0u64, 0u64, 0u64);
-    let url_fetcher = match HttpUrlFetcher::new() {
-        Ok(fetcher) => fetcher,
-        Err(e) => exit_err(&e, ctx.json),
-    };
-
-    for rt_source in &sources_to_index {
-        let source = source_row_to_core_source(rt_source);
-
-        let chunker = match ChunkerConfig::from_preset(&source.source_kind_preset) {
-            Ok(chunker) => chunker,
-            Err(e) => {
-                errors += 1;
-                eprintln!(
-                    "error indexing source {}: invalid chunker preset '{}': {}",
-                    rt_source.id, source.source_kind_preset, e
-                );
-                continue;
-            }
-        };
-        let cfg = IngestionConfig {
-            chunker,
-            ..ingestion_cfg.clone()
-        };
-        let sink = crate::progress::build_progress_sink(ctx.json);
-        match run_ingestion_for_source(
-            &source,
-            &mut doc_index,
-            handle.as_ref(),
-            embedder.as_ref(),
-            &cfg,
-            &extractor,
-            Some(&url_fetcher),
-            sink,
-        )
-        .await
-        {
-            Ok(r) => {
-                indexed += r.docs_indexed;
-                skipped += r.docs_skipped;
-                chunks += r.chunks_written;
-                errors += r.error_count;
-                unsupported += r.unsupported_format_count;
-            }
-            Err(e) => {
-                errors += 1;
-                eprintln!("error indexing source {}: {}", rt_source.id, e);
-            }
-        }
-    }
-
-    let status = if strict && errors > 0 { "error" } else { "ok" };
+    let status = if strict && summary.errors > 0 { "error" } else { "ok" };
     if ctx.json {
         print_json(&json!({
             "status": status,
-            "docs_indexed": indexed,
-            "docs_skipped": skipped,
-            "chunks_written": chunks,
-            "unsupported": unsupported,
-            "errors": errors,
+            "docs_indexed": summary.indexed,
+            "docs_skipped": summary.skipped,
+            "chunks_written": summary.chunks,
+            "unsupported": summary.unsupported,
+            "errors": summary.errors,
         }));
     } else {
         println!(
             "Index complete: {} indexed, {} skipped, {} chunks written, {} unsupported, {} errors",
-            indexed, skipped, chunks, unsupported, errors
+            summary.indexed, summary.skipped, summary.chunks, summary.unsupported, summary.errors
         );
     }
-    if strict && errors > 0 {
+    if strict && summary.errors > 0 {
         std::process::exit(2);
     }
 }
