@@ -1,0 +1,15 @@
+Task 31: Extract SearchService from HTTP search handler
+
+Implementation:
+- Added server/src/search_service.rs with owned `pub struct SearchService { state: AppState }`.
+- Added `pub fn new(state: AppState) -> Self`.
+- Added `pub async fn query(&self, req: SearchRequest) -> Result<SearchResponse, ApiError>`.
+- Moved search validation, cursor parsing, effective store filtering, embedder creation, retrieval store handle construction, `QueryRequest` construction, `SearchOrchestrator::query`, and pagination into `SearchService::query`.
+- Reduced HTTP handler to axum extraction, service construction, service call, and JSON serialization.
+- Confirmed `AppState` is `#[derive(Clone)]` over `Arc<Inner>` in `server/src/state.rs`.
+- Did not edit `core/src/ingestion.rs`.
+
+Verification:
+- `cargo fmt --all --check`: passed.
+- `cargo test -p server`: passed.
+- `git diff --stat cd8fbb3..HEAD -- core/src/ingestion.rs`: no output.

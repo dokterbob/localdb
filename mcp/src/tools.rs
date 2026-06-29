@@ -195,24 +195,10 @@ impl SearchArgs {
 ///
 /// If `store_names` is non-empty, only those stores are queried.
 /// Unknown store name → returns a tool error with code `store_not_found`.
-pub async fn tool_search(
+fn select_mcp_stores(
     stores: &[AvailableStore],
-    embedder: &dyn Embedder,
-    params: Option<&Value>,
-) -> CallToolResult {
-    let args = match SearchArgs::from_value(params) {
-        Ok(a) => a,
-        Err(msg) => {
-            return typed_error("invalid_request", format!("invalid arguments: {msg}"));
-        }
-    };
-
-    // E4: reject limit=0 explicitly.
-    if args.limit == 0 {
-        return typed_error("invalid_request", "limit must be at least 1");
-    }
-
-    // Filter stores by requested names (if any).
+    args: &SearchArgs,
+) -> Result<Vec<StoreHandle>, CallToolResult> {
     let selected_arcs: Vec<(String, String, Arc<dyn RetrievalStore>)> =
         if args.store_names.is_empty() {
             stores
@@ -235,40 +221,27 @@ pub async fn tool_search(
                         Arc::clone(&s.store),
                     )),
                     None => {
-                        return typed_error("store_not_found", format!("no store named '{name}'"));
+                        return Err(typed_error(
+                            "store_not_found",
+                            format!("no store named '{name}'"),
+                        ));
                     }
                 }
             }
             selected
         };
 
-    if selected_arcs.is_empty() {
-        let v = serde_json::json!({ "citations": [] });
-        return CallToolResult::success_json(&v);
-    }
-
-    let store_handles: Vec<StoreHandle> = selected_arcs
+    Ok(selected_arcs
         .into_iter()
         .map(|(id, name, arc)| StoreHandle {
             id,
             name,
             store: arc,
         })
-        .collect();
+        .collect())
+}
 
-    let request = QueryRequest {
-        query: args.query.clone(),
-        leg_k: None,
-        top_n: Some(args.limit),
-        filters: vec![],
-    };
-
-    let response: QueryResponse =
-        match SearchOrchestrator::query(&store_handles, embedder, &request).await {
-            Ok(r) => r,
-            Err(e) => return typed_error(e.code(), format!("search failed: {e}")),
-        };
-
+fn search_to_tool_result(response: QueryResponse, content_length: usize) -> CallToolResult {
     let citations_json: Vec<Value> = response
         .citations
         .iter()
@@ -280,10 +253,7 @@ pub async fn tool_search(
         "total_candidates": response.total_candidates,
     });
 
-    // Also build a short text rendering for non-structured clients.
-    let text_rendering = render_citations_text(&response.citations, args.content_length);
-
-    // Return both structured JSON and text rendering in the same text content item.
+    let text_rendering = render_citations_text(&response.citations, content_length);
     let json_str = serde_json::to_string_pretty(&v).unwrap_or_default();
     let full_text = format!("{json_str}\n\n---\n{text_rendering}");
 
@@ -291,6 +261,38 @@ pub async fn tool_search(
         content: vec![crate::protocol::ContentItem::Text { text: full_text }],
         is_error: false,
     }
+}
+
+pub async fn tool_search(
+    stores: &[AvailableStore],
+    embedder: &dyn Embedder,
+    params: Option<&Value>,
+) -> CallToolResult {
+    let args = match SearchArgs::from_value(params) {
+        Ok(a) => a,
+        Err(msg) => return typed_error("invalid_request", format!("invalid arguments: {msg}")),
+    };
+    if args.limit == 0 {
+        return typed_error("invalid_request", "limit must be at least 1");
+    }
+    let store_handles = match select_mcp_stores(stores, &args) {
+        Ok(handles) => handles,
+        Err(result) => return result,
+    };
+    if store_handles.is_empty() {
+        return CallToolResult::success_json(&serde_json::json!({ "citations": [] }));
+    }
+    let request = QueryRequest {
+        query: args.query.clone(),
+        leg_k: None,
+        top_n: Some(args.limit),
+        filters: vec![],
+    };
+    let response = match SearchOrchestrator::query(&store_handles, embedder, &request).await {
+        Ok(r) => r,
+        Err(e) => return typed_error(e.code(), format!("search failed: {e}")),
+    };
+    search_to_tool_result(response, args.content_length)
 }
 
 /// Render citations as human-readable text for non-structured clients.
@@ -348,102 +350,101 @@ pub fn render_citations_text(citations: &[Citation], max_chars: usize) -> String
 /// Note: URI-based lookup is not supported in v1 (the `RetrievalStore` trait
 /// provides `get_chunks_for_document` by ID only).  Callers must use a
 /// document ID obtained from a prior `search` call.
-pub async fn tool_get_document(
-    stores: &[AvailableStore],
-    params: Option<&Value>,
-) -> CallToolResult {
-    let args = params
-        .and_then(|p| p.get("arguments"))
-        .unwrap_or(&Value::Null);
+pub async fn tool_get_document(stores: &[AvailableStore], params: Option<&Value>) -> CallToolResult {
+    let args = match GetDocumentArgs::from_value(params) {
+        Ok(args) => args,
+        Err(result) => return result,
+    };
+    match find_document_chunks(stores, &args.id).await {
+        Ok(Some((store, chunks))) => CallToolResult::success_json(&document_json(store, &chunks)),
+        Ok(None) => typed_error(
+            "document_not_found",
+            format!("no document with id '{}' found in any store", args.id),
+        ),
+        Err(result) => result,
+    }
+}
 
-    // Accept "id" (document_id) preferred; "uri" is acknowledged but not supported in v1.
-    let doc_id = args.get("id").and_then(|v| v.as_str());
-    let uri_arg = args.get("uri").and_then(|v| v.as_str());
+#[derive(Debug, Clone)]
+struct GetDocumentArgs {
+    id: String,
+}
 
-    match (doc_id, uri_arg) {
-        (None, None) => {
-            return typed_error(
+impl GetDocumentArgs {
+    fn from_value(params: Option<&Value>) -> Result<Self, CallToolResult> {
+        let args = params
+            .and_then(|p| p.get("arguments"))
+            .unwrap_or(&Value::Null);
+        // Accept "id" (document_id) preferred; "uri" is acknowledged but not supported in v1.
+        let doc_id = args.get("id").and_then(|v| v.as_str());
+        let uri_arg = args.get("uri").and_then(|v| v.as_str());
+        match (doc_id, uri_arg) {
+            (None, None) => Err(typed_error(
                 "invalid_request",
                 "invalid arguments: must provide 'id' (document_id) or 'uri'",
-            );
-        }
-        (None, Some(_uri)) => {
-            // URI-based lookup: not supported in v1 (no index on URI).
-            return typed_error(
+            )),
+            (None, Some(_uri)) => Err(typed_error(
                 "invalid_request",
                 "uri-based get_document is not supported in v1; use the document 'id' from a search result",
-            );
-        }
-        (Some(id), _) if id.trim().is_empty() => {
-            return typed_error(
+            )),
+            (Some(id), _) if id.trim().is_empty() => Err(typed_error(
                 "invalid_request",
                 "invalid arguments: 'id' must not be empty",
-            );
+            )),
+            (Some(id), _) => Ok(Self { id: id.to_string() }),
         }
-        _ => {}
     }
+}
 
-    let doc_id = doc_id.unwrap();
-
-    // Search all stores for matching chunks by document ID.
-    for s in stores {
-        let chunks = match s.store.get_chunks_for_document(doc_id).await {
-            Ok(c) => c,
+async fn find_document_chunks<'a>(
+    stores: &'a [AvailableStore],
+    doc_id: &str,
+) -> Result<Option<(&'a AvailableStore, Vec<localdb_core::ChunkRecord>)>, CallToolResult> {
+    for store in stores {
+        let chunks = match store.store.get_chunks_for_document(doc_id).await {
+            Ok(chunks) => chunks,
             Err(e) => {
-                return typed_error(
+                return Err(typed_error(
                     e.code(),
-                    format!(
-                        "error fetching document from store '{}': {e}",
-                        s.descriptor.name
-                    ),
-                );
+                    format!("error fetching document from store '{}': {e}", store.descriptor.name),
+                ));
             }
         };
-
-        if !chunks.is_empty() {
-            // E3: Verify the document's owning store matches this AvailableStore.
-            // If the store_id on the chunk doesn't match the descriptor id, the document
-            // is not visible to this MCP session (it may belong to a federated store
-            // that is not in the available set).  Treat it as not found to avoid
-            // leaking the existence of documents in inaccessible stores.
-            let first = &chunks[0];
-            if first.store_id != s.descriptor.id {
-                // Continue scanning; do not reveal existence.
-                continue;
-            }
-
-            // Build document metadata from the first chunk.
-            let full_text = chunks
-                .iter()
-                .map(|c| c.text.as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            let v = serde_json::json!({
-                "document_id": first.document_id,
-                "uri": first.uri,
-                "title": first.metadata.title,
-                "store": {
-                    "id": s.descriptor.id,
-                    "name": s.descriptor.name,
-                },
-                "provenance": {
-                    "fetched_at": first.fetched_at,
-                    "content_hash": first.content_hash,
-                },
-                "metadata": first.metadata,
-                "chunk_count": chunks.len(),
-                "text": full_text,
-            });
-
-            return CallToolResult::success_json(&v);
+        if chunks.is_empty() {
+            continue;
         }
+        let first = &chunks[0];
+        if first.store_id != store.descriptor.id {
+            continue;
+        }
+        return Ok(Some((store, chunks)));
     }
+    Ok(None)
+}
 
-    typed_error(
-        "document_not_found",
-        format!("no document with id '{doc_id}' found in any store"),
-    )
+fn document_json(store: &AvailableStore, chunks: &[localdb_core::ChunkRecord]) -> Value {
+    let first = &chunks[0];
+    let full_text = chunks
+        .iter()
+        .map(|c| c.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    serde_json::json!({
+        "document_id": first.document_id,
+        "uri": first.uri,
+        "title": first.metadata.title,
+        "store": {
+            "id": store.descriptor.id,
+            "name": store.descriptor.name,
+        },
+        "provenance": {
+            "fetched_at": first.fetched_at,
+            "content_hash": first.content_hash,
+        },
+        "metadata": first.metadata,
+        "chunk_count": chunks.len(),
+        "text": full_text,
+    })
 }
 
 // ---------------------------------------------------------------------------
