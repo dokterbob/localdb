@@ -34,12 +34,16 @@ use localdb_core::{
     },
     ids::new_ulid,
     ingestion::now_rfc3339,
+    source::normalize_path_source,
     store_factory,
     types::{SourceKind, StoreVisibility},
     Error, SourceRow, StoreBackend, StoreBackendConfig, StoreRow,
 };
 use serde_json::json;
 use store_libsql::SqliteBackend;
+
+#[cfg(test)]
+use localdb_core::source::DEFAULT_PATH_EXCLUDES;
 
 // ---------------------------------------------------------------------------
 // Store name validation — A9-safety
@@ -508,59 +512,6 @@ pub fn classify_source(source: &str) -> (&str, Option<&str>, Option<&str>) {
     }
 }
 
-/// Normalize a file-system path source argument into `(root, include_globs, exclude_globs)`.
-///
-/// Shared by both the daemon branch and embedded branch of `source add` so that
-/// path validation, single-file promotion, and default excludes are always applied
-/// consistently regardless of whether the daemon is running.
-///
-/// Returns `Err(InvalidRequest)` (exit 2) if the path does not exist.
-fn normalize_path_source(raw_path: &str) -> Result<(String, Vec<String>, Vec<String>), Error> {
-    let p = std::path::Path::new(raw_path);
-
-    if !p.exists() {
-        return Err(Error::InvalidRequest {
-            message: format!("path '{}' does not exist", raw_path),
-        });
-    }
-
-    let (root, include_globs) = if p.is_file() {
-        // #7: single-file source — use parent dir as root, include only this file.
-        let parent = p
-            .parent()
-            .map(|par| {
-                if par == Path::new("") {
-                    Path::new(".")
-                } else {
-                    par
-                }
-            })
-            .unwrap_or(Path::new("."));
-        let filename = p
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        (parent.to_string_lossy().to_string(), vec![filename])
-    } else {
-        // Directory source: apply the default include allowlist so that only
-        // files with supported extensions are visited.  Callers that need to
-        // override this can set explicit include globs after construction.
-        let includes = DEFAULT_PATH_INCLUDES
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        (raw_path.to_string(), includes)
-    };
-
-    // #4: apply default excludes for path sources.
-    let exclude_globs: Vec<String> = DEFAULT_PATH_EXCLUDES
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-
-    Ok((root, include_globs, exclude_globs))
-}
-
 /// Determine whether a string looks like a ULID/UUID (not a path or URL).
 ///
 /// ULIDs are 26 uppercase alphanumeric characters. We use this to distinguish
@@ -1002,93 +953,6 @@ async fn run_store_remove_async(ctx: &CliContext, name: &str) {
         println!("Removed store: {}", name);
     }
 }
-
-/// Default include patterns for directory path sources.
-///
-/// When a directory source has no explicit `include` globs, this allowlist is
-/// applied so that only files with supported extensions (or known basenames) are
-/// visited.  Single-file sources are never affected by this constant — they
-/// already carry an exact filename as their include glob.
-///
-/// Generated from `extract::supported_extensions()`: plain extension tokens
-/// (no `.`) become `**/*.ext`; basename tokens (contain `.`) become
-/// `**/<basename>`.
-const DEFAULT_PATH_INCLUDES: &[&str] = &[
-    // Markdown
-    "**/*.md",
-    "**/*.markdown",
-    // HTML
-    "**/*.html",
-    "**/*.htm",
-    // PDF
-    "**/*.pdf",
-    // EPUB / ebook
-    "**/*.epub",
-    // Office formats
-    "**/*.docx",
-    "**/*.xlsx",
-    "**/*.pptx",
-    "**/*.odt",
-    "**/*.ods",
-    "**/*.odp",
-    // Plaintext prose
-    "**/*.txt",
-    "**/*.text",
-    // Code / data
-    "**/*.rs",
-    "**/*.py",
-    "**/*.js",
-    "**/*.mjs",
-    "**/*.ts",
-    "**/*.tsx",
-    "**/*.json",
-    "**/*.yaml",
-    "**/*.yml",
-    "**/*.toml",
-    "**/*.lock",
-    "**/*.c",
-    "**/*.h",
-    "**/*.cpp",
-    "**/*.hpp",
-    "**/*.go",
-    "**/*.java",
-    "**/*.rb",
-    "**/*.php",
-    "**/*.sh",
-    "**/*.css",
-    "**/*.scss",
-    "**/*.sql",
-    "**/*.csv",
-    "**/*.xml",
-    "**/*.ini",
-    "**/*.cfg",
-    // Lockfile basenames
-    "**/Cargo.lock",
-    "**/package-lock.json",
-    "**/yarn.lock",
-    "**/poetry.lock",
-    "**/Gemfile.lock",
-];
-
-/// Default exclude patterns for path sources (#4).
-///
-/// These patterns are matched against both the root-relative path and the bare
-/// basename of each entry (see `enumerate_dir` in `core`), so a pattern like
-/// `**/.git` prunes a `.git` directory at any depth before recursing into it.
-/// Using `**/X` (without a trailing `/**`) matches the entry itself; the subtree
-/// is never walked.  For single-file junk (`.DS_Store`) the same form works as a
-/// file-pattern.
-///
-/// **Include** globs are still anchored to the source root and NOT affected by
-/// this floating-basename rule.
-const DEFAULT_PATH_EXCLUDES: &[&str] = &[
-    "**/.git",
-    "**/node_modules",
-    "**/.DS_Store",
-    "**/target",
-    "**/__pycache__",
-    "**/.venv",
-];
 
 /// `localdb source add <path-or-url>`
 pub fn run_source_add(ctx: &CliContext, source_arg: &str, refresh: Option<&str>) {

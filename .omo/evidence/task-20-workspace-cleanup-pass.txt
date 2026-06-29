@@ -1,0 +1,34 @@
+Task 20 workspace cleanup evidence
+
+Exploration:
+- codegraph_explore("cli/src/lib.rs normalize_path_source DEFAULT_PATH_INCLUDES DEFAULT_PATH_EXCLUDES") reported:
+  - normalize_path_source in cli/src/lib.rs had 5 callers.
+  - DEFAULT_PATH_INCLUDES in cli/src/lib.rs had 1 caller.
+  - DEFAULT_PATH_EXCLUDES in cli/src/lib.rs had 2 callers.
+- Read core/src/source.rs and confirmed exports:
+  - DEFAULT_PATH_INCLUDES
+  - DEFAULT_PATH_EXCLUDES
+  - normalize_path_source(raw_path: &str) -> Result<(String, Vec<String>, Vec<String>), Error>
+
+Code changes:
+- Removed the local cli/src/lib.rs normalize_path_source function.
+- Removed the local cli/src/lib.rs DEFAULT_PATH_INCLUDES constant.
+- Removed the local cli/src/lib.rs DEFAULT_PATH_EXCLUDES constant.
+- Kept classify_source in cli/src/lib.rs.
+- Imported normalize_path_source from localdb_core::source for CLI use.
+- Imported DEFAULT_PATH_EXCLUDES from localdb_core::source for existing CLI unit test assertions.
+
+Verification command:
+cargo fmt --all --check && rg "fn normalize_path_source" "cli/src/lib.rs"; test $? -eq 1 && rg "const DEFAULT_PATH_INCLUDES" "cli/src/lib.rs"; test $? -eq 1 && test $(rg "fn classify_source" "cli/src/lib.rs" | wc -l | tr -d ' ') -eq 1 && cargo test --workspace && cargo test -p localdb --test cli_integration && test -z "$(GIT_MASTER=1 git diff --stat cd8fbb3..HEAD -- core/src/ingestion.rs)"
+
+Verification result:
+- cargo fmt --all --check: pass
+- rg "fn normalize_path_source" cli/src/lib.rs: 0 matches
+- rg "const DEFAULT_PATH_INCLUDES" cli/src/lib.rs: 0 matches
+- rg "fn classify_source" cli/src/lib.rs: 1 match
+- cargo test --workspace: pass
+- cargo test -p localdb --test cli_integration: pass (35 passed)
+- git diff --stat cd8fbb3..HEAD -- core/src/ingestion.rs: no output
+
+Full tool output:
+- /Users/drbob/.local/share/opencode/tool-output/tool_f1356b136001c72arrjipHWTUi
