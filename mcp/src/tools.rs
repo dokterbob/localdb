@@ -350,7 +350,10 @@ pub fn render_citations_text(citations: &[Citation], max_chars: usize) -> String
 /// Note: URI-based lookup is not supported in v1 (the `RetrievalStore` trait
 /// provides `get_chunks_for_document` by ID only).  Callers must use a
 /// document ID obtained from a prior `search` call.
-pub async fn tool_get_document(stores: &[AvailableStore], params: Option<&Value>) -> CallToolResult {
+pub async fn tool_get_document(
+    stores: &[AvailableStore],
+    params: Option<&Value>,
+) -> CallToolResult {
     let args = match GetDocumentArgs::from_value(params) {
         Ok(args) => args,
         Err(result) => return result,
@@ -406,7 +409,10 @@ async fn find_document_chunks<'a>(
             Err(e) => {
                 return Err(typed_error(
                     e.code(),
-                    format!("error fetching document from store '{}': {e}", store.descriptor.name),
+                    format!(
+                        "error fetching document from store '{}': {e}",
+                        store.descriptor.name
+                    ),
                 ));
             }
         };
@@ -503,10 +509,7 @@ mod get_document_tests {
             }
         };
         store
-            .upsert_chunks(vec![
-                make_chunk("alpha"),
-                make_chunk("beta"),
-            ])
+            .upsert_chunks(vec![make_chunk("alpha"), make_chunk("beta")])
             .await
             .unwrap();
 

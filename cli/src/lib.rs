@@ -1181,7 +1181,11 @@ async fn run_embedded_index(
         match all_sources.into_iter().find(|s| s.id == sid) {
             Some(s) => vec![s],
             None if mode.warn() => return Ok(IndexSummary::default()),
-            None => return Err(Error::SourceNotFound { id: sid.to_string() }),
+            None => {
+                return Err(Error::SourceNotFound {
+                    id: sid.to_string(),
+                })
+            }
         }
     } else {
         all_sources
@@ -1285,7 +1289,10 @@ async fn run_embedded_index(
             Err(e) => {
                 summary.errors += 1;
                 if mode.warn() {
-                    eprintln!("warning: auto-index error for source {}: {}", rt_source.id, e);
+                    eprintln!(
+                        "warning: auto-index error for source {}: {}",
+                        rt_source.id, e
+                    );
                 } else {
                     eprintln!("error indexing source {}: {}", rt_source.id, e);
                 }
@@ -1553,10 +1560,11 @@ async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, strict: bool
         Err(e) => exit_err(&e, ctx.json),
     };
 
-    let summary = match run_embedded_index(ctx, &store_row, source_id, IndexErrorMode::StrictExit).await {
-        Ok(summary) => summary,
-        Err(e) => exit_err(&e, ctx.json),
-    };
+    let summary =
+        match run_embedded_index(ctx, &store_row, source_id, IndexErrorMode::StrictExit).await {
+            Ok(summary) => summary,
+            Err(e) => exit_err(&e, ctx.json),
+        };
 
     if !summary.has_sources {
         if ctx.json {
@@ -1567,7 +1575,11 @@ async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, strict: bool
         return;
     }
 
-    let status = if strict && summary.errors > 0 { "error" } else { "ok" };
+    let status = if strict && summary.errors > 0 {
+        "error"
+    } else {
+        "ok"
+    };
     if ctx.json {
         print_json(&json!({
             "status": status,

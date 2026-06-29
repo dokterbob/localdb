@@ -153,11 +153,9 @@ fn spawn_url_scheduler(state: &AppState, url_scheduler: UrlRefreshScheduler) {
     tokio::spawn(url_scheduler.run(std::time::Duration::from_secs(60)));
 }
 
-fn server_future(listener: TcpListener, router: Router) -> impl std::future::Future<Output = ()> {
-    async move {
-        if let Err(e) = axum::serve(listener, router).await {
-            error!("server error: {}", e);
-        }
+async fn server_future(listener: TcpListener, router: Router) {
+    if let Err(e) = axum::serve(listener, router).await {
+        error!("server error: {}", e);
     }
 }
 
