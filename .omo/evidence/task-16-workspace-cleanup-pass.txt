@@ -5,9 +5,13 @@ changes:
 - Replaced infer_dim_encoding match logic in embed/src/factory.rs with a static SHAPES table lookup.
 - Added ShapeRule::matches() plus regression tests covering every current provider/model tuple and unknown-provider error behavior.
 
+loc:
+- embed/src/factory.rs pure LOC: 474
+
 verification:
 - cargo test -p embed ✅
 - cargo clippy -p embed -- -D warnings ✅
+- git diff --stat cd8fbb3..HEAD -- core/src/ingestion.rs: no output
 
 notes:
 - No (dim, encoding) tuple changed.
