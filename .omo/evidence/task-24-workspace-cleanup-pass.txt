@@ -12,9 +12,9 @@ Structural checks:
 - run_index_for_source_async deleted: rg found no matches after refactor.
 - New run_embedded_index(ctx, store_row, source_id, mode: IndexErrorMode) added.
 - run_index_async is now daemon-or-embedded dispatcher calling run_embedded_index.
-- rg -c "" cli/src/lib.rs: 2470
+- rg -c "" cli/src/lib.rs: 2518
 - Baseline cd8fbb3 cli/src/lib.rs line count: 2672
-- Reduction vs baseline: 202 lines
+- Reduction vs baseline: 154 lines after preserving intervening branch refactors
 
 Verification:
 - cargo fmt -p cli: pass
