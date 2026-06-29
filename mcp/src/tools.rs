@@ -524,7 +524,7 @@ mod get_document_tests {
         assert!(!result.is_error);
         assert_eq!(result.content.len(), 1);
 
-        let text = match &result.content[0] {
+        let rendered_text = match &result.content[0] {
             crate::protocol::ContentItem::Text { text } => text,
         };
 
@@ -546,7 +546,7 @@ mod get_document_tests {
         });
         let expected = serde_json::to_string_pretty(&expected).unwrap();
 
-        assert_eq!(text, &expected);
+        assert_eq!(rendered_text, &expected);
     }
 }
 
