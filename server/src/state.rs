@@ -261,7 +261,8 @@ impl AppState {
                 id: store_name.to_string(),
             })?;
         let store_id = store_row.id;
-        let (kind_enum, root, url, include, exclude) = parse_source_spec(kind, &spec)?;
+        let (kind_enum, root, url, include, exclude) =
+            localdb_core::source::parse_source_spec(kind, &spec)?;
 
         // Validate refresh interval before persisting anything.
         let interval_secs = match refresh {
@@ -391,75 +392,6 @@ fn store_visibility_to_str(visibility: &StoreVisibility) -> &'static str {
         StoreVisibility::Private => "private",
         StoreVisibility::Shared => "shared",
     }
-}
-
-type ParsedSourceSpec = (
-    localdb_core::types::SourceKind,
-    Option<String>,
-    Option<String>,
-    Vec<String>,
-    Vec<String>,
-);
-
-fn parse_source_spec(kind: &str, spec: &serde_json::Value) -> Result<ParsedSourceSpec, Error> {
-    match kind {
-        "path" => {
-            let root = spec
-                .get("root")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-                .ok_or_else(|| Error::InvalidRequest {
-                    message: "path source requires 'root'".to_string(),
-                })?;
-            let include = string_array_field(spec, "include")?;
-            let exclude = string_array_field(spec, "exclude")?;
-            Ok((
-                localdb_core::types::SourceKind::Path,
-                Some(root),
-                None,
-                include,
-                exclude,
-            ))
-        }
-        "url" => {
-            let url = spec
-                .get("url")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-                .ok_or_else(|| Error::InvalidRequest {
-                    message: "url source requires 'url'".to_string(),
-                })?;
-            Ok((
-                localdb_core::types::SourceKind::Url,
-                None,
-                Some(url),
-                Vec::new(),
-                Vec::new(),
-            ))
-        }
-        other => Err(Error::InvalidRequest {
-            message: format!("unknown source kind '{other}'"),
-        }),
-    }
-}
-
-fn string_array_field(spec: &serde_json::Value, field: &str) -> Result<Vec<String>, Error> {
-    let Some(raw) = spec.get(field) else {
-        return Ok(Vec::new());
-    };
-    let arr = raw.as_array().ok_or_else(|| Error::InvalidRequest {
-        message: format!("source spec field '{field}' must be a JSON array of strings"),
-    })?;
-    arr.iter()
-        .map(|value| {
-            value
-                .as_str()
-                .map(String::from)
-                .ok_or_else(|| Error::InvalidRequest {
-                    message: format!("source spec field '{field}' contains a non-string value"),
-                })
-        })
-        .collect()
 }
 
 fn source_row_to_record(row: SourceRow) -> Result<SourceRecord, Error> {
