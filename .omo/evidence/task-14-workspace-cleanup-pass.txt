@@ -1,0 +1,8 @@
+Task 14 workspace cleanup pass
+
+- Replaced VoyageEmbedder's inline retry loop in embed/src/voyage.rs with embed::http_helper::send_with_retry.
+- Preserved request shape, bearer auth, response parsing, and index reordering.
+- Moved Voyage tests into embed/tests/voyage.rs to keep the implementation file under the pure-LOC ceiling.
+- Verification: cargo test -p embed -- voyage ✅
+- LOC: embed/src/voyage.rs = 142 pure LOC; embed/tests/voyage.rs = 179 pure LOC.
+- core/src/ingestion.rs diff check: no output.
