@@ -50,13 +50,30 @@ pub async fn start_daemon(
 ) -> Result<(DaemonHandle, impl std::future::Future<Output = ()>), Error> {
     let bind_addr = options.config.server.bind.as_str();
     let port = options.config.server.port;
+    let socket_guard = bind_socket_guard(&options)?;
+    let (state, url_scheduler) = build_daemon_state(&options).await?;
+    let router = build_router(state.clone());
+    let (listener, bound_addr) = bind_tcp_listener(bind_addr, port).await?;
 
-    // Guard: refuse non-loopback bind without auth.
-    validate_bind_address(bind_addr)?;
+    spawn_config_watcher(options.paths.config_file.clone(), state.clone());
+    spawn_url_scheduler(&state, url_scheduler);
 
-    let socket_guard = SocketGuard::new(&options.paths.socket_path())?;
+    let handle = DaemonHandle {
+        _socket: socket_guard,
+        addr: bound_addr,
+    };
 
-    // Build shared application state.
+    Ok((handle, server_future(listener, router)))
+}
+
+fn bind_socket_guard(options: &DaemonOptions) -> Result<SocketGuard, Error> {
+    validate_bind_address(options.config.server.bind.as_str())?;
+    SocketGuard::new(&options.paths.socket_path())
+}
+
+async fn build_daemon_state(
+    options: &DaemonOptions,
+) -> Result<(AppState, UrlRefreshScheduler), Error> {
     let queue = JobQueue::new();
     let url_scheduler = UrlRefreshScheduler::new(queue.clone());
     let state = AppState::new(
@@ -67,10 +84,10 @@ pub async fn start_daemon(
     )
     .await?;
 
-    // Build router.
-    let router = build_router(state.clone());
+    Ok((state, url_scheduler))
+}
 
-    // Bind TCP listener.
+async fn bind_tcp_listener(bind_addr: &str, port: u16) -> Result<(TcpListener, SocketAddr), Error> {
     let addr_str = format!("{}:{}", bind_addr, port);
     let listener = TcpListener::bind(&addr_str)
         .await
@@ -86,24 +103,19 @@ pub async fn start_daemon(
 
     info!("daemon listening on {}", bound_addr);
 
-    // Spawn config watcher (non-fatal if it fails to start).
-    let config_file_path = options.paths.config_file.clone();
-    let state_for_watcher = state.clone();
+    Ok((listener, bound_addr))
+}
+
+fn spawn_config_watcher(config_file_path: PathBuf, state: AppState) {
     tokio::spawn(async move {
-        let result = run_config_watcher(config_file_path, state_for_watcher).await;
+        let result = run_config_watcher(config_file_path, state).await;
         if let Err(e) = result {
             error!("config watcher failed: {}", e);
         }
     });
+}
 
-    // Spawn URL refresh scheduler.
-    // Per T11 scope: "URL refresh scheduling" — daemon-exclusive capability.
-    // The scheduler polls every 60 seconds by default; each URL source with a
-    // configured refresh_interval_secs will be re-indexed when due.
-    //
-    // Register pre-existing URL sources from the DB at startup. Sources created
-    // after startup are registered dynamically in AppState::add_source.
-    // Uses persisted source IDs (not fresh ULIDs) so refresh history survives restarts.
+fn spawn_url_scheduler(state: &AppState, url_scheduler: UrlRefreshScheduler) {
     let backend_for_url = state.backend_arc();
     let sched_for_url = url_scheduler.clone();
     tokio::spawn(async move {
@@ -138,22 +150,15 @@ pub async fn start_daemon(
             }
         }
     });
-    // Start the scheduler loop in the background.
     tokio::spawn(url_scheduler.run(std::time::Duration::from_secs(60)));
+}
 
-    // Create the server future.
-    let server_future = async move {
+fn server_future(listener: TcpListener, router: Router) -> impl std::future::Future<Output = ()> {
+    async move {
         if let Err(e) = axum::serve(listener, router).await {
             error!("server error: {}", e);
         }
-    };
-
-    let handle = DaemonHandle {
-        _socket: socket_guard,
-        addr: bound_addr,
-    };
-
-    Ok((handle, server_future))
+    }
 }
 
 /// Build the axum router with all /v1 routes.
