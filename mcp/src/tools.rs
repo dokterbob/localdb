@@ -447,6 +447,109 @@ fn document_json(store: &AvailableStore, chunks: &[localdb_core::ChunkRecord]) -
     })
 }
 
+#[cfg(test)]
+mod get_document_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use localdb_core::ids::{chunk_id, content_hash, document_id, new_ulid};
+    use localdb_core::parser::DocumentMetadata;
+    use localdb_core::store::{FakeStore, RetrievalStore};
+    use localdb_core::{ChunkRecord, Span};
+
+    #[tokio::test]
+    async fn tool_get_document_returns_identical_json_for_fixed_document() {
+        let store_id = new_ulid();
+        let origin_store = new_ulid();
+        let source_id = new_ulid();
+        let doc_uri = "file:///docs/guide.md";
+        let doc_hash = content_hash("guide body");
+        let doc_id = document_id(doc_uri, &doc_hash);
+        let metadata = DocumentMetadata {
+            title: Some("Guide".to_string()),
+            creator: vec!["Ada".to_string()],
+            subject: vec!["docs".to_string()],
+            description: Some("reference document".to_string()),
+            publisher: Some("localdb".to_string()),
+            contributor: vec!["Bea".to_string()],
+            date: Some("2026-06-29".to_string()),
+            format: Some("text/markdown".to_string()),
+            identifier: Some("guide-1".to_string()),
+            language: Some("en".to_string()),
+            rights: Some("CC0".to_string()),
+            ..Default::default()
+        };
+
+        let store = FakeStore::new();
+        let make_chunk = |text: &str| {
+            let span = Span::new(0, text.len());
+            ChunkRecord {
+                id: chunk_id(&doc_id, text, span.start, span.end),
+                document_id: doc_id.clone(),
+                store_id: store_id.clone(),
+                text: text.to_string(),
+                span,
+                heading_path: vec!["Guide".to_string()],
+                embedding: vec![0.1, 0.2],
+                policy_version: "policy-v1".to_string(),
+                fetched_at: "2026-06-29T00:00:00Z".to_string(),
+                content_hash: doc_hash.clone(),
+                origin_store: origin_store.clone(),
+                source_id: source_id.clone(),
+                source_kind: "path".to_string(),
+                mime: None,
+                uri: doc_uri.to_string(),
+                metadata: metadata.clone(),
+            }
+        };
+        store
+            .upsert_chunks(vec![
+                make_chunk("alpha"),
+                make_chunk("beta"),
+            ])
+            .await
+            .unwrap();
+
+        let stores = vec![AvailableStore::from_arc(
+            StoreDescriptor {
+                id: store_id.to_string(),
+                name: "notes".to_string(),
+                visibility: "private".to_string(),
+            },
+            Arc::new(store),
+        )];
+        let params = serde_json::json!({"arguments": {"id": doc_id}});
+
+        let result = tool_get_document(&stores, Some(&params)).await;
+        assert!(!result.is_error);
+        assert_eq!(result.content.len(), 1);
+
+        let text = match &result.content[0] {
+            crate::protocol::ContentItem::Text { text } => text,
+        };
+
+        let expected = serde_json::json!({
+            "document_id": doc_id,
+            "uri": doc_uri,
+            "title": "Guide",
+            "store": {
+                "id": store_id.to_string(),
+                "name": "notes",
+            },
+            "provenance": {
+                "fetched_at": "2026-06-29T00:00:00Z",
+                "content_hash": doc_hash,
+            },
+            "metadata": metadata,
+            "chunk_count": 2,
+            "text": "alpha\nbeta",
+        });
+        let expected = serde_json::to_string_pretty(&expected).unwrap();
+
+        assert_eq!(text, &expected);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
