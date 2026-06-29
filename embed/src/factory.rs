@@ -20,7 +20,9 @@ struct ShapeRule {
 impl ShapeRule {
     fn matches(&self, policy: &EmbeddingPolicy) -> bool {
         self.providers.contains(&policy.provider.as_str())
-            && self.model.is_none_or(|model| model == policy.model.as_str())
+            && self
+                .model
+                .is_none_or(|model| model == policy.model.as_str())
     }
 }
 

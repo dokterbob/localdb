@@ -30,8 +30,8 @@
 
 use async_trait::async_trait;
 use localdb_core::{DocumentChunks, EmbeddedDocument, Embedder, Error as CoreError};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::Client;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 
 use crate::error::EmbedError;
