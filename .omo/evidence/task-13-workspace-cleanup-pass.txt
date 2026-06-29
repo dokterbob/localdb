@@ -1,0 +1,7 @@
+task-13 workspace cleanup pass
+
+- replaced Perplexity inline retry loop in `embed/src/perplexity.rs` with `embed::http_helper::send_with_retry`
+- preserved Perplexity request body shape, bearer auth, response parsing, and document-context handling
+- verified: `cargo test -p embed -- perplexity` ✅
+- verified: `core/src/ingestion.rs` unchanged via `git diff --stat cd8fbb3..HEAD -- core/src/ingestion.rs` ✅
+- verified: `embed/src/perplexity.rs` pure LOC reduced to 341
