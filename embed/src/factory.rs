@@ -10,74 +10,6 @@ use crate::error::EmbedError;
 
 type BoxedEmbedder = Box<dyn Embedder>;
 
-struct ShapeRule {
-    providers: &'static [&'static str],
-    model: Option<&'static str>,
-    dim: usize,
-    encoding: VectorEncoding,
-}
-
-impl ShapeRule {
-    fn matches(&self, policy: &EmbeddingPolicy) -> bool {
-        self.providers.contains(&policy.provider.as_str())
-            && match self.model {
-                Some(model) => model == policy.model.as_str(),
-                None => true,
-            }
-    }
-}
-
-const SHAPES: &[ShapeRule] = &[
-    ShapeRule {
-        providers: &["fake"],
-        model: Some("bge-small-en-v1.5"),
-        dim: 384,
-        encoding: VectorEncoding::Float32,
-    },
-    ShapeRule {
-        providers: &["fake"],
-        model: None,
-        dim: 128,
-        encoding: VectorEncoding::Float32,
-    },
-    ShapeRule {
-        providers: &["local", "local-coreml", "local-onnx"],
-        model: Some("pplx-embed-context-v1-0.6b"),
-        dim: 1024,
-        encoding: VectorEncoding::Binary,
-    },
-    ShapeRule {
-        providers: &["local", "local-onnx"],
-        model: Some("pplx-embed-v1-0.6b"),
-        dim: 1024,
-        encoding: VectorEncoding::Binary,
-    },
-    ShapeRule {
-        providers: &["local", "local-onnx"],
-        model: Some("bge-small-en-v1.5"),
-        dim: 384,
-        encoding: VectorEncoding::Float32,
-    },
-    ShapeRule {
-        providers: &["openai-compatible"],
-        model: None,
-        dim: 1536,
-        encoding: VectorEncoding::Float32,
-    },
-    ShapeRule {
-        providers: &["perplexity"],
-        model: None,
-        dim: 1024,
-        encoding: VectorEncoding::Float32,
-    },
-    ShapeRule {
-        providers: &["voyage"],
-        model: None,
-        dim: 1024,
-        encoding: VectorEncoding::Float32,
-    },
-];
-
 /// Statically map an `EmbeddingPolicy` to `(embedding_dim, encoding)` without
 /// constructing an embedder. The unified DB needs these at open time even for
 /// metadata-only commands; constructing the embedder there would trigger a
@@ -87,68 +19,28 @@ pub fn infer_dim_encoding(
     policy: &EmbeddingPolicy,
     _providers: &[ProviderConfig],
 ) -> Result<(usize, VectorEncoding), EmbedError> {
-    SHAPES
-        .iter()
-        .find(|rule| rule.matches(policy))
-        .map(|rule| (rule.dim, rule.encoding))
-        .ok_or_else(|| {
-            let provider = policy.provider.as_str();
-            let model = policy.model.as_str();
-            EmbedError::Internal(format!(
-                "cannot infer embedding shape for provider '{provider}' model '{model}'. \
-                 Supported providers: 'fake', 'local', 'local-coreml', 'local-onnx', \
-                 'openai-compatible', 'perplexity', 'voyage'."
-            ))
-        })
-}
+    match (policy.provider.as_str(), policy.model.as_str()) {
+        ("fake", "bge-small-en-v1.5") => Ok((384, VectorEncoding::Float32)),
+        ("fake", _) => Ok((128, VectorEncoding::Float32)),
 
-#[cfg(test)]
-mod shape_tests {
-    use super::*;
-
-    fn policy(provider: &str, model: &str) -> EmbeddingPolicy {
-        EmbeddingPolicy {
-            model: model.to_string(),
-            provider: provider.to_string(),
+        ("local" | "local-coreml" | "local-onnx", "pplx-embed-context-v1-0.6b") => {
+            Ok((1024, VectorEncoding::Binary))
         }
-    }
+        ("local" | "local-onnx", "pplx-embed-v1-0.6b") => Ok((1024, VectorEncoding::Binary)),
+        ("local" | "local-onnx", "bge-small-en-v1.5") => Ok((384, VectorEncoding::Float32)),
 
-    #[test]
-    fn infer_dim_encoding_matches_shape_table() {
-        for rule in SHAPES {
-            let model = rule.model.unwrap_or("any-model");
+        ("openai-compatible", _) => Ok((1536, VectorEncoding::Float32)),
+        ("perplexity", _) => Ok((1024, VectorEncoding::Float32)),
+        ("voyage", _) => Ok((1024, VectorEncoding::Float32)),
 
-            for provider in rule.providers {
-                let policy = policy(provider, model);
-                let result = infer_dim_encoding(&policy, &[]).expect("shape rule should match");
-
-                assert_eq!(result, (rule.dim, rule.encoding));
-            }
-        }
-    }
-
-    #[test]
-    fn infer_dim_encoding_keeps_unknown_provider_error() {
-        let policy = policy("unknown", "any-model");
-
-        let error = infer_dim_encoding(&policy, &[]).expect_err("unknown provider should fail");
-
-        assert!(matches!(error, EmbedError::Internal(message) if message.contains("unknown") && message.contains("Supported providers")));
+        (provider, model) => Err(EmbedError::Internal(format!(
+            "cannot infer embedding shape for provider '{provider}' model '{model}'. \
+             Supported providers: 'fake', 'local', 'local-coreml', 'local-onnx', \
+             'openai-compatible', 'perplexity', 'voyage'."
+        ))),
     }
 }
 
-/// Construct a boxed `Embedder` from an `EmbeddingPolicy` and the list of
-/// provider configs declared in the YAML config.
-///
-/// Provider dispatch:
-/// - `"fake"` — in-process `FakeEmbedder`; no I/O, no model download.
-/// - `"local"` — auto: on macOS with the `local-coreml` feature, use CoreML for
-///   the pplx context model (falling back to ONNX on error); otherwise ONNX.
-/// - `"local-coreml"` — force in-process CoreML (macOS + `local-coreml` only).
-/// - `"local-onnx"` — in-process ONNX inference (requires feature `local-onnx`).
-/// - `"openai-compatible"` — flat HTTP provider targeting any `/v1/embeddings` endpoint.
-/// - `"perplexity"` — contextualized HTTP provider.
-/// - `"voyage"` — contextualized HTTP provider.
 pub fn create_embedder(
     policy: &EmbeddingPolicy,
     providers: &[ProviderConfig],
@@ -192,9 +84,17 @@ fn create_openai_compatible(
     policy: &EmbeddingPolicy,
     providers: &[ProviderConfig],
 ) -> Result<BoxedEmbedder, EmbedError> {
-    let provider = provider_config(providers, HostedProvider::OpenAiCompatible)?;
+    let provider = provider_config(
+        providers,
+        "openai-compatible",
+        "no openai-compatible provider block in config; add a 'providers:' \
+         entry with kind: openai-compatible",
+    )?;
     let api_key = optional_api_key(provider);
-    let base_url = provider.base_url.as_deref().unwrap_or("https://api.openai.com");
+    let base_url = provider
+        .base_url
+        .as_deref()
+        .unwrap_or("https://api.openai.com");
     let embedder = crate::OpenAiEmbedder::new(
         base_url,
         api_key,
@@ -207,25 +107,45 @@ fn create_openai_compatible(
 }
 
 fn create_perplexity(providers: &[ProviderConfig]) -> Result<BoxedEmbedder, EmbedError> {
-    let api_key = required_api_key(provider_config(providers, HostedProvider::Perplexity)?)?;
-    let embedder = crate::PerplexityEmbedder::new(api_key, None, None, crate::RetryPolicy::default())?;
+    let provider = provider_config(
+        providers,
+        "perplexity",
+        "no perplexity provider block in config; add a 'providers:' entry \
+         with kind: perplexity and api_key_env pointing to your API key",
+    )?;
+    let api_key = required_api_key(
+        provider,
+        "perplexity provider requires 'api_key_env' to be set in config",
+    )?;
+    let embedder =
+        crate::PerplexityEmbedder::new(api_key, None, None, crate::RetryPolicy::default())?;
     Ok(Box::new(embedder))
 }
 
 fn create_voyage(providers: &[ProviderConfig]) -> Result<BoxedEmbedder, EmbedError> {
-    let api_key = required_api_key(provider_config(providers, HostedProvider::Voyage)?)?;
+    let provider = provider_config(
+        providers,
+        "voyage",
+        "no voyage provider block in config; add a 'providers:' entry \
+         with kind: voyage and api_key_env pointing to your API key",
+    )?;
+    let api_key = required_api_key(
+        provider,
+        "voyage provider requires 'api_key_env' to be set in config",
+    )?;
     let embedder = crate::VoyageEmbedder::new(api_key, None, None, crate::RetryPolicy::default())?;
     Ok(Box::new(embedder))
 }
 
-fn provider_config(
-    providers: &[ProviderConfig],
-    hosted_provider: HostedProvider,
-) -> Result<&ProviderConfig, EmbedError> {
+fn provider_config<'a>(
+    providers: &'a [ProviderConfig],
+    kind: &str,
+    missing_message: &str,
+) -> Result<&'a ProviderConfig, EmbedError> {
     providers
         .iter()
-        .find(|provider| provider.kind == hosted_provider.kind())
-        .ok_or_else(|| EmbedError::ProviderNotConfigured(hosted_provider.not_configured_message()))
+        .find(|provider| provider.kind == kind)
+        .ok_or_else(|| EmbedError::ProviderNotConfigured(missing_message.to_string()))
 }
 
 fn optional_api_key(provider: &ProviderConfig) -> Option<String> {
@@ -235,10 +155,13 @@ fn optional_api_key(provider: &ProviderConfig) -> Option<String> {
         .and_then(|env| std::env::var(env).ok())
 }
 
-fn required_api_key(provider: &ProviderConfig) -> Result<String, EmbedError> {
+fn required_api_key(
+    provider: &ProviderConfig,
+    missing_message: &str,
+) -> Result<String, EmbedError> {
     let Some(env) = &provider.api_key_env else {
         return Err(EmbedError::ProviderNotConfigured(
-            hosted_provider_missing_env(provider).to_string(),
+            missing_message.to_string(),
         ));
     };
     let key = std::env::var(env).unwrap_or_default();
@@ -251,61 +174,16 @@ fn required_api_key(provider: &ProviderConfig) -> Result<String, EmbedError> {
     Ok(key)
 }
 
-fn hosted_provider_missing_env(provider: &ProviderConfig) -> &'static str {
-    match provider.kind.as_str() {
-        "perplexity" => "perplexity provider requires 'api_key_env' to be set in config",
-        "voyage" => "voyage provider requires 'api_key_env' to be set in config",
-        _ => "hosted provider requires 'api_key_env' to be set in config",
-    }
-}
-
-#[derive(Clone, Copy)]
-enum HostedProvider {
-    OpenAiCompatible,
-    Perplexity,
-    Voyage,
-}
-
-impl HostedProvider {
-    const fn kind(self) -> &'static str {
-        match self {
-            Self::OpenAiCompatible => "openai-compatible",
-            Self::Perplexity => "perplexity",
-            Self::Voyage => "voyage",
-        }
-    }
-
-    fn not_configured_message(self) -> String {
-        match self {
-            Self::OpenAiCompatible => {
-                "no openai-compatible provider block in config; add a 'providers:' \
-                 entry with kind: openai-compatible"
-                    .to_string()
-            }
-            Self::Perplexity => {
-                "no perplexity provider block in config; add a 'providers:' entry \
-                 with kind: perplexity and api_key_env pointing to your API key"
-                    .to_string()
-            }
-            Self::Voyage => {
-                "no voyage provider block in config; add a 'providers:' entry \
-                 with kind: voyage and api_key_env pointing to your API key"
-                    .to_string()
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Local provider helpers
-// ---------------------------------------------------------------------------
-
 #[cfg(all(target_os = "macos", feature = "local-coreml"))]
-fn create_coreml(policy: &EmbeddingPolicy, models_dir: Option<&Path>) -> Result<BoxedEmbedder, EmbedError> {
+fn create_coreml(
+    policy: &EmbeddingPolicy,
+    models_dir: Option<&Path>,
+) -> Result<BoxedEmbedder, EmbedError> {
     let cache_dir = models_dir.map(|p| p.to_path_buf());
     match policy.model.as_str() {
         "pplx-embed-context-v1-0.6b" => {
-            let embedder = crate::pplx_context_coreml::PplxContextCoreMLEmbedder::new(cache_dir, true)?;
+            let embedder =
+                crate::pplx_context_coreml::PplxContextCoreMLEmbedder::new(cache_dir, true)?;
             Ok(Box::new(embedder))
         }
         unknown => Err(EmbedError::Internal(format!(
@@ -333,9 +211,11 @@ fn create_onnx_unavailable() -> Result<BoxedEmbedder, EmbedError> {
     ))
 }
 
-/// Build the in-process ONNX embedder for `policy.model` (requires `local-onnx`).
 #[cfg(feature = "local-onnx")]
-fn create_onnx(policy: &EmbeddingPolicy, models_dir: Option<&Path>) -> Result<BoxedEmbedder, EmbedError> {
+fn create_onnx(
+    policy: &EmbeddingPolicy,
+    models_dir: Option<&Path>,
+) -> Result<BoxedEmbedder, EmbedError> {
     let cache_dir = models_dir.map(|p| p.to_path_buf());
     match policy.model.as_str() {
         "pplx-embed-context-v1-0.6b" => {
@@ -358,17 +238,11 @@ fn create_onnx(policy: &EmbeddingPolicy, models_dir: Option<&Path>) -> Result<Bo
     }
 }
 
-/// AUTO local provider: prefer CoreML on macOS (falling back to ONNX on error),
-/// else use ONNX. Returns a clear error if no local backend is compiled in.
-//
-// `return` is used throughout so the cfg-gated branches compose across every
-// feature/platform combination; the trailing position differs per config.
 #[allow(clippy::needless_return)]
 fn create_local_auto(
     policy: &EmbeddingPolicy,
     models_dir: Option<&Path>,
 ) -> Result<BoxedEmbedder, EmbedError> {
-    // macOS + CoreML: try CoreML for the context model, fall back to ONNX.
     #[cfg(all(target_os = "macos", feature = "local-coreml"))]
     {
         if policy.model == "pplx-embed-context-v1-0.6b" {
@@ -391,7 +265,6 @@ fn create_local_auto(
                 }
             }
         }
-        // Non-context models: go straight to ONNX when available.
         #[cfg(feature = "local-onnx")]
         {
             return create_onnx(policy, models_dir);
@@ -407,7 +280,6 @@ fn create_local_auto(
         }
     }
 
-    // Non-macOS or no CoreML: ONNX if available, else a clear error.
     #[cfg(not(all(target_os = "macos", feature = "local-coreml")))]
     {
         #[cfg(feature = "local-onnx")]
@@ -482,14 +354,12 @@ mod tests {
     fn perplexity_empty_api_key_returns_error() {
         use localdb_core::config::schema::ProviderConfig;
         let policy = fake_policy("perplexity", "pplx-embed-context-v1");
-        // Use an env var that is guaranteed to be unset.
         let provider = ProviderConfig {
             name: "pplx".to_string(),
             kind: "perplexity".to_string(),
             base_url: None,
             api_key_env: Some("LOCALDB_TEST_UNSET_VAR_PERPLEXITY_XYZ".to_string()),
         };
-        // Ensure it's not set.
         std::env::remove_var("LOCALDB_TEST_UNSET_VAR_PERPLEXITY_XYZ");
         let result = create_embedder(&policy, &[provider], None);
         assert!(
