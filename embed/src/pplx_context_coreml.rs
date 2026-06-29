@@ -25,8 +25,10 @@
 
 use std::{
     collections::HashMap,
+    future::Future,
     ops::Range,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{Arc, Mutex},
 };
 
@@ -476,6 +478,51 @@ impl PplxContextCoreMLEmbedder {
             n_chunks,
         })
     }
+
+    fn plan_prediction_windows(&self, docs: &[DocumentChunks]) -> Result<Vec<WorkItem>, CoreError> {
+        let mut worklist = Vec::new();
+        for (doc_idx, doc) in docs.iter().enumerate() {
+            if doc.chunks.is_empty() {
+                continue;
+            }
+
+            let chunk_tok_counts = doc
+                .chunks
+                .iter()
+                .map(|chunk| {
+                    self.tokenizer
+                        .encode(chunk.as_str(), false)
+                        .map(|encoding| encoding.get_ids().len())
+                        .map_err(|err| EmbedError::Internal(format!("tokenize: {err}")))
+                })
+                .collect::<Result<Vec<usize>, EmbedError>>()
+                .map_err(CoreError::from)?;
+
+            let windows = plan_windows(&chunk_tok_counts, self.window_max_seq_len, N_MAX_CHUNKS);
+            for window in &windows {
+                worklist.push(WorkItem {
+                    doc_idx,
+                    chunk_start: window.start,
+                    chunks: doc.chunks[window.clone()].to_vec(),
+                });
+            }
+        }
+        Ok(worklist)
+    }
+}
+
+fn empty_result_slots(docs: &[DocumentChunks]) -> Vec<EmbeddedDocument> {
+    docs.iter()
+        .map(|doc| vec![vec![]; doc.chunks.len()])
+        .collect()
+}
+
+fn scatter_completed_rows(results: &mut [EmbeddedDocument], completed: Vec<CompletedWindowRows>) {
+    for window in completed {
+        for (offset, row) in window.rows.into_iter().enumerate() {
+            results[window.doc_idx][window.chunk_start + offset] = row;
+        }
+    }
 }
 
 /// Convert a slice of f16 bit patterns into `half::f16` values for `MlArray::f16`.
@@ -513,6 +560,158 @@ struct PreppedWindow {
     inputs: Vec<(&'static str, MlArray)>,
     /// Number of valid embedding rows in the output (= number of chunk spans found).
     n_chunks: usize,
+}
+
+struct WorkItem {
+    doc_idx: usize,
+    chunk_start: usize,
+    chunks: Vec<String>,
+}
+
+struct CompletedWindowRows {
+    doc_idx: usize,
+    chunk_start: usize,
+    rows: Vec<Vec<f32>>,
+}
+
+struct TaggedPrediction {
+    doc_idx: usize,
+    chunk_start: usize,
+    n_chunks: usize,
+    output: Result<Outputs, EmbedError>,
+}
+
+type PredictionFuture = Pin<Box<dyn Future<Output = TaggedPrediction> + Send>>;
+
+struct PredictionPipeline<'a> {
+    embedder: &'a PplxContextCoreMLEmbedder,
+    work: std::vec::IntoIter<WorkItem>,
+    inflight: FuturesUnordered<PredictionFuture>,
+    first_err: Option<CoreError>,
+}
+
+impl<'a> PredictionPipeline<'a> {
+    const MAX_INFLIGHT: usize = 4;
+
+    fn new(embedder: &'a PplxContextCoreMLEmbedder, worklist: Vec<WorkItem>) -> Self {
+        Self {
+            embedder,
+            work: worklist.into_iter(),
+            inflight: FuturesUnordered::new(),
+            first_err: None,
+        }
+    }
+
+    async fn run_to_completion(mut self) -> Result<Vec<CompletedWindowRows>, CoreError> {
+        let mut completed = Vec::new();
+
+        loop {
+            self.fill_inflight_predictions();
+
+            match self.inflight.next().await {
+                Some(prediction) => {
+                    if let Some(rows) = self.collect_completed_rows(prediction) {
+                        completed.push(rows);
+                    }
+                }
+                None => break,
+            }
+        }
+
+        match self.first_err {
+            Some(err) => Err(err),
+            None => Ok(completed),
+        }
+    }
+
+    fn fill_inflight_predictions(&mut self) {
+        if self.first_err.is_some() {
+            return;
+        }
+
+        while self.inflight.len() < Self::MAX_INFLIGHT {
+            match self.work.next() {
+                Some(work) => match self.start_window_prediction(work) {
+                    Ok(prediction) => self.inflight.push(prediction),
+                    Err(err) => {
+                        self.first_err = Some(err);
+                        break;
+                    }
+                },
+                None => break,
+            }
+        }
+    }
+
+    fn start_window_prediction(&self, work: WorkItem) -> Result<PredictionFuture, CoreError> {
+        // Drain per-window autoreleased Obj-C temporaries (NSString, NSNumber,
+        // MLFeatureValue, transient MLMultiArrays) that accumulate in
+        // prep_window / build_feature_provider / start_prediction.
+        // PendingPrediction holds only Retained<> objects, so it survives the
+        // pool drain.
+        let queued = autoreleasepool(|_| -> Result<_, CoreError> {
+            let prepped = self
+                .embedder
+                .prep_window(&work.chunks)
+                .map_err(CoreError::from)?;
+            let fixed_idx = prepped.fixed_idx;
+            let n_chunks = prepped.n_chunks;
+            let doc_idx = work.doc_idx;
+            let chunk_start = work.chunk_start;
+            let model = self
+                .embedder
+                .model_for(fixed_idx)
+                .map_err(CoreError::from)?;
+            let pending = model
+                .start_prediction(prepped.inputs)
+                .map_err(CoreError::from)?;
+            Ok((doc_idx, chunk_start, n_chunks, pending))
+        })?;
+
+        let (doc_idx, chunk_start, n_chunks, pending) = queued;
+        Ok(Box::pin(async move {
+            TaggedPrediction {
+                doc_idx,
+                chunk_start,
+                n_chunks,
+                output: pending.await,
+            }
+        }))
+    }
+
+    fn collect_completed_rows(
+        &mut self,
+        prediction: TaggedPrediction,
+    ) -> Option<CompletedWindowRows> {
+        if self.first_err.is_some() {
+            // Drain silently — keep awaiting until inflight empties.
+            return None;
+        }
+
+        // Drain per-completion autoreleased temporaries (NSString /
+        // MLFeatureValue / transient MLMultiArray) created while reading the
+        // output feature provider.
+        let rows_result = autoreleasepool(|_| {
+            prediction
+                .output
+                .map_err(CoreError::from)
+                .and_then(|output| {
+                    rows_from_output(&output, prediction.n_chunks).map_err(CoreError::from)
+                })
+        });
+
+        match rows_result {
+            Ok(rows) => Some(CompletedWindowRows {
+                doc_idx: prediction.doc_idx,
+                chunk_start: prediction.chunk_start,
+                rows,
+            }),
+            Err(err) => {
+                self.first_err = Some(err);
+                None
+            }
+        }
+    }
 }
 
 /// Blocking bridge to the async bundle download.
@@ -562,131 +761,12 @@ impl Embedder for PplxContextCoreMLEmbedder {
             return Ok(vec![]);
         }
 
-        // Pre-allocate result slots: results[doc_idx][chunk_idx] = embedding vector.
-        let mut results: Vec<Vec<Vec<f32>>> =
-            docs.iter().map(|d| vec![vec![]; d.chunks.len()]).collect();
-
-        // Build worklist: plan windows for each doc, collect (doc_idx, chunk_start, window_chunks).
-        // Tokenize each chunk to get token counts for plan_windows.
-        struct WorkItem {
-            doc_idx: usize,
-            chunk_start: usize,
-            chunks: Vec<String>,
-        }
-        let mut worklist: Vec<WorkItem> = Vec::new();
-        for (doc_idx, doc) in docs.iter().enumerate() {
-            if doc.chunks.is_empty() {
-                continue;
-            }
-            let chunk_tok_counts = doc
-                .chunks
-                .iter()
-                .map(|c| {
-                    self.tokenizer
-                        .encode(c.as_str(), false)
-                        .map(|enc| enc.get_ids().len())
-                        .map_err(|e| EmbedError::Internal(format!("tokenize: {e}")))
-                })
-                .collect::<Result<Vec<usize>, EmbedError>>()
-                .map_err(CoreError::from)?;
-
-            let windows = plan_windows(&chunk_tok_counts, self.window_max_seq_len, N_MAX_CHUNKS);
-            for window in &windows {
-                worklist.push(WorkItem {
-                    doc_idx,
-                    chunk_start: window.start,
-                    chunks: doc.chunks[window.clone()].to_vec(),
-                });
-            }
-        }
-
-        // Bounded-in-flight async pipeline: prep CPU work (tokenize + build arrays) while
-        // up to MAX_INFLIGHT-1 prior predictions run on the ANE. Completions arrive out of
-        // order; doc_idx+chunk_start scatter is order-independent — each window knows exactly
-        // which result slots to fill.
-        //
-        // Error discipline: we never early-return while `inflight` holds live
-        // `PendingPrediction` futures.  CoreML reads the input feature provider after
-        // `predictionFromFeatures_completionHandler` returns; dropping the provider while
-        // the ANE is still computing would be a use-after-free.  On any error we record
-        // it, stop enqueuing new work, and drain all in-flight futures before returning.
-        const MAX_INFLIGHT: usize = 4;
-        let mut inflight: FuturesUnordered<_> = FuturesUnordered::new();
-        let mut it = worklist.into_iter();
-        let mut first_err: Option<CoreError> = None;
-
-        loop {
-            // Fill up to MAX_INFLIGHT in-flight predictions (skip if an error was recorded).
-            if first_err.is_none() {
-                while inflight.len() < MAX_INFLIGHT {
-                    match it.next() {
-                        Some(w) => {
-                            // Drain per-window autoreleased Obj-C temporaries (NSString,
-                            // NSNumber, MLFeatureValue, transient MLMultiArrays) that
-                            // accumulate in prep_window / build_feature_provider /
-                            // start_prediction.  PendingPrediction holds only Retained<>
-                            // objects, so it survives the pool drain.
-                            let window_result = autoreleasepool(|_| -> Result<_, CoreError> {
-                                let p = self.prep_window(&w.chunks).map_err(CoreError::from)?;
-                                let fixed_idx = p.fixed_idx;
-                                let n_chunks = p.n_chunks;
-                                let doc_idx = w.doc_idx;
-                                let chunk_start = w.chunk_start;
-                                let model = self.model_for(fixed_idx).map_err(CoreError::from)?;
-                                let pending =
-                                    model.start_prediction(p.inputs).map_err(CoreError::from)?;
-                                Ok((doc_idx, chunk_start, n_chunks, pending))
-                            });
-                            match window_result {
-                                Ok((doc_idx, chunk_start, n_chunks, pending)) => {
-                                    // Each future carries its own index tag so the
-                                    // scatter below is order-independent.
-                                    inflight.push(async move {
-                                        (doc_idx, chunk_start, n_chunks, pending.await)
-                                    });
-                                }
-                                Err(e) => {
-                                    first_err = Some(e);
-                                    break;
-                                }
-                            }
-                        }
-                        None => break,
-                    }
-                }
-            }
-
-            match inflight.next().await {
-                Some((doc_idx, chunk_start, n_chunks, out)) => {
-                    if first_err.is_none() {
-                        // Drain per-completion autoreleased temporaries (NSString /
-                        // MLFeatureValue / transient MLMultiArray) created while
-                        // reading the output feature provider.
-                        let rows_result = autoreleasepool(|_| {
-                            out.map_err(CoreError::from).and_then(|o| {
-                                rows_from_output(&o, n_chunks).map_err(CoreError::from)
-                            })
-                        });
-                        match rows_result {
-                            Ok(rows) => {
-                                for (j, v) in rows.into_iter().enumerate() {
-                                    results[doc_idx][chunk_start + j] = v;
-                                }
-                            }
-                            Err(e) => {
-                                first_err = Some(e);
-                            }
-                        }
-                    }
-                    // else: drain silently — keep awaiting until inflight empties.
-                }
-                None => break, // worklist drained and all in-flight predictions settled
-            }
-        }
-
-        if let Some(e) = first_err {
-            return Err(e);
-        }
+        let mut results = empty_result_slots(&docs);
+        let worklist = self.plan_prediction_windows(&docs)?;
+        let completed = PredictionPipeline::new(self, worklist)
+            .run_to_completion()
+            .await?;
+        scatter_completed_rows(&mut results, completed);
         Ok(results)
     }
 
