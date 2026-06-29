@@ -9,7 +9,8 @@ use localdb_core::{
         schema::{IndexingPolicyConfig, RawConfig},
     },
     ingestion::now_rfc3339,
-    Error, SourceRow, Store, StoreBackend, StoreBackendConfig, StoreRow, StoreVisibility,
+    store_factory, Error, SourceRow, Store, StoreBackend, StoreBackendConfig, StoreRow,
+    StoreVisibility,
 };
 use store_libsql::SqliteBackend;
 
@@ -153,7 +154,6 @@ impl AppState {
             });
         }
 
-        let id = localdb_core::new_ulid();
         let vis_enum = match visibility {
             "shared" => StoreVisibility::Shared,
             "private" => StoreVisibility::Private,
@@ -165,23 +165,13 @@ impl AppState {
                 })
             }
         };
-        let indexing_policy =
-            serde_json::to_string(&self.inner.default_indexing_policy).map_err(|e| {
-                Error::Internal {
-                    message: format!("cannot serialize default indexing policy: {e}"),
-                    correlation_id: "appdb_serialize_default_policy".into(),
-                }
-            })?;
-        let row = StoreRow {
-            id: id.clone(),
-            name: name.to_string(),
-            visibility: vis_enum.clone(),
-            backend: "libsql".to_string(),
-            indexing_policy,
-            policy_version: self.inner.default_policy_version.clone(),
-            acl: "{}".to_string(),
-            created_at: now_rfc3339(),
-        };
+        let row = store_factory::default_store_row(
+            name,
+            vis_enum.clone(),
+            &self.inner.default_indexing_policy,
+            &self.inner.default_policy_version,
+        )?;
+        let id = row.id.clone();
 
         self.inner.backend.upsert_store(&row).await?;
 

@@ -34,6 +34,7 @@ use localdb_core::{
     },
     ids::new_ulid,
     ingestion::now_rfc3339,
+    store_factory,
     types::{SourceKind, StoreVisibility},
     Error, SourceRow, StoreBackend, StoreBackendConfig, StoreRow,
 };
@@ -366,21 +367,12 @@ fn source_kind_to_string(kind: &SourceKind) -> &'static str {
 }
 
 fn default_store_row(name: &str, db: &AppDb) -> Result<StoreRow, Error> {
-    Ok(StoreRow {
-        id: new_ulid(),
-        name: name.to_string(),
-        visibility: StoreVisibility::Private,
-        backend: "libsql".to_string(),
-        indexing_policy: serde_json::to_string(db.default_indexing_policy()).map_err(|e| {
-            Error::Internal {
-                message: format!("cannot serialize default indexing policy: {e}"),
-                correlation_id: "appdb_serialize_default_policy".into(),
-            }
-        })?,
-        policy_version: db.default_policy_version().to_string(),
-        acl: "{}".to_string(),
-        created_at: now_rfc3339(),
-    })
+    store_factory::default_store_row(
+        name,
+        StoreVisibility::Private,
+        db.default_indexing_policy(),
+        db.default_policy_version(),
+    )
 }
 
 async fn open_app_db_from_loader(config_loader: &ConfigLoader) -> Result<AppDb, Error> {
