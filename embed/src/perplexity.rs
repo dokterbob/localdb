@@ -31,10 +31,11 @@
 use async_trait::async_trait;
 use localdb_core::{DocumentChunks, EmbeddedDocument, Embedder, Error as CoreError};
 use reqwest::Client;
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
 
 use crate::error::EmbedError;
+use crate::http_helper::send_with_retry;
 use crate::retry::RetryPolicy;
 
 const DEFAULT_BASE_URL: &str = "https://api.perplexity.ai";
@@ -129,114 +130,45 @@ impl PerplexityEmbedder {
             "{}/v1/contextualizedembeddings",
             self.base_url.trim_end_matches('/')
         );
+        let body = PerplexityEmbedRequest {
+            model: &self.model,
+            document: document_context,
+            chunks,
+        };
 
-        let mut last_error = String::new();
-        let mut attempt = 0u32;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", self.api_key)).map_err(|e| {
+                EmbedError::Internal(format!("invalid authorization header value: {e}"))
+            })?,
+        );
 
-        loop {
-            if attempt > 0 {
-                let backoff = self.retry.backoff_for_attempt(attempt - 1);
-                debug!(
-                    attempt,
-                    backoff_ms = backoff.as_millis(),
-                    "retrying perplexity embedding request"
-                );
-                tokio::time::sleep(backoff).await;
-            }
+        let body = serde_json::to_vec(&body).map_err(|e| EmbedError::ProviderError {
+            provider: "perplexity".to_string(),
+            message: format!("failed to serialize request: {e}"),
+        })?;
 
-            let body = PerplexityEmbedRequest {
-                model: &self.model,
-                document: document_context,
-                chunks,
-            };
+        let response = send_with_retry(&self.client, &url, headers, body, &self.retry).await?;
 
-            match self
-                .client
-                .post(&url)
-                .bearer_auth(&self.api_key)
-                .json(&body)
-                .send()
-                .await
-            {
-                Ok(response) => {
-                    let status = response.status().as_u16();
-                    if response.status().is_success() {
-                        let resp: PerplexityEmbedResponse =
-                            response
-                                .json()
-                                .await
-                                .map_err(|e| EmbedError::ProviderError {
-                                    provider: "perplexity".to_string(),
-                                    message: format!("failed to parse response: {e}"),
-                                })?;
+        let resp: PerplexityEmbedResponse =
+            serde_json::from_slice(&response).map_err(|e| EmbedError::ProviderError {
+                provider: "perplexity".to_string(),
+                message: format!("failed to parse response: {e}"),
+            })?;
 
-                        let mut vecs: Vec<Option<Vec<f32>>> = vec![None; chunks.len()];
-                        for obj in resp.data {
-                            if obj.index < vecs.len() {
-                                vecs[obj.index] = Some(obj.embedding);
-                            }
-                        }
-                        let result: Option<Vec<Vec<f32>>> = vecs.into_iter().collect();
-                        return result.ok_or_else(|| EmbedError::ProviderError {
-                            provider: "perplexity".to_string(),
-                            message: "response missing some embedding indices".to_string(),
-                        });
-                    } else if self.retry.should_retry_status(status)
-                        && attempt + 1 < self.retry.max_attempts
-                    {
-                        let body_text = response.text().await.unwrap_or_default();
-                        warn!(status, "perplexity request failed, will retry");
-                        last_error = format!("HTTP {status}: {body_text}");
-                        attempt += 1;
-                        continue;
-                    } else {
-                        let body_text = response.text().await.unwrap_or_default();
-                        if attempt + 1 >= self.retry.max_attempts && !last_error.is_empty() {
-                            return Err(EmbedError::RetriesExhausted {
-                                provider: "perplexity".to_string(),
-                                attempts: attempt + 1,
-                                last_error,
-                            });
-                        }
-                        return Err(EmbedError::ProviderError {
-                            provider: "perplexity".to_string(),
-                            message: format!("HTTP {status}: {body_text}"),
-                        });
-                    }
-                }
-                Err(e) if e.is_timeout() => {
-                    warn!("perplexity request timed out");
-                    if attempt + 1 >= self.retry.max_attempts {
-                        return Err(EmbedError::Timeout {
-                            provider: "perplexity".to_string(),
-                            timeout_secs: self.retry.request_timeout.as_secs(),
-                        });
-                    }
-                    last_error = e.to_string();
-                    attempt += 1;
-                }
-                Err(e) => {
-                    warn!(%e, "perplexity request failed");
-                    if attempt + 1 >= self.retry.max_attempts {
-                        return Err(EmbedError::RetriesExhausted {
-                            provider: "perplexity".to_string(),
-                            attempts: attempt + 1,
-                            last_error: e.to_string(),
-                        });
-                    }
-                    last_error = e.to_string();
-                    attempt += 1;
-                }
-            }
-
-            if attempt >= self.retry.max_attempts {
-                return Err(EmbedError::RetriesExhausted {
-                    provider: "perplexity".to_string(),
-                    attempts: attempt,
-                    last_error,
-                });
+        let mut vecs: Vec<Option<Vec<f32>>> = vec![None; chunks.len()];
+        for obj in resp.data {
+            if obj.index < vecs.len() {
+                vecs[obj.index] = Some(obj.embedding);
             }
         }
+        let result: Option<Vec<Vec<f32>>> = vecs.into_iter().collect();
+        result.ok_or_else(|| EmbedError::ProviderError {
+            provider: "perplexity".to_string(),
+            message: "response missing some embedding indices".to_string(),
+        })
     }
 }
 
