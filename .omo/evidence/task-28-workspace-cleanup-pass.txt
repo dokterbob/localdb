@@ -1,0 +1,1 @@
+T28 CANCELLED: T12's http_helper rewire already collapsed embed_batch into a clean, single-pass shape (no retry loop helpers left to name). cargo test -p embed -- openai passed (11/11 embed tests ok).
