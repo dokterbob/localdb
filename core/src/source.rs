@@ -199,27 +199,160 @@ pub(crate) fn string_array_field(
 }
 
 #[cfg(test)]
-#[rustfmt::skip]
 mod tests {
     use super::*;
 
     #[test]
-    fn normalize_path_source_returns_file_parent_and_filename_when_path_is_file() { let temp_dir = tempfile::tempdir().unwrap(); let file_path = temp_dir.path().join("note.md"); std::fs::write(&file_path, "hello").unwrap(); let (root, include, exclude) = normalize_path_source(&file_path.to_string_lossy()).unwrap(); assert_eq!(root, temp_dir.path().to_string_lossy()); assert_eq!(include, vec!["note.md".to_string()]); assert_eq!(exclude, DEFAULT_PATH_EXCLUDES.iter().map(|value| value.to_string()).collect::<Vec<_>>()); }
+    fn normalize_path_source_returns_file_parent_and_filename_when_path_is_file() {
+        // Given
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("note.md");
+        std::fs::write(&file_path, "hello").unwrap();
+
+        // When
+        let (root, include, exclude) = normalize_path_source(&file_path.to_string_lossy()).unwrap();
+
+        // Then
+        assert_eq!(root, temp_dir.path().to_string_lossy());
+        assert_eq!(include, vec!["note.md".to_string()]);
+        assert_eq!(exclude, default_path_excludes());
+    }
 
     #[test]
-    fn normalize_path_source_returns_error_when_path_is_missing() { let temp_dir = tempfile::tempdir().unwrap(); let missing_path = temp_dir.path().join("missing.md"); let err = normalize_path_source(&missing_path.to_string_lossy()).unwrap_err(); assert_eq!(err, invalid_request(&format!("path '{}' does not exist", missing_path.to_string_lossy()))); }
+    fn normalize_path_source_returns_error_when_path_is_missing() {
+        // Given
+        let temp_dir = tempfile::tempdir().unwrap();
+        let missing_path = temp_dir.path().join("missing.md");
+
+        // When
+        let err = normalize_path_source(&missing_path.to_string_lossy()).unwrap_err();
+
+        // Then
+        assert_eq!(
+            err,
+            invalid_request(&format!(
+                "path '{}' does not exist",
+                missing_path.to_string_lossy()
+            ))
+        );
+    }
 
     #[test]
-    fn normalize_path_source_returns_directory_defaults_when_path_is_directory() { let temp_dir = tempfile::tempdir().unwrap(); let (root, include, exclude) = normalize_path_source(&temp_dir.path().to_string_lossy()).unwrap(); assert_eq!(root, temp_dir.path().to_string_lossy()); assert_eq!(include, DEFAULT_PATH_INCLUDES.iter().map(|value| value.to_string()).collect::<Vec<_>>()); assert_eq!(exclude, DEFAULT_PATH_EXCLUDES.iter().map(|value| value.to_string()).collect::<Vec<_>>()); }
+    fn normalize_path_source_returns_directory_defaults_when_path_is_directory() {
+        // Given
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // When
+        let (root, include, exclude) =
+            normalize_path_source(&temp_dir.path().to_string_lossy()).unwrap();
+
+        // Then
+        assert_eq!(root, temp_dir.path().to_string_lossy());
+        assert_eq!(include, default_path_includes());
+        assert_eq!(exclude, default_path_excludes());
+    }
 
     #[test]
-    fn parse_source_spec_returns_path_fields_when_path_spec_is_valid() { let spec = serde_json::json!({"root": "/tmp/docs", "include": ["**/*.md"], "exclude": ["**/.git"]}); let parsed = parse_source_spec("path", &spec).unwrap(); assert_eq!(parsed, (SourceKind::Path, Some("/tmp/docs".to_string()), None, vec!["**/*.md".to_string()], vec!["**/.git".to_string()])); }
+    fn parse_source_spec_returns_path_fields_when_path_spec_is_valid() {
+        // Given
+        let spec = serde_json::json!({
+            "root": "/tmp/docs",
+            "include": ["**/*.md"],
+            "exclude": ["**/.git"],
+        });
+
+        // When
+        let parsed = parse_source_spec("path", &spec).unwrap();
+
+        // Then
+        assert_eq!(
+            parsed,
+            (
+                SourceKind::Path,
+                Some("/tmp/docs".to_string()),
+                None,
+                vec!["**/*.md".to_string()],
+                vec!["**/.git".to_string()],
+            )
+        );
+    }
 
     #[test]
-    fn parse_source_spec_returns_error_when_array_field_contains_non_string() { let spec = serde_json::json!({"root": "/tmp/docs", "include": [42]}); let err = parse_source_spec("path", &spec).unwrap_err(); assert_eq!(err, invalid_request("source spec field 'include' contains a non-string value")); }
+    fn parse_source_spec_returns_error_when_array_field_contains_non_string() {
+        // Given
+        let spec = serde_json::json!({"root": "/tmp/docs", "include": [42]});
+
+        // When
+        let err = parse_source_spec("path", &spec).unwrap_err();
+
+        // Then
+        assert_eq!(
+            err,
+            invalid_request("source spec field 'include' contains a non-string value")
+        );
+    }
 
     #[test]
-    fn parse_source_spec_handles_url_and_rejects_missing_and_unknown_specs() { let url_spec = serde_json::json!({"url": "https://example.com/page"}); let missing_root_spec = serde_json::json!({"include": ["**/*.md"]}); let missing_url_spec = serde_json::json!({}); let string_field_spec = serde_json::json!({"root": "/tmp/docs", "include": "**/*.md"}); let parsed_url = parse_source_spec("url", &url_spec).unwrap(); let missing_root_err = parse_source_spec("path", &missing_root_spec).unwrap_err(); let missing_url_err = parse_source_spec("url", &missing_url_spec).unwrap_err(); let unknown_kind_err = parse_source_spec("rss", &missing_url_spec).unwrap_err(); let string_field_err = parse_source_spec("path", &string_field_spec).unwrap_err(); assert_eq!(parsed_url, (SourceKind::Url, None, Some("https://example.com/page".to_string()), Vec::new(), Vec::new())); assert_eq!(missing_root_err, invalid_request("path source requires 'root'")); assert_eq!(missing_url_err, invalid_request("url source requires 'url'")); assert_eq!(unknown_kind_err, invalid_request("unknown source kind 'rss'")); assert_eq!(string_field_err, invalid_request("source spec field 'include' must be a JSON array of strings")); }
+    fn parse_source_spec_handles_url_and_rejects_missing_and_unknown_specs() {
+        // Given
+        let url_spec = serde_json::json!({"url": "https://example.com/page"});
+        let missing_root_spec = serde_json::json!({"include": ["**/*.md"]});
+        let missing_url_spec = serde_json::json!({});
+        let string_field_spec = serde_json::json!({"root": "/tmp/docs", "include": "**/*.md"});
 
-    fn invalid_request(message: &str) -> Error { Error::InvalidRequest { message: message.to_string() } }
+        // When
+        let parsed_url = parse_source_spec("url", &url_spec).unwrap();
+        let missing_root_err = parse_source_spec("path", &missing_root_spec).unwrap_err();
+        let missing_url_err = parse_source_spec("url", &missing_url_spec).unwrap_err();
+        let unknown_kind_err = parse_source_spec("rss", &missing_url_spec).unwrap_err();
+        let string_field_err = parse_source_spec("path", &string_field_spec).unwrap_err();
+
+        // Then
+        assert_eq!(
+            parsed_url,
+            (
+                SourceKind::Url,
+                None,
+                Some("https://example.com/page".to_string()),
+                Vec::new(),
+                Vec::new(),
+            )
+        );
+        assert_eq!(
+            missing_root_err,
+            invalid_request("path source requires 'root'")
+        );
+        assert_eq!(
+            missing_url_err,
+            invalid_request("url source requires 'url'")
+        );
+        assert_eq!(
+            unknown_kind_err,
+            invalid_request("unknown source kind 'rss'")
+        );
+        assert_eq!(
+            string_field_err,
+            invalid_request("source spec field 'include' must be a JSON array of strings")
+        );
+    }
+
+    fn default_path_includes() -> Vec<String> {
+        DEFAULT_PATH_INCLUDES
+            .iter()
+            .map(|value| value.to_string())
+            .collect()
+    }
+
+    fn default_path_excludes() -> Vec<String> {
+        DEFAULT_PATH_EXCLUDES
+            .iter()
+            .map(|value| value.to_string())
+            .collect()
+    }
+
+    fn invalid_request(message: &str) -> Error {
+        Error::InvalidRequest {
+            message: message.to_string(),
+        }
+    }
 }
