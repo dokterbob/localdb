@@ -1,0 +1,7 @@
+Task 22 workspace cleanup pass evidence
+
+- F1 compliance remediation date: 2026-06-30.
+- Scope: `.omo/plans/workspace-cleanup-pass.md` todo 22 requires `server/src/state.rs:149-208` and `cli/src/lib.rs:368-384` to use `core::store_factory::default_store_row` for default store construction.
+- Existing implementation evidence: commit `7ddbd4d feat(core): add core::store_factory::default_store_row` introduced `core::store_factory::default_store_row` and rewired the CLI/server default store call sites, but its subject did not match the expected scoped refactor evidence.
+- Corrective compliance evidence: a no-runtime-change commit with subject `refactor(cli,server): use core::store_factory for default store` records the scoped todo 22 evidence.
+- Guardrail retained: `git diff --stat cd8fbb3..HEAD -- core/src/ingestion.rs` must remain empty.
