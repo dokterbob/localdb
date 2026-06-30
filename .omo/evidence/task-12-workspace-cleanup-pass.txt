@@ -1,9 +1,0 @@
-Task 12 workspace cleanup pass
-
-- Updated `embed/src/openai.rs` to call `embed::http_helper::send_with_retry` from `embed_batch`.
-- Preserved OpenAI request/response schema, auth header, response parsing, and result reordering.
-- Verification:
-  - `cargo test -p embed -- openai` ✅
-  - `git diff --stat cd8fbb3..HEAD -- core/src/ingestion.rs` ✅ no output
-- Size check:
-  - `awk '!/^[[:space:]]*$/ && !/^[[:space:]]*(\/\/|#|--)/' embed/src/openai.rs | wc -l` → `441`

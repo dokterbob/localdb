@@ -1,5 +1,0 @@
-task-29 evidence
-- extracted private select_mcp_stores and search_to_tool_result from mcp/src/tools.rs
-- tool_search now parses -> selects -> queries -> renders
-- cargo test -p mcp: pass (43 tests total)
-- git diff --stat cd8fbb3..HEAD -- core/src/ingestion.rs: no output
