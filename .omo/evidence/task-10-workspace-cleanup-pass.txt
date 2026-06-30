@@ -1,0 +1,8 @@
+Task 10 evidence
+
+- Socket bind boundary now returns `localdb_core::Error`.
+- `io::ErrorKind::AddrInUse` maps to `Error::DaemonRunning`.
+- Added regression test for double-bind on the same Unix socket path.
+- Fixed daemon config reload tests to match the existing `Error` return path.
+- Verification: `cargo test -p server` ✅
+- Search check: `Result<.*, std::io::Error>` in `server/src/socket.rs` ✅ 0 matches
