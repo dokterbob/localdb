@@ -31,3 +31,10 @@
 - Todo 22 evidence file added at `.omo/evidence/task-22-workspace-cleanup-pass.txt`.
 - Todo 25 after evidence regenerated deterministically from the existing baseline because the recorded baseline is `baseline unavailable`; `diff .omo/evidence/task-25-baseline.json .omo/evidence/task-25-after.json` must be empty.
 - Guardrail remains hard: `git diff --stat cd8fbb3..HEAD -- core/src/ingestion.rs` must produce no output.
+
+## 2026-06-30 F3 coverage remediation
+- F3 manual QA rejection was coverage-only: workspace line coverage was 78.37%; data-modifying-path coverage was already 95.01%.
+- Added Rust-only integration coverage for server HTTP API routes in `server/tests/common/mod.rs`, `server/tests/http_api_stores.rs`, `server/tests/http_api_sources.rs`, and `server/tests/http_api_ops.rs`.
+- Coverage after remediation: workspace line coverage 81.99%; `core/src/ingestion.rs` line coverage 95.01%.
+- Verification command passed: `cargo fmt --all --check && cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo llvm-cov --workspace --lcov --output-path /tmp/lcov-cleanup-after.info && cargo llvm-cov report --summary-only && git diff --stat cd8fbb3..HEAD -- core/src/ingestion.rs`.
+- Evidence written to `.omo/evidence/F3-coverage-remediation.txt`; `/tmp/lcov-cleanup-after.info` was generated successfully.
