@@ -6,9 +6,6 @@ license.workspace = true
 rust-version.workspace = true
 description = "HTTP API daemon: axum REST API, file watching, job queue, unix socket"
 
-[lib]
-test = false
-
 [dependencies]
 localdb-core = { path = "../core" }
 store-libsql = { path = "../store-libsql" }

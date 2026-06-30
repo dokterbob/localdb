@@ -6,9 +6,6 @@ license.workspace = true
 rust-version.workspace = true
 description = "CLI command implementations, thin layer on core / daemon client"
 
-[lib]
-test = false
-
 [dependencies]
 localdb-core = { path = "../core" }
 store-libsql = { path = "../store-libsql" }
