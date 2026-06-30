@@ -38,3 +38,8 @@
 - Coverage after remediation: workspace line coverage 81.99%; `core/src/ingestion.rs` line coverage 95.01%.
 - Verification command passed: `cargo fmt --all --check && cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo llvm-cov --workspace --lcov --output-path /tmp/lcov-cleanup-after.info && cargo llvm-cov report --summary-only && git diff --stat cd8fbb3..HEAD -- core/src/ingestion.rs`.
 - Evidence written to `.omo/evidence/F3-coverage-remediation.txt`; `/tmp/lcov-cleanup-after.info` was generated successfully.
+
+## 2026-06-30 F1 remediation for todo 19
+- Final-wave rejection was test-count only: `core::source` had 4 tests when todo 19 requires public-function coverage plus a QA run showing `cargo test -p localdb-core --lib source::` at >=6 passing tests.
+- Added directory-default coverage for `normalize_path_source` and URL/missing-root/missing-url/unknown-kind/non-array coverage for `parse_source_spec` without touching production behavior.
+- Evidence updated in `.omo/evidence/task-19-workspace-cleanup-pass.txt`; `lcov.info` was cleaned from the working tree.

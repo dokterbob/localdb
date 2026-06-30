@@ -11,8 +11,13 @@ Changed files:
 - core/src/ingestion.rs untouched.
 
 Verification:
-- cargo fmt --all: passed
-- cargo test -p localdb-core --lib source:: passed (4 passed; 0 failed)
+- cargo fmt --all --check: passed
+- cargo test -p localdb-core --lib source:: passed (6 passed; 0 failed)
+- cargo test --workspace: passed
+- cargo clippy --workspace --all-targets -- -D warnings: passed
 - cargo build --workspace: passed
 - git diff --stat cd8fbb3..HEAD -- core/src/ingestion.rs: no output
-- Pure LOC: core/src/source.rs = 206 (warning band), core/src/lib.rs = 46
+- Pure LOC: core/src/source.rs = 162 (healthy), core/src/lib.rs = 46
+
+Remediation note:
+- Added directory normalize coverage plus URL / missing-root / missing-url / unknown-kind / non-array source-spec checks so F1 acceptance now sees >=6 source tests.
