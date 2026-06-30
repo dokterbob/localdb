@@ -1,9 +1,11 @@
 //! Core domain model, traits, and shared logic for localdb.
 //!
 //! This crate contains no I/O frameworks. All domain types, the `RetrievalStore`
-//! trait, the `Embedder` trait, and the shared error taxonomy live here.
+//! trait, the `Embedder` trait, the `Ingestor` trait, and the shared error
+//! taxonomy live here.
 
 pub mod backend;
+pub mod block;
 pub mod chunker;
 pub mod citation;
 pub mod config;
@@ -11,7 +13,9 @@ pub mod embedder;
 pub mod error;
 pub mod heading_index;
 pub mod ids;
+pub mod ingestor;
 pub mod ingestion;
+pub mod metadata;
 pub mod parser;
 pub mod progress;
 pub mod search;
@@ -19,9 +23,14 @@ pub mod source;
 pub mod store;
 pub mod store_factory;
 pub mod types;
+pub mod uri;
 
 pub use backend::{
     DocumentInfo, SourceRow, StoreBackend, StoreBackendConfig, StoreBackendConnection, StoreRow,
+};
+pub use block::{
+    Block, BlockKind, BlockLocation, BoundingBox, ChunkLocation, IngestorKind, Resource,
+    ResourceKind,
 };
 pub use chunker::{chunk_document, CharSizer, ChunkOutput, ChunkSizer, ChunkerConfig, TokenSizer};
 /// Re-export key types at the crate root for convenience.
@@ -30,6 +39,12 @@ pub use embedder::{
     DocumentChunks, EmbeddedDocument, Embedder, FakeEmbedder, TokenCounter, VectorEncoding,
 };
 pub use error::Error;
+pub use ingestor::{
+    ConfigField, ConfigFieldType, IngestCallback, IngestResult, IngestSource, Ingestor,
+    IngestorConfig,
+};
+pub use metadata::{ConversationMetadata, DublinCoreMetadata, Metadata, TranscriptionMetadata};
+pub use uri::Uri;
 pub use ids::{chunk_id, content_hash, document_id, new_ulid};
 pub use ingestion::{
     complete_index_job, create_index_job, enumerate_path_source, fail_index_job, index_document,

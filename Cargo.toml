@@ -60,6 +60,9 @@ dirs = "6"
 # libSQL (Turso's SQLite fork) — async, DiskANN vectors, FTS5
 libsql = "=0.10.0-pre.4"
 
+# URL parsing
+url = "2"
+
 # Hashing for policy_version
 hex = "0.4"
 

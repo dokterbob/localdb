@@ -1,21 +1,25 @@
 # Spec 02 — Canonical Domain Model
 
-> Status: accepted draft, 2026-06-10. All entities live in the `core` crate and are shared by
-> every surface. Field lists are normative for meaning, not for exact Rust types.
+> Status: accepted draft, revised 2026-06-30. All entities live in the `core` crate and are
+> shared by every surface. Field lists are normative for meaning, not for exact Rust types.
+>
+> **Supersedes:** the Markdown-native IR model (commit `3da56d0`). The block model is
+> reintroduced as the canonical intermediate representation — see
+> [07-adr-blocks-canonical-ir.md](07-adr-blocks-canonical-ir.md) for the decision record.
 
 ## 1. Entity overview
 
 ```
-Store 1──* Source 1──* Document 1──* Chunk
-                            │            │
-                       IndexJob     Citation (view over Chunk + Document)
+Store 1──* Source 1──* Resource 1──* Block 1──* Chunk
+                           │                       │
+                      IndexJob            Citation (view over Chunk + Resource)
 ```
 
-Extraction produces a single normalized **Markdown string** per document, not a nested
-structural tree. The chunker (`MarkdownSplitter`) consumes that string directly, and per-chunk
-`heading_path` is *derived* from the Markdown heading structure (`core/src/heading_index.rs`),
-not from a stored intermediate. The older `Block`/`BlockKind` representation was removed in the
-Markdown-native migration (commit `3da56d0`).
+Ingestors produce **Resources** containing ordered **Blocks**. Each block has a `BlockKind`,
+canonical text, and optional source-location metadata. The chunker operates on blocks (not a
+Markdown string), and `heading_path` is derived from the block tree (heading blocks preceding
+content blocks). Chunks never cross block boundaries, with one explicit exception: message-window
+chunks span multiple `Message`/`Segment` blocks.
 
 ## 2. Entities
 
@@ -32,104 +36,176 @@ A named knowledge base. Unit of sharing, ACLs, indexing policy, and federation.
 | `acl` | Reserved; empty in MVP. |
 
 ### Source
-Where a store's content comes from.
+Where a store's content comes from. Each source is driven by an **ingestor** that knows how to
+acquire and structure its content.
 
 | Field | Notes |
 |---|---|
 | `id` | ULID. |
 | `store_id` | Owning store. |
-| `kind` | MVP: `path` \| `url`. Roadmap (reserved identifiers, not implemented): `imap`, `mbox`, messenger connectors. |
-| `spec` | Kind-specific: root path + include/exclude globs, or URL + refresh interval. |
+| `ingestor_kind` | Which ingestor drives this source: `file`, `url`, and future connectors (`notion`, `telegram`, `signal`, `hackmd`, `email`, `transcription`, `feed`). See [01-architecture.md](01-architecture.md) §1 for the `IngestorKind` enum. |
+| `spec` | Kind-specific configuration: root path + globs, URL + refresh interval, API token reference, etc. Stored as JSON; validated by the ingestor's `IngestorConfig`. |
+| `config_json` | Ingestor-specific configuration fields (typed per ingestor). |
 | `source_kind_preset` | Which indexing preset applies (`prose`, `messages`, `code`) — see [03-config.md](03-config.md) §2. |
 
 **Runtime representation:** `SourceRow` in `core::backend` is the concrete
-Rust type for sources persisted in the unified database (`localdb.db`). It is a core
-domain type, not a CLI type, and includes fields `id`, `store_id`, `kind`, `root`,
-`url`, `include`, `exclude`, and `preset`. Source CRUD is exposed via `StoreBackend`
-methods (`upsert_source`, `delete_source`, `list_sources`, `get_source`,
+Rust type for sources persisted in the unified database (`localdb.db`). Source CRUD is exposed
+via `StoreBackend` methods (`upsert_source`, `delete_source`, `list_sources`, `get_source`,
 `find_source_by_root_or_url`).
 
-### Document
-One logical content unit produced from a source: a file, a fetched page, later one message/thread.
+### Resource
+One logical content unit produced by an ingestor. Replaces the former `Document` entity.
+A resource is: a file, a fetched page, a Notion page, a conversation thread, a transcript,
+a feed entry.
 
 | Field | Notes |
 |---|---|
-| `id` | **Content-addressed**: `blake3(canonical_source_uri ‖ content_hash)` — see §3. |
+| `id` | **Content-addressed**: `blake3(uri ‖ content_hash)` — see §3. |
 | `source_id`, `store_id` | Ownership. |
-| `uri` | Canonical locator (absolute path as `file://`, or URL). |
-| `title`, `mime`, `lang` | From extraction. |
-| `content_hash` | blake3 of extracted normalized text. Drives incremental re-index. |
+| `ingestor_kind` | Which ingestor produced this resource (denormalized from source for queries). |
+| `resource_kind` | `document` \| `conversation` \| `transcription`. Determines block ordering semantics. |
+| `uri` | `Uri` newtype wrapping `url::Url`. Canonical locator (absolute path as `file://`, URL, or connector-defined scheme like `notion://`, `telegram://`). |
+| `external_id` | Arbitrary source-system ID (Notion page ID, Telegram message ID, email Message-ID). Optional. |
+| `external_etag` | Change detection token from the source system (HTTP ETag, Notion `last_edited_time`, file mtime). Optional. |
+| `content_hash` | blake3 of ordered block canonical texts concatenated. Drives incremental re-index. Not dependent on Markdown rendering. |
+| `title`, `mime`, `language` | From extraction. `language` is BCP 47. |
+| `date_original` | Dublin Core date string (may be partial, e.g. `2026` or `2026-06`). |
+| `date_parsed` | Best-effort ISO 8601 parse of `date_original` (sortable). |
+| `added_at` | When first indexed (our timestamp, RFC 3339). |
+| `modified_at` | When content last changed (RFC 3339). |
+| `thread_id` | Conversation thread identifier (conversation resources only). |
+| `channel` | Channel/folder/chat name (conversation resources only). |
+| `participants` | JSON array of participant names/IDs (conversation resources only). |
+| `metadata` | `Metadata` enum — see §7. Contains Dublin Core base fields plus resource-kind-specific fields. |
 | `provenance` | See §4. |
-| `meta` | Open key-value extension point (string → JSON). Message fields live here later (§5). |
+| `extractor_version` | Version string of the parser/ingestor that produced the blocks. Enables reprocessing when extraction logic improves. |
 
-### Normalized Markdown (intermediate representation)
-Extraction normalizes every format to a single **Markdown string** (`ParsedDocument.markdown`).
-This string is the document's intermediate representation: the chunker indexes spans directly
-into it, and `heading_path` (e.g. `["API", "Auth"]`) is derived on demand from the Markdown
-heading structure via `core/src/heading_index.rs`. There is no stored block tree — the former
-`Block`/`BlockKind` type was deleted in the Markdown-native migration (commit `3da56d0`).
+### Block
+A typed, ordered unit of content within a resource.
+
+| Field | Notes |
+|---|---|
+| `resource_id` | Parent resource. |
+| `seq` | Ordering within the resource (0-indexed). Stable as long as resource content doesn't change. |
+| `kind` | `BlockKind` — see §2a. |
+| `text` | Canonical text content of the block. Every block kind has a text representation. |
+| `metadata_json` | Kind-specific structured metadata (e.g. heading level, sender, timestamp). |
+| `location` | `BlockLocation` — optional source-location data for citation/navigation (§2b). |
+
+**Identity:** blocks are identified by `(resource_id, seq)`, not content-addressed. They are
+derived content that can be regenerated by re-running the ingestor.
+
+**Ordering semantics** depend on `ResourceKind`:
+- `document` — logical reading order
+- `conversation` — chronological message order
+- `transcription` — transcript time order
+
+### §2a. BlockKind
+
+| Kind | Text content | Metadata fields | Typical sources |
+|---|---|---|---|
+| `Heading` | Heading text | `level: u8` (1–6) | Documents, Notion pages |
+| `Paragraph` | Prose text | — | Documents, HTML, Notion |
+| `Code` | Code content | `language: Option<String>` | Markdown fences, Notion code blocks |
+| `Quote` | Quoted text | — | Documents |
+| `List` | List items as text | `ordered: bool` | Documents |
+| `Table` | Text rendering of table | `headers: Vec<String>`, `rows: usize` | Documents, spreadsheets |
+| `Message` | Message body text | `sender: String`, `timestamp: Option<String>`, `message_id: Option<String>`, `reply_to: Option<String>` | Conversations (chat, email) |
+| `Segment` | Transcript segment text | `speaker: Option<String>`, `start_ms: u64`, `end_ms: u64` | Transcriptions (SRT, VTT, Whisper) |
+| `Reference` | `"[label](target)"` | `target: String`, `label: Option<String>`, `ref_type: Option<String>` | Wikilinks, Notion mentions, citations |
+| `Attachment` | `"filename: description"` | `filename: String`, `mime: Option<String>`, `size_bytes: Option<u64>` | Email attachments, Notion files |
+| `Frontmatter` | Raw frontmatter text | `format: String` (yaml/toml/json) | Markdown, Obsidian |
+| `Image` | Alt text or OCR text | `alt: Option<String>`, `src: Option<String>` | Documents with images |
+
+### §2b. BlockLocation
+
+Source-location metadata for citation and navigation. Not all fields apply to every block kind.
+
+| Field | Notes |
+|---|---|
+| `page` | Page number (1-indexed, for PDFs and paginated documents). |
+| `bbox` | Bounding box `{x, y, width, height}` (for PDFs with layout). |
+| `section` | Section identifier or path (e.g. `["Chapter 1", "Introduction"]`). |
+| `line_start`, `line_end` | Line range in source file (for code and plain text). |
+| `uri_fragment` | URI fragment (e.g. `#heading-id` for HTML). |
 
 ### Chunk
 The retrieval unit: what gets embedded and indexed.
 
 | Field | Notes |
 |---|---|
-| `id` | **Content-addressed**: `blake3(document_id ‖ chunk_text ‖ span)` — stable across re-runs over identical content. |
-| `document_id`, `store_id` | Ownership. |
+| `id` | **Content-addressed**: `blake3(resource_id ‖ block_seq ‖ chunk_text ‖ seq_in_block)` — stable across re-runs over identical content. |
+| `resource_id`, `store_id` | Ownership. |
+| `block_id` | Reference to the parent block (blocks.rowid). |
+| `block_seq` | Denormalized block sequence number (for efficient ordering without join). |
+| `seq_in_block` | Chunk position within the block (0-indexed). |
 | `text` | Chunk text (also feeds BM25). |
-| `span` | Range in the normalized document text — the citation anchor. |
-| `heading_path` | Derived from the Markdown heading structure (`core/src/heading_index.rs`); shown in citations. |
+| `heading_path` | Derived from the block tree: heading blocks preceding this content block. JSON array. |
 | `embedding` | Dense vector (in backend, not in core serialization). |
-| `policy_version` | Hash of the indexing policy that produced it ([04-search-pipeline.md](04-search-pipeline.md) §4). |
-| `provenance` | Copied from document (§4) — chunks must be self-describing for federation. |
+| `location` | `ChunkLocation` — refined sub-block position (optional). |
+
+**Invariant:** a chunk is a subdivision of exactly one block. Chunk location =
+`{resource_id, block_id, chunk_seq_in_block}`. Chunks never cross block boundaries.
+
+**Exception — message-window chunks:** the `messages` chunking preset creates chunks that span
+multiple `Message`/`Segment` blocks via a sliding window. This is an explicit multi-block
+chunking mode. The `ChunkLocation` carries references to all participating blocks.
 
 ### Citation
 Not a stored entity: the **canonical result shape** every surface uses (§6).
 
 ### IndexJob
 A unit of indexing work with observable state. Fields: `id` (ULID), `store_id`, `scope` (full
-store / one source / one document), `state` (`pending` → `running` → `done` | `failed`),
-`stats` (docs seen/indexed/deleted, chunks written), `error`, timestamps. Embedded mode runs jobs
-synchronously but still records them; the daemon queues them ([05-surfaces.md](05-surfaces.md) §3).
+store / one source / one resource), `state` (`pending` → `running` → `done` | `failed`),
+`stats` (resources seen/indexed/deleted, chunks written), `error`, timestamps. Embedded mode
+runs jobs synchronously but still records them; the daemon queues them
+([05-surfaces.md](05-surfaces.md) §3).
 
 ## 3. ID scheme
 
 **Decision:** entities that exist by fiat (Store, Source, IndexJob) get **ULIDs**; entities
-derived from content (Document, Chunk) get **content-addressed blake3 IDs** as defined above.
+derived from content (Resource, Chunk) get **content-addressed blake3 IDs** as defined above.
 
 **Rationale:** content-addressed IDs are the federation prerequisite — two nodes indexing the same
 content derive the same chunk identity, enabling dedup, provenance comparison, and integrity
 checks without coordination ([VISION.md](../VISION.md)). They also make re-indexing idempotent.
-**Rejected:** auto-increment rows (meaningless off-node); UUIDv4 for documents/chunks (stable
+**Rejected:** auto-increment rows (meaningless off-node); UUIDv4 for resources/chunks (stable
 only by table lookup, not by content).
 
-Consequence: a document edit produces a *new* document ID; the pipeline treats it as
-replace-by-URI (delete chunks of the old ID, insert new) — see [04-search-pipeline.md](04-search-pipeline.md) §2.
+Consequence: a resource edit produces a *new* resource ID; the pipeline treats it as
+replace-by-URI (delete chunks of the old ID, insert new) — see
+[04-search-pipeline.md](04-search-pipeline.md) §2.
+
+**Block identity:** blocks are identified by `(resource_id, seq)`, not content-addressed.
+They are derived content — stable as long as the resource content and extractor version don't
+change. When the resource is re-ingested, blocks are replaced entirely.
 
 ## 4. Provenance
 
-Every document and every chunk carries:
+Every resource and every chunk carries:
 
 | Field | Notes |
 |---|---|
 | `origin_store` | Store ID where it was first indexed (≠ current store after future federation). |
-| `source_ref` | Source ID + kind. |
+| `source_ref` | Source ID + ingestor kind. |
 | `fetched_at` | Acquisition time (file mtime at scan / HTTP fetch time). |
-| `content_hash` | blake3 of normalized content. |
+| `content_hash` | blake3 of resource content (ordered block texts concatenated). |
 | `share_path` | Reserved, empty in MVP: list of (node, store) hops for federated content. |
 
-## 5. Message-shaped documents (extension point only)
+## 5. Conversations and non-document resources
 
-MVP defines **no** message connectors, but the mapping is fixed now so `meta` doesn't ossify:
+The resource model natively supports non-document content shapes:
 
-- One **thread** = one Document (URI = e.g. `imap://acct/folder;uid=...` or connector-defined);
-  one **message** = one Markdown section (later chunked by thread/turn windows, see preset
-  `messages` in [03-config.md](03-config.md) §2).
-- Reserved `meta` keys (namespaced, validated when present): `msg.thread_id`,
-  `msg.participants` (list), `msg.sent_at`, `msg.in_reply_to`, `msg.channel`.
-- Thread context is exactly what contextualized embeddings consume
-  ([04-search-pipeline.md](04-search-pipeline.md) §4) — the document-aware embedder interface is
-  sized for this from day one.
+- **Conversations** (chat, email): `resource_kind = conversation`. Each message is a `Message`
+  block with sender, timestamp, and message ID. Thread identity via `thread_id` on the resource.
+  Chunked by the `messages` preset (sliding turn windows).
+- **Transcriptions** (SRT, VTT, Whisper JSON): `resource_kind = transcription`. Each segment is
+  a `Segment` block with speaker, start/end timestamps. Chunked by time windows respecting
+  speaker boundaries.
+- **Documents** (files, web pages, Notion pages): `resource_kind = document`. Blocks follow
+  logical reading order. Chunked by the `prose` or `code` presets dispatched per block kind.
+
+Metadata is resource-kind-specific via the `Metadata` enum (§7), not open key-value `meta` keys.
 
 ## 6. Citation model
 
@@ -137,14 +213,16 @@ Every search hit, on every surface, resolves to the same citation structure:
 
 ```
 Citation {
-  chunk_id, document_id, store: {id, name},
-  uri,                  // file path or URL — the user-actionable locator
+  chunk_id, resource_id, store: {id, name},
+  uri,                  // resource URI — the user-actionable locator
   title, heading_path,
-  span: {start, end},   // range in normalized text
+  block: {seq, kind},   // which block the chunk came from
+  chunk_position: {seq_in_block},
   snippet,              // chunk text (possibly trimmed)
   score: {fused, dense, bm25},
   provenance: {fetched_at, content_hash},
-  metadata              // full DCMES DocumentMetadata per §7; always present, empty when none extracted
+  metadata,             // full Metadata (Dublin Core base + resource-kind-specific)
+  location              // BlockLocation + ChunkLocation for navigation
 }
 ```
 
@@ -153,15 +231,89 @@ Surface mappings — defined here once, referenced by [05-surfaces.md](05-surfac
 (and full JSON with `--json`). **MCP** returns it as structured tool output content, never as
 prose-only text, so agents can cite mechanically.
 
-The `span` refers to the **normalized extracted text**, not raw bytes of the original file;
-original-file line mapping is a roadmap item ([06-roadmap.md](06-roadmap.md) §5).
+**Context expansion:** given a search hit, the backend supports:
+1. Neighboring chunks in the same block (`chunks WHERE block_id = ? ORDER BY seq_in_block`)
+2. Nearby blocks in the same resource (`blocks WHERE resource_id = ? AND seq BETWEEN ? AND ?`)
+3. Full resource block sequence (`blocks WHERE resource_id = ? ORDER BY seq`)
 
-## 7. Extraction & parsing
+## 7. Metadata taxonomy
 
-### Parser chain (chain of responsibility)
+### DublinCoreMetadata (base for all resource kinds)
 
-The `Parser` trait (`core/src/parser.rs`) is the abstraction for format-specific text
-extraction. Each `Parser` is `Send + Sync` and runs synchronously (CPU-bound); callers run it
+Dublin Core Metadata Element Set 1.1 (DCMES), all 15 elements. Repeatable elements
+(multi-valued) use `Vec<String>`; singleton elements use `Option<String>`.
+
+| Element | Type | Notes |
+|---|---|---|
+| `title` | `Option<String>` | Title of the resource. |
+| `creator` | `Vec<String>` | Repeatable: authors, creators. |
+| `subject` | `Vec<String>` | Repeatable: topics, keywords. |
+| `description` | `Option<String>` | Summary or abstract. |
+| `publisher` | `Option<String>` | Entity responsible for making the resource available. |
+| `contributor` | `Vec<String>` | Repeatable: additional contributors. |
+| `date` | `Option<String>` | Date of creation or publication (ISO 8601 recommended). |
+| `r#type` | `Option<String>` | Nature or genre of the resource. |
+| `format` | `Option<String>` | File format or media type. |
+| `identifier` | `Option<String>` | Unambiguous reference (URL, DOI, ISBN, …). |
+| `source` | `Option<String>` | Source resource this document is derived from. |
+| `language` | `Option<String>` | Language of the resource (BCP 47 recommended). |
+| `relation` | `Vec<String>` | Repeatable: related resources. |
+| `coverage` | `Option<String>` | Spatial or temporal extent. |
+| `rights` | `Option<String>` | Rights statement or license. |
+
+### Metadata enum
+
+```rust
+enum Metadata {
+    Document(DocumentMetadata),       // DC base + document-specific fields
+    Conversation(ConversationMetadata), // DC base + conversation-specific fields
+    Transcription(TranscriptionMetadata), // DC base + transcription-specific fields
+}
+```
+
+Each variant embeds `DublinCoreMetadata` and adds kind-specific fields:
+
+- **DocumentMetadata**: `page_count: Option<u32>`, `word_count: Option<u32>`.
+- **ConversationMetadata**: `platform: Option<String>`, `message_count: Option<u32>`,
+  `date_range: Option<(String, String)>`.
+- **TranscriptionMetadata**: `duration_ms: Option<u64>`, `speakers: Vec<String>`,
+  `media_uri: Option<String>`.
+
+All variants expose `fn dublin_core(&self) -> &DublinCoreMetadata` for uniform access to the
+base metadata fields.
+
+**Persistence:** `Metadata` is JSON-encoded into a single `TEXT` column named `metadata_json`
+on each resource record in libsql. The discriminant is the `Metadata` enum variant tag.
+
+## 8. Extraction & parsing
+
+### Ingestor trait (acquisition + structuring)
+
+The `Ingestor` trait (`core/src/ingestor.rs`) is the abstraction for content acquisition and
+structuring. Each ingestor knows how to connect to a source, enumerate content, and produce
+`Resource`s with typed blocks.
+
+| Method | Signature | Notes |
+|---|---|---|
+| `kind` | `(&self) -> IngestorKind` | Which ingestor kind this is. |
+| `ingest` | `(&self, source, config) -> impl Stream<Item = Result<Resource, Error>>` | Async stream yielding resources. |
+
+**IngestorKind** enum: `File`, `Url`, `Notion`, `Telegram`, `Signal`, `HackMd`, `Email`,
+`Transcription`, `Feed`. The enum lives in `core`; concrete ingestor implementations live
+outside `core` (in `cli`, dedicated crates, or a future `ingest` crate).
+
+**Crate boundary:** `core::Ingestor` is the contract (yields `Resource`s). Terminal interaction,
+credential prompts, HTTP/API clients, and source-specific setup live outside `core`, consistent
+with the "no I/O frameworks in core" invariant ([01-architecture.md](01-architecture.md) §1).
+
+### Parser chain (file-ingestor implementation detail)
+
+The `Parser` trait remains as the abstraction for format-specific text extraction within the
+**file ingestor**. Parsers now return `Resource` (with typed blocks) instead of
+`ParsedDocument`. The `markdown_to_blocks()` helper converts Markdown pulldown-cmark events
+to typed blocks, so existing parsers can emit Markdown as before and convert at the boundary.
+
+Each `Parser` is `Send + Sync` and runs synchronously (CPU-bound); callers run it
 under `spawn_blocking`. Two methods:
 
 | Method | Signature | Notes |
@@ -176,17 +328,10 @@ under `spawn_blocking`. Two methods:
 - `Ok(Some(doc))` — handled successfully. First match wins; remaining parsers are not tried.
 - `Err(e)` — the format was recognized but parsing failed. **Short-circuits the chain** —
   remaining parsers are NOT tried, because the failure is definitive, not a format mismatch.
-  Two sub-cases, distinguished by the error variant:
-  - `Error::ExtractionFailed` — the format is *supported* but this specific instance is broken
-    (e.g. a corrupt or truncated DOCX/PDF). Counted in `error_count`; produces a WARN per file.
-  - `Error::UnsupportedFormat` — the format is *not handled* by any parser in scope (e.g. a
-    scanned PDF with no text layer). Counted in `unsupported_format_count`; silent.
 
 `ChainParser` implements this same `Parser` trait (Composite pattern), holding an ordered
 `Vec<Box<dyn Parser>>`. It is itself a `Parser` and can be nested. `build_chain(ids)` in
 `extract/src/registry.rs` maps the config `parsers:` strings to concrete `Parser` instances.
-Parser order and the valid IDs (`pdf`, `epub`, `office`, `html`, `markdown`, `plaintext`) are
-configured in [03-config.md](03-config.md) §2.
 
 ### Probe
 
@@ -197,69 +342,39 @@ happens once at the ingestion boundary; parsers never seek or re-fetch.
 |---|---|
 | `bytes` | Full document bytes. |
 | `path_hint: Option<&str>` | Original filename or URL path — used for file-extension hints. Advisory; may be absent. |
-| `sniffed_mime: Option<&str>` | MIME type inferred before parsing. Advisory; may be wrong or `None`. Real format decisions happen inside `parse`, not here. |
-| `header()` | Up to `PROBE_HEADER_LEN` (8 192) leading bytes for cheap magic-byte sniffing without reading the full document. |
+| `sniffed_mime: Option<&str>` | MIME type inferred before parsing. Advisory; may be wrong or `None`. |
+| `header()` | Up to `PROBE_HEADER_LEN` (8 192) leading bytes for cheap magic-byte sniffing. |
 
-### ParsedDocument
+### ParsedDocument → Resource conversion
 
-The successful output of a `parse` call.
+`ParsedDocument` remains as the parser output (Markdown string + title + Dublin Core metadata).
+The file ingestor converts it to a `Resource` by:
+1. Running `markdown_to_blocks()` on the Markdown string to produce typed blocks.
+2. Wrapping the Dublin Core metadata into `Metadata::Document(DocumentMetadata { ... })`.
+3. Computing the content hash from ordered block texts.
 
-| Field | Notes |
-|---|---|
-| `markdown` | Normalized document text as a Markdown string (§2). All chunk spans index into this string; it is the sole content IR — there is no separate block list. |
-| `title` | Title from extraction (typed fast-path; also available via `metadata.title`). |
-| `metadata` | `DocumentMetadata` — Dublin Core elements (see below). |
+This conversion is a compatibility bridge. Future parsers and ingestors can emit blocks directly.
 
-### DocumentMetadata
+## 9. Storage schema design rationale
 
-Dublin Core Metadata Element Set 1.1 (DCMES), all 15 elements. Repeatable elements
-(multi-valued) use `Vec<String>`; singleton elements use `Option<String>`.
+The unified database schema uses several design patterns to ensure referential integrity and
+query performance:
 
-| Element | Type | Notes |
-|---|---|---|
-| `title` | `Option<String>` | Title of the resource. |
-| `creator` | `Vec<String>` | Repeatable: authors, creators. |
-| `subject` | `Vec<String>` | Repeatable: topics, keywords. |
-| `description` | `Option<String>` | Summary or abstract. |
-| `publisher` | `Option<String>` | Entity responsible for making the resource available. |
-| `contributor` | `Vec<String>` | Repeatable: additional contributors. |
-| `date` | `Option<String>` | Date of creation or publication (ISO 8601 recommended). |
-| `type` | `Option<String>` | Nature or genre of the resource. |
-| `format` | `Option<String>` | File format or media type. |
-| `identifier` | `Option<String>` | Unambiguous reference (URL, DOI, ISBN, …). |
-| `source` | `Option<String>` | Source resource this document is derived from. |
-| `language` | `Option<String>` | Language of the resource (BCP 47 recommended). |
-| `relation` | `Vec<String>` | Repeatable: related resources. |
-| `coverage` | `Option<String>` | Spatial or temporal extent. |
-| `rights` | `Option<String>` | Rights statement or license. |
-
-**Persistence:** `DocumentMetadata` is JSON-encoded into a single `TEXT` column named
-`metadata` on each document record in libsql. Threading path:
-`Parser` -> `ParsedDocument.metadata` -> `DocumentInfo.metadata` ->
-libsql `metadata` column.
-
-**Defensive read:** tables created before this column was added (pre-migration) may have a
-missing column, a `NULL` value, or an unparseable payload. All three cases resolve to
-`DocumentMetadata::default()` (all fields empty/`None`).
-
-**Decision/Rationale:** a single structured column for all 15 DC elements keeps the schema
-stable as parsers populate more fields over time; JSON encoding avoids a 15-column explosion
-while remaining human-readable in the store. **Rejected:** one nullable column per DC element —
-schema churn every time a new element is populated; flat string bag — loses type information
-and makes the repeatable/singleton distinction invisible.
-
-**Cross-reference:** `Document.meta` (§2, `meta` row) accepts open key-value pairs; 15 `dc.*`
-keys are validated when present (`validate_dc_meta_key` in `core/src/types.rs`). These mirror
-the 15 DCMES elements in `DocumentMetadata` and are the untyped extension point for surfaces
-that need to set DC fields without going through a full `Parser`. The live ingestion path
-populates `DocumentMetadata` (typed) rather than `meta` (untyped).
-
-## 8. Storage Schema Design Rationale
-
-The unified database schema uses several design patterns to ensure referential integrity and query performance:
-
-- **Composite Uniqueness:** The `documents` and `chunks` tables use composite `(store_id, id)` uniqueness. Content-addressed IDs can collide across stores by design. This allows each store to maintain its own rows. Cross-store deduplication is deferred to query-time `GROUP BY` operations.
-- **Denormalised Store ID:** The `store_id` column is denormalised onto the `chunks` table. This allows per-store filtering directly on the rowid lookup after vector or FTS5 searches, avoiding an extra join through the `documents` table.
-- **FTS5 Content Keying:** The FTS5 virtual table `chunks_fts` uses external content keying over `chunks.text`. Filtering by `store_id` is performed on the `chunks` join, which is highly efficient since FTS5 returns rowids and `chunks` is rowid-keyed.
-- **Cascade Chain:** Foreign keys are configured with `ON DELETE CASCADE` across the chain: `stores` to `sources` / `documents` to `chunks`. Deleting a store cleans up all associated sources, documents, chunks, FTS5 entries, and vector index rows in a single transaction.
-- **Schema Versioning:** The database uses `PRAGMA user_version` to track the schema version. This survives `VACUUM` operations and avoids the need for a separate metadata table.
+- **Composite Uniqueness:** The `resources` and `chunks` tables use composite `(store_id, id)`
+  uniqueness. Content-addressed IDs can collide across stores by design. Each store maintains
+  its own rows. Cross-store deduplication is deferred to query-time `GROUP BY` operations.
+- **Normalized Blocks:** The `blocks` table stores individual blocks as rows (not a JSON blob),
+  enabling efficient context expansion queries (fetch neighboring blocks for a search hit).
+- **Denormalised Store ID:** The `store_id` column is denormalised onto the `chunks` table for
+  per-store filtering directly on the rowid lookup after vector or FTS5 searches.
+- **Block Reference on Chunks:** Each chunk references its parent block via `block_id`
+  (blocks.rowid) and denormalized `block_seq`, enabling block-level context expansion without
+  an extra join.
+- **FTS5 Content Keying:** The FTS5 virtual table `chunks_fts` uses external content keying
+  over `chunks.text`. Filtering by `store_id` is performed on the `chunks` join.
+- **Cascade Chain:** Foreign keys with `ON DELETE CASCADE` across the chain:
+  `stores → sources → resources → blocks → chunks`. Deleting a store cleans up everything.
+- **Schema Versioning:** The database uses `PRAGMA user_version` to track the schema version.
+  Pre-release: old schema versions trigger reinitialization (not migration).
+- **Extractor Versioning:** `resources.extractor_version` tracks which parser/ingestor version
+  produced the blocks, enabling selective reprocessing when extraction logic improves.

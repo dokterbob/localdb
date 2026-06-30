@@ -7,12 +7,16 @@
 
 | Phase | Scope | Notes |
 |---|---|---|
-| **1 — MVP** | Files + URLs → hybrid search (BM25+dense, RRF) with citations, via **CLI + MCP**; multiple stores; embedded-first with optional daemon + HTTP API | The whole of [PLAN.md](../PLAN.md). |
-| 2 — Web UI | Search/browse + admin on the existing HTTP API; SSE job progress | First management GUI; config edits via API (runtime-owned objects only, [03-config.md](03-config.md) §3). |
-| 3 — Remote store / home-server | Qdrant **server** adapter behind `RetrievalStore`; headless Linux mode; reverse-proxy guidance | "Laptop → home server without rethinking the stack." |
-| 4 — Message connectors | Email first (`imap`, `mbox`), then messenger/chat connectors; `messages` chunking preset goes live | Builds on the reserved mapping in [02-domain-model.md](02-domain-model.md) §5. |
-| 5 — Shared stores | `visibility: shared` becomes functional; **mature auth only** — OIDC/OAuth2 for client-server sharing; per-store ACLs | No homegrown crypto ([VISION.md](../VISION.md)). |
+| **1 — MVP** | Files + URLs → hybrid search (BM25+dense, RRF) with citations, via **CLI + MCP**; multiple stores; embedded-first with optional daemon + HTTP API | Complete. |
+| **1.5 — Ingestor framework** | Resource/Block/Ingestor architecture: typed blocks replace Markdown IR, `Ingestor` trait, `messages` chunker, schema replacement, context expansion queries | Current work. See [07-adr-blocks-canonical-ir.md](07-adr-blocks-canonical-ir.md). |
+| 2 — Connectors | Individual ingestors: Notion, Telegram, Signal, email (mbox/EML), transcription (SRT/VTT/Whisper), HackMD, Obsidian enhancements, Atom/RSS. Each tracked as a GitHub issue. | Builds on the Ingestor trait from Phase 1.5. |
+| 3 — Web UI | Search/browse + admin on the existing HTTP API; SSE job progress | First management GUI. |
+| 4 — Remote store / home-server | Qdrant **server** adapter behind `RetrievalStore`; headless Linux mode; reverse-proxy guidance | "Laptop → home server without rethinking the stack." |
+| 5 — Shared stores | `visibility: shared` becomes functional; **mature auth only** — OIDC/OAuth2 for client-server sharing; per-store ACLs | No homegrown crypto. |
 | 6 — Federation | Propagating shares through the social graph | §3 below. |
+
+Note: Phase 4 (Message connectors) from the old roadmap is now split: the framework is Phase 1.5
+(current), individual connectors are Phase 2.
 
 Also tracked but unscheduled: entities/graph layer (metadata-only entities first; graph extraction
 only after baseline retrieval quality is proven).
@@ -50,7 +54,7 @@ embedded-only libsql setup when **all** hold:
 
 MVP: `cargo install` + GitHub release tarballs (macOS arm64, Linux x86_64/arm64).
 Then: **Homebrew** formula with `brew services` (launchd) for the daemon; **systemd** unit for
-Linux; web UI assets embedded in the binary at Phase 2. Model files are never bundled
+Linux; web UI assets embedded in the binary at Phase 3. Model files are never bundled
 ([04-search-pipeline.md](04-search-pipeline.md) §4).
 
 ## 5. Consolidated "later" list
@@ -58,8 +62,9 @@ Linux; web UI assets embedded in the binary at Phase 2. Model files are never bu
 Deferred items referenced by other specs, in one place: reranking stage; SSE job streaming;
 original-file line mapping for citations; OCR / scanned PDFs; additional ebook formats (see
 below); OS keychain secret storage; interactive CLI browse; gRPC (if demanded); entities/graph;
-backup/export/import strategy (with Phase 3); metrics/tracing endpoints (structured logs ship in
-MVP; Prometheus metrics arrive with the daemon-centric Phase 3).
+backup/export/import strategy (with Phase 4); metrics/tracing endpoints (structured logs ship in
+MVP; Prometheus metrics arrive with the daemon-centric Phase 4); per-format native block
+extraction (beyond `markdown_to_blocks()` conversion).
 
 ### Document & ebook formats
 
