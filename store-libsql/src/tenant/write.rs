@@ -159,12 +159,10 @@ async fn upsert_chunks_inner(
                 correlation_id: "store_handle_upsert_heading".to_string(),
             })?;
 
-        // block_id / block_seq / seq_in_block: the old pipeline has no block
-        // concept — use 0 as the sentinel for "legacy single-block".
         let sql = format!(
             "INSERT INTO chunks (store_id, id, resource_id, block_id, block_seq,
                  seq_in_block, text, heading_path, embedding)
-             VALUES (?, ?, ?, 0, 0, 0, ?, ?, {vector_sql})
+             VALUES (?, ?, ?, 0, ?, ?, ?, ?, {vector_sql})
              ON CONFLICT(store_id, id) DO UPDATE SET
                  resource_id  = excluded.resource_id,
                  block_id     = excluded.block_id,
@@ -180,6 +178,8 @@ async fn upsert_chunks_inner(
                 record.store_id.as_str(),
                 record.id.as_str(),
                 record.document_id.as_str(), // resource_id column
+                record.block_seq as i64,
+                record.seq_in_block as i64,
                 record.text.as_str(),
                 heading_path_json.as_str(),
             ],

@@ -23,6 +23,8 @@ use crate::connection::map_libsql_err;
 ///  13  r.content_hash
 ///  14  r.origin_store
 ///  15  r.metadata_json    → metadata
+///  16  c.block_seq
+///  17  c.seq_in_block
 pub(crate) fn row_to_chunk_record_strict(row: &libsql::Row) -> Result<ChunkRecord, Error> {
     let id: String = row.get(0).map_err(map_libsql_err)?;
     let resource_id: String = row.get(1).map_err(map_libsql_err)?; // → document_id
@@ -57,14 +59,14 @@ pub(crate) fn row_to_chunk_record_strict(row: &libsql::Row) -> Result<ChunkRecor
             correlation_id: "store_handle_row_metadata".to_string(),
         })?;
 
-    // Span is no longer stored per-chunk in the new schema; use the text
-    // length as a proxy so existing callers that read the span field get a
-    // safe default rather than a zero-length span.
+    let block_seq: i64 = row.get(16).map_err(map_libsql_err)?;
+    let seq_in_block: i64 = row.get(17).map_err(map_libsql_err)?;
+
     let text_len = text.len();
 
     Ok(ChunkRecord {
         id,
-        document_id: resource_id, // schema rename: resource_id → document_id
+        document_id: resource_id,
         store_id,
         text: text.clone(),
         span: Span {
@@ -74,15 +76,15 @@ pub(crate) fn row_to_chunk_record_strict(row: &libsql::Row) -> Result<ChunkRecor
         heading_path,
         embedding,
         policy_version,
-        fetched_at: added_at, // schema rename: added_at → fetched_at
+        fetched_at: added_at,
         content_hash,
         origin_store,
         source_id,
-        source_kind: ingestor_kind, // schema rename: ingestor_kind → source_kind
+        source_kind: ingestor_kind,
         mime,
         uri,
         metadata,
-        block_seq: 0,
-        seq_in_block: 0,
+        block_seq: block_seq as u32,
+        seq_in_block: seq_in_block as u32,
     })
 }
