@@ -8,8 +8,8 @@
 use crate::block::{Block, IngestorKind, Resource, ResourceKind};
 use crate::error::Error;
 use crate::ids::{content_hash, document_id};
-use crate::ingestor::{IngestCallback, IngestResult, IngestSource, Ingestor};
 use crate::ingestion::{enumerate_path_source, now_rfc3339};
+use crate::ingestor::{IngestCallback, IngestResult, IngestSource, Ingestor};
 use crate::markdown_blocks::markdown_to_blocks;
 use crate::metadata::{DocumentMetadata, DublinCoreMetadata, Metadata};
 use crate::parser::{Parser, Probe};
@@ -111,10 +111,7 @@ impl Ingestor for FileIngestor {
 
             // Convert parser::DocumentMetadata → metadata::DublinCoreMetadata
             let dc = parser_meta_to_dc(&parsed.metadata);
-            let title = parsed
-                .title
-                .clone()
-                .or_else(|| dc.title.clone());
+            let title = parsed.title.clone().or_else(|| dc.title.clone());
 
             let resource = Resource {
                 id: res_id,
@@ -156,8 +153,11 @@ impl Ingestor for FileIngestor {
 }
 
 /// Compute a content hash from the concatenation of all block texts.
+///
+/// Block texts are concatenated directly with no separator, matching the
+/// spec's "ordered block canonical texts concatenated" definition.
 pub(crate) fn compute_blocks_hash(blocks: &[Block]) -> String {
-    let combined: String = blocks.iter().map(|b| b.text.as_str()).collect::<Vec<_>>().join("\0");
+    let combined: String = blocks.iter().map(|b| b.text.as_str()).collect();
     content_hash(&combined)
 }
 
@@ -185,7 +185,29 @@ pub(crate) fn parser_meta_to_dc(meta: &crate::parser::DocumentMetadata) -> Dubli
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block::BlockKind;
     use crate::parser::{ChainParser, ParsedDocument};
+
+    #[test]
+    fn compute_blocks_hash_no_separator() {
+        let blocks = vec![
+            Block {
+                seq: 0,
+                kind: BlockKind::Heading { level: 1 },
+                text: "Title".to_string(),
+                location: None,
+            },
+            Block {
+                seq: 1,
+                kind: BlockKind::Paragraph,
+                text: "Body.".to_string(),
+                location: None,
+            },
+        ];
+        let hash = compute_blocks_hash(&blocks);
+        let expected = crate::ids::content_hash("TitleBody.");
+        assert_eq!(hash, expected);
+    }
 
     /// A minimal parser for tests: accepts everything, returns the bytes as Markdown.
     struct AllParser;

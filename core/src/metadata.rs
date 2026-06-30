@@ -7,10 +7,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DublinCoreMetadata {
     pub title: Option<String>,
+    #[serde(default)]
     pub creator: Vec<String>,
+    #[serde(default)]
     pub subject: Vec<String>,
     pub description: Option<String>,
     pub publisher: Option<String>,
+    #[serde(default)]
     pub contributor: Vec<String>,
     pub date: Option<String>,
     pub r#type: Option<String>,
@@ -18,6 +21,7 @@ pub struct DublinCoreMetadata {
     pub identifier: Option<String>,
     pub source: Option<String>,
     pub language: Option<String>,
+    #[serde(default)]
     pub relation: Vec<String>,
     pub coverage: Option<String>,
     pub rights: Option<String>,
@@ -48,6 +52,7 @@ pub struct TranscriptionMetadata {
     #[serde(flatten)]
     pub dublin_core: DublinCoreMetadata,
     pub duration_ms: Option<u64>,
+    #[serde(default)]
     pub speakers: Vec<String>,
     pub media_uri: Option<String>,
 }
@@ -239,5 +244,17 @@ mod tests {
     fn metadata_default_is_document() {
         let meta = Metadata::default();
         assert!(matches!(meta, Metadata::Document(_)));
+    }
+
+    #[test]
+    fn dublin_core_missing_vec_fields_deserialize_as_empty() {
+        let json = r#"{"title": "Test"}"#;
+        let dc: DublinCoreMetadata =
+            serde_json::from_str(json).expect("should deserialize with missing Vec fields");
+        assert_eq!(dc.title.as_deref(), Some("Test"));
+        assert!(dc.creator.is_empty());
+        assert!(dc.subject.is_empty());
+        assert!(dc.contributor.is_empty());
+        assert!(dc.relation.is_empty());
     }
 }

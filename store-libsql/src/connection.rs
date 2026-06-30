@@ -83,6 +83,13 @@ impl LibsqlDb {
         if version != 0 && version != schema::SCHEMA_VERSION {
             // Old schema detected — drop everything and let create_schema rebuild.
             // This project is pre-release with no data preservation guarantee.
+            eprintln!(
+                "warning: database schema version mismatch (found v{}, expected v{}): \
+                 all indexed data will be erased and the database re-initialised. \
+                 Re-run `localdb index` to restore your index.",
+                version,
+                schema::SCHEMA_VERSION,
+            );
             tracing::warn!(
                 old_version = version,
                 new_version = schema::SCHEMA_VERSION,

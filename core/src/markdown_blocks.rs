@@ -133,7 +133,11 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                 let lang: Option<String> = match fence {
                     pulldown_cmark::CodeBlockKind::Fenced(s) => {
                         let s = s.trim().to_string();
-                        if s.is_empty() { None } else { Some(s) }
+                        if s.is_empty() {
+                            None
+                        } else {
+                            Some(s)
+                        }
                     }
                     pulldown_cmark::CodeBlockKind::Indented => None,
                 };
@@ -158,7 +162,9 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
 
             Event::Start(Tag::List(start)) => {
                 stack.push(ActiveBlock {
-                    kind: ActiveKind::List { ordered: start.is_some() },
+                    kind: ActiveKind::List {
+                        ordered: start.is_some(),
+                    },
                     text: Vec::new(),
                     table_headers: Vec::new(),
                     table_row_count: 0,
@@ -182,7 +188,9 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                 }
             }
 
-            Event::Start(Tag::Image { dest_url, title, .. }) => {
+            Event::Start(Tag::Image {
+                dest_url, title, ..
+            }) => {
                 let src = Some(dest_url.to_string());
                 // alt text comes as Text events inside the Image tag; title is the
                 // image title attribute (not the alt). We store src from dest_url.
@@ -282,12 +290,7 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                     let headers = b.table_headers.clone();
                     let rows = b.table_row_count;
                     let text = b.text.join(" ");
-                    push_block!(
-                        blocks,
-                        seq,
-                        BlockKind::Table { headers, rows },
-                        text
-                    );
+                    push_block!(blocks, seq, BlockKind::Table { headers, rows }, text);
                 }
             }
 
@@ -313,7 +316,11 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                     };
                     // Text events inside an image contain the alt text.
                     let alt_text = b.text.join("");
-                    let alt = if alt_text.is_empty() { None } else { Some(alt_text.clone()) };
+                    let alt = if alt_text.is_empty() {
+                        None
+                    } else {
+                        Some(alt_text.clone())
+                    };
                     let text = alt_text;
                     // Always emit Image block (even empty text)
                     blocks.push(Block {
@@ -369,7 +376,27 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                 }
             }
 
-            // Ignore everything else (HR, footnotes, HTML blocks, etc.)
+            Event::Html(t) => {
+                // Flush any open block before emitting an HTML block.
+                // HTML blocks are stand-alone: they do not nest inside a
+                // paragraph or other container.
+                while let Some(b) = stack.pop() {
+                    let text = b.text.join(" ");
+                    push_block!(blocks, seq, BlockKind::Paragraph, text);
+                }
+                let trimmed = t.trim().to_string();
+                if !trimmed.is_empty() {
+                    blocks.push(Block {
+                        seq,
+                        kind: BlockKind::Paragraph,
+                        text: trimmed,
+                        location: None,
+                    });
+                    seq += 1;
+                }
+            }
+
+            // Ignore everything else (HR, footnotes, etc.)
             _ => {}
         }
     }
@@ -388,25 +415,36 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
 /// at end-of-file).  Returns `(None, markdown)` if no front-matter is
 /// present.
 fn extract_frontmatter(markdown: &str) -> (Option<String>, &str) {
-    if !markdown.starts_with("---\n") {
+    // Determine the opening delimiter length (LF or CRLF).
+    let open_len = if markdown.starts_with("---\r\n") {
+        5
+    } else if markdown.starts_with("---\n") {
+        4
+    } else {
         return (None, markdown);
-    }
-    // Find the closing delimiter.
-    let after_open = &markdown[4..]; // skip leading "---\n"
-    if let Some(close_pos) = after_open.find("\n---\n") {
-        let body = &after_open[..close_pos];
-        let rest_start = 4 + close_pos + 5; // "---\n" + body + "\n---\n"
-        return (Some(body.to_string()), &markdown[rest_start..]);
-    }
-    // Check for "---" at end of file (no trailing newline).
-    if let Some(close_pos) = after_open.find("\n---") {
-        let candidate = &after_open[close_pos + 1..];
-        if candidate == "---" || candidate == "---\n" {
-            let body = &after_open[..close_pos];
-            return (Some(body.to_string()), "");
+    };
+    let after_open = &markdown[open_len..];
+
+    // Try the closing delimiter — CRLF first, then LF.
+    let (close_pos, close_len) = if let Some(pos) = after_open.find("\n---\r\n") {
+        (pos, 6) // "\n---\r\n".len()
+    } else if let Some(pos) = after_open.find("\n---\n") {
+        (pos, 5) // "\n---\n".len()
+    } else {
+        // Check for "---" at end of file (no trailing newline).
+        if let Some(pos) = after_open.find("\n---") {
+            let candidate = &after_open[pos + 1..];
+            if candidate == "---" || candidate == "---\r" {
+                let body = &after_open[..pos];
+                return (Some(body.to_string()), "");
+            }
         }
-    }
-    (None, markdown)
+        return (None, markdown);
+    };
+
+    let body = &after_open[..close_pos];
+    let rest = &markdown[open_len + close_pos + close_len..];
+    (Some(body.to_string()), rest)
 }
 
 // ---------------------------------------------------------------------------
@@ -492,7 +530,9 @@ fn main() {}
         }
 
         // Find a heading block with level 1.
-        let h1 = blocks.iter().find(|b| matches!(&b.kind, BlockKind::Heading { level: 1 }));
+        let h1 = blocks
+            .iter()
+            .find(|b| matches!(&b.kind, BlockKind::Heading { level: 1 }));
         assert!(h1.is_some(), "expected an h1 heading");
         assert_eq!(h1.unwrap().text, "Introduction");
 
@@ -504,7 +544,9 @@ fn main() {}
         assert_eq!(h2.unwrap().text, "Setup");
 
         // Find a code block.
-        let code = blocks.iter().find(|b| matches!(&b.kind, BlockKind::Code { .. }));
+        let code = blocks
+            .iter()
+            .find(|b| matches!(&b.kind, BlockKind::Code { .. }));
         assert!(code.is_some(), "expected a code block");
         let code_b = code.unwrap();
         if let BlockKind::Code { language } = &code_b.kind {
@@ -512,7 +554,9 @@ fn main() {}
         }
 
         // Find a list block.
-        let list = blocks.iter().find(|b| matches!(&b.kind, BlockKind::List { .. }));
+        let list = blocks
+            .iter()
+            .find(|b| matches!(&b.kind, BlockKind::List { .. }));
         assert!(list.is_some(), "expected a list block");
         assert!(list.unwrap().text.contains("Item one"));
 
@@ -578,7 +622,12 @@ fn main() {}
             .collect();
         let last_para = paras.last().unwrap();
         let path = heading_path_from_blocks(&blocks, last_para.seq);
-        assert_eq!(path, vec!["B".to_string()], "after # B, path must be just [B]; got {:?}", path);
+        assert_eq!(
+            path,
+            vec!["B".to_string()],
+            "after # B, path must be just [B]; got {:?}",
+            path
+        );
     }
 
     /// YAML front-matter is extracted as a Frontmatter block.
@@ -595,8 +644,13 @@ fn main() {}
         );
         assert!(fm.text.contains("title: Hello"));
         // Heading comes after frontmatter.
-        let heading = blocks.iter().find(|b| matches!(&b.kind, BlockKind::Heading { .. }));
-        assert!(heading.is_some(), "heading should be parsed after frontmatter");
+        let heading = blocks
+            .iter()
+            .find(|b| matches!(&b.kind, BlockKind::Heading { .. }));
+        assert!(
+            heading.is_some(),
+            "heading should be parsed after frontmatter"
+        );
     }
 
     /// No front-matter when the document doesn't start with `---\n`.
@@ -616,7 +670,9 @@ fn main() {}
     fn table_block() {
         let md = "| A | B |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n";
         let blocks = markdown_to_blocks(md);
-        let table = blocks.iter().find(|b| matches!(&b.kind, BlockKind::Table { .. }));
+        let table = blocks
+            .iter()
+            .find(|b| matches!(&b.kind, BlockKind::Table { .. }));
         assert!(table.is_some(), "expected a table block");
         let table_b = table.unwrap();
         if let BlockKind::Table { headers, rows } = &table_b.kind {
@@ -657,5 +713,29 @@ fn main() {}
         let blocks = markdown_to_blocks(md);
         let path = heading_path_from_blocks(&blocks, 10);
         assert!(path.is_empty());
+    }
+
+    /// HTML blocks must not be silently dropped.
+    #[test]
+    fn html_block_not_silently_dropped() {
+        let md = "# Before\n\n<div>raw HTML content</div>\n\nAfter paragraph.\n";
+        let blocks = markdown_to_blocks(md);
+        let has_html = blocks.iter().any(|b| b.text.contains("raw HTML content"));
+        assert!(has_html, "HTML block must not be silently dropped");
+        assert!(blocks.len() >= 3);
+    }
+
+    /// Frontmatter with CRLF line endings is detected correctly.
+    #[test]
+    fn frontmatter_detected_with_crlf() {
+        let md = "---\r\ntitle: Hello\r\n---\r\n\r\n# Content\r\n";
+        let blocks = markdown_to_blocks(md);
+        assert!(!blocks.is_empty());
+        assert!(
+            matches!(&blocks[0].kind, BlockKind::Frontmatter { format } if format == "yaml"),
+            "first block should be CRLF frontmatter; got {:?}",
+            blocks[0].kind
+        );
+        assert!(blocks[0].text.contains("title: Hello"));
     }
 }
