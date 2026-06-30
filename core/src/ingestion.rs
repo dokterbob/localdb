@@ -397,6 +397,8 @@ fn scale_to_chars(config: &ChunkerConfig) -> ChunkerConfig {
         preset: config.preset.clone(),
         target_tokens: Some(config.resolved_target_tokens() * 4),
         overlap_tokens: Some(config.resolved_overlap_tokens() * 4),
+        window_turns: config.window_turns,
+        stride_turns: config.stride_turns,
     }
 }
 
@@ -3104,6 +3106,8 @@ mod tests {
             preset: "prose".to_string(),
             target_tokens: Some(256),
             overlap_tokens: Some(0),
+            window_turns: None,
+            stride_turns: None,
         };
         let scaled = scale_to_chars(&cfg);
         assert_eq!(scaled.preset, "prose");
@@ -3125,6 +3129,8 @@ mod tests {
             preset: "code".to_string(),
             target_tokens: Some(3000),
             overlap_tokens: Some(0),
+            window_turns: None,
+            stride_turns: None,
         };
         let scaled = scale_to_chars(&cfg);
         assert_eq!(scaled.preset, "code");
@@ -3147,6 +3153,8 @@ mod tests {
             preset: "prose".to_string(),
             target_tokens: None,
             overlap_tokens: None,
+            window_turns: None,
+            stride_turns: None,
         };
         let scaled = scale_to_chars(&cfg);
         // Default prose target is 256; scaled = 256 * 4 = 1024. Overlap 0 → 0.

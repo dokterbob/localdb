@@ -100,6 +100,26 @@ pub struct ChunkOutput {
     pub block_seq: u32,
     /// Position of this chunk within the block (0-indexed).
     pub seq_in_block: u32,
+    /// For message-window chunks: all block seqs participating in the window.
+    /// Empty for non-message chunks. Mirrors `ChunkLocation::window_block_seqs`.
+    pub window_block_seqs: Vec<u32>,
+}
+
+impl ChunkOutput {
+    /// Construct a single-block, non-windowed chunk (no heading path, seq_in_block=0).
+    ///
+    /// Convenience constructor that reduces boilerplate in block-dispatch paths.
+    fn single(id: ContentId, text: String, span: Span, heading_path: Vec<String>, block_seq: u32) -> Self {
+        Self {
+            id,
+            text,
+            span,
+            heading_path,
+            block_seq,
+            seq_in_block: 0,
+            window_block_seqs: vec![],
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -109,7 +129,7 @@ pub struct ChunkOutput {
 /// Configuration for the chunking operation.
 #[derive(Debug, Clone)]
 pub struct ChunkerConfig {
-    /// Preset name: "prose", "code", or "messages" (reserved).
+    /// Preset name: "prose", "code", or "messages".
     pub preset: String,
     /// Target chunk size in tokens. `None` = preset default.
     ///
@@ -119,6 +139,10 @@ pub struct ChunkerConfig {
     pub target_tokens: Option<usize>,
     /// Overlap in tokens. `None` = preset default.
     pub overlap_tokens: Option<usize>,
+    /// Number of message turns per sliding window (messages preset). `None` = default (6).
+    pub window_turns: Option<usize>,
+    /// Stride in turns between windows (messages preset). `None` = default (3).
+    pub stride_turns: Option<usize>,
 }
 
 impl ChunkerConfig {
@@ -133,6 +157,8 @@ impl ChunkerConfig {
             preset: "prose".to_string(),
             target_tokens: Some(256),
             overlap_tokens: Some(0),
+            window_turns: None,
+            stride_turns: None,
         }
     }
 
@@ -145,6 +171,23 @@ impl ChunkerConfig {
             preset: "code".to_string(),
             target_tokens: Some(3000),
             overlap_tokens: Some(0),
+            window_turns: None,
+            stride_turns: None,
+        }
+    }
+
+    /// Create a config for the `messages` preset with the spec defaults.
+    ///
+    /// Default window = 6 turns, stride = 3 turns.
+    /// Token budget uses `target_tokens` (default 512) to cap windows.
+    /// See specs/04-search-pipeline.md §3.
+    pub fn messages() -> Self {
+        Self {
+            preset: "messages".to_string(),
+            target_tokens: Some(512),
+            overlap_tokens: Some(0),
+            window_turns: Some(6),
+            stride_turns: Some(3),
         }
     }
 
@@ -155,14 +198,10 @@ impl ChunkerConfig {
         match preset {
             "prose" => Ok(Self::prose()),
             "code" => Ok(Self::code()),
-            "messages" => Err(Error::InvalidRequest {
-                message: "chunking preset 'messages' is reserved and not implemented in v1; \
-                          use 'prose' or 'code'"
-                    .to_string(),
-            }),
+            "messages" => Ok(Self::messages()),
             other => Err(Error::InvalidRequest {
                 message: format!(
-                    "unknown chunking preset '{}'; valid values: prose, code",
+                    "unknown chunking preset '{}'; valid values: prose, code, messages",
                     other
                 ),
             }),
@@ -178,6 +217,16 @@ impl ChunkerConfig {
     pub fn resolved_overlap_tokens(&self) -> usize {
         self.overlap_tokens.unwrap_or(0)
     }
+
+    /// Resolved window turns for the messages preset (default 6).
+    pub fn resolved_window_turns(&self) -> usize {
+        self.window_turns.unwrap_or(6)
+    }
+
+    /// Resolved stride turns for the messages preset (default 3).
+    pub fn resolved_stride_turns(&self) -> usize {
+        self.stride_turns.unwrap_or(3)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -186,9 +235,10 @@ impl ChunkerConfig {
 
 /// Chunk a sequence of typed [`Block`]s into `ChunkOutput` records.
 ///
-/// Dispatches each block by kind:
-/// - `Heading`, `Paragraph`, `Quote`, `List`, `Message`, `Segment` → prose chunker.
-/// - `Code`, `Table` → code chunker.
+/// Dispatches by block kind:
+/// - `Message`, `Segment` → messages chunker (sliding window over all such blocks).
+/// - `Heading`, `Paragraph`, `Quote`, `List` → prose chunker (per block).
+/// - `Code`, `Table` → code chunker (per block).
 /// - `Reference`, `Attachment`, `Frontmatter`, `Image` → single chunk per block.
 ///
 /// For each sub-chunk within a block:
@@ -208,9 +258,29 @@ pub fn chunk_blocks(
 
     let mut out: Vec<ChunkOutput> = Vec::new();
 
+    // First pass: collect Message/Segment blocks and dispatch them together.
+    let msg_blocks: Vec<&crate::block::Block> = blocks
+        .iter()
+        .filter(|b| {
+            !b.text.is_empty()
+                && matches!(b.kind, BlockKind::Message { .. } | BlockKind::Segment { .. })
+        })
+        .collect();
+
+    if !msg_blocks.is_empty() {
+        let msg_chunks = chunk_messages(resource_id, blocks, config, sizer)?;
+        out.extend(msg_chunks);
+    }
+
+    // Second pass: handle all non-message blocks individually.
     for block in blocks {
         if block.text.is_empty() {
             continue;
+        }
+
+        let is_msg = matches!(block.kind, BlockKind::Message { .. } | BlockKind::Segment { .. });
+        if is_msg {
+            continue; // already handled above
         }
 
         let heading_path = heading_path_from_blocks(blocks, block.seq);
@@ -220,11 +290,7 @@ pub fn chunk_blocks(
             BlockKind::Heading { .. }
             | BlockKind::Paragraph
             | BlockKind::Quote
-            | BlockKind::List { .. }
-            | BlockKind::Message { .. }
-            | BlockKind::Segment { .. } => {
-                chunk_prose(resource_id, &block.text, config, sizer)?
-            }
+            | BlockKind::List { .. } => chunk_prose(resource_id, &block.text, config, sizer)?,
             // Code/table blocks
             BlockKind::Code { .. } | BlockKind::Table { .. } => {
                 chunk_code(resource_id, &block.text, config)?
@@ -236,15 +302,16 @@ pub fn chunk_blocks(
             | BlockKind::Image { .. } => {
                 let text = &block.text;
                 let id = chunk_id(resource_id, text, 0, text.len());
-                vec![ChunkOutput {
+                vec![ChunkOutput::single(
                     id,
-                    text: text.clone(),
-                    span: crate::types::Span::new(0, text.len()),
-                    heading_path: heading_path.clone(),
-                    block_seq: block.seq,
-                    seq_in_block: 0,
-                }]
+                    text.clone(),
+                    crate::types::Span::new(0, text.len()),
+                    heading_path.clone(),
+                    block.seq,
+                )]
             }
+            // Message/Segment already dispatched above
+            BlockKind::Message { .. } | BlockKind::Segment { .. } => unreachable!(),
         };
 
         for (i, mut c) in sub_chunks.into_iter().enumerate() {
@@ -255,6 +322,178 @@ pub fn chunk_blocks(
             }
             out.push(c);
         }
+    }
+
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Messages chunker
+// ---------------------------------------------------------------------------
+
+/// Format a sender label for a `Message` block.
+///
+/// Produces `[sender] (timestamp): ` or `[sender]: ` when no timestamp.
+fn format_message_prefix(sender: &str, timestamp: Option<&str>) -> String {
+    match timestamp {
+        Some(ts) => format!("[{sender}] ({ts}): "),
+        None => format!("[{sender}]: "),
+    }
+}
+
+/// Format a speaker label for a `Segment` block.
+///
+/// Produces `[speaker] (start_ms-end_ms): ` or `(start_ms-end_ms): ` when no speaker.
+fn format_segment_prefix(speaker: Option<&str>, start_ms: u64, end_ms: u64) -> String {
+    match speaker {
+        Some(sp) => format!("[{sp}] ({start_ms}-{end_ms}): "),
+        None => format!("({start_ms}-{end_ms}): "),
+    }
+}
+
+/// Messages chunker: sliding-window chunker over `Message` and `Segment` blocks.
+///
+/// Each `Message`/`Segment` block is one "turn". The window covers `window_turns`
+/// turns with `stride_turns` stride. Windows are also token-capped: if a window
+/// exceeds `max_tokens`, turns are dropped from the front until it fits.
+///
+/// Very long single messages (exceeding `max_tokens` alone) are split using
+/// prose-chunker logic, with the sender/speaker prefix prepended to each sub-chunk.
+///
+/// Message-window chunks intentionally span multiple blocks — this is the explicit
+/// exception to the "chunk ⊂ block" invariant (see specs/04-search-pipeline.md §3).
+pub fn chunk_messages(
+    resource_id: &str,
+    blocks: &[crate::block::Block],
+    config: &ChunkerConfig,
+    sizer: &dyn ChunkSizer,
+) -> Result<Vec<ChunkOutput>, Error> {
+    use crate::block::BlockKind;
+
+    let max_tokens = config.resolved_target_tokens();
+    let window_turns = config.resolved_window_turns();
+    let stride_turns = config.resolved_stride_turns();
+    let stride_turns = stride_turns.max(1); // prevent infinite loop
+
+    // Collect only Message/Segment blocks, in order.
+    let turns: Vec<&crate::block::Block> = blocks
+        .iter()
+        .filter(|b| {
+            !b.text.is_empty()
+                && matches!(b.kind, BlockKind::Message { .. } | BlockKind::Segment { .. })
+        })
+        .collect();
+
+    if turns.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Build prefixed text for each turn.
+    let turn_texts: Vec<String> = turns
+        .iter()
+        .map(|b| {
+            let prefix = match &b.kind {
+                BlockKind::Message {
+                    sender, timestamp, ..
+                } => format_message_prefix(sender, timestamp.as_deref()),
+                BlockKind::Segment {
+                    speaker,
+                    start_ms,
+                    end_ms,
+                } => format_segment_prefix(speaker.as_deref(), *start_ms, *end_ms),
+                _ => unreachable!(),
+            };
+            format!("{prefix}{}", b.text)
+        })
+        .collect();
+
+    let mut out: Vec<ChunkOutput> = Vec::new();
+    let n = turns.len();
+    let mut window_start = 0usize;
+
+    while window_start < n {
+        let window_end_excl = (window_start + window_turns).min(n);
+
+        // Determine how many turns fit within the token budget, starting from
+        // `window_start` and growing toward `window_end_excl`. We shrink from
+        // the front if the full window exceeds max_tokens.
+        let mut actual_start = window_start;
+
+        // Build the candidate window text and check token count.
+        let candidate_text: String = turn_texts[window_start..window_end_excl].join("\n");
+
+        if sizer.size(&candidate_text) > max_tokens {
+            // Try shrinking from the front one turn at a time.
+            let mut ok_start = window_end_excl.saturating_sub(1); // at minimum, last turn
+            for start in (window_start..window_end_excl).rev() {
+                let text: String = turn_texts[start..window_end_excl].join("\n");
+                if sizer.size(&text) <= max_tokens {
+                    ok_start = start;
+                    break;
+                }
+            }
+            actual_start = ok_start;
+        }
+
+        let window_seqs: Vec<u32> = turns[actual_start..window_end_excl]
+            .iter()
+            .map(|b| b.seq)
+            .collect();
+
+        // If even a single turn is too long, split it with prose chunker logic.
+        if actual_start + 1 == window_end_excl
+            && sizer.size(&turn_texts[actual_start]) > max_tokens
+        {
+            // Split the raw message body (without prefix) using prose chunker,
+            // then prepend the sender/speaker context to each sub-chunk.
+            let block = turns[actual_start];
+            let prefix = match &block.kind {
+                crate::block::BlockKind::Message {
+                    sender, timestamp, ..
+                } => format_message_prefix(sender, timestamp.as_deref()),
+                crate::block::BlockKind::Segment {
+                    speaker,
+                    start_ms,
+                    end_ms,
+                } => format_segment_prefix(speaker.as_deref(), *start_ms, *end_ms),
+                _ => unreachable!(),
+            };
+            let prose_chunks = chunk_prose(resource_id, &block.text, config, sizer)?;
+            let first_seq = block.seq;
+            for (i, pc) in prose_chunks.into_iter().enumerate() {
+                let prefixed_text = format!("{prefix}{}", pc.text);
+                let id = chunk_id(resource_id, &prefixed_text, 0, prefixed_text.len());
+                out.push(ChunkOutput {
+                    id,
+                    text: prefixed_text,
+                    span: pc.span,
+                    heading_path: vec![],
+                    block_seq: first_seq,
+                    seq_in_block: i as u32,
+                    window_block_seqs: vec![first_seq],
+                });
+            }
+        } else {
+            let window_text: String = turn_texts[actual_start..window_end_excl].join("\n");
+            let first_seq = turns[actual_start].seq;
+            let id = chunk_id(resource_id, &window_text, 0, window_text.len());
+            out.push(ChunkOutput {
+                id,
+                text: window_text,
+                span: crate::types::Span::new(0, 0), // not meaningful for multi-block windows
+                heading_path: vec![],
+                block_seq: first_seq,
+                seq_in_block: out.len() as u32, // index among message chunks
+                window_block_seqs: window_seqs,
+            });
+        }
+
+        window_start += stride_turns;
+    }
+
+    // Fix seq_in_block: should be the chunk's index within all message chunks.
+    for (i, c) in out.iter_mut().enumerate() {
+        c.seq_in_block = i as u32;
     }
 
     Ok(out)
@@ -273,7 +512,7 @@ pub fn chunk_blocks(
 /// sizes for the `prose` preset (the `code` preset uses its own char budget).
 ///
 /// # Errors
-/// - Returns `Error::InvalidRequest` if the preset is unknown or reserved.
+/// - Returns `Error::InvalidRequest` if the preset is unknown.
 pub fn chunk_document(
     document_id: &str,
     markdown: &str,
@@ -284,13 +523,13 @@ pub fn chunk_document(
         "prose" => chunk_prose(document_id, markdown, config, sizer),
         "code" => chunk_code(document_id, markdown, config),
         "messages" => Err(Error::InvalidRequest {
-            message: "chunking preset 'messages' is reserved and not implemented in v1; \
-                      use 'prose' or 'code'"
+            message: "chunking preset 'messages' requires typed Block input; \
+                      use chunk_blocks() instead of chunk_document()"
                 .to_string(),
         }),
         other => Err(Error::InvalidRequest {
             message: format!(
-                "unknown chunking preset '{}'; valid values: prose, code",
+                "unknown chunking preset '{}'; valid values: prose, code, messages",
                 other
             ),
         }),
@@ -371,14 +610,7 @@ fn chunk_prose(
         let span = Span::new(start, end);
         let heading_path = crate::heading_index::heading_path_at(&heading_idx, start);
         let id = chunk_id(document_id, chunk, start, end);
-        chunks.push(ChunkOutput {
-            id,
-            text: chunk.to_string(),
-            span,
-            heading_path,
-            block_seq: 0,
-            seq_in_block: 0,
-        });
+        chunks.push(ChunkOutput::single(id, chunk.to_string(), span, heading_path, 0));
     }
 
     Ok(chunks)
@@ -419,14 +651,13 @@ fn chunk_code(
                 if cs < ce {
                     let chunk_text = &markdown[cs..ce];
                     let id = chunk_id(document_id, chunk_text, cs, ce);
-                    chunks.push(ChunkOutput {
+                    chunks.push(ChunkOutput::single(
                         id,
-                        text: chunk_text.to_string(),
-                        span: Span::new(cs, ce),
-                        heading_path: vec![],
-                        block_seq: 0,
-                        seq_in_block: 0,
-                    });
+                        chunk_text.to_string(),
+                        Span::new(cs, ce),
+                        vec![],
+                        0,
+                    ));
                 }
             }
 
@@ -447,14 +678,13 @@ fn chunk_code(
                 if pos < piece_end {
                     let chunk_text = &markdown[pos..piece_end];
                     let id = chunk_id(document_id, chunk_text, pos, piece_end);
-                    chunks.push(ChunkOutput {
+                    chunks.push(ChunkOutput::single(
                         id,
-                        text: chunk_text.to_string(),
-                        span: Span::new(pos, piece_end),
-                        heading_path: vec![],
-                        block_seq: 0,
-                        seq_in_block: 0,
-                    });
+                        chunk_text.to_string(),
+                        Span::new(pos, piece_end),
+                        vec![],
+                        0,
+                    ));
                 }
                 pos = piece_end;
             }
@@ -471,14 +701,13 @@ fn chunk_code(
             if cs < ce {
                 let chunk_text = &markdown[cs..ce];
                 let id = chunk_id(document_id, chunk_text, cs, ce);
-                chunks.push(ChunkOutput {
+                chunks.push(ChunkOutput::single(
                     id,
-                    text: chunk_text.to_string(),
-                    span: Span::new(cs, ce),
-                    heading_path: vec![],
-                    block_seq: 0,
-                    seq_in_block: 0,
-                });
+                    chunk_text.to_string(),
+                    Span::new(cs, ce),
+                    vec![],
+                    0,
+                ));
             }
             current_start = line_start;
         }
@@ -496,14 +725,13 @@ fn chunk_code(
         if cs < ce {
             let chunk_text = &markdown[cs..ce];
             let id = chunk_id(document_id, chunk_text, cs, ce);
-            chunks.push(ChunkOutput {
+            chunks.push(ChunkOutput::single(
                 id,
-                text: chunk_text.to_string(),
-                span: Span::new(cs, ce),
-                heading_path: vec![],
-                block_seq: 0,
-                seq_in_block: 0,
-            });
+                chunk_text.to_string(),
+                Span::new(cs, ce),
+                vec![],
+                0,
+            ));
         }
     }
 
@@ -630,10 +858,11 @@ mod tests {
     }
 
     #[test]
-    fn chunker_config_from_preset_messages_errors() {
-        let result = ChunkerConfig::from_preset("messages");
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code(), "invalid_request");
+    fn chunker_config_from_preset_messages_succeeds() {
+        let cfg = ChunkerConfig::from_preset("messages").unwrap();
+        assert_eq!(cfg.preset, "messages");
+        assert_eq!(cfg.resolved_window_turns(), 6);
+        assert_eq!(cfg.resolved_stride_turns(), 3);
     }
 
     #[test]
@@ -717,6 +946,8 @@ mod tests {
             preset: "prose".to_string(),
             target_tokens: Some(60),
             overlap_tokens: Some(8),
+            window_turns: None,
+            stride_turns: None,
         };
         let chunks = chunk_document(&doc_id, &full_text, &cfg, &WordSizer).unwrap();
         assert!(
@@ -745,6 +976,8 @@ mod tests {
             preset: "prose".to_string(),
             target_tokens: Some(60),
             overlap_tokens: Some(0),
+            window_turns: None,
+            stride_turns: None,
         };
         let chunks = chunk_document(&doc_id, &full_text, &cfg, &WordSizer).unwrap();
         for w in chunks.windows(2) {
@@ -779,6 +1012,8 @@ mod tests {
             preset: "prose".to_string(),
             target_tokens: Some(80),
             overlap_tokens: Some(0),
+            window_turns: None,
+            stride_turns: None,
         };
         let chunks = chunk_document(&doc_id, &full_text, &cfg, &WordSizer).unwrap();
         assert!(
@@ -813,6 +1048,8 @@ mod tests {
             preset: "prose".to_string(),
             target_tokens: Some(8),
             overlap_tokens: Some(0),
+            window_turns: None,
+            stride_turns: None,
         };
 
         let chunks = chunk_document(&doc_id, full_text, &cfg, &WordSizer).unwrap();
@@ -835,6 +1072,8 @@ mod tests {
             preset: "messages".to_string(),
             target_tokens: None,
             overlap_tokens: None,
+            window_turns: None,
+            stride_turns: None,
         };
 
         let result = chunk_document(&doc_id, full_text, &cfg, &CharSizer);
@@ -866,6 +1105,8 @@ mod tests {
             preset: "prose".to_string(),
             target_tokens: Some(80),
             overlap_tokens: Some(60),
+            window_turns: None,
+            stride_turns: None,
         };
         let chunks = chunk_document(&doc_id, &full_text, &cfg, &WordSizer).unwrap();
         assert!(
@@ -889,6 +1130,8 @@ mod tests {
             preset: "prose".to_string(),
             target_tokens: Some(20),
             overlap_tokens: Some(0),
+            window_turns: None,
+            stride_turns: None,
         };
         let result = chunk_document(&doc_id, &full_text, &cfg, &CharSizer);
         assert!(
@@ -918,6 +1161,8 @@ mod tests {
             preset: "prose".to_string(),
             target_tokens: Some(8),
             overlap_tokens: Some(0),
+            window_turns: None,
+            stride_turns: None,
         };
         let chunks = chunk_document(&doc_id, md, &cfg, &WordSizer).unwrap();
         // At least one chunk should contain the `#` character (real Markdown, not stripped).
@@ -1145,5 +1390,315 @@ mod tests {
     fn preset_for_csv_is_code() {
         // Regression: CSV was already code, should still be.
         assert_eq!(preset_for(Some("data.csv"), None), "code");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Messages chunker tests
+    // ---------------------------------------------------------------------------
+
+    /// Build a Message block for testing.
+    fn msg_block(seq: u32, sender: &str, timestamp: &str, text: &str) -> crate::block::Block {
+        crate::block::Block {
+            seq,
+            kind: crate::block::BlockKind::Message {
+                sender: sender.to_string(),
+                timestamp: Some(timestamp.to_string()),
+                message_id: None,
+                reply_to: None,
+            },
+            text: text.to_string(),
+            location: None,
+        }
+    }
+
+    /// Build a Segment block for testing.
+    fn seg_block(
+        seq: u32,
+        speaker: Option<&str>,
+        start_ms: u64,
+        end_ms: u64,
+        text: &str,
+    ) -> crate::block::Block {
+        crate::block::Block {
+            seq,
+            kind: crate::block::BlockKind::Segment {
+                speaker: speaker.map(|s| s.to_string()),
+                start_ms,
+                end_ms,
+            },
+            text: text.to_string(),
+            location: None,
+        }
+    }
+
+    #[test]
+    fn messages_empty_conversation_returns_no_chunks() {
+        // No Message/Segment blocks → 0 chunks.
+        let blocks: Vec<crate::block::Block> = vec![
+            crate::block::Block {
+                seq: 0,
+                kind: crate::block::BlockKind::Paragraph,
+                text: "Some intro text.".to_string(),
+                location: None,
+            },
+        ];
+        let cfg = ChunkerConfig::messages();
+        let chunks = chunk_messages("resource-1", &blocks, &cfg, &CharSizer).unwrap();
+        assert!(chunks.is_empty(), "no message blocks → no chunks");
+    }
+
+    #[test]
+    fn messages_single_message_produces_one_chunk() {
+        let blocks = vec![msg_block(0, "Alice", "2026-01-01T10:00:00Z", "Hello there!")];
+        let cfg = ChunkerConfig::messages();
+        let chunks = chunk_messages("resource-1", &blocks, &cfg, &CharSizer).unwrap();
+        assert_eq!(chunks.len(), 1, "single message → single chunk");
+        assert!(
+            chunks[0].text.contains("Hello there!"),
+            "chunk should contain message text"
+        );
+        assert_eq!(chunks[0].window_block_seqs, vec![0]);
+        assert_eq!(chunks[0].block_seq, 0);
+        assert_eq!(chunks[0].seq_in_block, 0);
+    }
+
+    #[test]
+    fn messages_sliding_window_correct_chunk_count() {
+        // 10 messages, window=6, stride=3 → windows at [0..6], [3..9], [6..10], [9..10]
+        // = 4 windows (window_start advances by stride=3: 0, 3, 6, 9, stop at 10)
+        let blocks: Vec<_> = (0..10)
+            .map(|i| msg_block(i as u32, "User", "2026-01-01", &format!("Message {i}")))
+            .collect();
+        let cfg = ChunkerConfig {
+            preset: "messages".to_string(),
+            target_tokens: Some(5000), // large budget so no token-based shrink
+            overlap_tokens: Some(0),
+            window_turns: Some(6),
+            stride_turns: Some(3),
+        };
+        let chunks = chunk_messages("resource-1", &blocks, &cfg, &CharSizer).unwrap();
+        assert_eq!(
+            chunks.len(),
+            4,
+            "10 messages, window=6, stride=3 → 4 chunks; got {}",
+            chunks.len()
+        );
+    }
+
+    #[test]
+    fn messages_sliding_window_correct_content() {
+        // 10 messages, window=6, stride=3.
+        // Window 0: msgs 0-5; window 1: msgs 3-8; window 2: msgs 6-9 (4 msgs); window 3: msg 9.
+        let blocks: Vec<_> = (0..10)
+            .map(|i| msg_block(i as u32, "User", "2026-01-01", &format!("Msg{i}")))
+            .collect();
+        let cfg = ChunkerConfig {
+            preset: "messages".to_string(),
+            target_tokens: Some(5000),
+            overlap_tokens: Some(0),
+            window_turns: Some(6),
+            stride_turns: Some(3),
+        };
+        let chunks = chunk_messages("resource-1", &blocks, &cfg, &CharSizer).unwrap();
+        assert_eq!(chunks.len(), 4);
+
+        // Window 0 should contain msgs 0-5.
+        assert!(chunks[0].text.contains("Msg0"), "window 0 should start at Msg0");
+        assert!(chunks[0].text.contains("Msg5"), "window 0 should end at Msg5");
+        assert!(!chunks[0].text.contains("Msg6"), "window 0 should not contain Msg6");
+        assert_eq!(chunks[0].window_block_seqs, vec![0, 1, 2, 3, 4, 5]);
+
+        // Window 1 should contain msgs 3-8.
+        assert!(chunks[1].text.contains("Msg3"), "window 1 should start at Msg3");
+        assert!(chunks[1].text.contains("Msg8"), "window 1 should end at Msg8");
+        assert!(!chunks[1].text.contains("Msg9"), "window 1 should not contain Msg9");
+        assert_eq!(chunks[1].window_block_seqs, vec![3, 4, 5, 6, 7, 8]);
+
+        // Window 2 should contain msgs 6-9.
+        assert!(chunks[2].text.contains("Msg6"), "window 2 should start at Msg6");
+        assert!(chunks[2].text.contains("Msg9"), "window 2 should end at Msg9");
+        assert_eq!(chunks[2].window_block_seqs, vec![6, 7, 8, 9]);
+
+        // Window 3 should contain only msg 9 (tail window).
+        assert!(chunks[3].text.contains("Msg9"), "window 3 is the tail");
+        assert_eq!(chunks[3].window_block_seqs, vec![9]);
+    }
+
+    #[test]
+    fn messages_window_text_format() {
+        // Verify [sender] (timestamp): text format.
+        let blocks = vec![
+            msg_block(0, "Alice", "2026-01-01T10:00:00Z", "Hello!"),
+            msg_block(1, "Bob", "2026-01-01T10:01:00Z", "Hi there!"),
+        ];
+        let cfg = ChunkerConfig::messages();
+        let chunks = chunk_messages("resource-1", &blocks, &cfg, &CharSizer).unwrap();
+        assert_eq!(chunks.len(), 1, "2 messages within a window → 1 chunk");
+        let text = &chunks[0].text;
+        assert!(
+            text.contains("[Alice] (2026-01-01T10:00:00Z): Hello!"),
+            "should format as [sender] (timestamp): text; got: {text:?}"
+        );
+        assert!(
+            text.contains("[Bob] (2026-01-01T10:01:00Z): Hi there!"),
+            "should include second message; got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn messages_segment_blocks_windowing() {
+        // Segment blocks should behave the same as Message blocks.
+        let blocks: Vec<_> = (0..6)
+            .map(|i| {
+                seg_block(
+                    i as u32,
+                    Some("Speaker"),
+                    i as u64 * 2000,
+                    i as u64 * 2000 + 1999,
+                    &format!("Segment text {i}"),
+                )
+            })
+            .collect();
+        let cfg = ChunkerConfig {
+            preset: "messages".to_string(),
+            target_tokens: Some(5000),
+            overlap_tokens: Some(0),
+            window_turns: Some(4),
+            stride_turns: Some(2),
+        };
+        let chunks = chunk_messages("resource-1", &blocks, &cfg, &CharSizer).unwrap();
+        // 6 turns, window=4, stride=2 → windows at [0..4], [2..6], [4..6] → 3 windows
+        assert_eq!(
+            chunks.len(),
+            3,
+            "6 segments, window=4, stride=2 → 3 chunks; got {}",
+            chunks.len()
+        );
+        // Segment format: [speaker] (start_ms-end_ms): text
+        assert!(
+            chunks[0].text.contains("[Speaker] (0-1999): Segment text 0"),
+            "should format segment as [speaker] (start-end): text"
+        );
+    }
+
+    #[test]
+    fn messages_mixed_blocks_only_sees_message_and_segment() {
+        // Heading + Paragraph + 3 Message + Paragraph + 1 Message
+        // The messages chunker should see only the 4 Message blocks.
+        let blocks = vec![
+            crate::block::Block {
+                seq: 0,
+                kind: crate::block::BlockKind::Heading { level: 1 },
+                text: "Conversation".to_string(),
+                location: None,
+            },
+            crate::block::Block {
+                seq: 1,
+                kind: crate::block::BlockKind::Paragraph,
+                text: "Intro paragraph.".to_string(),
+                location: None,
+            },
+            msg_block(2, "Alice", "2026-01-01T10:00:00Z", "First message"),
+            msg_block(3, "Bob", "2026-01-01T10:01:00Z", "Second message"),
+            msg_block(4, "Alice", "2026-01-01T10:02:00Z", "Third message"),
+            crate::block::Block {
+                seq: 5,
+                kind: crate::block::BlockKind::Paragraph,
+                text: "Interlude paragraph.".to_string(),
+                location: None,
+            },
+            msg_block(6, "Bob", "2026-01-01T10:03:00Z", "Fourth message"),
+        ];
+        let cfg = ChunkerConfig {
+            preset: "messages".to_string(),
+            target_tokens: Some(5000),
+            overlap_tokens: Some(0),
+            window_turns: Some(6),
+            stride_turns: Some(3),
+        };
+        let chunks = chunk_messages("resource-1", &blocks, &cfg, &CharSizer).unwrap();
+        // 4 message blocks, window=6 (fits all 4), stride=3 → windows at 0 and 3.
+        // Window 0: msgs 2,3,4,6. Window 1 (stride 3): msg 6 only (index 3 in turns).
+        assert_eq!(chunks.len(), 2, "4 messages, window=6, stride=3 → 2 chunks; got {}", chunks.len());
+        // First window covers all 4 message blocks.
+        assert_eq!(chunks[0].window_block_seqs, vec![2, 3, 4, 6]);
+        // Should NOT contain non-message text.
+        assert!(
+            !chunks[0].text.contains("Intro paragraph"),
+            "chunker must not include non-message text"
+        );
+    }
+
+    #[test]
+    fn messages_very_long_single_message_splits() {
+        // A single message that exceeds max_tokens should be split into sub-chunks,
+        // with each sub-chunk prefixed by sender/timestamp context.
+        let long_text = "word ".repeat(200); // 200 words
+        let blocks = vec![msg_block(0, "Alice", "2026-01-01T10:00:00Z", &long_text)];
+        let cfg = ChunkerConfig {
+            preset: "messages".to_string(),
+            target_tokens: Some(50), // small budget to force splitting
+            overlap_tokens: Some(0),
+            window_turns: Some(6),
+            stride_turns: Some(3),
+        };
+        let chunks = chunk_messages("resource-1", &blocks, &cfg, &WordSizer).unwrap();
+        assert!(
+            chunks.len() > 1,
+            "very long message should produce multiple sub-chunks; got {}",
+            chunks.len()
+        );
+        // Every sub-chunk should contain the sender prefix.
+        for c in &chunks {
+            assert!(
+                c.text.contains("[Alice]"),
+                "each sub-chunk should preserve sender context; got: {:?}",
+                c.text
+            );
+        }
+    }
+
+    #[test]
+    fn messages_seq_in_block_sequential() {
+        // seq_in_block should be 0, 1, 2, ... across all message chunks.
+        let blocks: Vec<_> = (0..9)
+            .map(|i| msg_block(i as u32, "User", "2026-01-01", &format!("Msg{i}")))
+            .collect();
+        let cfg = ChunkerConfig {
+            preset: "messages".to_string(),
+            target_tokens: Some(5000),
+            overlap_tokens: Some(0),
+            window_turns: Some(6),
+            stride_turns: Some(3),
+        };
+        let chunks = chunk_messages("resource-1", &blocks, &cfg, &CharSizer).unwrap();
+        for (i, c) in chunks.iter().enumerate() {
+            assert_eq!(
+                c.seq_in_block, i as u32,
+                "seq_in_block should be index {i}; got {}",
+                c.seq_in_block
+            );
+        }
+    }
+
+    #[test]
+    fn messages_chunk_document_with_messages_preset_errors() {
+        // chunk_document() should still reject messages preset (requires Block input).
+        let cfg = ChunkerConfig::messages();
+        let result = chunk_document("doc-1", "some text", &cfg, &CharSizer);
+        assert!(
+            result.is_err(),
+            "chunk_document with messages preset must error"
+        );
+        assert_eq!(result.unwrap_err().code(), "invalid_request");
+    }
+
+    #[test]
+    fn messages_config_default_values() {
+        let cfg = ChunkerConfig::messages();
+        assert_eq!(cfg.preset, "messages");
+        assert_eq!(cfg.resolved_window_turns(), 6);
+        assert_eq!(cfg.resolved_stride_turns(), 3);
+        assert_eq!(cfg.resolved_target_tokens(), 512);
     }
 }
