@@ -50,26 +50,30 @@ pub async fn start_daemon(
 ) -> Result<(DaemonHandle, impl std::future::Future<Output = ()>), Error> {
     let bind_addr = options.config.server.bind.as_str();
     let port = options.config.server.port;
+    let socket_guard = bind_socket_guard(&options)?;
+    let (state, url_scheduler) = build_daemon_state(&options).await?;
+    let router = build_router(state.clone());
+    let (listener, bound_addr) = bind_tcp_listener(bind_addr, port).await?;
 
-    // Guard: refuse non-loopback bind without auth.
-    validate_bind_address(bind_addr)?;
+    spawn_config_watcher(options.paths.config_file.clone(), state.clone());
+    spawn_url_scheduler(&state, url_scheduler);
 
-    let socket_guard = SocketGuard::new(&options.paths.socket_path()).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::AddrInUse {
-            Error::DaemonRunning
-        } else {
-            Error::Internal {
-                message: format!(
-                    "cannot bind unix socket at '{}': {}",
-                    options.paths.socket_path().display(),
-                    e
-                ),
-                correlation_id: "socket_bind".to_string(),
-            }
-        }
-    })?;
+    let handle = DaemonHandle {
+        _socket: socket_guard,
+        addr: bound_addr,
+    };
 
-    // Build shared application state.
+    Ok((handle, server_future(listener, router)))
+}
+
+fn bind_socket_guard(options: &DaemonOptions) -> Result<SocketGuard, Error> {
+    validate_bind_address(options.config.server.bind.as_str())?;
+    SocketGuard::new(&options.paths.socket_path())
+}
+
+async fn build_daemon_state(
+    options: &DaemonOptions,
+) -> Result<(AppState, UrlRefreshScheduler), Error> {
     let queue = JobQueue::new();
     let url_scheduler = UrlRefreshScheduler::new(queue.clone());
     let state = AppState::new(
@@ -80,10 +84,10 @@ pub async fn start_daemon(
     )
     .await?;
 
-    // Build router.
-    let router = build_router(state.clone());
+    Ok((state, url_scheduler))
+}
 
-    // Bind TCP listener.
+async fn bind_tcp_listener(bind_addr: &str, port: u16) -> Result<(TcpListener, SocketAddr), Error> {
     let addr_str = format!("{}:{}", bind_addr, port);
     let listener = TcpListener::bind(&addr_str)
         .await
@@ -99,24 +103,19 @@ pub async fn start_daemon(
 
     info!("daemon listening on {}", bound_addr);
 
-    // Spawn config watcher (non-fatal if it fails to start).
-    let config_file_path = options.paths.config_file.clone();
-    let state_for_watcher = state.clone();
+    Ok((listener, bound_addr))
+}
+
+fn spawn_config_watcher(config_file_path: PathBuf, state: AppState) {
     tokio::spawn(async move {
-        let result = run_config_watcher(config_file_path, state_for_watcher).await;
+        let result = run_config_watcher(config_file_path, state).await;
         if let Err(e) = result {
             error!("config watcher failed: {}", e);
         }
     });
+}
 
-    // Spawn URL refresh scheduler.
-    // Per T11 scope: "URL refresh scheduling" — daemon-exclusive capability.
-    // The scheduler polls every 60 seconds by default; each URL source with a
-    // configured refresh_interval_secs will be re-indexed when due.
-    //
-    // Register pre-existing URL sources from the DB at startup. Sources created
-    // after startup are registered dynamically in AppState::add_source.
-    // Uses persisted source IDs (not fresh ULIDs) so refresh history survives restarts.
+fn spawn_url_scheduler(state: &AppState, url_scheduler: UrlRefreshScheduler) {
     let backend_for_url = state.backend_arc();
     let sched_for_url = url_scheduler.clone();
     tokio::spawn(async move {
@@ -151,22 +150,13 @@ pub async fn start_daemon(
             }
         }
     });
-    // Start the scheduler loop in the background.
     tokio::spawn(url_scheduler.run(std::time::Duration::from_secs(60)));
+}
 
-    // Create the server future.
-    let server_future = async move {
-        if let Err(e) = axum::serve(listener, router).await {
-            error!("server error: {}", e);
-        }
-    };
-
-    let handle = DaemonHandle {
-        _socket: socket_guard,
-        addr: bound_addr,
-    };
-
-    Ok((handle, server_future))
+async fn server_future(listener: TcpListener, router: Router) {
+    if let Err(e) = axum::serve(listener, router).await {
+        error!("server error: {}", e);
+    }
 }
 
 /// Build the axum router with all /v1 routes.
@@ -230,15 +220,19 @@ pub fn validate_bind_address(bind: &str) -> Result<(), Error> {
 /// Watch the config file for changes and reload the YAML config snapshot.
 ///
 /// Non-fatal: logs errors but does not stop the daemon.
-async fn run_config_watcher(
-    config_file: PathBuf,
-    state: AppState,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let parent = config_file
-        .parent()
-        .ok_or("config file has no parent directory")?;
+async fn run_config_watcher(config_file: PathBuf, state: AppState) -> Result<(), Error> {
+    let parent = config_file.parent().ok_or_else(|| Error::InvalidConfig {
+        message: "config file has no parent directory".to_string(),
+    })?;
 
-    let (mut rx, _handle) = crate::watcher::watch_path(parent, 300)?;
+    let (mut rx, _handle) =
+        crate::watcher::watch_path(parent, 300).map_err(|e| Error::Internal {
+            message: format!(
+                "cannot start config watcher for '{}': {e}",
+                config_file.display()
+            ),
+            correlation_id: "daemon_config_reload".into(),
+        })?;
 
     info!("config watcher started for: {}", config_file.display());
 
@@ -281,15 +275,48 @@ pub fn parse_refresh_interval(s: &str) -> Option<u64> {
 }
 
 /// Read and parse the config file.
-fn reload_config_file(path: &Path) -> Result<RawConfig, Box<dyn std::error::Error + Send + Sync>> {
-    let contents = std::fs::read_to_string(path)?;
-    let config: RawConfig = serde_yaml::from_str(&contents)?;
+fn reload_config_file(path: &Path) -> Result<RawConfig, Error> {
+    let contents = std::fs::read_to_string(path).map_err(|e| Error::Internal {
+        message: format!("cannot read config file '{}': {e}", path.display()),
+        correlation_id: "daemon_config_reload".into(),
+    })?;
+    let config: RawConfig = serde_yaml::from_str(&contents).map_err(|e| Error::Internal {
+        message: format!("cannot parse config file '{}': {e}", path.display()),
+        correlation_id: "daemon_config_reload".into(),
+    })?;
     Ok(config)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    async fn make_state() -> (TempDir, AppState) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut yaml_config = RawConfig {
+            version: 1,
+            server: Default::default(),
+            paths: Default::default(),
+            defaults: Default::default(),
+            providers: vec![],
+        };
+        yaml_config.defaults.indexing.embedding = localdb_core::config::schema::EmbeddingPolicy {
+            provider: "fake".to_string(),
+            model: "default".to_string(),
+        };
+        let queue = crate::job_queue::JobQueue::new();
+        let state = AppState::new(
+            yaml_config,
+            dir.path().to_path_buf(),
+            queue.clone(),
+            crate::scheduler::UrlRefreshScheduler::new(queue),
+        )
+        .await
+        .unwrap();
+        (dir, state)
+    }
+
     fn make_resolved_paths(dir: &Path) -> ResolvedPaths {
         ResolvedPaths {
             config_file: dir.join("config.yaml"),
@@ -331,6 +358,34 @@ mod tests {
             msg.contains("0.0.0.0") || msg.contains("non-loopback"),
             "error message should describe the problem: {}",
             msg
+        );
+    }
+
+    #[tokio::test]
+    async fn run_config_watcher_returns_invalid_config_when_path_has_no_parent() {
+        let (_dir, state) = make_state().await;
+
+        let err = run_config_watcher(PathBuf::new(), state).await.unwrap_err();
+
+        assert!(
+            matches!(err, Error::InvalidConfig { .. }),
+            "expected InvalidConfig, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn reload_config_file_maps_parse_errors_to_internal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "::not-yaml::").unwrap();
+
+        let err = reload_config_file(&path).unwrap_err();
+
+        assert!(
+            matches!(err, Error::Internal { ref correlation_id, .. } if correlation_id == "daemon_config_reload"),
+            "expected Internal with daemon_config_reload correlation id, got: {:?}",
+            err
         );
     }
 

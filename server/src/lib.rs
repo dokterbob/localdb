@@ -14,6 +14,7 @@ pub mod error;
 pub mod handlers;
 pub mod job_queue;
 pub mod scheduler;
+pub mod search_service;
 pub mod socket;
 pub mod state;
 pub mod watcher;

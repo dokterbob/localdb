@@ -10,7 +10,6 @@ description = "HTTP URL fetcher implementation for localdb ingestion"
 localdb-core = { path = "../core" }
 async-trait = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

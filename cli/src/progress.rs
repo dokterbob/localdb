@@ -4,6 +4,20 @@ use std::sync::{Arc, Mutex};
 use indicatif::{ProgressBar, ProgressStyle};
 use localdb_core::progress::{DocOutcome, ProgressEvent, ProgressSink};
 
+fn lock_or_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn spinner_style(template: &str) -> ProgressStyle {
+    ProgressStyle::with_template(template).unwrap_or_else(|_| ProgressStyle::default_spinner())
+}
+
+fn bar_style(template: &str) -> ProgressStyle {
+    ProgressStyle::with_template(template).unwrap_or_else(|_| ProgressStyle::default_bar())
+}
+
 /// Build a progress sink for CLI use.
 ///
 /// Returns `None` when `--json` is active (stdout must be clean).
@@ -26,52 +40,62 @@ pub fn build_progress_sink(json_mode: bool) -> Option<ProgressSink> {
 // ---------------------------------------------------------------------------
 
 fn tty_sink() -> ProgressSink {
+    let (sink, _, _) = tty_sink_parts();
+    sink
+}
+
+type TtySinkParts = (
+    ProgressSink,
+    Arc<Mutex<Option<ProgressBar>>>,
+    Arc<Mutex<usize>>,
+);
+
+fn tty_sink_parts() -> TtySinkParts {
     let pb: Arc<Mutex<Option<ProgressBar>>> = Arc::new(Mutex::new(None));
 
     // Chunk count accumulator shown in the message slot.
     let chunks: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
 
-    Arc::new(move |event: ProgressEvent| match event {
+    let pb_for_sink = Arc::clone(&pb);
+    let chunks_for_sink = Arc::clone(&chunks);
+
+    let sink = Arc::new(move |event: ProgressEvent| match event {
         ProgressEvent::SourceStarted { location, .. } => {
             let spinner = ProgressBar::new_spinner();
             spinner.set_style(
-                ProgressStyle::with_template("{spinner} {msg}")
-                    .unwrap()
+                spinner_style("{spinner} {msg}")
                     .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
             );
             spinner.set_message(format!("Indexing {location}…"));
             spinner.enable_steady_tick(std::time::Duration::from_millis(80));
-            *pb.lock().unwrap() = Some(spinner);
-            *chunks.lock().unwrap() = 0;
+            *lock_or_poison(&pb_for_sink) = Some(spinner);
+            *lock_or_poison(&chunks_for_sink) = 0;
         }
         ProgressEvent::Discovered { total } => {
-            let mut guard = pb.lock().unwrap();
+            let mut guard = lock_or_poison(&pb_for_sink);
             if let Some(old) = guard.take() {
                 old.finish_and_clear();
             }
             let bar = ProgressBar::new(total as u64);
             bar.set_style(
-                ProgressStyle::with_template(
-                    "{spinner} [{wide_bar}] {pos}/{len} (eta {eta}) {msg}",
-                )
-                .unwrap()
-                .progress_chars("=>-"),
+                bar_style("{spinner} [{wide_bar}] {pos}/{len} (eta {eta}) {msg}")
+                    .progress_chars("=>-"),
             );
             bar.enable_steady_tick(std::time::Duration::from_millis(80));
             *guard = Some(bar);
         }
         ProgressEvent::DocumentStarted { uri, .. } => {
-            let guard = pb.lock().unwrap();
+            let guard = lock_or_poison(&pb_for_sink);
             if let Some(bar) = guard.as_ref() {
                 let name = uri.rsplit('/').next().unwrap_or(&uri).to_string();
                 bar.set_message(name);
             }
         }
         ProgressEvent::DocumentFinished { outcome, .. } => {
-            let guard = pb.lock().unwrap();
+            let guard = lock_or_poison(&pb_for_sink);
             if let Some(bar) = guard.as_ref() {
                 if let DocOutcome::Indexed { chunks: c } = outcome {
-                    let mut total_chunks = chunks.lock().unwrap();
+                    let mut total_chunks = lock_or_poison(&chunks_for_sink);
                     *total_chunks += c;
                     bar.set_message(format!("{} chunks", *total_chunks));
                 }
@@ -79,7 +103,7 @@ fn tty_sink() -> ProgressSink {
             }
         }
         ProgressEvent::SourceFinished { result } => {
-            let mut guard = pb.lock().unwrap();
+            let mut guard = lock_or_poison(&pb_for_sink);
             if let Some(bar) = guard.take() {
                 bar.finish_and_clear();
             }
@@ -88,7 +112,9 @@ fn tty_sink() -> ProgressSink {
                 result.docs_indexed, result.docs_skipped, result.chunks_written
             );
         }
-    })
+    });
+
+    (sink, pb, chunks)
 }
 
 // ---------------------------------------------------------------------------
@@ -118,18 +144,24 @@ impl PlainState {
 const PLAIN_REPORT_INTERVAL: usize = 10;
 
 fn plain_sink() -> ProgressSink {
+    plain_sink_with_emitter(Arc::new(|line: String| {
+        eprintln!("{line}");
+    }))
+}
+
+fn plain_sink_with_emitter(writer: Arc<dyn Fn(String) + Send + Sync>) -> ProgressSink {
     let state: Arc<Mutex<PlainState>> = Arc::new(Mutex::new(PlainState::new()));
 
     Arc::new(move |event: ProgressEvent| {
-        let mut s = state.lock().unwrap();
+        let mut s = lock_or_poison(&state);
         match event {
             ProgressEvent::SourceStarted { location, .. } => {
                 *s = PlainState::new();
-                eprintln!("Indexing {location}");
+                writer(format!("Indexing {location}"));
             }
             ProgressEvent::Discovered { total } => {
                 s.total = total;
-                eprintln!("  discovered {} files", total);
+                writer(format!("  discovered {} files", total));
             }
             ProgressEvent::DocumentStarted { .. } => {}
             ProgressEvent::DocumentFinished { outcome, .. } => {
@@ -143,18 +175,28 @@ fn plain_sink() -> ProgressSink {
                     PLAIN_REPORT_INTERVAL
                 };
                 if s.done - s.last_reported_done >= interval {
-                    eprintln!("  {}", format_plain_progress(s.done, s.total, s.chunks));
+                    writer(format!(
+                        "  {}",
+                        format_plain_progress(s.done, s.total, s.chunks)
+                    ));
                     s.last_reported_done = s.done;
                 }
             }
             ProgressEvent::SourceFinished { result } => {
-                eprintln!(
+                writer(format!(
                     "  indexed {} docs, {} skipped, {} chunks",
                     result.docs_indexed, result.docs_skipped, result.chunks_written
-                );
+                ));
             }
         }
     })
+}
+
+#[cfg(test)]
+fn plain_sink_with_writer(writer: Arc<Mutex<Vec<String>>>) -> ProgressSink {
+    plain_sink_with_emitter(Arc::new(move |line: String| {
+        lock_or_poison(&writer).push(line);
+    }))
 }
 
 /// Pure function: format a mid-progress status line. Unit-testable.
@@ -201,7 +243,8 @@ mod tests {
     #[test]
     fn plain_sink_does_not_panic_on_full_sequence() {
         // Simulate a non-TTY sink driving through a full event sequence.
-        let sink = plain_sink();
+        let writer = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = plain_sink_with_writer(Arc::clone(&writer));
         sink(ProgressEvent::SourceStarted {
             source_id: "s1".to_string(),
             location: "/tmp/test".to_string(),
@@ -230,5 +273,47 @@ mod tests {
                 error_count: 0,
             },
         });
+
+        let output = lock_or_poison(&writer).clone();
+        assert!(output
+            .iter()
+            .any(|line| line.contains("Indexing /tmp/test")));
+        assert!(output
+            .iter()
+            .any(|line| line.contains("chunks_written: 6") || line.contains("6 chunk")));
+        assert_eq!(
+            output,
+            vec![
+                "Indexing /tmp/test".to_string(),
+                "  discovered 3 files".to_string(),
+                "  indexed 3 docs, 0 skipped, 6 chunks".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn poisoned_lock_does_not_panic() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        use std::thread;
+
+        let (sink, pb, _) = tty_sink_parts();
+        let poison = Arc::clone(&pb);
+
+        let handle = thread::spawn(move || {
+            let _guard = lock_or_poison(&poison);
+            panic!("poison progress mutex");
+        });
+
+        let _ = handle.join();
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            sink(ProgressEvent::DocumentStarted {
+                uri: "file:///tmp/test/doc.md".to_string(),
+                index: 0,
+                total: 1,
+            });
+        }));
+
+        assert!(result.is_ok());
     }
 }

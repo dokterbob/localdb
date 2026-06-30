@@ -741,8 +741,6 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 name = "cli"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "clap",
  "embed",
  "extract",
  "fetch",
@@ -750,14 +748,11 @@ dependencies = [
  "localdb-core",
  "mcp",
  "reqwest 0.12.28",
- "serde",
  "serde_json",
  "server",
  "store-libsql",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -1484,7 +1479,6 @@ checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 name = "embed"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-trait",
  "block2",
  "dirs 5.0.1",
@@ -1572,7 +1566,6 @@ dependencies = [
  "pulldown-cmark",
  "rbook",
  "scraper 0.27.0",
- "thiserror 2.0.18",
  "tracing",
  "zip 2.4.2",
 ]
@@ -1625,7 +1618,6 @@ dependencies = [
  "localdb-core",
  "reqwest 0.12.28",
  "tokio",
- "tracing",
  "wiremock",
 ]
 
@@ -1714,16 +1706,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76ee7a02da4d231650c7cea31349b889be2f45ddb3ef3032d2ec8185f6313fd2"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "fslock"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04412b8935272e3a9bae6f48c7bfff74c2911f60525404edfdd28e49884c3bfb"
-dependencies = [
- "libc",
- "winapi",
 ]
 
 [[package]]
@@ -2982,18 +2964,14 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 name = "localdb"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "assert_cmd",
  "clap",
  "cli",
  "libsql",
- "localdb-core",
  "predicates",
- "serde",
  "serde_json",
  "tempfile",
  "tokio",
- "tracing",
  "tracing-subscriber",
 ]
 
@@ -3006,10 +2984,8 @@ dependencies = [
  "directories",
  "dirs 6.0.0",
  "extract",
- "futures",
  "globset",
  "hex",
- "libsql",
  "pulldown-cmark",
  "serde",
  "serde_json",
@@ -3179,13 +3155,10 @@ dependencies = [
 name = "mcp"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "localdb-core",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -3376,7 +3349,6 @@ dependencies = [
  "libc",
  "log",
  "mio 0.8.11",
- "serde",
  "walkdir",
  "windows-sys 0.48.0",
 ]
@@ -4931,13 +4903,9 @@ dependencies = [
 name = "server"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "axum 0.8.9",
  "embed",
- "fslock",
- "futures",
  "localdb-core",
- "notify",
  "notify-debouncer-mini",
  "reqwest 0.12.28",
  "serde",
@@ -4945,12 +4913,9 @@ dependencies = [
  "serde_yaml",
  "store-libsql",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
  "tower 0.5.3",
- "tower-http 0.6.11",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -5148,12 +5113,9 @@ dependencies = [
  "async-trait",
  "libsql",
  "localdb-core",
- "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -5736,7 +5698,6 @@ dependencies = [
  "tower 0.5.3",
  "tower-layer",
  "tower-service",
- "tracing",
  "url",
 ]
 

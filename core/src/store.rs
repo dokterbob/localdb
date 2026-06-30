@@ -154,6 +154,20 @@ pub enum MetadataFilter {
     PolicyVersion(String),
 }
 
+impl MetadataFilter {
+    pub fn matches(&self, record: &ChunkRecord) -> bool {
+        match self {
+            MetadataFilter::Mime(mime) => record.mime.as_deref() == Some(mime.as_str()),
+            MetadataFilter::UriPrefix(prefix) => record.uri.starts_with(prefix.as_str()),
+            MetadataFilter::FetchedAfter(ts) => record.fetched_at.as_str() >= ts.as_str(),
+            MetadataFilter::FetchedBefore(ts) => record.fetched_at.as_str() <= ts.as_str(),
+            MetadataFilter::SourceId(id) => &record.source_id == id,
+            MetadataFilter::DocumentId(id) => &record.document_id == id,
+            MetadataFilter::PolicyVersion(v) => &record.policy_version == v,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // StoreStats
 // ---------------------------------------------------------------------------
@@ -312,46 +326,7 @@ fn simple_bm25_score(query: &str, text: &str) -> f32 {
 /// Apply metadata filters to a chunk record. Returns `true` if the record passes.
 #[cfg(any(test, feature = "test-support"))]
 fn passes_filters(record: &ChunkRecord, filters: &[MetadataFilter]) -> bool {
-    for filter in filters {
-        match filter {
-            MetadataFilter::Mime(mime) => {
-                if record.mime.as_deref() != Some(mime.as_str()) {
-                    return false;
-                }
-            }
-            MetadataFilter::UriPrefix(prefix) => {
-                if !record.uri.starts_with(prefix.as_str()) {
-                    return false;
-                }
-            }
-            MetadataFilter::FetchedAfter(ts) => {
-                if record.fetched_at.as_str() < ts.as_str() {
-                    return false;
-                }
-            }
-            MetadataFilter::FetchedBefore(ts) => {
-                if record.fetched_at.as_str() > ts.as_str() {
-                    return false;
-                }
-            }
-            MetadataFilter::SourceId(id) => {
-                if &record.source_id != id {
-                    return false;
-                }
-            }
-            MetadataFilter::DocumentId(id) => {
-                if &record.document_id != id {
-                    return false;
-                }
-            }
-            MetadataFilter::PolicyVersion(v) => {
-                if &record.policy_version != v {
-                    return false;
-                }
-            }
-        }
-    }
-    true
+    filters.iter().all(|f| f.matches(record))
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1092,5 +1067,33 @@ mod tests {
         let results = store.dense_search(&[1.0, 0.0], 10, &filter).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].chunk.id, "chunk-1");
+    }
+
+    #[test]
+    fn metadata_filter_matches_all_variants() {
+        let record = make_test_record("chunk-1", "doc-1", "text", vec![1.0, 0.0]);
+
+        assert!(MetadataFilter::Mime("text/plain".to_string()).matches(&record));
+        assert!(!MetadataFilter::Mime("text/html".to_string()).matches(&record));
+
+        assert!(MetadataFilter::UriPrefix("file:///".to_string()).matches(&record));
+        assert!(!MetadataFilter::UriPrefix("https://".to_string()).matches(&record));
+
+        assert!(MetadataFilter::FetchedAfter("2026-06-01T00:00:00Z".to_string()).matches(&record));
+        assert!(!MetadataFilter::FetchedAfter("2026-06-11T00:00:00Z".to_string()).matches(&record));
+
+        assert!(MetadataFilter::FetchedBefore("2026-07-01T00:00:00Z".to_string()).matches(&record));
+        assert!(
+            !MetadataFilter::FetchedBefore("2026-06-01T00:00:00Z".to_string()).matches(&record)
+        );
+
+        assert!(MetadataFilter::SourceId("src-1".to_string()).matches(&record));
+        assert!(!MetadataFilter::SourceId("src-2".to_string()).matches(&record));
+
+        assert!(MetadataFilter::DocumentId("doc-1".to_string()).matches(&record));
+        assert!(!MetadataFilter::DocumentId("doc-2".to_string()).matches(&record));
+
+        assert!(MetadataFilter::PolicyVersion("v1".to_string()).matches(&record));
+        assert!(!MetadataFilter::PolicyVersion("v2".to_string()).matches(&record));
     }
 }

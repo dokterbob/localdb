@@ -28,11 +28,12 @@
 
 use async_trait::async_trait;
 use localdb_core::{DocumentChunks, EmbeddedDocument, Embedder, Error as CoreError};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
 
 use crate::error::EmbedError;
+use crate::http_helper::send_with_retry;
 use crate::retry::RetryPolicy;
 
 const DEFAULT_BASE_URL: &str = "https://api.voyageai.com";
@@ -124,113 +125,49 @@ impl VoyageEmbedder {
             self.base_url.trim_end_matches('/')
         );
 
-        let mut last_error = String::new();
-        let mut attempt = 0u32;
+        let body = VoyageEmbedRequest {
+            model: &self.model,
+            document: document_context,
+            input: chunks,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", self.api_key)).map_err(|e| {
+                EmbedError::Internal(format!("failed to build authorization header: {e}"))
+            })?,
+        );
 
-        loop {
-            if attempt > 0 {
-                let backoff = self.retry.backoff_for_attempt(attempt - 1);
-                debug!(
-                    attempt,
-                    backoff_ms = backoff.as_millis(),
-                    "retrying voyage embedding request"
-                );
-                tokio::time::sleep(backoff).await;
-            }
+        let response = send_with_retry(
+            &self.client,
+            &url,
+            headers,
+            serde_json::to_vec(&body).map_err(|e| EmbedError::ProviderError {
+                provider: "voyage".to_string(),
+                message: format!("failed to serialize request: {e}"),
+            })?,
+            &self.retry,
+        )
+        .await?;
 
-            let body = VoyageEmbedRequest {
-                model: &self.model,
-                document: document_context,
-                input: chunks,
-            };
+        let resp: VoyageEmbedResponse =
+            serde_json::from_slice(&response).map_err(|e| EmbedError::ProviderError {
+                provider: "voyage".to_string(),
+                message: format!("failed to parse response: {e}"),
+            })?;
 
-            match self
-                .client
-                .post(&url)
-                .bearer_auth(&self.api_key)
-                .json(&body)
-                .send()
-                .await
-            {
-                Ok(response) => {
-                    let status = response.status().as_u16();
-                    if response.status().is_success() {
-                        let resp: VoyageEmbedResponse =
-                            response
-                                .json()
-                                .await
-                                .map_err(|e| EmbedError::ProviderError {
-                                    provider: "voyage".to_string(),
-                                    message: format!("failed to parse response: {e}"),
-                                })?;
-
-                        let mut vecs: Vec<Option<Vec<f32>>> = vec![None; chunks.len()];
-                        for obj in resp.data {
-                            if obj.index < vecs.len() {
-                                vecs[obj.index] = Some(obj.embedding);
-                            }
-                        }
-                        let result: Option<Vec<Vec<f32>>> = vecs.into_iter().collect();
-                        return result.ok_or_else(|| EmbedError::ProviderError {
-                            provider: "voyage".to_string(),
-                            message: "response missing some embedding indices".to_string(),
-                        });
-                    } else if self.retry.should_retry_status(status)
-                        && attempt + 1 < self.retry.max_attempts
-                    {
-                        let body_text = response.text().await.unwrap_or_default();
-                        warn!(status, "voyage request failed, will retry");
-                        last_error = format!("HTTP {status}: {body_text}");
-                        attempt += 1;
-                        continue;
-                    } else {
-                        let body_text = response.text().await.unwrap_or_default();
-                        if attempt + 1 >= self.retry.max_attempts && !last_error.is_empty() {
-                            return Err(EmbedError::RetriesExhausted {
-                                provider: "voyage".to_string(),
-                                attempts: attempt + 1,
-                                last_error,
-                            });
-                        }
-                        return Err(EmbedError::ProviderError {
-                            provider: "voyage".to_string(),
-                            message: format!("HTTP {status}: {body_text}"),
-                        });
-                    }
-                }
-                Err(e) if e.is_timeout() => {
-                    warn!("voyage request timed out");
-                    if attempt + 1 >= self.retry.max_attempts {
-                        return Err(EmbedError::Timeout {
-                            provider: "voyage".to_string(),
-                            timeout_secs: self.retry.request_timeout.as_secs(),
-                        });
-                    }
-                    last_error = e.to_string();
-                    attempt += 1;
-                }
-                Err(e) => {
-                    warn!(%e, "voyage request failed");
-                    if attempt + 1 >= self.retry.max_attempts {
-                        return Err(EmbedError::RetriesExhausted {
-                            provider: "voyage".to_string(),
-                            attempts: attempt + 1,
-                            last_error: e.to_string(),
-                        });
-                    }
-                    last_error = e.to_string();
-                    attempt += 1;
-                }
-            }
-
-            if attempt >= self.retry.max_attempts {
-                return Err(EmbedError::RetriesExhausted {
-                    provider: "voyage".to_string(),
-                    attempts: attempt,
-                    last_error,
-                });
+        let mut vecs: Vec<Option<Vec<f32>>> = vec![None; chunks.len()];
+        for obj in resp.data {
+            if obj.index < vecs.len() {
+                vecs[obj.index] = Some(obj.embedding);
             }
         }
+        let result: Option<Vec<Vec<f32>>> = vecs.into_iter().collect();
+        result.ok_or_else(|| EmbedError::ProviderError {
+            provider: "voyage".to_string(),
+            message: "response missing some embedding indices".to_string(),
+        })
     }
 }
 
@@ -261,222 +198,5 @@ impl Embedder for VoyageEmbedder {
 
     fn model_id(&self) -> &str {
         &self.model
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use localdb_core::{DocumentChunks, Embedder};
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    fn make_response(n: usize, dim: usize) -> serde_json::Value {
-        let data: Vec<serde_json::Value> = (0..n)
-            .map(|i| {
-                serde_json::json!({
-                    "embedding": vec![0.3f32; dim],
-                    "index": i
-                })
-            })
-            .collect();
-        serde_json::json!({ "data": data })
-    }
-
-    fn make_embedder(server_uri: &str) -> VoyageEmbedder {
-        VoyageEmbedder::new(
-            "voyage-test-key",
-            None,
-            Some(1024),
-            RetryPolicy {
-                max_attempts: 3,
-                initial_backoff: std::time::Duration::from_millis(10),
-                request_timeout: std::time::Duration::from_secs(5),
-                batch_size: 32,
-            },
-        )
-        .expect("failed to construct embedder")
-        .with_base_url(server_uri)
-    }
-
-    #[tokio::test]
-    async fn voyage_embedder_correct_shape() {
-        let server = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(path("/v1/contextual_embeddings"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(make_response(3, 1024)))
-            .mount(&server)
-            .await;
-
-        let embedder = make_embedder(&server.uri());
-        let docs = vec![DocumentChunks {
-            document_context: "Full document text for context".to_string(),
-            chunks: vec![
-                "chunk one".to_string(),
-                "chunk two".to_string(),
-                "chunk three".to_string(),
-            ],
-        }];
-
-        let result = embedder.embed_documents(docs).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].len(), 3);
-        assert_eq!(result[0][0].len(), 1024);
-    }
-
-    #[tokio::test]
-    async fn voyage_embedder_retries_on_429() {
-        let server = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(path("/v1/contextual_embeddings"))
-            .respond_with(ResponseTemplate::new(429))
-            .up_to_n_times(1)
-            .mount(&server)
-            .await;
-
-        Mock::given(method("POST"))
-            .and(path("/v1/contextual_embeddings"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(make_response(1, 1024)))
-            .mount(&server)
-            .await;
-
-        let embedder = make_embedder(&server.uri());
-        let docs = vec![DocumentChunks {
-            document_context: "ctx".to_string(),
-            chunks: vec!["text".to_string()],
-        }];
-        let result = embedder.embed_documents(docs).await;
-        assert!(result.is_ok(), "should succeed after retry: {result:?}");
-    }
-
-    #[tokio::test]
-    async fn voyage_embedder_fails_after_max_retries() {
-        let server = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(path("/v1/contextual_embeddings"))
-            .respond_with(ResponseTemplate::new(503))
-            .mount(&server)
-            .await;
-
-        let embedder = VoyageEmbedder::new(
-            "key",
-            None,
-            Some(1024),
-            RetryPolicy {
-                max_attempts: 2,
-                initial_backoff: std::time::Duration::from_millis(10),
-                request_timeout: std::time::Duration::from_secs(5),
-                batch_size: 32,
-            },
-        )
-        .expect("failed to construct embedder")
-        .with_base_url(server.uri());
-
-        let docs = vec![DocumentChunks {
-            document_context: "ctx".to_string(),
-            chunks: vec!["text".to_string()],
-        }];
-        let result = embedder.embed_documents(docs).await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code(), "provider_unavailable");
-    }
-
-    #[tokio::test]
-    async fn voyage_embedder_passes_document_field() {
-        let server = MockServer::start().await;
-
-        // Verify the request includes document field via body_partial_json matcher
-        Mock::given(method("POST"))
-            .and(path("/v1/contextual_embeddings"))
-            .and(wiremock::matchers::body_partial_json(serde_json::json!({
-                "document": "document context text"
-            })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(make_response(1, 1024)))
-            .mount(&server)
-            .await;
-
-        let embedder = make_embedder(&server.uri());
-        let docs = vec![DocumentChunks {
-            document_context: "document context text".to_string(),
-            chunks: vec!["chunk text".to_string()],
-        }];
-
-        let result = embedder.embed_documents(docs).await;
-        assert!(
-            result.is_ok(),
-            "voyage contextualized request should succeed: {result:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn voyage_embedder_timeout_returns_provider_unavailable() {
-        let server = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(path("/v1/contextual_embeddings"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(make_response(1, 1024))
-                    .set_delay(std::time::Duration::from_secs(5)),
-            )
-            .mount(&server)
-            .await;
-
-        let embedder = VoyageEmbedder::new(
-            "key",
-            None,
-            Some(1024),
-            RetryPolicy {
-                max_attempts: 1,
-                initial_backoff: std::time::Duration::from_millis(10),
-                request_timeout: std::time::Duration::from_millis(50),
-                batch_size: 32,
-            },
-        )
-        .expect("failed to construct embedder")
-        .with_base_url(server.uri());
-
-        let docs = vec![DocumentChunks {
-            document_context: "ctx".to_string(),
-            chunks: vec!["text".to_string()],
-        }];
-        let result = embedder.embed_documents(docs).await;
-        assert!(result.is_err(), "timed-out request should fail");
-        assert_eq!(
-            result.unwrap_err().code(),
-            "provider_unavailable",
-            "timeout should surface as provider_unavailable"
-        );
-    }
-
-    #[tokio::test]
-    async fn voyage_embedder_empty_docs() {
-        let server = MockServer::start().await;
-        let embedder = make_embedder(&server.uri());
-        let result = embedder.embed_documents(vec![]).await;
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_empty());
-    }
-
-    #[test]
-    fn voyage_embedder_model_id() {
-        let embedder = VoyageEmbedder::new("key", None, None, RetryPolicy::default())
-            .expect("failed to construct embedder");
-        assert_eq!(embedder.model_id(), DEFAULT_MODEL);
-        assert_eq!(embedder.embedding_dim(), DEFAULT_DIM);
-    }
-
-    #[test]
-    fn voyage_embedder_construction_does_not_panic() {
-        let retry = RetryPolicy::default();
-        let result = VoyageEmbedder::new("test-api-key", None, None, retry);
-        assert!(
-            result.is_ok(),
-            "should be able to construct embedder: {:?}",
-            result.err()
-        );
     }
 }

@@ -2,12 +2,15 @@
 ///
 /// Run with:
 ///   cargo test -p extract --test anytomd_xlsx_bug -- --ignored --nocapture
-#[test]
 #[ignore]
+#[test]
 fn anytomd_xlsx_hangs_on_large_file() {
     use std::time::{Duration, Instant};
 
-    let path = "/Users/drbob/Nextcloud/Work/Treescape/Data/EU Species Lists/official_EU_list_2023_05_16.xlsx";
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/eu_species_list_2023_05_16.xlsx"
+    );
     let bytes = std::fs::read(path).expect("test XLSX file must exist");
     eprintln!("Read {} bytes from XLSX", bytes.len());
 

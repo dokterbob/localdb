@@ -94,6 +94,38 @@ pub struct FusedChunkEntry {
     pub bm25_score: Option<f64>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum Leg {
+    Dense,
+    Bm25,
+}
+
+fn add_leg(
+    entries: &mut HashMap<String, FusedChunkEntry>,
+    results: &[SearchResult],
+    k: f64,
+    leg: Leg,
+) {
+    for (rank, result) in results.iter().enumerate() {
+        let contribution = rrf_score(rank, k);
+        let entry = entries
+            .entry(result.chunk.id.clone())
+            .or_insert_with(|| FusedChunkEntry {
+                chunk: result.chunk.clone(),
+                fused_score: 0.0,
+                dense_score: None,
+                bm25_score: None,
+            });
+
+        entry.fused_score += contribution;
+
+        match leg {
+            Leg::Dense => entry.dense_score = Some(result.score as f64),
+            Leg::Bm25 => entry.bm25_score = Some(result.score as f64),
+        }
+    }
+}
+
 /// Fuse two ranked lists using Reciprocal Rank Fusion.
 ///
 /// - `dense_results`: ranked results from the dense leg (most similar first).
@@ -114,33 +146,8 @@ pub fn rrf_fuse(
 ) -> Vec<FusedChunkEntry> {
     let mut entries: HashMap<String, FusedChunkEntry> = HashMap::new();
 
-    for (rank, result) in dense_results.iter().enumerate() {
-        let contribution = rrf_score(rank, k);
-        let entry = entries
-            .entry(result.chunk.id.clone())
-            .or_insert_with(|| FusedChunkEntry {
-                chunk: result.chunk.clone(),
-                fused_score: 0.0,
-                dense_score: None,
-                bm25_score: None,
-            });
-        entry.fused_score += contribution;
-        entry.dense_score = Some(result.score as f64);
-    }
-
-    for (rank, result) in bm25_results.iter().enumerate() {
-        let contribution = rrf_score(rank, k);
-        let entry = entries
-            .entry(result.chunk.id.clone())
-            .or_insert_with(|| FusedChunkEntry {
-                chunk: result.chunk.clone(),
-                fused_score: 0.0,
-                dense_score: None,
-                bm25_score: None,
-            });
-        entry.fused_score += contribution;
-        entry.bm25_score = Some(result.score as f64);
-    }
+    add_leg(&mut entries, dense_results, k, Leg::Dense);
+    add_leg(&mut entries, bm25_results, k, Leg::Bm25);
 
     let mut sorted: Vec<FusedChunkEntry> = entries.into_values().collect();
     sorted.sort_by(|a, b| {

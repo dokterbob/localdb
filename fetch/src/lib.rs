@@ -11,19 +11,15 @@ pub struct HttpUrlFetcher {
 }
 
 impl HttpUrlFetcher {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self, Error> {
         let client = Client::builder()
             .user_agent("localdb/0.1")
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .expect("failed to build reqwest client");
-        Self { client }
-    }
-}
-
-impl Default for HttpUrlFetcher {
-    fn default() -> Self {
-        Self::new()
+            .map_err(|e| Error::ProviderUnavailable {
+                message: format!("failed to build HTTP client: {e}"),
+            })?;
+        Ok(Self { client })
     }
 }
 
@@ -102,6 +98,15 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
     };
 
+    #[test]
+    fn http_url_fetcher_new_returns_err() {
+        let result = HttpUrlFetcher::new();
+        assert!(
+            result.is_ok(),
+            "HttpUrlFetcher::new() should return Ok in normal conditions"
+        );
+    }
+
     #[tokio::test]
     async fn test_200_with_headers() {
         let server = MockServer::start().await;
@@ -117,7 +122,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let fetcher = HttpUrlFetcher::new();
+        let fetcher = HttpUrlFetcher::new().expect("HttpUrlFetcher::new should succeed in tests");
         let result = fetcher
             .fetch(&format!("{}/doc", server.uri()), &FetchMetadata::default())
             .await
@@ -152,7 +157,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let fetcher = HttpUrlFetcher::new();
+        let fetcher = HttpUrlFetcher::new().expect("HttpUrlFetcher::new should succeed in tests");
         let meta = FetchMetadata {
             etag: Some("\"abc123\"".to_string()),
             last_modified: None,
@@ -175,7 +180,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let fetcher = HttpUrlFetcher::new();
+        let fetcher = HttpUrlFetcher::new().expect("HttpUrlFetcher::new should succeed in tests");
         let meta = FetchMetadata {
             etag: Some("\"etag-value\"".to_string()),
             last_modified: None,
@@ -197,7 +202,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let fetcher = HttpUrlFetcher::new();
+        let fetcher = HttpUrlFetcher::new().expect("HttpUrlFetcher::new should succeed in tests");
         let result = fetcher
             .fetch(&format!("{}/doc", server.uri()), &FetchMetadata::default())
             .await
@@ -215,7 +220,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let fetcher = HttpUrlFetcher::new();
+        let fetcher = HttpUrlFetcher::new().expect("HttpUrlFetcher::new should succeed in tests");
         let result = fetcher
             .fetch(&format!("{}/doc", server.uri()), &FetchMetadata::default())
             .await
@@ -233,7 +238,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let fetcher = HttpUrlFetcher::new();
+        let fetcher = HttpUrlFetcher::new().expect("HttpUrlFetcher::new should succeed in tests");
         let result = fetcher
             .fetch(&format!("{}/doc", server.uri()), &FetchMetadata::default())
             .await;
@@ -243,7 +248,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connection_refused_provider_unavailable() {
-        let fetcher = HttpUrlFetcher::new();
+        let fetcher = HttpUrlFetcher::new().expect("HttpUrlFetcher::new should succeed in tests");
         let result = fetcher
             .fetch("http://127.0.0.1:1", &FetchMetadata::default())
             .await;

@@ -5,7 +5,7 @@
 //!
 //! Scanned PDFs (no text layer) yield [`Error::UnsupportedFormat`], not garbage text.
 //!
-//! TODO: page-number citations — `pdf-extract` uses form-feed (`\x0C`) as page
+//! TODO(#103): page-number citations — `pdf-extract` uses form-feed (`\x0C`) as page
 //! separators; byte-offset → page number is cheap to compute and could be surfaced
 //! through the `heading_path` channel or a future `units` sidecar. Left as a seam.
 
