@@ -103,15 +103,15 @@ async fn upsert_chunks_inner(
         // `document_id` on ChunkRecord maps to `id` (and `resource_id`) in the
         // new schema.  `source_kind` maps to `ingestor_kind`.
         let resource_key = (record.store_id.clone(), record.document_id.clone());
-        if !seen_resources.contains_key(&resource_key) {
+        if let std::collections::hash_map::Entry::Vacant(e) =
+            seen_resources.entry(resource_key)
+        {
             let metadata_json =
                 serde_json::to_string(&record.metadata).map_err(|e| Error::Internal {
                     message: format!("upsert_chunks metadata serialize: {e}"),
                     correlation_id: "store_handle_upsert_meta".to_string(),
                 })?;
             let title = record.metadata.title.as_deref();
-            // Upsert into `resources`. Fields that have no direct equivalent in
-            // the old ChunkRecord are filled with sensible defaults.
             conn.execute(
                 "INSERT INTO resources (store_id, id, source_id, ingestor_kind, resource_kind,
                      uri, title, mime, content_hash, added_at, modified_at, origin_store,
@@ -146,7 +146,7 @@ async fn upsert_chunks_inner(
             )
             .await
             .map_err(map_libsql_err)?;
-            seen_resources.insert(resource_key, true);
+            e.insert(true);
         }
 
         let vector_sql = match encoding {

@@ -547,8 +547,8 @@ fn main() {}
         // At the deep text block, path should include all three headings.
         let deep_text_seq = blocks
             .iter()
-            .filter(|b| b.kind == BlockKind::Paragraph)
-            .last()
+            .rev()
+            .find(|b| b.kind == BlockKind::Paragraph)
             .map(|b| b.seq)
             .unwrap();
         let deep_path = heading_path_from_blocks(&blocks, deep_text_seq);
