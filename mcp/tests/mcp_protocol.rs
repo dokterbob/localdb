@@ -72,6 +72,8 @@ async fn make_server_with_seeded_store() -> (McpServer, String, String) {
         mime: Some("text/markdown".to_string()),
         uri: uri.to_string(),
         metadata: localdb_core::DocumentMetadata::default(),
+        block_seq: 0,
+        seq_in_block: 0,
     };
 
     store.upsert_chunks(vec![record]).await.expect("seed chunk");
@@ -538,6 +540,8 @@ async fn test_search_limit_respected() {
             mime: Some("text/markdown".to_string()),
             uri,
             metadata: localdb_core::DocumentMetadata::default(),
+            block_seq: 0,
+            seq_in_block: 0,
         });
     }
     store.upsert_chunks(records).await.unwrap();

@@ -145,6 +145,8 @@ pub(crate) async fn seed_store_a_chunk(state: &AppState, input: SeedChunkInput) 
         mime: Some("text/plain".to_string()),
         uri: input.uri.to_string(),
         metadata: input.metadata,
+        block_seq: 0,
+        seq_in_block: 0,
     };
     state
         .backend()

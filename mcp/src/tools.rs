@@ -506,6 +506,8 @@ mod get_document_tests {
                 mime: None,
                 uri: doc_uri.to_string(),
                 metadata: metadata.clone(),
+                block_seq: 0,
+                seq_in_block: 0,
             }
         };
         store
@@ -592,6 +594,8 @@ mod tests {
             mime: Some("text/plain".to_string()),
             uri: format!("file:///docs/{document_id}.md"),
             metadata: localdb_core::parser::DocumentMetadata::default(),
+            block_seq: 0,
+            seq_in_block: 0,
         }
     }
 
@@ -854,6 +858,8 @@ mod tests {
                 date,
                 ..Default::default()
             },
+            block_seq: None,
+            block_kind: None,
         }
     }
 

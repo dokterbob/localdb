@@ -82,5 +82,7 @@ pub(crate) fn row_to_chunk_record_strict(row: &libsql::Row) -> Result<ChunkRecor
         mime,
         uri,
         metadata,
+        block_seq: 0,
+        seq_in_block: 0,
     })
 }

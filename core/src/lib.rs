@@ -14,7 +14,9 @@ pub mod error;
 pub mod heading_index;
 pub mod ids;
 pub mod ingestor;
+pub mod ingestors;
 pub mod ingestion;
+pub mod markdown_blocks;
 pub mod metadata;
 pub mod parser;
 pub mod progress;
@@ -32,7 +34,11 @@ pub use block::{
     Block, BlockKind, BlockLocation, BoundingBox, ChunkLocation, IngestorKind, Resource,
     ResourceKind,
 };
-pub use chunker::{chunk_document, CharSizer, ChunkOutput, ChunkSizer, ChunkerConfig, TokenSizer};
+pub use chunker::{
+    chunk_blocks, chunk_document, CharSizer, ChunkOutput, ChunkSizer, ChunkerConfig, TokenSizer,
+};
+pub use markdown_blocks::{heading_path_from_blocks, markdown_to_blocks};
+pub use ingestors::{FileIngestor, UrlIngestor};
 /// Re-export key types at the crate root for convenience.
 pub use citation::Citation;
 pub use embedder::{

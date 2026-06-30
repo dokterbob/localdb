@@ -641,6 +641,8 @@ mod tests {
             mime: Some("text/plain".to_string()),
             uri: "file:///test.md".to_string(),
             metadata: localdb_core::DocumentMetadata::default(),
+            block_seq: 0,
+            seq_in_block: 0,
         };
 
         let handle = state.backend().retrieval_store(&store_id).await.unwrap();

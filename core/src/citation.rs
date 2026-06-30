@@ -83,6 +83,18 @@ pub struct Citation {
     /// Document metadata (Dublin Core); empty/`None` fields when none was extracted.
     #[serde(default)]
     pub metadata: DocumentMetadata,
+
+    /// Block sequence number where this chunk originated.
+    ///
+    /// `None` for citations produced before the Resource/Block architecture.
+    #[serde(default)]
+    pub block_seq: Option<u32>,
+
+    /// Block kind string (e.g. "paragraph", "heading").
+    ///
+    /// `None` for citations produced before the Resource/Block architecture.
+    #[serde(default)]
+    pub block_kind: Option<String>,
 }
 
 #[cfg(test)]
@@ -123,6 +135,8 @@ mod tests {
                 date: Some("2026-01-15".to_string()),
                 ..Default::default()
             },
+            block_seq: None,
+            block_kind: None,
         }
     }
 

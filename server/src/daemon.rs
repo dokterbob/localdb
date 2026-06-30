@@ -605,6 +605,8 @@ mod tests {
             mime: Some("text/markdown".to_string()),
             uri: format!("file://{}", watched_file.display()),
             metadata: localdb_core::DocumentMetadata::default(),
+            block_seq: 0,
+            seq_in_block: 0,
         }];
 
         // Submit a job that upserts the chunk (simulating real ingestion).

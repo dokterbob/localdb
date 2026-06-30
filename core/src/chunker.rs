@@ -96,6 +96,10 @@ pub struct ChunkOutput {
     pub span: Span,
     /// Heading path at the chunk's start offset.
     pub heading_path: Vec<String>,
+    /// Block sequence number this chunk came from (0 when not block-aware).
+    pub block_seq: u32,
+    /// Position of this chunk within the block (0-indexed).
+    pub seq_in_block: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -174,6 +178,86 @@ impl ChunkerConfig {
     pub fn resolved_overlap_tokens(&self) -> usize {
         self.overlap_tokens.unwrap_or(0)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Block-aware chunk function
+// ---------------------------------------------------------------------------
+
+/// Chunk a sequence of typed [`Block`]s into `ChunkOutput` records.
+///
+/// Dispatches each block by kind:
+/// - `Heading`, `Paragraph`, `Quote`, `List`, `Message`, `Segment` → prose chunker.
+/// - `Code`, `Table` → code chunker.
+/// - `Reference`, `Attachment`, `Frontmatter`, `Image` → single chunk per block.
+///
+/// For each sub-chunk within a block:
+/// - `block_seq` is set to `block.seq`.
+/// - `seq_in_block` is set to the chunk's index within that block.
+/// - `heading_path` is derived from `heading_path_from_blocks`.
+///
+/// Blocks with empty text are skipped.
+pub fn chunk_blocks(
+    resource_id: &str,
+    blocks: &[crate::block::Block],
+    config: &ChunkerConfig,
+    sizer: &dyn ChunkSizer,
+) -> Result<Vec<ChunkOutput>, Error> {
+    use crate::block::BlockKind;
+    use crate::markdown_blocks::heading_path_from_blocks;
+
+    let mut out: Vec<ChunkOutput> = Vec::new();
+
+    for block in blocks {
+        if block.text.is_empty() {
+            continue;
+        }
+
+        let heading_path = heading_path_from_blocks(blocks, block.seq);
+
+        let sub_chunks: Vec<ChunkOutput> = match &block.kind {
+            // Prose-style blocks
+            BlockKind::Heading { .. }
+            | BlockKind::Paragraph
+            | BlockKind::Quote
+            | BlockKind::List { .. }
+            | BlockKind::Message { .. }
+            | BlockKind::Segment { .. } => {
+                chunk_prose(resource_id, &block.text, config, sizer)?
+            }
+            // Code/table blocks
+            BlockKind::Code { .. } | BlockKind::Table { .. } => {
+                chunk_code(resource_id, &block.text, config)?
+            }
+            // Single-block pass-through
+            BlockKind::Reference { .. }
+            | BlockKind::Attachment { .. }
+            | BlockKind::Frontmatter { .. }
+            | BlockKind::Image { .. } => {
+                let text = &block.text;
+                let id = chunk_id(resource_id, text, 0, text.len());
+                vec![ChunkOutput {
+                    id,
+                    text: text.clone(),
+                    span: crate::types::Span::new(0, text.len()),
+                    heading_path: heading_path.clone(),
+                    block_seq: block.seq,
+                    seq_in_block: 0,
+                }]
+            }
+        };
+
+        for (i, mut c) in sub_chunks.into_iter().enumerate() {
+            c.block_seq = block.seq;
+            c.seq_in_block = i as u32;
+            if c.heading_path.is_empty() {
+                c.heading_path = heading_path.clone();
+            }
+            out.push(c);
+        }
+    }
+
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -292,6 +376,8 @@ fn chunk_prose(
             text: chunk.to_string(),
             span,
             heading_path,
+            block_seq: 0,
+            seq_in_block: 0,
         });
     }
 
@@ -338,6 +424,8 @@ fn chunk_code(
                         text: chunk_text.to_string(),
                         span: Span::new(cs, ce),
                         heading_path: vec![],
+                        block_seq: 0,
+                        seq_in_block: 0,
                     });
                 }
             }
@@ -364,6 +452,8 @@ fn chunk_code(
                         text: chunk_text.to_string(),
                         span: Span::new(pos, piece_end),
                         heading_path: vec![],
+                        block_seq: 0,
+                        seq_in_block: 0,
                     });
                 }
                 pos = piece_end;
@@ -386,6 +476,8 @@ fn chunk_code(
                     text: chunk_text.to_string(),
                     span: Span::new(cs, ce),
                     heading_path: vec![],
+                    block_seq: 0,
+                    seq_in_block: 0,
                 });
             }
             current_start = line_start;
@@ -409,6 +501,8 @@ fn chunk_code(
                 text: chunk_text.to_string(),
                 span: Span::new(cs, ce),
                 heading_path: vec![],
+                block_seq: 0,
+                seq_in_block: 0,
             });
         }
     }

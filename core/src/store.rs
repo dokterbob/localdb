@@ -81,6 +81,18 @@ pub struct ChunkRecord {
     /// before this schema migration return `DocumentMetadata::default()` on read.
     #[serde(default)]
     pub metadata: DocumentMetadata,
+
+    /// Block sequence number (populated from ChunkOutput.block_seq).
+    ///
+    /// 0 for chunks produced by the flat `chunk_document` path.
+    #[serde(default)]
+    pub block_seq: u32,
+
+    /// Chunk position within the block (populated from ChunkOutput.seq_in_block).
+    ///
+    /// 0 for chunks produced by the flat `chunk_document` path.
+    #[serde(default)]
+    pub seq_in_block: u32,
 }
 
 impl ChunkRecord {
@@ -109,6 +121,8 @@ impl ChunkRecord {
             mime,
             uri,
             metadata,
+            block_seq: 0,
+            seq_in_block: 0,
         }
     }
 }
@@ -494,6 +508,8 @@ pub mod conformance {
             mime: Some("text/plain".to_string()),
             uri: "file:///test.md".to_string(),
             metadata: crate::parser::DocumentMetadata::default(),
+            block_seq: 0,
+            seq_in_block: 0,
         }
     }
 
@@ -844,6 +860,8 @@ mod tests {
             mime: Some("text/plain".to_string()),
             uri: "file:///test.md".to_string(),
             metadata: crate::parser::DocumentMetadata::default(),
+            block_seq: 0,
+            seq_in_block: 0,
         }
     }
 

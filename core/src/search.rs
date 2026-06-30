@@ -201,6 +201,8 @@ pub fn shape_citation(fused: FusedChunkEntry, store_id: String, store_name: Stri
             content_hash: fused.chunk.content_hash.clone(),
         },
         metadata: fused.chunk.metadata.clone(),
+        block_seq: Some(fused.chunk.block_seq),
+        block_kind: None,
     }
 }
 
@@ -389,6 +391,8 @@ mod tests {
             mime: Some("text/markdown".to_string()),
             uri: uri.to_string(),
             metadata: crate::parser::DocumentMetadata::default(),
+            block_seq: 0,
+            seq_in_block: 0,
         }
     }
 

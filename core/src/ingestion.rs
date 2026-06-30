@@ -600,13 +600,15 @@ pub async fn index_document(
             provenance: provenance.clone(),
         };
 
-        let record = ChunkRecord::from_chunk(
+        let mut record = ChunkRecord::from_chunk(
             &chunk,
             embedding.clone(),
             input.uri.clone(),
             input.mime.clone(),
             metadata.clone(),
         );
+        record.block_seq = chunk_out.block_seq;
+        record.seq_in_block = chunk_out.seq_in_block;
         records.push(record);
     }
 
@@ -1407,6 +1409,8 @@ mod tests {
             mime: None,
             uri: "file:///doc1.md".to_string(),
             metadata: crate::parser::DocumentMetadata::default(),
+            block_seq: 0,
+            seq_in_block: 0,
         }];
 
         let idx = DocumentIndex::from_chunk_records(&records);
@@ -2565,6 +2569,8 @@ mod tests {
             mime: None,
             uri: url.to_string(),
             metadata: crate::parser::DocumentMetadata::default(),
+            block_seq: 0,
+            seq_in_block: 0,
         };
         store.upsert_chunks(vec![chunk]).await.unwrap();
 
@@ -3068,6 +3074,8 @@ mod tests {
             mime: None,
             uri: uri.to_string(),
             metadata: crate::parser::DocumentMetadata::default(),
+            block_seq: 0,
+            seq_in_block: 0,
         };
 
         // Hydrate a fresh DocumentIndex from the stored chunk records.
@@ -3583,6 +3591,8 @@ mod tests {
             mime: None,
             uri: uri.to_string(),
             metadata: crate::parser::DocumentMetadata::default(),
+            block_seq: 0,
+            seq_in_block: 0,
         }
     }
 }

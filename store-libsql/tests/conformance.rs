@@ -442,5 +442,7 @@ fn make_record(id: &str, doc_id: &str, store_id: &str, embedding: Vec<f32>) -> C
         mime: Some("text/plain".to_string()),
         uri: format!("file:///{store_id}/{doc_id}.md"),
         metadata: localdb_core::parser::DocumentMetadata::default(),
+        block_seq: 0,
+        seq_in_block: 0,
     }
 }
