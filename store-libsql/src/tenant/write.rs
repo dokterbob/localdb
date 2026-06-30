@@ -42,15 +42,16 @@ pub(crate) async fn delete_by_document(
     document_id: &str,
 ) -> Result<usize, Error> {
     let conn = store.conn().conn().await;
+    // `document_id` on ChunkRecord maps to `resource_id` in the schema.
     let chunk_count = conn
         .execute(
-            "DELETE FROM chunks WHERE store_id = ? AND document_id = ?",
+            "DELETE FROM chunks WHERE store_id = ? AND resource_id = ?",
             params![store.store_id().to_string(), document_id.to_string()],
         )
         .await
         .map_err(map_libsql_err)?;
     conn.execute(
-        "DELETE FROM documents WHERE store_id = ? AND id = ?",
+        "DELETE FROM resources WHERE store_id = ? AND id = ?",
         params![store.store_id().to_string(), document_id.to_string()],
     )
     .await
@@ -74,7 +75,7 @@ pub(crate) async fn delete_by_store(store: &TenantStore, store_id: &str) -> Resu
         .await
         .map_err(map_libsql_err)?;
     conn.execute(
-        "DELETE FROM documents WHERE store_id = ?",
+        "DELETE FROM resources WHERE store_id = ?",
         params![store_id.to_string()],
     )
     .await
@@ -94,43 +95,50 @@ async fn upsert_chunks_inner(
     records: &[ChunkRecord],
     encoding: VectorEncoding,
 ) -> Result<(), Error> {
-    let mut seen_documents: HashMap<(String, String), bool> = HashMap::new();
-    let mut doc_seq_counters: HashMap<(String, String), i64> = HashMap::new();
+    // Track which (store_id, resource_id) pairs we've already upserted in this
+    // batch so we don't issue duplicate resource upserts.
+    let mut seen_resources: HashMap<(String, String), bool> = HashMap::new();
 
     for record in records {
-        let doc_key = (record.store_id.clone(), record.document_id.clone());
-        if !seen_documents.contains_key(&doc_key) {
+        // `document_id` on ChunkRecord maps to `id` (and `resource_id`) in the
+        // new schema.  `source_kind` maps to `ingestor_kind`.
+        let resource_key = (record.store_id.clone(), record.document_id.clone());
+        if !seen_resources.contains_key(&resource_key) {
             let metadata_json =
                 serde_json::to_string(&record.metadata).map_err(|e| Error::Internal {
                     message: format!("upsert_chunks metadata serialize: {e}"),
                     correlation_id: "store_handle_upsert_meta".to_string(),
                 })?;
             let title = record.metadata.title.as_deref();
+            // Upsert into `resources`. Fields that have no direct equivalent in
+            // the old ChunkRecord are filled with sensible defaults.
             conn.execute(
-                "INSERT INTO documents (store_id, id, source_id, source_kind, uri, title, mime,
-                     content_hash, fetched_at, origin_store, policy_version, metadata)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "INSERT INTO resources (store_id, id, source_id, ingestor_kind, resource_kind,
+                     uri, title, mime, content_hash, added_at, modified_at, origin_store,
+                     policy_version, metadata_json, extractor_version)
+                 VALUES (?, ?, ?, ?, 'file', ?, ?, ?, ?, ?, ?, ?, ?, ?, '1')
                  ON CONFLICT(store_id, id) DO UPDATE SET
-                     source_id = excluded.source_id,
-                     source_kind = excluded.source_kind,
-                     uri = excluded.uri,
-                     title = excluded.title,
-                     mime = excluded.mime,
-                     content_hash = excluded.content_hash,
-                     fetched_at = excluded.fetched_at,
-                     origin_store = excluded.origin_store,
+                     source_id      = excluded.source_id,
+                     ingestor_kind  = excluded.ingestor_kind,
+                     uri            = excluded.uri,
+                     title          = excluded.title,
+                     mime           = excluded.mime,
+                     content_hash   = excluded.content_hash,
+                     modified_at    = excluded.modified_at,
+                     origin_store   = excluded.origin_store,
                      policy_version = excluded.policy_version,
-                     metadata = excluded.metadata",
+                     metadata_json  = excluded.metadata_json",
                 params![
                     record.store_id.as_str(),
-                    record.document_id.as_str(),
+                    record.document_id.as_str(), // id column
                     record.source_id.as_str(),
-                    record.source_kind.as_str(),
+                    record.source_kind.as_str(), // ingestor_kind column
                     record.uri.as_str(),
                     title,
                     record.mime.as_deref(),
                     record.content_hash.as_str(),
-                    record.fetched_at.as_str(),
+                    record.fetched_at.as_str(), // added_at column
+                    record.fetched_at.as_str(), // modified_at column
                     record.origin_store.as_str(),
                     record.policy_version.as_str(),
                     metadata_json.as_str(),
@@ -138,12 +146,9 @@ async fn upsert_chunks_inner(
             )
             .await
             .map_err(map_libsql_err)?;
-            seen_documents.insert(doc_key.clone(), true);
+            seen_resources.insert(resource_key, true);
         }
 
-        let seq = doc_seq_counters.entry(doc_key.clone()).or_insert(0);
-        let current_seq = *seq;
-        *seq += 1;
         let vector_sql = match encoding {
             VectorEncoding::Float32 => vectors::f32_to_vector32_sql(&record.embedding),
             VectorEncoding::Binary => vectors::f32_to_vector1bit_sql(&record.embedding),
@@ -153,34 +158,29 @@ async fn upsert_chunks_inner(
                 message: format!("upsert_chunks heading_path serialize: {e}"),
                 correlation_id: "store_handle_upsert_heading".to_string(),
             })?;
-        let span_start = i64::try_from(record.span.start).map_err(|_| Error::InvalidRequest {
-            message: format!("span value {} does not fit in i64", record.span.start),
-        })?;
-        let span_end = i64::try_from(record.span.end).map_err(|_| Error::InvalidRequest {
-            message: format!("span value {} does not fit in i64", record.span.end),
-        })?;
+
+        // block_id / block_seq / seq_in_block: the old pipeline has no block
+        // concept — use 0 as the sentinel for "legacy single-block".
         let sql = format!(
-            "INSERT INTO chunks (store_id, id, document_id, seq, text, span_start, span_end, heading_path, embedding)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, {vector_sql})
+            "INSERT INTO chunks (store_id, id, resource_id, block_id, block_seq,
+                 seq_in_block, text, heading_path, embedding)
+             VALUES (?, ?, ?, 0, 0, 0, ?, ?, {vector_sql})
              ON CONFLICT(store_id, id) DO UPDATE SET
-                 document_id = excluded.document_id,
-                 seq = excluded.seq,
-                 text = excluded.text,
-                 span_start = excluded.span_start,
-                 span_end = excluded.span_end,
+                 resource_id  = excluded.resource_id,
+                 block_id     = excluded.block_id,
+                 block_seq    = excluded.block_seq,
+                 seq_in_block = excluded.seq_in_block,
+                 text         = excluded.text,
                  heading_path = excluded.heading_path,
-                 embedding = excluded.embedding"
+                 embedding    = excluded.embedding"
         );
         conn.execute(
             &sql,
             params![
                 record.store_id.as_str(),
                 record.id.as_str(),
-                record.document_id.as_str(),
-                current_seq,
+                record.document_id.as_str(), // resource_id column
                 record.text.as_str(),
-                span_start,
-                span_end,
                 heading_path_json.as_str(),
             ],
         )

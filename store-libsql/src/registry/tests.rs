@@ -193,17 +193,21 @@ async fn check_constraint_rejects_path_kind_without_root() {
 }
 
 #[tokio::test]
-async fn check_constraint_rejects_url_kind_with_root() {
+async fn url_kind_with_root_is_now_allowed() {
+    // The v3 schema relaxes the CHECK constraint: url-kind sources no longer
+    // require `root IS NULL`. A url source that also has a root column value
+    // is valid (the new CHECK only requires that `url IS NOT NULL`).
     let (_dir, api) = make_api().await;
     api.upsert_store(&make_store("store-1", "notes"))
         .await
         .unwrap();
-    let mut bad = make_url_source("src-1", "store-1", "https://example.com");
-    bad.root = Some("/docs".to_string());
-    let result = api.upsert_source(&bad).await;
+    let mut src = make_url_source("src-1", "store-1", "https://example.com");
+    src.root = Some("/docs".to_string());
+    let result = api.upsert_source(&src).await;
     assert!(
-        result.is_err(),
-        "CHECK should reject url kind with root set"
+        result.is_ok(),
+        "url kind with root should now be accepted by the relaxed CHECK; got: {:?}",
+        result.err()
     );
 }
 

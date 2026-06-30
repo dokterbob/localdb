@@ -81,13 +81,19 @@ impl LibsqlDb {
             .await
             .map_err(map_libsql_err)?;
         if version != 0 && version != schema::SCHEMA_VERSION {
-            return Err(Error::InvalidConfig {
-                message: format!(
-                    "DB schema version {version} is incompatible with this build \
-                     (expects {}); delete the .db file and re-index.",
-                    schema::SCHEMA_VERSION
-                ),
-            });
+            // Old schema detected — drop everything and let create_schema rebuild.
+            // This project is pre-release with no data preservation guarantee.
+            tracing::warn!(
+                old_version = version,
+                new_version = schema::SCHEMA_VERSION,
+                "DB schema version mismatch: dropping all tables and reinitialising"
+            );
+            schema::drop_all_tables(&conn)
+                .await
+                .map_err(|e| Error::Internal {
+                    message: format!("drop_all_tables during schema upgrade: {e}"),
+                    correlation_id: "libsql_db_drop_tables".to_string(),
+                })?;
         }
 
         schema::create_schema(&conn, embedding_dim, encoding)
@@ -318,7 +324,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reopen_with_wrong_schema_version_errors() {
+    async fn reopen_with_old_schema_version_reinitialises() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
         // Stamp version 1 on a raw libsql DB (bypassing LibsqlDb::open).
@@ -327,15 +333,12 @@ mod tests {
             let conn = db.connect().unwrap();
             conn.query("PRAGMA user_version = 1", ()).await.unwrap();
         }
-        // Opening via LibsqlDb::open must return InvalidConfig.
+        // Opening via LibsqlDb::open should now succeed: it drops and recreates.
         let result = LibsqlDb::open(&path, 4, localdb_core::VectorEncoding::Float32).await;
         assert!(
-            matches!(result, Err(localdb_core::Error::InvalidConfig { .. })),
-            "expected InvalidConfig for wrong schema version, got: {}",
-            result
-                .as_ref()
-                .err()
-                .map_or("Ok(_)".to_string(), |e| format!("{e:?}"))
+            result.is_ok(),
+            "old schema version should trigger reinitialisation, not an error; got: {:?}",
+            result.as_ref().err()
         );
     }
 

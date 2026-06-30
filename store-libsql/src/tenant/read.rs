@@ -8,6 +8,37 @@ use super::TenantStore;
 use crate::connection::map_libsql_err;
 use crate::vectors;
 
+// Column projection shared across all chunk queries.
+//
+// The `resources` table replaces the old `documents` table. Field name mapping:
+//   resources.id          → ChunkRecord.document_id
+//   resources.ingestor_kind → ChunkRecord.source_kind
+//   resources.added_at    → ChunkRecord.fetched_at
+//   resources.metadata_json → ChunkRecord.metadata
+//
+// Column indices in the SELECT list (used in rows.rs):
+//   0  c.id
+//   1  c.resource_id      (→ document_id)
+//   2  c.text
+//   3  c.heading_path
+//   4  vector_extract(c.embedding) AS embedding_json
+//   5  r.store_id
+//   6  r.source_id
+//   7  r.ingestor_kind    (→ source_kind)
+//   8  r.uri
+//   9  r.title
+//  10  r.mime
+//  11  r.policy_version
+//  12  r.added_at         (→ fetched_at)
+//  13  r.content_hash
+//  14  r.origin_store
+//  15  r.metadata_json    (→ metadata)
+const CHUNK_COLS: &str = "c.id, c.resource_id,
+                    c.text, c.heading_path, vector_extract(c.embedding) AS embedding_json,
+                    r.store_id, r.source_id, r.ingestor_kind, r.uri, r.title, r.mime,
+                    r.policy_version, r.added_at, r.content_hash, r.origin_store,
+                    r.metadata_json";
+
 pub(crate) async fn dense_search(
     store: &TenantStore,
     query_vector: &[f32],
@@ -35,15 +66,11 @@ pub(crate) async fn dense_search(
         // require per-store chunk tables — see the tracking issue.
         // An exact-scan fallback below handles saturation by other tenants.
         let sql = format!(
-            "SELECT c.id, c.document_id, c.seq, c.text, c.span_start, c.span_end,
-                    c.heading_path, vector_extract(c.embedding) AS embedding_json,
-                    d.store_id, d.source_id, d.source_kind, d.uri, d.title, d.mime,
-                    d.policy_version, d.fetched_at, d.content_hash, d.origin_store,
-                    d.metadata,
+            "SELECT {CHUNK_COLS},
                     vector_distance_cos(c.embedding, {qvec_sql}) AS distance
              FROM vector_top_k('chunks_vec_idx', {qvec_sql}, {fetch_k}) AS v
              JOIN chunks c ON c.rowid = v.id
-             JOIN documents d ON d.store_id = c.store_id AND d.id = c.document_id
+             JOIN resources r ON r.store_id = c.store_id AND r.id = c.resource_id
              WHERE c.store_id = '{escaped_store_id}'
              {filter_clauses}
              ORDER BY distance ASC
@@ -53,7 +80,7 @@ pub(crate) async fn dense_search(
         results.clear();
         while let Some(row) = rows.next().await.map_err(map_libsql_err)? {
             let chunk = row_to_chunk_record_strict(&row)?;
-            let distance: f64 = row.get(19).map_err(map_libsql_err)?;
+            let distance: f64 = row.get(16).map_err(map_libsql_err)?;
             let score = match encoding {
                 VectorEncoding::Float32 => vectors::cosine_distance_to_score(distance),
                 VectorEncoding::Binary => vectors::hamming_distance_to_score(distance, dim),
@@ -79,14 +106,10 @@ pub(crate) async fn dense_search(
         let qvec_sql = vectors::query_vector_sql(query_vector, encoding);
         let escaped_store_id = store.store_id().replace('\'', "''");
         let sql = format!(
-            "SELECT c.id, c.document_id, c.seq, c.text, c.span_start, c.span_end,
-                    c.heading_path, vector_extract(c.embedding) AS embedding_json,
-                    d.store_id, d.source_id, d.source_kind, d.uri, d.title, d.mime,
-                    d.policy_version, d.fetched_at, d.content_hash, d.origin_store,
-                    d.metadata,
+            "SELECT {CHUNK_COLS},
                     vector_distance_cos(c.embedding, {qvec_sql}) AS distance
              FROM chunks c
-             JOIN documents d ON d.store_id = c.store_id AND d.id = c.document_id
+             JOIN resources r ON r.store_id = c.store_id AND r.id = c.resource_id
              WHERE c.store_id = '{escaped_store_id}'
              {filter_clauses}
              ORDER BY distance ASC
@@ -96,7 +119,7 @@ pub(crate) async fn dense_search(
         results.clear();
         while let Some(row) = rows.next().await.map_err(map_libsql_err)? {
             let chunk = row_to_chunk_record_strict(&row)?;
-            let distance: f64 = row.get(19).map_err(map_libsql_err)?;
+            let distance: f64 = row.get(16).map_err(map_libsql_err)?;
             let score = match encoding {
                 VectorEncoding::Float32 => vectors::cosine_distance_to_score(distance),
                 VectorEncoding::Binary => vectors::hamming_distance_to_score(distance, dim),
@@ -121,15 +144,11 @@ pub(crate) async fn bm25_search(
     let filter_clauses = build_filter_clauses(filters);
     let escaped_store_id = store.store_id().replace('\'', "''");
     let sql = format!(
-        "SELECT c.id, c.document_id, c.seq, c.text, c.span_start, c.span_end,
-                c.heading_path, vector_extract(c.embedding) AS embedding_json,
-                d.store_id, d.source_id, d.source_kind, d.uri, d.title, d.mime,
-                d.policy_version, d.fetched_at, d.content_hash, d.origin_store,
-                d.metadata,
+        "SELECT {CHUNK_COLS},
                 bm25(chunks_fts) AS score
          FROM chunks_fts f
          JOIN chunks c ON c.rowid = f.rowid
-         JOIN documents d ON d.store_id = c.store_id AND d.id = c.document_id
+         JOIN resources r ON r.store_id = c.store_id AND r.id = c.resource_id
          WHERE chunks_fts MATCH ?
          AND c.store_id = '{escaped_store_id}'
          {filter_clauses}
@@ -143,7 +162,7 @@ pub(crate) async fn bm25_search(
     let mut results = Vec::new();
     while let Some(row) = rows.next().await.map_err(map_libsql_err)? {
         let chunk = row_to_chunk_record_strict(&row)?;
-        let raw_score: f64 = row.get(19).map_err(map_libsql_err)?;
+        let raw_score: f64 = row.get(16).map_err(map_libsql_err)?;
         results.push(SearchResult {
             chunk,
             score: -raw_score as f32,
@@ -167,7 +186,7 @@ pub(crate) async fn stats(store: &TenantStore) -> Result<StoreStats, Error> {
     };
     let mut rows = conn
         .query(
-            "SELECT COUNT(*) FROM documents WHERE store_id = ?",
+            "SELECT COUNT(*) FROM resources WHERE store_id = ?",
             params![store.store_id().to_string()],
         )
         .await
@@ -189,14 +208,12 @@ pub(crate) async fn get_chunk(
     let conn = store.conn().conn().await;
     let mut rows = conn
         .query(
-            "SELECT c.id, c.document_id, c.seq, c.text, c.span_start, c.span_end,
-                    c.heading_path, vector_extract(c.embedding) AS embedding_json,
-                    d.store_id, d.source_id, d.source_kind, d.uri, d.title, d.mime,
-                    d.policy_version, d.fetched_at, d.content_hash, d.origin_store,
-                    d.metadata
-             FROM chunks c
-             JOIN documents d ON d.store_id = c.store_id AND d.id = c.document_id
-             WHERE c.store_id = ? AND c.id = ?",
+            &format!(
+                "SELECT {CHUNK_COLS}
+                 FROM chunks c
+                 JOIN resources r ON r.store_id = c.store_id AND r.id = c.resource_id
+                 WHERE c.store_id = ? AND c.id = ?"
+            ),
             params![store.store_id().to_string(), chunk_id.to_string()],
         )
         .await
@@ -212,17 +229,16 @@ pub(crate) async fn get_chunks_for_document(
     document_id: &str,
 ) -> Result<Vec<ChunkRecord>, Error> {
     let conn = store.conn().conn().await;
+    // `document_id` maps to `resource_id` in the new schema.
     let mut rows = conn
         .query(
-            "SELECT c.id, c.document_id, c.seq, c.text, c.span_start, c.span_end,
-                    c.heading_path, vector_extract(c.embedding) AS embedding_json,
-                    d.store_id, d.source_id, d.source_kind, d.uri, d.title, d.mime,
-                    d.policy_version, d.fetched_at, d.content_hash, d.origin_store,
-                    d.metadata
-             FROM chunks c
-             JOIN documents d ON d.store_id = c.store_id AND d.id = c.document_id
-             WHERE c.store_id = ? AND c.document_id = ?
-             ORDER BY c.seq",
+            &format!(
+                "SELECT {CHUNK_COLS}
+                 FROM chunks c
+                 JOIN resources r ON r.store_id = c.store_id AND r.id = c.resource_id
+                 WHERE c.store_id = ? AND c.resource_id = ?
+                 ORDER BY c.block_seq, c.seq_in_block"
+            ),
             params![store.store_id().to_string(), document_id.to_string()],
         )
         .await
@@ -238,10 +254,11 @@ pub(crate) async fn list_indexed_documents(
     store: &TenantStore,
 ) -> Result<Vec<DocumentRecord>, Error> {
     let conn = store.conn().conn().await;
+    // `resources.id` maps back to `DocumentRecord.document_id`.
     let mut rows = conn
         .query(
             "SELECT id, uri, content_hash, policy_version
-             FROM documents WHERE store_id = ?",
+             FROM resources WHERE store_id = ?",
             params![store.store_id().to_string()],
         )
         .await
