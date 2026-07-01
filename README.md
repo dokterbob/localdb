@@ -1,9 +1,10 @@
 # localdb
 
-**localdb** is a personal knowledge server. Point it at your notes, bookmarks, specs, and
-documentation — then search them instantly from the command line or let any MCP-capable AI
-assistant retrieve cited, verifiable excerpts from your own corpus. Everything runs on your
-machine: one binary, no cloud, no daemon required for search, no API key.
+**Point it at your stuff. Search it instantly — from the terminal, or from any AI assistant you
+already use.** Notes, specs, PDFs, Word/Excel/PowerPoint docs, EPUBs, bookmarked pages — one
+`localdb index` later, hybrid (keyword + semantic) search returns cited, byte-exact excerpts in
+milliseconds. One binary, no Python, no Docker, no cloud, no daemon required for search, no API
+key. See [how it compares to GPT4All, Khoj, Basic Memory, and others](#comparison-to-other-tools).
 
 The long-horizon goal is larger: a private, trust-weighted alternative to the feed — your
 knowledge enriched by what the people you trust have found, with provenance at every hop.
@@ -13,6 +14,44 @@ provenance, and stores as first-class shareable units. See [VISION.md](VISION.md
 **Status: v0.1.0 pre-release.** Hybrid search uses real dense embeddings via the default local model (`pplx-embed-context-v1-0.6b`, ONNX on CPU by default; CoreML ANE/GPU on Apple Silicon macOS automatically); the first `localdb index` or `localdb search` downloads ~706 MB from HuggingFace (no API key required). The HTTP daemon reads from and writes to the same unified database as the CLI; ingestion via `POST /v1/jobs` is currently a no-op. See [Honest status](#honest-status) below.
 
 **License:** [AGPL-3.0-or-later](LICENSE).
+
+---
+
+## Comparison to other tools
+
+localdb is for personal knowledge search from the command line or from an AI assistant, with
+no cloud dependency, no daemon required for search, and one binary to install — no Python
+interpreter, virtualenv, or Docker Compose stack. It's agent-first rather than chat-first: the
+CLI and MCP server are the primary surfaces, validated in practice against Codex, Claude Code,
+Claude Desktop, and Hermes Agent, using both cloud (Anthropic, OpenAI, DeepSeek) and local
+(Gemma) model providers. It already indexes more than "your notes": Markdown, plain text,
+HTML, PDF, Office documents (DOCX/PPTX/XLSX/XLS/CSV), and EPUB, all extracted in-process — with
+connectors for Notion, email, chat, and transcription planned next.
+
+It is deliberately narrow — "do one thing well": a verifiable retrieval primitive (index,
+search, cite), not an all-in-one chat app or team platform. That keeps its API stable enough
+for other things to be built on top instead of bundled in — a second-brain UI, or an agent's
+own live scratchpad search. A knowledge-graph layer, MCP tools for managing sources/stores, and
+eventually a web UI are on the roadmap, alongside — much further out — federation: searching
+datasets shared by people you trust, larger than any one person could assemble alone. No
+surveyed competitor addresses that last one yet. See [docs/comparison.md](docs/comparison.md)
+for the full survey against eight adjacent projects, including exactly where localdb is behind
+(no GUI yet, single-node, read-only MCP, no knowledge graph — see its "Where localdb is behind"
+section).
+
+| Project | Single binary, no runtime | No external services | Hybrid BM25+vector | Native MCP server | Structured citations |
+|---|:---:|:---:|:---:|:---:|:---:|
+| **localdb** | ✅ | ✅ | ✅ | ✅ | ✅ |
+| [GPT4All](https://www.nomic.ai/gpt4all) (LocalDocs) | ✅ | ✅ | ❌ | ❌ | ❌ |
+| [Khoj](https://khoj.dev) | ❌ | ⚠️ | ❌ | ❌ | ❌ |
+| [Basic Memory](https://basicmemory.com) | ❌ | ✅ | ✅ | ✅ | ❌ |
+
+GPT4All is the most common comparison point (and appears effectively stalled — no commits or
+releases in 13+ months); Khoj is the most popular actively-maintained self-hosted alternative
+(Python, needs `pip`/`uv`/Docker); Basic Memory is the closest architectural peer — native MCP,
+local-first, hybrid search — but trades localdb's read-only cited-corpus model for read-write
+note editing, and is scoped to Markdown only (no PDF/Office ingestion). Full details, sources,
+and caveats (including the `⚠️` partial marks) are in [docs/comparison.md](docs/comparison.md).
 
 ---
 
@@ -44,36 +83,6 @@ provenance, and stores as first-class shareable units. See [VISION.md](VISION.md
 - **libsql backend**: embedded database with DiskANN vector index and FTS5 full-text search, no separate server.
 - **`--json` everywhere** — machine-readable output on every command.
 - **`localdb status`** — shows indexed stores and daemon state at a glance.
-
----
-
-## Comparison to other tools
-
-localdb is for personal knowledge search from the command line or from an AI assistant, with
-no cloud dependency, no daemon required for search, and one binary to install. It's agent-first
-rather than chat-first: the CLI and MCP server are the primary surfaces, validated in practice
-against Codex, Claude Code, Claude Desktop, and Hermes Agent, using both cloud (Anthropic,
-OpenAI, DeepSeek) and local (Gemma) model providers.
-
-It is deliberately narrow — "do one thing well": a verifiable retrieval primitive (index,
-search, cite), not an all-in-one chat app or team platform. That keeps its API stable enough
-for other things to be built on top instead of bundled in — a second-brain UI, or an agent's
-own live scratchpad search. The roadmap points toward unbounded content types (connectors
-beyond files/URLs) and, eventually, federation — searching datasets shared by people you trust,
-larger than any one person could assemble alone — which is an axis no surveyed competitor
-addresses yet. See [docs/comparison.md](docs/comparison.md) for the full survey against eight
-adjacent projects.
-
-| Project | License | Search | MCP surface | Citations |
-|---|---|---|---|---|
-| **GPT4All (LocalDocs)** | MIT | Vector-only | None | File + snippet, no spans |
-| **Khoj** | AGPL-3.0 | Vector-only | Client-only (no MCP server) | File + excerpt, no spans/hashes |
-| **Basic Memory** | AGPL-3.0 | Hybrid full-text + vector | Native MCP server, read-write notes | Note-level, no byte-span/hash |
-
-GPT4All is the most common comparison point (and appears effectively stalled — no commits or
-releases in 13+ months); Khoj is the most popular actively-maintained self-hosted alternative;
-Basic Memory is the closest architectural peer, trading localdb's read-only cited-corpus model
-for read-write note editing over MCP.
 
 ---
 
