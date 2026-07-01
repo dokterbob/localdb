@@ -508,6 +508,7 @@ mod get_document_tests {
                 metadata: metadata.clone(),
                 block_seq: 0,
                 seq_in_block: 0,
+                block_kind: None,
             }
         };
         store
@@ -596,6 +597,7 @@ mod tests {
             metadata: localdb_core::parser::DocumentMetadata::default(),
             block_seq: 0,
             seq_in_block: 0,
+            block_kind: None,
         }
     }
 

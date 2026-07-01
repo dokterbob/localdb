@@ -13,6 +13,7 @@
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
 use crate::block::{Block, BlockKind};
+use crate::ids::content_hash;
 
 // ---------------------------------------------------------------------------
 // markdown_to_blocks
@@ -402,6 +403,19 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
     }
 
     blocks
+}
+
+// ---------------------------------------------------------------------------
+// compute_blocks_hash
+// ---------------------------------------------------------------------------
+
+/// Compute a content hash from the concatenation of all block texts.
+///
+/// Block texts are concatenated directly with no separator, matching the
+/// spec's "ordered block canonical texts concatenated" definition.
+pub fn compute_blocks_hash(blocks: &[Block]) -> String {
+    let combined: String = blocks.iter().map(|b| b.text.as_str()).collect();
+    content_hash(&combined)
 }
 
 // ---------------------------------------------------------------------------

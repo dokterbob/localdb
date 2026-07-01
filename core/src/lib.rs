@@ -13,9 +13,9 @@ pub mod embedder;
 pub mod error;
 pub mod heading_index;
 pub mod ids;
+pub mod ingestion;
 pub mod ingestor;
 pub mod ingestors;
-pub mod ingestion;
 pub mod markdown_blocks;
 pub mod metadata;
 pub mod parser;
@@ -37,20 +37,12 @@ pub use block::{
 pub use chunker::{
     chunk_blocks, chunk_document, CharSizer, ChunkOutput, ChunkSizer, ChunkerConfig, TokenSizer,
 };
-pub use markdown_blocks::{heading_path_from_blocks, markdown_to_blocks};
-pub use ingestors::{FileIngestor, UrlIngestor};
 /// Re-export key types at the crate root for convenience.
 pub use citation::Citation;
 pub use embedder::{
     DocumentChunks, EmbeddedDocument, Embedder, FakeEmbedder, TokenCounter, VectorEncoding,
 };
 pub use error::Error;
-pub use ingestor::{
-    ConfigField, ConfigFieldType, IngestCallback, IngestResult, IngestSource, Ingestor,
-    IngestorConfig,
-};
-pub use metadata::{ConversationMetadata, DublinCoreMetadata, Metadata, TranscriptionMetadata};
-pub use uri::Uri;
 pub use ids::{chunk_id, content_hash, document_id, new_ulid};
 pub use ingestion::{
     complete_index_job, create_index_job, enumerate_path_source, fail_index_job, index_document,
@@ -58,6 +50,13 @@ pub use ingestion::{
     DocumentInput, DocumentRecord, ExtractionResult, FetchMetadata, FetchResult, FoundFile,
     IngestionConfig, IngestionResult, UrlFetcher,
 };
+pub use ingestor::{
+    ConfigField, ConfigFieldType, IngestCallback, IngestResult, IngestSource, Ingestor,
+    IngestorConfig,
+};
+pub use ingestors::{FileIngestor, UrlIngestor};
+pub use markdown_blocks::{heading_path_from_blocks, markdown_to_blocks};
+pub use metadata::{ConversationMetadata, DublinCoreMetadata, Metadata, TranscriptionMetadata};
 pub use parser::{ChainParser, DocumentMetadata, ParsedDocument, Parser, Probe, PROBE_HEADER_LEN};
 pub use progress::{DocOutcome, ProgressEvent, ProgressSink};
 pub use search::{
@@ -73,3 +72,4 @@ pub use types::{
     IndexJobStats, IndexingPolicy, Provenance, Source, SourceKind, SourceRef, SourceSpec, Span,
     Store, StoreVisibility,
 };
+pub use uri::Uri;

@@ -19,10 +19,11 @@ use std::path::Path;
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 
-use crate::chunker::{chunk_document, CharSizer, ChunkSizer, ChunkerConfig, TokenSizer};
+use crate::chunker::{chunk_blocks, CharSizer, ChunkSizer, ChunkerConfig, TokenSizer};
 use crate::embedder::{DocumentChunks, Embedder};
 use crate::error::Error;
-use crate::ids::{content_hash, document_id, new_ulid};
+use crate::ids::{document_id, new_ulid};
+use crate::markdown_blocks::{compute_blocks_hash, markdown_to_blocks};
 use crate::store::{ChunkRecord, RetrievalStore};
 use crate::types::{
     Chunk, IndexJob, IndexJobScope, IndexJobState, IndexJobStats, Provenance, Source, SourceKind,
@@ -452,8 +453,9 @@ pub async fn index_document(
         std::panic::AssertUnwindSafe(|| extractor.extract(&input.bytes, input.filename.as_deref())),
     )?;
 
-    // Compute content hash.
-    let hash = content_hash(&extraction.markdown);
+    // Convert markdown to typed blocks and compute content hash.
+    let blocks = markdown_to_blocks(&extraction.markdown);
+    let hash = compute_blocks_hash(&blocks);
 
     // Content-addressed document ID.
     let doc_id = document_id(&input.uri, &hash);
@@ -503,7 +505,7 @@ pub async fn index_document(
     let chunk_outputs = catch_panic(
         "chunk",
         std::panic::AssertUnwindSafe(|| {
-            chunk_document(&doc_id, &extraction.markdown, &chunker_cfg, sizer.as_ref())
+            chunk_blocks(&doc_id, &blocks, &chunker_cfg, sizer.as_ref())
         }),
     )?;
 
@@ -611,11 +613,15 @@ pub async fn index_document(
         );
         record.block_seq = chunk_out.block_seq;
         record.seq_in_block = chunk_out.seq_in_block;
+        record.block_kind = chunk_out.block_kind.clone();
         records.push(record);
     }
 
     let written = records.len();
     store.upsert_chunks(records).await?;
+    store
+        .upsert_blocks(&config.store_id, &doc_id, &blocks)
+        .await?;
 
     let record = DocumentRecord {
         uri: input.uri.clone(),
@@ -1214,6 +1220,7 @@ fn detect_mime(path: &Path) -> Option<String> {
 mod tests {
     use super::*;
     use crate::embedder::FakeEmbedder;
+    use crate::ids::content_hash;
     use crate::store::FakeStore;
     use crate::types::{SourceKind, SourceSpec};
     use crate::Span;
@@ -1413,6 +1420,7 @@ mod tests {
             metadata: crate::parser::DocumentMetadata::default(),
             block_seq: 0,
             seq_in_block: 0,
+            block_kind: None,
         }];
 
         let idx = DocumentIndex::from_chunk_records(&records);
@@ -2573,6 +2581,7 @@ mod tests {
             metadata: crate::parser::DocumentMetadata::default(),
             block_seq: 0,
             seq_in_block: 0,
+            block_kind: None,
         };
         store.upsert_chunks(vec![chunk]).await.unwrap();
 
@@ -3078,6 +3087,7 @@ mod tests {
             metadata: crate::parser::DocumentMetadata::default(),
             block_seq: 0,
             seq_in_block: 0,
+            block_kind: None,
         };
 
         // Hydrate a fresh DocumentIndex from the stored chunk records.
@@ -3601,6 +3611,7 @@ mod tests {
             metadata: crate::parser::DocumentMetadata::default(),
             block_seq: 0,
             seq_in_block: 0,
+            block_kind: None,
         }
     }
 }

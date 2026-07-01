@@ -202,7 +202,7 @@ pub fn shape_citation(fused: FusedChunkEntry, store_id: String, store_name: Stri
         },
         metadata: fused.chunk.metadata.clone(),
         block_seq: Some(fused.chunk.block_seq),
-        block_kind: None,
+        block_kind: fused.chunk.block_kind.clone(),
     }
 }
 
@@ -393,6 +393,7 @@ mod tests {
             metadata: crate::parser::DocumentMetadata::default(),
             block_seq: 0,
             seq_in_block: 0,
+            block_kind: None,
         }
     }
 

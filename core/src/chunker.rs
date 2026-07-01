@@ -103,13 +103,21 @@ pub struct ChunkOutput {
     /// For message-window chunks: all block seqs participating in the window.
     /// Empty for non-message chunks. Mirrors `ChunkLocation::window_block_seqs`.
     pub window_block_seqs: Vec<u32>,
+    /// Block kind string (e.g. "paragraph", "heading"). `None` for flat-document chunks.
+    pub block_kind: Option<String>,
 }
 
 impl ChunkOutput {
     /// Construct a single-block, non-windowed chunk (no heading path, seq_in_block=0).
     ///
     /// Convenience constructor that reduces boilerplate in block-dispatch paths.
-    fn single(id: ContentId, text: String, span: Span, heading_path: Vec<String>, block_seq: u32) -> Self {
+    fn single(
+        id: ContentId,
+        text: String,
+        span: Span,
+        heading_path: Vec<String>,
+        block_seq: u32,
+    ) -> Self {
         Self {
             id,
             text,
@@ -118,6 +126,7 @@ impl ChunkOutput {
             block_seq,
             seq_in_block: 0,
             window_block_seqs: vec![],
+            block_kind: None,
         }
     }
 }
@@ -263,7 +272,10 @@ pub fn chunk_blocks(
         .iter()
         .filter(|b| {
             !b.text.is_empty()
-                && matches!(b.kind, BlockKind::Message { .. } | BlockKind::Segment { .. })
+                && matches!(
+                    b.kind,
+                    BlockKind::Message { .. } | BlockKind::Segment { .. }
+                )
         })
         .collect();
 
@@ -278,7 +290,10 @@ pub fn chunk_blocks(
             continue;
         }
 
-        let is_msg = matches!(block.kind, BlockKind::Message { .. } | BlockKind::Segment { .. });
+        let is_msg = matches!(
+            block.kind,
+            BlockKind::Message { .. } | BlockKind::Segment { .. }
+        );
         if is_msg {
             continue; // already handled above
         }
@@ -317,6 +332,7 @@ pub fn chunk_blocks(
         for (i, mut c) in sub_chunks.into_iter().enumerate() {
             c.block_seq = block.seq;
             c.seq_in_block = i as u32;
+            c.block_kind = Some(block.kind.kind_str().to_string());
             if c.heading_path.is_empty() {
                 c.heading_path = heading_path.clone();
             }
@@ -380,7 +396,10 @@ pub fn chunk_messages(
         .iter()
         .filter(|b| {
             !b.text.is_empty()
-                && matches!(b.kind, BlockKind::Message { .. } | BlockKind::Segment { .. })
+                && matches!(
+                    b.kind,
+                    BlockKind::Message { .. } | BlockKind::Segment { .. }
+                )
         })
         .collect();
 
@@ -441,8 +460,7 @@ pub fn chunk_messages(
             .collect();
 
         // If even a single turn is too long, split it with prose chunker logic.
-        if actual_start + 1 == window_end_excl
-            && sizer.size(&turn_texts[actual_start]) > max_tokens
+        if actual_start + 1 == window_end_excl && sizer.size(&turn_texts[actual_start]) > max_tokens
         {
             // Split the raw message body (without prefix) using prose chunker,
             // then prepend the sender/speaker context to each sub-chunk.
@@ -460,6 +478,7 @@ pub fn chunk_messages(
             };
             let prose_chunks = chunk_prose(resource_id, &block.text, config, sizer)?;
             let first_seq = block.seq;
+            let kind_str = block.kind.kind_str().to_string();
             for (i, pc) in prose_chunks.into_iter().enumerate() {
                 let prefixed_text = format!("{prefix}{}", pc.text);
                 let id = chunk_id(resource_id, &prefixed_text, 0, prefixed_text.len());
@@ -471,11 +490,13 @@ pub fn chunk_messages(
                     block_seq: first_seq,
                     seq_in_block: i as u32,
                     window_block_seqs: vec![first_seq],
+                    block_kind: Some(kind_str.clone()),
                 });
             }
         } else {
             let window_text: String = turn_texts[actual_start..window_end_excl].join("\n");
             let first_seq = turns[actual_start].seq;
+            let kind_str = turns[actual_start].kind.kind_str().to_string();
             let id = chunk_id(resource_id, &window_text, 0, window_text.len());
             out.push(ChunkOutput {
                 id,
@@ -485,6 +506,7 @@ pub fn chunk_messages(
                 block_seq: first_seq,
                 seq_in_block: out.len() as u32, // index among message chunks
                 window_block_seqs: window_seqs,
+                block_kind: Some(kind_str),
             });
         }
 
@@ -610,7 +632,13 @@ fn chunk_prose(
         let span = Span::new(start, end);
         let heading_path = crate::heading_index::heading_path_at(&heading_idx, start);
         let id = chunk_id(document_id, chunk, start, end);
-        chunks.push(ChunkOutput::single(id, chunk.to_string(), span, heading_path, 0));
+        chunks.push(ChunkOutput::single(
+            id,
+            chunk.to_string(),
+            span,
+            heading_path,
+            0,
+        ));
     }
 
     Ok(chunks)
@@ -1434,14 +1462,12 @@ mod tests {
     #[test]
     fn messages_empty_conversation_returns_no_chunks() {
         // No Message/Segment blocks → 0 chunks.
-        let blocks: Vec<crate::block::Block> = vec![
-            crate::block::Block {
-                seq: 0,
-                kind: crate::block::BlockKind::Paragraph,
-                text: "Some intro text.".to_string(),
-                location: None,
-            },
-        ];
+        let blocks: Vec<crate::block::Block> = vec![crate::block::Block {
+            seq: 0,
+            kind: crate::block::BlockKind::Paragraph,
+            text: "Some intro text.".to_string(),
+            location: None,
+        }];
         let cfg = ChunkerConfig::messages();
         let chunks = chunk_messages("resource-1", &blocks, &cfg, &CharSizer).unwrap();
         assert!(chunks.is_empty(), "no message blocks → no chunks");
@@ -1449,7 +1475,12 @@ mod tests {
 
     #[test]
     fn messages_single_message_produces_one_chunk() {
-        let blocks = vec![msg_block(0, "Alice", "2026-01-01T10:00:00Z", "Hello there!")];
+        let blocks = vec![msg_block(
+            0,
+            "Alice",
+            "2026-01-01T10:00:00Z",
+            "Hello there!",
+        )];
         let cfg = ChunkerConfig::messages();
         let chunks = chunk_messages("resource-1", &blocks, &cfg, &CharSizer).unwrap();
         assert_eq!(chunks.len(), 1, "single message → single chunk");
@@ -1503,20 +1534,44 @@ mod tests {
         assert_eq!(chunks.len(), 4);
 
         // Window 0 should contain msgs 0-5.
-        assert!(chunks[0].text.contains("Msg0"), "window 0 should start at Msg0");
-        assert!(chunks[0].text.contains("Msg5"), "window 0 should end at Msg5");
-        assert!(!chunks[0].text.contains("Msg6"), "window 0 should not contain Msg6");
+        assert!(
+            chunks[0].text.contains("Msg0"),
+            "window 0 should start at Msg0"
+        );
+        assert!(
+            chunks[0].text.contains("Msg5"),
+            "window 0 should end at Msg5"
+        );
+        assert!(
+            !chunks[0].text.contains("Msg6"),
+            "window 0 should not contain Msg6"
+        );
         assert_eq!(chunks[0].window_block_seqs, vec![0, 1, 2, 3, 4, 5]);
 
         // Window 1 should contain msgs 3-8.
-        assert!(chunks[1].text.contains("Msg3"), "window 1 should start at Msg3");
-        assert!(chunks[1].text.contains("Msg8"), "window 1 should end at Msg8");
-        assert!(!chunks[1].text.contains("Msg9"), "window 1 should not contain Msg9");
+        assert!(
+            chunks[1].text.contains("Msg3"),
+            "window 1 should start at Msg3"
+        );
+        assert!(
+            chunks[1].text.contains("Msg8"),
+            "window 1 should end at Msg8"
+        );
+        assert!(
+            !chunks[1].text.contains("Msg9"),
+            "window 1 should not contain Msg9"
+        );
         assert_eq!(chunks[1].window_block_seqs, vec![3, 4, 5, 6, 7, 8]);
 
         // Window 2 should contain msgs 6-9.
-        assert!(chunks[2].text.contains("Msg6"), "window 2 should start at Msg6");
-        assert!(chunks[2].text.contains("Msg9"), "window 2 should end at Msg9");
+        assert!(
+            chunks[2].text.contains("Msg6"),
+            "window 2 should start at Msg6"
+        );
+        assert!(
+            chunks[2].text.contains("Msg9"),
+            "window 2 should end at Msg9"
+        );
         assert_eq!(chunks[2].window_block_seqs, vec![6, 7, 8, 9]);
 
         // Window 3 should contain only msg 9 (tail window).
@@ -1576,7 +1631,9 @@ mod tests {
         );
         // Segment format: [speaker] (start_ms-end_ms): text
         assert!(
-            chunks[0].text.contains("[Speaker] (0-1999): Segment text 0"),
+            chunks[0]
+                .text
+                .contains("[Speaker] (0-1999): Segment text 0"),
             "should format segment as [speaker] (start-end): text"
         );
     }
@@ -1619,7 +1676,12 @@ mod tests {
         let chunks = chunk_messages("resource-1", &blocks, &cfg, &CharSizer).unwrap();
         // 4 message blocks, window=6 (fits all 4), stride=3 → windows at 0 and 3.
         // Window 0: msgs 2,3,4,6. Window 1 (stride 3): msg 6 only (index 3 in turns).
-        assert_eq!(chunks.len(), 2, "4 messages, window=6, stride=3 → 2 chunks; got {}", chunks.len());
+        assert_eq!(
+            chunks.len(),
+            2,
+            "4 messages, window=6, stride=3 → 2 chunks; got {}",
+            chunks.len()
+        );
         // First window covers all 4 message blocks.
         assert_eq!(chunks[0].window_block_seqs, vec![2, 3, 4, 6]);
         // Should NOT contain non-message text.

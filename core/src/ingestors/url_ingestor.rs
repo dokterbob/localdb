@@ -7,10 +7,10 @@
 use crate::block::{IngestorKind, Resource, ResourceKind};
 use crate::error::Error;
 use crate::ids::document_id;
-use crate::ingestor::{IngestCallback, IngestResult, IngestSource, Ingestor};
 use crate::ingestion::{now_rfc3339, FetchMetadata, FetchResult, UrlFetcher};
-use crate::ingestors::file_ingestor::{compute_blocks_hash, parser_meta_to_dc};
-use crate::markdown_blocks::markdown_to_blocks;
+use crate::ingestor::{IngestCallback, IngestResult, IngestSource, Ingestor};
+use crate::ingestors::file_ingestor::parser_meta_to_dc;
+use crate::markdown_blocks::{compute_blocks_hash, markdown_to_blocks};
 use crate::metadata::{DocumentMetadata, Metadata};
 use crate::parser::{Parser, Probe};
 use crate::uri::Uri;
@@ -95,11 +95,7 @@ impl Ingestor for UrlIngestor {
                 }
             };
 
-            let probe = Probe::new(
-                &bytes,
-                Some(url.as_str()),
-                content_type.as_deref(),
-            );
+            let probe = Probe::new(&bytes, Some(url.as_str()), content_type.as_deref());
 
             let parsed = match self.parser.parse(&probe) {
                 Ok(Some(doc)) => doc,
@@ -120,10 +116,7 @@ impl Ingestor for UrlIngestor {
             let now = now_rfc3339();
 
             let dc = parser_meta_to_dc(&parsed.metadata);
-            let title = parsed
-                .title
-                .clone()
-                .or_else(|| dc.title.clone());
+            let title = parsed.title.clone().or_else(|| dc.title.clone());
 
             let resource = Resource {
                 id: res_id,
@@ -228,10 +221,7 @@ mod tests {
     #[tokio::test]
     async fn url_ingestor_fetches_and_produces_resource() {
         let content = b"# Test Page\n\nHello from the web.\n".to_vec();
-        let ingestor = UrlIngestor::new(
-            Box::new(AllParser),
-            Box::new(StaticFetcher { content }),
-        );
+        let ingestor = UrlIngestor::new(Box::new(AllParser), Box::new(StaticFetcher { content }));
         let source = IngestSource {
             source_id: "src-1".to_string(),
             store_id: "store-1".to_string(),

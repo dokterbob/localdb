@@ -5,12 +5,12 @@
 //! uses the existing `enumerate_path_source` helper from `crate::ingestion`
 //! and the `Parser` trait for format-specific parsing.
 
-use crate::block::{Block, IngestorKind, Resource, ResourceKind};
+use crate::block::{IngestorKind, Resource, ResourceKind};
 use crate::error::Error;
-use crate::ids::{content_hash, document_id};
+use crate::ids::document_id;
 use crate::ingestion::{enumerate_path_source, now_rfc3339};
 use crate::ingestor::{IngestCallback, IngestResult, IngestSource, Ingestor};
-use crate::markdown_blocks::markdown_to_blocks;
+use crate::markdown_blocks::{compute_blocks_hash, markdown_to_blocks};
 use crate::metadata::{DocumentMetadata, DublinCoreMetadata, Metadata};
 use crate::parser::{Parser, Probe};
 use crate::uri::Uri;
@@ -152,15 +152,6 @@ impl Ingestor for FileIngestor {
     }
 }
 
-/// Compute a content hash from the concatenation of all block texts.
-///
-/// Block texts are concatenated directly with no separator, matching the
-/// spec's "ordered block canonical texts concatenated" definition.
-pub(crate) fn compute_blocks_hash(blocks: &[Block]) -> String {
-    let combined: String = blocks.iter().map(|b| b.text.as_str()).collect();
-    content_hash(&combined)
-}
-
 /// Convert `crate::parser::DocumentMetadata` to `crate::metadata::DublinCoreMetadata`.
 pub(crate) fn parser_meta_to_dc(meta: &crate::parser::DocumentMetadata) -> DublinCoreMetadata {
     DublinCoreMetadata {
@@ -185,7 +176,8 @@ pub(crate) fn parser_meta_to_dc(meta: &crate::parser::DocumentMetadata) -> Dubli
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::BlockKind;
+    use crate::block::{Block, BlockKind};
+    use crate::markdown_blocks::compute_blocks_hash;
     use crate::parser::{ChainParser, ParsedDocument};
 
     #[test]

@@ -90,6 +90,47 @@ fn tenant_violation<T>(message: String) -> Result<T, Error> {
     })
 }
 
+pub(crate) async fn upsert_blocks(
+    store: &TenantStore,
+    document_id: &str,
+    blocks: &[localdb_core::block::Block],
+) -> Result<(), localdb_core::Error> {
+    let conn = store.conn().conn().await;
+    for block in blocks {
+        let kind_str = block.kind.kind_str();
+        let metadata_json =
+            serde_json::to_string(&block.kind).map_err(|e| localdb_core::Error::Internal {
+                message: format!("block metadata serialize: {e}"),
+                correlation_id: "store_upsert_blocks_meta".to_string(),
+            })?;
+        let location_json = block
+            .location
+            .as_ref()
+            .map(|loc| serde_json::to_string(loc).unwrap_or_default());
+        conn.execute(
+            "INSERT INTO blocks (store_id, resource_id, seq, kind, text, metadata_json, location_json)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(store_id, resource_id, seq) DO UPDATE SET
+                 kind = excluded.kind,
+                 text = excluded.text,
+                 metadata_json = excluded.metadata_json,
+                 location_json = excluded.location_json",
+            libsql::params![
+                store.store_id(),
+                document_id,
+                block.seq as i64,
+                kind_str,
+                block.text.as_str(),
+                metadata_json.as_str(),
+                location_json.as_deref(),
+            ],
+        )
+        .await
+        .map_err(crate::connection::map_libsql_err)?;
+    }
+    Ok(())
+}
+
 async fn upsert_chunks_inner(
     conn: &Connection,
     records: &[ChunkRecord],
@@ -103,9 +144,7 @@ async fn upsert_chunks_inner(
         // `document_id` on ChunkRecord maps to `id` (and `resource_id`) in the
         // new schema.  `source_kind` maps to `ingestor_kind`.
         let resource_key = (record.store_id.clone(), record.document_id.clone());
-        if let std::collections::hash_map::Entry::Vacant(e) =
-            seen_resources.entry(resource_key)
-        {
+        if let std::collections::hash_map::Entry::Vacant(e) = seen_resources.entry(resource_key) {
             let metadata_json =
                 serde_json::to_string(&record.metadata).map_err(|e| Error::Internal {
                     message: format!("upsert_chunks metadata serialize: {e}"),

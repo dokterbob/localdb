@@ -86,5 +86,6 @@ pub(crate) fn row_to_chunk_record_strict(row: &libsql::Row) -> Result<ChunkRecor
         metadata,
         block_seq: block_seq as u32,
         seq_in_block: seq_in_block as u32,
+        block_kind: None, // not stored in DB yet; follow-up migration pending
     })
 }

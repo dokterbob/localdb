@@ -320,10 +320,7 @@ pub(crate) async fn drop_all_tables(conn: &Connection) -> Result<(), libsql::Err
     let mut triggers = Vec::new();
     {
         let mut rows = conn
-            .query(
-                "SELECT name FROM sqlite_master WHERE type = 'trigger'",
-                (),
-            )
+            .query("SELECT name FROM sqlite_master WHERE type = 'trigger'", ())
             .await?;
         while let Some(row) = rows.next().await? {
             triggers.push(row.get::<String>(0)?);

@@ -93,6 +93,13 @@ pub struct ChunkRecord {
     /// 0 for chunks produced by the flat `chunk_document` path.
     #[serde(default)]
     pub seq_in_block: u32,
+
+    /// Block kind string (e.g. "paragraph", "heading").
+    ///
+    /// `None` for chunks produced by the flat `chunk_document` path, or chunks
+    /// indexed before the Resource/Block architecture was introduced.
+    #[serde(default)]
+    pub block_kind: Option<String>,
 }
 
 impl ChunkRecord {
@@ -123,6 +130,7 @@ impl ChunkRecord {
             metadata,
             block_seq: 0,
             seq_in_block: 0,
+            block_kind: None,
         }
     }
 }
@@ -274,6 +282,22 @@ pub trait RetrievalStore: Send + Sync + 'static {
     /// One record per distinct URI (first chunk wins). Implementations must NOT
     /// return the embedding column to avoid loading vectors for the entire store.
     async fn list_indexed_documents(&self) -> Result<Vec<DocumentRecord>, Error>;
+
+    /// Upsert a set of blocks for a document.
+    ///
+    /// The resource row identified by `document_id` must already exist (written
+    /// by `upsert_chunks`). The default implementation is a no-op so that
+    /// `FakeStore` and test implementations do not need to override it; only
+    /// `TenantStore` provides the real persistence.
+    async fn upsert_blocks(
+        &self,
+        store_id: &str,
+        document_id: &str,
+        blocks: &[crate::block::Block],
+    ) -> Result<(), Error> {
+        let _ = (store_id, document_id, blocks);
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -510,6 +534,7 @@ pub mod conformance {
             metadata: crate::parser::DocumentMetadata::default(),
             block_seq: 0,
             seq_in_block: 0,
+            block_kind: None,
         }
     }
 
@@ -862,6 +887,7 @@ mod tests {
             metadata: crate::parser::DocumentMetadata::default(),
             block_seq: 0,
             seq_in_block: 0,
+            block_kind: None,
         }
     }
 

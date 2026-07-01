@@ -99,4 +99,13 @@ impl RetrievalStore for TenantStore {
     async fn list_indexed_documents(&self) -> Result<Vec<DocumentRecord>, Error> {
         read::list_indexed_documents(self).await
     }
+
+    async fn upsert_blocks(
+        &self,
+        _store_id: &str,
+        document_id: &str,
+        blocks: &[localdb_core::block::Block],
+    ) -> Result<(), localdb_core::Error> {
+        write::upsert_blocks(self, document_id, blocks).await
+    }
 }

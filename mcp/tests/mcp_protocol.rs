@@ -74,6 +74,7 @@ async fn make_server_with_seeded_store() -> (McpServer, String, String) {
         metadata: localdb_core::DocumentMetadata::default(),
         block_seq: 0,
         seq_in_block: 0,
+        block_kind: None,
     };
 
     store.upsert_chunks(vec![record]).await.expect("seed chunk");
@@ -542,6 +543,7 @@ async fn test_search_limit_respected() {
             metadata: localdb_core::DocumentMetadata::default(),
             block_seq: 0,
             seq_in_block: 0,
+            block_kind: None,
         });
     }
     store.upsert_chunks(records).await.unwrap();

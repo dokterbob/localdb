@@ -444,5 +444,6 @@ fn make_record(id: &str, doc_id: &str, store_id: &str, embedding: Vec<f32>) -> C
         metadata: localdb_core::parser::DocumentMetadata::default(),
         block_seq: 0,
         seq_in_block: 0,
+        block_kind: None,
     }
 }
