@@ -35,7 +35,7 @@ pub use block::{
     ResourceKind,
 };
 pub use chunker::{
-    chunk_blocks, chunk_document, CharSizer, ChunkOutput, ChunkSizer, ChunkerConfig, TokenSizer,
+    chunk_blocks, CharSizer, ChunkOutput, ChunkSizer, ChunkerConfig, TokenSizer,
 };
 /// Re-export key types at the crate root for convenience.
 pub use citation::Citation;

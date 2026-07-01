@@ -83,21 +83,17 @@ pub struct ChunkRecord {
     pub metadata: DocumentMetadata,
 
     /// Block sequence number (populated from ChunkOutput.block_seq).
-    ///
-    /// 0 for chunks produced by the flat `chunk_document` path.
     #[serde(default)]
     pub block_seq: u32,
 
     /// Chunk position within the block (populated from ChunkOutput.seq_in_block).
-    ///
-    /// 0 for chunks produced by the flat `chunk_document` path.
     #[serde(default)]
     pub seq_in_block: u32,
 
     /// Block kind string (e.g. "paragraph", "heading").
     ///
-    /// `None` for chunks produced by the flat `chunk_document` path, or chunks
-    /// indexed before the Resource/Block architecture was introduced.
+    /// `None` for chunks indexed before the Resource/Block architecture
+    /// was introduced.
     #[serde(default)]
     pub block_kind: Option<String>,
 }

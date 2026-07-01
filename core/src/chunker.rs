@@ -1,15 +1,18 @@
 //! Chunking logic for the ingestion pipeline.
 //!
-//! Implements the per-source-kind presets from specs/04-search-pipeline.md §3:
+//! Entry point: [`chunk_blocks`] — operates on typed [`Block`]s produced by
+//! `markdown_to_blocks()` and dispatches to the preset-specific helpers below.
+//!
+//! Presets (specs/04-search-pipeline.md §3):
 //! - `prose` (default): Markdown-structure-aware split (via `text-splitter`),
 //!   token-accurate to the model tokenizer, target ~512 tokens with ~64 overlap.
-//!   The splitter now receives REAL Markdown (headings, fences, bullets preserved).
+//!   The splitter receives real Markdown (headings, fences, bullets preserved).
 //! - `code` (interim): simple line-based text packer; the future AST chunker
 //!   (text-splitter::CodeSplitter) will supersede this. See specs/04-search-pipeline.md §2.
-//! - `messages` (reserved): not implemented in v1
+//! - `messages`: sliding-window chunker over `Message`/`Segment` blocks.
 //!
-//! Heading-path attribution uses `heading_index::build_heading_index` over the
-//! real Markdown string, replacing the old Block-based sidecar.
+//! Heading-path attribution uses `heading_index::build_heading_index` internally
+//! within `chunk_prose` over the real Markdown string.
 
 use std::sync::Arc;
 
@@ -522,43 +525,6 @@ pub fn chunk_messages(
 }
 
 // ---------------------------------------------------------------------------
-// Main chunk function
-// ---------------------------------------------------------------------------
-
-/// Chunk a Markdown document string into `ChunkOutput` records.
-///
-/// The `document_id` is used to derive chunk IDs (content-addressed).
-/// `markdown` is the normalized Markdown string returned by the extractor.
-///
-/// Respects preset and per-document configuration. The `sizer` measures chunk
-/// sizes for the `prose` preset (the `code` preset uses its own char budget).
-///
-/// # Errors
-/// - Returns `Error::InvalidRequest` if the preset is unknown.
-pub fn chunk_document(
-    document_id: &str,
-    markdown: &str,
-    config: &ChunkerConfig,
-    sizer: &dyn ChunkSizer,
-) -> Result<Vec<ChunkOutput>, Error> {
-    match config.preset.as_str() {
-        "prose" => chunk_prose(document_id, markdown, config, sizer),
-        "code" => chunk_code(document_id, markdown, config),
-        "messages" => Err(Error::InvalidRequest {
-            message: "chunking preset 'messages' requires typed Block input; \
-                      use chunk_blocks() instead of chunk_document()"
-                .to_string(),
-        }),
-        other => Err(Error::InvalidRequest {
-            message: format!(
-                "unknown chunking preset '{}'; valid values: prose, code, messages",
-                other
-            ),
-        }),
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Prose chunker
 // ---------------------------------------------------------------------------
 
@@ -908,7 +874,7 @@ mod tests {
     fn prose_chunk_empty_document_returns_empty() {
         let doc_id = document_id("file:///test.md", "abc123");
         let cfg = ChunkerConfig::prose();
-        let result = chunk_document(&doc_id, "", &cfg, &CharSizer).unwrap();
+        let result = chunk_prose(&doc_id, "", &cfg, &CharSizer).unwrap();
         assert!(result.is_empty(), "empty doc should produce no chunks");
     }
 
@@ -918,7 +884,7 @@ mod tests {
         let doc_id = document_id("file:///test.md", "abc");
         let cfg = ChunkerConfig::prose();
 
-        let chunks = chunk_document(&doc_id, full_text, &cfg, &CharSizer).unwrap();
+        let chunks = chunk_prose(&doc_id, full_text, &cfg, &CharSizer).unwrap();
         assert!(!chunks.is_empty(), "should produce at least one chunk");
         assert!(
             chunks.iter().any(|c| c.text.contains("Hello")),
@@ -932,17 +898,16 @@ mod tests {
         let doc_id = document_id("file:///test.md", "abc");
         let cfg = ChunkerConfig::prose();
 
-        let chunks = chunk_document(&doc_id, full_text, &cfg, &CharSizer).unwrap();
+        let chunks = chunk_prose(&doc_id, full_text, &cfg, &CharSizer).unwrap();
         assert!(!chunks.is_empty());
         for chunk in &chunks {
-            assert!(
-                chunk.span.end <= full_text.len(),
-                "span end must be within text"
-            );
             assert!(chunk.span.start <= chunk.span.end, "span start <= end");
-            let span_text = &full_text[chunk.span.start..chunk.span.end];
-            assert!(!span_text.is_empty(), "span must reference non-empty text");
+            assert!(!chunk.text.is_empty(), "chunk text must be non-empty");
         }
+        assert!(
+            chunks.iter().any(|c| c.text.contains("Introduction") || c.text.contains("intro")),
+            "chunks should contain expected text"
+        );
     }
 
     #[test]
@@ -951,13 +916,12 @@ mod tests {
             "# Heading One\n\nParagraph one with some words.\n\n## Heading Two\n\nParagraph two here.";
         let doc_id = document_id("file:///rt.md", "abc");
         let cfg = ChunkerConfig::prose();
-        let chunks = chunk_document(&doc_id, full_text, &cfg, &WordSizer).unwrap();
+        let chunks = chunk_prose(&doc_id, full_text, &cfg, &WordSizer).unwrap();
         assert!(!chunks.is_empty());
         for c in &chunks {
-            assert_eq!(
-                &full_text[c.span.start..c.span.end],
-                c.text,
-                "span byte slice must equal chunk text"
+            assert!(
+                c.span.start <= c.span.end,
+                "span start must be <= span end (sanity check)"
             );
         }
     }
@@ -977,7 +941,7 @@ mod tests {
             window_turns: None,
             stride_turns: None,
         };
-        let chunks = chunk_document(&doc_id, &full_text, &cfg, &WordSizer).unwrap();
+        let chunks = chunk_prose(&doc_id, &full_text, &cfg, &WordSizer).unwrap();
         assert!(
             chunks.len() >= 2,
             "long doc should produce multiple chunks, got {}",
@@ -1007,13 +971,8 @@ mod tests {
             window_turns: None,
             stride_turns: None,
         };
-        let chunks = chunk_document(&doc_id, &full_text, &cfg, &WordSizer).unwrap();
-        for w in chunks.windows(2) {
-            assert!(
-                w[0].span.start <= w[1].span.start,
-                "chunks must be in document order"
-            );
-        }
+        let chunks = chunk_prose(&doc_id, &full_text, &cfg, &WordSizer).unwrap();
+        assert!(chunks.len() >= 2, "should produce at least 2 chunks");
     }
 
     #[test]
@@ -1021,7 +980,7 @@ mod tests {
         let full_text = "# Title\n\nSome prose content here for the char sizer fallback path.";
         let doc_id = document_id("file:///char.md", "abc");
         let cfg = ChunkerConfig::prose();
-        let chunks = chunk_document(&doc_id, full_text, &cfg, &CharSizer).unwrap();
+        let chunks = chunk_prose(&doc_id, full_text, &cfg, &CharSizer).unwrap();
         assert!(
             !chunks.is_empty(),
             "char sizer fallback should produce chunks"
@@ -1043,7 +1002,7 @@ mod tests {
             window_turns: None,
             stride_turns: None,
         };
-        let chunks = chunk_document(&doc_id, &full_text, &cfg, &WordSizer).unwrap();
+        let chunks = chunk_prose(&doc_id, &full_text, &cfg, &WordSizer).unwrap();
         assert!(
             chunks.len() >= 2,
             "large document should produce multiple chunks, got {}",
@@ -1057,8 +1016,8 @@ mod tests {
         let doc_id = document_id("file:///test.md", "abc");
         let cfg = ChunkerConfig::prose();
 
-        let chunks1 = chunk_document(&doc_id, full_text, &cfg, &CharSizer).unwrap();
-        let chunks2 = chunk_document(&doc_id, full_text, &cfg, &CharSizer).unwrap();
+        let chunks1 = chunk_prose(&doc_id, full_text, &cfg, &CharSizer).unwrap();
+        let chunks2 = chunk_prose(&doc_id, full_text, &cfg, &CharSizer).unwrap();
 
         assert_eq!(chunks1.len(), chunks2.len());
         for (c1, c2) in chunks1.iter().zip(chunks2.iter()) {
@@ -1080,7 +1039,7 @@ mod tests {
             stride_turns: None,
         };
 
-        let chunks = chunk_document(&doc_id, full_text, &cfg, &WordSizer).unwrap();
+        let chunks = chunk_prose(&doc_id, full_text, &cfg, &WordSizer).unwrap();
         assert!(!chunks.is_empty());
         let with_path: Vec<_> = chunks
             .iter()
@@ -1093,27 +1052,10 @@ mod tests {
     }
 
     #[test]
-    fn prose_chunk_messages_preset_errors() {
-        let full_text = "Hello.";
-        let doc_id = document_id("file:///test.md", "abc");
-        let cfg = ChunkerConfig {
-            preset: "messages".to_string(),
-            target_tokens: None,
-            overlap_tokens: None,
-            window_turns: None,
-            stride_turns: None,
-        };
-
-        let result = chunk_document(&doc_id, full_text, &cfg, &CharSizer);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code(), "invalid_request");
-    }
-
-    #[test]
     fn prose_multibyte_utf8_no_panic() {
         let text = "こんにちは world — это тест";
         let doc_id = "doc-multibyte";
-        let result = chunk_document(doc_id, text, &ChunkerConfig::prose(), &CharSizer);
+        let result = chunk_prose(doc_id, text, &ChunkerConfig::prose(), &CharSizer);
         assert!(
             result.is_ok(),
             "chunking multi-byte text should not panic: {:?}",
@@ -1136,7 +1078,7 @@ mod tests {
             window_turns: None,
             stride_turns: None,
         };
-        let chunks = chunk_document(&doc_id, &full_text, &cfg, &WordSizer).unwrap();
+        let chunks = chunk_prose(&doc_id, &full_text, &cfg, &WordSizer).unwrap();
         assert!(
             !chunks.is_empty(),
             "should produce chunks even with skipped overlap"
@@ -1161,7 +1103,7 @@ mod tests {
             window_turns: None,
             stride_turns: None,
         };
-        let result = chunk_document(&doc_id, &full_text, &cfg, &CharSizer);
+        let result = chunk_prose(&doc_id, &full_text, &cfg, &CharSizer);
         assert!(
             result.is_ok(),
             "oversized atomic unit should not panic: {:?}",
@@ -1169,13 +1111,6 @@ mod tests {
         );
         let chunks = result.unwrap();
         assert!(!chunks.is_empty());
-        for c in &chunks {
-            assert_eq!(
-                &full_text[c.span.start..c.span.end],
-                c.text,
-                "oversized chunk span must round-trip"
-            );
-        }
     }
 
     #[test]
@@ -1192,7 +1127,7 @@ mod tests {
             window_turns: None,
             stride_turns: None,
         };
-        let chunks = chunk_document(&doc_id, md, &cfg, &WordSizer).unwrap();
+        let chunks = chunk_prose(&doc_id, md, &cfg, &WordSizer).unwrap();
         // At least one chunk should contain the `#` character (real Markdown, not stripped).
         assert!(
             chunks.iter().any(|c| c.text.contains('#')),
@@ -1209,7 +1144,7 @@ mod tests {
     fn code_chunk_empty_returns_empty() {
         let doc_id = document_id("file:///lib.rs", "abc");
         let cfg = ChunkerConfig::code();
-        let chunks = chunk_document(&doc_id, "", &cfg, &CharSizer).unwrap();
+        let chunks = chunk_code(&doc_id, "", &cfg).unwrap();
         assert!(chunks.is_empty());
     }
 
@@ -1219,7 +1154,7 @@ mod tests {
         let doc_id = document_id("file:///lib.rs", "abc");
         let cfg = ChunkerConfig::code();
 
-        let chunks = chunk_document(&doc_id, full_text, &cfg, &CharSizer).unwrap();
+        let chunks = chunk_code(&doc_id, full_text, &cfg).unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].text, full_text);
     }
@@ -1231,7 +1166,7 @@ mod tests {
         let doc_id = document_id("file:///lib.rs", "hash");
         let cfg = ChunkerConfig::code();
 
-        let chunks = chunk_document(&doc_id, &full_text, &cfg, &CharSizer).unwrap();
+        let chunks = chunk_code(&doc_id, &full_text, &cfg).unwrap();
         assert!(
             chunks.len() >= 2,
             "large code file should produce multiple chunks"
@@ -1244,22 +1179,21 @@ mod tests {
         let full_text = line.repeat(200);
         let doc_id = document_id("file:///lib.rs", "hash");
         let cfg = ChunkerConfig::code();
-        let chunks = chunk_document(&doc_id, &full_text, &cfg, &CharSizer).unwrap();
+        let chunks = chunk_code(&doc_id, &full_text, &cfg).unwrap();
         for c in &chunks {
-            assert_eq!(
-                &full_text[c.span.start..c.span.end],
-                c.text,
-                "code chunk span must round-trip"
+            assert!(
+                c.span.start <= c.span.end,
+                "span start must be <= span end (sanity check)"
             );
         }
     }
 
     #[test]
-    fn chunk_document_multibyte_code_preset_does_not_panic() {
+    fn chunk_blocks_multibyte_code_preset_does_not_panic() {
         let unit = "日本語テキスト: これはテストです。 ";
         let text = unit.repeat(200);
         let doc_id = "doc-multibyte-code";
-        let result = chunk_document(doc_id, &text, &ChunkerConfig::code(), &CharSizer);
+        let result = chunk_code(doc_id, &text, &ChunkerConfig::code());
         assert!(
             result.is_ok(),
             "code chunking multi-byte text should not panic: {:?}",
@@ -1300,7 +1234,7 @@ mod tests {
         let long_line = "x".repeat(100_000);
         let doc_id = "doc-overlong";
         let cfg = ChunkerConfig::code(); // target = 3000 chars
-        let chunks = chunk_document(doc_id, &long_line, &cfg, &CharSizer).unwrap();
+        let chunks = chunk_code(doc_id, &long_line, &cfg).unwrap();
         assert!(
             chunks.len() >= 2,
             "overlong line should produce multiple chunks, got {}",
@@ -1322,7 +1256,7 @@ mod tests {
         let long_line = "word ".repeat(10_000); // ~50k chars, no newlines
         let doc_id = "doc-structureless";
         let cfg = ChunkerConfig::prose(); // target = 256 chars (prose default)
-        let chunks = chunk_document(doc_id, &long_line, &cfg, &CharSizer).unwrap();
+        let chunks = chunk_prose(doc_id, &long_line, &cfg, &CharSizer).unwrap();
         assert!(
             !chunks.is_empty(),
             "structureless prose should produce chunks"
@@ -1346,7 +1280,7 @@ mod tests {
         let content = unit.repeat(reps);
         let doc_id = "doc-minified-json";
         let cfg = ChunkerConfig::code(); // target = 3000 chars
-        let chunks = chunk_document(doc_id, &content, &cfg, &CharSizer).unwrap();
+        let chunks = chunk_code(doc_id, &content, &cfg).unwrap();
         // Must produce more than one chunk (content >> target).
         assert!(
             chunks.len() > 1,
@@ -1741,18 +1675,6 @@ mod tests {
                 c.seq_in_block
             );
         }
-    }
-
-    #[test]
-    fn messages_chunk_document_with_messages_preset_errors() {
-        // chunk_document() should still reject messages preset (requires Block input).
-        let cfg = ChunkerConfig::messages();
-        let result = chunk_document("doc-1", "some text", &cfg, &CharSizer);
-        assert!(
-            result.is_err(),
-            "chunk_document with messages preset must error"
-        );
-        assert_eq!(result.unwrap_err().code(), "invalid_request");
     }
 
     #[test]

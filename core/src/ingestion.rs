@@ -1935,12 +1935,12 @@ mod tests {
     async fn index_document_chunker_panic_returns_err() {
         // PanicChunkExtractor returns a valid extraction but has corrupted text
         // that triggers a panic in the chunker.  We simulate this by wrapping
-        // the FakeExtractor output and then triggering chunk_document to panic via
+        // the FakeExtractor output and then triggering chunk_blocks to panic via
         // a deliberately crafted bad byte index.  Rather than fighting the real
         // chunker, we use a second panic extractor that panics AFTER extraction
         // but we test the more realistic scenario: use a custom extractor whose
         // extract() succeeds but whose text triggers a downstream panic in
-        // chunk_document via the sizer.
+        // chunk_blocks via the sizer.
         //
         // The simplest approach: inject a custom extractor that panics in extract
         // and verify the catch_unwind in the extract step handles it.  The chunk

@@ -397,7 +397,10 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                 }
             }
 
-            // Ignore everything else (HR, footnotes, etc.)
+            // Ignore everything else: HR, footnotes, soft/hard breaks, and
+            // inline HTML fragments (Event::InlineHtml, e.g. <br>, <em>).
+            // Inline HTML appears inside paragraphs/headings and is silently
+            // dropped; the surrounding text is still captured by Event::Text.
             _ => {}
         }
     }
