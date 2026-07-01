@@ -37,10 +37,13 @@ daemon. **Rejected:** gRPC (worse curl-ability and browser story for a local too
 later if a consumer demands it).
 
 - **Bind & trust:** `127.0.0.1` by default, **no auth in local mode** — documented trust
-  assumption: anything on this machine that can reach localhost is trusted, same boundary as the
-  files themselves. Binding to a non-loopback address without auth configured is a **refused
-  startup**, not a warning (forward-compatible with the shared/home-server mode in
-  [06-roadmap.md](06-roadmap.md) §1, which arrives together with real auth).
+  assumption: anything that can reach the bind address is trusted, same boundary as the files
+  themselves. Any bind address is accepted; the daemon does not refuse to start based on it.
+  Binding to a specific non-loopback address (e.g. a LAN or VPN IP) is treated as a deliberate
+  trust decision by the user and starts silently. Binding to `0.0.0.0` (all interfaces) logs a
+  warning at startup, since it makes the unauthenticated daemon reachable from any network the
+  machine is on and is the one case a user could plausibly not realize how exposed this makes
+  them.
 - **Resources** (`/v1`): `GET/POST /stores`, `GET/PATCH/DELETE /stores/{id}`,
   `GET/POST /stores/{id}/sources`, `POST /search` (body: query, store filter, metadata filters,
   limit; citations carry full `Metadata`), `GET /resources/{id}` (response includes
