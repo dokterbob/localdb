@@ -155,7 +155,7 @@ async fn upsert_chunks_inner(
                 "INSERT INTO resources (store_id, id, source_id, ingestor_kind, resource_kind,
                      uri, title, mime, content_hash, added_at, modified_at, origin_store,
                      policy_version, metadata_json, extractor_version)
-                 VALUES (?, ?, ?, ?, 'file', ?, ?, ?, ?, ?, ?, ?, ?, ?, '1')
+                 VALUES (?, ?, ?, ?, 'document', ?, ?, ?, ?, ?, ?, ?, ?, ?, '1')
                  ON CONFLICT(store_id, id) DO UPDATE SET
                      source_id      = excluded.source_id,
                      ingestor_kind  = excluded.ingestor_kind,
@@ -197,11 +197,19 @@ async fn upsert_chunks_inner(
                 message: format!("upsert_chunks heading_path serialize: {e}"),
                 correlation_id: "store_handle_upsert_heading".to_string(),
             })?;
+        let location_json = serde_json::to_string(&serde_json::json!({
+            "start": record.span.start,
+            "end": record.span.end,
+        }))
+        .map_err(|e| Error::Internal {
+            message: format!("upsert_chunks location_json serialize: {e}"),
+            correlation_id: "store_handle_upsert_location".to_string(),
+        })?;
 
         let sql = format!(
             "INSERT INTO chunks (store_id, id, resource_id, block_id, block_seq,
-                 seq_in_block, text, heading_path, embedding)
-             VALUES (?, ?, ?, 0, ?, ?, ?, ?, {vector_sql})
+                 seq_in_block, text, heading_path, location_json, embedding)
+             VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, {vector_sql})
              ON CONFLICT(store_id, id) DO UPDATE SET
                  resource_id  = excluded.resource_id,
                  block_id     = excluded.block_id,
@@ -209,6 +217,7 @@ async fn upsert_chunks_inner(
                  seq_in_block = excluded.seq_in_block,
                  text         = excluded.text,
                  heading_path = excluded.heading_path,
+                 location_json = excluded.location_json,
                  embedding    = excluded.embedding"
         );
         conn.execute(
@@ -221,6 +230,95 @@ async fn upsert_chunks_inner(
                 record.seq_in_block as i64,
                 record.text.as_str(),
                 heading_path_json.as_str(),
+                location_json.as_str(),
+            ],
+        )
+        .await
+        .map_err(map_libsql_err)?;
+    }
+    Ok(())
+}
+
+/// Atomically upsert chunks and blocks in a single transaction.
+///
+/// Unlike calling `upsert_chunks` and `upsert_blocks` separately (two
+/// transactions), this wraps both writes in one BEGIN/COMMIT so the resource
+/// can never appear indexed (chunks present) but un-blocked.
+pub(crate) async fn upsert_chunks_and_blocks(
+    store: &TenantStore,
+    document_id: &str,
+    records: Vec<ChunkRecord>,
+    blocks: &[localdb_core::block::Block],
+) -> Result<usize, localdb_core::Error> {
+    for record in &records {
+        if record.store_id != store.store_id() {
+            return Err(localdb_core::Error::Internal {
+                message: format!(
+                    "chunk '{id}' has store_id '{rec}' but handle owns store_id '{handle}'",
+                    id = record.id,
+                    rec = record.store_id,
+                    handle = store.store_id()
+                ),
+                correlation_id: "store_handle_tenant_violation".to_string(),
+            });
+        }
+    }
+    let conn = store.conn().conn().await;
+    let count = records.len();
+    conn.execute("BEGIN", ()).await.map_err(map_libsql_err)?;
+    let inner = async {
+        upsert_chunks_inner(&conn, &records, store.encoding()).await?;
+        upsert_blocks_inner(&conn, store.store_id(), document_id, blocks).await?;
+        Ok::<(), localdb_core::Error>(())
+    }
+    .await;
+    match inner {
+        Ok(()) => {
+            conn.execute("COMMIT", ()).await.map_err(map_libsql_err)?;
+            Ok(count)
+        }
+        Err(e) => {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+/// Inner (connection-level) helper for upserting blocks within an existing transaction.
+async fn upsert_blocks_inner(
+    conn: &Connection,
+    store_id: &str,
+    document_id: &str,
+    blocks: &[localdb_core::block::Block],
+) -> Result<(), localdb_core::Error> {
+    for block in blocks {
+        let kind_str = block.kind.kind_str();
+        let metadata_json = serde_json::to_string(&block.kind).map_err(|e| {
+            localdb_core::Error::Internal {
+                message: format!("block metadata serialize: {e}"),
+                correlation_id: "store_upsert_blocks_meta".to_string(),
+            }
+        })?;
+        let location_json = block
+            .location
+            .as_ref()
+            .map(|loc| serde_json::to_string(loc).unwrap_or_default());
+        conn.execute(
+            "INSERT INTO blocks (store_id, resource_id, seq, kind, text, metadata_json, location_json)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(store_id, resource_id, seq) DO UPDATE SET
+                 kind = excluded.kind,
+                 text = excluded.text,
+                 metadata_json = excluded.metadata_json,
+                 location_json = excluded.location_json",
+            libsql::params![
+                store_id,
+                document_id,
+                block.seq as i64,
+                kind_str,
+                block.text.as_str(),
+                metadata_json.as_str(),
+                location_json.as_deref(),
             ],
         )
         .await

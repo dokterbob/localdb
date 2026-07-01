@@ -490,7 +490,7 @@ mod get_document_tests {
         let make_chunk = |text: &str| {
             let span = Span::new(0, text.len());
             ChunkRecord {
-                id: chunk_id(&doc_id, text, span.start, span.end),
+                id: chunk_id(&doc_id, text, span.start, span.end, 0),
                 document_id: doc_id.clone(),
                 store_id: store_id.clone(),
                 text: text.to_string(),

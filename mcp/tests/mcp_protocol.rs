@@ -53,7 +53,7 @@ async fn make_server_with_seeded_store() -> (McpServer, String, String) {
     let doc_id = document_id(uri, &doc_hash);
     let snippet = "Rust is a systems programming language focused on safety and performance.";
     let span = Span::new(0, snippet.len());
-    let cid = chunk_id(&doc_id, snippet, span.start, span.end);
+    let cid = chunk_id(&doc_id, snippet, span.start, span.end, 0);
 
     let record = ChunkRecord {
         id: cid.clone(),
@@ -522,7 +522,7 @@ async fn test_search_limit_respected() {
         let doc_hash = content_hash(&text);
         let doc_id_val = document_id(&uri, &doc_hash);
         let span = Span::new(0, text.len());
-        let cid = chunk_id(&doc_id_val, &text, span.start, span.end);
+        let cid = chunk_id(&doc_id_val, &text, span.start, span.end, 0);
 
         records.push(ChunkRecord {
             id: cid,

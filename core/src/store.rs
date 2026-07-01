@@ -294,6 +294,25 @@ pub trait RetrievalStore: Send + Sync + 'static {
         let _ = (store_id, document_id, blocks);
         Ok(())
     }
+
+    /// Atomically upsert chunks and blocks for a document in a single operation.
+    ///
+    /// The default implementation calls `upsert_chunks` then `upsert_blocks`
+    /// sequentially (sufficient for `FakeStore` and tests). The `TenantStore`
+    /// override wraps both operations in a single database transaction so that
+    /// a failure between the two calls cannot leave the resource in a partially
+    /// indexed state (chunks without blocks, or vice-versa).
+    async fn upsert_chunks_and_blocks(
+        &self,
+        store_id: &str,
+        document_id: &str,
+        records: Vec<ChunkRecord>,
+        blocks: &[crate::block::Block],
+    ) -> Result<usize, Error> {
+        let count = self.upsert_chunks(records).await?;
+        self.upsert_blocks(store_id, document_id, blocks).await?;
+        Ok(count)
+    }
 }
 
 // ---------------------------------------------------------------------------

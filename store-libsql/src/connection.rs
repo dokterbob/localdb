@@ -80,7 +80,17 @@ impl LibsqlDb {
         let version = schema::get_schema_version(&conn)
             .await
             .map_err(map_libsql_err)?;
-        if version != 0 && version != schema::SCHEMA_VERSION {
+        if version != 0 && version > schema::SCHEMA_VERSION {
+            // Newer schema than this build understands — refuse to open.
+            return Err(Error::InvalidConfig {
+                message: format!(
+                    "database schema version {version} is newer than this build \
+                     (v{expected}); upgrade localdb or delete the database to reinitialize",
+                    expected = schema::SCHEMA_VERSION,
+                ),
+            });
+        }
+        if version != 0 && version < schema::SCHEMA_VERSION {
             // Old schema detected — drop everything and let create_schema rebuild.
             // This project is pre-release with no data preservation guarantee.
             eprintln!(
@@ -359,5 +369,35 @@ mod tests {
         LibsqlDb::open(&path, 4, localdb_core::VectorEncoding::Float32)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reopen_with_newer_schema_version_returns_invalid_config_error() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        // Stamp a version SCHEMA_VERSION + 1 on a raw libsql DB (bypassing LibsqlDb::open).
+        {
+            let db = libsql::Builder::new_local(&path).build().await.unwrap();
+            let conn = db.connect().unwrap();
+            let future_version = crate::schema::SCHEMA_VERSION + 1;
+            conn.query(
+                &format!("PRAGMA user_version = {future_version}"),
+                (),
+            )
+            .await
+            .unwrap();
+        }
+        // Opening via LibsqlDb::open must fail with InvalidConfig, NOT drop the data.
+        let result = LibsqlDb::open(&path, 4, localdb_core::VectorEncoding::Float32).await;
+        match result {
+            Err(Error::InvalidConfig { message }) => {
+                assert!(
+                    message.contains("newer"),
+                    "error should mention 'newer': {message}"
+                );
+            }
+            Err(other) => panic!("expected InvalidConfig, got: {other:?}"),
+            Ok(_) => panic!("expected InvalidConfig, but reopen with newer schema succeeded"),
+        }
     }
 }

@@ -106,7 +106,7 @@ mod tests {
         let doc_id = document_id("file:///docs/api.md", &content_hash("some content"));
         let snippet = "This is the chunk text.";
         let span = Span::new(100, 123);
-        let cid = chunk_id(&doc_id, snippet, span.start, span.end);
+        let cid = chunk_id(&doc_id, snippet, span.start, span.end, 0);
 
         Citation {
             chunk_id: cid,

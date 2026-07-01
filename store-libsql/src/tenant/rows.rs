@@ -25,6 +25,8 @@ use crate::connection::map_libsql_err;
 ///  15  r.metadata_json    → metadata
 ///  16  c.block_seq
 ///  17  c.seq_in_block
+///  18  c.location_json
+///  19  distance/score     (appended by each query, not read here)
 pub(crate) fn row_to_chunk_record_strict(row: &libsql::Row) -> Result<ChunkRecord, Error> {
     let id: String = row.get(0).map_err(map_libsql_err)?;
     let resource_id: String = row.get(1).map_err(map_libsql_err)?; // → document_id
@@ -62,17 +64,38 @@ pub(crate) fn row_to_chunk_record_strict(row: &libsql::Row) -> Result<ChunkRecor
     let block_seq: i64 = row.get(16).map_err(map_libsql_err)?;
     let seq_in_block: i64 = row.get(17).map_err(map_libsql_err)?;
 
+    // location_json is written by upsert_chunks_inner; fall back to text length
+    // for rows written before this column was populated.
     let text_len = text.len();
+    let span = {
+        let location_json: Option<String> = row.get(18).map_err(map_libsql_err)?;
+        match location_json {
+            Some(json) => {
+                let v: serde_json::Value =
+                    serde_json::from_str(&json).unwrap_or(serde_json::Value::Null);
+                let start = v.get("start").and_then(|s| s.as_u64()).map(|s| s as usize);
+                let end = v.get("end").and_then(|e| e.as_u64()).map(|e| e as usize);
+                match (start, end) {
+                    (Some(s), Some(e)) => Span { start: s, end: e },
+                    _ => Span {
+                        start: 0,
+                        end: text_len,
+                    },
+                }
+            }
+            None => Span {
+                start: 0,
+                end: text_len,
+            },
+        }
+    };
 
     Ok(ChunkRecord {
         id,
         document_id: resource_id,
         store_id,
         text: text.clone(),
-        span: Span {
-            start: 0,
-            end: text_len,
-        },
+        span,
         heading_path,
         embedding,
         policy_version,

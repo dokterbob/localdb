@@ -618,9 +618,8 @@ pub async fn index_document(
     }
 
     let written = records.len();
-    store.upsert_chunks(records).await?;
     store
-        .upsert_blocks(&config.store_id, &doc_id, &blocks)
+        .upsert_chunks_and_blocks(&config.store_id, &doc_id, records, &blocks)
         .await?;
 
     let record = DocumentRecord {
