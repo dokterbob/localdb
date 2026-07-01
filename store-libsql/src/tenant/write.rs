@@ -145,6 +145,7 @@ async fn upsert_chunks_inner(
         // new schema.  `source_kind` maps to `ingestor_kind`.
         let resource_key = (record.store_id.clone(), record.document_id.clone());
         if let std::collections::hash_map::Entry::Vacant(e) = seen_resources.entry(resource_key) {
+            // TODO(#130): record.metadata is flat parser::DocumentMetadata; should serialize as tagged Metadata enum once Resource-based reads land (#117)
             let metadata_json =
                 serde_json::to_string(&record.metadata).map_err(|e| Error::Internal {
                     message: format!("upsert_chunks metadata serialize: {e}"),
@@ -206,6 +207,7 @@ async fn upsert_chunks_inner(
             correlation_id: "store_handle_upsert_location".to_string(),
         })?;
 
+        // TODO(#128): block_id is hardcoded to 0; should reference the actual blocks.rowid
         let sql = format!(
             "INSERT INTO chunks (store_id, id, resource_id, block_id, block_seq,
                  seq_in_block, block_kind, text, heading_path, location_json, embedding)

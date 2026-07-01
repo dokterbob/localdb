@@ -627,6 +627,7 @@ pub async fn index_document(
         record.block_seq = chunk_out.block_seq;
         record.seq_in_block = chunk_out.seq_in_block;
         record.block_kind = chunk_out.block_kind.clone();
+        // TODO(#129): chunk_out.window_block_seqs not mapped — message-window membership lost after persistence
         records.push(record);
     }
 
