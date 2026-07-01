@@ -34,9 +34,7 @@ pub use block::{
     Block, BlockKind, BlockLocation, BoundingBox, ChunkLocation, IngestorKind, Resource,
     ResourceKind,
 };
-pub use chunker::{
-    chunk_blocks, CharSizer, ChunkOutput, ChunkSizer, ChunkerConfig, TokenSizer,
-};
+pub use chunker::{chunk_blocks, CharSizer, ChunkOutput, ChunkSizer, ChunkerConfig, TokenSizer};
 /// Re-export key types at the crate root for convenience.
 pub use citation::Citation;
 pub use embedder::{

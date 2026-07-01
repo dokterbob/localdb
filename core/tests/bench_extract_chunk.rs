@@ -82,8 +82,8 @@ mod bench_extract_chunk {
             let t_chunk = Instant::now();
             let sizer = localdb_core::CharSizer;
             let blocks = localdb_core::markdown_to_blocks(&extraction.markdown);
-            let chunks = localdb_core::chunk_blocks(doc_id, &blocks, &cfg, &sizer)
-                .expect("chunk failed");
+            let chunks =
+                localdb_core::chunk_blocks(doc_id, &blocks, &cfg, &sizer).expect("chunk failed");
             let chunk_ms = t_chunk.elapsed().as_millis();
 
             let char_sizes: Vec<usize> = chunks.iter().map(|c| c.text.chars().count()).collect();

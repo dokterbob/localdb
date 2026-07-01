@@ -293,12 +293,11 @@ async fn upsert_blocks_inner(
 ) -> Result<(), localdb_core::Error> {
     for block in blocks {
         let kind_str = block.kind.kind_str();
-        let metadata_json = serde_json::to_string(&block.kind).map_err(|e| {
-            localdb_core::Error::Internal {
+        let metadata_json =
+            serde_json::to_string(&block.kind).map_err(|e| localdb_core::Error::Internal {
                 message: format!("block metadata serialize: {e}"),
                 correlation_id: "store_upsert_blocks_meta".to_string(),
-            }
-        })?;
+            })?;
         let location_json = block
             .location
             .as_ref()

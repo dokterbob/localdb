@@ -465,9 +465,7 @@ pub fn chunk_messages(
             .collect();
 
         // If even a single turn is too long, split it with prose chunker logic.
-        if actual_end == window_start + 1
-            && sizer.size(&turn_texts[window_start]) > max_tokens
-        {
+        if actual_end == window_start + 1 && sizer.size(&turn_texts[window_start]) > max_tokens {
             // Split the raw message body (without prefix) using prose chunker,
             // then prepend the sender/speaker context to each sub-chunk.
             let block = turns[window_start];
@@ -487,7 +485,13 @@ pub fn chunk_messages(
             let kind_str = block.kind.kind_str().to_string();
             for (i, pc) in prose_chunks.into_iter().enumerate() {
                 let prefixed_text = format!("{prefix}{}", pc.text);
-                let id = chunk_id(resource_id, &prefixed_text, 0, prefixed_text.len(), first_seq);
+                let id = chunk_id(
+                    resource_id,
+                    &prefixed_text,
+                    0,
+                    prefixed_text.len(),
+                    first_seq,
+                );
                 out.push(ChunkOutput {
                     id,
                     text: prefixed_text,
@@ -910,7 +914,9 @@ mod tests {
             assert!(!chunk.text.is_empty(), "chunk text must be non-empty");
         }
         assert!(
-            chunks.iter().any(|c| c.text.contains("Introduction") || c.text.contains("intro")),
+            chunks
+                .iter()
+                .any(|c| c.text.contains("Introduction") || c.text.contains("intro")),
             "chunks should contain expected text"
         );
     }
@@ -1710,7 +1716,10 @@ mod tests {
         let doc_id = document_id("file:///test.rs", "abc");
         let cfg = ChunkerConfig::code();
         let chunks = chunk_blocks(&doc_id, &[block], &cfg, &CharSizer).unwrap();
-        assert!(!chunks.is_empty(), "code preset + Paragraph should produce chunks");
+        assert!(
+            !chunks.is_empty(),
+            "code preset + Paragraph should produce chunks"
+        );
         for c in &chunks {
             assert!(c.span.start <= c.span.end, "span start <= end");
         }

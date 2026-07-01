@@ -380,12 +380,9 @@ mod tests {
             let db = libsql::Builder::new_local(&path).build().await.unwrap();
             let conn = db.connect().unwrap();
             let future_version = crate::schema::SCHEMA_VERSION + 1;
-            conn.query(
-                &format!("PRAGMA user_version = {future_version}"),
-                (),
-            )
-            .await
-            .unwrap();
+            conn.query(&format!("PRAGMA user_version = {future_version}"), ())
+                .await
+                .unwrap();
         }
         // Opening via LibsqlDb::open must fail with InvalidConfig, NOT drop the data.
         let result = LibsqlDb::open(&path, 4, localdb_core::VectorEncoding::Float32).await;
