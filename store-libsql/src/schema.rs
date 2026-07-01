@@ -7,7 +7,7 @@ use crate::vectors::embedding_column_type;
 ///
 /// Survives `VACUUM` and doesn't require a separate table. Replaces the
 /// per-store `schema_version` table from the legacy schema.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Run the full DDL for the unified database.
 ///
@@ -190,6 +190,7 @@ async fn create_chunks(
             block_id      INTEGER NOT NULL,
             block_seq     INTEGER NOT NULL,
             seq_in_block  INTEGER NOT NULL DEFAULT 0,
+            block_kind    TEXT,
             text          TEXT NOT NULL,
             heading_path  TEXT NOT NULL,
             embedding     {col_type} NOT NULL,

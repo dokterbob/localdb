@@ -26,7 +26,8 @@ use crate::connection::map_libsql_err;
 ///  16  c.block_seq
 ///  17  c.seq_in_block
 ///  18  c.location_json
-///  19  distance/score     (appended by each query, not read here)
+///  19  c.block_kind
+///  20  distance/score     (appended by each query, not read here)
 pub(crate) fn row_to_chunk_record_strict(row: &libsql::Row) -> Result<ChunkRecord, Error> {
     let id: String = row.get(0).map_err(map_libsql_err)?;
     let resource_id: String = row.get(1).map_err(map_libsql_err)?; // → document_id
@@ -90,6 +91,8 @@ pub(crate) fn row_to_chunk_record_strict(row: &libsql::Row) -> Result<ChunkRecor
         }
     };
 
+    let block_kind: Option<String> = row.get(19).map_err(map_libsql_err)?;
+
     Ok(ChunkRecord {
         id,
         document_id: resource_id,
@@ -109,6 +112,6 @@ pub(crate) fn row_to_chunk_record_strict(row: &libsql::Row) -> Result<ChunkRecor
         metadata,
         block_seq: block_seq as u32,
         seq_in_block: seq_in_block as u32,
-        block_kind: None, // not stored in DB yet; follow-up migration pending
+        block_kind,
     })
 }

@@ -147,6 +147,11 @@ The retrieval unit: what gets embedded and indexed.
 **Invariant:** a chunk is a subdivision of exactly one block. Chunk location =
 `{resource_id, block_id, chunk_seq_in_block}`. Chunks never cross block boundaries.
 
+**Span semantics:** Chunk spans (`Span.start`, `Span.end`) are **block-relative byte offsets** —
+they index into the parent block's `text`, not the full document Markdown. Combined with
+`block_seq`, they provide a complete location: `(resource_id, block_seq, span)`. Document-relative
+offsets are not stored or computed.
+
 **Exception — message-window chunks:** the `messages` chunking preset creates chunks that span
 multiple `Message`/`Segment` blocks via a sliding window. This is an explicit multi-block
 chunking mode. The `ChunkLocation` carries references to all participating blocks.

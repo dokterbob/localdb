@@ -181,7 +181,9 @@ mod tests {
     use crate::parser::{ChainParser, ParsedDocument};
 
     #[test]
-    fn compute_blocks_hash_no_separator() {
+    fn compute_blocks_hash_includes_kind_and_separator() {
+        // Fix 1: hash now includes block kind and uses NUL separator between blocks.
+        // "heading:Title\x00paragraph:Body." is the canonical input.
         let blocks = vec![
             Block {
                 seq: 0,
@@ -197,8 +199,30 @@ mod tests {
             },
         ];
         let hash = compute_blocks_hash(&blocks);
-        let expected = crate::ids::content_hash("TitleBody.");
+        let expected = crate::ids::content_hash("heading:Title\x00paragraph:Body.");
         assert_eq!(hash, expected);
+    }
+
+    #[test]
+    fn compute_blocks_hash_structural_change_yields_different_hash() {
+        // A paragraph→heading change with the same text must produce a different hash.
+        let blocks_para = vec![Block {
+            seq: 0,
+            kind: BlockKind::Paragraph,
+            text: "Same text".to_string(),
+            location: None,
+        }];
+        let blocks_heading = vec![Block {
+            seq: 0,
+            kind: BlockKind::Heading { level: 1 },
+            text: "Same text".to_string(),
+            location: None,
+        }];
+        assert_ne!(
+            compute_blocks_hash(&blocks_para),
+            compute_blocks_hash(&blocks_heading),
+            "paragraph and heading with same text must have different hashes"
+        );
     }
 
     /// A minimal parser for tests: accepts everything, returns the bytes as Markdown.

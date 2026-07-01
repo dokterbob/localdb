@@ -812,7 +812,7 @@ trait SourceKindExt {
 impl SourceKindExt for SourceKind {
     fn to_string_kind(&self) -> String {
         match self {
-            SourceKind::Path => "path".to_string(),
+            SourceKind::Path => "file".to_string(),
             SourceKind::Url => "url".to_string(),
         }
     }

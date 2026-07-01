@@ -36,12 +36,13 @@ use crate::vectors;
 //  16  c.block_seq
 //  17  c.seq_in_block
 //  18  c.location_json
-//  19  distance/score     (appended by each query)
+//  19  c.block_kind
+//  20  distance/score     (appended by each query)
 const CHUNK_COLS: &str = "c.id, c.resource_id,
                     c.text, c.heading_path, vector_extract(c.embedding) AS embedding_json,
                     r.store_id, r.source_id, r.ingestor_kind, r.uri, r.title, r.mime,
                     r.policy_version, r.added_at, r.content_hash, r.origin_store,
-                    r.metadata_json, c.block_seq, c.seq_in_block, c.location_json";
+                    r.metadata_json, c.block_seq, c.seq_in_block, c.location_json, c.block_kind";
 
 pub(crate) async fn dense_search(
     store: &TenantStore,
@@ -84,7 +85,7 @@ pub(crate) async fn dense_search(
         results.clear();
         while let Some(row) = rows.next().await.map_err(map_libsql_err)? {
             let chunk = row_to_chunk_record_strict(&row)?;
-            let distance: f64 = row.get(19).map_err(map_libsql_err)?;
+            let distance: f64 = row.get(20).map_err(map_libsql_err)?;
             let score = match encoding {
                 VectorEncoding::Float32 => vectors::cosine_distance_to_score(distance),
                 VectorEncoding::Binary => vectors::hamming_distance_to_score(distance, dim),
@@ -123,7 +124,7 @@ pub(crate) async fn dense_search(
         results.clear();
         while let Some(row) = rows.next().await.map_err(map_libsql_err)? {
             let chunk = row_to_chunk_record_strict(&row)?;
-            let distance: f64 = row.get(19).map_err(map_libsql_err)?;
+            let distance: f64 = row.get(20).map_err(map_libsql_err)?;
             let score = match encoding {
                 VectorEncoding::Float32 => vectors::cosine_distance_to_score(distance),
                 VectorEncoding::Binary => vectors::hamming_distance_to_score(distance, dim),
@@ -166,7 +167,7 @@ pub(crate) async fn bm25_search(
     let mut results = Vec::new();
     while let Some(row) = rows.next().await.map_err(map_libsql_err)? {
         let chunk = row_to_chunk_record_strict(&row)?;
-        let raw_score: f64 = row.get(19).map_err(map_libsql_err)?;
+        let raw_score: f64 = row.get(20).map_err(map_libsql_err)?;
         results.push(SearchResult {
             chunk,
             score: -raw_score as f32,

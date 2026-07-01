@@ -412,12 +412,18 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
 // compute_blocks_hash
 // ---------------------------------------------------------------------------
 
-/// Compute a content hash from the concatenation of all block texts.
+/// Compute a content hash from block kind and text, joined with separators.
 ///
-/// Block texts are concatenated directly with no separator, matching the
-/// spec's "ordered block canonical texts concatenated" definition.
+/// Each block contributes `"kind:text"` and entries are separated by `\x00`
+/// (NUL byte) to prevent cross-block collisions. Including the block kind
+/// ensures that structural changes (e.g. paragraph→heading with same text)
+/// trigger re-indexing.
 pub fn compute_blocks_hash(blocks: &[Block]) -> String {
-    let combined: String = blocks.iter().map(|b| b.text.as_str()).collect();
+    let combined: String = blocks
+        .iter()
+        .map(|b| format!("{}:{}", b.kind.kind_str(), b.text))
+        .collect::<Vec<_>>()
+        .join("\x00");
     content_hash(&combined)
 }
 

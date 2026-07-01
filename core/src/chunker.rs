@@ -488,8 +488,8 @@ pub fn chunk_messages(
                 let id = chunk_id(
                     resource_id,
                     &prefixed_text,
-                    0,
-                    prefixed_text.len(),
+                    i,                         // sub-chunk index as virtual offset
+                    i + prefixed_text.len(),   // distinct from other sub-chunks
                     first_seq,
                 );
                 out.push(ChunkOutput {
@@ -520,7 +520,14 @@ pub fn chunk_messages(
             });
         }
 
-        window_start += stride_turns;
+        let turns_covered = actual_end - window_start;
+        if actual_end < window_end_excl {
+            // Window was shrunk — advance by what we covered to avoid skipping turns.
+            window_start += turns_covered;
+        } else {
+            // Normal window — advance by stride.
+            window_start += stride_turns;
+        }
     }
 
     // Fix seq_in_block: should be the chunk's index within all message chunks.
@@ -1695,6 +1702,37 @@ mod tests {
         assert_eq!(cfg.resolved_window_turns(), 6);
         assert_eq!(cfg.resolved_stride_turns(), 3);
         assert_eq!(cfg.resolved_target_tokens(), 512);
+    }
+
+    #[test]
+    fn messages_stride_advances_by_covered_turns_when_window_shrunk() {
+        // 10 turns, stride=3, budget so tight each turn exceeds it on its own.
+        // The end-shrink fix already handles reducing actual_end to window_start+1.
+        // The stride fix ensures we advance by 1 (turns_covered=1), not by stride=3,
+        // so every turn appears as a window_start.
+        // Each turn text is "[U]: 1234567890" (16 chars), budget = 5 chars.
+        let turns: Vec<_> = (0..10u32)
+            .map(|i| msg_block(i, "U", "2026-01-01", "1234567890"))
+            .collect();
+        let cfg = ChunkerConfig {
+            preset: "messages".to_string(),
+            target_tokens: Some(5), // smaller than a single "[U]: 1234567890" turn
+            overlap_tokens: Some(0),
+            window_turns: Some(3),
+            stride_turns: Some(3),
+        };
+        let chunks = chunk_messages("resource-stride", &turns, &cfg, &CharSizer).unwrap();
+        // Every turn must appear in at least one window.
+        let covered_seqs: std::collections::HashSet<u32> = chunks
+            .iter()
+            .flat_map(|c| c.window_block_seqs.iter().copied())
+            .collect();
+        for i in 0u32..10 {
+            assert!(
+                covered_seqs.contains(&i),
+                "turn {i} must appear in at least one window; covered: {covered_seqs:?}"
+            );
+        }
     }
 
     // ---------------------------------------------------------------------------

@@ -208,13 +208,14 @@ async fn upsert_chunks_inner(
 
         let sql = format!(
             "INSERT INTO chunks (store_id, id, resource_id, block_id, block_seq,
-                 seq_in_block, text, heading_path, location_json, embedding)
-             VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, {vector_sql})
+                 seq_in_block, block_kind, text, heading_path, location_json, embedding)
+             VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, {vector_sql})
              ON CONFLICT(store_id, id) DO UPDATE SET
                  resource_id  = excluded.resource_id,
                  block_id     = excluded.block_id,
                  block_seq    = excluded.block_seq,
                  seq_in_block = excluded.seq_in_block,
+                 block_kind   = excluded.block_kind,
                  text         = excluded.text,
                  heading_path = excluded.heading_path,
                  location_json = excluded.location_json,
@@ -228,6 +229,7 @@ async fn upsert_chunks_inner(
                 record.document_id.as_str(), // resource_id column
                 record.block_seq as i64,
                 record.seq_in_block as i64,
+                record.block_kind.as_deref(),
                 record.text.as_str(),
                 heading_path_json.as_str(),
                 location_json.as_str(),
