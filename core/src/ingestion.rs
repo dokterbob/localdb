@@ -408,11 +408,24 @@ fn scale_to_chars(config: &ChunkerConfig) -> ChunkerConfig {
 /// Any panic in extraction or chunking is downgraded to a per-document error so
 /// the ingestion loop can continue with the next file rather than unwinding the
 /// whole process.
+///
+/// The default panic hook is temporarily replaced with a no-op before calling
+/// `catch_unwind` to suppress the `thread 'main' panicked at ...` output that
+/// the default hook prints to stderr.  This swap is NOT thread-safe (the hook
+/// is a global), so callers must ensure no concurrent `catch_panic` calls occur.
+/// Currently extraction runs single-threaded, so this is safe.
 fn catch_panic<T>(
     label: &str,
     f: impl FnOnce() -> Result<T, Error> + std::panic::UnwindSafe,
 ) -> Result<T, Error> {
-    match std::panic::catch_unwind(f) {
+    // Suppress the default panic hook's stderr output for expected third-party panics
+    // (e.g. pdf-extract on malformed PDFs).  The caller emits a clean WARN line instead.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(f);
+    std::panic::set_hook(prev_hook);
+
+    match result {
         Ok(result) => result,
         Err(payload) => {
             let msg = payload
