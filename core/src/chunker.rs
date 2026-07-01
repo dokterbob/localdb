@@ -488,8 +488,8 @@ pub fn chunk_messages(
                 let id = chunk_id(
                     resource_id,
                     &prefixed_text,
-                    i,                         // sub-chunk index as virtual offset
-                    i + prefixed_text.len(),   // distinct from other sub-chunks
+                    i,                       // sub-chunk index as virtual offset
+                    i + prefixed_text.len(), // distinct from other sub-chunks
                     first_seq,
                 );
                 out.push(ChunkOutput {
