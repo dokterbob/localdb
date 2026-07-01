@@ -174,9 +174,12 @@ jobs:
         include:
           - os: macos-latest
             target: aarch64-apple-darwin
-          - os: ubuntu-latest
+          # Pinned to ubuntu-22.04 (glibc 2.35) to match release.yml's build
+          # floor (see issue #133) — keeps this check on the same glibc
+          # baseline as what actually ships, not a newer runner's floor.
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v4
