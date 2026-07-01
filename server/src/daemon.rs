@@ -6,7 +6,7 @@ use axum::{
     Router,
 };
 use tokio::net::TcpListener;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use localdb_core::{
     config::{loader::ResolvedPaths, schema::RawConfig},
@@ -44,7 +44,8 @@ impl std::fmt::Debug for DaemonHandle {
 /// Start the daemon.
 ///
 /// Steps:
-/// 1. Validate bind address: refuse non-loopback without auth.
+/// 1. Warn if the bind address is `0.0.0.0` (or `::`), since that's reachable
+///    from any interface with no authentication.
 pub async fn start_daemon(
     options: DaemonOptions,
 ) -> Result<(DaemonHandle, impl std::future::Future<Output = ()>), Error> {
@@ -67,7 +68,7 @@ pub async fn start_daemon(
 }
 
 fn bind_socket_guard(options: &DaemonOptions) -> Result<SocketGuard, Error> {
-    validate_bind_address(options.config.server.bind.as_str())?;
+    warn_if_bind_all_interfaces(options.config.server.bind.as_str());
     SocketGuard::new(&options.paths.socket_path())
 }
 
@@ -192,29 +193,26 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Validate the bind address.
-///
-/// Per specs/05-surfaces.md §3: "Binding to a non-loopback address without auth
-/// configured is a refused startup, not a warning."
-///
-/// MVP: any non-loopback address is refused.
-pub fn validate_bind_address(bind: &str) -> Result<(), Error> {
-    // Accept loopback addresses: 127.x.x.x or ::1 or localhost
-    let is_loopback =
-        bind == "127.0.0.1" || bind == "::1" || bind == "localhost" || bind.starts_with("127.");
+/// Whether `bind` means "all interfaces" (`0.0.0.0` or the IPv6 equivalent `::`).
+fn is_bind_all_interfaces(bind: &str) -> bool {
+    bind == "0.0.0.0" || bind == "::"
+}
 
-    if !is_loopback {
-        return Err(Error::InvalidConfig {
-            message: format!(
-                "refusing to bind to non-loopback address '{}' without auth configured; \
-                 use 127.0.0.1 for local-only mode (the default). \
-                 Non-loopback binding requires auth (roadmap feature).",
-                bind
-            ),
-        });
+/// Warn when binding to all interfaces (`0.0.0.0` / `::`).
+///
+/// Per specs/05-surfaces.md §3: the daemon has no authentication, so binding to
+/// all interfaces makes it reachable from any network the machine is on. Binding
+/// to a specific non-loopback address (e.g. a LAN/VPN IP) is treated as a
+/// deliberate trust decision and doesn't warn.
+fn warn_if_bind_all_interfaces(bind: &str) {
+    if is_bind_all_interfaces(bind) {
+        warn!(
+            bind = bind,
+            "binding to all interfaces ({}); the daemon has no authentication and will be \
+             reachable from any network this machine is on",
+            bind
+        );
     }
-
-    Ok(())
 }
 
 /// Watch the config file for changes and reload the YAML config snapshot.
@@ -326,39 +324,26 @@ mod tests {
         }
     }
 
-    // --- validate_bind_address ---
+    // --- bind address warning ---
 
     #[test]
-    fn loopback_addresses_are_accepted() {
-        assert!(validate_bind_address("127.0.0.1").is_ok());
-        assert!(validate_bind_address("::1").is_ok());
-        assert!(validate_bind_address("localhost").is_ok());
-        assert!(validate_bind_address("127.0.0.2").is_ok());
+    fn is_bind_all_interfaces_classifies_wildcard_addresses_only() {
+        assert!(is_bind_all_interfaces("0.0.0.0"));
+        assert!(is_bind_all_interfaces("::"));
+
+        assert!(!is_bind_all_interfaces("127.0.0.1"));
+        assert!(!is_bind_all_interfaces("::1"));
+        assert!(!is_bind_all_interfaces("localhost"));
+        assert!(!is_bind_all_interfaces("192.168.1.1"));
+        assert!(!is_bind_all_interfaces("100.78.241.43"));
     }
 
     #[test]
-    fn non_loopback_addresses_are_rejected() {
-        let result = validate_bind_address("0.0.0.0");
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert_eq!(err.code(), "invalid_config");
-
-        let result = validate_bind_address("192.168.1.1");
-        assert!(result.is_err());
-
-        let result = validate_bind_address("0.0.0.0");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn non_loopback_error_message_is_descriptive() {
-        let err = validate_bind_address("0.0.0.0").unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("0.0.0.0") || msg.contains("non-loopback"),
-            "error message should describe the problem: {}",
-            msg
-        );
+    fn warn_if_bind_all_interfaces_does_not_panic_for_any_input() {
+        warn_if_bind_all_interfaces("127.0.0.1");
+        warn_if_bind_all_interfaces("192.168.1.1");
+        warn_if_bind_all_interfaces("0.0.0.0");
+        warn_if_bind_all_interfaces("::");
     }
 
     #[tokio::test]
@@ -459,7 +444,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_loopback_bind_refuses_startup() {
+    async fn wildcard_bind_starts_successfully_with_warning() {
+        // 0.0.0.0 is the one address that's both non-loopback and reliably
+        // bindable in CI (it binds all local interfaces rather than requiring
+        // a specific routable non-loopback address to exist on the machine).
+        // It should now start successfully (only logging a warning) instead of
+        // being refused.
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("data")).unwrap();
 
@@ -471,16 +461,19 @@ mod tests {
             defaults: Default::default(),
             providers: vec![],
         };
-        // Set non-loopback bind address
         config.server.bind = "0.0.0.0".to_string();
+        config.server.port = 0; // let OS assign a free port
 
         let options = DaemonOptions { paths, config };
 
         let result = start_daemon(options).await;
         assert!(
-            matches!(result, Err(Error::InvalidConfig { .. })),
-            "non-loopback bind should fail with InvalidConfig"
+            result.is_ok(),
+            "wildcard bind should start: {:?}",
+            result.err()
         );
+        let (handle, _server_future) = result.unwrap();
+        assert!(handle.addr.port() > 0);
     }
 
     // --- Watcher integration: file change ⇒ re-index ⇒ search reflects it ---

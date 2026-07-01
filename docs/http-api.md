@@ -30,7 +30,7 @@ The bind address and port are controlled by the `server` block in `config.yaml`:
 ```yaml
 version: 1
 server:
-  bind: 127.0.0.1   # default; non-loopback addresses require auth (see Trust model below)
+  bind: 127.0.0.1   # default; any bind address is accepted (see Trust model below)
   port: 7700        # default; 0 = OS-assigned
 ```
 
@@ -40,11 +40,12 @@ line.
 ### Trust model
 
 The daemon binds `127.0.0.1` by default with **no authentication**. The documented trust boundary
-is: anything on this machine that can reach localhost is as trusted as the files themselves. Binding
-to a non-loopback address without auth configured is a **refused startup**, not a warning — this is
-forward-compatible with the multi-user/home-server mode described in
-[specs/06-roadmap.md](../specs/06-roadmap.md) §1, which will arrive together with real auth. See
-[specs/05-surfaces.md](../specs/05-surfaces.md) §3 for the binding and trust decision.
+is: anything that can reach the bind address is as trusted as the files themselves. Any bind
+address is accepted — binding to a specific non-loopback address (e.g. a LAN or VPN IP) is treated
+as a deliberate trust decision and starts silently. Binding to `0.0.0.0` (all interfaces) logs a
+warning at startup, since that makes the unauthenticated daemon reachable from any network the
+machine is on. See [specs/05-surfaces.md](../specs/05-surfaces.md) §3 for the binding and trust
+decision.
 
 ---
 
