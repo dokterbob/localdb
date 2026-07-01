@@ -1,6 +1,6 @@
 # Spec 03 — Configuration
 
-> Status: accepted draft, 2026-06-10.
+> Status: accepted draft, revised 2026-06-30.
 
 ## 1. Shape
 
@@ -75,7 +75,35 @@ store reindex.
 
 ## 3. Store and source management
 
-Stores and sources are managed exclusively via the CLI (`localdb store add`, `localdb source add`) or HTTP API. No YAML store declarations are supported. The unified database (`<data_dir>/localdb.db`) is the single source of truth for all stores and sources.
+Stores and sources are managed exclusively via the CLI (`localdb store add`, `localdb source add`)
+or HTTP API. No YAML store declarations are supported. The unified database
+(`<data_dir>/localdb.db`) is the single source of truth for all stores and sources.
+
+### Ingestor configuration
+
+Each source references an `ingestor_kind` and carries ingestor-specific configuration in
+`config_json`. The `IngestorConfig` trait in `core` describes the typed configuration for each
+ingestor kind via `ConfigField` descriptors:
+
+```rust
+struct ConfigField {
+    key: &'static str,
+    label: &'static str,
+    description: &'static str,
+    required: bool,
+    secret: bool,       // stored in credentials table, not config_json
+    field_type: ConfigFieldType,  // String, Path, Url, Integer, Boolean, Choice
+    default: Option<String>,
+}
+```
+
+**Interactive setup:** when a source is added for an ingestor kind that requires configuration
+(API tokens, auth flows), the CLI uses the ingestor's `ConfigField` descriptors to prompt the
+user interactively. Non-interactive creation (HTTP API, `--non-interactive` flag) requires all
+required fields to be provided upfront.
+
+**File and URL ingestors** use the existing `SourceSpec` shape (root/include/exclude for paths,
+url/refresh for URLs) and require no additional interactive setup.
 
 ## 4. File locations
 
@@ -105,6 +133,11 @@ path; `paths.*` in config override the rest.
 Never inline in YAML. Provider credentials are referenced by environment variable name
 (`api_key_env`) in MVP; OS keychain integration is a roadmap item
 ([06-roadmap.md](06-roadmap.md) §5).
+
+Ingestor credentials (API tokens, phone auth sessions) are stored in the `credentials` table
+in the unified database, keyed by `(ingestor_kind, source_id, key)`. The values are stored
+encrypted (details TBD per ingestor). Interactive credential setup is handled by the ingestor's
+setup flow in `cli`, not by YAML config.
 
 ## 7. Local embedding provider selection (`local` / `local-coreml` / `local-onnx`)
 

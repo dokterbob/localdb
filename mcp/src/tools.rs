@@ -490,7 +490,7 @@ mod get_document_tests {
         let make_chunk = |text: &str| {
             let span = Span::new(0, text.len());
             ChunkRecord {
-                id: chunk_id(&doc_id, text, span.start, span.end),
+                id: chunk_id(&doc_id, text, span.start, span.end, 0),
                 document_id: doc_id.clone(),
                 store_id: store_id.clone(),
                 text: text.to_string(),
@@ -506,6 +506,9 @@ mod get_document_tests {
                 mime: None,
                 uri: doc_uri.to_string(),
                 metadata: metadata.clone(),
+                block_seq: 0,
+                seq_in_block: 0,
+                block_kind: None,
             }
         };
         store
@@ -592,6 +595,9 @@ mod tests {
             mime: Some("text/plain".to_string()),
             uri: format!("file:///docs/{document_id}.md"),
             metadata: localdb_core::parser::DocumentMetadata::default(),
+            block_seq: 0,
+            seq_in_block: 0,
+            block_kind: None,
         }
     }
 
@@ -854,6 +860,8 @@ mod tests {
                 date,
                 ..Default::default()
             },
+            block_seq: None,
+            block_kind: None,
         }
     }
 

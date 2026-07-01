@@ -81,6 +81,21 @@ pub struct ChunkRecord {
     /// before this schema migration return `DocumentMetadata::default()` on read.
     #[serde(default)]
     pub metadata: DocumentMetadata,
+
+    /// Block sequence number (populated from ChunkOutput.block_seq).
+    #[serde(default)]
+    pub block_seq: u32,
+
+    /// Chunk position within the block (populated from ChunkOutput.seq_in_block).
+    #[serde(default)]
+    pub seq_in_block: u32,
+
+    /// Block kind string (e.g. "paragraph", "heading").
+    ///
+    /// `None` for chunks indexed before the Resource/Block architecture
+    /// was introduced.
+    #[serde(default)]
+    pub block_kind: Option<String>,
 }
 
 impl ChunkRecord {
@@ -109,6 +124,9 @@ impl ChunkRecord {
             mime,
             uri,
             metadata,
+            block_seq: 0,
+            seq_in_block: 0,
+            block_kind: None,
         }
     }
 }
@@ -260,6 +278,41 @@ pub trait RetrievalStore: Send + Sync + 'static {
     /// One record per distinct URI (first chunk wins). Implementations must NOT
     /// return the embedding column to avoid loading vectors for the entire store.
     async fn list_indexed_documents(&self) -> Result<Vec<DocumentRecord>, Error>;
+
+    /// Upsert a set of blocks for a document.
+    ///
+    /// The resource row identified by `document_id` must already exist (written
+    /// by `upsert_chunks`). The default implementation is a no-op so that
+    /// `FakeStore` and test implementations do not need to override it; only
+    /// `TenantStore` provides the real persistence.
+    async fn upsert_blocks(
+        &self,
+        store_id: &str,
+        document_id: &str,
+        blocks: &[crate::block::Block],
+    ) -> Result<(), Error> {
+        let _ = (store_id, document_id, blocks);
+        Ok(())
+    }
+
+    /// Atomically upsert chunks and blocks for a document in a single operation.
+    ///
+    /// The default implementation calls `upsert_chunks` then `upsert_blocks`
+    /// sequentially (sufficient for `FakeStore` and tests). The `TenantStore`
+    /// override wraps both operations in a single database transaction so that
+    /// a failure between the two calls cannot leave the resource in a partially
+    /// indexed state (chunks without blocks, or vice-versa).
+    async fn upsert_chunks_and_blocks(
+        &self,
+        store_id: &str,
+        document_id: &str,
+        records: Vec<ChunkRecord>,
+        blocks: &[crate::block::Block],
+    ) -> Result<usize, Error> {
+        let count = self.upsert_chunks(records).await?;
+        self.upsert_blocks(store_id, document_id, blocks).await?;
+        Ok(count)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -494,6 +547,9 @@ pub mod conformance {
             mime: Some("text/plain".to_string()),
             uri: "file:///test.md".to_string(),
             metadata: crate::parser::DocumentMetadata::default(),
+            block_seq: 0,
+            seq_in_block: 0,
+            block_kind: None,
         }
     }
 
@@ -844,6 +900,9 @@ mod tests {
             mime: Some("text/plain".to_string()),
             uri: "file:///test.md".to_string(),
             metadata: crate::parser::DocumentMetadata::default(),
+            block_seq: 0,
+            seq_in_block: 0,
+            block_kind: None,
         }
     }
 

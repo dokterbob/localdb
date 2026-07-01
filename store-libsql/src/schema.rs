@@ -7,7 +7,7 @@ use crate::vectors::embedding_column_type;
 ///
 /// Survives `VACUUM` and doesn't require a separate table. Replaces the
 /// per-store `schema_version` table from the legacy schema.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Run the full DDL for the unified database.
 ///
@@ -21,10 +21,13 @@ pub async fn create_schema(
 ) -> Result<(), libsql::Error> {
     create_stores(conn).await?;
     create_sources(conn).await?;
-    create_documents(conn).await?;
+    create_resources(conn).await?;
+    create_blocks(conn).await?;
     create_chunks(conn, embedding_dim, encoding).await?;
     create_fts(conn).await?;
     create_triggers(conn).await?;
+    create_sync_state(conn).await?;
+    create_credentials(conn).await?;
     set_user_version(conn).await?;
     Ok(())
 }
@@ -50,18 +53,22 @@ async fn create_stores(conn: &Connection) -> Result<(), libsql::Error> {
 async fn create_sources(conn: &Connection) -> Result<(), libsql::Error> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS sources (
-            id         TEXT PRIMARY KEY NOT NULL,
-            store_id   TEXT NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
-            kind       TEXT NOT NULL,
-            root       TEXT,
-            url        TEXT,
-            include    TEXT NOT NULL DEFAULT '[]',
-            exclude    TEXT NOT NULL DEFAULT '[]',
-            preset     TEXT NOT NULL DEFAULT 'prose',
-            refresh    TEXT,
-            created_at TEXT NOT NULL,
-            CHECK ((kind = 'path' AND root IS NOT NULL AND url IS NULL)
-                OR (kind = 'url'  AND url  IS NOT NULL AND root IS NULL)),
+            id          TEXT PRIMARY KEY NOT NULL,
+            store_id    TEXT NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+            kind        TEXT NOT NULL,
+            root        TEXT,
+            url         TEXT,
+            include     TEXT NOT NULL DEFAULT '[]',
+            exclude     TEXT NOT NULL DEFAULT '[]',
+            preset      TEXT NOT NULL DEFAULT 'prose',
+            refresh     TEXT,
+            created_at  TEXT NOT NULL,
+            config_json TEXT,
+            CHECK (
+                (kind = 'path' AND root IS NOT NULL)
+                OR (kind = 'url'  AND url  IS NOT NULL)
+                OR (kind NOT IN ('path', 'url'))
+            ),
             UNIQUE (store_id, id)
         )",
         (),
@@ -91,23 +98,34 @@ async fn create_sources(conn: &Connection) -> Result<(), libsql::Error> {
     Ok(())
 }
 
-async fn create_documents(conn: &Connection) -> Result<(), libsql::Error> {
+async fn create_resources(conn: &Connection) -> Result<(), libsql::Error> {
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS documents (
-            rowid          INTEGER PRIMARY KEY,
-            store_id       TEXT NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
-            id             TEXT NOT NULL,
-            source_id      TEXT NOT NULL,
-            source_kind    TEXT NOT NULL,
-            uri            TEXT NOT NULL,
-            title          TEXT,
-            mime           TEXT,
-            content_hash   TEXT NOT NULL,
-            fetched_at     TEXT NOT NULL,
-            origin_store   TEXT NOT NULL,
-            policy_version TEXT NOT NULL,
-            metadata       TEXT NOT NULL,
-            share_path     TEXT,
+        "CREATE TABLE IF NOT EXISTS resources (
+            rowid             INTEGER PRIMARY KEY,
+            store_id          TEXT NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+            id                TEXT NOT NULL,
+            source_id         TEXT NOT NULL,
+            ingestor_kind     TEXT NOT NULL,
+            resource_kind     TEXT NOT NULL,
+            uri               TEXT NOT NULL,
+            external_id       TEXT,
+            external_etag     TEXT,
+            content_hash      TEXT NOT NULL,
+            title             TEXT,
+            mime              TEXT,
+            language          TEXT,
+            date_original     TEXT,
+            date_parsed       TEXT,
+            added_at          TEXT NOT NULL,
+            modified_at       TEXT NOT NULL,
+            thread_id         TEXT,
+            channel           TEXT,
+            participants      TEXT DEFAULT '[]',
+            metadata_json     TEXT NOT NULL,
+            origin_store      TEXT NOT NULL,
+            policy_version    TEXT NOT NULL,
+            share_path        TEXT,
+            extractor_version TEXT NOT NULL,
             UNIQUE (store_id, id),
             FOREIGN KEY (store_id, source_id) REFERENCES sources(store_id, id) ON DELETE CASCADE
         )",
@@ -116,13 +134,40 @@ async fn create_documents(conn: &Connection) -> Result<(), libsql::Error> {
     .await?;
 
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_documents_store_uri ON documents(store_id, uri)",
+        "CREATE INDEX IF NOT EXISTS idx_resources_store_uri ON resources(store_id, uri)",
         (),
     )
     .await?;
 
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_documents_source_id ON documents(source_id)",
+        "CREATE INDEX IF NOT EXISTS idx_resources_source_id ON resources(source_id)",
+        (),
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn create_blocks(conn: &Connection) -> Result<(), libsql::Error> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS blocks (
+            rowid         INTEGER PRIMARY KEY,
+            store_id      TEXT NOT NULL,
+            resource_id   TEXT NOT NULL,
+            seq           INTEGER NOT NULL,
+            kind          TEXT NOT NULL,
+            text          TEXT NOT NULL,
+            metadata_json TEXT,
+            location_json TEXT,
+            UNIQUE (store_id, resource_id, seq),
+            FOREIGN KEY (store_id, resource_id) REFERENCES resources(store_id, id) ON DELETE CASCADE
+        )",
+        (),
+    )
+    .await?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_blocks_resource ON blocks(store_id, resource_id)",
         (),
     )
     .await?;
@@ -138,25 +183,27 @@ async fn create_chunks(
     let col_type = embedding_column_type(embedding_dim, encoding);
     let chunks_ddl = format!(
         "CREATE TABLE IF NOT EXISTS chunks (
-            rowid        INTEGER PRIMARY KEY,
-            store_id     TEXT NOT NULL,
-            id           TEXT NOT NULL,
-            document_id  TEXT NOT NULL,
-            seq          INTEGER NOT NULL,
-            text         TEXT NOT NULL,
-            span_start   INTEGER NOT NULL,
-            span_end     INTEGER NOT NULL,
-            heading_path TEXT NOT NULL,
-            embedding    {col_type} NOT NULL,
+            rowid         INTEGER PRIMARY KEY,
+            store_id      TEXT NOT NULL,
+            id            TEXT NOT NULL,
+            resource_id   TEXT NOT NULL,
+            block_id      INTEGER NOT NULL,
+            block_seq     INTEGER NOT NULL,
+            seq_in_block  INTEGER NOT NULL DEFAULT 0,
+            block_kind    TEXT,
+            text          TEXT NOT NULL,
+            heading_path  TEXT NOT NULL,
+            embedding     {col_type} NOT NULL,
+            location_json TEXT,
             UNIQUE (store_id, id),
-            FOREIGN KEY (store_id, document_id)
-                REFERENCES documents(store_id, id) ON DELETE CASCADE
+            FOREIGN KEY (store_id, resource_id)
+                REFERENCES resources(store_id, id) ON DELETE CASCADE
         )"
     );
     conn.execute(&chunks_ddl, ()).await?;
 
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_chunks_store_doc ON chunks(store_id, document_id)",
+        "CREATE INDEX IF NOT EXISTS idx_chunks_store_resource ON chunks(store_id, resource_id)",
         (),
     )
     .await?;
@@ -215,6 +262,36 @@ async fn create_triggers(conn: &Connection) -> Result<(), libsql::Error> {
     Ok(())
 }
 
+async fn create_sync_state(conn: &Connection) -> Result<(), libsql::Error> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS sync_state (
+            source_id    TEXT PRIMARY KEY,
+            cursor_json  TEXT,
+            last_sync_at TEXT,
+            items_synced INTEGER DEFAULT 0
+        )",
+        (),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn create_credentials(conn: &Connection) -> Result<(), libsql::Error> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS credentials (
+            ingestor_kind   TEXT NOT NULL,
+            source_id       TEXT NOT NULL,
+            key             TEXT NOT NULL,
+            value_encrypted BLOB,
+            updated_at      TEXT NOT NULL,
+            PRIMARY KEY (ingestor_kind, source_id, key)
+        )",
+        (),
+    )
+    .await?;
+    Ok(())
+}
+
 async fn set_user_version(conn: &Connection) -> Result<(), libsql::Error> {
     // `PRAGMA user_version = N` is idempotent. Use query() not execute()
     // because PRAGMAs may return rows.
@@ -233,6 +310,54 @@ pub(crate) async fn get_schema_version(conn: &Connection) -> Result<i64, libsql:
         Some(row) => row.get::<i64>(0),
         None => Ok(0),
     }
+}
+
+/// Drop all user-created tables, indexes, triggers, and virtual tables so the
+/// schema can be cleanly recreated from scratch.
+///
+/// Called when an old schema version (> 0 and < SCHEMA_VERSION) is detected.
+pub(crate) async fn drop_all_tables(conn: &Connection) -> Result<(), libsql::Error> {
+    // Collect all triggers first, then drop them.
+    let mut triggers = Vec::new();
+    {
+        let mut rows = conn
+            .query("SELECT name FROM sqlite_master WHERE type = 'trigger'", ())
+            .await?;
+        while let Some(row) = rows.next().await? {
+            triggers.push(row.get::<String>(0)?);
+        }
+    }
+    for name in &triggers {
+        conn.execute(&format!("DROP TRIGGER IF EXISTS \"{name}\""), ())
+            .await?;
+    }
+
+    // Collect all virtual tables (fts5 etc.) and regular tables.
+    let mut tables = Vec::new();
+    {
+        let mut rows = conn
+            .query(
+                "SELECT name FROM sqlite_master WHERE type IN ('table', 'view') \
+                 AND name NOT LIKE 'sqlite_%'",
+                (),
+            )
+            .await?;
+        while let Some(row) = rows.next().await? {
+            tables.push(row.get::<String>(0)?);
+        }
+    }
+    // Disable FK enforcement during the drop cascade so order doesn't matter.
+    conn.execute("PRAGMA foreign_keys = OFF", ()).await?;
+    for name in &tables {
+        conn.execute(&format!("DROP TABLE IF EXISTS \"{name}\""), ())
+            .await?;
+    }
+    conn.execute("PRAGMA foreign_keys = ON", ()).await?;
+
+    // Reset user_version to 0.
+    conn.query("PRAGMA user_version = 0", ()).await?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -324,7 +449,16 @@ mod tests {
             .await
             .unwrap();
         let names = table_names(&conn).await;
-        for expected in ["stores", "sources", "documents", "chunks", "chunks_fts"] {
+        for expected in [
+            "stores",
+            "sources",
+            "resources",
+            "blocks",
+            "chunks",
+            "chunks_fts",
+            "sync_state",
+            "credentials",
+        ] {
             assert!(
                 names.contains(expected),
                 "expected table '{expected}' missing; have: {names:?}"
@@ -343,9 +477,10 @@ mod tests {
             "idx_sources_store_id",
             "idx_sources_store_root",
             "idx_sources_store_url",
-            "idx_documents_store_uri",
-            "idx_documents_source_id",
-            "idx_chunks_store_doc",
+            "idx_resources_store_uri",
+            "idx_resources_source_id",
+            "idx_blocks_resource",
+            "idx_chunks_store_resource",
             "chunks_vec_idx",
         ] {
             assert!(
@@ -425,9 +560,9 @@ mod tests {
 
     /// Insert fixtures shared by the store-isolation FK tests.
     ///
-    /// Creates store-a and store-b, one source per store, and one document in
+    /// Creates store-a and store-b, one source per store, and one resource in
     /// store-a that references store-a's source.  Returns early before the
-    /// document insert so callers can attempt their own insert and assert the
+    /// resource insert so callers can attempt their own insert and assert the
     /// outcome.
     async fn insert_two_stores_and_sources(conn: &Connection) {
         for (id, name) in [("store-a", "Store A"), ("store-b", "Store B")] {
@@ -458,12 +593,12 @@ mod tests {
         }
     }
 
-    /// A document in store A must not be able to reference a source in store B.
+    /// A resource in store A must not be able to reference a source in store B.
     ///
     /// This guards against the cross-store contamination bug: with only a
-    /// simple `REFERENCES sources(id)` FK a document in store A could point to
+    /// simple `REFERENCES sources(id)` FK a resource in store A could point to
     /// a source in store B, and a cascade-delete of store B would then silently
-    /// remove store A's documents.  The composite FK
+    /// remove store A's resources.  The composite FK
     /// `FOREIGN KEY (store_id, source_id) REFERENCES sources(store_id, id)`
     /// closes that gap.
     #[tokio::test]
@@ -475,22 +610,24 @@ mod tests {
 
         insert_two_stores_and_sources(&conn).await;
 
-        // Attempt: document lives in store-a but references src-b (store-b).
+        // Attempt: resource lives in store-a but references src-b (store-b).
         let result = conn
             .execute(
-                "INSERT INTO documents \
-                 (store_id, id, source_id, source_kind, uri, \
-                  content_hash, fetched_at, origin_store, policy_version, metadata) \
+                "INSERT INTO resources \
+                 (store_id, id, source_id, ingestor_kind, resource_kind, uri, \
+                  content_hash, added_at, modified_at, origin_store, policy_version, \
+                  metadata_json, extractor_version) \
                  VALUES \
-                 ('store-a', 'doc-x', 'src-b', 'path', 'file:///doc.md', \
-                  'abc', '2024-01-01T00:00:00Z', 'store-a', '1', '{}')",
+                 ('store-a', 'res-x', 'src-b', 'path', 'file', 'file:///doc.md', \
+                  'abc', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', 'store-a', '1', \
+                  '{}', '1')",
                 (),
             )
             .await;
 
         assert!(
             result.is_err(),
-            "inserting a document in store-a that references a source in store-b \
+            "inserting a resource in store-a that references a source in store-b \
              should be rejected by the composite FK constraint"
         );
         let err_msg = result.unwrap_err().to_string();
@@ -500,15 +637,9 @@ mod tests {
         );
     }
 
-    /// Deleting store B must not cascade-delete documents that belong to store A.
-    ///
-    /// With the old simple `REFERENCES sources(id)` FK, deleting store B would
-    /// cascade-delete its sources, which in turn (if a document in store A
-    /// somehow referenced a store-B source) would cascade-delete store A's
-    /// documents.  The composite FK makes cross-store references impossible
-    /// in the first place, and cascade deletions remain store-scoped.
+    /// Deleting store B must not cascade-delete resources that belong to store A.
     #[tokio::test]
-    async fn deleting_store_b_does_not_cascade_to_store_a_documents() {
+    async fn deleting_store_b_does_not_cascade_to_store_a_resources() {
         let (_dir, conn) = open_test_db().await;
         create_schema(&conn, 4, VectorEncoding::Float32)
             .await
@@ -516,14 +647,16 @@ mod tests {
 
         insert_two_stores_and_sources(&conn).await;
 
-        // Insert a document in store-a that references store-a's own source.
+        // Insert a resource in store-a that references store-a's own source.
         conn.execute(
-            "INSERT INTO documents \
-             (store_id, id, source_id, source_kind, uri, \
-              content_hash, fetched_at, origin_store, policy_version, metadata) \
+            "INSERT INTO resources \
+             (store_id, id, source_id, ingestor_kind, resource_kind, uri, \
+              content_hash, added_at, modified_at, origin_store, policy_version, \
+              metadata_json, extractor_version) \
              VALUES \
-             ('store-a', 'doc-1', 'src-a', 'path', 'file:///doc.md', \
-              'abc', '2024-01-01T00:00:00Z', 'store-a', '1', '{}')",
+             ('store-a', 'res-1', 'src-a', 'path', 'file', 'file:///doc.md', \
+              'abc', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', 'store-a', '1', \
+              '{}', '1')",
             (),
         )
         .await
@@ -534,15 +667,52 @@ mod tests {
             .await
             .unwrap();
 
-        // Store A's document must still be present.
+        // Store A's resource must still be present.
         let mut rows = conn
-            .query("SELECT id FROM documents WHERE store_id = 'store-a'", ())
+            .query("SELECT id FROM resources WHERE store_id = 'store-a'", ())
             .await
             .unwrap();
         let row = rows.next().await.unwrap();
         assert!(
             row.is_some(),
-            "store A's document should still exist after deleting store B"
+            "store A's resource should still exist after deleting store B"
         );
+    }
+
+    /// drop_all_tables leaves the DB empty and with user_version=0.
+    #[tokio::test]
+    async fn drop_all_tables_resets_db() {
+        let (_dir, conn) = open_test_db().await;
+        create_schema(&conn, 4, VectorEncoding::Float32)
+            .await
+            .unwrap();
+
+        drop_all_tables(&conn).await.unwrap();
+
+        // No user tables remain.
+        let names = table_names(&conn).await;
+        assert!(
+            names.is_empty(),
+            "all tables should be dropped; remaining: {names:?}"
+        );
+
+        // user_version is reset.
+        let v = get_schema_version(&conn).await.unwrap();
+        assert_eq!(v, 0, "user_version should be 0 after drop_all_tables");
+    }
+
+    /// After drop_all_tables, create_schema succeeds again (full reinitialisation).
+    #[tokio::test]
+    async fn drop_and_recreate_schema_succeeds() {
+        let (_dir, conn) = open_test_db().await;
+        create_schema(&conn, 4, VectorEncoding::Float32)
+            .await
+            .unwrap();
+        drop_all_tables(&conn).await.unwrap();
+        create_schema(&conn, 4, VectorEncoding::Float32)
+            .await
+            .unwrap();
+        let v = get_schema_version(&conn).await.unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
     }
 }

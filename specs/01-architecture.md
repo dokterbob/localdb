@@ -15,8 +15,8 @@ things to version and install instead of one).
 
 | Crate | Contents |
 |---|---|
-| `core` | Domain model (stores, sources, documents, blocks, chunks, citations, index jobs), search orchestration, indexing policy, the `RetrievalStore` trait, the `Embedder` trait, error taxonomy. No I/O frameworks. |
-| `extract` | Format detection and extraction → normalized document (Markdown, plain text, HTML, text-layer PDF in v1). |
+| `core` | Domain model (stores, sources, resources, blocks, chunks, citations, index jobs), ingestor trait (`Ingestor`, `IngestorKind`), search orchestration, indexing policy, the `RetrievalStore` trait, the `Embedder` trait, error taxonomy. No I/O frameworks. |
+| `extract` | Format detection and extraction → blocks (Markdown, plain text, HTML, text-layer PDF in v1). Implementation detail of the file ingestor. |
 | `store-libsql` | libsql implementation of `RetrievalStore` (DiskANN vectors + FTS5). |
 | `embed` | `Embedder` implementations: local ONNX (fastembed-class), OpenAI-compatible HTTP provider, contextualized-embedding providers. Model download/cache management. |
 | `server` | HTTP API (axum or similar), daemon runtime: file watching, URL refresh scheduling, job queue, unix socket. |
@@ -26,6 +26,8 @@ things to version and install instead of one).
 
 **Invariant:** all surfaces (CLI, HTTP, MCP) sit on the same `core`; no retrieval, indexing, or
 domain logic is implemented in a surface crate — one shared core beats duplicated logic.
+
+**Ingestor crate boundary:** the `Ingestor` trait lives in `core` (contract: yields `Resource`s). Concrete ingestor implementations, terminal interaction, credential prompts, HTTP/API clients, and source-specific setup live outside `core`. The `file` and `url` ingestors currently live alongside `cli`; future connectors may live in dedicated crates.
 
 ## 2. Surface ordering & storage default
 
@@ -78,15 +80,17 @@ Two concepts, deliberately separated:
   `libsql`.
 
 `RetrievalStore` (trait sketch — normative surface, not final signatures): upsert chunks (dense
-vector + text for BM25 + metadata), delete by document, dense search, BM25 search, metadata
+vector + text for BM25 + metadata), delete by resource, dense search, BM25 search, metadata
 filtering, store-level stats. Fusion happens above the trait in `core`.
+
+**Resource replaces Document** as the logical content unit. A `Resource` is the ingested, identified representation of a source item (file, URL, etc.); it carries blocks that are then chunked for indexing. The term "document" is retired from the domain model in favor of "resource".
 
 ## 5. Federation-readiness constraints (design constraints only)
 
 MVP implements none of the federation behavior in [VISION.md](../VISION.md), but every MVP
 component must respect:
 
-1. **Stable, content-addressed IDs** for documents and chunks ([02-domain-model.md](02-domain-model.md) §3) — IDs must be meaningful outside the node that minted them.
+1. **Stable, content-addressed IDs** for resources and chunks ([02-domain-model.md](02-domain-model.md) §3) — IDs must be meaningful outside the node that minted them.
 2. **Provenance on every chunk** (origin store, source, content hash, fetch time).
 3. **Per-store visibility** modeled as an enum, never a boolean bolted on later.
 4. **No assumption of a single store** anywhere in core, surfaces, or config.
@@ -119,6 +123,6 @@ test first, then the implementation. Coverage gates, enforced in CI (e.g. `cargo
 - **≥ 80%** line coverage for critical functions — search orchestration, fusion, chunking,
   extraction normalization, config resolution, ID derivation.
 - **≥ 90%** for anything that **modifies data** — store upserts/deletes, index job execution,
-  document/chunk writes, config/state mutation, migrations.
+  resource/chunk writes, config/state mutation, migrations.
 
 Trait-based seams (`RetrievalStore`, `Embedder`) exist partly to make this practical. Core logic is tested against a real tmpdir SqliteBackend. Adapter crates are tested against the real backend (libsql tmpdir, ONNX tiny model) in integration tests. Every ticket in [PLAN.md](../PLAN.md) carries test expectations. A ticket is not done below its gate.

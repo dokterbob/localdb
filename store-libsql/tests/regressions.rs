@@ -82,6 +82,9 @@ fn make_chunk(id: &str, doc_id: &str, store_id: &str, embedding: Vec<f32>) -> Ch
         mime: Some("text/plain".to_string()),
         uri: format!("file:///data/{store_id}/{doc_id}.md"),
         metadata: DocumentMetadata::default(),
+        block_seq: 0,
+        seq_in_block: 0,
+        block_kind: None,
     }
 }
 

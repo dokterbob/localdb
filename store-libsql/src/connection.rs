@@ -80,14 +80,37 @@ impl LibsqlDb {
         let version = schema::get_schema_version(&conn)
             .await
             .map_err(map_libsql_err)?;
-        if version != 0 && version != schema::SCHEMA_VERSION {
+        if version != 0 && version > schema::SCHEMA_VERSION {
+            // Newer schema than this build understands — refuse to open.
             return Err(Error::InvalidConfig {
                 message: format!(
-                    "DB schema version {version} is incompatible with this build \
-                     (expects {}); delete the .db file and re-index.",
-                    schema::SCHEMA_VERSION
+                    "database schema version {version} is newer than this build \
+                     (v{expected}); upgrade localdb or delete the database to reinitialize",
+                    expected = schema::SCHEMA_VERSION,
                 ),
             });
+        }
+        if version != 0 && version < schema::SCHEMA_VERSION {
+            // Old schema detected — drop everything and let create_schema rebuild.
+            // This project is pre-release with no data preservation guarantee.
+            eprintln!(
+                "warning: database schema version mismatch (found v{}, expected v{}): \
+                 all indexed data will be erased and the database re-initialised. \
+                 Re-run `localdb index` to restore your index.",
+                version,
+                schema::SCHEMA_VERSION,
+            );
+            tracing::warn!(
+                old_version = version,
+                new_version = schema::SCHEMA_VERSION,
+                "DB schema version mismatch: dropping all tables and reinitialising"
+            );
+            schema::drop_all_tables(&conn)
+                .await
+                .map_err(|e| Error::Internal {
+                    message: format!("drop_all_tables during schema upgrade: {e}"),
+                    correlation_id: "libsql_db_drop_tables".to_string(),
+                })?;
         }
 
         schema::create_schema(&conn, embedding_dim, encoding)
@@ -318,7 +341,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reopen_with_wrong_schema_version_errors() {
+    async fn reopen_with_old_schema_version_reinitialises() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
         // Stamp version 1 on a raw libsql DB (bypassing LibsqlDb::open).
@@ -327,15 +350,12 @@ mod tests {
             let conn = db.connect().unwrap();
             conn.query("PRAGMA user_version = 1", ()).await.unwrap();
         }
-        // Opening via LibsqlDb::open must return InvalidConfig.
+        // Opening via LibsqlDb::open should now succeed: it drops and recreates.
         let result = LibsqlDb::open(&path, 4, localdb_core::VectorEncoding::Float32).await;
         assert!(
-            matches!(result, Err(localdb_core::Error::InvalidConfig { .. })),
-            "expected InvalidConfig for wrong schema version, got: {}",
-            result
-                .as_ref()
-                .err()
-                .map_or("Ok(_)".to_string(), |e| format!("{e:?}"))
+            result.is_ok(),
+            "old schema version should trigger reinitialisation, not an error; got: {:?}",
+            result.as_ref().err()
         );
     }
 
@@ -349,5 +369,32 @@ mod tests {
         LibsqlDb::open(&path, 4, localdb_core::VectorEncoding::Float32)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reopen_with_newer_schema_version_returns_invalid_config_error() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        // Stamp a version SCHEMA_VERSION + 1 on a raw libsql DB (bypassing LibsqlDb::open).
+        {
+            let db = libsql::Builder::new_local(&path).build().await.unwrap();
+            let conn = db.connect().unwrap();
+            let future_version = crate::schema::SCHEMA_VERSION + 1;
+            conn.query(&format!("PRAGMA user_version = {future_version}"), ())
+                .await
+                .unwrap();
+        }
+        // Opening via LibsqlDb::open must fail with InvalidConfig, NOT drop the data.
+        let result = LibsqlDb::open(&path, 4, localdb_core::VectorEncoding::Float32).await;
+        match result {
+            Err(Error::InvalidConfig { message }) => {
+                assert!(
+                    message.contains("newer"),
+                    "error should mention 'newer': {message}"
+                );
+            }
+            Err(other) => panic!("expected InvalidConfig, got: {other:?}"),
+            Ok(_) => panic!("expected InvalidConfig, but reopen with newer schema succeeded"),
+        }
     }
 }

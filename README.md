@@ -47,6 +47,36 @@ provenance, and stores as first-class shareable units. See [VISION.md](VISION.md
 
 ---
 
+## Comparison to other tools
+
+localdb is for personal knowledge search from the command line or from an AI assistant, with
+no cloud dependency, no daemon required for search, and one binary to install. It's agent-first
+rather than chat-first: the CLI and MCP server are the primary surfaces, validated in practice
+against Codex, Claude Code, Claude Desktop, and Hermes Agent, using both cloud (Anthropic,
+OpenAI, DeepSeek) and local (Gemma) model providers.
+
+It is deliberately narrow — "do one thing well": a verifiable retrieval primitive (index,
+search, cite), not an all-in-one chat app or team platform. That keeps its API stable enough
+for other things to be built on top instead of bundled in — a second-brain UI, or an agent's
+own live scratchpad search. The roadmap points toward unbounded content types (connectors
+beyond files/URLs) and, eventually, federation — searching datasets shared by people you trust,
+larger than any one person could assemble alone — which is an axis no surveyed competitor
+addresses yet. See [docs/comparison.md](docs/comparison.md) for the full survey against eight
+adjacent projects.
+
+| Project | License | Search | MCP surface | Citations |
+|---|---|---|---|---|
+| **GPT4All (LocalDocs)** | MIT | Vector-only | None | File + snippet, no spans |
+| **Khoj** | AGPL-3.0 | Vector-only | Client-only (no MCP server) | File + excerpt, no spans/hashes |
+| **Basic Memory** | AGPL-3.0 | Hybrid full-text + vector | Native MCP server, read-write notes | Note-level, no byte-span/hash |
+
+GPT4All is the most common comparison point (and appears effectively stalled — no commits or
+releases in 13+ months); Khoj is the most popular actively-maintained self-hosted alternative;
+Basic Memory is the closest architectural peer, trading localdb's read-only cited-corpus model
+for read-write note editing over MCP.
+
+---
+
 ## Install
 
 ### From source (works today)
@@ -186,6 +216,7 @@ Design rationale and planned behavior live in the [specs/](specs/) directory.
 | Document | Contents |
 |---|---|
 | [docs/install.md](docs/install.md) | Full install options, platform notes, shell completion |
+| [docs/comparison.md](docs/comparison.md) | Comparison to GPT4All, Khoj, Basic Memory, and 5 other adjacent projects |
 | [docs/release-engineering.md](docs/release-engineering.md) | Release pipeline, binary targets, MSRV, how to cut a release |
 | [docs/quickstart.md](docs/quickstart.md) | Annotated end-to-end walkthrough with real output |
 | [docs/configuration.md](docs/configuration.md) | YAML config schema, paths, store/source options |

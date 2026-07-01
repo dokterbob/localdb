@@ -153,15 +153,16 @@ pub enum SourceCommand {
 
 fn main() {
     // Initialize structured logging. In embedded mode (no daemon), emit to stderr.
-    // pdf-extract/lopdf emit high-volume WARN noise (unknown glyph, corrupt deflate,
-    // Unicode mismatch) that is not actionable — quiet those targets to `error`.
-    // Real per-document extraction failures surface via the job outcome path, not here.
+    // pdf-extract/lopdf/cff_parser emit high-volume noise (unknown glyph, corrupt deflate,
+    // Unicode mismatch, object load errors) that is not actionable for users — suppress
+    // those targets entirely by default.  Real per-document extraction failures surface via
+    // the job outcome path (one WARN line per failed file), not here.
     // RUST_LOG still overrides this default entirely (e.g. RUST_LOG=debug to see it all).
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new("warn,pdf_extract=error,lopdf=error")
+                tracing_subscriber::EnvFilter::new("warn,lopdf=off,pdf_extract=off,cff_parser=off")
             }),
         )
         .init();

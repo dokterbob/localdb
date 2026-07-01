@@ -89,6 +89,9 @@ fn make_record(store_id: &str, source_id: &str, idx: usize) -> ChunkRecord {
         mime: Some("text/plain".to_string()),
         uri: format!("file:///data/{store_id}/doc.md"),
         metadata: DocumentMetadata::default(),
+        block_seq: 0,
+        seq_in_block: 0,
+        block_kind: None,
     }
 }
 

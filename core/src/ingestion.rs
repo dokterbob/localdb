@@ -19,10 +19,11 @@ use std::path::Path;
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 
-use crate::chunker::{chunk_document, CharSizer, ChunkSizer, ChunkerConfig, TokenSizer};
+use crate::chunker::{chunk_blocks, CharSizer, ChunkSizer, ChunkerConfig, TokenSizer};
 use crate::embedder::{DocumentChunks, Embedder};
 use crate::error::Error;
-use crate::ids::{content_hash, document_id, new_ulid};
+use crate::ids::{document_id, new_ulid};
+use crate::markdown_blocks::{compute_blocks_hash, markdown_to_blocks};
 use crate::store::{ChunkRecord, RetrievalStore};
 use crate::types::{
     Chunk, IndexJob, IndexJobScope, IndexJobState, IndexJobStats, Provenance, Source, SourceKind,
@@ -397,6 +398,8 @@ fn scale_to_chars(config: &ChunkerConfig) -> ChunkerConfig {
         preset: config.preset.clone(),
         target_tokens: Some(config.resolved_target_tokens() * 4),
         overlap_tokens: Some(config.resolved_overlap_tokens() * 4),
+        window_turns: config.window_turns,
+        stride_turns: config.stride_turns,
     }
 }
 
@@ -405,11 +408,24 @@ fn scale_to_chars(config: &ChunkerConfig) -> ChunkerConfig {
 /// Any panic in extraction or chunking is downgraded to a per-document error so
 /// the ingestion loop can continue with the next file rather than unwinding the
 /// whole process.
+///
+/// The default panic hook is temporarily replaced with a no-op before calling
+/// `catch_unwind` to suppress the `thread 'main' panicked at ...` output that
+/// the default hook prints to stderr.  This swap is NOT thread-safe (the hook
+/// is a global), so callers must ensure no concurrent `catch_panic` calls occur.
+/// Currently extraction runs single-threaded, so this is safe.
 fn catch_panic<T>(
     label: &str,
     f: impl FnOnce() -> Result<T, Error> + std::panic::UnwindSafe,
 ) -> Result<T, Error> {
-    match std::panic::catch_unwind(f) {
+    // Suppress the default panic hook's stderr output for expected third-party panics
+    // (e.g. pdf-extract on malformed PDFs).  The caller emits a clean WARN line instead.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(f);
+    std::panic::set_hook(prev_hook);
+
+    match result {
         Ok(result) => result,
         Err(payload) => {
             let msg = payload
@@ -450,8 +466,9 @@ pub async fn index_document(
         std::panic::AssertUnwindSafe(|| extractor.extract(&input.bytes, input.filename.as_deref())),
     )?;
 
-    // Compute content hash.
-    let hash = content_hash(&extraction.markdown);
+    // Convert markdown to typed blocks and compute content hash.
+    let blocks = markdown_to_blocks(&extraction.markdown);
+    let hash = compute_blocks_hash(&blocks);
 
     // Content-addressed document ID.
     let doc_id = document_id(&input.uri, &hash);
@@ -501,7 +518,7 @@ pub async fn index_document(
     let chunk_outputs = catch_panic(
         "chunk",
         std::panic::AssertUnwindSafe(|| {
-            chunk_document(&doc_id, &extraction.markdown, &chunker_cfg, sizer.as_ref())
+            chunk_blocks(&doc_id, &blocks, &chunker_cfg, sizer.as_ref())
         }),
     )?;
 
@@ -600,18 +617,24 @@ pub async fn index_document(
             provenance: provenance.clone(),
         };
 
-        let record = ChunkRecord::from_chunk(
+        let mut record = ChunkRecord::from_chunk(
             &chunk,
             embedding.clone(),
             input.uri.clone(),
             input.mime.clone(),
             metadata.clone(),
         );
+        record.block_seq = chunk_out.block_seq;
+        record.seq_in_block = chunk_out.seq_in_block;
+        record.block_kind = chunk_out.block_kind.clone();
+        // TODO(#129): chunk_out.window_block_seqs not mapped — message-window membership lost after persistence
         records.push(record);
     }
 
     let written = records.len();
-    store.upsert_chunks(records).await?;
+    store
+        .upsert_chunks_and_blocks(&config.store_id, &doc_id, records, &blocks)
+        .await?;
 
     let record = DocumentRecord {
         uri: input.uri.clone(),
@@ -790,7 +813,7 @@ trait SourceKindExt {
 impl SourceKindExt for SourceKind {
     fn to_string_kind(&self) -> String {
         match self {
-            SourceKind::Path => "path".to_string(),
+            SourceKind::Path => "file".to_string(),
             SourceKind::Url => "url".to_string(),
         }
     }
@@ -1210,6 +1233,7 @@ fn detect_mime(path: &Path) -> Option<String> {
 mod tests {
     use super::*;
     use crate::embedder::FakeEmbedder;
+    use crate::ids::content_hash;
     use crate::store::FakeStore;
     use crate::types::{SourceKind, SourceSpec};
     use crate::Span;
@@ -1407,6 +1431,9 @@ mod tests {
             mime: None,
             uri: "file:///doc1.md".to_string(),
             metadata: crate::parser::DocumentMetadata::default(),
+            block_seq: 0,
+            seq_in_block: 0,
+            block_kind: None,
         }];
 
         let idx = DocumentIndex::from_chunk_records(&records);
@@ -1921,12 +1948,12 @@ mod tests {
     async fn index_document_chunker_panic_returns_err() {
         // PanicChunkExtractor returns a valid extraction but has corrupted text
         // that triggers a panic in the chunker.  We simulate this by wrapping
-        // the FakeExtractor output and then triggering chunk_document to panic via
+        // the FakeExtractor output and then triggering chunk_blocks to panic via
         // a deliberately crafted bad byte index.  Rather than fighting the real
         // chunker, we use a second panic extractor that panics AFTER extraction
         // but we test the more realistic scenario: use a custom extractor whose
         // extract() succeeds but whose text triggers a downstream panic in
-        // chunk_document via the sizer.
+        // chunk_blocks via the sizer.
         //
         // The simplest approach: inject a custom extractor that panics in extract
         // and verify the catch_unwind in the extract step handles it.  The chunk
@@ -2565,6 +2592,9 @@ mod tests {
             mime: None,
             uri: url.to_string(),
             metadata: crate::parser::DocumentMetadata::default(),
+            block_seq: 0,
+            seq_in_block: 0,
+            block_kind: None,
         };
         store.upsert_chunks(vec![chunk]).await.unwrap();
 
@@ -3068,6 +3098,9 @@ mod tests {
             mime: None,
             uri: uri.to_string(),
             metadata: crate::parser::DocumentMetadata::default(),
+            block_seq: 0,
+            seq_in_block: 0,
+            block_kind: None,
         };
 
         // Hydrate a fresh DocumentIndex from the stored chunk records.
@@ -3096,6 +3129,8 @@ mod tests {
             preset: "prose".to_string(),
             target_tokens: Some(256),
             overlap_tokens: Some(0),
+            window_turns: None,
+            stride_turns: None,
         };
         let scaled = scale_to_chars(&cfg);
         assert_eq!(scaled.preset, "prose");
@@ -3117,6 +3152,8 @@ mod tests {
             preset: "code".to_string(),
             target_tokens: Some(3000),
             overlap_tokens: Some(0),
+            window_turns: None,
+            stride_turns: None,
         };
         let scaled = scale_to_chars(&cfg);
         assert_eq!(scaled.preset, "code");
@@ -3139,6 +3176,8 @@ mod tests {
             preset: "prose".to_string(),
             target_tokens: None,
             overlap_tokens: None,
+            window_turns: None,
+            stride_turns: None,
         };
         let scaled = scale_to_chars(&cfg);
         // Default prose target is 256; scaled = 256 * 4 = 1024. Overlap 0 → 0.
@@ -3583,6 +3622,9 @@ mod tests {
             mime: None,
             uri: uri.to_string(),
             metadata: crate::parser::DocumentMetadata::default(),
+            block_seq: 0,
+            seq_in_block: 0,
+            block_kind: None,
         }
     }
 }
