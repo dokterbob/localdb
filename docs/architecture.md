@@ -217,6 +217,23 @@ unavailable); `local-onnx` forces ONNX. CoreML and ONNX vectors are index-interc
 sign agreement), so switching backends needs no reindex. See [specs/03-config.md](../specs/03-config.md) §7 and
 [specs/04-search-pipeline.md](../specs/04-search-pipeline.md) §4.
 
+**Linux ONNX Runtime glibc floor.** `local-onnx` pulls in `ort` via `fastembed`'s
+`ort-download-binaries-rustls-tls` feature, which downloads and statically links a
+prebuilt ONNX Runtime archive from pyke.io's CDN. That archive is compiled against
+glibc ≥ 2.38 headers, which redirect `strtol`/`strtoll`/`strtoull` to internal
+versioned symbols (`__isoc23_strtol` etc. — added for ISO C23 binary-literal
+parsing, otherwise behaviorally identical). Linking it on an older glibc (e.g.
+`ubuntu-22.04`, glibc 2.35 — see [Known gaps](#known-gaps) and issue
+[#133](https://github.com/dokterbob/localdb/issues/133)) fails with undefined-symbol
+errors; this is a known, unresolved upstream issue
+([pykeio/ort#523](https://github.com/pykeio/ort/issues/523)). `embed/build.rs`
+works around it on Linux by compiling `embed/glibc_shim.c` — three trivial
+pass-through definitions of the missing symbols — and linking them into the final
+binary, which both satisfies the link and removes the artificial glibc floor at
+runtime (the binary no longer references the versioned symbol at all). This is
+scoped to `target_os = "linux"` and the `local-onnx` feature only; macOS is
+unaffected.
+
 ---
 
 ## Known gaps {#known-gaps}
@@ -239,6 +256,9 @@ The CoreML backend (`local-coreml` feature; see [Platform notes](#platform-notes
 
 **5. Sources added before the include-allowlist change keep empty `include` globs.**
 As of the `only-index-supported-files` branch, `cli` automatically sets `DEFAULT_PATH_INCLUDES` (an extension-based allowlist) on new directory sources that have no explicit `include` globs. Sources that were added before this change already have an empty `include` list recorded in the unified database and will continue to index all files they enumerate until they are removed and re-added with `localdb source add`. There is no automatic migration, and this change is intentionally not folded into `policy_version`. The per-file chunk preset is determined deterministically from the filename/MIME type at index time, so re-indexing existing content with the new code produces correct results without a policy-hash change.
+
+**6. Linux release binary required glibc 2.38, breaking older distros.** ([#133](https://github.com/dokterbob/localdb/issues/133))
+**Root cause and fix documented in [Platform notes](#platform-notes)** — the actual floor-setter was `ort`'s prebuilt ONNX Runtime archive (not the build-machine glibc), worked around with a symbol shim in `embed/build.rs` / `embed/glibc_shim.c`. `release.yml` is additionally pinned to `ubuntu-22.04` with a CI check guarding against future regressions.
 
 ---
 

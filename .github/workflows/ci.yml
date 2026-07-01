@@ -166,7 +166,7 @@ jobs:
   # The function and test live in the core crate (error.rs / tests).
   # If tests are removed, coverage will drop and the coverage job will fail.
   build-all-platforms:
-    name: Cross-compile check (${{ matrix.target }})
+    name: Cross-compile build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -206,7 +206,10 @@ jobs:
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-${{ matrix.target }}-cargo-
-      - name: Check workspace builds for target
+      - name: Build localdb binary for target
+        # A full build+link (not `cargo check`, which never invokes the linker)
+        # mirrors release.yml's actual release build, so link-time regressions
+        # like #133's glibc-versioned-symbol failure are caught on every PR.
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo check --workspace --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} -p localdb

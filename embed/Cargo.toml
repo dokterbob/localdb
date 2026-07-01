@@ -59,3 +59,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # Mock HTTP server for testing hosted providers
 wiremock = "0.6"
 tempfile = "3"
+
+[build-dependencies]
+# Compiles glibc_shim.c (Linux + local-onnx only) — see build.rs and issue #133.
+cc = "1"

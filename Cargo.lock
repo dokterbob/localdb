@@ -1481,6 +1481,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "block2",
+ "cc",
  "dirs 5.0.1",
  "fastembed",
  "futures-util",
