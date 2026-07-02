@@ -4,7 +4,7 @@
 //! `handle_message` interface (simulates what a real stdio client would do).
 //!
 //! Acceptance criteria (T10):
-//! - Tool list exactly the three read-only tools.
+//! - Tool list exactly the four read-only tools.
 //! - `search` returns structured citations matching the canonical JSON.
 //! - Unknown store name → `store_not_found` as MCP tool error.
 //! - No mutating capability reachable.
@@ -22,7 +22,7 @@ use localdb_core::{
     FakeEmbedder,
 };
 use mcp::{
-    server::{McpServer, TOOL_GET_DOCUMENT, TOOL_LIST_STORES, TOOL_SEARCH},
+    server::{McpServer, TOOL_GET_CHUNKS, TOOL_GET_DOCUMENT, TOOL_LIST_STORES, TOOL_SEARCH},
     AvailableStore, StoreDescriptor,
 };
 
@@ -88,6 +88,65 @@ async fn make_server_with_seeded_store() -> (McpServer, String, String) {
     let embedder = Box::new(FakeEmbedder::new(4));
     let server = McpServer::new(vec![available], embedder);
     (server, doc_id, cid)
+}
+
+/// Build a test McpServer seeded with ONE document made of 3 chunks, inserted
+/// out of storage order. Proves that `get_chunks` sorts defensively by
+/// `(block_seq, seq_in_block)` rather than trusting insertion/store order
+/// (unlike libsql, `FakeStore` does not guarantee ordering).
+async fn make_server_with_multichunk_doc() -> (McpServer, String) {
+    let store = Arc::new(FakeStore::new());
+
+    let uri = "file:///docs/multi.md";
+    let doc_hash = content_hash("multi-chunk document body");
+    let doc_id = document_id(uri, &doc_hash);
+
+    let make_chunk = |text: &str, block_seq: u32, seq_in_block: u32, heading: &str| {
+        let span = Span::new(0, text.len());
+        let cid = chunk_id(&doc_id, text, span.start, span.end, block_seq);
+        ChunkRecord {
+            id: cid,
+            document_id: doc_id.clone(),
+            store_id: "store-1".to_string(),
+            text: text.to_string(),
+            span,
+            heading_path: vec![heading.to_string()],
+            embedding: vec![0.1, 0.2, 0.3, 0.4],
+            policy_version: "v1".to_string(),
+            fetched_at: "2026-06-10T12:00:00Z".to_string(),
+            content_hash: doc_hash.clone(),
+            origin_store: "store-1".to_string(),
+            source_id: new_ulid(),
+            source_kind: "path".to_string(),
+            mime: Some("text/markdown".to_string()),
+            uri: uri.to_string(),
+            metadata: localdb_core::DocumentMetadata {
+                title: Some("Multi-chunk Doc".to_string()),
+                ..Default::default()
+            },
+            block_seq,
+            seq_in_block,
+            block_kind: Some("paragraph".to_string()),
+        }
+    };
+
+    // Inserted out of (block_seq, seq_in_block) order on purpose.
+    let chunks = vec![
+        make_chunk("third chunk text", 1, 1, "Section Two"),
+        make_chunk("first chunk text", 0, 0, "Section One"),
+        make_chunk("second chunk text", 1, 0, "Section Two"),
+    ];
+    store.upsert_chunks(chunks).await.expect("seed chunks");
+
+    let sd = StoreDescriptor {
+        id: "store-1".to_string(),
+        name: "test-store".to_string(),
+        visibility: "private".to_string(),
+    };
+    let available = AvailableStore::from_arc(sd, store);
+    let embedder = Box::new(FakeEmbedder::new(4));
+    let server = McpServer::new(vec![available], embedder);
+    (server, doc_id)
 }
 
 fn make_request(id: u64, method: &str, params: Option<Value>) -> String {
@@ -167,9 +226,9 @@ async fn test_initialized_notification_no_response() {
     );
 }
 
-/// T03: tools/list returns exactly the three read-only tools
+/// T03: tools/list returns exactly the four read-only tools
 #[tokio::test]
-async fn test_tools_list_exact_three_tools() {
+async fn test_tools_list_exact_four_tools() {
     let server = make_server_with_one_store();
 
     let req_str = make_request(2, "tools/list", None);
@@ -183,7 +242,7 @@ async fn test_tools_list_exact_three_tools() {
         .as_array()
         .expect("tools should be array");
 
-    assert_eq!(tools.len(), 3, "should expose exactly 3 tools");
+    assert_eq!(tools.len(), 4, "should expose exactly 4 tools");
 
     let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
 
@@ -194,6 +253,10 @@ async fn test_tools_list_exact_three_tools() {
     assert!(
         tool_names.contains(&TOOL_GET_DOCUMENT),
         "should have 'get_document' tool"
+    );
+    assert!(
+        tool_names.contains(&TOOL_GET_CHUNKS),
+        "should have 'get_chunks' tool"
     );
     assert!(
         tool_names.contains(&TOOL_LIST_STORES),
@@ -674,6 +737,234 @@ async fn test_get_document_no_args() {
     let v = parse_response(&resp);
 
     assert_eq!(v["result"]["isError"], true, "should be a tool error");
+}
+
+// ---------------------------------------------------------------------------
+// Tool: get_chunks
+// ---------------------------------------------------------------------------
+
+/// get_chunks returns chunks sorted by (block_seq, seq_in_block) regardless
+/// of insertion order, with correct spans and heading_path.
+#[tokio::test]
+async fn test_get_chunks_happy_path_sorted() {
+    let (server, doc_id) = make_server_with_multichunk_doc().await;
+
+    let req_str = make_request(
+        60,
+        "tools/call",
+        Some(json!({
+            "name": TOOL_GET_CHUNKS,
+            "arguments": { "document_id": doc_id }
+        })),
+    );
+
+    let req = mcp::server::parse_message(&req_str).unwrap();
+    let resp = server.handle_message(&req).await.unwrap();
+    let v = parse_response(&resp);
+
+    assert!(v.get("error").is_none(), "should not have RPC error: {v}");
+    assert_eq!(v["result"]["isError"], false);
+
+    let content = v["result"]["content"].as_array().unwrap();
+    let text = content[0]["text"].as_str().unwrap();
+    let result: Value = serde_json::from_str(text).expect("valid JSON in content");
+
+    assert_eq!(result["document_id"], doc_id);
+    assert_eq!(result["uri"], "file:///docs/multi.md");
+    assert_eq!(result["title"], "Multi-chunk Doc");
+    assert_eq!(result["total_chunks"], 3);
+    assert_eq!(result["offset"], 0);
+    assert_eq!(result["returned"], 3);
+
+    let chunks = result["chunks"].as_array().expect("chunks array");
+    assert_eq!(chunks.len(), 3);
+
+    // Must be sorted by (block_seq, seq_in_block), not insertion order.
+    assert_eq!(chunks[0]["text"], "first chunk text");
+    assert_eq!(chunks[0]["block_seq"], 0);
+    assert_eq!(chunks[0]["seq_in_block"], 0);
+    assert_eq!(chunks[0]["heading_path"][0], "Section One");
+    assert_eq!(chunks[0]["span"]["start"], 0);
+    assert_eq!(chunks[0]["span"]["end"], "first chunk text".len());
+    assert_eq!(chunks[0]["block_kind"], "paragraph");
+
+    assert_eq!(chunks[1]["text"], "second chunk text");
+    assert_eq!(chunks[1]["block_seq"], 1);
+    assert_eq!(chunks[1]["seq_in_block"], 0);
+
+    assert_eq!(chunks[2]["text"], "third chunk text");
+    assert_eq!(chunks[2]["block_seq"], 1);
+    assert_eq!(chunks[2]["seq_in_block"], 1);
+}
+
+/// get_chunks paginates with offset/limit.
+#[tokio::test]
+async fn test_get_chunks_pagination_offset_limit() {
+    let (server, doc_id) = make_server_with_multichunk_doc().await;
+
+    let req_str = make_request(
+        61,
+        "tools/call",
+        Some(json!({
+            "name": TOOL_GET_CHUNKS,
+            "arguments": { "document_id": doc_id, "offset": 1, "limit": 1 }
+        })),
+    );
+
+    let req = mcp::server::parse_message(&req_str).unwrap();
+    let resp = server.handle_message(&req).await.unwrap();
+    let v = parse_response(&resp);
+
+    assert_eq!(v["result"]["isError"], false);
+    let content = v["result"]["content"].as_array().unwrap();
+    let text = content[0]["text"].as_str().unwrap();
+    let result: Value = serde_json::from_str(text).unwrap();
+
+    assert_eq!(result["total_chunks"], 3);
+    assert_eq!(result["offset"], 1);
+    assert_eq!(result["limit"], 1);
+    assert_eq!(result["returned"], 1);
+
+    let chunks = result["chunks"].as_array().unwrap();
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0]["text"], "second chunk text");
+}
+
+/// get_chunks with an out-of-range offset returns an empty chunks array,
+/// not an error.
+#[tokio::test]
+async fn test_get_chunks_offset_out_of_range_returns_empty() {
+    let (server, doc_id) = make_server_with_multichunk_doc().await;
+
+    let req_str = make_request(
+        62,
+        "tools/call",
+        Some(json!({
+            "name": TOOL_GET_CHUNKS,
+            "arguments": { "document_id": doc_id, "offset": 99 }
+        })),
+    );
+
+    let req = mcp::server::parse_message(&req_str).unwrap();
+    let resp = server.handle_message(&req).await.unwrap();
+    let v = parse_response(&resp);
+
+    assert_eq!(
+        v["result"]["isError"], false,
+        "out-of-range offset is not an error"
+    );
+    let content = v["result"]["content"].as_array().unwrap();
+    let text = content[0]["text"].as_str().unwrap();
+    let result: Value = serde_json::from_str(text).unwrap();
+
+    assert_eq!(result["total_chunks"], 3);
+    assert_eq!(result["returned"], 0);
+    assert!(result["chunks"].as_array().unwrap().is_empty());
+}
+
+/// get_chunks with missing document_id → invalid_request tool error.
+#[tokio::test]
+async fn test_get_chunks_missing_document_id() {
+    let server = make_server_with_one_store();
+
+    let req_str = make_request(
+        63,
+        "tools/call",
+        Some(json!({
+            "name": TOOL_GET_CHUNKS,
+            "arguments": {}
+        })),
+    );
+
+    let req = mcp::server::parse_message(&req_str).unwrap();
+    let resp = server.handle_message(&req).await.unwrap();
+    let v = parse_response(&resp);
+
+    assert_eq!(v["result"]["isError"], true, "should be a tool error");
+    let content = v["result"]["content"].as_array().unwrap();
+    let text = content[0]["text"].as_str().unwrap();
+    let parsed: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(parsed["error"]["code"].as_str().unwrap(), "invalid_request");
+}
+
+/// get_chunks with an unknown document_id → document_not_found tool error.
+#[tokio::test]
+async fn test_get_chunks_unknown_document_id() {
+    let (server, _doc_id) = make_server_with_multichunk_doc().await;
+
+    let req_str = make_request(
+        64,
+        "tools/call",
+        Some(json!({
+            "name": TOOL_GET_CHUNKS,
+            "arguments": { "document_id": "nonexistent-doc" }
+        })),
+    );
+
+    let req = mcp::server::parse_message(&req_str).unwrap();
+    let resp = server.handle_message(&req).await.unwrap();
+    let v = parse_response(&resp);
+
+    assert_eq!(v["result"]["isError"], true, "should be a tool error");
+    let content = v["result"]["content"].as_array().unwrap();
+    let text = content[0]["text"].as_str().unwrap();
+    let parsed: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(
+        parsed["error"]["code"].as_str().unwrap(),
+        "document_not_found"
+    );
+}
+
+/// Chaining test: `search` → take `citations[0].document_id` → `get_chunks`.
+/// Proves that `Citation.document_id` (already present, no search changes
+/// needed) is sufficient to drive `get_chunks`.
+#[tokio::test]
+async fn test_search_to_get_chunks_chaining() {
+    let (server, expected_doc_id, _chunk_id) = make_server_with_seeded_store().await;
+
+    let search_req = make_request(
+        70,
+        "tools/call",
+        Some(json!({
+            "name": TOOL_SEARCH,
+            "arguments": { "query": "Rust programming language", "limit": 5 }
+        })),
+    );
+    let req = mcp::server::parse_message(&search_req).unwrap();
+    let resp = server.handle_message(&req).await.unwrap();
+    let v = parse_response(&resp);
+
+    let content = v["result"]["content"].as_array().unwrap();
+    let text = content[0]["text"].as_str().unwrap();
+    let json_part = text.split("\n---\n").next().unwrap_or(text);
+    let result: Value = serde_json::from_str(json_part).unwrap();
+    let citations = result["citations"].as_array().unwrap();
+    assert!(!citations.is_empty(), "search should find the seeded chunk");
+
+    let document_id = citations[0]["document_id"]
+        .as_str()
+        .expect("citation.document_id must be a string")
+        .to_string();
+    assert_eq!(document_id, expected_doc_id);
+
+    let chunks_req = make_request(
+        71,
+        "tools/call",
+        Some(json!({
+            "name": TOOL_GET_CHUNKS,
+            "arguments": { "document_id": document_id }
+        })),
+    );
+    let req = mcp::server::parse_message(&chunks_req).unwrap();
+    let resp = server.handle_message(&req).await.unwrap();
+    let v = parse_response(&resp);
+
+    assert_eq!(v["result"]["isError"], false, "get_chunks should succeed");
+    let content = v["result"]["content"].as_array().unwrap();
+    let text = content[0]["text"].as_str().unwrap();
+    let result: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(result["document_id"], expected_doc_id);
+    assert_eq!(result["total_chunks"], 1);
 }
 
 // ---------------------------------------------------------------------------

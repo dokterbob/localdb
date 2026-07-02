@@ -453,6 +453,156 @@ fn document_json(store: &AvailableStore, chunks: &[localdb_core::ChunkRecord]) -
     })
 }
 
+// ---------------------------------------------------------------------------
+// Tool: get_chunks
+// ---------------------------------------------------------------------------
+
+/// Arguments for the `get_chunks` tool.
+#[derive(Debug, Clone)]
+struct GetChunksArgs {
+    document_id: String,
+    offset: usize,
+    limit: usize,
+}
+
+impl GetChunksArgs {
+    const DEFAULT_LIMIT: usize = 50;
+    const MAX_LIMIT: usize = 200;
+
+    fn from_value(params: Option<&Value>) -> Result<Self, CallToolResult> {
+        let args = params
+            .and_then(|p| p.get("arguments"))
+            .unwrap_or(&Value::Null);
+
+        let document_id = args.get("document_id").and_then(|v| v.as_str());
+        let document_id = match document_id {
+            None => {
+                return Err(typed_error(
+                    "invalid_request",
+                    "invalid arguments: missing required argument 'document_id'",
+                ));
+            }
+            Some(id) if id.trim().is_empty() => {
+                return Err(typed_error(
+                    "invalid_request",
+                    "invalid arguments: 'document_id' must not be empty",
+                ));
+            }
+            Some(id) => id.to_string(),
+        };
+
+        let offset = args
+            .get("offset")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+            .unwrap_or(0);
+
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| (n as usize).clamp(1, Self::MAX_LIMIT))
+            .unwrap_or(Self::DEFAULT_LIMIT);
+
+        Ok(Self {
+            document_id,
+            offset,
+            limit,
+        })
+    }
+}
+
+/// Execute the `get_chunks` tool.
+///
+/// Looks up a document's chunks across the available stores and returns
+/// them in order — sorted by `(block_seq, seq_in_block)` — sliced to the
+/// requested `offset`/`limit` page.
+///
+/// Pagination is applied here in the tool rather than added as a new
+/// `RetrievalStore` trait method: documents are chunk-bounded (at most a
+/// few hundred chunks), so slicing an already-fetched `Vec` is cheap, and a
+/// trait change would ripple into every backend implementation plus the
+/// conformance test suite for no measured benefit.
+///
+/// The store layer (libsql) returns chunks pre-sorted, but this function
+/// sorts defensively so the contract — deterministic pagination — holds
+/// for any `RetrievalStore` implementation, including `FakeStore`, which
+/// does not guarantee ordering.
+///
+/// Returns `document_not_found` error if no matching chunks are found.
+/// An out-of-range `offset` yields an empty `chunks` array, not an error.
+///
+/// Note: URI-based lookup is not supported in v1, matching `get_document`.
+pub async fn tool_get_chunks(stores: &[AvailableStore], params: Option<&Value>) -> CallToolResult {
+    let args = match GetChunksArgs::from_value(params) {
+        Ok(args) => args,
+        Err(result) => return result,
+    };
+    match find_document_chunks(stores, &args.document_id).await {
+        Ok(Some((store, mut chunks))) => {
+            chunks.sort_by_key(|c| (c.block_seq, c.seq_in_block));
+            CallToolResult::success_json(&chunks_json(store, &chunks, args.offset, args.limit))
+        }
+        Ok(None) => typed_error(
+            "document_not_found",
+            format!(
+                "no document with id '{}' found in any store",
+                args.document_id
+            ),
+        ),
+        Err(result) => result,
+    }
+}
+
+fn chunk_summary_json(chunk: &localdb_core::ChunkRecord) -> Value {
+    serde_json::json!({
+        "chunk_id": chunk.id,
+        "block_seq": chunk.block_seq,
+        "seq_in_block": chunk.seq_in_block,
+        "block_kind": chunk.block_kind,
+        "span": {
+            "start": chunk.span.start,
+            "end": chunk.span.end,
+        },
+        "heading_path": chunk.heading_path,
+        "text": chunk.text,
+    })
+}
+
+fn chunks_json(
+    store: &AvailableStore,
+    sorted_chunks: &[localdb_core::ChunkRecord],
+    offset: usize,
+    limit: usize,
+) -> Value {
+    let first = &sorted_chunks[0];
+    let total_chunks = sorted_chunks.len();
+    let end = offset.saturating_add(limit).min(total_chunks);
+    let page: Vec<Value> = if offset >= total_chunks {
+        Vec::new()
+    } else {
+        sorted_chunks[offset..end]
+            .iter()
+            .map(chunk_summary_json)
+            .collect()
+    };
+    let returned = page.len();
+
+    serde_json::json!({
+        "document_id": first.document_id,
+        "uri": first.uri,
+        "title": first.metadata.title,
+        "store": {
+            "id": store.descriptor.id,
+            "name": store.descriptor.name,
+        },
+        "total_chunks": total_chunks,
+        "offset": offset,
+        "limit": limit,
+        "returned": returned,
+        "chunks": page,
+    })
+}
+
 #[cfg(test)]
 mod get_document_tests {
     use std::sync::Arc;
@@ -938,5 +1088,58 @@ mod tests {
         });
         let args = SearchArgs::from_value(Some(&params)).unwrap();
         assert_eq!(args.content_length, 50);
+    }
+
+    // -----------------------------------------------------------------------
+    // GetChunksArgs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn get_chunks_args_limit_clamped_to_max() {
+        let params = build_params(serde_json::json!({
+            "document_id": "doc-1",
+            "limit": 9999
+        }));
+        let args = GetChunksArgs::from_value(Some(&params)).expect("should parse");
+        assert_eq!(args.limit, 200, "limit should be clamped to MAX_LIMIT=200");
+    }
+
+    #[test]
+    fn get_chunks_args_limit_clamped_to_min() {
+        let params = build_params(serde_json::json!({
+            "document_id": "doc-1",
+            "limit": 0
+        }));
+        let args = GetChunksArgs::from_value(Some(&params)).expect("should parse");
+        assert_eq!(args.limit, 1, "limit should be clamped to a minimum of 1");
+    }
+
+    #[test]
+    fn get_chunks_args_defaults() {
+        let params = build_params(serde_json::json!({ "document_id": "doc-1" }));
+        let args = GetChunksArgs::from_value(Some(&params)).expect("should parse");
+        assert_eq!(args.offset, 0, "default offset should be 0");
+        assert_eq!(args.limit, 50, "default limit should be 50");
+    }
+
+    #[test]
+    fn get_chunks_args_missing_document_id_is_invalid_request() {
+        let params = build_params(serde_json::json!({}));
+        let result = GetChunksArgs::from_value(Some(&params));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.is_error);
+        let text = match &err.content[0] {
+            crate::protocol::ContentItem::Text { text } => text.clone(),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["error"]["code"].as_str().unwrap(), "invalid_request");
+    }
+
+    #[test]
+    fn get_chunks_args_empty_document_id_is_invalid_request() {
+        let params = build_params(serde_json::json!({ "document_id": "   " }));
+        let result = GetChunksArgs::from_value(Some(&params));
+        assert!(result.is_err());
     }
 }
