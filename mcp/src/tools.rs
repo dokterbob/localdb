@@ -321,6 +321,16 @@ pub fn render_citations_text(citations: &[Citation], max_chars: usize) -> String
                     (cr, dt) => format!("\n   {cr} · {dt}"),
                 }
             };
+            // `content_length` is a soft cap: snap to a natural boundary
+            // rather than hard-cutting mid-word/mid-sentence. Only the text
+            // rendering is truncated — the JSON citation payload (`c.snippet`
+            // as serialized elsewhere) always carries the full snippet.
+            let (body, was_truncated) = localdb_core::truncate_snippet(&c.snippet, max_chars);
+            let snippet_text = if was_truncated {
+                format!("{body}…")
+            } else {
+                body.to_string()
+            };
             format!(
                 "{}. {}{}{}{}\n   Score: {:.4}\n   {}\n",
                 i + 1,
@@ -329,7 +339,7 @@ pub fn render_citations_text(citations: &[Citation], max_chars: usize) -> String
                 heading,
                 creator_date,
                 c.score.fused,
-                c.snippet.chars().take(max_chars).collect::<String>()
+                snippet_text
             )
         })
         .collect::<Vec<_>>()
@@ -914,6 +924,34 @@ mod tests {
         assert!(
             snippet_line.trim().chars().count() <= 50,
             "snippet should be capped at 50 chars, got: {snippet_line}"
+        );
+    }
+
+    #[test]
+    fn render_citations_text_snaps_to_sentence_boundary() {
+        let mut c = make_citation_with_metadata("file:///a.md", vec![], None);
+        c.snippet = "This is sentence one. This is sentence two that keeps going and going and going further."
+            .to_string();
+        let text = render_citations_text(&[c], 25);
+        let snippet_line = text
+            .lines()
+            .find(|l| l.trim_start().starts_with("This"))
+            .unwrap()
+            .trim();
+        assert!(
+            snippet_line.ends_with('…'),
+            "expected ellipsis marker, got: {snippet_line}"
+        );
+        // The char immediately before the ellipsis must be the sentence
+        // terminator, not a mid-word letter.
+        let before_ellipsis = snippet_line
+            .chars()
+            .rev()
+            .nth(1)
+            .expect("snippet should have content before the ellipsis");
+        assert_eq!(
+            before_ellipsis, '.',
+            "expected sentence-boundary cut, got: {snippet_line}"
         );
     }
 
