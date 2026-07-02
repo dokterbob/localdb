@@ -444,12 +444,18 @@ fn catch_panic<T>(
 /// Index a single document: extract → chunk → embed → upsert.
 ///
 /// If the document's content hash matches an existing record, returns early
-/// (incremental skip). If changed, deletes old chunks before inserting new ones.
+/// (incremental skip). If changed, the old document is replaced by the new
+/// one (see the `replaces` computation and the `upsert_chunks_and_blocks`
+/// call below).
 ///
 /// The order of operations is carefully chosen to be crash-safe (A6):
 ///   1. Extract, chunk, embed — all read-only / reversible.
-///   2. Delete old chunks — only after embedding succeeds.
-///   3. Upsert new chunks — last, so failure leaves old data intact.
+///   2. Determine whether this is a replace — only after embedding succeeds.
+///   3. Call `upsert_chunks_and_blocks` with the old document_id (if any) as
+///      `replaces_document_id` — the store deletes the old document and
+///      inserts the new one within a single transaction (issue #79), so a
+///      write failure leaves the old document intact and searchable rather
+///      than a separately-committed delete having already taken effect.
 ///
 /// Returns the `DocumentIndexOutput` with chunk counts and the new record.
 pub async fn index_document(
@@ -576,12 +582,19 @@ pub async fn index_document(
         });
     }
 
-    // Embedding succeeded — now it is safe to delete the old document chunks (A6).
-    if let Some(existing) = doc_index.get(&input.uri) {
+    // Embedding succeeded — now it is safe to replace the old document (A6).
+    // The delete is *not* performed here as a separate call (issue #79):
+    // instead, the old document_id is threaded through to
+    // `upsert_chunks_and_blocks` below, which deletes and inserts within a
+    // single store transaction so a write failure leaves the old document
+    // intact and searchable.
+    let replaces = doc_index.get(&input.uri).and_then(|existing| {
         if existing.content_hash != hash || existing.policy_version != config.policy_version {
-            store.delete_by_document(&existing.document_id).await?;
+            Some(existing.document_id.clone())
+        } else {
+            None
         }
-    }
+    });
 
     // Build Chunk and ChunkRecord structures.
     let provenance = Provenance {
@@ -633,7 +646,13 @@ pub async fn index_document(
 
     let written = records.len();
     store
-        .upsert_chunks_and_blocks(&config.store_id, &doc_id, records, &blocks)
+        .upsert_chunks_and_blocks(
+            &config.store_id,
+            &doc_id,
+            records,
+            &blocks,
+            replaces.as_deref(),
+        )
         .await?;
 
     let record = DocumentRecord {
@@ -1875,6 +1894,279 @@ mod tests {
             old_chunks.is_empty(),
             "old document chunks should be deleted on replace"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // RecordingStore — a test double that records write calls and can be
+    // told to fail the next `upsert_chunks_and_blocks` call, to verify the
+    // ingestion pipeline's replace wiring (issue #79).
+    // ---------------------------------------------------------------------------
+
+    /// One recorded `upsert_chunks_and_blocks` call: `(store_id, document_id,
+    /// records.len(), replaces_document_id)`.
+    type UpsertCall = (String, String, usize, Option<String>);
+
+    /// Wraps a `FakeStore`, recording every `delete_by_document` and
+    /// `upsert_chunks_and_blocks` call so tests can assert on *how* the
+    /// ingestion pipeline drives the store, not just the end state.
+    ///
+    /// `upsert_chunks_and_blocks` can be told to fail via `fail_next_upsert`;
+    /// when it does, it returns an error *without* touching the underlying
+    /// `FakeStore` at all (neither delete nor insert), simulating the
+    /// all-or-nothing behavior a real atomic transaction provides. This lets
+    /// tests verify that `index_document` itself never performs a separate
+    /// delete before calling `upsert_chunks_and_blocks` — if it did, the old
+    /// document would be gone even though the replace as a whole failed.
+    struct RecordingStore {
+        inner: FakeStore,
+        delete_calls: tokio::sync::Mutex<Vec<String>>,
+        upsert_calls: tokio::sync::Mutex<Vec<UpsertCall>>,
+        fail_next_upsert: std::sync::atomic::AtomicBool,
+    }
+
+    impl RecordingStore {
+        fn new() -> Self {
+            Self {
+                inner: FakeStore::new(),
+                delete_calls: tokio::sync::Mutex::new(Vec::new()),
+                upsert_calls: tokio::sync::Mutex::new(Vec::new()),
+                fail_next_upsert: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn fail_next_upsert(&self) {
+            self.fail_next_upsert
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        async fn delete_calls(&self) -> Vec<String> {
+            self.delete_calls.lock().await.clone()
+        }
+
+        async fn upsert_calls(&self) -> Vec<UpsertCall> {
+            self.upsert_calls.lock().await.clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RetrievalStore for RecordingStore {
+        async fn upsert_chunks(&self, records: Vec<ChunkRecord>) -> Result<usize, Error> {
+            self.inner.upsert_chunks(records).await
+        }
+
+        async fn delete_by_document(&self, document_id: &str) -> Result<usize, Error> {
+            self.delete_calls.lock().await.push(document_id.to_string());
+            self.inner.delete_by_document(document_id).await
+        }
+
+        async fn delete_by_store(&self, store_id: &str) -> Result<usize, Error> {
+            self.inner.delete_by_store(store_id).await
+        }
+
+        async fn dense_search(
+            &self,
+            query_vector: &[f32],
+            limit: usize,
+            filters: &[crate::store::MetadataFilter],
+        ) -> Result<Vec<crate::store::SearchResult>, Error> {
+            self.inner.dense_search(query_vector, limit, filters).await
+        }
+
+        async fn bm25_search(
+            &self,
+            query_text: &str,
+            limit: usize,
+            filters: &[crate::store::MetadataFilter],
+        ) -> Result<Vec<crate::store::SearchResult>, Error> {
+            self.inner.bm25_search(query_text, limit, filters).await
+        }
+
+        async fn stats(&self) -> Result<crate::store::StoreStats, Error> {
+            self.inner.stats().await
+        }
+
+        async fn get_chunk(&self, chunk_id: &str) -> Result<Option<ChunkRecord>, Error> {
+            self.inner.get_chunk(chunk_id).await
+        }
+
+        async fn get_chunks_for_document(
+            &self,
+            document_id: &str,
+        ) -> Result<Vec<ChunkRecord>, Error> {
+            self.inner.get_chunks_for_document(document_id).await
+        }
+
+        async fn list_indexed_documents(&self) -> Result<Vec<DocumentRecord>, Error> {
+            self.inner.list_indexed_documents().await
+        }
+
+        async fn upsert_chunks_and_blocks(
+            &self,
+            store_id: &str,
+            document_id: &str,
+            records: Vec<ChunkRecord>,
+            blocks: &[crate::block::Block],
+            replaces_document_id: Option<&str>,
+        ) -> Result<usize, Error> {
+            self.upsert_calls.lock().await.push((
+                store_id.to_string(),
+                document_id.to_string(),
+                records.len(),
+                replaces_document_id.map(str::to_string),
+            ));
+
+            if self
+                .fail_next_upsert
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(Error::Internal {
+                    message: "simulated upsert failure".to_string(),
+                    correlation_id: "recording_store_simulated_failure".to_string(),
+                });
+            }
+
+            // Simulate the atomic contract: delete-then-insert, both only
+            // observable together since we only reach here when not failing.
+            if let Some(old_id) = replaces_document_id {
+                self.inner.delete_by_document(old_id).await?;
+            }
+            let count = self.inner.upsert_chunks(records).await?;
+            self.inner
+                .upsert_blocks(store_id, document_id, blocks)
+                .await?;
+            Ok(count)
+        }
+    }
+
+    #[tokio::test]
+    async fn index_document_replace_uses_single_call_not_separate_delete() {
+        let store = RecordingStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let extractor = FakeExtractor;
+        let store_id = "store-1";
+        let config = make_ingestion_config(store_id);
+        let source = make_path_source(store_id, "/docs", vec![]);
+
+        let input_v1 = DocumentInput {
+            uri: "file:///docs/notes.md".to_string(),
+            bytes: b"Version one content.".to_vec(),
+            filename: Some("notes.md".to_string()),
+            mime: Some("text/markdown".to_string()),
+            fetched_at: "2026-06-10T12:00:00Z".to_string(),
+            source: source.clone(),
+        };
+
+        let mut doc_index = DocumentIndex::new();
+        let out1 = index_document(
+            &input_v1, &doc_index, &store, &embedder, &config, &extractor,
+        )
+        .await
+        .unwrap();
+        doc_index.upsert(out1.record);
+        let old_doc_id = doc_index
+            .get("file:///docs/notes.md")
+            .unwrap()
+            .document_id
+            .clone();
+
+        let input_v2 = DocumentInput {
+            uri: "file:///docs/notes.md".to_string(),
+            bytes: b"Version two content - completely different.".to_vec(),
+            filename: Some("notes.md".to_string()),
+            mime: Some("text/markdown".to_string()),
+            fetched_at: "2026-06-11T12:00:00Z".to_string(),
+            source,
+        };
+        let out2 = index_document(
+            &input_v2, &doc_index, &store, &embedder, &config, &extractor,
+        )
+        .await
+        .unwrap();
+        assert!(out2.was_indexed);
+
+        assert!(
+            store.delete_calls().await.is_empty(),
+            "index_document must never call delete_by_document directly on a \
+             content-changed replace — the delete must be folded into the \
+             upsert_chunks_and_blocks call"
+        );
+
+        let upserts = store.upsert_calls().await;
+        assert_eq!(upserts.len(), 2, "one upsert call per index_document call");
+        assert_eq!(
+            upserts[0].3, None,
+            "first index (no prior document) must not pass replaces_document_id"
+        );
+        assert_eq!(
+            upserts[1].3,
+            Some(old_doc_id),
+            "changed-content re-index must pass the old document_id as \
+             replaces_document_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn index_document_replace_failure_leaves_old_document_intact() {
+        let store = RecordingStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let extractor = FakeExtractor;
+        let store_id = "store-1";
+        let config = make_ingestion_config(store_id);
+        let source = make_path_source(store_id, "/docs", vec![]);
+
+        let input_v1 = DocumentInput {
+            uri: "file:///docs/notes.md".to_string(),
+            bytes: b"Version one content.".to_vec(),
+            filename: Some("notes.md".to_string()),
+            mime: Some("text/markdown".to_string()),
+            fetched_at: "2026-06-10T12:00:00Z".to_string(),
+            source: source.clone(),
+        };
+
+        let mut doc_index = DocumentIndex::new();
+        let out1 = index_document(
+            &input_v1, &doc_index, &store, &embedder, &config, &extractor,
+        )
+        .await
+        .unwrap();
+        doc_index.upsert(out1.record.clone());
+        let old_doc_id = out1.record.document_id.clone();
+
+        let old_chunks_before = store.get_chunks_for_document(&old_doc_id).await.unwrap();
+        assert_eq!(old_chunks_before.len(), 1);
+
+        // Arm the store to fail the *next* upsert_chunks_and_blocks call —
+        // i.e. the replace triggered by the content change below.
+        store.fail_next_upsert();
+
+        let input_v2 = DocumentInput {
+            uri: "file:///docs/notes.md".to_string(),
+            bytes: b"Version two content - completely different.".to_vec(),
+            filename: Some("notes.md".to_string()),
+            mime: Some("text/markdown".to_string()),
+            fetched_at: "2026-06-11T12:00:00Z".to_string(),
+            source,
+        };
+        let result = index_document(
+            &input_v2, &doc_index, &store, &embedder, &config, &extractor,
+        )
+        .await;
+        assert!(result.is_err(), "the simulated upsert failure must surface");
+
+        // The old document's chunks must still be retrievable — the failed
+        // replace must not have removed them via a separate delete call.
+        let old_chunks_after = store.get_chunks_for_document(&old_doc_id).await.unwrap();
+        assert_eq!(
+            old_chunks_after.len(),
+            1,
+            "old document chunks must survive a failed replace"
+        );
+
+        // doc_index must stay consistent: since index_document returned an
+        // error, the caller never updates it, so it must still point at the
+        // (still-present) old document.
+        let record = doc_index.get("file:///docs/notes.md").unwrap();
+        assert_eq!(record.document_id, old_doc_id);
     }
 
     #[tokio::test]
