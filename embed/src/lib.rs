@@ -33,6 +33,7 @@ pub mod factory;
 pub mod http_helper;
 pub mod model_cache;
 pub mod openai;
+pub mod ort_runtime;
 pub mod perplexity;
 pub mod retry;
 pub mod voyage;
