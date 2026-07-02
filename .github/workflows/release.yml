@@ -31,13 +31,17 @@ jobs:
             target: aarch64-apple-darwin
             cross: false
 
-          # Linux x86_64 (native)
-          - os: ubuntu-latest
+          # Linux x86_64 (native). Pinned to ubuntu-22.04 (not ubuntu-latest): our own Rust
+          # code inherits the build machine's glibc floor, so building on a newer Ubuntu
+          # would re-introduce issue #133 even though the embedded ONNX Runtime (build.rs)
+          # is no longer the culprit. See "Verify glibc floor" step below.
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             cross: false
 
-          # Linux arm64 (cross-compiled via cross or cargo with linker)
-          - os: ubuntu-latest
+          # Linux arm64 (cross-compiled via cross or cargo with linker). Also pinned to
+          # ubuntu-22.04 for the same glibc-floor reason as above (#133).
+          - os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
             cross: true
 
@@ -54,7 +58,9 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          # binutils-aarch64-linux-gnu provides aarch64-linux-gnu-objdump, used by the
+          # "Verify glibc floor" step below to inspect the cross-compiled binary.
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -112,6 +118,49 @@ jobs:
             echo "macOS dynamic dependency check passed."
           fi
 
+      - name: Verify glibc floor (Linux)
+        # Two independent glibc floors matter here (issue #133):
+        #   1. Our own Rust code — set by the build machine, hence pinning both Linux
+        #      matrix entries to ubuntu-22.04 above.
+        #   2. The embedded ONNX Runtime .so (embed/build.rs downloads Microsoft's official
+        #      build, verified offline to floor at GLIBC_2.27) — re-checked here as a
+        #      regression guard in case the pinned version/asset ever changes.
+        # Ubuntu 22.04 ships glibc 2.35, so both must stay at or below that.
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            OBJDUMP=$(command -v aarch64-linux-gnu-objdump || command -v objdump)
+          else
+            OBJDUMP=objdump
+          fi
+          echo "Using $OBJDUMP"
+
+          check_glibc_floor() {
+            local file="$1"
+            local max
+            max=$("$OBJDUMP" -T "$file" | grep -oE 'GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?' | sort -V -u | tail -1)
+            echo "$file: max ${max:-<none found>}"
+            if [ -n "$max" ]; then
+              local ver="${max#GLIBC_}"
+              local highest
+              highest=$(printf '%s\n2.35\n' "$ver" | sort -V | tail -1)
+              if [ "$highest" != "2.35" ]; then
+                echo "ERROR: $file requires GLIBC > 2.35 (found $ver); Ubuntu 22.04 ships 2.35, so this would break on Mint 21 / Ubuntu 22.04. See issue #133." >&2
+                exit 1
+              fi
+            fi
+          }
+
+          check_glibc_floor "target/${{ matrix.target }}/release/localdb"
+
+          ORT_LIB=$(find target -path '*embed-*/out/*libonnxruntime*' -type f | head -1)
+          if [ -z "$ORT_LIB" ]; then
+            echo "ERROR: expected an embedded libonnxruntime under target/ for a local-onnx release build" >&2
+            exit 1
+          fi
+          check_glibc_floor "$ORT_LIB"
+
       - name: Package tarball
         run: |
           VERSION="${GITHUB_REF_NAME}"
@@ -163,17 +212,35 @@ jobs:
           fail_on_unmatched_files: true
 
   smoke-test:
-    name: Smoke test (Linux x86_64)
+    name: Smoke test (${{ matrix.os }})
     needs: build-release
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu-22.04: proves the glibc-2.35 scenario from issue #133 (≈ Linux Mint 21.x)
+        # end-to-end (extraction + dlopen + index + search), not just at link time.
+        # ubuntu-latest: a current Linux, for good measure.
+        # macos-latest: the embedded-runtime mechanism is identical on macOS now, so it
+        # gets the same end-to-end proof.
+        os: [ubuntu-22.04, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download Linux x86_64 artifact
+      - name: Determine artifact pattern for this OS
+        id: artifact
+        run: |
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            echo "pattern=localdb-*-aarch64-apple-darwin" >> "$GITHUB_OUTPUT"
+          else
+            echo "pattern=localdb-*-x86_64-unknown-linux-gnu" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download artifact
         uses: actions/download-artifact@v4
         with:
-          pattern: "localdb-*-x86_64-unknown-linux-gnu"
+          pattern: "${{ steps.artifact.outputs.pattern }}"
           path: dist/
 
       - name: Install binary from tarball
