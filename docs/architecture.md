@@ -184,6 +184,11 @@ or `localdb search` when the default `local` embedder downloads `pplx-embed-cont
 the CoreML bundle is additionally fetched from `dokterbob/pplx-embed-coreml` (XET-deduped via
 `hf-hub` 1.0). Subsequent runs use the cached model.
 
+`--features local-onnx` builds (the default on Linux; the ONNX fallback on macOS) additionally
+populate `<cache_dir>/localdb/ort/<version>/` on first use with the embedded ONNX Runtime
+shared library — a separate, sibling directory to `models/`, not configurable via `paths.*`.
+See [Platform notes: ONNX Runtime loading](#platform-notes).
+
 ---
 
 ## Exit codes
@@ -216,6 +221,46 @@ unavailable); `local-onnx` forces ONNX. CoreML and ONNX vectors are index-interc
 (same `model_id`, 1024-dim, `Binary`; measured ~0.995–0.9995 cosine parity, ~98–99% per-dimension
 sign agreement), so switching backends needs no reindex. See [specs/03-config.md](../specs/03-config.md) §7 and
 [specs/04-search-pipeline.md](../specs/04-search-pipeline.md) §4.
+
+**ONNX Runtime loading (`local-onnx`, all platforms).** `embed`'s `ort` dependency uses the
+`load-dynamic` feature — the `localdb` executable links no ONNX Runtime ABI at all and instead
+`dlopen`s a shared library at a path chosen at runtime. `embed/build.rs` downloads *Microsoft's
+official* ONNX Runtime release (pinned to 1.24.4) for the build's target platform
+(`linux-x64`, `linux-aarch64`, `osx-arm64`), verifies it against a pinned sha256, and embeds it
+into the `embed` crate via `include_bytes!`. On first construction of any local-ONNX embedder,
+`embed::ort_runtime::ensure_ort_initialized` extracts that embedded library to
+`<cache_dir>/localdb/ort/<version>/` (mirroring the model-cache convention; idempotent —
+skipped if an up-to-date copy is already there) and calls `ort::init_from` on it before any
+other `ort` API is touched. Embedding the runtime grows the `localdb` binary by roughly
+12–20 MB depending on platform (measured: +11.8 MiB on macOS arm64, where it also replaced
+the previous statically-linked archive); the compressed release tarballs grow less.
+
+Two overrides exist for power users / distro packagers who want to supply their own ONNX
+Runtime instead of the embedded one:
+- `ORT_DYLIB_PATH` (runtime env var): `ensure_ort_initialized` honours this directly and
+  `dlopen`s that path instead of extracting the embedded copy.
+- `LOCALDB_ORT_LIB` (build-time env var, read by `embed/build.rs`): points the *build* at a
+  local ONNX Runtime library to embed instead of downloading one (offline/distro builds).
+
+Both overrides require ONNX Runtime **≥ 1.24** — `fastembed`'s own (unconditional) `ort`
+dependency declaration requests the `api-24` feature regardless of which `fastembed` features
+we enable, so despite `embed`'s own `ort` dependency line specifying no `api-*` feature, Cargo
+feature unification still enables `api-24` for the whole build. This is why the pinned embedded
+version is exactly 1.24.4, not an older 1.17–1.23 release.
+
+Why this exists: `ort`'s `download-binaries` feature (the previous approach) statically links
+pyke.io's prebuilt ONNX Runtime archive into `ort-sys`. That archive is built with GCC 14 on
+Ubuntu 24.04 and references `__isoc23_strtol*` symbols, giving the *release binary itself* a
+`GLIBC_2.38` floor — it refused to start on glibc-2.35 distros (Linux Mint 21.x, Ubuntu 22.04).
+It was also ABI-incompatible with GCC-11 libstdc++ when built on ubuntu-22.04. See
+[issue #133](https://github.com/dokterbob/localdb/issues/133) and
+[pykeio/ort#523](https://github.com/pykeio/ort/issues/523) (unresolved upstream). The Microsoft
+official Linux builds we embed instead float at `GLIBC_2.27` / `GLIBCXX_3.4.22` / `CXXABI_1.3.11`
+(verified via `objdump -T`), comfortably under Ubuntu 22.04's `GLIBC_2.35` baseline; the
+embedded macOS dylib declares a minimum of macOS 14.0 (`LC_BUILD_VERSION`). Because our own
+Rust code still inherits the *build machine's* glibc floor independent of this mechanism, the
+release and CI workflows also pin Linux builds to `ubuntu-22.04` (not `ubuntu-latest`) and
+verify both the `localdb` binary and the embedded `.so` stay at or below `GLIBC_2.35`.
 
 ---
 
