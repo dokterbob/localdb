@@ -215,6 +215,11 @@ impl PplxContextOnnxEmbedder {
     /// `<cache_dir>/pplx-embed-context-v1-0.6b/`.
     /// `show_progress`: emit download progress via `tracing::info!`.
     pub fn new(cache_dir: Option<PathBuf>, show_progress: bool) -> Result<Self, EmbedError> {
+        // Extract/dlopen the embedded ONNX Runtime (idempotent) before any `ort` API use
+        // below, and before the (potentially multi-hundred-MB) model download so ORT setup
+        // failures surface fast.
+        crate::ort_runtime::ensure_ort_initialized()?;
+
         let model_dir = cache_dir
             .unwrap_or_else(crate::model_cache::ModelCache::default_cache_dir)
             .join(MODEL_DIRNAME);
