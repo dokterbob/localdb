@@ -159,3 +159,13 @@ PR #92 in favour of libsql. The unified libsql backend wraps `upsert_chunks` in 
 transaction (`BEGIN ... COMMIT / ROLLBACK`) with WAL durability, so the delete-then-append
 sequence is now crash-atomic at the database level. The original concern — partial removal
 on crash between delete and append — no longer applies.
+
+**Closure note (issue #79).** A residual same-run window remained after the above: the
+replace delete (`delete_by_document`) still ran in its own transaction, separate from the
+`upsert_chunks_and_blocks` transaction that inserted the replacement. A write failure in the
+upsert (after the delete had already committed) left the old resource gone for the rest of
+the run. This is now closed by folding the delete into the upsert's transaction:
+`RetrievalStore::upsert_chunks_and_blocks` takes an optional `replaces_document_id`, and the
+libsql backend performs the delete against the same connection, inside the same
+BEGIN/COMMIT, immediately before the insert. A failure anywhere in that transaction rolls
+back the delete along with the insert, so the old resource remains intact and searchable.
