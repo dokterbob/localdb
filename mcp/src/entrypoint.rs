@@ -35,9 +35,27 @@ pub async fn run_stdio(mode: McpRunMode) -> anyhow::Result<()> {
         McpRunMode::Embedded(handler) => serve_embedded_stdio(handler).await,
         McpRunMode::Proxied { daemon_base_url } => {
             let handler = ProxyHandler::connect(&daemon_base_url).await?;
-            serve_stdio(handler).await
+            serve_proxied_stdio(handler).await
         }
     }
+}
+
+/// Serve an already-connected `ProxyHandler` over stdio until the client
+/// disconnects.
+///
+/// Split out from `run_stdio`'s `Proxied` arm (rather than only reachable
+/// through it) so `cli::cmds::surface::run_mcp_async` can call
+/// `ProxyHandler::connect` and this separately: a failure to connect (daemon
+/// gone, stale `LOCALDB_DAEMON_URL`) is a `daemon_unreachable` condition,
+/// while a failure in this loop is a Phase-3-proxy-specific internal error —
+/// `run_stdio`'s single `anyhow::Result` return can't tell those apart for a
+/// caller that wants to map them to different stable exit codes.
+///
+/// # Errors
+/// Returns an error if the transport fails or the service loop errors while
+/// running.
+pub async fn serve_proxied_stdio(handler: ProxyHandler) -> anyhow::Result<()> {
+    serve_stdio(handler).await
 }
 
 /// Serve the given handler over stdio until the client disconnects.

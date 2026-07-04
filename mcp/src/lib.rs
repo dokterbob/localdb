@@ -88,7 +88,7 @@ pub mod proxy;
 pub mod tools;
 
 // Re-export key items for the binary entry point and for `server`'s HTTP mount.
-pub use entrypoint::{run_stdio, serve_embedded_stdio, McpRunMode};
+pub use entrypoint::{run_stdio, serve_embedded_stdio, serve_proxied_stdio, McpRunMode};
 pub use handler::McpHandler;
 pub use http::build_streamable_http_service;
 pub use tools::{AvailableStore, StoreDescriptor};

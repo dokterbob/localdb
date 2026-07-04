@@ -239,6 +239,41 @@ fn mcp_stdio_proxies_to_running_daemon() {
     );
 }
 
+/// Codex review fix (PR #145): when `LOCALDB_DAEMON_URL` points at an
+/// unreachable daemon (stale env var, or the daemon died between
+/// `probe_daemon` and the actual `/mcp` connect), `run_mcp_async` must map
+/// the connect failure to `daemon_unreachable` (exit 5) — not `internal`
+/// (exit 1) — matching every other daemon-backed CLI path.
+/// `probe_daemon` trusts `LOCALDB_DAEMON_URL` unconditionally (no health
+/// probe when the override is set — see `daemon_client::probe_daemon`), so
+/// pointing it at a closed TCP port reliably drives the `Proxied` branch's
+/// `ProxyHandler::connect` into a connection failure.
+#[test]
+fn mcp_stdio_daemon_unreachable_maps_to_daemon_unreachable_exit_code() {
+    let dir = TempDir::new().unwrap();
+    write_config(&dir, "");
+
+    let closed_port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+        // listener drops here, closing the port.
+    };
+    let stale_url = format!("http://127.0.0.1:{closed_port}");
+
+    let assert = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &stale_url)
+        .arg("mcp")
+        .write_stdin("")
+        .assert()
+        .code(5);
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("daemon_unreachable") || stderr.contains("daemon"),
+        "expected a daemon-unreachable error, got stderr: {stderr}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // HTTP daemon
 // ---------------------------------------------------------------------------
