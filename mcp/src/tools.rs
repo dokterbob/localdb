@@ -491,17 +491,35 @@ impl GetChunksArgs {
             Some(id) => id.to_string(),
         };
 
-        let offset = args
-            .get("offset")
-            .and_then(|v| v.as_u64())
-            .map(|n| n as usize)
-            .unwrap_or(0);
+        // Distinguish absent (→ default) from present-but-invalid (→ error).
+        // The schema declares both as non-negative integers; a negative, float,
+        // or non-numeric value fails `as_u64()` and must be rejected rather than
+        // silently defaulting.
+        let offset = match args.get("offset") {
+            None | Some(Value::Null) => 0,
+            Some(v) => match v.as_u64() {
+                Some(n) => n as usize,
+                None => {
+                    return Err(typed_error(
+                        "invalid_request",
+                        "invalid arguments: 'offset' must be a non-negative integer",
+                    ));
+                }
+            },
+        };
 
-        let limit = args
-            .get("limit")
-            .and_then(|v| v.as_u64())
-            .map(|n| (n as usize).clamp(1, Self::MAX_LIMIT))
-            .unwrap_or(Self::DEFAULT_LIMIT);
+        let limit = match args.get("limit") {
+            None | Some(Value::Null) => Self::DEFAULT_LIMIT,
+            Some(v) => match v.as_u64() {
+                Some(n) => (n as usize).clamp(1, Self::MAX_LIMIT),
+                None => {
+                    return Err(typed_error(
+                        "invalid_request",
+                        "invalid arguments: 'limit' must be a positive integer",
+                    ));
+                }
+            },
+        };
 
         Ok(Self {
             document_id,
@@ -526,7 +544,12 @@ impl GetChunksArgs {
 /// The store layer (libsql) returns chunks pre-sorted, but this function
 /// sorts defensively so the contract — deterministic pagination — holds
 /// for any `RetrievalStore` implementation, including `FakeStore`, which
-/// does not guarantee ordering.
+/// does not guarantee ordering. The sort key is
+/// `(block_seq, seq_in_block, span.start, span.end, chunk_id)`: the trailing
+/// fields break ties among legacy records that share `(block_seq,
+/// seq_in_block) = (0, 0)`, and `chunk_id` (content-addressed, unique) makes
+/// the order total, so a given `offset`/`limit` returns the same page on
+/// every call regardless of backend return order.
 ///
 /// Returns `document_not_found` error if no matching chunks are found.
 /// An out-of-range `offset` yields an empty `chunks` array, not an error.
@@ -539,7 +562,15 @@ pub async fn tool_get_chunks(stores: &[AvailableStore], params: Option<&Value>) 
     };
     match find_document_chunks(stores, &args.document_id).await {
         Ok(Some((store, mut chunks))) => {
-            chunks.sort_by_key(|c| (c.block_seq, c.seq_in_block));
+            chunks.sort_by(|a, b| {
+                (a.block_seq, a.seq_in_block, a.span.start, a.span.end, &a.id).cmp(&(
+                    b.block_seq,
+                    b.seq_in_block,
+                    b.span.start,
+                    b.span.end,
+                    &b.id,
+                ))
+            });
             CallToolResult::success_json(&chunks_json(store, &chunks, args.offset, args.limit))
         }
         Ok(None) => typed_error(
@@ -1141,5 +1172,37 @@ mod tests {
         let params = build_params(serde_json::json!({ "document_id": "   " }));
         let result = GetChunksArgs::from_value(Some(&params));
         assert!(result.is_err());
+    }
+
+    /// Assert a `GetChunksArgs::from_value` failure carries the `invalid_request` code.
+    fn assert_invalid_request(result: Result<GetChunksArgs, CallToolResult>) {
+        let err = result.expect_err("expected an error result");
+        assert!(err.is_error);
+        let text = match &err.content[0] {
+            crate::protocol::ContentItem::Text { text } => text.clone(),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["error"]["code"].as_str().unwrap(), "invalid_request");
+    }
+
+    #[test]
+    fn get_chunks_args_negative_offset_is_invalid_request() {
+        // A present-but-negative offset must be rejected, not silently defaulted to 0.
+        let params = build_params(serde_json::json!({ "document_id": "doc-1", "offset": -1 }));
+        assert_invalid_request(GetChunksArgs::from_value(Some(&params)));
+    }
+
+    #[test]
+    fn get_chunks_args_non_integer_offset_is_invalid_request() {
+        // A present-but-non-integer offset (float / string) must be rejected.
+        let params = build_params(serde_json::json!({ "document_id": "doc-1", "offset": 1.5 }));
+        assert_invalid_request(GetChunksArgs::from_value(Some(&params)));
+    }
+
+    #[test]
+    fn get_chunks_args_negative_limit_is_invalid_request() {
+        // A present-but-negative limit must be rejected, not silently defaulted.
+        let params = build_params(serde_json::json!({ "document_id": "doc-1", "limit": -5 }));
+        assert_invalid_request(GetChunksArgs::from_value(Some(&params)));
     }
 }

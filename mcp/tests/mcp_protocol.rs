@@ -149,6 +149,62 @@ async fn make_server_with_multichunk_doc() -> (McpServer, String) {
     (server, doc_id)
 }
 
+/// Build a server seeded with ONE document whose two chunks both have
+/// `(block_seq, seq_in_block) = (0, 0)` and an identical span, so the ONLY
+/// distinguishing sort field is `chunk_id`. The two records are inserted in an
+/// order controlled by `reversed` — because `FakeStore` preserves insertion
+/// order, this exercises whether `get_chunks` imposes a stable total order
+/// (by `chunk_id`) regardless of backend return order.
+async fn make_server_with_tied_chunks(reversed: bool) -> (McpServer, String) {
+    let store = Arc::new(FakeStore::new());
+
+    let uri = "file:///docs/tied.md";
+    let doc_hash = content_hash("tied-chunk document body");
+    let doc_id = document_id(uri, &doc_hash);
+
+    // Same span and (block_seq, seq_in_block) for both; only text (hence id) differs.
+    let span = Span::new(0, 4);
+    let make_chunk = |text: &str| {
+        let cid = chunk_id(&doc_id, text, span.start, span.end, 0);
+        ChunkRecord {
+            id: cid,
+            document_id: doc_id.clone(),
+            store_id: "store-1".to_string(),
+            text: text.to_string(),
+            span: span.clone(),
+            heading_path: vec![],
+            embedding: vec![0.1, 0.2, 0.3, 0.4],
+            policy_version: "v1".to_string(),
+            fetched_at: "2026-06-10T12:00:00Z".to_string(),
+            content_hash: doc_hash.clone(),
+            origin_store: "store-1".to_string(),
+            source_id: new_ulid(),
+            source_kind: "path".to_string(),
+            mime: Some("text/markdown".to_string()),
+            uri: uri.to_string(),
+            metadata: localdb_core::DocumentMetadata::default(),
+            block_seq: 0,
+            seq_in_block: 0,
+            block_kind: Some("paragraph".to_string()),
+        }
+    };
+
+    let a = make_chunk("aaaa");
+    let b = make_chunk("bbbb");
+    let chunks = if reversed { vec![b, a] } else { vec![a, b] };
+    store.upsert_chunks(chunks).await.expect("seed chunks");
+
+    let sd = StoreDescriptor {
+        id: "store-1".to_string(),
+        name: "test-store".to_string(),
+        visibility: "private".to_string(),
+    };
+    let available = AvailableStore::from_arc(sd, store);
+    let embedder = Box::new(FakeEmbedder::new(4));
+    let server = McpServer::new(vec![available], embedder);
+    (server, doc_id)
+}
+
 fn make_request(id: u64, method: &str, params: Option<Value>) -> String {
     let mut msg = json!({
         "jsonrpc": "2.0",
@@ -965,6 +1021,60 @@ async fn test_search_to_get_chunks_chaining() {
     let result: Value = serde_json::from_str(text).unwrap();
     assert_eq!(result["document_id"], expected_doc_id);
     assert_eq!(result["total_chunks"], 1);
+}
+
+/// get_chunks imposes a stable total order even when chunks tie on
+/// `(block_seq, seq_in_block)`. Two `(0, 0)` chunks with an identical span
+/// but different ids must paginate identically across repeated calls AND
+/// regardless of the order the backend returns them in (proven by seeding the
+/// same pair in opposite insertion orders). The tie is broken by `chunk_id`.
+#[tokio::test]
+async fn test_get_chunks_deterministic_tie_breaker() {
+    async fn ordered_ids(server: &McpServer, doc_id: &str) -> Vec<String> {
+        let req_str = make_request(
+            80,
+            "tools/call",
+            Some(json!({
+                "name": TOOL_GET_CHUNKS,
+                "arguments": { "document_id": doc_id }
+            })),
+        );
+        let req = mcp::server::parse_message(&req_str).unwrap();
+        let resp = server.handle_message(&req).await.unwrap();
+        let v = parse_response(&resp);
+        assert_eq!(v["result"]["isError"], false);
+        let content = v["result"]["content"].as_array().unwrap();
+        let text = content[0]["text"].as_str().unwrap();
+        let result: Value = serde_json::from_str(text).unwrap();
+        result["chunks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["chunk_id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    let (server_fwd, doc_id) = make_server_with_tied_chunks(false).await;
+    let (server_rev, _doc_id_rev) = make_server_with_tied_chunks(true).await;
+
+    // Repeated calls on the same server are stable.
+    let first = ordered_ids(&server_fwd, &doc_id).await;
+    let second = ordered_ids(&server_fwd, &doc_id).await;
+    assert_eq!(first, second, "pagination must be stable across calls");
+
+    // Reversed insertion order yields the same result — order comes from the
+    // sort key, not the backend's return order.
+    let reversed = ordered_ids(&server_rev, &doc_id).await;
+    assert_eq!(
+        first, reversed,
+        "order must be independent of backend/insertion order"
+    );
+
+    // And that stable order is ascending by chunk_id.
+    assert_eq!(first.len(), 2);
+    let mut expected = first.clone();
+    expected.sort();
+    assert_eq!(first, expected, "tie should break by ascending chunk_id");
 }
 
 // ---------------------------------------------------------------------------
