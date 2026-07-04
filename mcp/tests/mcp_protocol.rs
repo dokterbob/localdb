@@ -1,19 +1,37 @@
 //! Protocol-level tests for the MCP server.
 //!
-//! These tests exercise the MCP server with a scripted client over the
-//! `handle_message` interface (simulates what a real stdio client would do).
+//! These tests drive `McpHandler` over a real `rmcp` client/server pair
+//! connected by an in-memory `tokio::io::duplex` — the same transport shape
+//! a real stdio client would see, minus the OS pipe.
 //!
-//! Acceptance criteria (T10):
+//! Acceptance criteria (T10, carried over from the pre-rmcp suite):
 //! - Tool list exactly the four read-only tools.
 //! - `search` returns structured citations matching the canonical JSON.
 //! - Unknown store name → `store_not_found` as MCP tool error.
 //! - No mutating capability reachable.
 //!
+//! Two-tier error model (new in the rmcp migration, see `mcp/src/lib.rs` for
+//! the full writeup — verified empirically here, not assumed):
+//! - **Protocol-level** (`Err(ServiceError::McpError)`, `ErrorCode::INVALID_PARAMS`):
+//!   only an unregistered tool *name* (`test_unknown_tool_call`).
+//! - **Tool-level** (`Ok(CallToolResult { is_error: Some(true), .. })`):
+//!   everything else — including a missing/wrong-typed *required* argument.
+//!   One might expect that to be a protocol-level error since `Parameters<T>`
+//!   deserialization itself produces an `ErrorData::invalid_params`, but
+//!   rmcp 1.8.0's `ToolRouter::call` downgrades any such error to a tool
+//!   result via `into_tool_argument_error` (see `assert_deserialization_error`
+//!   below and `test_search_missing_query_argument` /
+//!   `test_get_document_no_args` / `test_get_chunks_missing_document_id`).
+//!
 //! See specs/05-surfaces.md §4 and specs/02-domain-model.md §6.
 
-use std::sync::Arc;
-
 use serde_json::{json, Value};
+
+use rmcp::{
+    model::{CallToolRequestParams, CallToolResult, ErrorCode},
+    service::{RoleClient, RunningService, ServiceError},
+    ServiceExt,
+};
 
 use localdb_core::{
     ids::{chunk_id, content_hash, document_id, new_ulid},
@@ -21,33 +39,92 @@ use localdb_core::{
     types::Span,
     FakeEmbedder,
 };
-use mcp::{
-    server::{McpServer, TOOL_GET_CHUNKS, TOOL_GET_DOCUMENT, TOOL_LIST_STORES, TOOL_SEARCH},
-    AvailableStore, StoreDescriptor,
-};
+use mcp::{handler::McpHandler, AvailableStore, StoreDescriptor};
 
 // ---------------------------------------------------------------------------
-// Test helpers
+// Test harness
 // ---------------------------------------------------------------------------
 
-/// Build a test McpServer with one store containing seeded chunks.
-fn make_server_with_one_store() -> McpServer {
-    let store = Arc::new(FakeStore::new());
+/// Serve `handler` on one half of an in-memory duplex pipe and connect a
+/// trivial (no-op) client to the other half — the same shape a real stdio
+/// MCP client/server pair has, without an OS pipe.
+async fn client_for(handler: McpHandler) -> RunningService<RoleClient, ()> {
+    let (server_transport, client_transport) = tokio::io::duplex(8192);
+    tokio::spawn(async move {
+        match handler.serve(server_transport).await {
+            Ok(running) => {
+                let _ = running.waiting().await;
+            }
+            Err(e) => panic!("server failed to initialize: {e}"),
+        }
+    });
+    ().serve(client_transport)
+        .await
+        .expect("client should connect")
+}
+
+/// Call `name` with `arguments` (a JSON object) and return the raw result.
+async fn call_tool(
+    client: &RunningService<RoleClient, ()>,
+    name: &'static str,
+    arguments: Value,
+) -> Result<CallToolResult, ServiceError> {
+    let args = arguments
+        .as_object()
+        .cloned()
+        .unwrap_or_else(serde_json::Map::new);
+    client
+        .call_tool(CallToolRequestParams::new(name).with_arguments(args))
+        .await
+}
+
+/// Extract the text of the first content item of a `CallToolResult`.
+fn text_of(result: &CallToolResult) -> String {
+    result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("expected a text content item")
+}
+
+/// Assert `result` is a tool-level "failed to deserialize parameters" error
+/// (rmcp's `ToolRouter::call` downgrades `Parameters<T>` deserialization
+/// failures — including a missing required field — from the protocol-level
+/// `ErrorData::invalid_params` that `Parameters<T>`'s extractor itself
+/// produces into a tool-level `CallToolResult`, via
+/// `into_tool_argument_error` in `rmcp::handler::server::router::tool`; see
+/// the `mcp/src/lib.rs` doc comment for the full two-tier model as verified
+/// against rmcp 1.8.0). Returns the error message.
+fn assert_deserialization_error(result: Result<CallToolResult, ServiceError>) -> String {
+    let result = result.expect("deserialization failures are tool-level, not protocol-level");
+    assert_eq!(result.is_error, Some(true), "should be a tool error");
+    let text = text_of(&result);
+    assert!(
+        text.starts_with("failed to deserialize parameters:"),
+        "expected a parameter-deserialization error, got: {text}"
+    );
+    text
+}
+
+/// Build a handler with one empty store.
+fn make_handler_with_one_store() -> McpHandler {
+    let store = std::sync::Arc::new(FakeStore::new());
     let sd = StoreDescriptor {
         id: new_ulid(),
         name: "test-store".to_string(),
         visibility: "private".to_string(),
     };
-    let available = AvailableStore::from_arc(sd, store.clone());
-    let embedder = Box::new(FakeEmbedder::new(4));
-    McpServer::new(vec![available], embedder)
+    let available = AvailableStore::from_arc(sd, store);
+    let embedder: std::sync::Arc<dyn localdb_core::Embedder> =
+        std::sync::Arc::new(FakeEmbedder::new(4));
+    McpHandler::new(vec![available], embedder, false)
 }
 
-/// Build a test McpServer with one store and seed it with a chunk.
-async fn make_server_with_seeded_store() -> (McpServer, String, String) {
-    let store = Arc::new(FakeStore::new());
+/// Build a handler with one store seeded with a chunk.
+async fn make_handler_with_seeded_store() -> (McpHandler, String, String) {
+    let store = std::sync::Arc::new(FakeStore::new());
 
-    // Seed a chunk.
     let uri = "file:///docs/test.md";
     let doc_hash = content_hash("some document content about Rust programming");
     let doc_id = document_id(uri, &doc_hash);
@@ -84,18 +161,19 @@ async fn make_server_with_seeded_store() -> (McpServer, String, String) {
         name: "test-store".to_string(),
         visibility: "private".to_string(),
     };
-    let available = AvailableStore::from_arc(sd, store.clone());
-    let embedder = Box::new(FakeEmbedder::new(4));
-    let server = McpServer::new(vec![available], embedder);
-    (server, doc_id, cid)
+    let available = AvailableStore::from_arc(sd, store);
+    let embedder: std::sync::Arc<dyn localdb_core::Embedder> =
+        std::sync::Arc::new(FakeEmbedder::new(4));
+    let handler = McpHandler::new(vec![available], embedder, false);
+    (handler, doc_id, cid)
 }
 
-/// Build a test McpServer seeded with ONE document made of 3 chunks, inserted
-/// out of storage order. Proves that `get_chunks` sorts defensively by
+/// Build a handler seeded with ONE document made of 3 chunks, inserted out
+/// of storage order. Proves that `get_chunks` sorts defensively by
 /// `(block_seq, seq_in_block)` rather than trusting insertion/store order
 /// (unlike libsql, `FakeStore` does not guarantee ordering).
-async fn make_server_with_multichunk_doc() -> (McpServer, String) {
-    let store = Arc::new(FakeStore::new());
+async fn make_handler_with_multichunk_doc() -> (McpHandler, String) {
+    let store = std::sync::Arc::new(FakeStore::new());
 
     let uri = "file:///docs/multi.md";
     let doc_hash = content_hash("multi-chunk document body");
@@ -144,19 +222,20 @@ async fn make_server_with_multichunk_doc() -> (McpServer, String) {
         visibility: "private".to_string(),
     };
     let available = AvailableStore::from_arc(sd, store);
-    let embedder = Box::new(FakeEmbedder::new(4));
-    let server = McpServer::new(vec![available], embedder);
-    (server, doc_id)
+    let embedder: std::sync::Arc<dyn localdb_core::Embedder> =
+        std::sync::Arc::new(FakeEmbedder::new(4));
+    let handler = McpHandler::new(vec![available], embedder, false);
+    (handler, doc_id)
 }
 
-/// Build a server seeded with ONE document whose two chunks both have
+/// Build a handler seeded with ONE document whose two chunks both have
 /// `(block_seq, seq_in_block) = (0, 0)` and an identical span, so the ONLY
-/// distinguishing sort field is `chunk_id`. The two records are inserted in an
-/// order controlled by `reversed` — because `FakeStore` preserves insertion
-/// order, this exercises whether `get_chunks` imposes a stable total order
-/// (by `chunk_id`) regardless of backend return order.
-async fn make_server_with_tied_chunks(reversed: bool) -> (McpServer, String) {
-    let store = Arc::new(FakeStore::new());
+/// distinguishing sort field is `chunk_id`. The two records are inserted in
+/// an order controlled by `reversed` — because `FakeStore` preserves
+/// insertion order, this exercises whether `get_chunks` imposes a stable
+/// total order (by `chunk_id`) regardless of backend return order.
+async fn make_handler_with_tied_chunks(reversed: bool) -> (McpHandler, String) {
+    let store = std::sync::Arc::new(FakeStore::new());
 
     let uri = "file:///docs/tied.md";
     let doc_hash = content_hash("tied-chunk document body");
@@ -200,122 +279,36 @@ async fn make_server_with_tied_chunks(reversed: bool) -> (McpServer, String) {
         visibility: "private".to_string(),
     };
     let available = AvailableStore::from_arc(sd, store);
-    let embedder = Box::new(FakeEmbedder::new(4));
-    let server = McpServer::new(vec![available], embedder);
-    (server, doc_id)
-}
-
-fn make_request(id: u64, method: &str, params: Option<Value>) -> String {
-    let mut msg = json!({
-        "jsonrpc": "2.0",
-        "method": method,
-        "id": id,
-    });
-    if let Some(p) = params {
-        msg["params"] = p;
-    }
-    serde_json::to_string(&msg).unwrap()
-}
-
-fn make_notification(method: &str, params: Option<Value>) -> String {
-    let mut msg = json!({
-        "jsonrpc": "2.0",
-        "method": method,
-    });
-    if let Some(p) = params {
-        msg["params"] = p;
-    }
-    serde_json::to_string(&msg).unwrap()
-}
-
-fn parse_response(response: &str) -> Value {
-    serde_json::from_str(response).expect("valid JSON response")
+    let embedder: std::sync::Arc<dyn localdb_core::Embedder> =
+        std::sync::Arc::new(FakeEmbedder::new(4));
+    let handler = McpHandler::new(vec![available], embedder, false);
+    (handler, doc_id)
 }
 
 // ---------------------------------------------------------------------------
-// Protocol tests
+// tools/list
 // ---------------------------------------------------------------------------
-
-/// T01: initialize handshake
-#[tokio::test]
-async fn test_initialize_handshake() {
-    let server = make_server_with_one_store();
-
-    let req_str = make_request(
-        1,
-        "initialize",
-        Some(json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": { "name": "test-client", "version": "0.0.1" }
-        })),
-    );
-
-    let req = mcp::server::parse_message(&req_str).unwrap();
-    let resp = server.handle_message(&req).await.unwrap();
-    let v = parse_response(&resp);
-
-    // Must be a success response (no "error" field).
-    assert!(v.get("error").is_none(), "should not have error: {v}");
-    assert_eq!(v["id"], 1);
-    assert_eq!(v["jsonrpc"], "2.0");
-
-    let result = &v["result"];
-    assert!(result.get("protocolVersion").is_some());
-    assert!(result.get("capabilities").is_some());
-    assert!(result.get("serverInfo").is_some());
-    assert_eq!(result["serverInfo"]["name"], "localdb");
-}
-
-/// T02: notifications/initialized produces no response
-#[tokio::test]
-async fn test_initialized_notification_no_response() {
-    let server = make_server_with_one_store();
-
-    let notif_str = make_notification("notifications/initialized", None);
-    let req = mcp::server::parse_message(&notif_str).unwrap();
-    let resp = server.handle_message(&req).await;
-
-    assert!(
-        resp.is_none(),
-        "notifications should not produce a response"
-    );
-}
 
 /// T03: tools/list returns exactly the four read-only tools
 #[tokio::test]
 async fn test_tools_list_exact_four_tools() {
-    let server = make_server_with_one_store();
+    let client = client_for(make_handler_with_one_store()).await;
 
-    let req_str = make_request(2, "tools/list", None);
-    let req = mcp::server::parse_message(&req_str).unwrap();
-    let resp = server.handle_message(&req).await.unwrap();
-    let v = parse_response(&resp);
+    let result = client.list_tools(None).await.expect("list_tools succeeds");
+    assert_eq!(result.tools.len(), 4, "should expose exactly 4 tools");
 
-    assert!(v.get("error").is_none(), "should not have error: {v}");
-
-    let tools = v["result"]["tools"]
-        .as_array()
-        .expect("tools should be array");
-
-    assert_eq!(tools.len(), 4, "should expose exactly 4 tools");
-
-    let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-
+    let tool_names: Vec<&str> = result.tools.iter().map(|t| t.name.as_ref()).collect();
+    assert!(tool_names.contains(&"search"), "should have 'search' tool");
     assert!(
-        tool_names.contains(&TOOL_SEARCH),
-        "should have 'search' tool"
-    );
-    assert!(
-        tool_names.contains(&TOOL_GET_DOCUMENT),
+        tool_names.contains(&"get_document"),
         "should have 'get_document' tool"
     );
     assert!(
-        tool_names.contains(&TOOL_GET_CHUNKS),
+        tool_names.contains(&"get_chunks"),
         "should have 'get_chunks' tool"
     );
     assert!(
-        tool_names.contains(&TOOL_LIST_STORES),
+        tool_names.contains(&"list_stores"),
         "should have 'list_stores' tool"
     );
 }
@@ -323,57 +316,47 @@ async fn test_tools_list_exact_four_tools() {
 /// T04: each tool has a name, description, and inputSchema
 #[tokio::test]
 async fn test_tools_have_required_fields() {
-    let server = make_server_with_one_store();
+    let client = client_for(make_handler_with_one_store()).await;
+    let result = client.list_tools(None).await.expect("list_tools succeeds");
 
-    let req_str = make_request(3, "tools/list", None);
-    let req = mcp::server::parse_message(&req_str).unwrap();
-    let resp = server.handle_message(&req).await.unwrap();
-    let v = parse_response(&resp);
-    let tools = v["result"]["tools"].as_array().unwrap();
-
-    for tool in tools {
-        let name = tool["name"].as_str().unwrap_or("");
-        assert!(!name.is_empty(), "tool name must not be empty");
+    for tool in &result.tools {
+        assert!(!tool.name.is_empty(), "tool name must not be empty");
         assert!(
-            tool.get("description").is_some(),
-            "tool '{name}' must have description"
+            tool.description.as_ref().is_some_and(|d| !d.is_empty()),
+            "tool '{}' must have a non-empty description",
+            tool.name
         );
-        assert!(
-            tool.get("inputSchema").is_some(),
-            "tool '{name}' must have inputSchema"
+        assert_eq!(
+            tool.input_schema.get("type").and_then(Value::as_str),
+            Some("object"),
+            "tool '{}' inputSchema must be a JSON Schema object",
+            tool.name
         );
     }
 }
 
-/// T05: ping responds with an empty result
+/// T17: no mutating tool is accessible (only the 4 read-only tools exist)
 #[tokio::test]
-async fn test_ping_response() {
-    let server = make_server_with_one_store();
+async fn test_no_mutating_tools_accessible() {
+    let client = client_for(make_handler_with_one_store()).await;
+    let result = client.list_tools(None).await.expect("list_tools succeeds");
+    let tool_names: Vec<&str> = result.tools.iter().map(|t| t.name.as_ref()).collect();
 
-    let req_str = make_request(99, "ping", None);
-    let req = mcp::server::parse_message(&req_str).unwrap();
-    let resp = server.handle_message(&req).await.unwrap();
-    let v = parse_response(&resp);
-
-    assert!(v.get("error").is_none());
-    assert_eq!(v["id"], 99);
-}
-
-/// T06: unknown method → METHOD_NOT_FOUND error
-#[tokio::test]
-async fn test_unknown_method_returns_error() {
-    let server = make_server_with_one_store();
-
-    let req_str = make_request(10, "nonexistent/method", None);
-    let req = mcp::server::parse_message(&req_str).unwrap();
-    let resp = server.handle_message(&req).await.unwrap();
-    let v = parse_response(&resp);
-
-    assert!(
-        v.get("error").is_some(),
-        "unknown method should return error"
-    );
-    assert_eq!(v["error"]["code"], -32601, "should be METHOD_NOT_FOUND");
+    let mutating = [
+        "add_source",
+        "remove_source",
+        "reindex",
+        "delete_document",
+        "upsert_chunk",
+        "create_store",
+        "delete_store",
+    ];
+    for m in mutating {
+        assert!(
+            !tool_names.contains(&m),
+            "mutating tool '{m}' must not be accessible"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -383,30 +366,16 @@ async fn test_unknown_method_returns_error() {
 /// T07: list_stores returns all available stores
 #[tokio::test]
 async fn test_list_stores_returns_stores() {
-    let server = make_server_with_one_store();
+    let client = client_for(make_handler_with_one_store()).await;
 
-    let req_str = make_request(
-        20,
-        "tools/call",
-        Some(json!({
-            "name": TOOL_LIST_STORES,
-            "arguments": {}
-        })),
-    );
+    let result = call_tool(&client, "list_stores", json!({}))
+        .await
+        .expect("list_stores succeeds");
+    assert_ne!(result.is_error, Some(true), "should not be a tool error");
 
-    let req = mcp::server::parse_message(&req_str).unwrap();
-    let resp = server.handle_message(&req).await.unwrap();
-    let v = parse_response(&resp);
-
-    assert!(v.get("error").is_none(), "should not have RPC error: {v}");
-
-    let content = v["result"]["content"].as_array().expect("content array");
-    assert!(!content.is_empty(), "should have content");
-
-    let text = content[0]["text"].as_str().unwrap();
-    let result: Value = serde_json::from_str(text).expect("valid JSON in content");
-
-    let stores = result["stores"].as_array().expect("stores array");
+    let text = text_of(&result);
+    let parsed: Value = serde_json::from_str(&text).expect("valid JSON in content");
+    let stores = parsed["stores"].as_array().expect("stores array");
     assert_eq!(stores.len(), 1);
     assert_eq!(stores[0]["name"], "test-store");
     assert_eq!(stores[0]["visibility"], "private");
@@ -417,26 +386,17 @@ async fn test_list_stores_returns_stores() {
 /// T08: list_stores with empty stores returns empty list
 #[tokio::test]
 async fn test_list_stores_empty() {
-    let embedder = Box::new(FakeEmbedder::new(4));
-    let server = McpServer::new(vec![], embedder);
+    let embedder: std::sync::Arc<dyn localdb_core::Embedder> =
+        std::sync::Arc::new(FakeEmbedder::new(4));
+    let handler = McpHandler::new(vec![], embedder, false);
+    let client = client_for(handler).await;
 
-    let req_str = make_request(
-        21,
-        "tools/call",
-        Some(json!({
-            "name": TOOL_LIST_STORES,
-            "arguments": {}
-        })),
-    );
-
-    let req = mcp::server::parse_message(&req_str).unwrap();
-    let resp = server.handle_message(&req).await.unwrap();
-    let v = parse_response(&resp);
-
-    let content = v["result"]["content"].as_array().unwrap();
-    let text = content[0]["text"].as_str().unwrap();
-    let result: Value = serde_json::from_str(text).unwrap();
-    assert_eq!(result["stores"].as_array().unwrap().len(), 0);
+    let result = call_tool(&client, "list_stores", json!({}))
+        .await
+        .expect("list_stores succeeds");
+    let text = text_of(&result);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(parsed["stores"].as_array().unwrap().len(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -446,43 +406,25 @@ async fn test_list_stores_empty() {
 /// T09: search returns citations in the canonical JSON shape
 #[tokio::test]
 async fn test_search_returns_canonical_citations() {
-    let (server, _doc_id, _chunk_id) = make_server_with_seeded_store().await;
+    let (handler, _doc_id, _chunk_id) = make_handler_with_seeded_store().await;
+    let client = client_for(handler).await;
 
-    let req_str = make_request(
-        30,
-        "tools/call",
-        Some(json!({
-            "name": TOOL_SEARCH,
-            "arguments": {
-                "query": "Rust programming language",
-                "limit": 5
-            }
-        })),
-    );
+    let result = call_tool(
+        &client,
+        "search",
+        json!({ "query": "Rust programming language", "limit": 5 }),
+    )
+    .await
+    .expect("search succeeds");
+    assert_eq!(result.is_error, Some(false), "should not be a tool error");
 
-    let req = mcp::server::parse_message(&req_str).unwrap();
-    let resp = server.handle_message(&req).await.unwrap();
-    let v = parse_response(&resp);
+    let text = text_of(&result);
+    let json_part = text.split("\n---\n").next().unwrap_or(&text);
+    let parsed: Value = serde_json::from_str(json_part).expect("valid JSON in content");
 
-    assert!(v.get("error").is_none(), "should not have RPC error: {v}");
-
-    // The result should not be marked as an error.
-    assert_eq!(v["result"]["isError"], false, "should not be a tool error");
-
-    let content = v["result"]["content"].as_array().unwrap();
-    let text = content[0]["text"].as_str().unwrap();
-
-    // The text starts with JSON (before the "---" separator).
-    let json_part = text.split("\n---\n").next().unwrap_or(text);
-    let result: Value = serde_json::from_str(json_part).expect("valid JSON in content");
-
-    assert!(result.get("citations").is_some(), "should have citations");
-    let citations = result["citations"].as_array().unwrap();
-
-    // Since we seeded one chunk about Rust, and the query is about Rust, we should get a result.
+    let citations = parsed["citations"].as_array().expect("citations array");
     assert!(!citations.is_empty(), "should find at least one citation");
 
-    // Verify the canonical citation shape (specs/02-domain-model.md §6).
     let first = &citations[0];
     assert!(first.get("chunk_id").is_some(), "citation.chunk_id missing");
     assert!(
@@ -491,7 +433,6 @@ async fn test_search_returns_canonical_citations() {
     );
     assert!(first.get("store").is_some(), "citation.store missing");
     assert!(first.get("uri").is_some(), "citation.uri missing");
-    // title is optional but must be serialized (null or string).
     assert!(
         first.get("title").is_some() || first.get("title").map(|v| v.is_null()).unwrap_or(true),
         "citation.title must be present (null or string)"
@@ -508,14 +449,11 @@ async fn test_search_returns_canonical_citations() {
         "citation.provenance missing"
     );
 
-    // Score shape: all three fields required per spec.
     let score = &first["score"];
     assert!(score.get("fused").is_some(), "score.fused missing");
-    // dense and bm25 may be null when only one leg fires, but the key must exist.
     assert!(score.get("dense").is_some(), "score.dense missing");
     assert!(score.get("bm25").is_some(), "score.bm25 missing");
 
-    // Store shape.
     let store_obj = &first["store"];
     assert!(store_obj.get("id").is_some(), "citation.store.id missing");
     assert!(
@@ -523,12 +461,10 @@ async fn test_search_returns_canonical_citations() {
         "citation.store.name missing"
     );
 
-    // Span shape.
     let span = &first["span"];
     assert!(span.get("start").is_some(), "citation.span.start missing");
     assert!(span.get("end").is_some(), "citation.span.end missing");
 
-    // Provenance shape.
     let prov = &first["provenance"];
     assert!(
         prov.get("fetched_at").is_some(),
@@ -544,7 +480,7 @@ async fn test_search_returns_canonical_citations() {
 /// to a natural boundary instead of cutting mid-word.
 #[tokio::test]
 async fn test_search_content_length_snaps_snippet_to_boundary() {
-    let store = Arc::new(FakeStore::new());
+    let store = std::sync::Arc::new(FakeStore::new());
 
     let uri = "file:///docs/long.md";
     let text = "Rust programming is a systems language focused on safety. \
@@ -584,33 +520,25 @@ collector, which keeps runtime performance predictable and fast.";
         visibility: "private".to_string(),
     };
     let available = AvailableStore::from_arc(sd, store);
-    let embedder = Box::new(FakeEmbedder::new(4));
-    let server = McpServer::new(vec![available], embedder);
+    let embedder: std::sync::Arc<dyn localdb_core::Embedder> =
+        std::sync::Arc::new(FakeEmbedder::new(4));
+    let handler = McpHandler::new(vec![available], embedder, false);
+    let client = client_for(handler).await;
 
-    let req_str = make_request(
-        35,
-        "tools/call",
-        Some(json!({
-            "name": TOOL_SEARCH,
-            "arguments": {
-                "query": "Rust programming",
-                "limit": 1,
-                "content_length": 60
-            }
-        })),
-    );
+    let result = call_tool(
+        &client,
+        "search",
+        json!({ "query": "Rust programming", "limit": 1, "content_length": 60 }),
+    )
+    .await
+    .expect("search succeeds");
 
-    let req = mcp::server::parse_message(&req_str).unwrap();
-    let resp = server.handle_message(&req).await.unwrap();
-    let v = parse_response(&resp);
-
-    let content = v["result"]["content"].as_array().unwrap();
-    let text_out = content[0]["text"].as_str().unwrap();
+    let text_out = text_of(&result);
 
     // The JSON part must still carry the full, untruncated snippet.
-    let json_part = text_out.split("\n---\n").next().unwrap_or(text_out);
-    let result: Value = serde_json::from_str(json_part).unwrap();
-    let citations = result["citations"].as_array().unwrap();
+    let json_part = text_out.split("\n---\n").next().unwrap_or(&text_out);
+    let parsed: Value = serde_json::from_str(json_part).unwrap();
+    let citations = parsed["citations"].as_array().unwrap();
     assert!(!citations.is_empty(), "should find at least one citation");
     let full_snippet = citations[0]["snippet"].as_str().unwrap();
     assert_eq!(
@@ -618,8 +546,6 @@ collector, which keeps runtime performance predictable and fast.";
         "JSON citation snippet must remain untruncated"
     );
 
-    // The human-readable text rendering (after "---") must be boundary-aware:
-    // truncated with an ellipsis, not a mid-word hard cut.
     let human_part = text_out
         .split("\n---\n")
         .nth(1)
@@ -633,7 +559,6 @@ collector, which keeps runtime performance predictable and fast.";
         snippet_line.ends_with('…'),
         "expected ellipsis marker on truncated snippet, got: {snippet_line}"
     );
-    // Sentence-boundary snapping should land on the period before "It prevents...".
     assert!(
         snippet_line.contains("safety.…") || snippet_line.ends_with("safety…"),
         "expected snap at sentence boundary, got: {snippet_line}"
@@ -643,85 +568,55 @@ collector, which keeps runtime performance predictable and fast.";
 /// T10: search with unknown store name → store_not_found tool error
 #[tokio::test]
 async fn test_search_unknown_store_name() {
-    let (server, _, _) = make_server_with_seeded_store().await;
+    let (handler, _, _) = make_handler_with_seeded_store().await;
+    let client = client_for(handler).await;
 
-    let req_str = make_request(
-        31,
-        "tools/call",
-        Some(json!({
-            "name": TOOL_SEARCH,
-            "arguments": {
-                "query": "test",
-                "stores": ["nonexistent-store"]
-            }
-        })),
-    );
+    let result = call_tool(
+        &client,
+        "search",
+        json!({ "query": "test", "stores": ["nonexistent-store"] }),
+    )
+    .await
+    .expect("call succeeds at the protocol level");
 
-    let req = mcp::server::parse_message(&req_str).unwrap();
-    let resp = server.handle_message(&req).await.unwrap();
-    let v = parse_response(&resp);
-
-    // Should be a tool-level error (isError: true), not a JSON-RPC error.
-    assert!(v.get("error").is_none(), "should not have RPC error: {v}");
-    assert_eq!(v["result"]["isError"], true, "should be a tool error");
-
-    let content = v["result"]["content"].as_array().unwrap();
-    let error_text = content[0]["text"].as_str().unwrap();
+    assert_eq!(result.is_error, Some(true), "should be a tool error");
+    let error_text = text_of(&result);
     assert!(
         error_text.contains("store_not_found") || error_text.contains("nonexistent-store"),
         "error text should reference the missing store: {error_text}"
     );
 }
 
-/// T11: search with missing query argument → invalid_arguments tool error
+/// T11 (changed expectation): search with missing query argument now fails
+/// `Parameters<SearchArgs>` deserialization before `tool_search` runs — a
+/// tool-level "failed to deserialize parameters" error, per rmcp 1.8.0's
+/// `into_tool_argument_error` (verified empirically; see
+/// `assert_deserialization_error`).
 #[tokio::test]
 async fn test_search_missing_query_argument() {
-    let server = make_server_with_one_store();
-
-    let req_str = make_request(
-        32,
-        "tools/call",
-        Some(json!({
-            "name": TOOL_SEARCH,
-            "arguments": {}
-        })),
+    let client = client_for(make_handler_with_one_store()).await;
+    let result = call_tool(&client, "search", json!({})).await;
+    let text = assert_deserialization_error(result);
+    assert!(
+        text.contains("query"),
+        "error should mention 'query': {text}"
     );
-
-    let req = mcp::server::parse_message(&req_str).unwrap();
-    let resp = server.handle_message(&req).await.unwrap();
-    let v = parse_response(&resp);
-
-    assert!(v.get("error").is_none());
-    assert_eq!(v["result"]["isError"], true, "should be a tool error");
 }
 
 /// T12: search returns empty citations for a store with no content
 #[tokio::test]
 async fn test_search_empty_store() {
-    let server = make_server_with_one_store(); // store has no chunks
+    let client = client_for(make_handler_with_one_store()).await; // store has no chunks
 
-    let req_str = make_request(
-        33,
-        "tools/call",
-        Some(json!({
-            "name": TOOL_SEARCH,
-            "arguments": {
-                "query": "anything"
-            }
-        })),
-    );
+    let result = call_tool(&client, "search", json!({ "query": "anything" }))
+        .await
+        .expect("search succeeds");
+    assert_eq!(result.is_error, Some(false));
 
-    let req = mcp::server::parse_message(&req_str).unwrap();
-    let resp = server.handle_message(&req).await.unwrap();
-    let v = parse_response(&resp);
-
-    assert_eq!(v["result"]["isError"], false);
-
-    let content = v["result"]["content"].as_array().unwrap();
-    let text = content[0]["text"].as_str().unwrap();
-    let json_part = text.split("\n---\n").next().unwrap_or(text);
-    let result: Value = serde_json::from_str(json_part).unwrap();
-    let citations = result["citations"].as_array().unwrap();
+    let text = text_of(&result);
+    let json_part = text.split("\n---\n").next().unwrap_or(&text);
+    let parsed: Value = serde_json::from_str(json_part).unwrap();
+    let citations = parsed["citations"].as_array().unwrap();
     assert!(
         citations.is_empty(),
         "empty store should return no citations"
@@ -731,9 +626,8 @@ async fn test_search_empty_store() {
 /// T13: search limit is respected
 #[tokio::test]
 async fn test_search_limit_respected() {
-    let store = Arc::new(FakeStore::new());
+    let store = std::sync::Arc::new(FakeStore::new());
 
-    // Seed multiple chunks about different topics.
     let mut records = Vec::new();
     for i in 0..5 {
         let text = format!("Chunk {i} about Rust programming language and systems software.");
@@ -773,31 +667,23 @@ async fn test_search_limit_respected() {
         visibility: "private".to_string(),
     };
     let available = AvailableStore::from_arc(sd, store);
-    let embedder = Box::new(FakeEmbedder::new(4));
-    let server = McpServer::new(vec![available], embedder);
+    let embedder: std::sync::Arc<dyn localdb_core::Embedder> =
+        std::sync::Arc::new(FakeEmbedder::new(4));
+    let handler = McpHandler::new(vec![available], embedder, false);
+    let client = client_for(handler).await;
 
-    let req_str = make_request(
-        34,
-        "tools/call",
-        Some(json!({
-            "name": TOOL_SEARCH,
-            "arguments": {
-                "query": "Rust programming",
-                "limit": 3
-            }
-        })),
-    );
+    let result = call_tool(
+        &client,
+        "search",
+        json!({ "query": "Rust programming", "limit": 3 }),
+    )
+    .await
+    .expect("search succeeds");
 
-    let req = mcp::server::parse_message(&req_str).unwrap();
-    let resp = server.handle_message(&req).await.unwrap();
-    let v = parse_response(&resp);
-
-    let content = v["result"]["content"].as_array().unwrap();
-    let text = content[0]["text"].as_str().unwrap();
-    let json_part = text.split("\n---\n").next().unwrap_or(text);
-    let result: Value = serde_json::from_str(json_part).unwrap();
-    let citations = result["citations"].as_array().unwrap();
-
+    let text = text_of(&result);
+    let json_part = text.split("\n---\n").next().unwrap_or(&text);
+    let parsed: Value = serde_json::from_str(json_part).unwrap();
+    let citations = parsed["citations"].as_array().unwrap();
     assert!(
         citations.len() <= 3,
         "should return at most 3 citations, got {}",
@@ -812,87 +698,91 @@ async fn test_search_limit_respected() {
 /// T14: get_document by ID returns document metadata and text
 #[tokio::test]
 async fn test_get_document_by_id() {
-    let (server, doc_id, _) = make_server_with_seeded_store().await;
+    let (handler, doc_id, _) = make_handler_with_seeded_store().await;
+    let client = client_for(handler).await;
 
-    let req_str = make_request(
-        40,
-        "tools/call",
-        Some(json!({
-            "name": TOOL_GET_DOCUMENT,
-            "arguments": {
-                "id": doc_id
-            }
-        })),
-    );
+    let result = call_tool(&client, "get_document", json!({ "id": doc_id }))
+        .await
+        .expect("get_document succeeds");
+    assert_eq!(result.is_error, Some(false));
 
-    let req = mcp::server::parse_message(&req_str).unwrap();
-    let resp = server.handle_message(&req).await.unwrap();
-    let v = parse_response(&resp);
-
-    assert!(v.get("error").is_none(), "should not have RPC error: {v}");
-    assert_eq!(v["result"]["isError"], false);
-
-    let content = v["result"]["content"].as_array().unwrap();
-    let text = content[0]["text"].as_str().unwrap();
-    let result: Value = serde_json::from_str(text).expect("valid JSON in content");
-
-    assert_eq!(result["document_id"], doc_id);
-    assert_eq!(result["uri"], "file:///docs/test.md");
-    assert!(result.get("chunk_count").is_some());
-    assert!(result.get("text").is_some());
-    assert!(result.get("provenance").is_some());
-    assert!(result.get("store").is_some());
+    let text = text_of(&result);
+    let parsed: Value = serde_json::from_str(&text).expect("valid JSON in content");
+    assert_eq!(parsed["document_id"], doc_id);
+    assert_eq!(parsed["uri"], "file:///docs/test.md");
+    assert!(parsed.get("chunk_count").is_some());
+    assert!(parsed.get("text").is_some());
+    assert!(parsed.get("provenance").is_some());
+    assert!(parsed.get("store").is_some());
 }
 
 /// T15: get_document with unknown ID → document_not_found tool error
 #[tokio::test]
 async fn test_get_document_not_found() {
-    let (server, _, _) = make_server_with_seeded_store().await;
+    let (handler, _, _) = make_handler_with_seeded_store().await;
+    let client = client_for(handler).await;
 
-    let req_str = make_request(
-        41,
-        "tools/call",
-        Some(json!({
-            "name": TOOL_GET_DOCUMENT,
-            "arguments": {
-                "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            }
-        })),
-    );
+    let result = call_tool(
+        &client,
+        "get_document",
+        json!({ "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }),
+    )
+    .await
+    .expect("call succeeds at the protocol level");
 
-    let req = mcp::server::parse_message(&req_str).unwrap();
-    let resp = server.handle_message(&req).await.unwrap();
-    let v = parse_response(&resp);
-
-    assert_eq!(v["result"]["isError"], true, "should be a tool error");
-
-    let content = v["result"]["content"].as_array().unwrap();
-    let error_text = content[0]["text"].as_str().unwrap();
+    assert_eq!(result.is_error, Some(true), "should be a tool error");
+    let error_text = text_of(&result);
     assert!(
         error_text.contains("document_not_found"),
         "should report document_not_found: {error_text}"
     );
 }
 
-/// T16: get_document with no arguments → invalid_arguments tool error
+/// get_document with no arguments at all: `id` is `#[serde(default)]` (see
+/// args.rs's doc comment — a hard-required `id` would fail deserialization
+/// for *any* omitted-`id` call, including a `uri`-only one, before the tool
+/// body's more specific "uri not supported" guidance ever runs), so this
+/// reaches `tools::tool_get_document`'s body as an empty `id` and returns
+/// its usual tool-level `invalid_request` error, not a deserialization error.
 #[tokio::test]
 async fn test_get_document_no_args() {
-    let server = make_server_with_one_store();
-
-    let req_str = make_request(
-        42,
-        "tools/call",
-        Some(json!({
-            "name": TOOL_GET_DOCUMENT,
-            "arguments": {}
-        })),
+    let client = client_for(make_handler_with_one_store()).await;
+    let result = call_tool(&client, "get_document", json!({}))
+        .await
+        .expect("empty id is a tool-level error, not a protocol error");
+    assert_eq!(result.is_error, Some(true));
+    let text = text_of(&result);
+    assert!(
+        text.contains("invalid_request"),
+        "error should be invalid_request: {text}"
     );
+    assert!(
+        text.contains("must not be empty"),
+        "error should mention 'id' must not be empty: {text}"
+    );
+}
 
-    let req = mcp::server::parse_message(&req_str).unwrap();
-    let resp = server.handle_message(&req).await.unwrap();
-    let v = parse_response(&resp);
-
-    assert_eq!(v["result"]["isError"], true, "should be a tool error");
+/// get_document called with only `uri` (omitting `id` entirely, as a real
+/// MCP client unaware of localdb's v1 id-only lookup might do) must still
+/// reach the tool body's `uri`-specific guidance message, not a generic
+/// deserialization error — this is the actual case `id`'s
+/// `#[serde(default)]` (see args.rs) exists to preserve.
+#[tokio::test]
+async fn test_get_document_uri_only_gets_helpful_message() {
+    let client = client_for(make_handler_with_one_store()).await;
+    let result = call_tool(
+        &client,
+        "get_document",
+        json!({ "uri": "file:///docs/guide.md" }),
+    )
+    .await
+    .expect("uri-only call is a tool-level error, not a protocol error");
+    assert_eq!(result.is_error, Some(true));
+    let text = text_of(&result);
+    assert!(
+        text.contains("uri-based get_document is not supported"),
+        "error should point the caller at 'id' from a search result: {text}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -903,39 +793,27 @@ async fn test_get_document_no_args() {
 /// of insertion order, with correct spans and heading_path.
 #[tokio::test]
 async fn test_get_chunks_happy_path_sorted() {
-    let (server, doc_id) = make_server_with_multichunk_doc().await;
+    let (handler, doc_id) = make_handler_with_multichunk_doc().await;
+    let client = client_for(handler).await;
 
-    let req_str = make_request(
-        60,
-        "tools/call",
-        Some(json!({
-            "name": TOOL_GET_CHUNKS,
-            "arguments": { "document_id": doc_id }
-        })),
-    );
+    let result = call_tool(&client, "get_chunks", json!({ "document_id": doc_id }))
+        .await
+        .expect("get_chunks succeeds");
+    assert_eq!(result.is_error, Some(false));
 
-    let req = mcp::server::parse_message(&req_str).unwrap();
-    let resp = server.handle_message(&req).await.unwrap();
-    let v = parse_response(&resp);
+    let text = text_of(&result);
+    let parsed: Value = serde_json::from_str(&text).expect("valid JSON in content");
 
-    assert!(v.get("error").is_none(), "should not have RPC error: {v}");
-    assert_eq!(v["result"]["isError"], false);
+    assert_eq!(parsed["document_id"], doc_id);
+    assert_eq!(parsed["uri"], "file:///docs/multi.md");
+    assert_eq!(parsed["title"], "Multi-chunk Doc");
+    assert_eq!(parsed["total_chunks"], 3);
+    assert_eq!(parsed["offset"], 0);
+    assert_eq!(parsed["returned"], 3);
 
-    let content = v["result"]["content"].as_array().unwrap();
-    let text = content[0]["text"].as_str().unwrap();
-    let result: Value = serde_json::from_str(text).expect("valid JSON in content");
-
-    assert_eq!(result["document_id"], doc_id);
-    assert_eq!(result["uri"], "file:///docs/multi.md");
-    assert_eq!(result["title"], "Multi-chunk Doc");
-    assert_eq!(result["total_chunks"], 3);
-    assert_eq!(result["offset"], 0);
-    assert_eq!(result["returned"], 3);
-
-    let chunks = result["chunks"].as_array().expect("chunks array");
+    let chunks = parsed["chunks"].as_array().expect("chunks array");
     assert_eq!(chunks.len(), 3);
 
-    // Must be sorted by (block_seq, seq_in_block), not insertion order.
     assert_eq!(chunks[0]["text"], "first chunk text");
     assert_eq!(chunks[0]["block_seq"], 0);
     assert_eq!(chunks[0]["seq_in_block"], 0);
@@ -956,32 +834,26 @@ async fn test_get_chunks_happy_path_sorted() {
 /// get_chunks paginates with offset/limit.
 #[tokio::test]
 async fn test_get_chunks_pagination_offset_limit() {
-    let (server, doc_id) = make_server_with_multichunk_doc().await;
+    let (handler, doc_id) = make_handler_with_multichunk_doc().await;
+    let client = client_for(handler).await;
 
-    let req_str = make_request(
-        61,
-        "tools/call",
-        Some(json!({
-            "name": TOOL_GET_CHUNKS,
-            "arguments": { "document_id": doc_id, "offset": 1, "limit": 1 }
-        })),
-    );
+    let result = call_tool(
+        &client,
+        "get_chunks",
+        json!({ "document_id": doc_id, "offset": 1, "limit": 1 }),
+    )
+    .await
+    .expect("get_chunks succeeds");
+    assert_eq!(result.is_error, Some(false));
 
-    let req = mcp::server::parse_message(&req_str).unwrap();
-    let resp = server.handle_message(&req).await.unwrap();
-    let v = parse_response(&resp);
+    let text = text_of(&result);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(parsed["total_chunks"], 3);
+    assert_eq!(parsed["offset"], 1);
+    assert_eq!(parsed["limit"], 1);
+    assert_eq!(parsed["returned"], 1);
 
-    assert_eq!(v["result"]["isError"], false);
-    let content = v["result"]["content"].as_array().unwrap();
-    let text = content[0]["text"].as_str().unwrap();
-    let result: Value = serde_json::from_str(text).unwrap();
-
-    assert_eq!(result["total_chunks"], 3);
-    assert_eq!(result["offset"], 1);
-    assert_eq!(result["limit"], 1);
-    assert_eq!(result["returned"], 1);
-
-    let chunks = result["chunks"].as_array().unwrap();
+    let chunks = parsed["chunks"].as_array().unwrap();
     assert_eq!(chunks.len(), 1);
     assert_eq!(chunks[0]["text"], "second chunk text");
 }
@@ -990,81 +862,60 @@ async fn test_get_chunks_pagination_offset_limit() {
 /// not an error.
 #[tokio::test]
 async fn test_get_chunks_offset_out_of_range_returns_empty() {
-    let (server, doc_id) = make_server_with_multichunk_doc().await;
+    let (handler, doc_id) = make_handler_with_multichunk_doc().await;
+    let client = client_for(handler).await;
 
-    let req_str = make_request(
-        62,
-        "tools/call",
-        Some(json!({
-            "name": TOOL_GET_CHUNKS,
-            "arguments": { "document_id": doc_id, "offset": 99 }
-        })),
-    );
-
-    let req = mcp::server::parse_message(&req_str).unwrap();
-    let resp = server.handle_message(&req).await.unwrap();
-    let v = parse_response(&resp);
-
+    let result = call_tool(
+        &client,
+        "get_chunks",
+        json!({ "document_id": doc_id, "offset": 99 }),
+    )
+    .await
+    .expect("get_chunks succeeds");
     assert_eq!(
-        v["result"]["isError"], false,
+        result.is_error,
+        Some(false),
         "out-of-range offset is not an error"
     );
-    let content = v["result"]["content"].as_array().unwrap();
-    let text = content[0]["text"].as_str().unwrap();
-    let result: Value = serde_json::from_str(text).unwrap();
 
-    assert_eq!(result["total_chunks"], 3);
-    assert_eq!(result["returned"], 0);
-    assert!(result["chunks"].as_array().unwrap().is_empty());
+    let text = text_of(&result);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(parsed["total_chunks"], 3);
+    assert_eq!(parsed["returned"], 0);
+    assert!(parsed["chunks"].as_array().unwrap().is_empty());
 }
 
-/// get_chunks with missing document_id → invalid_request tool error.
+/// get_chunks with missing document_id (changed expectation): now fails
+/// `Parameters<GetChunksArgs>` deserialization (`document_id` is required)
+/// — a tool-level "failed to deserialize parameters" error.
 #[tokio::test]
 async fn test_get_chunks_missing_document_id() {
-    let server = make_server_with_one_store();
-
-    let req_str = make_request(
-        63,
-        "tools/call",
-        Some(json!({
-            "name": TOOL_GET_CHUNKS,
-            "arguments": {}
-        })),
+    let client = client_for(make_handler_with_one_store()).await;
+    let result = call_tool(&client, "get_chunks", json!({})).await;
+    let text = assert_deserialization_error(result);
+    assert!(
+        text.contains("document_id"),
+        "error should mention 'document_id': {text}"
     );
-
-    let req = mcp::server::parse_message(&req_str).unwrap();
-    let resp = server.handle_message(&req).await.unwrap();
-    let v = parse_response(&resp);
-
-    assert_eq!(v["result"]["isError"], true, "should be a tool error");
-    let content = v["result"]["content"].as_array().unwrap();
-    let text = content[0]["text"].as_str().unwrap();
-    let parsed: Value = serde_json::from_str(text).unwrap();
-    assert_eq!(parsed["error"]["code"].as_str().unwrap(), "invalid_request");
 }
 
 /// get_chunks with an unknown document_id → document_not_found tool error.
 #[tokio::test]
 async fn test_get_chunks_unknown_document_id() {
-    let (server, _doc_id) = make_server_with_multichunk_doc().await;
+    let (handler, _doc_id) = make_handler_with_multichunk_doc().await;
+    let client = client_for(handler).await;
 
-    let req_str = make_request(
-        64,
-        "tools/call",
-        Some(json!({
-            "name": TOOL_GET_CHUNKS,
-            "arguments": { "document_id": "nonexistent-doc" }
-        })),
-    );
+    let result = call_tool(
+        &client,
+        "get_chunks",
+        json!({ "document_id": "nonexistent-doc" }),
+    )
+    .await
+    .expect("call succeeds at the protocol level");
+    assert_eq!(result.is_error, Some(true), "should be a tool error");
 
-    let req = mcp::server::parse_message(&req_str).unwrap();
-    let resp = server.handle_message(&req).await.unwrap();
-    let v = parse_response(&resp);
-
-    assert_eq!(v["result"]["isError"], true, "should be a tool error");
-    let content = v["result"]["content"].as_array().unwrap();
-    let text = content[0]["text"].as_str().unwrap();
-    let parsed: Value = serde_json::from_str(text).unwrap();
+    let text = text_of(&result);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(
         parsed["error"]["code"].as_str().unwrap(),
         "document_not_found"
@@ -1072,29 +923,24 @@ async fn test_get_chunks_unknown_document_id() {
 }
 
 /// Chaining test: `search` → take `citations[0].document_id` → `get_chunks`.
-/// Proves that `Citation.document_id` (already present, no search changes
-/// needed) is sufficient to drive `get_chunks`.
+/// Proves that `Citation.document_id` is sufficient to drive `get_chunks`.
 #[tokio::test]
 async fn test_search_to_get_chunks_chaining() {
-    let (server, expected_doc_id, _chunk_id) = make_server_with_seeded_store().await;
+    let (handler, expected_doc_id, _chunk_id) = make_handler_with_seeded_store().await;
+    let client = client_for(handler).await;
 
-    let search_req = make_request(
-        70,
-        "tools/call",
-        Some(json!({
-            "name": TOOL_SEARCH,
-            "arguments": { "query": "Rust programming language", "limit": 5 }
-        })),
-    );
-    let req = mcp::server::parse_message(&search_req).unwrap();
-    let resp = server.handle_message(&req).await.unwrap();
-    let v = parse_response(&resp);
+    let search_result = call_tool(
+        &client,
+        "search",
+        json!({ "query": "Rust programming language", "limit": 5 }),
+    )
+    .await
+    .expect("search succeeds");
 
-    let content = v["result"]["content"].as_array().unwrap();
-    let text = content[0]["text"].as_str().unwrap();
-    let json_part = text.split("\n---\n").next().unwrap_or(text);
-    let result: Value = serde_json::from_str(json_part).unwrap();
-    let citations = result["citations"].as_array().unwrap();
+    let text = text_of(&search_result);
+    let json_part = text.split("\n---\n").next().unwrap_or(&text);
+    let parsed: Value = serde_json::from_str(json_part).unwrap();
+    let citations = parsed["citations"].as_array().unwrap();
     assert!(!citations.is_empty(), "search should find the seeded chunk");
 
     let document_id = citations[0]["document_id"]
@@ -1103,50 +949,37 @@ async fn test_search_to_get_chunks_chaining() {
         .to_string();
     assert_eq!(document_id, expected_doc_id);
 
-    let chunks_req = make_request(
-        71,
-        "tools/call",
-        Some(json!({
-            "name": TOOL_GET_CHUNKS,
-            "arguments": { "document_id": document_id }
-        })),
+    let chunks_result = call_tool(&client, "get_chunks", json!({ "document_id": document_id }))
+        .await
+        .expect("get_chunks succeeds");
+    assert_eq!(
+        chunks_result.is_error,
+        Some(false),
+        "get_chunks should succeed"
     );
-    let req = mcp::server::parse_message(&chunks_req).unwrap();
-    let resp = server.handle_message(&req).await.unwrap();
-    let v = parse_response(&resp);
 
-    assert_eq!(v["result"]["isError"], false, "get_chunks should succeed");
-    let content = v["result"]["content"].as_array().unwrap();
-    let text = content[0]["text"].as_str().unwrap();
-    let result: Value = serde_json::from_str(text).unwrap();
-    assert_eq!(result["document_id"], expected_doc_id);
-    assert_eq!(result["total_chunks"], 1);
+    let text = text_of(&chunks_result);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(parsed["document_id"], expected_doc_id);
+    assert_eq!(parsed["total_chunks"], 1);
 }
 
 /// get_chunks imposes a stable total order even when chunks tie on
 /// `(block_seq, seq_in_block)`. Two `(0, 0)` chunks with an identical span
 /// but different ids must paginate identically across repeated calls AND
-/// regardless of the order the backend returns them in (proven by seeding the
-/// same pair in opposite insertion orders). The tie is broken by `chunk_id`.
+/// regardless of the order the backend returns them in (proven by seeding
+/// the same pair in opposite insertion orders). The tie is broken by
+/// `chunk_id`.
 #[tokio::test]
 async fn test_get_chunks_deterministic_tie_breaker() {
-    async fn ordered_ids(server: &McpServer, doc_id: &str) -> Vec<String> {
-        let req_str = make_request(
-            80,
-            "tools/call",
-            Some(json!({
-                "name": TOOL_GET_CHUNKS,
-                "arguments": { "document_id": doc_id }
-            })),
-        );
-        let req = mcp::server::parse_message(&req_str).unwrap();
-        let resp = server.handle_message(&req).await.unwrap();
-        let v = parse_response(&resp);
-        assert_eq!(v["result"]["isError"], false);
-        let content = v["result"]["content"].as_array().unwrap();
-        let text = content[0]["text"].as_str().unwrap();
-        let result: Value = serde_json::from_str(text).unwrap();
-        result["chunks"]
+    async fn ordered_ids(client: &RunningService<RoleClient, ()>, doc_id: &str) -> Vec<String> {
+        let result = call_tool(client, "get_chunks", json!({ "document_id": doc_id }))
+            .await
+            .expect("get_chunks succeeds");
+        assert_eq!(result.is_error, Some(false));
+        let text = text_of(&result);
+        let parsed: Value = serde_json::from_str(&text).unwrap();
+        parsed["chunks"]
             .as_array()
             .unwrap()
             .iter()
@@ -1154,17 +987,19 @@ async fn test_get_chunks_deterministic_tie_breaker() {
             .collect()
     }
 
-    let (server_fwd, doc_id) = make_server_with_tied_chunks(false).await;
-    let (server_rev, _doc_id_rev) = make_server_with_tied_chunks(true).await;
+    let (handler_fwd, doc_id) = make_handler_with_tied_chunks(false).await;
+    let client_fwd = client_for(handler_fwd).await;
+    let (handler_rev, _doc_id_rev) = make_handler_with_tied_chunks(true).await;
+    let client_rev = client_for(handler_rev).await;
 
     // Repeated calls on the same server are stable.
-    let first = ordered_ids(&server_fwd, &doc_id).await;
-    let second = ordered_ids(&server_fwd, &doc_id).await;
+    let first = ordered_ids(&client_fwd, &doc_id).await;
+    let second = ordered_ids(&client_fwd, &doc_id).await;
     assert_eq!(first, second, "pagination must be stable across calls");
 
     // Reversed insertion order yields the same result — order comes from the
     // sort key, not the backend's return order.
-    let reversed = ordered_ids(&server_rev, &doc_id).await;
+    let reversed = ordered_ids(&client_rev, &doc_id).await;
     assert_eq!(
         first, reversed,
         "order must be independent of backend/insertion order"
@@ -1178,176 +1013,25 @@ async fn test_get_chunks_deterministic_tie_breaker() {
 }
 
 // ---------------------------------------------------------------------------
-// No mutating tool
+// Unknown tool
 // ---------------------------------------------------------------------------
 
-/// T17: no mutating tool is accessible (only 3 read-only tools exist)
-#[tokio::test]
-async fn test_no_mutating_tools_accessible() {
-    let server = make_server_with_one_store();
-    let req_str = make_request(50, "tools/list", None);
-    let req = mcp::server::parse_message(&req_str).unwrap();
-    let resp = server.handle_message(&req).await.unwrap();
-    let v = parse_response(&resp);
-
-    let tools = v["result"]["tools"].as_array().unwrap();
-    let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-
-    // Mutating operations that must NOT be present.
-    let mutating = [
-        "add_source",
-        "remove_source",
-        "reindex",
-        "delete_document",
-        "upsert_chunk",
-        "create_store",
-        "delete_store",
-    ];
-    for m in mutating {
-        assert!(
-            !tool_names.contains(&m),
-            "mutating tool '{m}' must not be accessible"
-        );
-    }
-}
-
-/// T18: calling an unknown tool returns a tool error (not an RPC error)
+/// T18 (changed expectation): calling an unregistered tool name is now
+/// dispatched by rmcp's own macro-generated `call_tool`, which returns a
+/// protocol-level error rather than the old hand-written tool-level
+/// `CallToolResult::error("unknown tool '...'")`. Confirmed against rmcp
+/// 1.8.0 source (`handler/server/router/tool.rs`): unmatched names return
+/// `ErrorData::invalid_params("tool not found", None)`.
 #[tokio::test]
 async fn test_unknown_tool_call() {
-    let server = make_server_with_one_store();
+    let client = client_for(make_handler_with_one_store()).await;
+    let result = call_tool(&client, "add_source", json!({ "path": "/evil" })).await;
 
-    let req_str = make_request(
-        51,
-        "tools/call",
-        Some(json!({
-            "name": "add_source",
-            "arguments": { "path": "/evil" }
-        })),
-    );
-
-    let req = mcp::server::parse_message(&req_str).unwrap();
-    let resp = server.handle_message(&req).await.unwrap();
-    let v = parse_response(&resp);
-
-    // Should be a tool-level error, not an RPC error.
-    assert!(v.get("error").is_none(), "should not have RPC error");
-    assert_eq!(v["result"]["isError"], true, "should be a tool error");
-
-    let content = v["result"]["content"].as_array().unwrap();
-    let msg = content[0]["text"].as_str().unwrap();
-    assert!(
-        msg.contains("add_source"),
-        "error should name the unknown tool"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Message parsing
-// ---------------------------------------------------------------------------
-
-/// T19: parse_message handles valid JSON-RPC requests
-#[test]
-fn test_parse_message_valid() {
-    let line = r#"{"jsonrpc":"2.0","method":"tools/list","id":1}"#;
-    let req = mcp::server::parse_message(line).unwrap();
-    assert_eq!(req.method, "tools/list");
-    assert_eq!(req.id, Some(Value::from(1)));
-}
-
-/// T20: parse_message returns error for invalid JSON
-#[test]
-fn test_parse_message_invalid_json() {
-    let result = mcp::server::parse_message("{not valid json}");
-    assert!(result.is_err());
-}
-
-/// T21: parse_message handles notifications (no id)
-#[test]
-fn test_parse_message_notification() {
-    let line = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
-    let req = mcp::server::parse_message(line).unwrap();
-    assert!(req.is_notification());
-}
-
-// ---------------------------------------------------------------------------
-// tools module unit tests
-// ---------------------------------------------------------------------------
-
-/// T22: SearchArgs::from_value parses correctly
-#[test]
-fn test_search_args_parse_basic() {
-    use mcp::server::TOOL_SEARCH;
-
-    let params = json!({
-        "name": TOOL_SEARCH,
-        "arguments": {
-            "query": "test query",
-            "limit": 5
+    match result {
+        Err(ServiceError::McpError(e)) => {
+            assert_eq!(e.code, ErrorCode::INVALID_PARAMS);
+            assert_eq!(e.message, "tool not found");
         }
-    });
-
-    let args = mcp::tools::SearchArgs::from_value(Some(&params)).unwrap();
-    assert_eq!(args.query, "test query");
-    assert_eq!(args.limit, 5);
-    assert!(args.store_names.is_empty());
-}
-
-/// T23: SearchArgs::from_value rejects empty query
-#[test]
-fn test_search_args_empty_query() {
-    let params = json!({
-        "name": "search",
-        "arguments": {
-            "query": "   "
-        }
-    });
-
-    let result = mcp::tools::SearchArgs::from_value(Some(&params));
-    assert!(result.is_err());
-}
-
-/// T24: SearchArgs::from_value rejects missing query
-#[test]
-fn test_search_args_missing_query() {
-    let params = json!({
-        "name": "search",
-        "arguments": {}
-    });
-
-    let result = mcp::tools::SearchArgs::from_value(Some(&params));
-    assert!(result.is_err());
-}
-
-/// T25: SearchArgs cap limit at MAX_LIMIT=100
-#[test]
-fn test_search_args_limit_capped() {
-    let params = json!({
-        "name": "search",
-        "arguments": {
-            "query": "q",
-            "limit": 9999
-        }
-    });
-
-    let args = mcp::tools::SearchArgs::from_value(Some(&params)).unwrap();
-    assert_eq!(args.limit, 100, "limit should be capped at 100");
-}
-
-/// T26: SearchArgs default limit is 10
-#[test]
-fn test_search_args_default_limit() {
-    let params = json!({
-        "name": "search",
-        "arguments": { "query": "q" }
-    });
-
-    let args = mcp::tools::SearchArgs::from_value(Some(&params)).unwrap();
-    assert_eq!(args.limit, 10, "default limit should be 10");
-}
-
-/// T27: render_citations_text with empty list returns "No results found."
-#[test]
-fn test_render_citations_empty() {
-    let text = mcp::tools::render_citations_text(&[], 400);
-    assert_eq!(text, "No results found.");
+        other => panic!("expected a protocol-level McpError, got {other:?}"),
+    }
 }

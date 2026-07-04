@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use axum::{
     routing::{delete, get, post},
@@ -10,11 +11,11 @@ use tracing::{error, info};
 
 use localdb_core::{
     config::{loader::ResolvedPaths, schema::RawConfig},
-    Error,
+    Embedder, Error,
 };
 
 use crate::{
-    handlers, job_queue::JobQueue, scheduler::UrlRefreshScheduler, socket::SocketGuard,
+    handlers, job_queue::JobQueue, mcp_bridge, scheduler::UrlRefreshScheduler, socket::SocketGuard,
     state::AppState,
 };
 
@@ -52,7 +53,8 @@ pub async fn start_daemon(
     let port = options.config.server.port;
     let socket_guard = bind_socket_guard(&options)?;
     let (state, url_scheduler) = build_daemon_state(&options).await?;
-    let router = build_router(state.clone());
+    let (mcp_stores, mcp_embedder) = mcp_bridge::build_available_stores(&state).await?;
+    let router = build_router(state.clone(), mcp_stores, mcp_embedder);
     let (listener, bound_addr) = bind_tcp_listener(bind_addr, port).await?;
 
     spawn_config_watcher(options.paths.config_file.clone(), state.clone());
@@ -159,14 +161,28 @@ async fn server_future(listener: TcpListener, router: Router) {
     }
 }
 
-/// Build the axum router with all /v1 routes.
+/// Build the axum router with all /v1 routes plus the `/mcp` MCP-over-HTTP
+/// route.
 ///
 /// Routes per specs/05-surfaces.md §3:
 ///   GET/POST /stores, GET/PATCH/DELETE /stores/{id},
 ///   GET/POST /stores/{id}/sources, DELETE /sources/{id},
 ///   GET /documents/{id}, POST /search,
 ///   POST /jobs, GET /jobs/{id}, GET /status, GET /config.
-pub fn build_router(state: AppState) -> Router {
+///
+/// `mcp_stores`/`mcp_embedder` are the startup-time snapshot built by
+/// `mcp_bridge::build_available_stores` (specs/05-surfaces.md §4) — see
+/// that function's doc comment for why `/mcp` doesn't see stores added
+/// later via `/v1/stores` without a restart. `nest_service` (rather than
+/// `route_service`) matches the mount pattern rmcp's own test suite uses
+/// for `StreamableHttpService` and composes fine with a `Router<AppState>`
+/// that also has `.with_state` routes: the mounted service handles
+/// `Request` directly and needs no state extraction.
+pub fn build_router(
+    state: AppState,
+    mcp_stores: Vec<mcp::AvailableStore>,
+    mcp_embedder: Arc<dyn Embedder>,
+) -> Router {
     Router::new()
         .route(
             "/v1/stores",
@@ -190,6 +206,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/status", get(handlers::get_status))
         .route("/v1/config", get(handlers::get_config))
         .with_state(state)
+        .nest_service(
+            "/mcp",
+            mcp::build_streamable_http_service(mcp_stores, mcp_embedder),
+        )
 }
 
 /// Validate the bind address.
@@ -662,7 +682,7 @@ mod tests {
         );
 
         // Run a search via the HTTP API to confirm the citation is returned.
-        let app = build_router(state);
+        let app = build_router(state, vec![], Arc::new(FakeEmbedder::new(1)));
 
         use axum::body::Body;
         use axum::http::Request;
@@ -727,7 +747,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let app = build_router(state);
+        let app = build_router(state, vec![], Arc::new(localdb_core::FakeEmbedder::new(1)));
 
         use axum::body::Body;
         use axum::http::Request;

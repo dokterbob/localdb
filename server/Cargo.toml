@@ -10,6 +10,8 @@ description = "HTTP API daemon: axum REST API, file watching, job queue, unix so
 localdb-core = { path = "../core" }
 store-libsql = { path = "../store-libsql" }
 embed = { path = "../embed" }
+mcp = { path = "../mcp" }
+async-trait = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true }
@@ -28,3 +30,11 @@ serde_yaml = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 reqwest = { version = "0.12", features = ["json"], default-features = false }
+
+# Client-side transport for the `/mcp` route's round-trip integration test
+# (server/tests/mcp_route.rs) — not used by any non-test code, which only
+# ever gets a concrete tower::Service back from `mcp::build_streamable_http_service`.
+rmcp = { workspace = true, features = [
+    "client",
+    "transport-streamable-http-client-reqwest",
+] }

@@ -46,7 +46,11 @@ async fn get_document_returns_record_when_indexed() {
     )
     .await;
 
-    let app = crate::daemon::build_router(state);
+    let app = crate::daemon::build_router(
+        state,
+        vec![],
+        std::sync::Arc::new(localdb_core::FakeEmbedder::new(1)),
+    );
     let resp = app
         .oneshot(
             Request::builder()
