@@ -79,8 +79,10 @@ pub(crate) fn probe_daemon_health_inner(base_url: &str) -> Option<bool> {
 /// Returns `DaemonState::Running` if the socket file is present (MVP check).
 /// The base_url is resolved in priority order:
 ///   1. `daemon_url_override` (from `LOCALDB_DAEMON_URL`, read once at startup)
-///   2. Content of `daemon.sock` file (if it contains a URL)
-///   3. Default `http://127.0.0.1:7700`
+///   2. Content of `daemon.url` (the discovery file the daemon writes at startup
+///      with its actual client-reachable base URL — see `server::socket::UrlFileGuard`)
+///   3. Default `http://127.0.0.1:7700`, for daemons started before `daemon.url`
+///      existed or if the file is missing/unreadable
 ///
 /// Returns `DaemonState::NotRunning` if neither the override is set nor the
 /// socket file exists.
@@ -92,9 +94,12 @@ pub fn probe_daemon(data_dir: &Path, daemon_url_override: Option<&str>) -> Daemo
     }
 
     let socket_path = data_dir.join("daemon.sock");
+    let url_path = data_dir.join("daemon.url");
     if socket_path.exists() {
-        // Read the sock file content — if it looks like a URL, use it as base_url.
-        let base_url = std::fs::read_to_string(&socket_path)
+        // `daemon.sock` itself is a live Unix socket, not a text file — the
+        // daemon records its actual base URL separately in `daemon.url` so
+        // discovery works for non-default binds/ports, not just 127.0.0.1:7700.
+        let base_url = std::fs::read_to_string(&url_path)
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| s.starts_with("http://") || s.starts_with("https://"))
@@ -109,8 +114,9 @@ pub fn probe_daemon(data_dir: &Path, daemon_url_override: Option<&str>) -> Daemo
         if reachable {
             DaemonState::Running { base_url }
         } else {
-            // Stale socket: remove it and report not running.
+            // Stale socket: remove it (and any discovery URL file) and report not running.
             let _ = std::fs::remove_file(&socket_path);
+            let _ = std::fs::remove_file(&url_path);
             DaemonState::NotRunning
         }
     } else {
@@ -222,6 +228,47 @@ mod tests {
         let state = probe_daemon(dir.path(), Some("http://127.0.0.1:9999"));
         assert!(
             matches!(state, DaemonState::Running { base_url } if base_url == "http://127.0.0.1:9999")
+        );
+    }
+
+    #[test]
+    fn probe_running_reads_base_url_from_discovery_file() {
+        // Simulate a daemon bound to a non-default port: `daemon.sock` marks a
+        // daemon as present, and `daemon.url` (server::socket::UrlFileGuard)
+        // records the real client-reachable base URL to probe.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{}", addr);
+
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("daemon.sock"), b"").unwrap();
+        std::fs::write(dir.path().join("daemon.url"), &base_url).unwrap();
+
+        let state = probe_daemon(dir.path(), None);
+        assert!(
+            matches!(state, DaemonState::Running { base_url: found } if found == base_url),
+            "expected Running with base_url from daemon.url"
+        );
+    }
+
+    #[test]
+    fn probe_stale_removes_both_socket_and_url_file() {
+        // Port 0 is never a listening address, so this deterministically fails
+        // the reachability check without depending on port availability in CI.
+        let dir = TempDir::new().unwrap();
+        let sock_path = dir.path().join("daemon.sock");
+        let url_path = dir.path().join("daemon.url");
+        std::fs::write(&sock_path, b"").unwrap();
+        std::fs::write(&url_path, b"http://127.0.0.1:0").unwrap();
+
+        assert!(matches!(
+            probe_daemon(dir.path(), None),
+            DaemonState::NotRunning
+        ));
+        assert!(!sock_path.exists(), "stale socket should be removed");
+        assert!(
+            !url_path.exists(),
+            "stale discovery URL file should be removed"
         );
     }
 }

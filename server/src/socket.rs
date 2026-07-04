@@ -1,8 +1,11 @@
-//! Unix socket management for daemon discovery.
+//! Unix socket and discovery-URL management for daemon discovery.
 //!
 //! The daemon binds a Unix domain socket at `<data_dir>/daemon.sock`.
 //! CLI and MCP commands probe this path on startup; if a connection succeeds
 //! they route through the daemon instead of opening the store directly.
+//! The daemon also writes its client-reachable base URL to
+//! `<data_dir>/daemon.url` (see [`UrlFileGuard`]) so that probe resolves to the
+//! actual configured bind address/port instead of a hardcoded default.
 //!
 //! See specs/01-architecture.md §3 and specs/03-config.md §4.
 
@@ -67,6 +70,48 @@ impl Drop for SocketGuard {
         // Remove the socket file so stale sockets don't block next startup.
         let _ = std::fs::remove_file(&self.path);
         tracing::debug!("daemon socket removed: {}", self.path.display());
+    }
+}
+
+/// Guard for the daemon discovery URL file.
+///
+/// Writes the daemon's client-reachable base URL to `<data_dir>/daemon.url` on
+/// construction so CLI/MCP discovery (`cli::daemon_client::probe_daemon`) can
+/// find the daemon regardless of the configured bind address or port, instead
+/// of assuming `http://127.0.0.1:7700`. Removes the file on drop, mirroring
+/// `SocketGuard`.
+pub struct UrlFileGuard {
+    path: PathBuf,
+}
+
+impl UrlFileGuard {
+    /// Write `base_url` to `url_path` and return a guard that removes it on drop.
+    pub fn new(url_path: &Path, base_url: &str) -> Result<Self, Error> {
+        if let Some(parent) = url_path.parent() {
+            std::fs::create_dir_all(parent).map_err(map_socket_io_error)?;
+        }
+        std::fs::write(url_path, base_url).map_err(map_socket_io_error)?;
+        tracing::debug!(
+            "daemon discovery URL recorded at {}: {}",
+            url_path.display(),
+            base_url
+        );
+
+        Ok(Self {
+            path: url_path.to_owned(),
+        })
+    }
+
+    /// Path of the discovery URL file.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for UrlFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        tracing::debug!("daemon discovery URL file removed: {}", self.path.display());
     }
 }
 
@@ -142,6 +187,39 @@ mod tests {
             !path.exists(),
             "socket file should be removed after guard is dropped"
         );
+    }
+
+    #[test]
+    fn url_file_guard_writes_url_and_removes_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.url");
+
+        {
+            let guard =
+                UrlFileGuard::new(&path, "http://127.0.0.1:7700").expect("should write url file");
+            assert_eq!(guard.path(), path.as_path());
+            assert!(path.exists(), "url file should exist while guard is live");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "http://127.0.0.1:7700"
+            );
+        }
+        assert!(
+            !path.exists(),
+            "url file should be removed after guard is dropped"
+        );
+    }
+
+    #[test]
+    fn url_file_guard_creates_missing_parent_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("daemon.url");
+
+        let guard = UrlFileGuard::new(&path, "http://192.168.1.5:7700")
+            .expect("should create parent dir and write url file");
+        assert!(path.exists());
+        drop(guard);
+        assert!(!path.exists());
     }
 
     #[test]

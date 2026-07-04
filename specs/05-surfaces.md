@@ -8,7 +8,9 @@
 
 Every command/tool first probes the daemon socket ([01-architecture.md](01-architecture.md) §3):
 daemon present → thin client over its HTTP API; absent → embedded mode (open store in-process).
-The behavior difference per command is noted below; users should rarely need to care.
+The client's base URL for the HTTP API comes from the daemon's recorded discovery URL (§3), not a
+hardcoded default, so this works for any configured bind address or port. The behavior difference
+per command is noted below; users should rarely need to care.
 
 ## 2. CLI
 
@@ -37,10 +39,17 @@ daemon. **Rejected:** gRPC (worse curl-ability and browser story for a local too
 later if a consumer demands it).
 
 - **Bind & trust:** `127.0.0.1` by default, **no auth in local mode** — documented trust
-  assumption: anything on this machine that can reach localhost is trusted, same boundary as the
-  files themselves. Binding to a non-loopback address without auth configured is a **refused
-  startup**, not a warning (forward-compatible with the shared/home-server mode in
-  [06-roadmap.md](06-roadmap.md) §1, which arrives together with real auth).
+  assumption: anything that can reach the bind address is trusted, same boundary as the files
+  themselves. Any bind address is accepted; the daemon does not refuse to start based on it.
+  Binding to a specific non-loopback address (e.g. a LAN or VPN IP) is treated as a deliberate
+  trust decision by the user and starts silently. Binding to all interfaces (`0.0.0.0`, `::`, or
+  any other address form the OS resolves to the unspecified address) logs a warning at startup —
+  checked against the address the OS actually bound, not the raw config string, so aliases the
+  string form can't see are still caught — since it makes the unauthenticated daemon reachable
+  from any network the machine is on and is the one case a user could plausibly not realize how
+  exposed this makes them. The daemon also records its client-reachable base URL (loopback
+  substituted for a wildcard bind) in a discovery file so CLI/MCP clients can find it regardless
+  of bind address or port ([01-architecture.md](01-architecture.md) §3).
 - **Resources** (`/v1`): `GET/POST /stores`, `GET/PATCH/DELETE /stores/{id}`,
   `GET/POST /stores/{id}/sources`, `POST /search` (body: query, store filter, metadata filters,
   limit; citations carry full `Metadata`), `GET /resources/{id}` (response includes
