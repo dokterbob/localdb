@@ -54,7 +54,11 @@ optional; when one is running, CLI and MCP become thin clients of its HTTP API.
 
 - **Discovery:** a unix socket at a well-known path in the data dir
   ([03-config.md](03-config.md) §4). Socket present and responsive → route through daemon;
-  otherwise → embedded mode. No configuration needed for the common case.
+  otherwise → embedded mode. No configuration needed for the common case. The daemon also records
+  its actual client-reachable base URL in a sibling `daemon.url` file at startup (substituting
+  loopback for an unspecified/wildcard bind, since that address isn't itself connectable) so
+  discovery works for any configured `server.bind`/`server.port` ([05-surfaces.md](05-surfaces.md)
+  §3), not just the default `127.0.0.1:7700`.
 - **Concurrency model:** SQLite WAL and `busy_timeout=5000` is the sole concurrency primitive. No advisory file lock. Multi-process is the first-class topology. Multiple stdio MCP servers, a CLI session running `localdb index`, and an optional `localdb serve` daemon may all share one data directory as peers. The daemon is no longer special. SQLite admits one writer at a time. Concurrent writers serialise via `busy_timeout`. An exhausted busy-timeout maps to `Error::RuntimeStateLocked` (exit 4).
 - **Daemon-exclusive capabilities:** continuous file watching, scheduled URL refresh, the HTTP
   API and (later) web UI, background job queue. Embedded mode does one-shot equivalents

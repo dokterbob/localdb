@@ -14,7 +14,10 @@ use localdb_core::{
 };
 
 use crate::{
-    handlers, job_queue::JobQueue, scheduler::UrlRefreshScheduler, socket::SocketGuard,
+    handlers,
+    job_queue::JobQueue,
+    scheduler::UrlRefreshScheduler,
+    socket::{SocketGuard, UrlFileGuard},
     state::AppState,
 };
 
@@ -31,6 +34,8 @@ pub struct DaemonOptions {
 pub struct DaemonHandle {
     /// The socket guard (cleans up socket file on drop).
     pub _socket: SocketGuard,
+    /// The discovery URL file guard (cleans up `daemon.url` on drop).
+    pub _url_file: UrlFileGuard,
     /// The bind address.
     pub addr: SocketAddr,
 }
@@ -44,8 +49,12 @@ impl std::fmt::Debug for DaemonHandle {
 /// Start the daemon.
 ///
 /// Steps:
-/// 1. Warn if the bind address is `0.0.0.0` (or `::`), since that's reachable
-///    from any interface with no authentication.
+/// 1. Bind the Unix discovery socket (fails fast if another daemon is running).
+/// 2. Bind the TCP listener at the configured `server.bind`/`server.port`. Any
+///    bind address is accepted (specs/05-surfaces.md §3); binding to all
+///    interfaces logs a warning since the daemon has no authentication.
+/// 3. Record the daemon's client-reachable base URL in `daemon.url` so CLI/MCP
+///    discovery finds it regardless of the configured bind address or port.
 pub async fn start_daemon(
     options: DaemonOptions,
 ) -> Result<(DaemonHandle, impl std::future::Future<Output = ()>), Error> {
@@ -55,12 +64,16 @@ pub async fn start_daemon(
     let (state, url_scheduler) = build_daemon_state(&options).await?;
     let router = build_router(state.clone());
     let (listener, bound_addr) = bind_tcp_listener(bind_addr, port).await?;
+    warn_if_unspecified(bound_addr);
+    let url_file_guard =
+        UrlFileGuard::new(&options.paths.url_path(), &client_base_url(bound_addr))?;
 
     spawn_config_watcher(options.paths.config_file.clone(), state.clone());
     spawn_url_scheduler(&state, url_scheduler);
 
     let handle = DaemonHandle {
         _socket: socket_guard,
+        _url_file: url_file_guard,
         addr: bound_addr,
     };
 
@@ -68,7 +81,6 @@ pub async fn start_daemon(
 }
 
 fn bind_socket_guard(options: &DaemonOptions) -> Result<SocketGuard, Error> {
-    warn_if_bind_all_interfaces(options.config.server.bind.as_str());
     SocketGuard::new(&options.paths.socket_path())
 }
 
@@ -193,25 +205,44 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Whether `bind` means "all interfaces" (`0.0.0.0` or the IPv6 equivalent `::`).
-fn is_bind_all_interfaces(bind: &str) -> bool {
-    bind == "0.0.0.0" || bind == "::"
-}
-
-/// Warn when binding to all interfaces (`0.0.0.0` / `::`).
+/// Warn when the actually-bound address is unspecified (all interfaces).
 ///
 /// Per specs/05-surfaces.md §3: the daemon has no authentication, so binding to
 /// all interfaces makes it reachable from any network the machine is on. Binding
 /// to a specific non-loopback address (e.g. a LAN/VPN IP) is treated as a
 /// deliberate trust decision and doesn't warn.
-fn warn_if_bind_all_interfaces(bind: &str) {
-    if is_bind_all_interfaces(bind) {
+///
+/// This checks the address the OS actually bound (`SocketAddr::ip().is_unspecified()`)
+/// rather than the raw config string, so wildcard aliases the string form can't see —
+/// `"0"`, `"[::]"`, `"000.000.000.000"` — are still caught.
+fn warn_if_unspecified(bound_addr: SocketAddr) {
+    if bound_addr.ip().is_unspecified() {
         warn!(
-            bind = bind,
+            bind = %bound_addr.ip(),
             "binding to all interfaces ({}); the daemon has no authentication and will be \
              reachable from any network this machine is on",
-            bind
+            bound_addr.ip()
         );
+    }
+}
+
+/// The daemon's client-reachable base URL for a bound address.
+///
+/// An unspecified (wildcard) bind such as `0.0.0.0` or `::` isn't itself a
+/// connectable address — substitute the loopback address for the same family so
+/// CLI/MCP discovery (which runs on the same machine) can always reach it.
+/// Any other bound address is used as-is (IPv6 hosts are bracketed by
+/// `SocketAddr`'s `Display` impl).
+fn client_base_url(bound_addr: SocketAddr) -> String {
+    let port = bound_addr.port();
+    if bound_addr.ip().is_unspecified() {
+        if bound_addr.is_ipv6() {
+            format!("http://[::1]:{port}")
+        } else {
+            format!("http://127.0.0.1:{port}")
+        }
+    } else {
+        format!("http://{bound_addr}")
     }
 }
 
@@ -327,23 +358,63 @@ mod tests {
     // --- bind address warning ---
 
     #[test]
-    fn is_bind_all_interfaces_classifies_wildcard_addresses_only() {
-        assert!(is_bind_all_interfaces("0.0.0.0"));
-        assert!(is_bind_all_interfaces("::"));
+    fn warn_if_unspecified_does_not_panic_for_any_input() {
+        warn_if_unspecified("127.0.0.1:7700".parse().unwrap());
+        warn_if_unspecified("192.168.1.1:7700".parse().unwrap());
+        warn_if_unspecified("0.0.0.0:7700".parse().unwrap());
+        warn_if_unspecified("[::]:7700".parse().unwrap());
+        warn_if_unspecified("[::1]:7700".parse().unwrap());
+    }
 
-        assert!(!is_bind_all_interfaces("127.0.0.1"));
-        assert!(!is_bind_all_interfaces("::1"));
-        assert!(!is_bind_all_interfaces("localhost"));
-        assert!(!is_bind_all_interfaces("192.168.1.1"));
-        assert!(!is_bind_all_interfaces("100.78.241.43"));
+    /// Pins the actual OS-resolution behavior the wildcard-alias fix depends on
+    /// (Codex review comment: string checks like `bind == "0.0.0.0"` miss aliases
+    /// such as `"0"`, `"[::]"`, `"000.000.000.000"` that the OS still resolves to
+    /// the unspecified address). Binding on the *actually returned* `SocketAddr`
+    /// rather than the config string is only a real fix if these forms truly
+    /// resolve to unspecified on the platforms we run on — this test binds each
+    /// one for real and checks `local_addr().ip().is_unspecified()`, instead of
+    /// just asserting the (already-known-correct) canonical `"0.0.0.0"` case.
+    #[tokio::test]
+    async fn wildcard_aliases_resolve_to_unspecified_when_actually_bound() {
+        for alias in ["0", "[::]", "000.000.000.000"] {
+            let (_listener, bound_addr) = bind_tcp_listener(alias, 0)
+                .await
+                .unwrap_or_else(|e| panic!("bind({alias:?}) should succeed: {e:?}"));
+            assert!(
+                bound_addr.ip().is_unspecified(),
+                "bind alias {alias:?} resolved to {bound_addr}, expected an unspecified address"
+            );
+        }
+    }
+
+    // --- client_base_url ---
+
+    #[test]
+    fn client_base_url_substitutes_loopback_for_unspecified_v4() {
+        let addr: SocketAddr = "0.0.0.0:7700".parse().unwrap();
+        assert_eq!(client_base_url(addr), "http://127.0.0.1:7700");
     }
 
     #[test]
-    fn warn_if_bind_all_interfaces_does_not_panic_for_any_input() {
-        warn_if_bind_all_interfaces("127.0.0.1");
-        warn_if_bind_all_interfaces("192.168.1.1");
-        warn_if_bind_all_interfaces("0.0.0.0");
-        warn_if_bind_all_interfaces("::");
+    fn client_base_url_substitutes_loopback_for_unspecified_v6() {
+        let addr: SocketAddr = "[::]:7700".parse().unwrap();
+        assert_eq!(client_base_url(addr), "http://[::1]:7700");
+    }
+
+    #[test]
+    fn client_base_url_passes_through_specific_addresses() {
+        assert_eq!(
+            client_base_url("127.0.0.1:7700".parse().unwrap()),
+            "http://127.0.0.1:7700"
+        );
+        assert_eq!(
+            client_base_url("192.168.1.5:7700".parse().unwrap()),
+            "http://192.168.1.5:7700"
+        );
+        assert_eq!(
+            client_base_url("[::1]:7700".parse().unwrap()),
+            "http://[::1]:7700"
+        );
     }
 
     #[tokio::test]
@@ -402,6 +473,18 @@ mod tests {
         assert!(result.is_ok(), "daemon should start: {:?}", result.err());
         let (handle, _server_future) = result.unwrap();
         assert!(handle.addr.port() > 0);
+
+        // The discovery URL file should record the actual bound address/port.
+        let url_path = paths.url_path();
+        assert!(url_path.exists(), "daemon.url should exist while running");
+        let recorded = std::fs::read_to_string(&url_path).unwrap();
+        assert_eq!(recorded, format!("http://127.0.0.1:{}", handle.addr.port()));
+
+        drop(handle);
+        assert!(
+            !url_path.exists(),
+            "daemon.url should be removed after the handle is dropped"
+        );
     }
 
     #[tokio::test]
@@ -464,7 +547,10 @@ mod tests {
         config.server.bind = "0.0.0.0".to_string();
         config.server.port = 0; // let OS assign a free port
 
-        let options = DaemonOptions { paths, config };
+        let options = DaemonOptions {
+            paths: paths.clone(),
+            config,
+        };
 
         let result = start_daemon(options).await;
         assert!(
@@ -474,6 +560,11 @@ mod tests {
         );
         let (handle, _server_future) = result.unwrap();
         assert!(handle.addr.port() > 0);
+
+        // Discovery must substitute loopback for the unbindable wildcard address
+        // so CLI/MCP clients on the same machine can actually connect.
+        let recorded = std::fs::read_to_string(paths.url_path()).unwrap();
+        assert_eq!(recorded, format!("http://127.0.0.1:{}", handle.addr.port()));
     }
 
     // --- Watcher integration: file change ⇒ re-index ⇒ search reflects it ---

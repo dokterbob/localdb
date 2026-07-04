@@ -21,7 +21,12 @@ daemon listening on http://127.0.0.1:7700
 ```
 
 It binds the HTTP listener and also creates a Unix discovery socket at
-`<data_dir>/daemon.sock` so that CLI and MCP processes can detect it.
+`<data_dir>/daemon.sock` so that CLI and MCP processes can detect it, plus a
+`<data_dir>/daemon.url` file recording the daemon's actual client-reachable base URL
+(e.g. `http://192.168.1.5:7700` for a LAN bind, or `http://127.0.0.1:7700` when bound to
+`0.0.0.0`/`::`, since the wildcard address itself isn't connectable). CLI/MCP discovery reads
+this file, so it works for any configured bind address or port — not just the default
+`127.0.0.1:7700`.
 
 ### Bind address and port
 
@@ -373,21 +378,21 @@ exit: 4
 
 there is already a daemon process running. Stop it before starting a new one.
 
-### Stale `daemon.sock` after an ungraceful shutdown
+### Stale `daemon.sock` / `daemon.url` after an ungraceful shutdown
 
 If the daemon process is killed (e.g. with `kill <pid>` or a crash), the Unix socket file at
-`<data_dir>/daemon.sock` is **not cleaned up**. The CLI will then report the daemon as running and
-`localdb search` will exit with:
+`<data_dir>/daemon.sock` and the discovery URL file at `<data_dir>/daemon.url` are **not cleaned
+up**. The CLI will then report the daemon as running and `localdb search` will exit with:
 
 ```
 error: daemon is unreachable
 exit: 5
 ```
 
-Fix: remove the stale socket file manually, then CLI commands will fall back to embedded mode.
+Fix: remove the stale files manually, then CLI commands will fall back to embedded mode.
 
 ```
-rm <data_dir>/daemon.sock
+rm <data_dir>/daemon.sock <data_dir>/daemon.url
 ```
 
 After removal `localdb status` will show `daemon: not running (embedded mode)`.
