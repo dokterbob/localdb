@@ -518,10 +518,20 @@ impl GetChunksArgs {
             },
         };
 
+        // Absent/null → default. A present but invalid value (negative, float,
+        // non-numeric) or an explicit `0` is rejected: the schema requires
+        // `limit >= 1`, so clamping `0` up to `1` would silently return a chunk
+        // the caller did not ask for. A valid `limit` is capped at `MAX_LIMIT`.
         let limit = match args.get("limit") {
             None | Some(Value::Null) => Self::DEFAULT_LIMIT,
             Some(v) => match v.as_u64() {
-                Some(n) => (n as usize).clamp(1, Self::MAX_LIMIT),
+                Some(0) => {
+                    return Err(typed_error(
+                        "invalid_request",
+                        "invalid arguments: 'limit' must be at least 1",
+                    ));
+                }
+                Some(n) => (n as usize).min(Self::MAX_LIMIT),
                 None => {
                     return Err(typed_error(
                         "invalid_request",
@@ -1174,13 +1184,12 @@ mod tests {
     }
 
     #[test]
-    fn get_chunks_args_limit_clamped_to_min() {
-        let params = build_params(serde_json::json!({
-            "document_id": "doc-1",
-            "limit": 0
-        }));
-        let args = GetChunksArgs::from_value(Some(&params)).expect("should parse");
-        assert_eq!(args.limit, 1, "limit should be clamped to a minimum of 1");
+    fn get_chunks_args_zero_limit_is_invalid_request() {
+        // The schema requires limit >= 1; an explicit 0 must be rejected rather
+        // than clamped up to 1 (which would return a chunk the caller did not
+        // ask for).
+        let params = build_params(serde_json::json!({ "document_id": "doc-1", "limit": 0 }));
+        assert_invalid_request(GetChunksArgs::from_value(Some(&params)));
     }
 
     #[test]
