@@ -52,7 +52,7 @@ fn search_schema() -> Value {
             },
             "content_length": {
                 "type": "integer",
-                "description": "Max characters of snippet text per result in the text rendering (default: 400)",
+                "description": "Soft cap on snippet text chars per result in the text rendering; snaps to the nearest paragraph/sentence/word boundary rather than cutting mid-word (default: 400). The JSON citation payload always carries the full snippet.",
                 "minimum": 1
             }
         },

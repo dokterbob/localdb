@@ -421,6 +421,106 @@ async fn test_search_returns_canonical_citations() {
     );
 }
 
+/// #94: search with a small `content_length` snaps the text-rendered snippet
+/// to a natural boundary instead of cutting mid-word.
+#[tokio::test]
+async fn test_search_content_length_snaps_snippet_to_boundary() {
+    let store = Arc::new(FakeStore::new());
+
+    let uri = "file:///docs/long.md";
+    let text = "Rust programming is a systems language focused on safety. \
+It prevents entire classes of memory bugs at compile time without a garbage \
+collector, which keeps runtime performance predictable and fast.";
+    let doc_hash = content_hash(text);
+    let doc_id_val = document_id(uri, &doc_hash);
+    let span = Span::new(0, text.len());
+    let cid = chunk_id(&doc_id_val, text, span.start, span.end, 0);
+
+    let record = ChunkRecord {
+        id: cid,
+        document_id: doc_id_val,
+        store_id: "store-1".to_string(),
+        text: text.to_string(),
+        span,
+        heading_path: vec![],
+        embedding: vec![0.9, 0.1, 0.1, 0.1],
+        policy_version: "v1".to_string(),
+        fetched_at: "2026-06-10T12:00:00Z".to_string(),
+        content_hash: doc_hash,
+        origin_store: "store-1".to_string(),
+        source_id: new_ulid(),
+        source_kind: "path".to_string(),
+        mime: Some("text/markdown".to_string()),
+        uri: uri.to_string(),
+        metadata: localdb_core::DocumentMetadata::default(),
+        block_seq: 0,
+        seq_in_block: 0,
+        block_kind: None,
+    };
+    store.upsert_chunks(vec![record]).await.unwrap();
+
+    let sd = StoreDescriptor {
+        id: "store-1".to_string(),
+        name: "test-store".to_string(),
+        visibility: "private".to_string(),
+    };
+    let available = AvailableStore::from_arc(sd, store);
+    let embedder = Box::new(FakeEmbedder::new(4));
+    let server = McpServer::new(vec![available], embedder);
+
+    let req_str = make_request(
+        35,
+        "tools/call",
+        Some(json!({
+            "name": TOOL_SEARCH,
+            "arguments": {
+                "query": "Rust programming",
+                "limit": 1,
+                "content_length": 60
+            }
+        })),
+    );
+
+    let req = mcp::server::parse_message(&req_str).unwrap();
+    let resp = server.handle_message(&req).await.unwrap();
+    let v = parse_response(&resp);
+
+    let content = v["result"]["content"].as_array().unwrap();
+    let text_out = content[0]["text"].as_str().unwrap();
+
+    // The JSON part must still carry the full, untruncated snippet.
+    let json_part = text_out.split("\n---\n").next().unwrap_or(text_out);
+    let result: Value = serde_json::from_str(json_part).unwrap();
+    let citations = result["citations"].as_array().unwrap();
+    assert!(!citations.is_empty(), "should find at least one citation");
+    let full_snippet = citations[0]["snippet"].as_str().unwrap();
+    assert_eq!(
+        full_snippet, text,
+        "JSON citation snippet must remain untruncated"
+    );
+
+    // The human-readable text rendering (after "---") must be boundary-aware:
+    // truncated with an ellipsis, not a mid-word hard cut.
+    let human_part = text_out
+        .split("\n---\n")
+        .nth(1)
+        .expect("text rendering section after separator");
+    let snippet_line = human_part
+        .lines()
+        .find(|l| l.trim_start().starts_with("Rust programming"))
+        .expect("rendered snippet line");
+    let snippet_line = snippet_line.trim();
+    assert!(
+        snippet_line.ends_with('…'),
+        "expected ellipsis marker on truncated snippet, got: {snippet_line}"
+    );
+    // Sentence-boundary snapping should land on the period before "It prevents...".
+    assert!(
+        snippet_line.contains("safety.…") || snippet_line.ends_with("safety…"),
+        "expected snap at sentence boundary, got: {snippet_line}"
+    );
+}
+
 /// T10: search with unknown store name → store_not_found tool error
 #[tokio::test]
 async fn test_search_unknown_store_name() {

@@ -37,14 +37,20 @@ pub(crate) fn print_json(value: &serde_json::Value) {
 }
 
 /// Format a chunk snippet for terminal display: collapse internal runs of
-/// whitespace into single spaces, then cap at `max_chars`, appending `…` if cut.
+/// whitespace into single spaces, then apply a boundary-aware soft cap at
+/// `max_chars` (see `localdb_core::truncate_snippet`), appending `…` if cut.
+///
+/// Note: collapsing whitespace first destroys `\n\n` paragraph breaks, so on
+/// this path only sentence- and word-boundary snapping can ever fire —
+/// paragraph snapping is effectively MCP-only (its text rendering truncates
+/// before whitespace collapse would apply, since it has none).
 pub(crate) fn format_snippet(snippet: &str, max_chars: usize) -> String {
     let normalized = snippet.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.chars().count() > max_chars {
-        let truncated: String = normalized.chars().take(max_chars).collect();
-        format!("{truncated}…")
+    let (body, truncated) = localdb_core::truncate_snippet(&normalized, max_chars);
+    if truncated {
+        format!("{body}…")
     } else {
-        normalized
+        body.to_string()
     }
 }
 
@@ -185,12 +191,38 @@ mod tests {
     }
 
     #[test]
-    fn format_snippet_truncates_long_input() {
+    fn format_snippet_truncates_long_input_at_boundary() {
         let base: String = "a".repeat(498);
         let input = format!("{base}é extra text that should be cut");
         let result = format_snippet(&input, 500);
         assert!(result.ends_with('…'));
-        assert_eq!(result.chars().count(), 501);
+        // Boundary-aware: no longer an exact 501-char hard cut. The result
+        // (minus the appended ellipsis) must respect the soft-cap overshoot
+        // bound from `localdb_core::truncate_snippet`.
+        assert!(result.chars().count() <= 500 + 500 / 5 + 1);
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn format_snippet_snaps_to_sentence_boundary() {
+        let input = "This is sentence one. This is sentence two that keeps going and going and going further.";
+        let result = format_snippet(input, 25);
+        assert!(result.ends_with('.') || result.ends_with("…"));
+        assert!(result.starts_with("This is sentence one."));
+    }
+
+    #[test]
+    fn format_snippet_snaps_to_word_boundary() {
+        let input = "word ".repeat(100);
+        let result = format_snippet(&input, 50);
+        assert!(result.ends_with('…'));
+        // No mid-word cut: strip the ellipsis and confirm the remainder ends
+        // on a full "word" token, not a partial fragment like "wor".
+        let body = result.trim_end_matches('…');
+        assert!(
+            body.ends_with("word") || body.is_empty(),
+            "expected a full-word ending, got: {body}"
+        );
     }
 
     #[test]

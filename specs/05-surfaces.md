@@ -24,7 +24,7 @@ Single binary, subcommand tree. Global flags: `--config`, `--json`, `--store <na
 | `source add/list/remove` | Manage sources on a store | direct write | routed to daemon |
 | `add <path|url>...` | Alias for `source add` — add one or more sources to a store | direct write | routed to daemon |
 | `index [--store S] [--source ID] [--strict]` | One-shot scan & index; creates IndexJob | runs job synchronously, progress to stderr | submits job, polls, streams progress |
-| `search <query>... [--limit N] [--content-length N]` | Hybrid search with citations; `--content-length` caps human-readable snippet chars (default 1000, JSON output always full text) | embedded read | via API |
+| `search <query>... [--limit N] [--content-length N]` | Hybrid search with citations; `--content-length` is a **soft cap** on human-readable snippet chars (default 1000; JSON output always full text) — see §4 for the snapping behavior shared with MCP | embedded read | via API |
 
 Output: human-readable by default (citations as `uri:heading_path` + snippet), `--json` emits the
 canonical structures for scripting. The CLI is **command-oriented**; interactive browse is a
@@ -67,6 +67,21 @@ Citations cross MCP as structured tool results (the JSON shape from
 [02-domain-model.md](02-domain-model.md) §6), with a short text rendering alongside for
 non-structured clients (text rendering includes `creator · date` where present).
 Resources/prompts: none in v1; resources are reachable via `get_resource`.
+
+`content_length` (default 400) is a **soft cap**, not a hard truncation point: the JSON
+citation payload always carries the full, untruncated snippet — only the human-readable
+text rendering is shortened. The text rendering snaps its cut point to the nearest natural
+boundary at or below the cap, checked in priority order: paragraph break (`\n\n`) → sentence
+terminator (`.`/`!`/`?`, optionally followed by a closing quote/bracket, then whitespace or
+end-of-text) → word boundary (last whitespace at or before the cap) → hard UTF-8
+char-boundary cut as a last resort. A bounded overshoot (up to ~20% over the cap) is allowed
+so a paragraph/sentence boundary just past the cap is preferred over a mid-word hard cut;
+word/char fallback never overshoots. An ellipsis (`…`) is appended whenever the snippet was
+actually shortened. This logic lives in `core` (`localdb_core::snippet::truncate_snippet`)
+and also backs the CLI's `--content-length` (§2) — the CLI additionally collapses whitespace
+before truncating, which removes `\n\n` paragraph breaks, so only sentence/word snapping
+applies on that path. `context_sentences` (an alternative sentence-count-based unit) is out
+of scope for this design.
 
 ## 5. Shared error taxonomy
 
