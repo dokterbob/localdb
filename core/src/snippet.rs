@@ -40,9 +40,17 @@ fn safe_trim_end(s: &str) -> &str {
 ///
 /// A sentence end is one of `.! ?`, optionally followed by a single closing
 /// quote/bracket (`"`, `'`, `)`, `]`, `）`), followed by whitespace or the end
-/// of `window`. Scans forward and keeps overwriting the candidate, so the
+/// of the full text. Scans forward and keeps overwriting the candidate, so the
 /// *last* valid match in `window` wins.
-fn last_sentence_end(window: &str) -> Option<usize> {
+///
+/// `next_after_window` is the char in the full text immediately following
+/// `window` (i.e. `text[hi_byte..].chars().next()`), or `None` iff `window`
+/// reaches the real end of the text. This lets a terminator sitting at the
+/// window's trailing edge be judged against the *actual* next char rather than
+/// being falsely treated as end-of-text — a terminator mid-token (e.g. the `.`
+/// in `example.com`) that merely happens to land on the window edge must not be
+/// accepted as a sentence end.
+fn last_sentence_end(window: &str, next_after_window: Option<char>) -> Option<usize> {
     const TERMINATORS: [char; 3] = ['.', '!', '?'];
     const CLOSERS: [char; 5] = ['"', '\'', ')', ']', '）'];
 
@@ -67,7 +75,13 @@ fn last_sentence_end(window: &str) -> Option<usize> {
         }
 
         let followed_by_boundary = match chars.get(end_idx) {
-            None => true, // reached end of window
+            // At the window's trailing edge: resolve against the real next char
+            // in the full text — only a genuine end-of-text (or trailing
+            // whitespace) counts as a boundary.
+            None => match next_after_window {
+                None => true, // real end of text
+                Some(c) => c.is_whitespace(),
+            },
             Some(&(_, next_ch)) => next_ch.is_whitespace(),
         };
 
@@ -143,17 +157,25 @@ pub fn truncate_snippet(text: &str, soft_cap: usize) -> (&str, bool) {
     }
 
     // 2. Sentence terminator.
-    if let Some(end) = last_sentence_end(window) {
+    let next_after_window = text[hi_byte..].chars().next();
+    if let Some(end) = last_sentence_end(window, next_after_window) {
         let cut = lo_byte + end;
         if cut > 0 {
             return (safe_trim_end(&text[..cut]), true);
         }
     }
 
-    // 3. Word boundary (no overshoot past soft_cap).
+    // 3. Word boundary (no overshoot past soft_cap). Search up to and including
+    // char-index `soft_cap` so a whitespace sitting exactly at the cap (which
+    // yields a prefix of exactly `soft_cap` chars — no overshoot) is a valid
+    // cut, not needlessly discarded in favour of the previous whitespace.
     let cap_byte = char_to_byte(soft_cap);
-    if let Some(w) = text[..cap_byte].rfind(|c: char| c.is_whitespace()) {
-        if w > 0 {
+    let word_search_byte = char_to_byte((soft_cap + 1).min(total_chars));
+    if let Some(w) = text[..word_search_byte].rfind(|c: char| c.is_whitespace()) {
+        // A cut at byte `w` must not exceed `soft_cap` chars. The only offset in
+        // `[cap_byte, word_search_byte)` is the whitespace at char-index
+        // `soft_cap` itself, which cuts to exactly `soft_cap` chars — allowed.
+        if w > 0 && w <= cap_byte {
             return (safe_trim_end(&text[..w]), true);
         }
     }
@@ -223,6 +245,31 @@ mod tests {
         assert!(prefix.chars().count() <= 50);
         assert!(!prefix.ends_with("wor"));
         assert!(prefix.ends_with("word") || prefix.trim_end().ends_with("word"));
+    }
+
+    #[test]
+    fn word_boundary_includes_whitespace_at_cap() {
+        // The whitespace between "world" and "again" sits at char-index 11 ==
+        // soft_cap; cutting there yields exactly 11 chars (no overshoot), so it
+        // must be chosen rather than falling back to the earlier space.
+        let (prefix, truncated) = truncate_snippet("hello world again", 11);
+        assert_eq!(prefix, "hello world");
+        assert!(truncated);
+    }
+
+    #[test]
+    fn no_false_sentence_end_at_window_edge() {
+        // The `.` in "example.com" lands on the window's trailing edge for
+        // soft_cap=10 (window covers chars [5,12)), but the real next char is
+        // 'c' (non-whitespace), so it is NOT a sentence end. The result must
+        // fall back to a word boundary rather than cutting at that `.`.
+        let (prefix, truncated) = truncate_snippet("see example.com/path for details", 10);
+        assert!(truncated);
+        assert!(
+            !prefix.ends_with('.'),
+            "must not cut at a mid-token period, got: {prefix:?}"
+        );
+        assert_eq!(prefix, "see");
     }
 
     #[test]
