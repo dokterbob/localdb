@@ -38,6 +38,9 @@ pub mod perplexity;
 pub mod retry;
 pub mod voyage;
 
+#[cfg(all(feature = "local-onnx", any(target_os = "linux", target_os = "macos")))]
+mod ort_download;
+
 #[cfg(feature = "local-onnx")]
 pub mod hf_download;
 

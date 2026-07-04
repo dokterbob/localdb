@@ -9,7 +9,7 @@ description = "Embedder implementations: local ONNX, OpenAI-compatible, and cont
 [features]
 default = []
 # Enable local ONNX inference via fastembed + direct ORT (pplx-embed-v1-0.6b)
-local-onnx = ["dep:fastembed", "dep:ort", "dep:tokenizers", "dep:ndarray"]
+local-onnx = ["dep:fastembed", "dep:ort", "dep:tokenizers", "dep:ndarray", "dep:ureq", "dep:flate2", "dep:tar"]
 # Enable local CoreML inference (macOS/Apple Silicon only)
 local-coreml = ["dep:objc2", "dep:objc2-core-ml", "dep:objc2-foundation", "dep:half", "dep:tokenizers", "dep:hf-hub", "dep:block2"]
 
@@ -59,6 +59,14 @@ futures-util = "0.3"
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "tracing", "load-dynamic"], optional = true }
 tokenizers = { version = "0.22", optional = true }
 ndarray = { version = "0.17", optional = true }
+
+# Runtime (first-use) download of Microsoft's official ONNX Runtime from a sha256-pinned
+# flavor table (issue #76; see embed/src/ort_download.rs). Same TLS rationale as the
+# [build-dependencies] ureq below: rustls-based, follows GitHub release redirects (assets
+# 302 to objects.githubusercontent.com), no native-tls/OpenSSL dependency.
+ureq = { version = "2", default-features = false, features = ["tls"], optional = true }
+flate2 = { version = "1", optional = true }
+tar = { version = "0.4", optional = true }
 
 # CoreML inference (macOS only, optional)
 [target.'cfg(target_os = "macos")'.dependencies]
