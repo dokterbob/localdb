@@ -28,6 +28,7 @@
 //!
 //! See specs/04-search-pipeline.md §4.
 
+pub mod cuda_ep;
 pub mod error;
 pub mod factory;
 pub mod http_helper;

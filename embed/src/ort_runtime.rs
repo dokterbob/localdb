@@ -113,7 +113,6 @@ pub fn ensure_ort_initialized(
 /// caller asks to initialize as CUDA but the process has already committed to CPU (or vice
 /// versa).
 #[cfg(all(feature = "local-onnx", any(target_os = "linux", target_os = "macos")))]
-#[allow(dead_code)]
 pub(crate) fn committed_flavor() -> Option<OrtFlavor> {
     imp::committed_flavor()
 }
