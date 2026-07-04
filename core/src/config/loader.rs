@@ -64,6 +64,15 @@ impl ResolvedPaths {
         self.data_dir.join("daemon.sock")
     }
 
+    /// Path of the daemon discovery URL file.
+    ///
+    /// The running daemon records its client-reachable base URL here so CLI/MCP
+    /// discovery honors the configured bind address and port instead of assuming
+    /// `http://127.0.0.1:7700`.
+    pub fn url_path(&self) -> PathBuf {
+        self.data_dir.join("daemon.url")
+    }
+
     pub fn db_path(&self) -> PathBuf {
         self.data_dir.join("localdb.db")
     }
