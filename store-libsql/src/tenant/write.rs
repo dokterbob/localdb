@@ -42,17 +42,36 @@ pub(crate) async fn delete_by_document(
     document_id: &str,
 ) -> Result<usize, Error> {
     let conn = store.conn().conn().await;
+    delete_document_inner(&conn, store.store_id(), document_id).await
+}
+
+/// Connection-level helper: delete all chunks and the resource row for a
+/// single document (`blocks` are removed via `ON DELETE CASCADE` from
+/// `resources`).
+///
+/// This is the shared implementation behind both the standalone
+/// `delete_by_document` (its own autocommit statement pair, used for source
+/// removal / store clearing) and the in-transaction delete performed by
+/// `upsert_chunks_and_blocks` when replacing a document (issue #79): the
+/// latter runs this against the transaction's own connection, between
+/// `BEGIN` and the replacement insert, so a failure anywhere in that
+/// transaction rolls back the delete along with the insert.
+async fn delete_document_inner(
+    conn: &Connection,
+    store_id: &str,
+    document_id: &str,
+) -> Result<usize, Error> {
     // `document_id` on ChunkRecord maps to `resource_id` in the schema.
     let chunk_count = conn
         .execute(
             "DELETE FROM chunks WHERE store_id = ? AND resource_id = ?",
-            params![store.store_id().to_string(), document_id.to_string()],
+            params![store_id.to_string(), document_id.to_string()],
         )
         .await
         .map_err(map_libsql_err)?;
     conn.execute(
         "DELETE FROM resources WHERE store_id = ? AND id = ?",
-        params![store.store_id().to_string(), document_id.to_string()],
+        params![store_id.to_string(), document_id.to_string()],
     )
     .await
     .map_err(map_libsql_err)?;
@@ -243,16 +262,29 @@ async fn upsert_chunks_inner(
     Ok(())
 }
 
-/// Atomically upsert chunks and blocks in a single transaction.
+/// Atomically upsert chunks and blocks in a single transaction, optionally
+/// replacing an existing document first.
 ///
 /// Unlike calling `upsert_chunks` and `upsert_blocks` separately (two
 /// transactions), this wraps both writes in one BEGIN/COMMIT so the resource
 /// can never appear indexed (chunks present) but un-blocked.
+///
+/// When `replaces_document_id` is `Some(old_id)`, the old document's chunks,
+/// blocks, and resource row are deleted **inside this same transaction**,
+/// before the new records are inserted (issue #79). This closes the residual
+/// same-run window from the A6 design decision (`docs/design-decisions.md`):
+/// previously the replace delete ran in its own transaction, so a write
+/// failure in the upsert that followed left the old chunks gone for the rest
+/// of the run. Folding the delete into this transaction means a failure
+/// anywhere below (including the delete-then-reinsert of the very same
+/// `document_id`, for a policy-only re-index) rolls back everything and
+/// leaves the old resource intact and searchable.
 pub(crate) async fn upsert_chunks_and_blocks(
     store: &TenantStore,
     document_id: &str,
     records: Vec<ChunkRecord>,
     blocks: &[localdb_core::block::Block],
+    replaces_document_id: Option<&str>,
 ) -> Result<usize, localdb_core::Error> {
     for record in &records {
         if record.store_id != store.store_id() {
@@ -271,6 +303,9 @@ pub(crate) async fn upsert_chunks_and_blocks(
     let count = records.len();
     conn.execute("BEGIN", ()).await.map_err(map_libsql_err)?;
     let inner = async {
+        if let Some(old_id) = replaces_document_id {
+            delete_document_inner(&conn, store.store_id(), old_id).await?;
+        }
         upsert_chunks_inner(&conn, &records, store.encoding()).await?;
         upsert_blocks_inner(&conn, store.store_id(), document_id, blocks).await?;
         Ok::<(), localdb_core::Error>(())

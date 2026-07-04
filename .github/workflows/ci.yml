@@ -174,9 +174,13 @@ jobs:
         include:
           - os: macos-latest
             target: aarch64-apple-darwin
-          - os: ubuntu-latest
+          # Pinned to ubuntu-22.04 (not ubuntu-latest): our own Rust code inherits the
+          # build machine's glibc floor, and this job now actually links (see the `cargo
+          # build` step below), so a stale ubuntu-latest pin here would let a #133-style
+          # glibc regression slip through CI again.
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v4
@@ -203,7 +207,11 @@ jobs:
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-${{ matrix.target }}-cargo-
-      - name: Check workspace builds for target
+      - name: Build localdb for target
+        # `cargo check` never links, so it can't catch link-time/runtime issues like #133
+        # (the GLIBC_2.38 floor from ort-sys's static archive) — that regression escaped CI
+        # because this job used to only `cargo check`. Actually build+link the release
+        # binary for each target instead.
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo check --workspace --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} -p localdb

@@ -97,6 +97,10 @@ impl OnnxEmbedder {
         cache_dir: Option<PathBuf>,
         show_download_progress: bool,
     ) -> Result<Self, EmbedError> {
+        // Extract/dlopen the embedded ONNX Runtime (idempotent) before touching any `ort`
+        // API — `fastembed::TextEmbedding::try_new` below creates an ORT session internally.
+        crate::ort_runtime::ensure_ort_initialized()?;
+
         info!(
             model = model_choice.model_id(),
             "loading ONNX embedding model"

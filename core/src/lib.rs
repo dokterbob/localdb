@@ -21,6 +21,7 @@ pub mod metadata;
 pub mod parser;
 pub mod progress;
 pub mod search;
+pub mod snippet;
 pub mod source;
 pub mod store;
 pub mod store_factory;
@@ -61,6 +62,7 @@ pub use search::{
     rerank_noop, rrf_fuse, rrf_score, shape_citation, FusedChunkEntry, QueryRequest, QueryResponse,
     SearchOrchestrator, StoreHandle,
 };
+pub use snippet::truncate_snippet;
 #[cfg(any(test, feature = "test-support"))]
 pub use store::FakeStore;
 pub use store::{ChunkRecord, MetadataFilter, RetrievalStore, SearchResult, StoreStats};

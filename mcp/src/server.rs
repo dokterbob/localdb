@@ -17,7 +17,9 @@ use crate::protocol::{
     ServerCapabilities, ServerInfo, Tool, ToolsCapability, ToolsListResult, INVALID_PARAMS,
     METHOD_NOT_FOUND,
 };
-use crate::tools::{tool_get_document, tool_list_stores, tool_search, AvailableStore};
+use crate::tools::{
+    tool_get_chunks, tool_get_document, tool_list_stores, tool_search, AvailableStore,
+};
 
 /// MCP protocol version this server implements.
 pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
@@ -25,6 +27,7 @@ pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 /// Tool names.
 pub const TOOL_SEARCH: &str = "search";
 pub const TOOL_GET_DOCUMENT: &str = "get_document";
+pub const TOOL_GET_CHUNKS: &str = "get_chunks";
 pub const TOOL_LIST_STORES: &str = "list_stores";
 
 // ---------------------------------------------------------------------------
@@ -52,7 +55,7 @@ fn search_schema() -> Value {
             },
             "content_length": {
                 "type": "integer",
-                "description": "Max characters of snippet text per result in the text rendering (default: 400)",
+                "description": "Soft cap on snippet text chars per result in the text rendering; snaps to the nearest paragraph/sentence/word boundary rather than cutting mid-word (default: 400). The JSON citation payload always carries the full snippet.",
                 "minimum": 1
             }
         },
@@ -76,6 +79,30 @@ fn get_document_schema() -> Value {
     })
 }
 
+fn get_chunks_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "document_id": {
+                "type": "string",
+                "description": "Document ID (content-addressed blake3 hash)"
+            },
+            "offset": {
+                "type": "integer",
+                "description": "Number of chunks to skip before the first returned chunk (default: 0)",
+                "minimum": 0
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of chunks to return (default: 50, max: 200)",
+                "minimum": 1,
+                "maximum": 200
+            }
+        },
+        "required": ["document_id"]
+    })
+}
+
 fn list_stores_schema() -> Value {
     serde_json::json!({
         "type": "object",
@@ -95,6 +122,11 @@ pub fn build_tool_list() -> Vec<Tool> {
             name: TOOL_GET_DOCUMENT,
             description: "Fetch the normalized text and metadata for a document by its ID or URI.",
             input_schema: get_document_schema(),
+        },
+        Tool {
+            name: TOOL_GET_CHUNKS,
+            description: "Fetch a document's chunks in order (block_seq, seq_in_block), paginated by offset/limit.",
+            input_schema: get_chunks_schema(),
         },
         Tool {
             name: TOOL_LIST_STORES,
@@ -195,9 +227,10 @@ impl McpServer {
         let result: CallToolResult = match tool_name {
             TOOL_SEARCH => tool_search(&self.stores, self.embedder.as_ref(), params).await,
             TOOL_GET_DOCUMENT => tool_get_document(&self.stores, params).await,
+            TOOL_GET_CHUNKS => tool_get_chunks(&self.stores, params).await,
             TOOL_LIST_STORES => tool_list_stores(&self.stores).await,
             name => CallToolResult::error(format!(
-                "unknown tool '{name}'; available: {TOOL_SEARCH}, {TOOL_GET_DOCUMENT}, {TOOL_LIST_STORES}"
+                "unknown tool '{name}'; available: {TOOL_SEARCH}, {TOOL_GET_DOCUMENT}, {TOOL_GET_CHUNKS}, {TOOL_LIST_STORES}"
             )),
         };
 

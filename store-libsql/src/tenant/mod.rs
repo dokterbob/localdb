@@ -115,7 +115,9 @@ impl RetrievalStore for TenantStore {
         document_id: &str,
         records: Vec<localdb_core::ChunkRecord>,
         blocks: &[localdb_core::block::Block],
+        replaces_document_id: Option<&str>,
     ) -> Result<usize, localdb_core::Error> {
-        write::upsert_chunks_and_blocks(self, document_id, records, blocks).await
+        write::upsert_chunks_and_blocks(self, document_id, records, blocks, replaces_document_id)
+            .await
     }
 }

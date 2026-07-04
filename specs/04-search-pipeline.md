@@ -31,8 +31,12 @@ determines how content reaches the pipeline and what kind of Resource it produce
 
 A resource is re-processed only when its `content_hash` changes. `content_hash` is a blake3
 hash of the ordered canonical texts of all blocks in the resource (not a hash of a Markdown
-string). Unchanged → skip; changed → replace-by-URI: delete the old resource's chunks,
-insert the new ones (new content-addressed IDs, [02-domain-model.md](02-domain-model.md) §3).
+string). Unchanged → skip; changed → replace-by-URI: the old resource's chunks/blocks/resource
+row are deleted AND the new ones (new content-addressed IDs,
+[02-domain-model.md](02-domain-model.md) §3) are inserted in a **single atomic store
+transaction**. A write failure during the replace (e.g. an embedding or constraint error)
+leaves the old resource intact and searchable — the store never observes a state where the
+old chunks are gone but the new ones failed to land.
 
 Resources also carry:
 - **`external_etag`:** for URL sources, the server-supplied ETag or Last-Modified value; used

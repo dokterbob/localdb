@@ -295,20 +295,37 @@ pub trait RetrievalStore: Send + Sync + 'static {
         Ok(())
     }
 
-    /// Atomically upsert chunks and blocks for a document in a single operation.
+    /// Atomically upsert chunks and blocks for a document in a single
+    /// operation, optionally replacing an existing document first.
     ///
-    /// The default implementation calls `upsert_chunks` then `upsert_blocks`
-    /// sequentially (sufficient for `FakeStore` and tests). The `TenantStore`
-    /// override wraps both operations in a single database transaction so that
-    /// a failure between the two calls cannot leave the resource in a partially
-    /// indexed state (chunks without blocks, or vice-versa).
+    /// When `replaces_document_id` is `Some(old_id)`, the old document's
+    /// chunks, blocks, and resource row are removed as part of the same
+    /// operation, before the new ones are inserted (replace-by-URI
+    /// re-indexing; see specs/04-search-pipeline.md §1). Callers performing a
+    /// replace must NOT call `delete_by_document` themselves — passing
+    /// `replaces_document_id` here is the whole point: a write failure must
+    /// leave the old document intact and searchable, which is only possible
+    /// if the delete and the insert are part of the same operation.
+    ///
+    /// **The default implementation is NOT atomic.** It performs the delete
+    /// (if requested) followed by `upsert_chunks` then `upsert_blocks`,
+    /// sequentially, as three separate operations. This is sufficient for
+    /// `FakeStore` and unit tests, but a failure partway through can leave
+    /// the store in a partially-replaced state. Only the `TenantStore`
+    /// (libsql) override wraps the delete and both upserts in a single
+    /// database transaction, guaranteeing that a write failure rolls back
+    /// the delete along with the insert.
     async fn upsert_chunks_and_blocks(
         &self,
         store_id: &str,
         document_id: &str,
         records: Vec<ChunkRecord>,
         blocks: &[crate::block::Block],
+        replaces_document_id: Option<&str>,
     ) -> Result<usize, Error> {
+        if let Some(old_id) = replaces_document_id {
+            self.delete_by_document(old_id).await?;
+        }
         let count = self.upsert_chunks(records).await?;
         self.upsert_blocks(store_id, document_id, blocks).await?;
         Ok(count)
@@ -638,6 +655,99 @@ pub mod conformance {
         assert_eq!(deleted, 0, "deleting nonexistent doc should return 0");
     }
 
+    /// Test: `upsert_chunks_and_blocks` with `replaces_document_id` set
+    /// deletes the old document and inserts the new one in one call — the
+    /// old document's chunks must be gone and only the new document's
+    /// chunks remain (issue #79: atomic delete-then-upsert replace).
+    pub async fn test_replace_document(store: &dyn RetrievalStore) {
+        let old_records = vec![
+            make_record(
+                "chunk-a1",
+                "doc-a",
+                "store-1",
+                "Doc A chunk 1",
+                vec![1.0, 0.0],
+            ),
+            make_record(
+                "chunk-a2",
+                "doc-a",
+                "store-1",
+                "Doc A chunk 2",
+                vec![0.9, 0.1],
+            ),
+        ];
+        store.upsert_chunks(old_records).await.unwrap();
+
+        let new_records = vec![make_record(
+            "chunk-b1",
+            "doc-b",
+            "store-1",
+            "Doc B chunk 1",
+            vec![0.0, 1.0],
+        )];
+        let written = store
+            .upsert_chunks_and_blocks("store-1", "doc-b", new_records, &[], Some("doc-a"))
+            .await
+            .unwrap();
+        assert_eq!(written, 1, "should report 1 written chunk for doc-b");
+
+        let doc_a_remaining = store.get_chunks_for_document("doc-a").await.unwrap();
+        assert!(
+            doc_a_remaining.is_empty(),
+            "doc-a's chunks should be gone after replace"
+        );
+
+        let doc_b_remaining = store.get_chunks_for_document("doc-b").await.unwrap();
+        assert_eq!(doc_b_remaining.len(), 1, "doc-b's chunk should be present");
+
+        let stats = store.stats().await.unwrap();
+        assert_eq!(
+            stats.chunk_count, 1,
+            "only doc-b's single chunk should remain"
+        );
+    }
+
+    /// Test: replacing a document with a new revision that hashes to the
+    /// *same* `document_id` (a policy-only re-index of unchanged content)
+    /// deletes then reinserts under the same ID within one call, without
+    /// duplicating chunks or violating PK/FK constraints.
+    pub async fn test_replace_same_document_id(store: &dyn RetrievalStore) {
+        let old_records = vec![make_record(
+            "chunk-1",
+            "doc-1",
+            "store-1",
+            "Original text",
+            vec![1.0, 0.0],
+        )];
+        store.upsert_chunks(old_records).await.unwrap();
+
+        // New revision: different chunk ID (content-addressed), same document_id.
+        let new_records = vec![make_record(
+            "chunk-2",
+            "doc-1",
+            "store-1",
+            "Re-chunked text under the same document",
+            vec![0.0, 1.0],
+        )];
+        let written = store
+            .upsert_chunks_and_blocks("store-1", "doc-1", new_records, &[], Some("doc-1"))
+            .await
+            .unwrap();
+        assert_eq!(written, 1, "should report 1 written chunk");
+
+        let remaining = store.get_chunks_for_document("doc-1").await.unwrap();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "exactly one chunk should remain for doc-1"
+        );
+        assert_eq!(remaining[0].id, "chunk-2", "old chunk-1 must be gone");
+
+        let stats = store.stats().await.unwrap();
+        assert_eq!(stats.chunk_count, 1, "no duplicate chunks after replace");
+        assert_eq!(stats.document_count, 1);
+    }
+
     /// Test: dense search returns results ordered by similarity.
     pub async fn test_dense_search_round_trip(store: &dyn RetrievalStore) {
         let records = vec![
@@ -928,6 +1038,18 @@ mod tests {
     async fn fake_store_delete_nonexistent_document() {
         let store = FakeStore::new();
         test_delete_nonexistent_document(&store).await;
+    }
+
+    #[tokio::test]
+    async fn fake_store_replace_document() {
+        let store = FakeStore::new();
+        test_replace_document(&store).await;
+    }
+
+    #[tokio::test]
+    async fn fake_store_replace_same_document_id() {
+        let store = FakeStore::new();
+        test_replace_same_document_id(&store).await;
     }
 
     #[tokio::test]

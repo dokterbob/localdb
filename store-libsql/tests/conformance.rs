@@ -387,6 +387,69 @@ async fn tenant_delete_by_store_rejects_foreign_store_id() {
 }
 
 #[tokio::test]
+async fn replace_document() {
+    let (_dir, db) = setup().await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+    conformance::test_replace_document(handle.as_ref()).await;
+}
+
+#[tokio::test]
+async fn replace_same_document_id() {
+    let (_dir, db) = setup().await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+    conformance::test_replace_same_document_id(handle.as_ref()).await;
+}
+
+/// Issue #79 (WI-1): the replace delete must run *inside* the same
+/// transaction as the replacement upsert. This test forces a write failure
+/// (an FK violation on the replacement resource) that fires *after* the
+/// in-transaction delete of the old document but before COMMIT, and asserts
+/// the old document survives — i.e. the delete rolled back along with the
+/// failed insert rather than having already committed on its own.
+#[tokio::test]
+async fn replace_rolls_back_old_document_on_write_failure() {
+    let (_dir, db) = setup().await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+
+    // Seed document A.
+    let doc_a = make_record("chunk-a1", "doc-a", "store-1", vec![1.0, 0.0]);
+    handle.upsert_chunks(vec![doc_a]).await.unwrap();
+
+    // Attempt to replace doc-a with doc-b, but doc-b's chunk references a
+    // source_id that does not exist for this store. The composite FK
+    // `resources(store_id, source_id) REFERENCES sources(store_id, id)`
+    // rejects the INSERT INTO resources for doc-b, which fires inside the
+    // transaction, after the in-transaction delete of doc-a would have run.
+    let mut doc_b = make_record("chunk-b1", "doc-b", "store-1", vec![0.0, 1.0]);
+    doc_b.source_id = "nonexistent-src".to_string();
+
+    let result = handle
+        .upsert_chunks_and_blocks("store-1", "doc-b", vec![doc_b], &[], Some("doc-a"))
+        .await;
+    assert!(
+        result.is_err(),
+        "FK violation on the replacement insert should surface as an error"
+    );
+
+    // doc-a's chunk must still be present: the delete must have rolled back
+    // along with the failed insert, not already committed on its own.
+    let remaining_a = handle.get_chunks_for_document("doc-a").await.unwrap();
+    assert_eq!(
+        remaining_a.len(),
+        1,
+        "doc-a should still be present after a failed replace"
+    );
+    assert_eq!(remaining_a[0].id, "chunk-a1");
+
+    // doc-b must be absent — the failed insert must not have partially landed.
+    let remaining_b = handle.get_chunks_for_document("doc-b").await.unwrap();
+    assert!(
+        remaining_b.is_empty(),
+        "doc-b should not have been inserted after a failed replace"
+    );
+}
+
+#[tokio::test]
 async fn find_document_errors_when_id_exists_in_multiple_stores() {
     let (_dir, db) = setup().await;
     let handle_a = db.retrieval_store("store-A").await.unwrap();
