@@ -26,13 +26,10 @@
 //! library ourselves (`load-dynamic`), not linking `ort`'s own CUDA bindings.
 //!
 //! This module only *downloads and verifies* tarball payloads to a cache directory; it does
-//! not touch `ort` initialization (see `ort_runtime.rs`) or embedder construction
-//! (`factory.rs`) — those are wired up in later chunks.
-
-// Nothing outside this module's own tests consumes it yet — `ort_runtime.rs`'s flavor-based
-// init and `factory.rs`'s CUDA selection are wired up in later chunks (issue #76). Remove
-// this allow once they land.
-#![allow(dead_code)]
+//! not touch `ort` initialization — `ort_runtime.rs` consumes [`cpu_flavor_for_target`] and
+//! [`ensure_downloaded`] to actually `dlopen` the downloaded library. `factory.rs`'s CUDA
+//! availability probe (choosing [`OrtFlavor::Cuda`](crate::ort_runtime::OrtFlavor::Cuda) over
+//! `Cpu`) is wired up in a later chunk.
 
 use std::{
     collections::HashMap,

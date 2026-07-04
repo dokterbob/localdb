@@ -275,10 +275,12 @@ fn create_onnx(
     policy: &EmbeddingPolicy,
     models_dir: Option<&Path>,
 ) -> Result<BoxedEmbedder, EmbedError> {
-    // Idempotent: extracts/dlopens the embedded ONNX Runtime once per process. Also called
-    // at the top of each embedder constructor below (OnnxEmbedder::new etc.) so that direct
-    // construction (tests, examples) doesn't skip it — the OnceLock makes the repeat cheap.
-    crate::ort_runtime::ensure_ort_initialized()?;
+    // Idempotent: downloads/dlopens the ONNX Runtime once per process. Also called at the top
+    // of each embedder constructor below (OnnxEmbedder::new etc.) so that direct construction
+    // (tests, examples) doesn't skip it — the OnceLock makes the repeat cheap.
+    // TODO(#76 later chunk): decide the flavor here (CUDA availability probe) and thread
+    // `embedding.ort_library` through instead of hardcoding Cpu/None.
+    crate::ort_runtime::ensure_ort_initialized(crate::ort_runtime::OrtFlavor::Cpu, None)?;
     let cache_dir = models_dir.map(|p| p.to_path_buf());
     match policy.model.as_str() {
         "pplx-embed-context-v1-0.6b" => {

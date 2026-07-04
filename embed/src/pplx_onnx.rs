@@ -111,10 +111,11 @@ impl PplxOnnxEmbedder {
     ///
     /// `show_progress`: emit download progress via `tracing::info!`.
     pub fn new(cache_dir: Option<PathBuf>, show_progress: bool) -> Result<Self, EmbedError> {
-        // Extract/dlopen the embedded ONNX Runtime (idempotent) before any `ort` API use
-        // below, and before the (potentially multi-GB) model download so ORT setup failures
-        // surface fast.
-        crate::ort_runtime::ensure_ort_initialized()?;
+        // Download/dlopen the ONNX Runtime (idempotent) before any `ort` API use below, and
+        // before the (potentially multi-GB) model download so ORT setup failures surface fast.
+        // TODO(#76 later chunk): thread the factory-decided flavor + config override through
+        // here instead of hardcoding Cpu/None.
+        crate::ort_runtime::ensure_ort_initialized(crate::ort_runtime::OrtFlavor::Cpu, None)?;
 
         let model_dir = cache_dir
             .unwrap_or_else(crate::model_cache::ModelCache::default_cache_dir)

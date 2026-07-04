@@ -33,8 +33,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # GCC 14 on Ubuntu 24.04 and references `__isoc23_strtol*` symbols → GLIBC >= 2.38 floor on the
 # *release binary itself*, breaking startup on older glibc distros (Mint 21, Ubuntu 22.04).
 # See issue #133 and pykeio/ort#523 (unresolved upstream). Instead we use `ort`'s
-# `load-dynamic` (dlopen) below and embed Microsoft's official ONNX Runtime build ourselves
-# (embed/build.rs) — no ONNX Runtime ABI ends up baked into our executable at all.
+# `load-dynamic` (dlopen) below and download Microsoft's official ONNX Runtime build ourselves
+# at runtime, on first use (src/ort_download.rs + src/ort_runtime.rs) — no ONNX Runtime ABI
+# ends up baked into our executable at all.
 fastembed = { version = "5", default-features = false, features = ["hf-hub-rustls-tls"], optional = true }
 
 # For model cache path management
@@ -53,9 +54,9 @@ futures-util = "0.3"
 # 1.17-1.24. NOTE: fastembed 5.17.2's own (unconditional, not feature-gated) `ort` dependency
 # declaration requests `api-24` regardless of which fastembed features we enable — Cargo feature
 # unification means api-24 ends up enabled anyway as long as fastembed is in the graph. That's
-# fine because we pin the embedded runtime to 1.24.4 (build.rs), but it does mean the
-# `ORT_DYLIB_PATH`/`LOCALDB_ORT_LIB` escape hatches require ONNX Runtime >= 1.24, not the full
-# 1.17-1.24 range `ort` alone would otherwise support. See embed/src/ort_runtime.rs.
+# fine because we pin the downloaded runtime to 1.24.4 (ort_download.rs), but it does mean the
+# `ORT_DYLIB_PATH`/`embedding.ort_library` escape hatches require ONNX Runtime >= 1.24, not the
+# full 1.17-1.24 range `ort` alone would otherwise support. See embed/src/ort_runtime.rs.
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "tracing", "load-dynamic"], optional = true }
 tokenizers = { version = "0.22", optional = true }
 ndarray = { version = "0.17", optional = true }
@@ -83,15 +84,3 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # Mock HTTP server for testing hosted providers
 wiremock = "0.6"
 tempfile = "3"
-
-# build.rs downloads and verifies the embedded ONNX Runtime shared library (see build.rs and
-# embed/src/ort_runtime.rs). ureq is rustls-based and follows redirects (GitHub release assets
-# redirect to objects.githubusercontent.com).
-[build-dependencies]
-# ureq's "tls" feature (despite the generic name) wires up its rustls-based TLS backend
-# (webpki + webpki-roots + rustls) with no native-tls/OpenSSL dependency.
-ureq = { version = "2", default-features = false, features = ["tls"] }
-sha2 = "0.10"
-hex = "0.4"
-flate2 = "1"
-tar = "0.4"
