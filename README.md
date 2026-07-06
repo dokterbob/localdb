@@ -110,7 +110,7 @@ backend are queryable by the other.
 | Platform | Tarball suffix | Notes |
 |---|---|---|
 | macOS Apple Silicon | `aarch64-apple-darwin` | CoreML (ANE/GPU) built in — auto-selected at runtime |
-| Linux x86_64 | `x86_64-unknown-linux-gnu` | ONNX CPU |
+| Linux x86_64 | `x86_64-unknown-linux-gnu` | ONNX CPU, or CUDA on an NVIDIA host (auto-detected, no separate artifact) |
 | Linux arm64 | `aarch64-unknown-linux-gnu` | ONNX CPU |
 
 Download and install from the [Releases](https://github.com/dokterbob/localdb/releases) page:
@@ -209,7 +209,7 @@ The daemon exposes a REST API. It is **experimental**: ingestion via `POST /v1/j
 |---|---|
 | Search ranking | Hybrid BM25 + dense (RRF fusion). Default embedder is `pplx-embed-context-v1-0.6b` (local ONNX, ~706 MB download on first use). |
 | Embedding models | Downloaded automatically on first `localdb index` or `localdb search` from the public HuggingFace repo `perplexity-ai/pplx-embed-context-v1-0.6b`. No API key required. |
-| Embedding backend | Default provider `local` runs ONNX on CPU. On Apple Silicon macOS (Rust ≥1.85), the macOS binary includes CoreML by default and auto-selects the ANE/GPU backend at runtime, falling back to ONNX otherwise. CoreML/ONNX indexes are interchangeable. Force a backend with `local-coreml` / `local-onnx`. |
+| Embedding backend | Default provider `local` runs ONNX on CPU. On Apple Silicon macOS (Rust ≥1.85), the macOS binary includes CoreML by default and auto-selects the ANE/GPU backend at runtime, falling back to ONNX otherwise. On Linux x86_64, `local` auto-detects an NVIDIA driver + CUDA 12.x + cuDNN 9 stack and prefers the CUDA execution provider when present, with automatic CPU fallback (force with `local-cuda`, opt out with `local-onnx`). The ONNX Runtime itself is downloaded from a sha256-pinned flavor table on first use, not embedded in the binary. CoreML/ONNX/CUDA indexes are all interchangeable — CPU/CUDA parity is expected but not yet measured on real GPU hardware (see `docs/architecture.md#known-gaps`). |
 | HTTP daemon | Experimental preview. Ingestion via POST /v1/jobs is a no-op; reads and writes the unified database. |
 | YAML-declared stores | Appear in `store list` but **cannot be indexed** (`localdb index` only resolves runtime stores). Use `localdb store add` + `localdb source add` instead. |
 | CLI while daemon runs | CLI and daemon can run concurrently. SQLite WAL and busy_timeout serialise concurrent writes. |

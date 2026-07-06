@@ -167,11 +167,24 @@ The CUDA execution provider is available under the `local-onnx` cargo feature on
 runtime. `embedding.ort_library` (see §1) is an advanced escape hatch shared by all three ONNX-backed
 providers, letting a packager point at a system ONNX Runtime build instead of the auto-downloaded one.
 
+**Runtime acquisition.** The ONNX Runtime shared library itself is downloaded from a sha256-pinned
+flavor table (`embed::ort_download`) the first time it is needed, not embedded in the `localdb`
+binary at build time — one release binary serves CPU-only Linux/macOS and Linux+CUDA alike,
+instead of every binary carrying a fixed library most installs never load. Downloads land under
+`<cache_dir>/localdb/ort/<version>/` (CPU flavors) or `<version>-cuda/` (the CUDA flavor) and are
+skipped entirely — no network access — once matching, verified payloads already exist there,
+including ones placed by hand for an offline install (see [docs/install.md](../docs/install.md)).
+`ORT_DYLIB_PATH` (env) and `ort_library` (§1, above) both bypass the download and `dlopen` a
+caller-supplied library instead, in that precedence order.
+
 **Index interchangeability.** All three backends share `model_id = pplx-embed-context-v1-0.6b`, are
 1024-dim, and emit binary-quantized vectors (`VectorEncoding::Binary`). Only the sign survives
 binarization; measured CoreML/ONNX cosine parity is ~0.995–0.9995 and per-dimension sign agreement
 ~98–99% (the ~1–2% of flips are near-zero dimensions that round to a different int8 sign under
 fp16). The CUDA execution provider runs the identical ONNX graph as the CPU execution provider, so
-its output is bit-identical (no cross-backend quantization to compare). An index built by one
-backend is queryable by any other — switching providers requires **no reindex** and does not
-change the `policy_version` ([04-search-pipeline.md](04-search-pipeline.md) §4).
+its output is expected to be bit-identical (no cross-backend quantization to compare) — **this
+parity has not yet been measured on real CUDA hardware**; `scripts/cuda-verify.sh` runs a top-5
+overlap check for exactly this, pending someone with an NVIDIA machine executing it (see
+[docs/release-engineering.md](../docs/release-engineering.md)). An index built by one backend is
+queryable by any other — switching providers requires **no reindex** and does not change the
+`policy_version` ([04-search-pipeline.md](04-search-pipeline.md) §4).
