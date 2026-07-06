@@ -72,6 +72,19 @@ jobs:
           key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-test-
+      - name: Cache downloaded ONNX Runtime CPU flavor
+        # `cli` unconditionally enables embed's `local-onnx` feature, and several embed unit
+        # tests (e.g. onnx.rs's `onnx_embedder_returns_correct_dim`) construct a real
+        # `OnnxEmbedder`, which calls `ensure_ort_initialized` for real. On a cold cache this
+        # performs a one-time ~8 MB download+verify of the pinned ORT CPU tarball from GitHub
+        # (runtime-download model, issue #76 — pre-#76 this runtime was embedded at build time,
+        # so no such download existed). Caching `~/.cache/localdb/ort` here removes the
+        # GitHub-release dependency from `cargo test --workspace`'s critical path on every run
+        # after the first.
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/localdb/ort
+          key: ort-1.24.4-cpu-3a211fbea252
       - name: Build workspace
         run: cargo build --workspace
       - name: Run tests
@@ -101,6 +114,17 @@ jobs:
           key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-coverage-
+      - name: Cache downloaded ONNX Runtime CPU flavor
+        # Same rationale as the `test` job above: the workspace test suite (run here under
+        # `cargo llvm-cov`) performs a one-time ORT CPU download on a cold cache because `cli`
+        # unconditionally enables embed's `local-onnx` feature, whose unit tests construct a
+        # real `OnnxEmbedder` (runtime-download model, issue #76). Caching
+        # `~/.cache/localdb/ort` removes the GitHub-release dependency from this job's critical
+        # path on every run after the first.
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/localdb/ort
+          key: ort-1.24.4-cpu-3a211fbea252
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Run coverage (all tests)
@@ -167,8 +191,16 @@ jobs:
           # Keyed on the pinned ORT version plus the first 12 hex chars of both the CPU-linux-x64
           # and CUDA-linux-x64 tarball sha256s (embed/src/ort_download.rs) — not just the version
           # string — so bumping either pin (a new ORT release, or a corrected hash) invalidates
-          # the cache instead of silently reusing stale/mismatched bytes. This makes the ~196 MB
-          # CUDA download (plus the smaller CPU one) a one-time cost per pin, not per CI run.
+          # the cache instead of silently reusing stale/mismatched bytes.
+          #
+          # This step does NOT help the "Download + verify" step immediately below — that step
+          # (`real_download`) downloads into its own TempDir every run, on purpose: re-downloading
+          # from GitHub and re-verifying the sha256 from scratch *is* the behavior under test.
+          # What this cache actually speeds up is the two steps after it, "Real ort::init_from
+          # against the downloaded CPU flavor" and "CUDA execution-provider probe fails cleanly
+          # without a GPU" — those read/write the real `~/.cache/localdb/ort` cache dir via
+          # `ensure_ort_initialized`, so restoring it here avoids re-fetching the ~8 MB CPU and
+          # ~196 MB CUDA tarballs from GitHub on every CI run.
           key: ort-1.24.4-cpu-3a211fbea252-cuda-c5f804ff5d23
       - name: Download + verify CPU and CUDA ONNX Runtime flavors (real network)
         env:
@@ -225,16 +257,18 @@ jobs:
           echo "Workspace-wide max GLIBCXX_ requirement: $MAX_GLIBCXX"
 
           # Gate choice: Ubuntu 22.04 (this runner's own OS, and our documented support floor,
-          # issue #133) ships glibc 2.35 and libstdc++ GLIBCXX_3.4.30. We deliberately gate
-          # *stricter* than that ceiling — at the values we've empirically verified these
-          # Microsoft-official builds actually require today (<=2.27 GLIBC, <=3.4.22 GLIBCXX) —
-          # so a future ORT_VERSION bump that creeps closer to the real floor trips this check
-          # long before it would actually break Ubuntu 22.04 / Mint 21 startup.
-          GLIBC_GATE="2.35"
+          # issue #133) ships glibc 2.35 and libstdc++ GLIBCXX_3.4.30. We deliberately gate at
+          # today's empirically verified maxima across the pinned 1.24.4 libraries — GLIBC 2.27
+          # (CPU x64/aarch64 and the CUDA main lib; providers_cuda itself needs only 2.2.5) and
+          # GLIBCXX 3.4.22 — which sit well under that Ubuntu 22.04 ceiling. So a future ORT
+          # version bump that raises either requirement trips this check long before the real
+          # Ubuntu 22.04 / Mint 21 support floor is actually threatened.
+          GLIBC_GATE="2.27"
           GLIBCXX_GATE="3.4.22"
           if [ "$(printf '%s\n%s\n' "$MAX_GLIBC" "$GLIBC_GATE" | sort -V | tail -1)" != "$GLIBC_GATE" ]; then
             echo "ERROR: downloaded ONNX Runtime libraries require GLIBC_$MAX_GLIBC, which" \
-                 "exceeds the $GLIBC_GATE gate (Ubuntu 22.04 support floor, issue #133)."
+                 "exceeds the $GLIBC_GATE gate (today's empirically verified maximum, well" \
+                 "under the Ubuntu 22.04 / issue #133 floor of 2.35 — investigate before raising)."
             exit 1
           fi
           if [ "$(printf '%s\n%s\n' "$MAX_GLIBCXX" "$GLIBCXX_GATE" | sort -V | tail -1)" != "$GLIBCXX_GATE" ]; then
@@ -284,19 +318,14 @@ jobs:
         run: cargo test -p embed --features local-coreml
       - name: Run clippy with local-coreml (deny warnings)
         run: cargo clippy -p embed --features local-coreml --all-targets -- -D warnings
-      - name: Cache downloaded ONNX Runtime CPU flavor (macOS)
-        uses: actions/cache@v4
-        with:
-          path: ~/Library/Caches/localdb/ort
-          # macOS's `dirs::cache_dir()` equivalent of the Linux job's `~/.cache/localdb/ort`.
-          # Keyed on the pinned ORT version plus the first 12 hex chars of the macOS aarch64 CPU
-          # tarball sha256 (embed/src/ort_download.rs's CPU_OSX_ARM64), so a pin bump invalidates
-          # the cache instead of reusing stale bytes.
-          key: ort-macos-1.24.4-cpu-93787795f47e
       - name: Download + verify CPU ONNX Runtime flavor (macOS, real network)
         # local-onnx (not local-coreml) deliberately: this exercises the same runtime-download
         # flavor table (issue #76) macOS falls back to when CoreML is unavailable, independent
-        # of this job's main local-coreml build above.
+        # of this job's main local-coreml build above. This test (`real_download_cpu_flavor`)
+        # downloads into its own TempDir, not the real `~/Library/Caches/localdb/ort` cache dir,
+        # so there is no cache step here to speed it up — every run re-downloads and
+        # re-verifies the ~30 MB tarball from GitHub on purpose (that re-download/re-verify
+        # behavior is what's under test).
         env:
           LOCALDB_TEST_ORT_DOWNLOAD: "1"
         run: cargo test -p embed --features local-onnx real_download_cpu_flavor -- --nocapture

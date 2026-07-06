@@ -33,8 +33,9 @@ jobs:
 
           # Linux x86_64 (native). Pinned to ubuntu-22.04 (not ubuntu-latest): our own Rust
           # code inherits the build machine's glibc floor, so building on a newer Ubuntu
-          # would re-introduce issue #133 even though the embedded ONNX Runtime (build.rs)
-          # is no longer the culprit. See "Verify glibc floor" step below.
+          # would re-introduce issue #133 even though the ONNX Runtime is no longer embedded
+          # at build time (issue #76 deleted embed/build.rs; it's downloaded lazily at
+          # runtime instead). See "Verify glibc floor" step below.
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             cross: false

@@ -99,7 +99,7 @@ and caches it — nothing is bundled in the binary:
 | What | Size | When |
 |---|---|---|
 | Embedding model (`pplx-embed-context-v1-0.6b`, default) | ~706 MB | Always, on first use, any provider. |
-| ONNX Runtime, CPU flavor | ~8 MB (Linux x86_64) / ~7 MB (Linux arm64) / ~30 MB (macOS arm64) | `local-onnx`, or `local`/`local-cuda` falling back to CPU. |
+| ONNX Runtime, CPU flavor | ~8 MB (Linux x86_64) / ~7 MB (Linux arm64) / ~30 MB (macOS arm64) | `local-onnx`, always; or `local` when no usable NVIDIA stack is detected (and, on macOS, only if CoreML is unavailable). Never downloaded by `local-cuda` — it never falls back to CPU. |
 | ONNX Runtime, CUDA flavor | ~196 MB | `local-cuda`, or `local` when it detects a usable NVIDIA stack. |
 
 All three are one-time downloads, sha256-verified, and cached indefinitely across upgrades of
