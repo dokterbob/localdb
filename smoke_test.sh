@@ -247,10 +247,12 @@ CUDA_STDERR=$(LOCALDB_CONFIG="$CUDA_CONFIG_FILE" localdb --store cuda-store inde
 CUDA_EXIT=$?
 set -e
 
-if [ "$CUDA_EXIT" -eq 0 ]; then
-    fail "provider 'local-cuda' unexpectedly exited 0 on a GPU-less runner"
+# CUDA-unavailable maps to core's ProviderUnavailable → exit 5 ("unavailable",
+# specs/05-surfaces.md §5) via embed's EmbedError::ProviderError.
+if [ "$CUDA_EXIT" -ne 5 ]; then
+    fail "provider 'local-cuda' should exit 5 (unavailable) on a GPU-less runner; got $CUDA_EXIT"
 fi
-ok "provider 'local-cuda' index exited non-zero (exit code: $CUDA_EXIT)"
+ok "provider 'local-cuda' index exited 5 (unavailable)"
 
 case "$(uname -s)" in
     Linux)

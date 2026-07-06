@@ -335,11 +335,14 @@ fn create_cuda(
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
     {
         let _ = (policy, models_dir);
-        Err(EmbedError::Internal(
-            "provider 'local-cuda' requires Linux x86_64 with an NVIDIA GPU. \
-             Use provider 'local' (auto-detects, CPU fallback) or 'local-onnx' instead."
+        // ProviderError (not Internal): maps to core's ProviderUnavailable → exit code 5
+        // ("unavailable", specs/05-surfaces.md §5) rather than 1.
+        Err(EmbedError::ProviderError {
+            provider: "local-cuda".to_string(),
+            message: "provider 'local-cuda' requires Linux x86_64 with an NVIDIA GPU. \
+                      Use provider 'local' (auto-detects, CPU fallback) or 'local-onnx' instead."
                 .to_string(),
-        ))
+        })
     }
 }
 
@@ -389,9 +392,12 @@ fn cuda_stack_error(status: crate::cuda_ep::CudaStackStatus) -> Option<EmbedErro
         return None;
     }
     let (cause, hint) = crate::cuda_ep::stack_status_cause_and_hint(status);
-    Some(EmbedError::Internal(
-        crate::cuda_ep::cuda_unavailable_error(cause, hint),
-    ))
+    // ProviderError (not Internal): maps to core's ProviderUnavailable → exit code 5
+    // ("unavailable", specs/05-surfaces.md §5) rather than 1.
+    Some(EmbedError::ProviderError {
+        provider: "local-cuda".to_string(),
+        message: crate::cuda_ep::cuda_unavailable_error(cause, hint),
+    })
 }
 
 /// Runs once the cheap detection ladder has already reported [`CudaStackStatus::Ok`]: inits
@@ -419,8 +425,10 @@ fn create_cuda_after_stack_ok(
         crate::ort_runtime::OrtFlavor::Cuda,
         policy.ort_library.as_deref(),
     )?;
-    crate::cuda_ep::probe_cuda()
-        .map_err(|e| EmbedError::Internal(crate::cuda_ep::cuda_unavailable_error(&e, None)))?;
+    crate::cuda_ep::probe_cuda().map_err(|e| EmbedError::ProviderError {
+        provider: "local-cuda".to_string(),
+        message: crate::cuda_ep::cuda_unavailable_error(&e, None),
+    })?;
     create_onnx_with(policy, models_dir, crate::cuda_ep::CudaPreference::Required)
 }
 
