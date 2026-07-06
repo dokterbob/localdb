@@ -23,6 +23,7 @@ pub(crate) async fn make_app() -> (TempDir, Router) {
                 embedding: localdb_core::config::schema::EmbeddingPolicy {
                     provider: "fake".to_string(),
                     model: "default".to_string(),
+                    ..Default::default()
                 },
                 ..Default::default()
             },
@@ -78,6 +79,7 @@ pub(crate) async fn make_state_with_fake_config() -> (TempDir, AppState) {
                 embedding: localdb_core::config::schema::EmbeddingPolicy {
                     provider: "fake".to_string(),
                     model: "default".to_string(),
+                    ..Default::default()
                 },
                 ..Default::default()
             },

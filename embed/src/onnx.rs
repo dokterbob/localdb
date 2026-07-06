@@ -96,12 +96,20 @@ impl OnnxEmbedder {
         model_choice: ModelChoice,
         cache_dir: Option<PathBuf>,
         show_download_progress: bool,
+        cuda: crate::cuda_ep::CudaPreference,
     ) -> Result<Self, EmbedError> {
         // Download/dlopen the ONNX Runtime (idempotent) before touching any `ort` API —
         // `fastembed::TextEmbedding::try_new` below creates an ORT session internally.
-        // TODO(#76 later chunk): thread the factory-decided flavor + config override through
-        // here instead of hardcoding Cpu/None.
-        crate::ort_runtime::ensure_ort_initialized(crate::ort_runtime::OrtFlavor::Cpu, None)?;
+        //
+        // Second-line, idempotent guard: the factory has already decided the process-wide
+        // flavor + `embedding.ort_library` override before constructing the first embedder.
+        // `None` here is safe — the override only matters on the first call in the process.
+        let flavor = match cuda {
+            crate::cuda_ep::CudaPreference::Disabled => crate::ort_runtime::OrtFlavor::Cpu,
+            crate::cuda_ep::CudaPreference::Preferred
+            | crate::cuda_ep::CudaPreference::Required => crate::ort_runtime::OrtFlavor::Cuda,
+        };
+        crate::ort_runtime::ensure_ort_initialized(flavor, None)?;
 
         info!(
             model = model_choice.model_id(),
@@ -111,7 +119,8 @@ impl OnnxEmbedder {
         let fastembed_model = model_choice.to_fastembed_model();
 
         let mut opts = TextInitOptions::new(fastembed_model)
-            .with_show_download_progress(show_download_progress);
+            .with_show_download_progress(show_download_progress)
+            .with_execution_providers(crate::cuda_ep::dispatch_list(cuda));
 
         if let Some(dir) = cache_dir {
             opts = opts.with_cache_dir(dir);
@@ -219,6 +228,7 @@ mod tests {
             ModelChoice::BgeSmallEnV15,
             Some(dir.path().to_path_buf()),
             false,
+            crate::cuda_ep::CudaPreference::Disabled,
         )
         .expect("ONNX embedder should load BGE Small model");
         (dir, embedder)

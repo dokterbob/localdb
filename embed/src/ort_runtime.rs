@@ -130,7 +130,7 @@ pub(crate) fn committed_flavor() -> Option<OrtFlavor> {
 mod imp {
     use std::{
         path::{Path, PathBuf},
-        sync::OnceLock,
+        sync::Mutex,
     };
 
     use super::OrtFlavor;
@@ -139,25 +139,79 @@ mod imp {
         ort_download::{self, RemoteRuntime},
     };
 
-    /// `(committed flavor, init outcome)`, set once by the first call (whether it succeeded or
-    /// failed). Recording the flavor alongside the outcome lets later calls detect a flavor
-    /// mismatch (see [`check_flavor`]) even when the first call itself returned an error.
-    static INIT: OnceLock<(OrtFlavor, Result<(), String>)> = OnceLock::new();
+    /// `(committed flavor, init outcome)`, set only once real `ort::init_from` has actually
+    /// been invoked (see [`InitAttempt`] and [`record_attempt`]) — *not* simply on the first
+    /// call to [`ensure_ort_initialized`]. Recording the flavor alongside the outcome lets
+    /// later calls detect a flavor mismatch (see [`check_flavor`]) even when the committing
+    /// call itself returned an error (e.g. a bad `dlopen` path).
+    ///
+    /// A plain `OnceLock` cannot express this: its closure runs (and its result is cached)
+    /// exactly once regardless of outcome, which would permanently "poison" the process
+    /// against a *different* flavor even when the first call failed for a reason that never
+    /// touched `ort` at all (a failed download, say) — see the module-level doc's "Once-only"
+    /// section and [`record_attempt`]'s doc comment for the failure mode this avoids: a failed
+    /// CUDA *download* must not block a subsequent CPU fallback in the same process.
+    static INIT: Mutex<Option<(OrtFlavor, Result<(), String>)>> = Mutex::new(None);
 
     pub(super) fn ensure_ort_initialized(
         flavor: OrtFlavor,
         ort_library_override: Option<&Path>,
     ) -> Result<(), EmbedError> {
-        let (committed, result) = INIT.get_or_init(|| {
-            let outcome = init_once(flavor, ort_library_override).map_err(|e| e.to_string());
-            (flavor, outcome)
-        });
-        check_flavor(*committed, flavor)?;
-        result.clone().map_err(EmbedError::Internal)
+        let mut guard = INIT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((committed, result)) = guard.as_ref() {
+            check_flavor(*committed, flavor)?;
+            return result.clone().map_err(EmbedError::Internal);
+        }
+        let attempt = init_once(flavor, ort_library_override);
+        record_attempt(&mut guard, flavor, attempt)
     }
 
     pub(super) fn committed_flavor() -> Option<OrtFlavor> {
-        INIT.get().map(|(flavor, _)| *flavor)
+        INIT.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|(flavor, _)| *flavor)
+    }
+
+    /// Outcome of one [`init_once`] attempt, distinguishing whether `ort::init_from` was
+    /// actually invoked from whether the attempt failed before ever reaching it.
+    #[derive(Debug)]
+    enum InitAttempt {
+        /// `ort::init_from` was actually called — even if it returned an error (e.g. `dlopen`
+        /// failed to load the path). This has real, irreversible process-wide side effects
+        /// (per the `ort` docs: the environment can only be configured once), so the outcome
+        /// must be committed permanently regardless of success or failure.
+        Committed(Result<(), String>),
+        /// Failed before `ort::init_from` was ever touched (resolving the lib source, or
+        /// downloading/verifying the flavor's payloads). No process-wide `ort` state changed,
+        /// so this must *not* be committed — a later call, even with a different flavor, can
+        /// retry cleanly.
+        NotAttempted(String),
+    }
+
+    /// Applies one [`init_once`] outcome to the process-wide `INIT` state. Factored out of
+    /// [`ensure_ort_initialized`] so the commit-vs-no-commit decision is unit-testable without
+    /// touching `ort`, the filesystem, or the network.
+    ///
+    /// This is the fix for the failed-CUDA-init-must-not-poison-CPU-fallback problem: a
+    /// [`InitAttempt::NotAttempted`] outcome (e.g. the CUDA runtime download failed) leaves
+    /// `guard` as `None`, so a subsequent call — e.g. the factory's automatic-mode CPU
+    /// fallback, requesting [`OrtFlavor::Cpu`] instead — is not rejected by [`check_flavor`]
+    /// and gets a fresh attempt of its own. Only [`InitAttempt::Committed`] (real `ort::init_from`
+    /// invocation, e.g. after a download succeeded) permanently records the flavor, matching
+    /// the fact that a real `dlopen` cannot be undone or retried with a different library.
+    fn record_attempt(
+        guard: &mut Option<(OrtFlavor, Result<(), String>)>,
+        flavor: OrtFlavor,
+        attempt: InitAttempt,
+    ) -> Result<(), EmbedError> {
+        match attempt {
+            InitAttempt::Committed(result) => {
+                *guard = Some((flavor, result.clone()));
+                result.map_err(EmbedError::Internal)
+            }
+            InitAttempt::NotAttempted(err) => Err(EmbedError::Internal(err)),
+        }
     }
 
     /// Pure flavor-consistency check, factored out of [`ensure_ort_initialized`] so it's
@@ -174,7 +228,7 @@ mod imp {
         )))
     }
 
-    fn init_once(flavor: OrtFlavor, ort_library_override: Option<&Path>) -> Result<(), EmbedError> {
+    fn init_once(flavor: OrtFlavor, ort_library_override: Option<&Path>) -> InitAttempt {
         let env_override = std::env::var("ORT_DYLIB_PATH").ok().map(PathBuf::from);
         match resolve_lib_source(env_override, ort_library_override, flavor) {
             LibSource::Env(path) => {
@@ -182,14 +236,14 @@ mod imp {
                     path = %path.display(),
                     "ORT_DYLIB_PATH set; using external ONNX Runtime"
                 );
-                commit_from(&path)
+                InitAttempt::Committed(commit_from(&path).map_err(|e| e.to_string()))
             }
             LibSource::Config(path) => {
                 tracing::info!(
                     path = %path.display(),
                     "embedding.ort_library set; using external ONNX Runtime"
                 );
-                commit_from(path)
+                InitAttempt::Committed(commit_from(path).map_err(|e| e.to_string()))
             }
             LibSource::Download(flavor) => download_and_commit(flavor),
         }
@@ -225,12 +279,14 @@ mod imp {
         }
     }
 
-    fn download_and_commit(flavor: OrtFlavor) -> Result<(), EmbedError> {
+    fn download_and_commit(flavor: OrtFlavor) -> InitAttempt {
         match flavor {
-            OrtFlavor::Cpu => {
-                let rt = ort_download::cpu_flavor_for_target()?;
-                download_rt_and_commit(rt)
-            }
+            OrtFlavor::Cpu => match ort_download::cpu_flavor_for_target() {
+                Ok(rt) => download_rt_and_commit(rt),
+                // Unsupported (os, arch): never touched `ort::init_from`, so this must not
+                // poison the process against a later, differently-flavored attempt.
+                Err(e) => InitAttempt::NotAttempted(e.to_string()),
+            },
             OrtFlavor::Cuda => cuda_download_and_commit(),
         }
     }
@@ -238,30 +294,36 @@ mod imp {
     /// The CUDA flavor only has a pinned table entry (and is only ever meaningfully requested
     /// by the factory) on linux/x86_64 — see `ort_download::CUDA_LINUX_X64`.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    fn cuda_download_and_commit() -> Result<(), EmbedError> {
+    fn cuda_download_and_commit() -> InitAttempt {
         download_rt_and_commit(&ort_download::CUDA_LINUX_X64)
     }
 
     /// On every other target, the factory should never route a CUDA request here.
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-    fn cuda_download_and_commit() -> Result<(), EmbedError> {
-        Err(EmbedError::Internal(
+    fn cuda_download_and_commit() -> InitAttempt {
+        InitAttempt::NotAttempted(
             "the CUDA ONNX Runtime flavor is only available on linux/x86_64; the embedder \
              factory should never request it on this target"
                 .to_string(),
-        ))
+        )
     }
 
-    fn download_rt_and_commit(rt: &'static RemoteRuntime) -> Result<(), EmbedError> {
+    fn download_rt_and_commit(rt: &'static RemoteRuntime) -> InitAttempt {
         let dir = cache_dir_for(rt);
-        ort_download::ensure_downloaded(rt, &dir)?;
+        // A download/verification failure here (network error, sha256 mismatch, etc.) never
+        // touches `ort::init_from` — report it as `NotAttempted` so it doesn't permanently
+        // poison the process against a later, differently-flavored attempt (e.g. the
+        // factory's automatic-mode CPU fallback after a CUDA download failure).
+        if let Err(e) = ort_download::ensure_downloaded(rt, &dir) {
+            return InitAttempt::NotAttempted(e.to_string());
+        }
         let lib_path = dir.join(main_lib_filename(rt));
         tracing::info!(
             path = %lib_path.display(),
             cache_subdir = rt.cache_subdir,
             "initializing ONNX Runtime (downloaded)"
         );
-        commit_from(&lib_path)
+        InitAttempt::Committed(commit_from(&lib_path).map_err(|e| e.to_string()))
     }
 
     fn commit_from(path: &Path) -> Result<(), EmbedError> {
@@ -325,6 +387,85 @@ mod imp {
         fn same_flavor_is_ok() {
             check_flavor(OrtFlavor::Cpu, OrtFlavor::Cpu).unwrap();
             check_flavor(OrtFlavor::Cuda, OrtFlavor::Cuda).unwrap();
+        }
+
+        // --- record_attempt state machine (the failed-CUDA-init-must-not-poison-CPU-fallback
+        // fix) --------------------------------------------------------------------------------
+        //
+        // These exercise `record_attempt` directly against a local `guard` variable — never the
+        // real process-wide `INIT` static — so they're fully isolated from every other test in
+        // this binary (including the real-`ort` integration tests in `tests/*.rs`, which run in
+        // separate binaries anyway) and require no network or filesystem access.
+
+        #[test]
+        fn not_attempted_outcome_does_not_commit() {
+            let mut guard = None;
+            let err = record_attempt(
+                &mut guard,
+                OrtFlavor::Cuda,
+                InitAttempt::NotAttempted("download failed: network unreachable".to_string()),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("network unreachable"));
+            assert!(
+                guard.is_none(),
+                "a pre-init (download/resolve) failure must not commit a flavor"
+            );
+        }
+
+        #[test]
+        fn committed_outcome_commits_even_on_failure() {
+            let mut guard = None;
+            let err = record_attempt(
+                &mut guard,
+                OrtFlavor::Cuda,
+                InitAttempt::Committed(Err("dlopen failed".to_string())),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("dlopen failed"));
+            assert_eq!(
+                guard,
+                Some((OrtFlavor::Cuda, Err("dlopen failed".to_string()))),
+                "a Committed outcome must be recorded permanently, even when it failed"
+            );
+        }
+
+        #[test]
+        fn committed_outcome_commits_on_success() {
+            let mut guard = None;
+            record_attempt(&mut guard, OrtFlavor::Cpu, InitAttempt::Committed(Ok(()))).unwrap();
+            assert_eq!(guard, Some((OrtFlavor::Cpu, Ok(()))));
+        }
+
+        #[test]
+        fn cuda_download_failure_does_not_block_subsequent_cpu_fallback() {
+            // The scenario this whole state machine exists for: `create_local_auto` attempts
+            // CUDA first (download fails, e.g. no network) and must be able to fall back to a
+            // normal CPU init in the very same process — the CUDA attempt must never have
+            // committed the flavor.
+            let mut guard = None;
+
+            let cuda_err = record_attempt(
+                &mut guard,
+                OrtFlavor::Cuda,
+                InitAttempt::NotAttempted(
+                    "ONNX Runtime download failed: connection reset".to_string(),
+                ),
+            )
+            .unwrap_err();
+            assert!(cuda_err.to_string().contains("connection reset"));
+            assert!(
+                guard.is_none(),
+                "failed CUDA download must leave the flavor uncommitted"
+            );
+
+            // The CPU fallback attempt now runs cleanly — not rejected by a stale Cuda commit.
+            record_attempt(&mut guard, OrtFlavor::Cpu, InitAttempt::Committed(Ok(()))).unwrap();
+            assert_eq!(
+                guard,
+                Some((OrtFlavor::Cpu, Ok(()))),
+                "CPU fallback must be able to commit after a failed CUDA download"
+            );
         }
 
         #[test]

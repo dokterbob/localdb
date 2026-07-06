@@ -17,6 +17,7 @@
 
 #![cfg(feature = "local-onnx")]
 
+use embed::cuda_ep::CudaPreference;
 use embed::PplxOnnxEmbedder;
 use localdb_core::{DocumentChunks, Embedder};
 
@@ -42,8 +43,8 @@ fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "slow: downloads ~2.4 GB of ONNX model files on first run; run with --ignored"]
 async fn pplx_embed_v1_int8_two_documents_retrieval() {
-    let embedder =
-        PplxOnnxEmbedder::new(None, true).expect("create PplxOnnxEmbedder (set HF_TOKEN if 401)");
+    let embedder = PplxOnnxEmbedder::new(None, true, CudaPreference::Disabled)
+        .expect("create PplxOnnxEmbedder (set HF_TOKEN if 401)");
 
     assert_eq!(embedder.embedding_dim(), 1024);
     assert_eq!(embedder.model_id(), "pplx-embed-v1-0.6b");

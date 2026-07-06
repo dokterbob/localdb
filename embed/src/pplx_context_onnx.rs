@@ -214,13 +214,29 @@ impl PplxContextOnnxEmbedder {
     /// `cache_dir`: parent directory; model stored under
     /// `<cache_dir>/pplx-embed-context-v1-0.6b/`.
     /// `show_progress`: emit download progress via `tracing::info!`.
-    pub fn new(cache_dir: Option<PathBuf>, show_progress: bool) -> Result<Self, EmbedError> {
+    /// `cuda`: how eagerly to register the CUDA execution provider (see
+    /// [`crate::cuda_ep::CudaPreference`]).
+    pub fn new(
+        cache_dir: Option<PathBuf>,
+        show_progress: bool,
+        cuda: crate::cuda_ep::CudaPreference,
+    ) -> Result<Self, EmbedError> {
         // Download/dlopen the ONNX Runtime (idempotent) before any `ort` API use below, and
         // before the (potentially multi-hundred-MB) model download so ORT setup failures
         // surface fast.
-        // TODO(#76 later chunk): thread the factory-decided flavor + config override through
-        // here instead of hardcoding Cpu/None.
-        crate::ort_runtime::ensure_ort_initialized(crate::ort_runtime::OrtFlavor::Cpu, None)?;
+        //
+        // This is a second-line, idempotent guard: the factory has already decided the
+        // process-wide flavor (Cpu vs Cuda) and called `ensure_ort_initialized` with any
+        // `embedding.ort_library` override before constructing the first embedder. Direct
+        // construction (tests, examples) that skips the factory still gets a correctly
+        // flavored runtime here — `None` for the override is safe because the override only
+        // matters on the *first* call in the process, which the factory already made.
+        let flavor = match cuda {
+            crate::cuda_ep::CudaPreference::Disabled => crate::ort_runtime::OrtFlavor::Cpu,
+            crate::cuda_ep::CudaPreference::Preferred
+            | crate::cuda_ep::CudaPreference::Required => crate::ort_runtime::OrtFlavor::Cuda,
+        };
+        crate::ort_runtime::ensure_ort_initialized(flavor, None)?;
 
         let model_dir = cache_dir
             .unwrap_or_else(crate::model_cache::ModelCache::default_cache_dir)
@@ -250,6 +266,8 @@ impl PplxContextOnnxEmbedder {
         info!(model = "pplx-embed-context-v1-0.6b", "loading ORT session");
         let session = ort::session::Session::builder()
             .map_err(|e| EmbedError::Internal(format!("ORT SessionBuilder: {e}")))?
+            .with_execution_providers(crate::cuda_ep::dispatch_list(cuda))
+            .map_err(|e| EmbedError::Internal(format!("ORT with_execution_providers: {e}")))?
             // ORT defaults its intra-op pool to physical core count; pin it to logical
             // cores so all of them engage during embedding. (Relies on the non-OpenMP
             // pyke prebuilt binary — OpenMP builds ignore this and need OMP_NUM_THREADS.)

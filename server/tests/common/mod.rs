@@ -37,6 +37,7 @@ fn fake_yaml_config() -> RawConfig {
                 embedding: EmbeddingPolicy {
                     provider: "fake".to_string(),
                     model: "default".to_string(),
+                    ..Default::default()
                 },
                 ..Default::default()
             },

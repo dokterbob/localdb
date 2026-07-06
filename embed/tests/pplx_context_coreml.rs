@@ -194,11 +194,13 @@ fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "device + download: needs Apple Silicon and ~1 GB of model files; run with --ignored"]
 async fn coreml_onnx_parity() {
+    use embed::cuda_ep::CudaPreference;
     use embed::PplxContextOnnxEmbedder;
 
     let coreml =
         PplxContextCoreMLEmbedder::new(None, false).expect("create PplxContextCoreMLEmbedder");
-    let onnx = PplxContextOnnxEmbedder::new(None, false).expect("create PplxContextOnnxEmbedder");
+    let onnx = PplxContextOnnxEmbedder::new(None, false, CudaPreference::Disabled)
+        .expect("create PplxContextOnnxEmbedder");
 
     let chunks = sample_chunks();
     let doc = DocumentChunks {

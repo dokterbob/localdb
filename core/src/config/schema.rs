@@ -8,6 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
 // Top-level raw config (before validation)
@@ -173,13 +174,25 @@ pub struct EmbeddingPolicy {
     pub model: String,
 
     /// Provider kind. Local options:
-    /// - `"local"` — auto: on macOS with CoreML support use CoreML, else ONNX.
+    /// - `"local"` — auto: on macOS with CoreML support use CoreML, else ONNX; on Linux
+    ///   x86_64 with an NVIDIA stack detected, downloads the CUDA-enabled ONNX Runtime
+    ///   (~196 MB, one-time) and prefers the CUDA execution provider with automatic CPU
+    ///   fallback; otherwise plain CPU ONNX.
     /// - `"local-coreml"` — force in-process CoreML (macOS/Apple Silicon only).
-    /// - `"local-onnx"` — force in-process ONNX inference.
+    /// - `"local-onnx"` — force in-process ONNX inference (CPU only).
+    /// - `"local-cuda"` — force the CUDA execution provider (Linux x86_64 with an NVIDIA
+    ///   GPU only); hard error if the CUDA stack is unavailable, with no CPU fallback.
     ///
     /// Hosted options: `"openai-compatible"`, `"perplexity"`, `"voyage"`.
     #[serde(default = "default_embedding_provider")]
     pub provider: String,
+
+    /// Advanced/packager escape hatch: path to a system ONNX Runtime shared library to use
+    /// instead of the auto-downloaded one. The `ORT_DYLIB_PATH` environment variable takes
+    /// precedence over this value. Requires ONNX Runtime >= 1.24. Only consulted by the
+    /// `"local"`, `"local-onnx"`, and `"local-cuda"` providers.
+    #[serde(default)]
+    pub ort_library: Option<PathBuf>,
 }
 
 impl Default for EmbeddingPolicy {
@@ -187,6 +200,7 @@ impl Default for EmbeddingPolicy {
         Self {
             model: default_embedding_model(),
             provider: default_embedding_provider(),
+            ort_library: None,
         }
     }
 }
@@ -254,6 +268,51 @@ mod tests {
         let p = EmbeddingPolicy::default();
         assert_eq!(p.model, "pplx-embed-context-v1-0.6b");
         assert_eq!(p.provider, "local");
+        assert_eq!(p.ort_library, None);
+    }
+
+    #[test]
+    fn ort_library_config_key_parses() {
+        let yaml = "version: 1\n\
+                     defaults:\n  \
+                       indexing:\n    \
+                         embedding:\n      \
+                           provider: local-cuda\n      \
+                           ort_library: /opt/onnxruntime/lib/libonnxruntime.so\n";
+        let cfg: RawConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            cfg.defaults.indexing.embedding.ort_library,
+            Some(std::path::PathBuf::from(
+                "/opt/onnxruntime/lib/libonnxruntime.so"
+            ))
+        );
+    }
+
+    #[test]
+    fn ort_library_absent_defaults_to_none() {
+        let yaml = "version: 1\n\
+                     defaults:\n  \
+                       indexing:\n    \
+                         embedding:\n      \
+                           provider: local\n";
+        let cfg: RawConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.defaults.indexing.embedding.ort_library, None);
+    }
+
+    #[test]
+    fn old_config_without_ort_library_still_parses() {
+        // Pre-existing configs (written before `ort_library` existed) must still parse —
+        // the new field is `#[serde(default)]` and additive, not a breaking schema change.
+        let yaml = "version: 1\n\
+                     defaults:\n  \
+                       indexing:\n    \
+                         embedding:\n      \
+                           provider: local-onnx\n      \
+                           model: bge-small-en-v1.5\n";
+        let cfg: RawConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.defaults.indexing.embedding.provider, "local-onnx");
+        assert_eq!(cfg.defaults.indexing.embedding.model, "bge-small-en-v1.5");
+        assert_eq!(cfg.defaults.indexing.embedding.ort_library, None);
     }
 
     #[test]
