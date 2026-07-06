@@ -280,8 +280,19 @@ mod ort_backed {
     /// speculatively (e.g. from a factory that isn't sure yet whether CUDA init happened).
     ///
     /// [`SessionBuilder`]: ort::session::builder::SessionBuilder
+    ///
+    /// # Visibility
+    ///
+    /// `pub` (not `pub(crate)`) so CI's GPU-less `ort-download` job
+    /// (`embed/tests/cuda_probe_gpuless.rs`) can exercise this exact probe directly, in its own
+    /// process, after a real `ensure_ort_initialized(OrtFlavor::Cuda, None)`. The alternative —
+    /// driving this only through `create_embedder`'s `local-cuda` provider — would instead
+    /// exercise `detect_cuda_stack`'s cheap file-level ladder, which fails at the driver-missing
+    /// rung on a GPU-less runner *before* ever reaching this probe; that's a different (also
+    /// useful) guarantee, not this one. This is otherwise a read-only, side-effect-free query
+    /// (see the `OnceLock` caching above), so widening it to a public API is low-risk.
     #[allow(dead_code, reason = "consumed by factory in the next change")]
-    pub(crate) fn probe_cuda() -> Result<(), String> {
+    pub fn probe_cuda() -> Result<(), String> {
         static PROBE: OnceLock<Result<(), String>> = OnceLock::new();
         PROBE.get_or_init(probe_cuda_once).clone()
     }
@@ -351,11 +362,16 @@ mod ort_backed {
 }
 
 /// Re-exported at module level (rather than requiring `crate::cuda_ep::ort_backed::...`) so the
-/// factory (issue #96, later chunk) can consume `crate::cuda_ep::{dispatch_list, probe_cuda}`
-/// directly without needing `ort_backed` itself to be `pub(crate)`.
+/// factory can consume `crate::cuda_ep::dispatch_list` directly without needing `ort_backed`
+/// itself to be `pub(crate)`.
 #[cfg(feature = "local-onnx")]
 #[allow(unused_imports, reason = "consumed by factory in the next change")]
-pub(crate) use ort_backed::{dispatch_list, probe_cuda};
+pub(crate) use ort_backed::dispatch_list;
+
+/// Re-exported `pub` (not `pub(crate)`) — see [`ort_backed::probe_cuda`]'s doc comment for why
+/// CI's GPU-less integration test needs to reach this from outside the crate.
+#[cfg(feature = "local-onnx")]
+pub use ort_backed::probe_cuda;
 
 #[cfg(test)]
 mod tests {

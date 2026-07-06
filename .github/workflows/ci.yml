@@ -131,6 +131,129 @@ jobs:
           files: lcov.info
           fail_ci_if_error: false
 
+  ort-download:
+    name: ORT runtime download (Linux, GPU-less)
+    # Deliberately GPU-less (ubuntu-22.04, not a GPU runner): this job exists to prove the CUDA
+    # flavor downloads/verifies/dlopens cleanly and fails *cleanly* (no panic/abort) when asked
+    # to actually register the CUDA execution provider with no GPU present — see
+    # `embed/tests/cuda_probe_gpuless.rs`. Pinned to 22.04 (not ubuntu-latest) because this job's
+    # glibc-floor assertion step below is what now guarantees the downloaded libraries stay
+    # within the Ubuntu 22.04 / glibc 2.35 support floor (issue #133) on every PR — that
+    # guarantee used to live in the release workflow as an objdump check of the *embedded*
+    # library; issue #76 replaced build-time embedding with this runtime download, so the check
+    # moved here and now runs against real downloaded artifacts instead.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable with clippy
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-ort-download-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-ort-download-
+      - name: Cache downloaded ONNX Runtime flavors
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/localdb/ort
+          # Keyed on the pinned ORT version plus the first 12 hex chars of both the CPU-linux-x64
+          # and CUDA-linux-x64 tarball sha256s (embed/src/ort_download.rs) — not just the version
+          # string — so bumping either pin (a new ORT release, or a corrected hash) invalidates
+          # the cache instead of silently reusing stale/mismatched bytes. This makes the ~196 MB
+          # CUDA download (plus the smaller CPU one) a one-time cost per pin, not per CI run.
+          key: ort-1.24.4-cpu-3a211fbea252-cuda-c5f804ff5d23
+      - name: Download + verify CPU and CUDA ONNX Runtime flavors (real network)
+        env:
+          LOCALDB_TEST_ORT_DOWNLOAD: "1"
+        run: cargo test -p embed --features local-onnx real_download -- --nocapture
+      - name: Real ort::init_from against the downloaded CPU flavor
+        env:
+          LOCALDB_TEST_ORT_DOWNLOAD: "1"
+        run: cargo test -p embed --features local-onnx --test ort_init_download -- --nocapture
+      - name: CUDA execution-provider probe fails cleanly without a GPU
+        env:
+          LOCALDB_TEST_ORT_DOWNLOAD: "1"
+        run: cargo test -p embed --features local-onnx --test cuda_probe_gpuless -- --nocapture
+      - name: Assert glibc/libstdc++ floor of downloaded ONNX Runtime libraries
+        run: |
+          set -euo pipefail
+          CACHE_ROOT="$HOME/.cache/localdb/ort"
+          echo "Scanning $CACHE_ROOT for shared libraries..."
+          # This job only ever runs on Linux, so only .so* files are expected — the `.dylib`
+          # exclusion is defensive/explicit documentation of intent (mirrors the old
+          # release-workflow step this replaces, which scanned both platforms from one script).
+          mapfile -t LIBS < <(find "$CACHE_ROOT" -type f -name '*.so*' ! -name '*.dylib' 2>/dev/null)
+          if [ "${#LIBS[@]}" -eq 0 ]; then
+            echo "ERROR: no .so libraries found under $CACHE_ROOT. The download steps above" \
+                 "should have populated both the CPU and CUDA flavor directories — finding" \
+                 "nothing here means this check would silently pass on nothing. Failing loudly" \
+                 "instead (mirrors the old release-step's at-least-one-found assertion)."
+            exit 1
+          fi
+          echo "Found ${#LIBS[@]} librarie(s):"
+          printf '  %s\n' "${LIBS[@]}"
+
+          MAX_GLIBC="0"
+          MAX_GLIBCXX="0"
+          for lib in "${LIBS[@]}"; do
+            echo "== $lib =="
+            glibc_ver=$(objdump -T "$lib" 2>/dev/null \
+              | grep -oE 'GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?' | sed 's/GLIBC_//' \
+              | sort -V | tail -1 || true)
+            glibcxx_ver=$(objdump -T "$lib" 2>/dev/null \
+              | grep -oE 'GLIBCXX_[0-9]+\.[0-9]+(\.[0-9]+)?' | sed 's/GLIBCXX_//' \
+              | sort -V | tail -1 || true)
+            echo "  max GLIBC_ requirement:   ${glibc_ver:-none}"
+            echo "  max GLIBCXX_ requirement: ${glibcxx_ver:-none}"
+            if [ -n "$glibc_ver" ]; then
+              MAX_GLIBC=$(printf '%s\n%s\n' "$glibc_ver" "$MAX_GLIBC" | sort -V | tail -1)
+            fi
+            if [ -n "$glibcxx_ver" ]; then
+              MAX_GLIBCXX=$(printf '%s\n%s\n' "$glibcxx_ver" "$MAX_GLIBCXX" | sort -V | tail -1)
+            fi
+          done
+
+          echo "Workspace-wide max GLIBC_ requirement:   $MAX_GLIBC"
+          echo "Workspace-wide max GLIBCXX_ requirement: $MAX_GLIBCXX"
+
+          # Gate choice: Ubuntu 22.04 (this runner's own OS, and our documented support floor,
+          # issue #133) ships glibc 2.35 and libstdc++ GLIBCXX_3.4.30. We deliberately gate
+          # *stricter* than that ceiling — at the values we've empirically verified these
+          # Microsoft-official builds actually require today (<=2.27 GLIBC, <=3.4.22 GLIBCXX) —
+          # so a future ORT_VERSION bump that creeps closer to the real floor trips this check
+          # long before it would actually break Ubuntu 22.04 / Mint 21 startup.
+          GLIBC_GATE="2.35"
+          GLIBCXX_GATE="3.4.22"
+          if [ "$(printf '%s\n%s\n' "$MAX_GLIBC" "$GLIBC_GATE" | sort -V | tail -1)" != "$GLIBC_GATE" ]; then
+            echo "ERROR: downloaded ONNX Runtime libraries require GLIBC_$MAX_GLIBC, which" \
+                 "exceeds the $GLIBC_GATE gate (Ubuntu 22.04 support floor, issue #133)."
+            exit 1
+          fi
+          if [ "$(printf '%s\n%s\n' "$MAX_GLIBCXX" "$GLIBCXX_GATE" | sort -V | tail -1)" != "$GLIBCXX_GATE" ]; then
+            echo "ERROR: downloaded ONNX Runtime libraries require GLIBCXX_$MAX_GLIBCXX, which" \
+                 "exceeds the $GLIBCXX_GATE gate (empirically verified ceiling)."
+            exit 1
+          fi
+          echo "OK: glibc/libstdc++ requirements of downloaded ONNX Runtime libraries are within gates."
+      - name: Run clippy on embed with local-onnx (deny warnings)
+        # Note: the workspace-level `clippy` job (`cargo clippy --workspace --all-targets`)
+        # already type-checks embed with `local-onnx` enabled — `cli`'s unconditional
+        # `embed = { path = "../embed", features = ["local-onnx"] }` dependency means Cargo's
+        # feature unification activates `local-onnx` for embed in that invocation too. This step
+        # is intentionally redundant with that: it pins the exact package/feature combination on
+        # this glibc-floor-pinned runner specifically, so a clippy regression scoped to
+        # `embed --features local-onnx` (including this job's own new integration test file)
+        # surfaces here even if workspace-level unification ever changes.
+        run: cargo clippy -p embed --all-targets --features local-onnx -- -D warnings
+
   coreml:
     name: CoreML backend (macOS)
     runs-on: macos-14
@@ -161,6 +284,22 @@ jobs:
         run: cargo test -p embed --features local-coreml
       - name: Run clippy with local-coreml (deny warnings)
         run: cargo clippy -p embed --features local-coreml --all-targets -- -D warnings
+      - name: Cache downloaded ONNX Runtime CPU flavor (macOS)
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/localdb/ort
+          # macOS's `dirs::cache_dir()` equivalent of the Linux job's `~/.cache/localdb/ort`.
+          # Keyed on the pinned ORT version plus the first 12 hex chars of the macOS aarch64 CPU
+          # tarball sha256 (embed/src/ort_download.rs's CPU_OSX_ARM64), so a pin bump invalidates
+          # the cache instead of reusing stale bytes.
+          key: ort-macos-1.24.4-cpu-93787795f47e
+      - name: Download + verify CPU ONNX Runtime flavor (macOS, real network)
+        # local-onnx (not local-coreml) deliberately: this exercises the same runtime-download
+        # flavor table (issue #76) macOS falls back to when CoreML is unavailable, independent
+        # of this job's main local-coreml build above.
+        env:
+          LOCALDB_TEST_ORT_DOWNLOAD: "1"
+        run: cargo test -p embed --features local-onnx real_download_cpu_flavor -- --nocapture
 
   # Demonstrate the coverage gate: this job has a dummy function with a test.
   # The function and test live in the core crate (error.rs / tests).
