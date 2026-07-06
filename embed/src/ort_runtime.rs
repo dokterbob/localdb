@@ -95,8 +95,62 @@ pub fn ensure_ort_initialized(
     imp::ensure_ort_initialized(flavor, ort_library_override)
 }
 
-/// No-op stub: no ONNX Runtime flavor is downloadable for this build configuration.
-#[cfg(not(all(feature = "local-onnx", any(target_os = "linux", target_os = "macos"))))]
+/// Actionable-error stub: `local-onnx` is enabled, but this target (e.g. a hypothetical Windows
+/// build) has no entry in `ort_download`'s flavor table — only linux/x86_64, linux/aarch64, and
+/// macos/aarch64 are downloadable (see `ort_download::cpu_flavor_for`). Unlike the fully no-op
+/// stub below, this must not silently return `Ok(())`: a caller with `local-onnx` enabled *will*
+/// go on to touch other `ort` APIs, which abort/panic under `load-dynamic` if the environment was
+/// never initialized (see this module's precondition docs) — silently OK-ing here would trade a
+/// clean error now for a hard panic later.
+///
+/// Still honors the `ORT_DYLIB_PATH` env var / `ort_library_override`: calling `ort::init_from`
+/// on an explicit path is sound on every target `ort` itself compiles for (only the
+/// *downloadable flavor table* is linux/macos-only), so an override lets `local-onnx` work here
+/// too, same as every other target.
+///
+/// Deliberately minimal: no once-only/flavor-commit state machine like `imp` below (a second call
+/// just re-invokes `ort::init_from`, which `ort` itself already treats as an idempotent no-op —
+/// see `commit()`'s `bool` return, ignored here). This whole branch is never exercised by CI (no
+/// Windows target), so it's kept as simple as possible rather than risk rotting unnoticed.
+#[cfg(all(
+    feature = "local-onnx",
+    not(any(target_os = "linux", target_os = "macos"))
+))]
+pub fn ensure_ort_initialized(
+    _flavor: OrtFlavor,
+    ort_library_override: Option<&Path>,
+) -> Result<(), EmbedError> {
+    let override_path = std::env::var_os("ORT_DYLIB_PATH")
+        .map(std::path::PathBuf::from)
+        .or_else(|| ort_library_override.map(Path::to_path_buf));
+
+    match override_path {
+        Some(path) => {
+            ort::init_from(&path)
+                .map_err(|e| {
+                    EmbedError::Internal(format!(
+                        "failed to load ONNX Runtime from {}: {e}",
+                        path.display()
+                    ))
+                })?
+                .commit();
+            Ok(())
+        }
+        None => Err(EmbedError::Internal(format!(
+            "localdb's `local-onnx` feature has no downloadable ONNX Runtime build for target \
+             {os}/{arch}. Supported: linux/x86_64, linux/aarch64, macos/aarch64. Set \
+             ORT_DYLIB_PATH to the path of a local ONNX Runtime shared library to use \
+             `local-onnx` on this target.",
+            os = std::env::consts::OS,
+            arch = std::env::consts::ARCH,
+        ))),
+    }
+}
+
+/// No-op stub: `local-onnx` is disabled, so no code path ever touches `ort` at all — unreachable
+/// by construction (see `factory.rs`'s `local-onnx`-gated call sites), so `Ok(())` is safe here
+/// regardless of target.
+#[cfg(not(feature = "local-onnx"))]
 pub fn ensure_ort_initialized(
     _flavor: OrtFlavor,
     _ort_library_override: Option<&Path>,
@@ -224,7 +278,9 @@ mod imp {
         }
         Err(EmbedError::Internal(format!(
             "ONNX Runtime already initialized with the {committed:?} flavor; cannot \
-             re-initialize as {requested:?} — the runtime library is loaded once per process"
+             re-initialize as {requested:?} — the runtime library is loaded once per process. \
+             This process already initialized the {committed:?} ONNX Runtime; run the \
+             {requested:?}-flavored operation in a separate invocation."
         )))
     }
 
@@ -479,6 +535,10 @@ mod imp {
             assert!(
                 msg.contains("Cuda"),
                 "message should name the requested flavor: {msg}"
+            );
+            assert!(
+                msg.contains("separate invocation"),
+                "message should give the actionable hint to retry in a separate process: {msg}"
             );
         }
 

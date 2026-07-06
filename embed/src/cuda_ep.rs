@@ -189,7 +189,7 @@ pub(crate) fn detect_cuda_stack() -> CudaStackStatus {
 
 /// Build the canonical "CUDA unavailable" message. `cause` names *why* (a specific missing
 /// component, or the underlying `ort` registration error); `missing_hint`, when present, names
-/// the concrete fix (e.g. "install cuDNN 9`). Reused verbatim by the factory (issue #96, later
+/// the concrete fix (e.g. "install cuDNN 9"). Reused verbatim by the factory (issue #96, later
 /// chunk) for both the cheap ladder's failures and [`probe_cuda`]'s ground-truth failure.
 #[allow(dead_code, reason = "consumed by factory in the next change")]
 pub(crate) fn cuda_unavailable_error(cause: &str, missing_hint: Option<&str>) -> String {
@@ -212,10 +212,15 @@ pub(crate) fn stack_status_cause_and_hint(
     status: CudaStackStatus,
 ) -> (&'static str, Option<&'static str>) {
     match status {
-        CudaStackStatus::Ok => (
-            "the CUDA stack looked complete (driver, CUDA runtime, and cuDNN all detected) but \
-             ONNX Runtime's CUDA execution provider still failed to register",
-            None,
+        // Never actually reached: the only caller, `factory.rs`'s `cuda_stack_error`, returns
+        // `None` (no error at all) for `CudaStackStatus::Ok` before ever calling this function —
+        // an `Ok` status means the cheap ladder found nothing to complain about. Kept as an
+        // explicit match arm (rather than restructuring `CudaStackStatus` to exclude `Ok`) so
+        // this function's signature can still accept the whole enum without a second type; the
+        // `unreachable!` documents the invariant instead of silently emitting dead prose.
+        CudaStackStatus::Ok => unreachable!(
+            "stack_status_cause_and_hint is never called with CudaStackStatus::Ok — callers \
+             short-circuit before reaching here (see factory.rs's cuda_stack_error)"
         ),
         CudaStackStatus::DriverMissing => (
             "no NVIDIA driver detected (checked /proc/driver/nvidia/version, /dev/nvidiactl, and \
@@ -346,12 +351,14 @@ mod ort_backed {
 
         #[test]
         fn probe_before_init_errors_cleanly() {
-            // This test (and every other test in this crate's unit test binary) must never
-            // itself call `ort_runtime::ensure_ort_initialized` / touch `ort::init_from` — real
-            // ONNX Runtime initialization only happens in `embed/tests/ort_init_download.rs`
-            // (a separate integration-test binary). That invariant is what makes it safe to
-            // assert `probe_cuda()` fails cleanly here: `committed_flavor()` is guaranteed `None`
-            // for the lifetime of this process.
+            // Other unit tests in this crate's test binary *do* call
+            // `ort_runtime::ensure_ort_initialized` for real (e.g. `onnx::tests`'s embedder
+            // constructors), so `committed_flavor()` is not guaranteed `None` here — but every
+            // such caller in this binary only ever requests `OrtFlavor::Cpu` (never `Cuda`; the
+            // only `Cuda`-flavored real init lives in `embed/tests/ort_init_download.rs`, a
+            // separate integration-test binary/process). `probe_cuda()`'s precondition checks
+            // for `Some(OrtFlavor::Cuda)` specifically, so it still deterministically fails here
+            // regardless of what order tests in this binary happen to run in.
             let err = probe_cuda().expect_err("probe should fail before ort is initialized");
             assert!(
                 err.contains("requires the CUDA-flavored ONNX Runtime"),
