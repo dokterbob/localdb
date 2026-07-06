@@ -16,7 +16,7 @@ than a few months out.
 
 localdb is a **search/retrieval primitive, not an app** — "do one thing well," in the Unix
 sense. Its surface is deliberately narrow: index, search, cite. The CLI and MCP server expose
-three read-only tools (`search`, `list_stores`, `get_document`); there is no note editor, chat
+four read-only tools (`search`, `list_stores`, `get_document`, `get_chunks`); there is no note editor, chat
 UI, or agent-orchestration layer built into the binary. That narrowness is a design choice, not
 an omission: it keeps the retrieval API stable enough for other things to be built *on top* of
 it. A project's or agent's own Markdown knowledge base can be pointed at with
@@ -208,7 +208,7 @@ an embedding model and a vector index to maintain, which is not free.
 
 ## Where localdb is behind
 
-In the interest of the same honesty as the README's [Honest status](../README.md#honest-status)
+In the interest of the same honesty as the README's [What works today](../README.md#what-works-today)
 table:
 
 - **v0.1.0 pre-release.** Several of the projects above (Khoj, Basic Memory, AnythingLLM, Onyx)
@@ -236,7 +236,7 @@ table:
 - **Ingestion via the HTTP daemon is a documented no-op.** True real-time (file-watch-triggered)
   re-indexing is the intended shape of the daemon, but isn't live yet: `server/src/watcher.rs`
   currently only watches for config-file changes in the running daemon, and `POST /v1/jobs` is a
-  no-op (see the README's Honest status table and `core/src/ingestion.rs`, which notes the
+  no-op (see the README's What works today table and `core/src/ingestion.rs`, which notes the
   daemon "adds file watching" as a T11 follow-up). Today, keeping an index current means running
   `localdb index` again — incremental, but not automatic.
 

@@ -54,6 +54,19 @@ decision.
 
 ---
 
+## MCP over HTTP
+
+Alongside `/v1`, the daemon also mounts `/mcp` — the same four read-only MCP tools
+(`search`, `get_document`, `get_chunks`, `list_stores`) served over the
+[MCP Streamable HTTP transport](https://modelcontextprotocol.io/), for connecting a
+remote MCP client (e.g. Claude Code on another machine, over Tailscale/LAN). It
+inherits this daemon's bind-address trust decision automatically — see
+[docs/mcp.md](mcp.md#remote-http-connecting-from-another-machine) for setup and
+[specs/05-surfaces.md](../specs/05-surfaces.md) §4.2 for the transport/error-model
+details.
+
+---
+
 ## Endpoint reference
 
 All endpoints are under the `/v1` prefix. Request and response bodies are JSON; set
