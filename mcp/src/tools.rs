@@ -1,13 +1,18 @@
-//! MCP tool implementations: search, get_document, list_stores.
+//! MCP tool implementations: search, get_document, get_chunks, list_stores.
 //!
-//! Each tool validates its arguments against the declared schema, calls into
-//! `core` search/store APIs, and returns structured `CallToolResult` values.
+//! Each tool receives its arguments as an already-typed struct from
+//! `args.rs` (rmcp's `Parameters<T>` extractor deserializes `tools/call`
+//! JSON into these before a tool method ever runs — see `handler.rs`), does
+//! its own semantic/business validation, calls into `core` search/store
+//! APIs, and returns a structured `rmcp::model::CallToolResult`.
 //!
 //! See specs/05-surfaces.md §4 and specs/02-domain-model.md §6.
 
 use std::sync::Arc;
 
 use serde_json::Value;
+
+use rmcp::model::{CallToolResult, Content};
 
 use localdb_core::{
     citation::Citation,
@@ -16,7 +21,7 @@ use localdb_core::{
     Embedder,
 };
 
-use crate::protocol::CallToolResult;
+use crate::args::{GetChunksArgs, GetDocumentArgs, SearchArgs};
 
 // ---------------------------------------------------------------------------
 // Typed error helper
@@ -33,12 +38,17 @@ fn typed_error(code: &str, message: impl Into<String>) -> CallToolResult {
             "message": message.into(),
         }
     });
-    CallToolResult {
-        content: vec![crate::protocol::ContentItem::Text {
-            text: serde_json::to_string_pretty(&v).unwrap_or_default(),
-        }],
-        is_error: true,
-    }
+    CallToolResult::error(vec![Content::text(
+        serde_json::to_string_pretty(&v).unwrap_or_default(),
+    )])
+}
+
+/// Build a successful `CallToolResult` carrying pretty-printed JSON as its
+/// single text content item.
+fn success_json(value: &Value) -> CallToolResult {
+    CallToolResult::success(vec![Content::text(
+        serde_json::to_string_pretty(value).unwrap_or_default(),
+    )])
 }
 
 // ---------------------------------------------------------------------------
@@ -59,7 +69,10 @@ pub struct StoreDescriptor {
 /// A named store available in this MCP session.
 ///
 /// The store is held behind an `Arc` so it can be cheaply shared
-/// with `StoreHandle` without lifetime constraints.
+/// with `StoreHandle` without lifetime constraints, and so `AvailableStore`
+/// itself is cheap to clone (needed for Phase 2's per-HTTP-session handler
+/// construction).
+#[derive(Clone)]
 pub struct AvailableStore {
     pub descriptor: StoreDescriptor,
     pub store: Arc<dyn RetrievalStore>,
@@ -115,76 +128,41 @@ pub async fn tool_list_stores(stores: &[AvailableStore]) -> CallToolResult {
     }
 
     let v = serde_json::json!({ "stores": result });
-    CallToolResult::success_json(&v)
+    success_json(&v)
 }
 
 // ---------------------------------------------------------------------------
 // Tool: search
 // ---------------------------------------------------------------------------
 
-/// Arguments for the `search` tool.
-#[derive(Debug)]
-pub struct SearchArgs {
-    /// The natural language query.
-    pub query: String,
-    /// Optional: restrict to these store names.
-    pub store_names: Vec<String>,
-    /// Maximum results to return.
-    pub limit: usize,
-    /// Max characters of snippet text per result in the text rendering.
-    pub content_length: usize,
+const SEARCH_DEFAULT_LIMIT: usize = 10;
+const SEARCH_MAX_LIMIT: usize = 100;
+const SEARCH_DEFAULT_CONTENT_LENGTH: usize = 400;
+
+/// Resolve `SearchArgs::limit` to a `usize`, preserving the pre-rmcp
+/// behavior: absent -> default; a valid non-negative integer -> clamped to
+/// `SEARCH_MAX_LIMIT`; a negative integer -> silently falls back to the
+/// default (mirroring the old raw-JSON `Value::as_u64()` parse, which
+/// simply failed to match on negative numbers and fell through to
+/// `unwrap_or(DEFAULT_LIMIT)`). An explicit `0` passes through unchanged so
+/// the tool-level guard in `tool_search` can reject it.
+fn resolve_search_limit(limit: Option<i64>) -> usize {
+    match limit {
+        None => SEARCH_DEFAULT_LIMIT,
+        Some(n) => usize::try_from(n)
+            .map(|v| v.min(SEARCH_MAX_LIMIT))
+            .unwrap_or(SEARCH_DEFAULT_LIMIT),
+    }
 }
 
-impl SearchArgs {
-    const DEFAULT_LIMIT: usize = 10;
-    const MAX_LIMIT: usize = 100;
-    const DEFAULT_CONTENT_LENGTH: usize = 400;
-
-    /// Parse from raw JSON params (the outer `params` object from JSON-RPC,
-    /// which contains `name` and `arguments` fields for `tools/call`).
-    pub fn from_value(params: Option<&Value>) -> Result<Self, String> {
-        let args = params
-            .and_then(|p| p.get("arguments"))
-            .unwrap_or(&Value::Null);
-
-        let query = args
-            .get("query")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing required argument: query".to_string())?
-            .to_string();
-
-        if query.trim().is_empty() {
-            return Err("query must not be empty".to_string());
-        }
-
-        let store_names = args
-            .get("stores")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let limit = args
-            .get("limit")
-            .and_then(|v| v.as_u64())
-            .map(|n| (n as usize).min(Self::MAX_LIMIT))
-            .unwrap_or(Self::DEFAULT_LIMIT);
-
-        let content_length = args
-            .get("content_length")
-            .and_then(|v| v.as_u64())
-            .map(|n| n as usize)
-            .unwrap_or(Self::DEFAULT_CONTENT_LENGTH);
-
-        Ok(SearchArgs {
-            query,
-            store_names,
-            limit,
-            content_length,
-        })
+/// Resolve `SearchArgs::content_length` to a `usize`, mirroring the same
+/// absent-vs-negative-vs-valid handling as `resolve_search_limit` (no
+/// separate max clamp — this is a soft snippet-length cap, not respected as
+/// a hard runtime bound beyond `usize`).
+fn resolve_content_length(content_length: Option<i64>) -> usize {
+    match content_length {
+        None => SEARCH_DEFAULT_CONTENT_LENGTH,
+        Some(n) => usize::try_from(n).unwrap_or(SEARCH_DEFAULT_CONTENT_LENGTH),
     }
 }
 
@@ -193,43 +171,42 @@ impl SearchArgs {
 /// Returns a list of citations in the canonical JSON shape
 /// (specs/02-domain-model.md §6).
 ///
-/// If `store_names` is non-empty, only those stores are queried.
+/// If `stores` is non-empty, only those store names are queried.
 /// Unknown store name → returns a tool error with code `store_not_found`.
 fn select_mcp_stores(
     stores: &[AvailableStore],
-    args: &SearchArgs,
+    store_names: &[String],
 ) -> Result<Vec<StoreHandle>, CallToolResult> {
-    let selected_arcs: Vec<(String, String, Arc<dyn RetrievalStore>)> =
-        if args.store_names.is_empty() {
-            stores
-                .iter()
-                .map(|s| {
-                    (
-                        s.descriptor.id.clone(),
-                        s.descriptor.name.clone(),
-                        Arc::clone(&s.store),
-                    )
-                })
-                .collect()
-        } else {
-            let mut selected = Vec::new();
-            for name in &args.store_names {
-                match stores.iter().find(|s| &s.descriptor.name == name) {
-                    Some(s) => selected.push((
-                        s.descriptor.id.clone(),
-                        s.descriptor.name.clone(),
-                        Arc::clone(&s.store),
-                    )),
-                    None => {
-                        return Err(typed_error(
-                            "store_not_found",
-                            format!("no store named '{name}'"),
-                        ));
-                    }
+    let selected_arcs: Vec<(String, String, Arc<dyn RetrievalStore>)> = if store_names.is_empty() {
+        stores
+            .iter()
+            .map(|s| {
+                (
+                    s.descriptor.id.clone(),
+                    s.descriptor.name.clone(),
+                    Arc::clone(&s.store),
+                )
+            })
+            .collect()
+    } else {
+        let mut selected = Vec::new();
+        for name in store_names {
+            match stores.iter().find(|s| &s.descriptor.name == name) {
+                Some(s) => selected.push((
+                    s.descriptor.id.clone(),
+                    s.descriptor.name.clone(),
+                    Arc::clone(&s.store),
+                )),
+                None => {
+                    return Err(typed_error(
+                        "store_not_found",
+                        format!("no store named '{name}'"),
+                    ));
                 }
             }
-            selected
-        };
+        }
+        selected
+    };
 
     Ok(selected_arcs
         .into_iter()
@@ -257,42 +234,44 @@ fn search_to_tool_result(response: QueryResponse, content_length: usize) -> Call
     let json_str = serde_json::to_string_pretty(&v).unwrap_or_default();
     let full_text = format!("{json_str}\n\n---\n{text_rendering}");
 
-    CallToolResult {
-        content: vec![crate::protocol::ContentItem::Text { text: full_text }],
-        is_error: false,
-    }
+    CallToolResult::success(vec![Content::text(full_text)])
 }
 
 pub async fn tool_search(
     stores: &[AvailableStore],
     embedder: &dyn Embedder,
-    params: Option<&Value>,
+    args: SearchArgs,
 ) -> CallToolResult {
-    let args = match SearchArgs::from_value(params) {
-        Ok(a) => a,
-        Err(msg) => return typed_error("invalid_request", format!("invalid arguments: {msg}")),
-    };
-    if args.limit == 0 {
+    if args.query.trim().is_empty() {
+        return typed_error(
+            "invalid_request",
+            "invalid arguments: query must not be empty",
+        );
+    }
+    let limit = resolve_search_limit(args.limit);
+    let content_length = resolve_content_length(args.content_length);
+    if limit == 0 {
         return typed_error("invalid_request", "limit must be at least 1");
     }
-    let store_handles = match select_mcp_stores(stores, &args) {
+    let store_names = args.stores.unwrap_or_default();
+    let store_handles = match select_mcp_stores(stores, &store_names) {
         Ok(handles) => handles,
         Err(result) => return result,
     };
     if store_handles.is_empty() {
-        return CallToolResult::success_json(&serde_json::json!({ "citations": [] }));
+        return success_json(&serde_json::json!({ "citations": [] }));
     }
     let request = QueryRequest {
         query: args.query.clone(),
         leg_k: None,
-        top_n: Some(args.limit),
+        top_n: Some(limit),
         filters: vec![],
     };
     let response = match SearchOrchestrator::query(&store_handles, embedder, &request).await {
         Ok(r) => r,
         Err(e) => return typed_error(e.code(), format!("search failed: {e}")),
     };
-    search_to_tool_result(response, args.content_length)
+    search_to_tool_result(response, content_length)
 }
 
 /// Render citations as human-readable text for non-structured clients.
@@ -358,54 +337,34 @@ pub fn render_citations_text(citations: &[Citation], max_chars: usize) -> String
 /// Returns `document_not_found` error if no matching chunks are found.
 ///
 /// Note: URI-based lookup is not supported in v1 (the `RetrievalStore` trait
-/// provides `get_chunks_for_document` by ID only).  Callers must use a
-/// document ID obtained from a prior `search` call.
-pub async fn tool_get_document(
-    stores: &[AvailableStore],
-    params: Option<&Value>,
-) -> CallToolResult {
-    let args = match GetDocumentArgs::from_value(params) {
-        Ok(args) => args,
-        Err(result) => return result,
-    };
+/// provides `get_chunks_for_document` by ID only). Callers must use a
+/// document ID obtained from a prior `search` call. `id` is a required
+/// field on `GetDocumentArgs`, so a caller omitting it entirely never
+/// reaches this function — rmcp's `Parameters<T>` extractor fails first,
+/// which is still a tool-level error (see `mcp/src/lib.rs`'s two-tier error
+/// model doc), just with a generic rmcp-authored message. An explicit empty
+/// string still reaches here and is rejected below (with a more specific
+/// message when `uri` was given instead, preserving v1's guidance).
+pub async fn tool_get_document(stores: &[AvailableStore], args: GetDocumentArgs) -> CallToolResult {
+    if args.id.trim().is_empty() {
+        if args.uri.is_some() {
+            return typed_error(
+                "invalid_request",
+                "uri-based get_document is not supported in v1; use the document 'id' from a search result",
+            );
+        }
+        return typed_error(
+            "invalid_request",
+            "invalid arguments: 'id' must not be empty",
+        );
+    }
     match find_document_chunks(stores, &args.id).await {
-        Ok(Some((store, chunks))) => CallToolResult::success_json(&document_json(store, &chunks)),
+        Ok(Some((store, chunks))) => success_json(&document_json(store, &chunks)),
         Ok(None) => typed_error(
             "document_not_found",
             format!("no document with id '{}' found in any store", args.id),
         ),
         Err(result) => result,
-    }
-}
-
-#[derive(Debug, Clone)]
-struct GetDocumentArgs {
-    id: String,
-}
-
-impl GetDocumentArgs {
-    fn from_value(params: Option<&Value>) -> Result<Self, CallToolResult> {
-        let args = params
-            .and_then(|p| p.get("arguments"))
-            .unwrap_or(&Value::Null);
-        // Accept "id" (document_id) preferred; "uri" is acknowledged but not supported in v1.
-        let doc_id = args.get("id").and_then(|v| v.as_str());
-        let uri_arg = args.get("uri").and_then(|v| v.as_str());
-        match (doc_id, uri_arg) {
-            (None, None) => Err(typed_error(
-                "invalid_request",
-                "invalid arguments: must provide 'id' (document_id) or 'uri'",
-            )),
-            (None, Some(_uri)) => Err(typed_error(
-                "invalid_request",
-                "uri-based get_document is not supported in v1; use the document 'id' from a search result",
-            )),
-            (Some(id), _) if id.trim().is_empty() => Err(typed_error(
-                "invalid_request",
-                "invalid arguments: 'id' must not be empty",
-            )),
-            (Some(id), _) => Ok(Self { id: id.to_string() }),
-        }
     }
 }
 
@@ -467,86 +426,47 @@ fn document_json(store: &AvailableStore, chunks: &[localdb_core::ChunkRecord]) -
 // Tool: get_chunks
 // ---------------------------------------------------------------------------
 
-/// Arguments for the `get_chunks` tool.
-#[derive(Debug, Clone)]
-struct GetChunksArgs {
-    document_id: String,
-    offset: usize,
-    limit: usize,
-}
+const GET_CHUNKS_DEFAULT_LIMIT: usize = 50;
+const GET_CHUNKS_MAX_LIMIT: usize = 200;
 
-impl GetChunksArgs {
-    const DEFAULT_LIMIT: usize = 50;
-    const MAX_LIMIT: usize = 200;
+/// Resolve `GetChunksArgs::offset`/`limit` to validated `usize`s.
+///
+/// Distinguishes absent (→ default) from present-but-invalid (→ error),
+/// same as the pre-rmcp raw-JSON parsing: an explicit negative offset/limit,
+/// or an explicit `limit: 0`, is a tool-level `invalid_request` error rather
+/// than a silent default or clamp (clamping `0` up to `1` would silently
+/// return a chunk the caller did not ask for). A valid `limit` is capped at
+/// `GET_CHUNKS_MAX_LIMIT`.
+fn resolve_get_chunks_pagination(args: &GetChunksArgs) -> Result<(usize, usize), CallToolResult> {
+    let offset = match args.offset {
+        None => 0,
+        Some(n) => usize::try_from(n).map_err(|_| {
+            typed_error(
+                "invalid_request",
+                "invalid arguments: 'offset' must be a non-negative integer",
+            )
+        })?,
+    };
 
-    fn from_value(params: Option<&Value>) -> Result<Self, CallToolResult> {
-        let args = params
-            .and_then(|p| p.get("arguments"))
-            .unwrap_or(&Value::Null);
-
-        let document_id = args.get("document_id").and_then(|v| v.as_str());
-        let document_id = match document_id {
-            None => {
-                return Err(typed_error(
+    let limit = match args.limit {
+        None => GET_CHUNKS_DEFAULT_LIMIT,
+        Some(0) => {
+            return Err(typed_error(
+                "invalid_request",
+                "invalid arguments: 'limit' must be at least 1",
+            ));
+        }
+        Some(n) => usize::try_from(n)
+            .map(|v| v.min(GET_CHUNKS_MAX_LIMIT))
+            .map_err(|_| {
+                typed_error(
                     "invalid_request",
-                    "invalid arguments: missing required argument 'document_id'",
-                ));
-            }
-            Some(id) if id.trim().is_empty() => {
-                return Err(typed_error(
-                    "invalid_request",
-                    "invalid arguments: 'document_id' must not be empty",
-                ));
-            }
-            Some(id) => id.to_string(),
-        };
+                    "invalid arguments: 'limit' must be a positive integer",
+                )
+            })?,
+    };
 
-        // Distinguish absent (→ default) from present-but-invalid (→ error).
-        // The schema declares both as non-negative integers; a negative, float,
-        // or non-numeric value fails `as_u64()` and must be rejected rather than
-        // silently defaulting.
-        let offset = match args.get("offset") {
-            None | Some(Value::Null) => 0,
-            Some(v) => match v.as_u64() {
-                Some(n) => n as usize,
-                None => {
-                    return Err(typed_error(
-                        "invalid_request",
-                        "invalid arguments: 'offset' must be a non-negative integer",
-                    ));
-                }
-            },
-        };
-
-        // Absent/null → default. A present but invalid value (negative, float,
-        // non-numeric) or an explicit `0` is rejected: the schema requires
-        // `limit >= 1`, so clamping `0` up to `1` would silently return a chunk
-        // the caller did not ask for. A valid `limit` is capped at `MAX_LIMIT`.
-        let limit = match args.get("limit") {
-            None | Some(Value::Null) => Self::DEFAULT_LIMIT,
-            Some(v) => match v.as_u64() {
-                Some(0) => {
-                    return Err(typed_error(
-                        "invalid_request",
-                        "invalid arguments: 'limit' must be at least 1",
-                    ));
-                }
-                Some(n) => (n as usize).min(Self::MAX_LIMIT),
-                None => {
-                    return Err(typed_error(
-                        "invalid_request",
-                        "invalid arguments: 'limit' must be a positive integer",
-                    ));
-                }
-            },
-        };
-
-        Ok(Self {
-            document_id,
-            offset,
-            limit,
-        })
-    }
+    Ok((offset, limit))
 }
 
 /// Execute the `get_chunks` tool.
@@ -575,9 +495,15 @@ impl GetChunksArgs {
 /// An out-of-range `offset` yields an empty `chunks` array, not an error.
 ///
 /// Note: URI-based lookup is not supported in v1, matching `get_document`.
-pub async fn tool_get_chunks(stores: &[AvailableStore], params: Option<&Value>) -> CallToolResult {
-    let args = match GetChunksArgs::from_value(params) {
-        Ok(args) => args,
+pub async fn tool_get_chunks(stores: &[AvailableStore], args: GetChunksArgs) -> CallToolResult {
+    if args.document_id.trim().is_empty() {
+        return typed_error(
+            "invalid_request",
+            "invalid arguments: 'document_id' must not be empty",
+        );
+    }
+    let (offset, limit) = match resolve_get_chunks_pagination(&args) {
+        Ok(v) => v,
         Err(result) => return result,
     };
     match find_document_chunks(stores, &args.document_id).await {
@@ -591,7 +517,7 @@ pub async fn tool_get_chunks(stores: &[AvailableStore], params: Option<&Value>) 
                     &b.id,
                 ))
             });
-            CallToolResult::success_json(&chunks_json(store, &chunks, args.offset, args.limit))
+            success_json(&chunks_json(store, &chunks, offset, limit))
         }
         Ok(None) => typed_error(
             "document_not_found",
@@ -664,6 +590,10 @@ mod get_document_tests {
     use localdb_core::store::{FakeStore, RetrievalStore};
     use localdb_core::{ChunkRecord, Span};
 
+    fn text_of(result: &CallToolResult) -> String {
+        result.content[0].as_text().unwrap().text.clone()
+    }
+
     #[tokio::test]
     async fn tool_get_document_returns_identical_json_for_fixed_document() {
         let store_id = new_ulid();
@@ -725,15 +655,16 @@ mod get_document_tests {
             },
             Arc::new(store),
         )];
-        let params = serde_json::json!({"arguments": {"id": doc_id}});
+        let args = GetDocumentArgs {
+            id: doc_id.clone(),
+            uri: None,
+        };
 
-        let result = tool_get_document(&stores, Some(&params)).await;
-        assert!(!result.is_error);
+        let result = tool_get_document(&stores, args).await;
+        assert_ne!(result.is_error, Some(true));
         assert_eq!(result.content.len(), 1);
 
-        let rendered_text = match &result.content[0] {
-            crate::protocol::ContentItem::Text { text } => text,
-        };
+        let rendered_text = text_of(&result);
 
         let expected = serde_json::json!({
             "document_id": doc_id,
@@ -753,7 +684,7 @@ mod get_document_tests {
         });
         let expected = serde_json::to_string_pretty(&expected).unwrap();
 
-        assert_eq!(rendered_text, &expected);
+        assert_eq!(rendered_text, expected);
     }
 }
 
@@ -802,8 +733,25 @@ mod tests {
         }
     }
 
-    fn build_params(json: serde_json::Value) -> serde_json::Value {
-        serde_json::json!({ "arguments": json })
+    fn text_of(result: &CallToolResult) -> String {
+        result.content[0].as_text().unwrap().text.clone()
+    }
+
+    fn search_args(query: &str) -> SearchArgs {
+        SearchArgs {
+            query: query.to_string(),
+            stores: None,
+            limit: None,
+            content_length: None,
+        }
+    }
+
+    fn get_chunks_args(document_id: &str) -> GetChunksArgs {
+        GetChunksArgs {
+            document_id: document_id.to_string(),
+            offset: None,
+            limit: None,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -815,21 +763,15 @@ mod tests {
         let store = FakeStore::new();
         let av = AvailableStore::new(make_descriptor("store-1", "mystore"), Box::new(store));
         let embedder = FakeEmbedder::new(128);
-        // Pass limit: 0 explicitly.  SearchArgs::from_value clamps by MAX but we bypass
-        // that by injecting limit=0 directly via a custom from_value call.
-        // To test the tool-level guard we must call from_value with limit=0.
-        // The JSON schema declares minimum:1, but we test the runtime guard here.
-        let params = serde_json::json!({
-            "arguments": {
-                "query": "hello",
-                "limit": 0
-            }
-        });
-        let result = tool_search(&[av], &embedder, Some(&params)).await;
-        assert!(result.is_error, "limit=0 should produce an error result");
-        let text = match result.content.first().unwrap() {
-            crate::protocol::ContentItem::Text { text } => text.clone(),
-        };
+        let mut args = search_args("hello");
+        args.limit = Some(0);
+        let result = tool_search(&[av], &embedder, args).await;
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "limit=0 should produce an error result"
+        );
+        let text = text_of(&result);
         let parsed: serde_json::Value = serde_json::from_str(&text).expect("error body is JSON");
         assert_eq!(
             parsed["error"]["code"].as_str().unwrap(),
@@ -845,21 +787,18 @@ mod tests {
         );
     }
 
-    // Confirm that limit=0 coming through SearchArgs::from_value is caught.
-    // SearchArgs clamps to MAX_LIMIT so we test from_value independently too.
     #[test]
-    fn search_args_limit_zero_passes_through() {
-        // from_value does not reject limit=0 itself (that's the tool's job).
-        // Verify it produces limit=0 so the tool guard can fire.
-        let params = serde_json::json!({
-            "arguments": {
-                "query": "test",
-                "limit": 0
-            }
-        });
-        let args = SearchArgs::from_value(Some(&params)).expect("from_value should succeed");
-        // 0_usize.min(MAX_LIMIT) == 0, so limit should be 0
-        assert_eq!(args.limit, 0, "limit=0 should survive from_value unchanged");
+    fn resolve_search_limit_zero_passes_through() {
+        // resolve_search_limit does not reject limit=0 itself (that's the
+        // tool's job) — 0 must survive unchanged so the tool-level guard fires.
+        assert_eq!(resolve_search_limit(Some(0)), 0);
+    }
+
+    #[test]
+    fn resolve_search_limit_negative_falls_back_to_default() {
+        // Mirrors the old raw-JSON `Value::as_u64()` parse, which failed on
+        // negative numbers and silently defaulted.
+        assert_eq!(resolve_search_limit(Some(-5)), SEARCH_DEFAULT_LIMIT);
     }
 
     // -----------------------------------------------------------------------
@@ -878,17 +817,19 @@ mod tests {
         // The AvailableStore has descriptor id "store-A" — the chunk's store_id doesn't match.
         let av = AvailableStore::new(make_descriptor("store-A", "store-a"), Box::new(fake));
 
-        let params = build_params(serde_json::json!({ "id": "doc-mismatched" }));
-        let result = tool_get_document(&[av], Some(&params)).await;
+        let args = GetDocumentArgs {
+            id: "doc-mismatched".to_string(),
+            uri: None,
+        };
+        let result = tool_get_document(&[av], args).await;
 
         // The tool should hide the document (not leak existence) and return not-found.
-        assert!(
+        assert_eq!(
             result.is_error,
+            Some(true),
             "mismatched store_id should cause document_not_found"
         );
-        let text = match result.content.first().unwrap() {
-            crate::protocol::ContentItem::Text { text } => text.clone(),
-        };
+        let text = text_of(&result);
         let parsed: serde_json::Value = serde_json::from_str(&text).expect("error body is JSON");
         assert_eq!(
             parsed["error"]["code"].as_str().unwrap(),
@@ -904,13 +845,18 @@ mod tests {
 
         let av = AvailableStore::new(make_descriptor("store-A", "store-a"), Box::new(fake));
 
-        let params = build_params(serde_json::json!({ "id": "doc-1" }));
-        let result = tool_get_document(&[av], Some(&params)).await;
-
-        assert!(!result.is_error, "matching store_id should succeed");
-        let text = match result.content.first().unwrap() {
-            crate::protocol::ContentItem::Text { text } => text.clone(),
+        let args = GetDocumentArgs {
+            id: "doc-1".to_string(),
+            uri: None,
         };
+        let result = tool_get_document(&[av], args).await;
+
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "matching store_id should succeed"
+        );
+        let text = text_of(&result);
         let parsed: serde_json::Value = serde_json::from_str(&text).expect("success body is JSON");
         assert_eq!(parsed["document_id"].as_str().unwrap(), "doc-1");
         assert!(
@@ -933,13 +879,14 @@ mod tests {
 
         let av = AvailableStore::new(make_descriptor("store-A", "store-a"), Box::new(fake));
 
-        let params = build_params(serde_json::json!({ "id": "doc-meta" }));
-        let result = tool_get_document(&[av], Some(&params)).await;
-
-        assert!(!result.is_error);
-        let text = match result.content.first().unwrap() {
-            crate::protocol::ContentItem::Text { text } => text.clone(),
+        let args = GetDocumentArgs {
+            id: "doc-meta".to_string(),
+            uri: None,
         };
+        let result = tool_get_document(&[av], args).await;
+
+        assert_ne!(result.is_error, Some(true));
+        let text = text_of(&result);
         let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
         let meta = &parsed["metadata"];
         assert_eq!(meta["title"].as_str().unwrap(), "Rich Doc");
@@ -957,10 +904,8 @@ mod tests {
     #[test]
     fn typed_error_helper_produces_correct_shape() {
         let result = typed_error("store_not_found", "no store named 'foo'");
-        assert!(result.is_error);
-        let text = match result.content.first().unwrap() {
-            crate::protocol::ContentItem::Text { text } => text.clone(),
-        };
+        assert_eq!(result.is_error, Some(true));
+        let text = text_of(&result);
         let parsed: serde_json::Value = serde_json::from_str(&text).expect("must be JSON");
         assert_eq!(parsed["error"]["code"].as_str().unwrap(), "store_not_found");
         assert!(parsed["error"]["message"]
@@ -976,28 +921,57 @@ mod tests {
         let av = AvailableStore::new(make_descriptor("store-1", "s1"), Box::new(fake));
         let embedder = FakeEmbedder::new(128);
 
-        let params = serde_json::json!({
-            "arguments": { "query": "totally absent term xyzzy" }
-        });
-        let result = tool_search(&[av], &embedder, Some(&params)).await;
+        let args = search_args("totally absent term xyzzy");
+        let result = tool_search(&[av], &embedder, args).await;
         // Should NOT be an error — just empty citations.
-        assert!(!result.is_error, "empty results should not be an error");
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "empty results should not be an error"
+        );
     }
 
     #[tokio::test]
-    async fn get_document_missing_id_returns_typed_error() {
+    async fn get_document_empty_id_returns_typed_error() {
         let fake = FakeStore::new();
         let av = AvailableStore::new(make_descriptor("store-1", "s1"), Box::new(fake));
 
-        // No 'id' or 'uri' argument.
-        let params = build_params(serde_json::json!({}));
-        let result = tool_get_document(&[av], Some(&params)).await;
-        assert!(result.is_error);
-        let text = match result.content.first().unwrap() {
-            crate::protocol::ContentItem::Text { text } => text.clone(),
+        // Empty 'id', no 'uri' either. `id` is `#[serde(default)]` (see
+        // args.rs), not schema-required, so an omitted `id` reaches this
+        // same tool-level "must not be empty" path rather than failing at
+        // deserialization — this exercises that path directly.
+        let args = GetDocumentArgs {
+            id: String::new(),
+            uri: None,
         };
+        let result = tool_get_document(&[av], args).await;
+        assert_eq!(result.is_error, Some(true));
+        let text = text_of(&result);
         let parsed: serde_json::Value = serde_json::from_str(&text).expect("must be JSON");
         assert_eq!(parsed["error"]["code"].as_str().unwrap(), "invalid_request");
+    }
+
+    #[tokio::test]
+    async fn get_document_empty_id_with_uri_mentions_search_result() {
+        let fake = FakeStore::new();
+        let av = AvailableStore::new(make_descriptor("store-1", "s1"), Box::new(fake));
+
+        let args = GetDocumentArgs {
+            id: String::new(),
+            uri: Some("file:///docs/guide.md".to_string()),
+        };
+        let result = tool_get_document(&[av], args).await;
+        assert_eq!(result.is_error, Some(true));
+        let text = text_of(&result);
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("must be JSON");
+        assert_eq!(parsed["error"]["code"].as_str().unwrap(), "invalid_request");
+        assert!(
+            parsed["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not supported in v1"),
+            "message should point the caller at 'id' from a search result"
+        );
     }
 
     #[tokio::test]
@@ -1006,17 +980,11 @@ mod tests {
         let av = AvailableStore::new(make_descriptor("store-1", "real-store"), Box::new(fake));
         let embedder = FakeEmbedder::new(128);
 
-        let params = serde_json::json!({
-            "arguments": {
-                "query": "hello",
-                "stores": ["nonexistent-store"]
-            }
-        });
-        let result = tool_search(&[av], &embedder, Some(&params)).await;
-        assert!(result.is_error);
-        let text = match result.content.first().unwrap() {
-            crate::protocol::ContentItem::Text { text } => text.clone(),
-        };
+        let mut args = search_args("hello");
+        args.stores = Some(vec!["nonexistent-store".to_string()]);
+        let result = tool_search(&[av], &embedder, args).await;
+        assert_eq!(result.is_error, Some(true));
+        let text = text_of(&result);
         let parsed: serde_json::Value = serde_json::from_str(&text).expect("must be JSON");
         assert_eq!(parsed["error"]["code"].as_str().unwrap(), "store_not_found");
     }
@@ -1148,39 +1116,28 @@ mod tests {
 
     #[test]
     fn search_args_default_content_length() {
-        let params = serde_json::json!({
-            "name": "search",
-            "arguments": { "query": "hello" }
-        });
-        let args = SearchArgs::from_value(Some(&params)).unwrap();
         assert_eq!(
-            args.content_length, 400,
+            resolve_content_length(None),
+            400,
             "default content_length should be 400"
         );
     }
 
     #[test]
     fn search_args_custom_content_length() {
-        let params = serde_json::json!({
-            "name": "search",
-            "arguments": { "query": "hello", "content_length": 50 }
-        });
-        let args = SearchArgs::from_value(Some(&params)).unwrap();
-        assert_eq!(args.content_length, 50);
+        assert_eq!(resolve_content_length(Some(50)), 50);
     }
 
     // -----------------------------------------------------------------------
-    // GetChunksArgs
+    // GetChunksArgs pagination resolution
     // -----------------------------------------------------------------------
 
     #[test]
     fn get_chunks_args_limit_clamped_to_max() {
-        let params = build_params(serde_json::json!({
-            "document_id": "doc-1",
-            "limit": 9999
-        }));
-        let args = GetChunksArgs::from_value(Some(&params)).expect("should parse");
-        assert_eq!(args.limit, 200, "limit should be clamped to MAX_LIMIT=200");
+        let mut args = get_chunks_args("doc-1");
+        args.limit = Some(9999);
+        let (_, limit) = resolve_get_chunks_pagination(&args).expect("should parse");
+        assert_eq!(limit, 200, "limit should be clamped to MAX_LIMIT=200");
     }
 
     #[test]
@@ -1188,46 +1145,36 @@ mod tests {
         // The schema requires limit >= 1; an explicit 0 must be rejected rather
         // than clamped up to 1 (which would return a chunk the caller did not
         // ask for).
-        let params = build_params(serde_json::json!({ "document_id": "doc-1", "limit": 0 }));
-        assert_invalid_request(GetChunksArgs::from_value(Some(&params)));
+        let mut args = get_chunks_args("doc-1");
+        args.limit = Some(0);
+        assert_invalid_request(resolve_get_chunks_pagination(&args));
     }
 
     #[test]
     fn get_chunks_args_defaults() {
-        let params = build_params(serde_json::json!({ "document_id": "doc-1" }));
-        let args = GetChunksArgs::from_value(Some(&params)).expect("should parse");
-        assert_eq!(args.offset, 0, "default offset should be 0");
-        assert_eq!(args.limit, 50, "default limit should be 50");
+        let args = get_chunks_args("doc-1");
+        let (offset, limit) = resolve_get_chunks_pagination(&args).expect("should parse");
+        assert_eq!(offset, 0, "default offset should be 0");
+        assert_eq!(limit, 50, "default limit should be 50");
     }
 
-    #[test]
-    fn get_chunks_args_missing_document_id_is_invalid_request() {
-        let params = build_params(serde_json::json!({}));
-        let result = GetChunksArgs::from_value(Some(&params));
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.is_error);
-        let text = match &err.content[0] {
-            crate::protocol::ContentItem::Text { text } => text.clone(),
-        };
+    #[tokio::test]
+    async fn get_chunks_empty_document_id_is_invalid_request() {
+        let fake = FakeStore::new();
+        let av = AvailableStore::new(make_descriptor("store-1", "s1"), Box::new(fake));
+        let args = get_chunks_args("   ");
+        let result = tool_get_chunks(&[av], args).await;
+        assert_eq!(result.is_error, Some(true));
+        let text = text_of(&result);
         let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(parsed["error"]["code"].as_str().unwrap(), "invalid_request");
     }
 
-    #[test]
-    fn get_chunks_args_empty_document_id_is_invalid_request() {
-        let params = build_params(serde_json::json!({ "document_id": "   " }));
-        let result = GetChunksArgs::from_value(Some(&params));
-        assert!(result.is_err());
-    }
-
-    /// Assert a `GetChunksArgs::from_value` failure carries the `invalid_request` code.
-    fn assert_invalid_request(result: Result<GetChunksArgs, CallToolResult>) {
+    /// Assert a `resolve_get_chunks_pagination` failure carries the `invalid_request` code.
+    fn assert_invalid_request(result: Result<(usize, usize), CallToolResult>) {
         let err = result.expect_err("expected an error result");
-        assert!(err.is_error);
-        let text = match &err.content[0] {
-            crate::protocol::ContentItem::Text { text } => text.clone(),
-        };
+        assert_eq!(err.is_error, Some(true));
+        let text = err.content[0].as_text().unwrap().text.clone();
         let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(parsed["error"]["code"].as_str().unwrap(), "invalid_request");
     }
@@ -1235,21 +1182,22 @@ mod tests {
     #[test]
     fn get_chunks_args_negative_offset_is_invalid_request() {
         // A present-but-negative offset must be rejected, not silently defaulted to 0.
-        let params = build_params(serde_json::json!({ "document_id": "doc-1", "offset": -1 }));
-        assert_invalid_request(GetChunksArgs::from_value(Some(&params)));
-    }
-
-    #[test]
-    fn get_chunks_args_non_integer_offset_is_invalid_request() {
-        // A present-but-non-integer offset (float / string) must be rejected.
-        let params = build_params(serde_json::json!({ "document_id": "doc-1", "offset": 1.5 }));
-        assert_invalid_request(GetChunksArgs::from_value(Some(&params)));
+        let mut args = get_chunks_args("doc-1");
+        args.offset = Some(-1);
+        assert_invalid_request(resolve_get_chunks_pagination(&args));
     }
 
     #[test]
     fn get_chunks_args_negative_limit_is_invalid_request() {
         // A present-but-negative limit must be rejected, not silently defaulted.
-        let params = build_params(serde_json::json!({ "document_id": "doc-1", "limit": -5 }));
-        assert_invalid_request(GetChunksArgs::from_value(Some(&params)));
+        let mut args = get_chunks_args("doc-1");
+        args.limit = Some(-5);
+        assert_invalid_request(resolve_get_chunks_pagination(&args));
+    }
+
+    #[test]
+    fn render_citations_empty() {
+        let text = render_citations_text(&[], 400);
+        assert_eq!(text, "No results found.");
     }
 }

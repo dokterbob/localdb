@@ -72,6 +72,10 @@ indicatif = "0.17"
 # Test utilities
 tempfile = "3"
 
+# MCP (Model Context Protocol) SDK
+rmcp = "1.8"
+schemars = "1.0"
+
 # Internal crates
 localdb-core = { path = "core" }
 extract = { path = "extract" }

@@ -128,6 +128,55 @@ before truncating, which removes `\n\n` paragraph breaks, so only sentence/word 
 applies on that path. `context_sentences` (an alternative sentence-count-based unit) is out
 of scope for this design.
 
+### 4.2 Transports and process model
+
+MCP is served over two transports, built on the official `rmcp` SDK:
+
+- **Stdio** (`localdb mcp`): if no daemon is running, the CLI opens the store(s) embedded
+  in-process and serves them directly. If a daemon is already running (detected the same way
+  every other daemon-aware CLI command detects it, §1), `localdb mcp` instead **proxies**
+  every request verbatim to that daemon's own `/mcp` HTTP route below, rather than opening the
+  store a second time. The stdio caller cannot tell which mode is in effect except by behavior:
+  proxied mode exposes whatever store set the daemon had at its own startup, unfiltered.
+  **Known v1 gap:** `--store` is not honored in proxied mode — the daemon's `/mcp` route has no
+  concept of a per-stdio-session store filter, and building client-side re-filtering for this
+  narrow case was rejected as not worth the complexity in v1. `localdb mcp --store <name>`
+  against a running daemon prints a non-fatal warning to stderr and serves the daemon's full
+  store set regardless of the flag; this is a documented limitation, not a bug.
+- **HTTP** (`/mcp`, mounted on the daemon alongside its own `/v1` routes): a startup-time
+  snapshot of stores, not rebuilt per session — a store added later via `/v1/stores` is
+  invisible over MCP until the daemon restarts (see `mcp::http::build_streamable_http_service`'s
+  doc comment). HTTP MCP sessions always run with `allow_write = false`.
+
+Tool registration (the four read-only tools) and business logic are identical on both
+transports and in both stdio modes — only the code path serving the request differs.
+
+### 4.3 Error model
+
+MCP failures split into exactly two tiers, by whether the request could be *routed* to a tool
+at all:
+
+- **Protocol-level** (a JSON-RPC error): the tool name itself is unregistered. `rmcp`'s
+  macro-generated dispatch returns `ErrorCode::INVALID_PARAMS` ("tool not found") for any name
+  not in the tool router. This is the one case a caller cannot recover from within the tool
+  result.
+- **Tool-level** (`CallToolResult { isError: true, .. }`): everything else — including cases
+  one might expect to be protocol-level. A missing or wrong-typed *required* argument (e.g.
+  `search`'s `query`, `get_chunks`'s `document_id`) fails `rmcp`'s `Parameters<T>`
+  deserialization, which itself produces a protocol-level `ErrorData::invalid_params` — but
+  `rmcp` 1.8.0's tool router downgrades that specific case to a tool-level result via
+  `into_tool_argument_error`, so the caller's MCP client can render it like any other tool
+  result. This is a real behavior difference from what an initial reading of the `rmcp` API
+  might suggest; it was verified empirically (`mcp/tests/mcp_protocol.rs`), not assumed. Our own
+  semantic validation (empty strings, out-of-range `limit`/`offset`, unknown store names,
+  not-found lookups) is always tool-level, carrying a `{"error": {"code", "message"}}` JSON
+  body as its text content.
+
+Proxied stdio mode forwards whichever tier the daemon's own `/mcp` route returns unchanged —
+the proxy never re-tiers an error it received an answer for. A failure of the proxy hop itself
+(the daemon unreachable, the connection dropped mid-request) is a distinct case: there is no
+upstream answer to relay a tier from, so it surfaces as a fresh protocol-level error instead.
+
 ## 5. Shared error taxonomy
 
 One enum in `core`; every surface maps it mechanically (HTTP status / CLI exit code + stderr /

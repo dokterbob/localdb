@@ -23,7 +23,15 @@ pub(crate) async fn make_app() -> (TempDir, Router) {
     .await
     .expect("fake daemon state should open a temp libsql database");
 
-    (dir, build_router(state))
+    (
+        dir,
+        build_router(
+            state,
+            vec![],
+            std::sync::Arc::new(localdb_core::FakeEmbedder::new(1)),
+            vec![],
+        ),
+    )
 }
 
 fn fake_yaml_config() -> RawConfig {

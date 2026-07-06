@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use axum::{
     routing::{delete, get, post},
@@ -10,12 +11,13 @@ use tracing::{error, info, warn};
 
 use localdb_core::{
     config::{loader::ResolvedPaths, schema::RawConfig},
-    Error,
+    Embedder, Error,
 };
 
 use crate::{
     handlers,
     job_queue::JobQueue,
+    mcp_bridge,
     scheduler::UrlRefreshScheduler,
     socket::{SocketGuard, UrlFileGuard},
     state::AppState,
@@ -62,9 +64,22 @@ pub async fn start_daemon(
     let port = options.config.server.port;
     let socket_guard = bind_socket_guard(&options)?;
     let (state, url_scheduler) = build_daemon_state(&options).await?;
-    let router = build_router(state.clone());
+    let (mcp_stores, mcp_embedder) = mcp_bridge::build_available_stores(&state).await?;
+    // Bind first so `mcp_allowed_hosts` sees the actually-bound address
+    // (wildcard aliases like `"0"`/`"[::]"` only resolve to a concrete
+    // `SocketAddr` after binding — same reasoning as `warn_if_unspecified`
+    // and `client_base_url`, both of which also key off `bound_addr` rather
+    // than the raw config string). `build_available_stores`'s embedder is a
+    // `LazyEmbedder` and doesn't block on model loading, so reordering the
+    // (cheap) router construction after the bind doesn't delay startup.
     let (listener, bound_addr) = bind_tcp_listener(bind_addr, port).await?;
     warn_if_unspecified(bound_addr);
+    let router = build_router(
+        state.clone(),
+        mcp_stores,
+        mcp_embedder,
+        mcp_allowed_hosts(bound_addr),
+    );
     let url_file_guard =
         UrlFileGuard::new(&options.paths.url_path(), &client_base_url(bound_addr))?;
 
@@ -172,14 +187,29 @@ async fn server_future(listener: TcpListener, router: Router) {
     }
 }
 
-/// Build the axum router with all /v1 routes.
+/// Build the axum router with all /v1 routes plus the `/mcp` MCP-over-HTTP
+/// route.
 ///
 /// Routes per specs/05-surfaces.md §3:
 ///   GET/POST /stores, GET/PATCH/DELETE /stores/{id},
 ///   GET/POST /stores/{id}/sources, DELETE /sources/{id},
 ///   GET /documents/{id}, POST /search,
 ///   POST /jobs, GET /jobs/{id}, GET /status, GET /config.
-pub fn build_router(state: AppState) -> Router {
+///
+/// `mcp_stores`/`mcp_embedder` are the startup-time snapshot built by
+/// `mcp_bridge::build_available_stores` (specs/05-surfaces.md §4) — see
+/// that function's doc comment for why `/mcp` doesn't see stores added
+/// later via `/v1/stores` without a restart. `nest_service` (rather than
+/// `route_service`) matches the mount pattern rmcp's own test suite uses
+/// for `StreamableHttpService` and composes fine with a `Router<AppState>`
+/// that also has `.with_state` routes: the mounted service handles
+/// `Request` directly and needs no state extraction.
+pub fn build_router(
+    state: AppState,
+    mcp_stores: Vec<mcp::AvailableStore>,
+    mcp_embedder: Arc<dyn Embedder>,
+    mcp_allowed_hosts: Vec<String>,
+) -> Router {
     Router::new()
         .route(
             "/v1/stores",
@@ -203,6 +233,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/status", get(handlers::get_status))
         .route("/v1/config", get(handlers::get_config))
         .with_state(state)
+        .nest_service(
+            "/mcp",
+            mcp::build_streamable_http_service(mcp_stores, mcp_embedder, mcp_allowed_hosts),
+        )
 }
 
 /// Warn when the actually-bound address is unspecified (all interfaces).
@@ -224,6 +258,42 @@ fn warn_if_unspecified(bound_addr: SocketAddr) {
             bound_addr.ip()
         );
     }
+}
+
+/// Host allowlist for rmcp's DNS-rebinding `Host`-header check on the `/mcp`
+/// route, derived from the daemon's own already-accepted bind-address trust
+/// decision (specs/05-surfaces.md §3, PR #135) rather than rmcp's
+/// independent localhost-only default — otherwise a deliberately-chosen
+/// non-loopback bind (e.g. a Tailscale/LAN IP) works for every other route
+/// but rmcp still 403s `/mcp` with "Host header is not allowed", which MCP
+/// clients like Claude Code surface as a spurious "needs authentication".
+///
+/// Checks the actually-bound `SocketAddr` (see `bind_tcp_listener`), not the
+/// raw config string, for the same reason `warn_if_unspecified` and
+/// `client_base_url` do: wildcard aliases (`"0"`, `"[::]"`) only resolve to
+/// a concrete unspecified address once actually bound.
+fn mcp_allowed_hosts(bound_addr: SocketAddr) -> Vec<String> {
+    if bound_addr.ip().is_unspecified() {
+        // Wildcard bind: `warn_if_unspecified` already warns this is
+        // reachable from any network and accepts connections from anywhere.
+        // There's no single external IP to allow-list ahead of time (it
+        // could be any interface on the machine), and layering an
+        // incomplete Host check on top of an already-fully-open bind adds
+        // inconsistency, not security. Empty means "disabled" — see
+        // `mcp::build_streamable_http_service`'s doc comment.
+        return Vec::new();
+    }
+    // `with_allowed_hosts` *replaces* rmcp's default list rather than
+    // extending it, so the localhost defaults must be included explicitly
+    // alongside the bind address — otherwise local access (e.g. `localdb
+    // mcp` proxying to a daemon bound to a LAN IP, or a human curling it
+    // locally) would break.
+    vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+        bound_addr.ip().to_string(),
+    ]
 }
 
 /// The daemon's client-reachable base URL for a bound address.
@@ -414,6 +484,56 @@ mod tests {
         assert_eq!(
             client_base_url("[::1]:7700".parse().unwrap()),
             "http://[::1]:7700"
+        );
+    }
+
+    // --- mcp_allowed_hosts ---
+    //
+    // These pin the actual bug fix: rmcp's Streamable HTTP transport enforces
+    // its own DNS-rebinding `Host`-header allowlist, defaulting to
+    // localhost/127.0.0.1/::1 only — independent of, and narrower than, the
+    // daemon's own non-loopback-bind trust decision (PR #135). Without this
+    // function's fix, a deliberately-bound LAN/Tailscale address 403s every
+    // `/mcp` request with "Host header is not allowed", which MCP clients
+    // (e.g. Claude Code) surface as a spurious "needs authentication".
+
+    #[test]
+    fn mcp_allowed_hosts_includes_localhost_defaults_for_loopback_bind() {
+        let hosts = mcp_allowed_hosts("127.0.0.1:7700".parse().unwrap());
+        assert!(hosts.contains(&"localhost".to_string()));
+        assert!(hosts.contains(&"127.0.0.1".to_string()));
+        assert!(hosts.contains(&"::1".to_string()));
+    }
+
+    /// The actual bug: before this fix, only rmcp's localhost-only default
+    /// applied, so a deliberately-bound non-loopback address (e.g. a
+    /// Tailscale/LAN IP, here a TEST-NET-1 address per RFC 5737 — guaranteed
+    /// non-routable, so safe to use as a plain `SocketAddr` without binding
+    /// to it) would 403 on `/mcp` despite working on every other route.
+    #[test]
+    fn mcp_allowed_hosts_includes_the_specific_bind_address() {
+        let hosts = mcp_allowed_hosts("192.0.2.1:7700".parse().unwrap());
+        assert!(
+            hosts.contains(&"192.0.2.1".to_string()),
+            "expected the bind address itself to be allow-listed, got: {hosts:?}"
+        );
+        // Local access must keep working too — `with_allowed_hosts` replaces
+        // rmcp's default list rather than extending it, so the defaults must
+        // still be present alongside the bind-specific host.
+        assert!(hosts.contains(&"localhost".to_string()));
+        assert!(hosts.contains(&"127.0.0.1".to_string()));
+        assert!(hosts.contains(&"::1".to_string()));
+    }
+
+    #[test]
+    fn mcp_allowed_hosts_disables_the_check_for_wildcard_binds() {
+        assert_eq!(
+            mcp_allowed_hosts("0.0.0.0:7700".parse().unwrap()),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            mcp_allowed_hosts("[::]:7700".parse().unwrap()),
+            Vec::<String>::new()
         );
     }
 
@@ -746,7 +866,10 @@ mod tests {
         );
 
         // Run a search via the HTTP API to confirm the citation is returned.
-        let app = build_router(state);
+        // `vec![]` disables the Host check entirely (see `mcp_allowed_hosts`);
+        // this test only drives `/v1/search` via `oneshot`, never `/mcp`, so
+        // the allowlist behavior itself is untested here.
+        let app = build_router(state, vec![], Arc::new(FakeEmbedder::new(1)), vec![]);
 
         use axum::body::Body;
         use axum::http::Request;
@@ -811,7 +934,14 @@ mod tests {
         )
         .await
         .unwrap();
-        let app = build_router(state);
+        // `vec![]` disables the Host check entirely (see `mcp_allowed_hosts`);
+        // this test only drives `/v1/status` via `oneshot`, never `/mcp`.
+        let app = build_router(
+            state,
+            vec![],
+            Arc::new(localdb_core::FakeEmbedder::new(1)),
+            vec![],
+        );
 
         use axum::body::Body;
         use axum::http::Request;

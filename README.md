@@ -11,7 +11,7 @@ knowledge enriched by what the people you trust have found, with provenance at e
 The foundation for that is built in from day one: content-addressed documents, per-chunk
 provenance, and stores as first-class shareable units. See [VISION.md](VISION.md).
 
-**Status: v0.1.0 pre-release.** Hybrid search uses real dense embeddings via the default local model (`pplx-embed-context-v1-0.6b`, ONNX on CPU by default; CoreML ANE/GPU on Apple Silicon macOS automatically); the first `localdb index` or `localdb search` downloads ~706 MB from HuggingFace (no API key required). The HTTP daemon reads from and writes to the same unified database as the CLI; ingestion via `POST /v1/jobs` is currently a no-op. See [Honest status](#honest-status) below.
+**Status: v0.1.0 pre-release.** Hybrid search uses real dense embeddings via the default local model (`pplx-embed-context-v1-0.6b`, ONNX on CPU by default; CoreML ANE/GPU on Apple Silicon macOS automatically); the first `localdb index` or `localdb search` downloads ~706 MB from HuggingFace (no API key required). The HTTP daemon reads from and writes to the same unified database as the CLI; ingestion via `POST /v1/jobs` is currently a no-op. See [What works today](#what-works-today) below.
 
 **License:** [AGPL-3.0-or-later](LICENSE).
 
@@ -66,8 +66,10 @@ and caveats (including the `⚠️` partial marks) are in [docs/comparison.md](d
   `localdb source add https://example.com/page`; incremental re-index skips unchanged content.
 - **Embedded-first** — `localdb search` opens the store in-process; nothing needs to be running.
   The MCP server works the same way.
-- **MCP server** — `localdb mcp` exposes three read-only tools (`search`, `list_stores`,
-  `get_document`) to any MCP-capable AI assistant. Connect once, search forever.
+- **MCP server** — `localdb mcp` exposes four read-only tools (`search`, `list_stores`,
+  `get_document`, `get_chunks`) to any MCP-capable AI assistant, over stdio or (via
+  `localdb serve`) HTTP — including from another machine over Tailscale/LAN. Connect
+  once, search forever.
 - **Multiple stores** — each store is isolated; query one or all with `--store`.
 - **Context-aware dense search** — the default embedder (`pplx-embed-context-v1-0.6b`) is a
   late-chunking model from Perplexity AI that encodes each chunk in the context of its full
@@ -181,15 +183,21 @@ localdb search "hybrid search" --store notes --json
 claude mcp add localdb -- localdb mcp
 ```
 
-This registers `localdb` as a local MCP server over stdio. Three read-only tools are exposed:
+This registers `localdb` as a local MCP server over stdio. Four read-only tools are exposed:
 `search` (hybrid search returning Citation JSON), `list_stores` (store names, document counts,
-chunk counts), and `get_document` (full document text and metadata by document ID).
+chunk counts), `get_document` (full document text and metadata by document ID), and
+`get_chunks` (a document's chunks, paginated).
 
 Once connected, any MCP-capable AI assistant can call `search` against your indexed stores
 and return cited excerpts with source URI, heading path, and document metadata — grounded
 in actual passages from your files.
 
-See [docs/mcp.md](docs/mcp.md) for full tool schemas and example calls.
+Running `localdb serve` too? `localdb mcp` detects it automatically and proxies through
+the daemon instead of conflicting with it — no need to stop one to use the other. The
+daemon also serves the same tools directly over HTTP at `/mcp`, so you can point an MCP
+client on a different machine (e.g. over Tailscale) at it too.
+
+See [docs/mcp.md](docs/mcp.md) for full tool schemas, the HTTP/remote setup, and example calls.
 
 ---
 
@@ -199,11 +207,12 @@ See [docs/mcp.md](docs/mcp.md) for full tool schemas and example calls.
 localdb serve   # binds http://127.0.0.1:7700 by default
 ```
 
-The daemon exposes a REST API. It is **experimental**: ingestion via `POST /v1/jobs` is currently a no-op. The daemon reads and writes the same unified database as the CLI, so CLI-indexed data is visible to it. See [docs/http-api.md](docs/http-api.md) for endpoint reference and known limitations.
+The daemon exposes a REST API, plus the same MCP tools over HTTP at `/mcp` (see
+[MCP hookup](#mcp-hookup) above). It is **experimental**: ingestion via `POST /v1/jobs` is currently a no-op. The daemon reads and writes the same unified database as the CLI, so CLI-indexed data is visible to it. See [docs/http-api.md](docs/http-api.md) for endpoint reference and known limitations.
 
 ---
 
-## Honest status
+## What works today
 
 | Area | What is true today |
 |---|---|
@@ -213,6 +222,8 @@ The daemon exposes a REST API. It is **experimental**: ingestion via `POST /v1/j
 | HTTP daemon | Experimental preview. Ingestion via POST /v1/jobs is a no-op; reads and writes the unified database. |
 | YAML-declared stores | Appear in `store list` but **cannot be indexed** (`localdb index` only resolves runtime stores). Use `localdb store add` + `localdb source add` instead. |
 | CLI while daemon runs | CLI and daemon can run concurrently. SQLite WAL and busy_timeout serialise concurrent writes. |
+| MCP while daemon runs | `localdb mcp` now detects a running daemon and proxies to its `/mcp` route automatically, rather than conflicting with it. `--store` narrowing is not honored in proxied mode (v1 limitation — see [docs/mcp.md](docs/mcp.md#daemon-proxied-stdio)). |
+| MCP over HTTP | `/mcp` on the daemon snapshots the store list once at startup — a store added later via `/v1/stores` isn't visible over MCP until restart. |
 
 Docs sync: the old Known Gaps entries for source path validation and the macOS bundle ID are resolved in code and reflected in `docs/architecture.md`.
 
@@ -231,7 +242,7 @@ Design rationale and planned behavior live in the [specs/](specs/) directory.
 | [docs/configuration.md](docs/configuration.md) | YAML config schema, paths, store/source options |
 | [docs/cli.md](docs/cli.md) | All commands and flags, exit codes, error messages |
 | [docs/http-api.md](docs/http-api.md) | REST endpoint reference, request/response shapes, limitations |
-| [docs/mcp.md](docs/mcp.md) | MCP tool schemas, stdio wire protocol, example calls |
+| [docs/mcp.md](docs/mcp.md) | MCP tool schemas, stdio and HTTP transports, remote setup, example calls |
 | [docs/architecture.md](docs/architecture.md) | Crate layout, storage, search pipeline overview |
 | [specs/01-architecture.md](specs/01-architecture.md) | Workspace layout, embedded-first process model, storage trait |
 | [specs/02-domain-model.md](specs/02-domain-model.md) | Store, Source, Document, Block, Chunk, Citation; content-addressed IDs |

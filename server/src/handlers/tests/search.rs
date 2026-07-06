@@ -80,7 +80,12 @@ async fn search_returns_citations_after_indexing() {
     )
     .await;
 
-    let app = crate::daemon::build_router(state);
+    let app = crate::daemon::build_router(
+        state,
+        vec![],
+        std::sync::Arc::new(localdb_core::FakeEmbedder::new(1)),
+        vec![],
+    );
     let resp = app
         .oneshot(
             Request::builder()
@@ -115,7 +120,12 @@ async fn search_with_nonexistent_store_filter_returns_empty() {
     )
     .await;
 
-    let app = crate::daemon::build_router(state);
+    let app = crate::daemon::build_router(
+        state,
+        vec![],
+        std::sync::Arc::new(localdb_core::FakeEmbedder::new(1)),
+        vec![],
+    );
     let resp = app
         .oneshot(
             Request::builder()

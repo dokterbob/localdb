@@ -72,10 +72,14 @@ no-op — see [Known gaps §1](#known-gaps). See [specs/05-surfaces.md](../specs
 
 ### `mcp`
 
-Stdio MCP server (JSON-RPC 2.0, newline-delimited). Exposes three read-only tools —
-`search`, `get_document`, `list_stores` — and speaks the same `Citation` shape that every
-other surface uses. Fully functional in embedded mode (opens stores in-process). The
-`--allow-write` flag is parsed for forward compatibility but write tools are rejected in v1.
+MCP server built on the official `rmcp` SDK (full macro-native `#[tool_router]`/
+`#[tool_handler]`), speaking the same `Citation` shape that every other surface uses.
+Exposes four read-only tools — `search`, `get_document`, `get_chunks`, `list_stores`.
+Served over two transports: stdio (`localdb mcp`, embedded-in-process or, if a daemon
+is already running, proxied to its `/mcp` route — see `mcp/src/proxy.rs`) and HTTP
+(`/mcp`, mounted on `server`'s axum router alongside `/v1` — see `mcp/src/http.rs` and
+`server/src/mcp_bridge.rs`). The `--allow-write` flag is parsed for forward
+compatibility but write tools are rejected in v1 on both transports.
 See [specs/05-surfaces.md](../specs/05-surfaces.md) §4.
 
 ### `localdb` (binary)
@@ -284,6 +288,20 @@ The CoreML backend (`local-coreml` feature; see [Platform notes](#platform-notes
 
 **5. Sources added before the include-allowlist change keep empty `include` globs.**
 As of the `only-index-supported-files` branch, `cli` automatically sets `DEFAULT_PATH_INCLUDES` (an extension-based allowlist) on new directory sources that have no explicit `include` globs. Sources that were added before this change already have an empty `include` list recorded in the unified database and will continue to index all files they enumerate until they are removed and re-added with `localdb source add`. There is no automatic migration, and this change is intentionally not folded into `policy_version`. The per-file chunk preset is determined deterministically from the filename/MIME type at index time, so re-indexing existing content with the new code produces correct results without a policy-hash change.
+
+**6. `/mcp` (HTTP) doesn't see stores added after daemon startup.**
+`server::mcp_bridge::build_available_stores` snapshots the daemon's store list once,
+at `start_daemon` time — a store added later via `POST /v1/stores` is invisible over
+MCP until the daemon restarts. Root cause: `rmcp`'s Streamable HTTP service factory is
+synchronous, so there's no hook to redo the async `AppState` lookup per session
+without an ugly blocking bridge. See [docs/mcp.md](mcp.md#remote-http-connecting-from-another-machine).
+
+**7. `--store` is not honored when `localdb mcp` proxies to a running daemon.**
+The daemon's `/mcp` route has no concept of a per-stdio-session store filter, so
+proxied stdio mode always exposes the daemon's full store set regardless of
+`--store`; a non-fatal warning is printed to stderr. Building client-side
+re-filtering for this was rejected as not worth the complexity in v1. See
+[docs/mcp.md](mcp.md#daemon-proxied-stdio) and [specs/05-surfaces.md](../specs/05-surfaces.md) §4.2.
 
 ---
 

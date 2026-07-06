@@ -28,7 +28,7 @@ Default workflow is **TDD** — write the failing test first.
 | `embed` | Embedder implementations: ONNX (local), OpenAI-compatible, Perplexity, Voyage |
 | `extract` | Format detection and text extraction (Markdown, plain text, HTML, PDF → Markdown) |
 | `localdb` | Binary entry point; wires all subcommands |
-| `mcp` | Stdio MCP server (JSON-RPC 2.0); tools: `search`, `get_document`, `list_stores` |
+| `mcp` | `rmcp`-based MCP server, stdio (embedded or daemon-proxied) and HTTP (`/mcp`); tools: `search`, `get_document`, `get_chunks`, `list_stores` |
 | `server` | HTTP daemon (`/v1` axum routes), background jobs, file-watch, write-lock lifecycle |
 | `store-libsql` | `RetrievalStore` impl: libsql (DiskANN vectors + FTS5 BM25); RRF fusion lives in `core`, not here |
 
