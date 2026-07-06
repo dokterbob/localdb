@@ -68,7 +68,7 @@ pub fn run_mcp(ctx: &CliContext, allow_write: bool) {
 }
 
 pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
-    use mcp::{proxy::ProxyHandler, AvailableStore, McpHandler, McpRunMode, StoreDescriptor};
+    use mcp::{proxy::ProxyHandler, AvailableStore, McpHandler, StoreDescriptor};
 
     // `load_app_db` is unconditional here — same sequencing as
     // `search.rs`'s `run_search_async` — since `probe_daemon` needs
@@ -94,7 +94,8 @@ pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
                  the daemon's full store set will be used instead"
             );
         }
-        // Connect and serve are split (rather than one `run_stdio` call) so a
+        // Connect and serve are separate calls (`ProxyHandler::connect` then
+        // `mcp::serve_proxied_stdio`, rather than one moded entrypoint) so a
         // failure to reach the daemon at all — it went away between
         // `probe_daemon` and here, or `LOCALDB_DAEMON_URL` points at a stale
         // endpoint — maps to the same `daemon_unreachable`/exit-5 outcome as
@@ -161,7 +162,7 @@ pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
 
     let handler = McpHandler::new(available, std::sync::Arc::from(embedder), allow_write);
 
-    if let Err(e) = mcp::run_stdio(McpRunMode::Embedded(handler)).await {
+    if let Err(e) = mcp::serve_embedded_stdio(handler).await {
         exit_err(
             &Error::Internal {
                 message: format!("mcp stdio loop failed: {}", e),

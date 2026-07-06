@@ -28,7 +28,7 @@ use rmcp::{
 /// A `ServerHandler` that proxies every `tools/list`/`tools/call` request to
 /// an upstream rmcp server reached over Streamable HTTP — used when
 /// `localdb mcp` runs while a daemon is already up (see
-/// `entrypoint::run_stdio`).
+/// `entrypoint::serve_proxied_stdio`).
 ///
 /// Holds the upstream MCP client session for the handler's whole lifetime:
 /// `RunningService` owns the background task pumping the HTTP transport, so

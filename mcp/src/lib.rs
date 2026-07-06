@@ -64,21 +64,21 @@
 //! `--allow-write` flag is parsed but always rejected in v1: no mutating
 //! tool is registered on either transport.
 //!
-//! Phase 3 (`entrypoint::run_stdio`, `proxy.rs`) adds a third mode rather
-//! than a third transport: `localdb mcp` still always speaks stdio to its
-//! caller, but when `cli` detects a daemon is already running, it hands
-//! `run_stdio` an [`entrypoint::McpRunMode::Proxied`] instead of an
-//! `Embedded` one. In that mode, every stdio request is forwarded verbatim
-//! to the daemon's own `/mcp` HTTP route by `proxy::ProxyHandler` — a
+//! Phase 3 (`entrypoint::serve_proxied_stdio`, `proxy.rs`) adds a third mode
+//! rather than a third transport: `localdb mcp` still always speaks stdio to
+//! its caller, but when `cli` detects a daemon is already running, it calls
+//! `proxy::ProxyHandler::connect` and hands the result to
+//! `entrypoint::serve_proxied_stdio` instead of building an embedded
+//! `McpHandler`. In that mode, every stdio request is forwarded verbatim to
+//! the daemon's own `/mcp` HTTP route by `proxy::ProxyHandler` — a
 //! hand-written `ServerHandler` (the one non-macro-native one in this
 //! crate; see its doc comment for why) — rather than opening the store a
 //! second time in the CLI process. Store resolution then happens entirely
 //! on the daemon side: a stdio caller's `--store` flags are not honored in
 //! proxied mode (specs/05-surfaces.md §4 documents this as a known v1
 //! gap), since the daemon's own `/mcp` route has no notion of a per-session
-//! store filter to apply. `cli` alone decides which `McpRunMode` to build —
-//! this crate has no dependency on `cli` and never probes for a daemon
-//! itself.
+//! store filter to apply. `cli` alone decides which mode to run in — this
+//! crate has no dependency on `cli` and never probes for a daemon itself.
 
 pub mod args;
 pub mod entrypoint;
@@ -88,7 +88,7 @@ pub mod proxy;
 pub mod tools;
 
 // Re-export key items for the binary entry point and for `server`'s HTTP mount.
-pub use entrypoint::{run_stdio, serve_embedded_stdio, serve_proxied_stdio, McpRunMode};
+pub use entrypoint::{serve_embedded_stdio, serve_proxied_stdio};
 pub use handler::McpHandler;
 pub use http::build_streamable_http_service;
 pub use tools::{AvailableStore, StoreDescriptor};
