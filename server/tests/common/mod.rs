@@ -29,6 +29,7 @@ pub(crate) async fn make_app() -> (TempDir, Router) {
             state,
             vec![],
             std::sync::Arc::new(localdb_core::FakeEmbedder::new(1)),
+            vec![],
         ),
     )
 }

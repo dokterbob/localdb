@@ -84,6 +84,7 @@ async fn search_returns_citations_after_indexing() {
         state,
         vec![],
         std::sync::Arc::new(localdb_core::FakeEmbedder::new(1)),
+        vec![],
     );
     let resp = app
         .oneshot(
@@ -123,6 +124,7 @@ async fn search_with_nonexistent_store_filter_returns_empty() {
         state,
         vec![],
         std::sync::Arc::new(localdb_core::FakeEmbedder::new(1)),
+        vec![],
     );
     let resp = app
         .oneshot(

@@ -75,7 +75,10 @@ async fn start_upstream_daemon() -> (String, String) {
     let available = AvailableStore::from_arc(sd, store);
     let embedder: Arc<dyn localdb_core::Embedder> = Arc::new(FakeEmbedder::new(4));
 
-    let service = mcp::build_streamable_http_service(vec![available], embedder);
+    // `vec![]` disables rmcp's Host-header allowlist entirely — this test
+    // exercises proxy forwarding, not the allowlist itself, and connects
+    // over a real loopback socket regardless.
+    let service = mcp::build_streamable_http_service(vec![available], embedder, vec![]);
     let app = Router::new().nest_service("/mcp", service);
 
     let listener = TcpListener::bind("127.0.0.1:0")
