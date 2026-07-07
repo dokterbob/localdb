@@ -15,6 +15,7 @@ mod cmds {
     pub(crate) mod auth;
     pub(crate) mod index;
     pub(crate) mod init;
+    pub(crate) mod login;
     pub(crate) mod search;
     pub(crate) mod source;
     pub(crate) mod status;
@@ -26,6 +27,7 @@ pub use app_db::AppDb;
 pub use cmds::auth::{run_key_create, run_user_add};
 pub use cmds::index::run_index;
 pub use cmds::init::run_init;
+pub use cmds::login::{run_login, run_logout};
 pub use cmds::search::run_search;
 pub use cmds::source::{run_source_add, run_source_list, run_source_remove};
 pub use cmds::status::run_status;

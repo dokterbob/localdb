@@ -56,6 +56,28 @@ pub struct AuthTokenRow {
     pub rotated_from: Option<String>,
 }
 
+/// A persisted OAuth2 authorization code (RFC 6749 §4.1, T4).
+///
+/// Single-use, bound at issue time to `client_id` + `redirect_uri` +
+/// `code_challenge` (PKCE S256) so a code minted for one exchange can't be
+/// replayed against a different client/redirect/verifier combination — see
+/// `AuthService::redeem_auth_code`. Only `code_hash` (blake3) is ever
+/// stored; the plaintext code is shown once, in the `Location` redirect from
+/// `POST /authorize`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthCodeRow {
+    pub id: String,
+    pub client_id: String,
+    pub user_id: String,
+    pub code_hash: String,
+    pub code_challenge: String,
+    pub code_challenge_method: String,
+    pub redirect_uri: String,
+    pub expires_at: String,
+    pub consumed_at: Option<String>,
+    pub created_at: String,
+}
+
 /// A store-name/user-id grant (D7). Normalized: one row per grant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoreGrantRow {
@@ -149,6 +171,17 @@ pub trait AuthStore: Send + Sync + 'static {
     async fn list_tokens_for_user(&self, user_id: &str) -> Result<Vec<AuthTokenRow>, Error>;
 
     // ------------------------------------------------------------------
+    // OAuth2 authorization codes (T4)
+    // ------------------------------------------------------------------
+    async fn create_auth_code(&self, code: &AuthCodeRow) -> Result<(), Error>;
+    async fn find_auth_code_by_hash(&self, code_hash: &str) -> Result<Option<AuthCodeRow>, Error>;
+    /// Mark the code consumed iff it is not already consumed. Returns
+    /// `true` if this call consumed it, `false` if it was already consumed
+    /// (or unknown) — this is the atomic "consume-once" guard against a
+    /// concurrent-redemption race (see `AuthService::redeem_auth_code`).
+    async fn consume_auth_code(&self, id: &str, consumed_at: &str) -> Result<bool, Error>;
+
+    // ------------------------------------------------------------------
     // Grants
     // ------------------------------------------------------------------
     async fn grant_store(&self, grant: &StoreGrantRow) -> Result<(), Error>;
@@ -191,6 +224,7 @@ pub trait AuthStore: Send + Sync + 'static {
 struct FakeAuthStoreInner {
     users: Vec<UserRow>,
     tokens: Vec<AuthTokenRow>,
+    auth_codes: Vec<AuthCodeRow>,
     grants: Vec<StoreGrantRow>,
     invites: Vec<InviteRow>,
     access_requests: Vec<AccessRequestRow>,
@@ -340,6 +374,33 @@ impl AuthStore for FakeAuthStore {
             .filter(|t| t.user_id == user_id)
             .cloned()
             .collect())
+    }
+
+    async fn create_auth_code(&self, code: &AuthCodeRow) -> Result<(), Error> {
+        self.inner.write().await.auth_codes.push(code.clone());
+        Ok(())
+    }
+
+    async fn find_auth_code_by_hash(&self, code_hash: &str) -> Result<Option<AuthCodeRow>, Error> {
+        Ok(self
+            .inner
+            .read()
+            .await
+            .auth_codes
+            .iter()
+            .find(|c| c.code_hash == code_hash)
+            .cloned())
+    }
+
+    async fn consume_auth_code(&self, id: &str, consumed_at: &str) -> Result<bool, Error> {
+        let mut inner = self.inner.write().await;
+        match inner.auth_codes.iter_mut().find(|c| c.id == id) {
+            Some(c) if c.consumed_at.is_none() => {
+                c.consumed_at = Some(consumed_at.to_string());
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     async fn grant_store(&self, grant: &StoreGrantRow) -> Result<(), Error> {

@@ -158,13 +158,139 @@ fn base_url_of(url: &str) -> Option<String> {
 /// header (fine against an open-mode daemon).
 fn bearer_for_request(ctx: &CliContext, url: &str) -> Option<String> {
     let base_url = base_url_of(url)?;
+    let config_file = resolved_config_file(ctx);
+    crate::credentials::resolve_bearer(ctx.api_key.as_deref(), config_file.as_deref(), &base_url)
+}
+
+pub(crate) fn resolved_config_file(ctx: &CliContext) -> Option<std::path::PathBuf> {
     let options = localdb_core::config::loader::LoadOptions {
         config_path: ctx.config.clone(),
         ..Default::default()
     };
-    let config_file =
-        localdb_core::config::loader::resolve_config_path(&options, ctx.config_env.as_deref()).ok();
-    crate::credentials::resolve_bearer(ctx.api_key.as_deref(), config_file.as_deref(), &base_url)
+    localdb_core::config::loader::resolve_config_path(&options, ctx.config_env.as_deref()).ok()
+}
+
+fn build_http_client() -> Result<reqwest::Client, Error> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| Error::Internal {
+            message: format!("cannot build HTTP client: {}", e),
+            correlation_id: "daemon_client_build".to_string(),
+        })
+}
+
+/// Issue one HTTP request, with an explicit bearer override (rather than
+/// re-resolving it from `ctx`/`credentials.json`) so a post-refresh retry
+/// can use the freshly rotated access token without a second file lookup.
+async fn send_once(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: &str,
+    body: Option<&serde_json::Value>,
+    bearer: Option<&str>,
+) -> Result<(reqwest::StatusCode, serde_json::Value), Error> {
+    let mut req = client.request(method, url);
+    if let Some(secret) = bearer {
+        req = req.bearer_auth(secret);
+    }
+    if let Some(b) = body {
+        req = req.json(b);
+    }
+    let resp = req.send().await.map_err(|_| Error::DaemonUnreachable)?;
+    let status = resp.status();
+    let json: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+    Ok((status, json))
+}
+
+/// Map a non-2xx `(status, json)` pair to our error taxonomy. The server's
+/// error body uses `{code, message}` (see `server/src/error.rs`).
+fn map_error_response(status: reqwest::StatusCode, json: &serde_json::Value) -> Error {
+    let code = json
+        .get("code")
+        .and_then(|e| e.as_str())
+        .unwrap_or("internal");
+    let msg = json
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or("daemon error")
+        .to_string();
+
+    match code {
+        "store_not_found" => Error::StoreNotFound { id: msg },
+        "source_not_found" => Error::SourceNotFound { id: msg },
+        "document_not_found" => Error::DocumentNotFound { id: msg },
+        "job_not_found" => Error::JobNotFound { id: msg },
+        "runtime_state_locked" => Error::RuntimeStateLocked,
+        "daemon_running" => Error::DaemonRunning,
+        "daemon_unreachable" => Error::DaemonUnreachable,
+        "invalid_config" => Error::InvalidConfig { message: msg },
+        "invalid_request" => Error::InvalidRequest { message: msg },
+        "index_in_progress" => Error::IndexInProgress,
+        "provider_unavailable" => Error::ProviderUnavailable { message: msg },
+        "model_missing" => Error::ModelMissing { message: msg },
+        "unauthorized" => Error::Unauthorized { message: msg },
+        "forbidden" => Error::Forbidden { message: msg },
+        _ => Error::Internal {
+            message: format!("daemon returned {}: {}", status.as_u16(), msg),
+            correlation_id: "daemon_http".to_string(),
+        },
+    }
+}
+
+/// Attempt a refresh-grant exchange for the stored refresh token (if any)
+/// against `base_url`'s `/token` endpoint, persisting the rotated pair on
+/// success. Returns the new access token to retry with, or `None` if there
+/// was nothing to refresh or the refresh itself failed — either way the
+/// caller falls through to surfacing the original 401.
+///
+/// Skipped entirely when `ctx.api_key` (`LOCALDB_API_KEY`) is set: a
+/// statically configured bearer isn't part of the login token-pair rotation
+/// model, so there is nothing to refresh.
+async fn try_refresh_and_persist(ctx: &CliContext, url: &str) -> Option<String> {
+    if ctx.api_key.as_deref().is_some_and(|k| !k.is_empty()) {
+        return None;
+    }
+    let base_url = base_url_of(url)?;
+    let config_file = resolved_config_file(ctx)?;
+    let credentials_file = crate::credentials::credentials_path(&config_file);
+    let entry = crate::credentials::lookup_entry(&credentials_file, &base_url)?;
+    let refresh_token = entry.refresh_token?;
+
+    let client = build_http_client().ok()?;
+    let token_url = format!("{base_url}/token");
+    let resp = client
+        .post(&token_url)
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token.as_str()),
+        ])
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let json: serde_json::Value = resp.json().await.ok()?;
+    let access_token = json.get("access_token")?.as_str()?.to_string();
+    let new_refresh_token = json
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let expires_in = json
+        .get("expires_in")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(3600);
+
+    let new_entry = crate::credentials::CredentialEntry {
+        secret: None,
+        access_token: Some(access_token.clone()),
+        refresh_token: new_refresh_token.or(Some(refresh_token)),
+        access_expires_at: Some(localdb_core::auth::rfc3339_from_now(expires_in)),
+    };
+    crate::credentials::write_entry(&credentials_file, &base_url, new_entry).ok()?;
+
+    Some(access_token)
 }
 
 pub(crate) async fn daemon_request_async(
@@ -173,62 +299,37 @@ pub(crate) async fn daemon_request_async(
     url: &str,
     body: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, Error> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| Error::Internal {
-            message: format!("cannot build HTTP client: {}", e),
-            correlation_id: "daemon_client_build".to_string(),
-        })?;
+    let client = build_http_client()?;
+    let bearer = bearer_for_request(ctx, url);
+    let (status, json) = send_once(
+        &client,
+        method.clone(),
+        url,
+        body.as_ref(),
+        bearer.as_deref(),
+    )
+    .await?;
 
-    let mut req = client.request(method, url);
-    if let Some(secret) = bearer_for_request(ctx, url) {
-        req = req.bearer_auth(secret);
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        if let Some(new_access) = try_refresh_and_persist(ctx, url).await {
+            let (status2, json2) =
+                send_once(&client, method, url, body.as_ref(), Some(&new_access)).await?;
+            return if status2.is_success() {
+                Ok(json2)
+            } else {
+                Err(map_error_response(status2, &json2))
+            };
+        }
+        return Err(Error::Unauthorized {
+            message: "credentials rejected or expired; run `localdb login` to re-authenticate"
+                .to_string(),
+        });
     }
-    if let Some(b) = body {
-        req = req.json(&b);
-    }
-
-    let resp = req.send().await.map_err(|_| Error::DaemonUnreachable)?;
-
-    let status = resp.status();
-    let json: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
 
     if status.is_success() {
         Ok(json)
     } else {
-        // Map HTTP error codes to our error types.
-        // The server's error body uses {code, message} (see server/src/error.rs).
-        let code = json
-            .get("code")
-            .and_then(|e| e.as_str())
-            .unwrap_or("internal");
-        let msg = json
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("daemon error")
-            .to_string();
-
-        Err(match code {
-            "store_not_found" => Error::StoreNotFound { id: msg },
-            "source_not_found" => Error::SourceNotFound { id: msg },
-            "document_not_found" => Error::DocumentNotFound { id: msg },
-            "job_not_found" => Error::JobNotFound { id: msg },
-            "runtime_state_locked" => Error::RuntimeStateLocked,
-            "daemon_running" => Error::DaemonRunning,
-            "daemon_unreachable" => Error::DaemonUnreachable,
-            "invalid_config" => Error::InvalidConfig { message: msg },
-            "invalid_request" => Error::InvalidRequest { message: msg },
-            "index_in_progress" => Error::IndexInProgress,
-            "provider_unavailable" => Error::ProviderUnavailable { message: msg },
-            "model_missing" => Error::ModelMissing { message: msg },
-            "unauthorized" => Error::Unauthorized { message: msg },
-            "forbidden" => Error::Forbidden { message: msg },
-            _ => Error::Internal {
-                message: format!("daemon returned {}: {}", status.as_u16(), msg),
-                correlation_id: "daemon_http".to_string(),
-            },
-        })
+        Err(map_error_response(status, &json))
     }
 }
 
@@ -335,5 +436,252 @@ mod tests {
             !url_path.exists(),
             "stale discovery URL file should be removed"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // T4: 401-retry-with-refresh
+    // -----------------------------------------------------------------
+
+    /// A minimal stateful mock daemon (hand-rolled raw TCP, mirroring
+    /// `localdb/tests/auth_cli.rs`'s style): any non-`/token` route answers
+    /// 401 unless `Authorization: Bearer new_access` is presented; `POST
+    /// /token` with `grant_type=refresh_token&refresh_token=old_refresh`
+    /// answers a fresh `new_access`/`new_refresh` pair, anything else
+    /// `invalid_grant`.
+    fn start_refresh_mock_daemon() -> u16 {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock daemon");
+        let port = listener.local_addr().unwrap().port();
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+                let mut request_line = String::new();
+                let _ = reader.read_line(&mut request_line);
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .to_string();
+
+                let mut auth: Option<String> = None;
+                let mut content_length: usize = 0;
+                loop {
+                    let mut line = String::new();
+                    let _ = reader.read_line(&mut line);
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    let lower = line.to_ascii_lowercase();
+                    if lower.starts_with("authorization:") {
+                        auth = Some(line["authorization:".len()..].trim().to_string());
+                    }
+                    if let Some(rest) = lower.strip_prefix("content-length:") {
+                        content_length = rest.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; content_length];
+                if content_length > 0 {
+                    let _ = reader.read_exact(&mut body);
+                }
+                let body = String::from_utf8_lossy(&body).to_string();
+
+                let response = if path.starts_with("/token") {
+                    if body.contains("grant_type=refresh_token")
+                        && body.contains("refresh_token=old_refresh")
+                    {
+                        let json = r#"{"access_token":"new_access","refresh_token":"new_refresh","expires_in":3600,"token_type":"Bearer"}"#;
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                            json.len(),
+                            json
+                        )
+                    } else {
+                        let json = r#"{"error":"invalid_grant"}"#;
+                        format!(
+                            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                            json.len(),
+                            json
+                        )
+                    }
+                } else if auth.as_deref() == Some("Bearer new_access") {
+                    let json = r#"{"status":"ok"}"#;
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        json.len(),
+                        json
+                    )
+                } else {
+                    let json =
+                        r#"{"code":"unauthorized","message":"missing or expired bearer token"}"#;
+                    format!(
+                        "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nWWW-Authenticate: Bearer\r\nContent-Length: {}\r\n\r\n{}",
+                        json.len(),
+                        json
+                    )
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        port
+    }
+
+    fn ctx_with_config(config_file: &std::path::Path) -> CliContext {
+        CliContext {
+            config: Some(config_file.to_path_buf()),
+            json: false,
+            stores: vec![],
+            yes: false,
+            daemon_url: None,
+            config_env: None,
+            api_key: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_access_token_is_retried_once_with_refreshed_token() {
+        let dir = TempDir::new().unwrap();
+        let config_file = dir.path().join("config.yaml");
+        std::fs::write(&config_file, "version: 1\n").unwrap();
+        let port = start_refresh_mock_daemon();
+        let base_url = format!("http://127.0.0.1:{port}");
+
+        let credentials_file = crate::credentials::credentials_path(&config_file);
+        crate::credentials::write_entry(
+            &credentials_file,
+            &base_url,
+            crate::credentials::CredentialEntry {
+                secret: None,
+                access_token: Some("old_access".to_string()),
+                refresh_token: Some("old_refresh".to_string()),
+                access_expires_at: None,
+            },
+        )
+        .unwrap();
+
+        let ctx = ctx_with_config(&config_file);
+        let result = daemon_request_async(
+            &ctx,
+            reqwest::Method::GET,
+            &format!("{base_url}/v1/status"),
+            None,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "expired-token retry should succeed: {:?}",
+            result.err()
+        );
+
+        let entry = crate::credentials::lookup_entry(&credentials_file, &base_url).unwrap();
+        assert_eq!(entry.access_token.as_deref(), Some("new_access"));
+        assert_eq!(entry.refresh_token.as_deref(), Some("new_refresh"));
+    }
+
+    #[tokio::test]
+    async fn no_refresh_token_available_surfaces_unauthorized_with_login_guidance() {
+        let dir = TempDir::new().unwrap();
+        let config_file = dir.path().join("config.yaml");
+        std::fs::write(&config_file, "version: 1\n").unwrap();
+        let port = start_refresh_mock_daemon();
+        let base_url = format!("http://127.0.0.1:{port}");
+
+        // No credentials.json entry at all: nothing to refresh.
+        let ctx = ctx_with_config(&config_file);
+        let result = daemon_request_async(
+            &ctx,
+            reqwest::Method::GET,
+            &format!("{base_url}/v1/status"),
+            None,
+        )
+        .await;
+
+        let err = result.unwrap_err();
+        assert!(matches!(err, Error::Unauthorized { .. }));
+        assert!(
+            err.to_string().contains("login") || format!("{err:?}").contains("login"),
+            "guidance should point at `localdb login`: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_refresh_token_that_the_daemon_rejects_surfaces_unauthorized() {
+        let dir = TempDir::new().unwrap();
+        let config_file = dir.path().join("config.yaml");
+        std::fs::write(&config_file, "version: 1\n").unwrap();
+        let port = start_refresh_mock_daemon();
+        let base_url = format!("http://127.0.0.1:{port}");
+
+        let credentials_file = crate::credentials::credentials_path(&config_file);
+        crate::credentials::write_entry(
+            &credentials_file,
+            &base_url,
+            crate::credentials::CredentialEntry {
+                secret: None,
+                access_token: Some("old_access".to_string()),
+                refresh_token: Some("no-longer-valid".to_string()),
+                access_expires_at: None,
+            },
+        )
+        .unwrap();
+
+        let ctx = ctx_with_config(&config_file);
+        let result = daemon_request_async(
+            &ctx,
+            reqwest::Method::GET,
+            &format!("{base_url}/v1/status"),
+            None,
+        )
+        .await;
+
+        assert!(matches!(result.unwrap_err(), Error::Unauthorized { .. }));
+    }
+
+    #[tokio::test]
+    async fn env_api_key_skips_refresh_attempt_entirely() {
+        // LOCALDB_API_KEY is a static bearer, not part of the token-pair
+        // rotation model — a 401 with it set must not attempt a refresh
+        // grant at all (there is nothing to refresh it with).
+        let dir = TempDir::new().unwrap();
+        let config_file = dir.path().join("config.yaml");
+        std::fs::write(&config_file, "version: 1\n").unwrap();
+        let port = start_refresh_mock_daemon();
+        let base_url = format!("http://127.0.0.1:{port}");
+
+        let credentials_file = crate::credentials::credentials_path(&config_file);
+        // Even with a valid refresh token cached, the env override must win
+        // and no refresh attempt should be made.
+        crate::credentials::write_entry(
+            &credentials_file,
+            &base_url,
+            crate::credentials::CredentialEntry {
+                secret: None,
+                access_token: Some("old_access".to_string()),
+                refresh_token: Some("old_refresh".to_string()),
+                access_expires_at: None,
+            },
+        )
+        .unwrap();
+
+        let mut ctx = ctx_with_config(&config_file);
+        ctx.api_key = Some("ldb_env_override_that_is_wrong".to_string());
+
+        let result = daemon_request_async(
+            &ctx,
+            reqwest::Method::GET,
+            &format!("{base_url}/v1/status"),
+            None,
+        )
+        .await;
+
+        assert!(matches!(result.unwrap_err(), Error::Unauthorized { .. }));
+        // The cached refresh token must be untouched — no refresh attempt happened.
+        let entry = crate::credentials::lookup_entry(&credentials_file, &base_url).unwrap();
+        assert_eq!(entry.access_token.as_deref(), Some("old_access"));
     }
 }

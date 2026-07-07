@@ -7,6 +7,7 @@
 //! one-time setup-code bootstrap seam (D3b, redeemed by `/authorize` in T4).
 
 pub mod middleware;
+pub mod oauth;
 
 use localdb_core::{
     auth::{mint_secret, AuthStore as _},

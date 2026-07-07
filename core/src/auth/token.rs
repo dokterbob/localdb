@@ -21,6 +21,10 @@ pub const ACCESS_TOKEN_TTL_SECS: i64 = 60 * 60;
 /// Refresh token TTL (D1): 30 days, rotated on use.
 pub const REFRESH_TOKEN_TTL_SECS: i64 = 30 * 24 * 60 * 60;
 
+/// Authorization-code TTL (T4, specs/05-surfaces.md §3.1 R5): 10 minutes,
+/// single-use.
+pub const AUTH_CODE_TTL_SECS: i64 = 10 * 60;
+
 /// A freshly minted secret: the plaintext (shown once to the caller) and its
 /// blake3 hash (the only form persisted at rest).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +60,21 @@ pub fn verify_secret(secret: &str, hash: &str) -> bool {
 pub fn verify_pkce_s256(verifier: &str, challenge: &str) -> bool {
     let digest = Sha256::digest(verifier.as_bytes());
     base64url_encode(&digest) == challenge
+}
+
+/// Generate a fresh PKCE (RFC 7636) verifier/challenge pair: `verifier` is
+/// 32 random bytes from `OsRng`, base64url (no-pad) encoded (43 chars —
+/// within the 43-128 char range RFC 7636 §4.1 requires); `challenge` is
+/// `S256(verifier)`, guaranteed to round-trip against [`verify_pkce_s256`]
+/// since both share the same `base64url_encode`. Used by `localdb login`
+/// (`cli::cmds::login`) to drive the authorization-code + PKCE flow.
+pub fn generate_pkce_pair() -> (String, String) {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    let verifier = base64url_encode(&bytes);
+    let digest = Sha256::digest(verifier.as_bytes());
+    let challenge = base64url_encode(&digest);
+    (verifier, challenge)
 }
 
 const B64URL_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -204,5 +223,19 @@ mod tests {
     #[test]
     fn is_expired_false_for_future_timestamp() {
         assert!(!is_expired(&rfc3339_from_now(3600)));
+    }
+
+    #[test]
+    fn generate_pkce_pair_round_trips_with_verify() {
+        let (verifier, challenge) = generate_pkce_pair();
+        assert!(verify_pkce_s256(&verifier, &challenge));
+        assert_eq!(verifier.len(), 43, "32 bytes base64url no-pad is 43 chars");
+    }
+
+    #[test]
+    fn generate_pkce_pair_differs_each_call() {
+        let (v1, _) = generate_pkce_pair();
+        let (v2, _) = generate_pkce_pair();
+        assert_ne!(v1, v2);
     }
 }

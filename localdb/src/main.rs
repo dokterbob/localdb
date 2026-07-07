@@ -120,6 +120,32 @@ pub enum Command {
     /// to run while a daemon is up).
     #[command(subcommand)]
     Key(KeyCommand),
+
+    /// Authenticate against a daemon via OAuth2 (authorization code + PKCE)
+    /// and cache the resulting token in credentials.json.
+    Login {
+        /// Daemon base URL (default: auto-detected running daemon).
+        #[arg(long)]
+        url: Option<String>,
+
+        /// Pre-fill the consent form's one-time setup code (bootstrap);
+        /// the form still requires an explicit submit.
+        #[arg(long = "setup-code")]
+        setup_code: Option<String>,
+
+        /// Don't try to open a browser; print the URL and read a pasted
+        /// code from stdin instead.
+        #[arg(long = "no-browser")]
+        no_browser: bool,
+    },
+
+    /// Revoke the cached token for a daemon and clear it from
+    /// credentials.json.
+    Logout {
+        /// Daemon base URL (default: auto-detected running daemon).
+        #[arg(long)]
+        url: Option<String>,
+    },
 }
 
 /// User management subcommands (specs/05-surfaces.md §2; T3 ships only `add`).
@@ -261,6 +287,12 @@ fn main() {
         Command::Key(cmd) => match cmd {
             KeyCommand::Create { user } => cli::run_key_create(&ctx, user),
         },
+        Command::Login {
+            url,
+            setup_code,
+            no_browser,
+        } => cli::run_login(&ctx, url.as_deref(), setup_code.as_deref(), *no_browser),
+        Command::Logout { url } => cli::run_logout(&ctx, url.as_deref()),
     }
 }
 

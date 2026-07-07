@@ -15,10 +15,13 @@ fetch = { path = "../fetch" }
 mcp = { path = "../mcp" }
 server = { path = "../server" }
 tokio = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 indicatif = { workspace = true }
 async-trait = { workspace = true }
+url = { workspace = true }
+webbrowser = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # On macOS, auto-enable CoreML so any localdb build (release tarball or cargo install)
@@ -28,3 +31,4 @@ embed = { path = "../embed", features = ["local-coreml"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+axum = { workspace = true }

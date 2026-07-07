@@ -362,6 +362,20 @@ async fn create_auth_tables(conn: &Connection) -> Result<(), libsql::Error> {
     )
     .await?;
 
+    // Seed the built-in `localdb-cli` public client (T4,
+    // `localdb_core::auth::LOCALDB_CLI_CLIENT_ID`). Its recognition and
+    // redirect-uri policy (RFC 8252 §7.3 loopback exception) are pure-core
+    // logic (`localdb_core::auth::validate_redirect_uri`) — this row exists
+    // solely so `auth_codes.client_id`'s FK constraint is satisfiable when
+    // `/authorize` issues a code for it; `redirect_uris` is left empty here
+    // since the actual policy is enforced in `core`, not read from this row.
+    conn.execute(
+        "INSERT OR IGNORE INTO oauth_clients (id, client_name, redirect_uris, created_at)
+         VALUES ('localdb-cli', 'localdb CLI', '[]', '1970-01-01T00:00:00Z')",
+        (),
+    )
+    .await?;
+
     // OAuth2 authorization codes (code+PKCE flow, later ticket).
     conn.execute(
         "CREATE TABLE IF NOT EXISTS auth_codes (

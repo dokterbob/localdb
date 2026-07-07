@@ -12,11 +12,11 @@ use crate::Error;
 
 use super::principal::{Principal, Role, StoreAccess};
 use super::store::{
-    AuthStore, AuthTokenRow, InviteMode, InviteRow, StoreGrantRow, TokenKind, UserRow,
+    AuthCodeRow, AuthStore, AuthTokenRow, InviteMode, InviteRow, StoreGrantRow, TokenKind, UserRow,
 };
 use super::token::{
-    hash_secret, is_expired, mint_secret, rfc3339_from_now, ACCESS_TOKEN_TTL_SECS,
-    REFRESH_TOKEN_TTL_SECS,
+    hash_secret, is_expired, mint_secret, rfc3339_from_now, verify_pkce_s256,
+    ACCESS_TOKEN_TTL_SECS, AUTH_CODE_TTL_SECS, REFRESH_TOKEN_TTL_SECS,
 };
 
 /// A newly minted bearer token: the persisted row plus the plaintext secret
@@ -32,6 +32,14 @@ pub struct IssuedToken {
 #[derive(Debug, Clone)]
 pub struct IssuedInvite {
     pub row: InviteRow,
+    pub secret: String,
+}
+
+/// A newly minted authorization code: the persisted row plus the plaintext
+/// code (shown once, in the `POST /authorize` redirect's `code` param).
+#[derive(Debug, Clone)]
+pub struct IssuedAuthCode {
+    pub row: AuthCodeRow,
     pub secret: String,
 }
 
@@ -244,6 +252,137 @@ impl<S: AuthStore> AuthService<S> {
         let new_access = self.issue_access_token(&token.user_id).await?;
 
         Ok((new_access, new_refresh))
+    }
+
+    /// Mint a single-use OAuth2 authorization code (RFC 6749 §4.1), bound to
+    /// `client_id` + `redirect_uri` + PKCE `code_challenge` at issue time
+    /// and expiring in [`AUTH_CODE_TTL_SECS`] (T4, specs/05-surfaces.md
+    /// §3.1 R5). Redirect-uri validation policy is the caller's
+    /// responsibility (`core::auth::validate_redirect_uri`, checked by
+    /// `server/src/auth/oauth.rs` before calling this).
+    pub async fn issue_auth_code(
+        &self,
+        client_id: &str,
+        user_id: &str,
+        redirect_uri: &str,
+        code_challenge: &str,
+    ) -> Result<IssuedAuthCode, Error> {
+        let minted = mint_secret();
+        let row = AuthCodeRow {
+            id: new_ulid(),
+            client_id: client_id.to_string(),
+            user_id: user_id.to_string(),
+            code_hash: minted.hash,
+            code_challenge: code_challenge.to_string(),
+            code_challenge_method: "S256".to_string(),
+            redirect_uri: redirect_uri.to_string(),
+            expires_at: rfc3339_from_now(AUTH_CODE_TTL_SECS),
+            consumed_at: None,
+            created_at: now_rfc3339(),
+        };
+        self.store.create_auth_code(&row).await?;
+        Ok(IssuedAuthCode {
+            row,
+            secret: minted.secret,
+        })
+    }
+
+    /// Redeem an authorization code for the user it was issued to (RFC 6749
+    /// §4.1.3 + RFC 7636 §4.6 PKCE verification).
+    ///
+    /// Checks, in order: the code is known, unconsumed, unexpired, and that
+    /// `client_id` + `redirect_uri` exactly match what was bound at issue
+    /// time, then verifies `code_verifier` against the stored S256
+    /// challenge. On success the code is atomically marked consumed
+    /// (`AuthStore::consume_auth_code` is a single "consume iff unconsumed"
+    /// UPDATE, so a concurrent second redemption attempt always loses the
+    /// race and fails here even if it passed every earlier check) and the
+    /// associated user is returned.
+    ///
+    /// Every failure returns `Error::Unauthorized` with a distinct message;
+    /// the HTTP surface (`server/src/auth/oauth.rs`) maps all of them
+    /// uniformly to the RFC 6749 §5.2 `invalid_grant` JSON error — none of
+    /// these messages are meant to leak which specific check failed to an
+    /// untrusted caller.
+    pub async fn redeem_auth_code(
+        &self,
+        code: &str,
+        client_id: &str,
+        redirect_uri: &str,
+        code_verifier: &str,
+    ) -> Result<UserRow, Error> {
+        let hash = hash_secret(code);
+        let row = self
+            .store
+            .find_auth_code_by_hash(&hash)
+            .await?
+            .ok_or_else(|| Error::Unauthorized {
+                message: "invalid or unknown authorization code".to_string(),
+            })?;
+
+        if row.consumed_at.is_some() {
+            return Err(Error::Unauthorized {
+                message: "authorization code already used".to_string(),
+            });
+        }
+        if is_expired(&row.expires_at) {
+            return Err(Error::Unauthorized {
+                message: "authorization code expired".to_string(),
+            });
+        }
+        if row.client_id != client_id {
+            return Err(Error::Unauthorized {
+                message: "client_id does not match the authorization code".to_string(),
+            });
+        }
+        if row.redirect_uri != redirect_uri {
+            return Err(Error::Unauthorized {
+                message: "redirect_uri does not match the authorization code".to_string(),
+            });
+        }
+        if !verify_pkce_s256(code_verifier, &row.code_challenge) {
+            return Err(Error::Unauthorized {
+                message: "PKCE verification failed".to_string(),
+            });
+        }
+
+        let consumed = self
+            .store
+            .consume_auth_code(&row.id, &now_rfc3339())
+            .await?;
+        if !consumed {
+            return Err(Error::Unauthorized {
+                message: "authorization code already used".to_string(),
+            });
+        }
+
+        self.store
+            .get_user(&row.user_id)
+            .await?
+            .ok_or_else(|| Error::Unauthorized {
+                message: "authorization code's user no longer exists".to_string(),
+            })
+    }
+
+    /// RFC 7009 token revocation: revoke whatever bearer secret `secret`
+    /// refers to (an access token, a refresh token — which revokes its
+    /// whole rotation family, matching reuse-detection semantics — or an
+    /// API key). Returns `true` if something was revoked, `false` if the
+    /// secret was unknown or already revoked. Callers (`POST /revoke`)
+    /// return HTTP 200 either way per RFC 7009 §2.2, which deliberately
+    /// never leaks whether a presented token existed.
+    pub async fn revoke_by_secret(&self, secret: &str) -> Result<bool, Error> {
+        let hash = hash_secret(secret);
+        let Some(token) = self.store.find_token_by_hash(&hash).await? else {
+            return Ok(false);
+        };
+        if token.kind == TokenKind::Refresh {
+            if let Some(family) = &token.family_id {
+                let revoked = self.store.revoke_token_family(family).await?;
+                return Ok(revoked > 0);
+            }
+        }
+        self.store.revoke_token(&token.id).await
     }
 
     /// Grant a member access to a `shared`-visibility store (D7).
@@ -564,6 +703,228 @@ mod tests {
         let principal = svc.authenticate(&issued.secret).await.unwrap();
         assert!(principal.can_read_store("docs", StoreVisibility::Shared));
         assert!(!principal.can_read_store("other", StoreVisibility::Shared));
+    }
+
+    // -----------------------------------------------------------------
+    // OAuth2 authorization code (T4)
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn issue_and_redeem_auth_code_happy_path() {
+        let svc = service();
+        let user = svc.create_user("ivy", Role::Admin).await.unwrap();
+        let (verifier, challenge) = crate::auth::generate_pkce_pair();
+
+        let issued = svc
+            .issue_auth_code(
+                "localdb-cli",
+                &user.id,
+                "http://127.0.0.1:1234/cb",
+                &challenge,
+            )
+            .await
+            .unwrap();
+
+        let redeemed = svc
+            .redeem_auth_code(
+                &issued.secret,
+                "localdb-cli",
+                "http://127.0.0.1:1234/cb",
+                &verifier,
+            )
+            .await
+            .unwrap();
+        assert_eq!(redeemed.id, user.id);
+    }
+
+    #[tokio::test]
+    async fn redeem_auth_code_wrong_verifier_fails() {
+        let svc = service();
+        let user = svc.create_user("jack", Role::Admin).await.unwrap();
+        let (_verifier, challenge) = crate::auth::generate_pkce_pair();
+        let issued = svc
+            .issue_auth_code("localdb-cli", &user.id, "http://127.0.0.1:1/cb", &challenge)
+            .await
+            .unwrap();
+
+        let err = svc
+            .redeem_auth_code(
+                &issued.secret,
+                "localdb-cli",
+                "http://127.0.0.1:1/cb",
+                "wrong-verifier",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Unauthorized { .. }));
+    }
+
+    #[tokio::test]
+    async fn redeem_auth_code_is_single_use() {
+        let svc = service();
+        let user = svc.create_user("kim", Role::Admin).await.unwrap();
+        let (verifier, challenge) = crate::auth::generate_pkce_pair();
+        let issued = svc
+            .issue_auth_code("localdb-cli", &user.id, "http://127.0.0.1:1/cb", &challenge)
+            .await
+            .unwrap();
+
+        svc.redeem_auth_code(
+            &issued.secret,
+            "localdb-cli",
+            "http://127.0.0.1:1/cb",
+            &verifier,
+        )
+        .await
+        .unwrap();
+
+        let err = svc
+            .redeem_auth_code(
+                &issued.secret,
+                "localdb-cli",
+                "http://127.0.0.1:1/cb",
+                &verifier,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Unauthorized { .. }));
+    }
+
+    #[tokio::test]
+    async fn redeem_auth_code_expired_fails() {
+        let svc = service();
+        let user = svc.create_user("liam", Role::Admin).await.unwrap();
+        let (verifier, challenge) = crate::auth::generate_pkce_pair();
+        let minted = mint_secret();
+        let row = AuthCodeRow {
+            id: new_ulid(),
+            client_id: "localdb-cli".to_string(),
+            user_id: user.id.clone(),
+            code_hash: minted.hash.clone(),
+            code_challenge: challenge,
+            code_challenge_method: "S256".to_string(),
+            redirect_uri: "http://127.0.0.1:1/cb".to_string(),
+            expires_at: rfc3339_from_now(-10),
+            consumed_at: None,
+            created_at: now_rfc3339(),
+        };
+        svc.store.create_auth_code(&row).await.unwrap();
+
+        let err = svc
+            .redeem_auth_code(
+                &minted.secret,
+                "localdb-cli",
+                "http://127.0.0.1:1/cb",
+                &verifier,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Unauthorized { .. }));
+    }
+
+    #[tokio::test]
+    async fn redeem_auth_code_client_id_mismatch_fails() {
+        let svc = service();
+        let user = svc.create_user("mona", Role::Admin).await.unwrap();
+        let (verifier, challenge) = crate::auth::generate_pkce_pair();
+        let issued = svc
+            .issue_auth_code("localdb-cli", &user.id, "http://127.0.0.1:1/cb", &challenge)
+            .await
+            .unwrap();
+
+        let err = svc
+            .redeem_auth_code(
+                &issued.secret,
+                "some-other-client",
+                "http://127.0.0.1:1/cb",
+                &verifier,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Unauthorized { .. }));
+    }
+
+    #[tokio::test]
+    async fn redeem_auth_code_redirect_uri_mismatch_fails() {
+        let svc = service();
+        let user = svc.create_user("nora", Role::Admin).await.unwrap();
+        let (verifier, challenge) = crate::auth::generate_pkce_pair();
+        let issued = svc
+            .issue_auth_code("localdb-cli", &user.id, "http://127.0.0.1:1/cb", &challenge)
+            .await
+            .unwrap();
+
+        let err = svc
+            .redeem_auth_code(
+                &issued.secret,
+                "localdb-cli",
+                "http://127.0.0.1:9999/cb",
+                &verifier,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Unauthorized { .. }));
+    }
+
+    #[tokio::test]
+    async fn redeem_auth_code_unknown_code_fails() {
+        let svc = service();
+        let err = svc
+            .redeem_auth_code(
+                "ldb_not-a-real-code",
+                "localdb-cli",
+                "http://127.0.0.1:1/cb",
+                "v",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Unauthorized { .. }));
+    }
+
+    // -----------------------------------------------------------------
+    // RFC 7009 revocation
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn revoke_by_secret_revokes_api_key() {
+        let svc = service();
+        let user = svc.create_user("oscar", Role::Admin).await.unwrap();
+        let issued = svc.issue_api_key(&user.id).await.unwrap();
+
+        assert!(svc.revoke_by_secret(&issued.secret).await.unwrap());
+        let err = svc.authenticate(&issued.secret).await.unwrap_err();
+        assert!(matches!(err, Error::Unauthorized { .. }));
+    }
+
+    #[tokio::test]
+    async fn revoke_by_secret_revokes_whole_refresh_family() {
+        let svc = service();
+        let user = svc.create_user("pia", Role::Admin).await.unwrap();
+        let refresh = svc.issue_refresh_token(&user.id).await.unwrap();
+        let (_new_access, new_refresh) = svc.rotate_refresh_token(&refresh.secret).await.unwrap();
+
+        assert!(svc.revoke_by_secret(&new_refresh.secret).await.unwrap());
+
+        let err = svc
+            .rotate_refresh_token(&new_refresh.secret)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Unauthorized { .. }));
+    }
+
+    #[tokio::test]
+    async fn revoke_by_secret_unknown_token_returns_false() {
+        let svc = service();
+        assert!(!svc.revoke_by_secret("ldb_unknown").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn revoke_by_secret_already_revoked_returns_false() {
+        let svc = service();
+        let user = svc.create_user("quinn", Role::Admin).await.unwrap();
+        let issued = svc.issue_api_key(&user.id).await.unwrap();
+        assert!(svc.revoke_by_secret(&issued.secret).await.unwrap());
+        assert!(!svc.revoke_by_secret(&issued.secret).await.unwrap());
     }
 
     #[tokio::test]

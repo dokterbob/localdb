@@ -1,8 +1,8 @@
 //! SQL <-> Rust converters for the auth tables (mirrors `registry/sql.rs`).
 
 use localdb_core::auth::{
-    AccessRequestRow, AccessRequestState, AuthTokenRow, InviteMode, InviteRow, Role, StoreGrantRow,
-    TokenKind, UserRow,
+    AccessRequestRow, AccessRequestState, AuthCodeRow, AuthTokenRow, InviteMode, InviteRow, Role,
+    StoreGrantRow, TokenKind, UserRow,
 };
 use localdb_core::Error;
 
@@ -119,6 +119,31 @@ pub(super) fn row_to_token(row: &libsql::Row) -> Result<AuthTokenRow, Error> {
         created_at,
         family_id,
         rotated_from,
+    })
+}
+
+pub(super) fn row_to_auth_code(row: &libsql::Row) -> Result<AuthCodeRow, Error> {
+    let id: String = row.get(0).map_err(map_libsql_err)?;
+    let client_id: String = row.get(1).map_err(map_libsql_err)?;
+    let user_id: String = row.get(2).map_err(map_libsql_err)?;
+    let code_hash: String = row.get(3).map_err(map_libsql_err)?;
+    let code_challenge: String = row.get(4).map_err(map_libsql_err)?;
+    let code_challenge_method: String = row.get(5).map_err(map_libsql_err)?;
+    let redirect_uri: String = row.get(6).map_err(map_libsql_err)?;
+    let expires_at: String = row.get(7).map_err(map_libsql_err)?;
+    let consumed_at: Option<String> = row.get(8).map_err(map_libsql_err)?;
+    let created_at: String = row.get(9).map_err(map_libsql_err)?;
+    Ok(AuthCodeRow {
+        id,
+        client_id,
+        user_id,
+        code_hash,
+        code_challenge,
+        code_challenge_method,
+        redirect_uri,
+        expires_at,
+        consumed_at,
+        created_at,
     })
 }
 

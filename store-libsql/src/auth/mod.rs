@@ -7,13 +7,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use localdb_core::auth::{
-    AccessRequestRow, AccessRequestState, AuthStore, AuthTokenRow, InviteRow, Role, StoreGrantRow,
-    UserRow,
+    AccessRequestRow, AccessRequestState, AuthCodeRow, AuthStore, AuthTokenRow, InviteRow, Role,
+    StoreGrantRow, UserRow,
 };
 use localdb_core::Error;
 
 use crate::connection::LibsqlDb;
 
+mod auth_codes;
 mod grants;
 mod invites;
 mod sql;
@@ -93,6 +94,18 @@ impl AuthStore for LibsqlAuthStore {
 
     async fn list_tokens_for_user(&self, user_id: &str) -> Result<Vec<AuthTokenRow>, Error> {
         tokens::list_tokens_for_user(&self.conn, user_id).await
+    }
+
+    async fn create_auth_code(&self, code: &AuthCodeRow) -> Result<(), Error> {
+        auth_codes::create_auth_code(&self.conn, code).await
+    }
+
+    async fn find_auth_code_by_hash(&self, code_hash: &str) -> Result<Option<AuthCodeRow>, Error> {
+        auth_codes::find_auth_code_by_hash(&self.conn, code_hash).await
+    }
+
+    async fn consume_auth_code(&self, id: &str, consumed_at: &str) -> Result<bool, Error> {
+        auth_codes::consume_auth_code(&self.conn, id, consumed_at).await
     }
 
     async fn grant_store(&self, grant: &StoreGrantRow) -> Result<(), Error> {

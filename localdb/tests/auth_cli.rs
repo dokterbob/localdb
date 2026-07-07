@@ -326,3 +326,88 @@ fn user_and_key_subcommands_are_registered() {
         .success()
         .stdout(predicates::str::contains("create"));
 }
+
+// ---------------------------------------------------------------------------
+// T4: login / logout CLI surface
+// ---------------------------------------------------------------------------
+
+#[test]
+fn login_and_logout_subcommands_are_registered_with_expected_flags() {
+    cmd()
+        .args(["login", "--help"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("--url"))
+        .stdout(predicates::str::contains("--setup-code"))
+        .stdout(predicates::str::contains("--no-browser"));
+    cmd()
+        .args(["logout", "--help"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("--url"));
+}
+
+#[test]
+fn login_without_a_reachable_daemon_exits_5() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    // No daemon.sock/daemon.url and no LOCALDB_DAEMON_URL override: there is
+    // nothing to log into (specs/05-surfaces.md §2 — login only makes sense
+    // daemon-attached).
+    let output = cmd_with_dir(&dir).args(["login"]).output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "login without a reachable daemon must exit 5 (daemon_unreachable); stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn logout_without_a_cached_credential_reports_nothing_to_clear() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["logout", "--url", "http://127.0.0.1:19999"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "logout with no cached credential should still succeed as a no-op; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.to_lowercase().contains("no cached credentials"),
+        "expected a 'no cached credentials' message; got: {stdout}"
+    );
+}
+
+#[test]
+fn logout_url_flag_bypasses_daemon_probing() {
+    // `--url` is honored even when no daemon is detected via the socket —
+    // logout should not require a live daemon to clear a local credential.
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    std::fs::write(
+        dir.path().join("credentials.json"),
+        r#"{"version":1,"credentials":{"http://127.0.0.1:19999":{"secret":"ldb_stale"}}}"#,
+    )
+    .unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .args(["logout", "--url", "http://127.0.0.1:19999"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.to_lowercase().contains("logged out"));
+
+    let contents = std::fs::read_to_string(dir.path().join("credentials.json")).unwrap();
+    assert!(
+        !contents.contains("ldb_stale"),
+        "the cached credential must be removed: {contents}"
+    );
+}

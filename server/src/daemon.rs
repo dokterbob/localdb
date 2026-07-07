@@ -254,9 +254,11 @@ async fn server_future(listener: TcpListener, router: Router) {
 ///
 /// Auth (specs/05-surfaces.md §3.1): the `require_auth` middleware layer is
 /// applied *after* the `/mcp` `nest_service`, so it wraps every `/v1/*`
-/// route AND the MCP mount — none of the public routes from the spec's
-/// route table exist yet (T4+), so everything registered here is protected.
-/// The MCP handler's default principal follows the same mode: `Open` passes
+/// route AND the MCP mount. `/authorize`, `/token`, and `/revoke` (T4) are
+/// built as a **separate, unlayered router** and merged in afterwards — they
+/// *are* the auth flow itself (specs/05-surfaces.md §3.1's public-routes
+/// table) and must be reachable without a bearer token. The MCP handler's
+/// default principal follows the protected router's mode: `Open` passes
 /// `local_trust` (requests carry it anyway via the middleware, but embedded
 /// construction paths share this signature), while `Enforced` passes `None`
 /// so a missing request-extension `Principal` fails closed inside the tool
@@ -271,7 +273,7 @@ pub fn build_router(
         AuthMode::Open => Some(Principal::local_trust()),
         AuthMode::Enforced => None,
     };
-    Router::new()
+    let protected = Router::new()
         .route(
             "/v1/stores",
             get(handlers::list_stores).post(handlers::create_store),
@@ -305,7 +307,18 @@ pub fn build_router(
             ),
         )
         // Applied after `.nest_service` so the auth layer wraps `/mcp` too.
-        .layer(middleware::from_fn_with_state(state, require_auth))
+        .layer(middleware::from_fn_with_state(state.clone(), require_auth));
+
+    let public = Router::new()
+        .route(
+            "/authorize",
+            get(auth::oauth::get_authorize).post(auth::oauth::post_authorize),
+        )
+        .route("/token", post(auth::oauth::post_token))
+        .route("/revoke", post(auth::oauth::post_revoke))
+        .with_state(state);
+
+    public.merge(protected)
 }
 
 /// Warn when the actually-bound address is unspecified (all interfaces).
