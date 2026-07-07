@@ -8,7 +8,9 @@
 
 Every command/tool first probes the daemon socket ([01-architecture.md](01-architecture.md) §3):
 daemon present → thin client over its HTTP API; absent → embedded mode (open store in-process).
-The behavior difference per command is noted below; users should rarely need to care.
+The client's base URL for the HTTP API comes from the daemon's recorded discovery URL (§3), not a
+hardcoded default, so this works for any configured bind address or port. The behavior difference
+per command is noted below; users should rarely need to care.
 
 ## 2. CLI
 
@@ -37,10 +39,17 @@ daemon. **Rejected:** gRPC (worse curl-ability and browser story for a local too
 later if a consumer demands it).
 
 - **Bind & trust:** `127.0.0.1` by default, **no auth in local mode** — documented trust
-  assumption: anything on this machine that can reach localhost is trusted, same boundary as the
-  files themselves. Binding to a non-loopback address without auth configured is a **refused
-  startup**, not a warning (forward-compatible with the shared/home-server mode in
-  [06-roadmap.md](06-roadmap.md) §1, which arrives together with real auth).
+  assumption: anything that can reach the bind address is trusted, same boundary as the files
+  themselves. Any bind address is accepted; the daemon does not refuse to start based on it.
+  Binding to a specific non-loopback address (e.g. a LAN or VPN IP) is treated as a deliberate
+  trust decision by the user and starts silently. Binding to all interfaces (`0.0.0.0`, `::`, or
+  any other address form the OS resolves to the unspecified address) logs a warning at startup —
+  checked against the address the OS actually bound, not the raw config string, so aliases the
+  string form can't see are still caught — since it makes the unauthenticated daemon reachable
+  from any network the machine is on and is the one case a user could plausibly not realize how
+  exposed this makes them. The daemon also records its client-reachable base URL (loopback
+  substituted for a wildcard bind) in a discovery file so CLI/MCP clients can find it regardless
+  of bind address or port ([01-architecture.md](01-architecture.md) §3).
 - **Resources** (`/v1`): `GET/POST /stores`, `GET/PATCH/DELETE /stores/{id}`,
   `GET/POST /stores/{id}/sources`, `POST /search` (body: query, store filter, metadata filters,
   limit; citations carry full `Metadata`), `GET /resources/{id}` (response includes
@@ -118,6 +127,55 @@ and also backs the CLI's `--content-length` (§2) — the CLI additionally colla
 before truncating, which removes `\n\n` paragraph breaks, so only sentence/word snapping
 applies on that path. `context_sentences` (an alternative sentence-count-based unit) is out
 of scope for this design.
+
+### 4.2 Transports and process model
+
+MCP is served over two transports, built on the official `rmcp` SDK:
+
+- **Stdio** (`localdb mcp`): if no daemon is running, the CLI opens the store(s) embedded
+  in-process and serves them directly. If a daemon is already running (detected the same way
+  every other daemon-aware CLI command detects it, §1), `localdb mcp` instead **proxies**
+  every request verbatim to that daemon's own `/mcp` HTTP route below, rather than opening the
+  store a second time. The stdio caller cannot tell which mode is in effect except by behavior:
+  proxied mode exposes whatever store set the daemon had at its own startup, unfiltered.
+  **Known v1 gap:** `--store` is not honored in proxied mode — the daemon's `/mcp` route has no
+  concept of a per-stdio-session store filter, and building client-side re-filtering for this
+  narrow case was rejected as not worth the complexity in v1. `localdb mcp --store <name>`
+  against a running daemon prints a non-fatal warning to stderr and serves the daemon's full
+  store set regardless of the flag; this is a documented limitation, not a bug.
+- **HTTP** (`/mcp`, mounted on the daemon alongside its own `/v1` routes): a startup-time
+  snapshot of stores, not rebuilt per session — a store added later via `/v1/stores` is
+  invisible over MCP until the daemon restarts (see `mcp::http::build_streamable_http_service`'s
+  doc comment). HTTP MCP sessions always run with `allow_write = false`.
+
+Tool registration (the four read-only tools) and business logic are identical on both
+transports and in both stdio modes — only the code path serving the request differs.
+
+### 4.3 Error model
+
+MCP failures split into exactly two tiers, by whether the request could be *routed* to a tool
+at all:
+
+- **Protocol-level** (a JSON-RPC error): the tool name itself is unregistered. `rmcp`'s
+  macro-generated dispatch returns `ErrorCode::INVALID_PARAMS` ("tool not found") for any name
+  not in the tool router. This is the one case a caller cannot recover from within the tool
+  result.
+- **Tool-level** (`CallToolResult { isError: true, .. }`): everything else — including cases
+  one might expect to be protocol-level. A missing or wrong-typed *required* argument (e.g.
+  `search`'s `query`, `get_chunks`'s `document_id`) fails `rmcp`'s `Parameters<T>`
+  deserialization, which itself produces a protocol-level `ErrorData::invalid_params` — but
+  `rmcp` 1.8.0's tool router downgrades that specific case to a tool-level result via
+  `into_tool_argument_error`, so the caller's MCP client can render it like any other tool
+  result. This is a real behavior difference from what an initial reading of the `rmcp` API
+  might suggest; it was verified empirically (`mcp/tests/mcp_protocol.rs`), not assumed. Our own
+  semantic validation (empty strings, out-of-range `limit`/`offset`, unknown store names,
+  not-found lookups) is always tool-level, carrying a `{"error": {"code", "message"}}` JSON
+  body as its text content.
+
+Proxied stdio mode forwards whichever tier the daemon's own `/mcp` route returns unchanged —
+the proxy never re-tiers an error it received an answer for. A failure of the proxy hop itself
+(the daemon unreachable, the connection dropped mid-request) is a distinct case: there is no
+upstream answer to relay a tier from, so it surfaces as a fresh protocol-level error instead.
 
 ## 5. Shared error taxonomy
 

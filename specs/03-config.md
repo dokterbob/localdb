@@ -122,7 +122,7 @@ url/refresh for URLs) and require no additional interactive setup.
 | Model cache | `~/Library/Caches/localdb/models/` | `$XDG_CACHE_HOME/localdb/models/` |
 | Logs | `~/Library/Logs/localdb/` | `$XDG_STATE_HOME/localdb/logs/` |
 
-Unix socket: `<data>/daemon.sock`
+Unix socket: `<data>/daemon.sock`; daemon discovery URL: `<data>/daemon.url`
 ([01-architecture.md](01-architecture.md) §3). `--config` / `LOCALDB_CONFIG` override the config
 path; `paths.*` in config override the rest.
 

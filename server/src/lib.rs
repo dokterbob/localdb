@@ -13,13 +13,14 @@ pub mod daemon;
 pub mod error;
 pub mod handlers;
 pub mod job_queue;
+pub mod mcp_bridge;
 pub mod scheduler;
 pub mod search_service;
 pub mod socket;
 pub mod state;
 pub mod watcher;
 
-pub use daemon::{build_router, start_daemon, validate_bind_address, DaemonHandle, DaemonOptions};
+pub use daemon::{build_router, start_daemon, DaemonHandle, DaemonOptions};
 pub use error::{ApiError, ErrorResponse};
 pub use job_queue::JobQueue;
 pub use scheduler::UrlRefreshScheduler;

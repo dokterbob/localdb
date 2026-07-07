@@ -61,23 +61,28 @@ localdb search "your query" --store notes --json \
 
 ## MCP tool shapes
 
-When localdb is registered as an MCP server (`localdb mcp`), three tools are
-available:
+When localdb is registered as an MCP server (`localdb mcp`, or over HTTP at `/mcp`
+on a running `localdb serve` daemon), four tools are available:
 
 ```
-search(query: string, stores?: string[], limit?: int)
+search(query: string, stores?: string[], limit?: int, content_length?: int)
   → citations array (same shape as CLI --json)
 
 get_document(id: string)
   → { document_id, uri, text, title, chunk_count, provenance, store, metadata }
   Note: uri-based lookup is NOT supported in v1; use document_id from a search result.
 
+get_chunks(document_id: string, offset?: int, limit?: int)
+  → { document_id, uri, title, store, total_chunks, offset, limit, returned, chunks }
+  Paginated; an out-of-range offset returns an empty chunks array, not an error.
+
 list_stores()
   → { stores: [{ id, name, visibility, document_count, chunk_count }] }
 ```
 
 Tool results are returned as a `text` content item whose `text` field contains
-pretty-printed JSON.
+pretty-printed JSON. If `localdb serve` is already running, `localdb mcp` proxies to
+its `/mcp` route automatically rather than conflicting with it.
 
 ---
 
@@ -100,7 +105,7 @@ Pass it to any command with `--config /path/to/config.yaml`.
 | Symptom | Cause | Fix |
 |---|---|---|
 | `error: store not found: handbook` on `localdb index` | Store was declared in YAML config — YAML-declared stores cannot be indexed | Use `localdb store add handbook` to create a runtime store, then `localdb source add` |
-| `Database already open. Cannot acquire lock.` | `localdb serve` (HTTP daemon) is running and holds the DB lock | Stop the daemon; CLI and MCP work in embedded mode without it |
+| `Database already open. Cannot acquire lock.` | Another embedded-mode process opened the DB while the daemon also holds it | Prefer letting the daemon serve reads/MCP (`localdb mcp` proxies to it automatically); stop the daemon only if you need direct embedded access |
 | `error: daemon is unreachable` (exit 5) | Stale `daemon.sock` left after daemon crash or `SIGKILL` | `rm <data_dir>/daemon.sock` |
 | Empty search results | Store has not been indexed yet | Run `localdb index --store <name>` |
 | `error: invalid request: store 'X' already exists` (exit 2) | `store add` called for a store that already exists | Use the existing store; list stores with `localdb store list` |

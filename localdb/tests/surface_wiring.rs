@@ -74,7 +74,7 @@ fn mcp_stdio_initialize_tools_list_and_search() {
     seed_indexed_store(&dir);
 
     let input = concat!(
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test-client","version":"0.0.1"}}}"#,
         "\n",
         r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
         "\n",
@@ -113,7 +113,7 @@ fn mcp_stdio_initialize_tools_list_and_search() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    for expected in ["search", "get_document", "list_stores"] {
+    for expected in ["search", "get_document", "get_chunks", "list_stores"] {
         assert!(
             names.contains(&expected),
             "missing tool {expected}: {names:?}"
@@ -140,7 +140,9 @@ fn mcp_allow_write_flag_still_serves_tools() {
     write_config(&dir, "");
 
     let input = concat!(
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test-client","version":"0.0.1"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
         "\n",
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
         "\n",
@@ -152,6 +154,124 @@ fn mcp_allow_write_flag_still_serves_tools() {
         .success();
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     assert!(stdout.contains("tools"), "stdout was: {stdout}");
+}
+
+/// Phase 3: `localdb mcp` delegates to a running daemon's `/mcp` HTTP route
+/// (Phase 2's mount) instead of opening the store embedded, when a daemon is
+/// already up — proven by a real two-subprocess round trip, not a mock. Also
+/// verifies the documented v1 gap: `--store` is warned-about, not honored,
+/// in proxied mode (specs/05-surfaces.md §4).
+#[test]
+fn mcp_stdio_proxies_to_running_daemon() {
+    let dir = TempDir::new().unwrap();
+    write_config(&dir, "server:\n  port: 0\n");
+    seed_indexed_store(&dir);
+
+    let bin = assert_cmd::cargo::cargo_bin("localdb");
+    let mut daemon = std::process::Command::new(&bin)
+        .arg("serve")
+        .env("LOCALDB_CONFIG", dir.path().join("config.yaml"))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn localdb serve");
+
+    let daemon_stdout = daemon.stdout.take().unwrap();
+    let mut reader = BufReader::new(daemon_stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read announce line");
+    let addr = line
+        .split("http://")
+        .nth(1)
+        .unwrap_or_else(|| panic!("announce line must contain http:// URL, got: {line}"))
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    let base_url = format!("http://{addr}");
+
+    let input = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test-client","version":"0.0.1"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+        "\n",
+    );
+
+    // `--store notes` is passed on purpose: proxied mode must ignore it
+    // (with a warning) rather than filtering client-side (see run_mcp_async).
+    let assert = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &base_url)
+        .args(["mcp", "--store", "notes"])
+        .write_stdin(input)
+        .assert()
+        .success();
+
+    daemon.kill().ok();
+    daemon.wait().ok();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let responses: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("each stdout line is JSON"))
+        .collect();
+    assert_eq!(responses.len(), 2, "stdout was: {stdout}");
+
+    let tools = &responses[1];
+    let names: Vec<&str> = tools["result"]["tools"]
+        .as_array()
+        .expect("tools/list result.tools is an array")
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    for expected in ["search", "get_document", "get_chunks", "list_stores"] {
+        assert!(
+            names.contains(&expected),
+            "missing tool {expected} via daemon-proxied mcp: {names:?}"
+        );
+    }
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("--store") && stderr.contains("daemon"),
+        "proxied mode must warn that --store is ignored: {stderr}"
+    );
+}
+
+/// Codex review fix (PR #145): when `LOCALDB_DAEMON_URL` points at an
+/// unreachable daemon (stale env var, or the daemon died between
+/// `probe_daemon` and the actual `/mcp` connect), `run_mcp_async` must map
+/// the connect failure to `daemon_unreachable` (exit 5) — not `internal`
+/// (exit 1) — matching every other daemon-backed CLI path.
+/// `probe_daemon` trusts `LOCALDB_DAEMON_URL` unconditionally (no health
+/// probe when the override is set — see `daemon_client::probe_daemon`), so
+/// pointing it at a closed TCP port reliably drives the `Proxied` branch's
+/// `ProxyHandler::connect` into a connection failure.
+#[test]
+fn mcp_stdio_daemon_unreachable_maps_to_daemon_unreachable_exit_code() {
+    let dir = TempDir::new().unwrap();
+    write_config(&dir, "");
+
+    let closed_port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+        // listener drops here, closing the port.
+    };
+    let stale_url = format!("http://127.0.0.1:{closed_port}");
+
+    let assert = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &stale_url)
+        .arg("mcp")
+        .write_stdin("")
+        .assert()
+        .code(5);
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("daemon_unreachable") || stderr.contains("daemon"),
+        "expected a daemon-unreachable error, got stderr: {stderr}"
+    );
 }
 
 // ---------------------------------------------------------------------------

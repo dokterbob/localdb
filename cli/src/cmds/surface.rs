@@ -6,7 +6,7 @@ use serde_json::json;
 
 use crate::{
     app_db::load_app_db,
-    daemon_client::CliContext,
+    daemon_client::{probe_daemon, CliContext, DaemonState},
     normalize::{exit_err, print_json, visibility_to_string},
 };
 
@@ -68,9 +68,57 @@ pub fn run_mcp(ctx: &CliContext, allow_write: bool) {
 }
 
 pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
-    use mcp::{AvailableStore, McpServer, StoreDescriptor};
+    use mcp::{proxy::ProxyHandler, AvailableStore, McpHandler, StoreDescriptor};
 
+    // `load_app_db` is unconditional here — same sequencing as
+    // `search.rs`'s `run_search_async` — since `probe_daemon` needs
+    // `config_loader.paths.data_dir` regardless of which mode we end up in.
+    // SQLite WAL mode makes opening it harmless even when a daemon is
+    // already running (see `app_db::load_app_db`'s doc comment); in the
+    // `Proxied` branch below, `db`/`config_loader` simply go unused beyond
+    // this point, exactly as `search.rs`'s `SearchMode::Daemon` branch
+    // leaves its own `db` unused.
     let (config_loader, db) = load_app_db(ctx).await;
+
+    if let DaemonState::Running { base_url } =
+        probe_daemon(&config_loader.paths.data_dir, ctx.daemon_url.as_deref())
+    {
+        // The daemon's `/mcp` route has no notion of a stdio caller's
+        // `--store` scope (specs/05-surfaces.md §4) — re-filtering
+        // client-side would mean re-deriving store visibility rules the
+        // daemon already applied, for a flag combination narrow enough not
+        // to be worth it in v1. Warn instead of silently ignoring it.
+        if !ctx.stores.is_empty() {
+            eprintln!(
+                "warning: --store is not honored when a daemon is running; \
+                 the daemon's full store set will be used instead"
+            );
+        }
+        // Connect and serve are separate calls (`ProxyHandler::connect` then
+        // `mcp::serve_proxied_stdio`, rather than one moded entrypoint) so a
+        // failure to reach the daemon at all — it went away between
+        // `probe_daemon` and here, or `LOCALDB_DAEMON_URL` points at a stale
+        // endpoint — maps to the same `daemon_unreachable`/exit-5 outcome as
+        // every other daemon-backed CLI path, instead of `internal`/exit-1.
+        // Only a failure in the stdio loop *after* a successful proxy
+        // connection (a much rarer case) still falls back to `internal`.
+        let handler = match ProxyHandler::connect(&base_url).await {
+            Ok(handler) => handler,
+            Err(_) => {
+                exit_err(&Error::DaemonUnreachable, ctx.json);
+            }
+        };
+        if let Err(e) = mcp::serve_proxied_stdio(handler).await {
+            exit_err(
+                &Error::Internal {
+                    message: format!("mcp stdio loop failed: {}", e),
+                    correlation_id: "mcp_stdio".to_string(),
+                },
+                ctx.json,
+            );
+        }
+        return;
+    }
 
     let runtime_stores = match db.backend().list_stores().await {
         Ok(s) => s,
@@ -112,10 +160,9 @@ pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
         }
     }
 
-    let mut mcp_server = McpServer::new(available, embedder);
-    mcp_server.allow_write = allow_write;
+    let handler = McpHandler::new(available, std::sync::Arc::from(embedder), allow_write);
 
-    if let Err(e) = mcp::run_stdio_loop(&mcp_server).await {
+    if let Err(e) = mcp::serve_embedded_stdio(handler).await {
         exit_err(
             &Error::Internal {
                 message: format!("mcp stdio loop failed: {}", e),

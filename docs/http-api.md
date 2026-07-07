@@ -21,7 +21,12 @@ daemon listening on http://127.0.0.1:7700
 ```
 
 It binds the HTTP listener and also creates a Unix discovery socket at
-`<data_dir>/daemon.sock` so that CLI and MCP processes can detect it.
+`<data_dir>/daemon.sock` so that CLI and MCP processes can detect it, plus a
+`<data_dir>/daemon.url` file recording the daemon's actual client-reachable base URL
+(e.g. `http://192.168.1.5:7700` for a LAN bind, or `http://127.0.0.1:7700` when bound to
+`0.0.0.0`/`::`, since the wildcard address itself isn't connectable). CLI/MCP discovery reads
+this file, so it works for any configured bind address or port — not just the default
+`127.0.0.1:7700`.
 
 ### Bind address and port
 
@@ -30,7 +35,7 @@ The bind address and port are controlled by the `server` block in `config.yaml`:
 ```yaml
 version: 1
 server:
-  bind: 127.0.0.1   # default; non-loopback addresses require auth (see Trust model below)
+  bind: 127.0.0.1   # default; any bind address is accepted (see Trust model below)
   port: 7700        # default; 0 = OS-assigned
 ```
 
@@ -40,11 +45,25 @@ line.
 ### Trust model
 
 The daemon binds `127.0.0.1` by default with **no authentication**. The documented trust boundary
-is: anything on this machine that can reach localhost is as trusted as the files themselves. Binding
-to a non-loopback address without auth configured is a **refused startup**, not a warning — this is
-forward-compatible with the multi-user/home-server mode described in
-[specs/06-roadmap.md](../specs/06-roadmap.md) §1, which will arrive together with real auth. See
-[specs/05-surfaces.md](../specs/05-surfaces.md) §3 for the binding and trust decision.
+is: anything that can reach the bind address is as trusted as the files themselves. Any bind
+address is accepted — binding to a specific non-loopback address (e.g. a LAN or VPN IP) is treated
+as a deliberate trust decision and starts silently. Binding to `0.0.0.0` (all interfaces) logs a
+warning at startup, since that makes the unauthenticated daemon reachable from any network the
+machine is on. See [specs/05-surfaces.md](../specs/05-surfaces.md) §3 for the binding and trust
+decision.
+
+---
+
+## MCP over HTTP
+
+Alongside `/v1`, the daemon also mounts `/mcp` — the same four read-only MCP tools
+(`search`, `get_document`, `get_chunks`, `list_stores`) served over the
+[MCP Streamable HTTP transport](https://modelcontextprotocol.io/), for connecting a
+remote MCP client (e.g. Claude Code on another machine, over Tailscale/LAN). It
+inherits this daemon's bind-address trust decision automatically — see
+[docs/mcp.md](mcp.md#remote-http-connecting-from-another-machine) for setup and
+[specs/05-surfaces.md](../specs/05-surfaces.md) §4.2 for the transport/error-model
+details.
 
 ---
 
@@ -372,21 +391,21 @@ exit: 4
 
 there is already a daemon process running. Stop it before starting a new one.
 
-### Stale `daemon.sock` after an ungraceful shutdown
+### Stale `daemon.sock` / `daemon.url` after an ungraceful shutdown
 
 If the daemon process is killed (e.g. with `kill <pid>` or a crash), the Unix socket file at
-`<data_dir>/daemon.sock` is **not cleaned up**. The CLI will then report the daemon as running and
-`localdb search` will exit with:
+`<data_dir>/daemon.sock` and the discovery URL file at `<data_dir>/daemon.url` are **not cleaned
+up**. The CLI will then report the daemon as running and `localdb search` will exit with:
 
 ```
 error: daemon is unreachable
 exit: 5
 ```
 
-Fix: remove the stale socket file manually, then CLI commands will fall back to embedded mode.
+Fix: remove the stale files manually, then CLI commands will fall back to embedded mode.
 
 ```
-rm <data_dir>/daemon.sock
+rm <data_dir>/daemon.sock <data_dir>/daemon.url
 ```
 
 After removal `localdb status` will show `daemon: not running (embedded mode)`.
