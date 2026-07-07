@@ -1,6 +1,6 @@
 # Spec 05 — Surfaces: CLI, HTTP API, MCP
 
-> Status: accepted draft, revised 2026-06-30. All three surfaces sit on the same `core`
+> Status: accepted draft, revised 2026-07-07. All three surfaces sit on the same `core`
 > ([01-architecture.md](01-architecture.md) §1) and return the same Citation shape
 > ([02-domain-model.md](02-domain-model.md) §6) and error taxonomy (§5).
 
@@ -21,16 +21,31 @@ Single binary, subcommand tree. Global flags: `--config`, `--json`, `--store <na
 | `init` | Create config + data dir, first-run model download prompt | full | n/a (refuses if daemon running with different data dir) |
 | `serve` | Run the daemon (HTTP API, watching, refresh, socket) | becomes the daemon | error `daemon_running` |
 | `mcp` | Run MCP server on stdio | embedded core | thin client |
-| `status` | Stores, resource/chunk counts, policy staleness, daemon state | reads directly | queries daemon |
+| `status` | Stores, resource/chunk counts, policy staleness, daemon state — extended to show the caller's identity (user, role) and cached token expiry once auth lands | reads directly | queries daemon |
 | `store add/list/remove` | Manage runtime-owned stores | direct write | routed to daemon |
 | `source add/list/remove` | Manage sources on a store | direct write | routed to daemon |
 | `add <path|url>...` | Alias for `source add` — add one or more sources to a store | direct write | routed to daemon |
 | `index [--store S] [--source ID] [--strict]` | One-shot scan & index; creates IndexJob | runs job synchronously, progress to stderr | submits job, polls, streams progress |
 | `search <query>... [--limit N] [--content-length N]` | Hybrid search with citations; `--content-length` is a **soft cap** on human-readable snippet chars (default 1000; JSON output always full text) — see §4 for the snapping behavior shared with MCP | embedded read | via API |
+| `login` / `logout` (planned) | Authenticate against a daemon and cache the resulting token, or revoke and clear it | n/a — there is no auth to log into without a daemon (§3.1) | `login` exchanges credentials via `/token` (or an invite/API-key flow) and writes `credentials.json` (§6, [03-config.md](03-config.md) §6); `logout` calls `/revoke` and clears the cached entry |
+| `user add\|list\|remove\|set-role` (planned) | Manage user accounts (admin only) | **break-glass**: writes the unified DB's `users` table directly — recovery path when the daemon is unreachable or auth is locked out | routed to daemon, requires an admin bearer token; `user add` also accepts a `--direct-db` flag to bypass a running daemon for lockout recovery |
+| `key create\|list\|revoke` (planned) | Manage API keys (`auth_tokens` rows with `kind='api_key'`) for the caller or, as admin, another user | break-glass direct write | routed to daemon; managing another user's key requires admin |
+| `store grant\|revoke` (planned) | Grant/revoke a member's read access to a `shared` store (D7); rejected on `private` stores | direct write | routed to daemon, admin only |
+| `invite create\|list\|revoke\|requests\|approve\|deny` (planned) | Manage invites and pending access requests (admin only; the full redeem/approve state machine lands in T6) | direct write | routed to daemon, admin only |
 
 Output: human-readable by default (citations as `uri:heading_path` + snippet), `--json` emits the
 canonical structures for scripting. The CLI is **command-oriented**; interactive browse is a
 roadmap item with the web UI.
+
+**Break-glass commands:** `user`, `key`, `store grant/revoke`, and `invite` all have a
+daemonless mode that writes the unified database directly, bypassing HTTP auth entirely. This
+is deliberate: it is the recovery path when the daemon can't be reached, or when every admin
+credential has been lost or revoked. It carries the same trust assumption as any other
+daemonless CLI command — whoever can open the database file is already trusted (§3.1) — so no
+additional confirmation is required. `user add --direct-db` extends this to force break-glass
+behavior even while a daemon is running, for the lockout-recovery case specifically. None of
+the commands in this paragraph are implemented yet (T1 ships only the underlying schema and
+`core::auth` types); see the design note above each row.
 
 ## 3. HTTP API
 
@@ -38,18 +53,26 @@ roadmap item with the web UI.
 daemon. **Rejected:** gRPC (worse curl-ability and browser story for a local tool; can be added
 later if a consumer demands it).
 
-- **Bind & trust:** `127.0.0.1` by default, **no auth in local mode** — documented trust
-  assumption: anything that can reach the bind address is trusted, same boundary as the files
-  themselves. Any bind address is accepted; the daemon does not refuse to start based on it.
-  Binding to a specific non-loopback address (e.g. a LAN or VPN IP) is treated as a deliberate
-  trust decision by the user and starts silently. Binding to all interfaces (`0.0.0.0`, `::`, or
-  any other address form the OS resolves to the unspecified address) logs a warning at startup —
-  checked against the address the OS actually bound, not the raw config string, so aliases the
-  string form can't see are still caught — since it makes the unauthenticated daemon reachable
-  from any network the machine is on and is the one case a user could plausibly not realize how
-  exposed this makes them. The daemon also records its client-reachable base URL (loopback
-  substituted for a wildcard bind) in a discovery file so CLI/MCP clients can find it regardless
-  of bind address or port ([01-architecture.md](01-architecture.md) §3).
+- **Bind & trust:** `127.0.0.1` by default. Auth enforcement is controlled by `server.auth:
+  auto | required | off` (default `auto`) ([03-config.md](03-config.md) §1) — see §3.1 for what
+  "enforced" means. `auto` enforces auth **iff** the daemon is bound to a non-loopback address;
+  loopback (`127.0.0.1` / `::1`) under `auto` stays auth-free, same trust boundary as today:
+  anything that can reach the bind address is trusted, same as the files themselves. `required`
+  always enforces auth regardless of bind address, including loopback. Binding to a specific
+  non-loopback address (e.g. a LAN or VPN IP) is still a deliberate trust decision by the user,
+  but it is now only accepted if auth ends up enforced (`auto` or `required`) — `off` combined
+  with a non-loopback bind is a hard startup error (`invalid_config`): the daemon refuses to
+  start rather than exposing an unauthenticated surface to a network. Binding to all interfaces
+  (`0.0.0.0`, `::`, or any other address form the OS resolves to the unspecified address) logs a
+  warning at startup — checked against the address the OS actually bound, not the raw config
+  string, so aliases the string form can't see are still caught — since it makes the daemon
+  reachable from any network the machine is on and is the one case a user could plausibly not
+  realize how exposed this makes them; this warning applies regardless of auth mode. The daemon
+  also records its client-reachable base URL (loopback substituted for a wildcard bind) in a
+  discovery file so CLI/MCP clients can find it regardless of bind address or port
+  ([01-architecture.md](01-architecture.md) §3). When auth is enforced and zero users exist yet
+  (`AuthStore::count_users() == 0`), `serve` prints a one-time setup code to stdout/stderr so the
+  operator can bootstrap the first admin user (§3.1).
 - **Resources** (`/v1`): `GET/POST /stores`, `GET/PATCH/DELETE /stores/{id}`,
   `GET/POST /stores/{id}/sources`, `POST /search` (body: query, store filter, metadata filters,
   limit; citations carry full `Metadata`), `GET /resources/{id}` (response includes
@@ -60,6 +83,41 @@ later if a consumer demands it).
   job resource is designed so SSE adds a representation, not a new model.
 - **Pagination:** cursor-based (`?cursor=`, `?limit=`) on list endpoints from day one.
 
+### 3.1 Authentication
+
+**Status:** foundation only as of this ticket (T1) — `core::auth` (types, `AuthStore` trait,
+`AuthService`) and the `store-libsql` persistence layer and schema exist
+([02-domain-model.md](02-domain-model.md) §2, §9), but nothing below is enforced yet. No
+middleware runs, no route requires a token, and `server.auth` has no runtime effect. Enforcement
+lands incrementally across T2–T7; this section describes the target shape so later tickets have
+a design to implement against.
+
+**Decision (target shape):** bearer tokens (`Authorization: Bearer ldb_...`) on every route under
+`/v1/*` and `/mcp`, once auth is enforced for the daemon (§3). A request with a missing or
+invalid token gets `401` with a `WWW-Authenticate: Bearer` header. A request from an
+authenticated principal who lacks permission for the resource (e.g. a member reading a store
+they have no grant for, or any non-admin route) gets `403`. See §5 for the `unauthorized`
+(401) / `forbidden` (403) error codes.
+
+**Route table (target, D7 for the read model):**
+
+| Routes | Auth |
+|---|---|
+| `GET /.well-known/oauth-protected-resource`, `GET /.well-known/oauth-authorization-server`, `GET\|POST /authorize`, `POST /token`, `POST /revoke`, `POST /register`, `POST /v1/invites/redeem`, `GET /v1/invites/requests/{id}` | Public — no bearer token required (these routes *are* the auth flow, or are the deliberately open invite-redemption/status-check surface). |
+| Everything else under `/v1/*` and `/mcp` | Bearer token required once auth is enforced (§3). Results are filtered by the principal's store access — admins see all stores; members see only `shared` stores they hold a grant for (D7, [02-domain-model.md](02-domain-model.md) §2). |
+| User management, grant management, invite management (once they exist as routes) | Bearer token **and** `role = admin` (`Principal::require_admin`). |
+
+**One-time setup code:** when `localdb serve` starts with auth enforced and no users exist yet
+(`AuthStore::count_users() == 0`), the daemon prints a one-time setup code to stdout/stderr so
+the operator can bootstrap the first admin user without any prior credential.
+
+**Token model:** opaque 32-byte secrets minted from `OsRng`, `ldb_`-prefixed, shown once at
+issuance and stored at rest only as a blake3 hash — never a password anywhere. Access tokens are
+short-lived (1h); refresh tokens (30d) rotate on every use with reuse detection — presenting an
+already-rotated refresh token revokes its entire token family. API keys share the same
+`auth_tokens` table (`kind = 'api_key'`), have no default expiry, and track `last_used_at`. OAuth2
+authorization-code + PKCE (S256) is the flow behind `/authorize` and `/token`, once implemented.
+
 ## 4. MCP
 
 **Decision:** v1 MCP is **read-only**: tools `search` (args: query, optional store names, limit, optional content_length →
@@ -68,6 +126,12 @@ Citation list as structured content; each citation carries full `Metadata`),
 `get_chunks` (document_id, optional offset/limit → the document's chunks in order, paginated),
 `list_stores` (names, visibility, counts). **Mutating tools** (`add_source`, `reindex`, …) are a
 follow-up behind an explicit opt-in flag (`localdb mcp --allow-write`), never on by default.
+
+Once auth is enforced (§3.1), tool results on any authenticated transport are filtered by the
+principal's store access — admins see every store, members only the `shared` stores they hold a
+grant for (D7). The embedded stdio MCP (§4.2, no daemon running) stays unauthenticated: it is
+already trusted as local-files-equivalent, the same trust boundary as every other daemonless
+command.
 
 **Rationale:** the dominant agent use case is retrieval; a read-only surface has a trivially
 auditable blast radius, and write semantics through agents deserve their own design pass.
@@ -143,10 +207,9 @@ MCP is served over two transports, built on the official `rmcp` SDK:
   narrow case was rejected as not worth the complexity in v1. `localdb mcp --store <name>`
   against a running daemon prints a non-fatal warning to stderr and serves the daemon's full
   store set regardless of the flag; this is a documented limitation, not a bug.
-- **HTTP** (`/mcp`, mounted on the daemon alongside its own `/v1` routes): a startup-time
-  snapshot of stores, not rebuilt per session — a store added later via `/v1/stores` is
-  invisible over MCP until the daemon restarts (see `mcp::http::build_streamable_http_service`'s
-  doc comment). HTTP MCP sessions always run with `allow_write = false`.
+- **HTTP** (`/mcp`, mounted on the daemon alongside its own `/v1` routes): built from the
+  daemon's store set at its own startup (see `mcp::http::build_streamable_http_service`'s doc
+  comment). HTTP MCP sessions always run with `allow_write = false`.
 
 Tool registration (the four read-only tools) and business logic are identical on both
 transports and in both stdio modes — only the code path serving the request differs.
@@ -189,6 +252,8 @@ MCP tool error). Codes are stable API:
 | `daemon_running` / `daemon_unreachable` | Process-model conflicts | 409 / 502 |
 | `invalid_config` | Config failed validation (path-precise message) | 422 |
 | `invalid_request` | Bad arguments/body | 400 |
+| `unauthorized` | Missing or invalid bearer token (§3.1) | 401 |
+| `forbidden` | Authenticated, but insufficient permission for the resource (§3.1, D7) | 403 |
 | `unsupported_format` | Extraction can't handle the file type (informational in job stats) | 422 |
 | `extraction_failed` | Recognized, supported format whose contents could not be extracted (corrupt/truncated). Counted in `error_count` in job stats; produces a WARN per file. | 422 |
 | `provider_unavailable` | External embedding endpoint down/misconfigured | 502 |
@@ -197,7 +262,7 @@ MCP tool error). Codes are stable API:
 | `internal` | Bug; includes correlation id, logged with backtrace | 500 |
 
 CLI exit codes: `0` ok, `1` internal, `2` invalid usage/config, `3` not found, `4` conflict/locked,
-`5` unavailable (daemon/provider/model).
+`5` unavailable (daemon/provider/model), `6` permission denied (auth required/insufficient).
 
 ### `localdb index --strict`
 

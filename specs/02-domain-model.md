@@ -1,6 +1,6 @@
 # Spec 02 — Canonical Domain Model
 
-> Status: accepted draft, revised 2026-06-30. All entities live in the `core` crate and are
+> Status: accepted draft, revised 2026-07-07. All entities live in the `core` crate and are
 > shared by every surface. Field lists are normative for meaning, not for exact Rust types.
 >
 > **Supersedes:** the Markdown-native IR model (commit `3da56d0`). The block model is
@@ -33,7 +33,7 @@ A named knowledge base. Unit of sharing, ACLs, indexing policy, and federation.
 | `visibility` | `private` \| `shared`. MVP: only `private` functional; field exists from day one ([01-architecture.md](01-architecture.md) §5). |
 | `backend` | Backend kind + connection info; default `libsql`. |
 | `indexing` | Indexing policy: `{chunking, embedding, parsers}` as one unit ([03-config.md](03-config.md) §2). |
-| `acl` | Reserved; empty in MVP. |
+| `acl` | Reserved; empty in MVP. **Stays reserved and unused** now that auth exists — `StoreGrant` rows, not `acl`, are the real access-control mechanism (D7, see `StoreGrant` below and [05-surfaces.md](05-surfaces.md) §3.1). |
 
 ### Source
 Where a store's content comes from. Each source is driven by an **ingestor** that knows how to
@@ -165,6 +165,75 @@ store / one source / one resource), `state` (`pending` → `running` → `done` 
 `stats` (resources seen/indexed/deleted, chunks written), `error`, timestamps. Embedded mode
 runs jobs synchronously but still records them; the daemon queues them
 ([05-surfaces.md](05-surfaces.md) §3).
+
+### User
+An authenticated principal. Lives in `core::auth`; persisted via the `AuthStore` trait
+([05-surfaces.md](05-surfaces.md) §3.1).
+
+| Field | Notes |
+|---|---|
+| `id` | ULID. |
+| `name` | Human-readable, unique per instance. |
+| `role` | `admin` \| `member`. Admins see and manage every store; members see/search only `shared` stores they hold a `StoreGrant` for (D7). |
+| `created_at` | RFC 3339. |
+
+### AuthToken
+An issued credential. Access, refresh, and API-key tokens all share one table/type
+(`kind` discriminates), since they differ only in TTL, rotation behavior, and issuance flow, not
+in shape (D1).
+
+| Field | Notes |
+|---|---|
+| `id` | ULID. |
+| `user_id` | Owning user. |
+| `kind` | `access` \| `refresh` \| `api_key`. Access tokens: 1h TTL. Refresh tokens: 30d TTL, rotated on every use. API keys: no default expiry. |
+| `secret_hash` | blake3 hash of the opaque, `ldb_`-prefixed, 32-byte `OsRng` secret. The secret itself is shown once at issuance and never persisted. |
+| `expires_at` | Nullable — unset for API keys. |
+| `last_used_at` | Updated on each successful authentication; primarily meaningful for API keys. |
+| `revoked_at` | Nullable; set on explicit revocation or reuse-detected rotation (below). |
+| `family_id` | Groups a refresh token with all tokens descended from it via rotation. |
+| `rotated_from` | The `AuthToken.id` this row was rotated from, if any. Presenting an already-rotated (no longer current) refresh token is treated as credential theft: the entire `family_id` is revoked and authentication fails with `Unauthorized`. |
+
+### Invite
+A minted, shareable credential that lets a new user join without an existing admin creating
+their account directly. The full redeem/approve state machine (open vs. closed mode, request
+review) is a later ticket (T6) — the table and type exist from this ticket so the schema doesn't
+need another migration to add them.
+
+| Field | Notes |
+|---|---|
+| `id` | ULID. |
+| `token_hash` | blake3 hash of the invite's opaque secret; the secret is shown once, at creation. |
+| `mode` | `open` (redeeming creates the user immediately) \| `closed` (redeeming creates an `AccessRequest` pending admin approval). |
+| `store_grants` | JSON array of store names the resulting user is granted on redemption/approval. |
+| `max_uses`, `uses` | `max_uses` defaults to 1. |
+| `expires_at`, `revoked_at` | Nullable. |
+| `created_by` | Issuing user's ID. |
+| `created_at` | RFC 3339. |
+
+### AccessRequest
+A pending join request created by redeeming a `closed`-mode `Invite`, awaiting admin approval
+or denial. State machine lands in T6; the table exists now.
+
+| Field | Notes |
+|---|---|
+| `id` | ULID. |
+| `invite_id` | The `Invite` this request was made against. |
+| `requested_name` | The name the requester asked for. |
+| `secret_hash` | blake3 hash of the credential the requester will use once approved. |
+| `state` | `pending` \| `approved` \| `denied`. |
+| `resulting_user_id` | Set once approved and the `User` row is created. |
+| `created_at`, `decided_at` | RFC 3339; `decided_at` nullable until the request leaves `pending`. |
+
+### StoreGrant
+A normalized row granting one user read access to one `shared`-visibility store (D7). Grants on
+`private` stores are rejected — `private` stores are admin-only and ungrantable.
+
+| Field | Notes |
+|---|---|
+| `store_name`, `user_id` | Composite key; one grant per (store, user) pair. |
+| `granted_by` | The admin user who created the grant. |
+| `created_at` | RFC 3339. |
 
 ## 3. ID scheme
 
@@ -380,6 +449,15 @@ query performance:
 - **Cascade Chain:** Foreign keys with `ON DELETE CASCADE` across the chain:
   `stores → sources → resources → blocks → chunks`. Deleting a store cleans up everything.
 - **Schema Versioning:** The database uses `PRAGMA user_version` to track the schema version.
-  Pre-release: old schema versions trigger reinitialization (not migration).
+  Upgrades are **stepwise and additive-only**: `store-libsql::schema::MIGRATIONS` is an ordered
+  list of `Migration { from, to, run }` steps, each executed inside its own transaction that
+  also bumps `PRAGMA user_version` atomically, so fresh-create and migrate-from-previous converge
+  on an identical schema. A database whose version has no migration path — including any
+  pre-migration-list version — is a **hard error** at startup (`Error::InvalidConfig`) instructing
+  the user to recreate the database or restore from backup; the file is left completely untouched
+  before that error is raised. There is deliberately no silent drop-and-recreate. `SCHEMA_VERSION`
+  bumped `4 → 5` adding the auth tables (`users`, `auth_tokens`, `oauth_clients`, `auth_codes`,
+  `store_grants`, `invites`, `access_requests` — see §2 above) is the first migration step shipped
+  under this runner.
 - **Extractor Versioning:** `resources.extractor_version` tracks which parser/ingestor version
   produced the blocks, enabling selective reprocessing when extraction logic improves.

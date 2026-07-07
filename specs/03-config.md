@@ -1,6 +1,6 @@
 # Spec 03 — Configuration
 
-> Status: accepted draft, revised 2026-06-30.
+> Status: accepted draft, revised 2026-07-07.
 
 ## 1. Shape
 
@@ -13,6 +13,12 @@ version: 1
 server:
   bind: 127.0.0.1        # local-only by default; see 05-surfaces.md §3
   port: 7700
+  auth: auto             # auto | required | off — default auto: enforced iff bound non-loopback;
+                         #   required: always enforced; off: hard error if bind is non-loopback.
+                         #   See 05-surfaces.md §3.1.
+  # public_url: https://localdb.example.com   # optional; only set behind a TLS-terminating
+                         #   reverse proxy — used as the OAuth issuer/resource identifier in
+                         #   the .well-known responses (05-surfaces.md §3.1)
 
 paths:                    # all optional; platform defaults in §4
   data: ~                 # index data, socket
@@ -127,6 +133,11 @@ path; `paths.*` in config override the rest.
 - **Versioning:** top-level `version: 1` required. Breaking schema changes bump the version;
   the loader migrates old versions **in memory** and logs a deprecation note — it never rewrites
   the user's file (§3). Unversioned files are rejected with a hint.
+- **No hot-reload:** config is read once, at process startup. A change to the file takes effect
+  only on the next restart of the affected process (daemon or CLI invocation) — there is no
+  live-reload of an already-running daemon. (The existing file-watcher-based config reload is
+  being removed in T3; treat any current live-reload behavior as deprecated, not a guarantee to
+  depend on.)
 
 ## 6. Secrets
 
@@ -138,6 +149,14 @@ Ingestor credentials (API tokens, phone auth sessions) are stored in the `creden
 in the unified database, keyed by `(ingestor_kind, source_id, key)`. The values are stored
 encrypted (details TBD per ingestor). Interactive credential setup is handled by the ingestor's
 setup flow in `cli`, not by YAML config.
+
+**`credentials.json`** (auth, [05-surfaces.md](05-surfaces.md) §3.1): a separate file, `0600`
+permissions, living next to `config.yaml` (§4), that caches locally-issued API keys/tokens the
+CLI uses to authenticate to a given daemon. Keyed by the daemon's base URL, so a machine talking
+to multiple daemons keeps a separate cached credential per one. Written by `localdb login`
+(planned, §3.1) and read by every daemon-attached command. Never written into or read from the
+YAML config — it is credential material, not declarative config. The `LOCALDB_API_KEY`
+environment variable, when set, overrides the cached credential for that invocation.
 
 ## 7. Local embedding provider selection (`local` / `local-coreml` / `local-onnx`)
 

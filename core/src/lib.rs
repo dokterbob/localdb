@@ -4,6 +4,7 @@
 //! trait, the `Embedder` trait, the `Ingestor` trait, and the shared error
 //! taxonomy live here.
 
+pub mod auth;
 pub mod backend;
 pub mod block;
 pub mod chunker;

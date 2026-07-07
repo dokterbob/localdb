@@ -6,6 +6,7 @@ use localdb_core::{
     StoreBackendConnection, StoreRow, VectorEncoding,
 };
 
+use crate::auth::LibsqlAuthStore;
 use crate::connection::LibsqlDb;
 use crate::registry;
 use crate::tenant::TenantStore;
@@ -90,5 +91,19 @@ impl StoreBackend for SqliteBackend {
             self.embedding_dim,
             self.encoding,
         )))
+    }
+}
+
+impl SqliteBackend {
+    /// Build an `AuthStore` (D5) sharing this backend's unified-database
+    /// connection. Not part of the `StoreBackend` trait — auth tables are a
+    /// libsql implementation detail alongside stores/sources/etc., not a
+    /// `core` retrieval concept, so this is an inherent method rather than a
+    /// trait requirement. No daemon/CLI wiring calls this yet (that's a
+    /// later ticket); it exists so `LibsqlAuthStore` has a real, public
+    /// construction path instead of only being reachable from this crate's
+    /// own tests.
+    pub fn auth_store(&self) -> LibsqlAuthStore {
+        LibsqlAuthStore::new(self.conn.clone())
     }
 }

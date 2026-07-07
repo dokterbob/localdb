@@ -66,6 +66,9 @@ pub fn http_status_for(err: &CoreError) -> StatusCode {
         CoreError::ModelMissing { .. } => StatusCode::SERVICE_UNAVAILABLE,
 
         CoreError::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+
+        CoreError::Unauthorized { .. } => StatusCode::UNAUTHORIZED,
+        CoreError::Forbidden { .. } => StatusCode::FORBIDDEN,
     }
 }
 
@@ -181,6 +184,26 @@ mod tests {
                 correlation_id: "abc".into(),
             }),
             StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn unauthorized_maps_to_401() {
+        assert_eq!(
+            http_status_for(&Error::Unauthorized {
+                message: "m".into()
+            }),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn forbidden_maps_to_403() {
+        assert_eq!(
+            http_status_for(&Error::Forbidden {
+                message: "m".into()
+            }),
+            StatusCode::FORBIDDEN
         );
     }
 }

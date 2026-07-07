@@ -99,6 +99,20 @@ pub enum Error {
         message: String,
         correlation_id: String,
     },
+
+    /// Missing or invalid credentials on a request that requires authentication.
+    ///
+    /// HTTP 401. CLI exit code: 6.
+    #[error("unauthorized: {message}")]
+    Unauthorized { message: String },
+
+    /// Valid credentials, but the principal lacks permission for the requested
+    /// operation (e.g. a member attempting an admin-only action, or attempting
+    /// to access a store they hold no grant for).
+    ///
+    /// HTTP 403. CLI exit code: 6.
+    #[error("forbidden: {message}")]
+    Forbidden { message: String },
 }
 
 impl Error {
@@ -120,6 +134,8 @@ impl Error {
             Error::ModelMissing { .. } => "model_missing",
             Error::IndexInProgress => "index_in_progress",
             Error::Internal { .. } => "internal",
+            Error::Unauthorized { .. } => "unauthorized",
+            Error::Forbidden { .. } => "forbidden",
         }
     }
 
@@ -137,6 +153,7 @@ impl Error {
             | Error::ProviderUnavailable { .. }
             | Error::ModelMissing { .. } => 5,
             Error::UnsupportedFormat { .. } | Error::ExtractionFailed { .. } => 2,
+            Error::Unauthorized { .. } | Error::Forbidden { .. } => 6,
         }
     }
 }
@@ -220,6 +237,20 @@ mod tests {
                 "internal",
                 1,
             ),
+            (
+                Error::Unauthorized {
+                    message: "m".into(),
+                },
+                "unauthorized",
+                6,
+            ),
+            (
+                Error::Forbidden {
+                    message: "m".into(),
+                },
+                "forbidden",
+                6,
+            ),
         ];
 
         for (err, expected_code, expected_exit) in cases {
@@ -279,6 +310,38 @@ mod tests {
             }
             .exit_code(),
             5
+        );
+    }
+
+    #[test]
+    fn auth_errors_exit_6() {
+        assert_eq!(
+            Error::Unauthorized {
+                message: "m".into()
+            }
+            .exit_code(),
+            6
+        );
+        assert_eq!(
+            Error::Forbidden {
+                message: "m".into()
+            }
+            .exit_code(),
+            6
+        );
+        assert_eq!(
+            Error::Unauthorized {
+                message: "m".into()
+            }
+            .code(),
+            "unauthorized"
+        );
+        assert_eq!(
+            Error::Forbidden {
+                message: "m".into()
+            }
+            .code(),
+            "forbidden"
         );
     }
 }

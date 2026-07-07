@@ -183,6 +183,8 @@ pub(crate) async fn daemon_request_async(
             "index_in_progress" => Error::IndexInProgress,
             "provider_unavailable" => Error::ProviderUnavailable { message: msg },
             "model_missing" => Error::ModelMissing { message: msg },
+            "unauthorized" => Error::Unauthorized { message: msg },
+            "forbidden" => Error::Forbidden { message: msg },
             _ => Error::Internal {
                 message: format!("daemon returned {}: {}", status.as_u16(), msg),
                 correlation_id: "daemon_http".to_string(),

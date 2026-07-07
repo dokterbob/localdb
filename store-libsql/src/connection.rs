@@ -91,26 +91,17 @@ impl LibsqlDb {
             });
         }
         if version != 0 && version < schema::SCHEMA_VERSION {
-            // Old schema detected — drop everything and let create_schema rebuild.
-            // This project is pre-release with no data preservation guarantee.
-            eprintln!(
-                "warning: database schema version mismatch (found v{}, expected v{}): \
-                 all indexed data will be erased and the database re-initialised. \
-                 Re-run `localdb index` to restore your index.",
-                version,
-                schema::SCHEMA_VERSION,
-            );
-            tracing::warn!(
+            // Old (but understood) schema detected — migrate forward
+            // stepwise, never destructively (D13). `run_migrations` itself
+            // returns a hard `InvalidConfig` error, without touching any
+            // data, for a version with no migration path (see
+            // specs/02-domain-model.md's schema/versioning section).
+            tracing::info!(
                 old_version = version,
                 new_version = schema::SCHEMA_VERSION,
-                "DB schema version mismatch: dropping all tables and reinitialising"
+                "migrating database schema"
             );
-            schema::drop_all_tables(&conn)
-                .await
-                .map_err(|e| Error::Internal {
-                    message: format!("drop_all_tables during schema upgrade: {e}"),
-                    correlation_id: "libsql_db_drop_tables".to_string(),
-                })?;
+            schema::run_migrations(&conn, version, schema::SCHEMA_VERSION).await?;
         }
 
         schema::create_schema(&conn, embedding_dim, encoding)
@@ -340,22 +331,92 @@ mod tests {
         }
     }
 
+    /// Versions 1-3 predate the migration list (D13): there is no step that
+    /// starts from them, so opening must hard-error rather than silently
+    /// drop and recreate the database (the old, pre-migration-runner
+    /// behavior this test used to assert).
     #[tokio::test]
-    async fn reopen_with_old_schema_version_reinitialises() {
+    async fn open_with_versions_lacking_a_migration_path_errors() {
+        for old_version in [1i64, 2, 3] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("test.db");
+            {
+                let db = libsql::Builder::new_local(&path).build().await.unwrap();
+                let conn = db.connect().unwrap();
+                conn.query(&format!("PRAGMA user_version = {old_version}"), ())
+                    .await
+                    .unwrap();
+            }
+            let result = LibsqlDb::open(&path, 4, localdb_core::VectorEncoding::Float32).await;
+            match result {
+                Err(Error::InvalidConfig { message }) => {
+                    assert!(
+                        message.contains("no migration path"),
+                        "error should explain the lack of a migration path: {message}"
+                    );
+                }
+                Err(other) => {
+                    panic!("expected InvalidConfig for version {old_version}, got: {other:?}")
+                }
+                Ok(_) => {
+                    panic!("expected InvalidConfig for version {old_version}, but open succeeded")
+                }
+            }
+        }
+    }
+
+    /// The one migration this PR ships: a v4 database (pre-auth-tables)
+    /// opens successfully, ends up at `SCHEMA_VERSION`, gains the auth
+    /// tables, and — the whole point of D13 — keeps every pre-existing row.
+    #[tokio::test]
+    async fn open_migrates_v4_database_to_current_and_preserves_data() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
-        // Stamp version 1 on a raw libsql DB (bypassing LibsqlDb::open).
         {
             let db = libsql::Builder::new_local(&path).build().await.unwrap();
             let conn = db.connect().unwrap();
-            conn.query("PRAGMA user_version = 1", ()).await.unwrap();
+            conn.query("PRAGMA foreign_keys = ON", ()).await.unwrap();
+            crate::schema::create_pre_auth_schema_v4_for_test(&conn)
+                .await
+                .unwrap();
+            conn.execute(
+                "INSERT INTO stores \
+                 (id, name, indexing_policy, policy_version, created_at) \
+                 VALUES ('store-1', 'Store One', '{}', '1', '2024-01-01T00:00:00Z')",
+                (),
+            )
+            .await
+            .unwrap();
         }
-        // Opening via LibsqlDb::open should now succeed: it drops and recreates.
-        let result = LibsqlDb::open(&path, 4, localdb_core::VectorEncoding::Float32).await;
+
+        let db = LibsqlDb::open(&path, 4, localdb_core::VectorEncoding::Float32)
+            .await
+            .unwrap();
+        let conn = db.conn().await;
+
+        let version = crate::schema::get_schema_version(&conn).await.unwrap();
+        assert_eq!(version, crate::schema::SCHEMA_VERSION);
+
+        let mut rows = conn
+            .query(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='auth_tokens'",
+                (),
+            )
+            .await
+            .unwrap();
         assert!(
-            result.is_ok(),
-            "old schema version should trigger reinitialisation, not an error; got: {:?}",
-            result.as_ref().err()
+            rows.next().await.unwrap().is_some(),
+            "auth_tokens table should exist after migration"
+        );
+
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM stores WHERE id = 'store-1'", ())
+            .await
+            .unwrap();
+        let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(
+            count, 1,
+            "pre-existing store row must survive the migration"
         );
     }
 
