@@ -214,23 +214,32 @@ async fn upsert_chunks_inner(
                 message: format!("upsert_chunks heading_path serialize: {e}"),
                 correlation_id: "store_handle_upsert_heading".to_string(),
             })?;
-        let location_json = serde_json::to_string(&serde_json::json!({
+        // location_json shape: `{"start": N, "end": N, "window_block_seqs": [..]}`.
+        // `window_block_seqs` is included only for message-window chunks (#129) —
+        // plain chunks keep the original `{start, end}` shape.
+        let mut location_value = serde_json::json!({
             "start": record.span.start,
             "end": record.span.end,
-        }))
-        .map_err(|e| Error::Internal {
-            message: format!("upsert_chunks location_json serialize: {e}"),
-            correlation_id: "store_handle_upsert_location".to_string(),
-        })?;
+        });
+        if !record.window_block_seqs.is_empty() {
+            location_value["window_block_seqs"] = serde_json::json!(record.window_block_seqs);
+        }
+        let location_json =
+            serde_json::to_string(&location_value).map_err(|e| Error::Internal {
+                message: format!("upsert_chunks location_json serialize: {e}"),
+                correlation_id: "store_handle_upsert_location".to_string(),
+            })?;
 
-        // TODO(#128): block_id is hardcoded to 0; should reference the actual blocks.rowid
+        // The canonical block reference is `(store_id, resource_id, block_seq)` — no
+        // `block_id`/rowid foreign key (#128): rowids aren't stable across a
+        // replace, and window chunks (#129) reference a *set* of block seqs,
+        // which a single scalar FK can't express.
         let sql = format!(
-            "INSERT INTO chunks (store_id, id, resource_id, block_id, block_seq,
+            "INSERT INTO chunks (store_id, id, resource_id, block_seq,
                  seq_in_block, block_kind, text, heading_path, location_json, embedding)
-             VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, {vector_sql})
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, {vector_sql})
              ON CONFLICT(store_id, id) DO UPDATE SET
                  resource_id  = excluded.resource_id,
-                 block_id     = excluded.block_id,
                  block_seq    = excluded.block_seq,
                  seq_in_block = excluded.seq_in_block,
                  block_kind   = excluded.block_kind,

@@ -186,7 +186,6 @@ async fn create_chunks(
             store_id      TEXT NOT NULL,
             id            TEXT NOT NULL,
             resource_id   TEXT NOT NULL,
-            block_id      INTEGER NOT NULL,
             block_seq     INTEGER NOT NULL,
             seq_in_block  INTEGER NOT NULL DEFAULT 0,
             block_kind    TEXT,
@@ -201,8 +200,12 @@ async fn create_chunks(
     );
     conn.execute(&chunks_ddl, ()).await?;
 
+    // Canonical block reference is (store_id, resource_id, block_seq) — see
+    // schema v5 (#128): no block_id/rowid FK. This composite index supports
+    // both per-document chunk listing and block-scoped context expansion.
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_chunks_store_resource ON chunks(store_id, resource_id)",
+        "CREATE INDEX IF NOT EXISTS idx_chunks_store_resource_pos \
+         ON chunks(store_id, resource_id, block_seq, seq_in_block)",
         (),
     )
     .await?;
@@ -478,7 +481,7 @@ mod tests {
             "idx_resources_store_uri",
             "idx_resources_source_id",
             "idx_blocks_resource",
-            "idx_chunks_store_resource",
+            "idx_chunks_store_resource_pos",
             "chunks_vec_idx",
         ] {
             assert!(

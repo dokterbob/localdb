@@ -516,6 +516,93 @@ mod tests {
         );
     }
 
+    /// A DB stamped at the pre-#128 v4 schema (old `chunks.block_id` column and
+    /// `idx_chunks_store_resource` index, `user_version=4`) must trigger the
+    /// wipe+reinit path on open, landing on the v5 schema — not error out, and
+    /// not silently keep serving the old shape.
+    #[tokio::test]
+    async fn reopen_with_v4_schema_wipes_and_reinitialises_to_v5() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        {
+            let db = libsql::Builder::new_local(&path).build().await.unwrap();
+            let conn = db.connect().unwrap();
+            // Old (v4) chunks table shape: has block_id, old index name.
+            conn.execute(
+                "CREATE TABLE chunks (
+                    rowid         INTEGER PRIMARY KEY,
+                    store_id      TEXT NOT NULL,
+                    id            TEXT NOT NULL,
+                    resource_id   TEXT NOT NULL,
+                    block_id      INTEGER NOT NULL,
+                    block_seq     INTEGER NOT NULL,
+                    seq_in_block  INTEGER NOT NULL DEFAULT 0,
+                    block_kind    TEXT,
+                    text          TEXT NOT NULL,
+                    heading_path  TEXT NOT NULL,
+                    embedding     F32_BLOB(4) NOT NULL,
+                    location_json TEXT,
+                    UNIQUE (store_id, id)
+                )",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "CREATE INDEX idx_chunks_store_resource ON chunks(store_id, resource_id)",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.query("PRAGMA user_version = 4", ()).await.unwrap();
+        }
+
+        let db = LibsqlDb::open(&path, 4, localdb_core::VectorEncoding::Float32)
+            .await
+            .unwrap();
+
+        let conn = db.conn().await;
+        let version = schema::get_schema_version(&conn).await.unwrap();
+        assert_eq!(version, schema::SCHEMA_VERSION, "should land on v5");
+
+        // block_id must be gone from the recreated chunks table.
+        let mut rows = conn
+            .query(
+                "SELECT name FROM pragma_table_info('chunks') WHERE name = 'block_id'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(
+            rows.next().await.unwrap().is_none(),
+            "block_id column should not exist after v4→v5 reinit"
+        );
+
+        // The new composite index must exist; the old one must not.
+        let mut rows = conn
+            .query(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name = 'idx_chunks_store_resource_pos'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(
+            rows.next().await.unwrap().is_some(),
+            "idx_chunks_store_resource_pos should exist after v4→v5 reinit"
+        );
+        let mut rows = conn
+            .query(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name = 'idx_chunks_store_resource'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(
+            rows.next().await.unwrap().is_none(),
+            "old idx_chunks_store_resource index should be gone after v4→v5 reinit"
+        );
+    }
+
     #[tokio::test]
     async fn fresh_db_and_reopen_both_succeed() {
         let dir = tempdir().unwrap();

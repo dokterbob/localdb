@@ -85,6 +85,7 @@ fn make_chunk(id: &str, doc_id: &str, store_id: &str, embedding: Vec<f32>) -> Ch
         block_seq: 0,
         seq_in_block: 0,
         block_kind: None,
+        window_block_seqs: vec![],
     }
 }
 

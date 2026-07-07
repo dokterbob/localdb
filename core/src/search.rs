@@ -394,6 +394,7 @@ mod tests {
             block_seq: 0,
             seq_in_block: 0,
             block_kind: None,
+            window_block_seqs: vec![],
         }
     }
 

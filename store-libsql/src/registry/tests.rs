@@ -422,6 +422,7 @@ async fn metadata_json_round_trips_tagged_document_kind() {
         block_seq: 0,
         seq_in_block: 0,
         block_kind: None,
+        window_block_seqs: vec![],
     };
 
     let handle = api.retrieval_store("store-1").await.unwrap();

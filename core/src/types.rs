@@ -385,6 +385,11 @@ pub struct Chunk {
     /// Provenance copied from document.
     /// Chunks must be self-describing for federation.
     pub provenance: Provenance,
+
+    /// For message-window chunks: all block seqs participating in the window.
+    /// Empty for non-window chunks (the common case).
+    #[serde(default)]
+    pub window_block_seqs: Vec<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -726,10 +731,38 @@ mod tests {
             heading_path: vec!["API".to_string(), "Introduction".to_string()],
             policy_version: "abc123def456".to_string(),
             provenance: make_provenance(),
+            window_block_seqs: vec![],
         };
         let json = serde_json::to_string(&chunk).unwrap();
         let chunk2: Chunk = serde_json::from_str(&json).unwrap();
         assert_eq!(chunk, chunk2);
+    }
+
+    #[test]
+    fn chunk_window_block_seqs_defaults_empty_on_missing_field() {
+        // Old JSON, written before window_block_seqs existed, must still deserialize.
+        let doc_id = resource_id("file:///docs/api.md", &content_hash("doc content"));
+        let text = "This is a chunk of text.";
+        let json = format!(
+            r#"{{
+                "id": "{id}",
+                "resource_id": "{doc_id}",
+                "store_id": "store-1",
+                "text": "{text}",
+                "span": {{"start": 0, "end": {len}}},
+                "policy_version": "v1",
+                "provenance": {{
+                    "origin_store": "store-1",
+                    "source_ref": {{"id": "src-1", "kind": "path"}},
+                    "fetched_at": "2026-06-10T12:00:00Z",
+                    "content_hash": "abc123"
+                }}
+            }}"#,
+            id = chunk_id(&doc_id, 0, text, 0),
+            len = text.len(),
+        );
+        let chunk: Chunk = serde_json::from_str(&json).unwrap();
+        assert!(chunk.window_block_seqs.is_empty());
     }
 
     // --- IndexJob tests ---

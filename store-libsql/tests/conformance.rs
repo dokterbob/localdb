@@ -125,6 +125,13 @@ async fn get_chunk() {
 }
 
 #[tokio::test]
+async fn window_block_seqs_round_trip() {
+    let (_dir, db) = setup().await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+    conformance::test_window_block_seqs_round_trip(handle.as_ref()).await;
+}
+
+#[tokio::test]
 async fn get_chunks_for_resource() {
     let (_dir, db) = setup().await;
     let handle = db.retrieval_store("store-1").await.unwrap();
@@ -508,5 +515,6 @@ fn make_record(id: &str, doc_id: &str, store_id: &str, embedding: Vec<f32>) -> C
         block_seq: 0,
         seq_in_block: 0,
         block_kind: None,
+        window_block_seqs: vec![],
     }
 }

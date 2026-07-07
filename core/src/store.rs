@@ -98,6 +98,13 @@ pub struct ChunkRecord {
     /// was introduced.
     #[serde(default)]
     pub block_kind: Option<String>,
+
+    /// For message-window chunks (#129): all block seqs participating in the
+    /// window. Empty for ordinary single-block chunks. Persisted inside
+    /// `location_json` as `{"start", "end", "window_block_seqs"?}`, present
+    /// only when non-empty.
+    #[serde(default)]
+    pub window_block_seqs: Vec<u32>,
 }
 
 impl ChunkRecord {
@@ -129,6 +136,7 @@ impl ChunkRecord {
             block_seq: 0,
             seq_in_block: 0,
             block_kind: None,
+            window_block_seqs: chunk.window_block_seqs.clone(),
         }
     }
 }
@@ -569,6 +577,7 @@ pub mod conformance {
             block_seq: 0,
             seq_in_block: 0,
             block_kind: None,
+            window_block_seqs: vec![],
         }
     }
 
@@ -972,6 +981,45 @@ pub mod conformance {
         assert_eq!(results.len(), 2, "BM25 limit should be respected");
     }
 
+    /// Test: `window_block_seqs` (#129) round-trips through upsert/get.
+    ///
+    /// A window chunk's non-empty `window_block_seqs` survives write→read intact,
+    /// and a plain (non-window) chunk's empty `window_block_seqs` stays empty.
+    pub async fn test_window_block_seqs_round_trip(store: &dyn RetrievalStore) {
+        let mut windowed = make_record(
+            "chunk-window",
+            "doc-1",
+            "store-1",
+            "window chunk text",
+            vec![1.0, 0.0],
+        );
+        windowed.window_block_seqs = vec![3, 4, 5];
+
+        let plain = make_record(
+            "chunk-plain",
+            "doc-1",
+            "store-1",
+            "plain chunk text",
+            vec![0.0, 1.0],
+        );
+        assert!(plain.window_block_seqs.is_empty());
+
+        store.upsert_chunks(vec![windowed, plain]).await.unwrap();
+
+        let got_window = store.get_chunk("chunk-window").await.unwrap().unwrap();
+        assert_eq!(
+            got_window.window_block_seqs,
+            vec![3, 4, 5],
+            "window chunk's window_block_seqs must survive round trip"
+        );
+
+        let got_plain = store.get_chunk("chunk-plain").await.unwrap().unwrap();
+        assert!(
+            got_plain.window_block_seqs.is_empty(),
+            "plain chunk's window_block_seqs must stay empty after round trip"
+        );
+    }
+
     /// Run a subset of the conformance suite that does not require a pre-built FTS index.
     ///
     /// The store must be freshly created (empty) when this is called.
@@ -1015,6 +1063,7 @@ mod tests {
             block_seq: 0,
             seq_in_block: 0,
             block_kind: None,
+            window_block_seqs: vec![],
         }
     }
 
@@ -1109,6 +1158,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fake_store_window_block_seqs_round_trip() {
+        let store = FakeStore::new();
+        test_window_block_seqs_round_trip(&store).await;
+    }
+
+    #[tokio::test]
     async fn fake_store_empty_stats() {
         let store = FakeStore::new();
         let stats = store.stats().await.unwrap();
@@ -1171,6 +1226,7 @@ mod tests {
                 content_hash: "abc123".to_string(),
                 share_path: vec![],
             },
+            window_block_seqs: vec![7, 8],
         };
 
         let record = ChunkRecord::from_chunk(
@@ -1190,6 +1246,7 @@ mod tests {
         assert_eq!(record.mime, Some("text/markdown".to_string()));
         assert_eq!(record.source_id, "source-id");
         assert_eq!(record.ingestor_kind, "path");
+        assert_eq!(record.window_block_seqs, vec![7, 8]);
     }
 
     #[tokio::test]

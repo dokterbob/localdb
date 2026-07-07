@@ -64,6 +64,7 @@ async fn start_upstream_daemon() -> (String, String) {
         block_seq: 0,
         seq_in_block: 0,
         block_kind: None,
+        window_block_seqs: vec![],
     };
     store.upsert_chunks(vec![record]).await.expect("seed chunk");
 

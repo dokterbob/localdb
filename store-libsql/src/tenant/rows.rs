@@ -66,8 +66,12 @@ pub(crate) fn row_to_chunk_record_strict(row: &libsql::Row) -> Result<ChunkRecor
     let seq_in_block: i64 = row.get(17).map_err(map_libsql_err)?;
 
     // location_json is written by upsert_chunks_inner; fall back to text length
-    // for rows written before this column was populated.
+    // for rows written before this column was populated. Shape:
+    // `{"start": N, "end": N, "window_block_seqs": [..]}`, with
+    // `window_block_seqs` present only for message-window chunks (#129) —
+    // absent (and thus defaulting to empty) for ordinary chunks.
     let text_len = text.len();
+    let mut window_block_seqs: Vec<u32> = Vec::new();
     let span = {
         let location_json: Option<String> = row.get(18).map_err(map_libsql_err)?;
         match location_json {
@@ -76,6 +80,13 @@ pub(crate) fn row_to_chunk_record_strict(row: &libsql::Row) -> Result<ChunkRecor
                     serde_json::from_str(&json).unwrap_or(serde_json::Value::Null);
                 let start = v.get("start").and_then(|s| s.as_u64()).map(|s| s as usize);
                 let end = v.get("end").and_then(|e| e.as_u64()).map(|e| e as usize);
+                if let Some(seqs) = v.get("window_block_seqs").and_then(|w| w.as_array()) {
+                    window_block_seqs = seqs
+                        .iter()
+                        .filter_map(|s| s.as_u64())
+                        .map(|s| s as u32)
+                        .collect();
+                }
                 match (start, end) {
                     (Some(s), Some(e)) => Span { start: s, end: e },
                     _ => Span {
@@ -113,5 +124,6 @@ pub(crate) fn row_to_chunk_record_strict(row: &libsql::Row) -> Result<ChunkRecor
         block_seq: block_seq as u32,
         seq_in_block: seq_in_block as u32,
         block_kind,
+        window_block_seqs,
     })
 }

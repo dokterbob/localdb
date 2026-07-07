@@ -633,6 +633,7 @@ pub async fn index_document(
             heading_path: chunk_out.heading_path.clone(),
             policy_version: config.policy_version.clone(),
             provenance: provenance.clone(),
+            window_block_seqs: chunk_out.window_block_seqs.clone(),
         };
 
         let mut record = ChunkRecord::from_chunk(
@@ -645,7 +646,6 @@ pub async fn index_document(
         record.block_seq = chunk_out.block_seq;
         record.seq_in_block = chunk_out.seq_in_block;
         record.block_kind = chunk_out.block_kind.clone();
-        // TODO(#129): chunk_out.window_block_seqs not mapped — message-window membership lost after persistence
         records.push(record);
     }
 
@@ -1458,6 +1458,7 @@ mod tests {
             block_seq: 0,
             seq_in_block: 0,
             block_kind: None,
+            window_block_seqs: vec![],
         }];
 
         let idx = DocumentIndex::from_chunk_records(&records);
@@ -2892,6 +2893,7 @@ mod tests {
             block_seq: 0,
             seq_in_block: 0,
             block_kind: None,
+            window_block_seqs: vec![],
         };
         store.upsert_chunks(vec![chunk]).await.unwrap();
 
@@ -3398,6 +3400,7 @@ mod tests {
             block_seq: 0,
             seq_in_block: 0,
             block_kind: None,
+            window_block_seqs: vec![],
         };
 
         // Hydrate a fresh DocumentIndex from the stored chunk records.
@@ -3922,6 +3925,7 @@ mod tests {
             block_seq: 0,
             seq_in_block: 0,
             block_kind: None,
+            window_block_seqs: vec![],
         }
     }
 }
