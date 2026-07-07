@@ -293,6 +293,119 @@ async fn make_handler_with_tied_chunks(reversed: bool) -> (McpHandler, String) {
     (handler, doc_id)
 }
 
+/// Build a handler seeded with ONE document made of `count` chunks, one per
+/// block (`block_seq` 0..count, `seq_in_block` 0) — mirrors the shape of the
+/// spec's worked anchor-pagination example (specs/05-surfaces.md §4.1: 20
+/// chunks, one chunk per block). Returns the handler, the resource id, and
+/// the chunk ids in `(block_seq, seq_in_block)` order (index == block_seq).
+async fn make_handler_with_sequential_chunks(count: u32) -> (McpHandler, String, Vec<String>) {
+    let store = std::sync::Arc::new(FakeStore::new());
+
+    let uri = "file:///docs/sequential.md";
+    let doc_hash = content_hash("sequential document body");
+    let doc_id = resource_id(uri, &doc_hash);
+
+    let mut chunks = Vec::new();
+    let mut ids = Vec::new();
+    for block_seq in 0..count {
+        let text = format!("chunk body {block_seq}");
+        let cid = chunk_id(&doc_id, block_seq, &text, 0);
+        ids.push(cid.clone());
+        chunks.push(ChunkRecord {
+            id: cid,
+            resource_id: doc_id.clone(),
+            store_id: "store-1".to_string(),
+            text: text.clone(),
+            span: Span::new(0, text.len()),
+            heading_path: vec![],
+            embedding: vec![0.1, 0.2, 0.3, 0.4],
+            policy_version: "v1".to_string(),
+            fetched_at: "2026-06-10T12:00:00Z".to_string(),
+            content_hash: doc_hash.clone(),
+            origin_store: "store-1".to_string(),
+            source_id: new_ulid(),
+            ingestor_kind: "path".to_string(),
+            mime: Some("text/markdown".to_string()),
+            uri: uri.to_string(),
+            metadata: localdb_core::metadata::Metadata::default(),
+            block_seq,
+            seq_in_block: 0,
+            block_kind: Some("paragraph".to_string()),
+            window_block_seqs: vec![],
+        });
+    }
+    store.upsert_chunks(chunks).await.expect("seed chunks");
+
+    let sd = StoreDescriptor {
+        id: "store-1".to_string(),
+        name: "test-store".to_string(),
+        visibility: "private".to_string(),
+    };
+    let available = AvailableStore::from_arc(sd, store);
+    let embedder: std::sync::Arc<dyn localdb_core::Embedder> =
+        std::sync::Arc::new(FakeEmbedder::new(4));
+    let handler = McpHandler::new(vec![available], embedder, false);
+    (handler, doc_id, ids)
+}
+
+/// Build a handler seeded with ONE document with a gap in `block_seq` and a
+/// block holding multiple chunks, for `anchor_block_seq` lower-bound and
+/// tie-break tests (#146): `block_seq` 0 (one chunk), `block_seq` 5 (three
+/// chunks, `seq_in_block` 0/1/2, inserted out of order), `block_seq` 10 (one
+/// chunk).
+async fn make_handler_with_block_seq_gaps() -> (McpHandler, String) {
+    let store = std::sync::Arc::new(FakeStore::new());
+    let uri = "file:///docs/gaps.md";
+    let doc_hash = content_hash("gapped document body");
+    let doc_id = resource_id(uri, &doc_hash);
+
+    let make_chunk = |text: &str, block_seq: u32, seq_in_block: u32| {
+        let cid = chunk_id(&doc_id, block_seq, text, seq_in_block);
+        ChunkRecord {
+            id: cid,
+            resource_id: doc_id.clone(),
+            store_id: "store-1".to_string(),
+            text: text.to_string(),
+            span: Span::new(0, text.len()),
+            heading_path: vec![],
+            embedding: vec![0.1, 0.2, 0.3, 0.4],
+            policy_version: "v1".to_string(),
+            fetched_at: "2026-06-10T12:00:00Z".to_string(),
+            content_hash: doc_hash.clone(),
+            origin_store: "store-1".to_string(),
+            source_id: new_ulid(),
+            ingestor_kind: "path".to_string(),
+            mime: Some("text/markdown".to_string()),
+            uri: uri.to_string(),
+            metadata: localdb_core::metadata::Metadata::default(),
+            block_seq,
+            seq_in_block,
+            block_kind: Some("paragraph".to_string()),
+            window_block_seqs: vec![],
+        }
+    };
+
+    let chunks = vec![
+        make_chunk("b0", 0, 0),
+        make_chunk("b5-2", 5, 2),
+        make_chunk("b5-0", 5, 0),
+        make_chunk("b5-1", 5, 1),
+        make_chunk("b10", 10, 0),
+    ];
+    store.upsert_chunks(chunks).await.expect("seed chunks");
+
+    let sd = StoreDescriptor {
+        id: "store-1".to_string(),
+        name: "test-store".to_string(),
+        visibility: "private".to_string(),
+    };
+    let available = AvailableStore::from_arc(sd, store);
+    let embedder: std::sync::Arc<dyn localdb_core::Embedder> =
+        std::sync::Arc::new(FakeEmbedder::new(4));
+    let handler = McpHandler::new(vec![available], embedder, false);
+    (handler, doc_id)
+}
+
 // ---------------------------------------------------------------------------
 // tools/list
 // ---------------------------------------------------------------------------
@@ -449,7 +562,12 @@ async fn test_search_returns_canonical_citations() {
         first.get("heading_path").is_some(),
         "citation.heading_path missing"
     );
-    assert!(first.get("span").is_some(), "citation.span missing");
+    assert!(first.get("block").is_some(), "citation.block missing");
+    assert!(
+        first.get("chunk_position").is_some(),
+        "citation.chunk_position missing"
+    );
+    assert!(first.get("location").is_some(), "citation.location missing");
     assert!(first.get("snippet").is_some(), "citation.snippet missing");
     assert!(first.get("score").is_some(), "citation.score missing");
     assert!(
@@ -469,9 +587,24 @@ async fn test_search_returns_canonical_citations() {
         "citation.store.name missing"
     );
 
-    let span = &first["span"];
-    assert!(span.get("start").is_some(), "citation.span.start missing");
-    assert!(span.get("end").is_some(), "citation.span.end missing");
+    let block = &first["block"];
+    assert!(block.get("seq").is_some(), "citation.block.seq missing");
+    assert!(block.get("kind").is_some(), "citation.block.kind missing");
+
+    assert!(
+        first["chunk_position"].get("seq_in_block").is_some(),
+        "citation.chunk_position.seq_in_block missing"
+    );
+
+    let span = &first["location"]["span"];
+    assert!(
+        span.get("start").is_some(),
+        "citation.location.span.start missing"
+    );
+    assert!(
+        span.get("end").is_some(),
+        "citation.location.span.end missing"
+    );
 
     let prov = &first["provenance"];
     assert!(
@@ -1020,6 +1153,318 @@ async fn test_get_chunks_deterministic_tie_breaker() {
     let mut expected = first.clone();
     expected.sort();
     assert_eq!(first, expected, "tie should break by ascending chunk_id");
+}
+
+// ---------------------------------------------------------------------------
+// Tool: get_chunks — anchor-relative pagination (#146)
+// ---------------------------------------------------------------------------
+
+/// Reproduces the spec's worked example verbatim (specs/05-surfaces.md
+/// §4.1): 20 chunks (one per block, `block_seq` 0-19), `anchor_chunk_id` at
+/// `block_seq = 10`, `limit: 5` -> centered window covering `block_seq`
+/// 8-12, `offset: 8`, and the anchor as the 3rd of 5 returned chunks
+/// (`anchor_index: 2`).
+#[tokio::test]
+async fn test_get_chunks_anchor_chunk_id_centered_window_spec_example() {
+    let (handler, doc_id, ids) = make_handler_with_sequential_chunks(20).await;
+    let client = client_for(handler).await;
+
+    let anchor_id = ids[10].clone();
+    let result = call_tool(
+        &client,
+        "get_chunks",
+        json!({ "resource_id": doc_id, "anchor_chunk_id": anchor_id, "limit": 5 }),
+    )
+    .await
+    .expect("get_chunks succeeds");
+    assert_eq!(result.is_error, Some(false));
+
+    let text = text_of(&result);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(parsed["total_chunks"], 20);
+    assert_eq!(parsed["offset"], 8);
+    assert_eq!(parsed["limit"], 5);
+    assert_eq!(parsed["returned"], 5);
+    assert_eq!(parsed["anchor_index"], 2);
+
+    let chunks = parsed["chunks"].as_array().unwrap();
+    assert_eq!(chunks.len(), 5);
+    for (i, expected_block_seq) in (8i32..=12).enumerate() {
+        assert_eq!(chunks[i]["block_seq"], expected_block_seq);
+    }
+    assert_eq!(chunks[2]["chunk_id"], anchor_id);
+}
+
+/// The same anchor resolved via `anchor_block_seq` instead of
+/// `anchor_chunk_id` must produce an identical window (same `offset` and
+/// `anchor_index`, and the anchor chunk at the same position).
+#[tokio::test]
+async fn test_get_chunks_anchor_block_seq_centered_window_matches_chunk_id() {
+    let (handler, doc_id, ids) = make_handler_with_sequential_chunks(20).await;
+    let client = client_for(handler).await;
+
+    let result = call_tool(
+        &client,
+        "get_chunks",
+        json!({ "resource_id": doc_id, "anchor_block_seq": 10, "limit": 5 }),
+    )
+    .await
+    .expect("get_chunks succeeds");
+    assert_eq!(result.is_error, Some(false));
+
+    let text = text_of(&result);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(parsed["offset"], 8);
+    assert_eq!(parsed["anchor_index"], 2);
+    assert_eq!(parsed["chunks"][2]["chunk_id"], ids[10]);
+}
+
+/// The spec's second worked example: the same anchor with `limit: 30`
+/// against the 20-chunk resource clamps to the whole list: `offset: 0`,
+/// `returned: 20`, `anchor_index: 10`.
+#[tokio::test]
+async fn test_get_chunks_anchor_limit_greater_than_total_clamps_to_whole_list() {
+    let (handler, doc_id, _ids) = make_handler_with_sequential_chunks(20).await;
+    let client = client_for(handler).await;
+
+    let result = call_tool(
+        &client,
+        "get_chunks",
+        json!({ "resource_id": doc_id, "anchor_block_seq": 10, "limit": 30 }),
+    )
+    .await
+    .expect("get_chunks succeeds");
+    assert_eq!(result.is_error, Some(false));
+
+    let text = text_of(&result);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(parsed["total_chunks"], 20);
+    assert_eq!(parsed["offset"], 0);
+    assert_eq!(parsed["returned"], 20);
+    assert_eq!(parsed["anchor_index"], 10);
+}
+
+/// Clamping near the start: an anchor at `block_seq = 1` with `limit: 5`
+/// cannot center (a centered window would need `offset: -1`) — the window
+/// shifts toward the interior and clamps at `offset: 0`, so the anchor
+/// sits at `anchor_index: 1`, not the fully-centered `2`.
+#[tokio::test]
+async fn test_get_chunks_anchor_clamps_at_start() {
+    let (handler, doc_id, _ids) = make_handler_with_sequential_chunks(20).await;
+    let client = client_for(handler).await;
+
+    let result = call_tool(
+        &client,
+        "get_chunks",
+        json!({ "resource_id": doc_id, "anchor_block_seq": 1, "limit": 5 }),
+    )
+    .await
+    .expect("get_chunks succeeds");
+    assert_eq!(result.is_error, Some(false));
+
+    let text = text_of(&result);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(parsed["offset"], 0, "window must clamp at the start");
+    assert_eq!(
+        parsed["returned"], 5,
+        "window must stay full-sized even near the edge"
+    );
+    assert_eq!(parsed["anchor_index"], 1);
+}
+
+/// Clamping near the end: an anchor at `block_seq = 18` (index 18 of 20)
+/// with `limit: 5` would need `offset: 16` to center, but `16 + 5 = 21 >
+/// 20` — clamps to `offset: 15`, so the anchor sits at `anchor_index: 3`,
+/// not the fully-centered `2`.
+#[tokio::test]
+async fn test_get_chunks_anchor_clamps_at_end() {
+    let (handler, doc_id, _ids) = make_handler_with_sequential_chunks(20).await;
+    let client = client_for(handler).await;
+
+    let result = call_tool(
+        &client,
+        "get_chunks",
+        json!({ "resource_id": doc_id, "anchor_block_seq": 18, "limit": 5 }),
+    )
+    .await
+    .expect("get_chunks succeeds");
+    assert_eq!(result.is_error, Some(false));
+
+    let text = text_of(&result);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(parsed["offset"], 15, "window must clamp at the end");
+    assert_eq!(
+        parsed["returned"], 5,
+        "window must stay full-sized even near the edge"
+    );
+    assert_eq!(parsed["anchor_index"], 3);
+}
+
+/// `anchor_chunk_id` set to an id absent from the resource -> `chunk_not_found`.
+#[tokio::test]
+async fn test_get_chunks_anchor_chunk_id_unknown_is_chunk_not_found() {
+    let (handler, doc_id, _ids) = make_handler_with_sequential_chunks(5).await;
+    let client = client_for(handler).await;
+
+    let result = call_tool(
+        &client,
+        "get_chunks",
+        json!({ "resource_id": doc_id, "anchor_chunk_id": "does-not-exist" }),
+    )
+    .await
+    .expect("call succeeds at the protocol level");
+    assert_eq!(result.is_error, Some(true));
+
+    let text = text_of(&result);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(parsed["error"]["code"].as_str().unwrap(), "chunk_not_found");
+}
+
+/// `anchor_block_seq` past every block in the resource -> `chunk_not_found`.
+#[tokio::test]
+async fn test_get_chunks_anchor_block_seq_past_end_is_chunk_not_found() {
+    let (handler, doc_id, _ids) = make_handler_with_sequential_chunks(5).await;
+    let client = client_for(handler).await;
+
+    let result = call_tool(
+        &client,
+        "get_chunks",
+        json!({ "resource_id": doc_id, "anchor_block_seq": 100 }),
+    )
+    .await
+    .expect("call succeeds at the protocol level");
+    assert_eq!(result.is_error, Some(true));
+
+    let text = text_of(&result);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(parsed["error"]["code"].as_str().unwrap(), "chunk_not_found");
+}
+
+/// `anchor_block_seq` lower-bound resolution and tie-break: block seqs
+/// present are {0, 5 (x3 chunks), 10}. An exact `anchor_block_seq: 5` must
+/// resolve to the `seq_in_block = 0` chunk at that block (not one of its
+/// two siblings) — the tie-break rule. An `anchor_block_seq: 1` (absent)
+/// must resolve via lower-bound to the next block_seq present (5's first
+/// chunk), not the nearest chunk by any other measure.
+#[tokio::test]
+async fn test_get_chunks_anchor_block_seq_lower_bound_and_tie_break() {
+    let (handler, doc_id) = make_handler_with_block_seq_gaps().await;
+    let client = client_for(handler).await;
+
+    // Exact match on a block_seq with 3 chunks: must tie-break to seq_in_block 0.
+    let result = call_tool(
+        &client,
+        "get_chunks",
+        json!({ "resource_id": doc_id, "anchor_block_seq": 5, "limit": 3 }),
+    )
+    .await
+    .expect("get_chunks succeeds");
+    assert_eq!(result.is_error, Some(false));
+    let text = text_of(&result);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(parsed["total_chunks"], 5);
+    let chunks = parsed["chunks"].as_array().unwrap();
+    let anchor_idx = parsed["anchor_index"].as_u64().unwrap() as usize;
+    assert_eq!(
+        chunks[anchor_idx]["text"], "b5-0",
+        "tie-break must pick the lowest seq_in_block at block_seq 5"
+    );
+    assert_eq!(chunks[anchor_idx]["seq_in_block"], 0);
+
+    // Lower-bound: block_seq 1 doesn't exist -> resolves to block_seq 5's
+    // first chunk (the next block_seq present).
+    let result2 = call_tool(
+        &client,
+        "get_chunks",
+        json!({ "resource_id": doc_id, "anchor_block_seq": 1, "limit": 3 }),
+    )
+    .await
+    .expect("get_chunks succeeds");
+    assert_eq!(result2.is_error, Some(false));
+    let text2 = text_of(&result2);
+    let parsed2: Value = serde_json::from_str(&text2).unwrap();
+    let chunks2 = parsed2["chunks"].as_array().unwrap();
+    let anchor_idx2 = parsed2["anchor_index"].as_u64().unwrap() as usize;
+    assert_eq!(chunks2[anchor_idx2]["text"], "b5-0");
+}
+
+/// Plain-`offset` (non-anchor) requests must carry `anchor_index: null`.
+#[tokio::test]
+async fn test_get_chunks_anchor_index_null_in_offset_mode() {
+    let (handler, doc_id) = make_handler_with_multichunk_doc().await;
+    let client = client_for(handler).await;
+
+    let result = call_tool(&client, "get_chunks", json!({ "resource_id": doc_id }))
+        .await
+        .expect("get_chunks succeeds");
+    assert_eq!(result.is_error, Some(false));
+
+    let text = text_of(&result);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    assert!(
+        parsed["anchor_index"].is_null(),
+        "anchor_index must be null in plain-offset mode"
+    );
+}
+
+/// `offset` + `anchor_chunk_id` together violates mutual exclusivity ->
+/// tool-level `invalid_request` error.
+#[tokio::test]
+async fn test_get_chunks_offset_and_anchor_chunk_id_mutually_exclusive() {
+    let (handler, doc_id, ids) = make_handler_with_sequential_chunks(5).await;
+    let client = client_for(handler).await;
+
+    let result = call_tool(
+        &client,
+        "get_chunks",
+        json!({ "resource_id": doc_id, "offset": 1, "anchor_chunk_id": ids[2] }),
+    )
+    .await
+    .expect("call succeeds at the protocol level");
+    assert_eq!(result.is_error, Some(true));
+    let text = text_of(&result);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(parsed["error"]["code"].as_str().unwrap(), "invalid_request");
+}
+
+/// `offset` + `anchor_block_seq` together violates mutual exclusivity ->
+/// tool-level `invalid_request` error.
+#[tokio::test]
+async fn test_get_chunks_offset_and_anchor_block_seq_mutually_exclusive() {
+    let (handler, doc_id, _ids) = make_handler_with_sequential_chunks(5).await;
+    let client = client_for(handler).await;
+
+    let result = call_tool(
+        &client,
+        "get_chunks",
+        json!({ "resource_id": doc_id, "offset": 1, "anchor_block_seq": 2 }),
+    )
+    .await
+    .expect("call succeeds at the protocol level");
+    assert_eq!(result.is_error, Some(true));
+    let text = text_of(&result);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(parsed["error"]["code"].as_str().unwrap(), "invalid_request");
+}
+
+/// `anchor_chunk_id` + `anchor_block_seq` together violates mutual
+/// exclusivity -> tool-level `invalid_request` error.
+#[tokio::test]
+async fn test_get_chunks_anchor_chunk_id_and_anchor_block_seq_mutually_exclusive() {
+    let (handler, doc_id, ids) = make_handler_with_sequential_chunks(5).await;
+    let client = client_for(handler).await;
+
+    let result = call_tool(
+        &client,
+        "get_chunks",
+        json!({ "resource_id": doc_id, "anchor_chunk_id": ids[2], "anchor_block_seq": 2 }),
+    )
+    .await
+    .expect("call succeeds at the protocol level");
+    assert_eq!(result.is_error, Some(true));
+    let text = text_of(&result);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(parsed["error"]["code"].as_str().unwrap(), "invalid_request");
 }
 
 // ---------------------------------------------------------------------------

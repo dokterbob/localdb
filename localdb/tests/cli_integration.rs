@@ -524,10 +524,25 @@ fn end_to_end_init_store_source_index_search() {
     assert!(store.get("id").is_some(), "store.id missing");
     assert!(store.get("name").is_some(), "store.name missing");
 
-    // span: {start, end}
-    let span = cit.get("span").expect("missing span field");
-    assert!(span.get("start").is_some(), "span.start missing");
-    assert!(span.get("end").is_some(), "span.end missing");
+    // block: {seq, kind}
+    let block = cit.get("block").expect("missing block field");
+    assert!(block.get("seq").is_some(), "block.seq missing");
+    assert!(block.get("kind").is_some(), "block.kind missing");
+
+    // chunk_position: {seq_in_block}
+    let chunk_position = cit
+        .get("chunk_position")
+        .expect("missing chunk_position field");
+    assert!(
+        chunk_position.get("seq_in_block").is_some(),
+        "chunk_position.seq_in_block missing"
+    );
+
+    // location: {span: {start, end}, window_block_seqs?}
+    let location = cit.get("location").expect("missing location field");
+    let span = location.get("span").expect("missing location.span field");
+    assert!(span.get("start").is_some(), "location.span.start missing");
+    assert!(span.get("end").is_some(), "location.span.end missing");
 
     // heading_path (array, may be empty)
     assert!(

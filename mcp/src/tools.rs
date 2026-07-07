@@ -430,33 +430,20 @@ fn document_json(store: &AvailableStore, chunks: &[localdb_core::ChunkRecord]) -
 const GET_CHUNKS_DEFAULT_LIMIT: usize = 50;
 const GET_CHUNKS_MAX_LIMIT: usize = 200;
 
-/// Resolve `GetChunksArgs::offset`/`limit` to validated `usize`s.
+/// Resolve `GetChunksArgs::limit` to a validated `usize`.
 ///
-/// Distinguishes absent (→ default) from present-but-invalid (→ error),
-/// same as the pre-rmcp raw-JSON parsing: an explicit negative offset/limit,
-/// or an explicit `limit: 0`, is a tool-level `invalid_request` error rather
-/// than a silent default or clamp (clamping `0` up to `1` would silently
-/// return a chunk the caller did not ask for). A valid `limit` is capped at
-/// `GET_CHUNKS_MAX_LIMIT`.
-fn resolve_get_chunks_pagination(args: &GetChunksArgs) -> Result<(usize, usize), CallToolResult> {
-    let offset = match args.offset {
-        None => 0,
-        Some(n) => usize::try_from(n).map_err(|_| {
-            typed_error(
-                "invalid_request",
-                "invalid arguments: 'offset' must be a non-negative integer",
-            )
-        })?,
-    };
-
-    let limit = match args.limit {
-        None => GET_CHUNKS_DEFAULT_LIMIT,
-        Some(0) => {
-            return Err(typed_error(
-                "invalid_request",
-                "invalid arguments: 'limit' must be at least 1",
-            ));
-        }
+/// Distinguishes absent (→ default) from present-but-invalid (→ error): an
+/// explicit `limit: 0` or a negative value is a tool-level `invalid_request`
+/// error rather than a silent default or clamp (clamping `0` up to `1` would
+/// silently return a chunk the caller did not ask for). A valid `limit` is
+/// capped at `GET_CHUNKS_MAX_LIMIT`.
+fn resolve_limit(limit: Option<i64>) -> Result<usize, CallToolResult> {
+    match limit {
+        None => Ok(GET_CHUNKS_DEFAULT_LIMIT),
+        Some(0) => Err(typed_error(
+            "invalid_request",
+            "invalid arguments: 'limit' must be at least 1",
+        )),
         Some(n) => usize::try_from(n)
             .map(|v| v.min(GET_CHUNKS_MAX_LIMIT))
             .map_err(|_| {
@@ -464,10 +451,115 @@ fn resolve_get_chunks_pagination(args: &GetChunksArgs) -> Result<(usize, usize),
                     "invalid_request",
                     "invalid arguments: 'limit' must be a positive integer",
                 )
-            })?,
-    };
+            }),
+    }
+}
 
+/// Resolve `GetChunksArgs::offset` to a validated `usize` (absent → 0).
+fn resolve_offset(offset: Option<i64>) -> Result<usize, CallToolResult> {
+    match offset {
+        None => Ok(0),
+        Some(n) => usize::try_from(n).map_err(|_| {
+            typed_error(
+                "invalid_request",
+                "invalid arguments: 'offset' must be a non-negative integer",
+            )
+        }),
+    }
+}
+
+/// Resolve `GetChunksArgs::offset`/`limit` to validated `usize`s.
+///
+/// A thin wrapper over [`resolve_offset`]/[`resolve_limit`], kept only for
+/// their dedicated unit tests below (`tool_get_chunks` itself calls the two
+/// underlying functions separately, since the anchor path needs `limit`
+/// resolved before `offset` even applies).
+#[cfg(test)]
+fn resolve_get_chunks_pagination(args: &GetChunksArgs) -> Result<(usize, usize), CallToolResult> {
+    let offset = resolve_offset(args.offset)?;
+    let limit = resolve_limit(args.limit)?;
     Ok((offset, limit))
+}
+
+/// Anchor-relative pagination (#146): `offset`, `anchor_chunk_id`, and
+/// `anchor_block_seq` are pairwise mutually exclusive — specifying more than
+/// one is a tool-level `invalid_request` error, not a silent precedence rule.
+/// See specs/05-surfaces.md §4.1.
+fn check_anchor_mutual_exclusivity(args: &GetChunksArgs) -> Result<(), CallToolResult> {
+    let specified_count = [
+        args.offset.is_some(),
+        args.anchor_chunk_id.is_some(),
+        args.anchor_block_seq.is_some(),
+    ]
+    .into_iter()
+    .filter(|&specified| specified)
+    .count();
+
+    if specified_count > 1 {
+        return Err(typed_error(
+            "invalid_request",
+            "invalid arguments: 'offset', 'anchor_chunk_id', and 'anchor_block_seq' are mutually exclusive; pass at most one",
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve `anchor_chunk_id` to its 0-based index in `sorted_chunks` (already
+/// sorted by `(block_seq, seq_in_block, ...)`): an exact `chunk_id` match.
+/// Unknown id → `chunk_not_found`.
+fn resolve_anchor_chunk_id(
+    sorted_chunks: &[localdb_core::ChunkRecord],
+    anchor_chunk_id: &str,
+) -> Result<usize, CallToolResult> {
+    sorted_chunks
+        .iter()
+        .position(|c| c.id == anchor_chunk_id)
+        .ok_or_else(|| {
+            typed_error(
+                "chunk_not_found",
+                format!("no chunk with id '{anchor_chunk_id}' found in this resource"),
+            )
+        })
+}
+
+/// Resolve `anchor_block_seq` to its 0-based index in `sorted_chunks` via
+/// lower-bound: the first chunk with `block_seq >= anchor_block_seq`. Since
+/// `sorted_chunks` is already ordered by `(block_seq, seq_in_block, ...)`,
+/// the first position satisfying the predicate is automatically tie-broken
+/// by the lowest `seq_in_block` at that `block_seq`. `anchor_block_seq` past
+/// every block in the resource → `chunk_not_found`.
+fn resolve_anchor_block_seq(
+    sorted_chunks: &[localdb_core::ChunkRecord],
+    anchor_block_seq: u32,
+) -> Result<usize, CallToolResult> {
+    sorted_chunks
+        .iter()
+        .position(|c| c.block_seq >= anchor_block_seq)
+        .ok_or_else(|| {
+            typed_error(
+                "chunk_not_found",
+                format!("anchor_block_seq {anchor_block_seq} is past every block in this resource"),
+            )
+        })
+}
+
+/// Compute the `limit`-sized page centered on `anchor_idx` within a
+/// `total`-length list, clamped to the list bounds. Returns `(offset, end)`.
+///
+/// Per specs/05-surfaces.md §4.1: the window never shrinks below `limit`
+/// purely because the anchor is near an edge — it shifts toward the
+/// interior instead; it only returns fewer than `limit` chunks when
+/// `total < limit`.
+fn centered_window(anchor_idx: usize, total: usize, limit: usize) -> (usize, usize) {
+    if total <= limit {
+        return (0, total);
+    }
+    let half = limit / 2;
+    let mut offset = anchor_idx.saturating_sub(half);
+    if offset + limit > total {
+        offset = total - limit;
+    }
+    (offset, offset + limit)
 }
 
 /// Execute the `get_chunks` tool.
@@ -495,6 +587,15 @@ fn resolve_get_chunks_pagination(args: &GetChunksArgs) -> Result<(usize, usize),
 /// Returns `resource_not_found` error if no matching chunks are found.
 /// An out-of-range `offset` yields an empty `chunks` array, not an error.
 ///
+/// **Anchor-relative pagination (#146):** as an alternative to `offset`,
+/// callers may pass `anchor_chunk_id` or `anchor_block_seq` (mutually
+/// exclusive with `offset` and with each other — see
+/// `check_anchor_mutual_exclusivity`). Once an anchor resolves to a position
+/// in the full sorted chunk list, the response window is `limit` chunks
+/// centered on that position (see `centered_window`), and the response
+/// carries `anchor_index` — the anchor's 0-based index within the returned
+/// `chunks` array — instead of `null`. See specs/05-surfaces.md §4.1.
+///
 /// Note: URI-based lookup is not supported in v1, matching `get_document`.
 pub async fn tool_get_chunks(stores: &[AvailableStore], args: GetChunksArgs) -> CallToolResult {
     if args.resource_id.trim().is_empty() {
@@ -503,7 +604,10 @@ pub async fn tool_get_chunks(stores: &[AvailableStore], args: GetChunksArgs) -> 
             "invalid arguments: 'resource_id' must not be empty",
         );
     }
-    let (offset, limit) = match resolve_get_chunks_pagination(&args) {
+    if let Err(result) = check_anchor_mutual_exclusivity(&args) {
+        return result;
+    }
+    let limit = match resolve_limit(args.limit) {
         Ok(v) => v,
         Err(result) => return result,
     };
@@ -518,7 +622,31 @@ pub async fn tool_get_chunks(stores: &[AvailableStore], args: GetChunksArgs) -> 
                     &b.id,
                 ))
             });
-            success_json(&chunks_json(store, &chunks, offset, limit))
+
+            let (offset, anchor_index) = if let Some(anchor_chunk_id) = &args.anchor_chunk_id {
+                match resolve_anchor_chunk_id(&chunks, anchor_chunk_id) {
+                    Ok(idx) => {
+                        let (offset, _end) = centered_window(idx, chunks.len(), limit);
+                        (offset, Some(idx - offset))
+                    }
+                    Err(result) => return result,
+                }
+            } else if let Some(anchor_block_seq) = args.anchor_block_seq {
+                match resolve_anchor_block_seq(&chunks, anchor_block_seq) {
+                    Ok(idx) => {
+                        let (offset, _end) = centered_window(idx, chunks.len(), limit);
+                        (offset, Some(idx - offset))
+                    }
+                    Err(result) => return result,
+                }
+            } else {
+                match resolve_offset(args.offset) {
+                    Ok(offset) => (offset, None),
+                    Err(result) => return result,
+                }
+            };
+
+            success_json(&chunks_json(store, &chunks, offset, limit, anchor_index))
         }
         Ok(None) => typed_error(
             "resource_not_found",
@@ -551,6 +679,7 @@ fn chunks_json(
     sorted_chunks: &[localdb_core::ChunkRecord],
     offset: usize,
     limit: usize,
+    anchor_index: Option<usize>,
 ) -> Value {
     let first = &sorted_chunks[0];
     let total_chunks = sorted_chunks.len();
@@ -577,6 +706,7 @@ fn chunks_json(
         "offset": offset,
         "limit": limit,
         "returned": returned,
+        "anchor_index": anchor_index,
         "chunks": page,
     })
 }
@@ -757,6 +887,8 @@ mod tests {
             resource_id: resource_id.to_string(),
             offset: None,
             limit: None,
+            anchor_chunk_id: None,
+            anchor_block_seq: None,
         }
     }
 
@@ -1009,7 +1141,10 @@ mod tests {
         date: Option<String>,
     ) -> localdb_core::citation::Citation {
         use localdb_core::{
-            citation::{CitationProvenance, CitationStore, Score},
+            citation::{
+                ChunkPosition, CitationBlock, CitationLocation, CitationProvenance, CitationStore,
+                Score,
+            },
             metadata::{DocumentMetadata, DublinCoreMetadata, Metadata},
             types::Span,
         };
@@ -1023,7 +1158,12 @@ mod tests {
             uri: uri.to_string(),
             title: None,
             heading_path: vec![],
-            span: Span::new(0, 4),
+            block: CitationBlock { seq: 0, kind: None },
+            chunk_position: ChunkPosition { seq_in_block: 0 },
+            location: CitationLocation {
+                span: Span::new(0, 4),
+                window_block_seqs: vec![],
+            },
             snippet: "text".to_string(),
             score: Score {
                 fused: 0.5,
@@ -1042,8 +1182,6 @@ mod tests {
                 },
                 ..Default::default()
             }),
-            block_seq: None,
-            block_kind: None,
         }
     }
 

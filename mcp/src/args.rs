@@ -105,4 +105,24 @@ pub struct GetChunksArgs {
         range(min = 1, max = 200)
     )]
     pub limit: Option<i64>,
+
+    /// Anchor pagination (#146): resolve to the chunk with this exact
+    /// `chunk_id`, then return a window of `limit` chunks centered on it.
+    /// Mutually exclusive with `offset` and `anchor_block_seq`.
+    #[serde(default)]
+    #[schemars(
+        description = "Resolve to the chunk with this exact chunk_id, then return a window of `limit` chunks centered on it. Mutually exclusive with `offset` and `anchor_block_seq`."
+    )]
+    pub anchor_chunk_id: Option<String>,
+
+    /// Anchor pagination (#146): resolve via lower-bound to the first chunk
+    /// with `block_seq >= anchor_block_seq` (tie-broken by lowest
+    /// `seq_in_block`), then return a window of `limit` chunks centered on
+    /// it. Mutually exclusive with `offset` and `anchor_chunk_id`.
+    #[serde(default)]
+    #[schemars(
+        description = "Resolve via lower-bound to the first chunk with block_seq >= anchor_block_seq (tie-broken by lowest seq_in_block), then return a window of `limit` chunks centered on it. Mutually exclusive with `offset` and `anchor_chunk_id`.",
+        range(min = 0)
+    )]
+    pub anchor_block_seq: Option<u32>,
 }
