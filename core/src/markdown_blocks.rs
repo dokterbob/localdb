@@ -72,8 +72,26 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
         text: Vec<String>,
         /// Table-specific state.
         table_headers: Vec<String>,
+        table_rows: Vec<Vec<String>>,
+        table_row: Vec<String>,
+        table_cell: Vec<String>,
         table_row_count: usize,
         in_table_head: bool,
+    }
+
+    impl ActiveBlock {
+        fn new(kind: ActiveKind) -> Self {
+            ActiveBlock {
+                kind,
+                text: Vec::new(),
+                table_headers: Vec::new(),
+                table_rows: Vec::new(),
+                table_row: Vec::new(),
+                table_cell: Vec::new(),
+                table_row_count: 0,
+                in_table_head: false,
+            }
+        }
     }
 
     enum ActiveKind {
@@ -111,23 +129,11 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
             // ----------------------------------------------------------------
             Event::Start(Tag::Heading { level, .. }) => {
                 let lv = level as u8;
-                stack.push(ActiveBlock {
-                    kind: ActiveKind::Heading { level: lv },
-                    text: Vec::new(),
-                    table_headers: Vec::new(),
-                    table_row_count: 0,
-                    in_table_head: false,
-                });
+                stack.push(ActiveBlock::new(ActiveKind::Heading { level: lv }));
             }
 
             Event::Start(Tag::Paragraph) => {
-                stack.push(ActiveBlock {
-                    kind: ActiveKind::Paragraph,
-                    text: Vec::new(),
-                    table_headers: Vec::new(),
-                    table_row_count: 0,
-                    in_table_head: false,
-                });
+                stack.push(ActiveBlock::new(ActiveKind::Paragraph));
             }
 
             Event::Start(Tag::CodeBlock(fence)) => {
@@ -142,45 +148,21 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                     }
                     pulldown_cmark::CodeBlockKind::Indented => None,
                 };
-                stack.push(ActiveBlock {
-                    kind: ActiveKind::Code { language: lang },
-                    text: Vec::new(),
-                    table_headers: Vec::new(),
-                    table_row_count: 0,
-                    in_table_head: false,
-                });
+                stack.push(ActiveBlock::new(ActiveKind::Code { language: lang }));
             }
 
             Event::Start(Tag::BlockQuote(_)) => {
-                stack.push(ActiveBlock {
-                    kind: ActiveKind::Quote,
-                    text: Vec::new(),
-                    table_headers: Vec::new(),
-                    table_row_count: 0,
-                    in_table_head: false,
-                });
+                stack.push(ActiveBlock::new(ActiveKind::Quote));
             }
 
             Event::Start(Tag::List(start)) => {
-                stack.push(ActiveBlock {
-                    kind: ActiveKind::List {
-                        ordered: start.is_some(),
-                    },
-                    text: Vec::new(),
-                    table_headers: Vec::new(),
-                    table_row_count: 0,
-                    in_table_head: false,
-                });
+                stack.push(ActiveBlock::new(ActiveKind::List {
+                    ordered: start.is_some(),
+                }));
             }
 
             Event::Start(Tag::Table(_alignments)) => {
-                stack.push(ActiveBlock {
-                    kind: ActiveKind::Table,
-                    text: Vec::new(),
-                    table_headers: Vec::new(),
-                    table_row_count: 0,
-                    in_table_head: false,
-                });
+                stack.push(ActiveBlock::new(ActiveKind::Table));
             }
 
             Event::Start(Tag::TableHead) => {
@@ -197,13 +179,7 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                 // image title attribute (not the alt). We store src from dest_url.
                 // The title attribute is stored separately if present.
                 let _ = title; // may use in future
-                stack.push(ActiveBlock {
-                    kind: ActiveKind::Image { src },
-                    text: Vec::new(),
-                    table_headers: Vec::new(),
-                    table_row_count: 0,
-                    in_table_head: false,
-                });
+                stack.push(ActiveBlock::new(ActiveKind::Image { src }));
             }
 
             // ----------------------------------------------------------------
@@ -245,13 +221,7 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                         }
                         _ => {
                             // Restore — shouldn't happen normally.
-                            stack.push(ActiveBlock {
-                                kind: b.kind,
-                                text: b.text,
-                                table_headers: b.table_headers,
-                                table_row_count: b.table_row_count,
-                                in_table_head: b.in_table_head,
-                            });
+                            stack.push(b);
                         }
                     }
                 }
@@ -290,8 +260,43 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                 if let Some(b) = stack.pop() {
                     let headers = b.table_headers.clone();
                     let rows = b.table_row_count;
-                    let text = b.text.join(" ");
+                    // Reconstruct pipe-syntax Markdown so downstream consumers
+                    // (chunk_table) can re-split the table row-by-row. Cell text
+                    // containing `|` is re-escaped to keep each line parseable.
+                    let esc = |s: &String| s.replace('|', "\\|");
+                    let ncols = b
+                        .table_headers
+                        .len()
+                        .max(b.table_rows.iter().map(Vec::len).max().unwrap_or(0));
+                    let text = if ncols == 0 {
+                        String::new()
+                    } else {
+                        let render_row = |cells: &[String]| {
+                            let padded: Vec<String> = (0..ncols)
+                                .map(|i| cells.get(i).map(esc).unwrap_or_default())
+                                .collect();
+                            format!("| {} |", padded.join(" | "))
+                        };
+                        let mut lines = vec![
+                            render_row(&b.table_headers),
+                            format!("|{}|", vec![" --- "; ncols].join("|")),
+                        ];
+                        lines.extend(b.table_rows.iter().map(|r| render_row(r)));
+                        lines.join("\n")
+                    };
                     push_block!(blocks, seq, BlockKind::Table { headers, rows }, text);
+                }
+            }
+
+            Event::End(TagEnd::TableCell) => {
+                if let Some(b) = stack.last_mut() {
+                    let cell = b.table_cell.join("").trim().to_string();
+                    b.table_cell.clear();
+                    if b.in_table_head {
+                        b.table_headers.push(cell);
+                    } else {
+                        b.table_row.push(cell);
+                    }
                 }
             }
 
@@ -305,6 +310,7 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                 if let Some(b) = stack.last_mut() {
                     if !b.in_table_head {
                         b.table_row_count += 1;
+                        b.table_rows.push(std::mem::take(&mut b.table_row));
                     }
                 }
             }
@@ -340,28 +346,30 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
             Event::Text(t) => {
                 if let Some(b) = stack.last_mut() {
                     match &b.kind {
-                        ActiveKind::Table => {
-                            if b.in_table_head {
-                                b.table_headers.push(t.to_string());
-                            } else {
-                                b.text.push(t.to_string());
-                            }
-                        }
+                        // Table text accumulates per cell; TagEnd::TableCell
+                        // routes the finished cell to headers or the open row.
+                        ActiveKind::Table => b.table_cell.push(t.to_string()),
                         _ => b.text.push(t.to_string()),
                     }
                 }
             }
 
             Event::Code(t) => {
-                // Inline code inside a paragraph/heading.
+                // Inline code inside a paragraph/heading/table cell.
                 if let Some(b) = stack.last_mut() {
-                    b.text.push(t.to_string());
+                    match &b.kind {
+                        ActiveKind::Table => b.table_cell.push(t.to_string()),
+                        _ => b.text.push(t.to_string()),
+                    }
                 }
             }
 
             Event::SoftBreak | Event::HardBreak => {
                 if let Some(b) = stack.last_mut() {
-                    b.text.push(" ".to_string());
+                    match &b.kind {
+                        ActiveKind::Table => b.table_cell.push(" ".to_string()),
+                        _ => b.text.push(" ".to_string()),
+                    }
                 }
             }
 
@@ -701,6 +709,37 @@ fn main() {}
         if let BlockKind::Table { headers, rows } = &table_b.kind {
             assert_eq!(headers, &vec!["A".to_string(), "B".to_string()]);
             assert_eq!(*rows, 2, "expected 2 data rows");
+        }
+        assert_eq!(
+            table_b.text, "| A | B |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |",
+            "table text must be reconstructed pipe-syntax Markdown"
+        );
+    }
+
+    /// Table block text is valid pipe syntax: header line, separator line, one
+    /// line per data row — even with inline formatting and escaped pipes in
+    /// cells. This is the contract chunk_table's row splitter relies on.
+    #[test]
+    fn table_block_text_is_reparseable_markdown() {
+        let md = "| Name | Notes |\n|---|---|\n| `a\\|b` | uses *pipes* |\n| c | d |\n";
+        let blocks = markdown_to_blocks(md);
+        let table_b = blocks
+            .iter()
+            .find(|b| matches!(&b.kind, BlockKind::Table { .. }))
+            .expect("expected a table block");
+        let lines: Vec<&str> = table_b.text.lines().collect();
+        assert_eq!(lines.len(), 4, "header + separator + 2 rows: {lines:?}");
+        assert!(lines[0].starts_with('|') && lines[0].ends_with('|'));
+        assert_eq!(lines[1], "| --- | --- |");
+        assert!(
+            lines[2].contains("a\\|b"),
+            "pipe inside a cell must be re-escaped: {}",
+            lines[2]
+        );
+        // Every line has the same unescaped-pipe cell count.
+        for line in &lines {
+            let cells = line.replace("\\|", "\u{0}").matches('|').count();
+            assert_eq!(cells, 3, "expected 2 cells per line: {line}");
         }
     }
 
