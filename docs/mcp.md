@@ -88,9 +88,9 @@ allowlist alongside `rmcp`'s own `localhost`/`127.0.0.1`/`::1` defaults; a wildc
 bind, `0.0.0.0`/`::`, disables the check entirely, since it already accepts
 connections from any network. See [specs/05-surfaces.md](../specs/05-surfaces.md) §4.2.)
 
-**Known v1 limitation:** the HTTP `/mcp` route snapshots the daemon's stores once at
-startup — a store added later via `POST /v1/stores` won't appear over MCP until the
-daemon restarts.
+Store resolution over `/mcp` is realtime: a store added later via `POST /v1/stores`
+appears on the very next MCP call (`search`, `get_document`, `get_chunks`,
+`list_stores`) — no daemon restart needed.
 
 ---
 
@@ -103,11 +103,12 @@ own `/mcp` route instead of opening the store a second time. This means:
 - You no longer need to stop `localdb serve` before using `localdb mcp` — the two now
   coexist by design (this replaces earlier v1 guidance that told you to stop the
   daemon first).
-- Proxied mode always exposes whatever store set the daemon had at its own startup —
-  **`--store` narrowing is not honored** when a daemon is running. `localdb mcp
-  --store <name>` against a running daemon prints a non-fatal warning to stderr and
-  serves the daemon's full store set regardless. This is a documented v1 limitation,
-  not a bug — see [specs/05-surfaces.md](../specs/05-surfaces.md) §4.2.
+- Proxied mode always exposes the daemon's current (realtime) full store set —
+  **`--store` narrowing is not honored** when a daemon is running, since the daemon's
+  own `/mcp` route has no notion of a per-stdio-session store filter to apply.
+  `localdb mcp --store <name>` against a running daemon prints a non-fatal warning to
+  stderr and serves the daemon's full store set regardless. This is a documented v1
+  limitation, not a bug — see [specs/05-surfaces.md](../specs/05-surfaces.md) §4.2.
 
 If no daemon is running, `localdb mcp` opens the store(s) embedded in-process exactly
 as before — no behavior change for the common case.

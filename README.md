@@ -223,9 +223,9 @@ The daemon exposes a REST API, plus the same MCP tools over HTTP at `/mcp` (see
 | YAML-declared stores | Appear in `store list` but **cannot be indexed** (`localdb index` only resolves runtime stores). Use `localdb store add` + `localdb source add` instead. |
 | CLI while daemon runs | CLI and daemon can run concurrently. SQLite WAL and busy_timeout serialise concurrent writes. |
 | MCP while daemon runs | `localdb mcp` now detects a running daemon and proxies to its `/mcp` route automatically, rather than conflicting with it. `--store` narrowing is not honored in proxied mode (v1 limitation — see [docs/mcp.md](docs/mcp.md#daemon-proxied-stdio)). |
-| MCP over HTTP | `/mcp` on the daemon snapshots the store list once at startup — a store added later via `/v1/stores` isn't visible over MCP until restart. |
+| MCP over HTTP | `/mcp` on the daemon resolves stores realtime — a store added later via `/v1/stores` appears on the next MCP call, no restart needed. |
 
-Docs sync: the old Known Gaps entries for source path validation and the macOS bundle ID are resolved in code and reflected in `docs/architecture.md`.
+Docs sync: the old Known Gaps entries for source path validation, the macOS bundle ID, and the MCP store-snapshot staleness are resolved in code and reflected in `docs/architecture.md`.
 
 Design rationale and planned behavior live in the [specs/](specs/) directory.
 

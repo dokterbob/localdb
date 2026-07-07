@@ -58,11 +58,13 @@
 //! in-process (embedded mode) over stdio. Phase 2 (`http.rs`) adds a second
 //! transport: `server::daemon::build_router` mounts
 //! `build_streamable_http_service`'s tower service at `/mcp` alongside the
-//! daemon's own `/v1` routes, over a startup-time snapshot of stores (see
-//! `http.rs`'s doc comment for why it isn't rebuilt per session). See
-//! specs/05-surfaces.md §4 and specs/01-architecture.md §3. The
-//! `--allow-write` flag is parsed but always rejected in v1: no mutating
-//! tool is registered on either transport.
+//! daemon's own `/v1` routes. Store resolution is realtime on both
+//! transports: `McpHandler` holds a `StoreProvider` (see `store_provider.rs`)
+//! and resolves stores fresh, per tool call, rather than from a snapshot
+//! taken once at construction — see specs/05-surfaces.md §4 and
+//! specs/01-architecture.md §3. The `--allow-write` flag is parsed but
+//! always rejected in v1: no mutating tool is registered on either
+//! transport.
 //!
 //! Phase 3 (`entrypoint::serve_proxied_stdio`, `proxy.rs`) adds a third mode
 //! rather than a third transport: `localdb mcp` still always speaks stdio to
@@ -85,10 +87,12 @@ pub mod entrypoint;
 pub mod handler;
 pub mod http;
 pub mod proxy;
+pub mod store_provider;
 pub mod tools;
 
 // Re-export key items for the binary entry point and for `server`'s HTTP mount.
 pub use entrypoint::{serve_embedded_stdio, serve_proxied_stdio};
 pub use handler::McpHandler;
 pub use http::build_streamable_http_service;
+pub use store_provider::{StaticStoreProvider, StoreProvider};
 pub use tools::{AvailableStore, StoreDescriptor};

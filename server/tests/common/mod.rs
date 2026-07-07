@@ -7,7 +7,9 @@ use localdb_core::config::schema::{
     DefaultsConfig, EmbeddingPolicy, IndexingPolicyConfig, RawConfig,
 };
 use serde_json::{json, Value};
-use server::{build_router, AppState, JobQueue, UrlRefreshScheduler};
+use server::{
+    build_router, mcp_bridge::AppStateStoreProvider, AppState, JobQueue, UrlRefreshScheduler,
+};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -23,11 +25,20 @@ pub(crate) async fn make_app() -> (TempDir, Router) {
     .await
     .expect("fake daemon state should open a temp libsql database");
 
+    // The provider wraps a clone of `state` (cheap — `AppState` is
+    // `Arc`-backed) so it keeps resolving stores from the *same* live
+    // database `state`/the returned `Router` share, even after this
+    // function returns — this is what lets `mcp_route.rs`'s realtime test
+    // add a store via `POST /v1/stores` after the router is built and see
+    // it reflected in a later `list_stores` MCP call, no restart needed.
+    let mcp_provider: std::sync::Arc<dyn mcp::StoreProvider> =
+        std::sync::Arc::new(AppStateStoreProvider::new(state.clone()));
+
     (
         dir,
         build_router(
             state,
-            vec![],
+            mcp_provider,
             std::sync::Arc::new(localdb_core::FakeEmbedder::new(1)),
             vec![],
         ),

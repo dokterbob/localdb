@@ -27,7 +27,7 @@ use localdb_core::{
     types::Span,
     FakeEmbedder,
 };
-use mcp::{proxy::ProxyHandler, AvailableStore, StoreDescriptor};
+use mcp::{proxy::ProxyHandler, AvailableStore, StaticStoreProvider, StoreDescriptor};
 
 /// Start a real upstream MCP-over-HTTP "daemon" seeded with one store
 /// holding one chunk. Returns its bare base URL (no `/mcp` suffix — matches
@@ -78,7 +78,8 @@ async fn start_upstream_daemon() -> (String, String) {
     // `vec![]` disables rmcp's Host-header allowlist entirely — this test
     // exercises proxy forwarding, not the allowlist itself, and connects
     // over a real loopback socket regardless.
-    let service = mcp::build_streamable_http_service(vec![available], embedder, vec![]);
+    let provider = Arc::new(StaticStoreProvider::new(vec![available]));
+    let service = mcp::build_streamable_http_service(provider, embedder, vec![]);
     let app = Router::new().nest_service("/mcp", service);
 
     let listener = TcpListener::bind("127.0.0.1:0")

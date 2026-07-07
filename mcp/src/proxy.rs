@@ -6,12 +6,12 @@
 //! macro-native: `#[tool_router]`/`#[tool_handler]` generates dispatch from
 //! typed argument structs it owns ahead of time. `ProxyHandler` cannot be
 //! macro-native — it has no argument structs of its own and does not know
-//! the upstream's tool set ahead of time (that set is whatever store
-//! snapshot the daemon happened to build at its own startup, see
-//! `server::mcp_bridge::build_available_stores`'s doc comment) — so it just
-//! relays whatever request arrives to the upstream connection and returns
-//! whatever comes back, unexamined. This is the one hand-written
-//! `ServerHandler` impl in the migration, deliberately.
+//! the upstream's tool set ahead of time (that set is whatever the
+//! upstream's `StoreProvider` currently resolves — realtime as of T2, see
+//! `server::mcp_bridge::AppStateStoreProvider`) — so it just relays whatever
+//! request arrives to the upstream connection and returns whatever comes
+//! back, unexamined. This is the one hand-written `ServerHandler` impl in
+//! the migration, deliberately.
 
 use rmcp::{
     model::{

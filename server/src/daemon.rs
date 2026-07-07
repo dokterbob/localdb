@@ -64,19 +64,21 @@ pub async fn start_daemon(
     let port = options.config.server.port;
     let socket_guard = bind_socket_guard(&options)?;
     let (state, url_scheduler) = build_daemon_state(&options).await?;
-    let (mcp_stores, mcp_embedder) = mcp_bridge::build_available_stores(&state).await?;
+    let mcp_provider: Arc<dyn mcp::StoreProvider> =
+        Arc::new(mcp_bridge::AppStateStoreProvider::new(state.clone()));
+    let mcp_embedder = mcp_bridge::build_mcp_embedder(&state).await;
     // Bind first so `mcp_allowed_hosts` sees the actually-bound address
     // (wildcard aliases like `"0"`/`"[::]"` only resolve to a concrete
     // `SocketAddr` after binding — same reasoning as `warn_if_unspecified`
     // and `client_base_url`, both of which also key off `bound_addr` rather
-    // than the raw config string). `build_available_stores`'s embedder is a
-    // `LazyEmbedder` and doesn't block on model loading, so reordering the
-    // (cheap) router construction after the bind doesn't delay startup.
+    // than the raw config string). `mcp_embedder` is a `LazyEmbedder` and
+    // doesn't block on model loading, so reordering the (cheap) router
+    // construction after the bind doesn't delay startup.
     let (listener, bound_addr) = bind_tcp_listener(bind_addr, port).await?;
     warn_if_unspecified(bound_addr);
     let router = build_router(
         state.clone(),
-        mcp_stores,
+        mcp_provider,
         mcp_embedder,
         mcp_allowed_hosts(bound_addr),
     );
@@ -196,17 +198,19 @@ async fn server_future(listener: TcpListener, router: Router) {
 ///   GET /documents/{id}, POST /search,
 ///   POST /jobs, GET /jobs/{id}, GET /status, GET /config.
 ///
-/// `mcp_stores`/`mcp_embedder` are the startup-time snapshot built by
-/// `mcp_bridge::build_available_stores` (specs/05-surfaces.md §4) — see
-/// that function's doc comment for why `/mcp` doesn't see stores added
-/// later via `/v1/stores` without a restart. `nest_service` (rather than
-/// `route_service`) matches the mount pattern rmcp's own test suite uses
-/// for `StreamableHttpService` and composes fine with a `Router<AppState>`
-/// that also has `.with_state` routes: the mounted service handles
-/// `Request` directly and needs no state extraction.
+/// `mcp_provider` is realtime (specs/05-surfaces.md §4): it resolves the
+/// current store list fresh on every `/mcp` tool call rather than from a
+/// snapshot taken once at construction, so a store added later via
+/// `POST /v1/stores` is visible on the very next MCP call — see
+/// `mcp_bridge::AppStateStoreProvider` and `mcp::store_provider`'s design
+/// rationale (D12). `nest_service` (rather than `route_service`) matches the
+/// mount pattern rmcp's own test suite uses for `StreamableHttpService` and
+/// composes fine with a `Router<AppState>` that also has `.with_state`
+/// routes: the mounted service handles `Request` directly and needs no
+/// state extraction.
 pub fn build_router(
     state: AppState,
-    mcp_stores: Vec<mcp::AvailableStore>,
+    mcp_provider: Arc<dyn mcp::StoreProvider>,
     mcp_embedder: Arc<dyn Embedder>,
     mcp_allowed_hosts: Vec<String>,
 ) -> Router {
@@ -235,7 +239,7 @@ pub fn build_router(
         .with_state(state)
         .nest_service(
             "/mcp",
-            mcp::build_streamable_http_service(mcp_stores, mcp_embedder, mcp_allowed_hosts),
+            mcp::build_streamable_http_service(mcp_provider, mcp_embedder, mcp_allowed_hosts),
         )
 }
 
@@ -869,7 +873,12 @@ mod tests {
         // `vec![]` disables the Host check entirely (see `mcp_allowed_hosts`);
         // this test only drives `/v1/search` via `oneshot`, never `/mcp`, so
         // the allowlist behavior itself is untested here.
-        let app = build_router(state, vec![], Arc::new(FakeEmbedder::new(1)), vec![]);
+        let app = build_router(
+            state,
+            Arc::new(mcp::StaticStoreProvider::new(vec![])),
+            Arc::new(FakeEmbedder::new(1)),
+            vec![],
+        );
 
         use axum::body::Body;
         use axum::http::Request;
@@ -938,7 +947,7 @@ mod tests {
         // this test only drives `/v1/status` via `oneshot`, never `/mcp`.
         let app = build_router(
             state,
-            vec![],
+            Arc::new(mcp::StaticStoreProvider::new(vec![])),
             Arc::new(localdb_core::FakeEmbedder::new(1)),
             vec![],
         );

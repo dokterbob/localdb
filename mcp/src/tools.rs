@@ -31,7 +31,10 @@ use crate::args::{GetChunksArgs, GetDocumentArgs, SearchArgs};
 ///
 /// Content shape: `{"error": {"code": "...", "message": "..."}}`.
 /// Use `localdb_core::Error::code()` for the code when mapping a domain error.
-fn typed_error(code: &str, message: impl Into<String>) -> CallToolResult {
+///
+/// `pub(crate)` rather than private: `handler.rs` also needs this to convert
+/// a `StoreProvider::available_stores` failure into a tool-level error.
+pub(crate) fn typed_error(code: &str, message: impl Into<String>) -> CallToolResult {
     let v = serde_json::json!({
         "error": {
             "code": code,

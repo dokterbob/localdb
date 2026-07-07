@@ -39,7 +39,7 @@ use localdb_core::{
     types::Span,
     FakeEmbedder,
 };
-use mcp::{handler::McpHandler, AvailableStore, StoreDescriptor};
+use mcp::{handler::McpHandler, AvailableStore, StaticStoreProvider, StoreDescriptor};
 
 // ---------------------------------------------------------------------------
 // Test harness
@@ -118,7 +118,11 @@ fn make_handler_with_one_store() -> McpHandler {
     let available = AvailableStore::from_arc(sd, store);
     let embedder: std::sync::Arc<dyn localdb_core::Embedder> =
         std::sync::Arc::new(FakeEmbedder::new(4));
-    McpHandler::new(vec![available], embedder, false)
+    McpHandler::new(
+        std::sync::Arc::new(StaticStoreProvider::new(vec![available])),
+        embedder,
+        false,
+    )
 }
 
 /// Build a handler with one store seeded with a chunk.
@@ -164,7 +168,11 @@ async fn make_handler_with_seeded_store() -> (McpHandler, String, String) {
     let available = AvailableStore::from_arc(sd, store);
     let embedder: std::sync::Arc<dyn localdb_core::Embedder> =
         std::sync::Arc::new(FakeEmbedder::new(4));
-    let handler = McpHandler::new(vec![available], embedder, false);
+    let handler = McpHandler::new(
+        std::sync::Arc::new(StaticStoreProvider::new(vec![available])),
+        embedder,
+        false,
+    );
     (handler, doc_id, cid)
 }
 
@@ -224,7 +232,11 @@ async fn make_handler_with_multichunk_doc() -> (McpHandler, String) {
     let available = AvailableStore::from_arc(sd, store);
     let embedder: std::sync::Arc<dyn localdb_core::Embedder> =
         std::sync::Arc::new(FakeEmbedder::new(4));
-    let handler = McpHandler::new(vec![available], embedder, false);
+    let handler = McpHandler::new(
+        std::sync::Arc::new(StaticStoreProvider::new(vec![available])),
+        embedder,
+        false,
+    );
     (handler, doc_id)
 }
 
@@ -281,7 +293,11 @@ async fn make_handler_with_tied_chunks(reversed: bool) -> (McpHandler, String) {
     let available = AvailableStore::from_arc(sd, store);
     let embedder: std::sync::Arc<dyn localdb_core::Embedder> =
         std::sync::Arc::new(FakeEmbedder::new(4));
-    let handler = McpHandler::new(vec![available], embedder, false);
+    let handler = McpHandler::new(
+        std::sync::Arc::new(StaticStoreProvider::new(vec![available])),
+        embedder,
+        false,
+    );
     (handler, doc_id)
 }
 
@@ -388,7 +404,11 @@ async fn test_list_stores_returns_stores() {
 async fn test_list_stores_empty() {
     let embedder: std::sync::Arc<dyn localdb_core::Embedder> =
         std::sync::Arc::new(FakeEmbedder::new(4));
-    let handler = McpHandler::new(vec![], embedder, false);
+    let handler = McpHandler::new(
+        std::sync::Arc::new(StaticStoreProvider::new(vec![])),
+        embedder,
+        false,
+    );
     let client = client_for(handler).await;
 
     let result = call_tool(&client, "list_stores", json!({}))
@@ -522,7 +542,11 @@ collector, which keeps runtime performance predictable and fast.";
     let available = AvailableStore::from_arc(sd, store);
     let embedder: std::sync::Arc<dyn localdb_core::Embedder> =
         std::sync::Arc::new(FakeEmbedder::new(4));
-    let handler = McpHandler::new(vec![available], embedder, false);
+    let handler = McpHandler::new(
+        std::sync::Arc::new(StaticStoreProvider::new(vec![available])),
+        embedder,
+        false,
+    );
     let client = client_for(handler).await;
 
     let result = call_tool(
@@ -669,7 +693,11 @@ async fn test_search_limit_respected() {
     let available = AvailableStore::from_arc(sd, store);
     let embedder: std::sync::Arc<dyn localdb_core::Embedder> =
         std::sync::Arc::new(FakeEmbedder::new(4));
-    let handler = McpHandler::new(vec![available], embedder, false);
+    let handler = McpHandler::new(
+        std::sync::Arc::new(StaticStoreProvider::new(vec![available])),
+        embedder,
+        false,
+    );
     let client = client_for(handler).await;
 
     let result = call_tool(

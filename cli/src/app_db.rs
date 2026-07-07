@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use async_trait::async_trait;
+
 use localdb_core::{
     config::{
         loader::{
@@ -13,9 +15,10 @@ use localdb_core::{
     types::StoreVisibility,
     Error, StoreBackend, StoreBackendConfig, StoreRow,
 };
+use mcp::{AvailableStore, StoreDescriptor, StoreProvider};
 use store_libsql::SqliteBackend;
 
-use crate::{daemon_client::CliContext, normalize::exit_err};
+use crate::{daemon_client::CliContext, normalize::exit_err, normalize::visibility_to_string};
 
 pub struct AppDb {
     backend: Arc<dyn StoreBackend>,
@@ -69,6 +72,56 @@ impl AppDb {
                 id: name.to_string(),
             }),
         }
+    }
+}
+
+/// A `StoreProvider` over an embedded-mode `AppDb` (the CLI's own in-process
+/// libsql handle, used when `localdb mcp` is *not* proxying to a running
+/// daemon — see `cmds::surface::run_mcp_async`). Each call re-derives the
+/// store list from the DB via `list_stores`, narrowed by `store_names`
+/// (mirrors `--store` on `localdb search`/`localdb mcp`; empty means "all
+/// runtime stores, whatever they are at call time") — so a store added by a
+/// concurrent `localdb store add` (or another process sharing the same
+/// SQLite WAL-mode database) is visible on the very next MCP tool call, with
+/// no restart of this stdio process needed.
+pub(crate) struct AppDbStoreProvider {
+    db: Arc<AppDb>,
+    store_names: Vec<String>,
+}
+
+impl AppDbStoreProvider {
+    /// `store_names` empty means "all runtime stores"; non-empty narrows to
+    /// just those names (unknown names are silently omitted, matching the
+    /// pre-existing `run_mcp_async` behavior this replaces).
+    pub(crate) fn new(db: Arc<AppDb>, store_names: Vec<String>) -> Self {
+        Self { db, store_names }
+    }
+}
+
+#[async_trait]
+impl StoreProvider for AppDbStoreProvider {
+    async fn available_stores(&self) -> Result<Vec<AvailableStore>, Error> {
+        let runtime_stores = self.db.backend().list_stores().await?;
+        let selected: Vec<&StoreRow> = if self.store_names.is_empty() {
+            runtime_stores.iter().collect()
+        } else {
+            runtime_stores
+                .iter()
+                .filter(|s| self.store_names.contains(&s.name))
+                .collect()
+        };
+
+        let mut available = Vec::with_capacity(selected.len());
+        for store_row in selected {
+            let descriptor = StoreDescriptor {
+                id: store_row.id.clone(),
+                name: store_row.name.clone(),
+                visibility: visibility_to_string(&store_row.visibility).to_string(),
+            };
+            let handle = self.db.backend().retrieval_store(&store_row.id).await?;
+            available.push(AvailableStore::from_arc(descriptor, handle));
+        }
+        Ok(available)
     }
 }
 
@@ -270,6 +323,42 @@ mod tests {
         assert_eq!(stores.len(), 1);
         assert_eq!(stores[0].name, "mystore");
         assert!(db.backend().delete_store(&id).await.unwrap());
+    }
+
+    // -----------------------------------------------------------------------
+    // AppDbStoreProvider — T2 realtime MCP store resolution
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn app_db_store_provider_reflects_stores_added_after_construction() {
+        let dir = TempDir::new().unwrap();
+        let db = Arc::new(tmp_app_db(&dir).await);
+        let provider = AppDbStoreProvider::new(db.clone(), vec![]);
+
+        let before = provider.available_stores().await.unwrap();
+        assert!(before.is_empty(), "no stores yet");
+
+        let store = default_store_row("late-store", &db).unwrap();
+        db.backend().upsert_store(&store).await.unwrap();
+
+        let after = provider.available_stores().await.unwrap();
+        assert_eq!(after.len(), 1, "the newly added store must be visible");
+        assert_eq!(after[0].descriptor.name, "late-store");
+    }
+
+    #[tokio::test]
+    async fn app_db_store_provider_narrows_by_store_names() {
+        let dir = TempDir::new().unwrap();
+        let db = Arc::new(tmp_app_db(&dir).await);
+        for name in ["alpha", "beta"] {
+            let store = default_store_row(name, &db).unwrap();
+            db.backend().upsert_store(&store).await.unwrap();
+        }
+
+        let provider = AppDbStoreProvider::new(db.clone(), vec!["beta".to_string()]);
+        let stores = provider.available_stores().await.unwrap();
+        assert_eq!(stores.len(), 1);
+        assert_eq!(stores[0].descriptor.name, "beta");
     }
 
     #[tokio::test]

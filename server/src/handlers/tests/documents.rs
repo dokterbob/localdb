@@ -48,7 +48,7 @@ async fn get_document_returns_record_when_indexed() {
 
     let app = crate::daemon::build_router(
         state,
-        vec![],
+        std::sync::Arc::new(mcp::StaticStoreProvider::new(vec![])),
         std::sync::Arc::new(localdb_core::FakeEmbedder::new(1)),
         vec![],
     );

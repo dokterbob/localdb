@@ -289,12 +289,20 @@ The CoreML backend (`local-coreml` feature; see [Platform notes](#platform-notes
 **5. Sources added before the include-allowlist change keep empty `include` globs.**
 As of the `only-index-supported-files` branch, `cli` automatically sets `DEFAULT_PATH_INCLUDES` (an extension-based allowlist) on new directory sources that have no explicit `include` globs. Sources that were added before this change already have an empty `include` list recorded in the unified database and will continue to index all files they enumerate until they are removed and re-added with `localdb source add`. There is no automatic migration, and this change is intentionally not folded into `policy_version`. The per-file chunk preset is determined deterministically from the filename/MIME type at index time, so re-indexing existing content with the new code produces correct results without a policy-hash change.
 
-**6. `/mcp` (HTTP) doesn't see stores added after daemon startup.**
-`server::mcp_bridge::build_available_stores` snapshots the daemon's store list once,
-at `start_daemon` time — a store added later via `POST /v1/stores` is invisible over
-MCP until the daemon restarts. Root cause: `rmcp`'s Streamable HTTP service factory is
-synchronous, so there's no hook to redo the async `AppState` lookup per session
-without an ugly blocking bridge. See [docs/mcp.md](mcp.md#remote-http-connecting-from-another-machine).
+**6. Resolved as of T2 (2026-07-07): `/mcp` now sees stores added after daemon startup.**
+`McpHandler` no longer holds a `Vec<AvailableStore>` snapshot taken once at
+`start_daemon` time. It instead holds a `StoreProvider` (`mcp::store_provider`, design
+decision D12) — `server::mcp_bridge::AppStateStoreProvider` for the daemon-hosted `/mcp`
+route, `cli::app_db::AppDbStoreProvider` for embedded-stdio `localdb mcp` — that
+re-derives the store list from the database on every tool call. A store added later via
+`POST /v1/stores` (or a concurrent `localdb store add`) is visible on the very next
+`search`/`get_document`/`get_chunks`/`list_stores` call, no restart needed. This was
+previously blocked by the mistaken belief that `rmcp`'s synchronous Streamable HTTP
+service-factory closure prevented any async re-resolution; in fact that closure only
+constrains *construction-time* lookups (building a new `McpHandler` per session) — an
+individual tool method's own `async fn` body is unaffected, which is exactly where
+`StoreProvider::available_stores().await` is now called. See
+[docs/mcp.md](mcp.md#remote-http-connecting-from-another-machine).
 
 **7. `--store` is not honored when `localdb mcp` proxies to a running daemon.**
 The daemon's `/mcp` route has no concept of a per-stdio-session store filter, so
