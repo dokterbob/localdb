@@ -19,10 +19,12 @@ use std::path::Path;
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 
+use crate::block::Resource;
 use crate::chunker::{chunk_blocks, CharSizer, ChunkSizer, ChunkerConfig, TokenSizer};
 use crate::embedder::{DocumentChunks, Embedder};
 use crate::error::Error;
 use crate::ids::{new_ulid, resource_id};
+use crate::ingestor::{IngestCallback, IngestSource, Ingestor, SkipReason};
 use crate::markdown_blocks::{compute_blocks_hash, markdown_to_blocks};
 use crate::store::{ChunkRecord, RetrievalStore};
 use crate::types::{
@@ -1187,6 +1189,522 @@ async fn run_url_source(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Unified ingestion pipeline (#117) — Ingestor-driven, no I/O in core
+// ---------------------------------------------------------------------------
+//
+// `run_source_ingestion` + `index_resource` are the pipeline shape described in
+// specs/01-architecture.md §1: the caller (CLI) builds a concrete `&dyn Ingestor`
+// per `SourceSpec` and drives it through `core` here. This section does not
+// replace `index_document`/`run_ingestion_for_source` above — those still
+// compile and pass (deletion of the legacy path is a later wave) — but shares
+// its crash-safe A6 ordering and skip/replace semantics. The key difference is
+// *where* extraction happens: the legacy path extracts raw bytes inside `core`
+// via `DocumentExtractor`; this path receives an already-built `Resource`
+// (blocks, metadata, content_hash final) from the ingestor, which does its own
+// acquisition + extraction I/O outside `core`.
+
+/// Dependencies for [`index_resource`]: the storage/embedding seam plus the
+/// effective ingestion config — mirrors the parameter shape `index_document`
+/// already uses (store, embedder, chunker config), minus the extractor (the
+/// `Resource` arrives pre-extracted).
+pub struct IndexResourceDeps<'a> {
+    pub store: &'a dyn RetrievalStore,
+    pub embedder: &'a dyn Embedder,
+    pub config: &'a IngestionConfig,
+}
+
+/// Compute the effective `ChunkerConfig` for one resource (issue #60; see
+/// specs/04-search-pipeline.md §3 "Source preset override").
+///
+/// - A source whose `source_preset` is anything other than the default
+///   `"prose"` is authoritative: `base_chunker` (assumed already resolved for
+///   that preset by the caller, e.g. `ChunkerConfig::code()`/`::messages()`
+///   plus any store-level overrides) is used **unconditionally**, regardless
+///   of what per-file detection would otherwise guess. This is what lets an
+///   explicit `code` or `messages` source win over a `.md` file that
+///   `preset_for` would otherwise route to `prose`.
+/// - A `"prose"` (default) source allows per-file auto-routing: `preset_for`
+///   inspects `filename_hint`/`mime`; when it says `"code"`,
+///   `ChunkerConfig::code()` defaults are used, otherwise `base_chunker` (the
+///   store's configured prose chunker) is used. This exactly mirrors
+///   `index_document`'s prior "Layer A" per-file override (which never
+///   consulted any source-level preset at all).
+fn effective_chunker_config(
+    source_preset: &str,
+    base_chunker: &ChunkerConfig,
+    filename_hint: Option<&str>,
+    mime: Option<&str>,
+) -> ChunkerConfig {
+    if source_preset != "prose" {
+        return base_chunker.clone();
+    }
+    use crate::chunker::preset_for;
+    if preset_for(filename_hint, mime) == "code" {
+        ChunkerConfig::code()
+    } else {
+        base_chunker.clone()
+    }
+}
+
+/// Derive a filename hint from a resource's URI: its last path segment, if any.
+///
+/// Used by [`effective_chunker_config`]'s per-file auto-routing. Non-hierarchical
+/// or extension-less URIs (e.g. `notion://page/abc123`) simply yield `None`,
+/// falling through to mime-based or default (`prose`) routing.
+fn filename_hint_from_uri(uri: &crate::uri::Uri) -> Option<String> {
+    let last = uri.as_url().path_segments()?.next_back()?;
+    if last.is_empty() {
+        None
+    } else {
+        Some(last.to_string())
+    }
+}
+
+/// Index a single already-built `Resource`: the post-extraction half of the
+/// pipeline (preset gate → chunk → embed → upsert).
+///
+/// Mirrors `index_document`'s crash-safe A6 ordering exactly: chunking and
+/// embedding happen first (read-only / reversible); only once embedding has
+/// succeeded is `replaces_resource_id` threaded into a single
+/// `upsert_chunks_and_blocks` call, so a write failure leaves any existing
+/// document for this URI intact and searchable (issue #79) — the replace
+/// delete is never issued as a separate call.
+///
+/// The skip-check (unchanged content) is the caller's responsibility (see
+/// `PipelineCallback` below) — this function always (re)indexes; `resource`'s
+/// blocks, metadata, and `content_hash` must already be final.
+///
+/// Returns the number of chunks written.
+pub async fn index_resource(
+    resource: &Resource,
+    source: &Source,
+    replaces_resource_id: Option<&str>,
+    deps: &IndexResourceDeps<'_>,
+) -> Result<usize, Error> {
+    let token_counter = deps.embedder.token_counter();
+    let sizer: Box<dyn ChunkSizer> = match &token_counter {
+        Some(f) => Box::new(TokenSizer::new(f.clone())),
+        None => Box::new(CharSizer),
+    };
+
+    // Preset gate (#60).
+    let filename_hint = filename_hint_from_uri(&resource.uri);
+    let effective_chunker = effective_chunker_config(
+        &source.source_preset,
+        &deps.config.chunker,
+        filename_hint.as_deref(),
+        resource.mime.as_deref(),
+    );
+
+    let chunker_cfg = if token_counter.is_none() {
+        scale_to_chars(&effective_chunker)
+    } else {
+        effective_chunker
+    };
+
+    let chunk_outputs = catch_panic(
+        "chunk",
+        std::panic::AssertUnwindSafe(|| {
+            chunk_blocks(&resource.id, &resource.blocks, &chunker_cfg, sizer.as_ref())
+        }),
+    )?;
+
+    if chunk_outputs.is_empty() {
+        // No chunks produced (empty resource) — mirrors index_document: delete
+        // any old chunks if this is a replace, write nothing new.
+        if let Some(old_id) = replaces_resource_id {
+            deps.store.delete_by_resource(old_id).await?;
+        }
+        return Ok(0);
+    }
+
+    // Embed BEFORE any delete (A6) — see module doc comment and index_document.
+    // `document_context` is built from the resource's block texts in order
+    // (the new `Resource` shape carries blocks, not a flat Markdown string).
+    let document_context = resource
+        .blocks
+        .iter()
+        .map(|b| b.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let doc_chunks = DocumentChunks {
+        document_context,
+        chunks: chunk_outputs.iter().map(|c| c.text.clone()).collect(),
+    };
+
+    let embedded = deps.embedder.embed_documents(vec![doc_chunks]).await?;
+
+    // Guard: the embedder must return exactly one EmbeddedDocument (one per
+    // input document), and that document must have exactly one vector per
+    // chunk. A length mismatch indicates a malformed embedder response (F4).
+    if embedded.len() != 1 {
+        return Err(Error::Internal {
+            message: format!(
+                "embedder returned {} EmbeddedDocuments for 1 input document",
+                embedded.len()
+            ),
+            correlation_id: "embed_count_mismatch".to_string(),
+        });
+    }
+    let embeddings = &embedded[0];
+    if embeddings.len() != chunk_outputs.len() {
+        return Err(Error::Internal {
+            message: format!(
+                "embedder returned {} vectors for {} chunks",
+                embeddings.len(),
+                chunk_outputs.len()
+            ),
+            correlation_id: "embed_chunk_count_mismatch".to_string(),
+        });
+    }
+
+    let provenance = Provenance {
+        origin_store: deps.config.store_id.clone(),
+        source_ref: SourceRef {
+            id: resource.source_id.clone(),
+            kind: resource.ingestor_kind.as_str().to_string(),
+        },
+        fetched_at: resource.modified_at.clone(),
+        content_hash: resource.content_hash.clone(),
+        share_path: vec![],
+    };
+
+    // Title propagation: resource.title backfills the metadata's Dublin Core
+    // title when the resource's own metadata doesn't already carry one
+    // (mirrors index_document's extraction.title fallback).
+    let mut record_metadata = resource.metadata.clone();
+    if record_metadata.dublin_core().title.is_none() {
+        if let Some(title) = &resource.title {
+            record_metadata.dublin_core_mut().title = Some(title.clone());
+        }
+    }
+
+    let mut records = Vec::with_capacity(chunk_outputs.len());
+    for (chunk_out, embedding) in chunk_outputs.iter().zip(embeddings.iter()) {
+        let chunk = Chunk {
+            id: chunk_out.id.clone(),
+            resource_id: resource.id.clone(),
+            store_id: deps.config.store_id.clone(),
+            text: chunk_out.text.clone(),
+            span: chunk_out.span.clone(),
+            heading_path: chunk_out.heading_path.clone(),
+            policy_version: deps.config.policy_version.clone(),
+            provenance: provenance.clone(),
+            window_block_seqs: chunk_out.window_block_seqs.clone(),
+        };
+
+        let mut record = ChunkRecord::from_chunk(
+            &chunk,
+            embedding.clone(),
+            resource.uri.as_str().to_string(),
+            resource.mime.clone(),
+            record_metadata.clone(),
+        );
+        record.block_seq = chunk_out.block_seq;
+        record.seq_in_block = chunk_out.seq_in_block;
+        record.block_kind = chunk_out.block_kind.clone();
+        records.push(record);
+    }
+
+    let written = records.len();
+    deps.store
+        .upsert_chunks_and_blocks(
+            &deps.config.store_id,
+            &resource.id,
+            records,
+            &resource.blocks,
+            replaces_resource_id,
+        )
+        .await?;
+
+    Ok(written)
+}
+
+/// Dependencies for [`run_source_ingestion`]: the mutable incremental-skip
+/// index plus everything [`index_resource`] needs, grouped for a single run.
+pub struct SourceIngestionDeps<'a> {
+    pub doc_index: &'a mut DocumentIndex,
+    pub store: &'a dyn RetrievalStore,
+    pub embedder: &'a dyn Embedder,
+    pub config: &'a IngestionConfig,
+    pub progress: Option<crate::progress::ProgressSink>,
+}
+
+/// Run the unified ingestion pipeline for one source, driven by a caller-supplied
+/// `&dyn Ingestor` (issue #117; specs/01-architecture.md §1).
+///
+/// Streams `Resource`s one at a time via [`PipelineCallback`] — no buffering of
+/// an entire source's resources in memory. Per resource: skip-check (unchanged
+/// `content_hash` + `policy_version`) → [`index_resource`] → counters/progress.
+/// Per-resource errors become stats counters and progress events, never abort
+/// the run. After `ingestor.ingest()` returns, runs the delete-sweep: any URI
+/// previously indexed for this source that was neither yielded nor reported via
+/// `on_skipped` this run is deleted — this is how a file deletion, source
+/// removal, or (once ingestors report it) a Gone URL is swept, mirroring
+/// `run_path_source`/`run_url_source`'s delete semantics exactly.
+pub async fn run_source_ingestion(
+    source: &Source,
+    ingestor: &dyn Ingestor,
+    deps: SourceIngestionDeps<'_>,
+) -> Result<IngestionResult, Error> {
+    let SourceIngestionDeps {
+        doc_index,
+        store,
+        embedder,
+        config,
+        progress,
+    } = deps;
+
+    let ingest_config = serde_json::to_value(&source.spec).map_err(|e| Error::Internal {
+        message: format!("failed to serialize source spec: {e}"),
+        correlation_id: "source_spec_serialize".to_string(),
+    })?;
+
+    let ingest_source = IngestSource {
+        source_id: source.id.clone(),
+        store_id: source.store_id.clone(),
+        ingestor_kind: ingestor.kind(),
+        config: ingest_config,
+        policy_version: config.policy_version.clone(),
+    };
+
+    if let Some(sink) = &progress {
+        sink(crate::progress::ProgressEvent::SourceStarted {
+            source_id: source.id.clone(),
+            location: source_location(source),
+        });
+    }
+
+    let mut callback = PipelineCallback {
+        source,
+        doc_index,
+        store,
+        embedder,
+        config,
+        progress: progress.clone(),
+        result: IngestionResult::default(),
+        seen: std::collections::HashSet::new(),
+        discovered_total: 0,
+        next_index: 0,
+    };
+
+    ingestor.ingest(&ingest_source, &mut callback).await?;
+
+    let PipelineCallback {
+        mut result,
+        seen,
+        doc_index,
+        ..
+    } = callback;
+
+    // Delete-sweep: any URI known to this source's doc_index that was neither
+    // yielded (on_resource) nor reported skipped (on_skipped) this run is
+    // gone — delete it. Mirrors run_path_source/run_url_source exactly: a
+    // deleted file simply isn't enumerated again; a Gone URL is simply never
+    // yielded. Restricting to `is_uri_from_source` mirrors the old path's
+    // guard against sweeping another source's URIs out of a shared doc_index.
+    let existing_uris = doc_index.uris();
+    for uri in existing_uris {
+        if !is_uri_from_source(&uri, source) {
+            continue;
+        }
+        if seen.contains(&uri) {
+            continue;
+        }
+        if let Some(old_record) = doc_index.remove(&uri) {
+            let deleted = store.delete_by_resource(&old_record.resource_id).await?;
+            if deleted > 0 {
+                result.docs_deleted += 1;
+            }
+        }
+    }
+
+    if let Some(sink) = &progress {
+        sink(crate::progress::ProgressEvent::SourceFinished {
+            result: result.clone(),
+        });
+    }
+
+    Ok(result)
+}
+
+/// Human-readable "location" string for `ProgressEvent::SourceStarted`,
+/// mirroring what `run_path_source`/`run_url_source` report today.
+fn source_location(source: &Source) -> String {
+    match &source.spec {
+        SourceSpec::Path { root, .. } => root.clone(),
+        SourceSpec::Url { url, .. } => url.clone(),
+    }
+}
+
+/// `IngestCallback` implementation that drives the unified pipeline one
+/// `Resource` at a time.
+///
+/// # The `&mut DocumentIndex`-across-`await` design
+///
+/// `PipelineCallback` OWNS its dependency references (including
+/// `doc_index: &'a mut DocumentIndex`) as plain struct fields rather than
+/// threading them through method parameters. `#[async_trait]` desugars
+/// `on_resource`/`on_discovered`/`on_skipped` into methods returning
+/// `Pin<Box<dyn Future<Output = ...> + Send + 'async_trait>>` tied to
+/// `&'async_trait mut self`. Since the mutable borrow of `DocumentIndex` lives
+/// entirely *inside* that per-call future (never held across separate calls,
+/// never stored anywhere else), there is no conflict: each call reborrows
+/// `self.doc_index` for its own duration and releases it when the future
+/// resolves — ordinary NLL reborrowing, not a lifetime fight. `run_source_ingestion`
+/// hands `PipelineCallback` its own `&mut DocumentIndex` (from
+/// `SourceIngestionDeps`) for the lifetime of the `ingestor.ingest(...)` call
+/// only; once that call returns, `callback` is destructured and `doc_index` is
+/// used directly again for the delete-sweep. No interior mutability
+/// (`RefCell`/`Mutex`) is needed — the fix for the "known risk" flagged for
+/// this ticket was simply to give the callback ownership of the dependency
+/// *references* up front, rather than threading `&mut DocumentIndex` through a
+/// chain of function parameters that would each need to re-borrow it across an
+/// `.await` point.
+struct PipelineCallback<'a> {
+    source: &'a Source,
+    doc_index: &'a mut DocumentIndex,
+    store: &'a dyn RetrievalStore,
+    embedder: &'a dyn Embedder,
+    config: &'a IngestionConfig,
+    progress: Option<crate::progress::ProgressSink>,
+    result: IngestionResult,
+    /// URIs yielded or reported skipped this run — survive the delete-sweep.
+    seen: std::collections::HashSet<String>,
+    /// Last total reported via `on_discovered`, if any (0 until then).
+    discovered_total: usize,
+    /// Running index for `ProgressEvent::DocumentStarted`.
+    next_index: usize,
+}
+
+impl PipelineCallback<'_> {
+    fn emit(&self, event: crate::progress::ProgressEvent) {
+        if let Some(sink) = &self.progress {
+            sink(event);
+        }
+    }
+
+    fn start_document(&mut self, uri: &str) {
+        let index = self.next_index;
+        self.next_index += 1;
+        self.emit(crate::progress::ProgressEvent::DocumentStarted {
+            uri: uri.to_string(),
+            index,
+            total: self.discovered_total,
+        });
+    }
+}
+
+#[async_trait::async_trait]
+impl IngestCallback for PipelineCallback<'_> {
+    async fn on_resource(&mut self, resource: Resource) -> Result<(), Error> {
+        let uri = resource.uri.as_str().to_string();
+        self.seen.insert(uri.clone());
+        self.result.docs_seen += 1;
+        self.start_document(&uri);
+
+        // Skip-check: unchanged content_hash + same policy_version → skip.
+        // Ingestors may ALSO skip earlier via `on_skipped`; both paths mark
+        // the URI seen so the delete-sweep leaves it alone.
+        if let Some(existing) = self.doc_index.get(&uri) {
+            if existing.content_hash == resource.content_hash
+                && existing.policy_version == self.config.policy_version
+            {
+                self.result.docs_skipped += 1;
+                self.emit(crate::progress::ProgressEvent::DocumentFinished {
+                    uri,
+                    outcome: crate::progress::DocOutcome::Skipped,
+                });
+                return Ok(());
+            }
+        }
+
+        let replaces = self.doc_index.get(&uri).map(|e| e.resource_id.clone());
+
+        let deps = IndexResourceDeps {
+            store: self.store,
+            embedder: self.embedder,
+            config: self.config,
+        };
+
+        match index_resource(&resource, self.source, replaces.as_deref(), &deps).await {
+            Ok(chunks_written) => {
+                self.result.docs_indexed += 1;
+                self.result.chunks_written += chunks_written as u64;
+                self.doc_index.upsert(DocumentRecord {
+                    uri: uri.clone(),
+                    resource_id: resource.id.clone(),
+                    content_hash: resource.content_hash.clone(),
+                    policy_version: self.config.policy_version.clone(),
+                });
+                self.emit(crate::progress::ProgressEvent::DocumentFinished {
+                    uri,
+                    outcome: crate::progress::DocOutcome::Indexed {
+                        chunks: chunks_written,
+                    },
+                });
+            }
+            Err(e) => {
+                // Per-resource errors never abort the run (specs/04 §2).
+                // doc_index is deliberately left untouched, same as
+                // index_document's error path, so a later run retries.
+                tracing::warn!("error indexing resource '{}': {}", uri, e);
+                self.result.error_count += 1;
+                self.emit(crate::progress::ProgressEvent::DocumentFinished {
+                    uri,
+                    outcome: crate::progress::DocOutcome::Error,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn on_discovered(&mut self, total: usize) {
+        self.discovered_total = total;
+        self.emit(crate::progress::ProgressEvent::Discovered { total });
+    }
+
+    async fn on_skipped(&mut self, uri: &str, reason: SkipReason) {
+        self.seen.insert(uri.to_string());
+        self.result.docs_seen += 1;
+        self.start_document(uri);
+
+        match reason {
+            SkipReason::Unchanged => {
+                // Still alive, just unchanged — never re-index, never sweep.
+                self.result.docs_skipped += 1;
+                self.emit(crate::progress::ProgressEvent::DocumentFinished {
+                    uri: uri.to_string(),
+                    outcome: crate::progress::DocOutcome::Skipped,
+                });
+            }
+            SkipReason::Unsupported => {
+                // Mirrors run_path_source: an unsupported file is counted but
+                // never deleted — it stays "seen" so any previously-indexed
+                // content for it (from before it became unsupported) survives
+                // the sweep untouched, neither refreshed nor removed.
+                self.result.unsupported_format_count += 1;
+                self.emit(crate::progress::ProgressEvent::DocumentFinished {
+                    uri: uri.to_string(),
+                    outcome: crate::progress::DocOutcome::Unsupported,
+                });
+            }
+            SkipReason::Other(_) => {
+                // No direct old-path analog; nearest classification is a
+                // (non-format, non-error) skip. Alive either way (marked seen
+                // above), so it survives the sweep regardless.
+                self.result.docs_skipped += 1;
+                self.emit(crate::progress::ProgressEvent::DocumentFinished {
+                    uri: uri.to_string(),
+                    outcome: crate::progress::DocOutcome::Skipped,
+                });
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3926,6 +4444,1039 @@ mod tests {
             seq_in_block: 0,
             block_kind: None,
             window_block_seqs: vec![],
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Unified pipeline (#117) tests — run_source_ingestion / index_resource
+    //
+    // Ports the critical index_document/run_* test families onto the new
+    // Ingestor-driven path, using a scripted FakeIngestor in place of real
+    // file/URL enumeration.
+    // ---------------------------------------------------------------------------
+    mod unified_pipeline {
+        use super::*;
+        use crate::block::{Block, BlockKind, IngestorKind, ResourceKind};
+        use crate::embedder::EmbeddedDocument;
+        use crate::ingestor::IngestResult;
+        use crate::metadata::{DocumentMetadata, DublinCoreMetadata, Metadata};
+        use crate::progress::{DocOutcome, ProgressEvent};
+        use crate::uri::Uri;
+
+        // -----------------------------------------------------------------
+        // Fixtures
+        // -----------------------------------------------------------------
+
+        fn make_source_with_preset(store_id: &str, preset: &str) -> Source {
+            Source {
+                id: new_ulid(),
+                store_id: store_id.to_string(),
+                kind: SourceKind::Path,
+                spec: SourceSpec::Path {
+                    root: "/docs".to_string(),
+                    include: vec![],
+                    exclude: vec![],
+                },
+                source_preset: preset.to_string(),
+            }
+        }
+
+        fn make_resource(uri: &str, text: &str, source_id: &str, store_id: &str) -> Resource {
+            make_resource_with_blocks(
+                uri,
+                source_id,
+                store_id,
+                vec![Block {
+                    seq: 0,
+                    kind: BlockKind::Paragraph,
+                    text: text.to_string(),
+                    location: None,
+                }],
+            )
+        }
+
+        fn make_resource_with_blocks(
+            uri: &str,
+            source_id: &str,
+            store_id: &str,
+            blocks: Vec<Block>,
+        ) -> Resource {
+            let joined: String = blocks
+                .iter()
+                .map(|b| b.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let hash = content_hash(&joined);
+            let id = resource_id(uri, &hash);
+            Resource {
+                id,
+                store_id: store_id.to_string(),
+                source_id: source_id.to_string(),
+                ingestor_kind: IngestorKind::File,
+                resource_kind: ResourceKind::Document,
+                uri: Uri::parse(uri).unwrap_or_else(|| panic!("invalid test uri: {uri}")),
+                external_id: None,
+                external_etag: None,
+                content_hash: hash,
+                title: None,
+                mime: Some("text/markdown".to_string()),
+                metadata: Metadata::Document(DocumentMetadata::default()),
+                added_at: "2026-06-10T12:00:00Z".to_string(),
+                modified_at: "2026-06-10T12:00:00Z".to_string(),
+                thread_id: None,
+                channel: None,
+                participants: vec![],
+                origin_store: store_id.to_string(),
+                policy_version: "policy-v1".to_string(),
+                share_path: None,
+                extractor_version: "1".to_string(),
+                blocks,
+            }
+        }
+
+        /// Index a resource directly (bypassing the callback) to seed prior
+        /// state in `store/doc_index`, mimicking "already indexed in an
+        /// earlier run".
+        async fn seed_indexed(
+            store: &FakeStore,
+            embedder: &FakeEmbedder,
+            config: &IngestionConfig,
+            source: &Source,
+            uri: &str,
+            text: &str,
+        ) -> DocumentRecord {
+            let resource = make_resource(uri, text, &source.id, &config.store_id);
+            let deps = IndexResourceDeps {
+                store,
+                embedder,
+                config,
+            };
+            index_resource(&resource, source, None, &deps)
+                .await
+                .expect("seed index must succeed");
+            DocumentRecord {
+                uri: uri.to_string(),
+                resource_id: resource.id.clone(),
+                content_hash: resource.content_hash.clone(),
+                policy_version: config.policy_version.clone(),
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // FakeIngestor — scripted Ingestor for testing run_source_ingestion
+        // -----------------------------------------------------------------
+
+        // Test-only fixture enum; the size skew between variants doesn't
+        // matter here (small, short-lived Vec<ScriptStep> per test).
+        #[allow(clippy::large_enum_variant)]
+        enum ScriptStep {
+            Discovered(usize),
+            Resource(Resource),
+            Skipped(String, SkipReason),
+        }
+
+        struct FakeIngestor {
+            script: std::sync::Mutex<Vec<ScriptStep>>,
+        }
+
+        impl FakeIngestor {
+            fn new(script: Vec<ScriptStep>) -> Self {
+                Self {
+                    script: std::sync::Mutex::new(script),
+                }
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl Ingestor for FakeIngestor {
+            fn kind(&self) -> IngestorKind {
+                IngestorKind::File
+            }
+
+            async fn ingest(
+                &self,
+                _source: &IngestSource,
+                callback: &mut dyn IngestCallback,
+            ) -> Result<IngestResult, Error> {
+                let steps: Vec<ScriptStep> = std::mem::take(&mut *self.script.lock().unwrap());
+                let mut produced = 0;
+                let mut skipped = 0;
+                for step in steps {
+                    match step {
+                        ScriptStep::Discovered(n) => callback.on_discovered(n).await,
+                        ScriptStep::Resource(r) => {
+                            callback.on_resource(r).await?;
+                            produced += 1;
+                        }
+                        ScriptStep::Skipped(uri, reason) => {
+                            callback.on_skipped(&uri, reason).await;
+                            skipped += 1;
+                        }
+                    }
+                }
+                Ok(IngestResult {
+                    resources_produced: produced,
+                    resources_skipped: skipped,
+                    errors: 0,
+                })
+            }
+        }
+
+        /// Embedder that fails only when a chunk's text contains a marker
+        /// substring, delegating to a real `FakeEmbedder` otherwise — lets a
+        /// mixed script exercise both a successful resource and a failing one.
+        struct SelectiveFailEmbedder {
+            fail_marker: &'static str,
+            inner: FakeEmbedder,
+        }
+
+        #[async_trait::async_trait]
+        impl Embedder for SelectiveFailEmbedder {
+            async fn embed_documents(
+                &self,
+                docs: Vec<DocumentChunks>,
+            ) -> Result<Vec<EmbeddedDocument>, Error> {
+                for doc in &docs {
+                    if doc.chunks.iter().any(|c| c.contains(self.fail_marker)) {
+                        return Err(Error::Internal {
+                            message: "selective embedder failure for testing".to_string(),
+                            correlation_id: "selective_fail_embedder".to_string(),
+                        });
+                    }
+                }
+                self.inner.embed_documents(docs).await
+            }
+
+            fn embedding_dim(&self) -> usize {
+                self.inner.embedding_dim()
+            }
+
+            fn model_id(&self) -> &str {
+                self.inner.model_id()
+            }
+        }
+
+        fn progress_collector() -> (
+            crate::progress::ProgressSink,
+            std::sync::Arc<std::sync::Mutex<Vec<ProgressEvent>>>,
+        ) {
+            let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let events2 = events.clone();
+            let sink: crate::progress::ProgressSink = std::sync::Arc::new(move |e| {
+                events2.lock().unwrap().push(e);
+            });
+            (sink, events)
+        }
+
+        // -----------------------------------------------------------------
+        // 1. Counter parity for a mixed script
+        // -----------------------------------------------------------------
+
+        #[tokio::test]
+        async fn counter_parity_for_mixed_script() {
+            let store = FakeStore::new();
+            let embedder = SelectiveFailEmbedder {
+                fail_marker: "FAIL_MARKER",
+                inner: FakeEmbedder::new(4),
+            };
+            let store_id = "store-1";
+            let config = make_ingestion_config(store_id);
+            let source = make_source_with_preset(store_id, "prose");
+
+            let good = make_resource(
+                "file:///docs/good.md",
+                "Some good content to index.",
+                &source.id,
+                store_id,
+            );
+            let bad = make_resource(
+                "file:///docs/bad.md",
+                "This contains FAIL_MARKER and will error.",
+                &source.id,
+                store_id,
+            );
+
+            let ingestor = FakeIngestor::new(vec![
+                ScriptStep::Discovered(4),
+                ScriptStep::Resource(good),
+                ScriptStep::Resource(bad),
+                ScriptStep::Skipped(
+                    "file:///docs/unchanged.md".to_string(),
+                    SkipReason::Unchanged,
+                ),
+                ScriptStep::Skipped(
+                    "file:///docs/binary.bin".to_string(),
+                    SkipReason::Unsupported,
+                ),
+            ]);
+
+            let mut doc_index = DocumentIndex::new();
+            let deps = SourceIngestionDeps {
+                doc_index: &mut doc_index,
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+                progress: None,
+            };
+            let result = run_source_ingestion(&source, &ingestor, deps)
+                .await
+                .unwrap();
+
+            assert_eq!(result.docs_seen, 4, "all four discovered items are seen");
+            assert_eq!(result.docs_indexed, 1, "only the good resource indexes");
+            assert_eq!(
+                result.docs_skipped, 1,
+                "on_skipped(Unchanged) counts as skipped"
+            );
+            assert_eq!(result.unsupported_format_count, 1);
+            assert_eq!(
+                result.error_count, 1,
+                "the failing resource counts as an error"
+            );
+            assert!(result.chunks_written > 0);
+        }
+
+        // -----------------------------------------------------------------
+        // 2. Progress-event sequence parity
+        // -----------------------------------------------------------------
+
+        #[tokio::test]
+        async fn progress_event_sequence_parity() {
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let config = make_ingestion_config(store_id);
+            let source = make_source_with_preset(store_id, "prose");
+
+            let good = make_resource(
+                "file:///docs/good.md",
+                "Some content to index.",
+                &source.id,
+                store_id,
+            );
+
+            let ingestor = FakeIngestor::new(vec![
+                ScriptStep::Discovered(2),
+                ScriptStep::Resource(good),
+                ScriptStep::Skipped(
+                    "file:///docs/unsupported.bin".to_string(),
+                    SkipReason::Unsupported,
+                ),
+            ]);
+
+            let (sink, events) = progress_collector();
+            let mut doc_index = DocumentIndex::new();
+            let deps = SourceIngestionDeps {
+                doc_index: &mut doc_index,
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+                progress: Some(sink),
+            };
+            run_source_ingestion(&source, &ingestor, deps)
+                .await
+                .unwrap();
+
+            let events = events.lock().unwrap();
+            let kinds: Vec<&'static str> = events
+                .iter()
+                .map(|e| match e {
+                    ProgressEvent::SourceStarted { .. } => "source_started",
+                    ProgressEvent::Discovered { .. } => "discovered",
+                    ProgressEvent::DocumentStarted { .. } => "doc_started",
+                    ProgressEvent::DocumentFinished { .. } => "doc_finished",
+                    ProgressEvent::SourceFinished { .. } => "source_finished",
+                })
+                .collect();
+
+            assert_eq!(
+                kinds,
+                vec![
+                    "source_started",
+                    "discovered",
+                    "doc_started",
+                    "doc_finished",
+                    "doc_started",
+                    "doc_finished",
+                    "source_finished",
+                ]
+            );
+
+            // The indexed resource must report Indexed{chunks > 0}; the
+            // unsupported one must report Unsupported.
+            match &events[3] {
+                ProgressEvent::DocumentFinished {
+                    outcome: DocOutcome::Indexed { chunks },
+                    ..
+                } => assert!(*chunks > 0),
+                other => panic!("expected Indexed outcome, got {other:?}"),
+            }
+            match &events[5] {
+                ProgressEvent::DocumentFinished {
+                    outcome: DocOutcome::Unsupported,
+                    ..
+                } => {}
+                other => panic!("expected Unsupported outcome, got {other:?}"),
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // 3. Incremental skip via content_hash+policy in the callback
+        // -----------------------------------------------------------------
+
+        #[tokio::test]
+        async fn callback_skips_unchanged_content_and_policy() {
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let config = make_ingestion_config(store_id);
+            let source = make_source_with_preset(store_id, "prose");
+
+            let text = "Stable content that never changes.";
+            let uri = "file:///docs/stable.md";
+            let record = seed_indexed(&store, &embedder, &config, &source, uri, text).await;
+            let chunk_count_before = store.stats().await.unwrap().chunk_count;
+
+            let mut doc_index = DocumentIndex::new();
+            doc_index.upsert(record);
+
+            // The ingestor still yields the (unchanged) resource via on_resource —
+            // the callback's own skip-check must catch it.
+            let resource = make_resource(uri, text, &source.id, store_id);
+            let ingestor = FakeIngestor::new(vec![ScriptStep::Resource(resource)]);
+
+            let deps = SourceIngestionDeps {
+                doc_index: &mut doc_index,
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+                progress: None,
+            };
+            let result = run_source_ingestion(&source, &ingestor, deps)
+                .await
+                .unwrap();
+
+            assert_eq!(result.docs_indexed, 0);
+            assert_eq!(result.docs_skipped, 1);
+            let chunk_count_after = store.stats().await.unwrap().chunk_count;
+            assert_eq!(
+                chunk_count_before, chunk_count_after,
+                "skip must not write any new chunks"
+            );
+        }
+
+        // -----------------------------------------------------------------
+        // 4. Policy-change forces re-index
+        // -----------------------------------------------------------------
+
+        #[tokio::test]
+        async fn policy_change_forces_reindex() {
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let config_v1 = make_ingestion_config(store_id);
+            let source = make_source_with_preset(store_id, "prose");
+
+            let text = "Content whose policy will change.";
+            let uri = "file:///docs/policy.md";
+            let record = seed_indexed(&store, &embedder, &config_v1, &source, uri, text).await;
+            let old_resource_id = record.resource_id.clone();
+
+            let mut doc_index = DocumentIndex::new();
+            doc_index.upsert(record);
+
+            let config_v2 = IngestionConfig {
+                store_id: store_id.to_string(),
+                policy_version: "policy-v2".to_string(),
+                chunker: ChunkerConfig::prose(),
+            };
+
+            let resource = make_resource(uri, text, &source.id, store_id);
+            let new_resource_id = resource.id.clone();
+            let ingestor = FakeIngestor::new(vec![ScriptStep::Resource(resource)]);
+
+            let deps = SourceIngestionDeps {
+                doc_index: &mut doc_index,
+                store: &store,
+                embedder: &embedder,
+                config: &config_v2,
+                progress: None,
+            };
+            let result = run_source_ingestion(&source, &ingestor, deps)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                result.docs_indexed, 1,
+                "a policy change must force re-indexing even with unchanged content"
+            );
+
+            // Same URI + same content_hash ⇒ same content-addressed resource_id;
+            // policy_version isn't a resource_id input, so the id is unchanged,
+            // but the chunk's stored policy_version must reflect v2.
+            assert_eq!(old_resource_id, new_resource_id);
+            let chunks = store
+                .get_chunks_for_resource(&new_resource_id)
+                .await
+                .unwrap();
+            assert!(!chunks.is_empty());
+            assert!(chunks.iter().all(|c| c.policy_version == "policy-v2"));
+        }
+
+        // -----------------------------------------------------------------
+        // 5/6. Delete-sweep: not-yielded URI is deleted; yielded URI is kept
+        // -----------------------------------------------------------------
+
+        #[tokio::test]
+        async fn delete_sweep_removes_uri_not_yielded_keeps_yielded() {
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let config = make_ingestion_config(store_id);
+            let source = make_source_with_preset(store_id, "prose");
+
+            let kept_uri = "file:///docs/kept.md";
+            let gone_uri = "file:///docs/gone.md";
+            let kept_record = seed_indexed(
+                &store,
+                &embedder,
+                &config,
+                &source,
+                kept_uri,
+                "Kept content.",
+            )
+            .await;
+            let gone_record = seed_indexed(
+                &store,
+                &embedder,
+                &config,
+                &source,
+                gone_uri,
+                "Gone content.",
+            )
+            .await;
+
+            let mut doc_index = DocumentIndex::new();
+            doc_index.upsert(kept_record.clone());
+            doc_index.upsert(gone_record.clone());
+
+            // This run only yields `kept_uri` — `gone_uri` is simply absent,
+            // exactly like a deleted file or a 404'd URL.
+            let kept_resource = make_resource(kept_uri, "Kept content.", &source.id, store_id);
+            let ingestor = FakeIngestor::new(vec![ScriptStep::Resource(kept_resource)]);
+
+            let deps = SourceIngestionDeps {
+                doc_index: &mut doc_index,
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+                progress: None,
+            };
+            let result = run_source_ingestion(&source, &ingestor, deps)
+                .await
+                .unwrap();
+
+            assert_eq!(result.docs_deleted, 1);
+            let gone_chunks = store
+                .get_chunks_for_resource(&gone_record.resource_id)
+                .await
+                .unwrap();
+            assert!(
+                gone_chunks.is_empty(),
+                "swept resource's chunks must be gone"
+            );
+            let kept_chunks = store
+                .get_chunks_for_resource(&kept_record.resource_id)
+                .await
+                .unwrap();
+            assert!(
+                !kept_chunks.is_empty(),
+                "yielded resource must survive the sweep"
+            );
+            assert!(doc_index.get(gone_uri).is_none());
+            assert!(doc_index.get(kept_uri).is_some());
+        }
+
+        // -----------------------------------------------------------------
+        // 7. on_skipped(Unchanged) marks the URI seen — survives the sweep
+        // -----------------------------------------------------------------
+
+        #[tokio::test]
+        async fn on_skipped_unchanged_survives_delete_sweep() {
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let config = make_ingestion_config(store_id);
+            let source = make_source_with_preset(store_id, "prose");
+
+            let uri = "file:///docs/prefiltered.md";
+            let record = seed_indexed(&store, &embedder, &config, &source, uri, "Content.").await;
+
+            let mut doc_index = DocumentIndex::new();
+            doc_index.upsert(record.clone());
+
+            // The ingestor pre-filters this URI itself (e.g. mtime unchanged)
+            // and never calls on_resource for it at all.
+            let ingestor = FakeIngestor::new(vec![ScriptStep::Skipped(
+                uri.to_string(),
+                SkipReason::Unchanged,
+            )]);
+
+            let deps = SourceIngestionDeps {
+                doc_index: &mut doc_index,
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+                progress: None,
+            };
+            let result = run_source_ingestion(&source, &ingestor, deps)
+                .await
+                .unwrap();
+
+            assert_eq!(result.docs_deleted, 0);
+            assert_eq!(result.docs_skipped, 1);
+            let chunks = store
+                .get_chunks_for_resource(&record.resource_id)
+                .await
+                .unwrap();
+            assert!(
+                !chunks.is_empty(),
+                "on_skipped(Unchanged) must not delete existing chunks"
+            );
+            assert!(doc_index.get(uri).is_some());
+        }
+
+        // -----------------------------------------------------------------
+        // 8. URL-Gone-style absence is swept (Url-kind source)
+        // -----------------------------------------------------------------
+
+        #[tokio::test]
+        async fn gone_url_style_absence_is_swept() {
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let config = make_ingestion_config(store_id);
+            let source = Source {
+                id: new_ulid(),
+                store_id: store_id.to_string(),
+                kind: SourceKind::Url,
+                spec: SourceSpec::Url {
+                    url: "https://example.com/page".to_string(),
+                    refresh_interval_secs: None,
+                },
+                source_preset: "prose".to_string(),
+            };
+
+            let url = "https://example.com/page";
+            let record = seed_indexed(&store, &embedder, &config, &source, url, "Page body.").await;
+
+            let mut doc_index = DocumentIndex::new();
+            doc_index.upsert(record.clone());
+
+            // The URL now 404s/410s — the ingestor simply never yields it
+            // (and never reports it via on_skipped either).
+            let ingestor = FakeIngestor::new(vec![]);
+
+            let deps = SourceIngestionDeps {
+                doc_index: &mut doc_index,
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+                progress: None,
+            };
+            let result = run_source_ingestion(&source, &ingestor, deps)
+                .await
+                .unwrap();
+
+            assert_eq!(result.docs_deleted, 1);
+            let chunks = store
+                .get_chunks_for_resource(&record.resource_id)
+                .await
+                .unwrap();
+            assert!(chunks.is_empty());
+        }
+
+        // -----------------------------------------------------------------
+        // 9. A per-resource error doesn't abort the run — later resources
+        //    still index
+        // -----------------------------------------------------------------
+
+        #[tokio::test]
+        async fn per_resource_error_does_not_abort_later_resources_still_index() {
+            let store = FakeStore::new();
+            let embedder = SelectiveFailEmbedder {
+                fail_marker: "FAIL_MARKER",
+                inner: FakeEmbedder::new(4),
+            };
+            let store_id = "store-1";
+            let config = make_ingestion_config(store_id);
+            let source = make_source_with_preset(store_id, "prose");
+
+            let first = make_resource(
+                "file:///docs/first.md",
+                "First good content.",
+                &source.id,
+                store_id,
+            );
+            let bad = make_resource(
+                "file:///docs/bad.md",
+                "This has FAIL_MARKER in it.",
+                &source.id,
+                store_id,
+            );
+            let last = make_resource(
+                "file:///docs/last.md",
+                "Last good content.",
+                &source.id,
+                store_id,
+            );
+            let first_id = first.id.clone();
+            let last_id = last.id.clone();
+
+            let ingestor = FakeIngestor::new(vec![
+                ScriptStep::Resource(first),
+                ScriptStep::Resource(bad),
+                ScriptStep::Resource(last),
+            ]);
+
+            let mut doc_index = DocumentIndex::new();
+            let deps = SourceIngestionDeps {
+                doc_index: &mut doc_index,
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+                progress: None,
+            };
+            let result = run_source_ingestion(&source, &ingestor, deps)
+                .await
+                .unwrap();
+
+            assert_eq!(result.error_count, 1);
+            assert_eq!(result.docs_indexed, 2, "the two good resources both index");
+            assert!(!store
+                .get_chunks_for_resource(&first_id)
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(!store
+                .get_chunks_for_resource(&last_id)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+
+        // -----------------------------------------------------------------
+        // 10. Embed-failure ⇒ error counted, no delete of existing chunks
+        //     (crash-safety, A6)
+        // -----------------------------------------------------------------
+
+        #[tokio::test]
+        async fn embed_failure_preserves_existing_chunks_and_counts_error() {
+            let store = FakeStore::new();
+            let good_embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let config = make_ingestion_config(store_id);
+            let source = make_source_with_preset(store_id, "prose");
+
+            let uri = "file:///docs/doc.md";
+            let record = seed_indexed(
+                &store,
+                &good_embedder,
+                &config,
+                &source,
+                uri,
+                "Original content for the document.",
+            )
+            .await;
+            let original_id = record.resource_id.clone();
+
+            let mut doc_index = DocumentIndex::new();
+            doc_index.upsert(record);
+
+            let changed = make_resource(
+                uri,
+                "Changed content that triggers re-indexing.",
+                &source.id,
+                store_id,
+            );
+            let ingestor = FakeIngestor::new(vec![ScriptStep::Resource(changed)]);
+
+            let failing_embedder = FailingEmbedder;
+            let deps = SourceIngestionDeps {
+                doc_index: &mut doc_index,
+                store: &store,
+                embedder: &failing_embedder,
+                config: &config,
+                progress: None,
+            };
+            let result = run_source_ingestion(&source, &ingestor, deps)
+                .await
+                .unwrap();
+
+            assert_eq!(result.error_count, 1);
+            assert_eq!(result.docs_indexed, 0);
+            let chunks = store.get_chunks_for_resource(&original_id).await.unwrap();
+            assert!(
+                !chunks.is_empty(),
+                "a failed re-index must never delete the previously-indexed chunks"
+            );
+            // doc_index must still point at the old (still-present) resource_id.
+            assert_eq!(doc_index.get(uri).unwrap().resource_id, original_id);
+        }
+
+        // -----------------------------------------------------------------
+        // 11. window_block_seqs flow through to upserted ChunkRecords for a
+        //     messages-preset resource
+        // -----------------------------------------------------------------
+
+        #[tokio::test]
+        async fn window_block_seqs_flow_through_for_messages_preset() {
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let source = make_source_with_preset(store_id, "messages");
+            let config = IngestionConfig {
+                store_id: store_id.to_string(),
+                policy_version: "policy-v1".to_string(),
+                chunker: ChunkerConfig {
+                    preset: "messages".to_string(),
+                    target_tokens: Some(512),
+                    overlap_tokens: Some(0),
+                    window_turns: Some(2),
+                    stride_turns: Some(1),
+                },
+            };
+
+            let blocks: Vec<Block> = (0..5)
+                .map(|i| Block {
+                    seq: i,
+                    kind: BlockKind::Message {
+                        sender: "alice".to_string(),
+                        timestamp: None,
+                        message_id: None,
+                        reply_to: None,
+                    },
+                    text: format!("message number {i}"),
+                    location: None,
+                })
+                .collect();
+
+            let resource =
+                make_resource_with_blocks("file:///chat/thread.json", &source.id, store_id, blocks);
+
+            let deps = IndexResourceDeps {
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+            };
+            index_resource(&resource, &source, None, &deps)
+                .await
+                .unwrap();
+
+            let chunks = store.get_chunks_for_resource(&resource.id).await.unwrap();
+            assert!(!chunks.is_empty());
+            assert!(
+                chunks.iter().any(|c| c.window_block_seqs.len() >= 2),
+                "at least one window chunk must span multiple blocks; got: {:?}",
+                chunks
+                    .iter()
+                    .map(|c| &c.window_block_seqs)
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        // -----------------------------------------------------------------
+        // 12. Preset gate (#60) — direct unit tests on effective_chunker_config
+        // -----------------------------------------------------------------
+
+        #[test]
+        fn preset_gate_explicit_code_source_wins_over_md_extension() {
+            let base = ChunkerConfig::code();
+            let cfg = effective_chunker_config("code", &base, Some("notes.md"), None);
+            assert_eq!(cfg.preset, "code");
+        }
+
+        #[test]
+        fn preset_gate_default_prose_source_auto_routes_rs_file_to_code() {
+            let base = ChunkerConfig::prose();
+            let cfg = effective_chunker_config("prose", &base, Some("main.rs"), None);
+            assert_eq!(cfg.preset, "code");
+        }
+
+        #[test]
+        fn preset_gate_messages_source_wins_regardless_of_filename() {
+            let base = ChunkerConfig::messages();
+            let cfg = effective_chunker_config("messages", &base, Some("transcript.md"), None);
+            assert_eq!(cfg.preset, "messages");
+            assert_eq!(cfg.resolved_window_turns(), 6);
+        }
+
+        /// Integration-level check that the preset gate is actually wired into
+        /// `index_resource`: an explicit `code` source must not apply the
+        /// prose splitter's heading-path attribution to a Markdown file.
+        #[tokio::test]
+        async fn index_resource_respects_explicit_code_source_preset() {
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let source = make_source_with_preset(store_id, "code");
+            let config = IngestionConfig {
+                store_id: store_id.to_string(),
+                policy_version: "policy-v1".to_string(),
+                chunker: ChunkerConfig::code(),
+            };
+
+            let resource = make_resource(
+                "file:///docs/notes.md",
+                "# Heading\n\nSome prose-looking text under a heading.",
+                &source.id,
+                store_id,
+            );
+
+            let deps = IndexResourceDeps {
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+            };
+            index_resource(&resource, &source, None, &deps)
+                .await
+                .unwrap();
+
+            let chunks = store.get_chunks_for_resource(&resource.id).await.unwrap();
+            assert!(!chunks.is_empty());
+            // The code chunker never derives heading_path (unlike chunk_prose,
+            // which would attribute "Heading" here).
+            assert!(
+                chunks.iter().all(|c| c.heading_path.is_empty()),
+                "an explicit code source must route through the code chunker, \
+                 not the heading-path-aware prose chunker"
+            );
+        }
+
+        // -----------------------------------------------------------------
+        // 13. Title propagation: Resource.title/metadata → ChunkRecord.metadata title
+        // -----------------------------------------------------------------
+
+        #[tokio::test]
+        async fn title_propagates_from_resource_title_when_metadata_has_none() {
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let source = make_source_with_preset(store_id, "prose");
+            let config = make_ingestion_config(store_id);
+
+            let mut resource = make_resource(
+                "file:///docs/titled.md",
+                "Body content for the titled document.",
+                &source.id,
+                store_id,
+            );
+            resource.title = Some("My Great Title".to_string());
+            // metadata's own Dublin Core title is left None (default).
+
+            let deps = IndexResourceDeps {
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+            };
+            index_resource(&resource, &source, None, &deps)
+                .await
+                .unwrap();
+
+            let chunks = store.get_chunks_for_resource(&resource.id).await.unwrap();
+            assert!(!chunks.is_empty());
+            for c in &chunks {
+                assert_eq!(c.metadata.title(), Some("My Great Title"));
+            }
+        }
+
+        #[tokio::test]
+        async fn title_from_metadata_is_not_overwritten_by_resource_title() {
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let source = make_source_with_preset(store_id, "prose");
+            let config = make_ingestion_config(store_id);
+
+            let mut resource = make_resource(
+                "file:///docs/titled2.md",
+                "Body content for the second titled document.",
+                &source.id,
+                store_id,
+            );
+            resource.title = Some("Fallback Title".to_string());
+            resource.metadata = Metadata::Document(DocumentMetadata {
+                dublin_core: DublinCoreMetadata {
+                    title: Some("Authoritative Title".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+
+            let deps = IndexResourceDeps {
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+            };
+            index_resource(&resource, &source, None, &deps)
+                .await
+                .unwrap();
+
+            let chunks = store.get_chunks_for_resource(&resource.id).await.unwrap();
+            assert!(!chunks.is_empty());
+            for c in &chunks {
+                assert_eq!(c.metadata.title(), Some("Authoritative Title"));
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Extra: empty-resource replace deletes old chunks and writes nothing
+        // -----------------------------------------------------------------
+
+        #[tokio::test]
+        async fn index_resource_empty_blocks_deletes_old_and_writes_nothing() {
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let source = make_source_with_preset(store_id, "prose");
+            let config = make_ingestion_config(store_id);
+
+            let old_record = seed_indexed(
+                &store,
+                &embedder,
+                &config,
+                &source,
+                "file:///docs/e.md",
+                "Body.",
+            )
+            .await;
+
+            let empty_resource =
+                make_resource_with_blocks("file:///docs/e.md", &source.id, store_id, vec![]);
+
+            let deps = IndexResourceDeps {
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+            };
+            let written = index_resource(
+                &empty_resource,
+                &source,
+                Some(&old_record.resource_id),
+                &deps,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(written, 0);
+            let old_chunks = store
+                .get_chunks_for_resource(&old_record.resource_id)
+                .await
+                .unwrap();
+            assert!(
+                old_chunks.is_empty(),
+                "replacing with an empty resource must delete the old chunks"
+            );
         }
     }
 }

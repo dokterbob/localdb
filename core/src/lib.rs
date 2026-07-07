@@ -45,9 +45,10 @@ pub use error::Error;
 pub use ids::{chunk_id, content_hash, new_ulid, resource_id};
 pub use ingestion::{
     complete_index_job, create_index_job, enumerate_path_source, fail_index_job, index_document,
-    is_store_stale, run_ingestion_for_source, start_index_job, DocumentExtractor, DocumentIndex,
-    DocumentInput, DocumentRecord, ExtractionResult, FetchMetadata, FetchResult, FoundFile,
-    IngestionConfig, IngestionResult, UrlFetcher,
+    index_resource, is_store_stale, run_ingestion_for_source, run_source_ingestion,
+    start_index_job, DocumentExtractor, DocumentIndex, DocumentInput, DocumentRecord,
+    ExtractionResult, FetchMetadata, FetchResult, FoundFile, IndexResourceDeps, IngestionConfig,
+    IngestionResult, SourceIngestionDeps, UrlFetcher,
 };
 pub use ingestor::{
     ConfigField, ConfigFieldType, IngestCallback, IngestResult, IngestSource, Ingestor,
