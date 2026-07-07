@@ -530,17 +530,19 @@ fn create_local_auto(
 /// CUDA isn't even attempted — the caller falls through to the normal CPU ONNX path only in
 /// the `None` case.
 ///
-/// Falling back to CPU is only sound *before* [`ensure_ort_initialized`] commits the process
-/// to the CUDA flavor: once that succeeds, the process-wide runtime is irreversibly the
-/// CUDA-flavored library (see `ort_runtime.rs`'s once-only/flavor-committed semantics), so a
-/// later construction failure (e.g. the model download itself failing) must be surfaced as an
-/// error rather than silently retried as `OrtFlavor::Cpu` — that retry would itself fail with
-/// "already initialized as Cuda". This is why only [`detect_cuda_stack`] failures, and
-/// [`ensure_ort_initialized`] failures that never actually committed the process to a flavor
-/// (see [`cuda_init_fallback_allowed`]), return `None` here; a [`create_onnx_with`] failure after
-/// a successful CUDA commit — or an [`ensure_ort_initialized`] failure that *did* commit (e.g. a
-/// `dlopen` error, per `ort_runtime.rs`'s `InitAttempt::Committed`) — is returned as
-/// `Some(Err(..))` instead, since the CPU fallback attempted in that case would itself
+/// Falling back to CPU is only sound when the process either hasn't committed to a flavor yet,
+/// or has *already* committed to `Cpu` (in which case "falling back" just means reusing the
+/// runtime that's already loaded — see [`cuda_init_fallback_allowed`]). Once the process commits
+/// to `Cuda`, the process-wide runtime is irreversibly the CUDA-flavored library (see
+/// `ort_runtime.rs`'s once-only/flavor-committed semantics), so a later construction failure
+/// (e.g. the model download itself failing) must be surfaced as an error rather than silently
+/// retried as `OrtFlavor::Cpu` — that retry would itself fail with "already initialized as
+/// Cuda". This is why only [`detect_cuda_stack`] failures, and [`ensure_ort_initialized`]
+/// failures that left the process uncommitted or already-`Cpu` (see
+/// [`cuda_init_fallback_allowed`]), return `None` here; a [`create_onnx_with`] failure after a
+/// successful CUDA commit — or an [`ensure_ort_initialized`] failure that committed the process
+/// to `Cuda` (e.g. a `dlopen` error, per `ort_runtime.rs`'s `InitAttempt::Committed`) — is
+/// returned as `Some(Err(..))` instead, since a CPU fallback attempted in that case would itself
 /// deterministically fail the flavor-mismatch check.
 ///
 /// No [`probe_cuda`] ground-truth check either (unlike `local-cuda`'s
@@ -571,19 +573,44 @@ fn try_local_auto_cuda(
         crate::ort_runtime::OrtFlavor::Cuda,
         policy.ort_library.as_deref(),
     ) {
-        // F1: a CUDA init failure only permits CPU fallback if it never actually committed the
-        // process to a flavor (e.g. the CUDA download failed — `InitAttempt::NotAttempted` in
-        // `ort_runtime.rs`). If it *did* commit (e.g. `ort::init_from`/dlopen itself failed —
-        // `InitAttempt::Committed(Err(..))`), the process is now permanently Cuda-flavored and a
-        // subsequent `ensure_ort_initialized(Cpu, ..)` would die on the flavor-mismatch check
-        // instead of actually falling back — surface the real error instead of lying about a
-        // fallback that can't happen.
-        if cuda_init_fallback_allowed(crate::ort_runtime::committed_flavor()) {
-            tracing::warn!(
-                error = %e,
-                "CUDA-flavored ONNX Runtime initialization failed before committing the \
-                 process to a flavor; falling back to CPU"
-            );
+        // F1/F2: a failed `ensure_ort_initialized(Cuda, ..)` call permits CPU fallback in two
+        // distinct cases, both read from `committed_flavor()` immediately after the failure:
+        //
+        // - `None` — the attempt never committed the process to a flavor at all (e.g. the CUDA
+        //   download itself failed, `InitAttempt::NotAttempted` in `ort_runtime.rs`). A fresh
+        //   `ensure_ort_initialized(Cpu, ..)` is free to proceed normally.
+        // - `Some(Cpu)` — the process had *already* committed to `Cpu` before this call even ran
+        //   (e.g. a long-lived daemon process constructed a `local-onnx` embedder earlier). The
+        //   `Cuda` request above failed immediately on `ort_runtime`'s flavor-mismatch check
+        //   without changing the committed flavor, so `Cpu` is still exactly what's loaded —
+        //   falling back reuses the already-`dlopen`ed CPU runtime and `ensure_ort_initialized`
+        //   is idempotent for a matching flavor, so this is not just safe, it's a no-op.
+        //
+        // Only `Some(Cuda)` blocks fallback: the *failed* attempt itself committed the process
+        // to `Cuda` (e.g. `ort::init_from`/dlopen failed after being invoked —
+        // `InitAttempt::Committed(Err(..))`), so the process is now permanently Cuda-flavored
+        // and a subsequent `ensure_ort_initialized(Cpu, ..)` would die on the flavor-mismatch
+        // check instead of actually falling back — surface the real error instead of lying
+        // about a fallback that can't happen.
+        let committed = crate::ort_runtime::committed_flavor();
+        if cuda_init_fallback_allowed(committed) {
+            match committed {
+                None => tracing::warn!(
+                    error = %e,
+                    "CUDA-flavored ONNX Runtime initialization failed before committing the \
+                     process to a flavor; falling back to CPU"
+                ),
+                Some(crate::ort_runtime::OrtFlavor::Cpu) => tracing::warn!(
+                    error = %e,
+                    "CUDA-flavored ONNX Runtime initialization failed, but the process was \
+                     already committed to the CPU flavor (e.g. an earlier local-onnx embedder \
+                     in this process); reusing the already-loaded CPU runtime"
+                ),
+                Some(crate::ort_runtime::OrtFlavor::Cuda) => unreachable!(
+                    "cuda_init_fallback_allowed(Some(Cuda)) is always false, so this arm is \
+                     never reached"
+                ),
+            }
             return None;
         }
         tracing::error!(
@@ -608,16 +635,27 @@ fn try_local_auto_cuda(
     ))
 }
 
-/// F1: whether a failed `ensure_ort_initialized(Cuda, ..)` call still permits falling back to a
-/// CPU init in the same process, given the flavor (if any) the process committed to *as a result
-/// of that failed attempt* — i.e. `crate::ort_runtime::committed_flavor()` read immediately
-/// after the failure.
+/// F1/F2: whether a failed `ensure_ort_initialized(Cuda, ..)` call still permits falling back to
+/// a CPU init in the same process, given the flavor (if any) the process is committed to
+/// *immediately after* that failed attempt — i.e. `crate::ort_runtime::committed_flavor()` read
+/// right after the failure.
 ///
-/// Mirrors `ort_runtime.rs`'s `InitAttempt`/`record_attempt` state machine from the caller's side:
-/// a failure that left the process uncommitted (`None` — e.g. the CUDA download itself failed,
-/// `InitAttempt::NotAttempted`) can safely retry as `OrtFlavor::Cpu`. A failure that *did* commit
-/// a flavor (`Some(_)` — e.g. `ort::init_from`/dlopen itself failed, `InitAttempt::Committed`)
-/// means the process is now permanently flavored; a CPU retry would not actually fall back, it
+/// Mirrors `ort_runtime.rs`'s `InitAttempt`/`record_attempt` state machine from the caller's
+/// side, and allows fallback in two cases:
+///
+/// - `None` — the attempt left the process uncommitted (e.g. the CUDA download itself failed,
+///   `InitAttempt::NotAttempted`): a fresh `OrtFlavor::Cpu` init can safely proceed.
+/// - `Some(Cpu)` — the process had *already* committed to `Cpu` before this `Cuda` attempt even
+///   ran (e.g. a long-lived daemon constructed a `local-onnx` embedder earlier, then a later
+///   `local`/automatic request finds a healthy NVIDIA stack and tries `Cuda` anyway). The
+///   `Cuda` request fails immediately on the flavor-mismatch check without changing the
+///   committed flavor, so `Cpu` is still exactly what's loaded — "falling back" just reuses the
+///   already-`dlopen`ed CPU runtime, and `ensure_ort_initialized(Cpu, ..)` is idempotent for a
+///   flavor that's already committed.
+///
+/// Only `Some(Cuda)` blocks fallback: the failed attempt itself committed the process to `Cuda`
+/// (e.g. `ort::init_from`/dlopen itself failed after being invoked, `InitAttempt::Committed`),
+/// so the process is now permanently Cuda-flavored; a CPU retry would not actually fall back, it
 /// would just fail `ort_runtime`'s flavor-mismatch check with a confusing second error instead of
 /// the real one. Factored out as a pure function over an already-read `Option<OrtFlavor>` (rather
 /// than reading `committed_flavor()` itself) so it's unit-testable without touching `ort`, the
@@ -633,7 +671,10 @@ fn try_local_auto_cuda(
 fn cuda_init_fallback_allowed(
     committed_after_failure: Option<crate::ort_runtime::OrtFlavor>,
 ) -> bool {
-    committed_after_failure.is_none()
+    !matches!(
+        committed_after_failure,
+        Some(crate::ort_runtime::OrtFlavor::Cuda)
+    )
 }
 
 /// Whether automatic ("local") mode should even attempt the CUDA execution provider, given an
@@ -1036,15 +1077,19 @@ mod tests {
         }
     }
 
-    /// F1: the CPU-fallback decision after a failed `ensure_ort_initialized(Cuda, ..)` call must
-    /// key off whether that failure actually committed the process to a flavor, not just
-    /// "did it return Err". See `ort_runtime.rs`'s `InitAttempt`/`record_attempt` state machine:
-    /// an uncommitted failure (e.g. the CUDA download itself failed) leaves the process free to
-    /// retry as CPU; a committed failure (e.g. a `dlopen` error) permanently flavors the process,
-    /// so a CPU retry can no longer actually fall back — it would just fail the flavor-mismatch
-    /// check instead.
+    /// F1/F2: the CPU-fallback decision after a failed `ensure_ort_initialized(Cuda, ..)` call
+    /// must key off which flavor (if any) the process is committed to immediately after that
+    /// failure, not just "did it return Err". See `ort_runtime.rs`'s `InitAttempt`/
+    /// `record_attempt` state machine: an uncommitted failure (e.g. the CUDA download itself
+    /// failed) leaves the process free to try CPU; a failure that left the process already
+    /// committed to `Cpu` (e.g. a long-lived daemon process had already constructed a
+    /// `local-onnx` embedder before this `Cuda` attempt ran) means CPU fallback is not just
+    /// permitted but exactly correct — the CPU runtime is already loaded and idempotent to
+    /// re-request. Only a failure that committed the process to `Cuda` itself (e.g. a `dlopen`
+    /// error) permanently flavors the process such that a CPU retry can no longer actually fall
+    /// back — it would just fail the flavor-mismatch check instead.
     #[test]
-    fn cuda_init_fallback_allowed_only_when_uncommitted() {
+    fn cuda_init_fallback_allowed_when_uncommitted_or_already_cpu() {
         use crate::ort_runtime::OrtFlavor;
 
         assert!(
@@ -1052,13 +1097,15 @@ mod tests {
             "an uncommitted failure (e.g. a failed download) must permit CPU fallback"
         );
         assert!(
+            cuda_init_fallback_allowed(Some(OrtFlavor::Cpu)),
+            "a failure that left the process already committed to Cpu (e.g. a daemon that \
+             already constructed a local-onnx embedder) must permit reusing the loaded CPU \
+             runtime"
+        );
+        assert!(
             !cuda_init_fallback_allowed(Some(OrtFlavor::Cuda)),
             "a committed failure (e.g. a dlopen error) must not permit CPU fallback — the \
              process is now permanently Cuda-flavored"
-        );
-        assert!(
-            !cuda_init_fallback_allowed(Some(OrtFlavor::Cpu)),
-            "any committed flavor blocks fallback, not just a matching one"
         );
     }
 }

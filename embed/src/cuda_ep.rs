@@ -24,12 +24,18 @@
 //! that flavor is loaded:
 //!
 //! 1. **Driver** — is an NVIDIA driver present at all? Checked via `/proc/driver/nvidia/version`,
-//!    `/dev/nvidiactl`, or `ldconfig -p` listing `libcuda.so.1` (libcuda ships with the driver;
-//!    the file checks additionally work inside `docker --gpus` containers where `ldconfig` may
-//!    not list host-mounted libraries).
-//! 2. **CUDA runtime** — does `ldconfig -p` list `libcudart.so.12`?
-//! 3. **cuDNN** — does `ldconfig -p` list `libcudnn.so.9`? This is the most commonly missing
-//!    piece: cuDNN ships separately from both the driver and the CUDA toolkit metapackages.
+//!    `/dev/nvidiactl`, or `ldconfig -p`/`$LD_LIBRARY_PATH` listing `libcuda.so.1` (libcuda ships
+//!    with the driver; the file checks additionally work inside `docker --gpus` containers where
+//!    `ldconfig` may not list host-mounted libraries).
+//! 2. **CUDA runtime** — does `ldconfig -p` or `$LD_LIBRARY_PATH` list `libcudart.so.12`?
+//! 3. **cuDNN** — does `ldconfig -p` or `$LD_LIBRARY_PATH` list `libcudnn.so.9`? This is the most
+//!    commonly missing piece: cuDNN ships separately from both the driver and the CUDA toolkit
+//!    metapackages.
+//!
+//! `$LD_LIBRARY_PATH` is consulted because conda/tarball/container-mounted CUDA installs commonly
+//! expose these libraries only via that variable, never registering them with `ldconfig` at all —
+//! `ldconfig -p` alone would wrongly report the whole stack missing on those setups even though
+//! `dlopen` would succeed. See [`CudaProbeInputs::ld_library_path_files`] and [`lib_visible`].
 //!
 //! A stack that passes all three rungs can still fail at the real (`ort`) probe — driver/library
 //! version skew, a broken install, etc. — which is why rung 3 (the ladder) is a pre-filter, not
@@ -77,9 +83,11 @@ pub enum CudaPreference {
 pub(crate) enum CudaStackStatus {
     /// Rung 1 failed: no NVIDIA driver detected by any of the checks in [`cuda_stack_status`].
     DriverMissing,
-    /// Rung 1 passed but rung 2 failed: no `libcudart.so.12` found via `ldconfig -p`.
+    /// Rung 1 passed but rung 2 failed: no `libcudart.so.12` found via `ldconfig -p` or
+    /// `$LD_LIBRARY_PATH`.
     CudartMissing,
-    /// Rungs 1-2 passed but rung 3 failed: no `libcudnn.so.9` found via `ldconfig -p`.
+    /// Rungs 1-2 passed but rung 3 failed: no `libcudnn.so.9` found via `ldconfig -p` or
+    /// `$LD_LIBRARY_PATH`.
     CudnnMissing,
     /// All three rungs passed. Does **not** guarantee the ONNX Runtime CUDA execution provider
     /// will actually register successfully — see [`probe_cuda`] for the ground-truth check.
@@ -101,6 +109,12 @@ pub(crate) struct CudaProbeInputs {
     /// Captured stdout of `ldconfig -p`, or `None` if the process could not be spawned (missing
     /// binary, permission error, etc. — treated as "no information", not as "nothing installed").
     pub ldconfig_output: Option<String>,
+    /// File names (not full paths — just what `libcudart.so.12`-style needles are matched
+    /// against) seen in any directory listed in `$LD_LIBRARY_PATH`. Populated by the wrapper via
+    /// one `readdir` per `:`-separated directory; empty/unreadable/nonexistent directories and an
+    /// unset `$LD_LIBRARY_PATH` all collapse to an empty `Vec` here (treated the same as "no
+    /// information", exactly like `ldconfig_output: None` — never a false positive).
+    pub ld_library_path_files: Vec<String>,
 }
 
 /// Pure decision function for the detection ladder described in the module docs. Takes already
@@ -113,20 +127,32 @@ pub(crate) struct CudaProbeInputs {
 pub(crate) fn cuda_stack_status(inputs: &CudaProbeInputs) -> CudaStackStatus {
     let driver_present = inputs.proc_driver_version_exists
         || inputs.dev_nvidiactl_exists
-        || ldconfig_lists(inputs.ldconfig_output.as_deref(), "libcuda.so.1");
+        || lib_visible(inputs, "libcuda.so.1");
     if !driver_present {
         return CudaStackStatus::DriverMissing;
     }
 
-    if !ldconfig_lists(inputs.ldconfig_output.as_deref(), "libcudart.so.12") {
+    if !lib_visible(inputs, "libcudart.so.12") {
         return CudaStackStatus::CudartMissing;
     }
 
-    if !ldconfig_lists(inputs.ldconfig_output.as_deref(), "libcudnn.so.9") {
+    if !lib_visible(inputs, "libcudnn.so.9") {
         return CudaStackStatus::CudnnMissing;
     }
 
     CudaStackStatus::Ok
+}
+
+/// True iff `needle` is visible either in `ldconfig -p` output (see [`ldconfig_lists`]) or as a
+/// file name under some `$LD_LIBRARY_PATH` directory (see [`ld_library_path_lists`]) — either
+/// source is sufficient, since either one means `dlopen(needle)` would plausibly succeed.
+#[allow(
+    dead_code,
+    reason = "called by cuda_stack_status, itself only live on linux/x86_64 outside tests"
+)]
+fn lib_visible(inputs: &CudaProbeInputs, needle: &str) -> bool {
+    ldconfig_lists(inputs.ldconfig_output.as_deref(), needle)
+        || ld_library_path_lists(&inputs.ld_library_path_files, needle)
 }
 
 /// True iff any line of `ldconfig -p` output contains `needle` as a substring. `None` output
@@ -144,12 +170,40 @@ fn ldconfig_lists(output: Option<&str>, needle: &str) -> bool {
     output.is_some_and(|text| text.lines().any(|line| line.contains(needle)))
 }
 
-/// Thin OS wrapper around [`cuda_stack_status`]: collects the real inputs (file existence checks
-/// plus a single `ldconfig -p` spawn) on linux/x86_64, the only target the CUDA ONNX Runtime
-/// flavor is downloadable for (see `ort_download::CUDA_LINUX_X64`). Every other target reports
-/// [`CudaStackStatus::DriverMissing`] unconditionally — there is no CUDA flavor to fall back to
-/// there anyway, so the factory's "should I even attempt CUDA" question is answered "no" as
-/// cheaply as possible.
+/// True iff some file name in `files` (as collected from `$LD_LIBRARY_PATH` directories) is
+/// `needle` itself or a versioned variant of it (e.g. needle `libcudnn.so.9` matches file
+/// `libcudnn.so.9.1.0`).
+///
+/// Uses a version-boundary check rather than a bare [`str::starts_with`]: `needle` must be
+/// followed by either nothing or a `.` — `libcudnn.so.9` must NOT match `libcudnn.so.91` (that's
+/// a different, unrelated soname that merely happens to start with the needle's characters), but
+/// must match `libcudnn.so.9.1.0` (a fully-versioned soname of the same library). See this
+/// module's `ld_library_path_*` tests for the exact boundary cases this was checked against.
+#[allow(
+    dead_code,
+    reason = "called by lib_visible, itself only live on linux/x86_64 outside tests"
+)]
+fn ld_library_path_lists(files: &[String], needle: &str) -> bool {
+    files.iter().any(|file| is_versioned_match(needle, file))
+}
+
+/// `true` iff `file` equals `needle` or extends it with a `.`-delimited version suffix (see
+/// [`ld_library_path_lists`]'s doc comment for why a bare `starts_with` is insufficient).
+#[allow(
+    dead_code,
+    reason = "called by ld_library_path_lists, itself only live on linux/x86_64 outside tests"
+)]
+fn is_versioned_match(needle: &str, file: &str) -> bool {
+    file.strip_prefix(needle)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+}
+
+/// Thin OS wrapper around [`cuda_stack_status`]: collects the real inputs (file existence checks,
+/// a single `ldconfig -p` spawn, and a listing of `$LD_LIBRARY_PATH` directories) on linux/x86_64,
+/// the only target the CUDA ONNX Runtime flavor is downloadable for (see
+/// `ort_download::CUDA_LINUX_X64`). Every other target reports [`CudaStackStatus::DriverMissing`]
+/// unconditionally — there is no CUDA flavor to fall back to there anyway, so the factory's
+/// "should I even attempt CUDA" question is answered "no" as cheaply as possible.
 ///
 /// Consumed by the embedder factory (issue #96, later chunk) to decide whether to attempt the
 /// CUDA ONNX Runtime flavor before spending a download/dlopen on it.
@@ -163,6 +217,7 @@ pub(crate) fn detect_cuda_stack() -> CudaStackStatus {
         proc_driver_version_exists: Path::new("/proc/driver/nvidia/version").exists(),
         dev_nvidiactl_exists: Path::new("/dev/nvidiactl").exists(),
         ldconfig_output: run_ldconfig(),
+        ld_library_path_files: collect_ld_library_path_files(),
     };
     cuda_stack_status(&inputs)
 }
@@ -176,6 +231,43 @@ fn run_ldconfig() -> Option<String> {
         .output()
         .ok()
         .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Cap on the number of `$LD_LIBRARY_PATH` directories that will actually be read, and
+/// separately on the total number of file names collected — a pathologically long
+/// `$LD_LIBRARY_PATH` (hundreds of entries, or a directory with huge fan-out) must not turn this
+/// cheap pre-filter into an expensive scan.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const LD_LIBRARY_PATH_SCAN_LIMIT: usize = 64;
+
+/// Collect the file names (not full paths) present in every `:`-separated directory of
+/// `$LD_LIBRARY_PATH`. Empty segments (e.g. a leading/trailing/doubled `:`) and directories that
+/// don't exist or can't be read are silently skipped — never panics, one `readdir` per directory.
+/// Bounded by [`LD_LIBRARY_PATH_SCAN_LIMIT`] on both directories scanned and files collected.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn collect_ld_library_path_files() -> Vec<String> {
+    let Ok(path_var) = std::env::var("LD_LIBRARY_PATH") else {
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+    for dir in path_var
+        .split(':')
+        .filter(|dir| !dir.is_empty())
+        .take(LD_LIBRARY_PATH_SCAN_LIMIT)
+    {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                files.push(name.to_string());
+            }
+            if files.len() >= LD_LIBRARY_PATH_SCAN_LIMIT * LD_LIBRARY_PATH_SCAN_LIMIT {
+                return files;
+            }
+        }
+    }
+    files
 }
 
 /// No-op stub counterpart of [`detect_cuda_stack`] for every target other than linux/x86_64: the
@@ -224,15 +316,15 @@ pub(crate) fn stack_status_cause_and_hint(
         ),
         CudaStackStatus::DriverMissing => (
             "no NVIDIA driver detected (checked /proc/driver/nvidia/version, /dev/nvidiactl, and \
-             ldconfig for libcuda.so.1)",
+             ldconfig/$LD_LIBRARY_PATH for libcuda.so.1)",
             Some("install an NVIDIA driver, R525 or newer"),
         ),
         CudaStackStatus::CudartMissing => (
-            "libcudart.so.12 not found (checked ldconfig -p)",
+            "libcudart.so.12 not found (checked ldconfig -p and $LD_LIBRARY_PATH)",
             Some("install the CUDA 12.x runtime"),
         ),
         CudaStackStatus::CudnnMissing => (
-            "libcudnn.so.9 not found (checked ldconfig -p)",
+            "libcudnn.so.9 not found (checked ldconfig -p and $LD_LIBRARY_PATH)",
             Some("install cuDNN 9"),
         ),
     }
@@ -385,10 +477,23 @@ mod tests {
     use super::*;
 
     fn inputs(proc: bool, dev: bool, ldconfig: Option<&str>) -> CudaProbeInputs {
+        inputs_with_ld_path(proc, dev, ldconfig, &[])
+    }
+
+    fn inputs_with_ld_path(
+        proc: bool,
+        dev: bool,
+        ldconfig: Option<&str>,
+        ld_library_path_files: &[&str],
+    ) -> CudaProbeInputs {
         CudaProbeInputs {
             proc_driver_version_exists: proc,
             dev_nvidiactl_exists: dev,
             ldconfig_output: ldconfig.map(str::to_string),
+            ld_library_path_files: ld_library_path_files
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         }
     }
 
@@ -458,6 +563,99 @@ mod tests {
             cuda_stack_status(&inputs(true, true, Some(FULL_STACK_LDCONFIG))),
             CudaStackStatus::Ok
         );
+    }
+
+    // --- $LD_LIBRARY_PATH visibility -------------------------------------------------------
+
+    #[test]
+    fn driver_via_ld_library_path_only() {
+        // libcuda.so.1 visible only via $LD_LIBRARY_PATH (no ldconfig entry, no /proc, no /dev)
+        // — the driver rung must still pass; cudart is unconfirmed so CudartMissing follows.
+        let inputs = inputs_with_ld_path(false, false, None, &["libcuda.so.1"]);
+        assert_eq!(cuda_stack_status(&inputs), CudaStackStatus::CudartMissing);
+    }
+
+    #[test]
+    fn cudart_via_ld_library_path_only() {
+        // Driver confirmed via /proc, cudart visible only via $LD_LIBRARY_PATH, no ldconfig
+        // evidence for cudnn at all — CudnnMissing follows.
+        let inputs = inputs_with_ld_path(true, false, None, &["libcudart.so.12"]);
+        assert_eq!(cuda_stack_status(&inputs), CudaStackStatus::CudnnMissing);
+    }
+
+    #[test]
+    fn cudnn_via_ld_library_path_only() {
+        // Driver + cudart confirmed via ldconfig, cudnn visible only via $LD_LIBRARY_PATH
+        // (versioned soname) — full stack should report Ok.
+        let ldconfig = "\
+            \tlibcudart.so.12 (libc6,x86-64) => /usr/lib/x86_64-linux-gnu/libcudart.so.12\n\
+            \tlibcuda.so.1 (libc6,x86-64) => /usr/lib/x86_64-linux-gnu/libcuda.so.1\n";
+        let inputs = inputs_with_ld_path(true, false, Some(ldconfig), &["libcudnn.so.9.1.0"]);
+        assert_eq!(cuda_stack_status(&inputs), CudaStackStatus::Ok);
+    }
+
+    #[test]
+    fn full_stack_entirely_via_ld_library_path() {
+        // No /proc, no /dev, ldconfig spawn failed entirely — every rung satisfied purely by
+        // $LD_LIBRARY_PATH file names. This is exactly the conda/tarball/container scenario the
+        // fix targets.
+        let inputs = inputs_with_ld_path(
+            false,
+            false,
+            None,
+            &["libcuda.so.1", "libcudart.so.12", "libcudnn.so.9"],
+        );
+        assert_eq!(cuda_stack_status(&inputs), CudaStackStatus::Ok);
+    }
+
+    #[test]
+    fn ld_library_path_versioned_cudnn_file_matches() {
+        let inputs = inputs_with_ld_path(
+            true,
+            false,
+            Some("\tlibcudart.so.12 (libc6,x86-64) => /usr/lib/x86_64-linux-gnu/libcudart.so.12\n"),
+            &["libcudnn.so.9.1.0"],
+        );
+        assert_eq!(cuda_stack_status(&inputs), CudaStackStatus::Ok);
+    }
+
+    // --- $LD_LIBRARY_PATH boundary cases (needle must be followed by end-of-string or '.') ---
+
+    #[test]
+    fn is_versioned_match_exact_name_matches() {
+        assert!(is_versioned_match("libcudnn.so.9", "libcudnn.so.9"));
+    }
+
+    #[test]
+    fn is_versioned_match_dotted_suffix_matches() {
+        assert!(is_versioned_match("libcudnn.so.9", "libcudnn.so.9.1.0"));
+        assert!(is_versioned_match("libcudart.so.12", "libcudart.so.12.1"));
+    }
+
+    #[test]
+    fn is_versioned_match_rejects_digit_glued_suffix() {
+        // "libcudnn.so.9" must NOT match "libcudnn.so.91" — that's soname .91, a different
+        // (nonexistent) library, not a versioned variant of .so.9. The character immediately
+        // after the needle must be absent or '.', never another digit.
+        assert!(!is_versioned_match("libcudnn.so.9", "libcudnn.so.91"));
+        assert!(!is_versioned_match("libcudart.so.12", "libcudart.so.120"));
+    }
+
+    #[test]
+    fn is_versioned_match_rejects_non_prefix() {
+        assert!(!is_versioned_match("libcudnn.so.9", "libcudart.so.12"));
+        assert!(!is_versioned_match("libcuda.so.1", "libcudart.so.12"));
+    }
+
+    #[test]
+    fn cudnn_missing_when_ld_library_path_has_only_digit_glued_variant() {
+        // A file named "libcudnn.so.91" in $LD_LIBRARY_PATH must not satisfy the "libcudnn.so.9"
+        // rung.
+        let ldconfig = "\
+            \tlibcudart.so.12 (libc6,x86-64) => /usr/lib/x86_64-linux-gnu/libcudart.so.12\n\
+            \tlibcuda.so.1 (libc6,x86-64) => /usr/lib/x86_64-linux-gnu/libcuda.so.1\n";
+        let inputs = inputs_with_ld_path(true, false, Some(ldconfig), &["libcudnn.so.91"]);
+        assert_eq!(cuda_stack_status(&inputs), CudaStackStatus::CudnnMissing);
     }
 
     #[test]
