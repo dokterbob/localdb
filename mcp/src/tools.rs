@@ -334,10 +334,10 @@ pub fn render_citations_text(citations: &[Citation], max_chars: usize) -> String
 /// Looks up a document by ID across the available stores and returns
 /// normalized text + metadata.
 ///
-/// Returns `document_not_found` error if no matching chunks are found.
+/// Returns `resource_not_found` error if no matching chunks are found.
 ///
 /// Note: URI-based lookup is not supported in v1 (the `RetrievalStore` trait
-/// provides `get_chunks_for_document` by ID only). Callers must use a
+/// provides `get_chunks_for_resource` by ID only). Callers must use a
 /// document ID obtained from a prior `search` call. `id` is a required
 /// field on `GetDocumentArgs`, so a caller omitting it entirely never
 /// reaches this function — rmcp's `Parameters<T>` extractor fails first,
@@ -361,7 +361,7 @@ pub async fn tool_get_document(stores: &[AvailableStore], args: GetDocumentArgs)
     match find_document_chunks(stores, &args.id).await {
         Ok(Some((store, chunks))) => success_json(&document_json(store, &chunks)),
         Ok(None) => typed_error(
-            "document_not_found",
+            "resource_not_found",
             format!("no document with id '{}' found in any store", args.id),
         ),
         Err(result) => result,
@@ -373,7 +373,7 @@ async fn find_document_chunks<'a>(
     doc_id: &str,
 ) -> Result<Option<(&'a AvailableStore, Vec<localdb_core::ChunkRecord>)>, CallToolResult> {
     for store in stores {
-        let chunks = match store.store.get_chunks_for_document(doc_id).await {
+        let chunks = match store.store.get_chunks_for_resource(doc_id).await {
             Ok(chunks) => chunks,
             Err(e) => {
                 return Err(typed_error(
@@ -405,7 +405,7 @@ fn document_json(store: &AvailableStore, chunks: &[localdb_core::ChunkRecord]) -
         .collect::<Vec<_>>()
         .join("\n");
     serde_json::json!({
-        "document_id": first.document_id,
+        "resource_id": first.resource_id,
         "uri": first.uri,
         "title": first.metadata.title,
         "store": {
@@ -491,22 +491,22 @@ fn resolve_get_chunks_pagination(args: &GetChunksArgs) -> Result<(usize, usize),
 /// the order total, so a given `offset`/`limit` returns the same page on
 /// every call regardless of backend return order.
 ///
-/// Returns `document_not_found` error if no matching chunks are found.
+/// Returns `resource_not_found` error if no matching chunks are found.
 /// An out-of-range `offset` yields an empty `chunks` array, not an error.
 ///
 /// Note: URI-based lookup is not supported in v1, matching `get_document`.
 pub async fn tool_get_chunks(stores: &[AvailableStore], args: GetChunksArgs) -> CallToolResult {
-    if args.document_id.trim().is_empty() {
+    if args.resource_id.trim().is_empty() {
         return typed_error(
             "invalid_request",
-            "invalid arguments: 'document_id' must not be empty",
+            "invalid arguments: 'resource_id' must not be empty",
         );
     }
     let (offset, limit) = match resolve_get_chunks_pagination(&args) {
         Ok(v) => v,
         Err(result) => return result,
     };
-    match find_document_chunks(stores, &args.document_id).await {
+    match find_document_chunks(stores, &args.resource_id).await {
         Ok(Some((store, mut chunks))) => {
             chunks.sort_by(|a, b| {
                 (a.block_seq, a.seq_in_block, a.span.start, a.span.end, &a.id).cmp(&(
@@ -520,10 +520,10 @@ pub async fn tool_get_chunks(stores: &[AvailableStore], args: GetChunksArgs) -> 
             success_json(&chunks_json(store, &chunks, offset, limit))
         }
         Ok(None) => typed_error(
-            "document_not_found",
+            "resource_not_found",
             format!(
                 "no document with id '{}' found in any store",
-                args.document_id
+                args.resource_id
             ),
         ),
         Err(result) => result,
@@ -565,7 +565,7 @@ fn chunks_json(
     let returned = page.len();
 
     serde_json::json!({
-        "document_id": first.document_id,
+        "resource_id": first.resource_id,
         "uri": first.uri,
         "title": first.metadata.title,
         "store": {
@@ -585,7 +585,7 @@ mod get_document_tests {
     use std::sync::Arc;
 
     use super::*;
-    use localdb_core::ids::{chunk_id, content_hash, document_id, new_ulid};
+    use localdb_core::ids::{chunk_id, content_hash, new_ulid, resource_id};
     use localdb_core::parser::DocumentMetadata;
     use localdb_core::store::{FakeStore, RetrievalStore};
     use localdb_core::{ChunkRecord, Span};
@@ -601,7 +601,7 @@ mod get_document_tests {
         let source_id = new_ulid();
         let doc_uri = "file:///docs/guide.md";
         let doc_hash = content_hash("guide body");
-        let doc_id = document_id(doc_uri, &doc_hash);
+        let doc_id = resource_id(doc_uri, &doc_hash);
         let metadata = DocumentMetadata {
             title: Some("Guide".to_string()),
             creator: vec!["Ada".to_string()],
@@ -622,7 +622,7 @@ mod get_document_tests {
             let span = Span::new(0, text.len());
             ChunkRecord {
                 id: chunk_id(&doc_id, text, span.start, span.end, 0),
-                document_id: doc_id.clone(),
+                resource_id: doc_id.clone(),
                 store_id: store_id.clone(),
                 text: text.to_string(),
                 span,
@@ -633,7 +633,7 @@ mod get_document_tests {
                 content_hash: doc_hash.clone(),
                 origin_store: origin_store.clone(),
                 source_id: source_id.clone(),
-                source_kind: "path".to_string(),
+                ingestor_kind: "path".to_string(),
                 mime: None,
                 uri: doc_uri.to_string(),
                 metadata: metadata.clone(),
@@ -667,7 +667,7 @@ mod get_document_tests {
         let rendered_text = text_of(&result);
 
         let expected = serde_json::json!({
-            "document_id": doc_id,
+            "resource_id": doc_id,
             "uri": doc_uri,
             "title": "Guide",
             "store": {
@@ -709,10 +709,10 @@ mod tests {
         }
     }
 
-    fn make_chunk(id: &str, document_id: &str, store_id: &str, text: &str) -> ChunkRecord {
+    fn make_chunk(id: &str, resource_id: &str, store_id: &str, text: &str) -> ChunkRecord {
         ChunkRecord {
             id: id.to_string(),
-            document_id: document_id.to_string(),
+            resource_id: resource_id.to_string(),
             store_id: store_id.to_string(),
             text: text.to_string(),
             span: Span::new(0, text.len()),
@@ -723,9 +723,9 @@ mod tests {
             content_hash: "abc123".to_string(),
             origin_store: store_id.to_string(),
             source_id: "src-1".to_string(),
-            source_kind: "path".to_string(),
+            ingestor_kind: "path".to_string(),
             mime: Some("text/plain".to_string()),
-            uri: format!("file:///docs/{document_id}.md"),
+            uri: format!("file:///docs/{resource_id}.md"),
             metadata: localdb_core::parser::DocumentMetadata::default(),
             block_seq: 0,
             seq_in_block: 0,
@@ -746,9 +746,9 @@ mod tests {
         }
     }
 
-    fn get_chunks_args(document_id: &str) -> GetChunksArgs {
+    fn get_chunks_args(resource_id: &str) -> GetChunksArgs {
         GetChunksArgs {
-            document_id: document_id.to_string(),
+            resource_id: resource_id.to_string(),
             offset: None,
             limit: None,
         }
@@ -827,13 +827,13 @@ mod tests {
         assert_eq!(
             result.is_error,
             Some(true),
-            "mismatched store_id should cause document_not_found"
+            "mismatched store_id should cause resource_not_found"
         );
         let text = text_of(&result);
         let parsed: serde_json::Value = serde_json::from_str(&text).expect("error body is JSON");
         assert_eq!(
             parsed["error"]["code"].as_str().unwrap(),
-            "document_not_found",
+            "resource_not_found",
         );
     }
 
@@ -858,7 +858,7 @@ mod tests {
         );
         let text = text_of(&result);
         let parsed: serde_json::Value = serde_json::from_str(&text).expect("success body is JSON");
-        assert_eq!(parsed["document_id"].as_str().unwrap(), "doc-1");
+        assert_eq!(parsed["resource_id"].as_str().unwrap(), "doc-1");
         assert!(
             parsed.get("metadata").is_some(),
             "metadata field must be present"
@@ -1005,7 +1005,7 @@ mod tests {
         };
         localdb_core::citation::Citation {
             chunk_id: "c1".to_string(),
-            document_id: "d1".to_string(),
+            resource_id: "d1".to_string(),
             store: CitationStore {
                 id: "s1".to_string(),
                 name: "store".to_string(),
@@ -1159,7 +1159,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_chunks_empty_document_id_is_invalid_request() {
+    async fn get_chunks_empty_resource_id_is_invalid_request() {
         let fake = FakeStore::new();
         let av = AvailableStore::new(make_descriptor("store-1", "s1"), Box::new(fake));
         let args = get_chunks_args("   ");

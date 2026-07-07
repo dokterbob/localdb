@@ -6,7 +6,7 @@
 
 use crate::block::{IngestorKind, Resource, ResourceKind};
 use crate::error::Error;
-use crate::ids::document_id;
+use crate::ids::resource_id;
 use crate::ingestion::{now_rfc3339, FetchMetadata, FetchResult, UrlFetcher};
 use crate::ingestor::{IngestCallback, IngestResult, IngestSource, Ingestor};
 use crate::ingestors::file_ingestor::parser_meta_to_dc;
@@ -112,7 +112,7 @@ impl Ingestor for UrlIngestor {
 
             let blocks = markdown_to_blocks(&parsed.markdown);
             let hash = compute_blocks_hash(&blocks);
-            let res_id = document_id(url, &hash);
+            let res_id = resource_id(url, &hash);
             let now = now_rfc3339();
 
             let dc = parser_meta_to_dc(&parsed.metadata);

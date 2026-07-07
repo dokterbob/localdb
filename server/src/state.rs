@@ -626,7 +626,7 @@ mod tests {
 
         let chunk = localdb_core::ChunkRecord {
             id: "chunk-1".to_string(),
-            document_id: "doc-1".to_string(),
+            resource_id: "doc-1".to_string(),
             store_id: store_id.clone(),
             text: "hello world rust programming".to_string(),
             span: localdb_core::types::Span::new(0, 30),
@@ -637,7 +637,7 @@ mod tests {
             content_hash: "abc".to_string(),
             origin_store: store_id.clone(),
             source_id: source.id,
-            source_kind: "path".to_string(),
+            ingestor_kind: "path".to_string(),
             mime: Some("text/plain".to_string()),
             uri: "file:///test.md".to_string(),
             metadata: localdb_core::DocumentMetadata::default(),

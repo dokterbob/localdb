@@ -52,7 +52,7 @@ pub struct Citation {
     pub chunk_id: ContentId,
 
     /// Document ID (content-addressed blake3).
-    pub document_id: ContentId,
+    pub resource_id: ContentId,
 
     /// Store reference.
     pub store: CitationStore,
@@ -100,17 +100,17 @@ pub struct Citation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::{chunk_id, content_hash, document_id, new_ulid};
+    use crate::ids::{chunk_id, content_hash, new_ulid, resource_id};
 
     fn make_citation() -> Citation {
-        let doc_id = document_id("file:///docs/api.md", &content_hash("some content"));
+        let doc_id = resource_id("file:///docs/api.md", &content_hash("some content"));
         let snippet = "This is the chunk text.";
         let span = Span::new(100, 123);
         let cid = chunk_id(&doc_id, snippet, span.start, span.end, 0);
 
         Citation {
             chunk_id: cid,
-            document_id: doc_id,
+            resource_id: doc_id,
             store: CitationStore {
                 id: new_ulid(),
                 name: "my-store".to_string(),
@@ -158,7 +158,7 @@ mod tests {
 
         // All required top-level fields present
         assert!(v.get("chunk_id").is_some(), "chunk_id missing");
-        assert!(v.get("document_id").is_some(), "document_id missing");
+        assert!(v.get("resource_id").is_some(), "resource_id missing");
         assert!(v.get("store").is_some(), "store missing");
         assert!(v.get("uri").is_some(), "uri missing");
         assert!(v.get("heading_path").is_some(), "heading_path missing");

@@ -514,7 +514,7 @@ fn end_to_end_init_store_source_index_search() {
     // Citation must have the FULL canonical shape from specs/02-domain-model.md §6.
     let cit = &citations[0];
     assert!(cit.get("chunk_id").is_some(), "missing chunk_id");
-    assert!(cit.get("document_id").is_some(), "missing document_id");
+    assert!(cit.get("resource_id").is_some(), "missing resource_id");
     assert!(cit.get("uri").is_some(), "missing uri");
     assert!(cit.get("snippet").is_some(), "missing snippet");
     assert!(cit.get("score").is_some(), "missing score");

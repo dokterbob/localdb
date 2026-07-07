@@ -58,8 +58,8 @@ impl RetrievalStore for TenantStore {
         write::upsert_chunks(self, records).await
     }
 
-    async fn delete_by_document(&self, document_id: &str) -> Result<usize, Error> {
-        write::delete_by_document(self, document_id).await
+    async fn delete_by_resource(&self, resource_id: &str) -> Result<usize, Error> {
+        write::delete_by_resource(self, resource_id).await
     }
 
     async fn delete_by_store(&self, store_id: &str) -> Result<usize, Error> {
@@ -92,8 +92,8 @@ impl RetrievalStore for TenantStore {
         read::get_chunk(self, chunk_id).await
     }
 
-    async fn get_chunks_for_document(&self, document_id: &str) -> Result<Vec<ChunkRecord>, Error> {
-        read::get_chunks_for_document(self, document_id).await
+    async fn get_chunks_for_resource(&self, resource_id: &str) -> Result<Vec<ChunkRecord>, Error> {
+        read::get_chunks_for_resource(self, resource_id).await
     }
 
     async fn list_indexed_documents(&self) -> Result<Vec<DocumentRecord>, Error> {
@@ -103,21 +103,21 @@ impl RetrievalStore for TenantStore {
     async fn upsert_blocks(
         &self,
         _store_id: &str,
-        document_id: &str,
+        resource_id: &str,
         blocks: &[localdb_core::block::Block],
     ) -> Result<(), localdb_core::Error> {
-        write::upsert_blocks(self, document_id, blocks).await
+        write::upsert_blocks(self, resource_id, blocks).await
     }
 
     async fn upsert_chunks_and_blocks(
         &self,
         _store_id: &str,
-        document_id: &str,
+        resource_id: &str,
         records: Vec<localdb_core::ChunkRecord>,
         blocks: &[localdb_core::block::Block],
-        replaces_document_id: Option<&str>,
+        replaces_resource_id: Option<&str>,
     ) -> Result<usize, localdb_core::Error> {
-        write::upsert_chunks_and_blocks(self, document_id, records, blocks, replaces_document_id)
+        write::upsert_chunks_and_blocks(self, resource_id, records, blocks, replaces_resource_id)
             .await
     }
 }

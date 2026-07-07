@@ -8,13 +8,13 @@ use crate::connection::map_libsql_err;
 ///
 /// Column index map (must stay in sync with `read::CHUNK_COLS`):
 ///   0  c.id
-///   1  c.resource_id      → document_id
+///   1  c.resource_id
 ///   2  c.text
 ///   3  c.heading_path
 ///   4  embedding_json     (vector_extract result)
 ///   5  r.store_id
 ///   6  r.source_id
-///   7  r.ingestor_kind    → source_kind
+///   7  r.ingestor_kind
 ///   8  r.uri
 ///   9  r.title            (unused here; kept for positional alignment)
 ///  10  r.mime
@@ -30,13 +30,13 @@ use crate::connection::map_libsql_err;
 ///  20  distance/score     (appended by each query, not read here)
 pub(crate) fn row_to_chunk_record_strict(row: &libsql::Row) -> Result<ChunkRecord, Error> {
     let id: String = row.get(0).map_err(map_libsql_err)?;
-    let resource_id: String = row.get(1).map_err(map_libsql_err)?; // → document_id
+    let resource_id: String = row.get(1).map_err(map_libsql_err)?;
     let text: String = row.get(2).map_err(map_libsql_err)?;
     let heading_path_str: String = row.get(3).map_err(map_libsql_err)?;
     let embedding_str: String = row.get(4).map_err(map_libsql_err)?;
     let store_id: String = row.get(5).map_err(map_libsql_err)?;
     let source_id: String = row.get(6).map_err(map_libsql_err)?;
-    let ingestor_kind: String = row.get(7).map_err(map_libsql_err)?; // → source_kind
+    let ingestor_kind: String = row.get(7).map_err(map_libsql_err)?;
     let uri: String = row.get(8).map_err(map_libsql_err)?;
     let _title: Option<String> = row.get(9).map_err(map_libsql_err)?;
     let mime: Option<String> = row.get(10).map_err(map_libsql_err)?;
@@ -95,7 +95,7 @@ pub(crate) fn row_to_chunk_record_strict(row: &libsql::Row) -> Result<ChunkRecor
 
     Ok(ChunkRecord {
         id,
-        document_id: resource_id,
+        resource_id,
         store_id,
         text: text.clone(),
         span,
@@ -106,7 +106,7 @@ pub(crate) fn row_to_chunk_record_strict(row: &libsql::Row) -> Result<ChunkRecor
         content_hash,
         origin_store,
         source_id,
-        source_kind: ingestor_kind,
+        ingestor_kind,
         mime,
         uri,
         metadata,

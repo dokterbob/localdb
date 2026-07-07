@@ -32,7 +32,7 @@ pub struct ChunkRecord {
     pub id: ContentId,
 
     /// Parent document ID.
-    pub document_id: ContentId,
+    pub resource_id: ContentId,
 
     /// Owning store ID.
     pub store_id: UlidId,
@@ -66,7 +66,7 @@ pub struct ChunkRecord {
     pub source_id: UlidId,
 
     /// Source kind (e.g. "path", "url").
-    pub source_kind: String,
+    pub ingestor_kind: String,
 
     /// MIME type for metadata filtering.
     #[serde(default)]
@@ -109,7 +109,7 @@ impl ChunkRecord {
     ) -> Self {
         Self {
             id: chunk.id.clone(),
-            document_id: chunk.document_id.clone(),
+            resource_id: chunk.resource_id.clone(),
             store_id: chunk.store_id.clone(),
             text: chunk.text.clone(),
             span: chunk.span.clone(),
@@ -120,7 +120,7 @@ impl ChunkRecord {
             content_hash: chunk.provenance.content_hash.clone(),
             origin_store: chunk.provenance.origin_store.clone(),
             source_id: chunk.provenance.source_ref.id.clone(),
-            source_kind: chunk.provenance.source_ref.kind.clone(),
+            ingestor_kind: chunk.provenance.source_ref.kind.clone(),
             mime,
             uri,
             metadata,
@@ -167,7 +167,7 @@ pub enum MetadataFilter {
     /// Filter by source ID.
     SourceId(UlidId),
     /// Filter by document ID.
-    DocumentId(ContentId),
+    ResourceId(ContentId),
     /// Filter by policy version.
     PolicyVersion(String),
 }
@@ -180,7 +180,7 @@ impl MetadataFilter {
             MetadataFilter::FetchedAfter(ts) => record.fetched_at.as_str() >= ts.as_str(),
             MetadataFilter::FetchedBefore(ts) => record.fetched_at.as_str() <= ts.as_str(),
             MetadataFilter::SourceId(id) => &record.source_id == id,
-            MetadataFilter::DocumentId(id) => &record.document_id == id,
+            MetadataFilter::ResourceId(id) => &record.resource_id == id,
             MetadataFilter::PolicyVersion(v) => &record.policy_version == v,
         }
     }
@@ -230,7 +230,7 @@ pub trait RetrievalStore: Send + Sync + 'static {
     /// Delete all chunks belonging to a given document.
     ///
     /// Returns the number of chunks deleted.
-    async fn delete_by_document(&self, document_id: &str) -> Result<usize, Error>;
+    async fn delete_by_resource(&self, resource_id: &str) -> Result<usize, Error>;
 
     /// Delete all chunks belonging to a given store.
     ///
@@ -270,7 +270,7 @@ pub trait RetrievalStore: Send + Sync + 'static {
     async fn get_chunk(&self, chunk_id: &str) -> Result<Option<ChunkRecord>, Error>;
 
     /// Retrieve all chunks for a given document.
-    async fn get_chunks_for_document(&self, document_id: &str) -> Result<Vec<ChunkRecord>, Error>;
+    async fn get_chunks_for_resource(&self, resource_id: &str) -> Result<Vec<ChunkRecord>, Error>;
 
     /// Enumerate per-document indexing identity for every distinct document in the
     /// store. Used to rehydrate the incremental-skip index across process runs.
@@ -281,29 +281,29 @@ pub trait RetrievalStore: Send + Sync + 'static {
 
     /// Upsert a set of blocks for a document.
     ///
-    /// The resource row identified by `document_id` must already exist (written
+    /// The resource row identified by `resource_id` must already exist (written
     /// by `upsert_chunks`). The default implementation is a no-op so that
     /// `FakeStore` and test implementations do not need to override it; only
     /// `TenantStore` provides the real persistence.
     async fn upsert_blocks(
         &self,
         store_id: &str,
-        document_id: &str,
+        resource_id: &str,
         blocks: &[crate::block::Block],
     ) -> Result<(), Error> {
-        let _ = (store_id, document_id, blocks);
+        let _ = (store_id, resource_id, blocks);
         Ok(())
     }
 
     /// Atomically upsert chunks and blocks for a document in a single
     /// operation, optionally replacing an existing document first.
     ///
-    /// When `replaces_document_id` is `Some(old_id)`, the old document's
+    /// When `replaces_resource_id` is `Some(old_id)`, the old document's
     /// chunks, blocks, and resource row are removed as part of the same
     /// operation, before the new ones are inserted (replace-by-URI
     /// re-indexing; see specs/04-search-pipeline.md §1). Callers performing a
-    /// replace must NOT call `delete_by_document` themselves — passing
-    /// `replaces_document_id` here is the whole point: a write failure must
+    /// replace must NOT call `delete_by_resource` themselves — passing
+    /// `replaces_resource_id` here is the whole point: a write failure must
     /// leave the old document intact and searchable, which is only possible
     /// if the delete and the insert are part of the same operation.
     ///
@@ -318,16 +318,16 @@ pub trait RetrievalStore: Send + Sync + 'static {
     async fn upsert_chunks_and_blocks(
         &self,
         store_id: &str,
-        document_id: &str,
+        resource_id: &str,
         records: Vec<ChunkRecord>,
         blocks: &[crate::block::Block],
-        replaces_document_id: Option<&str>,
+        replaces_resource_id: Option<&str>,
     ) -> Result<usize, Error> {
-        if let Some(old_id) = replaces_document_id {
-            self.delete_by_document(old_id).await?;
+        if let Some(old_id) = replaces_resource_id {
+            self.delete_by_resource(old_id).await?;
         }
         let count = self.upsert_chunks(records).await?;
-        self.upsert_blocks(store_id, document_id, blocks).await?;
+        self.upsert_blocks(store_id, resource_id, blocks).await?;
         Ok(count)
     }
 }
@@ -416,10 +416,10 @@ impl RetrievalStore for FakeStore {
         Ok(count)
     }
 
-    async fn delete_by_document(&self, document_id: &str) -> Result<usize, Error> {
+    async fn delete_by_resource(&self, resource_id: &str) -> Result<usize, Error> {
         let mut chunks = self.chunks.write().await;
         let before = chunks.len();
-        chunks.retain(|c| c.document_id != document_id);
+        chunks.retain(|c| c.resource_id != resource_id);
         Ok(before - chunks.len())
     }
 
@@ -494,7 +494,7 @@ impl RetrievalStore for FakeStore {
         let chunks = self.chunks.read().await;
         let chunk_count = chunks.len() as u64;
         let doc_ids: std::collections::HashSet<&str> =
-            chunks.iter().map(|c| c.document_id.as_str()).collect();
+            chunks.iter().map(|c| c.resource_id.as_str()).collect();
         Ok(StoreStats {
             chunk_count,
             document_count: doc_ids.len() as u64,
@@ -506,11 +506,11 @@ impl RetrievalStore for FakeStore {
         Ok(chunks.iter().find(|c| c.id == chunk_id).cloned())
     }
 
-    async fn get_chunks_for_document(&self, document_id: &str) -> Result<Vec<ChunkRecord>, Error> {
+    async fn get_chunks_for_resource(&self, resource_id: &str) -> Result<Vec<ChunkRecord>, Error> {
         let chunks = self.chunks.read().await;
         Ok(chunks
             .iter()
-            .filter(|c| c.document_id == document_id)
+            .filter(|c| c.resource_id == resource_id)
             .cloned()
             .collect())
     }
@@ -521,7 +521,7 @@ impl RetrievalStore for FakeStore {
         for chunk in chunks.iter() {
             seen.entry(chunk.uri.clone()).or_insert(DocumentRecord {
                 uri: chunk.uri.clone(),
-                document_id: chunk.document_id.clone(),
+                resource_id: chunk.resource_id.clone(),
                 content_hash: chunk.content_hash.clone(),
                 policy_version: chunk.policy_version.clone(),
             });
@@ -542,14 +542,14 @@ pub mod conformance {
 
     fn make_record(
         id: &str,
-        document_id: &str,
+        resource_id: &str,
         store_id: &str,
         text: &str,
         embedding: Vec<f32>,
     ) -> ChunkRecord {
         ChunkRecord {
             id: id.to_string(),
-            document_id: document_id.to_string(),
+            resource_id: resource_id.to_string(),
             store_id: store_id.to_string(),
             text: text.to_string(),
             span: Span::new(0, text.len()),
@@ -560,7 +560,7 @@ pub mod conformance {
             content_hash: "abc123".to_string(),
             origin_store: store_id.to_string(),
             source_id: "src-1".to_string(),
-            source_kind: "path".to_string(),
+            ingestor_kind: "path".to_string(),
             mime: Some("text/plain".to_string()),
             uri: "file:///test.md".to_string(),
             metadata: crate::parser::DocumentMetadata::default(),
@@ -627,8 +627,8 @@ pub mod conformance {
         assert_eq!(stats.chunk_count, 1, "should still have exactly 1 chunk");
     }
 
-    /// Test: delete_by_document removes all chunks for that document.
-    pub async fn test_delete_by_document(store: &dyn RetrievalStore) {
+    /// Test: delete_by_resource removes all chunks for that document.
+    pub async fn test_delete_by_resource(store: &dyn RetrievalStore) {
         let records = vec![
             make_record("chunk-1", "doc-1", "store-1", "Doc1 chunk1", vec![1.0, 0.0]),
             make_record("chunk-2", "doc-1", "store-1", "Doc1 chunk2", vec![0.9, 0.1]),
@@ -636,7 +636,7 @@ pub mod conformance {
         ];
         store.upsert_chunks(records).await.unwrap();
 
-        let deleted = store.delete_by_document("doc-1").await.unwrap();
+        let deleted = store.delete_by_resource("doc-1").await.unwrap();
         assert_eq!(deleted, 2, "should delete 2 chunks from doc-1");
 
         let stats = store.stats().await.unwrap();
@@ -644,18 +644,18 @@ pub mod conformance {
         assert_eq!(stats.document_count, 1, "only doc-2 remains");
 
         // Verify the remaining chunk is from doc-2
-        let remaining = store.get_chunks_for_document("doc-2").await.unwrap();
+        let remaining = store.get_chunks_for_resource("doc-2").await.unwrap();
         assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].document_id, "doc-2");
+        assert_eq!(remaining[0].resource_id, "doc-2");
     }
 
-    /// Test: delete_by_document on non-existent document returns 0.
+    /// Test: delete_by_resource on non-existent document returns 0.
     pub async fn test_delete_nonexistent_document(store: &dyn RetrievalStore) {
-        let deleted = store.delete_by_document("nonexistent-doc").await.unwrap();
+        let deleted = store.delete_by_resource("nonexistent-doc").await.unwrap();
         assert_eq!(deleted, 0, "deleting nonexistent doc should return 0");
     }
 
-    /// Test: `upsert_chunks_and_blocks` with `replaces_document_id` set
+    /// Test: `upsert_chunks_and_blocks` with `replaces_resource_id` set
     /// deletes the old document and inserts the new one in one call — the
     /// old document's chunks must be gone and only the new document's
     /// chunks remain (issue #79: atomic delete-then-upsert replace).
@@ -691,13 +691,13 @@ pub mod conformance {
             .unwrap();
         assert_eq!(written, 1, "should report 1 written chunk for doc-b");
 
-        let doc_a_remaining = store.get_chunks_for_document("doc-a").await.unwrap();
+        let doc_a_remaining = store.get_chunks_for_resource("doc-a").await.unwrap();
         assert!(
             doc_a_remaining.is_empty(),
             "doc-a's chunks should be gone after replace"
         );
 
-        let doc_b_remaining = store.get_chunks_for_document("doc-b").await.unwrap();
+        let doc_b_remaining = store.get_chunks_for_resource("doc-b").await.unwrap();
         assert_eq!(doc_b_remaining.len(), 1, "doc-b's chunk should be present");
 
         let stats = store.stats().await.unwrap();
@@ -708,10 +708,10 @@ pub mod conformance {
     }
 
     /// Test: replacing a document with a new revision that hashes to the
-    /// *same* `document_id` (a policy-only re-index of unchanged content)
+    /// *same* `resource_id` (a policy-only re-index of unchanged content)
     /// deletes then reinserts under the same ID within one call, without
     /// duplicating chunks or violating PK/FK constraints.
-    pub async fn test_replace_same_document_id(store: &dyn RetrievalStore) {
+    pub async fn test_replace_same_resource_id(store: &dyn RetrievalStore) {
         let old_records = vec![make_record(
             "chunk-1",
             "doc-1",
@@ -721,7 +721,7 @@ pub mod conformance {
         )];
         store.upsert_chunks(old_records).await.unwrap();
 
-        // New revision: different chunk ID (content-addressed), same document_id.
+        // New revision: different chunk ID (content-addressed), same resource_id.
         let new_records = vec![make_record(
             "chunk-2",
             "doc-1",
@@ -735,7 +735,7 @@ pub mod conformance {
             .unwrap();
         assert_eq!(written, 1, "should report 1 written chunk");
 
-        let remaining = store.get_chunks_for_document("doc-1").await.unwrap();
+        let remaining = store.get_chunks_for_resource("doc-1").await.unwrap();
         assert_eq!(
             remaining.len(),
             1,
@@ -873,8 +873,8 @@ pub mod conformance {
         assert!(not_found.is_none());
     }
 
-    /// Test: get_chunks_for_document returns all chunks for a document.
-    pub async fn test_get_chunks_for_document(store: &dyn RetrievalStore) {
+    /// Test: get_chunks_for_resource returns all chunks for a document.
+    pub async fn test_get_chunks_for_resource(store: &dyn RetrievalStore) {
         let records = vec![
             make_record("chunk-1", "doc-1", "store-1", "First chunk", vec![1.0, 0.0]),
             make_record(
@@ -888,13 +888,13 @@ pub mod conformance {
         ];
         store.upsert_chunks(records).await.unwrap();
 
-        let doc1_chunks = store.get_chunks_for_document("doc-1").await.unwrap();
+        let doc1_chunks = store.get_chunks_for_resource("doc-1").await.unwrap();
         assert_eq!(doc1_chunks.len(), 2);
 
-        let doc2_chunks = store.get_chunks_for_document("doc-2").await.unwrap();
+        let doc2_chunks = store.get_chunks_for_resource("doc-2").await.unwrap();
         assert_eq!(doc2_chunks.len(), 1);
 
-        let missing = store.get_chunks_for_document("nonexistent").await.unwrap();
+        let missing = store.get_chunks_for_resource("nonexistent").await.unwrap();
         assert!(missing.is_empty());
     }
 
@@ -995,7 +995,7 @@ mod tests {
     fn make_test_record(id: &str, doc_id: &str, text: &str, embedding: Vec<f32>) -> ChunkRecord {
         ChunkRecord {
             id: id.to_string(),
-            document_id: doc_id.to_string(),
+            resource_id: doc_id.to_string(),
             store_id: "test-store".to_string(),
             text: text.to_string(),
             span: Span::new(0, text.len()),
@@ -1006,7 +1006,7 @@ mod tests {
             content_hash: "abc123".to_string(),
             origin_store: "test-store".to_string(),
             source_id: "src-1".to_string(),
-            source_kind: "path".to_string(),
+            ingestor_kind: "path".to_string(),
             mime: Some("text/plain".to_string()),
             uri: "file:///test.md".to_string(),
             metadata: crate::parser::DocumentMetadata::default(),
@@ -1029,9 +1029,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fake_store_delete_by_document() {
+    async fn fake_store_delete_by_resource() {
         let store = FakeStore::new();
-        test_delete_by_document(&store).await;
+        test_delete_by_resource(&store).await;
     }
 
     #[tokio::test]
@@ -1047,9 +1047,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fake_store_replace_same_document_id() {
+    async fn fake_store_replace_same_resource_id() {
         let store = FakeStore::new();
-        test_replace_same_document_id(&store).await;
+        test_replace_same_resource_id(&store).await;
     }
 
     #[tokio::test]
@@ -1083,9 +1083,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fake_store_get_chunks_for_document() {
+    async fn fake_store_get_chunks_for_resource() {
         let store = FakeStore::new();
-        test_get_chunks_for_document(&store).await;
+        test_get_chunks_for_resource(&store).await;
     }
 
     #[tokio::test]
@@ -1153,7 +1153,7 @@ mod tests {
 
         let chunk = Chunk {
             id: "chunk-id".to_string(),
-            document_id: "doc-id".to_string(),
+            resource_id: "doc-id".to_string(),
             store_id: "store-id".to_string(),
             text: "Some text".to_string(),
             span: Span::new(0, 9),
@@ -1180,14 +1180,14 @@ mod tests {
         );
 
         assert_eq!(record.id, "chunk-id");
-        assert_eq!(record.document_id, "doc-id");
+        assert_eq!(record.resource_id, "doc-id");
         assert_eq!(record.store_id, "store-id");
         assert_eq!(record.text, "Some text");
         assert_eq!(record.embedding, vec![0.1, 0.2, 0.3]);
         assert_eq!(record.uri, "file:///test.md");
         assert_eq!(record.mime, Some("text/markdown".to_string()));
         assert_eq!(record.source_id, "source-id");
-        assert_eq!(record.source_kind, "path");
+        assert_eq!(record.ingestor_kind, "path");
     }
 
     #[tokio::test]
@@ -1271,8 +1271,8 @@ mod tests {
         assert!(MetadataFilter::SourceId("src-1".to_string()).matches(&record));
         assert!(!MetadataFilter::SourceId("src-2".to_string()).matches(&record));
 
-        assert!(MetadataFilter::DocumentId("doc-1".to_string()).matches(&record));
-        assert!(!MetadataFilter::DocumentId("doc-2".to_string()).matches(&record));
+        assert!(MetadataFilter::ResourceId("doc-1".to_string()).matches(&record));
+        assert!(!MetadataFilter::ResourceId("doc-2".to_string()).matches(&record));
 
         assert!(MetadataFilter::PolicyVersion("v1".to_string()).matches(&record));
         assert!(!MetadataFilter::PolicyVersion("v2".to_string()).matches(&record));

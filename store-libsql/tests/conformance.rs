@@ -76,10 +76,10 @@ async fn upsert_replaces_existing() {
 }
 
 #[tokio::test]
-async fn delete_by_document() {
+async fn delete_by_resource() {
     let (_dir, db) = setup().await;
     let handle = db.retrieval_store("store-1").await.unwrap();
-    conformance::test_delete_by_document(handle.as_ref()).await;
+    conformance::test_delete_by_resource(handle.as_ref()).await;
 }
 
 #[tokio::test]
@@ -125,10 +125,10 @@ async fn get_chunk() {
 }
 
 #[tokio::test]
-async fn get_chunks_for_document() {
+async fn get_chunks_for_resource() {
     let (_dir, db) = setup().await;
     let handle = db.retrieval_store("store-1").await.unwrap();
-    conformance::test_get_chunks_for_document(handle.as_ref()).await;
+    conformance::test_get_chunks_for_resource(handle.as_ref()).await;
 }
 
 #[tokio::test]
@@ -394,10 +394,10 @@ async fn replace_document() {
 }
 
 #[tokio::test]
-async fn replace_same_document_id() {
+async fn replace_same_resource_id() {
     let (_dir, db) = setup().await;
     let handle = db.retrieval_store("store-1").await.unwrap();
-    conformance::test_replace_same_document_id(handle.as_ref()).await;
+    conformance::test_replace_same_resource_id(handle.as_ref()).await;
 }
 
 /// Issue #79 (WI-1): the replace delete must run *inside* the same
@@ -433,7 +433,7 @@ async fn replace_rolls_back_old_document_on_write_failure() {
 
     // doc-a's chunk must still be present: the delete must have rolled back
     // along with the failed insert, not already committed on its own.
-    let remaining_a = handle.get_chunks_for_document("doc-a").await.unwrap();
+    let remaining_a = handle.get_chunks_for_resource("doc-a").await.unwrap();
     assert_eq!(
         remaining_a.len(),
         1,
@@ -442,7 +442,7 @@ async fn replace_rolls_back_old_document_on_write_failure() {
     assert_eq!(remaining_a[0].id, "chunk-a1");
 
     // doc-b must be absent — the failed insert must not have partially landed.
-    let remaining_b = handle.get_chunks_for_document("doc-b").await.unwrap();
+    let remaining_b = handle.get_chunks_for_resource("doc-b").await.unwrap();
     assert!(
         remaining_b.is_empty(),
         "doc-b should not have been inserted after a failed replace"
@@ -490,7 +490,7 @@ fn make_record(id: &str, doc_id: &str, store_id: &str, embedding: Vec<f32>) -> C
     let source_id = store_id.replacen("store-", "src-", 1);
     ChunkRecord {
         id: id.to_string(),
-        document_id: doc_id.to_string(),
+        resource_id: doc_id.to_string(),
         store_id: store_id.to_string(),
         text: text.clone(),
         span: Span::new(0, text.len()),
@@ -501,7 +501,7 @@ fn make_record(id: &str, doc_id: &str, store_id: &str, embedding: Vec<f32>) -> C
         content_hash: "abc123".to_string(),
         origin_store: store_id.to_string(),
         source_id,
-        source_kind: "path".to_string(),
+        ingestor_kind: "path".to_string(),
         mime: Some("text/plain".to_string()),
         uri: format!("file:///{store_id}/{doc_id}.md"),
         metadata: localdb_core::parser::DocumentMetadata::default(),

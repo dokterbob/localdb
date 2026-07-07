@@ -37,12 +37,12 @@ pub(crate) async fn upsert_chunks(
     }
 }
 
-pub(crate) async fn delete_by_document(
+pub(crate) async fn delete_by_resource(
     store: &TenantStore,
-    document_id: &str,
+    resource_id: &str,
 ) -> Result<usize, Error> {
     let conn = store.conn().conn().await;
-    delete_document_inner(&conn, store.store_id(), document_id).await
+    delete_document_inner(&conn, store.store_id(), resource_id).await
 }
 
 /// Connection-level helper: delete all chunks and the resource row for a
@@ -50,7 +50,7 @@ pub(crate) async fn delete_by_document(
 /// `resources`).
 ///
 /// This is the shared implementation behind both the standalone
-/// `delete_by_document` (its own autocommit statement pair, used for source
+/// `delete_by_resource` (its own autocommit statement pair, used for source
 /// removal / store clearing) and the in-transaction delete performed by
 /// `upsert_chunks_and_blocks` when replacing a document (issue #79): the
 /// latter runs this against the transaction's own connection, between
@@ -59,19 +59,18 @@ pub(crate) async fn delete_by_document(
 async fn delete_document_inner(
     conn: &Connection,
     store_id: &str,
-    document_id: &str,
+    resource_id: &str,
 ) -> Result<usize, Error> {
-    // `document_id` on ChunkRecord maps to `resource_id` in the schema.
     let chunk_count = conn
         .execute(
             "DELETE FROM chunks WHERE store_id = ? AND resource_id = ?",
-            params![store_id.to_string(), document_id.to_string()],
+            params![store_id.to_string(), resource_id.to_string()],
         )
         .await
         .map_err(map_libsql_err)?;
     conn.execute(
         "DELETE FROM resources WHERE store_id = ? AND id = ?",
-        params![store_id.to_string(), document_id.to_string()],
+        params![store_id.to_string(), resource_id.to_string()],
     )
     .await
     .map_err(map_libsql_err)?;
@@ -111,7 +110,7 @@ fn tenant_violation<T>(message: String) -> Result<T, Error> {
 
 pub(crate) async fn upsert_blocks(
     store: &TenantStore,
-    document_id: &str,
+    resource_id: &str,
     blocks: &[localdb_core::block::Block],
 ) -> Result<(), localdb_core::Error> {
     let conn = store.conn().conn().await;
@@ -136,7 +135,7 @@ pub(crate) async fn upsert_blocks(
                  location_json = excluded.location_json",
             libsql::params![
                 store.store_id(),
-                document_id,
+                resource_id,
                 block.seq as i64,
                 kind_str,
                 block.text.as_str(),
@@ -160,9 +159,8 @@ async fn upsert_chunks_inner(
     let mut seen_resources: HashMap<(String, String), bool> = HashMap::new();
 
     for record in records {
-        // `document_id` on ChunkRecord maps to `id` (and `resource_id`) in the
-        // new schema.  `source_kind` maps to `ingestor_kind`.
-        let resource_key = (record.store_id.clone(), record.document_id.clone());
+        // `record.resource_id` maps to the `id` column on `resources`.
+        let resource_key = (record.store_id.clone(), record.resource_id.clone());
         if let std::collections::hash_map::Entry::Vacant(e) = seen_resources.entry(resource_key) {
             // TODO(#130): record.metadata is flat parser::DocumentMetadata; should serialize as tagged Metadata enum once Resource-based reads land (#117)
             let metadata_json =
@@ -189,9 +187,9 @@ async fn upsert_chunks_inner(
                      metadata_json  = excluded.metadata_json",
                 params![
                     record.store_id.as_str(),
-                    record.document_id.as_str(), // id column
+                    record.resource_id.as_str(), // id column
                     record.source_id.as_str(),
-                    record.source_kind.as_str(), // ingestor_kind column
+                    record.ingestor_kind.as_str(), // ingestor_kind column
                     record.uri.as_str(),
                     title,
                     record.mime.as_deref(),
@@ -247,7 +245,7 @@ async fn upsert_chunks_inner(
             params![
                 record.store_id.as_str(),
                 record.id.as_str(),
-                record.document_id.as_str(), // resource_id column
+                record.resource_id.as_str(), // resource_id column
                 record.block_seq as i64,
                 record.seq_in_block as i64,
                 record.block_kind.as_deref(),
@@ -269,7 +267,7 @@ async fn upsert_chunks_inner(
 /// transactions), this wraps both writes in one BEGIN/COMMIT so the resource
 /// can never appear indexed (chunks present) but un-blocked.
 ///
-/// When `replaces_document_id` is `Some(old_id)`, the old document's chunks,
+/// When `replaces_resource_id` is `Some(old_id)`, the old document's chunks,
 /// blocks, and resource row are deleted **inside this same transaction**,
 /// before the new records are inserted (issue #79). This closes the residual
 /// same-run window from the A6 design decision (`docs/design-decisions.md`):
@@ -277,14 +275,14 @@ async fn upsert_chunks_inner(
 /// failure in the upsert that followed left the old chunks gone for the rest
 /// of the run. Folding the delete into this transaction means a failure
 /// anywhere below (including the delete-then-reinsert of the very same
-/// `document_id`, for a policy-only re-index) rolls back everything and
+/// `resource_id`, for a policy-only re-index) rolls back everything and
 /// leaves the old resource intact and searchable.
 pub(crate) async fn upsert_chunks_and_blocks(
     store: &TenantStore,
-    document_id: &str,
+    resource_id: &str,
     records: Vec<ChunkRecord>,
     blocks: &[localdb_core::block::Block],
-    replaces_document_id: Option<&str>,
+    replaces_resource_id: Option<&str>,
 ) -> Result<usize, localdb_core::Error> {
     for record in &records {
         if record.store_id != store.store_id() {
@@ -303,11 +301,11 @@ pub(crate) async fn upsert_chunks_and_blocks(
     let count = records.len();
     conn.execute("BEGIN", ()).await.map_err(map_libsql_err)?;
     let inner = async {
-        if let Some(old_id) = replaces_document_id {
+        if let Some(old_id) = replaces_resource_id {
             delete_document_inner(&conn, store.store_id(), old_id).await?;
         }
         upsert_chunks_inner(&conn, &records, store.encoding()).await?;
-        upsert_blocks_inner(&conn, store.store_id(), document_id, blocks).await?;
+        upsert_blocks_inner(&conn, store.store_id(), resource_id, blocks).await?;
         Ok::<(), localdb_core::Error>(())
     }
     .await;
@@ -327,7 +325,7 @@ pub(crate) async fn upsert_chunks_and_blocks(
 async fn upsert_blocks_inner(
     conn: &Connection,
     store_id: &str,
-    document_id: &str,
+    resource_id: &str,
     blocks: &[localdb_core::block::Block],
 ) -> Result<(), localdb_core::Error> {
     for block in blocks {
@@ -351,7 +349,7 @@ async fn upsert_blocks_inner(
                  location_json = excluded.location_json",
             libsql::params![
                 store_id,
-                document_id,
+                resource_id,
                 block.seq as i64,
                 kind_str,
                 block.text.as_str(),

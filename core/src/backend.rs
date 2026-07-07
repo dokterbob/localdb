@@ -63,7 +63,7 @@ pub struct DocumentInfo {
     pub store_id: String,
     pub id: String,
     pub source_id: String,
-    pub source_kind: String,
+    pub ingestor_kind: String,
     pub uri: String,
     pub title: Option<String>,
     pub mime: Option<String>,

@@ -67,7 +67,7 @@ fn make_chunk(id: &str, doc_id: &str, store_id: &str, embedding: Vec<f32>) -> Ch
     let text = format!("text for {id}");
     ChunkRecord {
         id: id.to_string(),
-        document_id: doc_id.to_string(),
+        resource_id: doc_id.to_string(),
         store_id: store_id.to_string(),
         text: text.clone(),
         span: Span::new(0, text.len()),
@@ -78,7 +78,7 @@ fn make_chunk(id: &str, doc_id: &str, store_id: &str, embedding: Vec<f32>) -> Ch
         content_hash: "abc123".to_string(),
         origin_store: store_id.to_string(),
         source_id: format!("src-{store_id}"),
-        source_kind: "path".to_string(),
+        ingestor_kind: "path".to_string(),
         mime: Some("text/plain".to_string()),
         uri: format!("file:///data/{store_id}/{doc_id}.md"),
         metadata: DocumentMetadata::default(),

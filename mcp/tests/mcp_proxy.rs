@@ -22,7 +22,7 @@ use rmcp::{
 };
 
 use localdb_core::{
-    ids::{chunk_id, content_hash, document_id, new_ulid},
+    ids::{chunk_id, content_hash, new_ulid, resource_id},
     store::{ChunkRecord, FakeStore, RetrievalStore},
     types::Span,
     FakeEmbedder,
@@ -39,14 +39,14 @@ async fn start_upstream_daemon() -> (String, String) {
 
     let uri = "file:///docs/proxy-test.md";
     let doc_hash = content_hash("proxy transparency test content");
-    let doc_id = document_id(uri, &doc_hash);
+    let doc_id = resource_id(uri, &doc_hash);
     let snippet = "The proxy must forward this citation unchanged end to end.";
     let span = Span::new(0, snippet.len());
     let cid = chunk_id(&doc_id, snippet, span.start, span.end, 0);
 
     let record = ChunkRecord {
         id: cid,
-        document_id: doc_id.clone(),
+        resource_id: doc_id.clone(),
         store_id: "store-1".to_string(),
         text: snippet.to_string(),
         span,
@@ -57,7 +57,7 @@ async fn start_upstream_daemon() -> (String, String) {
         content_hash: doc_hash,
         origin_store: "store-1".to_string(),
         source_id: new_ulid(),
-        source_kind: "path".to_string(),
+        ingestor_kind: "path".to_string(),
         mime: Some("text/markdown".to_string()),
         uri: uri.to_string(),
         metadata: localdb_core::DocumentMetadata::default(),
@@ -145,7 +145,7 @@ async fn proxy_forwards_tool_list_and_calls_unchanged() {
     assert_eq!(stores.len(), 1);
     assert_eq!(stores[0]["name"], "proxy-store");
 
-    let get_chunks_args = serde_json::json!({ "document_id": doc_id })
+    let get_chunks_args = serde_json::json!({ "resource_id": doc_id })
         .as_object()
         .cloned()
         .unwrap();
@@ -156,7 +156,7 @@ async fn proxy_forwards_tool_list_and_calls_unchanged() {
     assert_ne!(get_chunks_result.is_error, Some(true));
     let text = get_chunks_result.content[0].as_text().unwrap().text.clone();
     let parsed: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
-    assert_eq!(parsed["document_id"], doc_id);
+    assert_eq!(parsed["resource_id"], doc_id);
     assert_eq!(parsed["total_chunks"], 1);
 
     let _ = client.cancel().await;

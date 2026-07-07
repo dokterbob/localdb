@@ -14,7 +14,6 @@ pub(crate) async fn find_document(
     let conn = db.conn().await;
     // Column mapping from resources → DocumentInfo:
     //   resources.id           → DocumentInfo.id
-    //   resources.ingestor_kind → DocumentInfo.source_kind
     //   resources.added_at     → DocumentInfo.fetched_at
     //   resources.metadata_json → DocumentInfo.metadata
     let mut rows = conn
@@ -45,7 +44,7 @@ fn row_to_document_info(row: &libsql::Row) -> Result<DocumentInfo, Error> {
     let store_id: String = row.get(0).map_err(map_libsql_err)?;
     let id: String = row.get(1).map_err(map_libsql_err)?;
     let source_id: String = row.get(2).map_err(map_libsql_err)?;
-    let source_kind: String = row.get(3).map_err(map_libsql_err)?; // ingestor_kind
+    let ingestor_kind: String = row.get(3).map_err(map_libsql_err)?;
     let uri: String = row.get(4).map_err(map_libsql_err)?;
     let title: Option<String> = row.get(5).map_err(map_libsql_err)?;
     let mime: Option<String> = row.get(6).map_err(map_libsql_err)?;
@@ -64,7 +63,7 @@ fn row_to_document_info(row: &libsql::Row) -> Result<DocumentInfo, Error> {
         store_id,
         id,
         source_id,
-        source_kind,
+        ingestor_kind,
         uri,
         title,
         mime,

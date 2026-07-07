@@ -40,7 +40,7 @@ pub async fn get_document(
         .await
         .map_err(ApiError)?;
     let chunks = handle
-        .get_chunks_for_document(&info.id)
+        .get_chunks_for_resource(&info.id)
         .await
         .map_err(ApiError)?;
     let normalized_text = chunks

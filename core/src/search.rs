@@ -178,7 +178,7 @@ pub fn rerank_noop(results: Vec<FusedChunkEntry>) -> Vec<FusedChunkEntry> {
 pub fn shape_citation(fused: FusedChunkEntry, store_id: String, store_name: String) -> Citation {
     Citation {
         chunk_id: fused.chunk.id.clone(),
-        document_id: fused.chunk.document_id.clone(),
+        resource_id: fused.chunk.resource_id.clone(),
         store: CitationStore {
             id: store_id,
             name: store_name,
@@ -376,7 +376,7 @@ mod tests {
     ) -> ChunkRecord {
         ChunkRecord {
             id: id.to_string(),
-            document_id: doc_id.to_string(),
+            resource_id: doc_id.to_string(),
             store_id: store_id.to_string(),
             text: text.to_string(),
             span: Span::new(0, text.len()),
@@ -387,7 +387,7 @@ mod tests {
             content_hash: "abc123".to_string(),
             origin_store: store_id.to_string(),
             source_id: "src-1".to_string(),
-            source_kind: "path".to_string(),
+            ingestor_kind: "path".to_string(),
             mime: Some("text/markdown".to_string()),
             uri: uri.to_string(),
             metadata: crate::parser::DocumentMetadata::default(),
@@ -749,7 +749,7 @@ mod tests {
         let citation = shape_citation(entry, "store-A".to_string(), "my-store".to_string());
 
         assert_eq!(citation.chunk_id, "chunk-1");
-        assert_eq!(citation.document_id, "doc-1");
+        assert_eq!(citation.resource_id, "doc-1");
         assert_eq!(citation.store.id, "store-A");
         assert_eq!(citation.store.name, "my-store");
         assert_eq!(citation.uri, "file:///docs/guide.md");
@@ -804,7 +804,7 @@ mod tests {
         let v: serde_json::Value = serde_json::to_value(&citation).unwrap();
         // Verify canonical shape from specs/02-domain-model.md §6
         assert!(v.get("chunk_id").is_some());
-        assert!(v.get("document_id").is_some());
+        assert!(v.get("resource_id").is_some());
         assert!(v.get("store").is_some());
         assert!(v.get("uri").is_some());
         assert!(v.get("heading_path").is_some());

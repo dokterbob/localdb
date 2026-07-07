@@ -22,7 +22,7 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use crate::chunker::{chunk_blocks, CharSizer, ChunkSizer, ChunkerConfig, TokenSizer};
 use crate::embedder::{DocumentChunks, Embedder};
 use crate::error::Error;
-use crate::ids::{document_id, new_ulid};
+use crate::ids::{new_ulid, resource_id};
 use crate::markdown_blocks::{compute_blocks_hash, markdown_to_blocks};
 use crate::store::{ChunkRecord, RetrievalStore};
 use crate::types::{
@@ -44,7 +44,7 @@ pub struct DocumentRecord {
     /// Canonical URI of the document.
     pub uri: String,
     /// Content-addressed document ID from last indexing.
-    pub document_id: String,
+    pub resource_id: String,
     /// blake3 content hash of normalized text from last indexing.
     pub content_hash: String,
     /// The policy version that was used to index this document.
@@ -74,14 +74,14 @@ impl DocumentIndex {
 
     /// Pre-populate the index from existing chunk records in the store.
     ///
-    /// Each unique (uri, document_id, content_hash, policy_version) combination
+    /// Each unique (uri, resource_id, content_hash, policy_version) combination
     /// in the store becomes one record.
     pub fn from_chunk_records(chunks: &[ChunkRecord]) -> Self {
         let mut records = HashMap::new();
         for chunk in chunks {
             records.entry(chunk.uri.clone()).or_insert(DocumentRecord {
                 uri: chunk.uri.clone(),
-                document_id: chunk.document_id.clone(),
+                resource_id: chunk.resource_id.clone(),
                 content_hash: chunk.content_hash.clone(),
                 policy_version: chunk.policy_version.clone(),
             });
@@ -451,8 +451,8 @@ fn catch_panic<T>(
 /// The order of operations is carefully chosen to be crash-safe (A6):
 ///   1. Extract, chunk, embed — all read-only / reversible.
 ///   2. Determine whether this is a replace — only after embedding succeeds.
-///   3. Call `upsert_chunks_and_blocks` with the old document_id (if any) as
-///      `replaces_document_id` — the store deletes the old document and
+///   3. Call `upsert_chunks_and_blocks` with the old resource_id (if any) as
+///      `replaces_resource_id` — the store deletes the old document and
 ///      inserts the new one within a single transaction (issue #79), so a
 ///      write failure leaves the old document intact and searchable rather
 ///      than a separately-committed delete having already taken effect.
@@ -477,7 +477,7 @@ pub async fn index_document(
     let hash = compute_blocks_hash(&blocks);
 
     // Content-addressed document ID.
-    let doc_id = document_id(&input.uri, &hash);
+    let doc_id = resource_id(&input.uri, &hash);
 
     // Check for incremental skip: same hash, same policy → skip.
     if let Some(existing) = doc_index.get(&input.uri) {
@@ -532,12 +532,12 @@ pub async fn index_document(
         // No chunks produced (empty doc) — delete old chunks if any and record as indexed.
         if let Some(existing) = doc_index.get(&input.uri) {
             if existing.content_hash != hash || existing.policy_version != config.policy_version {
-                store.delete_by_document(&existing.document_id).await?;
+                store.delete_by_resource(&existing.resource_id).await?;
             }
         }
         let record = DocumentRecord {
             uri: input.uri.clone(),
-            document_id: doc_id,
+            resource_id: doc_id,
             content_hash: hash,
             policy_version: config.policy_version.clone(),
         };
@@ -584,13 +584,13 @@ pub async fn index_document(
 
     // Embedding succeeded — now it is safe to replace the old document (A6).
     // The delete is *not* performed here as a separate call (issue #79):
-    // instead, the old document_id is threaded through to
+    // instead, the old resource_id is threaded through to
     // `upsert_chunks_and_blocks` below, which deletes and inserts within a
     // single store transaction so a write failure leaves the old document
     // intact and searchable.
     let replaces = doc_index.get(&input.uri).and_then(|existing| {
         if existing.content_hash != hash || existing.policy_version != config.policy_version {
-            Some(existing.document_id.clone())
+            Some(existing.resource_id.clone())
         } else {
             None
         }
@@ -621,7 +621,7 @@ pub async fn index_document(
     for (chunk_out, embedding) in chunk_outputs.iter().zip(embeddings.iter()) {
         let chunk = Chunk {
             id: chunk_out.id.clone(),
-            document_id: doc_id.clone(),
+            resource_id: doc_id.clone(),
             store_id: config.store_id.clone(),
             text: chunk_out.text.clone(),
             span: chunk_out.span.clone(),
@@ -657,7 +657,7 @@ pub async fn index_document(
 
     let record = DocumentRecord {
         uri: input.uri.clone(),
-        document_id: doc_id,
+        resource_id: doc_id,
         content_hash: hash,
         policy_version: config.policy_version.clone(),
     };
@@ -1059,7 +1059,7 @@ async fn run_path_source(
             if let Some(old_record) = ctx.doc_index.remove(uri) {
                 let deleted = ctx
                     .store
-                    .delete_by_document(&old_record.document_id)
+                    .delete_by_resource(&old_record.resource_id)
                     .await?;
                 if deleted > 0 {
                     result.docs_deleted += 1;
@@ -1172,7 +1172,7 @@ async fn run_url_source(
             if let Some(old_record) = ctx.doc_index.remove(url) {
                 let deleted = ctx
                     .store
-                    .delete_by_document(&old_record.document_id)
+                    .delete_by_resource(&old_record.resource_id)
                     .await?;
                 if deleted > 0 {
                     result.docs_deleted += 1;
@@ -1364,7 +1364,7 @@ mod tests {
                 include,
                 exclude: vec![],
             },
-            source_kind_preset: "prose".to_string(),
+            source_preset: "prose".to_string(),
         }
     }
 
@@ -1377,7 +1377,7 @@ mod tests {
                 url: url.to_string(),
                 refresh_interval_secs: None,
             },
-            source_kind_preset: "prose".to_string(),
+            source_preset: "prose".to_string(),
         }
     }
 
@@ -1405,13 +1405,13 @@ mod tests {
         let mut idx = DocumentIndex::new();
         let rec = DocumentRecord {
             uri: "file:///test.md".to_string(),
-            document_id: "doc-id-1".to_string(),
+            resource_id: "doc-id-1".to_string(),
             content_hash: "hash-1".to_string(),
             policy_version: "v1".to_string(),
         };
         idx.upsert(rec.clone());
         let found = idx.get("file:///test.md").unwrap();
-        assert_eq!(found.document_id, "doc-id-1");
+        assert_eq!(found.resource_id, "doc-id-1");
     }
 
     #[test]
@@ -1419,7 +1419,7 @@ mod tests {
         let mut idx = DocumentIndex::new();
         let rec = DocumentRecord {
             uri: "file:///test.md".to_string(),
-            document_id: "doc-id-1".to_string(),
+            resource_id: "doc-id-1".to_string(),
             content_hash: "hash-1".to_string(),
             policy_version: "v1".to_string(),
         };
@@ -1435,7 +1435,7 @@ mod tests {
 
         let records = vec![ChunkRecord {
             id: "chunk-1".to_string(),
-            document_id: "doc-1".to_string(),
+            resource_id: "doc-1".to_string(),
             store_id: "store-1".to_string(),
             text: "text".to_string(),
             span: Span::new(0, 4),
@@ -1446,7 +1446,7 @@ mod tests {
             content_hash: "hash-1".to_string(),
             origin_store: "store-1".to_string(),
             source_id: "src-1".to_string(),
-            source_kind: "path".to_string(),
+            ingestor_kind: "path".to_string(),
             mime: None,
             uri: "file:///doc1.md".to_string(),
             metadata: crate::parser::DocumentMetadata::default(),
@@ -1877,7 +1877,7 @@ mod tests {
         let old_doc_id = doc_index
             .get("file:///docs/notes.md")
             .unwrap()
-            .document_id
+            .resource_id
             .clone();
 
         let out2 = index_document(
@@ -1889,7 +1889,7 @@ mod tests {
         assert!(out2.chunks_written > 0);
 
         // Old chunks should be gone
-        let old_chunks = store.get_chunks_for_document(&old_doc_id).await.unwrap();
+        let old_chunks = store.get_chunks_for_resource(&old_doc_id).await.unwrap();
         assert!(
             old_chunks.is_empty(),
             "old document chunks should be deleted on replace"
@@ -1902,11 +1902,11 @@ mod tests {
     // ingestion pipeline's replace wiring (issue #79).
     // ---------------------------------------------------------------------------
 
-    /// One recorded `upsert_chunks_and_blocks` call: `(store_id, document_id,
-    /// records.len(), replaces_document_id)`.
+    /// One recorded `upsert_chunks_and_blocks` call: `(store_id, resource_id,
+    /// records.len(), replaces_resource_id)`.
     type UpsertCall = (String, String, usize, Option<String>);
 
-    /// Wraps a `FakeStore`, recording every `delete_by_document` and
+    /// Wraps a `FakeStore`, recording every `delete_by_resource` and
     /// `upsert_chunks_and_blocks` call so tests can assert on *how* the
     /// ingestion pipeline drives the store, not just the end state.
     ///
@@ -1954,9 +1954,9 @@ mod tests {
             self.inner.upsert_chunks(records).await
         }
 
-        async fn delete_by_document(&self, document_id: &str) -> Result<usize, Error> {
-            self.delete_calls.lock().await.push(document_id.to_string());
-            self.inner.delete_by_document(document_id).await
+        async fn delete_by_resource(&self, resource_id: &str) -> Result<usize, Error> {
+            self.delete_calls.lock().await.push(resource_id.to_string());
+            self.inner.delete_by_resource(resource_id).await
         }
 
         async fn delete_by_store(&self, store_id: &str) -> Result<usize, Error> {
@@ -1989,11 +1989,11 @@ mod tests {
             self.inner.get_chunk(chunk_id).await
         }
 
-        async fn get_chunks_for_document(
+        async fn get_chunks_for_resource(
             &self,
-            document_id: &str,
+            resource_id: &str,
         ) -> Result<Vec<ChunkRecord>, Error> {
-            self.inner.get_chunks_for_document(document_id).await
+            self.inner.get_chunks_for_resource(resource_id).await
         }
 
         async fn list_indexed_documents(&self) -> Result<Vec<DocumentRecord>, Error> {
@@ -2003,16 +2003,16 @@ mod tests {
         async fn upsert_chunks_and_blocks(
             &self,
             store_id: &str,
-            document_id: &str,
+            resource_id: &str,
             records: Vec<ChunkRecord>,
             blocks: &[crate::block::Block],
-            replaces_document_id: Option<&str>,
+            replaces_resource_id: Option<&str>,
         ) -> Result<usize, Error> {
             self.upsert_calls.lock().await.push((
                 store_id.to_string(),
-                document_id.to_string(),
+                resource_id.to_string(),
                 records.len(),
-                replaces_document_id.map(str::to_string),
+                replaces_resource_id.map(str::to_string),
             ));
 
             if self
@@ -2027,12 +2027,12 @@ mod tests {
 
             // Simulate the atomic contract: delete-then-insert, both only
             // observable together since we only reach here when not failing.
-            if let Some(old_id) = replaces_document_id {
-                self.inner.delete_by_document(old_id).await?;
+            if let Some(old_id) = replaces_resource_id {
+                self.inner.delete_by_resource(old_id).await?;
             }
             let count = self.inner.upsert_chunks(records).await?;
             self.inner
-                .upsert_blocks(store_id, document_id, blocks)
+                .upsert_blocks(store_id, resource_id, blocks)
                 .await?;
             Ok(count)
         }
@@ -2066,7 +2066,7 @@ mod tests {
         let old_doc_id = doc_index
             .get("file:///docs/notes.md")
             .unwrap()
-            .document_id
+            .resource_id
             .clone();
 
         let input_v2 = DocumentInput {
@@ -2086,7 +2086,7 @@ mod tests {
 
         assert!(
             store.delete_calls().await.is_empty(),
-            "index_document must never call delete_by_document directly on a \
+            "index_document must never call delete_by_resource directly on a \
              content-changed replace — the delete must be folded into the \
              upsert_chunks_and_blocks call"
         );
@@ -2095,13 +2095,13 @@ mod tests {
         assert_eq!(upserts.len(), 2, "one upsert call per index_document call");
         assert_eq!(
             upserts[0].3, None,
-            "first index (no prior document) must not pass replaces_document_id"
+            "first index (no prior document) must not pass replaces_resource_id"
         );
         assert_eq!(
             upserts[1].3,
             Some(old_doc_id),
-            "changed-content re-index must pass the old document_id as \
-             replaces_document_id"
+            "changed-content re-index must pass the old resource_id as \
+             replaces_resource_id"
         );
     }
 
@@ -2130,9 +2130,9 @@ mod tests {
         .await
         .unwrap();
         doc_index.upsert(out1.record.clone());
-        let old_doc_id = out1.record.document_id.clone();
+        let old_doc_id = out1.record.resource_id.clone();
 
-        let old_chunks_before = store.get_chunks_for_document(&old_doc_id).await.unwrap();
+        let old_chunks_before = store.get_chunks_for_resource(&old_doc_id).await.unwrap();
         assert_eq!(old_chunks_before.len(), 1);
 
         // Arm the store to fail the *next* upsert_chunks_and_blocks call —
@@ -2155,7 +2155,7 @@ mod tests {
 
         // The old document's chunks must still be retrievable — the failed
         // replace must not have removed them via a separate delete call.
-        let old_chunks_after = store.get_chunks_for_document(&old_doc_id).await.unwrap();
+        let old_chunks_after = store.get_chunks_for_resource(&old_doc_id).await.unwrap();
         assert_eq!(
             old_chunks_after.len(),
             1,
@@ -2166,7 +2166,7 @@ mod tests {
         // error, the caller never updates it, so it must still point at the
         // (still-present) old document.
         let record = doc_index.get("file:///docs/notes.md").unwrap();
-        assert_eq!(record.document_id, old_doc_id);
+        assert_eq!(record.resource_id, old_doc_id);
     }
 
     #[tokio::test]
@@ -2338,10 +2338,10 @@ mod tests {
 
         // Because content hash is unchanged, doc_id is the same as before.
         // The old chunks (policy-v1) are deleted and new chunks (policy-v2) are
-        // inserted under the same document_id.
+        // inserted under the same resource_id.
         // Verify all chunks for this document now carry the new policy version.
         let chunks_after = store
-            .get_chunks_for_document(&out2.record.document_id)
+            .get_chunks_for_resource(&out2.record.resource_id)
             .await
             .unwrap();
         assert!(!chunks_after.is_empty(), "new chunks should exist");
@@ -2420,7 +2420,7 @@ mod tests {
 
         // All written chunks must carry the extraction title.
         let chunks = store
-            .get_chunks_for_document(&output.record.document_id)
+            .get_chunks_for_resource(&output.record.resource_id)
             .await
             .unwrap();
         assert!(!chunks.is_empty());
@@ -2466,7 +2466,7 @@ mod tests {
 
         // All written chunks must keep the original metadata title.
         let chunks = store
-            .get_chunks_for_document(&output.record.document_id)
+            .get_chunks_for_resource(&output.record.resource_id)
             .await
             .unwrap();
         assert!(!chunks.is_empty());
@@ -2607,7 +2607,7 @@ mod tests {
                 "file://{}",
                 dir.path().join("doc.md").canonicalize().unwrap().display()
             ))
-            .map(|r| r.document_id.clone());
+            .map(|r| r.resource_id.clone());
 
         // Edit the file
         std::fs::write(
@@ -2634,7 +2634,7 @@ mod tests {
 
         // Old chunks should be removed
         if let Some(old_id) = old_doc_id {
-            let old_chunks = store.get_chunks_for_document(&old_id).await.unwrap();
+            let old_chunks = store.get_chunks_for_resource(&old_id).await.unwrap();
             assert!(
                 old_chunks.is_empty(),
                 "old document's chunks should be deleted"
@@ -2863,13 +2863,13 @@ mod tests {
         // Pre-populate doc_index as if previously indexed
         let mut doc_index = DocumentIndex::new();
         let existing_hash = content_hash("old content");
-        let existing_doc_id = document_id(url, &existing_hash);
+        let existing_doc_id = resource_id(url, &existing_hash);
 
         // Insert some chunks for this document
         use crate::store::ChunkRecord;
         let chunk = ChunkRecord {
             id: "old-chunk".to_string(),
-            document_id: existing_doc_id.clone(),
+            resource_id: existing_doc_id.clone(),
             store_id: store_id.to_string(),
             text: "old content".to_string(),
             span: Span::new(0, 11),
@@ -2880,7 +2880,7 @@ mod tests {
             content_hash: existing_hash.clone(),
             origin_store: store_id.to_string(),
             source_id: source.id.clone(),
-            source_kind: "url".to_string(),
+            ingestor_kind: "url".to_string(),
             mime: None,
             uri: url.to_string(),
             metadata: crate::parser::DocumentMetadata::default(),
@@ -2892,7 +2892,7 @@ mod tests {
 
         doc_index.upsert(DocumentRecord {
             uri: url.to_string(),
-            document_id: existing_doc_id.clone(),
+            resource_id: existing_doc_id.clone(),
             content_hash: existing_hash,
             policy_version: "policy-v1".to_string(),
         });
@@ -2914,7 +2914,7 @@ mod tests {
 
         assert_eq!(result.docs_deleted, 1, "gone URL should trigger deletion");
         let remaining = store
-            .get_chunks_for_document(&existing_doc_id)
+            .get_chunks_for_resource(&existing_doc_id)
             .await
             .unwrap();
         assert!(
@@ -3273,10 +3273,10 @@ mod tests {
         let original_doc_id = doc_index
             .get("file:///docs/doc.md")
             .unwrap()
-            .document_id
+            .resource_id
             .clone();
         let chunks_before = store
-            .get_chunks_for_document(&original_doc_id)
+            .get_chunks_for_resource(&original_doc_id)
             .await
             .unwrap();
         assert!(
@@ -3312,7 +3312,7 @@ mod tests {
 
         // Original chunks must still be in the store (embed-before-delete ordering).
         let chunks_after = store
-            .get_chunks_for_document(&original_doc_id)
+            .get_chunks_for_resource(&original_doc_id)
             .await
             .unwrap();
         assert!(
@@ -3371,11 +3371,11 @@ mod tests {
         let uri = "file:///docs/existing.md";
         let content = "Already indexed content.";
         let hash = content_hash(content);
-        let doc_id = document_id(uri, &hash);
+        let doc_id = resource_id(uri, &hash);
 
         let existing_chunk = ChunkRecord {
             id: "chunk-existing".to_string(),
-            document_id: doc_id.clone(),
+            resource_id: doc_id.clone(),
             store_id: "store-1".to_string(),
             text: content.to_string(),
             span: Span::new(0, content.len()),
@@ -3386,7 +3386,7 @@ mod tests {
             content_hash: hash.clone(),
             origin_store: "store-1".to_string(),
             source_id: "src-1".to_string(),
-            source_kind: "path".to_string(),
+            ingestor_kind: "path".to_string(),
             mime: None,
             uri: uri.to_string(),
             metadata: crate::parser::DocumentMetadata::default(),
@@ -3408,7 +3408,7 @@ mod tests {
             .expect("record must be present after hydration");
         assert_eq!(record.content_hash, hash);
         assert_eq!(record.policy_version, "policy-v1");
-        assert_eq!(record.document_id, doc_id);
+        assert_eq!(record.resource_id, doc_id);
     }
 
     // ---------------------------------------------------------------------------
@@ -3899,7 +3899,7 @@ mod tests {
         use crate::types::Span;
         crate::store::ChunkRecord {
             id: id.to_string(),
-            document_id: doc_id.to_string(),
+            resource_id: doc_id.to_string(),
             store_id: store_id.to_string(),
             text: "test text".to_string(),
             span: Span::new(0, 9),
@@ -3910,7 +3910,7 @@ mod tests {
             content_hash: content_hash.to_string(),
             origin_store: store_id.to_string(),
             source_id: "src-1".to_string(),
-            source_kind: "path".to_string(),
+            ingestor_kind: "path".to_string(),
             mime: None,
             uri: uri.to_string(),
             metadata: crate::parser::DocumentMetadata::default(),

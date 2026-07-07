@@ -130,19 +130,19 @@ pub(crate) async fn run_embedded_index(
 
     for rt_source in &sources_to_index {
         let source = source_row_to_core_source(rt_source);
-        let chunker = match ChunkerConfig::from_preset(&source.source_kind_preset) {
+        let chunker = match ChunkerConfig::from_preset(&source.source_preset) {
             Ok(chunker) => chunker,
             Err(e) => {
                 summary.errors += 1;
                 if mode.warn() {
                     eprintln!(
                         "warning: invalid chunker preset '{}' for source {}: {}",
-                        source.source_kind_preset, rt_source.id, e
+                        source.source_preset, rt_source.id, e
                     );
                 } else {
                     eprintln!(
                         "error indexing source {}: invalid chunker preset '{}': {}",
-                        rt_source.id, source.source_kind_preset, e
+                        rt_source.id, source.source_preset, e
                     );
                 }
                 continue;

@@ -7,7 +7,7 @@
 
 use crate::block::{IngestorKind, Resource, ResourceKind};
 use crate::error::Error;
-use crate::ids::document_id;
+use crate::ids::resource_id;
 use crate::ingestion::{enumerate_path_source, now_rfc3339};
 use crate::ingestor::{IngestCallback, IngestResult, IngestSource, Ingestor};
 use crate::markdown_blocks::{compute_blocks_hash, markdown_to_blocks};
@@ -106,7 +106,7 @@ impl Ingestor for FileIngestor {
 
             let blocks = markdown_to_blocks(&parsed.markdown);
             let hash = compute_blocks_hash(&blocks);
-            let res_id = document_id(&file.uri, &hash);
+            let res_id = resource_id(&file.uri, &hash);
             let now = now_rfc3339();
 
             // Convert parser::DocumentMetadata → metadata::DublinCoreMetadata

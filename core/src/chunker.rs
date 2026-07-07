@@ -91,7 +91,7 @@ fn floor_char_boundary(s: &str, index: usize) -> usize {
 /// Markdown string. `heading_path` is derived from the Markdown heading structure.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChunkOutput {
-    /// Content-addressed chunk ID: `blake3(document_id || text || span)`.
+    /// Content-addressed chunk ID: `blake3(resource_id || text || span)`.
     pub id: ContentId,
     /// Chunk text (a slice of the Markdown string).
     pub text: String,
@@ -549,7 +549,7 @@ pub fn chunk_messages(
 /// Heading-path attribution uses `heading_index::build_heading_index` over the
 /// same Markdown string — no Block sidecar needed.
 fn chunk_prose(
-    document_id: &str,
+    resource_id: &str,
     markdown: &str,
     config: &ChunkerConfig,
     sizer: &dyn ChunkSizer,
@@ -579,7 +579,7 @@ fn chunk_prose(
                 max_line_len,
                 "chunk_prose backstop: delegating to chunk_code"
             );
-            return chunk_code(document_id, markdown, config, block_seq);
+            return chunk_code(resource_id, markdown, config, block_seq);
         }
     }
 
@@ -612,7 +612,7 @@ fn chunk_prose(
         let end = byte_off + chunk.len();
         let span = Span::new(start, end);
         let heading_path = crate::heading_index::heading_path_at(&heading_idx, start);
-        let id = chunk_id(document_id, chunk, start, end, block_seq);
+        let id = chunk_id(resource_id, chunk, start, end, block_seq);
         chunks.push(ChunkOutput::single(
             id,
             chunk.to_string(),
@@ -635,7 +635,7 @@ fn chunk_prose(
 /// It will be superseded by `text-splitter::CodeSplitter` (tree-sitter) when
 /// code sources become a focus. See specs/04-search-pipeline.md §2.
 fn chunk_code(
-    document_id: &str,
+    resource_id: &str,
     markdown: &str,
     config: &ChunkerConfig,
     block_seq: u32,
@@ -660,7 +660,7 @@ fn chunk_code(
                 let ce = floor_char_boundary(markdown, current_end);
                 if cs < ce {
                     let chunk_text = &markdown[cs..ce];
-                    let id = chunk_id(document_id, chunk_text, cs, ce, block_seq);
+                    let id = chunk_id(resource_id, chunk_text, cs, ce, block_seq);
                     chunks.push(ChunkOutput::single(
                         id,
                         chunk_text.to_string(),
@@ -687,7 +687,7 @@ fn chunk_code(
                 let piece_end = (pos + byte_len).min(line_end);
                 if pos < piece_end {
                     let chunk_text = &markdown[pos..piece_end];
-                    let id = chunk_id(document_id, chunk_text, pos, piece_end, block_seq);
+                    let id = chunk_id(resource_id, chunk_text, pos, piece_end, block_seq);
                     chunks.push(ChunkOutput::single(
                         id,
                         chunk_text.to_string(),
@@ -710,7 +710,7 @@ fn chunk_code(
             let ce = floor_char_boundary(markdown, current_end);
             if cs < ce {
                 let chunk_text = &markdown[cs..ce];
-                let id = chunk_id(document_id, chunk_text, cs, ce, block_seq);
+                let id = chunk_id(resource_id, chunk_text, cs, ce, block_seq);
                 chunks.push(ChunkOutput::single(
                     id,
                     chunk_text.to_string(),
@@ -734,7 +734,7 @@ fn chunk_code(
         let ce = floor_char_boundary(markdown, current_end);
         if cs < ce {
             let chunk_text = &markdown[cs..ce];
-            let id = chunk_id(document_id, chunk_text, cs, ce, block_seq);
+            let id = chunk_id(resource_id, chunk_text, cs, ce, block_seq);
             chunks.push(ChunkOutput::single(
                 id,
                 chunk_text.to_string(),
@@ -826,7 +826,7 @@ pub fn preset_for(filename: Option<&str>, mime: Option<&str>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::document_id;
+    use crate::ids::resource_id;
 
     /// Word-count sizer for tests — no model download required.
     struct WordSizer;
@@ -888,7 +888,7 @@ mod tests {
 
     #[test]
     fn prose_chunk_empty_document_returns_empty() {
-        let doc_id = document_id("file:///test.md", "abc123");
+        let doc_id = resource_id("file:///test.md", "abc123");
         let cfg = ChunkerConfig::prose();
         let result = chunk_prose(&doc_id, "", &cfg, &CharSizer, 0).unwrap();
         assert!(result.is_empty(), "empty doc should produce no chunks");
@@ -897,7 +897,7 @@ mod tests {
     #[test]
     fn prose_chunk_single_paragraph() {
         let full_text = "Hello, this is a paragraph.";
-        let doc_id = document_id("file:///test.md", "abc");
+        let doc_id = resource_id("file:///test.md", "abc");
         let cfg = ChunkerConfig::prose();
 
         let chunks = chunk_prose(&doc_id, full_text, &cfg, &CharSizer, 0).unwrap();
@@ -911,7 +911,7 @@ mod tests {
     #[test]
     fn prose_chunk_span_references_markdown() {
         let full_text = "# Introduction\n\nThis is the intro paragraph.";
-        let doc_id = document_id("file:///test.md", "abc");
+        let doc_id = resource_id("file:///test.md", "abc");
         let cfg = ChunkerConfig::prose();
 
         let chunks = chunk_prose(&doc_id, full_text, &cfg, &CharSizer, 0).unwrap();
@@ -932,7 +932,7 @@ mod tests {
     fn prose_spans_round_trip() {
         let full_text =
             "# Heading One\n\nParagraph one with some words.\n\n## Heading Two\n\nParagraph two here.";
-        let doc_id = document_id("file:///rt.md", "abc");
+        let doc_id = resource_id("file:///rt.md", "abc");
         let cfg = ChunkerConfig::prose();
         let chunks = chunk_prose(&doc_id, full_text, &cfg, &WordSizer, 0).unwrap();
         assert!(!chunks.is_empty());
@@ -951,7 +951,7 @@ mod tests {
         for i in 0..10 {
             full_text.push_str(&format!("## Section {i}\n\n{para}\n\n"));
         }
-        let doc_id = document_id("file:///long.md", "abc");
+        let doc_id = resource_id("file:///long.md", "abc");
         let cfg = ChunkerConfig {
             preset: "prose".to_string(),
             target_tokens: Some(60),
@@ -981,7 +981,7 @@ mod tests {
         for i in 0..6 {
             full_text.push_str(&format!("## Section {i}\n\n{para}\n\n"));
         }
-        let doc_id = document_id("file:///order.md", "abc");
+        let doc_id = resource_id("file:///order.md", "abc");
         let cfg = ChunkerConfig {
             preset: "prose".to_string(),
             target_tokens: Some(60),
@@ -996,7 +996,7 @@ mod tests {
     #[test]
     fn prose_char_sizer_fallback_produces_chunks() {
         let full_text = "# Title\n\nSome prose content here for the char sizer fallback path.";
-        let doc_id = document_id("file:///char.md", "abc");
+        let doc_id = resource_id("file:///char.md", "abc");
         let cfg = ChunkerConfig::prose();
         let chunks = chunk_prose(&doc_id, full_text, &cfg, &CharSizer, 0).unwrap();
         assert!(
@@ -1012,7 +1012,7 @@ mod tests {
         for i in 0..8 {
             full_text.push_str(&format!("## Para {i}\n\n{para}\n\n"));
         }
-        let doc_id = document_id("file:///large.md", "hash");
+        let doc_id = resource_id("file:///large.md", "hash");
         let cfg = ChunkerConfig {
             preset: "prose".to_string(),
             target_tokens: Some(80),
@@ -1031,7 +1031,7 @@ mod tests {
     #[test]
     fn prose_chunk_ids_are_content_addressed() {
         let full_text = "Hello world this is content.";
-        let doc_id = document_id("file:///test.md", "abc");
+        let doc_id = resource_id("file:///test.md", "abc");
         let cfg = ChunkerConfig::prose();
 
         let chunks1 = chunk_prose(&doc_id, full_text, &cfg, &CharSizer, 0).unwrap();
@@ -1048,7 +1048,7 @@ mod tests {
         // The splitter now sees real Markdown — heading_path is derived from the
         // Markdown heading structure, not from a Block sidecar.
         let full_text = "# API\n\nAPI documentation.\n\n# Auth\n\nAuth documentation.";
-        let doc_id = document_id("file:///api.md", "abc");
+        let doc_id = resource_id("file:///api.md", "abc");
         let cfg = ChunkerConfig {
             preset: "prose".to_string(),
             target_tokens: Some(8),
@@ -1088,7 +1088,7 @@ mod tests {
         for i in 0..4 {
             full_text.push_str(&format!("## Section {i}\n\n{para}\n\n"));
         }
-        let doc_id = document_id("file:///overlap_guard.md", "abc");
+        let doc_id = resource_id("file:///overlap_guard.md", "abc");
         let cfg = ChunkerConfig {
             preset: "prose".to_string(),
             target_tokens: Some(80),
@@ -1113,7 +1113,7 @@ mod tests {
     fn prose_oversized_single_atomic_unit_no_panic() {
         let long_word = "a".repeat(2000);
         let full_text = format!("# Title\n\n{long_word}");
-        let doc_id = document_id("file:///oversized.md", "abc");
+        let doc_id = resource_id("file:///oversized.md", "abc");
         let cfg = ChunkerConfig {
             preset: "prose".to_string(),
             target_tokens: Some(20),
@@ -1137,7 +1137,7 @@ mod tests {
         // must be present in chunk text so MarkdownSplitter can split on structure).
         let md =
             "# Section One\n\nContent of section one.\n\n# Section Two\n\nContent of section two.";
-        let doc_id = document_id("file:///structure.md", "abc");
+        let doc_id = resource_id("file:///structure.md", "abc");
         let cfg = ChunkerConfig {
             preset: "prose".to_string(),
             target_tokens: Some(8),
@@ -1160,7 +1160,7 @@ mod tests {
 
     #[test]
     fn code_chunk_empty_returns_empty() {
-        let doc_id = document_id("file:///lib.rs", "abc");
+        let doc_id = resource_id("file:///lib.rs", "abc");
         let cfg = ChunkerConfig::code();
         let chunks = chunk_code(&doc_id, "", &cfg, 0).unwrap();
         assert!(chunks.is_empty());
@@ -1169,7 +1169,7 @@ mod tests {
     #[test]
     fn code_chunk_single_block() {
         let full_text = "fn hello() {\n    println!(\"hi\");\n}";
-        let doc_id = document_id("file:///lib.rs", "abc");
+        let doc_id = resource_id("file:///lib.rs", "abc");
         let cfg = ChunkerConfig::code();
 
         let chunks = chunk_code(&doc_id, full_text, &cfg, 0).unwrap();
@@ -1181,7 +1181,7 @@ mod tests {
     fn code_chunk_large_splits() {
         let line = "let x = some_function_with_long_name(arg1, arg2, arg3);\n";
         let full_text = line.repeat(100); // ~5600 chars
-        let doc_id = document_id("file:///lib.rs", "hash");
+        let doc_id = resource_id("file:///lib.rs", "hash");
         let cfg = ChunkerConfig::code();
 
         let chunks = chunk_code(&doc_id, &full_text, &cfg, 0).unwrap();
@@ -1195,7 +1195,7 @@ mod tests {
     fn code_chunk_spans_round_trip() {
         let line = "let x = 1;\n";
         let full_text = line.repeat(200);
-        let doc_id = document_id("file:///lib.rs", "hash");
+        let doc_id = resource_id("file:///lib.rs", "hash");
         let cfg = ChunkerConfig::code();
         let chunks = chunk_code(&doc_id, &full_text, &cfg, 0).unwrap();
         for c in &chunks {
@@ -1751,7 +1751,7 @@ mod tests {
             text: "fn hello() {\n    println!(\"hi\");\n}".to_string(),
             location: None,
         };
-        let doc_id = document_id("file:///test.rs", "abc");
+        let doc_id = resource_id("file:///test.rs", "abc");
         let cfg = ChunkerConfig::code();
         let chunks = chunk_blocks(&doc_id, &[block], &cfg, &CharSizer).unwrap();
         assert!(

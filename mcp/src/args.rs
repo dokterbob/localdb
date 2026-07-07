@@ -7,7 +7,7 @@
 //! tool method body ever runs.
 //!
 //! A missing/wrong-typed *required* field (a non-`Option` field: `query` on
-//! [`SearchArgs`], `id` on [`GetDocumentArgs`], `document_id` on
+//! [`SearchArgs`], `id` on [`GetDocumentArgs`], `resource_id` on
 //! [`GetChunksArgs`]) fails at this deserialization step — but that surfaces
 //! as a **tool-level** `CallToolResult` error (rmcp downgrades it via
 //! `into_tool_argument_error`; it does *not* propagate as a protocol-level
@@ -84,11 +84,11 @@ pub struct GetDocumentArgs {
 /// Arguments for the `get_chunks` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetChunksArgs {
-    /// Document ID (content-addressed blake3 hash). Missing or non-string
+    /// Resource ID (content-addressed blake3 hash). Missing or non-string
     /// input fails deserialization (a tool-level "failed to deserialize
     /// parameters" error, see `lib.rs`).
-    #[schemars(description = "Document ID (content-addressed blake3 hash)")]
-    pub document_id: String,
+    #[schemars(description = "Resource ID (content-addressed blake3 hash)")]
+    pub resource_id: String,
 
     /// Number of chunks to skip before the first returned chunk (default: 0).
     #[serde(default)]

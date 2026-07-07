@@ -21,7 +21,7 @@
 //!   rmcp 1.8.0's `ToolRouter::call` downgrades any such error to a tool
 //!   result via `into_tool_argument_error` (see `assert_deserialization_error`
 //!   below and `test_search_missing_query_argument` /
-//!   `test_get_document_no_args` / `test_get_chunks_missing_document_id`).
+//!   `test_get_document_no_args` / `test_get_chunks_missing_resource_id`).
 //!
 //! See specs/05-surfaces.md §4 and specs/02-domain-model.md §6.
 
@@ -34,7 +34,7 @@ use rmcp::{
 };
 
 use localdb_core::{
-    ids::{chunk_id, content_hash, document_id, new_ulid},
+    ids::{chunk_id, content_hash, new_ulid, resource_id},
     store::{ChunkRecord, FakeStore, RetrievalStore},
     types::Span,
     FakeEmbedder,
@@ -127,14 +127,14 @@ async fn make_handler_with_seeded_store() -> (McpHandler, String, String) {
 
     let uri = "file:///docs/test.md";
     let doc_hash = content_hash("some document content about Rust programming");
-    let doc_id = document_id(uri, &doc_hash);
+    let doc_id = resource_id(uri, &doc_hash);
     let snippet = "Rust is a systems programming language focused on safety and performance.";
     let span = Span::new(0, snippet.len());
     let cid = chunk_id(&doc_id, snippet, span.start, span.end, 0);
 
     let record = ChunkRecord {
         id: cid.clone(),
-        document_id: doc_id.clone(),
+        resource_id: doc_id.clone(),
         store_id: "store-1".to_string(),
         text: snippet.to_string(),
         span,
@@ -145,7 +145,7 @@ async fn make_handler_with_seeded_store() -> (McpHandler, String, String) {
         content_hash: doc_hash.clone(),
         origin_store: "store-1".to_string(),
         source_id: new_ulid(),
-        source_kind: "path".to_string(),
+        ingestor_kind: "path".to_string(),
         mime: Some("text/markdown".to_string()),
         uri: uri.to_string(),
         metadata: localdb_core::DocumentMetadata::default(),
@@ -177,14 +177,14 @@ async fn make_handler_with_multichunk_doc() -> (McpHandler, String) {
 
     let uri = "file:///docs/multi.md";
     let doc_hash = content_hash("multi-chunk document body");
-    let doc_id = document_id(uri, &doc_hash);
+    let doc_id = resource_id(uri, &doc_hash);
 
     let make_chunk = |text: &str, block_seq: u32, seq_in_block: u32, heading: &str| {
         let span = Span::new(0, text.len());
         let cid = chunk_id(&doc_id, text, span.start, span.end, block_seq);
         ChunkRecord {
             id: cid,
-            document_id: doc_id.clone(),
+            resource_id: doc_id.clone(),
             store_id: "store-1".to_string(),
             text: text.to_string(),
             span,
@@ -195,7 +195,7 @@ async fn make_handler_with_multichunk_doc() -> (McpHandler, String) {
             content_hash: doc_hash.clone(),
             origin_store: "store-1".to_string(),
             source_id: new_ulid(),
-            source_kind: "path".to_string(),
+            ingestor_kind: "path".to_string(),
             mime: Some("text/markdown".to_string()),
             uri: uri.to_string(),
             metadata: localdb_core::DocumentMetadata {
@@ -239,7 +239,7 @@ async fn make_handler_with_tied_chunks(reversed: bool) -> (McpHandler, String) {
 
     let uri = "file:///docs/tied.md";
     let doc_hash = content_hash("tied-chunk document body");
-    let doc_id = document_id(uri, &doc_hash);
+    let doc_id = resource_id(uri, &doc_hash);
 
     // Same span and (block_seq, seq_in_block) for both; only text (hence id) differs.
     let span = Span::new(0, 4);
@@ -247,7 +247,7 @@ async fn make_handler_with_tied_chunks(reversed: bool) -> (McpHandler, String) {
         let cid = chunk_id(&doc_id, text, span.start, span.end, 0);
         ChunkRecord {
             id: cid,
-            document_id: doc_id.clone(),
+            resource_id: doc_id.clone(),
             store_id: "store-1".to_string(),
             text: text.to_string(),
             span: span.clone(),
@@ -258,7 +258,7 @@ async fn make_handler_with_tied_chunks(reversed: bool) -> (McpHandler, String) {
             content_hash: doc_hash.clone(),
             origin_store: "store-1".to_string(),
             source_id: new_ulid(),
-            source_kind: "path".to_string(),
+            ingestor_kind: "path".to_string(),
             mime: Some("text/markdown".to_string()),
             uri: uri.to_string(),
             metadata: localdb_core::DocumentMetadata::default(),
@@ -428,8 +428,8 @@ async fn test_search_returns_canonical_citations() {
     let first = &citations[0];
     assert!(first.get("chunk_id").is_some(), "citation.chunk_id missing");
     assert!(
-        first.get("document_id").is_some(),
-        "citation.document_id missing"
+        first.get("resource_id").is_some(),
+        "citation.resource_id missing"
     );
     assert!(first.get("store").is_some(), "citation.store missing");
     assert!(first.get("uri").is_some(), "citation.uri missing");
@@ -487,13 +487,13 @@ async fn test_search_content_length_snaps_snippet_to_boundary() {
 It prevents entire classes of memory bugs at compile time without a garbage \
 collector, which keeps runtime performance predictable and fast.";
     let doc_hash = content_hash(text);
-    let doc_id_val = document_id(uri, &doc_hash);
+    let doc_id_val = resource_id(uri, &doc_hash);
     let span = Span::new(0, text.len());
     let cid = chunk_id(&doc_id_val, text, span.start, span.end, 0);
 
     let record = ChunkRecord {
         id: cid,
-        document_id: doc_id_val,
+        resource_id: doc_id_val,
         store_id: "store-1".to_string(),
         text: text.to_string(),
         span,
@@ -504,7 +504,7 @@ collector, which keeps runtime performance predictable and fast.";
         content_hash: doc_hash,
         origin_store: "store-1".to_string(),
         source_id: new_ulid(),
-        source_kind: "path".to_string(),
+        ingestor_kind: "path".to_string(),
         mime: Some("text/markdown".to_string()),
         uri: uri.to_string(),
         metadata: localdb_core::DocumentMetadata::default(),
@@ -633,13 +633,13 @@ async fn test_search_limit_respected() {
         let text = format!("Chunk {i} about Rust programming language and systems software.");
         let uri = format!("file:///docs/doc{i}.md");
         let doc_hash = content_hash(&text);
-        let doc_id_val = document_id(&uri, &doc_hash);
+        let doc_id_val = resource_id(&uri, &doc_hash);
         let span = Span::new(0, text.len());
         let cid = chunk_id(&doc_id_val, &text, span.start, span.end, 0);
 
         records.push(ChunkRecord {
             id: cid,
-            document_id: doc_id_val,
+            resource_id: doc_id_val,
             store_id: "store-1".to_string(),
             text,
             span,
@@ -650,7 +650,7 @@ async fn test_search_limit_respected() {
             content_hash: doc_hash,
             origin_store: "store-1".to_string(),
             source_id: new_ulid(),
-            source_kind: "path".to_string(),
+            ingestor_kind: "path".to_string(),
             mime: Some("text/markdown".to_string()),
             uri,
             metadata: localdb_core::DocumentMetadata::default(),
@@ -708,7 +708,7 @@ async fn test_get_document_by_id() {
 
     let text = text_of(&result);
     let parsed: Value = serde_json::from_str(&text).expect("valid JSON in content");
-    assert_eq!(parsed["document_id"], doc_id);
+    assert_eq!(parsed["resource_id"], doc_id);
     assert_eq!(parsed["uri"], "file:///docs/test.md");
     assert!(parsed.get("chunk_count").is_some());
     assert!(parsed.get("text").is_some());
@@ -716,9 +716,9 @@ async fn test_get_document_by_id() {
     assert!(parsed.get("store").is_some());
 }
 
-/// T15: get_document with unknown ID → document_not_found tool error
+/// T15: get_document with unknown ID → resource_not_found tool error
 #[tokio::test]
-async fn test_get_document_not_found() {
+async fn test_get_document_resource_not_found() {
     let (handler, _, _) = make_handler_with_seeded_store().await;
     let client = client_for(handler).await;
 
@@ -733,8 +733,8 @@ async fn test_get_document_not_found() {
     assert_eq!(result.is_error, Some(true), "should be a tool error");
     let error_text = text_of(&result);
     assert!(
-        error_text.contains("document_not_found"),
-        "should report document_not_found: {error_text}"
+        error_text.contains("resource_not_found"),
+        "should report resource_not_found: {error_text}"
     );
 }
 
@@ -796,7 +796,7 @@ async fn test_get_chunks_happy_path_sorted() {
     let (handler, doc_id) = make_handler_with_multichunk_doc().await;
     let client = client_for(handler).await;
 
-    let result = call_tool(&client, "get_chunks", json!({ "document_id": doc_id }))
+    let result = call_tool(&client, "get_chunks", json!({ "resource_id": doc_id }))
         .await
         .expect("get_chunks succeeds");
     assert_eq!(result.is_error, Some(false));
@@ -804,7 +804,7 @@ async fn test_get_chunks_happy_path_sorted() {
     let text = text_of(&result);
     let parsed: Value = serde_json::from_str(&text).expect("valid JSON in content");
 
-    assert_eq!(parsed["document_id"], doc_id);
+    assert_eq!(parsed["resource_id"], doc_id);
     assert_eq!(parsed["uri"], "file:///docs/multi.md");
     assert_eq!(parsed["title"], "Multi-chunk Doc");
     assert_eq!(parsed["total_chunks"], 3);
@@ -840,7 +840,7 @@ async fn test_get_chunks_pagination_offset_limit() {
     let result = call_tool(
         &client,
         "get_chunks",
-        json!({ "document_id": doc_id, "offset": 1, "limit": 1 }),
+        json!({ "resource_id": doc_id, "offset": 1, "limit": 1 }),
     )
     .await
     .expect("get_chunks succeeds");
@@ -868,7 +868,7 @@ async fn test_get_chunks_offset_out_of_range_returns_empty() {
     let result = call_tool(
         &client,
         "get_chunks",
-        json!({ "document_id": doc_id, "offset": 99 }),
+        json!({ "resource_id": doc_id, "offset": 99 }),
     )
     .await
     .expect("get_chunks succeeds");
@@ -885,30 +885,30 @@ async fn test_get_chunks_offset_out_of_range_returns_empty() {
     assert!(parsed["chunks"].as_array().unwrap().is_empty());
 }
 
-/// get_chunks with missing document_id (changed expectation): now fails
-/// `Parameters<GetChunksArgs>` deserialization (`document_id` is required)
+/// get_chunks with missing resource_id (changed expectation): now fails
+/// `Parameters<GetChunksArgs>` deserialization (`resource_id` is required)
 /// — a tool-level "failed to deserialize parameters" error.
 #[tokio::test]
-async fn test_get_chunks_missing_document_id() {
+async fn test_get_chunks_missing_resource_id() {
     let client = client_for(make_handler_with_one_store()).await;
     let result = call_tool(&client, "get_chunks", json!({})).await;
     let text = assert_deserialization_error(result);
     assert!(
-        text.contains("document_id"),
-        "error should mention 'document_id': {text}"
+        text.contains("resource_id"),
+        "error should mention 'resource_id': {text}"
     );
 }
 
-/// get_chunks with an unknown document_id → document_not_found tool error.
+/// get_chunks with an unknown resource_id → resource_not_found tool error.
 #[tokio::test]
-async fn test_get_chunks_unknown_document_id() {
+async fn test_get_chunks_unknown_resource_id() {
     let (handler, _doc_id) = make_handler_with_multichunk_doc().await;
     let client = client_for(handler).await;
 
     let result = call_tool(
         &client,
         "get_chunks",
-        json!({ "document_id": "nonexistent-doc" }),
+        json!({ "resource_id": "nonexistent-doc" }),
     )
     .await
     .expect("call succeeds at the protocol level");
@@ -918,12 +918,12 @@ async fn test_get_chunks_unknown_document_id() {
     let parsed: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(
         parsed["error"]["code"].as_str().unwrap(),
-        "document_not_found"
+        "resource_not_found"
     );
 }
 
-/// Chaining test: `search` → take `citations[0].document_id` → `get_chunks`.
-/// Proves that `Citation.document_id` is sufficient to drive `get_chunks`.
+/// Chaining test: `search` → take `citations[0].resource_id` → `get_chunks`.
+/// Proves that `Citation.resource_id` is sufficient to drive `get_chunks`.
 #[tokio::test]
 async fn test_search_to_get_chunks_chaining() {
     let (handler, expected_doc_id, _chunk_id) = make_handler_with_seeded_store().await;
@@ -943,13 +943,13 @@ async fn test_search_to_get_chunks_chaining() {
     let citations = parsed["citations"].as_array().unwrap();
     assert!(!citations.is_empty(), "search should find the seeded chunk");
 
-    let document_id = citations[0]["document_id"]
+    let resource_id = citations[0]["resource_id"]
         .as_str()
-        .expect("citation.document_id must be a string")
+        .expect("citation.resource_id must be a string")
         .to_string();
-    assert_eq!(document_id, expected_doc_id);
+    assert_eq!(resource_id, expected_doc_id);
 
-    let chunks_result = call_tool(&client, "get_chunks", json!({ "document_id": document_id }))
+    let chunks_result = call_tool(&client, "get_chunks", json!({ "resource_id": resource_id }))
         .await
         .expect("get_chunks succeeds");
     assert_eq!(
@@ -960,7 +960,7 @@ async fn test_search_to_get_chunks_chaining() {
 
     let text = text_of(&chunks_result);
     let parsed: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(parsed["document_id"], expected_doc_id);
+    assert_eq!(parsed["resource_id"], expected_doc_id);
     assert_eq!(parsed["total_chunks"], 1);
 }
 
@@ -973,7 +973,7 @@ async fn test_search_to_get_chunks_chaining() {
 #[tokio::test]
 async fn test_get_chunks_deterministic_tie_breaker() {
     async fn ordered_ids(client: &RunningService<RoleClient, ()>, doc_id: &str) -> Vec<String> {
-        let result = call_tool(client, "get_chunks", json!({ "document_id": doc_id }))
+        let result = call_tool(client, "get_chunks", json!({ "resource_id": doc_id }))
             .await
             .expect("get_chunks succeeds");
         assert_eq!(result.is_error, Some(false));
