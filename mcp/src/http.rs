@@ -12,7 +12,7 @@ use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
 
-use localdb_core::Embedder;
+use localdb_core::{auth::Principal, Embedder};
 
 use crate::handler::McpHandler;
 use crate::store_provider::StoreProvider;
@@ -61,10 +61,17 @@ use crate::store_provider::StoreProvider;
 /// case would silently keep rmcp's localhost-only default and this whole
 /// fix would be a no-op for the one case (non-loopback bind) it exists for.
 /// Do not "simplify" this back to always using `::default()`.
+///
+/// `default_principal` is the fallback identity when a tool call's request
+/// extensions carry no `Principal` (see `handler::McpHandler::principal_for`):
+/// the daemon passes `Some(Principal::local_trust())` in open (unauthenticated)
+/// mode and `None` when auth is enforced, so a request that somehow bypassed
+/// the auth middleware fails closed instead of running with full access.
 pub fn build_streamable_http_service(
     provider: Arc<dyn StoreProvider>,
     embedder: Arc<dyn Embedder>,
     allowed_hosts: Vec<String>,
+    default_principal: Option<Principal>,
 ) -> StreamableHttpService<McpHandler, LocalSessionManager> {
     let config = if allowed_hosts.is_empty() {
         StreamableHttpServerConfig::default().disable_allowed_hosts()
@@ -72,7 +79,14 @@ pub fn build_streamable_http_service(
         StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts)
     };
     StreamableHttpService::new(
-        move || Ok(McpHandler::new(provider.clone(), embedder.clone(), false)),
+        move || {
+            Ok(McpHandler::new(
+                provider.clone(),
+                embedder.clone(),
+                false,
+                default_principal.clone(),
+            ))
+        },
         Default::default(),
         config,
     )

@@ -19,11 +19,17 @@ pub struct EffectiveStoreView {
     pub backend: String,
 }
 
+/// `GET /v1/config`.
+///
+/// `yaml_config` reflects **startup state**: the config file is read once
+/// when the daemon starts and never reloaded (specs/03-config.md §5 — the
+/// hot-reload watcher was removed in T3). Edits to the file take effect on
+/// the next daemon restart.
 pub async fn get_config(State(state): State<AppState>) -> Result<Json<ConfigResponse>, ApiError> {
-    let yaml = state.yaml_config().await;
+    let yaml = state.yaml_config();
     let effective = state.effective_config().await?;
 
-    let yaml_value = serde_json::to_value(&yaml).map_err(|e| {
+    let yaml_value = serde_json::to_value(yaml).map_err(|e| {
         ApiError(CoreError::Internal {
             message: format!("cannot serialize config: {}", e),
             correlation_id: "config_serialize".to_string(),

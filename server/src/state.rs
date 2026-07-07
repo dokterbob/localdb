@@ -1,7 +1,5 @@
 use std::path::PathBuf;
-use std::sync::Arc;
-
-use tokio::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use localdb_core::{
     config::{
@@ -12,9 +10,13 @@ use localdb_core::{
     store_factory, Error, SourceRow, Store, StoreBackend, StoreBackendConfig, StoreRow,
     StoreVisibility,
 };
-use store_libsql::SqliteBackend;
+use store_libsql::{LibsqlAuthStore, SqliteBackend};
 
-use crate::{job_queue::JobQueue, scheduler::UrlRefreshScheduler};
+use crate::{
+    auth::{AuthMode, ServerAuthService},
+    job_queue::JobQueue,
+    scheduler::UrlRefreshScheduler,
+};
 
 /// Effective config built from the DB.
 #[derive(Debug, Clone)]
@@ -48,9 +50,28 @@ pub struct AppState {
 }
 
 struct Inner {
-    yaml_config: RwLock<RawConfig>,
+    /// The YAML config as loaded at startup. Plain (no lock): config is read
+    /// once at process startup and never reloaded — the file-watcher-based
+    /// hot-reload was removed in T3 (specs/03-config.md §5). A change to the
+    /// file takes effect on the next daemon restart.
+    yaml_config: RawConfig,
     data_dir: PathBuf,
     backend: Arc<dyn StoreBackend>,
+    /// The auth policy service over the same unified on-disk database as
+    /// `backend` (`<data_dir>/localdb.db`) — users/keys persist across
+    /// restarts, and break-glass CLI writes (`localdb user add`) are visible
+    /// to a subsequently started daemon.
+    auth: Arc<ServerAuthService>,
+    /// The raw `AuthStore` behind `auth`, for queries the policy layer does
+    /// not wrap (e.g. `count_users` for the setup-code bootstrap).
+    auth_store: Arc<LibsqlAuthStore>,
+    /// Resolved at startup from `server.auth` + the actually-bound address
+    /// (`daemon::resolve_auth_mode`).
+    auth_mode: AuthMode,
+    /// blake3 hash of the one-time setup code, when one was generated at
+    /// startup (`auth::generate_setup_code_if_needed`). T4's `/authorize`
+    /// redeems it; nothing consumes it in T3.
+    setup_code_hash: RwLock<Option<String>>,
     default_indexing_policy: IndexingPolicyConfig,
     default_policy_version: String,
     job_queue: JobQueue,
@@ -64,6 +85,7 @@ impl AppState {
         data_dir: PathBuf,
         job_queue: JobQueue,
         url_scheduler: UrlRefreshScheduler,
+        auth_mode: AuthMode,
     ) -> Result<Self, Error> {
         let embedding_policy = &yaml_config.defaults.indexing.embedding;
         let providers = &yaml_config.providers;
@@ -75,15 +97,24 @@ impl AppState {
             })?;
         let db_path = data_dir.join("localdb.db");
         let config = StoreBackendConfig::local_path(db_path, dim, encoding);
-        let backend = Arc::new(SqliteBackend::open(config).await?) as Arc<dyn StoreBackend>;
+        let backend = Arc::new(SqliteBackend::open(config).await?);
+        // Auth shares the unified database connection (persistent on disk),
+        // so the daemon and the break-glass CLI see the same users/keys.
+        let auth_store = Arc::new(backend.auth_store());
+        let auth = Arc::new(ServerAuthService::new(auth_store.clone()));
+        let backend = backend as Arc<dyn StoreBackend>;
         let default_indexing_policy = yaml_config.defaults.indexing.clone();
         let default_policy_version = compute_policy_version(&default_indexing_policy);
 
         Ok(Self {
             inner: Arc::new(Inner {
-                yaml_config: RwLock::new(yaml_config),
+                yaml_config,
                 data_dir,
                 backend,
+                auth,
+                auth_store,
+                auth_mode,
+                setup_code_hash: RwLock::new(None),
                 default_indexing_policy,
                 default_policy_version,
                 job_queue,
@@ -133,15 +164,48 @@ impl AppState {
         Ok(EffectiveConfig { stores })
     }
 
-    /// Get the current YAML config snapshot.
-    pub async fn yaml_config(&self) -> RawConfig {
-        self.inner.yaml_config.read().await.clone()
+    /// The YAML config as loaded at startup. There is no hot-reload
+    /// (specs/03-config.md §5): this reflects startup state for the process
+    /// lifetime.
+    pub fn yaml_config(&self) -> &RawConfig {
+        &self.inner.yaml_config
     }
 
-    /// Reload the YAML config snapshot (called by the file watcher).
-    pub async fn reload_yaml_config(&self, new_config: RawConfig) {
-        let mut yaml = self.inner.yaml_config.write().await;
-        *yaml = new_config;
+    /// The auth policy service, backed by the same persistent unified
+    /// database as `backend()`.
+    pub fn auth(&self) -> &Arc<ServerAuthService> {
+        &self.inner.auth
+    }
+
+    /// The raw `AuthStore` behind `auth()` (setup-code bootstrap, tests).
+    pub fn auth_store(&self) -> &Arc<LibsqlAuthStore> {
+        &self.inner.auth_store
+    }
+
+    /// The auth enforcement mode resolved at startup.
+    pub fn auth_mode(&self) -> AuthMode {
+        self.inner.auth_mode
+    }
+
+    /// Record the blake3 hash of the one-time setup code (D3b). Called once
+    /// at startup by `auth::generate_setup_code_if_needed`.
+    pub fn set_setup_code_hash(&self, hash: String) {
+        *self
+            .inner
+            .setup_code_hash
+            .write()
+            .expect("setup_code_hash lock poisoned") = Some(hash);
+    }
+
+    /// The held setup-code hash, if a code was generated at startup. This is
+    /// the T4 seam: `/authorize` verifies a presented code against this hash
+    /// to bootstrap the first admin user.
+    pub fn setup_code_hash(&self) -> Option<String> {
+        self.inner
+            .setup_code_hash
+            .read()
+            .expect("setup_code_hash lock poisoned")
+            .clone()
     }
 
     /// Add a runtime-owned store.
@@ -462,6 +526,7 @@ mod tests {
             dir.path().to_path_buf(),
             queue.clone(),
             UrlRefreshScheduler::new(queue),
+            AuthMode::Open,
         )
         .await
         .unwrap();

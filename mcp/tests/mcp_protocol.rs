@@ -122,6 +122,7 @@ fn make_handler_with_one_store() -> McpHandler {
         std::sync::Arc::new(StaticStoreProvider::new(vec![available])),
         embedder,
         false,
+        Some(localdb_core::auth::Principal::local_trust()),
     )
 }
 
@@ -172,6 +173,7 @@ async fn make_handler_with_seeded_store() -> (McpHandler, String, String) {
         std::sync::Arc::new(StaticStoreProvider::new(vec![available])),
         embedder,
         false,
+        Some(localdb_core::auth::Principal::local_trust()),
     );
     (handler, doc_id, cid)
 }
@@ -236,6 +238,7 @@ async fn make_handler_with_multichunk_doc() -> (McpHandler, String) {
         std::sync::Arc::new(StaticStoreProvider::new(vec![available])),
         embedder,
         false,
+        Some(localdb_core::auth::Principal::local_trust()),
     );
     (handler, doc_id)
 }
@@ -297,6 +300,7 @@ async fn make_handler_with_tied_chunks(reversed: bool) -> (McpHandler, String) {
         std::sync::Arc::new(StaticStoreProvider::new(vec![available])),
         embedder,
         false,
+        Some(localdb_core::auth::Principal::local_trust()),
     );
     (handler, doc_id)
 }
@@ -408,6 +412,7 @@ async fn test_list_stores_empty() {
         std::sync::Arc::new(StaticStoreProvider::new(vec![])),
         embedder,
         false,
+        Some(localdb_core::auth::Principal::local_trust()),
     );
     let client = client_for(handler).await;
 
@@ -546,6 +551,7 @@ collector, which keeps runtime performance predictable and fast.";
         std::sync::Arc::new(StaticStoreProvider::new(vec![available])),
         embedder,
         false,
+        Some(localdb_core::auth::Principal::local_trust()),
     );
     let client = client_for(handler).await;
 
@@ -697,6 +703,7 @@ async fn test_search_limit_respected() {
         std::sync::Arc::new(StaticStoreProvider::new(vec![available])),
         embedder,
         false,
+        Some(localdb_core::auth::Principal::local_trust()),
     );
     let client = client_for(handler).await;
 

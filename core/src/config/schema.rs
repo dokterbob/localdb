@@ -54,6 +54,22 @@ pub struct ServerConfig {
     /// Port to listen on.
     #[serde(default = "default_port")]
     pub port: u16,
+
+    /// Auth enforcement mode (specs/03-config.md §1, specs/05-surfaces.md §3):
+    /// `auto` (default) enforces auth iff the daemon's actually-bound address
+    /// is non-loopback; `required` always enforces; `off` never enforces and
+    /// is a hard startup error (`invalid_config`) combined with a
+    /// non-loopback bind.
+    #[serde(default)]
+    pub auth: ServerAuthMode,
+
+    /// Optional client-reachable public base URL (specs/03-config.md §1).
+    /// Only meaningful behind a TLS-terminating reverse proxy; used as the
+    /// OAuth issuer/resource identifier in the `.well-known` responses once
+    /// discovery lands (T7). Stored and surfaced via `GET /v1/config`, but
+    /// otherwise unused in T3.
+    #[serde(default)]
+    pub public_url: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -61,8 +77,25 @@ impl Default for ServerConfig {
         Self {
             bind: default_bind(),
             port: default_port(),
+            auth: ServerAuthMode::default(),
+            public_url: None,
         }
     }
+}
+
+/// `server.auth` values (specs/05-surfaces.md §3). Unknown values are
+/// rejected at parse time like any other invalid enum content, consistent
+/// with the strict unknown-key policy (specs/03-config.md §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServerAuthMode {
+    /// Enforce auth iff the actually-bound address is non-loopback.
+    #[default]
+    Auto,
+    /// Always enforce auth, including on loopback binds.
+    Required,
+    /// Never enforce auth; refuse to start on a non-loopback bind.
+    Off,
 }
 
 fn default_bind() -> String {
@@ -261,6 +294,44 @@ mod tests {
         let s = ServerConfig::default();
         assert_eq!(s.bind, "127.0.0.1");
         assert_eq!(s.port, 7700);
+        assert_eq!(s.auth, ServerAuthMode::Auto);
+        assert_eq!(s.public_url, None);
+    }
+
+    #[test]
+    fn server_auth_mode_parses_all_values() {
+        for (yaml_value, expected) in [
+            ("auto", ServerAuthMode::Auto),
+            ("required", ServerAuthMode::Required),
+            ("off", ServerAuthMode::Off),
+        ] {
+            let yaml = format!("version: 1\nserver:\n  auth: {yaml_value}\n");
+            let cfg: RawConfig = serde_yaml::from_str(&yaml).unwrap();
+            assert_eq!(cfg.server.auth, expected, "auth: {yaml_value}");
+        }
+    }
+
+    #[test]
+    fn server_auth_mode_defaults_to_auto_when_absent() {
+        let cfg: RawConfig = serde_yaml::from_str("version: 1\n").unwrap();
+        assert_eq!(cfg.server.auth, ServerAuthMode::Auto);
+    }
+
+    #[test]
+    fn server_auth_mode_rejects_unknown_value() {
+        let yaml = "version: 1\nserver:\n  auth: sometimes\n";
+        let result: Result<RawConfig, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_err(), "unknown auth mode should be rejected");
+    }
+
+    #[test]
+    fn server_public_url_parses() {
+        let yaml = "version: 1\nserver:\n  public_url: https://localdb.example.com\n";
+        let cfg: RawConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            cfg.server.public_url.as_deref(),
+            Some("https://localdb.example.com")
+        );
     }
 
     /// This list is duplicated in `extract::registry::default_parser_ids`

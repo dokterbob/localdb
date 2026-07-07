@@ -185,6 +185,7 @@ async fn mcp_route_reports_provider_errors_as_tool_errors_and_stays_up() {
         dir.path().to_path_buf(),
         queue.clone(),
         server::UrlRefreshScheduler::new(queue),
+        server::AuthMode::Open,
     )
     .await
     .expect("state should construct over a temp libsql database");
@@ -234,6 +235,97 @@ async fn mcp_route_reports_provider_errors_as_tool_errors_and_stays_up() {
     assert_eq!(second.is_error, Some(true));
 
     let _ = client.cancel().await;
+    server_task.abort();
+}
+
+/// R4 (the critical propagation pin): with auth **enforced**, the axum
+/// `require_auth` middleware authenticates the bearer token and inserts the
+/// resulting `Principal` into the request extensions; rmcp's Streamable
+/// HTTP transport then injects the remaining `http::request::Parts` into
+/// the tool call's `RequestContext.extensions`, where `McpHandler` reads
+/// the `Principal` back out (`Parts.extensions`). Under enforced mode the
+/// handler is constructed with `default_principal = None`, so this call
+/// succeeding end-to-end proves the extension genuinely propagated — if it
+/// hadn't, the handler would fail closed with an `unauthorized` tool error,
+/// and if the middleware hadn't run at all the request would 401 before
+/// rmcp ever saw it.
+#[tokio::test]
+async fn enforced_mcp_propagates_principal_from_middleware_into_tool_handler() {
+    let (_dir, state, app) = common::make_enforced_app().await;
+
+    // Seed an admin + API key through the same persistent AuthService the
+    // router's middleware consults.
+    let user = state
+        .auth()
+        .create_user("mcp-admin", localdb_core::auth::Role::Admin)
+        .await
+        .expect("seed admin");
+    let secret = state
+        .auth()
+        .issue_api_key(&user.id)
+        .await
+        .expect("mint api key")
+        .secret;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("binding a loopback listener should succeed");
+    let addr = listener.local_addr().expect("listener has a local addr");
+    let server_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    // rmcp's client transport sends `Authorization: Bearer <auth_header>`
+    // on every request (initialize, tool calls, SSE stream alike).
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"))
+            .auth_header(secret),
+    );
+    let client = ClientInfo::default()
+        .serve(transport)
+        .await
+        .expect("authenticated client should complete the MCP initialize handshake");
+
+    let result = client
+        .call_tool(CallToolRequestParams::new("list_stores"))
+        .await
+        .expect("authenticated call_tool should succeed at the protocol level");
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "admin principal must reach the tool handler through rmcp's extension \
+         propagation — a tool-level error here means the Principal was lost \
+         (fail-closed path fired): {result:?}"
+    );
+
+    let _ = client.cancel().await;
+    server_task.abort();
+}
+
+/// The counterpart: without a bearer token the middleware rejects the
+/// request before rmcp sees it, so the MCP initialize handshake itself
+/// fails — an unauthenticated client cannot even open a session.
+#[tokio::test]
+async fn enforced_mcp_rejects_unauthenticated_client_at_handshake() {
+    let (_dir, _state, app) = common::make_enforced_app().await;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("binding a loopback listener should succeed");
+    let addr = listener.local_addr().expect("listener has a local addr");
+    let server_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp")),
+    );
+    let handshake = ClientInfo::default().serve(transport).await;
+    assert!(
+        handshake.is_err(),
+        "initialize without a bearer token must fail against an enforcing daemon"
+    );
+
     server_task.abort();
 }
 

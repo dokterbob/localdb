@@ -54,7 +54,7 @@ impl SearchService {
             }
         }
 
-        let yaml = self.state.yaml_config().await;
+        let yaml = self.state.yaml_config();
         let embed_policy = &yaml.defaults.indexing.embedding;
 
         let embedder: Box<dyn localdb_core::Embedder> =

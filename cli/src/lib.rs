@@ -7,10 +7,12 @@
 pub mod progress;
 
 mod app_db;
+mod credentials;
 mod daemon_client;
 mod normalize;
 
 mod cmds {
+    pub(crate) mod auth;
     pub(crate) mod index;
     pub(crate) mod init;
     pub(crate) mod search;
@@ -21,6 +23,7 @@ mod cmds {
 }
 
 pub use app_db::AppDb;
+pub use cmds::auth::{run_key_create, run_user_add};
 pub use cmds::index::run_index;
 pub use cmds::init::run_init;
 pub use cmds::search::run_search;
@@ -46,6 +49,7 @@ mod tests {
             yes: false,
             daemon_url: None,
             config_env: None,
+            api_key: None,
         };
         assert!(!ctx.json);
     }

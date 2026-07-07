@@ -79,7 +79,12 @@ async fn start_upstream_daemon() -> (String, String) {
     // exercises proxy forwarding, not the allowlist itself, and connects
     // over a real loopback socket regardless.
     let provider = Arc::new(StaticStoreProvider::new(vec![available]));
-    let service = mcp::build_streamable_http_service(provider, embedder, vec![]);
+    let service = mcp::build_streamable_http_service(
+        provider,
+        embedder,
+        vec![],
+        Some(localdb_core::auth::Principal::local_trust()),
+    );
     let app = Router::new().nest_service("/mcp", service);
 
     let listener = TcpListener::bind("127.0.0.1:0")

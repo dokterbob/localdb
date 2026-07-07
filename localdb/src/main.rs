@@ -110,6 +110,40 @@ pub enum Command {
         #[arg(long)]
         refresh: Option<String>,
     },
+
+    /// Manage user accounts (break-glass: writes the database directly;
+    /// refuses to run while a daemon is up).
+    #[command(subcommand)]
+    User(UserCommand),
+
+    /// Manage API keys (break-glass: writes the database directly; refuses
+    /// to run while a daemon is up).
+    #[command(subcommand)]
+    Key(KeyCommand),
+}
+
+/// User management subcommands (specs/05-surfaces.md §2; T3 ships only `add`).
+#[derive(Debug, Subcommand)]
+pub enum UserCommand {
+    /// Create a user account.
+    Add {
+        /// User name (unique).
+        name: String,
+        /// Create the user with the admin role (default: member).
+        #[arg(long)]
+        admin: bool,
+    },
+}
+
+/// API key management subcommands (specs/05-surfaces.md §2; T3 ships only `create`).
+#[derive(Debug, Subcommand)]
+pub enum KeyCommand {
+    /// Mint an API key for a user. The secret is shown exactly once.
+    Create {
+        /// The user name to mint the key for.
+        #[arg(long)]
+        user: String,
+    },
 }
 
 /// Store management subcommands.
@@ -180,6 +214,9 @@ fn main() {
         config_env: std::env::var("LOCALDB_CONFIG")
             .ok()
             .map(std::path::PathBuf::from),
+        api_key: std::env::var("LOCALDB_API_KEY")
+            .ok()
+            .filter(|s| !s.is_empty()),
     };
 
     match &cli.command {
@@ -218,6 +255,12 @@ fn main() {
                 cli::run_source_add(&ctx, source, refresh.as_deref());
             }
         }
+        Command::User(cmd) => match cmd {
+            UserCommand::Add { name, admin } => cli::run_user_add(&ctx, name, *admin),
+        },
+        Command::Key(cmd) => match cmd {
+            KeyCommand::Create { user } => cli::run_key_create(&ctx, user),
+        },
     }
 }
 

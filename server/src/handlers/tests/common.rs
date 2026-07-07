@@ -35,6 +35,7 @@ pub(crate) async fn make_app() -> (TempDir, Router) {
         dir.path().to_path_buf(),
         queue.clone(),
         crate::scheduler::UrlRefreshScheduler::new(queue),
+        crate::auth::AuthMode::Open,
     )
     .await
     .unwrap();
@@ -90,6 +91,7 @@ pub(crate) async fn make_state_with_fake_config() -> (TempDir, AppState) {
         dir.path().to_path_buf(),
         queue.clone(),
         crate::scheduler::UrlRefreshScheduler::new(queue),
+        crate::auth::AuthMode::Open,
     )
     .await
     .unwrap();

@@ -94,15 +94,25 @@ pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
                  the daemon's full store set will be used instead"
             );
         }
-        // Connect and serve are separate calls (`ProxyHandler::connect` then
-        // `mcp::serve_proxied_stdio`, rather than one moded entrypoint) so a
+        // Attach the caller's bearer credential (LOCALDB_API_KEY, else
+        // credentials.json keyed by the daemon base URL — specs/03-config.md
+        // §6) so proxied stdio MCP works against an auth-enforcing daemon.
+        // `None` (no credential available) is fine against an open-mode
+        // daemon; an enforcing daemon answers 401 and the handshake fails.
+        let bearer = crate::credentials::resolve_bearer(
+            ctx.api_key.as_deref(),
+            Some(&config_loader.paths.config_file),
+            &base_url,
+        );
+        // Connect and serve are separate calls (`ProxyHandler::connect_with_auth`
+        // then `mcp::serve_proxied_stdio`, rather than one moded entrypoint) so a
         // failure to reach the daemon at all — it went away between
         // `probe_daemon` and here, or `LOCALDB_DAEMON_URL` points at a stale
         // endpoint — maps to the same `daemon_unreachable`/exit-5 outcome as
         // every other daemon-backed CLI path, instead of `internal`/exit-1.
         // Only a failure in the stdio loop *after* a successful proxy
         // connection (a much rarer case) still falls back to `internal`.
-        let handler = match ProxyHandler::connect(&base_url).await {
+        let handler = match ProxyHandler::connect_with_auth(&base_url, bearer).await {
             Ok(handler) => handler,
             Err(_) => {
                 exit_err(&Error::DaemonUnreachable, ctx.json);
@@ -142,7 +152,15 @@ pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
         crate::app_db::AppDbStoreProvider::new(std::sync::Arc::new(db), ctx.stores.clone()),
     );
 
-    let handler = McpHandler::new(provider, std::sync::Arc::from(embedder), allow_write);
+    // Embedded stdio MCP stays unauthenticated (D8, specs/05-surfaces.md §4):
+    // the caller is already trusted as local-files-equivalent, so every tool
+    // call runs as the local-trust principal.
+    let handler = McpHandler::new(
+        provider,
+        std::sync::Arc::from(embedder),
+        allow_write,
+        Some(localdb_core::auth::Principal::local_trust()),
+    );
 
     if let Err(e) = mcp::serve_embedded_stdio(handler).await {
         exit_err(

@@ -28,7 +28,7 @@ pub(crate) async fn run_store_add_async(ctx: &CliContext, name: &str) {
     if let DaemonState::Running { base_url } = probe_daemon(data_dir, ctx.daemon_url.as_deref()) {
         let url = format!("{}/v1/stores", base_url);
         let body = json!({ "name": name, "visibility": "private", "backend": "libsql" });
-        match daemon_request_async(reqwest::Method::POST, &url, Some(body)).await {
+        match daemon_request_async(ctx, reqwest::Method::POST, &url, Some(body)).await {
             Ok(v) => {
                 if ctx.json {
                     print_json(&v);
@@ -133,7 +133,7 @@ pub(crate) async fn run_store_remove_async(ctx: &CliContext, name: &str) {
     // Per specs/05-surfaces.md §2: route to daemon when running.
     if let DaemonState::Running { base_url } = probe_daemon(data_dir, ctx.daemon_url.as_deref()) {
         let url = format!("{}/v1/stores/{}", base_url, name);
-        match daemon_request_async(reqwest::Method::DELETE, &url, None).await {
+        match daemon_request_async(ctx, reqwest::Method::DELETE, &url, None).await {
             Ok(v) => {
                 if ctx.json {
                     print_json(&v);

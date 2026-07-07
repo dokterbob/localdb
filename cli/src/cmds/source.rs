@@ -60,7 +60,7 @@ pub(crate) async fn run_source_add_async(
             "preset": "prose",
             "refresh": refresh,
         });
-        match daemon_request_async(reqwest::Method::POST, &url_str, Some(body)).await {
+        match daemon_request_async(ctx, reqwest::Method::POST, &url_str, Some(body)).await {
             Ok(v) => {
                 if ctx.json {
                     print_json(&v);
@@ -172,6 +172,7 @@ pub(crate) async fn run_source_add_async(
             yes: false,
             daemon_url: ctx.daemon_url.clone(),
             config_env: ctx.config_env.clone(),
+            api_key: ctx.api_key.clone(),
         };
         if let Err(e) = run_embedded_index(
             &index_ctx,
@@ -295,7 +296,7 @@ pub(crate) async fn run_source_remove_async(ctx: &CliContext, id: &str) {
     if let DaemonState::Running { base_url } = probe_daemon(data_dir, ctx.daemon_url.as_deref()) {
         // Route is DELETE /v1/sources/{id} (see server/src/daemon.rs build_router).
         let url = format!("{}/v1/sources/{}", base_url, id);
-        match daemon_request_async(reqwest::Method::DELETE, &url, None).await {
+        match daemon_request_async(ctx, reqwest::Method::DELETE, &url, None).await {
             Ok(v) => {
                 if ctx.json {
                     print_json(&v);

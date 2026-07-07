@@ -17,6 +17,10 @@ pub struct CliContext {
     pub daemon_url: Option<String>,
     /// Config file path from `LOCALDB_CONFIG` env var, read once at startup.
     pub config_env: Option<PathBuf>,
+    /// Bearer secret from `LOCALDB_API_KEY`, read once at startup. Overrides
+    /// any `credentials.json` entry for daemon-attached requests
+    /// (specs/03-config.md §6).
+    pub api_key: Option<String>,
 }
 
 /// Result of probing the daemon socket.
@@ -132,7 +136,39 @@ pub fn probe_daemon(data_dir: &Path, daemon_url_override: Option<&str>) -> Daemo
 // writing directly to the embedded store. This thin client issues the
 // appropriate HTTP requests and maps responses to exit codes.
 
+/// The `credentials.json` key for a request URL: its origin
+/// (`scheme://host[:port]`), matching the base URLs `probe_daemon` hands
+/// out (which always carry an explicit port). The port is preserved exactly
+/// as written rather than normalized to a scheme default, so the key
+/// round-trips byte-for-byte with what the daemon recorded in `daemon.url`.
+fn base_url_of(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    let scheme = parsed.scheme();
+    Some(match parsed.port() {
+        Some(port) => format!("{scheme}://{host}:{port}"),
+        None => format!("{scheme}://{host}"),
+    })
+}
+
+/// Resolve the bearer secret for a daemon request per specs/03-config.md §6:
+/// `LOCALDB_API_KEY` (read once into `ctx.api_key`) wins; otherwise the
+/// `credentials.json` next to the resolved config file, keyed by the
+/// request's base URL. `None` sends the request without an Authorization
+/// header (fine against an open-mode daemon).
+fn bearer_for_request(ctx: &CliContext, url: &str) -> Option<String> {
+    let base_url = base_url_of(url)?;
+    let options = localdb_core::config::loader::LoadOptions {
+        config_path: ctx.config.clone(),
+        ..Default::default()
+    };
+    let config_file =
+        localdb_core::config::loader::resolve_config_path(&options, ctx.config_env.as_deref()).ok();
+    crate::credentials::resolve_bearer(ctx.api_key.as_deref(), config_file.as_deref(), &base_url)
+}
+
 pub(crate) async fn daemon_request_async(
+    ctx: &CliContext,
     method: reqwest::Method,
     url: &str,
     body: Option<serde_json::Value>,
@@ -146,6 +182,9 @@ pub(crate) async fn daemon_request_async(
         })?;
 
     let mut req = client.request(method, url);
+    if let Some(secret) = bearer_for_request(ctx, url) {
+        req = req.bearer_auth(secret);
+    }
     if let Some(b) = body {
         req = req.json(&b);
     }
@@ -197,6 +236,30 @@ pub(crate) async fn daemon_request_async(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn base_url_of_extracts_origin_with_port() {
+        assert_eq!(
+            base_url_of("http://127.0.0.1:7700/v1/stores").as_deref(),
+            Some("http://127.0.0.1:7700")
+        );
+    }
+
+    #[test]
+    fn base_url_of_preserves_bracketed_ipv6() {
+        assert_eq!(
+            base_url_of("http://[::1]:7700/v1/status").as_deref(),
+            Some("http://[::1]:7700")
+        );
+    }
+
+    #[test]
+    fn base_url_of_without_port() {
+        assert_eq!(
+            base_url_of("https://daemon.example.com/v1/search").as_deref(),
+            Some("https://daemon.example.com")
+        );
+    }
 
     #[test]
     fn probe_not_running_without_socket() {

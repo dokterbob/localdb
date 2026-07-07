@@ -23,9 +23,6 @@ tracing = { workspace = true }
 # Use notify v6 since notify-debouncer-mini 0.4 depends on notify 6
 notify-debouncer-mini = "0.4"
 
-# YAML parsing for config reload
-serde_yaml = { workspace = true }
-
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }

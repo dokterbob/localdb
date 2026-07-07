@@ -17,12 +17,14 @@
 //!   POST /jobs                    — submit index job
 //!   GET  /jobs/:id                — get job by ID
 //!   GET  /status                  — daemon status
-//!   GET  /config                  — resolved config
+//!   GET  /config                  — resolved config (startup snapshot; no hot-reload)
+//!   GET  /auth/me                 — the caller's authenticated principal
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
 
+mod auth;
 mod config;
 mod documents;
 mod jobs;
@@ -31,6 +33,7 @@ mod sources;
 mod status;
 mod stores;
 
+pub use auth::get_me;
 pub use config::get_config;
 pub use documents::get_document;
 pub use jobs::{create_job, get_job};

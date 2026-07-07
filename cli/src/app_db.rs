@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use localdb_core::auth::AuthService;
 use localdb_core::{
     config::{
         loader::{
@@ -16,12 +17,17 @@ use localdb_core::{
     Error, StoreBackend, StoreBackendConfig, StoreRow,
 };
 use mcp::{AvailableStore, StoreDescriptor, StoreProvider};
-use store_libsql::SqliteBackend;
+use store_libsql::{LibsqlAuthStore, SqliteBackend};
 
 use crate::{daemon_client::CliContext, normalize::exit_err, normalize::visibility_to_string};
 
 pub struct AppDb {
     backend: Arc<dyn StoreBackend>,
+    /// Auth tables live in the same unified database file
+    /// (`<data_dir>/localdb.db`) as everything else — this handle shares
+    /// `backend`'s connection. Used by the break-glass `localdb user`/`key`
+    /// commands (specs/05-surfaces.md §2).
+    auth_store: Arc<LibsqlAuthStore>,
     default_indexing_policy: IndexingPolicyConfig,
     default_policy_version: String,
 }
@@ -40,10 +46,13 @@ impl AppDb {
                 }
             })?;
         let config = StoreBackendConfig::local_path(paths.db_path(), dim, encoding);
-        let backend = Arc::new(SqliteBackend::open(config).await?) as Arc<dyn StoreBackend>;
+        let backend = Arc::new(SqliteBackend::open(config).await?);
+        let auth_store = Arc::new(backend.auth_store());
+        let backend = backend as Arc<dyn StoreBackend>;
         let default_policy_version = compute_policy_version(&default_indexing_policy);
         Ok(Self {
             backend,
+            auth_store,
             default_indexing_policy,
             default_policy_version,
         })
@@ -55,6 +64,18 @@ impl AppDb {
 
     pub fn backend_arc(&self) -> Arc<dyn StoreBackend> {
         self.backend.clone()
+    }
+
+    /// The libsql `AuthStore` over this database (break-glass user/key
+    /// management; direct queries like `get_user_by_name`).
+    pub fn auth_store(&self) -> &Arc<LibsqlAuthStore> {
+        &self.auth_store
+    }
+
+    /// An `AuthService` (core policy layer) over this database's auth
+    /// tables. Cheap to construct — it only clones the shared store handle.
+    pub fn auth_service(&self) -> AuthService<LibsqlAuthStore> {
+        AuthService::new(self.auth_store.clone())
     }
 
     pub fn default_indexing_policy(&self) -> &IndexingPolicyConfig {

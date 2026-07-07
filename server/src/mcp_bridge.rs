@@ -70,8 +70,8 @@ impl StoreProvider for AppStateStoreProvider {
 /// can never be a reason for `start_daemon` to fail or block; any embedder
 /// misconfiguration instead surfaces as a normal tool-level error on the
 /// first `search` call that actually needs to embed a query.
-pub async fn build_mcp_embedder(state: &AppState) -> Arc<dyn Embedder> {
-    let yaml = state.yaml_config().await;
+pub fn build_mcp_embedder(state: &AppState) -> Arc<dyn Embedder> {
+    let yaml = state.yaml_config();
     // Server has no `models_dir` override the way the CLI does (see
     // `run_mcp_async`) — mirrors `search_service.rs`'s `create_embedder` call.
     Arc::new(LazyEmbedder::new(
@@ -163,6 +163,7 @@ mod tests {
             dir.path().to_path_buf(),
             queue.clone(),
             UrlRefreshScheduler::new(queue),
+            crate::auth::AuthMode::Open,
         )
         .await
         .unwrap();
@@ -205,7 +206,7 @@ mod tests {
             .available_stores()
             .await
             .unwrap();
-        let embedder = build_mcp_embedder(&state).await;
+        let embedder = build_mcp_embedder(&state);
 
         assert!(stores.is_empty());
         assert_eq!(embedder.model_id(), "uninitialized");
@@ -237,7 +238,7 @@ mod tests {
             .available_stores()
             .await
             .unwrap();
-        let embedder = build_mcp_embedder(&state).await;
+        let embedder = build_mcp_embedder(&state);
 
         assert_eq!(stores.len(), 1);
         assert_eq!(stores[0].descriptor.name, "notes");
