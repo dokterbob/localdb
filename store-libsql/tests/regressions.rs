@@ -7,7 +7,7 @@
 
 use tempfile::tempdir;
 
-use localdb_core::parser::DocumentMetadata;
+use localdb_core::metadata::Metadata;
 use localdb_core::store::ChunkRecord;
 use localdb_core::types::{SourceKind, Span, StoreVisibility};
 use localdb_core::{SourceRow, StoreBackend, StoreBackendConfig, StoreRow, VectorEncoding};
@@ -81,7 +81,7 @@ fn make_chunk(id: &str, doc_id: &str, store_id: &str, embedding: Vec<f32>) -> Ch
         ingestor_kind: "path".to_string(),
         mime: Some("text/plain".to_string()),
         uri: format!("file:///data/{store_id}/{doc_id}.md"),
-        metadata: DocumentMetadata::default(),
+        metadata: Metadata::default(),
         block_seq: 0,
         seq_in_block: 0,
         block_kind: None,

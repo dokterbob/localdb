@@ -28,12 +28,16 @@ async fn get_document_not_found_returns_404() {
 #[tokio::test]
 async fn get_document_returns_record_when_indexed() {
     let (_dir, state) = make_state_with_fake_config().await;
-    let metadata = localdb_core::parser::DocumentMetadata {
-        title: Some("Test Doc".to_string()),
-        creator: vec!["Test Author".to_string()],
-        date: Some("2026-06-10".to_string()),
-        ..Default::default()
-    };
+    let metadata =
+        localdb_core::metadata::Metadata::Document(localdb_core::metadata::DocumentMetadata {
+            dublin_core: localdb_core::metadata::DublinCoreMetadata {
+                title: Some("Test Doc".to_string()),
+                creator: vec!["Test Author".to_string()],
+                date: Some("2026-06-10".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
     seed_store_a_chunk(
         &state,
         SeedChunkInput {

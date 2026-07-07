@@ -101,7 +101,7 @@ pub(crate) struct SeedChunkInput {
     pub(crate) doc_id: &'static str,
     pub(crate) text: &'static str,
     pub(crate) uri: &'static str,
-    pub(crate) metadata: localdb_core::DocumentMetadata,
+    pub(crate) metadata: localdb_core::metadata::Metadata,
 }
 
 pub(crate) async fn seed_store_a_chunk(state: &AppState, input: SeedChunkInput) {

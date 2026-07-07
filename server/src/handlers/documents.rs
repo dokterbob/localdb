@@ -4,7 +4,7 @@ use axum::{
 };
 use serde::Serialize;
 
-use localdb_core::parser::DocumentMetadata;
+use localdb_core::metadata::Metadata;
 use localdb_core::Error as CoreError;
 
 use crate::error::ApiError;
@@ -21,7 +21,7 @@ pub struct DocumentRecord {
     pub content_hash: String,
     pub fetched_at: String,
     pub normalized_text: String,
-    pub metadata: DocumentMetadata,
+    pub metadata: Metadata,
 }
 
 pub async fn get_document(

@@ -75,7 +75,7 @@ async fn search_returns_citations_after_indexing() {
             doc_id: "doc-1",
             text: "hello world rust programming",
             uri: "file:///hello.md",
-            metadata: localdb_core::DocumentMetadata::default(),
+            metadata: localdb_core::metadata::Metadata::default(),
         },
     )
     .await;
@@ -115,7 +115,7 @@ async fn search_with_nonexistent_store_filter_returns_empty() {
             doc_id: "doc-ff",
             text: "hello world",
             uri: "file:///foreign.md",
-            metadata: localdb_core::DocumentMetadata::default(),
+            metadata: localdb_core::metadata::Metadata::default(),
         },
     )
     .await;

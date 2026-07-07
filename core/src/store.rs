@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use crate::ids::{ContentId, UlidId};
 use crate::ingestion::DocumentRecord;
-use crate::parser::DocumentMetadata;
+use crate::metadata::Metadata;
 use crate::types::{Chunk, Span};
 use crate::Error;
 
@@ -75,12 +75,14 @@ pub struct ChunkRecord {
     /// Document URI (e.g. `file:///path/to/file` or URL).
     pub uri: String,
 
-    /// Document metadata extracted from the document.
+    /// Resource metadata, tagged by resource kind.
     ///
-    /// Persisted as a JSON-encoded column. Read defensively: stores created
-    /// before this schema migration return `DocumentMetadata::default()` on read.
+    /// Persisted as a JSON-encoded column (`"kind":"document"|"conversation"|"transcription"`
+    /// plus the flattened Dublin Core fields). Read defensively: rows written
+    /// before this schema migration (untagged, flat Dublin Core JSON) fall
+    /// back to `Metadata::default()` on read rather than erroring.
     #[serde(default)]
-    pub metadata: DocumentMetadata,
+    pub metadata: Metadata,
 
     /// Block sequence number (populated from ChunkOutput.block_seq).
     #[serde(default)]
@@ -105,7 +107,7 @@ impl ChunkRecord {
         embedding: Vec<f32>,
         uri: String,
         mime: Option<String>,
-        metadata: DocumentMetadata,
+        metadata: Metadata,
     ) -> Self {
         Self {
             id: chunk.id.clone(),
@@ -563,7 +565,7 @@ pub mod conformance {
             ingestor_kind: "path".to_string(),
             mime: Some("text/plain".to_string()),
             uri: "file:///test.md".to_string(),
-            metadata: crate::parser::DocumentMetadata::default(),
+            metadata: crate::metadata::Metadata::default(),
             block_seq: 0,
             seq_in_block: 0,
             block_kind: None,
@@ -1009,7 +1011,7 @@ mod tests {
             ingestor_kind: "path".to_string(),
             mime: Some("text/plain".to_string()),
             uri: "file:///test.md".to_string(),
-            metadata: crate::parser::DocumentMetadata::default(),
+            metadata: crate::metadata::Metadata::default(),
             block_seq: 0,
             seq_in_block: 0,
             block_kind: None,
@@ -1176,7 +1178,7 @@ mod tests {
             vec![0.1, 0.2, 0.3],
             "file:///test.md".to_string(),
             Some("text/markdown".to_string()),
-            crate::parser::DocumentMetadata::default(),
+            crate::metadata::Metadata::default(),
         );
 
         assert_eq!(record.id, "chunk-id");

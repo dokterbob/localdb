@@ -19,7 +19,8 @@ pub mod registry;
 
 // Re-export chain types for consumers that wire ExtractBridge.
 pub use chain_extractor::ChainExtractor;
-pub use localdb_core::parser::{ChainParser, DocumentMetadata, ParsedDocument, Parser, Probe};
+pub use localdb_core::metadata::DublinCoreMetadata;
+pub use localdb_core::parser::{ChainParser, ParsedDocument, Parser, Probe};
 pub use mime::sniff_mime;
 pub use registry::{build_chain, default_parser_ids};
 

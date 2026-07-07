@@ -4,7 +4,8 @@
 //! Place this **last** in the chain so that more specific parsers (Office, HTML,
 //! Markdown, PDF) get first pick.
 
-use localdb_core::parser::{DocumentMetadata, ParsedDocument, Parser, Probe};
+use localdb_core::metadata::DublinCoreMetadata;
+use localdb_core::parser::{ParsedDocument, Parser, Probe};
 use localdb_core::Error;
 
 /// Recognized extensions for the plaintext parser (prose text).
@@ -75,7 +76,7 @@ impl Parser for PlaintextParser {
 
         let (markdown, title) = crate::plaintext::extract_plaintext(text)?;
 
-        let mut dc = DocumentMetadata::default();
+        let mut dc = DublinCoreMetadata::default();
         if let Some(mime) = probe.sniffed_mime {
             dc.format = Some(mime.to_string());
         }

@@ -640,7 +640,7 @@ mod tests {
             ingestor_kind: "path".to_string(),
             mime: Some("text/plain".to_string()),
             uri: "file:///test.md".to_string(),
-            metadata: localdb_core::DocumentMetadata::default(),
+            metadata: localdb_core::metadata::Metadata::default(),
             block_seq: 0,
             seq_in_block: 0,
             block_kind: None,

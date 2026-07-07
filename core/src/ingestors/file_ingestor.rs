@@ -11,7 +11,7 @@ use crate::ids::resource_id;
 use crate::ingestion::{enumerate_path_source, now_rfc3339};
 use crate::ingestor::{IngestCallback, IngestResult, IngestSource, Ingestor};
 use crate::markdown_blocks::{compute_blocks_hash, markdown_to_blocks};
-use crate::metadata::{DocumentMetadata, DublinCoreMetadata, Metadata};
+use crate::metadata::{DocumentMetadata, Metadata};
 use crate::parser::{Parser, Probe};
 use crate::uri::Uri;
 
@@ -109,8 +109,7 @@ impl Ingestor for FileIngestor {
             let res_id = resource_id(&file.uri, &hash);
             let now = now_rfc3339();
 
-            // Convert parser::DocumentMetadata → metadata::DublinCoreMetadata
-            let dc = parser_meta_to_dc(&parsed.metadata);
+            let dc = parsed.metadata.clone();
             let title = parsed.title.clone().or_else(|| dc.title.clone());
 
             let resource = Resource {
@@ -149,27 +148,6 @@ impl Ingestor for FileIngestor {
         }
 
         Ok(result)
-    }
-}
-
-/// Convert `crate::parser::DocumentMetadata` to `crate::metadata::DublinCoreMetadata`.
-pub(crate) fn parser_meta_to_dc(meta: &crate::parser::DocumentMetadata) -> DublinCoreMetadata {
-    DublinCoreMetadata {
-        title: meta.title.clone(),
-        creator: meta.creator.clone(),
-        subject: meta.subject.clone(),
-        description: meta.description.clone(),
-        publisher: meta.publisher.clone(),
-        contributor: meta.contributor.clone(),
-        date: meta.date.clone(),
-        r#type: meta.r#type.clone(),
-        format: meta.format.clone(),
-        identifier: meta.identifier.clone(),
-        source: meta.source.clone(),
-        language: meta.language.clone(),
-        relation: meta.relation.clone(),
-        coverage: meta.coverage.clone(),
-        rights: meta.rights.clone(),
     }
 }
 
@@ -236,7 +214,7 @@ mod tests {
             Ok(Some(ParsedDocument {
                 markdown: text,
                 title: None,
-                metadata: crate::parser::DocumentMetadata::default(),
+                metadata: crate::metadata::DublinCoreMetadata::default(),
             }))
         }
     }

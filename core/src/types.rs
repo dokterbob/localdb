@@ -715,7 +715,7 @@ mod tests {
         let doc_id = resource_id("file:///docs/api.md", &content_hash("doc content"));
         let text = "This is a chunk of text.";
         let span = Span::new(0, text.len());
-        let id = chunk_id(&doc_id, text, span.start, span.end, 0);
+        let id = chunk_id(&doc_id, 0, text, 0);
 
         let chunk = Chunk {
             id,

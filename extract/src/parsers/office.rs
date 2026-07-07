@@ -5,7 +5,8 @@
 //! over 16 minutes in production for an 87K-row file; use CSV export instead).
 //! Tracking issue: <https://github.com/developer0hye/anytomd-rs/issues/94>
 
-use localdb_core::parser::{DocumentMetadata, ParsedDocument, Parser, Probe};
+use localdb_core::metadata::DublinCoreMetadata;
+use localdb_core::parser::{ParsedDocument, Parser, Probe};
 use localdb_core::Error;
 
 /// Handles office document formats via `anytomd`.
@@ -39,10 +40,10 @@ impl Parser for OfficeParser {
         })?;
 
         let title = result.title.clone();
-        let dc = DocumentMetadata {
+        let dc = DublinCoreMetadata {
             title: title.clone(),
             format: probe.sniffed_mime.map(|s| s.to_string()),
-            ..DocumentMetadata::default()
+            ..DublinCoreMetadata::default()
         };
 
         Ok(Some(ParsedDocument {

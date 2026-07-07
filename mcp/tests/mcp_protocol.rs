@@ -130,7 +130,7 @@ async fn make_handler_with_seeded_store() -> (McpHandler, String, String) {
     let doc_id = resource_id(uri, &doc_hash);
     let snippet = "Rust is a systems programming language focused on safety and performance.";
     let span = Span::new(0, snippet.len());
-    let cid = chunk_id(&doc_id, snippet, span.start, span.end, 0);
+    let cid = chunk_id(&doc_id, 0, snippet, 0);
 
     let record = ChunkRecord {
         id: cid.clone(),
@@ -148,7 +148,7 @@ async fn make_handler_with_seeded_store() -> (McpHandler, String, String) {
         ingestor_kind: "path".to_string(),
         mime: Some("text/markdown".to_string()),
         uri: uri.to_string(),
-        metadata: localdb_core::DocumentMetadata::default(),
+        metadata: localdb_core::metadata::Metadata::default(),
         block_seq: 0,
         seq_in_block: 0,
         block_kind: None,
@@ -181,7 +181,7 @@ async fn make_handler_with_multichunk_doc() -> (McpHandler, String) {
 
     let make_chunk = |text: &str, block_seq: u32, seq_in_block: u32, heading: &str| {
         let span = Span::new(0, text.len());
-        let cid = chunk_id(&doc_id, text, span.start, span.end, block_seq);
+        let cid = chunk_id(&doc_id, block_seq, text, seq_in_block);
         ChunkRecord {
             id: cid,
             resource_id: doc_id.clone(),
@@ -198,10 +198,15 @@ async fn make_handler_with_multichunk_doc() -> (McpHandler, String) {
             ingestor_kind: "path".to_string(),
             mime: Some("text/markdown".to_string()),
             uri: uri.to_string(),
-            metadata: localdb_core::DocumentMetadata {
-                title: Some("Multi-chunk Doc".to_string()),
-                ..Default::default()
-            },
+            metadata: localdb_core::metadata::Metadata::Document(
+                localdb_core::metadata::DocumentMetadata {
+                    dublin_core: localdb_core::metadata::DublinCoreMetadata {
+                        title: Some("Multi-chunk Doc".to_string()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
             block_seq,
             seq_in_block,
             block_kind: Some("paragraph".to_string()),
@@ -244,7 +249,7 @@ async fn make_handler_with_tied_chunks(reversed: bool) -> (McpHandler, String) {
     // Same span and (block_seq, seq_in_block) for both; only text (hence id) differs.
     let span = Span::new(0, 4);
     let make_chunk = |text: &str| {
-        let cid = chunk_id(&doc_id, text, span.start, span.end, 0);
+        let cid = chunk_id(&doc_id, 0, text, 0);
         ChunkRecord {
             id: cid,
             resource_id: doc_id.clone(),
@@ -261,7 +266,7 @@ async fn make_handler_with_tied_chunks(reversed: bool) -> (McpHandler, String) {
             ingestor_kind: "path".to_string(),
             mime: Some("text/markdown".to_string()),
             uri: uri.to_string(),
-            metadata: localdb_core::DocumentMetadata::default(),
+            metadata: localdb_core::metadata::Metadata::default(),
             block_seq: 0,
             seq_in_block: 0,
             block_kind: Some("paragraph".to_string()),
@@ -489,7 +494,7 @@ collector, which keeps runtime performance predictable and fast.";
     let doc_hash = content_hash(text);
     let doc_id_val = resource_id(uri, &doc_hash);
     let span = Span::new(0, text.len());
-    let cid = chunk_id(&doc_id_val, text, span.start, span.end, 0);
+    let cid = chunk_id(&doc_id_val, 0, text, 0);
 
     let record = ChunkRecord {
         id: cid,
@@ -507,7 +512,7 @@ collector, which keeps runtime performance predictable and fast.";
         ingestor_kind: "path".to_string(),
         mime: Some("text/markdown".to_string()),
         uri: uri.to_string(),
-        metadata: localdb_core::DocumentMetadata::default(),
+        metadata: localdb_core::metadata::Metadata::default(),
         block_seq: 0,
         seq_in_block: 0,
         block_kind: None,
@@ -635,7 +640,7 @@ async fn test_search_limit_respected() {
         let doc_hash = content_hash(&text);
         let doc_id_val = resource_id(&uri, &doc_hash);
         let span = Span::new(0, text.len());
-        let cid = chunk_id(&doc_id_val, &text, span.start, span.end, 0);
+        let cid = chunk_id(&doc_id_val, 0, &text, 0);
 
         records.push(ChunkRecord {
             id: cid,
@@ -653,7 +658,7 @@ async fn test_search_limit_respected() {
             ingestor_kind: "path".to_string(),
             mime: Some("text/markdown".to_string()),
             uri,
-            metadata: localdb_core::DocumentMetadata::default(),
+            metadata: localdb_core::metadata::Metadata::default(),
             block_seq: 0,
             seq_in_block: 0,
             block_kind: None,

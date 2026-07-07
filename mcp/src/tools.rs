@@ -291,8 +291,9 @@ pub fn render_citations_text(citations: &[Citation], max_chars: usize) -> String
             };
             let title = c.title.as_deref().unwrap_or("");
             let creator_date = {
-                let creator = c.metadata.creator.first().map(|s| s.as_str()).unwrap_or("");
-                let date = c.metadata.date.as_deref().unwrap_or("");
+                let dc = c.metadata.dublin_core();
+                let creator = dc.creator.first().map(|s| s.as_str()).unwrap_or("");
+                let date = dc.date.as_deref().unwrap_or("");
                 match (creator, date) {
                     ("", "") => String::new(),
                     (cr, "") => format!("\n   {cr}"),
@@ -407,7 +408,7 @@ fn document_json(store: &AvailableStore, chunks: &[localdb_core::ChunkRecord]) -
     serde_json::json!({
         "resource_id": first.resource_id,
         "uri": first.uri,
-        "title": first.metadata.title,
+        "title": first.metadata.title(),
         "store": {
             "id": store.descriptor.id,
             "name": store.descriptor.name,
@@ -567,7 +568,7 @@ fn chunks_json(
     serde_json::json!({
         "resource_id": first.resource_id,
         "uri": first.uri,
-        "title": first.metadata.title,
+        "title": first.metadata.title(),
         "store": {
             "id": store.descriptor.id,
             "name": store.descriptor.name,
@@ -586,7 +587,7 @@ mod get_document_tests {
 
     use super::*;
     use localdb_core::ids::{chunk_id, content_hash, new_ulid, resource_id};
-    use localdb_core::parser::DocumentMetadata;
+    use localdb_core::metadata::{DocumentMetadata, DublinCoreMetadata, Metadata};
     use localdb_core::store::{FakeStore, RetrievalStore};
     use localdb_core::{ChunkRecord, Span};
 
@@ -602,26 +603,29 @@ mod get_document_tests {
         let doc_uri = "file:///docs/guide.md";
         let doc_hash = content_hash("guide body");
         let doc_id = resource_id(doc_uri, &doc_hash);
-        let metadata = DocumentMetadata {
-            title: Some("Guide".to_string()),
-            creator: vec!["Ada".to_string()],
-            subject: vec!["docs".to_string()],
-            description: Some("reference document".to_string()),
-            publisher: Some("localdb".to_string()),
-            contributor: vec!["Bea".to_string()],
-            date: Some("2026-06-29".to_string()),
-            format: Some("text/markdown".to_string()),
-            identifier: Some("guide-1".to_string()),
-            language: Some("en".to_string()),
-            rights: Some("CC0".to_string()),
+        let metadata = Metadata::Document(DocumentMetadata {
+            dublin_core: DublinCoreMetadata {
+                title: Some("Guide".to_string()),
+                creator: vec!["Ada".to_string()],
+                subject: vec!["docs".to_string()],
+                description: Some("reference document".to_string()),
+                publisher: Some("localdb".to_string()),
+                contributor: vec!["Bea".to_string()],
+                date: Some("2026-06-29".to_string()),
+                format: Some("text/markdown".to_string()),
+                identifier: Some("guide-1".to_string()),
+                language: Some("en".to_string()),
+                rights: Some("CC0".to_string()),
+                ..Default::default()
+            },
             ..Default::default()
-        };
+        });
 
         let store = FakeStore::new();
         let make_chunk = |text: &str| {
             let span = Span::new(0, text.len());
             ChunkRecord {
-                id: chunk_id(&doc_id, text, span.start, span.end, 0),
+                id: chunk_id(&doc_id, 0, text, 0),
                 resource_id: doc_id.clone(),
                 store_id: store_id.clone(),
                 text: text.to_string(),
@@ -726,7 +730,7 @@ mod tests {
             ingestor_kind: "path".to_string(),
             mime: Some("text/plain".to_string()),
             uri: format!("file:///docs/{resource_id}.md"),
-            metadata: localdb_core::parser::DocumentMetadata::default(),
+            metadata: localdb_core::metadata::Metadata::default(),
             block_seq: 0,
             seq_in_block: 0,
             block_kind: None,
@@ -869,12 +873,16 @@ mod tests {
     async fn get_document_metadata_carries_through() {
         let fake = FakeStore::new();
         let mut chunk = make_chunk("chunk-1", "doc-meta", "store-A", "text content");
-        chunk.metadata = localdb_core::parser::DocumentMetadata {
-            title: Some("Rich Doc".to_string()),
-            creator: vec!["Carol".to_string()],
-            date: Some("2026-05-01".to_string()),
-            ..Default::default()
-        };
+        chunk.metadata =
+            localdb_core::metadata::Metadata::Document(localdb_core::metadata::DocumentMetadata {
+                dublin_core: localdb_core::metadata::DublinCoreMetadata {
+                    title: Some("Rich Doc".to_string()),
+                    creator: vec!["Carol".to_string()],
+                    date: Some("2026-05-01".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
         fake.upsert_chunks(vec![chunk]).await.unwrap();
 
         let av = AvailableStore::new(make_descriptor("store-A", "store-a"), Box::new(fake));
@@ -1000,7 +1008,7 @@ mod tests {
     ) -> localdb_core::citation::Citation {
         use localdb_core::{
             citation::{CitationProvenance, CitationStore, Score},
-            parser::DocumentMetadata,
+            metadata::{DocumentMetadata, DublinCoreMetadata, Metadata},
             types::Span,
         };
         localdb_core::citation::Citation {
@@ -1024,11 +1032,14 @@ mod tests {
                 fetched_at: "2026-01-01T00:00:00Z".to_string(),
                 content_hash: "abc".to_string(),
             },
-            metadata: DocumentMetadata {
-                creator,
-                date,
+            metadata: Metadata::Document(DocumentMetadata {
+                dublin_core: DublinCoreMetadata {
+                    creator,
+                    date,
+                    ..Default::default()
+                },
                 ..Default::default()
-            },
+            }),
             block_seq: None,
             block_kind: None,
         }

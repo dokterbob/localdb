@@ -162,13 +162,12 @@ async fn upsert_chunks_inner(
         // `record.resource_id` maps to the `id` column on `resources`.
         let resource_key = (record.store_id.clone(), record.resource_id.clone());
         if let std::collections::hash_map::Entry::Vacant(e) = seen_resources.entry(resource_key) {
-            // TODO(#130): record.metadata is flat parser::DocumentMetadata; should serialize as tagged Metadata enum once Resource-based reads land (#117)
             let metadata_json =
                 serde_json::to_string(&record.metadata).map_err(|e| Error::Internal {
                     message: format!("upsert_chunks metadata serialize: {e}"),
                     correlation_id: "store_handle_upsert_meta".to_string(),
                 })?;
-            let title = record.metadata.title.as_deref();
+            let title = record.metadata.title();
             conn.execute(
                 "INSERT INTO resources (store_id, id, source_id, ingestor_kind, resource_kind,
                      uri, title, mime, content_hash, added_at, modified_at, origin_store,

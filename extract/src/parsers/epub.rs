@@ -1,12 +1,13 @@
 //! EPUB parser: spine chapters → Markdown via `rbook` + `anytomd`.
 //!
 //! An EPUB is a ZIP of XHTML chapters plus an OPF manifest whose metadata is
-//! literally Dublin Core — a 1:1 fit for [`DocumentMetadata`]. We iterate the
+//! literally Dublin Core — a 1:1 fit for [`DublinCoreMetadata`]. We iterate the
 //! spine in canonical reading order, convert each chapter's XHTML to Markdown
 //! (no readability pruning — see [`crate::html::xhtml_to_markdown`]), and join
 //! the chapters with a blank-line separator.
 
-use localdb_core::parser::{DocumentMetadata, ParsedDocument, Parser, Probe};
+use localdb_core::metadata::DublinCoreMetadata;
+use localdb_core::parser::{ParsedDocument, Parser, Probe};
 use localdb_core::Error;
 use rbook::Epub;
 
@@ -96,15 +97,15 @@ impl Parser for EpubParser {
     }
 }
 
-/// Map OPF Dublin Core metadata onto [`DocumentMetadata`].
-fn map_metadata(epub: &Epub, probe: &Probe) -> DocumentMetadata {
+/// Map OPF Dublin Core metadata onto [`DublinCoreMetadata`].
+fn map_metadata(epub: &Epub, probe: &Probe) -> DublinCoreMetadata {
     let meta = epub.metadata();
 
     let creator: Vec<String> = meta.creators().map(|c| c.value().to_string()).collect();
     let contributor: Vec<String> = meta.contributors().map(|c| c.value().to_string()).collect();
     let subject: Vec<String> = meta.tags().map(|t| t.value().to_string()).collect();
 
-    DocumentMetadata {
+    DublinCoreMetadata {
         title: meta.title().map(|t| t.value().to_string()),
         creator,
         subject,
@@ -116,7 +117,7 @@ fn map_metadata(epub: &Epub, probe: &Probe) -> DocumentMetadata {
         identifier: meta.identifier().map(|i| i.value().to_string()),
         language: meta.language().map(|l| l.value().to_string()),
         rights: meta.rights().next().map(|r| r.value().to_string()),
-        ..DocumentMetadata::default()
+        ..DublinCoreMetadata::default()
     }
 }
 

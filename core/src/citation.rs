@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{ContentId, UlidId};
-use crate::parser::DocumentMetadata;
+use crate::metadata::Metadata;
 use crate::types::Span;
 
 /// A store reference embedded in a citation.
@@ -80,9 +80,10 @@ pub struct Citation {
     /// Provenance summary.
     pub provenance: CitationProvenance,
 
-    /// Document metadata (Dublin Core); empty/`None` fields when none was extracted.
+    /// Resource metadata (Dublin Core plus kind-specific fields), tagged by
+    /// resource kind (`"kind":"document"|"conversation"|"transcription"`).
     #[serde(default)]
-    pub metadata: DocumentMetadata,
+    pub metadata: Metadata,
 
     /// Block sequence number where this chunk originated.
     ///
@@ -106,7 +107,7 @@ mod tests {
         let doc_id = resource_id("file:///docs/api.md", &content_hash("some content"));
         let snippet = "This is the chunk text.";
         let span = Span::new(100, 123);
-        let cid = chunk_id(&doc_id, snippet, span.start, span.end, 0);
+        let cid = chunk_id(&doc_id, 0, snippet, 0);
 
         Citation {
             chunk_id: cid,
@@ -129,12 +130,15 @@ mod tests {
                 fetched_at: "2026-06-10T12:00:00Z".to_string(),
                 content_hash: content_hash("some content"),
             },
-            metadata: DocumentMetadata {
-                title: Some("API Documentation".to_string()),
-                creator: vec!["Alice Example".to_string()],
-                date: Some("2026-01-15".to_string()),
+            metadata: Metadata::Document(crate::metadata::DocumentMetadata {
+                dublin_core: crate::metadata::DublinCoreMetadata {
+                    title: Some("API Documentation".to_string()),
+                    creator: vec!["Alice Example".to_string()],
+                    date: Some("2026-01-15".to_string()),
+                    ..Default::default()
+                },
                 ..Default::default()
-            },
+            }),
             block_seq: None,
             block_kind: None,
         }
@@ -194,9 +198,10 @@ mod tests {
             "provenance.content_hash missing"
         );
 
-        // Metadata shape
+        // Metadata shape — tagged enum, Dublin Core fields flattened alongside "kind".
         assert!(v.get("metadata").is_some(), "metadata missing");
         let meta = &v["metadata"];
+        assert_eq!(meta["kind"].as_str().unwrap(), "document");
         assert_eq!(
             meta["creator"].as_array().unwrap()[0].as_str().unwrap(),
             "Alice Example"

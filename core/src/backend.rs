@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::parser::DocumentMetadata;
+use crate::metadata::Metadata;
 use crate::store::RetrievalStore;
 use crate::types::{SourceKind, StoreVisibility};
 use crate::{Error, VectorEncoding};
@@ -71,7 +71,7 @@ pub struct DocumentInfo {
     pub fetched_at: String,
     pub origin_store: String,
     pub policy_version: String,
-    pub metadata: DocumentMetadata,
+    pub metadata: Metadata,
 }
 
 #[async_trait]

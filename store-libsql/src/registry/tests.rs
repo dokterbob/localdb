@@ -1,4 +1,6 @@
-use localdb_core::types::{SourceKind, StoreVisibility};
+use localdb_core::metadata::{DocumentMetadata, DublinCoreMetadata, Metadata};
+use localdb_core::store::ChunkRecord;
+use localdb_core::types::{SourceKind, Span, StoreVisibility};
 use localdb_core::{SourceRow, StoreBackend, StoreBackendConfig, StoreRow, VectorEncoding};
 use tempfile::tempdir;
 
@@ -370,4 +372,91 @@ async fn same_root_across_different_stores_allowed() {
     api.upsert_source(&make_path_source("src-b", "s2", "/docs"))
         .await
         .unwrap();
+}
+
+/// Regression test for #130/#117 item 7: `ChunkRecord.metadata` (and, by
+/// extension, `resources.metadata_json`) must persist the *tagged* `Metadata`
+/// enum — `"kind":"document"` plus the flattened Dublin Core fields — not the
+/// old untagged flat struct. Verifies both ends: the raw stored JSON carries
+/// the tag, and `find_document` round-trips non-trivial Dublin Core fields.
+#[tokio::test]
+async fn metadata_json_round_trips_tagged_document_kind() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    api.upsert_source(&make_path_source("src-1", "store-1", "/docs"))
+        .await
+        .unwrap();
+
+    let metadata = Metadata::Document(DocumentMetadata {
+        dublin_core: DublinCoreMetadata {
+            title: Some("Round Trip Doc".to_string()),
+            creator: vec!["Ada Lovelace".to_string()],
+            subject: vec!["math".to_string(), "computing".to_string()],
+            date: Some("2026-07-01".to_string()),
+            language: Some("en".to_string()),
+            ..Default::default()
+        },
+        page_count: Some(12),
+        word_count: Some(3400),
+    });
+
+    let record = ChunkRecord {
+        id: "chunk-1".to_string(),
+        resource_id: "doc-1".to_string(),
+        store_id: "store-1".to_string(),
+        text: "some chunk text".to_string(),
+        span: Span::new(0, 15),
+        heading_path: vec![],
+        embedding: vec![0.1, 0.2, 0.3, 0.4],
+        policy_version: "v1".to_string(),
+        fetched_at: "2026-07-01T00:00:00Z".to_string(),
+        content_hash: "abc123".to_string(),
+        origin_store: "store-1".to_string(),
+        source_id: "src-1".to_string(),
+        ingestor_kind: "path".to_string(),
+        mime: Some("text/markdown".to_string()),
+        uri: "file:///docs/doc.md".to_string(),
+        metadata: metadata.clone(),
+        block_seq: 0,
+        seq_in_block: 0,
+        block_kind: None,
+    };
+
+    let handle = api.retrieval_store("store-1").await.unwrap();
+    handle.upsert_chunks(vec![record]).await.unwrap();
+
+    // Raw column check: the persisted JSON must be tagged.
+    let conn = api.conn.conn().await;
+    let mut rows = conn
+        .query(
+            "SELECT metadata_json FROM resources WHERE id = ?",
+            libsql::params!["doc-1".to_string()],
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().expect("resource row must exist");
+    let metadata_json: String = row.get(0).unwrap();
+    drop(conn);
+    assert!(
+        metadata_json.contains("\"kind\":\"document\""),
+        "persisted metadata_json must be tagged with kind=document, got: {metadata_json}"
+    );
+
+    // Round trip via the public find_document API.
+    let info = api
+        .find_document("doc-1")
+        .await
+        .unwrap()
+        .expect("document must be found");
+    assert_eq!(
+        info.metadata, metadata,
+        "metadata must survive a write→read round trip"
+    );
+    assert_eq!(info.metadata.title(), Some("Round Trip Doc"));
+    assert_eq!(
+        info.metadata.dublin_core().creator,
+        vec!["Ada Lovelace".to_string()]
+    );
 }

@@ -184,7 +184,7 @@ pub fn shape_citation(fused: FusedChunkEntry, store_id: String, store_name: Stri
             name: store_name,
         },
         uri: fused.chunk.uri.clone(),
-        title: fused.chunk.metadata.title.clone(),
+        title: fused.chunk.metadata.title().map(|s| s.to_string()),
         heading_path: fused.chunk.heading_path.clone(),
         span: Span {
             start: fused.chunk.span.start,
@@ -390,7 +390,7 @@ mod tests {
             ingestor_kind: "path".to_string(),
             mime: Some("text/markdown".to_string()),
             uri: uri.to_string(),
-            metadata: crate::parser::DocumentMetadata::default(),
+            metadata: crate::metadata::Metadata::default(),
             block_seq: 0,
             seq_in_block: 0,
             block_kind: None,
@@ -822,12 +822,15 @@ mod tests {
     #[test]
     fn shape_citation_carries_metadata() {
         let mut chunk = make_chunk("c1", "d1", "s1", "text", vec![], "file:///a.md", vec![1.0]);
-        chunk.metadata = crate::parser::DocumentMetadata {
-            title: Some("My Title".to_string()),
-            creator: vec!["Bob".to_string()],
-            date: Some("2026-03-01".to_string()),
+        chunk.metadata = crate::metadata::Metadata::Document(crate::metadata::DocumentMetadata {
+            dublin_core: crate::metadata::DublinCoreMetadata {
+                title: Some("My Title".to_string()),
+                creator: vec!["Bob".to_string()],
+                date: Some("2026-03-01".to_string()),
+                ..Default::default()
+            },
             ..Default::default()
-        };
+        });
         let entry = FusedChunkEntry {
             chunk,
             fused_score: 0.5,
@@ -835,9 +838,15 @@ mod tests {
             bm25_score: Some(4.0),
         };
         let citation = shape_citation(entry, "s1".to_string(), "store-one".to_string());
-        assert_eq!(citation.metadata.title.as_deref(), Some("My Title"));
-        assert_eq!(citation.metadata.creator, vec!["Bob".to_string()]);
-        assert_eq!(citation.metadata.date.as_deref(), Some("2026-03-01"));
+        assert_eq!(citation.metadata.title(), Some("My Title"));
+        assert_eq!(
+            citation.metadata.dublin_core().creator,
+            vec!["Bob".to_string()]
+        );
+        assert_eq!(
+            citation.metadata.dublin_core().date.as_deref(),
+            Some("2026-03-01")
+        );
     }
 
     // -----------------------------------------------------------------------

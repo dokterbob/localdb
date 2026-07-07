@@ -616,6 +616,11 @@ pub async fn index_document(
     if metadata.title.is_none() {
         metadata.title = extraction.title.clone();
     }
+    let record_metadata = crate::metadata::Metadata::Document(crate::metadata::DocumentMetadata {
+        dublin_core: metadata,
+        page_count: None,
+        word_count: None,
+    });
 
     let mut records = Vec::new();
     for (chunk_out, embedding) in chunk_outputs.iter().zip(embeddings.iter()) {
@@ -635,7 +640,7 @@ pub async fn index_document(
             embedding.clone(),
             input.uri.clone(),
             input.mime.clone(),
-            metadata.clone(),
+            record_metadata.clone(),
         );
         record.block_seq = chunk_out.block_seq;
         record.seq_in_block = chunk_out.seq_in_block;
@@ -696,8 +701,8 @@ pub struct ExtractionResult {
     pub markdown: String,
     /// Optional document title.
     pub title: Option<String>,
-    /// Document metadata extracted from the document.
-    pub metadata: crate::parser::DocumentMetadata,
+    /// Dublin Core metadata extracted from the document.
+    pub metadata: crate::metadata::DublinCoreMetadata,
 }
 
 // ---------------------------------------------------------------------------
@@ -1281,7 +1286,7 @@ mod tests {
             Ok(ExtractionResult {
                 markdown,
                 title: None,
-                metadata: crate::parser::DocumentMetadata::default(),
+                metadata: crate::metadata::DublinCoreMetadata::default(),
             })
         }
     }
@@ -1449,7 +1454,7 @@ mod tests {
             ingestor_kind: "path".to_string(),
             mime: None,
             uri: "file:///doc1.md".to_string(),
-            metadata: crate::parser::DocumentMetadata::default(),
+            metadata: crate::metadata::Metadata::default(),
             block_seq: 0,
             seq_in_block: 0,
             block_kind: None,
@@ -2375,7 +2380,7 @@ mod tests {
                     format: "binary".to_string(),
                 })?
                 .to_string();
-            let metadata = crate::parser::DocumentMetadata {
+            let metadata = crate::metadata::DublinCoreMetadata {
                 title: self.metadata_title.clone(),
                 ..Default::default()
             };
@@ -2426,7 +2431,7 @@ mod tests {
         assert!(!chunks.is_empty());
         for chunk in &chunks {
             assert_eq!(
-                chunk.metadata.title.as_deref(),
+                chunk.metadata.title(),
                 Some("PDF Title"),
                 "chunk metadata.title must equal ExtractionResult.title when metadata.title was None"
             );
@@ -2472,7 +2477,7 @@ mod tests {
         assert!(!chunks.is_empty());
         for chunk in &chunks {
             assert_eq!(
-                chunk.metadata.title.as_deref(),
+                chunk.metadata.title(),
                 Some("Existing"),
                 "chunk metadata.title must not be overwritten when it already had a value"
             );
@@ -2883,7 +2888,7 @@ mod tests {
             ingestor_kind: "url".to_string(),
             mime: None,
             uri: url.to_string(),
-            metadata: crate::parser::DocumentMetadata::default(),
+            metadata: crate::metadata::Metadata::default(),
             block_seq: 0,
             seq_in_block: 0,
             block_kind: None,
@@ -3389,7 +3394,7 @@ mod tests {
             ingestor_kind: "path".to_string(),
             mime: None,
             uri: uri.to_string(),
-            metadata: crate::parser::DocumentMetadata::default(),
+            metadata: crate::metadata::Metadata::default(),
             block_seq: 0,
             seq_in_block: 0,
             block_kind: None,
@@ -3913,7 +3918,7 @@ mod tests {
             ingestor_kind: "path".to_string(),
             mime: None,
             uri: uri.to_string(),
-            metadata: crate::parser::DocumentMetadata::default(),
+            metadata: crate::metadata::Metadata::default(),
             block_seq: 0,
             seq_in_block: 0,
             block_kind: None,

@@ -9,7 +9,6 @@ use crate::error::Error;
 use crate::ids::resource_id;
 use crate::ingestion::{now_rfc3339, FetchMetadata, FetchResult, UrlFetcher};
 use crate::ingestor::{IngestCallback, IngestResult, IngestSource, Ingestor};
-use crate::ingestors::file_ingestor::parser_meta_to_dc;
 use crate::markdown_blocks::{compute_blocks_hash, markdown_to_blocks};
 use crate::metadata::{DocumentMetadata, Metadata};
 use crate::parser::{Parser, Probe};
@@ -115,7 +114,7 @@ impl Ingestor for UrlIngestor {
             let res_id = resource_id(url, &hash);
             let now = now_rfc3339();
 
-            let dc = parser_meta_to_dc(&parsed.metadata);
+            let dc = parsed.metadata.clone();
             let title = parsed.title.clone().or_else(|| dc.title.clone());
 
             let resource = Resource {
@@ -174,7 +173,7 @@ mod tests {
             Ok(Some(ParsedDocument {
                 markdown: text,
                 title: None,
-                metadata: crate::parser::DocumentMetadata::default(),
+                metadata: crate::metadata::DublinCoreMetadata::default(),
             }))
         }
     }

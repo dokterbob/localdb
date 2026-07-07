@@ -56,7 +56,7 @@ pub use ingestor::{
 pub use ingestors::{FileIngestor, UrlIngestor};
 pub use markdown_blocks::{heading_path_from_blocks, markdown_to_blocks};
 pub use metadata::{ConversationMetadata, DublinCoreMetadata, Metadata, TranscriptionMetadata};
-pub use parser::{ChainParser, DocumentMetadata, ParsedDocument, Parser, Probe, PROBE_HEADER_LEN};
+pub use parser::{ChainParser, ParsedDocument, Parser, Probe, PROBE_HEADER_LEN};
 pub use progress::{DocOutcome, ProgressEvent, ProgressSink};
 pub use search::{
     rerank_noop, rrf_fuse, rrf_score, shape_citation, FusedChunkEntry, QueryRequest, QueryResponse,

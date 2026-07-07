@@ -53,11 +53,11 @@ fn row_to_document_info(row: &libsql::Row) -> Result<DocumentInfo, Error> {
     let origin_store: String = row.get(9).map_err(map_libsql_err)?;
     let policy_version: String = row.get(10).map_err(map_libsql_err)?;
     let metadata_str: String = row.get(11).map_err(map_libsql_err)?; // metadata_json
-    let metadata: localdb_core::DocumentMetadata =
-        serde_json::from_str(&metadata_str).map_err(|e| Error::Internal {
-            message: format!("invalid resource metadata JSON for '{id}': {e}"),
-            correlation_id: "runtime_state_find_doc_meta".to_string(),
-        })?;
+                                                                     // Read defensively: rows written before the tagged-`Metadata` migration
+                                                                     // (#130) hold untagged, flat Dublin Core JSON — fall back to
+                                                                     // `Metadata::default()` rather than erroring the whole lookup.
+    let metadata: localdb_core::metadata::Metadata =
+        serde_json::from_str(&metadata_str).unwrap_or_default();
 
     Ok(DocumentInfo {
         store_id,

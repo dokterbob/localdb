@@ -1,4 +1,4 @@
-use localdb_core::parser::DocumentMetadata;
+use localdb_core::metadata::Metadata;
 use localdb_core::types::Span;
 use localdb_core::{ChunkRecord, Error};
 
@@ -56,11 +56,11 @@ pub(crate) fn row_to_chunk_record_strict(row: &libsql::Row) -> Result<ChunkRecor
             message: format!("invalid embedding JSON: {e}"),
             correlation_id: "store_handle_row_embedding".to_string(),
         })?;
-    let metadata: DocumentMetadata =
-        serde_json::from_str(&metadata_str).map_err(|e| Error::Internal {
-            message: format!("invalid metadata JSON: {e}"),
-            correlation_id: "store_handle_row_metadata".to_string(),
-        })?;
+    // Read defensively: rows written before the tagged-`Metadata` migration
+    // (#130) hold untagged, flat Dublin Core JSON and fail to deserialize as
+    // the tagged enum — fall back to `Metadata::default()` rather than
+    // erroring the whole read.
+    let metadata: Metadata = serde_json::from_str(&metadata_str).unwrap_or_default();
 
     let block_seq: i64 = row.get(16).map_err(map_libsql_err)?;
     let seq_in_block: i64 = row.get(17).map_err(map_libsql_err)?;

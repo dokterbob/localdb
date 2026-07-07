@@ -42,7 +42,7 @@ async fn start_upstream_daemon() -> (String, String) {
     let doc_id = resource_id(uri, &doc_hash);
     let snippet = "The proxy must forward this citation unchanged end to end.";
     let span = Span::new(0, snippet.len());
-    let cid = chunk_id(&doc_id, snippet, span.start, span.end, 0);
+    let cid = chunk_id(&doc_id, 0, snippet, 0);
 
     let record = ChunkRecord {
         id: cid,
@@ -60,7 +60,7 @@ async fn start_upstream_daemon() -> (String, String) {
         ingestor_kind: "path".to_string(),
         mime: Some("text/markdown".to_string()),
         uri: uri.to_string(),
-        metadata: localdb_core::DocumentMetadata::default(),
+        metadata: localdb_core::metadata::Metadata::default(),
         block_seq: 0,
         seq_in_block: 0,
         block_kind: None,
