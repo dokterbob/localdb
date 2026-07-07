@@ -134,27 +134,36 @@ The retrieval unit: what gets embedded and indexed.
 
 | Field | Notes |
 |---|---|
-| `id` | **Content-addressed**: `blake3(resource_id ‖ block_seq ‖ chunk_text ‖ seq_in_block)` — stable across re-runs over identical content. |
+| `id` | **Content-addressed**: `blake3(resource_id ‖ block_seq ‖ chunk_text ‖ seq_in_block)` — stable across re-runs over identical content. Computed *after* `block_seq`/`seq_in_block` are assigned, so both are inputs to the hash, not derived from it. |
 | `resource_id`, `store_id` | Ownership. |
-| `block_id` | Reference to the parent block (blocks.rowid). |
-| `block_seq` | Denormalized block sequence number (for efficient ordering without join). |
+| `block_seq` | Sequence number of the parent block (denormalized, for efficient ordering without a join). |
 | `seq_in_block` | Chunk position within the block (0-indexed). |
 | `text` | Chunk text (also feeds BM25). |
 | `heading_path` | Derived from the block tree: heading blocks preceding this content block. JSON array. |
 | `embedding` | Dense vector (in backend, not in core serialization). |
-| `location` | `ChunkLocation` — refined sub-block position (optional). |
+| `location` | `ChunkLocation` — refined sub-block position (optional). Persisted as `location_json`: `{"start": N, "end": N, "window_block_seqs": [..]}`, with `window_block_seqs` absent/optional for non-window chunks. `ChunkRecord` carries this as `window_block_seqs: Vec<u32>` (`#[serde(default)]`). |
 
-**Invariant:** a chunk is a subdivision of exactly one block. Chunk location =
-`{resource_id, block_id, chunk_seq_in_block}`. Chunks never cross block boundaries.
+**Invariant:** a chunk is a subdivision of exactly one block. The canonical block reference is the
+triple **`(store_id, resource_id, block_seq)`** — there is no `block_id` column; blocks are looked
+up by sequence number, not by a synthetic row reference. The chunks index is
+`(store_id, resource_id, block_seq, seq_in_block)`. Chunks never cross block boundaries.
 
-**Span semantics:** Chunk spans (`Span.start`, `Span.end`) are **block-relative byte offsets** —
-they index into the parent block's `text`, not the full document Markdown. Combined with
-`block_seq`, they provide a complete location: `(resource_id, block_seq, span)`. Document-relative
-offsets are not stored or computed.
+**Why not `block_id`:** an earlier revision of this schema referenced the parent block via
+`chunks.block_id` (a `blocks.rowid` foreign key). That column is dropped (#128): rowids are not
+stable across a replace (delete+insert of a resource mints new block rows), and window chunks
+(#129) need to reference a *set* of block sequence numbers, which a single scalar foreign key
+cannot express. `(store_id, resource_id, block_seq)` is stable and generalizes to sets.
+
+**Span semantics:** Chunk spans (`location.start`, `location.end`) are **block-relative byte
+offsets** — they index into the parent block's `text`, not the full document Markdown. Combined
+with `block_seq`, they provide a complete location: `(resource_id, block_seq, span)`.
+Document-relative offsets are not stored or computed.
 
 **Exception — message-window chunks:** the `messages` chunking preset creates chunks that span
 multiple `Message`/`Segment` blocks via a sliding window. This is an explicit multi-block
-chunking mode. The `ChunkLocation` carries references to all participating blocks.
+chunking mode. The `ChunkLocation` carries `window_block_seqs`: the set of participating block
+sequence numbers. `window_block_seqs` is present only for this chunk shape — absent for
+single-block chunks.
 
 ### Citation
 Not a stored entity: the **canonical result shape** every surface uses (§6).
@@ -216,20 +225,29 @@ Metadata is resource-kind-specific via the `Metadata` enum (§7), not open key-v
 
 Every search hit, on every surface, resolves to the same citation structure:
 
-```
-Citation {
-  chunk_id, resource_id, store: {id, name},
-  uri,                  // resource URI — the user-actionable locator
-  title, heading_path,
-  block: {seq, kind},   // which block the chunk came from
-  chunk_position: {seq_in_block},
-  snippet,              // chunk text (possibly trimmed)
-  score: {fused, dense, bm25},
-  provenance: {fetched_at, content_hash},
-  metadata,             // full Metadata (Dublin Core base + resource-kind-specific)
-  location              // BlockLocation + ChunkLocation for navigation
+```json
+{
+  "resource_id": "...",
+  "uri": "...",
+  "title": "...",
+  "block": { "seq": 3, "kind": "paragraph" },
+  "chunk_position": { "seq_in_block": 0 },
+  "location": {
+    "span": { "start": 120, "end": 512 },
+    "window_block_seqs": [3, 4, 5]
+  },
+  "score": 0.87
 }
 ```
+
+That's the shape of the field list distinctive to the block model; the full `Citation` also
+carries `chunk_id`, `store: {id, name}`, `heading_path`, `snippet` (chunk text, possibly trimmed),
+the full `score: {fused, dense, bm25}` breakdown, `provenance: {fetched_at, content_hash}`, and
+`metadata` (the tagged `Metadata` enum — Dublin Core base + resource-kind-specific fields, §7).
+There is no top-level `document_id`, `block_seq`, `block_kind`, or `span` — those are superseded by
+`resource_id`, the nested `block {seq, kind}`, `chunk_position {seq_in_block}`, and
+`location {span, window_block_seqs}` respectively. `window_block_seqs` is present only for
+message-window chunks (§2); absent otherwise.
 
 Surface mappings — defined here once, referenced by [05-surfaces.md](05-surfaces.md):
 **HTTP** returns the structure verbatim as JSON. **CLI** renders `uri` + heading path + snippet
@@ -237,7 +255,7 @@ Surface mappings — defined here once, referenced by [05-surfaces.md](05-surfac
 prose-only text, so agents can cite mechanically.
 
 **Context expansion:** given a search hit, the backend supports:
-1. Neighboring chunks in the same block (`chunks WHERE block_id = ? ORDER BY seq_in_block`)
+1. Neighboring chunks in the same block (`chunks WHERE store_id = ? AND resource_id = ? AND block_seq = ? ORDER BY seq_in_block`)
 2. Nearby blocks in the same resource (`blocks WHERE resource_id = ? AND seq BETWEEN ? AND ?`)
 3. Full resource block sequence (`blocks WHERE resource_id = ? ORDER BY seq`)
 
@@ -288,7 +306,15 @@ All variants expose `fn dublin_core(&self) -> &DublinCoreMetadata` for uniform a
 base metadata fields.
 
 **Persistence:** `Metadata` is JSON-encoded into a single `TEXT` column named `metadata_json`
-on each resource record in libsql. The discriminant is the `Metadata` enum variant tag.
+on each resource record in libsql. The discriminant is the `Metadata` enum variant tag (e.g.
+`{"kind":"document","dublin_core":{...},"page_count":...}`).
+
+**Metadata unification (#130):** the flat, parser-level `DocumentMetadata` struct (a bare
+15-element Dublin Core struct that lived in the parser boundary and was easily confused with the
+same-named `DocumentMetadata` variant payload above) is retired. `ParsedDocument.metadata` is
+`DublinCoreMetadata` directly — the same base type every `Metadata` variant embeds — so there is
+exactly one Dublin-Core-shaped struct in the codebase, not two. Resources, chunks, and citations
+all carry the tagged `Metadata` enum; nothing downstream of parsing sees the untagged flat form.
 
 ## 8. Extraction & parsing
 
@@ -352,10 +378,11 @@ happens once at the ingestion boundary; parsers never seek or re-fetch.
 
 ### ParsedDocument → Resource conversion
 
-`ParsedDocument` remains as the parser output (Markdown string + title + Dublin Core metadata).
+`ParsedDocument` remains as the parser output: a Markdown string + title + `DublinCoreMetadata`.
 The file ingestor converts it to a `Resource` by:
 1. Running `markdown_to_blocks()` on the Markdown string to produce typed blocks.
-2. Wrapping the Dublin Core metadata into `Metadata::Document(DocumentMetadata { ... })`.
+2. Wrapping `ParsedDocument.metadata` (`DublinCoreMetadata`) into
+   `Metadata::Document(DocumentMetadata { dublin_core, page_count, word_count })` — see §7.
 3. Computing the content hash from ordered block texts.
 
 This conversion is a compatibility bridge. Future parsers and ingestors can emit blocks directly.
@@ -372,9 +399,10 @@ query performance:
   enabling efficient context expansion queries (fetch neighboring blocks for a search hit).
 - **Denormalised Store ID:** The `store_id` column is denormalised onto the `chunks` table for
   per-store filtering directly on the rowid lookup after vector or FTS5 searches.
-- **Block Reference on Chunks:** Each chunk references its parent block via `block_id`
-  (blocks.rowid) and denormalized `block_seq`, enabling block-level context expansion without
-  an extra join.
+- **Block Reference on Chunks:** Each chunk references its parent block via denormalized
+  `block_seq` (no `block_id`/rowid foreign key — see §2), enabling block-level context expansion
+  without an extra join, on the composite index `idx_chunks_store_resource_pos
+  (store_id, resource_id, block_seq, seq_in_block)`.
 - **FTS5 Content Keying:** The FTS5 virtual table `chunks_fts` uses external content keying
   over `chunks.text`. Filtering by `store_id` is performed on the `chunks` join.
 - **Cascade Chain:** Foreign keys with `ON DELETE CASCADE` across the chain:
@@ -433,3 +461,36 @@ query performance:
   `create_schema()`'s output, so the two can't silently diverge.
 - **Extractor Versioning:** `resources.extractor_version` tracks which parser/ingestor version
   produced the blocks, enabling selective reprocessing when extraction logic improves.
+
+### Schema v5 (2026-07)
+
+Schema version 5 — the first entry in the migration chain above (§9's `schema_migrations` table),
+`drop_chunks_block_id_and_retag_resource_metadata` — ships this refactor's storage changes:
+
+- `chunks.block_id` is dropped (§2, #128); the parent block is looked up by `block_seq`, not a
+  row reference.
+- New composite index `idx_chunks_store_resource_pos (store_id, resource_id, block_seq,
+  seq_in_block)` replaces the old `block_id`-keyed lookup.
+- `resources.metadata_json` carries the tagged `Metadata` enum encoding (§7), not the retired flat
+  `DocumentMetadata`.
+- `chunks.location_json` gains the optional `window_block_seqs` array (§2, #129).
+
+**A v4 store refuses to open until migrated:** as with every schema change under the migration
+framework, opening a store still at v4 fails with `invalid_config` (exit 2) pointing at
+`localdb db migrate` — nothing is wiped implicitly. Running `localdb db migrate` applies this
+migration (drops `chunks.block_id`, swaps the index, retags `resources.metadata_json`) in one
+transaction and lands the store at v5.
+
+**This migration is not downgradable:** `chunks.block_id` cannot be reconstructed from what
+remains once dropped, so its `Down` is `Unsupported` — `localdb db downgrade` refuses cleanly past
+this step, naming the reason. It also sets `needs_reindex: true`: applying it marks existing
+chunks stale (see the chunk-ID paragraph below), and `db migrate` prints a `localdb index` hint
+after applying it.
+
+**Old chunk IDs are tolerated, not migrated:** chunk IDs computed under the pre-#128 formula
+(keyed off `block_id`) are not translated to the new `blake3(resource_id ‖ block_seq ‖ chunk_text
+‖ seq_in_block)` formula. Instead, the chunking policy identifier bumps
+(`textsplitter-md-v3` → `textsplitter-md-v4`), which changes every chunk's `policy_version`. The
+existing incremental-skip check already treats a `policy_version` mismatch as "needs reindex," so
+the next `localdb index` re-chunks and re-derives every chunk ID under the new formula without any
+special-cased migration logic.

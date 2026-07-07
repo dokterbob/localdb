@@ -63,8 +63,9 @@ citation anchors, or chunk boundaries.
    API order.
 
 4. A **Chunk** is a subdivision of exactly one block. Chunk location =
-   `{resource_id, block_id, chunk_seq_in_block}`. Chunks never cross block
-   boundaries.
+   `(store_id, resource_id, block_seq, seq_in_block)` — there is no `block_id`
+   row reference; the block is addressed by sequence number (#128). Chunks
+   never cross block boundaries.
 
 5. **Exception: message-window chunks** span multiple `Message`/`Segment`
    blocks. The sliding window is an explicit multi-block chunking mode, not a
@@ -87,7 +88,8 @@ citation anchors, or chunk boundaries.
 - **Resource content hash** = blake3 of ordered block canonical contents
   concatenated. Not dependent on Markdown rendering.
 
-- **Chunk hash** = blake3 of `{resource_id, block_id, chunk_text, chunk_range}`.
+- **Chunk hash** = blake3 of `resource_id ‖ block_seq ‖ chunk_text ‖ seq_in_block`,
+  computed after `block_seq`/`seq_in_block` are assigned.
 
 - **Block hash** is not content-addressed globally — blocks are identified by
   `(resource_id, seq)`, which is stable as long as the resource content
@@ -119,10 +121,28 @@ Two categories, kept separate:
   citation/navigation): page number, bounding box, transcript timestamp,
   message ID, URI fragment, table cell range. Not primary search filters.
 
+## Alternatives considered
+
+**Parsers emit blocks directly, instead of `ParsedDocument` + `markdown_to_blocks()`.**
+Considered and rejected for now. The `Parser` trait keeps returning `ParsedDocument`
+(a Markdown string + title + `DublinCoreMetadata`, [02-domain-model.md](02-domain-model.md) §8);
+ingestors convert it to blocks via `markdown_to_blocks()` at the ingestion boundary. Blocks are
+still the canonical IR at that boundary — `ParsedDocument` never leaks past the file ingestor —
+but every existing format-specific parser (Markdown, plain text, HTML, PDF) keeps its simple
+"produce normalized Markdown" contract instead of each one independently emitting typed blocks.
+**Rejected (for now):** blocks-emitting parsers — more accurate per-format structure (e.g. a
+table parser emitting a real `Table` block instead of a Markdown table rendering), but it multiplies
+the work of every future parser and duplicates block-construction logic across parsers instead of
+centralizing it in one `markdown_to_blocks()` implementation. Revisit per-format block emission
+opportunistically (e.g. HTML, PDF) once the block model has proven itself; it does not require
+another ADR to introduce for a single format, since `Parser` returning blocks directly is already
+an accepted future evolution of this same interface.
+
 ## Consequences
 
-- `ParsedDocument` (Markdown string + title + Dublin Core metadata) is
-  replaced by `Resource` (metadata + ordered blocks).
+- `ParsedDocument` (Markdown string + title + `DublinCoreMetadata`) is no longer the canonical
+  pipeline representation — `Resource` (metadata + ordered blocks) is. `ParsedDocument` survives
+  only as the file ingestor's internal parser-output type (see "Alternatives considered" above).
 - `Document` (the stored entity) is replaced by `Resource`.
 - The chunker receives blocks, not a Markdown string. Chunk dispatch is by
   `BlockKind`, not by source preset.

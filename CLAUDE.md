@@ -27,6 +27,7 @@ Default workflow is **TDD** — write the failing test first.
 | `cli` | Thin surface over `core`; `init`, `store`, `source`, `index`, `search` commands |
 | `embed` | Embedder implementations: ONNX (local), OpenAI-compatible, Perplexity, Voyage |
 | `extract` | Format detection and text extraction (Markdown, plain text, HTML, PDF → Markdown) |
+| `ingest` | Concrete `Ingestor` impls (`FileIngestor`, `UrlIngestor`, future connectors — Atom/RSS, Notion, Telegram, …); depends on `core` + `extract`; owns all acquisition I/O |
 | `localdb` | Binary entry point; wires all subcommands |
 | `mcp` | `rmcp`-based MCP server, stdio (embedded or daemon-proxied) and HTTP (`/mcp`); tools: `search`, `get_document`, `get_chunks`, `list_stores` |
 | `server` | HTTP daemon (`/v1` axum routes), background jobs, file-watch, write-lock lifecycle |
