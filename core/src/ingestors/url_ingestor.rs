@@ -201,6 +201,7 @@ mod tests {
             Box::new(StaticFetcher { content: vec![] }),
         );
         let source = IngestSource {
+            policy_version: "test-policy".to_string(),
             source_id: "src-1".to_string(),
             store_id: "store-1".to_string(),
             ingestor_kind: IngestorKind::Url,
@@ -222,6 +223,7 @@ mod tests {
         let content = b"# Test Page\n\nHello from the web.\n".to_vec();
         let ingestor = UrlIngestor::new(Box::new(AllParser), Box::new(StaticFetcher { content }));
         let source = IngestSource {
+            policy_version: "test-policy".to_string(),
             source_id: "src-1".to_string(),
             store_id: "store-1".to_string(),
             ingestor_kind: IngestorKind::Url,

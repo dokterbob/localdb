@@ -223,6 +223,7 @@ mod tests {
     async fn file_ingestor_missing_root_errors() {
         let ingestor = FileIngestor::new(Box::new(ChainParser::new("chain", vec![])));
         let source = IngestSource {
+            policy_version: "test-policy".to_string(),
             source_id: "src-1".to_string(),
             store_id: "store-1".to_string(),
             ingestor_kind: IngestorKind::File,
@@ -243,6 +244,7 @@ mod tests {
     async fn file_ingestor_nonexistent_root_produces_no_resources() {
         let ingestor = FileIngestor::new(Box::new(AllParser));
         let source = IngestSource {
+            policy_version: "test-policy".to_string(),
             source_id: "src-1".to_string(),
             store_id: "store-1".to_string(),
             ingestor_kind: IngestorKind::File,
@@ -275,6 +277,7 @@ mod tests {
 
         let ingestor = FileIngestor::new(Box::new(AllParser));
         let source = IngestSource {
+            policy_version: "test-policy".to_string(),
             source_id: "src-1".to_string(),
             store_id: "store-1".to_string(),
             ingestor_kind: IngestorKind::File,
