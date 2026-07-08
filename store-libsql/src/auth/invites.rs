@@ -101,10 +101,31 @@ pub(crate) async fn revoke_invite(
     Ok(n > 0)
 }
 
-pub(crate) async fn increment_invite_uses(db: &LibsqlDb, id: &str) -> Result<(), Error> {
+/// Atomic "reserve a use iff one remains" (mirrors `mark_access_request_collected`'s
+/// and `consume_auth_code`'s single-condition-in-the-WHERE-clause convention):
+/// a single UPDATE with the eligibility check baked into the WHERE clause, so
+/// concurrent callers racing the same invite can never together push `uses`
+/// past `max_uses`.
+pub(crate) async fn try_consume_invite_use(db: &LibsqlDb, id: &str) -> Result<bool, Error> {
+    let conn = db.conn().await;
+    let n = conn
+        .execute(
+            "UPDATE invites SET uses = uses + 1 WHERE id = ? AND uses < max_uses",
+            libsql::params![id.to_string()],
+        )
+        .await
+        .map_err(map_libsql_err)?;
+    Ok(n > 0)
+}
+
+/// Release a use previously reserved by `try_consume_invite_use` when the
+/// subsequent mint (user-create / access-request-file) failed. The `uses > 0`
+/// guard is defensive — it keeps a double-release from ever driving the
+/// counter negative.
+pub(crate) async fn release_invite_use(db: &LibsqlDb, id: &str) -> Result<(), Error> {
     let conn = db.conn().await;
     conn.execute(
-        "UPDATE invites SET uses = uses + 1 WHERE id = ?",
+        "UPDATE invites SET uses = uses - 1 WHERE id = ? AND uses > 0",
         libsql::params![id.to_string()],
     )
     .await

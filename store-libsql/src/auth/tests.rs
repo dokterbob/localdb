@@ -643,16 +643,57 @@ async fn revoke_invite_sets_revoked_at_once() {
 }
 
 #[tokio::test]
-async fn increment_invite_uses_increments() {
+async fn try_consume_invite_use_increments_up_to_max_uses_then_fails() {
+    let (_dir, _backend, store) = make_store().await;
+    let mut invite = make_invite("i1", "h1", InviteMode::Open);
+    invite.max_uses = 2;
+    store.create_invite(&invite).await.unwrap();
+
+    assert!(store.try_consume_invite_use("i1").await.unwrap());
+    assert!(store.try_consume_invite_use("i1").await.unwrap());
+    // Third call: already at max_uses == uses, must not increment further.
+    assert!(!store.try_consume_invite_use("i1").await.unwrap());
+    // A tight loop of extra attempts never overshoots max_uses either.
+    for _ in 0..5 {
+        assert!(!store.try_consume_invite_use("i1").await.unwrap());
+    }
+
+    let found = store.find_invite("i1").await.unwrap().unwrap();
+    assert_eq!(found.uses, 2, "uses must never exceed max_uses");
+}
+
+#[tokio::test]
+async fn release_invite_use_decrements_a_reserved_use() {
     let (_dir, _backend, store) = make_store().await;
     store
         .create_invite(&make_invite("i1", "h1", InviteMode::Open))
         .await
         .unwrap();
-    store.increment_invite_uses("i1").await.unwrap();
-    store.increment_invite_uses("i1").await.unwrap();
+
+    assert!(store.try_consume_invite_use("i1").await.unwrap());
     let found = store.find_invite("i1").await.unwrap().unwrap();
-    assert_eq!(found.uses, 2);
+    assert_eq!(found.uses, 1);
+
+    store.release_invite_use("i1").await.unwrap();
+    let found = store.find_invite("i1").await.unwrap().unwrap();
+    assert_eq!(found.uses, 0, "release must give the reserved slot back");
+
+    // The released slot can be reserved again.
+    assert!(store.try_consume_invite_use("i1").await.unwrap());
+}
+
+#[tokio::test]
+async fn release_invite_use_never_goes_negative() {
+    let (_dir, _backend, store) = make_store().await;
+    store
+        .create_invite(&make_invite("i1", "h1", InviteMode::Open))
+        .await
+        .unwrap();
+
+    // Releasing with nothing reserved must not drive uses below zero.
+    store.release_invite_use("i1").await.unwrap();
+    let found = store.find_invite("i1").await.unwrap().unwrap();
+    assert_eq!(found.uses, 0);
 }
 
 #[tokio::test]

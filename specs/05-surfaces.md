@@ -204,13 +204,16 @@ credential is minted here — that happens at the requester's next poll) and ret
 `POST /v1/invites/requests/{id}/deny` (admin) marks it
 denied; the requester's next poll observes `denied`.
 
-**Concurrency (documented choice):** `redeem_invite` increments `uses` *before* creating the user
-/ filing the access request. A burst of concurrent redemptions against a `max_uses = 1` invite can
-therefore over-count `uses` (cosmetic, self-limiting — the invite reads as exhausted for everyone
-right after) but can never double-mint a user under the same name: the `users.name` UNIQUE
-constraint at the store level is the independent backstop (a losing racer gets an ordinary
-"already exists" `400`, never a second user). See `AuthService::redeem_invite`'s doc comment for
-the full reasoning.
+**Concurrency (documented choice):** `redeem_invite` atomically *reserves* a use
+(`AuthStore::try_consume_invite_use`, an `UPDATE ... WHERE uses < max_uses` conditional update)
+before creating the user / filing the access request, and *releases* the reservation
+(`AuthStore::release_invite_use`) if that mint then fails. This closes both hazards: concurrent
+redemptions — even under distinct requested names — can never together push `uses` past
+`max_uses` (the atomic reservation is the gate, not the `users.name` UNIQUE constraint), and a
+redemption that reserves a use but then fails (most commonly a duplicate `requested_name` racing
+`create_user`'s UNIQUE constraint) never permanently burns that use — a caller can retry with a
+different name against the same `max_uses = 1` invite. See `AuthService::redeem_invite`'s doc
+comment for the full reasoning.
 
 **Consent page (T4 seam):** `GET /authorize?invite=<token>` renders an invite-redemption variant
 of the consent form (a "your name" field instead of the setup-code/API-key credential field).

@@ -208,7 +208,7 @@ described in full in [05-surfaces.md](05-surfaces.md) §2/§3.1.
 | `token_hash` | blake3 hash of the invite's opaque secret; the secret is shown once, at creation. |
 | `mode` | `open` (redeeming creates the user immediately) \| `closed` (redeeming creates an `AccessRequest` pending admin approval). |
 | `store_grants` | JSON array of store names the resulting user is granted on redemption/approval. |
-| `max_uses`, `uses` | `max_uses` defaults to 1. `uses` is incremented before the redemption's user-create/access-request-file step (see `redeem_invite`'s doc comment) — a concurrent burst can over-count `uses` past `max_uses` (cosmetic, self-limiting) but can never double-mint a user, which the `users.name` UNIQUE constraint independently prevents. |
+| `max_uses`, `uses` | `max_uses` defaults to 1. A use is atomically *reserved* (`AuthStore::try_consume_invite_use`, `UPDATE ... WHERE uses < max_uses`) before the redemption's user-create/access-request-file step and *released* (`AuthStore::release_invite_use`) if that step then fails — see `redeem_invite`'s doc comment. This caps `uses` at `max_uses` even under concurrent redemptions with distinct names, and ensures a failed redemption never permanently burns a use. |
 | `expires_at`, `revoked_at` | Nullable. |
 | `created_by` | Issuing user's ID. |
 | `created_at` | RFC 3339. |

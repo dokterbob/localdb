@@ -239,7 +239,23 @@ pub trait AuthStore: Send + Sync + 'static {
     async fn find_invite(&self, id: &str) -> Result<Option<InviteRow>, Error>;
     async fn list_invites(&self) -> Result<Vec<InviteRow>, Error>;
     async fn revoke_invite(&self, id: &str) -> Result<bool, Error>;
-    async fn increment_invite_uses(&self, id: &str) -> Result<(), Error>;
+    /// Atomically reserve one use against `max_uses` (T6, D9): the
+    /// conditional update `UPDATE invites SET uses = uses + 1 WHERE id = ?
+    /// AND uses < max_uses`. Returns `true` iff this call reserved a slot
+    /// (mirrors `consume_auth_code`'s "consume iff eligible" convention);
+    /// `false` means the invite has no remaining uses.
+    ///
+    /// `AuthService::redeem_invite` calls this to RESERVE a use *before*
+    /// attempting the mint (user-create / access-request-file) — the atomic
+    /// gate that caps concurrent redemptions at `max_uses` even when they
+    /// race under distinct requested names. If the mint then fails, the
+    /// caller must call `release_invite_use` to give the reserved slot back
+    /// so a failed redemption never permanently burns a use.
+    async fn try_consume_invite_use(&self, id: &str) -> Result<bool, Error>;
+    /// Release a use previously reserved by `try_consume_invite_use` when
+    /// the subsequent mint failed. Restores `uses` by one (never below
+    /// zero).
+    async fn release_invite_use(&self, id: &str) -> Result<(), Error>;
 
     async fn create_access_request(&self, req: &AccessRequestRow) -> Result<(), Error>;
     async fn find_access_request(&self, id: &str) -> Result<Option<AccessRequestRow>, Error>;
@@ -290,6 +306,10 @@ struct FakeAuthStoreInner {
     grants: Vec<StoreGrantRow>,
     invites: Vec<InviteRow>,
     access_requests: Vec<AccessRequestRow>,
+    /// Test-only hook (see `FakeAuthStore::poison_next_revoke`): token IDs
+    /// whose *next* `revoke_token` call should report "lost the race"
+    /// (`false`) without touching `revoked_at`.
+    poisoned_revokes: std::collections::HashSet<String>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -299,6 +319,21 @@ pub struct FakeAuthStore {
 
 #[cfg(any(test, feature = "test-support"))]
 impl FakeAuthStore {
+    /// Deterministically simulate losing the atomic-revoke race in
+    /// `AuthService::rotate_refresh_token`: the *next* `revoke_token(id)`
+    /// call will return `false` (as if a concurrent caller's own
+    /// conditional `UPDATE ... WHERE revoked_at IS NULL` had already run
+    /// between this call's token fetch and its own revoke attempt) without
+    /// marking the row revoked itself. True concurrent interleaving is hard
+    /// to reproduce deterministically in a single-threaded unit test; this
+    /// hook pins the resulting "revoke returned false" branch directly.
+    pub async fn poison_next_revoke(&self, id: &str) {
+        self.inner
+            .write()
+            .await
+            .poisoned_revokes
+            .insert(id.to_string());
+    }
     pub fn new() -> Self {
         Self {
             inner: tokio::sync::RwLock::new(FakeAuthStoreInner::default()),
@@ -406,6 +441,10 @@ impl AuthStore for FakeAuthStore {
 
     async fn revoke_token(&self, id: &str) -> Result<bool, Error> {
         let mut inner = self.inner.write().await;
+        if inner.poisoned_revokes.remove(id) {
+            // See `FakeAuthStore::poison_next_revoke`.
+            return Ok(false);
+        }
         let now = crate::ingestion::now_rfc3339();
         match inner.tokens.iter_mut().find(|t| t.id == id) {
             Some(t) if t.revoked_at.is_none() => {
@@ -577,10 +616,21 @@ impl AuthStore for FakeAuthStore {
         }
     }
 
-    async fn increment_invite_uses(&self, id: &str) -> Result<(), Error> {
+    async fn try_consume_invite_use(&self, id: &str) -> Result<bool, Error> {
+        let mut inner = self.inner.write().await;
+        match inner.invites.iter_mut().find(|i| i.id == id) {
+            Some(i) if i.uses < i.max_uses => {
+                i.uses += 1;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn release_invite_use(&self, id: &str) -> Result<(), Error> {
         let mut inner = self.inner.write().await;
         if let Some(i) = inner.invites.iter_mut().find(|i| i.id == id) {
-            i.uses += 1;
+            i.uses = i.uses.saturating_sub(1);
         }
         Ok(())
     }
@@ -671,6 +721,33 @@ mod tests {
         store.create_user(&user("u1", "alice")).await.unwrap();
         let err = store.create_user(&user("u2", "alice")).await.unwrap_err();
         assert!(matches!(err, Error::InvalidRequest { .. }));
+    }
+
+    #[tokio::test]
+    async fn poison_next_revoke_makes_revoke_token_report_false_once() {
+        let store = FakeAuthStore::new();
+        let token = AuthTokenRow {
+            id: "t1".to_string(),
+            user_id: "u1".to_string(),
+            kind: super::TokenKind::Refresh,
+            secret_hash: "hash-1".to_string(),
+            expires_at: None,
+            last_used_at: None,
+            revoked_at: None,
+            created_at: "2026-06-10T12:00:00Z".to_string(),
+            family_id: None,
+            rotated_from: None,
+        };
+        store.insert_token(&token).await.unwrap();
+
+        store.poison_next_revoke("t1").await;
+        assert!(!store.revoke_token("t1").await.unwrap());
+        // `revoked_at` itself must remain untouched by the poisoned call.
+        let stored = store.find_token("t1").await.unwrap().unwrap();
+        assert!(stored.revoked_at.is_none());
+
+        // The poison is single-shot: the next call behaves normally.
+        assert!(store.revoke_token("t1").await.unwrap());
     }
 
     #[tokio::test]

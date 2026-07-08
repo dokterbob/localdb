@@ -161,6 +161,17 @@ impl<S: AuthStore> AuthService<S> {
             }
         }
 
+        if token.kind == TokenKind::Refresh {
+            // A refresh secret is only ever meant to be exchanged via
+            // `rotate_refresh_token`; accepting it as a bearer credential here
+            // would let a 30-day refresh secret authenticate indefinitely
+            // without ever rotating (defeats the rotation/reuse-detection
+            // design). Access tokens and API keys remain valid bearer kinds.
+            return Err(Error::Unauthorized {
+                message: "refresh tokens cannot be used as bearer credentials".to_string(),
+            });
+        }
+
         let user =
             self.store
                 .get_user(&token.user_id)
@@ -239,7 +250,22 @@ impl<S: AuthStore> AuthService<S> {
             }
         }
 
-        self.store.revoke_token(&token.id).await?;
+        // `revoke_token` is an atomic "revoke iff not already revoked"
+        // conditional update. If it returns `false`, we lost a race against
+        // another concurrent rotation of this same refresh token — that
+        // other caller already rotated it away, so minting a fresh pair
+        // here too would produce two live refresh tokens in the same
+        // family, defeating reuse detection. Treat this exactly like the
+        // reuse-of-an-already-rotated-token branch above: burn the whole
+        // family and fail closed.
+        if !self.store.revoke_token(&token.id).await? {
+            if let Some(family) = &token.family_id {
+                self.store.revoke_token_family(family).await?;
+            }
+            return Err(Error::Unauthorized {
+                message: "refresh token reuse detected; session revoked".to_string(),
+            });
+        }
 
         let family = token.family_id.clone().unwrap_or_else(new_ulid);
         let new_refresh = self
@@ -625,27 +651,26 @@ impl<S: AuthStore> AuthService<S> {
     /// 3. not expired,
     /// 4. `uses < max_uses`.
     ///
-    /// **Concurrency (documented choice):** `uses` is incremented *before*
-    /// the user is created/access-request is filed. A burst of concurrent
-    /// redemptions against a `max_uses = 1` invite can therefore over-count
-    /// `uses` past `max_uses` (each racer passes the uses check before any
-    /// of them increments) — a purely cosmetic overshoot visible to an admin
-    /// via `invite list`/`GET /v1/invites`, and self-limiting since the
-    /// invite is revoked/exhausted for everyone after. What must never
-    /// happen is two racers both minting a user under the same
-    /// `requested_name`: that hazard is independently closed by the
-    /// `users.name` UNIQUE constraint enforced at the store level (see
-    /// `store-libsql`'s `create_user`, which maps the UNIQUE violation to
-    /// `Error::InvalidRequest`) — at worst one racer wins the name and the
-    /// other gets an ordinary "already exists" error, never a double-mint.
-    /// Incrementing `uses` first (rather than "check then act" with the
-    /// increment last) is the fail-*safe* ordering here: the failure mode of
-    /// over-counting uses is harmless, while under-counting (incrementing
-    /// only after a successful mint) would let two racers both observe
-    /// `uses < max_uses` and both attempt a mint against a `max_uses = 1`
-    /// invite — same UNIQUE-constraint backstop either way, but
-    /// over-counting is the more honest audit trail of "how many attempts
-    /// actually raced here."
+    /// **Concurrency (documented choice):** a use is *reserved* atomically
+    /// (`AuthStore::try_consume_invite_use`, an `UPDATE ... WHERE uses <
+    /// max_uses` conditional update) before the mint (user-create /
+    /// access-request-file) is attempted, and *released*
+    /// (`AuthStore::release_invite_use`) if that mint then fails. This
+    /// reserve-then-release ordering satisfies both invariants at once:
+    ///
+    /// 1. **Never over-redeem:** because the reservation is an atomic
+    ///    conditional update, concurrent redemptions — even under distinct
+    ///    `requested_name`s, which the `users.name` UNIQUE constraint alone
+    ///    cannot help with — can never together push `uses` past
+    ///    `max_uses`. A racer that arrives after the invite is exhausted
+    ///    gets `Unauthorized` "invite has no remaining uses" immediately,
+    ///    before attempting any mint.
+    /// 2. **Never burn a use on a failed redemption:** if the reservation
+    ///    succeeds but the subsequent mint fails (most commonly a duplicate
+    ///    `requested_name` racing `create_user`'s UNIQUE constraint), the
+    ///    reserved slot is released before the error is returned — so a
+    ///    caller can retry with a different name against the same
+    ///    `max_uses = 1` invite without it reading as exhausted.
     pub async fn redeem_invite(
         &self,
         token_secret: &str,
@@ -677,46 +702,81 @@ impl<S: AuthStore> AuthService<S> {
                 });
             }
         }
-        if invite.uses >= invite.max_uses {
+
+        // Reserve a use atomically before attempting the mint — see the doc
+        // comment above for why this ordering (rather than incrementing
+        // after a successful mint, or before any check at all) is what
+        // makes both concurrency invariants hold simultaneously.
+        if !self.store.try_consume_invite_use(&invite.id).await? {
             return Err(Error::Unauthorized {
                 message: "invite has no remaining uses".to_string(),
             });
         }
 
-        // See the doc comment above for why this happens before the mint.
-        self.store.increment_invite_uses(&invite.id).await?;
-
-        match invite.mode {
+        let outcome = match invite.mode {
             InviteMode::Open => {
-                let user = self.create_user(requested_name, Role::Member).await?;
-                self.apply_invite_grants(&invite, &user.id).await?;
-                let credential = self.issue_api_key(&user.id).await?;
-                Ok(RedeemOutcome::Open {
-                    user,
-                    grants: invite.store_grants.clone(),
-                    credential: Box::new(credential),
-                })
+                self.mint_open_invite_redemption(&invite, requested_name)
+                    .await
             }
             InviteMode::Closed => {
-                let minted = mint_secret();
-                let request = AccessRequestRow {
-                    id: new_ulid(),
-                    invite_id: invite.id.clone(),
-                    requested_name: requested_name.to_string(),
-                    secret_hash: minted.hash,
-                    state: AccessRequestState::Pending,
-                    resulting_user_id: None,
-                    created_at: now_rfc3339(),
-                    decided_at: None,
-                    collected_at: None,
-                };
-                self.store.create_access_request(&request).await?;
-                Ok(RedeemOutcome::Closed {
-                    request_id: request.id,
-                    request_secret: minted.secret,
-                })
+                self.mint_closed_invite_redemption(&invite, requested_name)
+                    .await
             }
+        };
+
+        if outcome.is_err() {
+            // The mint failed after we reserved a use — release it so this
+            // failed redemption doesn't permanently consume a slot. Best
+            // effort: if the release itself errors, we still surface the
+            // original mint error (e.g. "user already exists") rather than
+            // masking it with an unrelated store error.
+            let _ = self.store.release_invite_use(&invite.id).await;
         }
+
+        outcome
+    }
+
+    /// `open`-mode mint half of `redeem_invite`: create the user, apply the
+    /// invite's store grants, and issue a show-once API-key credential.
+    async fn mint_open_invite_redemption(
+        &self,
+        invite: &InviteRow,
+        requested_name: &str,
+    ) -> Result<RedeemOutcome, Error> {
+        let user = self.create_user(requested_name, Role::Member).await?;
+        self.apply_invite_grants(invite, &user.id).await?;
+        let credential = self.issue_api_key(&user.id).await?;
+        Ok(RedeemOutcome::Open {
+            user,
+            grants: invite.store_grants.clone(),
+            credential: Box::new(credential),
+        })
+    }
+
+    /// `closed`-mode mint half of `redeem_invite`: file a pending
+    /// `AccessRequestRow` awaiting admin approval.
+    async fn mint_closed_invite_redemption(
+        &self,
+        invite: &InviteRow,
+        requested_name: &str,
+    ) -> Result<RedeemOutcome, Error> {
+        let minted = mint_secret();
+        let request = AccessRequestRow {
+            id: new_ulid(),
+            invite_id: invite.id.clone(),
+            requested_name: requested_name.to_string(),
+            secret_hash: minted.hash,
+            state: AccessRequestState::Pending,
+            resulting_user_id: None,
+            created_at: now_rfc3339(),
+            decided_at: None,
+            collected_at: None,
+        };
+        self.store.create_access_request(&request).await?;
+        Ok(RedeemOutcome::Closed {
+            request_id: request.id,
+            request_secret: minted.secret,
+        })
     }
 
     /// Approve a pending closed-mode access request (T6): creates the user
@@ -1063,6 +1123,75 @@ mod tests {
         // The now-revoked replacement can no longer authenticate either.
         let err = svc.authenticate(&new_refresh.secret).await.unwrap_err();
         assert!(matches!(err, Error::Unauthorized { .. }));
+    }
+
+    #[tokio::test]
+    async fn rotate_refresh_token_lost_race_burns_family_and_mints_nothing() {
+        // Simulates two concurrent `rotate_refresh_token` calls for the same
+        // refresh token: both would see `revoked_at: None` in their own
+        // fetch, but only one wins the atomic `revoke_token` update. The
+        // loser must observe `revoke_token` return `false` and treat it
+        // exactly like reuse — burn the whole family and fail closed —
+        // rather than silently proceeding to mint a second live refresh
+        // +access pair into the same family.
+        let svc = service();
+        let user = svc.create_user("river", Role::Admin).await.unwrap();
+        let refresh = svc.issue_refresh_token(&user.id).await.unwrap();
+
+        svc.store.poison_next_revoke(&refresh.row.id).await;
+
+        let err = svc.rotate_refresh_token(&refresh.secret).await.unwrap_err();
+        assert!(matches!(err, Error::Unauthorized { .. }));
+
+        // The family-revoke fallback must still have caught the original
+        // token (whose `revoked_at` the poisoned call itself left alone).
+        let stored = svc
+            .store
+            .find_token_by_hash(&refresh.row.secret_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            stored.revoked_at.is_some(),
+            "the family revoke must catch the token even though the \
+             poisoned revoke_token call didn't"
+        );
+
+        // No new refresh/access pair was minted for the loser.
+        let tokens = svc.store.list_tokens_for_user(&user.id).await.unwrap();
+        assert_eq!(
+            tokens.len(),
+            1,
+            "a lost-race rotation must not mint anything"
+        );
+        assert!(tokens[0].revoked_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn authenticate_rejects_refresh_token_as_bearer_credential() {
+        let svc = service();
+        let user = svc.create_user("sasha", Role::Admin).await.unwrap();
+        let refresh = svc.issue_refresh_token(&user.id).await.unwrap();
+
+        let err = svc.authenticate(&refresh.secret).await.unwrap_err();
+        assert!(matches!(err, Error::Unauthorized { .. }));
+    }
+
+    #[tokio::test]
+    async fn authenticate_still_accepts_access_token_and_api_key() {
+        let svc = service();
+        let user = svc.create_user("tara", Role::Admin).await.unwrap();
+        let access = svc.issue_access_token(&user.id).await.unwrap();
+        let api_key = svc.issue_api_key(&user.id).await.unwrap();
+
+        assert_eq!(
+            svc.authenticate(&access.secret).await.unwrap().user_id,
+            user.id
+        );
+        assert_eq!(
+            svc.authenticate(&api_key.secret).await.unwrap().user_id,
+            user.id
+        );
     }
 
     #[tokio::test]
@@ -1593,6 +1722,82 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::InvalidRequest { .. }));
+    }
+
+    #[tokio::test]
+    async fn redeem_open_invite_failed_mint_does_not_burn_use_and_retry_succeeds() {
+        // Pins findings #3 + #7: a failed redemption (duplicate name
+        // colliding with `create_user`'s UNIQUE constraint) must not
+        // permanently consume the invite's only use — a fresh name must
+        // still be able to redeem the same `max_uses = 1` invite.
+        let svc = service();
+        svc.create_user("taken", Role::Member).await.unwrap();
+        let issued = make_open_invite(&svc, 1).await;
+
+        let err = svc
+            .redeem_invite(&issued.secret, "taken")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidRequest { .. }));
+
+        let invite = svc
+            .store
+            .find_invite(&issued.row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            invite.uses, 0,
+            "a failed redemption must not burn the reserved use"
+        );
+
+        // Retrying with a fresh name against the same max_uses=1 invite
+        // must still succeed.
+        let outcome = svc
+            .redeem_invite(&issued.secret, "fresh-name")
+            .await
+            .unwrap();
+        assert!(matches!(outcome, RedeemOutcome::Open { .. }));
+
+        let invite = svc
+            .store
+            .find_invite(&issued.row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(invite.uses, 1);
+
+        // And the invite is now genuinely exhausted.
+        let err = svc
+            .redeem_invite(&issued.secret, "yet-another")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Unauthorized { .. }));
+    }
+
+    #[tokio::test]
+    async fn redeem_closed_invite_consumes_a_use_on_success() {
+        let svc = service();
+        let issued = make_closed_invite(&svc, 1).await;
+
+        svc.redeem_invite(&issued.secret, "requester")
+            .await
+            .unwrap();
+
+        let invite = svc
+            .store
+            .find_invite(&issued.row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(invite.uses, 1);
+
+        // The invite is now exhausted for a second requester.
+        let err = svc
+            .redeem_invite(&issued.secret, "another")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Unauthorized { .. }));
     }
 
     #[tokio::test]

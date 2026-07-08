@@ -158,8 +158,12 @@ impl AuthStore for LibsqlAuthStore {
         invites::revoke_invite(&self.conn, id, &now).await
     }
 
-    async fn increment_invite_uses(&self, id: &str) -> Result<(), Error> {
-        invites::increment_invite_uses(&self.conn, id).await
+    async fn try_consume_invite_use(&self, id: &str) -> Result<bool, Error> {
+        invites::try_consume_invite_use(&self.conn, id).await
+    }
+
+    async fn release_invite_use(&self, id: &str) -> Result<(), Error> {
+        invites::release_invite_use(&self.conn, id).await
     }
 
     async fn create_access_request(&self, req: &AccessRequestRow) -> Result<(), Error> {
