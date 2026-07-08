@@ -240,25 +240,34 @@ pub(crate) async fn mark_access_request_collected(
     Ok(n > 0)
 }
 
-pub(crate) async fn update_access_request_state(
+/// Atomic "decide iff currently pending" (finding #4): the transition to a
+/// terminal `state` (`approved`/`denied`) is conditioned on `state =
+/// 'pending'` in the same UPDATE, mirroring `mark_access_request_collected`'s
+/// and `try_consume_invite_use`'s single-condition-in-the-WHERE-clause
+/// convention — so two concurrent approve/deny calls on the same request can
+/// never both take effect (last-writer-wins overwrite is impossible; the
+/// second racer's UPDATE simply affects zero rows).
+pub(crate) async fn try_decide_access_request(
     db: &LibsqlDb,
     id: &str,
     state: AccessRequestState,
     resulting_user_id: Option<&str>,
     decided_at: &str,
-) -> Result<(), Error> {
+) -> Result<bool, Error> {
     let conn = db.conn().await;
-    conn.execute(
-        "UPDATE access_requests \
-         SET state = ?, resulting_user_id = ?, decided_at = ? WHERE id = ?",
-        libsql::params![
-            access_request_state_to_sql(state).to_string(),
-            resulting_user_id.map(|s| s.to_string()),
-            decided_at.to_string(),
-            id.to_string(),
-        ],
-    )
-    .await
-    .map_err(map_libsql_err)?;
-    Ok(())
+    let n = conn
+        .execute(
+            "UPDATE access_requests \
+             SET state = ?, resulting_user_id = ?, decided_at = ? \
+             WHERE id = ? AND state = 'pending'",
+            libsql::params![
+                access_request_state_to_sql(state).to_string(),
+                resulting_user_id.map(|s| s.to_string()),
+                decided_at.to_string(),
+                id.to_string(),
+            ],
+        )
+        .await
+        .map_err(map_libsql_err)?;
+    Ok(n > 0)
 }

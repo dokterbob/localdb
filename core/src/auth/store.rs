@@ -188,6 +188,24 @@ pub trait AuthStore: Send + Sync + 'static {
     /// Total user count — used to decide whether to print the one-time
     /// setup code at daemon startup (specs/05-surfaces.md §3.1).
     async fn count_users(&self) -> Result<u64, Error>;
+    /// Atomically delete `id` unless it is currently the *sole* admin (D7's
+    /// last-admin lockout guard): a single conditional `DELETE ... WHERE id
+    /// = ? AND (role <> 'admin' OR (admin count) > 1)`, so two concurrent
+    /// guarded deletes/demotes racing the same two-admin instance can never
+    /// both succeed and leave zero admins. Returns `true` iff this call
+    /// deleted the row; `false` covers both "unknown id" and "would have
+    /// left zero admins" — `AuthService::delete_user` disambiguates the two
+    /// for its error message via `is_last_admin`.
+    async fn try_delete_user_unless_last_admin(&self, id: &str) -> Result<bool, Error>;
+    /// Atomically demote `id` to `Role::Member` unless it is currently the
+    /// sole admin — the demotion counterpart to
+    /// `try_delete_user_unless_last_admin`, same conditional-UPDATE
+    /// convention. Returns `true` iff this call performed the demotion;
+    /// `false` covers "unknown id", "already not an admin", and "would have
+    /// left zero admins" — `AuthService::set_user_role` disambiguates via
+    /// `is_last_admin` before falling back to the plain `update_user_role`
+    /// for the idempotent non-admin cases.
+    async fn try_demote_user_unless_last_admin(&self, id: &str) -> Result<bool, Error>;
 
     // ------------------------------------------------------------------
     // Tokens
@@ -268,13 +286,23 @@ pub trait AuthStore: Send + Sync + 'static {
     /// pagination): the number of pending/decided join requests is expected
     /// to be tiny relative to, say, chunk counts.
     async fn list_access_requests(&self) -> Result<Vec<AccessRequestRow>, Error>;
-    async fn update_access_request_state(
+    /// Atomically transition a pending access request to a terminal
+    /// decision (`Approved` or `Denied`), iff it is currently `Pending`: a
+    /// single conditional `UPDATE ... WHERE id = ? AND state = 'pending'`
+    /// (same single-condition-in-the-WHERE-clause convention as
+    /// `try_consume_invite_use`/`mark_access_request_collected`). Returns
+    /// `true` iff this call performed the transition; `false` means the
+    /// request was unknown or already decided (by a concurrent
+    /// approve/deny), in which case the caller must not treat its own
+    /// decision as having taken effect — see `AuthService::approve_request`
+    /// and `AuthService::deny_request`.
+    async fn try_decide_access_request(
         &self,
         id: &str,
         state: AccessRequestState,
         resulting_user_id: Option<&str>,
         decided_at: &str,
-    ) -> Result<(), Error>;
+    ) -> Result<bool, Error>;
     /// Atomically mark an `Approved` access request's credential as
     /// collected, iff it hasn't been already (T6's "handed out exactly
     /// once" contract — mirrors `consume_auth_code`'s single-use guard).
@@ -310,6 +338,19 @@ struct FakeAuthStoreInner {
     /// whose *next* `revoke_token` call should report "lost the race"
     /// (`false`) without touching `revoked_at`.
     poisoned_revokes: std::collections::HashSet<String>,
+    /// Test-only hook (see `FakeAuthStore::poison_next_decide`): access
+    /// request IDs whose *next* `try_decide_access_request` call should
+    /// report "lost the race" (`false`) without touching `state`.
+    poisoned_decides: std::collections::HashSet<String>,
+    /// Test-only hook (see `FakeAuthStore::poison_next_collect`): access
+    /// request IDs whose *next* `mark_access_request_collected` call should
+    /// report "lost the race" (`false`) without touching `collected_at`.
+    poisoned_collects: std::collections::HashSet<String>,
+    /// Test-only hook (see `FakeAuthStore::poison_next_insert_token`): when
+    /// `true`, the *next* `insert_token` call fails instead of persisting —
+    /// simulates a transient store failure partway through a multi-step
+    /// mint (T6 finding #6/#7 regression tests).
+    poison_next_insert_token: bool,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -334,6 +375,42 @@ impl FakeAuthStore {
             .poisoned_revokes
             .insert(id.to_string());
     }
+
+    /// Deterministically simulate losing the atomic decision race in
+    /// `AuthService::approve_request`/`deny_request`: the *next*
+    /// `try_decide_access_request(id, ..)` call will return `false` (as if a
+    /// concurrent approve/deny had already transitioned the request out of
+    /// `Pending`) without touching the row itself.
+    pub async fn poison_next_decide(&self, id: &str) {
+        self.inner
+            .write()
+            .await
+            .poisoned_decides
+            .insert(id.to_string());
+    }
+
+    /// Deterministically simulate losing the atomic collect race in
+    /// `AuthService::poll_request`: the *next*
+    /// `mark_access_request_collected(id, ..)` call will return `false` (as
+    /// if a concurrent poll had already collected first) without touching
+    /// `collected_at`.
+    pub async fn poison_next_collect(&self, id: &str) {
+        self.inner
+            .write()
+            .await
+            .poisoned_collects
+            .insert(id.to_string());
+    }
+
+    /// Deterministically simulate a transient store failure partway through
+    /// a multi-step mint: the *next* `insert_token` call fails instead of
+    /// persisting a row, so `AuthService::issue_api_key` (and anything built
+    /// on it, e.g. `mint_open_invite_redemption`/`poll_request`) returns an
+    /// error without having minted anything.
+    pub async fn poison_next_insert_token(&self) {
+        self.inner.write().await.poison_next_insert_token = true;
+    }
+
     pub fn new() -> Self {
         Self {
             inner: tokio::sync::RwLock::new(FakeAuthStoreInner::default()),
@@ -346,6 +423,31 @@ impl Default for FakeAuthStore {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Delete `id` from `inner.users` and cascade the cleanup the real schema
+/// performs via FK constraints (`store-libsql/src/schema.rs`): tokens and
+/// store grants are `ON DELETE CASCADE` (removed outright), and
+/// `access_requests.resulting_user_id` is `ON DELETE SET NULL`. Shared by
+/// the plain `delete_user` and the guarded `try_delete_user_unless_last_admin`
+/// so both report the same cascaded state to callers relying on it (e.g. the
+/// compensating deletes in `AuthService::approve_request`/
+/// `mint_open_invite_redemption`).
+#[cfg(any(test, feature = "test-support"))]
+fn delete_user_and_cascade(inner: &mut FakeAuthStoreInner, id: &str) -> bool {
+    let before = inner.users.len();
+    inner.users.retain(|u| u.id != id);
+    let deleted = inner.users.len() != before;
+    if deleted {
+        inner.tokens.retain(|t| t.user_id != id);
+        inner.grants.retain(|g| g.user_id != id);
+        for r in inner.access_requests.iter_mut() {
+            if r.resulting_user_id.as_deref() == Some(id) {
+                r.resulting_user_id = None;
+            }
+        }
+    }
+    deleted
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -403,17 +505,54 @@ impl AuthStore for FakeAuthStore {
 
     async fn delete_user(&self, id: &str) -> Result<bool, Error> {
         let mut inner = self.inner.write().await;
-        let before = inner.users.len();
-        inner.users.retain(|u| u.id != id);
-        Ok(inner.users.len() != before)
+        let deleted = delete_user_and_cascade(&mut inner, id);
+        Ok(deleted)
     }
 
     async fn count_users(&self) -> Result<u64, Error> {
         Ok(self.inner.read().await.users.len() as u64)
     }
 
+    async fn try_delete_user_unless_last_admin(&self, id: &str) -> Result<bool, Error> {
+        let mut inner = self.inner.write().await;
+        let target_is_admin = inner
+            .users
+            .iter()
+            .any(|u| u.id == id && u.role == Role::Admin);
+        if target_is_admin {
+            let admin_count = inner.users.iter().filter(|u| u.role == Role::Admin).count();
+            if admin_count <= 1 {
+                // Would drop admins to zero — refuse, matching the atomic
+                // libsql guard `DELETE ... WHERE role <> 'admin' OR (admin
+                // count) > 1`.
+                return Ok(false);
+            }
+        }
+        Ok(delete_user_and_cascade(&mut inner, id))
+    }
+
+    async fn try_demote_user_unless_last_admin(&self, id: &str) -> Result<bool, Error> {
+        let mut inner = self.inner.write().await;
+        let admin_count = inner.users.iter().filter(|u| u.role == Role::Admin).count();
+        match inner.users.iter_mut().find(|u| u.id == id) {
+            Some(u) if u.role == Role::Admin && admin_count > 1 => {
+                u.role = Role::Member;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     async fn insert_token(&self, token: &AuthTokenRow) -> Result<(), Error> {
-        self.inner.write().await.tokens.push(token.clone());
+        let mut inner = self.inner.write().await;
+        if inner.poison_next_insert_token {
+            inner.poison_next_insert_token = false;
+            return Err(Error::Internal {
+                message: "poisoned insert_token: simulated store failure".to_string(),
+                correlation_id: "fake_auth_store_poison_insert_token".to_string(),
+            });
+        }
+        inner.tokens.push(token.clone());
         Ok(())
     }
 
@@ -670,20 +809,27 @@ impl AuthStore for FakeAuthStore {
         Ok(self.inner.read().await.access_requests.clone())
     }
 
-    async fn update_access_request_state(
+    async fn try_decide_access_request(
         &self,
         id: &str,
         state: AccessRequestState,
         resulting_user_id: Option<&str>,
         decided_at: &str,
-    ) -> Result<(), Error> {
+    ) -> Result<bool, Error> {
         let mut inner = self.inner.write().await;
-        if let Some(r) = inner.access_requests.iter_mut().find(|r| r.id == id) {
-            r.state = state;
-            r.resulting_user_id = resulting_user_id.map(|s| s.to_string());
-            r.decided_at = Some(decided_at.to_string());
+        if inner.poisoned_decides.remove(id) {
+            // See `FakeAuthStore::poison_next_decide`.
+            return Ok(false);
         }
-        Ok(())
+        match inner.access_requests.iter_mut().find(|r| r.id == id) {
+            Some(r) if r.state == AccessRequestState::Pending => {
+                r.state = state;
+                r.resulting_user_id = resulting_user_id.map(|s| s.to_string());
+                r.decided_at = Some(decided_at.to_string());
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     async fn mark_access_request_collected(
@@ -692,6 +838,10 @@ impl AuthStore for FakeAuthStore {
         collected_at: &str,
     ) -> Result<bool, Error> {
         let mut inner = self.inner.write().await;
+        if inner.poisoned_collects.remove(id) {
+            // See `FakeAuthStore::poison_next_collect`.
+            return Ok(false);
+        }
         match inner.access_requests.iter_mut().find(|r| r.id == id) {
             Some(r) if r.state == AccessRequestState::Approved && r.collected_at.is_none() => {
                 r.collected_at = Some(collected_at.to_string());
@@ -712,6 +862,13 @@ mod tests {
             name: name.to_string(),
             role: Role::Member,
             created_at: "2026-06-10T12:00:00Z".to_string(),
+        }
+    }
+
+    fn admin(id: &str, name: &str) -> UserRow {
+        UserRow {
+            role: Role::Admin,
+            ..user(id, name)
         }
     }
 
@@ -750,12 +907,258 @@ mod tests {
         assert!(store.revoke_token("t1").await.unwrap());
     }
 
+    // -----------------------------------------------------------------
+    // T5/finding #5: atomic last-admin guard at the store level
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn try_delete_user_unless_last_admin_refuses_the_sole_admin() {
+        let store = FakeAuthStore::new();
+        store.create_user(&admin("a1", "only-admin")).await.unwrap();
+
+        assert!(!store.try_delete_user_unless_last_admin("a1").await.unwrap());
+        assert!(store.get_user("a1").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn try_delete_user_unless_last_admin_succeeds_with_another_admin() {
+        let store = FakeAuthStore::new();
+        store.create_user(&admin("a1", "admin1")).await.unwrap();
+        store.create_user(&admin("a2", "admin2")).await.unwrap();
+
+        assert!(store.try_delete_user_unless_last_admin("a1").await.unwrap());
+        assert!(store.get_user("a1").await.unwrap().is_none());
+        assert!(store.get_user("a2").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn try_delete_user_unless_last_admin_allows_deleting_a_member() {
+        let store = FakeAuthStore::new();
+        store.create_user(&admin("a1", "solo-admin")).await.unwrap();
+        store.create_user(&user("m1", "some-member")).await.unwrap();
+
+        // The guard only ever blocks dropping the *admin* count to zero —
+        // deleting a member is unaffected even with only one admin present.
+        assert!(store.try_delete_user_unless_last_admin("m1").await.unwrap());
+        assert!(store.get_user("m1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn try_delete_user_unless_last_admin_cascades_tokens_and_grants() {
+        let store = FakeAuthStore::new();
+        store.create_user(&admin("a1", "admin1")).await.unwrap();
+        store.create_user(&admin("a2", "admin2")).await.unwrap();
+        store
+            .insert_token(&AuthTokenRow {
+                id: "t1".to_string(),
+                user_id: "a1".to_string(),
+                kind: super::TokenKind::ApiKey,
+                secret_hash: "hash-1".to_string(),
+                expires_at: None,
+                last_used_at: None,
+                revoked_at: None,
+                created_at: "2026-06-10T12:00:00Z".to_string(),
+                family_id: None,
+                rotated_from: None,
+            })
+            .await
+            .unwrap();
+        store
+            .grant_store(&StoreGrantRow {
+                store_name: "docs".to_string(),
+                user_id: "a1".to_string(),
+                granted_by: "a2".to_string(),
+                created_at: "2026-06-10T12:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert!(store.try_delete_user_unless_last_admin("a1").await.unwrap());
+        assert!(store.list_tokens_for_user("a1").await.unwrap().is_empty());
+        assert!(store.list_grants_for_user("a1").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn try_demote_user_unless_last_admin_refuses_the_sole_admin() {
+        let store = FakeAuthStore::new();
+        store.create_user(&admin("a1", "only-admin")).await.unwrap();
+
+        assert!(!store.try_demote_user_unless_last_admin("a1").await.unwrap());
+        let reloaded = store.get_user("a1").await.unwrap().unwrap();
+        assert_eq!(reloaded.role, Role::Admin);
+    }
+
+    #[tokio::test]
+    async fn try_demote_user_unless_last_admin_succeeds_with_another_admin() {
+        let store = FakeAuthStore::new();
+        store.create_user(&admin("a1", "admin1")).await.unwrap();
+        store.create_user(&admin("a2", "admin2")).await.unwrap();
+
+        assert!(store.try_demote_user_unless_last_admin("a1").await.unwrap());
+        let reloaded = store.get_user("a1").await.unwrap().unwrap();
+        assert_eq!(reloaded.role, Role::Member);
+        // The remaining admin is unaffected.
+        let a2 = store.get_user("a2").await.unwrap().unwrap();
+        assert_eq!(a2.role, Role::Admin);
+    }
+
+    #[tokio::test]
+    async fn try_demote_user_unless_last_admin_is_a_noop_on_a_member() {
+        let store = FakeAuthStore::new();
+        store.create_user(&admin("a1", "solo-admin")).await.unwrap();
+        store.create_user(&user("m1", "some-member")).await.unwrap();
+
+        // `m1` isn't an admin at all — the guard's WHERE clause never
+        // matches, so this reports `false` (nothing to demote), not a
+        // last-admin refusal.
+        assert!(!store.try_demote_user_unless_last_admin("m1").await.unwrap());
+    }
+
     #[tokio::test]
     async fn count_users_reflects_inserts() {
         let store = FakeAuthStore::new();
         assert_eq!(store.count_users().await.unwrap(), 0);
         store.create_user(&user("u1", "alice")).await.unwrap();
         assert_eq!(store.count_users().await.unwrap(), 1);
+    }
+
+    fn access_request(id: &str, invite_id: &str) -> AccessRequestRow {
+        AccessRequestRow {
+            id: id.to_string(),
+            invite_id: invite_id.to_string(),
+            requested_name: "someone".to_string(),
+            secret_hash: "req-hash".to_string(),
+            state: AccessRequestState::Pending,
+            resulting_user_id: None,
+            created_at: "2026-06-10T12:00:00Z".to_string(),
+            decided_at: None,
+            collected_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn try_decide_access_request_transitions_pending_once() {
+        let store = FakeAuthStore::new();
+        store
+            .create_access_request(&access_request("ar1", "i1"))
+            .await
+            .unwrap();
+
+        assert!(store
+            .try_decide_access_request(
+                "ar1",
+                AccessRequestState::Approved,
+                Some("u1"),
+                "2026-06-11T00:00:00Z",
+            )
+            .await
+            .unwrap());
+        let found = store.find_access_request("ar1").await.unwrap().unwrap();
+        assert_eq!(found.state, AccessRequestState::Approved);
+        assert_eq!(found.resulting_user_id.as_deref(), Some("u1"));
+
+        // Already decided: a second decision must not overwrite it.
+        assert!(!store
+            .try_decide_access_request(
+                "ar1",
+                AccessRequestState::Denied,
+                None,
+                "2026-06-11T00:00:01Z",
+            )
+            .await
+            .unwrap());
+        let unchanged = store.find_access_request("ar1").await.unwrap().unwrap();
+        assert_eq!(unchanged.state, AccessRequestState::Approved);
+    }
+
+    #[tokio::test]
+    async fn poison_next_decide_makes_try_decide_report_false_once() {
+        let store = FakeAuthStore::new();
+        store
+            .create_access_request(&access_request("ar1", "i1"))
+            .await
+            .unwrap();
+
+        store.poison_next_decide("ar1").await;
+        assert!(!store
+            .try_decide_access_request(
+                "ar1",
+                AccessRequestState::Approved,
+                Some("u1"),
+                "2026-06-11T00:00:00Z",
+            )
+            .await
+            .unwrap());
+        let untouched = store.find_access_request("ar1").await.unwrap().unwrap();
+        assert_eq!(untouched.state, AccessRequestState::Pending);
+
+        // Single-shot: the next call behaves normally.
+        assert!(store
+            .try_decide_access_request(
+                "ar1",
+                AccessRequestState::Approved,
+                Some("u1"),
+                "2026-06-11T00:00:01Z",
+            )
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn poison_next_collect_makes_mark_collected_report_false_once() {
+        let store = FakeAuthStore::new();
+        store
+            .create_access_request(&access_request("ar1", "i1"))
+            .await
+            .unwrap();
+        store
+            .try_decide_access_request(
+                "ar1",
+                AccessRequestState::Approved,
+                Some("u1"),
+                "2026-06-11T00:00:00Z",
+            )
+            .await
+            .unwrap();
+
+        store.poison_next_collect("ar1").await;
+        assert!(!store
+            .mark_access_request_collected("ar1", "2026-06-11T00:00:01Z")
+            .await
+            .unwrap());
+        let untouched = store.find_access_request("ar1").await.unwrap().unwrap();
+        assert!(untouched.collected_at.is_none());
+
+        // Single-shot: the next call behaves normally.
+        assert!(store
+            .mark_access_request_collected("ar1", "2026-06-11T00:00:02Z")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn poison_next_insert_token_fails_the_next_insert_only() {
+        let store = FakeAuthStore::new();
+        let token = AuthTokenRow {
+            id: "t1".to_string(),
+            user_id: "u1".to_string(),
+            kind: super::TokenKind::ApiKey,
+            secret_hash: "hash-1".to_string(),
+            expires_at: None,
+            last_used_at: None,
+            revoked_at: None,
+            created_at: "2026-06-10T12:00:00Z".to_string(),
+            family_id: None,
+            rotated_from: None,
+        };
+
+        store.poison_next_insert_token().await;
+        assert!(store.insert_token(&token).await.is_err());
+        assert!(store.find_token("t1").await.unwrap().is_none());
+
+        // Single-shot: the next call behaves normally.
+        store.insert_token(&token).await.unwrap();
+        assert!(store.find_token("t1").await.unwrap().is_some());
     }
 
     #[tokio::test]

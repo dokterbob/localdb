@@ -71,6 +71,14 @@ impl AuthStore for LibsqlAuthStore {
         users::count_users(&self.conn).await
     }
 
+    async fn try_delete_user_unless_last_admin(&self, id: &str) -> Result<bool, Error> {
+        users::try_delete_user_unless_last_admin(&self.conn, id).await
+    }
+
+    async fn try_demote_user_unless_last_admin(&self, id: &str) -> Result<bool, Error> {
+        users::try_demote_user_unless_last_admin(&self.conn, id).await
+    }
+
     async fn insert_token(&self, token: &AuthTokenRow) -> Result<(), Error> {
         tokens::insert_token(&self.conn, token).await
     }
@@ -185,14 +193,14 @@ impl AuthStore for LibsqlAuthStore {
         invites::list_access_requests(&self.conn).await
     }
 
-    async fn update_access_request_state(
+    async fn try_decide_access_request(
         &self,
         id: &str,
         state: AccessRequestState,
         resulting_user_id: Option<&str>,
         decided_at: &str,
-    ) -> Result<(), Error> {
-        invites::update_access_request_state(&self.conn, id, state, resulting_user_id, decided_at)
+    ) -> Result<bool, Error> {
+        invites::try_decide_access_request(&self.conn, id, state, resulting_user_id, decided_at)
             .await
     }
 

@@ -107,6 +107,52 @@ pub(crate) async fn delete_user(db: &LibsqlDb, id: &str) -> Result<bool, Error> 
     Ok(n > 0)
 }
 
+/// Atomic "delete iff this wouldn't drop admins to zero" (D7 last-admin
+/// lockout guard, finding #5): the eligibility check — whether `id` is
+/// currently the *sole* admin — is folded into the `DELETE`'s own WHERE
+/// clause via a correlated subquery, so two concurrent guarded deletes (or a
+/// guarded delete racing `try_demote_user_unless_last_admin`) against the
+/// same two-admin instance can never both succeed and leave zero admins.
+/// Returns `true` iff this call deleted the row.
+pub(crate) async fn try_delete_user_unless_last_admin(
+    db: &LibsqlDb,
+    id: &str,
+) -> Result<bool, Error> {
+    let conn = db.conn().await;
+    let n = conn
+        .execute(
+            "DELETE FROM users WHERE id = ? AND ( \
+                 role <> 'admin' \
+                 OR (SELECT COUNT(*) FROM users WHERE role = 'admin') > 1 \
+             )",
+            libsql::params![id.to_string()],
+        )
+        .await
+        .map_err(map_libsql_err)?;
+    Ok(n > 0)
+}
+
+/// Atomic "demote to member iff this wouldn't drop admins to zero" — the
+/// demotion counterpart to `try_delete_user_unless_last_admin`, same
+/// correlated-subquery-in-the-WHERE-clause convention. Returns `true` iff
+/// this call performed the demotion; `false` covers "unknown id", "already
+/// not an admin", and "would have left zero admins".
+pub(crate) async fn try_demote_user_unless_last_admin(
+    db: &LibsqlDb,
+    id: &str,
+) -> Result<bool, Error> {
+    let conn = db.conn().await;
+    let n = conn
+        .execute(
+            "UPDATE users SET role = 'member' WHERE id = ? AND role = 'admin' \
+             AND (SELECT COUNT(*) FROM users WHERE role = 'admin') > 1",
+            libsql::params![id.to_string()],
+        )
+        .await
+        .map_err(map_libsql_err)?;
+    Ok(n > 0)
+}
+
 pub(crate) async fn count_users(db: &LibsqlDb) -> Result<u64, Error> {
     let conn = db.conn().await;
     let mut rows = conn

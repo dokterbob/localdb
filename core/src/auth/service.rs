@@ -537,20 +537,53 @@ impl<S: AuthStore> AuthService<S> {
     /// user cascades to their tokens and store grants at the schema level
     /// (`ON DELETE CASCADE`, specs/02-domain-model.md §9), so no separate
     /// token-revocation step is needed here.
+    ///
+    /// **Concurrency (finding #5 fix):** the guard is enforced atomically at
+    /// the store layer (`AuthStore::try_delete_user_unless_last_admin`, a
+    /// conditional `DELETE ... WHERE role <> 'admin' OR (admin count) >
+    /// 1`), not merely by a check-then-act pre-check — two concurrent
+    /// `delete_user`/`set_user_role` calls each observing 2 admins can no
+    /// longer both proceed and leave zero admins, since the eligibility
+    /// check is folded into the same statement as the mutation. If the
+    /// guarded delete reports `false`, `is_last_admin` is consulted purely
+    /// to build the right message: either `id` really is the sole admin
+    /// (refuse), or the guard's `false` was simply "unknown id" / "not an
+    /// admin at all" (report "not found" via `Ok(false)`, unchanged from
+    /// before).
     pub async fn delete_user(&self, id: &str) -> Result<bool, Error> {
+        if self.store.try_delete_user_unless_last_admin(id).await? {
+            return Ok(true);
+        }
         if self.is_last_admin(id).await? {
             return Err(Error::InvalidRequest {
                 message: "cannot delete the last remaining admin account".to_string(),
             });
         }
-        self.store.delete_user(id).await
+        Ok(false)
     }
 
     /// Change a user's role, refusing to demote the last remaining admin to
     /// `member` (D7 guard rail — same lockout concern as `delete_user`).
     /// Promoting a member to admin is always allowed.
+    ///
+    /// **Concurrency (finding #5 fix):** demotion to `member` is enforced
+    /// atomically at the store layer
+    /// (`AuthStore::try_demote_user_unless_last_admin`), the same
+    /// conditional-write pattern as `delete_user` above — see that method's
+    /// doc comment for the race it closes. If the guarded demotion reports
+    /// `false`, `is_last_admin` disambiguates a genuine last-admin refusal
+    /// from "unknown id" / "already not an admin", falling back to the
+    /// plain unconditional `update_user_role` for those idempotent cases
+    /// (preserving both "not found" errors and a no-op member->member
+    /// "demotion").
     pub async fn set_user_role(&self, id: &str, role: Role) -> Result<(), Error> {
-        if role == Role::Member && self.is_last_admin(id).await? {
+        if role != Role::Member {
+            return self.store.update_user_role(id, role).await;
+        }
+        if self.store.try_demote_user_unless_last_admin(id).await? {
+            return Ok(());
+        }
+        if self.is_last_admin(id).await? {
             return Err(Error::InvalidRequest {
                 message: "cannot demote the last remaining admin account".to_string(),
             });
@@ -738,14 +771,39 @@ impl<S: AuthStore> AuthService<S> {
 
     /// `open`-mode mint half of `redeem_invite`: create the user, apply the
     /// invite's store grants, and issue a show-once API-key credential.
+    ///
+    /// **Orphan cleanup (finding #6 fix):** `AuthStore` has no multi-call
+    /// transaction seam, so a failure in either post-create step
+    /// (`apply_invite_grants` — e.g. a store deleted after the invite was
+    /// created — or `issue_api_key`) would otherwise leave a real, if
+    /// uncredentialed, user row behind: `redeem_invite` releases the
+    /// reserved invite use on any error here, but that alone doesn't remove
+    /// the user, so a retry with the same `requested_name` would then fail
+    /// "user already exists" forever. Instead, once `create_user` has
+    /// succeeded, any later failure triggers a best-effort compensating
+    /// `delete_user` (the plain, unconditional store method — this is a
+    /// fresh `Role::Member` row, never subject to the last-admin guard)
+    /// before the original error is surfaced, so the caller's next attempt
+    /// starts from a clean slate.
     async fn mint_open_invite_redemption(
         &self,
         invite: &InviteRow,
         requested_name: &str,
     ) -> Result<RedeemOutcome, Error> {
         let user = self.create_user(requested_name, Role::Member).await?;
-        self.apply_invite_grants(invite, &user.id).await?;
-        let credential = self.issue_api_key(&user.id).await?;
+
+        if let Err(err) = self.apply_invite_grants(invite, &user.id).await {
+            let _ = self.store.delete_user(&user.id).await;
+            return Err(err);
+        }
+        let credential = match self.issue_api_key(&user.id).await {
+            Ok(credential) => credential,
+            Err(err) => {
+                let _ = self.store.delete_user(&user.id).await;
+                return Err(err);
+            }
+        };
+
         Ok(RedeemOutcome::Open {
             user,
             grants: invite.store_grants.clone(),
@@ -790,6 +848,25 @@ impl<S: AuthStore> AuthService<S> {
     /// minted in `poll_request`, at the moment the requester first collects
     /// it, so the durable credential is born only once someone has actually
     /// picked it up — never merely by an admin approving in the abstract.
+    ///
+    /// **Concurrency (finding #4 fix):** the initial `state != Pending`
+    /// check above is only a fast-path rejection — it cannot by itself
+    /// prevent two concurrent decisions (an `approve_request` racing a
+    /// `deny_request`, or either racing a duplicate call) from both passing
+    /// the check and then both writing. The actual guard is
+    /// `AuthStore::try_decide_access_request`, an atomic `UPDATE ... WHERE
+    /// state = 'pending'` performed *after* the user has been created and
+    /// granted: whichever caller's conditional update lands first wins the
+    /// decision, and the loser's `try_decide_access_request` reports
+    /// `false`. Because the user is created *before* claiming the decision
+    /// (there is no way to know its id otherwise), a losing `approve_request`
+    /// would otherwise leave a real user with live grants attached to a
+    /// request that ended up `denied` — so on `false` we best-effort
+    /// compensating-delete the user we just created (mirroring
+    /// `mint_open_invite_redemption`'s finding #6 cleanup) before surfacing
+    /// the conflict. This guarantees a denied request can never have a live
+    /// resulting user, and exactly one of a racing approve/deny pair takes
+    /// effect.
     pub async fn approve_request(&self, request_id: &str) -> Result<UserRow, Error> {
         let request = self
             .store
@@ -821,20 +898,40 @@ impl<S: AuthStore> AuthService<S> {
             .await?;
         self.apply_invite_grants(&invite, &user.id).await?;
 
-        self.store
-            .update_access_request_state(
+        let decided = self
+            .store
+            .try_decide_access_request(
                 request_id,
                 AccessRequestState::Approved,
                 Some(&user.id),
                 &now_rfc3339(),
             )
             .await?;
+        if !decided {
+            // Lost the race: a concurrent approve/deny already decided this
+            // request first. Don't leave the user we just created (with
+            // grants already applied) dangling off a request that isn't
+            // `approved` — best-effort delete it, then surface the
+            // conflict. `self.store.delete_user` (not `self.delete_user`)
+            // is deliberate: this is a fresh `Role::Member` row, never
+            // subject to the last-admin guard.
+            let _ = self.store.delete_user(&user.id).await;
+            return Err(Error::InvalidRequest {
+                message: format!("access request '{request_id}' is no longer pending"),
+            });
+        }
 
         Ok(user)
     }
 
     /// Deny a pending closed-mode access request (T6). No user is created;
     /// the requester's next `poll_request` observes `PollOutcome::Denied`.
+    ///
+    /// **Concurrency (finding #4 fix):** same atomic guard as
+    /// `approve_request` — see that method's doc comment. A denial that
+    /// loses the race to a concurrent decision reports the same "no longer
+    /// pending" conflict rather than silently overwriting whatever the
+    /// winner decided.
     pub async fn deny_request(&self, request_id: &str) -> Result<(), Error> {
         let request = self
             .store
@@ -848,14 +945,16 @@ impl<S: AuthStore> AuthService<S> {
                 message: format!("access request '{request_id}' is no longer pending"),
             });
         }
-        self.store
-            .update_access_request_state(
-                request_id,
-                AccessRequestState::Denied,
-                None,
-                &now_rfc3339(),
-            )
-            .await
+        let decided = self
+            .store
+            .try_decide_access_request(request_id, AccessRequestState::Denied, None, &now_rfc3339())
+            .await?;
+        if !decided {
+            return Err(Error::InvalidRequest {
+                message: format!("access request '{request_id}' is no longer pending"),
+            });
+        }
+        Ok(())
     }
 
     /// Poll a closed-mode access request's status (T6, device-authorization
@@ -874,8 +973,24 @@ impl<S: AuthStore> AuthService<S> {
     /// `AuthStore::mark_access_request_collected` is an atomic consume-once
     /// gate (mirroring `consume_auth_code`), so a second successful poll (or
     /// two concurrent ones racing the first) observes
-    /// `PollOutcome::AlreadyCollected` instead of a credential — and no
-    /// token row exists at all until the winning poll mints one.
+    /// `PollOutcome::AlreadyCollected` instead of a credential.
+    ///
+    /// **Mint-then-mark ordering (finding #7 fix):** the API key is minted
+    /// *before* the collection is marked, not after. Marking collected
+    /// first (the original ordering) meant a subsequent `issue_api_key`
+    /// failure — the user deleted between approval and poll, or a
+    /// transient store error — left `collected_at` set with no credential
+    /// ever having been handed out, permanently bricking collection (every
+    /// later poll would see `AlreadyCollected` forever). With minting
+    /// first: if the mint fails, `collected_at` is never touched, so the
+    /// request remains collectible and a later poll can retry. If the mint
+    /// succeeds but this poll then loses the atomic collect race to a
+    /// concurrent one, the freshly minted key is best-effort revoked before
+    /// reporting `AlreadyCollected`, so a losing racer never leaves a live,
+    /// never-handed-out credential behind — the exactly-once delivery
+    /// invariant (at most one *usable* key reaches a caller) holds
+    /// alongside the new liveness invariant (a mint failure doesn't
+    /// permanently brick collection).
     pub async fn poll_request(
         &self,
         request_id: &str,
@@ -901,28 +1016,36 @@ impl<S: AuthStore> AuthService<S> {
                 if request.collected_at.is_some() {
                     return Ok(PollOutcome::AlreadyCollected);
                 }
+                let user_id =
+                    request
+                        .resulting_user_id
+                        .as_deref()
+                        .ok_or_else(|| Error::Internal {
+                            message: format!(
+                                "access request '{request_id}' is approved but has no \
+                                 resulting_user_id"
+                            ),
+                            correlation_id: "poll_request_missing_resulting_user".to_string(),
+                        })?;
+
+                // Mint first (see doc comment): a failure here leaves
+                // `collected_at` untouched, so this request stays
+                // collectible for a retry.
+                let issued = self.issue_api_key(user_id).await?;
+
                 let collected = self
                     .store
                     .mark_access_request_collected(request_id, &now_rfc3339())
                     .await?;
                 if collected {
-                    let user_id =
-                        request
-                            .resulting_user_id
-                            .as_deref()
-                            .ok_or_else(|| Error::Internal {
-                                message: format!(
-                                    "access request '{request_id}' is approved but has no \
-                                     resulting_user_id"
-                                ),
-                                correlation_id: "poll_request_missing_resulting_user".to_string(),
-                            })?;
-                    let issued = self.issue_api_key(user_id).await?;
                     Ok(PollOutcome::Approved {
                         credential: issued.secret,
                     })
                 } else {
-                    // Lost the race to a concurrent poll.
+                    // Lost the race to a concurrent poll that collected
+                    // first — don't leave the key we just minted live and
+                    // unclaimed.
+                    let _ = self.store.revoke_token(&issued.row.id).await;
                     Ok(PollOutcome::AlreadyCollected)
                 }
             }
@@ -1776,6 +1899,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn redeem_open_invite_mint_failure_after_create_user_cleans_up_orphan() {
+        // Pins finding #6: if a post-create step (`issue_api_key` here,
+        // simulated via the `poison_next_insert_token` hook) fails after
+        // `create_user` already succeeded, the user must not be left
+        // behind — otherwise a retry with the same name would fail forever
+        // with "user already exists", and an uncredentialed member would
+        // linger with no way to reach it.
+        let svc = service();
+        let issued = make_open_invite(&svc, 1).await;
+
+        svc.store.poison_next_insert_token().await;
+
+        let err = svc
+            .redeem_invite(&issued.secret, "newbie")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Internal { .. }));
+
+        // No orphaned user left behind.
+        assert!(svc
+            .store
+            .get_user_by_name("newbie")
+            .await
+            .unwrap()
+            .is_none());
+
+        // The invite use was released (composes with the existing
+        // reserve/release behavior), not permanently burned.
+        let invite = svc
+            .store
+            .find_invite(&issued.row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            invite.uses, 0,
+            "a failed mint must not burn the reserved invite use"
+        );
+
+        // Retrying with the SAME name now succeeds — proof the orphaned
+        // user was actually removed, not just that the invite use reset.
+        let outcome = svc.redeem_invite(&issued.secret, "newbie").await.unwrap();
+        let RedeemOutcome::Open {
+            user, credential, ..
+        } = outcome
+        else {
+            panic!("expected Open outcome");
+        };
+        assert_eq!(user.name, "newbie");
+        // The retry's credential actually authenticates.
+        svc.authenticate(&credential.secret).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn redeem_closed_invite_consumes_a_use_on_success() {
         let svc = service();
         let issued = make_closed_invite(&svc, 1).await;
@@ -1920,6 +2097,95 @@ mod tests {
         assert_eq!(second, PollOutcome::AlreadyCollected);
     }
 
+    // -----------------------------------------------------------------
+    // Finding #7: poll_request mint-then-mark ordering
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn poll_request_mint_failure_does_not_permanently_brick_collection() {
+        // Pins finding #7: if `issue_api_key` fails on the collecting poll
+        // (simulated via `poison_next_insert_token`), `collected_at` must
+        // NOT have been set — otherwise every subsequent poll would
+        // observe `AlreadyCollected` forever and the requester could never
+        // get a credential.
+        let svc = service();
+        let issued = make_closed_invite(&svc, 1).await;
+        let RedeemOutcome::Closed {
+            request_id,
+            request_secret,
+        } = svc
+            .redeem_invite(&issued.secret, "requester")
+            .await
+            .unwrap()
+        else {
+            panic!("expected Closed outcome");
+        };
+        svc.approve_request(&request_id).await.unwrap();
+
+        svc.store.poison_next_insert_token().await;
+        let err = svc
+            .poll_request(&request_id, &request_secret)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Internal { .. }));
+
+        // Not bricked: a retry after the transient failure still succeeds
+        // and hands back a real credential (not `AlreadyCollected`).
+        let retry = svc
+            .poll_request(&request_id, &request_secret)
+            .await
+            .unwrap();
+        let PollOutcome::Approved { credential } = retry else {
+            panic!("expected Approved on retry after mint failure, got {retry:?}");
+        };
+        svc.authenticate(&credential).await.unwrap();
+
+        // Exactly-once still holds: a third poll is terminal.
+        let third = svc
+            .poll_request(&request_id, &request_secret)
+            .await
+            .unwrap();
+        assert_eq!(third, PollOutcome::AlreadyCollected);
+    }
+
+    #[tokio::test]
+    async fn poll_request_lost_collect_race_revokes_its_own_freshly_minted_key() {
+        // Pins finding #7's other half: a poll that mints successfully but
+        // then loses the atomic `mark_access_request_collected` race (a
+        // concurrent poll collected first — simulated via
+        // `poison_next_collect`) must not leave its own freshly minted key
+        // live: exactly one *usable* credential must exist afterward.
+        let svc = service();
+        let issued = make_closed_invite(&svc, 1).await;
+        let RedeemOutcome::Closed {
+            request_id,
+            request_secret,
+        } = svc
+            .redeem_invite(&issued.secret, "requester")
+            .await
+            .unwrap()
+        else {
+            panic!("expected Closed outcome");
+        };
+        let user = svc.approve_request(&request_id).await.unwrap();
+
+        svc.store.poison_next_collect(&request_id).await;
+        let outcome = svc
+            .poll_request(&request_id, &request_secret)
+            .await
+            .unwrap();
+        assert_eq!(outcome, PollOutcome::AlreadyCollected);
+
+        // The key minted during the losing attempt must be revoked, not
+        // left live and unclaimed.
+        let tokens = svc.store.list_tokens_for_user(&user.id).await.unwrap();
+        assert_eq!(tokens.len(), 1);
+        assert!(
+            tokens[0].revoked_at.is_some(),
+            "a lost collect race must revoke its own freshly minted key"
+        );
+    }
+
     #[tokio::test]
     async fn closed_invite_request_secret_never_authenticates() {
         // Pin: the request secret is poll-only, both before and after
@@ -2029,6 +2295,119 @@ mod tests {
         svc.approve_request(&request_id).await.unwrap();
         let err = svc.approve_request(&request_id).await.unwrap_err();
         assert!(matches!(err, Error::InvalidRequest { .. }));
+    }
+
+    // -----------------------------------------------------------------
+    // Finding #4: approve/deny access-request decision atomicity
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn approve_request_lost_atomic_race_deletes_the_orphaned_user_and_errors() {
+        // Simulates a concurrent decision winning the atomic
+        // `try_decide_access_request` race after `approve_request` has
+        // already created the user and applied grants: the pre-check
+        // passed (the request looked pending), but the store-level
+        // conditional UPDATE reports "no-op" (poisoned here to stand in for
+        // a real concurrent winner). The user created for the losing
+        // attempt must not survive.
+        let svc = service();
+        let issued = make_closed_invite(&svc, 1).await;
+        let RedeemOutcome::Closed { request_id, .. } = svc
+            .redeem_invite(&issued.secret, "requester")
+            .await
+            .unwrap()
+        else {
+            panic!("expected Closed outcome");
+        };
+
+        svc.store.poison_next_decide(&request_id).await;
+
+        let err = svc.approve_request(&request_id).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidRequest { .. }));
+
+        // No orphaned user left behind, despite `create_user` +
+        // `apply_invite_grants` having already succeeded before the lost
+        // race was discovered.
+        assert!(svc
+            .store
+            .get_user_by_name("requester")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn deny_request_lost_atomic_race_errors_without_side_effects() {
+        let svc = service();
+        let issued = make_closed_invite(&svc, 1).await;
+        let RedeemOutcome::Closed { request_id, .. } = svc
+            .redeem_invite(&issued.secret, "requester")
+            .await
+            .unwrap()
+        else {
+            panic!("expected Closed outcome");
+        };
+
+        svc.store.poison_next_decide(&request_id).await;
+
+        let err = svc.deny_request(&request_id).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidRequest { .. }));
+
+        // `deny_request` never creates a user regardless; pin that too.
+        assert!(svc
+            .store
+            .get_user_by_name("requester")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn approve_request_normal_path_still_works_after_atomicity_fix() {
+        // Regression guard: the atomic guard must not disturb the ordinary
+        // single-caller happy path.
+        let svc = service();
+        let issued = make_closed_invite(&svc, 1).await;
+        let RedeemOutcome::Closed { request_id, .. } = svc
+            .redeem_invite(&issued.secret, "requester")
+            .await
+            .unwrap()
+        else {
+            panic!("expected Closed outcome");
+        };
+
+        let user = svc.approve_request(&request_id).await.unwrap();
+        assert_eq!(user.name, "requester");
+        let request = svc
+            .store
+            .find_access_request(&request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.state, AccessRequestState::Approved);
+        assert_eq!(request.resulting_user_id.as_deref(), Some(user.id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn deny_request_normal_path_still_works_after_atomicity_fix() {
+        let svc = service();
+        let issued = make_closed_invite(&svc, 1).await;
+        let RedeemOutcome::Closed { request_id, .. } = svc
+            .redeem_invite(&issued.secret, "requester")
+            .await
+            .unwrap()
+        else {
+            panic!("expected Closed outcome");
+        };
+
+        svc.deny_request(&request_id).await.unwrap();
+        let request = svc
+            .store
+            .find_access_request(&request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.state, AccessRequestState::Denied);
     }
 
     #[tokio::test]

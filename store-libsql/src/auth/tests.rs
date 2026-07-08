@@ -175,6 +175,102 @@ async fn count_users_tracks_inserts_and_deletes() {
 }
 
 // ---------------------------------------------------------------------
+// T5/finding #5: atomic last-admin guard
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn try_delete_user_unless_last_admin_refuses_the_sole_admin() {
+    let (_dir, _backend, store) = make_store().await;
+    store
+        .create_user(&make_user("u1", "only-admin", Role::Admin))
+        .await
+        .unwrap();
+
+    assert!(!store.try_delete_user_unless_last_admin("u1").await.unwrap());
+    assert!(store.get_user("u1").await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn try_delete_user_unless_last_admin_succeeds_with_another_admin() {
+    let (_dir, _backend, store) = make_store().await;
+    store
+        .create_user(&make_user("u1", "admin1", Role::Admin))
+        .await
+        .unwrap();
+    store
+        .create_user(&make_user("u2", "admin2", Role::Admin))
+        .await
+        .unwrap();
+
+    assert!(store.try_delete_user_unless_last_admin("u1").await.unwrap());
+    assert!(store.get_user("u1").await.unwrap().is_none());
+    assert!(store.get_user("u2").await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn try_delete_user_unless_last_admin_allows_deleting_a_member() {
+    let (_dir, _backend, store) = make_store().await;
+    store
+        .create_user(&make_user("u1", "solo-admin", Role::Admin))
+        .await
+        .unwrap();
+    store
+        .create_user(&make_user("u2", "some-member", Role::Member))
+        .await
+        .unwrap();
+
+    assert!(store.try_delete_user_unless_last_admin("u2").await.unwrap());
+    assert!(store.get_user("u2").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn try_demote_user_unless_last_admin_refuses_the_sole_admin() {
+    let (_dir, _backend, store) = make_store().await;
+    store
+        .create_user(&make_user("u1", "only-admin", Role::Admin))
+        .await
+        .unwrap();
+
+    assert!(!store.try_demote_user_unless_last_admin("u1").await.unwrap());
+    let found = store.get_user("u1").await.unwrap().unwrap();
+    assert_eq!(found.role, Role::Admin);
+}
+
+#[tokio::test]
+async fn try_demote_user_unless_last_admin_succeeds_with_another_admin() {
+    let (_dir, _backend, store) = make_store().await;
+    store
+        .create_user(&make_user("u1", "admin1", Role::Admin))
+        .await
+        .unwrap();
+    store
+        .create_user(&make_user("u2", "admin2", Role::Admin))
+        .await
+        .unwrap();
+
+    assert!(store.try_demote_user_unless_last_admin("u1").await.unwrap());
+    let found = store.get_user("u1").await.unwrap().unwrap();
+    assert_eq!(found.role, Role::Member);
+    let other = store.get_user("u2").await.unwrap().unwrap();
+    assert_eq!(other.role, Role::Admin);
+}
+
+#[tokio::test]
+async fn try_demote_user_unless_last_admin_is_a_noop_on_a_member() {
+    let (_dir, _backend, store) = make_store().await;
+    store
+        .create_user(&make_user("u1", "solo-admin", Role::Admin))
+        .await
+        .unwrap();
+    store
+        .create_user(&make_user("u2", "some-member", Role::Member))
+        .await
+        .unwrap();
+
+    assert!(!store.try_demote_user_unless_last_admin("u2").await.unwrap());
+}
+
+// ---------------------------------------------------------------------
 // Tokens
 // ---------------------------------------------------------------------
 
@@ -725,7 +821,7 @@ async fn create_and_find_access_request_round_trips() {
 }
 
 #[tokio::test]
-async fn update_access_request_state_approves_with_resulting_user() {
+async fn try_decide_access_request_approves_with_resulting_user() {
     let (_dir, _backend, store) = make_store().await;
     store
         .create_invite(&make_invite("i1", "h1", InviteMode::Closed))
@@ -750,20 +846,85 @@ async fn update_access_request_state_approves_with_resulting_user() {
         .await
         .unwrap();
 
-    store
-        .update_access_request_state(
-            "ar1",
-            AccessRequestState::Approved,
-            Some("u1"),
-            "2026-06-11T00:00:00Z",
-        )
-        .await
-        .unwrap();
+    assert!(
+        store
+            .try_decide_access_request(
+                "ar1",
+                AccessRequestState::Approved,
+                Some("u1"),
+                "2026-06-11T00:00:00Z",
+            )
+            .await
+            .unwrap(),
+        "the first decision on a pending request must take effect"
+    );
 
     let found = store.find_access_request("ar1").await.unwrap().unwrap();
     assert_eq!(found.state, AccessRequestState::Approved);
     assert_eq!(found.resulting_user_id.as_deref(), Some("u1"));
     assert_eq!(found.decided_at.as_deref(), Some("2026-06-11T00:00:00Z"));
+}
+
+/// Finding #4: two decisions racing the same request must never both take
+/// effect — the second (whichever it is) must observe the first's decision
+/// already landed and report `false` rather than overwriting it.
+#[tokio::test]
+async fn try_decide_access_request_refuses_once_already_decided() {
+    let (_dir, _backend, store) = make_store().await;
+    store
+        .create_invite(&make_invite("i1", "h1", InviteMode::Closed))
+        .await
+        .unwrap();
+    store
+        .create_access_request(&AccessRequestRow {
+            id: "ar1".to_string(),
+            invite_id: "i1".to_string(),
+            requested_name: "carol".to_string(),
+            secret_hash: "req-hash".to_string(),
+            state: AccessRequestState::Pending,
+            resulting_user_id: None,
+            created_at: "2026-06-10T12:00:00Z".to_string(),
+            decided_at: None,
+            collected_at: None,
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        store
+            .try_decide_access_request(
+                "ar1",
+                AccessRequestState::Denied,
+                None,
+                "2026-06-11T00:00:00Z",
+            )
+            .await
+            .unwrap(),
+        "the first (denying) decision must take effect"
+    );
+
+    // A second, differing decision (an approve racing the deny above) must
+    // be refused, not overwrite the denial.
+    assert!(
+        !store
+            .try_decide_access_request(
+                "ar1",
+                AccessRequestState::Approved,
+                Some("u1"),
+                "2026-06-11T00:00:01Z",
+            )
+            .await
+            .unwrap(),
+        "a second decision on an already-decided request must be refused"
+    );
+
+    let found = store.find_access_request("ar1").await.unwrap().unwrap();
+    assert_eq!(
+        found.state,
+        AccessRequestState::Denied,
+        "the original decision must be left untouched"
+    );
+    assert!(found.resulting_user_id.is_none());
 }
 
 #[tokio::test]
@@ -888,7 +1049,7 @@ async fn mark_access_request_collected_succeeds_once_then_fails() {
     );
 
     store
-        .update_access_request_state(
+        .try_decide_access_request(
             "ar1",
             AccessRequestState::Approved,
             Some("u1"),
