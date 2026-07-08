@@ -238,7 +238,7 @@ async fn replay_one(tx: &Connection, row: &MigrationRow) -> Result<(), libsql::E
     }
     table::delete_row(tx, row.version).await?;
     // PRAGMAs may return rows; use query() not execute() (see
-    // schema::set_user_version).
+    // baseline::set_user_version).
     tx.query(&format!("PRAGMA user_version = {}", row.version - 1), ())
         .await?;
     Ok(())

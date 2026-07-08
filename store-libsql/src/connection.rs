@@ -655,6 +655,59 @@ mod tests {
         assert_eq!(rows[0].name, "baseline");
     }
 
+    // Codex review #152 fix 1: a database that only got as far as
+    // `create_schema` (no seeding, no stamp — simulating a crash between
+    // `create_schema` finishing and `seed_for_fresh_create` committing) must
+    // still open successfully: `user_version` is still 0, so `open`
+    // classifies it as `Fresh` and re-runs `create_schema` (idempotent) plus
+    // seeding, landing at head with the baseline row present.
+    #[tokio::test]
+    async fn crash_before_seeding_reclassifies_as_fresh_and_recovers_on_reopen() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        // Simulate the interrupted fresh-create: run create_schema directly,
+        // bypassing LibsqlDb::open, and never seed schema_migrations or stamp
+        // user_version — exactly what create_schema alone now leaves behind.
+        {
+            let db = libsql::Builder::new_local(&path).build().await.unwrap();
+            let conn = db.connect().unwrap();
+            conn.query("PRAGMA foreign_keys = ON", ()).await.unwrap();
+            schema::create_schema(&conn, 4, VectorEncoding::Float32)
+                .await
+                .unwrap();
+        }
+
+        // Confirm the simulated crash point: schema exists, but user_version
+        // is still 0.
+        {
+            let db = libsql::Builder::new_local(&path).build().await.unwrap();
+            let conn = db.connect().unwrap();
+            assert_eq!(
+                schema::get_schema_version(&conn).await.unwrap(),
+                0,
+                "create_schema alone must not stamp user_version"
+            );
+        }
+
+        // Reopening via the normal path must succeed — classified as Fresh —
+        // and end up healthy at head with the baseline row present.
+        let db = LibsqlDb::open(&path, 4, VectorEncoding::Float32)
+            .await
+            .unwrap();
+        let conn = db.conn().await;
+
+        let v = schema::get_schema_version(&conn).await.unwrap();
+        assert_eq!(v, chain::head_version(&chain::migrations()));
+
+        let rows = table::list_rows_desc_above(&conn, i64::MIN).await.unwrap();
+        assert!(
+            rows.iter()
+                .any(|r| r.version == chain::BASELINE_VERSION && r.name == "baseline"),
+            "recovered store should have the baseline row: {rows:?}"
+        );
+    }
+
     // Checksum drift: a healthy at-head store whose baseline row's checksum
     // has been tampered with must refuse to open (Error::Internal) without
     // mutating anything further.

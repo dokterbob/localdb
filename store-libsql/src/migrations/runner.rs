@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use libsql::{Connection, TransactionBehavior};
 use localdb_core::Error;
 
-use super::chain::{validate_chain, BASELINE_VERSION};
+use super::chain::{head_version, validate_chain, BASELINE_VERSION};
 use super::checksum::migration_checksum;
 use super::table::{self, MigrationRow};
 use super::{Down, Migration, MigrationContext, Up};
@@ -182,7 +182,7 @@ async fn apply_one(
     table::insert_row(tx, &row).await?;
 
     // PRAGMAs may return rows; use query() not execute() (see
-    // schema::set_user_version).
+    // baseline::set_user_version).
     tx.query(
         &format!(
             "PRAGMA user_version = {version}",
@@ -207,7 +207,8 @@ fn render_down(
 
 /// Seed `schema_migrations` for a database that was just created fresh at
 /// head version (via `schema::create_schema`), rather than upgraded from an
-/// older one.
+/// older one — and stamp `PRAGMA user_version` to the chain's head version as
+/// the LAST statement of this function's own seeding transaction.
 ///
 /// For every entry in `chain` this inserts a `MigrationRow` carrying its
 /// rendered down-SQL (or unsupported reason) and checksum, with
@@ -217,12 +218,23 @@ fn render_down(
 /// it can read these rows' down-SQL without ever having run the
 /// corresponding up-SQL itself.
 ///
-/// Does NOT touch `PRAGMA user_version` — the caller's `schema::create_schema`
-/// has already stamped it (verified by `schema.rs`'s own tests:
-/// `user_version_set_to_schema_version`). Once real chain entries exist,
-/// whatever builds a "fresh head" database is responsible for stamping
-/// `user_version` to `chain::head_version(chain)`; this function only
-/// backfills the bookkeeping table.
+/// Stamping `user_version` here — as the final operation inside the same
+/// transaction that inserts the seed rows — rather than in `create_schema`,
+/// is deliberate crash-safety ordering: `create_schema` no longer touches
+/// `user_version` at all (see its doc comment). If the process is
+/// interrupted between `create_schema` finishing and this function's
+/// transaction committing, `user_version` is still `0`, which
+/// `connection.rs`'s `classify_version` reads as `Fresh` rather than
+/// `AtHead` — so the next open simply re-runs `create_schema` (idempotent:
+/// every statement is `CREATE ... IF NOT EXISTS`) and this function again.
+/// That retry is safe because this function's own transaction is atomic: an
+/// interruption mid-transaction rolls back the whole thing (no partial rows,
+/// `user_version` unchanged), so the retry starts from the same clean slate
+/// rather than fighting a half-seeded table. Contrast this with the old
+/// ordering (stamp-then-seed), where an interruption left a store that
+/// *read* as "at head" but was missing rows — failing
+/// `checksum::verify_checksums`'s completeness check with no recovery path
+/// short of manual editing.
 pub async fn seed_for_fresh_create(
     conn: &Connection,
     chain: &[Migration],
@@ -240,7 +252,7 @@ pub async fn seed_for_fresh_create(
         .await
         .map_err(map_libsql_err)?;
 
-    if let Err(e) = seed_all(&tx, chain, ctx).await {
+    if let Err(e) = seed_all_and_stamp(&tx, chain, ctx).await {
         if let Err(rollback_err) = tx.rollback().await {
             tracing::error!(error = %rollback_err, "rollback after failed seed also failed");
         }
@@ -271,6 +283,23 @@ async fn seed_all(
         };
         table::insert_row(tx, &row).await?;
     }
+    Ok(())
+}
+
+/// `seed_all` plus the final `PRAGMA user_version` stamp, run as one
+/// fallible unit so `seed_for_fresh_create` rolls both back together on
+/// failure — see that function's doc comment for why the stamp must be
+/// last.
+async fn seed_all_and_stamp(
+    tx: &Connection,
+    chain: &[Migration],
+    ctx: &MigrationContext,
+) -> Result<(), libsql::Error> {
+    seed_all(tx, chain, ctx).await?;
+
+    let head = head_version(chain);
+    tx.query(&format!("PRAGMA user_version = {head}"), ())
+        .await?;
     Ok(())
 }
 
@@ -668,14 +697,18 @@ mod tests {
         );
     }
 
-    // 6. seed_for_fresh_create backfills bookkeeping without touching
-    // user_version or running any up-SQL.
+    // 6. seed_for_fresh_create backfills bookkeeping (down-SQL/checksums per
+    // chain entry) without running any up-SQL, and stamps user_version to
+    // head as the last step of its own transaction (the atomic-stamp
+    // contract itself is pinned separately by
+    // `seed_for_fresh_create_stamps_head_atomically` and
+    // `seed_for_fresh_create_failure_leaves_user_version_untouched` below) —
+    // this test's focus is the bookkeeping-rows contract.
     #[tokio::test]
     async fn seed_for_fresh_create_backfills_rows_without_running_up_sql() {
         // Build a "fresh head" DB by hand: baseline DDL plus the fixture
-        // chain's DDL applied cumulatively, with user_version stamped
-        // manually (create_schema sets user_version=4 today; the fixture
-        // chain's head is 7, so this test builds its own "fresh at head"
+        // chain's DDL applied cumulatively (create_schema no longer stamps
+        // user_version itself, so this test builds its own "fresh at head"
         // fixture rather than reusing schema::create_schema directly).
         let (_dir, conn) = open_baseline_db().await;
         let chain = fixture_chain();
@@ -690,17 +723,13 @@ mod tests {
             conn.execute(&stmt, ()).await.unwrap();
         }
         let head = BASELINE_VERSION + chain.len() as i64;
-        conn.query(&format!("PRAGMA user_version = {head}"), ())
-            .await
-            .unwrap();
 
-        let version_before = user_version(&conn).await;
         seed_for_fresh_create(&conn, &chain, &c).await.unwrap();
 
         assert_eq!(
             user_version(&conn).await,
-            version_before,
-            "seed_for_fresh_create must not touch user_version"
+            head,
+            "seed_for_fresh_create stamps user_version to the chain's head"
         );
 
         let rows = table::list_rows_desc_above(&conn, BASELINE_VERSION - 1)
@@ -734,6 +763,79 @@ mod tests {
                 }
             }
         }
+    }
+
+    // 6a. Codex review #152 fix 1: seed_for_fresh_create stamps
+    // user_version to head as the LAST operation of its own transaction,
+    // atomically with the seed rows — on a bare (never-touched, version 0)
+    // database, exactly like `connection.rs`'s `Fresh` branch hands it.
+    #[tokio::test]
+    async fn seed_for_fresh_create_stamps_head_atomically() {
+        let (_dir, conn) = open_test_db().await;
+        let chain = fixture_chain();
+        let c = ctx();
+
+        assert_eq!(user_version(&conn).await, 0, "precondition: untouched db");
+
+        seed_for_fresh_create(&conn, &chain, &c).await.unwrap();
+
+        let head = BASELINE_VERSION + chain.len() as i64;
+        assert_eq!(
+            user_version(&conn).await,
+            head,
+            "seed_for_fresh_create must stamp user_version to head"
+        );
+
+        let rows = table::list_rows_desc_above(&conn, BASELINE_VERSION - 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            chain.len() + 1,
+            "baseline row plus one row per chain entry should exist: {rows:?}"
+        );
+    }
+
+    // 6b. If seeding fails partway, the whole transaction — including the
+    // user_version stamp, which is the LAST statement in it — rolls back
+    // together, leaving user_version at 0 rather than partially advanced.
+    #[tokio::test]
+    async fn seed_for_fresh_create_failure_leaves_user_version_untouched() {
+        let (_dir, conn) = open_test_db().await;
+        let chain = fixture_chain();
+        let c = ctx();
+
+        // Force seed_all (called inside seed_for_fresh_create) to fail: an
+        // existing row at the first chain entry's version makes its INSERT
+        // violate the schema_migrations PRIMARY KEY constraint.
+        table::ensure_table(&conn).await.unwrap();
+        table::insert_row(
+            &conn,
+            &MigrationRow {
+                version: chain[0].version,
+                name: "colliding_row".to_string(),
+                applied_at: "2024-01-01T00:00:00Z".to_string(),
+                down_sql: Some(vec!["SELECT 1".to_string()]),
+                down_unsupported_reason: None,
+                checksum: "bogus".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(user_version(&conn).await, 0, "precondition: untouched db");
+
+        let result = seed_for_fresh_create(&conn, &chain, &c).await;
+        assert!(
+            result.is_err(),
+            "a colliding pre-existing row should make seeding fail"
+        );
+
+        assert_eq!(
+            user_version(&conn).await,
+            0,
+            "a failed seed must leave user_version at 0, not partially stamped"
+        );
     }
 
     // 7. apply_pending is a no-op once the database is already at head.
