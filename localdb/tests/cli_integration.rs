@@ -1364,6 +1364,64 @@ fn db_migrate_noop_at_head() {
         .stdout(predicate::str::contains("already at head"));
 }
 
+/// `db migrate` on an at-head store whose migration bookkeeping has been
+/// tampered with (a stored checksum no longer matches what the compiled
+/// chain would produce) must fail loudly, not report "already at head".
+///
+/// This is the regression test for the bug where `run_db_migrate` decided
+/// "already at head" from a read-only pre-inspect and returned *without*
+/// ever calling `migrate_store` — skipping the checksum/bookkeeping
+/// verification that `migrate_store`'s own no-op-at-head path performs.
+/// Every other command refuses to open a store in this state; `db migrate`
+/// is the one meant to fix/diagnose it, so it must go through the library
+/// even when the pre-inspect says nothing looks pending.
+#[test]
+fn db_migrate_on_corrupted_at_head_store_fails_verification() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    let db_path = data_dir.join("localdb.db");
+
+    // `store add` creates a fresh store at head (v4), seeding
+    // schema_migrations with a valid baseline checksum.
+    cmd_with_dir(&dir)
+        .args(["store", "add", "s1"])
+        .assert()
+        .success();
+
+    // Tamper with the baseline row's stored checksum directly, bypassing
+    // every CLI path — simulates on-disk corruption or an out-of-band edit.
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let db = libsql::Builder::new_local(&db_path).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE schema_migrations SET checksum = 'deadbeef' WHERE version = 4",
+            (),
+        )
+        .await
+        .unwrap();
+    });
+
+    let output = cmd_with_dir(&dir).args(["db", "migrate"]).output().unwrap();
+    assert_ne!(
+        output.status.code().unwrap(),
+        0,
+        "db migrate on a corrupted at-head store must not exit 0; stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("checksum"),
+        "stderr should surface the checksum-mismatch error: {stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("already at head"),
+        "a corrupted at-head store must not be reported as 'already at head'; stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
 /// `db migrate` on a legacy (pre-baseline) store without confirmation
 /// aborts (non-interactive + no `--yes` → exit 2 via `confirm_destructive`)
 /// and leaves the store completely untouched.

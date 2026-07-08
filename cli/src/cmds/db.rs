@@ -187,26 +187,21 @@ pub(crate) async fn run_db_migrate_async(ctx: &CliContext) {
         Err(e) => exit_err(&e, ctx.json),
     };
 
-    // Pre-inspect (read-only) so we can print a friendly no-op message and
-    // decide whether the legacy-rebuild confirmation prompt is needed —
-    // `migrate_store` itself never prompts; the CLI's confirmation is what
-    // actually authorizes a legacy rebuild's data loss.
+    // Pre-inspect (read-only) only to decide whether the legacy-rebuild
+    // confirmation prompt is needed — `migrate_store` itself never prompts;
+    // the CLI's confirmation is what actually authorizes a legacy rebuild's
+    // data loss. This must NOT be used to short-circuit an "already at head"
+    // report: `migrate_store`'s own no-op-at-head path still runs full
+    // checksum/bookkeeping verification (`post_check`), and skipping the
+    // library call here would let `db migrate` report false success on an
+    // at-head store with corrupted migration bookkeeping. Every other
+    // command refuses to open a store in that state; this is the one
+    // command meant to fix/diagnose it, so it must always go through
+    // `migrate_store`.
     let pre = match inspect_schema(&path).await {
         Ok(s) => s,
         Err(e) => exit_err(&e, ctx.json),
     };
-
-    if !pre.legacy && pre.current_version == pre.head_version {
-        if ctx.json {
-            print_json(&json!({
-                "status": "ok",
-                "message": format!("already at head (v{})", pre.head_version),
-            }));
-        } else {
-            println!("already at head (v{})", pre.head_version);
-        }
-        return;
-    }
 
     let allow_legacy_rebuild = if pre.legacy {
         let prompt = format!(
@@ -229,6 +224,28 @@ pub(crate) async fn run_db_migrate_async(ctx: &CliContext) {
         Ok(r) => r,
         Err(e) => exit_err(&e, ctx.json),
     };
+
+    // A true no-op: nothing applied and the version didn't move (this can
+    // only happen via the incremental at-head path, never the fresh-create
+    // or legacy-rebuild paths, both of which always change from_version).
+    // `migrate_store` still ran `post_check`'s checksum/bookkeeping
+    // verification to get here, so this is a verified "already at head",
+    // not merely an unexamined pre-inspect snapshot.
+    let noop_at_head = !report.legacy_rebuilt
+        && report.applied.is_empty()
+        && report.from_version == report.to_version;
+
+    if noop_at_head {
+        if ctx.json {
+            print_json(&json!({
+                "status": "ok",
+                "message": format!("already at head (v{})", report.to_version),
+            }));
+        } else {
+            println!("already at head (v{})", report.to_version);
+        }
+        return;
+    }
 
     if ctx.json {
         print_json(&json!({
