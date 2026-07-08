@@ -353,3 +353,297 @@ fn call_tool_json(result: CallToolResult) -> Value {
         .expect("expected a text content item");
     serde_json::from_str(&text).expect("content should be valid JSON")
 }
+
+// ---------------------------------------------------------------------------
+// T5: D7 store-grant filtering over MCP (D12 composition — the realtime
+// StoreProvider pin means a grant change is visible on the very next tool
+// call, no reconnect or restart needed).
+// ---------------------------------------------------------------------------
+
+/// Spin up a real HTTP server for `app` and connect an MCP client to it,
+/// optionally with a bearer `auth_header`. Returns the connected client and
+/// the server task handle (abort it when done, matching every other test in
+/// this file).
+async fn connect_mcp_client(
+    app: axum::Router,
+    bearer: Option<&str>,
+) -> (
+    rmcp::service::RunningService<rmcp::RoleClient, ClientInfo>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("binding a loopback listener should succeed");
+    let addr = listener.local_addr().expect("listener has a local addr");
+    let server_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let mut config = StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"));
+    if let Some(secret) = bearer {
+        config = config.auth_header(secret.to_string());
+    }
+    let transport = StreamableHttpClientTransport::from_config(config);
+    let client = ClientInfo::default()
+        .serve(transport)
+        .await
+        .expect("client should complete the MCP initialize handshake");
+    (client, server_task)
+}
+
+fn list_stores_names(result: CallToolResult) -> Vec<String> {
+    let body = call_tool_json(result);
+    body["stores"]
+        .as_array()
+        .expect("stores array")
+        .iter()
+        .map(|s| s["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn mcp_admin_sees_every_store_regardless_of_visibility() {
+    let (_dir, state, app) = common::make_enforced_app().await;
+    let admin_secret =
+        common::seed_user_with_key(&state, "mcp-admin-vis", localdb_core::auth::Role::Admin).await;
+    common::create_store_as(app.clone(), "shared-x", "shared", Some(&admin_secret)).await;
+    common::create_store_as(app.clone(), "private-x", "private", Some(&admin_secret)).await;
+
+    let (client, server_task) = connect_mcp_client(app, Some(&admin_secret)).await;
+
+    let result = client
+        .call_tool(CallToolRequestParams::new("list_stores"))
+        .await
+        .expect("admin call_tool should succeed");
+    let mut names = list_stores_names(result);
+    names.sort();
+    assert_eq!(names, vec!["private-x", "shared-x"]);
+
+    let _ = client.cancel().await;
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn mcp_member_sees_only_granted_shared_stores() {
+    let (_dir, state, app) = common::make_enforced_app().await;
+    let admin_secret =
+        common::seed_user_with_key(&state, "mcp-admin-grant", localdb_core::auth::Role::Admin)
+            .await;
+    common::create_store_as(app.clone(), "granted", "shared", Some(&admin_secret)).await;
+    common::create_store_as(app.clone(), "ungranted", "shared", Some(&admin_secret)).await;
+    common::create_store_as(app.clone(), "private-z", "private", Some(&admin_secret)).await;
+
+    let member = state
+        .auth()
+        .create_user("mcp-member", localdb_core::auth::Role::Member)
+        .await
+        .unwrap();
+    let member_secret = state.auth().issue_api_key(&member.id).await.unwrap().secret;
+
+    let resp = request_with_bearer_admin(
+        &app,
+        axum::http::Method::POST,
+        "/v1/stores/granted/grants",
+        Some(serde_json::json!({ "user": "mcp-member" })),
+        &admin_secret,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let (client, server_task) = connect_mcp_client(app, Some(&member_secret)).await;
+
+    let result = client
+        .call_tool(CallToolRequestParams::new("list_stores"))
+        .await
+        .expect("member call_tool should succeed");
+    assert_eq!(list_stores_names(result), vec!["granted"]);
+
+    let _ = client.cancel().await;
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn mcp_member_search_on_invisible_store_behaves_as_unknown_store() {
+    let (_dir, state, app) = common::make_enforced_app().await;
+    let admin_secret =
+        common::seed_user_with_key(&state, "mcp-admin-search", localdb_core::auth::Role::Admin)
+            .await;
+    common::create_store_as(
+        app.clone(),
+        "invisible-to-member",
+        "shared",
+        Some(&admin_secret),
+    )
+    .await;
+
+    let member = state
+        .auth()
+        .create_user("mcp-member-search", localdb_core::auth::Role::Member)
+        .await
+        .unwrap();
+    let member_secret = state.auth().issue_api_key(&member.id).await.unwrap().secret;
+    // No grant given: the store is invisible to this member.
+
+    let (client, server_task) = connect_mcp_client(app, Some(&member_secret)).await;
+
+    let args = serde_json::json!({ "query": "hello", "stores": ["invisible-to-member"] });
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("search").with_arguments(args.as_object().unwrap().clone()),
+        )
+        .await
+        .expect("call_tool itself succeeds at the protocol level");
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "an invisible store name must behave like an unknown one"
+    );
+    let body = call_tool_json(result);
+    assert_eq!(body["error"]["code"], "store_not_found");
+
+    let _ = client.cancel().await;
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn mcp_grant_added_after_connect_is_visible_on_the_very_next_call() {
+    let (_dir, state, app) = common::make_enforced_app().await;
+    let admin_secret = common::seed_user_with_key(
+        &state,
+        "mcp-admin-realtime",
+        localdb_core::auth::Role::Admin,
+    )
+    .await;
+    common::create_store_as(
+        app.clone(),
+        "realtime-shared",
+        "shared",
+        Some(&admin_secret),
+    )
+    .await;
+
+    let member = state
+        .auth()
+        .create_user("mcp-member-realtime", localdb_core::auth::Role::Member)
+        .await
+        .unwrap();
+    let member_secret = state.auth().issue_api_key(&member.id).await.unwrap().secret;
+
+    let (client, server_task) = connect_mcp_client(app.clone(), Some(&member_secret)).await;
+
+    // Before the grant: invisible.
+    let before = client
+        .call_tool(CallToolRequestParams::new("list_stores"))
+        .await
+        .unwrap();
+    assert!(list_stores_names(before).is_empty());
+
+    // Grant it — no reconnect.
+    let resp = request_with_bearer_admin(
+        &app,
+        axum::http::Method::POST,
+        "/v1/stores/realtime-shared/grants",
+        Some(serde_json::json!({ "user": "mcp-member-realtime" })),
+        &admin_secret,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Same connected client, next call: visible.
+    let after = client
+        .call_tool(CallToolRequestParams::new("list_stores"))
+        .await
+        .unwrap();
+    assert_eq!(list_stores_names(after), vec!["realtime-shared"]);
+
+    let _ = client.cancel().await;
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn mcp_grant_revoked_is_gone_on_the_very_next_call() {
+    let (_dir, state, app) = common::make_enforced_app().await;
+    let admin_secret =
+        common::seed_user_with_key(&state, "mcp-admin-revoke", localdb_core::auth::Role::Admin)
+            .await;
+    common::create_store_as(
+        app.clone(),
+        "revocable-shared",
+        "shared",
+        Some(&admin_secret),
+    )
+    .await;
+
+    let member = state
+        .auth()
+        .create_user("mcp-member-revoke", localdb_core::auth::Role::Member)
+        .await
+        .unwrap();
+    let member_secret = state.auth().issue_api_key(&member.id).await.unwrap().secret;
+
+    request_with_bearer_admin(
+        &app,
+        axum::http::Method::POST,
+        "/v1/stores/revocable-shared/grants",
+        Some(serde_json::json!({ "user": "mcp-member-revoke" })),
+        &admin_secret,
+    )
+    .await;
+
+    let (client, server_task) = connect_mcp_client(app.clone(), Some(&member_secret)).await;
+
+    let before = client
+        .call_tool(CallToolRequestParams::new("list_stores"))
+        .await
+        .unwrap();
+    assert_eq!(list_stores_names(before), vec!["revocable-shared"]);
+
+    // Revoke — no reconnect.
+    request_with_bearer_admin(
+        &app,
+        axum::http::Method::DELETE,
+        "/v1/stores/revocable-shared/grants/mcp-member-revoke",
+        None,
+        &admin_secret,
+    )
+    .await;
+
+    let after = client
+        .call_tool(CallToolRequestParams::new("list_stores"))
+        .await
+        .unwrap();
+    assert!(
+        list_stores_names(after).is_empty(),
+        "grant revocation must take effect on the very next call, no restart"
+    );
+
+    let _ = client.cancel().await;
+    server_task.abort();
+}
+
+/// Drive a plain `/v1` request against `app` via `oneshot` with an admin
+/// bearer — a thin wrapper so the grant-toggling calls above don't need to
+/// juggle a second real HTTP listener alongside the MCP client's.
+async fn request_with_bearer_admin(
+    app: &axum::Router,
+    method: axum::http::Method,
+    uri: &str,
+    body: Option<Value>,
+    bearer: &str,
+) -> axum::response::Response {
+    use tower::ServiceExt;
+
+    let mut builder = axum::http::Request::builder().method(method).uri(uri);
+    builder = builder.header("authorization", format!("Bearer {bearer}"));
+    let request_body = match body {
+        Some(value) => {
+            builder = builder.header("content-type", "application/json");
+            axum::body::Body::from(value.to_string())
+        }
+        None => axum::body::Body::empty(),
+    };
+    app.clone()
+        .oneshot(builder.body(request_body).unwrap())
+        .await
+        .unwrap()
+}

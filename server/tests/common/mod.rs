@@ -125,6 +125,27 @@ pub(crate) async fn request_with_bearer(
     .expect("router should answer test request")
 }
 
+/// Seed a user and mint an API key through the state's own `AuthService` —
+/// the same persistent database the router serves. Shared by
+/// `auth_middleware.rs`, `admin_management.rs`, and `mcp_route.rs`.
+pub(crate) async fn seed_user_with_key(
+    state: &AppState,
+    name: &str,
+    role: localdb_core::auth::Role,
+) -> String {
+    let user = state
+        .auth()
+        .create_user(name, role)
+        .await
+        .expect("seeding a user must succeed");
+    state
+        .auth()
+        .issue_api_key(&user.id)
+        .await
+        .expect("minting an api key must succeed")
+        .secret
+}
+
 pub(crate) async fn create_store(app: Router, name: &str) -> Value {
     let resp = request(
         app,
@@ -134,5 +155,30 @@ pub(crate) async fn create_store(app: Router, name: &str) -> Value {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::CREATED);
+    json_body(resp.into_body()).await
+}
+
+/// Like `create_store`, but with an explicit `visibility` and an optional
+/// bearer — needed against an enforced-mode app, where `POST /v1/stores` is
+/// admin-only (D7 write routes).
+pub(crate) async fn create_store_as(
+    app: Router,
+    name: &str,
+    visibility: &str,
+    bearer: Option<&str>,
+) -> Value {
+    let resp = request_with_bearer(
+        app,
+        Method::POST,
+        "/v1/stores",
+        Some(json!({ "name": name, "visibility": visibility })),
+        bearer,
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "store creation should succeed"
+    );
     json_body(resp.into_body()).await
 }

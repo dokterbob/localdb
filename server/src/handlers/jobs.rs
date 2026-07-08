@@ -1,12 +1,14 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    Json,
+    Extension, Json,
 };
 use serde::Deserialize;
 
+use localdb_core::auth::Principal;
 use localdb_core::{Error as CoreError, IndexJob, IndexJobScope};
 
+use super::require_principal;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -17,10 +19,16 @@ pub struct CreateJobRequest {
     pub source_id: Option<String>,
 }
 
+/// `POST /v1/jobs`: admin-only for now (indexing is a mutation, and members
+/// are readers in this phase — specs/05-surfaces.md §3.1).
 pub async fn create_job(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     Json(req): Json<CreateJobRequest>,
 ) -> Result<(StatusCode, Json<IndexJob>), ApiError> {
+    require_principal(principal)?
+        .require_admin()
+        .map_err(ApiError)?;
     let effective = state.effective_config().await?;
     let _store = effective
         .stores
@@ -48,10 +56,16 @@ pub async fn create_job(
     Ok((StatusCode::ACCEPTED, Json(job)))
 }
 
+/// `GET /v1/jobs/{id}`: admin-only, grouped with the rest of the job-queue
+/// surface (specs/05-surfaces.md §3.1).
 pub async fn get_job(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     Path(job_id): Path<String>,
 ) -> Result<Json<IndexJob>, ApiError> {
+    require_principal(principal)?
+        .require_admin()
+        .map_err(ApiError)?;
     state
         .job_queue()
         .get_job(&job_id)

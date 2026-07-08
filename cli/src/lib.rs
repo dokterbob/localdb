@@ -24,14 +24,19 @@ mod cmds {
 }
 
 pub use app_db::AppDb;
-pub use cmds::auth::{run_key_create, run_user_add};
+pub use cmds::auth::{
+    run_key_create, run_key_list, run_key_revoke, run_user_add, run_user_list, run_user_remove,
+    run_user_set_role,
+};
 pub use cmds::index::run_index;
 pub use cmds::init::run_init;
 pub use cmds::login::{run_login, run_logout};
 pub use cmds::search::run_search;
 pub use cmds::source::{run_source_add, run_source_list, run_source_remove};
 pub use cmds::status::run_status;
-pub use cmds::store::{run_store_add, run_store_list, run_store_remove};
+pub use cmds::store::{
+    run_store_add, run_store_grant, run_store_list, run_store_remove, run_store_revoke,
+};
 pub use cmds::surface::{run_mcp, run_serve};
 pub use daemon_client::{probe_daemon, CliContext, DaemonState};
 pub use normalize::{

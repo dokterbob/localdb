@@ -13,9 +13,16 @@
 //!   resolves it via `AuthService::authenticate`, and inserts the resulting
 //!   `Principal`. Missing/invalid credentials → 401 with the standard error
 //!   envelope plus `WWW-Authenticate: Bearer` (D6, added by
-//!   `ApiError::into_response`). T3 interim policy: authenticated `member`
-//!   principals get 403 on ALL protected routes — store-grant-scoped access
-//!   activates in T5 (fail-safe staging); only admins pass.
+//!   `ApiError::into_response`).
+//!
+//! T5 lifts the T3 interim policy that rejected every authenticated
+//! `member` principal wholesale: this middleware now inserts *any*
+//! authenticated principal — admin or member — and authorization is
+//! enforced per-resource by the individual handlers instead (D7: members
+//! read only the `shared` stores they hold a grant for via
+//! `Principal::can_read_store`; admin-only management routes call
+//! `Principal::require_admin`). See specs/05-surfaces.md §3.1 for the route
+//! table.
 //!
 //! The inserted `Principal` is what `/v1/auth/me` reads back, and what rmcp
 //! propagates into MCP tool handlers via `http::request::Parts` extensions
@@ -28,10 +35,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use localdb_core::{
-    auth::{Principal, Role},
-    Error,
-};
+use localdb_core::{auth::Principal, Error};
 
 use crate::{error::ApiError, state::AppState};
 
@@ -70,20 +74,10 @@ pub async fn require_auth(State(state): State<AppState>, mut req: Request, next:
                 Ok(p) => p,
                 Err(e) => return ApiError(e).into_response(),
             };
-            // T3 interim authorization policy: members are rejected wholesale
-            // on every protected route. T5 lifts this by activating store
-            // grants (D7) — until then, failing safe beats accidentally
-            // exposing unfiltered results to a grant-scoped principal.
-            if principal.role == Role::Member {
-                return ApiError(Error::Forbidden {
-                    message: format!(
-                        "user '{}' has role 'member'; member access activates with store \
-                         grants in a later release — only admins may use the API for now",
-                        principal.name
-                    ),
-                })
-                .into_response();
-            }
+            // T5: no wholesale role gate here — every authenticated
+            // principal passes; per-resource authorization (store-grant
+            // scoping, admin-only management routes) is enforced by the
+            // handlers themselves.
             req.extensions_mut().insert(principal);
             next.run(req).await
         }

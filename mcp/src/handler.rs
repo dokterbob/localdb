@@ -25,9 +25,14 @@
 //!   `Principal` is an authentication error (fail closed) — never full
 //!   access.
 //!
-//! T3 interim policy: admins (and `local_trust`) pass; `member` principals
-//! get a `forbidden` tool error on every tool. T5 replaces the member gate
-//! with store-grant filtering (D7).
+//! T5: admins (and `local_trust`) see every store; `member` principals are
+//! no longer rejected wholesale — instead the resolved store list is
+//! filtered per call to just the `shared` stores they hold a grant for
+//! (D7, D12), via `Principal::can_read_store`. A tool referencing a store
+//! name that got filtered out behaves exactly as if that store didn't
+//! exist (the `tools::*` fns already treat an unknown name as
+//! `store_not_found`) — there is no separate "forbidden" tier for MCP
+//! store access.
 
 use std::sync::Arc;
 
@@ -38,10 +43,7 @@ use rmcp::{
     tool, tool_handler, tool_router, RoleServer, ServerHandler,
 };
 
-use localdb_core::{
-    auth::{Principal, Role},
-    Embedder, Error,
-};
+use localdb_core::{auth::Principal, types::StoreVisibility, Embedder, Error};
 
 use crate::args::{GetChunksArgs, GetDocumentArgs, SearchArgs};
 use crate::store_provider::StoreProvider;
@@ -131,24 +133,6 @@ impl McpHandler {
         }
     }
 
-    /// T3 interim authorization: resolve the principal and reject members
-    /// wholesale. T5 lifts this by filtering tool results by store grants
-    /// (D7) instead.
-    fn require_authorized(&self, extensions: &Extensions) -> Result<Principal, CallToolResult> {
-        let principal = self.principal_for(extensions)?;
-        if principal.role == Role::Member {
-            return Err(tools::typed_error(
-                "forbidden",
-                format!(
-                    "user '{}' has role 'member'; member access to MCP tools activates with \
-                     store grants in a later release",
-                    principal.name
-                ),
-            ));
-        }
-        Ok(principal)
-    }
-
     /// Resolve the current store list, or `None` (having already produced
     /// the tool-error result) on provider failure.
     async fn resolve_stores(&self) -> Result<Vec<AvailableStore>, CallToolResult> {
@@ -158,13 +142,35 @@ impl McpHandler {
             .map_err(|e| provider_error(&e))
     }
 
-    /// Shared per-tool preamble: authorize the caller, then resolve stores.
+    /// D7 filtering: keep only the stores `principal` may read. Admins (and
+    /// `local_trust`) keep every store; members keep only `shared` stores
+    /// they hold a grant for. An unrecognized visibility string (never
+    /// produced by any current `StoreProvider`, so only reachable via a bug)
+    /// is treated as `private` — fail safe, deny by default, rather than
+    /// leak an unknown-shaped store to a member.
+    fn filter_visible(principal: &Principal, stores: Vec<AvailableStore>) -> Vec<AvailableStore> {
+        stores
+            .into_iter()
+            .filter(|s| {
+                let visibility = StoreVisibility::parse(&s.descriptor.visibility)
+                    .unwrap_or(StoreVisibility::Private);
+                principal.can_read_store(&s.descriptor.name, visibility)
+            })
+            .collect()
+    }
+
+    /// Shared per-tool preamble: resolve the caller's principal (fail closed
+    /// if none — see `principal_for`), resolve the live store list, then
+    /// filter it to what that principal may read (D7). Tools thus never see
+    /// a store the caller isn't entitled to, so an invisible store name
+    /// behaves identically to an unknown one.
     async fn authorize_and_resolve(
         &self,
         extensions: &Extensions,
     ) -> Result<Vec<AvailableStore>, CallToolResult> {
-        self.require_authorized(extensions)?;
-        self.resolve_stores().await
+        let principal = self.principal_for(extensions)?;
+        let stores = self.resolve_stores().await?;
+        Ok(Self::filter_visible(&principal, stores))
     }
 
     // The `*_inner` methods below carry the full tool behavior against a
@@ -280,7 +286,7 @@ mod tests {
     use super::*;
     use crate::store_provider::StaticStoreProvider;
     use async_trait::async_trait;
-    use localdb_core::auth::StoreAccess;
+    use localdb_core::auth::{Role, StoreAccess};
     use localdb_core::embedder::FakeEmbedder;
 
     /// A `StoreProvider` that always fails, to prove a provider error
@@ -409,16 +415,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn member_principal_gets_forbidden_tool_error() {
-        // T3 interim policy: members are rejected on every tool (grants
-        // activate in T5).
+    async fn member_principal_is_no_longer_rejected_wholesale() {
+        // T5 lifts the T3 interim member-403 block: a member now passes
+        // (against an empty store set the call trivially succeeds with no
+        // stores, rather than erroring).
         let provider = Arc::new(StaticStoreProvider::new(vec![]));
         let handler = McpHandler::new(provider, embedder(), false, None);
         let result = handler
             .list_stores_inner(&http_extensions_with_principal(member("bob")))
             .await;
-        assert_eq!(result.is_error, Some(true));
-        assert_eq!(error_code(&result), "forbidden");
+        assert_ne!(result.is_error, Some(true));
     }
 
     #[tokio::test]
@@ -431,13 +437,98 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn member_default_principal_is_also_gated() {
-        // Nothing constructs this today, but the member gate must hold no
+    async fn member_default_principal_is_no_longer_gated_either() {
+        // Nothing constructs this today, but the lifted gate must hold no
         // matter how the principal arrived.
         let provider = Arc::new(StaticStoreProvider::new(vec![]));
         let handler = McpHandler::new(provider, embedder(), false, Some(member("carol")));
         let result = handler.list_stores_inner(&no_extensions()).await;
+        assert_ne!(result.is_error, Some(true));
+    }
+
+    // -----------------------------------------------------------------
+    // T5: D7 store filtering by principal
+    // -----------------------------------------------------------------
+
+    fn store_with_visibility(name: &str, visibility: &str) -> AvailableStore {
+        AvailableStore::new(
+            crate::tools::StoreDescriptor {
+                id: format!("id-{name}"),
+                name: name.to_string(),
+                visibility: visibility.to_string(),
+            },
+            Box::new(localdb_core::store::FakeStore::new()),
+        )
+    }
+
+    fn stores_json(result: &CallToolResult) -> Vec<String> {
+        let text = result.content[0].as_text().unwrap().text.clone();
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        parsed["stores"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn admin_sees_every_store_private_and_shared() {
+        let provider = Arc::new(StaticStoreProvider::new(vec![
+            store_with_visibility("shared-docs", "shared"),
+            store_with_visibility("secret-docs", "private"),
+        ]));
+        let handler = McpHandler::new(provider, embedder(), false, None);
+        let result = handler
+            .list_stores_inner(&http_extensions_with_principal(Principal::local_trust()))
+            .await;
+        assert_ne!(result.is_error, Some(true));
+        let mut names = stores_json(&result);
+        names.sort();
+        assert_eq!(names, vec!["secret-docs", "shared-docs"]);
+    }
+
+    #[tokio::test]
+    async fn member_sees_only_granted_shared_stores() {
+        let provider = Arc::new(StaticStoreProvider::new(vec![
+            store_with_visibility("granted-shared", "shared"),
+            store_with_visibility("ungranted-shared", "shared"),
+            store_with_visibility("secret-private", "private"),
+        ]));
+        let handler = McpHandler::new(provider, embedder(), false, None);
+        let principal = Principal {
+            user_id: "u1".into(),
+            name: "member-with-grant".into(),
+            role: Role::Member,
+            access: StoreAccess::Granted(["granted-shared".to_string()].into_iter().collect()),
+        };
+        let result = handler
+            .list_stores_inner(&http_extensions_with_principal(principal))
+            .await;
+        assert_ne!(result.is_error, Some(true));
+        let names = stores_json(&result);
+        assert_eq!(names, vec!["granted-shared"]);
+    }
+
+    #[tokio::test]
+    async fn member_tool_call_on_invisible_store_behaves_as_unknown_store() {
+        // A named store the member holds no grant for must behave exactly
+        // like a store that doesn't exist at all.
+        let provider = Arc::new(StaticStoreProvider::new(vec![store_with_visibility(
+            "ungranted",
+            "shared",
+        )]));
+        let handler = McpHandler::new(provider, embedder(), false, None);
+        let args = SearchArgs {
+            query: "hello".to_string(),
+            stores: Some(vec!["ungranted".to_string()]),
+            limit: None,
+            content_length: None,
+        };
+        let result = handler
+            .search_inner(args, &http_extensions_with_principal(member("dana")))
+            .await;
         assert_eq!(result.is_error, Some(true));
-        assert_eq!(error_code(&result), "forbidden");
+        assert_eq!(error_code(&result), "store_not_found");
     }
 }

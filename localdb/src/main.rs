@@ -111,13 +111,18 @@ pub enum Command {
         refresh: Option<String>,
     },
 
-    /// Manage user accounts (break-glass: writes the database directly;
-    /// refuses to run while a daemon is up).
+    /// Manage user accounts. Every subcommand routes to a running daemon
+    /// (admin bearer) by default and falls back to a direct database
+    /// read/write when no daemon is reachable; `add` also accepts
+    /// `--direct-db` to bypass a running daemon for lockout recovery.
     #[command(subcommand)]
     User(UserCommand),
 
-    /// Manage API keys (break-glass: writes the database directly; refuses
-    /// to run while a daemon is up).
+    /// Manage API keys. Every subcommand routes to a running daemon by
+    /// default (admin bearer, except minting your own key) and falls back
+    /// to a direct database read/write when no daemon is reachable;
+    /// `create` also accepts `--direct-db` to bypass a running daemon for
+    /// lockout recovery.
     #[command(subcommand)]
     Key(KeyCommand),
 
@@ -148,27 +153,65 @@ pub enum Command {
     },
 }
 
-/// User management subcommands (specs/05-surfaces.md §2; T3 ships only `add`).
+/// User management subcommands (specs/05-surfaces.md §2).
 #[derive(Debug, Subcommand)]
 pub enum UserCommand {
-    /// Create a user account.
+    /// Create a user account. Routed to a running daemon (admin bearer) by
+    /// default; falls back to a direct database write when no daemon is
+    /// reachable.
     Add {
         /// User name (unique).
         name: String,
         /// Create the user with the admin role (default: member).
         #[arg(long)]
         admin: bool,
+        /// Write directly to the database even if a daemon is running
+        /// (lockout recovery — bypasses the daemon rather than refusing).
+        #[arg(long = "direct-db")]
+        direct_db: bool,
+    },
+    /// List all user accounts.
+    List,
+    /// Remove a user account.
+    Remove {
+        /// User name.
+        name: String,
+    },
+    /// Change a user's role.
+    SetRole {
+        /// User name.
+        name: String,
+        /// New role: "admin" or "member".
+        role: String,
     },
 }
 
-/// API key management subcommands (specs/05-surfaces.md §2; T3 ships only `create`).
+/// API key management subcommands (specs/05-surfaces.md §2).
 #[derive(Debug, Subcommand)]
 pub enum KeyCommand {
-    /// Mint an API key for a user. The secret is shown exactly once.
+    /// Mint an API key for a user. The secret is shown exactly once. Routed
+    /// to a running daemon by default (admin bearer, unless minting a key
+    /// for yourself); falls back to a direct database write when no daemon
+    /// is reachable.
     Create {
         /// The user name to mint the key for.
         #[arg(long)]
         user: String,
+        /// Write directly to the database even if a daemon is running
+        /// (lockout recovery — bypasses the daemon rather than refusing).
+        #[arg(long = "direct-db")]
+        direct_db: bool,
+    },
+    /// List API keys (metadata only — never secrets).
+    List {
+        /// Restrict to this user's keys (default: every user's).
+        #[arg(long)]
+        user: Option<String>,
+    },
+    /// Revoke an API key by its ID.
+    Revoke {
+        /// The key's ID (see `key list`).
+        id: String,
     },
 }
 
@@ -186,6 +229,20 @@ pub enum StoreCommand {
     Remove {
         /// Store name or ID.
         name: String,
+    },
+    /// Grant a user read access to a `shared` store (D7).
+    Grant {
+        /// Store name.
+        store: String,
+        /// User name or ID.
+        user: String,
+    },
+    /// Revoke a user's read access to a store.
+    Revoke {
+        /// Store name.
+        store: String,
+        /// User name or ID.
+        user: String,
     },
 }
 
@@ -254,6 +311,8 @@ fn main() {
             StoreCommand::Add { name } => cli::run_store_add(&ctx, name),
             StoreCommand::List => cli::run_store_list(&ctx),
             StoreCommand::Remove { name } => cli::run_store_remove(&ctx, name),
+            StoreCommand::Grant { store, user } => cli::run_store_grant(&ctx, store, user),
+            StoreCommand::Revoke { store, user } => cli::run_store_revoke(&ctx, store, user),
         },
         Command::Source(cmd) => match cmd {
             SourceCommand::Add { sources, refresh } => {
@@ -282,10 +341,19 @@ fn main() {
             }
         }
         Command::User(cmd) => match cmd {
-            UserCommand::Add { name, admin } => cli::run_user_add(&ctx, name, *admin),
+            UserCommand::Add {
+                name,
+                admin,
+                direct_db,
+            } => cli::run_user_add(&ctx, name, *admin, *direct_db),
+            UserCommand::List => cli::run_user_list(&ctx),
+            UserCommand::Remove { name } => cli::run_user_remove(&ctx, name),
+            UserCommand::SetRole { name, role } => cli::run_user_set_role(&ctx, name, role),
         },
         Command::Key(cmd) => match cmd {
-            KeyCommand::Create { user } => cli::run_key_create(&ctx, user),
+            KeyCommand::Create { user, direct_db } => cli::run_key_create(&ctx, user, *direct_db),
+            KeyCommand::List { user } => cli::run_key_list(&ctx, user.as_deref()),
+            KeyCommand::Revoke { id } => cli::run_key_revoke(&ctx, id),
         },
         Command::Login {
             url,

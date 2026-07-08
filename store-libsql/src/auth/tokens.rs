@@ -50,6 +50,21 @@ pub(crate) async fn find_token_by_hash(
     }
 }
 
+pub(crate) async fn find_token(db: &LibsqlDb, id: &str) -> Result<Option<AuthTokenRow>, Error> {
+    let conn = db.conn().await;
+    let mut rows = conn
+        .query(
+            &format!("SELECT {TOKEN_COLUMNS} FROM auth_tokens WHERE id = ?"),
+            libsql::params![id.to_string()],
+        )
+        .await
+        .map_err(map_libsql_err)?;
+    match rows.next().await.map_err(map_libsql_err)? {
+        Some(row) => row_to_token(&row).map(Some),
+        None => Ok(None),
+    }
+}
+
 pub(crate) async fn revoke_token(db: &LibsqlDb, id: &str, revoked_at: &str) -> Result<bool, Error> {
     let conn = db.conn().await;
     let n = conn

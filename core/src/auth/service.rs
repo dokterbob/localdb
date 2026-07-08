@@ -420,6 +420,45 @@ impl<S: AuthStore> AuthService<S> {
         self.store.revoke_store_grant(store_name, user_id).await
     }
 
+    /// `true` iff `user_id` names an admin and is the *only* remaining admin
+    /// — the lockout condition guarded against by `delete_user` and
+    /// `set_user_role` below. Unknown `user_id` is not "the last admin"
+    /// (there is nothing to guard).
+    async fn is_last_admin(&self, user_id: &str) -> Result<bool, Error> {
+        let users = self.store.list_users().await?;
+        let admin_count = users.iter().filter(|u| u.role == Role::Admin).count();
+        let is_admin = users
+            .iter()
+            .any(|u| u.id == user_id && u.role == Role::Admin);
+        Ok(is_admin && admin_count <= 1)
+    }
+
+    /// Delete a user, refusing if it would leave zero admins (D7 guard
+    /// rail — avoids locking every admin out of the instance). Deleting a
+    /// user cascades to their tokens and store grants at the schema level
+    /// (`ON DELETE CASCADE`, specs/02-domain-model.md §9), so no separate
+    /// token-revocation step is needed here.
+    pub async fn delete_user(&self, id: &str) -> Result<bool, Error> {
+        if self.is_last_admin(id).await? {
+            return Err(Error::InvalidRequest {
+                message: "cannot delete the last remaining admin account".to_string(),
+            });
+        }
+        self.store.delete_user(id).await
+    }
+
+    /// Change a user's role, refusing to demote the last remaining admin to
+    /// `member` (D7 guard rail — same lockout concern as `delete_user`).
+    /// Promoting a member to admin is always allowed.
+    pub async fn set_user_role(&self, id: &str, role: Role) -> Result<(), Error> {
+        if role == Role::Member && self.is_last_admin(id).await? {
+            return Err(Error::InvalidRequest {
+                message: "cannot demote the last remaining admin account".to_string(),
+            });
+        }
+        self.store.update_user_role(id, role).await
+    }
+
     /// D7 grant evaluation, delegated to the pure logic on `Principal`.
     pub fn can_read_store(
         &self,
@@ -925,6 +964,80 @@ mod tests {
         let issued = svc.issue_api_key(&user.id).await.unwrap();
         assert!(svc.revoke_by_secret(&issued.secret).await.unwrap());
         assert!(!svc.revoke_by_secret(&issued.secret).await.unwrap());
+    }
+
+    // -----------------------------------------------------------------
+    // T5: last-admin guard rails
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn delete_user_refuses_the_last_admin() {
+        let svc = service();
+        let admin = svc.create_user("only-admin", Role::Admin).await.unwrap();
+
+        let err = svc.delete_user(&admin.id).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidRequest { .. }));
+        assert!(svc.store.get_user(&admin.id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_user_allows_a_non_last_admin() {
+        let svc = service();
+        let admin1 = svc.create_user("admin1", Role::Admin).await.unwrap();
+        let admin2 = svc.create_user("admin2", Role::Admin).await.unwrap();
+
+        assert!(svc.delete_user(&admin1.id).await.unwrap());
+        assert!(svc.store.get_user(&admin2.id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_user_allows_deleting_a_member() {
+        let svc = service();
+        let admin = svc.create_user("solo-admin", Role::Admin).await.unwrap();
+        let member = svc.create_user("some-member", Role::Member).await.unwrap();
+
+        assert!(svc.delete_user(&member.id).await.unwrap());
+        // The sole admin is untouched and still present.
+        assert!(svc.store.get_user(&admin.id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn set_user_role_refuses_to_demote_the_last_admin() {
+        let svc = service();
+        let admin = svc.create_user("only-admin2", Role::Admin).await.unwrap();
+
+        let err = svc
+            .set_user_role(&admin.id, Role::Member)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidRequest { .. }));
+        let reloaded = svc.store.get_user(&admin.id).await.unwrap().unwrap();
+        assert_eq!(reloaded.role, Role::Admin, "role must be unchanged");
+    }
+
+    #[tokio::test]
+    async fn set_user_role_allows_demoting_a_non_last_admin() {
+        let svc = service();
+        let admin1 = svc.create_user("admin1b", Role::Admin).await.unwrap();
+        let admin2 = svc.create_user("admin2b", Role::Admin).await.unwrap();
+
+        svc.set_user_role(&admin1.id, Role::Member).await.unwrap();
+        let reloaded = svc.store.get_user(&admin1.id).await.unwrap().unwrap();
+        assert_eq!(reloaded.role, Role::Member);
+        // The remaining admin is unaffected.
+        let admin2_reloaded = svc.store.get_user(&admin2.id).await.unwrap().unwrap();
+        assert_eq!(admin2_reloaded.role, Role::Admin);
+    }
+
+    #[tokio::test]
+    async fn set_user_role_allows_promoting_a_member_to_admin() {
+        let svc = service();
+        svc.create_user("solo-admin2", Role::Admin).await.unwrap();
+        let member = svc.create_user("promotable", Role::Member).await.unwrap();
+
+        svc.set_user_role(&member.id, Role::Admin).await.unwrap();
+        let reloaded = svc.store.get_user(&member.id).await.unwrap().unwrap();
+        assert_eq!(reloaded.role, Role::Admin);
     }
 
     #[tokio::test]

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use axum::{
     middleware,
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
     Router,
 };
 use tokio::net::TcpListener;
@@ -296,6 +296,27 @@ pub fn build_router(
         .route("/v1/status", get(handlers::get_status))
         .route("/v1/config", get(handlers::get_config))
         .route("/v1/auth/me", get(handlers::get_me))
+        .route(
+            "/v1/users",
+            get(handlers::list_users).post(handlers::create_user),
+        )
+        .route(
+            "/v1/users/{id}",
+            patch(handlers::patch_user).delete(handlers::delete_user),
+        )
+        .route(
+            "/v1/users/{id}/keys",
+            get(handlers::list_keys).post(handlers::create_key),
+        )
+        .route("/v1/keys/{id}", delete(handlers::revoke_key))
+        .route(
+            "/v1/stores/{name}/grants",
+            get(handlers::list_grants).post(handlers::create_grant),
+        )
+        .route(
+            "/v1/stores/{name}/grants/{user}",
+            delete(handlers::delete_grant),
+        )
         .with_state(state.clone())
         .nest_service(
             "/mcp",

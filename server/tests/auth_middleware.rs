@@ -8,23 +8,10 @@ use axum::http::{header, Method, StatusCode};
 use localdb_core::auth::Role;
 use server::AuthMode;
 
-use common::{json_body, make_app_with_mode, make_enforced_app, request, request_with_bearer};
-
-/// Seed a user and mint an API key through the state's own AuthService —
-/// the same persistent database the router serves.
-async fn seed_user_with_key(state: &server::AppState, name: &str, role: Role) -> String {
-    let user = state
-        .auth()
-        .create_user(name, role)
-        .await
-        .expect("seeding a user must succeed");
-    state
-        .auth()
-        .issue_api_key(&user.id)
-        .await
-        .expect("minting an api key must succeed")
-        .secret
-}
+use common::{
+    json_body, make_app_with_mode, make_enforced_app, request, request_with_bearer,
+    seed_user_with_key,
+};
 
 #[tokio::test]
 async fn enforced_no_header_is_401_with_www_authenticate_and_envelope() {
@@ -85,20 +72,28 @@ async fn enforced_valid_admin_key_reaches_auth_me_with_identity() {
 }
 
 #[tokio::test]
-async fn enforced_member_key_is_403_wholesale() {
-    // T3 interim policy: members are rejected on every protected route;
-    // store-grant-scoped access activates in T5.
+async fn enforced_member_key_passes_the_middleware_now() {
+    // T5 lifts the T3 interim wholesale member-403: a member principal now
+    // passes the auth *middleware* on every route — per-resource
+    // authorization (D7 store-grant scoping, admin-only routes) is enforced
+    // by the individual handlers instead (see server/tests/admin_management.rs
+    // and mcp_route.rs for that coverage).
     let (_dir, state, app) = make_enforced_app().await;
     let secret = seed_user_with_key(&state, "bob", Role::Member).await;
 
     let resp =
         request_with_bearer(app.clone(), Method::GET, "/v1/auth/me", None, Some(&secret)).await;
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::OK);
     let body = json_body(resp.into_body()).await;
-    assert_eq!(body["code"], "forbidden");
+    assert_eq!(body["role"], "member");
 
-    // Not just /v1/auth/me — any protected route.
-    let resp = request_with_bearer(app, Method::GET, "/v1/stores", None, Some(&secret)).await;
+    // A member CAN reach a read route (returns their own — empty — view).
+    let resp =
+        request_with_bearer(app.clone(), Method::GET, "/v1/stores", None, Some(&secret)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // But an admin-only management route still 403s for a member.
+    let resp = request_with_bearer(app, Method::GET, "/v1/users", None, Some(&secret)).await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 

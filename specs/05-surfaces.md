@@ -28,24 +28,33 @@ Single binary, subcommand tree. Global flags: `--config`, `--json`, `--store <na
 | `index [--store S] [--source ID] [--strict]` | One-shot scan & index; creates IndexJob | runs job synchronously, progress to stderr | submits job, polls, streams progress |
 | `search <query>... [--limit N] [--content-length N]` | Hybrid search with citations; `--content-length` is a **soft cap** on human-readable snippet chars (default 1000; JSON output always full text) — see §4 for the snapping behavior shared with MCP | embedded read | via API |
 | `login` / `logout` (planned) | Authenticate against a daemon and cache the resulting token, or revoke and clear it | n/a — there is no auth to log into without a daemon (§3.1) | `login` exchanges credentials via `/token` (or an invite/API-key flow) and writes `credentials.json` (§6, [03-config.md](03-config.md) §6); `logout` calls `/revoke` and clears the cached entry |
-| `user add\|list\|remove\|set-role` (planned) | Manage user accounts (admin only) | **break-glass**: writes the unified DB's `users` table directly — recovery path when the daemon is unreachable or auth is locked out | routed to daemon, requires an admin bearer token; `user add` also accepts a `--direct-db` flag to bypass a running daemon for lockout recovery |
-| `key create\|list\|revoke` (planned) | Manage API keys (`auth_tokens` rows with `kind='api_key'`) for the caller or, as admin, another user | break-glass direct write | routed to daemon; managing another user's key requires admin |
-| `store grant\|revoke` (planned) | Grant/revoke a member's read access to a `shared` store (D7); rejected on `private` stores | direct write | routed to daemon, admin only |
+| `user add\|list\|remove\|set-role` | Manage user accounts (admin only) | direct write/read against the unified DB's `users` table — the recovery path when the daemon is unreachable or auth is locked out | routed to daemon, requires an admin bearer token; `user add` also accepts a `--direct-db` flag to bypass a running daemon for lockout recovery |
+| `key create\|list\|revoke` | Manage API keys (`auth_tokens` rows with `kind='api_key'`) for the caller or, as admin, another user | direct write/read | routed to daemon; managing another user's key requires admin (minting your *own* key is always allowed); `key create` also accepts `--direct-db` |
+| `store grant\|revoke` | Grant/revoke a member's read access to a `shared` store (D7); rejected on `private` stores | direct write | routed to daemon, admin only |
 | `invite create\|list\|revoke\|requests\|approve\|deny` (planned) | Manage invites and pending access requests (admin only; the full redeem/approve state machine lands in T6) | direct write | routed to daemon, admin only |
 
 Output: human-readable by default (citations as `uri:heading_path` + snippet), `--json` emits the
 canonical structures for scripting. The CLI is **command-oriented**; interactive browse is a
 roadmap item with the web UI.
 
-**Break-glass commands:** `user`, `key`, `store grant/revoke`, and `invite` all have a
-daemonless mode that writes the unified database directly, bypassing HTTP auth entirely. This
-is deliberate: it is the recovery path when the daemon can't be reached, or when every admin
-credential has been lost or revoked. It carries the same trust assumption as any other
-daemonless CLI command — whoever can open the database file is already trusted (§3.1) — so no
-additional confirmation is required. `user add --direct-db` extends this to force break-glass
-behavior even while a daemon is running, for the lockout-recovery case specifically. None of
-the commands in this paragraph are implemented yet (T1 ships only the underlying schema and
-`core::auth` types); see the design note above each row.
+**Daemon-routed-first, direct-DB fallback (T5):** `user`, `key`, and `store grant/revoke` follow
+the same pattern as `store add/list/remove` (§2 above): when a daemon is reachable, the request
+goes over HTTP with the caller's bearer — admin where the route requires it
+([§3.1](#31-authentication)'s route table — a non-admin bearer gets `forbidden`/exit 6 from the
+daemon, not a CLI-side refusal); otherwise it falls back to a direct, trusted database
+read/write, carrying the same trust assumption as every other daemonless CLI command — whoever
+can open the database file is already trusted. This makes "add a user while the server is up"
+just work over HTTP, the common case, rather than requiring the daemon to be stopped first.
+
+**Break-glass escape hatch:** `user add --direct-db` (and `key create --direct-db`) is the one
+deliberate exception — it forces the direct-DB write even while a daemon is running, for the
+lockout-recovery case where the daemon's own auth is broken or every admin credential has been
+lost. It warns (non-JSON mode) that a daemon is running rather than refusing: SQLite's
+write-ahead log plus busy-timeout already make concurrent access with a live daemon safe (the
+same `runtime_state_locked`/exit 4 outcome as any other contended direct-DB write in the worst
+case), so refusing outright would only get in the way of the one scenario this flag exists for.
+`invite` (T6) is the remaining fully-`planned` row above; it will follow the same pattern once
+implemented.
 
 ## 3. HTTP API
 
@@ -85,27 +94,38 @@ later if a consumer demands it).
 
 ### 3.1 Authentication
 
-**Status:** foundation only as of this ticket (T1) — `core::auth` (types, `AuthStore` trait,
-`AuthService`) and the `store-libsql` persistence layer and schema exist
-([02-domain-model.md](02-domain-model.md) §2, §9), but nothing below is enforced yet. No
-middleware runs, no route requires a token, and `server.auth` has no runtime effect. Enforcement
-lands incrementally across T2–T7; this section describes the target shape so later tickets have
-a design to implement against.
+**Status:** T1 shipped the foundation (`core::auth` types, `AuthStore` trait, `AuthService`, the
+`store-libsql` persistence layer and schema — [02-domain-model.md](02-domain-model.md) §2, §9).
+T2–T4 wired bearer-token enforcement, the `require_auth` middleware, and the OAuth2
+authorization-code + PKCE flow. **T5 lifts the interim "every member gets 403 everywhere" gate**
+(a fail-safe staging measure T3 shipped before store grants existed) and activates the target
+shape described below: per-resource D7 scoping instead of a wholesale role gate, plus the
+user/key/grant management routes themselves. Invite management (the last row below) remains T6.
 
-**Decision (target shape):** bearer tokens (`Authorization: Bearer ldb_...`) on every route under
-`/v1/*` and `/mcp`, once auth is enforced for the daemon (§3). A request with a missing or
-invalid token gets `401` with a `WWW-Authenticate: Bearer` header. A request from an
-authenticated principal who lacks permission for the resource (e.g. a member reading a store
-they have no grant for, or any non-admin route) gets `403`. See §5 for the `unauthorized`
-(401) / `forbidden` (403) error codes.
+**Decision:** bearer tokens (`Authorization: Bearer ldb_...`) on every route under `/v1/*` and
+`/mcp`, once auth is enforced for the daemon (§3). A request with a missing or invalid token gets
+`401` with a `WWW-Authenticate: Bearer` header. A request from an authenticated principal who
+lacks permission for the resource (e.g. a member reading a store they have no grant for, or any
+non-admin route) gets `403`. See §5 for the `unauthorized` (401) / `forbidden` (403) error codes.
 
-**Route table (target, D7 for the read model):**
+**Route table:**
 
 | Routes | Auth |
 |---|---|
 | `GET /.well-known/oauth-protected-resource`, `GET /.well-known/oauth-authorization-server`, `GET\|POST /authorize`, `POST /token`, `POST /revoke`, `POST /register`, `POST /v1/invites/redeem`, `GET /v1/invites/requests/{id}` | Public — no bearer token required (these routes *are* the auth flow, or are the deliberately open invite-redemption/status-check surface). |
-| Everything else under `/v1/*` and `/mcp` | Bearer token required once auth is enforced (§3). Results are filtered by the principal's store access — admins see all stores; members see only `shared` stores they hold a grant for (D7, [02-domain-model.md](02-domain-model.md) §2). |
-| User management, grant management, invite management (once they exist as routes) | Bearer token **and** `role = admin` (`Principal::require_admin`). |
+| `GET /v1/stores`, `GET /v1/stores/{name}`, `GET /v1/stores/{name}/sources`, `POST /v1/search`, `GET /v1/documents/{id}`, `GET /v1/auth/me`, `/mcp` | Bearer token required once auth is enforced (§3). Results/visibility are scoped by the principal's store access (D7, [02-domain-model.md](02-domain-model.md) §2): admins see every store; members see only `shared` stores they hold a grant for. A named-but-unreadable store (a direct `GET`, or an explicit `store_filter`/MCP `stores` entry naming one) is **403, not 404** — consistent with the filtered list views, and chosen over 404 so a caller can't use the distinction to fish for private store names; see `handlers::stores::get_store`'s doc comment. |
+| `POST/PATCH/DELETE /v1/stores`, `POST /v1/stores/{name}/sources`, `DELETE /v1/sources/{id}`, `POST/GET /v1/jobs`, `GET /v1/jobs/{id}`, `GET /v1/config` | Bearer token **and** `role = admin`. Members are readers only in this phase — every mutation, plus `GET /v1/config` (server configuration, not store-scoped content), is admin-only regardless of any store grant. |
+| `GET/POST /v1/users`, `PATCH/DELETE /v1/users/{id}`, `GET /v1/users/{id}/keys`, `DELETE /v1/keys/{id}`, `GET/POST /v1/stores/{name}/grants`, `DELETE /v1/stores/{name}/grants/{user}` | Bearer token **and** `role = admin` (`Principal::require_admin`), with one carve-out: `POST /v1/users/{id}/keys` also allows a non-admin principal to mint a key **for themselves** (`id` equal to the caller's own `user_id`) — every other combination (another user's keys, any user/grant list or mutation) is admin-only. |
+| Invite management (once it exists as routes, T6) | Bearer token **and** `role = admin`. |
+
+**Guard rails (D7 lockout prevention):** deleting or demoting (`role = admin` → `member`) the
+*last remaining admin* is rejected — `AuthService::delete_user`/`set_user_role` check this
+generically (would the action leave zero admins?), not just for self-targeted calls, so it also
+catches e.g. an admin demoting the only other admin down to zero. Mapped to `invalid_request`
+(400 / CLI exit 2) — the same code already used for other "well-formed request, not allowed given
+current state" cases (e.g. a duplicate user name) — rather than inventing a new taxonomy entry
+for it (§5's codes are stable API). Deleting a user cascades to their tokens and store grants via
+`ON DELETE CASCADE` at the schema level ([02-domain-model.md](02-domain-model.md) §9).
 
 **One-time setup code:** when `localdb serve` starts with auth enforced and no users exist yet
 (`AuthStore::count_users() == 0`), the daemon prints a one-time setup code to stdout/stderr so

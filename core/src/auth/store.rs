@@ -163,6 +163,11 @@ pub trait AuthStore: Send + Sync + 'static {
     // ------------------------------------------------------------------
     async fn insert_token(&self, token: &AuthTokenRow) -> Result<(), Error>;
     async fn find_token_by_hash(&self, secret_hash: &str) -> Result<Option<AuthTokenRow>, Error>;
+    /// Look up a token by its own ID (not its secret hash) — used by
+    /// `DELETE /v1/keys/{id}` to resolve the owning user before checking
+    /// "self or admin" (specs/05-surfaces.md §3.1), where the caller only
+    /// has the token's ID, never its secret.
+    async fn find_token(&self, id: &str) -> Result<Option<AuthTokenRow>, Error>;
     async fn revoke_token(&self, id: &str) -> Result<bool, Error>;
     /// Revoke every token sharing `family_id`. Called on rotated-refresh
     /// -token reuse detection (D1).
@@ -328,6 +333,17 @@ impl AuthStore for FakeAuthStore {
             .tokens
             .iter()
             .find(|t| t.secret_hash == secret_hash)
+            .cloned())
+    }
+
+    async fn find_token(&self, id: &str) -> Result<Option<AuthTokenRow>, Error> {
+        Ok(self
+            .inner
+            .read()
+            .await
+            .tokens
+            .iter()
+            .find(|t| t.id == id)
             .cloned())
     }
 

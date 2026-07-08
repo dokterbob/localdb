@@ -78,6 +78,10 @@ impl AuthStore for LibsqlAuthStore {
         tokens::find_token_by_hash(&self.conn, secret_hash).await
     }
 
+    async fn find_token(&self, id: &str) -> Result<Option<AuthTokenRow>, Error> {
+        tokens::find_token(&self.conn, id).await
+    }
+
     async fn revoke_token(&self, id: &str) -> Result<bool, Error> {
         let now = localdb_core::ingestion::now_rfc3339();
         tokens::revoke_token(&self.conn, id, &now).await
