@@ -52,11 +52,16 @@
 -- sources, and resource metadata across that bump instead of re-ingesting
 -- from scratch.
 --
--- Run it with `-bail` and check the exit code, so a failed statement is
--- reported (rather than silently continuing to the next line):
+-- Run it with the sqlite3 CLI and check the exit code:
 --
---   sqlite3 -bail /path/to/localdb.db < docs/migrations/v4-to-v5.sql
+--   sqlite3 /path/to/localdb.db < docs/migrations/v4-to-v5.sql
 --   echo "exit: $?"   # non-zero means the migration did NOT apply
+--
+-- The `.bail on` dot-command below makes the sqlite3 CLI abort on the first
+-- failed statement even without the `-bail` flag; without it, a plain
+-- invocation would print the error, keep executing the remaining
+-- statements, and COMMIT a half-applied migration stamped v5. (Passing
+-- `-bail` explicitly is equivalent and also fine.)
 --
 -- Transaction safety: the whole script runs inside a single BEGIN
 -- IMMEDIATE/COMMIT transaction, with `PRAGMA user_version = 5` as the LAST
@@ -73,12 +78,14 @@
 -- Idempotency: re-running this script against an already-migrated (v5)
 -- database is safe but NOT silent -- step 1's `ALTER TABLE chunks DROP
 -- COLUMN block_id` fails with "no such column: block_id" once the column is
--- already gone. Under `-bail` that failure aborts the script and (per the
+-- already gone. With `.bail on` that failure aborts the script and (per the
 -- transaction safety note above) rolls back the whole transaction, so it is
 -- harmless: you get a non-zero exit code and an unchanged, already-v5
 -- database, not a corrupted one. This is by design -- it is not worth
 -- special-casing step 1 to be silently skippable just to make a script
 -- that should only ever be run once look clean on a second run.
+
+.bail on
 
 BEGIN IMMEDIATE;
 

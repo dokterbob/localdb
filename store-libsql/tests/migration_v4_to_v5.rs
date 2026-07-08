@@ -189,9 +189,16 @@ async fn apply_migration_script(conn: &libsql::Connection) {
     // this script's header comments contains semicolons of its own, e.g.
     // "left as-is; they are not translated..." — splitting on ';' before
     // removing comments would misparse those as statement boundaries).
+    // Also strip sqlite3-CLI dot-commands (`.bail on`): they are interpreted
+    // by the CLI, not the SQL engine, and this harness's abort-on-error
+    // behavior (unwrap on the first failed statement) matches what `.bail on`
+    // gives the CLI.
     let code_only: String = script
         .lines()
-        .filter(|line| !line.trim_start().starts_with("--"))
+        .filter(|line| {
+            let t = line.trim_start();
+            !t.starts_with("--") && !t.starts_with('.')
+        })
         .collect::<Vec<_>>()
         .join("\n");
 
