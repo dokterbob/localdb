@@ -238,32 +238,24 @@ fn map_error_response(status: reqwest::StatusCode, json: &serde_json::Value) -> 
     }
 }
 
-/// Attempt a refresh-grant exchange for the stored refresh token (if any)
-/// against `base_url`'s `/token` endpoint, persisting the rotated pair on
-/// success. Returns the new access token to retry with, or `None` if there
-/// was nothing to refresh or the refresh itself failed — either way the
-/// caller falls through to surfacing the original 401.
-///
-/// Skipped entirely when `ctx.api_key` (`LOCALDB_API_KEY`) is set: a
-/// statically configured bearer isn't part of the login token-pair rotation
-/// model, so there is nothing to refresh.
-async fn try_refresh_and_persist(ctx: &CliContext, url: &str) -> Option<String> {
-    if ctx.api_key.as_deref().is_some_and(|k| !k.is_empty()) {
-        return None;
-    }
-    let base_url = base_url_of(url)?;
-    let config_file = resolved_config_file(ctx)?;
-    let credentials_file = crate::credentials::credentials_path(&config_file);
-    let entry = crate::credentials::lookup_entry(&credentials_file, &base_url)?;
-    let refresh_token = entry.refresh_token?;
-
+/// Redeem `refresh_token` against `base_url`'s `/token` endpoint, returning
+/// the new access token and the rotated `CredentialEntry` to persist, or
+/// `None` if the request failed outright or the daemon rejected it (expired
+/// or revoked refresh token). Pure HTTP exchange — callers own the
+/// credentials-file lookup and write so this can be shared by both the
+/// retry-on-401 path (`try_refresh_and_persist`) and the proactive
+/// pre-connect path (`ensure_fresh_bearer`).
+async fn redeem_refresh_token(
+    base_url: &str,
+    refresh_token: &str,
+) -> Option<(String, crate::credentials::CredentialEntry)> {
     let client = build_http_client().ok()?;
     let token_url = format!("{base_url}/token");
     let resp = client
         .post(&token_url)
         .form(&[
             ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token.as_str()),
+            ("refresh_token", refresh_token),
         ])
         .send()
         .await
@@ -285,12 +277,85 @@ async fn try_refresh_and_persist(ctx: &CliContext, url: &str) -> Option<String> 
     let new_entry = crate::credentials::CredentialEntry {
         secret: None,
         access_token: Some(access_token.clone()),
-        refresh_token: new_refresh_token.or(Some(refresh_token)),
+        refresh_token: new_refresh_token.or_else(|| Some(refresh_token.to_string())),
         access_expires_at: Some(localdb_core::auth::rfc3339_from_now(expires_in)),
     };
+    Some((access_token, new_entry))
+}
+
+/// Attempt a refresh-grant exchange for the stored refresh token (if any)
+/// against `base_url`'s `/token` endpoint, persisting the rotated pair on
+/// success. Returns the new access token to retry with, or `None` if there
+/// was nothing to refresh or the refresh itself failed — either way the
+/// caller falls through to surfacing the original 401.
+///
+/// Skipped entirely when `ctx.api_key` (`LOCALDB_API_KEY`) is set: a
+/// statically configured bearer isn't part of the login token-pair rotation
+/// model, so there is nothing to refresh.
+async fn try_refresh_and_persist(ctx: &CliContext, url: &str) -> Option<String> {
+    if ctx.api_key.as_deref().is_some_and(|k| !k.is_empty()) {
+        return None;
+    }
+    let base_url = base_url_of(url)?;
+    let config_file = resolved_config_file(ctx)?;
+    let credentials_file = crate::credentials::credentials_path(&config_file);
+    let entry = crate::credentials::lookup_entry(&credentials_file, &base_url)?;
+    let refresh_token = entry.refresh_token?;
+
+    let (access_token, new_entry) = redeem_refresh_token(&base_url, &refresh_token).await?;
     crate::credentials::write_entry(&credentials_file, &base_url, new_entry).ok()?;
 
     Some(access_token)
+}
+
+/// Resolve a currently-valid bearer for `base_url`, refreshing proactively
+/// when the cached access token is expired and a refresh token is on hand.
+///
+/// This exists for callers that open a long-lived connection up front and
+/// can't cheaply retry mid-stream on a 401 the way `daemon_request_async`
+/// does (the MCP daemon-proxy handshake in `cmds::surface::run_mcp_async`).
+/// Resolution order mirrors `bearer_for_request`/`resolve_bearer`:
+/// 1. `ctx.api_key` (`LOCALDB_API_KEY`) wins outright, returned verbatim
+///    without touching `credentials.json` — API keys aren't part of the
+///    login token-pair rotation model, so there's nothing to refresh.
+/// 2. Otherwise, the `credentials.json` entry for `base_url`: if it carries
+///    an `access_token` whose `access_expires_at` has passed and a
+///    `refresh_token` is present, redeem the refresh token and persist the
+///    rotated pair, returning the fresh access token.
+/// 3. Otherwise (including a failed refresh attempt, or an entry with no
+///    expiry info) the cached secret (`access_token` or legacy `secret`) is
+///    returned as-is — best effort, matching today's non-refreshing
+///    behavior; a stale-but-still-cached token still gets a chance against
+///    the daemon rather than sending no bearer at all.
+pub(crate) async fn ensure_fresh_bearer(ctx: &CliContext, base_url: &str) -> Option<String> {
+    if let Some(key) = ctx.api_key.as_deref() {
+        if !key.is_empty() {
+            return Some(key.to_string());
+        }
+    }
+    let config_file = resolved_config_file(ctx)?;
+    let credentials_file = crate::credentials::credentials_path(&config_file);
+    let entry = crate::credentials::lookup_entry(&credentials_file, base_url)?;
+    let current = entry.access_token.clone().or_else(|| entry.secret.clone());
+
+    let is_expired_access_token = entry.access_token.is_some()
+        && entry
+            .access_expires_at
+            .as_deref()
+            .is_some_and(localdb_core::auth::is_expired);
+
+    if is_expired_access_token {
+        if let Some(refresh_token) = entry.refresh_token.clone() {
+            if let Some((access_token, new_entry)) =
+                redeem_refresh_token(base_url, &refresh_token).await
+            {
+                let _ = crate::credentials::write_entry(&credentials_file, base_url, new_entry);
+                return Some(access_token);
+            }
+        }
+    }
+
+    current
 }
 
 pub(crate) async fn daemon_request_async(
@@ -359,6 +424,47 @@ mod tests {
         assert_eq!(
             base_url_of("https://daemon.example.com/v1/search").as_deref(),
             Some("https://daemon.example.com")
+        );
+    }
+
+    /// Regression test for a reviewer claim that an IPv6 daemon origin key
+    /// might be written one way (e.g. by `login`, from the raw base URL
+    /// `probe_daemon`/`daemon.url` hand out) and looked up another way (via
+    /// `base_url_of` on the constructed request URL), causing a bracket
+    /// mismatch and a spurious 401. Both sides in fact go through the same
+    /// canonical `scheme://[host]:port` shape — `daemon.url` is written from
+    /// `std::net::SocketAddr`'s `Display` impl, which already brackets IPv6
+    /// (`[::1]:7700`), and `base_url_of` reserializes via `url::Url`, which
+    /// also brackets IPv6 host_str. This test writes a credential keyed by
+    /// the raw bracketed base URL (as `login` would) and confirms
+    /// `bearer_for_request` on a URL built from that same base URL finds it.
+    #[test]
+    fn bearer_for_request_matches_credential_written_for_bracketed_ipv6_base_url() {
+        let dir = TempDir::new().unwrap();
+        let config_file = dir.path().join("config.yaml");
+        std::fs::write(&config_file, "version: 1\n").unwrap();
+
+        let base_url = "http://[::1]:7700";
+        let credentials_file = crate::credentials::credentials_path(&config_file);
+        crate::credentials::write_entry(
+            &credentials_file,
+            base_url,
+            crate::credentials::CredentialEntry {
+                secret: None,
+                access_token: Some("ldb_ipv6_access".to_string()),
+                refresh_token: None,
+                access_expires_at: None,
+            },
+        )
+        .unwrap();
+
+        let ctx = ctx_with_config(&config_file);
+        let request_url = format!("{base_url}/v1/status");
+        assert_eq!(
+            bearer_for_request(&ctx, &request_url).as_deref(),
+            Some("ldb_ipv6_access"),
+            "the credential written for the bracketed IPv6 base URL must be \
+             found again when looked up via the same base URL derivation"
         );
     }
 
@@ -683,5 +789,147 @@ mod tests {
         // The cached refresh token must be untouched — no refresh attempt happened.
         let entry = crate::credentials::lookup_entry(&credentials_file, &base_url).unwrap();
         assert_eq!(entry.access_token.as_deref(), Some("old_access"));
+    }
+
+    // -----------------------------------------------------------------
+    // ensure_fresh_bearer: proactive pre-connect refresh for the MCP
+    // daemon-proxy handshake (`cmds::surface::run_mcp_async`), which has no
+    // cheap way to retry mid-stream on a 401 the way `daemon_request_async`
+    // does.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn ensure_fresh_bearer_refreshes_an_expired_access_token() {
+        let dir = TempDir::new().unwrap();
+        let config_file = dir.path().join("config.yaml");
+        std::fs::write(&config_file, "version: 1\n").unwrap();
+        let port = start_refresh_mock_daemon();
+        let base_url = format!("http://127.0.0.1:{port}");
+
+        let credentials_file = crate::credentials::credentials_path(&config_file);
+        crate::credentials::write_entry(
+            &credentials_file,
+            &base_url,
+            crate::credentials::CredentialEntry {
+                secret: None,
+                access_token: Some("old_access".to_string()),
+                refresh_token: Some("old_refresh".to_string()),
+                access_expires_at: Some(localdb_core::auth::rfc3339_from_now(-10)),
+            },
+        )
+        .unwrap();
+
+        let ctx = ctx_with_config(&config_file);
+        let bearer = ensure_fresh_bearer(&ctx, &base_url).await;
+
+        assert_eq!(
+            bearer.as_deref(),
+            Some("new_access"),
+            "an expired access token with a live refresh token must be redeemed proactively"
+        );
+        let entry = crate::credentials::lookup_entry(&credentials_file, &base_url).unwrap();
+        assert_eq!(entry.access_token.as_deref(), Some("new_access"));
+        assert_eq!(
+            entry.refresh_token.as_deref(),
+            Some("new_refresh"),
+            "the rotated refresh token must be persisted, not just the access token"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_fresh_bearer_returns_unexpired_token_without_refreshing() {
+        let dir = TempDir::new().unwrap();
+        let config_file = dir.path().join("config.yaml");
+        std::fs::write(&config_file, "version: 1\n").unwrap();
+        // No mock daemon needed: a fresh token must never trigger a network
+        // call, so any unreachable base URL will do — if the code tried to
+        // refresh, the test would still pass by accident (redeem failure
+        // falls back to the current token), so we additionally assert the
+        // credentials file is untouched to catch a spurious refresh attempt.
+        let base_url = "http://127.0.0.1:1".to_string();
+
+        let credentials_file = crate::credentials::credentials_path(&config_file);
+        crate::credentials::write_entry(
+            &credentials_file,
+            &base_url,
+            crate::credentials::CredentialEntry {
+                secret: None,
+                access_token: Some("still_good".to_string()),
+                refresh_token: Some("unused_refresh".to_string()),
+                access_expires_at: Some(localdb_core::auth::rfc3339_from_now(3600)),
+            },
+        )
+        .unwrap();
+
+        let ctx = ctx_with_config(&config_file);
+        let bearer = ensure_fresh_bearer(&ctx, &base_url).await;
+
+        assert_eq!(bearer.as_deref(), Some("still_good"));
+        let entry = crate::credentials::lookup_entry(&credentials_file, &base_url).unwrap();
+        assert_eq!(
+            entry.refresh_token.as_deref(),
+            Some("unused_refresh"),
+            "the refresh token must be untouched — no refresh attempt should happen"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_fresh_bearer_env_override_wins_without_touching_credentials() {
+        let dir = TempDir::new().unwrap();
+        let config_file = dir.path().join("config.yaml");
+        std::fs::write(&config_file, "version: 1\n").unwrap();
+        let base_url = "http://127.0.0.1:1".to_string();
+
+        // No credentials.json entry at all — if the env override is not
+        // returned verbatim first, this would fall through to `None`
+        // instead, or (if the code were buggy) attempt a file read.
+        let ctx = {
+            let mut ctx = ctx_with_config(&config_file);
+            ctx.api_key = Some("ldb_env_key".to_string());
+            ctx
+        };
+
+        let bearer = ensure_fresh_bearer(&ctx, &base_url).await;
+        assert_eq!(bearer.as_deref(), Some("ldb_env_key"));
+
+        let credentials_file = crate::credentials::credentials_path(&config_file);
+        assert!(
+            !credentials_file.exists(),
+            "the env override must be returned without ever creating/touching credentials.json"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_fresh_bearer_falls_back_to_stale_token_when_refresh_fails() {
+        let dir = TempDir::new().unwrap();
+        let config_file = dir.path().join("config.yaml");
+        std::fs::write(&config_file, "version: 1\n").unwrap();
+        let port = start_refresh_mock_daemon();
+        let base_url = format!("http://127.0.0.1:{port}");
+
+        let credentials_file = crate::credentials::credentials_path(&config_file);
+        crate::credentials::write_entry(
+            &credentials_file,
+            &base_url,
+            crate::credentials::CredentialEntry {
+                secret: None,
+                access_token: Some("old_access".to_string()),
+                // The mock daemon only accepts `old_refresh`; this one is
+                // rejected, exercising the best-effort fallback.
+                refresh_token: Some("no-longer-valid".to_string()),
+                access_expires_at: Some(localdb_core::auth::rfc3339_from_now(-10)),
+            },
+        )
+        .unwrap();
+
+        let ctx = ctx_with_config(&config_file);
+        let bearer = ensure_fresh_bearer(&ctx, &base_url).await;
+
+        assert_eq!(
+            bearer.as_deref(),
+            Some("old_access"),
+            "a failed refresh should still hand back the stale cached token \
+             (best effort) rather than nothing at all"
+        );
     }
 }

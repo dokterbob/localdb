@@ -99,11 +99,16 @@ pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
         // §6) so proxied stdio MCP works against an auth-enforcing daemon.
         // `None` (no credential available) is fine against an open-mode
         // daemon; an enforcing daemon answers 401 and the handshake fails.
-        let bearer = crate::credentials::resolve_bearer(
-            ctx.api_key.as_deref(),
-            Some(&config_loader.paths.config_file),
-            &base_url,
-        );
+        //
+        // Unlike `daemon_request_async`, this is a long-lived stdio<->HTTP
+        // proxy handshake with no cheap way to retry mid-stream on a 401, so
+        // the bearer is resolved through `ensure_fresh_bearer` instead of
+        // `resolve_bearer`/`bearer_for_request`: if the cached access token
+        // is already expired and a refresh token is on hand, it proactively
+        // redeems it (persisting the rotated pair to credentials.json)
+        // *before* connecting, rather than handing the daemon a token that's
+        // certain to be rejected.
+        let bearer = crate::daemon_client::ensure_fresh_bearer(ctx, &base_url).await;
         // Connect and serve are separate calls (`ProxyHandler::connect_with_auth`
         // then `mcp::serve_proxied_stdio`, rather than one moded entrypoint) so a
         // failure to reach the daemon at all — it went away between
