@@ -175,6 +175,13 @@ async fn window_block_seqs_round_trip() {
 }
 
 #[tokio::test]
+async fn blocks_round_trip_ordered() {
+    let (_dir, db) = setup().await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+    conformance::test_blocks_round_trip_ordered(handle.as_ref()).await;
+}
+
+#[tokio::test]
 async fn get_chunks_for_resource() {
     let (_dir, db) = setup().await;
     let handle = db.retrieval_store("store-1").await.unwrap();

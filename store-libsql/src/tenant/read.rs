@@ -2,7 +2,7 @@ use libsql::params;
 use localdb_core::ingestion::DocumentRecord;
 use localdb_core::{ChunkRecord, Error, MetadataFilter, SearchResult, StoreStats, VectorEncoding};
 
-use super::rows::row_to_chunk_record_strict;
+use super::rows::{row_to_block, row_to_chunk_record_strict};
 use super::sql::{build_filter_clauses, escape_fts5_query};
 use super::TenantStore;
 use crate::connection::map_libsql_err;
@@ -248,6 +248,34 @@ pub(crate) async fn get_chunks_for_resource(
     let mut out = Vec::new();
     while let Some(row) = rows.next().await.map_err(map_libsql_err)? {
         out.push(row_to_chunk_record_strict(&row)?);
+    }
+    Ok(out)
+}
+
+/// Retrieve all blocks for a document, ordered by `seq`.
+///
+/// Backs `RetrievalStore::get_blocks_for_resource`. Blocks are the persisted
+/// canonical source of truth for document reconstruction — see
+/// `write::upsert_blocks`/`write::upsert_blocks_inner` and the trait doc on
+/// `get_blocks_for_resource` in `core::store`.
+pub(crate) async fn get_blocks_for_resource(
+    store: &TenantStore,
+    resource_id: &str,
+) -> Result<Vec<localdb_core::block::Block>, Error> {
+    let conn = store.conn().conn().await;
+    let mut rows = conn
+        .query(
+            "SELECT seq, kind, text, metadata_json, location_json
+             FROM blocks
+             WHERE store_id = ? AND resource_id = ?
+             ORDER BY seq",
+            params![store.store_id().to_string(), resource_id.to_string()],
+        )
+        .await
+        .map_err(map_libsql_err)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(map_libsql_err)? {
+        out.push(row_to_block(&row)?);
     }
     Ok(out)
 }

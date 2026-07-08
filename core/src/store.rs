@@ -305,6 +305,32 @@ pub trait RetrievalStore: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Retrieve all blocks for a document, ordered by `seq`.
+    ///
+    /// Blocks are the persisted canonical source of truth for document
+    /// reconstruction (see `upsert_blocks`): each block's full text is stored
+    /// exactly once, unlike chunks, which can duplicate content — most
+    /// visibly the table chunker (spec 04 §3, intentional), which re-emits
+    /// the header + separator row in every chunk of a multi-chunk table.
+    /// Callers reconstructing a document's full text should join these block
+    /// texts rather than joining `ChunkRecord.text` across a document's
+    /// chunks.
+    ///
+    /// The default implementation returns an empty vector, mirroring the
+    /// default (no-op) `upsert_blocks` above: `FakeStore`-based tests and any
+    /// store that never called `upsert_blocks`/`upsert_chunks_and_blocks`
+    /// (including legacy rows indexed before the Resource/Block architecture
+    /// existed) get `Ok(vec![])` here, not an error. Callers must treat an
+    /// empty result as "no blocks persisted for this resource" and fall back
+    /// to chunk-based reconstruction accordingly.
+    async fn get_blocks_for_resource(
+        &self,
+        resource_id: &str,
+    ) -> Result<Vec<crate::block::Block>, Error> {
+        let _ = resource_id;
+        Ok(Vec::new())
+    }
+
     /// Atomically upsert chunks and blocks for a document in a single
     /// operation, optionally replacing an existing document first.
     ///
@@ -352,6 +378,11 @@ pub trait RetrievalStore: Send + Sync + 'static {
 #[cfg(any(test, feature = "test-support"))]
 pub struct FakeStore {
     chunks: tokio::sync::RwLock<Vec<ChunkRecord>>,
+    /// Blocks upserted via `upsert_blocks`/`upsert_chunks_and_blocks`, keyed by
+    /// `resource_id` (mirroring `get_chunks_for_resource`'s own
+    /// `store_id`-agnostic lookup below — `FakeStore` is used single-store-at-
+    /// a-time in tests, so `store_id` is accepted but not partitioned on).
+    blocks: tokio::sync::RwLock<HashMap<String, Vec<crate::block::Block>>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -360,6 +391,7 @@ impl FakeStore {
     pub fn new() -> Self {
         Self {
             chunks: tokio::sync::RwLock::new(Vec::new()),
+            blocks: tokio::sync::RwLock::new(HashMap::new()),
         }
     }
 }
@@ -537,6 +569,27 @@ impl RetrievalStore for FakeStore {
             });
         }
         Ok(seen.into_values().collect())
+    }
+
+    async fn upsert_blocks(
+        &self,
+        _store_id: &str,
+        resource_id: &str,
+        blocks: &[crate::block::Block],
+    ) -> Result<(), Error> {
+        let mut all_blocks = self.blocks.write().await;
+        all_blocks.insert(resource_id.to_string(), blocks.to_vec());
+        Ok(())
+    }
+
+    async fn get_blocks_for_resource(
+        &self,
+        resource_id: &str,
+    ) -> Result<Vec<crate::block::Block>, Error> {
+        let all_blocks = self.blocks.read().await;
+        let mut blocks = all_blocks.get(resource_id).cloned().unwrap_or_default();
+        blocks.sort_by_key(|b| b.seq);
+        Ok(blocks)
     }
 }
 
@@ -1020,6 +1073,56 @@ pub mod conformance {
         );
     }
 
+    /// Test: `upsert_blocks` then `get_blocks_for_resource` round-trips
+    /// blocks ordered by `seq`, regardless of insertion order — proving
+    /// reconstruction can't accidentally depend on physical/insertion order.
+    pub async fn test_blocks_round_trip_ordered(store: &dyn RetrievalStore) {
+        use crate::block::{Block, BlockKind};
+
+        let chunk = make_record(
+            "chunk-1",
+            "doc-blocks",
+            "store-1",
+            "chunk text",
+            vec![1.0, 0.0],
+        );
+        store.upsert_chunks(vec![chunk]).await.unwrap();
+
+        // Insert out of seq order to prove get_blocks_for_resource sorts by
+        // seq rather than relying on insertion/physical order.
+        let blocks = vec![
+            Block {
+                seq: 1,
+                kind: BlockKind::Paragraph,
+                text: "second block".to_string(),
+                location: None,
+            },
+            Block {
+                seq: 0,
+                kind: BlockKind::Heading { level: 1 },
+                text: "first block".to_string(),
+                location: None,
+            },
+        ];
+        store
+            .upsert_blocks("store-1", "doc-blocks", &blocks)
+            .await
+            .unwrap();
+
+        let got = store.get_blocks_for_resource("doc-blocks").await.unwrap();
+        assert_eq!(got.len(), 2, "both blocks should be returned");
+        assert_eq!(got[0].seq, 0, "blocks must be ordered by seq");
+        assert_eq!(got[0].text, "first block");
+        assert_eq!(got[1].seq, 1);
+        assert_eq!(got[1].text, "second block");
+
+        let missing = store.get_blocks_for_resource("nonexistent").await.unwrap();
+        assert!(
+            missing.is_empty(),
+            "unknown resource_id returns empty, not an error"
+        );
+    }
+
     /// Run a subset of the conformance suite that does not require a pre-built FTS index.
     ///
     /// The store must be freshly created (empty) when this is called.
@@ -1161,6 +1264,12 @@ mod tests {
     async fn fake_store_window_block_seqs_round_trip() {
         let store = FakeStore::new();
         test_window_block_seqs_round_trip(&store).await;
+    }
+
+    #[tokio::test]
+    async fn fake_store_blocks_round_trip_ordered() {
+        let store = FakeStore::new();
+        test_blocks_round_trip_ordered(&store).await;
     }
 
     #[tokio::test]

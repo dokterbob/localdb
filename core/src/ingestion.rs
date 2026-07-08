@@ -1103,6 +1103,22 @@ impl IngestCallback for PipelineCallback<'_> {
 ///
 /// For path sources, checks if the URI starts with `file://` + canonical root path.
 /// For URL sources, checks if the URI matches the source URL.
+///
+/// # Normalization (delete-sweep false-negative fix)
+///
+/// `uri` here is always one already stored in the `DocumentIndex`/store — i.e.
+/// `Resource.uri.as_str()`, which is a *normalized* `url::Url` string (percent
+/// -encoded path bytes, lower-cased host, a trailing `/` added when the URL
+/// crate considers the path empty, etc. — see `core/src/uri.rs`). Both arms
+/// below MUST compare against that same normalized representation, not a raw
+/// string built from config/filesystem data, or a root/URL containing a space,
+/// non-ASCII character, or non-canonical casing/trailing-slash would never
+/// match its own indexed resources and its documents would never be swept on
+/// delete (silent under-deletion). Normalization only changes byte
+/// *representation*, never decodes `/` vs `%2F`, so the boundary-aware
+/// string comparison (exact match, or match immediately followed by a literal
+/// `/`) remains sound: a percent-encoded slash in a URI can never be mistaken
+/// for a path boundary.
 fn is_uri_from_source(uri: &str, source: &Source) -> bool {
     match &source.spec {
         SourceSpec::Path { root, .. } => {
@@ -1115,7 +1131,20 @@ fn is_uri_from_source(uri: &str, source: &Source) -> bool {
             // well-defined regardless of whether `root` came in (or
             // canonicalized) with a trailing separator.
             let canonical_root = canonical_root.trim_end_matches('/');
-            let file_prefix = format!("file://{}", canonical_root);
+            let raw_prefix = format!("file://{}", canonical_root);
+
+            // Normalize through the exact same `Uri`/`url::Url` pipeline that
+            // produced the indexed URIs (`enumerate_path_source` builds
+            // `file://<abs_path>`, then `FileIngestor` runs it through
+            // `Uri::parse` before handing the `Resource` to core — see
+            // ingest/src/file_ingestor.rs). Doing the same here keeps both
+            // sides byte-for-byte comparable. If parsing fails for some
+            // reason, fall back to the raw string: a false negative here only
+            // means "don't delete" (safe direction), never a panic.
+            let file_prefix = crate::uri::Uri::parse(&raw_prefix)
+                .map(|u| u.as_str().trim_end_matches('/').to_string())
+                .unwrap_or(raw_prefix);
+
             // Boundary-aware match (C0): a plain `starts_with` here would
             // let a sibling source whose root is a *string* prefix of this
             // one (e.g. root=/data/blog vs root=/data/blog-drafts) be
@@ -1127,9 +1156,20 @@ fn is_uri_from_source(uri: &str, source: &Source) -> bool {
             // separator, so only true descendants of `root` match.
             uri == file_prefix || uri.starts_with(&format!("{file_prefix}/"))
         }
-        // Already boundary-safe: exact equality can't suffer the
-        // string-prefix misattribution the path arm above guards against.
-        SourceSpec::Url { url, .. } => uri == url.as_str(),
+        SourceSpec::Url { url, .. } => {
+            // Normalize the configured URL the same way the indexed URI was
+            // normalized (`Uri::parse`), so e.g. an uppercase host or a
+            // missing trailing slash in config still matches. Already
+            // boundary-safe either way: exact equality can't suffer the
+            // string-prefix misattribution the path arm above guards
+            // against. Falls back to raw comparison if the configured URL
+            // fails to parse (should not happen for a validated source, but
+            // never worse than the old behavior).
+            match crate::uri::Uri::parse(url) {
+                Some(normalized) => uri == normalized.as_str(),
+                None => uri == url.as_str(),
+            }
+        }
     }
 }
 
@@ -1800,6 +1840,121 @@ mod tests {
             &source
         ));
         assert!(!is_uri_from_source("https://example.com/blog/1", &source));
+    }
+
+    // ---------------------------------------------------------------------------
+    // Normalization fix — path root / config URL must compare against the same
+    // normalized representation the indexed URIs use (percent-encoding, host
+    // case-folding, url-crate trailing-slash-on-empty-path), or the
+    // delete-sweep silently never matches (under-deletion).
+    // ---------------------------------------------------------------------------
+
+    /// Pin exactly what `url::Url` (via `crate::uri::Uri`) does to a `file://`
+    /// URI built from a path containing a space and to an `https://` URI with
+    /// an uppercase host — this is the normalization the fix must match.
+    #[test]
+    fn uri_normalization_pins_percent_encoding_and_host_lowercasing() {
+        let file_uri = crate::uri::Uri::parse("file:///a/My Docs/x.md").unwrap();
+        assert_eq!(file_uri.as_str(), "file:///a/My%20Docs/x.md");
+
+        let http_uri = crate::uri::Uri::parse("https://EXAMPLE.com/Path").unwrap();
+        assert_eq!(http_uri.as_str(), "https://example.com/Path");
+
+        let no_path_uri = crate::uri::Uri::parse("https://example.com").unwrap();
+        assert_eq!(no_path_uri.as_str(), "https://example.com/");
+    }
+
+    #[test]
+    fn is_uri_from_source_path_root_with_space_matches_percent_encoded_resource_uri() {
+        // Regression: a root containing a space (or any percent-encodable
+        // char) previously never matched its own resources' normalized
+        // URIs, so a deleted file under it was never swept.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("My Docs")).unwrap();
+        let root = dir.path().join("My Docs").canonicalize().unwrap();
+        let source = path_source(root.to_str().unwrap());
+
+        // Build the resource URI exactly the way enumerate_path_source +
+        // FileIngestor do: raw `file://<abs_path>` then `Uri::parse`.
+        let raw = format!("file://{}/notes.md", root.display());
+        let resource_uri = crate::uri::Uri::parse(&raw).unwrap();
+
+        assert!(
+            is_uri_from_source(resource_uri.as_str(), &source),
+            "space-containing root must match its own percent-encoded resource URI"
+        );
+    }
+
+    #[test]
+    fn is_uri_from_source_path_root_itself_with_space_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("My Docs")).unwrap();
+        let root = dir.path().join("My Docs").canonicalize().unwrap();
+        let source = path_source(root.to_str().unwrap());
+
+        let raw = format!("file://{}", root.display());
+        let resource_uri = crate::uri::Uri::parse(&raw).unwrap();
+
+        assert!(is_uri_from_source(resource_uri.as_str(), &source));
+    }
+
+    #[test]
+    fn is_uri_from_source_url_uppercase_host_matches_normalized_resource_uri() {
+        // Config says "EXAMPLE.com"; the indexed resource URI (as it would
+        // have been normalized by Uri::parse when the resource was fetched)
+        // is lower-cased. The comparison must normalize the config side too.
+        let source = url_source("https://EXAMPLE.com/blog");
+        let resource_uri = crate::uri::Uri::parse("https://EXAMPLE.com/blog").unwrap();
+        assert_eq!(resource_uri.as_str(), "https://example.com/blog");
+        assert!(is_uri_from_source(resource_uri.as_str(), &source));
+    }
+
+    #[test]
+    fn is_uri_from_source_url_missing_trailing_slash_matches_normalized_resource_uri() {
+        // url::Url adds a trailing "/" when the path is empty; config
+        // omitting it must still match the normalized indexed URI.
+        let source = url_source("https://example.com");
+        let resource_uri = crate::uri::Uri::parse("https://example.com").unwrap();
+        assert_eq!(resource_uri.as_str(), "https://example.com/");
+        assert!(is_uri_from_source(resource_uri.as_str(), &source));
+    }
+
+    #[test]
+    fn is_uri_from_source_percent_encoded_slash_cannot_fake_a_path_boundary() {
+        // A literal "%2F" (percent-encoded '/') appearing right after the
+        // root string must NOT be treated as a path separator: comparison is
+        // purely string-level (never percent-decoded), so "root%2Fevil" is
+        // correctly rejected as a distinct, non-descendant string — the
+        // boundary check requires an actual '/' byte immediately after the
+        // root, not a decoded one.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("blog")).unwrap();
+        let root = dir.path().join("blog").canonicalize().unwrap();
+        let source = path_source(root.to_str().unwrap());
+
+        let fake_uri = format!("file://{}%2Fevil", root.display());
+        assert!(
+            !is_uri_from_source(&fake_uri, &source),
+            "a percent-encoded slash must not be treated as a path boundary"
+        );
+    }
+
+    #[test]
+    fn is_uri_from_source_sibling_string_prefix_root_still_does_not_match_after_normalization() {
+        // Re-pin C0 alongside the normalization fix: normalizing both sides
+        // must not reintroduce the sibling string-prefix bug.
+        let base = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(base.path().join("blog")).unwrap();
+        std::fs::create_dir_all(base.path().join("blog-drafts")).unwrap();
+
+        let blog_root = base.path().join("blog").canonicalize().unwrap();
+        let source = path_source(blog_root.to_str().unwrap());
+
+        let blog_drafts_root = base.path().join("blog-drafts").canonicalize().unwrap();
+        let raw = format!("file://{}/draft.md", blog_drafts_root.display());
+        let sibling_uri = crate::uri::Uri::parse(&raw).unwrap();
+
+        assert!(!is_uri_from_source(sibling_uri.as_str(), &source));
     }
 
     // ---------------------------------------------------------------------------
@@ -2568,6 +2723,94 @@ mod tests {
             );
             assert!(doc_index.get(gone_uri).is_none());
             assert!(doc_index.get(kept_uri).is_some());
+        }
+
+        // -----------------------------------------------------------------
+        // 5b. Regression: delete-sweep must fire for a file under a
+        // space-containing root. Before the normalization fix,
+        // `is_uri_from_source`'s Path arm built its prefix from the raw
+        // (non-percent-encoded) canonical root, which never matched the
+        // percent-encoded `Resource.uri` a real file ingestor produces —
+        // so a deleted file under such a root was silently never swept
+        // (stale chunks live forever).
+        // -----------------------------------------------------------------
+
+        #[tokio::test]
+        async fn delete_sweep_removes_file_under_space_containing_root() {
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let config = make_ingestion_config(store_id);
+
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join("My Docs")).unwrap();
+            std::fs::write(
+                dir.path().join("My Docs").join("note.md"),
+                b"Space root content.",
+            )
+            .unwrap();
+            let root = dir.path().join("My Docs").canonicalize().unwrap();
+
+            let source = Source {
+                id: new_ulid(),
+                store_id: store_id.to_string(),
+                kind: SourceKind::Path,
+                spec: SourceSpec::Path {
+                    root: root.to_str().unwrap().to_string(),
+                    include: vec![],
+                    exclude: vec![],
+                },
+                source_preset: "prose".to_string(),
+            };
+
+            // Enumerate for real — this is exactly how the URI the doc_index
+            // stores is shaped in production (raw `file://<abs_path>` fed
+            // through `Uri::parse` by the file ingestor).
+            let found = enumerate_path_source(root.to_str().unwrap(), &[], &[]).unwrap();
+            assert_eq!(found.len(), 1);
+            let normalized_uri = crate::uri::Uri::parse(&found[0].uri).unwrap();
+            assert!(
+                normalized_uri.as_str().contains("My%20Docs"),
+                "sanity: the space must be percent-encoded in the indexed URI"
+            );
+
+            let record = seed_indexed(
+                &store,
+                &embedder,
+                &config,
+                &source,
+                normalized_uri.as_str(),
+                "Space root content.",
+            )
+            .await;
+
+            let mut doc_index = DocumentIndex::new();
+            doc_index.upsert(record.clone());
+
+            // Simulate the file having been deleted from disk: this run's
+            // ingestor yields nothing at all.
+            let ingestor = FakeIngestor::new(vec![]);
+            let deps = SourceIngestionDeps {
+                doc_index: &mut doc_index,
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+                progress: None,
+            };
+            let result = run_source_ingestion(&source, &ingestor, deps)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                result.docs_deleted, 1,
+                "the file under the space-containing root must be swept"
+            );
+            let chunks = store
+                .get_chunks_for_resource(&record.resource_id)
+                .await
+                .unwrap();
+            assert!(chunks.is_empty(), "swept resource's chunks must be gone");
+            assert!(doc_index.get(normalized_uri.as_str()).is_none());
         }
 
         // -----------------------------------------------------------------

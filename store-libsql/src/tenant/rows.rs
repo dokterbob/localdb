@@ -1,3 +1,4 @@
+use localdb_core::block::{Block, BlockKind, BlockLocation};
 use localdb_core::metadata::Metadata;
 use localdb_core::types::Span;
 use localdb_core::{ChunkRecord, Error};
@@ -126,5 +127,53 @@ pub(crate) fn row_to_chunk_record_strict(row: &libsql::Row) -> Result<ChunkRecor
         seq_in_block: seq_in_block as u32,
         block_kind,
         window_block_seqs,
+    })
+}
+
+/// Parse a row produced by `read::get_blocks_for_resource`'s `SELECT`.
+///
+/// Column index map:
+///   0  seq
+///   1  kind           (redundant discriminant string, unused here — the
+///                      full typed `BlockKind` is reconstructed from
+///                      `metadata_json` below)
+///   2  text
+///   3  metadata_json   → kind (tagged `BlockKind` JSON, written by
+///                       `write::upsert_blocks_inner` as
+///                       `serde_json::to_string(&block.kind)`)
+///   4  location_json   → location
+pub(crate) fn row_to_block(row: &libsql::Row) -> Result<Block, Error> {
+    let seq: i64 = row.get(0).map_err(map_libsql_err)?;
+    let _kind_str: String = row.get(1).map_err(map_libsql_err)?;
+    let text: String = row.get(2).map_err(map_libsql_err)?;
+    let metadata_json: Option<String> = row.get(3).map_err(map_libsql_err)?;
+    let location_json: Option<String> = row.get(4).map_err(map_libsql_err)?;
+
+    let kind: BlockKind = match metadata_json {
+        Some(json) => serde_json::from_str(&json).map_err(|e| Error::Internal {
+            message: format!("invalid block metadata_json: {e}"),
+            correlation_id: "store_handle_row_block_kind".to_string(),
+        })?,
+        None => {
+            return Err(Error::Internal {
+                message: "block row missing metadata_json".to_string(),
+                correlation_id: "store_handle_row_block_kind_missing".to_string(),
+            })
+        }
+    };
+
+    let location: Option<BlockLocation> = match location_json {
+        Some(json) => Some(serde_json::from_str(&json).map_err(|e| Error::Internal {
+            message: format!("invalid block location_json: {e}"),
+            correlation_id: "store_handle_row_block_location".to_string(),
+        })?),
+        None => None,
+    };
+
+    Ok(Block {
+        seq: seq as u32,
+        kind,
+        text,
+        location,
     })
 }

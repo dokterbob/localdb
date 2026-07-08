@@ -109,6 +109,13 @@ impl RetrievalStore for TenantStore {
         write::upsert_blocks(self, resource_id, blocks).await
     }
 
+    async fn get_blocks_for_resource(
+        &self,
+        resource_id: &str,
+    ) -> Result<Vec<localdb_core::block::Block>, Error> {
+        read::get_blocks_for_resource(self, resource_id).await
+    }
+
     async fn upsert_chunks_and_blocks(
         &self,
         _store_id: &str,

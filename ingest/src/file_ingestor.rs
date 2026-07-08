@@ -136,7 +136,17 @@ impl Ingestor for FileIngestor {
             //    `Probe.sniffed_mime` before calling the parser chain.
             let mime = detect_mime(&file.path);
             let sniffed = sniff_mime(&bytes, filename.as_deref());
-            let probe = Probe::new(&bytes, file.path.to_str(), sniffed.as_deref());
+            // `Path::to_str()` returns `None` if *any* component of the path
+            // (not just the filename) is non-UTF-8 — e.g. a valid `notes.md`
+            // living under a non-UTF-8-named directory. Falling back to
+            // `None` here would blind extension-gated parsers (which read
+            // `Probe::path_hint` for the extension) and misclassify a
+            // perfectly supported file as `SkipReason::Unsupported`. Fall
+            // back to a lossy hint instead — it's only used for
+            // extension/mime sniffing, never persisted, so lossy
+            // replacement characters are harmless.
+            let path_hint = path_hint_lossy(&file.path);
+            let probe = Probe::new(&bytes, Some(path_hint.as_str()), sniffed.as_deref());
 
             // Panic-tolerant parsing: a panicking parser must not crash the
             // whole walk. `catch_panic` wraps extraction and the panic is
@@ -226,6 +236,22 @@ impl Ingestor for FileIngestor {
         }
 
         Ok(result)
+    }
+}
+
+/// Compute the `Probe::path_hint` for a filesystem path, tolerating non-UTF-8
+/// components anywhere in the path (not just the filename).
+///
+/// `Path::to_str()` returns `None` as soon as *any* component fails to
+/// decode as UTF-8, which would otherwise blind extension-gated parsers on a
+/// perfectly valid file (e.g. `notes.md`) simply because it lives under a
+/// non-UTF-8-named ancestor directory. This is only used for
+/// extension/mime-sniffing hints, never persisted, so a lossy fallback
+/// (`to_string_lossy`, replacing invalid sequences with U+FFFD) is safe.
+fn path_hint_lossy(path: &std::path::Path) -> String {
+    match path.to_str() {
+        Some(s) => s.to_string(),
+        None => path.to_string_lossy().into_owned(),
     }
 }
 
@@ -364,6 +390,77 @@ mod tests {
         assert_eq!(cb.skipped.len(), 1);
         assert!(cb.skipped[0].0.ends_with("b.bin"));
         assert_eq!(cb.skipped[0].1, SkipReason::Unsupported);
+    }
+
+    /// A non-UTF-8 path component must not blank out the whole path hint.
+    /// `Path::to_str()` returns `None` when *any* component of the path is
+    /// not valid UTF-8 — including ancestor directories, not just the
+    /// filename itself — which would otherwise blind extension-gated parsers
+    /// (they read `Probe::path_hint` for the extension) on an otherwise
+    /// perfectly supported file. `path_hint_lossy` must fall back to
+    /// `to_string_lossy` and still expose a usable extension.
+    ///
+    /// Constructed directly via `OsStrExt` (no real filesystem I/O): on
+    /// macOS/APFS the kernel itself rejects invalid UTF-8 byte sequences in
+    /// filenames, so a non-UTF-8 directory can't actually be created there
+    /// (see `non_utf8_directory_full_ingest_is_still_parsed` below for the
+    /// filesystem-level exercise, gated to platforms that allow it).
+    #[cfg(unix)]
+    #[test]
+    fn path_hint_lossy_preserves_extension_despite_non_utf8_component() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        // 0xFF is not valid UTF-8 in any position, so this directory name
+        // cannot round-trip through `OsStr::to_str`, and neither can any
+        // path built on top of it.
+        let bad_dir = OsStr::from_bytes(b"bad\xFFdir");
+        let path = std::path::Path::new("/root").join(bad_dir).join("notes.md");
+        assert!(
+            path.to_str().is_none(),
+            "test setup invariant: the constructed path must not be valid UTF-8"
+        );
+
+        let hint = path_hint_lossy(&path);
+        let probe = Probe::new(b"# Notes\n\nBody.", Some(hint.as_str()), None);
+        assert!(
+            MdOnlyParser.parse(&probe).unwrap().is_some(),
+            "extension-gated parser should still recognize notes.md via the lossy hint"
+        );
+    }
+
+    /// Filesystem-level companion to the test above: a real non-UTF-8
+    /// directory name, ingested end-to-end, must not cause `notes.md` to be
+    /// skipped as unsupported. Not run on macOS: APFS/HFS+ reject invalid
+    /// UTF-8 byte sequences in filenames at the OS level, so this specific
+    /// repro can't be constructed there (the underlying bug is exercised by
+    /// `path_hint_lossy_preserves_extension_despite_non_utf8_component`
+    /// instead, which needs no filesystem support).
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[tokio::test]
+    async fn non_utf8_directory_full_ingest_is_still_parsed() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bad_name = OsStr::from_bytes(b"bad\xFFdir");
+        let subdir = dir.path().join(bad_name);
+        std::fs::create_dir(&subdir).unwrap();
+        std::fs::write(subdir.join("notes.md"), "# Notes\n\nBody.").unwrap();
+
+        let ingestor = FileIngestor::new(Box::new(MdOnlyParser));
+        let source = source_with_root(dir.path().to_str().unwrap());
+        let mut cb = RecordingCallback::default();
+        let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+        assert_eq!(
+            result.resources_produced, 1,
+            "notes.md under a non-UTF-8 directory should still be parsed \
+             (extension hint preserved), not skipped as unsupported: {:?}",
+            cb.skipped
+        );
+        assert_eq!(result.resources_skipped, 0);
+        assert_eq!(cb.resources.len(), 1);
     }
 
     #[tokio::test]

@@ -33,7 +33,7 @@ pub async fn get_document(
         .find_document(&doc_id)
         .await
         .map_err(ApiError)?
-        .ok_or(ApiError(CoreError::DocumentNotFound { id: doc_id.clone() }))?;
+        .ok_or(ApiError(CoreError::ResourceNotFound { id: doc_id.clone() }))?;
     let handle = state
         .backend()
         .retrieval_store(&info.store_id)
@@ -43,11 +43,31 @@ pub async fn get_document(
         .get_chunks_for_resource(&info.id)
         .await
         .map_err(ApiError)?;
-    let normalized_text = chunks
-        .iter()
-        .map(|c| c.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let blocks = handle
+        .get_blocks_for_resource(&info.id)
+        .await
+        .map_err(ApiError)?;
+    // Reconstruct from `blocks` when available: each block's canonical text
+    // is persisted exactly once, so joining these avoids duplicating the
+    // header/separator row that the table chunker (spec 04 §3, intentional)
+    // re-emits in every chunk of a multi-chunk table. Falls back to the
+    // legacy chunk-text join when `blocks` is empty (rows indexed before the
+    // Resource/Block architecture existed never persisted blocks). Joined
+    // with "\n\n", matching the blank-line separation Markdown extraction
+    // strips out between sibling blocks.
+    let normalized_text = if blocks.is_empty() {
+        chunks
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        blocks
+            .iter()
+            .map(|b| b.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
     Ok(Json(DocumentRecord {
         id: info.id,
         uri: info.uri,

@@ -360,7 +360,22 @@ pub async fn tool_get_document(stores: &[AvailableStore], args: GetDocumentArgs)
         );
     }
     match find_document_chunks(stores, &args.id).await {
-        Ok(Some((store, chunks))) => success_json(&document_json(store, &chunks)),
+        Ok(Some((store, chunks))) => {
+            let resource_id = chunks[0].resource_id.clone();
+            let blocks = match store.store.get_blocks_for_resource(&resource_id).await {
+                Ok(blocks) => blocks,
+                Err(e) => {
+                    return typed_error(
+                        e.code(),
+                        format!(
+                            "error fetching blocks for document from store '{}': {e}",
+                            store.descriptor.name
+                        ),
+                    )
+                }
+            };
+            success_json(&document_json(store, &chunks, &blocks))
+        }
         Ok(None) => typed_error(
             "resource_not_found",
             format!("no document with id '{}' found in any store", args.id),
@@ -398,13 +413,45 @@ async fn find_document_chunks<'a>(
     Ok(None)
 }
 
-fn document_json(store: &AvailableStore, chunks: &[localdb_core::ChunkRecord]) -> Value {
+/// Build the `get_document` JSON payload.
+///
+/// `text` is reconstructed from `blocks` when available — each block's
+/// canonical text is stored exactly once (see
+/// `RetrievalStore::get_blocks_for_resource`), so joining these avoids the
+/// duplicated header/separator rows that joining `ChunkRecord.text` produces
+/// for a multi-chunk table (the table chunker intentionally re-emits the
+/// header + separator in every chunk, spec 04 §3) — and likewise avoids
+/// duplicating overlapping turns across message-window chunks (#129). Blocks
+/// are joined with `"\n\n"`, matching the blank-line separation Markdown
+/// extraction strips out between sibling blocks (the same separator
+/// `chunker.rs`'s message-window path already uses when it joins multiple
+/// blocks' texts into one chunk).
+///
+/// Falls back to the legacy chunk-text join when `blocks` is empty: rows
+/// indexed before the Resource/Block architecture existed never persisted
+/// blocks, and `FakeStore`-backed tests that only call `upsert_chunks`
+/// (not `upsert_chunks_and_blocks`/`upsert_blocks`) have none either. All
+/// other fields (title, metadata, uri, chunk_count, etc.) always come from
+/// the chunk records regardless of which path produced `text`.
+fn document_json(
+    store: &AvailableStore,
+    chunks: &[localdb_core::ChunkRecord],
+    blocks: &[localdb_core::block::Block],
+) -> Value {
     let first = &chunks[0];
-    let full_text = chunks
-        .iter()
-        .map(|c| c.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let full_text = if blocks.is_empty() {
+        chunks
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        blocks
+            .iter()
+            .map(|b| b.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
     serde_json::json!({
         "resource_id": first.resource_id,
         "uri": first.uri,
@@ -820,6 +867,130 @@ mod get_document_tests {
         let expected = serde_json::to_string_pretty(&expected).unwrap();
 
         assert_eq!(rendered_text, expected);
+    }
+
+    /// Regression test: `get_document` must reconstruct a multi-chunk table
+    /// from its persisted `blocks`, not by joining `ChunkRecord.text`. The
+    /// table chunker (spec 04 §3, intentional) re-emits the header +
+    /// `|---|` separator row in every chunk of a table split across
+    /// multiple chunks — joining chunk texts would duplicate that header
+    /// once per chunk. The single `Table` block holds the canonical text
+    /// with the header exactly once, so reconstruction from blocks must not
+    /// duplicate it.
+    #[tokio::test]
+    async fn tool_get_document_reconstructs_table_without_duplicated_header() {
+        use localdb_core::block::{Block, BlockKind};
+        use localdb_core::{chunk_blocks, CharSizer, ChunkerConfig};
+
+        let store_id = new_ulid();
+        let doc_uri = "file:///docs/table.md";
+
+        // Same fixture shape as chunker.rs's own
+        // `table_multi_chunk_split_preserves_header` unit test: with
+        // target_tokens=40 and CharSizer, 2 data rows pack per chunk, so 10
+        // rows split into 5 chunks, each re-emitting the header/separator.
+        let table_text = {
+            let mut md = String::from("| A | B |\n|---|---|\n");
+            let rows: Vec<String> = (0..10).map(|i| format!("| {i} | {i} |")).collect();
+            md.push_str(&rows.join("\n"));
+            md
+        };
+        let doc_hash = content_hash(&table_text);
+        let doc_id = resource_id(doc_uri, &doc_hash);
+
+        let block = Block {
+            seq: 0,
+            kind: BlockKind::Table {
+                headers: vec!["A".to_string(), "B".to_string()],
+                rows: 10,
+            },
+            text: table_text.clone(),
+            location: None,
+        };
+
+        let cfg = ChunkerConfig {
+            preset: "prose".to_string(),
+            target_tokens: Some(40),
+            overlap_tokens: Some(0),
+            window_turns: None,
+            stride_turns: None,
+        };
+        let chunk_outputs = chunk_blocks(&doc_id, std::slice::from_ref(&block), &cfg, &CharSizer)
+            .expect("chunking the table fixture must succeed");
+        assert!(
+            chunk_outputs.len() >= 2,
+            "fixture must produce a multi-chunk table split, got {} chunk(s)",
+            chunk_outputs.len()
+        );
+
+        let metadata = Metadata::default();
+        let store = FakeStore::new();
+        let chunk_records: Vec<ChunkRecord> = chunk_outputs
+            .iter()
+            .map(|co| ChunkRecord {
+                id: co.id.clone(),
+                resource_id: doc_id.clone(),
+                store_id: store_id.clone(),
+                text: co.text.clone(),
+                span: co.span.clone(),
+                heading_path: co.heading_path.clone(),
+                embedding: vec![0.1, 0.2],
+                policy_version: "policy-v1".to_string(),
+                fetched_at: "2026-06-29T00:00:00Z".to_string(),
+                content_hash: doc_hash.clone(),
+                origin_store: store_id.clone(),
+                source_id: "src-1".to_string(),
+                ingestor_kind: "path".to_string(),
+                mime: Some("text/markdown".to_string()),
+                uri: doc_uri.to_string(),
+                metadata: metadata.clone(),
+                block_seq: co.block_seq,
+                seq_in_block: co.seq_in_block,
+                block_kind: co.block_kind.clone(),
+                window_block_seqs: co.window_block_seqs.clone(),
+            })
+            .collect();
+
+        store
+            .upsert_chunks_and_blocks(&store_id, &doc_id, chunk_records, &[block], None)
+            .await
+            .unwrap();
+
+        let stores = vec![AvailableStore::from_arc(
+            StoreDescriptor {
+                id: store_id.to_string(),
+                name: "notes".to_string(),
+                visibility: "private".to_string(),
+            },
+            Arc::new(store),
+        )];
+        let args = GetDocumentArgs {
+            id: doc_id.clone(),
+            uri: None,
+        };
+
+        let result = tool_get_document(&stores, args).await;
+        assert_ne!(result.is_error, Some(true));
+        let rendered_text = text_of(&result);
+        let parsed: Value = serde_json::from_str(&rendered_text).unwrap();
+        let reconstructed = parsed["text"].as_str().unwrap();
+
+        assert_eq!(
+            reconstructed.matches("| A | B |").count(),
+            1,
+            "reconstructed text must contain the table header exactly once, \
+             not once per chunk; got: {reconstructed:?}"
+        );
+        assert_eq!(
+            reconstructed.matches("|---|---|").count(),
+            1,
+            "reconstructed text must contain the separator row exactly once; \
+             got: {reconstructed:?}"
+        );
+        assert_eq!(
+            reconstructed, table_text,
+            "block-based reconstruction should equal the canonical block text exactly"
+        );
     }
 }
 
