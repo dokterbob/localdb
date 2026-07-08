@@ -52,7 +52,11 @@ history:
 
 ### `localdb db migrate`
 
-Applies every pending migration in order, one transaction per step, with per-step progress on
+Before applying anything, `db migrate` re-verifies the store's *existing* `schema_migrations` rows
+(completeness, checksum, and payload — the same checks `LibsqlDb::open` runs, bounded to the
+already-applied prefix) and refuses, untouched, if that history is drifted or incomplete — a store
+with corrupted bookkeeping never gets new migrations layered on top of it. Only once that passes
+does it apply every pending migration in order, one transaction per step, with per-step progress on
 stderr (`applied migration v5 'create_auth_tables' in 12ms`). If already at head:
 
 ```

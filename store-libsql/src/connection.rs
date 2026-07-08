@@ -175,7 +175,7 @@ impl LibsqlDb {
                 table::ensure_baseline_row(&conn)
                     .await
                     .map_err(map_libsql_err)?;
-                checksum::verify_checksums(&conn, &chain::migrations(), &ctx).await?;
+                checksum::verify_checksums(&conn, &chain::migrations(), &ctx, head).await?;
 
                 schema::create_schema(&conn, embedding_dim, encoding)
                     .await

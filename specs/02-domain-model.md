@@ -390,7 +390,7 @@ query performance:
   | `applied_at` | RFC 3339 timestamp. |
   | `down_sql` | JSON array of statements that reverse this migration, or `NULL` if not mechanically reversible. |
   | `down_unsupported_reason` | Human-readable reason downgrade past this step is refused, or `NULL` if `down_sql` is set. |
-  | `checksum` | `blake3` over the migration's version, name, rendered up-SQL, and rendered down-SQL (or reason). Verified on every open; a mismatch is an `internal` error, not a silent continue. |
+  | `checksum` | `blake3` over the migration's version, name, rendered up-SQL, and rendered down-SQL (or reason). Verified on every open, bounded to the already-applied prefix before `db migrate` applies anything new, and again over the full chain afterward; a mismatch is an `internal` error, not a silent continue. Verification also requires a row to *exist* for the baseline and every applicable chain version (not just checking whatever rows happen to be present), and that each row's stored `name`/`down_sql`/`down_unsupported_reason` still match the compiled migration even when its `checksum` column reads correctly — a missing or tampered-but-checksum-intact row is treated the same as a checksum mismatch. `db downgrade` similarly requires the row history between its target and the current version to be contiguous before replaying anything. |
 
   `CHECK` constraint: exactly one of `down_sql` / `down_unsupported_reason` is set per row.
 

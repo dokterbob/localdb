@@ -8,6 +8,22 @@
 //! authored (chain entries must be treated as immutable once released, like
 //! the `baseline` module), and refusing to proceed is safer than silently
 //! running against a database that doesn't match the compiled chain.
+//!
+//! [`verify_checksums`] does three things, not just one:
+//! - **Completeness**: a row must *exist* for the baseline and for every
+//!   compiled chain migration up to the caller-supplied `up_to` bound (capped
+//!   at this binary's `head_version`) — not just for whatever rows happen to
+//!   be present. A store that's missing a row (e.g. a fresh create that died
+//!   between `create_schema` stamping `user_version` and the seed rows
+//!   landing, or tampering) is corrupt bookkeeping, not an empty-but-valid
+//!   history.
+//! - **Checksum match**: each present row's `checksum` column must match what
+//!   [`migration_checksum`] (or [`baseline_checksum`]) produces today.
+//! - **Payload integrity**: each present row's `name`, `down_sql`, and
+//!   `down_unsupported_reason` must match what the compiled migration would
+//!   render, even if its `checksum` column happens to still read correctly —
+//!   catching an edit that touched the payload columns but left `checksum`
+//!   untouched (or stale-but-accidentally-equal).
 
 use super::chain::{head_version, BASELINE_VERSION};
 use super::table;
@@ -49,27 +65,51 @@ pub fn baseline_checksum() -> String {
     blake3::hash(input.as_bytes()).to_hex().to_string()
 }
 
-/// Verify every applicable `schema_migrations` row's stored checksum against
-/// what the compiled `chain` (rendered with `ctx`) would produce today.
+/// Verify every applicable `schema_migrations` row's stored checksum and
+/// payload against what the compiled `chain` (rendered with `ctx`) would
+/// produce today, AND that no required row is missing.
 ///
-/// - The baseline row (`version == BASELINE_VERSION`), if present, is checked
-///   against [`baseline_checksum`].
-/// - Rows with `BASELINE_VERSION < version <= head_version(chain)` are
-///   checked against the matching chain entry.
-/// - Rows with `version > head_version(chain)` are **skipped**: they were
+/// `up_to` bounds how far completeness is required to reach — it is capped at
+/// `head_version(chain)` internally, so callers may freely pass a database's
+/// current `PRAGMA user_version` without checking it against head first.
+/// Callers:
+/// - `LibsqlDb::open`'s `AtHead` branch passes `head_version(chain)`: the
+///   whole chain must be fully and correctly recorded.
+/// - `migrate_store` passes the database's current version *before* applying
+///   any pending migrations (only the already-applied prefix can possibly
+///   have rows yet), then passes `head_version(chain)` again in its
+///   post-apply check.
+///
+/// Checks performed:
+/// - **Completeness**: the baseline row (`version == BASELINE_VERSION`) and a
+///   row for every chain entry with `version <= min(up_to, head_version(chain))`
+///   must exist. A missing row returns `Error::Internal` with correlation id
+///   `libsql_migrations_missing_row` naming the missing version.
+/// - **Checksum**: every *present* row's `checksum` column, for the baseline
+///   and for `BASELINE_VERSION < version <= head_version(chain)`, must match
+///   [`baseline_checksum`] / [`migration_checksum`] respectively.
+/// - **Payload integrity**: every present chain row's `name`, `down_sql`, and
+///   `down_unsupported_reason` must match what the compiled migration renders
+///   today — independent of whether its `checksum` column happens to still
+///   read correctly, so an edit that touched only the payload columns (and
+///   left `checksum` alone) is still caught.
+/// - Rows with `version > head_version(chain)` are **skipped** for checksum
+///   and payload checks (and don't count toward completeness): they were
 ///   written by a newer binary than this one, which has already verified
 ///   them; this (older) binary can still read their stored down-SQL to
 ///   downgrade past them without understanding what they do.
 ///
-/// Returns `Error::Internal` with correlation id
-/// `libsql_migrations_checksum_mismatch` naming the offending migration on
-/// the first mismatch found.
+/// Checksum/payload mismatches return `Error::Internal` with correlation id
+/// `libsql_migrations_checksum_mismatch` naming the offending migration (and,
+/// for payload mismatches, the offending field) on the first mismatch found.
 pub async fn verify_checksums(
     conn: &libsql::Connection,
     chain: &[Migration],
     ctx: &MigrationContext,
+    up_to: i64,
 ) -> Result<(), localdb_core::Error> {
     let head = head_version(chain);
+    let required_upper = up_to.min(head);
     let rows = table::list_rows_desc_above(conn, BASELINE_VERSION - 1)
         .await
         .map_err(|e| localdb_core::Error::Internal {
@@ -77,7 +117,11 @@ pub async fn verify_checksums(
             correlation_id: "libsql_migrations_checksum_mismatch".to_string(),
         })?;
 
-    for row in rows {
+    let mut seen_versions = std::collections::HashSet::new();
+
+    for row in &rows {
+        seen_versions.insert(row.version);
+
         if row.version == BASELINE_VERSION {
             let expected = baseline_checksum();
             if row.checksum != expected {
@@ -121,6 +165,68 @@ pub async fn verify_checksums(
                 &expected,
             ));
         }
+
+        verify_payload(row, migration, ctx)?;
+    }
+
+    // Completeness: every version that should have a row up to
+    // `required_upper` actually does.
+    if !seen_versions.contains(&BASELINE_VERSION) {
+        return Err(missing_row_err(BASELINE_VERSION, "baseline"));
+    }
+    if let Some(migration) = chain
+        .iter()
+        .find(|m| m.version <= required_upper && !seen_versions.contains(&m.version))
+    {
+        return Err(missing_row_err(migration.version, migration.name));
+    }
+
+    Ok(())
+}
+
+/// Compare a present row's payload (`name`, `down_sql`,
+/// `down_unsupported_reason`) against what `migration` renders today — see
+/// the module docs and [`verify_checksums`] for why this is checked
+/// independently of the `checksum` column.
+fn verify_payload(
+    row: &table::MigrationRow,
+    migration: &Migration,
+    ctx: &MigrationContext,
+) -> Result<(), localdb_core::Error> {
+    if row.name != migration.name {
+        return Err(payload_mismatch_err(
+            migration.name,
+            row.version,
+            "name",
+            &row.name,
+            migration.name,
+        ));
+    }
+
+    match &migration.down {
+        Down::Sql(render) => {
+            let expected_down = render(ctx);
+            if row.down_sql.as_deref() != Some(expected_down.as_slice()) {
+                return Err(payload_mismatch_err(
+                    migration.name,
+                    row.version,
+                    "down_sql",
+                    &format!("{:?}", row.down_sql),
+                    &format!("{expected_down:?}"),
+                ));
+            }
+        }
+        Down::Unsupported(reason) => {
+            if row.down_unsupported_reason.as_deref() != Some(*reason) {
+                return Err(payload_mismatch_err(
+                    migration.name,
+                    row.version,
+                    "down_unsupported_reason",
+                    &format!("{:?}", row.down_unsupported_reason),
+                    &format!("{reason:?}"),
+                ));
+            }
+        }
     }
 
     Ok(())
@@ -134,6 +240,34 @@ fn mismatch_err(name: &str, version: i64, stored: &str, expected: &str) -> local
              applied to this database."
         ),
         correlation_id: "libsql_migrations_checksum_mismatch".to_string(),
+    }
+}
+
+fn payload_mismatch_err(
+    name: &str,
+    version: i64,
+    field: &str,
+    stored: &str,
+    expected: &str,
+) -> localdb_core::Error {
+    localdb_core::Error::Internal {
+        message: format!(
+            "stored {field} for migration '{name}' (version {version}) does not match the \
+             compiled migration even though its checksum column reads correctly: stored={stored}, \
+             expected={expected}. This store's schema_migrations bookkeeping has been tampered \
+             with or corrupted."
+        ),
+        correlation_id: "libsql_migrations_checksum_mismatch".to_string(),
+    }
+}
+
+fn missing_row_err(version: i64, name: &str) -> localdb_core::Error {
+    localdb_core::Error::Internal {
+        message: format!(
+            "schema_migrations is missing a row for migration '{name}' (version {version}): \
+             this store's migration bookkeeping is corrupt or incomplete."
+        ),
+        correlation_id: "libsql_migrations_missing_row".to_string(),
     }
 }
 
@@ -235,6 +369,57 @@ mod tests {
         (dir, conn)
     }
 
+    /// A fixture migration with `Down::Unsupported`, at version 5
+    /// (`BASELINE_VERSION + 1`) — for tests that use it as the sole entry of
+    /// a single-migration chain.
+    fn unsupported_migration() -> Migration {
+        Migration {
+            version: 5,
+            name: "add_a_unsupported",
+            summary: "adds table a, irreversibly",
+            up: Up::Sql(up_a),
+            down: Down::Unsupported("original reason: a cannot be dropped safely"),
+            needs_reindex: false,
+        }
+    }
+
+    /// A second chain entry, at version 6 (`BASELINE_VERSION + 2`), for tests
+    /// that pair it with [`base_migration`] in a 2-entry chain.
+    fn second_chain_migration() -> Migration {
+        Migration {
+            version: 6,
+            name: "add_b_unsupported",
+            summary: "adds table b, irreversibly",
+            up: Up::Sql(up_b),
+            down: Down::Unsupported("original reason: b cannot be dropped safely"),
+            needs_reindex: false,
+        }
+    }
+
+    async fn insert_matching_row(
+        conn: &libsql::Connection,
+        migration: &Migration,
+        ctx: &MigrationContext,
+    ) {
+        let (down_sql, down_unsupported_reason) = match &migration.down {
+            Down::Sql(render) => (Some(render(ctx)), None),
+            Down::Unsupported(reason) => (None, Some(reason.to_string())),
+        };
+        table::insert_row(
+            conn,
+            &MigrationRow {
+                version: migration.version,
+                name: migration.name.to_string(),
+                applied_at: "2024-06-01T00:00:00Z".to_string(),
+                down_sql,
+                down_unsupported_reason,
+                checksum: migration_checksum(migration, ctx),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn verify_checksums_passes_on_freshly_built_matching_table() {
         let (_dir, conn) = open_test_db().await;
@@ -243,22 +428,28 @@ mod tests {
 
         let c = ctx();
         let migration = base_migration();
-        table::insert_row(
-            &conn,
-            &MigrationRow {
-                version: migration.version,
-                name: migration.name.to_string(),
-                applied_at: "2024-06-01T00:00:00Z".to_string(),
-                down_sql: Some(vec!["DROP TABLE a".to_string()]),
-                down_unsupported_reason: None,
-                checksum: migration_checksum(&migration, &c),
-            },
-        )
-        .await
-        .unwrap();
+        insert_matching_row(&conn, &migration, &c).await;
 
         let chain = vec![migration];
-        verify_checksums(&conn, &chain, &c).await.unwrap();
+        verify_checksums(&conn, &chain, &c, BASELINE_VERSION + 1)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn verify_checksums_passes_when_down_is_unsupported_and_untampered() {
+        let (_dir, conn) = open_test_db().await;
+        table::ensure_table(&conn).await.unwrap();
+        table::ensure_baseline_row(&conn).await.unwrap();
+
+        let c = ctx();
+        let migration = unsupported_migration();
+        insert_matching_row(&conn, &migration, &c).await;
+
+        let chain = vec![migration];
+        verify_checksums(&conn, &chain, &c, BASELINE_VERSION + 1)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -269,19 +460,7 @@ mod tests {
 
         let c = ctx();
         let migration = base_migration();
-        table::insert_row(
-            &conn,
-            &MigrationRow {
-                version: migration.version,
-                name: migration.name.to_string(),
-                applied_at: "2024-06-01T00:00:00Z".to_string(),
-                down_sql: Some(vec!["DROP TABLE a".to_string()]),
-                down_unsupported_reason: None,
-                checksum: migration_checksum(&migration, &c),
-            },
-        )
-        .await
-        .unwrap();
+        insert_matching_row(&conn, &migration, &c).await;
 
         conn.execute(
             "UPDATE schema_migrations SET checksum = 'tampered' WHERE version = ?",
@@ -291,7 +470,7 @@ mod tests {
         .unwrap();
 
         let chain = vec![migration];
-        let err = verify_checksums(&conn, &chain, &c)
+        let err = verify_checksums(&conn, &chain, &c, BASELINE_VERSION + 1)
             .await
             .expect_err("tampered checksum should fail verification");
         match err {
@@ -335,8 +514,217 @@ mod tests {
         .await
         .unwrap();
 
-        verify_checksums(&conn, &chain, &c)
+        verify_checksums(&conn, &chain, &c, BASELINE_VERSION)
             .await
             .expect("rows above head_version should be skipped, not fail verification");
+    }
+
+    // -- Finding 1: completeness — a row must exist for every compiled chain
+    // migration up to `up_to`, not just for whatever happens to be present.
+
+    #[tokio::test]
+    async fn verify_checksums_fails_when_baseline_row_is_missing() {
+        let (_dir, conn) = open_test_db().await;
+        table::ensure_table(&conn).await.unwrap();
+        table::ensure_baseline_row(&conn).await.unwrap();
+        table::delete_row(&conn, BASELINE_VERSION).await.unwrap();
+
+        let c = ctx();
+        let chain: Vec<Migration> = Vec::new();
+        let err = verify_checksums(&conn, &chain, &c, BASELINE_VERSION)
+            .await
+            .expect_err("missing baseline row must fail verification");
+        match err {
+            Error::Internal {
+                message,
+                correlation_id,
+            } => {
+                assert_eq!(correlation_id, "libsql_migrations_missing_row");
+                assert!(
+                    message.contains("baseline"),
+                    "message should name the baseline row: {message}"
+                );
+            }
+            other => panic!("expected Error::Internal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_checksums_fails_when_a_chain_row_is_missing() {
+        let (_dir, conn) = open_test_db().await;
+        table::ensure_table(&conn).await.unwrap();
+        table::ensure_baseline_row(&conn).await.unwrap();
+
+        let c = ctx();
+        let m1 = base_migration();
+        let m2 = second_chain_migration();
+        insert_matching_row(&conn, &m1, &c).await;
+        insert_matching_row(&conn, &m2, &c).await;
+
+        // Simulate a store that died (or was tampered with) between stamping
+        // user_version at head and finishing the bookkeeping insert: the row
+        // for the second chain entry is gone even though the schema itself
+        // (not exercised here) may already be at head.
+        table::delete_row(&conn, m2.version).await.unwrap();
+
+        let chain = vec![m1, m2];
+        let head = head_version(&chain);
+        let err = verify_checksums(&conn, &chain, &c, head)
+            .await
+            .expect_err("missing chain row must fail verification");
+        match err {
+            Error::Internal {
+                message,
+                correlation_id,
+            } => {
+                assert_eq!(correlation_id, "libsql_migrations_missing_row");
+                assert!(
+                    message.contains("add_b_unsupported"),
+                    "message should name the missing migration: {message}"
+                );
+                assert!(
+                    message.contains('6'),
+                    "message should name the missing version: {message}"
+                );
+            }
+            other => panic!("expected Error::Internal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_checksums_up_to_bounds_completeness_to_the_applied_prefix() {
+        // A "pending" store: only the first of a 2-step chain has been
+        // applied (and recorded) so far. Bounding `up_to` at the applied
+        // version must NOT demand a row for the not-yet-applied second
+        // entry.
+        let (_dir, conn) = open_test_db().await;
+        table::ensure_table(&conn).await.unwrap();
+        table::ensure_baseline_row(&conn).await.unwrap();
+
+        let c = ctx();
+        let m1 = base_migration();
+        let m2 = second_chain_migration();
+        insert_matching_row(&conn, &m1, &c).await;
+        // m2 deliberately not inserted — it hasn't been applied yet.
+
+        let up_to = m1.version;
+        let chain = vec![m1, m2];
+        verify_checksums(&conn, &chain, &c, up_to)
+            .await
+            .expect("completeness must only be required up to `up_to`");
+    }
+
+    // -- Finding 2: payload integrity — a tampered `name`/`down_sql`/
+    // `down_unsupported_reason` must be caught even when the `checksum`
+    // column itself was left alone.
+
+    #[tokio::test]
+    async fn verify_checksums_fails_when_name_is_tampered_but_checksum_is_intact() {
+        let (_dir, conn) = open_test_db().await;
+        table::ensure_table(&conn).await.unwrap();
+        table::ensure_baseline_row(&conn).await.unwrap();
+
+        let c = ctx();
+        let migration = base_migration();
+        insert_matching_row(&conn, &migration, &c).await;
+
+        conn.execute(
+            "UPDATE schema_migrations SET name = 'tampered_name' WHERE version = ?",
+            libsql::params![migration.version],
+        )
+        .await
+        .unwrap();
+
+        let chain = vec![migration];
+        let err = verify_checksums(&conn, &chain, &c, BASELINE_VERSION + 1)
+            .await
+            .expect_err("tampered name must fail verification even with an intact checksum");
+        match err {
+            Error::Internal {
+                message,
+                correlation_id,
+            } => {
+                assert_eq!(correlation_id, "libsql_migrations_checksum_mismatch");
+                assert!(message.contains("name"), "message: {message}");
+                assert!(message.contains("tampered_name"), "message: {message}");
+            }
+            other => panic!("expected Error::Internal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_checksums_fails_when_down_sql_is_tampered_but_checksum_is_intact() {
+        let (_dir, conn) = open_test_db().await;
+        table::ensure_table(&conn).await.unwrap();
+        table::ensure_baseline_row(&conn).await.unwrap();
+
+        let c = ctx();
+        let migration = base_migration();
+        insert_matching_row(&conn, &migration, &c).await;
+
+        conn.execute(
+            "UPDATE schema_migrations SET down_sql = '[\"DROP TABLE bogus\"]' WHERE version = ?",
+            libsql::params![migration.version],
+        )
+        .await
+        .unwrap();
+
+        let chain = vec![migration];
+        let err = verify_checksums(&conn, &chain, &c, BASELINE_VERSION + 1)
+            .await
+            .expect_err("tampered down_sql must fail verification even with an intact checksum");
+        match err {
+            Error::Internal {
+                message,
+                correlation_id,
+            } => {
+                assert_eq!(correlation_id, "libsql_migrations_checksum_mismatch");
+                assert!(message.contains("down_sql"), "message: {message}");
+                assert!(message.contains("bogus"), "message: {message}");
+            }
+            other => panic!("expected Error::Internal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_checksums_fails_when_down_unsupported_reason_is_tampered_but_checksum_is_intact(
+    ) {
+        let (_dir, conn) = open_test_db().await;
+        table::ensure_table(&conn).await.unwrap();
+        table::ensure_baseline_row(&conn).await.unwrap();
+
+        let c = ctx();
+        let migration = unsupported_migration();
+        insert_matching_row(&conn, &migration, &c).await;
+
+        conn.execute(
+            "UPDATE schema_migrations SET down_unsupported_reason = 'tampered reason' \
+             WHERE version = ?",
+            libsql::params![migration.version],
+        )
+        .await
+        .unwrap();
+
+        let chain = vec![migration];
+        let err = verify_checksums(&conn, &chain, &c, BASELINE_VERSION + 1)
+            .await
+            .expect_err(
+                "tampered down_unsupported_reason must fail verification even with an intact \
+                 checksum",
+            );
+        match err {
+            Error::Internal {
+                message,
+                correlation_id,
+            } => {
+                assert_eq!(correlation_id, "libsql_migrations_checksum_mismatch");
+                assert!(
+                    message.contains("down_unsupported_reason"),
+                    "message: {message}"
+                );
+                assert!(message.contains("tampered reason"), "message: {message}");
+            }
+            other => panic!("expected Error::Internal, got {other:?}"),
+        }
     }
 }

@@ -23,6 +23,7 @@ use super::chain::{self, BASELINE_VERSION};
 use super::checksum;
 use super::maintenance::open_for_maintenance;
 use super::runner::{self, AppliedStep};
+use super::table;
 use super::{Migration, MigrationContext};
 use crate::connection::map_libsql_err;
 use crate::schema;
@@ -140,6 +141,19 @@ async fn migrate_store_with_chain(
         });
     }
 
+    // Verify the EXISTING applied history before applying anything new: a
+    // store with pre-existing drift (missing/tampered rows below `current`)
+    // must be refused untouched, not have new migrations applied on top of a
+    // history we already know is untrustworthy. Backfill bookkeeping first —
+    // mirrors `LibsqlDb::open`'s `AtHead` branch — so a pre-framework store
+    // that's otherwise healthy gets its `schema_migrations` table/baseline
+    // row created rather than spuriously failing the completeness check.
+    table::ensure_table(&conn).await.map_err(map_libsql_err)?;
+    table::ensure_baseline_row(&conn)
+        .await
+        .map_err(map_libsql_err)?;
+    checksum::verify_checksums(&conn, real_chain, ctx, current).await?;
+
     let report = runner::apply_pending(&conn, real_chain, ctx).await?;
     post_check(&conn, real_chain, ctx).await?;
 
@@ -169,7 +183,8 @@ async fn post_check(
     ctx: &MigrationContext,
 ) -> Result<(), Error> {
     chain::validate_chain(real_chain)?;
-    checksum::verify_checksums(conn, real_chain, ctx).await
+    let head = chain::head_version(real_chain);
+    checksum::verify_checksums(conn, real_chain, ctx, head).await
 }
 
 #[cfg(test)]
@@ -321,5 +336,68 @@ mod tests {
             }
             other => panic!("expected InvalidConfig, got {other:?}"),
         }
+    }
+
+    // Finding 3: existing history must be verified BEFORE pending migrations
+    // are applied — a store with drift in its already-applied prefix must be
+    // refused untouched, not have new migrations layered on top of it first.
+    #[tokio::test]
+    async fn migrate_store_refuses_and_leaves_db_untouched_when_existing_history_is_corrupt() {
+        let (_dir, path) = test_fixtures::temp_db_path();
+        let mut two_step_chain = test_fixtures::reversible_chain();
+        two_step_chain.truncate(2);
+
+        // Apply only the first of the two steps, leaving the database
+        // "pending" at v5 with one legitimately-recorded row.
+        test_fixtures::write_baseline_plus_chain(&path, &two_step_chain[..1]).await;
+
+        // Corrupt that already-applied row's checksum in place — the same
+        // kind of drift `checksum::verify_checksums` catches on open.
+        {
+            let (_db, conn) = open_for_maintenance(&path).await.unwrap();
+            conn.execute(
+                "UPDATE schema_migrations SET checksum = 'tampered' WHERE version = ?",
+                libsql::params![BASELINE_VERSION + 1],
+            )
+            .await
+            .unwrap();
+        }
+
+        let before = test_fixtures::dump_db(&path).await;
+        let result =
+            migrate_store_with_chain(&path, &test_fixtures::ctx(), false, &two_step_chain).await;
+        let after = test_fixtures::dump_db(&path).await;
+
+        match result {
+            Err(Error::Internal {
+                message,
+                correlation_id,
+            }) => {
+                assert_eq!(correlation_id, "libsql_migrations_checksum_mismatch");
+                assert!(
+                    message.contains(two_step_chain[0].name),
+                    "message should name the corrupted migration: {message}"
+                );
+            }
+            other => panic!("expected Error::Internal, got {other:?}"),
+        }
+
+        assert_eq!(
+            before, after,
+            "a store refused for pre-existing drift must not be mutated at all — in \
+             particular, the second (pending) migration must NOT have been applied"
+        );
+        assert_eq!(
+            after.user_version,
+            BASELINE_VERSION + 1,
+            "user_version must still be v5 — the second migration must not have run"
+        );
+        assert!(
+            !after
+                .migration_rows
+                .iter()
+                .any(|r| r.version == BASELINE_VERSION + 2),
+            "no row for the second (pending) migration should have been written"
+        );
     }
 }
