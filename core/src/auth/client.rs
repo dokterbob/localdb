@@ -55,6 +55,37 @@ pub fn validate_redirect_uri(client_id: &str, redirect_uri: &str) -> bool {
     redirect_uri == OOB_REDIRECT_URI || is_loopback_redirect(redirect_uri)
 }
 
+/// Validate a redirect_uri presented at Dynamic Client Registration time
+/// (RFC 7591, T7, specs/05-surfaces.md §3.1 work item 4).
+///
+/// Accepts exactly two shapes: an `https://` URL with a non-empty host, or
+/// the same loopback pattern `localdb-cli` gets (`http://127.0.0.1[:port]/...`
+/// / `http://localhost[:port]/...`) — reused via [`is_loopback_redirect`].
+/// Everything else, including custom URI schemes (`myapp://...`) some native
+/// apps use per RFC 8252 §7.1, is rejected.
+///
+/// **Decision (T7):** custom schemes are deliberately out of scope. RFC 8252's
+/// loopback-interface exception already covers the CLI/native-app redirect
+/// case (and is what the built-in `localdb-cli` client already uses); there is
+/// no evidence a stock MCP client needs a private-use URI scheme to complete
+/// DCR against a localdb daemon, and accepting one would require registering
+/// (and trusting the registrant's claim to) a scheme with no verification
+/// that the calling process actually owns it. If an MCP ecosystem client
+/// later needs one, extend this function then — the caller
+/// (`AuthService::register_client`) validates every `redirect_uris` entry
+/// against this single predicate, so relaxing it is a one-place change.
+pub fn validate_registration_redirect_uri(redirect_uri: &str) -> bool {
+    if let Some(rest) = redirect_uri.strip_prefix("https://") {
+        if rest.is_empty() {
+            return false;
+        }
+        return url::Url::parse(redirect_uri)
+            .map(|u| u.scheme() == "https" && u.host_str().is_some())
+            .unwrap_or(false);
+    }
+    is_loopback_redirect(redirect_uri)
+}
+
 /// `http://127.0.0.1:<port>/<anything>` or `http://localhost:<port>/<anything>`,
 /// port required and numeric, path optional.
 fn is_loopback_redirect(redirect_uri: &str) -> bool {
@@ -177,5 +208,53 @@ mod tests {
             LOCALDB_CLI_CLIENT_ID,
             "http://notlocalhost:1234/callback"
         ));
+    }
+
+    // -----------------------------------------------------------------
+    // T7: DCR redirect_uri validation
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn registration_accepts_https_url() {
+        assert!(validate_registration_redirect_uri(
+            "https://app.example.com/oauth/callback"
+        ));
+    }
+
+    #[test]
+    fn registration_accepts_loopback_http() {
+        assert!(validate_registration_redirect_uri(
+            "http://127.0.0.1:51234/callback"
+        ));
+        assert!(validate_registration_redirect_uri(
+            "http://localhost:8080/cb"
+        ));
+    }
+
+    #[test]
+    fn registration_rejects_plain_http_non_loopback() {
+        assert!(!validate_registration_redirect_uri(
+            "http://app.example.com/callback"
+        ));
+    }
+
+    #[test]
+    fn registration_rejects_custom_scheme() {
+        assert!(!validate_registration_redirect_uri(
+            "myapp://oauth/callback"
+        ));
+        assert!(!validate_registration_redirect_uri("cursor://callback"));
+    }
+
+    #[test]
+    fn registration_rejects_empty_https_host() {
+        assert!(!validate_registration_redirect_uri("https://"));
+    }
+
+    #[test]
+    fn registration_rejects_oob_sentinel() {
+        // The OOB sentinel is a localdb-cli-only fallback, not a valid
+        // registration redirect for a general public client.
+        assert!(!validate_registration_redirect_uri(OOB_REDIRECT_URI));
     }
 }

@@ -208,7 +208,15 @@ localdb serve   # binds http://127.0.0.1:7700 by default
 ```
 
 The daemon exposes a REST API, plus the same MCP tools over HTTP at `/mcp` (see
-[MCP hookup](#mcp-hookup) above). It is **experimental**: ingestion via `POST /v1/jobs` is currently a no-op. The daemon reads and writes the same unified database as the CLI, so CLI-indexed data is visible to it. See [docs/http-api.md](docs/http-api.md) for endpoint reference and known limitations.
+[MCP hookup](#mcp-hookup) above). It is **experimental**: ingestion via `POST /v1/jobs` is currently a no-op. The daemon reads and writes the same unified database as the CLI, so CLI-indexed data is visible to it.
+
+Bound to loopback (the default), the daemon has no authentication — reachability is the trust
+boundary, same as the files on disk. Bound to any other address (a LAN/Tailscale IP, or
+deliberately `0.0.0.0`), bearer-token auth is enforced automatically: `localdb login` (browser
+OAuth) or `localdb key create` mints a credential, and a stock MCP client can even onboard with
+zero static config via OAuth discovery + Dynamic Client Registration. See
+[docs/http-api.md](docs/http-api.md) for endpoint reference, the trust model, and known
+limitations.
 
 ---
 

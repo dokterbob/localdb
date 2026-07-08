@@ -78,6 +78,25 @@ pub struct AuthCodeRow {
     pub created_at: String,
 }
 
+/// A dynamically registered OAuth2 client (RFC 7591, T7).
+///
+/// Public clients only (D1's "no passwords" ethos extends here: no
+/// `client_secret` is ever minted or stored) — `token_endpoint_auth_method`
+/// is always `"none"` and is not persisted, since it never varies.
+/// `redirect_uris` are matched **exactly** at `/authorize` time (T7 decision,
+/// specs/05-surfaces.md §3.1): registered clients get no loopback-any-port
+/// exception the way the built-in `localdb-cli` client does — see
+/// `core::auth::client::validate_registration_redirect_uri`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OAuthClientRow {
+    pub id: String,
+    pub client_name: Option<String>,
+    /// The exact set of redirect URIs this client registered. Stored as a
+    /// JSON array in the `oauth_clients.redirect_uris` column.
+    pub redirect_uris: Vec<String>,
+    pub created_at: String,
+}
+
 /// A store-name/user-id grant (D7). Normalized: one row per grant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoreGrantRow {
@@ -199,6 +218,12 @@ pub trait AuthStore: Send + Sync + 'static {
     async fn consume_auth_code(&self, id: &str, consumed_at: &str) -> Result<bool, Error>;
 
     // ------------------------------------------------------------------
+    // OAuth2 dynamic client registration (RFC 7591, T7)
+    // ------------------------------------------------------------------
+    async fn create_oauth_client(&self, client: &OAuthClientRow) -> Result<(), Error>;
+    async fn find_oauth_client(&self, id: &str) -> Result<Option<OAuthClientRow>, Error>;
+
+    // ------------------------------------------------------------------
     // Grants
     // ------------------------------------------------------------------
     async fn grant_store(&self, grant: &StoreGrantRow) -> Result<(), Error>;
@@ -261,6 +286,7 @@ struct FakeAuthStoreInner {
     users: Vec<UserRow>,
     tokens: Vec<AuthTokenRow>,
     auth_codes: Vec<AuthCodeRow>,
+    oauth_clients: Vec<OAuthClientRow>,
     grants: Vec<StoreGrantRow>,
     invites: Vec<InviteRow>,
     access_requests: Vec<AccessRequestRow>,
@@ -448,6 +474,22 @@ impl AuthStore for FakeAuthStore {
             }
             _ => Ok(false),
         }
+    }
+
+    async fn create_oauth_client(&self, client: &OAuthClientRow) -> Result<(), Error> {
+        self.inner.write().await.oauth_clients.push(client.clone());
+        Ok(())
+    }
+
+    async fn find_oauth_client(&self, id: &str) -> Result<Option<OAuthClientRow>, Error> {
+        Ok(self
+            .inner
+            .read()
+            .await
+            .oauth_clients
+            .iter()
+            .find(|c| c.id == id)
+            .cloned())
     }
 
     async fn grant_store(&self, grant: &StoreGrantRow) -> Result<(), Error> {

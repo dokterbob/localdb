@@ -10,10 +10,11 @@ use crate::ingestion::now_rfc3339;
 use crate::types::StoreVisibility;
 use crate::Error;
 
+use super::client;
 use super::principal::{Principal, Role, StoreAccess};
 use super::store::{
     AccessRequestRow, AccessRequestState, AuthCodeRow, AuthStore, AuthTokenRow, InviteMode,
-    InviteRow, StoreGrantRow, TokenKind, UserRow,
+    InviteRow, OAuthClientRow, StoreGrantRow, TokenKind, UserRow,
 };
 use super::token::{
     hash_secret, is_expired, mint_secret, rfc3339_from_now, verify_pkce_s256, verify_secret,
@@ -286,6 +287,77 @@ impl<S: AuthStore> AuthService<S> {
             row,
             secret: minted.secret,
         })
+    }
+
+    /// Whether `client_id` is recognized: the built-in `localdb-cli` public
+    /// client (pure, no store lookup — `client::is_known_client`) or a
+    /// dynamically registered client (T7, `POST /register`) found in the
+    /// `oauth_clients` table. Extends the T4 seam documented on
+    /// `client::is_known_client`.
+    pub async fn is_known_client(&self, client_id: &str) -> Result<bool, Error> {
+        if client::is_known_client(client_id) {
+            return Ok(true);
+        }
+        Ok(self.store.find_oauth_client(client_id).await?.is_some())
+    }
+
+    /// Validate `redirect_uri` for `client_id` (T7 extension of the T4 seam
+    /// documented on `client::validate_redirect_uri`): the built-in
+    /// `localdb-cli` client keeps its RFC 8252 §7.3 loopback-any-port
+    /// exception; a registered client gets **exact match only** against its
+    /// own stored `redirect_uris` — no loopback exception, since a registered
+    /// client's redirect is a fixed, pre-declared value (specs/05-surfaces.md
+    /// §3.1). An unknown `client_id` returns `Ok(false)`, matching
+    /// `is_known_client`'s "unknown" case rather than an error.
+    pub async fn validate_client_redirect_uri(
+        &self,
+        client_id: &str,
+        redirect_uri: &str,
+    ) -> Result<bool, Error> {
+        if client::is_known_client(client_id) {
+            return Ok(client::validate_redirect_uri(client_id, redirect_uri));
+        }
+        match self.store.find_oauth_client(client_id).await? {
+            Some(row) => Ok(row.redirect_uris.iter().any(|u| u == redirect_uri)),
+            None => Ok(false),
+        }
+    }
+
+    /// Dynamic Client Registration (RFC 7591, T7): register a new public
+    /// client with the given `redirect_uris` (validated one-by-one via
+    /// `client::validate_registration_redirect_uri` — exact `https://` or
+    /// loopback `http://` only, see that function's doc comment for the
+    /// custom-scheme rejection rationale) and an optional display
+    /// `client_name`. Mints a ULID `client_id`; there is no client secret
+    /// (public clients only, mirroring `localdb-cli`'s own policy).
+    pub async fn register_client(
+        &self,
+        redirect_uris: Vec<String>,
+        client_name: Option<String>,
+    ) -> Result<OAuthClientRow, Error> {
+        if redirect_uris.is_empty() {
+            return Err(Error::InvalidRequest {
+                message: "redirect_uris is required and must not be empty".to_string(),
+            });
+        }
+        for uri in &redirect_uris {
+            if !client::validate_registration_redirect_uri(uri) {
+                return Err(Error::InvalidRequest {
+                    message: format!(
+                        "redirect_uri '{uri}' is not allowed: must be an https:// URL or a \
+                         loopback http://127.0.0.1[:port]/... or http://localhost[:port]/... URL"
+                    ),
+                });
+            }
+        }
+        let row = OAuthClientRow {
+            id: new_ulid(),
+            client_name,
+            redirect_uris,
+            created_at: now_rfc3339(),
+        };
+        self.store.create_oauth_client(&row).await?;
+        Ok(row)
     }
 
     /// Redeem an authorization code for the user it was issued to (RFC 6749
@@ -837,6 +909,7 @@ pub enum PollOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::client::LOCALDB_CLI_CLIENT_ID;
     use crate::auth::store::FakeAuthStore;
     use crate::auth::token::TOKEN_PREFIX;
 
@@ -1829,5 +1902,101 @@ mod tests {
         let grants = svc.store.list_grants_for_user(&user.id).await.unwrap();
         assert_eq!(grants.len(), 1);
         assert_eq!(grants[0].store_name, "docs");
+    }
+
+    // -----------------------------------------------------------------
+    // T7: dynamic client registration + client resolution
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn is_known_client_recognizes_builtin_and_registered() {
+        let svc = service();
+        assert!(svc.is_known_client(LOCALDB_CLI_CLIENT_ID).await.unwrap());
+        assert!(!svc.is_known_client("nonexistent").await.unwrap());
+
+        let registered = svc
+            .register_client(
+                vec!["http://127.0.0.1:4000/cb".to_string()],
+                Some("Test Client".to_string()),
+            )
+            .await
+            .unwrap();
+        assert!(svc.is_known_client(&registered.id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn register_client_rejects_empty_redirect_uris() {
+        let svc = service();
+        let err = svc.register_client(vec![], None).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidRequest { .. }));
+    }
+
+    #[tokio::test]
+    async fn register_client_rejects_invalid_redirect_uri() {
+        let svc = service();
+        let err = svc
+            .register_client(vec!["http://evil.com/cb".to_string()], None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidRequest { .. }));
+    }
+
+    #[tokio::test]
+    async fn register_client_accepts_https_and_loopback() {
+        let svc = service();
+        let row = svc
+            .register_client(
+                vec![
+                    "https://app.example.com/cb".to_string(),
+                    "http://127.0.0.1:9999/cb".to_string(),
+                ],
+                Some("Multi Redirect Client".to_string()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.redirect_uris.len(), 2);
+        assert!(!row.id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn validate_client_redirect_uri_registered_client_exact_match_only() {
+        let svc = service();
+        let row = svc
+            .register_client(vec!["https://app.example.com/cb".to_string()], None)
+            .await
+            .unwrap();
+
+        assert!(svc
+            .validate_client_redirect_uri(&row.id, "https://app.example.com/cb")
+            .await
+            .unwrap());
+        // A different path is a different registered URI — rejected, no
+        // loopback-style leniency for registered clients.
+        assert!(!svc
+            .validate_client_redirect_uri(&row.id, "https://app.example.com/other")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn validate_client_redirect_uri_unknown_client_is_false_not_error() {
+        let svc = service();
+        assert!(!svc
+            .validate_client_redirect_uri("unknown-client", "https://app.example.com/cb")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn validate_client_redirect_uri_builtin_keeps_loopback_any_port() {
+        let svc = service();
+        assert!(svc
+            .validate_client_redirect_uri(LOCALDB_CLI_CLIENT_ID, "http://127.0.0.1:1/cb")
+            .await
+            .unwrap());
+        assert!(svc
+            .validate_client_redirect_uri(LOCALDB_CLI_CLIENT_ID, "http://127.0.0.1:65535/cb")
+            .await
+            .unwrap());
     }
 }

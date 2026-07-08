@@ -6,8 +6,10 @@
 //! wiring: the resolved [`AuthMode`], the axum [`middleware`], and the
 //! one-time setup-code bootstrap seam (D3b, redeemed by `/authorize` in T4).
 
+pub mod base_url;
 pub mod middleware;
 pub mod oauth;
+pub mod register;
 
 use localdb_core::{
     auth::{mint_secret, AuthStore as _},

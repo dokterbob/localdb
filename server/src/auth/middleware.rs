@@ -13,7 +13,14 @@
 //!   resolves it via `AuthService::authenticate`, and inserts the resulting
 //!   `Principal`. Missing/invalid credentials → 401 with the standard error
 //!   envelope plus `WWW-Authenticate: Bearer` (D6, added by
-//!   `ApiError::into_response`).
+//!   `ApiError::into_response`), upgraded here to carry
+//!   `resource_metadata="<base>/.well-known/oauth-protected-resource"` (T7,
+//!   RFC 9728 §5.1) — the trigger a stock MCP client uses to discover this
+//!   daemon's AS and onboard with zero static config. `ApiError` itself has
+//!   no access to the request's `Host` header or `AppState`, so this
+//!   middleware post-processes the 401 response it already built rather than
+//!   restructuring `ApiError` to carry a base URL — see
+//!   `add_resource_metadata_challenge` below.
 //!
 //! T5 lifts the T3 interim policy that rejected every authenticated
 //! `member` principal wholesale: this middleware now inserts *any*
@@ -30,7 +37,7 @@
 
 use axum::{
     extract::{Request, State},
-    http::header,
+    http::{header, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -39,7 +46,7 @@ use localdb_core::{auth::Principal, Error};
 
 use crate::{error::ApiError, state::AppState};
 
-use super::AuthMode;
+use super::{base_url::resolve_base_url, AuthMode};
 
 /// Extract the bearer secret from an `Authorization` header value.
 ///
@@ -64,15 +71,26 @@ pub async fn require_auth(State(state): State<AppState>, mut req: Request, next:
             next.run(req).await
         }
         AuthMode::Enforced => {
+            let host_header = req
+                .headers()
+                .get(header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
             let Some(secret) = bearer_secret(req.headers()) else {
-                return ApiError(Error::Unauthorized {
+                let mut response = ApiError(Error::Unauthorized {
                     message: "missing bearer token".to_string(),
                 })
                 .into_response();
+                add_resource_metadata_challenge(&mut response, &state, host_header.as_deref());
+                return response;
             };
             let principal = match state.auth().authenticate(secret).await {
                 Ok(p) => p,
-                Err(e) => return ApiError(e).into_response(),
+                Err(e) => {
+                    let mut response = ApiError(e).into_response();
+                    add_resource_metadata_challenge(&mut response, &state, host_header.as_deref());
+                    return response;
+                }
             };
             // T5: no wholesale role gate here — every authenticated
             // principal passes; per-resource authorization (store-grant
@@ -81,6 +99,33 @@ pub async fn require_auth(State(state): State<AppState>, mut req: Request, next:
             req.extensions_mut().insert(principal);
             next.run(req).await
         }
+    }
+}
+
+/// Upgrade a 401 response's `WWW-Authenticate: Bearer` header (set by
+/// `ApiError::into_response`, D6) to carry the RFC 9728 §5.1
+/// `resource_metadata` parameter, iff a base URL can be resolved
+/// (`server::auth::base_url::resolve_base_url` — prefers `server.public_url`,
+/// falls back to a sanitized `Host` header). If no base URL can be resolved
+/// (no `public_url` configured and a missing/hostile `Host` header), the
+/// response is left with the plain `Bearer` challenge `ApiError` already
+/// set — failing open on the *discovery hint* only, never on the 401 itself.
+fn add_resource_metadata_challenge(
+    response: &mut Response,
+    state: &AppState,
+    host_header: Option<&str>,
+) {
+    if response.status() != StatusCode::UNAUTHORIZED {
+        return;
+    }
+    let Some(base) = resolve_base_url(state.public_url(), host_header) else {
+        return;
+    };
+    let value = format!("Bearer resource_metadata=\"{base}/.well-known/oauth-protected-resource\"");
+    if let Ok(header_value) = HeaderValue::from_str(&value) {
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, header_value);
     }
 }
 

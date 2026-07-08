@@ -29,6 +29,11 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 reqwest = { version = "0.12", features = ["json"], default-features = false }
 
+# `FakeAuthStore` for oauth.rs's unit tests (T7) — exercises
+# `validate_authorize_params` against an in-memory `AuthService` instead of a
+# real libsql database, mirroring `core::auth::service`'s own test helper.
+localdb-core = { path = "../core", features = ["test-support"] }
+
 # Client-side transport for the `/mcp` route's round-trip integration test
 # (server/tests/mcp_route.rs) — not used by any non-test code, which only
 # ever gets a concrete tower::Service back from `mcp::build_streamable_http_service`.

@@ -16,7 +16,10 @@ mod service;
 mod store;
 mod token;
 
-pub use client::{is_known_client, validate_redirect_uri, LOCALDB_CLI_CLIENT_ID, OOB_REDIRECT_URI};
+pub use client::{
+    is_known_client, validate_redirect_uri, validate_registration_redirect_uri,
+    LOCALDB_CLI_CLIENT_ID, OOB_REDIRECT_URI,
+};
 pub use principal::{Principal, Role, StoreAccess};
 pub use service::{
     AuthService, IssuedAuthCode, IssuedInvite, IssuedToken, PollOutcome, RedeemOutcome,
@@ -25,7 +28,7 @@ pub use service::{
 pub use store::FakeAuthStore;
 pub use store::{
     AccessRequestRow, AccessRequestState, AuthCodeRow, AuthStore, AuthTokenRow, InviteMode,
-    InviteRow, StoreGrantRow, TokenKind, UserRow,
+    InviteRow, OAuthClientRow, StoreGrantRow, TokenKind, UserRow,
 };
 pub use token::{
     generate_pkce_pair, hash_secret, is_expired, mint_secret, rfc3339_from_now, verify_pkce_s256,

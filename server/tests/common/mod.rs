@@ -31,10 +31,21 @@ pub(crate) async fn make_enforced_app() -> (TempDir, AppState, Router) {
 }
 
 pub(crate) async fn make_app_with_mode(mode: AuthMode) -> (TempDir, AppState, Router) {
+    make_app_with_mode_and_public_url(mode, None).await
+}
+
+/// Like `make_app_with_mode`, but with an explicit `server.public_url`
+/// (T7 discovery base-URL resolution — `server::auth::base_url`).
+pub(crate) async fn make_app_with_mode_and_public_url(
+    mode: AuthMode,
+    public_url: Option<&str>,
+) -> (TempDir, AppState, Router) {
     let dir = tempfile::tempdir().expect("tempdir is created for isolated server API test");
     let queue = JobQueue::new();
+    let mut yaml_config = fake_yaml_config();
+    yaml_config.server.public_url = public_url.map(|s| s.to_string());
     let state = AppState::new(
-        fake_yaml_config(),
+        yaml_config,
         dir.path().to_path_buf(),
         queue.clone(),
         UrlRefreshScheduler::new(queue),

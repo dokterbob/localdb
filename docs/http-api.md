@@ -42,15 +42,149 @@ server:
 Setting `port: 0` asks the OS for an ephemeral port. The assigned port is shown in the announce
 line.
 
-### Trust model
+### Trust model and authentication
 
-The daemon binds `127.0.0.1` by default with **no authentication**. The documented trust boundary
-is: anything that can reach the bind address is as trusted as the files themselves. Any bind
-address is accepted — binding to a specific non-loopback address (e.g. a LAN or VPN IP) is treated
-as a deliberate trust decision and starts silently. Binding to `0.0.0.0` (all interfaces) logs a
-warning at startup, since that makes the unauthenticated daemon reachable from any network the
-machine is on. See [specs/05-surfaces.md](../specs/05-surfaces.md) §3 for the binding and trust
-decision.
+The daemon binds `127.0.0.1` by default. Whether requests need a bearer token is controlled by
+`server.auth` in `config.yaml`:
+
+| `server.auth` | Loopback bind | Non-loopback bind (LAN, Tailscale, `0.0.0.0`, …) |
+|---|---|---|
+| `auto` (default) | **Open** — no bearer token required | **Enforced** — every protected route requires `Authorization: Bearer ldb_...` |
+| `required` | Enforced | Enforced |
+| `off` | Open | **Hard error at startup** (`invalid_config`) — the daemon refuses to expose an unauthenticated surface to a network |
+
+Binding to a specific non-loopback address is a deliberate trust decision and is accepted
+(auth enforced automatically under the default `auto`). Binding to `0.0.0.0`/`::` (all
+interfaces) additionally logs a startup warning, since that's reachable from every network the
+machine is on. See [specs/05-surfaces.md](../specs/05-surfaces.md) §3 for the full binding and
+auth-mode decision matrix.
+
+**When auth is Open:** every request runs as an implicit admin principal (`Principal::local_trust()`)
+— the same trust boundary as the CLI and embedded MCP: anything that can reach the bind address
+is as trusted as the files themselves.
+
+**When auth is Enforced:** a request with a missing or invalid bearer token gets `401` with
+`WWW-Authenticate: Bearer` (plus, since the discovery routes below exist, a
+`resource_metadata="<base>/.well-known/oauth-protected-resource"` parameter — see
+[OAuth discovery](#oauth-discovery--dynamic-client-registration) below). A request from an
+authenticated principal who lacks permission for the resource gets `403`. Members (as opposed
+to admins) only see/search `shared`-visibility stores they hold an explicit grant for
+(`localdb store grant`) — see [specs/05-surfaces.md](../specs/05-surfaces.md) §3.1 for the D7
+authorization model.
+
+**One-time setup code.** The first time `localdb serve` starts with auth enforced and zero
+users exist yet, it prints a one-time setup code to stderr:
+
+```
+No users exist yet and authentication is enforced.
+One-time setup code (use it to create the first admin account; shown only once):
+
+    ldb_...
+```
+
+Paste that code into the browser consent page `GET /authorize` renders (or run
+`localdb login --setup-code <code>`) to create the first admin account. The code is single-use
+and is rejected once any user exists.
+
+**Route table:**
+
+| Routes | Auth |
+|---|---|
+| `GET /.well-known/oauth-protected-resource`, `GET /.well-known/oauth-authorization-server`, `GET\|POST /authorize`, `POST /token`, `POST /revoke`, `POST /register`, `POST /v1/invites/redeem`, `GET /v1/invites/requests/{id}` | **Public** — no bearer token, even when auth is enforced. These routes *are* the auth flow (OAuth discovery, DCR, and the code+PKCE/invite-redemption flows themselves). |
+| `GET /v1/stores`, `GET /v1/stores/{name}`, `GET /v1/stores/{name}/sources`, `POST /v1/search`, `GET /v1/documents/{id}`, `GET /v1/auth/me`, `/mcp` | Bearer token required once enforced. Results are scoped by the principal's store access (admins: everything; members: granted `shared` stores only). |
+| `POST/PATCH/DELETE /v1/stores`, `POST /v1/stores/{name}/sources`, `DELETE /v1/sources/{id}`, `POST/GET /v1/jobs`, `GET /v1/jobs/{id}`, `GET /v1/config` | Bearer token **and** `role = admin`. |
+| `GET/POST /v1/users`, `PATCH/DELETE /v1/users/{id}`, `GET /v1/users/{id}/keys`, `DELETE /v1/keys/{id}`, `GET/POST /v1/stores/{name}/grants`, `DELETE /v1/stores/{name}/grants/{user}` | Bearer token **and** `role = admin` — except `POST /v1/users/{id}/keys` also allows a non-admin principal to mint a key for themselves. |
+| `GET/POST /v1/invites`, `DELETE /v1/invites/{id}`, `GET /v1/invites/requests`, `POST /v1/invites/requests/{id}/approve\|deny` | Bearer token **and** `role = admin`. |
+
+### OAuth discovery + Dynamic Client Registration
+
+Once auth is enforced, three RFCs work together so a stock MCP client can onboard against
+`/mcp` (or any bearer-protected route) with **zero static configuration** — no pre-shared
+token, no manually-typed client ID:
+
+1. The client calls a protected route (e.g. `POST /mcp`) with no credential and gets `401` with
+   `WWW-Authenticate: Bearer resource_metadata="<base>/.well-known/oauth-protected-resource"`.
+2. It follows that URL to **RFC 9728** protected-resource metadata:
+
+   ```json
+   {
+     "resource": "http://127.0.0.1:7700",
+     "authorization_servers": ["http://127.0.0.1:7700"],
+     "bearer_methods_supported": ["header"]
+   }
+   ```
+3. It follows `authorization_servers[0]` to **RFC 8414** authorization-server metadata at
+   `GET /.well-known/oauth-authorization-server`:
+
+   ```json
+   {
+     "issuer": "http://127.0.0.1:7700",
+     "authorization_endpoint": "http://127.0.0.1:7700/authorize",
+     "token_endpoint": "http://127.0.0.1:7700/token",
+     "revocation_endpoint": "http://127.0.0.1:7700/revoke",
+     "registration_endpoint": "http://127.0.0.1:7700/register",
+     "response_types_supported": ["code"],
+     "grant_types_supported": ["authorization_code", "refresh_token"],
+     "code_challenge_methods_supported": ["S256"],
+     "token_endpoint_auth_methods_supported": ["none"],
+     "revocation_endpoint_auth_methods_supported": ["none"]
+   }
+   ```
+4. It registers itself against `registration_endpoint` (**RFC 7591**, `POST /register`):
+
+   ```
+   curl -s -X POST http://127.0.0.1:7700/register \
+     -H 'Content-Type: application/json' \
+     -d '{"redirect_uris": ["http://127.0.0.1:54321/callback"], "client_name": "My MCP Client"}'
+   ```
+
+   ```json
+   {
+     "client_id": "01K...",
+     "client_name": "My MCP Client",
+     "redirect_uris": ["http://127.0.0.1:54321/callback"],
+     "grant_types": ["authorization_code", "refresh_token"],
+     "response_types": ["code"],
+     "token_endpoint_auth_method": "none"
+   }
+   ```
+
+   Every `redirect_uris` entry must be either an `https://` URL or a loopback
+   `http://127.0.0.1[:port]/...` / `http://localhost[:port]/...` URL — custom URI schemes
+   (`myapp://callback`) are rejected. `token_endpoint_auth_method`, if sent, must be `"none"`:
+   this endpoint only ever registers **public** clients, so no `client_secret` is ever minted
+   or returned. Unlike the built-in `localdb-cli` client (which gets an RFC 8252 §7.3
+   loopback-*any-port* exception, since the CLI binds a fresh ephemeral port per login), a
+   registered client's redirect_uri is matched **exactly** against what it registered — no
+   loopback leniency.
+5. It runs the ordinary code+PKCE flow (`GET/POST /authorize` → `POST /token`) using the
+   `client_id` from step 4.
+
+**Base URL resolution.** `<base>` in every URL above is `server.public_url` when configured
+(trimmed of a trailing slash), or otherwise derived from the request's own `Host` header. Set
+`server.public_url` whenever the daemon sits behind a TLS-terminating reverse proxy for remote
+use — it becomes the canonical issuer/resource identifier and the daemon itself never needs to
+know it's behind TLS:
+
+```yaml
+server:
+  public_url: https://localdb.example.com   # only set behind a TLS-terminating reverse proxy
+```
+
+Without `public_url`, the `Host` header is attacker-influencable (these are, by design, some of
+the few unauthenticated routes) — a malformed or hostile header (embedded path, scheme,
+userinfo, or control characters) is rejected with `400 invalid_request` rather than ever echoed
+back, and the discovery routes need *some* valid header to respond at all in that case.
+
+**Plain-HTTP LAN risk.** If you bind the daemon to a LAN/Tailscale address *without* a
+TLS-terminating reverse proxy (i.e. without `public_url`, talking plain `http://`), bearer
+tokens travel in cleartext on that network segment — anyone who can observe the traffic (a
+compromised device on the same LAN, a malicious access point) can capture and replay a token
+until it's revoked or expires. This is the same risk as any bearer-token API served over plain
+HTTP; the mitigations are the usual ones — trust the network segment (Tailscale's own
+WireGuard tunnel already encrypts the transport, which is why the Tailscale case above is
+lower-risk in practice), or put a TLS-terminating reverse proxy in front (and set
+`server.public_url` to match) for any bind that leaves your own machine.
 
 ---
 
@@ -369,6 +503,8 @@ HTTP status codes follow the shared error taxonomy in [specs/05-surfaces.md](../
 | `daemon_unreachable` | 502 | Daemon socket exists but is not responding |
 | `invalid_config` | 422 | Config failed validation |
 | `invalid_request` | 400 | Bad request body or arguments |
+| `unauthorized` | 401 | Missing or invalid bearer token (once auth is enforced) — carries `WWW-Authenticate: Bearer`, upgraded with `resource_metadata=...` when a base URL can be resolved (see [OAuth discovery](#oauth-discovery--dynamic-client-registration)) |
+| `forbidden` | 403 | Authenticated, but insufficient permission for the resource (e.g. a member reading an ungranted store, or any non-admin management route) |
 | `unsupported_format` | 422 | Extractor cannot handle the file |
 | `provider_unavailable` | 502 | External embedding endpoint down |
 | `model_missing` | 503 | Local model not yet downloaded |

@@ -96,7 +96,22 @@ impl OAuthError {
     }
 }
 
-fn validate_authorize_params(
+/// Validates the structural + client/redirect-uri shape of an `/authorize`
+/// request. Generic over `AuthStore` (rather than tied to `AppState`/
+/// `ServerAuthService`) so unit tests below can exercise it against a
+/// `FakeAuthStore`-backed `AuthService` with no real database — the same
+/// pattern `core::auth::service`'s own tests use.
+///
+/// T7: `client_id` recognition and `redirect_uri` validation now go through
+/// `AuthService::is_known_client`/`validate_client_redirect_uri`, which
+/// extend the built-in `localdb-cli` pure check with a store-backed lookup
+/// for `POST /register`-created clients (specs/05-surfaces.md §3.1). A store
+/// read failure is treated the same as "not found" here — surfaced as the
+/// same `unauthorized_client`/`invalid_request` the caller would see for an
+/// actually-unknown client, never as a distinct error shape that could leak
+/// which case occurred.
+async fn validate_authorize_params<S: localdb_core::auth::AuthStore>(
+    auth: &localdb_core::auth::AuthService<S>,
     response_type: Option<&str>,
     client_id: Option<&str>,
     redirect_uri: Option<&str>,
@@ -113,13 +128,18 @@ fn validate_authorize_params(
     let client_id = client_id
         .filter(|s| !s.is_empty())
         .ok_or_else(|| OAuthError::new("invalid_request", "client_id is required"))?;
-    if !auth::is_known_client(client_id) {
+    let known = auth.is_known_client(client_id).await.unwrap_or(false);
+    if !known {
         return Err(OAuthError::new("unauthorized_client", "unknown client_id"));
     }
     let redirect_uri = redirect_uri
         .filter(|s| !s.is_empty())
         .ok_or_else(|| OAuthError::new("invalid_request", "redirect_uri is required"))?;
-    if !auth::validate_redirect_uri(client_id, redirect_uri) {
+    let redirect_ok = auth
+        .validate_client_redirect_uri(client_id, redirect_uri)
+        .await
+        .unwrap_or(false);
+    if !redirect_ok {
         return Err(OAuthError::new(
             "invalid_request",
             "redirect_uri is not allowed for this client",
@@ -267,15 +287,21 @@ fn oauth_error_page(err: OAuthError) -> Response {
 /// `GET /authorize` — renders the consent form. Params are validated before
 /// rendering so a structurally invalid request (bad `redirect_uri`, missing
 /// PKCE, unknown client) never gets a form that could plausibly complete.
-pub async fn get_authorize(Query(query): Query<AuthorizeQuery>) -> Response {
+pub async fn get_authorize(
+    State(state): State<AppState>,
+    Query(query): Query<AuthorizeQuery>,
+) -> Response {
     let params = match validate_authorize_params(
+        state.auth(),
         query.response_type.as_deref(),
         query.client_id.as_deref(),
         query.redirect_uri.as_deref(),
         query.state.as_deref(),
         query.code_challenge.as_deref(),
         query.code_challenge_method.as_deref(),
-    ) {
+    )
+    .await
+    {
         Ok(p) => p,
         Err(e) => return oauth_error_page(e),
     };
@@ -293,13 +319,16 @@ pub async fn post_authorize(
     Form(form): Form<AuthorizeForm>,
 ) -> Response {
     let params = match validate_authorize_params(
+        state.auth(),
         form.response_type.as_deref(),
         form.client_id.as_deref(),
         form.redirect_uri.as_deref(),
         form.state.as_deref(),
         form.code_challenge.as_deref(),
         form.code_challenge_method.as_deref(),
-    ) {
+    )
+    .await
+    {
         Ok(p) => p,
         Err(e) => return oauth_error_page(e),
     };
@@ -557,7 +586,12 @@ async fn handle_auth_code_grant(state: &AppState, form: TokenForm) -> Response {
             "code, redirect_uri, client_id, and code_verifier are all required",
         );
     };
-    if !auth::is_known_client(&client_id) {
+    let known = state
+        .auth()
+        .is_known_client(&client_id)
+        .await
+        .unwrap_or(false);
+    if !known {
         return token_error(
             StatusCode::UNAUTHORIZED,
             "invalid_client",
@@ -650,6 +684,16 @@ pub async fn post_revoke(State(state): State<AppState>, Form(form): Form<RevokeF
 #[cfg(test)]
 mod tests {
     use super::*;
+    use localdb_core::auth::{AuthService, FakeAuthStore};
+    use std::sync::Arc;
+
+    /// A fresh in-memory `AuthService` — recognizes the built-in
+    /// `localdb-cli` client purely (no DB row needed) plus whatever T7 test
+    /// callers register on it, mirroring `core::auth::service`'s own test
+    /// helper.
+    fn fake_auth() -> AuthService<FakeAuthStore> {
+        AuthService::new(Arc::new(FakeAuthStore::new()))
+    }
 
     #[test]
     fn escape_html_neutralizes_script_tags() {
@@ -658,9 +702,11 @@ mod tests {
         assert!(escaped.contains("&lt;script&gt;"));
     }
 
-    #[test]
-    fn validate_authorize_params_happy_path() {
+    #[tokio::test]
+    async fn validate_authorize_params_happy_path() {
+        let auth = fake_auth();
         let params = validate_authorize_params(
+            &auth,
             Some("code"),
             Some("localdb-cli"),
             Some("http://127.0.0.1:1234/callback"),
@@ -668,14 +714,17 @@ mod tests {
             Some("challenge-value"),
             Some("S256"),
         )
+        .await
         .unwrap();
         assert_eq!(params.client_id, "localdb-cli");
         assert_eq!(params.state, "xyz");
     }
 
-    #[test]
-    fn validate_authorize_params_rejects_bad_redirect_uri() {
+    #[tokio::test]
+    async fn validate_authorize_params_rejects_bad_redirect_uri() {
+        let auth = fake_auth();
         let err = validate_authorize_params(
+            &auth,
             Some("code"),
             Some("localdb-cli"),
             Some("http://evil.example.com/callback"),
@@ -683,13 +732,16 @@ mod tests {
             Some("c"),
             Some("S256"),
         )
+        .await
         .unwrap_err();
         assert_eq!(err.code, "invalid_request");
     }
 
-    #[test]
-    fn validate_authorize_params_rejects_missing_pkce() {
+    #[tokio::test]
+    async fn validate_authorize_params_rejects_missing_pkce() {
+        let auth = fake_auth();
         let err = validate_authorize_params(
+            &auth,
             Some("code"),
             Some("localdb-cli"),
             Some("http://127.0.0.1:1/callback"),
@@ -697,13 +749,16 @@ mod tests {
             None,
             None,
         )
+        .await
         .unwrap_err();
         assert_eq!(err.code, "invalid_request");
     }
 
-    #[test]
-    fn validate_authorize_params_rejects_plain_challenge_method() {
+    #[tokio::test]
+    async fn validate_authorize_params_rejects_plain_challenge_method() {
+        let auth = fake_auth();
         let err = validate_authorize_params(
+            &auth,
             Some("code"),
             Some("localdb-cli"),
             Some("http://127.0.0.1:1/callback"),
@@ -711,13 +766,16 @@ mod tests {
             Some("c"),
             Some("plain"),
         )
+        .await
         .unwrap_err();
         assert_eq!(err.code, "invalid_request");
     }
 
-    #[test]
-    fn validate_authorize_params_rejects_unknown_client() {
+    #[tokio::test]
+    async fn validate_authorize_params_rejects_unknown_client() {
+        let auth = fake_auth();
         let err = validate_authorize_params(
+            &auth,
             Some("code"),
             Some("some-other-client"),
             Some("http://127.0.0.1:1/callback"),
@@ -725,8 +783,54 @@ mod tests {
             Some("c"),
             Some("S256"),
         )
+        .await
         .unwrap_err();
         assert_eq!(err.code, "unauthorized_client");
+    }
+
+    #[tokio::test]
+    async fn validate_authorize_params_accepts_registered_client_exact_redirect() {
+        let auth = fake_auth();
+        let row = auth
+            .register_client(vec!["https://app.example.com/cb".to_string()], None)
+            .await
+            .unwrap();
+        let params = validate_authorize_params(
+            &auth,
+            Some("code"),
+            Some(&row.id),
+            Some("https://app.example.com/cb"),
+            None,
+            Some("c"),
+            Some("S256"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(params.client_id, row.id);
+    }
+
+    #[tokio::test]
+    async fn validate_authorize_params_rejects_registered_client_mismatched_redirect() {
+        let auth = fake_auth();
+        let row = auth
+            .register_client(vec!["https://app.example.com/cb".to_string()], None)
+            .await
+            .unwrap();
+        // A different port/path than what was registered must be rejected —
+        // registered clients get exact match only, no loopback-any-port
+        // exception (T7 decision).
+        let err = validate_authorize_params(
+            &auth,
+            Some("code"),
+            Some(&row.id),
+            Some("https://app.example.com/other-path"),
+            None,
+            Some("c"),
+            Some("S256"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, "invalid_request");
     }
 
     #[test]

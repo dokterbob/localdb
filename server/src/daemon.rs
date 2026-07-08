@@ -254,10 +254,17 @@ async fn server_future(listener: TcpListener, router: Router) {
 ///
 /// Auth (specs/05-surfaces.md §3.1): the `require_auth` middleware layer is
 /// applied *after* the `/mcp` `nest_service`, so it wraps every `/v1/*`
-/// route AND the MCP mount. `/authorize`, `/token`, and `/revoke` (T4) are
-/// built as a **separate, unlayered router** and merged in afterwards — they
-/// *are* the auth flow itself (specs/05-surfaces.md §3.1's public-routes
-/// table) and must be reachable without a bearer token. The MCP handler's
+/// route AND the MCP mount. `/authorize`, `/token`, `/revoke` (T4),
+/// `/register` (T7 DCR), and the two `/.well-known/oauth-*` discovery routes
+/// (T7) are built as a **separate, unlayered router** and merged in
+/// afterwards — they *are* the auth flow itself (specs/05-surfaces.md §3.1's
+/// public-routes table) and must be reachable without a bearer token. This
+/// is also the trigger for zero-config MCP client onboarding: a 401 from the
+/// protected router now carries `WWW-Authenticate: Bearer
+/// resource_metadata="<base>/.well-known/oauth-protected-resource"`
+/// (`auth::middleware::require_auth`), which a stock MCP client follows to
+/// this router's discovery routes, then to `/register`, then to the
+/// existing code+PKCE flow. The MCP handler's
 /// default principal follows the protected router's mode: `Open` passes
 /// `local_trust` (requests carry it anyway via the middleware, but embedded
 /// construction paths share this signature), while `Enforced` passes `None`
@@ -346,11 +353,20 @@ pub fn build_router(
 
     let public = Router::new()
         .route(
+            "/.well-known/oauth-protected-resource",
+            get(handlers::oauth_protected_resource),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(handlers::oauth_authorization_server),
+        )
+        .route(
             "/authorize",
             get(auth::oauth::get_authorize).post(auth::oauth::post_authorize),
         )
         .route("/token", post(auth::oauth::post_token))
         .route("/revoke", post(auth::oauth::post_revoke))
+        .route("/register", post(auth::register::post_register))
         .route("/v1/invites/redeem", post(handlers::redeem_invite_public))
         .route(
             "/v1/invites/requests/{id}",

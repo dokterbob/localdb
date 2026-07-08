@@ -29,6 +29,7 @@ use crate::error::ApiError;
 
 mod auth;
 mod config;
+mod discovery;
 mod documents;
 mod grants;
 mod invites;
@@ -42,6 +43,7 @@ mod users;
 
 pub use auth::get_me;
 pub use config::get_config;
+pub use discovery::{oauth_authorization_server, oauth_protected_resource};
 pub use documents::get_document;
 pub use grants::{create_grant, delete_grant, list_grants};
 pub use invites::{

@@ -92,6 +92,43 @@ Store resolution over `/mcp` is realtime: a store added later via `POST /v1/stor
 appears on the very next MCP call (`search`, `get_document`, `get_chunks`,
 `list_stores`) — no daemon restart needed.
 
+### Authentication
+
+A daemon bound to a non-loopback address enforces bearer-token auth automatically (see
+[docs/http-api.md](http-api.md#trust-model-and-authentication) for the full mode matrix) —
+`/mcp` is one of the protected routes. Two ways to connect:
+
+**Zero-config discovery (recommended for MCP clients that support it).** Point the client at
+`/mcp` with no credential at all. A stock MCP client (Claude Code and similar) follows the
+standard chain automatically: the first request gets `401` with `WWW-Authenticate: Bearer
+resource_metadata="<base>/.well-known/oauth-protected-resource"`; the client fetches that
+document, follows it to `/.well-known/oauth-authorization-server`, registers itself via
+`POST /register` (RFC 7591 Dynamic Client Registration — no client secret, since this only ever
+mints public clients), and completes the ordinary authorization-code + PKCE flow, opening a
+browser for the human to approve. No token needs to be typed in anywhere. See
+[docs/http-api.md](http-api.md#oauth-discovery--dynamic-client-registration) for the full
+protocol walk-through and the exact JSON shapes.
+
+**Static bearer header (for clients without OAuth discovery support, or scripted/headless
+use).** Mint a credential ahead of time — `localdb login` (interactive browser flow) or
+`localdb key create --user <name>` (long-lived API key, no browser) — and pass it as a static
+header when registering the MCP server:
+
+```
+claude mcp add --transport http localdb http://100.x.y.z:7700/mcp \
+  --header "Authorization: Bearer ldb_..."
+```
+
+Any MCP client that lets you attach a static header to an HTTP transport works the same way.
+
+**Stdio is always unauthenticated.** `localdb mcp` over stdio (embedded, or proxied to a local
+daemon — see [Daemon-proxied stdio](#daemon-proxied-stdio) below) never requires a bearer
+token, regardless of the daemon's own `server.auth` setting: stdio access to the local process
+is already trusted as local-files-equivalent, the same trust boundary as every other
+daemonless CLI command. Auth only applies to the HTTP transport (`/mcp` on a running daemon),
+which is what makes remote access meaningfully different from running `localdb mcp` on the
+same machine as the caller.
+
 ---
 
 ## Daemon-proxied stdio

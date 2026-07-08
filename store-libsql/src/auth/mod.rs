@@ -7,14 +7,15 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use localdb_core::auth::{
-    AccessRequestRow, AccessRequestState, AuthCodeRow, AuthStore, AuthTokenRow, InviteRow, Role,
-    StoreGrantRow, UserRow,
+    AccessRequestRow, AccessRequestState, AuthCodeRow, AuthStore, AuthTokenRow, InviteRow,
+    OAuthClientRow, Role, StoreGrantRow, UserRow,
 };
 use localdb_core::Error;
 
 use crate::connection::LibsqlDb;
 
 mod auth_codes;
+mod clients;
 mod grants;
 mod invites;
 mod sql;
@@ -110,6 +111,14 @@ impl AuthStore for LibsqlAuthStore {
 
     async fn consume_auth_code(&self, id: &str, consumed_at: &str) -> Result<bool, Error> {
         auth_codes::consume_auth_code(&self.conn, id, consumed_at).await
+    }
+
+    async fn create_oauth_client(&self, client: &OAuthClientRow) -> Result<(), Error> {
+        clients::create_oauth_client(&self.conn, client).await
+    }
+
+    async fn find_oauth_client(&self, id: &str) -> Result<Option<OAuthClientRow>, Error> {
+        clients::find_oauth_client(&self.conn, id).await
     }
 
     async fn grant_store(&self, grant: &StoreGrantRow) -> Result<(), Error> {

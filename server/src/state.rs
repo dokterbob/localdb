@@ -171,6 +171,13 @@ impl AppState {
         &self.inner.yaml_config
     }
 
+    /// The configured `server.public_url`, if any (specs/03-config.md §1) —
+    /// the OAuth discovery base-URL resolution's preferred source
+    /// (`server::auth::base_url::resolve_base_url`, T7).
+    pub fn public_url(&self) -> Option<&str> {
+        self.inner.yaml_config.server.public_url.as_deref()
+    }
+
     /// The auth policy service, backed by the same persistent unified
     /// database as `backend()`.
     pub fn auth(&self) -> &Arc<ServerAuthService> {

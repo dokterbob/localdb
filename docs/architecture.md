@@ -62,13 +62,16 @@ Calls `embed::create_embedder` from the config policy to obtain the embedder for
 
 ### `server`
 
-The axum-based HTTP API daemon. Exposes the `/v1` REST surface, manages the daemon unix
-socket for discovery, runs the file-watcher (`notify`), the URL refresh scheduler, and the
-background job queue. Opens the same unified database (`<data_dir>/localdb.db`) as the CLI;
-CLI-indexed data is visible. Multi-process is the first-class concurrency model — the daemon
-is one writer among peers (CLI sessions, multiple stdio MCP servers); concurrent writers
-serialise via SQLite WAL + `busy_timeout=5000`. Ingestion via `POST /v1/jobs` is currently a
-no-op — see [Known gaps §1](#known-gaps). See [specs/05-surfaces.md](../specs/05-surfaces.md) §3.
+The axum-based HTTP API daemon. Exposes the `/v1` REST surface (and, once auth is enforced,
+the OAuth2 authorization-code + PKCE flow at `/authorize`/`/token`/`/revoke`, RFC 7591 Dynamic
+Client Registration at `/register`, and RFC 9728/8414 discovery at `/.well-known/oauth-*` — see
+[Authentication](#authentication) below), manages the daemon unix socket for discovery, runs
+the file-watcher (`notify`), the URL refresh scheduler, and the background job queue. Opens the
+same unified database (`<data_dir>/localdb.db`) as the CLI; CLI-indexed data is visible.
+Multi-process is the first-class concurrency model — the daemon is one writer among peers (CLI
+sessions, multiple stdio MCP servers); concurrent writers serialise via SQLite WAL +
+`busy_timeout=5000`. Ingestion via `POST /v1/jobs` is currently a no-op — see
+[Known gaps §1](#known-gaps). See [specs/05-surfaces.md](../specs/05-surfaces.md) §3.
 
 ### `mcp`
 
@@ -86,7 +89,9 @@ See [specs/05-surfaces.md](../specs/05-surfaces.md) §4.
 
 The single-binary entry point. Parses the top-level subcommand tree with clap and delegates
 to the appropriate crate. No logic of its own. Subcommands: `init`, `serve`, `mcp`, `status`,
-`store`, `source`, `index`, `search`.
+`store` (incl. `grant`/`revoke`), `source`, `index`, `search`, `add`, `login`, `logout`, `user`,
+`key`, `invite` — see [Authentication](#authentication) for the auth-related ones and
+[docs/cli.md](cli.md) for the full reference.
 
 ---
 
@@ -161,6 +166,81 @@ local ONNX model). No configuration is needed for the common case. See [specs/01
 
 ---
 
+## Authentication {#authentication}
+
+The daemon's HTTP surface (`/v1/*` and `/mcp`) is bearer-token authenticated once auth is
+*enforced* — controlled by `server.auth: auto | required | off` (default `auto`, which enforces
+iff the daemon is bound to a non-loopback address). A loopback-bound daemon under `auto`, and
+every daemonless CLI/embedded-MCP invocation, remain unauthenticated by design: the same trust
+boundary as the on-disk files themselves. See
+[specs/05-surfaces.md](../specs/05-surfaces.md) §3/§3.1 for the full decision matrix.
+
+**Bootstrap.** The first `localdb serve` with auth enforced and zero users yet prints a
+one-time setup code to stderr. Paste it into the browser consent page `/authorize` opens (or
+pass it via `localdb login --setup-code <code>`) to create the first admin account.
+
+**Bearer tokens.** Opaque `ldb_`-prefixed secrets, shown once at issuance, stored only as a
+blake3 hash. Access tokens are short-lived (1h); refresh tokens (30d) rotate on every use with
+reuse detection (presenting an already-rotated refresh token revokes its whole family). API
+keys (`localdb key create`) share the same token table, never expire by default, and track
+`last_used_at`.
+
+**OAuth2 authorization-code + PKCE (S256)** is the flow behind `GET/POST /authorize` (an
+inline-HTML consent page) and `POST /token`. `POST /revoke` implements RFC 7009 (always `200`,
+even for an unknown token).
+
+**Zero-config MCP client onboarding (RFC 9728 + 8414 + 7591).** A stock MCP client (Claude Code
+and similar) pointed at `http://host:port/mcp` with no static header can onboard with no manual
+configuration: a `401` on any protected route carries `WWW-Authenticate: Bearer
+resource_metadata="<base>/.well-known/oauth-protected-resource"`; that protected-resource
+metadata document (RFC 9728) points at the authorization server; the authorization-server
+metadata document (RFC 8414, `/.well-known/oauth-authorization-server`) advertises
+`/register`, `/authorize`, and `/token`; `POST /register` (RFC 7591 Dynamic Client Registration)
+mints the client a `client_id` it then uses to run the ordinary code+PKCE flow. `<base>` is
+`server.public_url` when configured (set this behind a TLS-terminating reverse proxy — see
+[specs/03-config.md](../specs/03-config.md) §1) or, otherwise, derived from the request's own
+`Host` header after strict sanitization (`server::auth::base_url`) — the header is
+attacker-influencable on these unauthenticated routes, so a malformed one is rejected rather
+than ever echoed back.
+
+Client redirect-uri policy differs by origin: the built-in `localdb-cli` client keeps the RFC
+8252 §7.3 loopback-any-port exception (`http://127.0.0.1:<any port>/...` /
+`http://localhost:<any port>/...`, since the CLI binds a fresh ephemeral port per login
+attempt); a client created via `/register` is matched by **exact** redirect_uri only — no
+loopback-any-port leniency — and its `redirect_uris` must each be either an `https://` URL or a
+loopback `http://` URL (custom URI schemes such as `myapp://callback` are rejected; see
+`core::auth::validate_registration_redirect_uri`'s doc comment for the rationale). Public
+clients only — DCR never mints a `client_secret`.
+
+**Authorization (D7).** Every user has a role, `admin` or `member`. Admins see and manage every
+store; members see/search only `shared`-visibility stores they hold an explicit grant for
+(`localdb store grant/revoke`). `private` stores are always admin-only, ungrantable. Invites
+(`localdb invite create/list/revoke/requests/approve/deny`) let a new user join without an
+admin creating their account directly: `open`-mode invites mint a user + API key immediately on
+redemption; `closed`-mode invites file a pending access request an admin must approve before a
+credential is minted.
+
+**CLI identity.** `localdb login` drives the browser OAuth flow (`--invite <token>` redeems an
+invite instead — no browser round trip) and caches the resulting bearer in `credentials.json`
+next to `config.yaml` ([specs/03-config.md](../specs/03-config.md) §6); `localdb logout`
+revokes it and clears the cache. `localdb status` shows the caller's identity and cached token
+expiry once authenticated. The `LOCALDB_API_KEY` environment variable overrides the cached
+credential for a single invocation. Exit code `6` (new) is reserved for
+`unauthorized`/`forbidden`.
+
+**Behavior changes worth flagging to anyone tracking this branch:**
+- **Config hot-reload was removed.** Earlier builds re-read `config.yaml` on file change while
+  the daemon ran; as of the auth work, config is read once at process startup only
+  ([specs/03-config.md](../specs/03-config.md) §5) — a change to the file takes effect on the
+  next restart, not live.
+- **Pre-migration-list unified databases now hard-error at startup** instead of being silently
+  reinitialized: a database whose schema version has no migration path gets `invalid_config`
+  instructing the operator to recreate it or restore from backup, and the file is left
+  completely untouched before that error is raised
+  ([specs/02-domain-model.md](../specs/02-domain-model.md) §9).
+
+---
+
 ## On-disk layout
 
 The config file and the data directory are independent paths (`--config` /
@@ -205,6 +285,7 @@ See [Platform notes: ONNX Runtime loading](#platform-notes).
 | 3 | Not found (unknown store, unknown source) |
 | 4 | Conflict / already running (duplicate store, second daemon) |
 | 5 | Unavailable (daemon unreachable, model missing) |
+| 6 | Permission denied — missing or insufficient auth (`unauthorized`/`forbidden`) |
 
 ---
 
