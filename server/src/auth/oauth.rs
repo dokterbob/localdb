@@ -465,15 +465,23 @@ async fn resolve_credential(state: &AppState, credential: &str) -> Result<String
     let presented_hash = auth::hash_secret(credential);
     if state.consume_setup_code_if_matches(&presented_hash) {
         // Defense in depth: the setup code is only minted at startup when
-        // `count_users() == 0`, but a user could have been created via a
-        // different path (break-glass CLI) since then. Guard again here so
+        // no admin exists yet (`AuthStore::admin_exists`, finding #5), but
+        // an admin could have been created via a different path (break-glass
+        // CLI, or a concurrent redemption) since then. Guard again here so
         // the bootstrap path can never create a second implicit admin.
-        let existing = state
+        //
+        // This deliberately checks `admin_exists`, not "any user exists":
+        // finding #5's whole point is that a first user created without
+        // `--admin` (a plain `Role::Member`) must NOT block the setup code
+        // from minting the first *admin* — checking `count_users() > 0`
+        // here would immediately re-break that fix by rejecting the very
+        // code just minted for that scenario.
+        let admin_already_exists = state
             .auth_store()
-            .count_users()
+            .admin_exists()
             .await
             .map_err(|e| e.to_string())?;
-        if existing > 0 {
+        if admin_already_exists {
             return Err(
                 "setup code is no longer valid; an admin account already exists".to_string(),
             );
@@ -545,31 +553,6 @@ fn token_error(status: StatusCode, code: &'static str, description: impl Into<St
         .into_response()
 }
 
-/// Whether `err` is an internal/server-side fault — a bug, a write-lock or
-/// store failure, an unreachable or misconfigured dependency — rather than
-/// genuine client input (finding #5, specs/05-surfaces.md §5). Mirrors
-/// `server::error::http_status_for`'s classification: `RuntimeStateLocked`/
-/// `DaemonRunning`/`IndexInProgress` (lock/conflict), `DaemonUnreachable`/
-/// `ProviderUnavailable` (upstream unavailable), `ModelMissing` (unavailable
-/// dependency), and `Internal` (bug) all describe something wrong with the
-/// server or its dependencies, never a malformed or invalid *request* — so a
-/// `/token` caller must not be told `400 invalid_grant`/`server_error` for
-/// them (RFC 6749 §5.2's token-error registry describes client-input
-/// failures) and the underlying message must never be echoed back (it can
-/// carry internal detail, e.g. a raw SQL error via `Error::Internal`).
-fn is_internal_class_error(err: &CoreError) -> bool {
-    matches!(
-        err,
-        CoreError::Internal { .. }
-            | CoreError::RuntimeStateLocked
-            | CoreError::DaemonRunning
-            | CoreError::IndexInProgress
-            | CoreError::DaemonUnreachable
-            | CoreError::ProviderUnavailable { .. }
-            | CoreError::ModelMissing { .. }
-    )
-}
-
 /// Generic RFC 6749 §5.2 `server_error` body for an internal-class fault
 /// (finding #5): `500`, since RFC 6749's token-error status/code registry
 /// only constrains 4xx responses, and a fixed, generic description — never
@@ -582,13 +565,14 @@ fn internal_token_error() -> Response {
     )
 }
 
-/// Classify a token-issuance/rotation failure (finding #5): an
-/// internal-class error (see [`is_internal_class_error`]) becomes a generic
-/// `500`; anything else is genuine client input and stays a `400
-/// invalid_grant` with `description` (the token-endpoint code for a bad,
-/// expired, or already-consumed grant, RFC 6749 §5.2).
+/// Classify a token-issuance/rotation/auth-code-redemption failure (finding
+/// #5, #1): an internal-class error (see
+/// [`super::is_internal_class_error`]) becomes a generic `500`; anything else
+/// is genuine client input and stays a `400 invalid_grant` with `description`
+/// (the token-endpoint code for a bad, expired, or already-consumed grant,
+/// RFC 6749 §5.2).
 fn token_error_for_failure(err: CoreError, description: &'static str) -> Response {
-    if is_internal_class_error(&err) {
+    if super::is_internal_class_error(&err) {
         internal_token_error()
     } else {
         token_error(StatusCode::BAD_REQUEST, "invalid_grant", description)
@@ -656,10 +640,9 @@ async fn handle_auth_code_grant(state: &AppState, form: TokenForm) -> Response {
         .await
     {
         Ok(user) => user,
-        Err(_) => {
-            return token_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_grant",
+        Err(e) => {
+            return token_error_for_failure(
+                e,
                 "the authorization code is invalid, expired, already used, or does not match \
                  this client/redirect_uri/code_verifier",
             )
@@ -776,7 +759,7 @@ mod tests {
         ];
         for err in internal_errors {
             assert!(
-                is_internal_class_error(&err),
+                crate::auth::is_internal_class_error(&err),
                 "{err:?} should be classified internal"
             );
         }
@@ -798,7 +781,7 @@ mod tests {
         ];
         for err in client_errors {
             assert!(
-                !is_internal_class_error(&err),
+                !crate::auth::is_internal_class_error(&err),
                 "{err:?} should not be classified internal"
             );
         }
@@ -846,6 +829,53 @@ mod tests {
         assert_eq!(
             body["error_description"],
             "the refresh token is invalid, expired, or already used"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Finding #1: `handle_auth_code_grant`'s `redeem_auth_code` failure arm
+    // must classify the error the same way the issuance/refresh paths do
+    // (via `token_error_for_failure`), not collapse every failure to `400
+    // invalid_grant` unconditionally. `FakeAuthStore` has no seam to make
+    // `redeem_auth_code` itself return a store-layer error (its `auth_codes`
+    // vec has no poison hook), so — per the fix's own guidance — this pins
+    // the classification at this call site's exact description text rather
+    // than driving a real internal fault end-to-end through the HTTP route.
+    // -----------------------------------------------------------------
+
+    const AUTH_CODE_GRANT_FAILURE_DESCRIPTION: &str =
+        "the authorization code is invalid, expired, already used, or does not match \
+         this client/redirect_uri/code_verifier";
+
+    #[tokio::test]
+    async fn auth_code_grant_failure_maps_internal_class_error_to_500() {
+        let err = CoreError::Internal {
+            message: "raw sql error: database is locked".into(),
+            correlation_id: "corr-1".into(),
+        };
+        let resp = token_error_for_failure(err, AUTH_CODE_GRANT_FAILURE_DESCRIPTION);
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response_body_json(resp).await;
+        assert_eq!(body["error"], "server_error");
+        let description = body["error_description"].as_str().unwrap();
+        assert!(
+            !description.contains("database is locked") && !description.contains("corr-1"),
+            "internal error detail must not leak into the response: {description}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_code_grant_failure_keeps_genuine_bad_code_at_400_invalid_grant() {
+        let err = CoreError::Unauthorized {
+            message: "authorization code already used".to_string(),
+        };
+        let resp = token_error_for_failure(err, AUTH_CODE_GRANT_FAILURE_DESCRIPTION);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = response_body_json(resp).await;
+        assert_eq!(body["error"], "invalid_grant");
+        assert_eq!(
+            body["error_description"],
+            AUTH_CODE_GRANT_FAILURE_DESCRIPTION
         );
     }
 

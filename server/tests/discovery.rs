@@ -432,6 +432,73 @@ async fn register_is_reachable_without_a_bearer_token() {
 }
 
 // ---------------------------------------------------------------------
+// POST /register grant_types/response_types validation (finding #3): an
+// unsupported entry must not be echoed back in a 201 — this AS only ever
+// supports authorization_code + refresh_token grants and the code response
+// type (matches discovery::oauth_authorization_server's
+// grant_types_supported/response_types_supported, single source of truth in
+// core::auth::client::SUPPORTED_GRANT_TYPES/SUPPORTED_RESPONSE_TYPES).
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn register_rejects_unsupported_grant_type() {
+    let (_dir, _state, app) = make_enforced_app().await;
+    let resp = post_json(
+        app,
+        "/register",
+        serde_json::json!({
+            "redirect_uris": ["https://app.example.com/cb"],
+            "grant_types": ["client_credentials"],
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(resp.into_body()).await;
+    assert_eq!(body["error"], "invalid_client_metadata");
+    assert!(body.get("code").is_none());
+}
+
+#[tokio::test]
+async fn register_rejects_unsupported_response_type() {
+    let (_dir, _state, app) = make_enforced_app().await;
+    let resp = post_json(
+        app,
+        "/register",
+        serde_json::json!({
+            "redirect_uris": ["https://app.example.com/cb"],
+            "response_types": ["token"],
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(resp.into_body()).await;
+    assert_eq!(body["error"], "invalid_client_metadata");
+    assert!(body.get("code").is_none());
+}
+
+#[tokio::test]
+async fn register_accepts_explicit_supported_grant_and_response_types() {
+    let (_dir, _state, app) = make_enforced_app().await;
+    let resp = post_json(
+        app,
+        "/register",
+        serde_json::json!({
+            "redirect_uris": ["https://app.example.com/cb"],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = json_body(resp.into_body()).await;
+    assert_eq!(
+        body["grant_types"],
+        serde_json::json!(["authorization_code", "refresh_token"])
+    );
+    assert_eq!(body["response_types"], serde_json::json!(["code"]));
+}
+
+// ---------------------------------------------------------------------
 // Full DCR -> code+PKCE -> token flow, as a registered (non-built-in) client
 // ---------------------------------------------------------------------
 

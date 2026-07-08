@@ -185,9 +185,19 @@ pub trait AuthStore: Send + Sync + 'static {
     async fn list_users(&self) -> Result<Vec<UserRow>, Error>;
     async fn update_user_role(&self, id: &str, role: Role) -> Result<(), Error>;
     async fn delete_user(&self, id: &str) -> Result<bool, Error>;
-    /// Total user count — used to decide whether to print the one-time
-    /// setup code at daemon startup (specs/05-surfaces.md §3.1).
+    /// Total user count — used by `AuthService`/callers that need a plain
+    /// user census (specs/05-surfaces.md §3.1).
     async fn count_users(&self) -> Result<u64, Error>;
+    /// Whether at least one `Role::Admin` user exists.
+    ///
+    /// Finding #5: the one-time setup-code bootstrap
+    /// (`server::auth::generate_setup_code_if_needed`) must key off this, not
+    /// `count_users() > 0` — a first user created without `--admin` (e.g.
+    /// direct `localdb user add bob`) is a `Role::Member`, and suppressing
+    /// the setup code on "any user exists" would leave the instance
+    /// auth-enforced with zero admins and no way to create one via the API
+    /// (every admin-management route requires an admin principal already).
+    async fn admin_exists(&self) -> Result<bool, Error>;
     /// Atomically delete `id` unless it is currently the *sole* admin (D7's
     /// last-admin lockout guard): a single conditional `DELETE ... WHERE id
     /// = ? AND (role <> 'admin' OR (admin count) > 1)`, so two concurrent
@@ -511,6 +521,16 @@ impl AuthStore for FakeAuthStore {
 
     async fn count_users(&self) -> Result<u64, Error> {
         Ok(self.inner.read().await.users.len() as u64)
+    }
+
+    async fn admin_exists(&self) -> Result<bool, Error> {
+        Ok(self
+            .inner
+            .read()
+            .await
+            .users
+            .iter()
+            .any(|u| u.role == Role::Admin))
     }
 
     async fn try_delete_user_unless_last_admin(&self, id: &str) -> Result<bool, Error> {
@@ -1020,6 +1040,31 @@ mod tests {
         assert_eq!(store.count_users().await.unwrap(), 0);
         store.create_user(&user("u1", "alice")).await.unwrap();
         assert_eq!(store.count_users().await.unwrap(), 1);
+    }
+
+    // -----------------------------------------------------------------
+    // Finding #5: `admin_exists` must key off role, not mere presence.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn admin_exists_is_false_with_zero_users() {
+        let store = FakeAuthStore::new();
+        assert!(!store.admin_exists().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn admin_exists_is_false_with_only_member_users() {
+        let store = FakeAuthStore::new();
+        store.create_user(&user("m1", "some-member")).await.unwrap();
+        assert!(!store.admin_exists().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn admin_exists_is_true_once_an_admin_is_present() {
+        let store = FakeAuthStore::new();
+        store.create_user(&user("m1", "some-member")).await.unwrap();
+        store.create_user(&admin("a1", "an-admin")).await.unwrap();
+        assert!(store.admin_exists().await.unwrap());
     }
 
     fn access_request(id: &str, invite_id: &str) -> AccessRequestRow {

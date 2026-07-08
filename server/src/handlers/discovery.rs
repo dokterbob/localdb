@@ -14,6 +14,7 @@ use axum::{
     Json,
 };
 
+use localdb_core::auth::{SUPPORTED_GRANT_TYPES, SUPPORTED_RESPONSE_TYPES};
 use localdb_core::Error as CoreError;
 
 use crate::auth::base_url::resolve_base_url;
@@ -59,8 +60,8 @@ pub async fn oauth_authorization_server(
         "token_endpoint": format!("{base}/token"),
         "revocation_endpoint": format!("{base}/revoke"),
         "registration_endpoint": format!("{base}/register"),
-        "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "response_types_supported": SUPPORTED_RESPONSE_TYPES,
+        "grant_types_supported": SUPPORTED_GRANT_TYPES,
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
         "revocation_endpoint_auth_methods_supported": ["none"],

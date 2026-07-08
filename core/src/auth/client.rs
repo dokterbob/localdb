@@ -86,6 +86,21 @@ pub fn validate_registration_redirect_uri(redirect_uri: &str) -> bool {
     is_loopback_redirect(redirect_uri)
 }
 
+/// Grant types this authorization server supports (RFC 8414
+/// `grant_types_supported`; RFC 7591 §2 `grant_types`). Single source of
+/// truth for both `server::handlers::discovery`'s `.well-known` document and
+/// `server::auth::register`'s DCR validation (finding #3) — this AS only
+/// ever supports the authorization-code + refresh-token grants (T4/T7); a
+/// registrant asking for anything else (e.g. `client_credentials`) would get
+/// a 201 advertising a flow `/token` can't actually service.
+pub const SUPPORTED_GRANT_TYPES: &[&str] = &["authorization_code", "refresh_token"];
+
+/// Response types this authorization server supports (RFC 8414
+/// `response_types_supported`; RFC 7591 §2 `response_types`) — only the
+/// authorization-code flow (`code`); this server never issues an implicit-flow
+/// token directly from `/authorize`.
+pub const SUPPORTED_RESPONSE_TYPES: &[&str] = &["code"];
+
 /// DCR bound policy (finding #8, specs/05-surfaces.md §3.1's DCR note): a
 /// public, unauthenticated `POST /register` must not let a single request
 /// grow `oauth_clients` metadata without limit. These are minimal,

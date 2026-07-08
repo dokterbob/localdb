@@ -170,3 +170,27 @@ pub(crate) async fn count_users(db: &LibsqlDb) -> Result<u64, Error> {
     let count: i64 = row.get(0).map_err(map_libsql_err)?;
     Ok(count as u64)
 }
+
+/// Whether at least one `Role::Admin` user exists (finding #5) — backs the
+/// setup-code bootstrap decision, which must key off admin existence rather
+/// than mere user existence.
+pub(crate) async fn admin_exists(db: &LibsqlDb) -> Result<bool, Error> {
+    let conn = db.conn().await;
+    let mut rows = conn
+        .query(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE role = 'admin')",
+            (),
+        )
+        .await
+        .map_err(map_libsql_err)?;
+    let row = rows
+        .next()
+        .await
+        .map_err(map_libsql_err)?
+        .ok_or_else(|| Error::Internal {
+            message: "EXISTS(...) returned no rows".to_string(),
+            correlation_id: "auth_admin_exists".to_string(),
+        })?;
+    let exists: i64 = row.get(0).map_err(map_libsql_err)?;
+    Ok(exists != 0)
+}

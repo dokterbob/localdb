@@ -405,6 +405,35 @@ async fn setup_code_bootstraps_first_admin_and_is_single_use() {
     );
 }
 
+/// Finding #5 regression: a first user created without `--admin` (a plain
+/// `Role::Member`) must not block the setup-code bootstrap. Before the fix,
+/// `generate_setup_code_if_needed` suppressed the code whenever
+/// `count_users() > 0` (member included), and `resolve_credential`'s
+/// defense-in-depth re-check made the same mistake — so even if a code had
+/// been minted, redeeming it against a member-only instance would fail with
+/// "an admin account already exists". Both must now key off admin
+/// existence, not mere user existence.
+#[tokio::test]
+async fn setup_code_still_bootstraps_first_admin_when_only_members_exist() {
+    let (_dir, state, app) = make_enforced_app().await;
+    state.auth().create_user("bob", Role::Member).await.unwrap();
+
+    let setup_code = server::auth::generate_setup_code_if_needed(&state)
+        .await
+        .unwrap()
+        .expect("a member-only instance must still yield a setup code");
+
+    let (_verifier, challenge) = localdb_core::auth::generate_pkce_pair();
+    let (_code, _) = do_authorize(app, REDIRECT_URI, "s", &challenge, &setup_code).await;
+
+    let users = state.auth_store().list_users().await.unwrap();
+    assert_eq!(users.len(), 2, "bob plus the newly minted admin");
+    assert!(
+        users.iter().any(|u| u.role == Role::Admin),
+        "the setup code must still create an admin: {users:?}"
+    );
+}
+
 // ---------------------------------------------------------------------
 // POST /revoke (RFC 7009)
 // ---------------------------------------------------------------------

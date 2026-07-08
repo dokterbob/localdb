@@ -71,6 +71,10 @@ impl AuthStore for LibsqlAuthStore {
         users::count_users(&self.conn).await
     }
 
+    async fn admin_exists(&self) -> Result<bool, Error> {
+        users::admin_exists(&self.conn).await
+    }
+
     async fn try_delete_user_unless_last_admin(&self, id: &str) -> Result<bool, Error> {
         users::try_delete_user_unless_last_admin(&self.conn, id).await
     }
