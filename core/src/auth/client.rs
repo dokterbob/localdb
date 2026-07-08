@@ -86,6 +86,41 @@ pub fn validate_registration_redirect_uri(redirect_uri: &str) -> bool {
     is_loopback_redirect(redirect_uri)
 }
 
+/// DCR bound policy (finding #8, specs/05-surfaces.md §3.1's DCR note): a
+/// public, unauthenticated `POST /register` must not let a single request
+/// grow `oauth_clients` metadata without limit. These are minimal,
+/// proportionate per-request caps, not a rate limiter — they bound how much
+/// a single registration can store, not how often a caller may register.
+/// A global registration-count cap / rate limit is a separate, out-of-scope
+/// concern (tracked as a `// TODO` at the call site in
+/// `server/src/auth/register.rs`).
+///
+/// At most this many `redirect_uris` entries per registration.
+pub const MAX_REGISTRATION_REDIRECT_URIS: usize = 5;
+/// Each `redirect_uris` entry must be at most this many characters.
+pub const MAX_REGISTRATION_REDIRECT_URI_LEN: usize = 2048;
+/// `client_name`, if present, must be at most this many characters.
+pub const MAX_REGISTRATION_CLIENT_NAME_LEN: usize = 256;
+
+/// Whether `redirect_uris` is within the DCR count and per-URI length caps
+/// ([`MAX_REGISTRATION_REDIRECT_URIS`] / [`MAX_REGISTRATION_REDIRECT_URI_LEN`]).
+/// Purely a size check — shape/scheme validity is
+/// [`validate_registration_redirect_uri`]'s job.
+pub fn registration_redirect_uris_within_bounds(redirect_uris: &[String]) -> bool {
+    redirect_uris.len() <= MAX_REGISTRATION_REDIRECT_URIS
+        && redirect_uris
+            .iter()
+            .all(|uri| uri.len() <= MAX_REGISTRATION_REDIRECT_URI_LEN)
+}
+
+/// Whether `client_name` (if present) is within the DCR length cap
+/// ([`MAX_REGISTRATION_CLIENT_NAME_LEN`]).
+pub fn registration_client_name_within_bounds(client_name: Option<&str>) -> bool {
+    client_name
+        .map(|name| name.len() <= MAX_REGISTRATION_CLIENT_NAME_LEN)
+        .unwrap_or(true)
+}
+
 /// `http://127.0.0.1:<port>/<anything>` or `http://localhost:<port>/<anything>`,
 /// port required and numeric, path optional.
 fn is_loopback_redirect(redirect_uri: &str) -> bool {

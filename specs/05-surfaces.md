@@ -144,6 +144,13 @@ already-rotated refresh token revokes its entire token family. API keys share th
 `auth_tokens` table (`kind = 'api_key'`), have no default expiry, and track `last_used_at`. OAuth2
 authorization-code + PKCE (S256) is the flow behind `/authorize` and `/token`, once implemented.
 
+**Dynamic Client Registration (T7, RFC 7591):** `POST /register` is public/unauthenticated, so it
+enforces per-request size caps on registration metadata — at most 5 `redirect_uris`, each at most
+2048 characters, and an optional `client_name` at most 256 characters (`core::auth::client`'s
+`MAX_REGISTRATION_*` constants) — rejected as `400 invalid_client_metadata`/`invalid_redirect_uri`
+(RFC 7591 §3.2.2). These bound a single request's payload, not registration frequency; a global
+registration-count cap or rate limit is a separate, not-yet-implemented concern.
+
 ### 3.1.1 Invites (T6, D9)
 
 An invite ([02-domain-model.md](02-domain-model.md) §2) carries a `mode` (`open` | `closed`),

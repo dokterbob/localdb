@@ -23,6 +23,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use localdb_core::auth::{self, AuthStore as _, RedeemOutcome, Role};
+use localdb_core::Error as CoreError;
 
 use crate::state::AppState;
 
@@ -544,6 +545,56 @@ fn token_error(status: StatusCode, code: &'static str, description: impl Into<St
         .into_response()
 }
 
+/// Whether `err` is an internal/server-side fault — a bug, a write-lock or
+/// store failure, an unreachable or misconfigured dependency — rather than
+/// genuine client input (finding #5, specs/05-surfaces.md §5). Mirrors
+/// `server::error::http_status_for`'s classification: `RuntimeStateLocked`/
+/// `DaemonRunning`/`IndexInProgress` (lock/conflict), `DaemonUnreachable`/
+/// `ProviderUnavailable` (upstream unavailable), `ModelMissing` (unavailable
+/// dependency), and `Internal` (bug) all describe something wrong with the
+/// server or its dependencies, never a malformed or invalid *request* — so a
+/// `/token` caller must not be told `400 invalid_grant`/`server_error` for
+/// them (RFC 6749 §5.2's token-error registry describes client-input
+/// failures) and the underlying message must never be echoed back (it can
+/// carry internal detail, e.g. a raw SQL error via `Error::Internal`).
+fn is_internal_class_error(err: &CoreError) -> bool {
+    matches!(
+        err,
+        CoreError::Internal { .. }
+            | CoreError::RuntimeStateLocked
+            | CoreError::DaemonRunning
+            | CoreError::IndexInProgress
+            | CoreError::DaemonUnreachable
+            | CoreError::ProviderUnavailable { .. }
+            | CoreError::ModelMissing { .. }
+    )
+}
+
+/// Generic RFC 6749 §5.2 `server_error` body for an internal-class fault
+/// (finding #5): `500`, since RFC 6749's token-error status/code registry
+/// only constrains 4xx responses, and a fixed, generic description — never
+/// `err.to_string()` — so no internal detail leaks to the caller.
+fn internal_token_error() -> Response {
+    token_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "server_error",
+        "internal error",
+    )
+}
+
+/// Classify a token-issuance/rotation failure (finding #5): an
+/// internal-class error (see [`is_internal_class_error`]) becomes a generic
+/// `500`; anything else is genuine client input and stays a `400
+/// invalid_grant` with `description` (the token-endpoint code for a bad,
+/// expired, or already-consumed grant, RFC 6749 §5.2).
+fn token_error_for_failure(err: CoreError, description: &'static str) -> Response {
+    if is_internal_class_error(&err) {
+        internal_token_error()
+    } else {
+        token_error(StatusCode::BAD_REQUEST, "invalid_grant", description)
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct TokenResponse {
     access_token: String,
@@ -635,22 +686,20 @@ async fn handle_refresh_grant(state: &AppState, form: TokenForm) -> Response {
             refresh_token: Some(refresh.secret),
         })
         .into_response(),
-        Err(_) => token_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_grant",
-            "the refresh token is invalid, expired, or already used",
-        ),
+        Err(e) => {
+            token_error_for_failure(e, "the refresh token is invalid, expired, or already used")
+        }
     }
 }
 
 async fn issue_token_pair(state: &AppState, user_id: &str) -> Response {
     let access = match state.auth().issue_access_token(user_id).await {
         Ok(a) => a,
-        Err(e) => return token_error(StatusCode::BAD_REQUEST, "server_error", e.to_string()),
+        Err(e) => return token_error_for_failure(e, "the token request could not be completed"),
     };
     let refresh = match state.auth().issue_refresh_token(user_id).await {
         Ok(r) => r,
-        Err(e) => return token_error(StatusCode::BAD_REQUEST, "server_error", e.to_string()),
+        Err(e) => return token_error_for_failure(e, "the token request could not be completed"),
     };
     Json(TokenResponse {
         access_token: access.secret,
@@ -693,6 +742,111 @@ mod tests {
     /// helper.
     fn fake_auth() -> AuthService<FakeAuthStore> {
         AuthService::new(Arc::new(FakeAuthStore::new()))
+    }
+
+    // -----------------------------------------------------------------
+    // Finding #5: internal-class token-issuance/rotation failures must map
+    // to 500, not 400 `server_error`/`invalid_grant`. `AuthService`'s
+    // `FakeAuthStore` has no seam to make `issue_access_token`/
+    // `issue_refresh_token`/`rotate_refresh_token` return a store-layer
+    // error (its only poison hook, `poison_next_revoke`, makes
+    // `revoke_token` report a lost race — which `rotate_refresh_token`
+    // already turns into `Error::Unauthorized`, not an internal error), so
+    // this is covered at the classification-helper level per the fix's own
+    // guidance rather than end-to-end through a real store fault.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn internal_class_errors_are_classified_internal() {
+        let internal_errors = [
+            CoreError::Internal {
+                message: "bug".into(),
+                correlation_id: "x".into(),
+            },
+            CoreError::RuntimeStateLocked,
+            CoreError::DaemonRunning,
+            CoreError::IndexInProgress,
+            CoreError::DaemonUnreachable,
+            CoreError::ProviderUnavailable {
+                message: "down".into(),
+            },
+            CoreError::ModelMissing {
+                message: "missing".into(),
+            },
+        ];
+        for err in internal_errors {
+            assert!(
+                is_internal_class_error(&err),
+                "{err:?} should be classified internal"
+            );
+        }
+    }
+
+    #[test]
+    fn client_input_errors_are_not_classified_internal() {
+        let client_errors = [
+            CoreError::Unauthorized {
+                message: "bad token".into(),
+            },
+            CoreError::InvalidRequest {
+                message: "bad request".into(),
+            },
+            CoreError::Forbidden {
+                message: "no access".into(),
+            },
+            CoreError::StoreNotFound { id: "x".into() },
+        ];
+        for err in client_errors {
+            assert!(
+                !is_internal_class_error(&err),
+                "{err:?} should not be classified internal"
+            );
+        }
+    }
+
+    async fn response_body_json(resp: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn token_error_for_failure_maps_internal_class_to_500_generic_body() {
+        let err = CoreError::Internal {
+            message: "raw sql error: table auth_tokens has no column named oops".into(),
+            correlation_id: "abc123".into(),
+        };
+        let resp = token_error_for_failure(
+            err,
+            "the refresh token is invalid, expired, or already used",
+        );
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response_body_json(resp).await;
+        assert_eq!(body["error"], "server_error");
+        let description = body["error_description"].as_str().unwrap();
+        assert!(
+            !description.contains("auth_tokens") && !description.contains("abc123"),
+            "internal error detail must not leak into the response: {description}"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_error_for_failure_keeps_client_class_at_400_invalid_grant() {
+        let err = CoreError::Unauthorized {
+            message: "refresh token has expired".to_string(),
+        };
+        let resp = token_error_for_failure(
+            err,
+            "the refresh token is invalid, expired, or already used",
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = response_body_json(resp).await;
+        assert_eq!(body["error"], "invalid_grant");
+        assert_eq!(
+            body["error_description"],
+            "the refresh token is invalid, expired, or already used"
+        );
     }
 
     #[test]

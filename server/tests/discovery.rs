@@ -310,6 +310,10 @@ async fn register_rejects_non_loopback_http_redirect_uri() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(resp.into_body()).await;
+    // finding #10: RFC 7591 §3.2.2 shape — an `error` member, no `code`.
+    assert_eq!(body["error"], "invalid_redirect_uri");
+    assert!(body.get("code").is_none());
 }
 
 #[tokio::test]
@@ -317,6 +321,9 @@ async fn register_rejects_empty_redirect_uris() {
     let (_dir, _state, app) = make_enforced_app().await;
     let resp = post_json(app, "/register", serde_json::json!({"redirect_uris": []})).await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(resp.into_body()).await;
+    assert_eq!(body["error"], "invalid_client_metadata");
+    assert!(body.get("code").is_none());
 }
 
 #[tokio::test]
@@ -332,6 +339,84 @@ async fn register_rejects_non_none_token_endpoint_auth_method() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(resp.into_body()).await;
+    assert_eq!(body["error"], "invalid_client_metadata");
+    assert!(body.get("code").is_none());
+}
+
+// ---------------------------------------------------------------------
+// POST /register DCR bounds (finding #8, RFC-shaped per finding #10)
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn register_rejects_too_many_redirect_uris() {
+    let (_dir, _state, app) = make_enforced_app().await;
+    // MAX_REGISTRATION_REDIRECT_URIS is 5 — 6 entries must be rejected.
+    let redirect_uris: Vec<String> = (0..6)
+        .map(|i| format!("https://app.example.com/cb{i}"))
+        .collect();
+    let resp = post_json(
+        app,
+        "/register",
+        serde_json::json!({"redirect_uris": redirect_uris}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(resp.into_body()).await;
+    assert_eq!(body["error"], "invalid_client_metadata");
+    assert!(body.get("code").is_none());
+}
+
+#[tokio::test]
+async fn register_rejects_over_long_redirect_uri() {
+    let (_dir, _state, app) = make_enforced_app().await;
+    // MAX_REGISTRATION_REDIRECT_URI_LEN is 2048 — pad the path past that.
+    let long_uri = format!("https://app.example.com/{}", "a".repeat(2048));
+    let resp = post_json(
+        app,
+        "/register",
+        serde_json::json!({"redirect_uris": [long_uri]}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(resp.into_body()).await;
+    assert_eq!(body["error"], "invalid_client_metadata");
+    assert!(body.get("code").is_none());
+}
+
+#[tokio::test]
+async fn register_rejects_over_long_client_name() {
+    let (_dir, _state, app) = make_enforced_app().await;
+    // MAX_REGISTRATION_CLIENT_NAME_LEN is 256.
+    let long_name = "a".repeat(257);
+    let resp = post_json(
+        app,
+        "/register",
+        serde_json::json!({
+            "redirect_uris": ["https://app.example.com/cb"],
+            "client_name": long_name,
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(resp.into_body()).await;
+    assert_eq!(body["error"], "invalid_client_metadata");
+    assert!(body.get("code").is_none());
+}
+
+#[tokio::test]
+async fn register_accepts_normal_registration_within_bounds() {
+    let (_dir, _state, app) = make_enforced_app().await;
+    let resp = post_json(
+        app,
+        "/register",
+        serde_json::json!({
+            "redirect_uris": ["https://app.example.com/cb"],
+            "client_name": "A Normal Client",
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
 }
 
 #[tokio::test]
