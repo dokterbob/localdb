@@ -32,6 +32,7 @@ use localdb_core::types::StoreVisibility;
 use localdb_core::Error as CoreError;
 
 use super::require_principal;
+use crate::auth::base_url::resolve_base_url;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -167,6 +168,25 @@ pub async fn create_invite(
 
     let mode = parse_invite_mode(&req.mode)?;
 
+    // Resolve the consent URL's base *before* creating the invite (the same
+    // way discovery/T7 does — `server::auth::base_url::resolve_base_url`):
+    // prefer the operator-configured `server.public_url` (correct behind a
+    // TLS-terminating reverse proxy), falling back to the request's own
+    // sanitized `Host` header only when no `public_url` is configured.
+    // Building this from a hard-coded `http://` + raw `Host` header (as
+    // before) ignored `public_url` entirely and could downgrade/break the
+    // show-once invite link (finding #9). Failing this check up front —
+    // rather than after `create_invite` below — avoids minting a usable
+    // invite the caller then can't learn the token for.
+    let host_header = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+    let base = resolve_base_url(state.public_url(), host_header).ok_or_else(|| {
+        ApiError(CoreError::InvalidRequest {
+            message: "cannot determine this server's base URL: no server.public_url is \
+                      configured and the request's Host header is missing or invalid"
+                .to_string(),
+        })
+    })?;
+
     let mut store_grants = Vec::with_capacity(req.stores.len());
     for name in &req.stores {
         let store = state.get_store_by_name(name).await?;
@@ -186,15 +206,7 @@ pub async fn create_invite(
         )
         .await?;
 
-    // The consent URL is built from the request's own Host header — the
-    // exact interface the caller reached this daemon on — rather than a
-    // base URL threaded through `AppState`, so it's correct for any bind
-    // address/port with no extra plumbing.
-    let host = headers
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("127.0.0.1:7700");
-    let consent_url = format!("http://{host}/authorize?invite={}", issued.secret);
+    let consent_url = format!("{base}/authorize?invite={}", issued.secret);
 
     Ok((
         StatusCode::CREATED,

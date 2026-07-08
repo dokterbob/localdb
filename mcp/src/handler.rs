@@ -28,11 +28,16 @@
 //! T5: admins (and `local_trust`) see every store; `member` principals are
 //! no longer rejected wholesale — instead the resolved store list is
 //! filtered per call to just the `shared` stores they hold a grant for
-//! (D7, D12), via `Principal::can_read_store`. A tool referencing a store
-//! name that got filtered out behaves exactly as if that store didn't
-//! exist (the `tools::*` fns already treat an unknown name as
-//! `store_not_found`) — there is no separate "forbidden" tier for MCP
-//! store access.
+//! (D7, D12), via `Principal::can_read_store`.
+//!
+//! specs/05-surfaces.md §3.1: a store name a tool call explicitly asks for
+//! (`search`'s `stores` filter) that exists but was filtered out by D7 is a
+//! `forbidden` tool error, not `store_not_found` — matching the HTTP surface
+//! (`server::search_service::SearchService::query`'s `store_filter` handling)
+//! exactly. Only a name absent from the *full*, pre-filter store list stays
+//! `store_not_found`. With no store named explicitly (unfiltered `search`,
+//! or `list_stores`), the visible set is silently narrowed as before — there
+//! is nothing to be "forbidden" from since nothing specific was requested.
 
 use std::sync::Arc;
 
@@ -148,29 +153,77 @@ impl McpHandler {
     /// produced by any current `StoreProvider`, so only reachable via a bug)
     /// is treated as `private` — fail safe, deny by default, rather than
     /// leak an unknown-shaped store to a member.
-    fn filter_visible(principal: &Principal, stores: Vec<AvailableStore>) -> Vec<AvailableStore> {
+    fn filter_visible(principal: &Principal, stores: &[AvailableStore]) -> Vec<AvailableStore> {
         stores
-            .into_iter()
+            .iter()
             .filter(|s| {
                 let visibility = StoreVisibility::parse(&s.descriptor.visibility)
                     .unwrap_or(StoreVisibility::Private);
                 principal.can_read_store(&s.descriptor.name, visibility)
             })
+            .cloned()
             .collect()
     }
 
     /// Shared per-tool preamble: resolve the caller's principal (fail closed
     /// if none — see `principal_for`), resolve the live store list, then
     /// filter it to what that principal may read (D7). Tools thus never see
-    /// a store the caller isn't entitled to, so an invisible store name
-    /// behaves identically to an unknown one.
+    /// a store the caller isn't entitled to. For tools with no explicit
+    /// store-name argument (`get_document`/`get_chunks`/`list_stores`) an
+    /// invisible store behaves identically to an unknown one — there's
+    /// nothing named to be "forbidden" from. `search`'s `stores` filter is
+    /// the one call site with an explicit name, so it uses
+    /// `authorize_and_resolve_with_full` instead (see below).
     async fn authorize_and_resolve(
         &self,
         extensions: &Extensions,
     ) -> Result<Vec<AvailableStore>, CallToolResult> {
         let principal = self.principal_for(extensions)?;
         let stores = self.resolve_stores().await?;
-        Ok(Self::filter_visible(&principal, stores))
+        Ok(Self::filter_visible(&principal, &stores))
+    }
+
+    /// Like `authorize_and_resolve`, but also returns the full, pre-D7-filter
+    /// store list alongside the visible one — needed by `search_inner` to
+    /// distinguish a named store that's unreadable (present in `full`,
+    /// dropped from the visible set) from one that's genuinely unknown
+    /// (absent from `full` too); see `forbidden_for_named_unreadable_store`.
+    async fn authorize_and_resolve_with_full(
+        &self,
+        extensions: &Extensions,
+    ) -> Result<(Vec<AvailableStore>, Vec<AvailableStore>), CallToolResult> {
+        let principal = self.principal_for(extensions)?;
+        let stores = self.resolve_stores().await?;
+        let visible = Self::filter_visible(&principal, &stores);
+        Ok((stores, visible))
+    }
+
+    /// specs/05-surfaces.md §3.1: a store name in `requested` that exists in
+    /// `full` (the unfiltered store list) but was dropped from `visible` by
+    /// D7 filtering is `forbidden`, not `store_not_found` — the caller named
+    /// a real store and was refused, mirroring the HTTP surface's
+    /// `server::search_service::SearchService::query` (`store_filter` naming
+    /// an ungranted store -> 403). A name absent from `full` returns `None`
+    /// here and falls through unchanged to the tool's own `store_not_found`
+    /// handling (it only ever sees `visible`, so it's not found there
+    /// either). Returns the *first* unreadable name found, matching the HTTP
+    /// surface's fail-fast-on-first-bad-name behavior.
+    fn forbidden_for_named_unreadable_store(
+        full: &[AvailableStore],
+        visible: &[AvailableStore],
+        requested: &[String],
+    ) -> Option<CallToolResult> {
+        for name in requested {
+            let exists = full.iter().any(|s| &s.descriptor.name == name);
+            let is_visible = visible.iter().any(|s| &s.descriptor.name == name);
+            if exists && !is_visible {
+                return Some(tools::typed_error(
+                    "forbidden",
+                    format!("you do not have access to store '{name}'"),
+                ));
+            }
+        }
+        None
     }
 
     // The `*_inner` methods below carry the full tool behavior against a
@@ -181,11 +234,17 @@ impl McpHandler {
     // the end-to-end test in `server/tests/` (R4).
 
     async fn search_inner(&self, args: SearchArgs, extensions: &Extensions) -> CallToolResult {
-        let stores = match self.authorize_and_resolve(extensions).await {
+        let (full, visible) = match self.authorize_and_resolve_with_full(extensions).await {
             Ok(s) => s,
             Err(result) => return result,
         };
-        tools::tool_search(&stores, self.embedder.as_ref(), args).await
+        if let Some(names) = &args.stores {
+            if let Some(result) = Self::forbidden_for_named_unreadable_store(&full, &visible, names)
+            {
+                return result;
+            }
+        }
+        tools::tool_search(&visible, self.embedder.as_ref(), args).await
     }
 
     async fn get_document_inner(
@@ -511,9 +570,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn member_tool_call_on_invisible_store_behaves_as_unknown_store() {
-        // A named store the member holds no grant for must behave exactly
-        // like a store that doesn't exist at all.
+    async fn member_search_naming_an_ungranted_store_is_forbidden_not_not_found() {
+        // specs/05-surfaces.md §3.1: a store the member holds no grant for,
+        // but that genuinely exists, must be `forbidden` (403 on the HTTP
+        // surface) — not collapsed into `store_not_found`, which would be
+        // inconsistent with `server::search_service::SearchService::query`'s
+        // identical `store_filter` check.
         let provider = Arc::new(StaticStoreProvider::new(vec![store_with_visibility(
             "ungranted",
             "shared",
@@ -529,6 +591,59 @@ mod tests {
             .search_inner(args, &http_extensions_with_principal(member("dana")))
             .await;
         assert_eq!(result.is_error, Some(true));
+        assert_eq!(error_code(&result), "forbidden");
+    }
+
+    #[tokio::test]
+    async fn member_search_naming_a_truly_unknown_store_is_store_not_found() {
+        // A name absent from the full store list entirely (not merely
+        // filtered out by D7) must still be `store_not_found` — only
+        // "exists but unreadable" is promoted to `forbidden`.
+        let provider = Arc::new(StaticStoreProvider::new(vec![store_with_visibility(
+            "granted-shared",
+            "shared",
+        )]));
+        let handler = McpHandler::new(provider, embedder(), false, None);
+        let principal = Principal {
+            user_id: "u1".into(),
+            name: "member-with-grant".into(),
+            role: Role::Member,
+            access: StoreAccess::Granted(["granted-shared".to_string()].into_iter().collect()),
+        };
+        let args = SearchArgs {
+            query: "hello".to_string(),
+            stores: Some(vec!["does-not-exist".to_string()]),
+            limit: None,
+            content_length: None,
+        };
+        let result = handler
+            .search_inner(args, &http_extensions_with_principal(principal))
+            .await;
+        assert_eq!(result.is_error, Some(true));
         assert_eq!(error_code(&result), "store_not_found");
+    }
+
+    #[tokio::test]
+    async fn admin_search_naming_any_store_works() {
+        // An admin (or local_trust) is never subject to D7 filtering, so
+        // naming any real store — private or shared — must succeed.
+        let provider = Arc::new(StaticStoreProvider::new(vec![
+            store_with_visibility("shared-docs", "shared"),
+            store_with_visibility("secret-docs", "private"),
+        ]));
+        let handler = McpHandler::new(provider, embedder(), false, None);
+        let args = SearchArgs {
+            query: "hello".to_string(),
+            stores: Some(vec!["secret-docs".to_string()]),
+            limit: None,
+            content_length: None,
+        };
+        let result = handler
+            .search_inner(
+                args,
+                &http_extensions_with_principal(Principal::local_trust()),
+            )
+            .await;
+        assert_ne!(result.is_error, Some(true));
     }
 }

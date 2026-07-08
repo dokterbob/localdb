@@ -16,8 +16,10 @@ use tower::ServiceExt;
 use localdb_core::auth::{AuthStore as _, Role};
 
 use common::{
-    create_store_as, json_body, make_enforced_app, request_with_bearer, seed_user_with_key,
+    create_store_as, json_body, make_app_with_mode_and_public_url, make_enforced_app,
+    request_with_bearer, seed_user_with_key,
 };
+use server::AuthMode;
 
 fn form_encode(pairs: &[(&str, &str)]) -> String {
     url::form_urlencoded::Serializer::new(String::new())
@@ -55,6 +57,39 @@ async fn body_string(body: Body) -> String {
     String::from_utf8(bytes.to_vec()).unwrap()
 }
 
+/// Like `request_with_bearer`, but also sets a `Host` header — needed since
+/// `POST /v1/invites`'s `consent_url` is built from `resolve_base_url`
+/// (finding #9), which requires either a configured `server.public_url` or a
+/// `Host` header to resolve a base URL at all. `oneshot` requests carry no
+/// `Host` header unless one is set explicitly (unlike a real TCP listener),
+/// so every `create_invite` call needs one to keep resolving successfully.
+async fn request_with_bearer_and_host(
+    app: Router,
+    method: Method,
+    uri: &str,
+    body: Option<Value>,
+    bearer: Option<&str>,
+    host: Option<&str>,
+) -> axum::response::Response {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(secret) = bearer {
+        builder = builder.header("authorization", format!("Bearer {secret}"));
+    }
+    if let Some(h) = host {
+        builder = builder.header("host", h);
+    }
+    let request_body = match body {
+        Some(value) => {
+            builder = builder.header("content-type", "application/json");
+            Body::from(value.to_string())
+        }
+        None => Body::empty(),
+    };
+    app.oneshot(builder.body(request_body).unwrap())
+        .await
+        .unwrap()
+}
+
 async fn create_invite(
     app: Router,
     admin_secret: &str,
@@ -62,12 +97,13 @@ async fn create_invite(
     stores: &[&str],
     max_uses: u32,
 ) -> Value {
-    let resp = request_with_bearer(
+    let resp = request_with_bearer_and_host(
         app,
         Method::POST,
         "/v1/invites",
         Some(json!({ "mode": mode, "stores": stores, "max_uses": max_uses })),
         Some(admin_secret),
+        Some("127.0.0.1:7700"),
     )
     .await;
     assert_eq!(
@@ -162,6 +198,89 @@ async fn admin_invite_create_list_revoke_happy_path() {
     )
     .await;
     assert!(resp.status().is_client_error());
+}
+
+// ---------------------------------------------------------------------------
+// consent_url base resolution (finding #9): `server.public_url` when
+// configured, else the sanitized `Host` header, else 400 — matching
+// `server::auth::base_url::resolve_base_url` and how discovery.rs already
+// tests it against the `.well-known` endpoints.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn consent_url_uses_configured_public_url_over_host_header() {
+    let (_dir, state, app) =
+        make_app_with_mode_and_public_url(AuthMode::Enforced, Some("https://db.example.com/"))
+            .await;
+    let admin_secret = seed_user_with_key(&state, "root-admin-pub", Role::Admin).await;
+    create_store_as(app.clone(), "docs", "shared", Some(&admin_secret)).await;
+
+    // Even with a hostile/irrelevant internal Host header, the configured
+    // public_url must win — never a downgraded/internal-hostname link.
+    let resp = request_with_bearer_and_host(
+        app,
+        Method::POST,
+        "/v1/invites",
+        Some(json!({ "mode": "open", "stores": ["docs"], "max_uses": 1 })),
+        Some(&admin_secret),
+        Some("10.0.0.5:7700"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created = json_body(resp.into_body()).await;
+    let consent_url = created["consent_url"].as_str().unwrap();
+    assert!(
+        consent_url.starts_with("https://db.example.com/authorize?invite="),
+        "expected the configured public_url as the base, got: {consent_url}"
+    );
+}
+
+#[tokio::test]
+async fn consent_url_falls_back_to_sanitized_host_header_without_public_url() {
+    let (_dir, state, app) = make_enforced_app().await;
+    let admin_secret = seed_user_with_key(&state, "root-admin-host", Role::Admin).await;
+    create_store_as(app.clone(), "docs", "shared", Some(&admin_secret)).await;
+
+    let resp = request_with_bearer_and_host(
+        app,
+        Method::POST,
+        "/v1/invites",
+        Some(json!({ "mode": "open", "stores": ["docs"], "max_uses": 1 })),
+        Some(&admin_secret),
+        Some("192.168.1.50:8080"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created = json_body(resp.into_body()).await;
+    let consent_url = created["consent_url"].as_str().unwrap();
+    assert!(
+        consent_url.starts_with("http://192.168.1.50:8080/authorize?invite="),
+        "expected the sanitized Host header as the base, got: {consent_url}"
+    );
+}
+
+#[tokio::test]
+async fn consent_url_rejects_hostile_host_header_without_public_url() {
+    let (_dir, state, app) = make_enforced_app().await;
+    let admin_secret = seed_user_with_key(&state, "root-admin-hostile", Role::Admin).await;
+    create_store_as(app.clone(), "docs", "shared", Some(&admin_secret)).await;
+
+    let resp = request_with_bearer_and_host(
+        app,
+        Method::POST,
+        "/v1/invites",
+        Some(json!({ "mode": "open", "stores": ["docs"], "max_uses": 1 })),
+        Some(&admin_secret),
+        Some("evil.com/../../etc/passwd"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(resp.into_body()).await;
+    let text = body.to_string();
+    assert!(
+        !text.contains("evil.com"),
+        "the hostile Host header must never be echoed back unsanitized: {text}"
+    );
 }
 
 #[tokio::test]

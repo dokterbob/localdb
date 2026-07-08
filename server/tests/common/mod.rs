@@ -66,7 +66,14 @@ pub(crate) async fn make_app_with_mode_and_public_url(
     let router = build_router(
         state.clone(),
         mcp_provider,
-        std::sync::Arc::new(localdb_core::FakeEmbedder::new(1)),
+        // Dimension must match `fake_yaml_config`'s embedding policy
+        // (provider "fake", model "default" -> 128-dim, see
+        // `embed::infer_dim_encoding`/`SHAPES`) — this is the dimension the
+        // libsql backend's vector index was actually created with, so an
+        // MCP `search` tool call against a real store needs its query
+        // embedder to agree, or every call fails with a vector-dimension
+        // mismatch regardless of authorization outcome.
+        std::sync::Arc::new(localdb_core::FakeEmbedder::new(128)),
         vec![],
     );
     (dir, state, router)

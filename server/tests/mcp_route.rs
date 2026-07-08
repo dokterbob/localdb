@@ -463,7 +463,11 @@ async fn mcp_member_sees_only_granted_shared_stores() {
 }
 
 #[tokio::test]
-async fn mcp_member_search_on_invisible_store_behaves_as_unknown_store() {
+async fn mcp_member_search_naming_an_invisible_store_is_forbidden() {
+    // specs/05-surfaces.md §3.1: a store the member holds no grant for, but
+    // that genuinely exists, is `forbidden` — not `store_not_found` — over
+    // MCP, matching the HTTP `/v1/search` surface's identical
+    // `store_filter` behavior (`search_service.rs`).
     let (_dir, state, app) = common::make_enforced_app().await;
     let admin_secret =
         common::seed_user_with_key(&state, "mcp-admin-search", localdb_core::auth::Role::Admin)
@@ -496,10 +500,92 @@ async fn mcp_member_search_on_invisible_store_behaves_as_unknown_store() {
     assert_eq!(
         result.is_error,
         Some(true),
-        "an invisible store name must behave like an unknown one"
+        "a named-but-unreadable store must be a tool-level error"
     );
     let body = call_tool_json(result);
+    assert_eq!(body["error"]["code"], "forbidden");
+
+    let _ = client.cancel().await;
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn mcp_member_search_naming_a_truly_unknown_store_is_store_not_found() {
+    // Only a name absent from the full store list stays `store_not_found` —
+    // this is the counterpart to the `forbidden` case above.
+    let (_dir, state, app) = common::make_enforced_app().await;
+    let admin_secret = common::seed_user_with_key(
+        &state,
+        "mcp-admin-search-unknown",
+        localdb_core::auth::Role::Admin,
+    )
+    .await;
+    common::create_store_as(app.clone(), "granted-real", "shared", Some(&admin_secret)).await;
+
+    let member = state
+        .auth()
+        .create_user(
+            "mcp-member-search-unknown",
+            localdb_core::auth::Role::Member,
+        )
+        .await
+        .unwrap();
+    let member_secret = state.auth().issue_api_key(&member.id).await.unwrap().secret;
+
+    let resp = request_with_bearer_admin(
+        &app,
+        axum::http::Method::POST,
+        "/v1/stores/granted-real/grants",
+        Some(serde_json::json!({ "user": "mcp-member-search-unknown" })),
+        &admin_secret,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let (client, server_task) = connect_mcp_client(app, Some(&member_secret)).await;
+
+    let args = serde_json::json!({ "query": "hello", "stores": ["does-not-exist-at-all"] });
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("search").with_arguments(args.as_object().unwrap().clone()),
+        )
+        .await
+        .expect("call_tool itself succeeds at the protocol level");
+    assert_eq!(result.is_error, Some(true));
+    let body = call_tool_json(result);
     assert_eq!(body["error"]["code"], "store_not_found");
+
+    let _ = client.cancel().await;
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn mcp_admin_search_naming_any_store_works() {
+    // An admin is never subject to D7 filtering, so naming any real store —
+    // private or shared — must succeed rather than error.
+    let (_dir, state, app) = common::make_enforced_app().await;
+    let admin_secret = common::seed_user_with_key(
+        &state,
+        "mcp-admin-search-any",
+        localdb_core::auth::Role::Admin,
+    )
+    .await;
+    common::create_store_as(app.clone(), "admin-private", "private", Some(&admin_secret)).await;
+
+    let (client, server_task) = connect_mcp_client(app, Some(&admin_secret)).await;
+
+    let args = serde_json::json!({ "query": "hello", "stores": ["admin-private"] });
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("search").with_arguments(args.as_object().unwrap().clone()),
+        )
+        .await
+        .expect("call_tool itself succeeds at the protocol level");
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "admin naming any real store must succeed"
+    );
 
     let _ = client.cancel().await;
     server_task.abort();

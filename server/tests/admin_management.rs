@@ -612,6 +612,97 @@ async fn admin_sees_every_store_regardless_of_visibility() {
 }
 
 // ---------------------------------------------------------------------------
+// D7 member store visibility scoping — GET /v1/status (finding #6)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn member_status_counts_are_scoped_to_readable_stores() {
+    let (_dir, state, app) = make_enforced_app().await;
+    let admin_secret = seed_user_with_key(&state, "root-admin-status", Role::Admin).await;
+
+    create_store_as(app.clone(), "granted-shared", "shared", Some(&admin_secret)).await;
+    create_store_as(
+        app.clone(),
+        "ungranted-shared",
+        "shared",
+        Some(&admin_secret),
+    )
+    .await;
+    create_store_as(
+        app.clone(),
+        "secret-private",
+        "private",
+        Some(&admin_secret),
+    )
+    .await;
+
+    // One source per store, so `source_count` also has something to leak
+    // if it isn't scoped.
+    seed_chunk(&state, "granted-shared", "hello world rust", "file:///a.md").await;
+    seed_chunk(
+        &state,
+        "ungranted-shared",
+        "hello world rust",
+        "file:///b.md",
+    )
+    .await;
+    seed_chunk(&state, "secret-private", "hello world rust", "file:///c.md").await;
+
+    let member = state
+        .auth()
+        .create_user("ursula", Role::Member)
+        .await
+        .unwrap();
+    let member_secret = state.auth().issue_api_key(&member.id).await.unwrap().secret;
+
+    // Grant only "granted-shared".
+    let resp = request_with_bearer(
+        app.clone(),
+        Method::POST,
+        "/v1/stores/granted-shared/grants",
+        Some(json!({ "user": "ursula" })),
+        Some(&admin_secret),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Admin sees the true totals: all three stores, one source each.
+    let resp = request_with_bearer(
+        app.clone(),
+        Method::GET,
+        "/v1/status",
+        None,
+        Some(&admin_secret),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp.into_body()).await;
+    assert_eq!(body["store_count"], 3);
+    assert_eq!(body["source_count"], 3);
+
+    // The member only holds a grant on one shared store: counts must
+    // reflect just that store, not the ungranted-shared or private ones.
+    let resp = request_with_bearer(
+        app.clone(),
+        Method::GET,
+        "/v1/status",
+        None,
+        Some(&member_secret),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp.into_body()).await;
+    assert_eq!(
+        body["store_count"], 1,
+        "member must only see the granted store in the count"
+    );
+    assert_eq!(
+        body["source_count"], 1,
+        "member must only see sources from the granted store"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Grant create -> list -> delete; rejection on private stores; realtime
 // revoke effect on the very next request (no restart, D7+D12 composition).
 // ---------------------------------------------------------------------------
