@@ -142,6 +142,12 @@ would have to replay past such a row — it pre-scans the whole planned path bef
 anything — naming the migration, the stored reason, and the nearest `--to` target that keeps that
 step applied.
 
+`db downgrade` also pre-scans for a **contiguous** history: it requires exactly one
+`schema_migrations` row per version in `(target, current]` before replaying anything. A missing row
+(a corrupted or partially-written store) is refused up front — naming the missing version(s) and
+touching nothing — rather than silently skipping that migration's down-SQL or, in the worst case,
+finding zero rows and reporting a no-op "success" while `PRAGMA user_version` stays put.
+
 ### Behavior change vs. pre-0.x
 
 Older `store-libsql` builds — before this framework — **silently erased and reinitialized** a

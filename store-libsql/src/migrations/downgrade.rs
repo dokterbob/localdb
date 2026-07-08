@@ -2,8 +2,13 @@
 //!
 //! `downgrade_store` replays only the *stored* down-SQL rows in a store's own
 //! `schema_migrations` table, never the compiled migration chain — see its
-//! doc comment for why that asymmetry matters. `inspect_schema` is the
-//! never-refuses read used by `db status`.
+//! doc comment for why that asymmetry matters. Before replaying anything, it
+//! requires the history between the downgrade target and the current version
+//! to be *contiguous* — exactly one row per version in that range — and
+//! refuses (untouched) if a row is missing; see the "sparse history" comment
+//! in `downgrade_store` for why trusting whatever rows merely happen to exist
+//! is not safe. `inspect_schema` is the never-refuses read used by `db
+//! status`.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -111,6 +116,37 @@ pub async fn downgrade_store(path: &Path, target: Option<i64>) -> Result<Downgra
     // read `PRAGMA user_version` as, even if schema_migrations somehow has
     // stale rows above it.
     rows.retain(|r| r.version <= from_version);
+
+    // Refuse up front, before touching anything, if the history between
+    // `target` and `from_version` is sparse: `schema_migrations` must have
+    // *exactly* one row per version in `(target, from_version]`, or replaying
+    // whatever happens to be present would silently skip a migration's
+    // down-SQL (or, if nothing is present at all, report success after doing
+    // zero steps while `user_version` stays put). A missing row here is the
+    // same class of corruption `checksum::verify_checksums` guards against on
+    // open/migrate — surface it the same way rather than trusting the rows
+    // that do exist.
+    {
+        let present: std::collections::HashSet<i64> = rows.iter().map(|r| r.version).collect();
+        let missing: Vec<i64> = ((target + 1)..=from_version)
+            .filter(|v| !present.contains(v))
+            .collect();
+        if !missing.is_empty() {
+            let missing_list = missing
+                .iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(Error::Internal {
+                message: format!(
+                    "schema_migrations is missing a row for version(s) {missing_list} between \
+                     target {target} and current version {from_version}: this store's migration \
+                     bookkeeping is corrupt or incomplete; downgrade refused. Nothing was changed."
+                ),
+                correlation_id: "libsql_migrations_missing_row".to_string(),
+            });
+        }
+    }
 
     // Refuse up front, before touching anything, if any planned row can't be
     // reversed — naming the nearest target that *is* reachable rather than
@@ -454,6 +490,95 @@ mod tests {
             }
             other => panic!("expected InvalidConfig, got {other:?}"),
         }
+    }
+
+    // -- Finding 4: contiguity — a sparse/incomplete history between target
+    // and the current version must be refused, not silently under-replayed.
+
+    #[tokio::test]
+    async fn downgrade_store_refuses_when_a_middle_row_is_missing_and_leaves_db_untouched() {
+        let (_dir, path) = test_fixtures::temp_db_path();
+        test_fixtures::write_baseline_plus_chain(&path, &test_fixtures::reversible_chain()).await;
+
+        // Delete the middle row (BASELINE_VERSION + 2) while user_version
+        // still reports BASELINE_VERSION + 3 — a corrupted/tampered store
+        // that a naive downgrade would otherwise silently skip a step for.
+        {
+            let (_db, conn) = open_for_maintenance(&path).await.unwrap();
+            table::delete_row(&conn, BASELINE_VERSION + 2)
+                .await
+                .unwrap();
+        }
+
+        let before = test_fixtures::dump_db(&path).await;
+        let result = downgrade_store(&path, None).await;
+        let after = test_fixtures::dump_db(&path).await;
+
+        match result {
+            Err(Error::Internal {
+                message,
+                correlation_id,
+            }) => {
+                assert_eq!(correlation_id, "libsql_migrations_missing_row");
+                assert!(
+                    message.contains(&(BASELINE_VERSION + 2).to_string()),
+                    "message should name the missing version: {message}"
+                );
+            }
+            other => panic!("expected Error::Internal, got {other:?}"),
+        }
+        assert_eq!(
+            before, after,
+            "a refused downgrade must not mutate the store at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn downgrade_store_refuses_when_no_rows_exist_above_target_but_version_says_otherwise() {
+        let (_dir, path) = test_fixtures::temp_db_path();
+        test_fixtures::write_baseline_plus_chain(&path, &test_fixtures::reversible_chain()).await;
+
+        // Delete every chain row while leaving PRAGMA user_version stamped
+        // at head: a naive implementation would find zero rows to replay and
+        // report a "successful" no-op downgrade instead of refusing.
+        {
+            let (_db, conn) = open_for_maintenance(&path).await.unwrap();
+            for version in [
+                BASELINE_VERSION + 1,
+                BASELINE_VERSION + 2,
+                BASELINE_VERSION + 3,
+            ] {
+                table::delete_row(&conn, version).await.unwrap();
+            }
+        }
+
+        let before = test_fixtures::dump_db(&path).await;
+        let result = downgrade_store(&path, None).await;
+        let after = test_fixtures::dump_db(&path).await;
+
+        match result {
+            Err(Error::Internal {
+                message,
+                correlation_id,
+            }) => {
+                assert_eq!(correlation_id, "libsql_migrations_missing_row");
+                for version in [
+                    BASELINE_VERSION + 1,
+                    BASELINE_VERSION + 2,
+                    BASELINE_VERSION + 3,
+                ] {
+                    assert!(
+                        message.contains(&version.to_string()),
+                        "message should name missing version {version}: {message}"
+                    );
+                }
+            }
+            other => panic!("expected Error::Internal, got {other:?}"),
+        }
+        assert_eq!(
+            before, after,
+            "a refused downgrade must not mutate the store at all"
+        );
     }
 
     #[tokio::test]
