@@ -113,7 +113,7 @@ pub(crate) async fn increment_invite_uses(db: &LibsqlDb, id: &str) -> Result<(),
 }
 
 const ACCESS_REQUEST_COLUMNS: &str = "id, invite_id, requested_name, secret_hash, state, \
-    resulting_user_id, created_at, decided_at";
+    resulting_user_id, created_at, decided_at, collected_at";
 
 pub(crate) async fn create_access_request(
     db: &LibsqlDb,
@@ -123,7 +123,7 @@ pub(crate) async fn create_access_request(
     conn.execute(
         &format!(
             "INSERT INTO access_requests ({ACCESS_REQUEST_COLUMNS}) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
         ),
         libsql::params![
             req.id.clone(),
@@ -134,6 +134,7 @@ pub(crate) async fn create_access_request(
             req.resulting_user_id.clone(),
             req.created_at.clone(),
             req.decided_at.clone(),
+            req.collected_at.clone(),
         ],
     )
     .await
@@ -179,6 +180,43 @@ pub(crate) async fn list_access_requests_for_invite(
         out.push(row_to_access_request(&row)?);
     }
     Ok(out)
+}
+
+pub(crate) async fn list_access_requests(db: &LibsqlDb) -> Result<Vec<AccessRequestRow>, Error> {
+    let conn = db.conn().await;
+    let mut rows = conn
+        .query(
+            &format!("SELECT {ACCESS_REQUEST_COLUMNS} FROM access_requests ORDER BY created_at"),
+            (),
+        )
+        .await
+        .map_err(map_libsql_err)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(map_libsql_err)? {
+        out.push(row_to_access_request(&row)?);
+    }
+    Ok(out)
+}
+
+/// Atomic "mark collected iff currently `approved` and not yet collected"
+/// (mirrors `consume_auth_code`'s single-use guard): a single UPDATE with
+/// both conditions in the WHERE clause, so two concurrent callers can never
+/// both observe success.
+pub(crate) async fn mark_access_request_collected(
+    db: &LibsqlDb,
+    id: &str,
+    collected_at: &str,
+) -> Result<bool, Error> {
+    let conn = db.conn().await;
+    let n = conn
+        .execute(
+            "UPDATE access_requests SET collected_at = ? \
+             WHERE id = ? AND state = 'approved' AND collected_at IS NULL",
+            libsql::params![collected_at.to_string(), id.to_string()],
+        )
+        .await
+        .map_err(map_libsql_err)?;
+    Ok(n > 0)
 }
 
 pub(crate) async fn update_access_request_state(

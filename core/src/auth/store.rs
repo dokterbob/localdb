@@ -126,6 +126,17 @@ pub enum AccessRequestState {
 }
 
 /// A request to redeem a `closed`-mode invite, awaiting admin approval.
+///
+/// `secret_hash` (T6): the blake3 hash of the request secret minted at
+/// redemption time (`AuthService::redeem_invite`) and shown once to the
+/// requester then. On approval (`AuthService::approve_request`) that same
+/// secret is promoted to the new user's live API key — this is deliberate:
+/// it avoids ever holding a *second* plaintext credential in memory between
+/// approval and the requester's next poll (see `AuthService::approve_request`
+/// doc comment). `collected_at` (T6) guards the "handed out exactly once"
+/// contract: `AuthStore::mark_access_request_collected` is the atomic
+/// consume-once gate `poll_request` uses, mirroring `consume_auth_code`'s
+/// convention for the OAuth2 authorization code.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccessRequestRow {
     pub id: String,
@@ -136,6 +147,7 @@ pub struct AccessRequestRow {
     pub resulting_user_id: Option<String>,
     pub created_at: String,
     pub decided_at: Option<String>,
+    pub collected_at: Option<String>,
 }
 
 /// Persistence seam for all auth policy state.
@@ -210,6 +222,11 @@ pub trait AuthStore: Send + Sync + 'static {
         &self,
         invite_id: &str,
     ) -> Result<Vec<AccessRequestRow>, Error>;
+    /// Every access request across every invite, newest-created last — backs
+    /// `GET /v1/invites/requests` (T6). Small admin-facing surface (no
+    /// pagination): the number of pending/decided join requests is expected
+    /// to be tiny relative to, say, chunk counts.
+    async fn list_access_requests(&self) -> Result<Vec<AccessRequestRow>, Error>;
     async fn update_access_request_state(
         &self,
         id: &str,
@@ -217,6 +234,20 @@ pub trait AuthStore: Send + Sync + 'static {
         resulting_user_id: Option<&str>,
         decided_at: &str,
     ) -> Result<(), Error>;
+    /// Atomically mark an `Approved` access request's credential as
+    /// collected, iff it hasn't been already (T6's "handed out exactly
+    /// once" contract — mirrors `consume_auth_code`'s single-use guard).
+    /// Returns `true` only if this call performed the transition; `false`
+    /// if the request is unknown, not yet approved, or already collected —
+    /// `AuthService::poll_request` treats every `false` outcome as
+    /// `PollOutcome::AlreadyCollected` rather than distinguishing further,
+    /// since by the time this is called the caller has already proven
+    /// knowledge of the request secret.
+    async fn mark_access_request_collected(
+        &self,
+        id: &str,
+        collected_at: &str,
+    ) -> Result<bool, Error>;
 }
 
 // ---------------------------------------------------------------------------
@@ -543,6 +574,10 @@ impl AuthStore for FakeAuthStore {
             .collect())
     }
 
+    async fn list_access_requests(&self) -> Result<Vec<AccessRequestRow>, Error> {
+        Ok(self.inner.read().await.access_requests.clone())
+    }
+
     async fn update_access_request_state(
         &self,
         id: &str,
@@ -557,6 +592,21 @@ impl AuthStore for FakeAuthStore {
             r.decided_at = Some(decided_at.to_string());
         }
         Ok(())
+    }
+
+    async fn mark_access_request_collected(
+        &self,
+        id: &str,
+        collected_at: &str,
+    ) -> Result<bool, Error> {
+        let mut inner = self.inner.write().await;
+        match inner.access_requests.iter_mut().find(|r| r.id == id) {
+            Some(r) if r.state == AccessRequestState::Approved && r.collected_at.is_none() => {
+                r.collected_at = Some(collected_at.to_string());
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 }
 

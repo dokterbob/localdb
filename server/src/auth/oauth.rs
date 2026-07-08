@@ -22,7 +22,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use localdb_core::auth::{self, AuthStore as _, Role};
+use localdb_core::auth::{self, AuthStore as _, RedeemOutcome, Role};
 
 use crate::state::AppState;
 
@@ -41,6 +41,11 @@ pub struct AuthorizeQuery {
     /// Pre-fills the consent form's credential field (D3b bootstrap UX) —
     /// the form still requires an explicit submit.
     pub setup_code: Option<String>,
+    /// T6: an invite token (`/authorize?invite=<token>`, the URL `POST
+    /// /v1/invites` hands back) — switches the rendered form to the invite
+    /// -redemption variant (a "your name" field instead of a
+    /// setup-code/API-key credential field), see `render_consent_page`.
+    pub invite: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,9 +57,17 @@ pub struct AuthorizeForm {
     pub code_challenge: Option<String>,
     pub code_challenge_method: Option<String>,
     /// Either the one-time setup code (bootstrap) or an existing API key —
-    /// see `resolve_credential`. T6 adds a third branch here (invite
-    /// tokens); that seam is `resolve_credential`, not this struct.
+    /// see `resolve_credential`. Mutually exclusive with `invite` (below);
+    /// which branch runs is decided by whether `invite` is present, in
+    /// `post_authorize`.
     pub credential: Option<String>,
+    /// T6: an invite token, round-tripped from the hidden field
+    /// `render_consent_page`'s invite variant renders. Present iff this
+    /// submission is an invite redemption rather than a setup-code/API-key
+    /// login.
+    pub invite: Option<String>,
+    /// T6: the requester's chosen user name, required alongside `invite`.
+    pub requested_name: Option<String>,
 }
 
 /// The subset of `/authorize` params needed once validated: known-good
@@ -144,19 +157,44 @@ fn escape_html(s: &str) -> String {
 /// A minimal, dependency-free (inline CSS only) consent page. Every
 /// interpolated value is HTML-escaped. The hidden fields round-trip the
 /// full set of OAuth params the POST handler re-validates.
+///
+/// `invite_token`, when present (T6, `/authorize?invite=<token>`), switches
+/// the credential field for an invite-redemption variant: a hidden `invite`
+/// field carrying the token plus a "your name" text input, rather than the
+/// setup-code/API-key password field — an invite token IS the credential
+/// here, there is nothing else to type.
 fn render_consent_page(
     params: &ValidParams,
     credential_prefill: &str,
+    invite_token: Option<&str>,
     error: Option<&str>,
 ) -> Html<String> {
     let client_id = escape_html(&params.client_id);
     let redirect_uri = escape_html(&params.redirect_uri);
     let state = escape_html(&params.state);
     let code_challenge = escape_html(&params.code_challenge);
-    let credential_prefill = escape_html(credential_prefill);
     let error_html = match error {
         Some(e) => format!("<p class=\"error\">{}</p>", escape_html(e)),
         None => String::new(),
+    };
+    let credential_field = match invite_token {
+        Some(token) => {
+            let token_escaped = escape_html(token);
+            format!(
+                r#"<input type="hidden" name="invite" value="{token_escaped}">
+<label>Your name
+<input type="text" name="requested_name" autofocus></label>
+<p class="hint">You were invited to join this localdb instance. Choose a name to continue.</p>"#
+            )
+        }
+        None => {
+            let credential_prefill = escape_html(credential_prefill);
+            format!(
+                r#"<label>One-time setup code (first run) or existing API key
+<input type="password" name="credential" value="{credential_prefill}" autofocus></label>
+<p class="hint">New installs: paste the setup code printed by <code>localdb serve</code>. Otherwise, use an API key from <code>localdb key create</code>.</p>"#
+            )
+        }
     };
 
     Html(format!(
@@ -186,14 +224,32 @@ button {{ margin-top: 20px; padding: 8px 20px; font-size: 1rem; }}
 <input type="hidden" name="state" value="{state}">
 <input type="hidden" name="code_challenge" value="{code_challenge}">
 <input type="hidden" name="code_challenge_method" value="S256">
-<label>One-time setup code (first run) or existing API key
-<input type="password" name="credential" value="{credential_prefill}" autofocus></label>
-<p class="hint">New installs: paste the setup code printed by <code>localdb serve</code>. Otherwise, use an API key from <code>localdb key create</code>.</p>
+{credential_field}
 <button type="submit">Authorize</button>
 </form>
 </body>
 </html>"#
     ))
+}
+
+/// The closed-mode invite consent-page landing page (T6): no OAuth code is
+/// issued here (the CLI's poll loop, not the browser, drives closed-mode
+/// approval — see `cli::cmds::login`'s doc comment for why that path is
+/// primary). This is deliberately a static, unparameterized page: the
+/// request id/secret already went to the requester in the JSON-API path;
+/// there is nothing untrusted to interpolate here, so no escaping is
+/// needed.
+fn render_request_submitted_page() -> Html<String> {
+    Html(
+        r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Request submitted</title>
+<style>body { font-family: -apple-system, system-ui, sans-serif; max-width: 420px; margin: 48px auto; padding: 0 16px; }</style>
+</head><body>
+<h1>Request submitted</h1>
+<p>Your access request has been submitted. An administrator needs to approve it before you can sign in — ask them to run <code>localdb invite approve</code>, then try again.</p>
+</body></html>"#
+            .to_string(),
+    )
 }
 
 fn oauth_error_page(err: OAuthError) -> Response {
@@ -224,7 +280,7 @@ pub async fn get_authorize(Query(query): Query<AuthorizeQuery>) -> Response {
         Err(e) => return oauth_error_page(e),
     };
     let prefill = query.setup_code.unwrap_or_default();
-    render_consent_page(&params, &prefill, None).into_response()
+    render_consent_page(&params, &prefill, query.invite.as_deref(), None).into_response()
 }
 
 /// `POST /authorize` — validates the credential (setup code or API key),
@@ -248,22 +304,79 @@ pub async fn post_authorize(
         Err(e) => return oauth_error_page(e),
     };
 
+    // T6: an invite token takes an entirely different path — it identifies
+    // a *new* user (via `redeem_invite`, requiring a chosen name) rather
+    // than an existing one, and a `closed`-mode invite doesn't continue the
+    // OAuth flow at all (no admin has approved yet).
+    if let Some(invite_token) = form.invite.as_deref().filter(|s| !s.is_empty()) {
+        let requested_name = form.requested_name.unwrap_or_default();
+        return handle_invite_authorize(&state, &params, invite_token, requested_name.trim()).await;
+    }
+
     let credential = form.credential.unwrap_or_default();
     if credential.trim().is_empty() {
-        return render_consent_page(&params, "", Some("Enter a setup code or API key."))
+        return render_consent_page(&params, "", None, Some("Enter a setup code or API key."))
             .into_response();
     }
 
     let user_id = match resolve_credential(&state, credential.trim()).await {
         Ok(id) => id,
-        Err(message) => return render_consent_page(&params, "", Some(&message)).into_response(),
+        Err(message) => {
+            return render_consent_page(&params, "", None, Some(&message)).into_response()
+        }
     };
 
+    issue_code_and_continue(&state, &params, &user_id).await
+}
+
+/// T6: handle a consent-page submission that carries an invite token rather
+/// than a setup-code/API-key credential (`AuthorizeForm::invite`).
+///
+/// `open`-mode invites redeem immediately and continue the OAuth flow as
+/// the freshly created user, so `localdb login --invite <token>`'s browser
+/// path (if used — the direct-redeem path in `cli::cmds::login` is primary)
+/// yields ordinary browser-session tokens. `closed`-mode invites do NOT
+/// continue the flow here — no admin has approved yet, so there is no user
+/// to issue a code for; the requester sees a "request submitted" page and
+/// polls (or has the CLI poll for them) instead of getting a redirect.
+async fn handle_invite_authorize(
+    state: &AppState,
+    params: &ValidParams,
+    invite_token: &str,
+    requested_name: &str,
+) -> Response {
+    if requested_name.is_empty() {
+        return render_consent_page(params, "", Some(invite_token), Some("Enter your name."))
+            .into_response();
+    }
+    match state
+        .auth()
+        .redeem_invite(invite_token, requested_name)
+        .await
+    {
+        Ok(RedeemOutcome::Open { user, .. }) => {
+            issue_code_and_continue(state, params, &user.id).await
+        }
+        Ok(RedeemOutcome::Closed { .. }) => render_request_submitted_page().into_response(),
+        Err(e) => render_consent_page(params, "", Some(invite_token), Some(&e.to_string()))
+            .into_response(),
+    }
+}
+
+/// Shared tail of `post_authorize`'s credential and invite branches: mint a
+/// single-use authorization code for `user_id` and either redirect to
+/// `redirect_uri` with it, or (the `--no-browser` oob sentinel) render it
+/// inline for copy/paste.
+async fn issue_code_and_continue(
+    state: &AppState,
+    params: &ValidParams,
+    user_id: &str,
+) -> Response {
     let issued = match state
         .auth()
         .issue_auth_code(
             &params.client_id,
-            &user_id,
+            user_id,
             &params.redirect_uri,
             &params.code_challenge,
         )
@@ -624,7 +737,7 @@ mod tests {
             state: "\"><script>alert(2)</script>".to_string(),
             code_challenge: "c".to_string(),
         };
-        let html = render_consent_page(&params, "", None).0;
+        let html = render_consent_page(&params, "", None, None).0;
         assert!(
             !html.contains("<script>"),
             "raw script tag must never appear: {html}"

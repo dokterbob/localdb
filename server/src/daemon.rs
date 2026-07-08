@@ -317,6 +317,20 @@ pub fn build_router(
             "/v1/stores/{name}/grants/{user}",
             delete(handlers::delete_grant),
         )
+        .route(
+            "/v1/invites",
+            get(handlers::list_invites).post(handlers::create_invite),
+        )
+        .route("/v1/invites/{id}", delete(handlers::revoke_invite))
+        .route("/v1/invites/requests", get(handlers::list_access_requests))
+        .route(
+            "/v1/invites/requests/{id}/approve",
+            post(handlers::approve_access_request),
+        )
+        .route(
+            "/v1/invites/requests/{id}/deny",
+            post(handlers::deny_access_request),
+        )
         .with_state(state.clone())
         .nest_service(
             "/mcp",
@@ -337,6 +351,11 @@ pub fn build_router(
         )
         .route("/token", post(auth::oauth::post_token))
         .route("/revoke", post(auth::oauth::post_revoke))
+        .route("/v1/invites/redeem", post(handlers::redeem_invite_public))
+        .route(
+            "/v1/invites/requests/{id}",
+            get(handlers::poll_access_request),
+        )
         .with_state(state);
 
     public.merge(protected)

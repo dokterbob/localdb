@@ -196,9 +196,11 @@ in shape (D1).
 
 ### Invite
 A minted, shareable credential that lets a new user join without an existing admin creating
-their account directly. The full redeem/approve state machine (open vs. closed mode, request
-review) is a later ticket (T6) — the table and type exist from this ticket so the schema doesn't
-need another migration to add them.
+their account directly. `store_grants` named against a `private` store are rejected at CREATE
+time (`Error::Forbidden`, reusing D7's grant rule) — a bad invite fails loudly for the admin who
+typo'd a store name, not silently for whoever redeems it later. The redeem/approve state machine
+(T6, `core::auth::AuthService::redeem_invite`/`approve_request`/`deny_request`/`poll_request`) is
+described in full in [05-surfaces.md](05-surfaces.md) §2/§3.1.
 
 | Field | Notes |
 |---|---|
@@ -206,24 +208,25 @@ need another migration to add them.
 | `token_hash` | blake3 hash of the invite's opaque secret; the secret is shown once, at creation. |
 | `mode` | `open` (redeeming creates the user immediately) \| `closed` (redeeming creates an `AccessRequest` pending admin approval). |
 | `store_grants` | JSON array of store names the resulting user is granted on redemption/approval. |
-| `max_uses`, `uses` | `max_uses` defaults to 1. |
+| `max_uses`, `uses` | `max_uses` defaults to 1. `uses` is incremented before the redemption's user-create/access-request-file step (see `redeem_invite`'s doc comment) — a concurrent burst can over-count `uses` past `max_uses` (cosmetic, self-limiting) but can never double-mint a user, which the `users.name` UNIQUE constraint independently prevents. |
 | `expires_at`, `revoked_at` | Nullable. |
 | `created_by` | Issuing user's ID. |
 | `created_at` | RFC 3339. |
 
 ### AccessRequest
 A pending join request created by redeeming a `closed`-mode `Invite`, awaiting admin approval
-or denial. State machine lands in T6; the table exists now.
+or denial (T6).
 
 | Field | Notes |
 |---|---|
 | `id` | ULID. |
 | `invite_id` | The `Invite` this request was made against. |
 | `requested_name` | The name the requester asked for. |
-| `secret_hash` | blake3 hash of the credential the requester will use once approved. |
+| `secret_hash` | blake3 hash of the request secret minted at redemption time and shown once to the requester then. This secret is poll-only — it is never promoted to a credential (it travels as a URL query parameter on every poll, which would otherwise leak into access logs/proxies/shell history as a long-lived, live-from-approval-time API key). A *fresh* API key is minted instead, in `AuthService::poll_request`, the first time a poll observes the `Approved` state and collects it — see `collected_at` below. |
 | `state` | `pending` \| `approved` \| `denied`. |
 | `resulting_user_id` | Set once approved and the `User` row is created. |
 | `created_at`, `decided_at` | RFC 3339; `decided_at` nullable until the request leaves `pending`. |
+| `collected_at` (T6, schema v6) | Nullable RFC 3339. Set exactly once, atomically (`AuthStore::mark_access_request_collected`, mirroring `consume_auth_code`'s single-use guard), the first time a poll observes the `Approved` state and hands back the credential — every later poll observes `AlreadyCollected` instead of re-issuing it. |
 
 ### StoreGrant
 A normalized row granting one user read access to one `shared`-visibility store (D7). Grants on

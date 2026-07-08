@@ -168,6 +168,10 @@ impl AuthStore for LibsqlAuthStore {
         invites::list_access_requests_for_invite(&self.conn, invite_id).await
     }
 
+    async fn list_access_requests(&self) -> Result<Vec<AccessRequestRow>, Error> {
+        invites::list_access_requests(&self.conn).await
+    }
+
     async fn update_access_request_state(
         &self,
         id: &str,
@@ -177,5 +181,13 @@ impl AuthStore for LibsqlAuthStore {
     ) -> Result<(), Error> {
         invites::update_access_request_state(&self.conn, id, state, resulting_user_id, decided_at)
             .await
+    }
+
+    async fn mark_access_request_collected(
+        &self,
+        id: &str,
+        collected_at: &str,
+    ) -> Result<bool, Error> {
+        invites::mark_access_request_collected(&self.conn, id, collected_at).await
     }
 }

@@ -12,7 +12,11 @@ use crate::vectors::embedding_column_type;
 /// v4 -> v5 (issue #98): added the auth tables (`users`, `auth_tokens`,
 /// `oauth_clients`, `auth_codes`, `store_grants`, `invites`,
 /// `access_requests`). Purely additive — see `MIGRATIONS` below.
-pub const SCHEMA_VERSION: i64 = 5;
+///
+/// v5 -> v6 (T6, issue #98): added `access_requests.collected_at` — the
+/// atomic "credential handed out exactly once" guard for closed-mode invite
+/// polling (`AuthStore::mark_access_request_collected`). Purely additive.
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// Run the full DDL for the unified database.
 ///
@@ -442,7 +446,8 @@ async fn create_auth_tables(conn: &Connection) -> Result<(), libsql::Error> {
             state              TEXT NOT NULL DEFAULT 'pending',
             resulting_user_id  TEXT REFERENCES users(id) ON DELETE SET NULL,
             created_at         TEXT NOT NULL,
-            decided_at         TEXT
+            decided_at         TEXT,
+            collected_at       TEXT
         )",
         (),
     )
@@ -454,6 +459,36 @@ async fn create_auth_tables(conn: &Connection) -> Result<(), libsql::Error> {
     )
     .await?;
 
+    Ok(())
+}
+
+/// v5 -> v6 (T6): `access_requests.collected_at` didn't exist in the v5 DDL
+/// above, so a database that already ran `create_auth_tables` at v5 needs an
+/// explicit `ALTER TABLE` to add it. Guarded by a `pragma_table_info` check
+/// (same introspection pattern used elsewhere in this file) rather than
+/// running the `ALTER TABLE` unconditionally: a database that jumps straight
+/// from v4 to the current version runs this step *after* the `4 -> 5` step
+/// above, whose `create_auth_tables` DDL already includes `collected_at` (it
+/// is shared verbatim with a fresh create) — an unconditional `ALTER TABLE`
+/// would then fail with "duplicate column name" on that path. A database
+/// that was already at v5 before this ticket, on the other hand, genuinely
+/// needs the column added here.
+async fn add_access_requests_collected_at_column(conn: &Connection) -> Result<(), libsql::Error> {
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*) FROM pragma_table_info('access_requests') WHERE name = 'collected_at'",
+            (),
+        )
+        .await?;
+    let already_present: i64 = rows.next().await?.and_then(|r| r.get(0).ok()).unwrap_or(0);
+    if already_present > 0 {
+        return Ok(());
+    }
+    conn.execute(
+        "ALTER TABLE access_requests ADD COLUMN collected_at TEXT",
+        (),
+    )
+    .await?;
     Ok(())
 }
 
@@ -501,17 +536,24 @@ type MigrationFn = for<'a> fn(
 
 /// Ordered migration list, keyed by the version each step starts from.
 ///
-/// Every step reuses the same DDL helper `create_schema` itself calls, so a
-/// freshly created database and a migrated one converge on an identical
-/// schema (D13). This PR ships exactly one step: `4 -> 5` (create the auth
-/// tables). A schema version with no entry here — older than the oldest
-/// step, or newer than `SCHEMA_VERSION` — has no migration path;
-/// `run_migrations` returns a hard error rather than dropping data.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    from: 4,
-    to: 5,
-    run: |conn| Box::pin(create_auth_tables(conn)),
-}];
+/// Every step reuses the same DDL helper(s) `create_schema` itself calls
+/// where possible, so a freshly created database and a migrated one
+/// converge on an identical schema (D13). A schema version with no entry
+/// here — older than the oldest step, or newer than `SCHEMA_VERSION` — has
+/// no migration path; `run_migrations` returns a hard error rather than
+/// dropping data.
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        from: 4,
+        to: 5,
+        run: |conn| Box::pin(create_auth_tables(conn)),
+    },
+    Migration {
+        from: 5,
+        to: 6,
+        run: |conn| Box::pin(add_access_requests_collected_at_column(conn)),
+    },
+];
 
 /// Migrate `conn` from `current_version` up to `target_version`, one step at
 /// a time, per `MIGRATIONS`.

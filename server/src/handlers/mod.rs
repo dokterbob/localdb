@@ -31,6 +31,7 @@ mod auth;
 mod config;
 mod documents;
 mod grants;
+mod invites;
 mod jobs;
 mod keys;
 mod search;
@@ -43,6 +44,11 @@ pub use auth::get_me;
 pub use config::get_config;
 pub use documents::get_document;
 pub use grants::{create_grant, delete_grant, list_grants};
+pub use invites::{
+    approve_request as approve_access_request, create_invite, deny_request as deny_access_request,
+    list_access_requests, list_invites, poll_request as poll_access_request,
+    redeem_invite as redeem_invite_public, revoke_invite,
+};
 pub use jobs::{create_job, get_job};
 pub use keys::{create_key, list_keys, revoke_key};
 pub use search::search;

@@ -1,8 +1,8 @@
 # Spec 05 — Surfaces: CLI, HTTP API, MCP
 
-> Status: accepted draft, revised 2026-07-07. All three surfaces sit on the same `core`
-> ([01-architecture.md](01-architecture.md) §1) and return the same Citation shape
-> ([02-domain-model.md](02-domain-model.md) §6) and error taxonomy (§5).
+> Status: accepted draft, revised 2026-07-08 (T6: invite create/redeem/approve). All three
+> surfaces sit on the same `core` ([01-architecture.md](01-architecture.md) §1) and return the
+> same Citation shape ([02-domain-model.md](02-domain-model.md) §6) and error taxonomy (§5).
 
 ## 1. Process-model behavior shared by CLI and MCP
 
@@ -27,11 +27,11 @@ Single binary, subcommand tree. Global flags: `--config`, `--json`, `--store <na
 | `add <path|url>...` | Alias for `source add` — add one or more sources to a store | direct write | routed to daemon |
 | `index [--store S] [--source ID] [--strict]` | One-shot scan & index; creates IndexJob | runs job synchronously, progress to stderr | submits job, polls, streams progress |
 | `search <query>... [--limit N] [--content-length N]` | Hybrid search with citations; `--content-length` is a **soft cap** on human-readable snippet chars (default 1000; JSON output always full text) — see §4 for the snapping behavior shared with MCP | embedded read | via API |
-| `login` / `logout` (planned) | Authenticate against a daemon and cache the resulting token, or revoke and clear it | n/a — there is no auth to log into without a daemon (§3.1) | `login` exchanges credentials via `/token` (or an invite/API-key flow) and writes `credentials.json` (§6, [03-config.md](03-config.md) §6); `logout` calls `/revoke` and clears the cached entry |
+| `login [--invite <token>] [--name <name>]` / `logout` | Authenticate against a daemon and cache the resulting token, or revoke and clear it. `login` without `--invite` drives the OAuth2 authorization-code + PKCE browser flow (T4); `login --invite <token>` (T6) redeems the invite directly against `POST /v1/invites/redeem` instead — no browser round trip. `--name` sets the requested user name (default: the OS login name, `$USER`/`%USERNAME%`) | n/a — there is no auth to log into without a daemon (§3.1) | `login` (no `--invite`) exchanges credentials via `/token` and writes `credentials.json` (§6, [03-config.md](03-config.md) §6); `login --invite`: `open`-mode invites persist the redeemed API key immediately; `closed`-mode invites print a "waiting for admin approval" message and poll `GET /v1/invites/requests/{id}` (1s interval) until an admin approves (credential persisted) or denies (clear error, non-zero exit); `logout` calls `/revoke` and clears the cached entry |
 | `user add\|list\|remove\|set-role` | Manage user accounts (admin only) | direct write/read against the unified DB's `users` table — the recovery path when the daemon is unreachable or auth is locked out | routed to daemon, requires an admin bearer token; `user add` also accepts a `--direct-db` flag to bypass a running daemon for lockout recovery |
 | `key create\|list\|revoke` | Manage API keys (`auth_tokens` rows with `kind='api_key'`) for the caller or, as admin, another user | direct write/read | routed to daemon; managing another user's key requires admin (minting your *own* key is always allowed); `key create` also accepts `--direct-db` |
 | `store grant\|revoke` | Grant/revoke a member's read access to a `shared` store (D7); rejected on `private` stores | direct write | routed to daemon, admin only |
-| `invite create\|list\|revoke\|requests\|approve\|deny` (planned) | Manage invites and pending access requests (admin only; the full redeem/approve state machine lands in T6) | direct write | routed to daemon, admin only |
+| `invite create\|list\|revoke\|requests\|approve\|deny` | Manage invites and pending access requests (admin only, T6) — §3.1's invite route table | direct write | routed to daemon, admin only |
 
 Output: human-readable by default (citations as `uri:heading_path` + snippet), `--json` emits the
 canonical structures for scripting. The CLI is **command-oriented**; interactive browse is a
@@ -53,8 +53,12 @@ lost. It warns (non-JSON mode) that a daemon is running rather than refusing: SQ
 write-ahead log plus busy-timeout already make concurrent access with a live daemon safe (the
 same `runtime_state_locked`/exit 4 outcome as any other contended direct-DB write in the worst
 case), so refusing outright would only get in the way of the one scenario this flag exists for.
-`invite` (T6) is the remaining fully-`planned` row above; it will follow the same pattern once
-implemented.
+`invite` (T6) follows the same daemon-routed-first, direct-DB-fallback pattern as `user`/`key`
+(no `--direct-db` escape hatch, though — invites aren't a lockout-recovery primitive, so there is
+no reason to force past a running daemon). `invite create` prints the show-once plaintext token
+plus a ready-made consent URL (`{base}/authorize?invite=<token>`, built from the request's own
+`Host` header in the daemon-routed case, or a placeholder pointing at "start a daemon" in the
+direct-DB case, since there is no base URL to build one from without a running daemon).
 
 ## 3. HTTP API
 
@@ -100,7 +104,9 @@ T2–T4 wired bearer-token enforcement, the `require_auth` middleware, and the O
 authorization-code + PKCE flow. **T5 lifts the interim "every member gets 403 everywhere" gate**
 (a fail-safe staging measure T3 shipped before store grants existed) and activates the target
 shape described below: per-resource D7 scoping instead of a wholesale role gate, plus the
-user/key/grant management routes themselves. Invite management (the last row below) remains T6.
+user/key/grant management routes themselves. **T6 lands invite management**: the
+create/list/revoke/redeem/approve/deny/poll state machine (`core::auth::AuthService`) and its
+HTTP routes (last two rows below).
 
 **Decision:** bearer tokens (`Authorization: Bearer ldb_...`) on every route under `/v1/*` and
 `/mcp`, once auth is enforced for the daemon (§3). A request with a missing or invalid token gets
@@ -116,7 +122,7 @@ non-admin route) gets `403`. See §5 for the `unauthorized` (401) / `forbidden` 
 | `GET /v1/stores`, `GET /v1/stores/{name}`, `GET /v1/stores/{name}/sources`, `POST /v1/search`, `GET /v1/documents/{id}`, `GET /v1/auth/me`, `/mcp` | Bearer token required once auth is enforced (§3). Results/visibility are scoped by the principal's store access (D7, [02-domain-model.md](02-domain-model.md) §2): admins see every store; members see only `shared` stores they hold a grant for. A named-but-unreadable store (a direct `GET`, or an explicit `store_filter`/MCP `stores` entry naming one) is **403, not 404** — consistent with the filtered list views, and chosen over 404 so a caller can't use the distinction to fish for private store names; see `handlers::stores::get_store`'s doc comment. |
 | `POST/PATCH/DELETE /v1/stores`, `POST /v1/stores/{name}/sources`, `DELETE /v1/sources/{id}`, `POST/GET /v1/jobs`, `GET /v1/jobs/{id}`, `GET /v1/config` | Bearer token **and** `role = admin`. Members are readers only in this phase — every mutation, plus `GET /v1/config` (server configuration, not store-scoped content), is admin-only regardless of any store grant. |
 | `GET/POST /v1/users`, `PATCH/DELETE /v1/users/{id}`, `GET /v1/users/{id}/keys`, `DELETE /v1/keys/{id}`, `GET/POST /v1/stores/{name}/grants`, `DELETE /v1/stores/{name}/grants/{user}` | Bearer token **and** `role = admin` (`Principal::require_admin`), with one carve-out: `POST /v1/users/{id}/keys` also allows a non-admin principal to mint a key **for themselves** (`id` equal to the caller's own `user_id`) — every other combination (another user's keys, any user/grant list or mutation) is admin-only. |
-| Invite management (once it exists as routes, T6) | Bearer token **and** `role = admin`. |
+| `GET/POST /v1/invites`, `DELETE /v1/invites/{id}`, `GET /v1/invites/requests`, `POST /v1/invites/requests/{id}/approve`, `POST /v1/invites/requests/{id}/deny` (T6) | Bearer token **and** `role = admin`. |
 
 **Guard rails (D7 lockout prevention):** deleting or demoting (`role = admin` → `member`) the
 *last remaining admin* is rejected — `AuthService::delete_user`/`set_user_role` check this
@@ -137,6 +143,85 @@ short-lived (1h); refresh tokens (30d) rotate on every use with reuse detection 
 already-rotated refresh token revokes its entire token family. API keys share the same
 `auth_tokens` table (`kind = 'api_key'`), have no default expiry, and track `last_used_at`. OAuth2
 authorization-code + PKCE (S256) is the flow behind `/authorize` and `/token`, once implemented.
+
+### 3.1.1 Invites (T6, D9)
+
+An invite ([02-domain-model.md](02-domain-model.md) §2) carries a `mode` (`open` | `closed`),
+optional `store_grants` (rejected at CREATE time if any named store is `private`), `max_uses`
+(default 1), and an optional absolute-RFC-3339 `expires_at`. The state machine lives entirely in
+`core::auth::AuthService` (no domain logic in `server`/`cli`, per
+[01-architecture.md](01-architecture.md) §1):
+`create_invite`/`redeem_invite`/`approve_request`/`deny_request`/`poll_request`.
+
+**`POST /v1/invites`** (admin) — body `{"mode": "open"|"closed", "stores": ["name", ...],
+"max_uses": 1, "expires_at": "<RFC3339>"|null}` → `201`:
+
+```json
+{
+  "id": "...", "mode": "open", "store_grants": ["docs"], "max_uses": 1,
+  "expires_at": null, "created_at": "...",
+  "token": "ldb_...", "consent_url": "http://<host>/authorize?invite=ldb_..."
+}
+```
+
+`token` is the show-once plaintext invite secret (blake3-hashed at rest, D1); `consent_url` is
+built from the request's own `Host` header (correct for any bind address/port with no extra
+`AppState` plumbing) and is a ready-made link to the T4 consent page's invite-redemption variant
+(§below). `GET /v1/invites` (admin) lists every invite with no secrets; `DELETE /v1/invites/{id}`
+(admin) revokes one.
+
+**`POST /v1/invites/redeem`** (public — no bearer, D9 device-authorization-grant pattern): body
+`{"token": "<invite secret>", "name": "<requested user name>"}`.
+
+- `open` mode → `201`: `{"user": {"id","name","role","created_at"}, "granted_stores": [...],
+  "api_key": "ldb_..."}` — the user, its grants, and a show-once API key, all created immediately.
+- `closed` mode → `202`: `{"request_id": "...", "request_secret": "ldb_...", "poll":
+  "/v1/invites/requests/{id}?secret=..."}` — a pending `AccessRequest` is filed; `request_secret`
+  is shown once here and doubles as the poll credential below.
+- Unknown/revoked/expired/exhausted invite → `401 unauthorized` (mirrors `redeem_auth_code`'s
+  "don't leak which check failed" convention for this public route); a requested name colliding
+  with an existing user → the existing `400 invalid_request` duplicate-name shape.
+
+**`GET /v1/invites/requests/{id}?secret=<request_secret>`** (public, query-param secret — chosen
+over a header for `curl`-ability and to match the `poll` hint above): `200` with
+`{"state": "pending"}` / `{"state": "denied"}` / `{"state": "approved", "api_key": "ldb_..."}` /
+`{"state": "collected"}`. An unknown `id` and a wrong `secret` against a real one are
+**deliberately indistinguishable** (`401 unauthorized`, identical body) — no existence oracle.
+A **freshly minted** API key is handed back **exactly once**, on the poll that first observes the
+`approved` transition (`AccessRequest.collected_at`, an atomic single-use guard mirroring
+`consume_auth_code`) — every later poll answers `collected` instead of re-issuing a credential.
+`request_secret` itself never becomes a credential: it is poll-only, scoped to proving knowledge
+of this one request, and is deliberately never accepted by `AuthService::authenticate` — minting a
+fresh key at collection time (rather than promoting the request secret, which travels as a URL
+query parameter on every poll and would otherwise become a long-lived credential live from
+approval time even if never collected) is what closes that hole. See
+`AuthService::poll_request`'s doc comment for the full reasoning.
+
+**Admin decision routes:** `GET /v1/invites/requests` (admin) lists every access request across
+every invite (pending, approved, and denied alike; no pagination — this is a small admin-facing
+surface). `POST /v1/invites/requests/{id}/approve` (admin) creates the user + grants (no
+credential is minted here — that happens at the requester's next poll) and returns the new user.
+`POST /v1/invites/requests/{id}/deny` (admin) marks it
+denied; the requester's next poll observes `denied`.
+
+**Concurrency (documented choice):** `redeem_invite` increments `uses` *before* creating the user
+/ filing the access request. A burst of concurrent redemptions against a `max_uses = 1` invite can
+therefore over-count `uses` (cosmetic, self-limiting — the invite reads as exhausted for everyone
+right after) but can never double-mint a user under the same name: the `users.name` UNIQUE
+constraint at the store level is the independent backstop (a losing racer gets an ordinary
+"already exists" `400`, never a second user). See `AuthService::redeem_invite`'s doc comment for
+the full reasoning.
+
+**Consent page (T4 seam):** `GET /authorize?invite=<token>` renders an invite-redemption variant
+of the consent form (a "your name" field instead of the setup-code/API-key credential field).
+Submitting it (`server::auth::oauth::handle_invite_authorize`) redeems the invite: `open` mode
+continues the OAuth2 flow as the newly created user (issuing an authorization code exactly like
+the credential-based path), so `localdb login --invite <token>`'s browser fallback, if used, still
+ends in ordinary browser-session tokens; `closed` mode renders a static "request submitted, ask
+your admin" page and issues no code (no admin has approved yet, so there is no user to issue one
+for). The CLI's own `login --invite` (§2) does **not** go through this page — it redeems and, for
+`closed` mode, polls directly against the JSON routes above, since only that path can drive a
+poll loop; the consent-page branch exists for the pure-browser case.
 
 ## 4. MCP
 

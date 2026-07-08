@@ -18,7 +18,9 @@ mod token;
 
 pub use client::{is_known_client, validate_redirect_uri, LOCALDB_CLI_CLIENT_ID, OOB_REDIRECT_URI};
 pub use principal::{Principal, Role, StoreAccess};
-pub use service::{AuthService, IssuedAuthCode, IssuedInvite, IssuedToken};
+pub use service::{
+    AuthService, IssuedAuthCode, IssuedInvite, IssuedToken, PollOutcome, RedeemOutcome,
+};
 #[cfg(any(test, feature = "test-support"))]
 pub use store::FakeAuthStore;
 pub use store::{

@@ -621,6 +621,7 @@ async fn create_and_find_access_request_round_trips() {
         resulting_user_id: None,
         created_at: "2026-06-10T12:00:00Z".to_string(),
         decided_at: None,
+        collected_at: None,
     };
     store.create_access_request(&req).await.unwrap();
 
@@ -652,6 +653,7 @@ async fn update_access_request_state_approves_with_resulting_user() {
             resulting_user_id: None,
             created_at: "2026-06-10T12:00:00Z".to_string(),
             decided_at: None,
+            collected_at: None,
         })
         .await
         .unwrap();
@@ -692,6 +694,7 @@ async fn access_requests_cascade_on_invite_delete() {
             resulting_user_id: None,
             created_at: "2026-06-10T12:00:00Z".to_string(),
             decided_at: None,
+            collected_at: None,
         })
         .await
         .unwrap();
@@ -707,5 +710,164 @@ async fn access_requests_cascade_on_invite_delete() {
     assert!(
         store.find_access_request("ar1").await.unwrap().is_none(),
         "access requests must cascade-delete when their invite is removed"
+    );
+}
+
+#[tokio::test]
+async fn list_access_requests_returns_every_request_across_invites() {
+    let (_dir, _backend, store) = make_store().await;
+    store
+        .create_invite(&make_invite("i1", "h1", InviteMode::Closed))
+        .await
+        .unwrap();
+    store
+        .create_invite(&make_invite("i2", "h2", InviteMode::Closed))
+        .await
+        .unwrap();
+    store
+        .create_access_request(&AccessRequestRow {
+            id: "ar1".to_string(),
+            invite_id: "i1".to_string(),
+            requested_name: "carol".to_string(),
+            secret_hash: "req-hash-1".to_string(),
+            state: AccessRequestState::Pending,
+            resulting_user_id: None,
+            created_at: "2026-06-10T12:00:00Z".to_string(),
+            decided_at: None,
+            collected_at: None,
+        })
+        .await
+        .unwrap();
+    store
+        .create_access_request(&AccessRequestRow {
+            id: "ar2".to_string(),
+            invite_id: "i2".to_string(),
+            requested_name: "dave".to_string(),
+            secret_hash: "req-hash-2".to_string(),
+            state: AccessRequestState::Pending,
+            resulting_user_id: None,
+            created_at: "2026-06-10T12:00:01Z".to_string(),
+            decided_at: None,
+            collected_at: None,
+        })
+        .await
+        .unwrap();
+
+    let all = store.list_access_requests().await.unwrap();
+    assert_eq!(all.len(), 2);
+    let ids: Vec<&str> = all.iter().map(|r| r.id.as_str()).collect();
+    assert!(ids.contains(&"ar1"));
+    assert!(ids.contains(&"ar2"));
+}
+
+#[tokio::test]
+async fn mark_access_request_collected_succeeds_once_then_fails() {
+    let (_dir, _backend, store) = make_store().await;
+    store
+        .create_invite(&make_invite("i1", "h1", InviteMode::Closed))
+        .await
+        .unwrap();
+    store
+        .create_user(&make_user("u1", "carol", Role::Member))
+        .await
+        .unwrap();
+    store
+        .create_access_request(&AccessRequestRow {
+            id: "ar1".to_string(),
+            invite_id: "i1".to_string(),
+            requested_name: "carol".to_string(),
+            secret_hash: "req-hash".to_string(),
+            state: AccessRequestState::Pending,
+            resulting_user_id: None,
+            created_at: "2026-06-10T12:00:00Z".to_string(),
+            decided_at: None,
+            collected_at: None,
+        })
+        .await
+        .unwrap();
+
+    // Not yet approved: collecting must fail.
+    assert!(
+        !store
+            .mark_access_request_collected("ar1", "2026-06-11T00:00:00Z")
+            .await
+            .unwrap(),
+        "a pending request's credential cannot be collected"
+    );
+
+    store
+        .update_access_request_state(
+            "ar1",
+            AccessRequestState::Approved,
+            Some("u1"),
+            "2026-06-11T00:00:00Z",
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        store
+            .mark_access_request_collected("ar1", "2026-06-11T00:00:01Z")
+            .await
+            .unwrap(),
+        "the first collection attempt after approval must succeed"
+    );
+    let found = store.find_access_request("ar1").await.unwrap().unwrap();
+    assert_eq!(found.collected_at.as_deref(), Some("2026-06-11T00:00:01Z"));
+
+    assert!(
+        !store
+            .mark_access_request_collected("ar1", "2026-06-11T00:00:02Z")
+            .await
+            .unwrap(),
+        "a second collection attempt must fail (single-use guard)"
+    );
+    // The timestamp from the first, successful collection is untouched.
+    let found_again = store.find_access_request("ar1").await.unwrap().unwrap();
+    assert_eq!(
+        found_again.collected_at.as_deref(),
+        Some("2026-06-11T00:00:01Z")
+    );
+}
+
+#[tokio::test]
+async fn mark_access_request_collected_unknown_id_returns_false() {
+    let (_dir, _backend, store) = make_store().await;
+    assert!(!store
+        .mark_access_request_collected("nonexistent", "2026-06-11T00:00:00Z")
+        .await
+        .unwrap());
+}
+
+/// T6's documented concurrency choice (`AuthService::redeem_invite`'s doc
+/// comment): a double-redemption race can over-count an invite's `uses`,
+/// but it must never double-mint a user under the same requested name — the
+/// `users.name` UNIQUE constraint is the backstop that makes that safe, at
+/// the store level, independent of whatever ordering the service layer
+/// uses. This simulates two racing redeemers who both decided to use the
+/// same requested name.
+#[tokio::test]
+async fn double_redeem_same_requested_name_collides_on_unique_constraint() {
+    let (_dir, _backend, store) = make_store().await;
+    let first = make_user("u1", "same-name", Role::Member);
+    let second = make_user("u2", "same-name", Role::Member);
+
+    store.create_user(&first).await.unwrap();
+    let err = store.create_user(&second).await.unwrap_err();
+    assert!(
+        matches!(err, Error::InvalidRequest { .. }),
+        "the second racer must get a well-formed InvalidRequest, not a double-mint: {err:?}"
+    );
+
+    // Exactly one user exists under that name.
+    assert_eq!(
+        store
+            .list_users()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|u| u.name == "same-name")
+            .count(),
+        1
     );
 }

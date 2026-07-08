@@ -12,10 +12,11 @@ use crate::Error;
 
 use super::principal::{Principal, Role, StoreAccess};
 use super::store::{
-    AuthCodeRow, AuthStore, AuthTokenRow, InviteMode, InviteRow, StoreGrantRow, TokenKind, UserRow,
+    AccessRequestRow, AccessRequestState, AuthCodeRow, AuthStore, AuthTokenRow, InviteMode,
+    InviteRow, StoreGrantRow, TokenKind, UserRow,
 };
 use super::token::{
-    hash_secret, is_expired, mint_secret, rfc3339_from_now, verify_pkce_s256,
+    hash_secret, is_expired, mint_secret, rfc3339_from_now, verify_pkce_s256, verify_secret,
     ACCESS_TOKEN_TTL_SECS, AUTH_CODE_TTL_SECS, REFRESH_TOKEN_TTL_SECS,
 };
 
@@ -469,22 +470,45 @@ impl<S: AuthStore> AuthService<S> {
         principal.can_read_store(store_name, visibility)
     }
 
-    /// Create an invite. T1 ships the table plus minting; the redeem/approve
-    /// state machine is T6.
+    /// Create an invite (T6): `mode` (open/closed), `store_grants` (name +
+    /// visibility pairs — the caller resolves visibility via `StoreBackend`,
+    /// the same seam `grant_store` uses), `max_uses` (>= 1), and an optional
+    /// absolute RFC 3339 `expires_at`.
+    ///
+    /// Grants against a `private` store are rejected here at CREATE time
+    /// (`Forbidden`, reusing D7's "private stores are admin-only and
+    /// ungrantable" rule from `grant_store`) rather than deferred to
+    /// redemption — a bad invite should fail loudly for the admin who typo'd
+    /// a store name, not silently for whoever redeems it later.
     pub async fn create_invite(
         &self,
         mode: InviteMode,
-        store_grants: Vec<String>,
+        store_grants: &[(String, StoreVisibility)],
         max_uses: u32,
         expires_at: Option<String>,
         created_by: &str,
     ) -> Result<IssuedInvite, Error> {
+        if max_uses == 0 {
+            return Err(Error::InvalidRequest {
+                message: "max_uses must be at least 1".to_string(),
+            });
+        }
+        for (store_name, visibility) in store_grants {
+            if *visibility == StoreVisibility::Private {
+                return Err(Error::Forbidden {
+                    message: format!(
+                        "store '{store_name}' is private; only shared stores can be granted \
+                         via invite"
+                    ),
+                });
+            }
+        }
         let minted = mint_secret();
         let row = InviteRow {
             id: new_ulid(),
             token_hash: minted.hash,
             mode,
-            store_grants,
+            store_grants: store_grants.iter().map(|(name, _)| name.clone()).collect(),
             max_uses,
             uses: 0,
             expires_at,
@@ -498,6 +522,316 @@ impl<S: AuthStore> AuthService<S> {
             secret: minted.secret,
         })
     }
+
+    /// Apply an invite's `store_grants` to a freshly created user, on behalf
+    /// of the invite's own creator (`invite.created_by`) — shared by the
+    /// `open`-mode immediate path (`redeem_invite`) and the `closed`-mode
+    /// approval path (`approve_request`).
+    async fn apply_invite_grants(&self, invite: &InviteRow, user_id: &str) -> Result<(), Error> {
+        for store_name in &invite.store_grants {
+            self.store
+                .grant_store(&StoreGrantRow {
+                    store_name: store_name.clone(),
+                    user_id: user_id.to_string(),
+                    granted_by: invite.created_by.clone(),
+                    created_at: now_rfc3339(),
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Redeem an invite token (T6, D9): resolves the presented secret to an
+    /// `InviteRow`, validates it, and either creates a user immediately
+    /// (`open` mode) or files a pending `AccessRequestRow` (`closed` mode).
+    ///
+    /// Validation order — unknown/revoked/expired/exhausted all map to
+    /// `Unauthorized` (mirroring `redeem_auth_code`'s "don't leak which
+    /// check failed" convention; this is a public, unauthenticated route):
+    /// 1. token resolves to a known invite,
+    /// 2. not revoked,
+    /// 3. not expired,
+    /// 4. `uses < max_uses`.
+    ///
+    /// **Concurrency (documented choice):** `uses` is incremented *before*
+    /// the user is created/access-request is filed. A burst of concurrent
+    /// redemptions against a `max_uses = 1` invite can therefore over-count
+    /// `uses` past `max_uses` (each racer passes the uses check before any
+    /// of them increments) — a purely cosmetic overshoot visible to an admin
+    /// via `invite list`/`GET /v1/invites`, and self-limiting since the
+    /// invite is revoked/exhausted for everyone after. What must never
+    /// happen is two racers both minting a user under the same
+    /// `requested_name`: that hazard is independently closed by the
+    /// `users.name` UNIQUE constraint enforced at the store level (see
+    /// `store-libsql`'s `create_user`, which maps the UNIQUE violation to
+    /// `Error::InvalidRequest`) — at worst one racer wins the name and the
+    /// other gets an ordinary "already exists" error, never a double-mint.
+    /// Incrementing `uses` first (rather than "check then act" with the
+    /// increment last) is the fail-*safe* ordering here: the failure mode of
+    /// over-counting uses is harmless, while under-counting (incrementing
+    /// only after a successful mint) would let two racers both observe
+    /// `uses < max_uses` and both attempt a mint against a `max_uses = 1`
+    /// invite — same UNIQUE-constraint backstop either way, but
+    /// over-counting is the more honest audit trail of "how many attempts
+    /// actually raced here."
+    pub async fn redeem_invite(
+        &self,
+        token_secret: &str,
+        requested_name: &str,
+    ) -> Result<RedeemOutcome, Error> {
+        if requested_name.trim().is_empty() {
+            return Err(Error::InvalidRequest {
+                message: "requested name must not be empty".to_string(),
+            });
+        }
+        let hash = hash_secret(token_secret);
+        let invite = self
+            .store
+            .find_invite_by_hash(&hash)
+            .await?
+            .ok_or_else(|| Error::Unauthorized {
+                message: "invalid or unknown invite token".to_string(),
+            })?;
+
+        if invite.revoked_at.is_some() {
+            return Err(Error::Unauthorized {
+                message: "invite has been revoked".to_string(),
+            });
+        }
+        if let Some(expires_at) = &invite.expires_at {
+            if is_expired(expires_at) {
+                return Err(Error::Unauthorized {
+                    message: "invite has expired".to_string(),
+                });
+            }
+        }
+        if invite.uses >= invite.max_uses {
+            return Err(Error::Unauthorized {
+                message: "invite has no remaining uses".to_string(),
+            });
+        }
+
+        // See the doc comment above for why this happens before the mint.
+        self.store.increment_invite_uses(&invite.id).await?;
+
+        match invite.mode {
+            InviteMode::Open => {
+                let user = self.create_user(requested_name, Role::Member).await?;
+                self.apply_invite_grants(&invite, &user.id).await?;
+                let credential = self.issue_api_key(&user.id).await?;
+                Ok(RedeemOutcome::Open {
+                    user,
+                    grants: invite.store_grants.clone(),
+                    credential: Box::new(credential),
+                })
+            }
+            InviteMode::Closed => {
+                let minted = mint_secret();
+                let request = AccessRequestRow {
+                    id: new_ulid(),
+                    invite_id: invite.id.clone(),
+                    requested_name: requested_name.to_string(),
+                    secret_hash: minted.hash,
+                    state: AccessRequestState::Pending,
+                    resulting_user_id: None,
+                    created_at: now_rfc3339(),
+                    decided_at: None,
+                    collected_at: None,
+                };
+                self.store.create_access_request(&request).await?;
+                Ok(RedeemOutcome::Closed {
+                    request_id: request.id,
+                    request_secret: minted.secret,
+                })
+            }
+        }
+    }
+
+    /// Approve a pending closed-mode access request (T6): creates the user
+    /// and applies the invite's store grants. No API-key token row is
+    /// created here.
+    ///
+    /// The request secret (minted at `redeem_invite` time and known only to
+    /// the requester) never becomes a credential — it exists purely to let
+    /// the requester poll `poll_request` for their own request's status
+    /// (device-authorization-grant pattern, RFC 8628). A fresh API key is
+    /// minted in `poll_request`, at the moment the requester first collects
+    /// it, so the durable credential is born only once someone has actually
+    /// picked it up — never merely by an admin approving in the abstract.
+    pub async fn approve_request(&self, request_id: &str) -> Result<UserRow, Error> {
+        let request = self
+            .store
+            .find_access_request(request_id)
+            .await?
+            .ok_or_else(|| Error::InvalidRequest {
+                message: format!("access request '{request_id}' not found"),
+            })?;
+        if request.state != AccessRequestState::Pending {
+            return Err(Error::InvalidRequest {
+                message: format!("access request '{request_id}' is no longer pending"),
+            });
+        }
+        let invite = self
+            .store
+            .find_invite(&request.invite_id)
+            .await?
+            .ok_or(Error::Internal {
+                message: format!(
+                    "access request '{request_id}' references missing invite \
+                     '{}'",
+                    request.invite_id
+                ),
+                correlation_id: "approve_request_missing_invite".to_string(),
+            })?;
+
+        let user = self
+            .create_user(&request.requested_name, Role::Member)
+            .await?;
+        self.apply_invite_grants(&invite, &user.id).await?;
+
+        self.store
+            .update_access_request_state(
+                request_id,
+                AccessRequestState::Approved,
+                Some(&user.id),
+                &now_rfc3339(),
+            )
+            .await?;
+
+        Ok(user)
+    }
+
+    /// Deny a pending closed-mode access request (T6). No user is created;
+    /// the requester's next `poll_request` observes `PollOutcome::Denied`.
+    pub async fn deny_request(&self, request_id: &str) -> Result<(), Error> {
+        let request = self
+            .store
+            .find_access_request(request_id)
+            .await?
+            .ok_or_else(|| Error::InvalidRequest {
+                message: format!("access request '{request_id}' not found"),
+            })?;
+        if request.state != AccessRequestState::Pending {
+            return Err(Error::InvalidRequest {
+                message: format!("access request '{request_id}' is no longer pending"),
+            });
+        }
+        self.store
+            .update_access_request_state(
+                request_id,
+                AccessRequestState::Denied,
+                None,
+                &now_rfc3339(),
+            )
+            .await
+    }
+
+    /// Poll a closed-mode access request's status (T6, device-authorization
+    /// -grant pattern, RFC 8628). `presented_secret` must match the
+    /// request's own `secret_hash` — an unknown `request_id` and a wrong
+    /// secret are deliberately indistinguishable (`Unauthorized`, same
+    /// message), so a caller cannot use this endpoint to enumerate valid
+    /// request IDs (no existence oracle; specs/05-surfaces.md §3.1).
+    ///
+    /// The request secret is poll-only — it is never promoted to a
+    /// credential (it travels as a URL query parameter on every poll, which
+    /// would otherwise leak into access logs/proxies/shell history as a
+    /// long-lived, live-from-approval-time API key). Instead, on the
+    /// transition into `Approved`, a *fresh* API key is minted for the
+    /// request's resulting user and handed back exactly once:
+    /// `AuthStore::mark_access_request_collected` is an atomic consume-once
+    /// gate (mirroring `consume_auth_code`), so a second successful poll (or
+    /// two concurrent ones racing the first) observes
+    /// `PollOutcome::AlreadyCollected` instead of a credential — and no
+    /// token row exists at all until the winning poll mints one.
+    pub async fn poll_request(
+        &self,
+        request_id: &str,
+        presented_secret: &str,
+    ) -> Result<PollOutcome, Error> {
+        let request = self
+            .store
+            .find_access_request(request_id)
+            .await?
+            .ok_or_else(|| Error::Unauthorized {
+                message: "invalid access request id or secret".to_string(),
+            })?;
+        if !verify_secret(presented_secret, &request.secret_hash) {
+            return Err(Error::Unauthorized {
+                message: "invalid access request id or secret".to_string(),
+            });
+        }
+
+        match request.state {
+            AccessRequestState::Pending => Ok(PollOutcome::Pending),
+            AccessRequestState::Denied => Ok(PollOutcome::Denied),
+            AccessRequestState::Approved => {
+                if request.collected_at.is_some() {
+                    return Ok(PollOutcome::AlreadyCollected);
+                }
+                let collected = self
+                    .store
+                    .mark_access_request_collected(request_id, &now_rfc3339())
+                    .await?;
+                if collected {
+                    let user_id =
+                        request
+                            .resulting_user_id
+                            .as_deref()
+                            .ok_or_else(|| Error::Internal {
+                                message: format!(
+                                    "access request '{request_id}' is approved but has no \
+                                     resulting_user_id"
+                                ),
+                                correlation_id: "poll_request_missing_resulting_user".to_string(),
+                            })?;
+                    let issued = self.issue_api_key(user_id).await?;
+                    Ok(PollOutcome::Approved {
+                        credential: issued.secret,
+                    })
+                } else {
+                    // Lost the race to a concurrent poll.
+                    Ok(PollOutcome::AlreadyCollected)
+                }
+            }
+        }
+    }
+}
+
+/// Outcome of `AuthService::redeem_invite` (T6, D9).
+#[derive(Debug, Clone)]
+pub enum RedeemOutcome {
+    /// `open`-mode invite: the user, its store grants (echoed back for
+    /// display), and a show-once API-key credential, all created
+    /// immediately.
+    Open {
+        user: UserRow,
+        grants: Vec<String>,
+        credential: Box<IssuedToken>,
+    },
+    /// `closed`-mode invite: a pending access request was filed. The
+    /// requester polls `AuthService::poll_request` with `request_secret`
+    /// until an admin decides.
+    Closed {
+        request_id: String,
+        request_secret: String,
+    },
+}
+
+/// Outcome of `AuthService::poll_request` (T6, D9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PollOutcome {
+    Pending,
+    /// The credential is handed back exactly once, on the poll that
+    /// observes the `Approved` transition (see `poll_request`'s doc
+    /// comment).
+    Approved {
+        credential: String,
+    },
+    Denied,
+    /// The request was approved, but its credential was already collected
+    /// by an earlier successful poll — terminal state.
+    AlreadyCollected,
 }
 
 #[cfg(test)]
@@ -1046,7 +1380,7 @@ mod tests {
         let issued = svc
             .create_invite(
                 InviteMode::Open,
-                vec!["docs".to_string()],
+                &[("docs".to_string(), StoreVisibility::Shared)],
                 1,
                 None,
                 "admin-1",
@@ -1056,5 +1390,444 @@ mod tests {
         assert!(issued.secret.starts_with(TOKEN_PREFIX));
         assert_eq!(issued.row.uses, 0);
         assert_eq!(issued.row.max_uses, 1);
+        assert_eq!(issued.row.store_grants, vec!["docs".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn create_invite_rejects_private_store_grant() {
+        let svc = service();
+        let err = svc
+            .create_invite(
+                InviteMode::Open,
+                &[("secret-store".to_string(), StoreVisibility::Private)],
+                1,
+                None,
+                "admin-1",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Forbidden { .. }));
+    }
+
+    #[tokio::test]
+    async fn create_invite_rejects_zero_max_uses() {
+        let svc = service();
+        let err = svc
+            .create_invite(InviteMode::Open, &[], 0, None, "admin-1")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidRequest { .. }));
+    }
+
+    // -----------------------------------------------------------------
+    // T6: invite redeem / approve / deny / poll state machine
+    // -----------------------------------------------------------------
+
+    async fn make_open_invite(svc: &AuthService<FakeAuthStore>, max_uses: u32) -> IssuedInvite {
+        svc.create_invite(
+            InviteMode::Open,
+            &[("docs".to_string(), StoreVisibility::Shared)],
+            max_uses,
+            None,
+            "admin-1",
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn make_closed_invite(svc: &AuthService<FakeAuthStore>, max_uses: u32) -> IssuedInvite {
+        svc.create_invite(
+            InviteMode::Closed,
+            &[("docs".to_string(), StoreVisibility::Shared)],
+            max_uses,
+            None,
+            "admin-1",
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn redeem_open_invite_happy_path_creates_user_grants_and_credential() {
+        let svc = service();
+        let issued = make_open_invite(&svc, 1).await;
+
+        let outcome = svc.redeem_invite(&issued.secret, "newbie").await.unwrap();
+        let RedeemOutcome::Open {
+            user,
+            grants,
+            credential,
+        } = outcome
+        else {
+            panic!("expected Open outcome");
+        };
+        assert_eq!(user.name, "newbie");
+        assert_eq!(user.role, Role::Member);
+        assert_eq!(grants, vec!["docs".to_string()]);
+        assert!(credential.secret.starts_with(TOKEN_PREFIX));
+
+        // The credential actually authenticates as the new user with the grant.
+        let principal = svc.authenticate(&credential.secret).await.unwrap();
+        assert_eq!(principal.user_id, user.id);
+        assert!(principal.can_read_store("docs", StoreVisibility::Shared));
+
+        let invite = svc
+            .store
+            .find_invite(&issued.row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(invite.uses, 1);
+    }
+
+    #[tokio::test]
+    async fn redeem_open_invite_max_uses_one_double_redeem_fails() {
+        let svc = service();
+        let issued = make_open_invite(&svc, 1).await;
+
+        svc.redeem_invite(&issued.secret, "first").await.unwrap();
+        let err = svc
+            .redeem_invite(&issued.secret, "second")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Unauthorized { .. }));
+    }
+
+    #[tokio::test]
+    async fn redeem_open_invite_max_uses_two_allows_two_distinct_names() {
+        let svc = service();
+        let issued = make_open_invite(&svc, 2).await;
+
+        svc.redeem_invite(&issued.secret, "first").await.unwrap();
+        svc.redeem_invite(&issued.secret, "second").await.unwrap();
+        let invite = svc
+            .store
+            .find_invite(&issued.row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(invite.uses, 2);
+    }
+
+    #[tokio::test]
+    async fn redeem_invite_rejects_duplicate_requested_name() {
+        let svc = service();
+        svc.create_user("taken", Role::Member).await.unwrap();
+        let issued = make_open_invite(&svc, 5).await;
+
+        let err = svc
+            .redeem_invite(&issued.secret, "taken")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidRequest { .. }));
+    }
+
+    #[tokio::test]
+    async fn redeem_invite_unknown_token_fails() {
+        let svc = service();
+        let err = svc
+            .redeem_invite("ldb_not-a-real-invite", "someone")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Unauthorized { .. }));
+    }
+
+    #[tokio::test]
+    async fn redeem_invite_revoked_fails() {
+        let svc = service();
+        let issued = make_open_invite(&svc, 1).await;
+        svc.store.revoke_invite(&issued.row.id).await.unwrap();
+
+        let err = svc
+            .redeem_invite(&issued.secret, "someone")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Unauthorized { .. }));
+    }
+
+    #[tokio::test]
+    async fn redeem_invite_expired_fails() {
+        let svc = service();
+        let minted = mint_secret();
+        let invite = InviteRow {
+            id: new_ulid(),
+            token_hash: minted.hash,
+            mode: InviteMode::Open,
+            store_grants: vec![],
+            max_uses: 1,
+            uses: 0,
+            expires_at: Some(rfc3339_from_now(-10)),
+            revoked_at: None,
+            created_by: "admin-1".to_string(),
+            created_at: now_rfc3339(),
+        };
+        svc.store.create_invite(&invite).await.unwrap();
+
+        let err = svc
+            .redeem_invite(&minted.secret, "someone")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Unauthorized { .. }));
+    }
+
+    #[tokio::test]
+    async fn redeem_closed_invite_happy_path_files_pending_request() {
+        let svc = service();
+        let issued = make_closed_invite(&svc, 1).await;
+
+        let outcome = svc
+            .redeem_invite(&issued.secret, "requester")
+            .await
+            .unwrap();
+        let RedeemOutcome::Closed {
+            request_id,
+            request_secret,
+        } = outcome
+        else {
+            panic!("expected Closed outcome");
+        };
+        assert!(request_secret.starts_with(TOKEN_PREFIX));
+
+        let poll = svc
+            .poll_request(&request_id, &request_secret)
+            .await
+            .unwrap();
+        assert_eq!(poll, PollOutcome::Pending);
+    }
+
+    #[tokio::test]
+    async fn closed_invite_approve_then_poll_once_then_already_collected() {
+        let svc = service();
+        let issued = make_closed_invite(&svc, 1).await;
+        let RedeemOutcome::Closed {
+            request_id,
+            request_secret,
+        } = svc
+            .redeem_invite(&issued.secret, "requester")
+            .await
+            .unwrap()
+        else {
+            panic!("expected Closed outcome");
+        };
+
+        let user = svc.approve_request(&request_id).await.unwrap();
+        assert_eq!(user.name, "requester");
+        assert_eq!(user.role, Role::Member);
+        assert!(svc.store.get_user(&user.id).await.unwrap().is_some());
+
+        // First poll after approval: a freshly minted credential is handed back.
+        let first = svc
+            .poll_request(&request_id, &request_secret)
+            .await
+            .unwrap();
+        let PollOutcome::Approved { credential } = first else {
+            panic!("expected Approved on first post-approval poll, got {first:?}");
+        };
+        assert_ne!(
+            credential, request_secret,
+            "the poll-only request secret must never become the live credential"
+        );
+
+        // The freshly minted credential actually authenticates as the newly
+        // created user, with the invite's store grants applied.
+        let principal = svc.authenticate(&credential).await.unwrap();
+        assert_eq!(principal.user_id, user.id);
+        assert!(principal.can_read_store("docs", StoreVisibility::Shared));
+
+        // Second poll: terminal "already collected" state, not a credential again.
+        let second = svc
+            .poll_request(&request_id, &request_secret)
+            .await
+            .unwrap();
+        assert_eq!(second, PollOutcome::AlreadyCollected);
+    }
+
+    #[tokio::test]
+    async fn closed_invite_request_secret_never_authenticates() {
+        // Pin: the request secret is poll-only, both before and after
+        // collection — it must never itself work as a bearer credential,
+        // since it travels as a URL query parameter on every poll (access
+        // logs, proxies, shell history).
+        let svc = service();
+        let issued = make_closed_invite(&svc, 1).await;
+        let RedeemOutcome::Closed {
+            request_id,
+            request_secret,
+        } = svc
+            .redeem_invite(&issued.secret, "requester")
+            .await
+            .unwrap()
+        else {
+            panic!("expected Closed outcome");
+        };
+
+        // Not a credential while pending.
+        let err = svc.authenticate(&request_secret).await.unwrap_err();
+        assert!(matches!(err, Error::Unauthorized { .. }));
+
+        svc.approve_request(&request_id).await.unwrap();
+
+        // Not a credential immediately after approval either (live from
+        // approval time was exactly the defect being fixed).
+        let err = svc.authenticate(&request_secret).await.unwrap_err();
+        assert!(matches!(err, Error::Unauthorized { .. }));
+
+        svc.poll_request(&request_id, &request_secret)
+            .await
+            .unwrap();
+
+        // Still not a credential after the collecting poll.
+        let err = svc.authenticate(&request_secret).await.unwrap_err();
+        assert!(matches!(err, Error::Unauthorized { .. }));
+    }
+
+    #[tokio::test]
+    async fn closed_invite_approve_without_poll_mints_no_api_key_token() {
+        // Pin: the durable credential is born only at first successful
+        // collection, never merely by approval — an approved-but-never
+        // -polled request must leave no API-key token row for its user.
+        let svc = service();
+        let issued = make_closed_invite(&svc, 1).await;
+        let RedeemOutcome::Closed { request_id, .. } = svc
+            .redeem_invite(&issued.secret, "requester")
+            .await
+            .unwrap()
+        else {
+            panic!("expected Closed outcome");
+        };
+
+        let user = svc.approve_request(&request_id).await.unwrap();
+
+        let tokens = svc.store.list_tokens_for_user(&user.id).await.unwrap();
+        assert!(
+            tokens.is_empty(),
+            "approval alone must not mint any credential for the new user"
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_invite_deny_then_poll_denied() {
+        let svc = service();
+        let issued = make_closed_invite(&svc, 1).await;
+        let RedeemOutcome::Closed {
+            request_id,
+            request_secret,
+        } = svc
+            .redeem_invite(&issued.secret, "requester")
+            .await
+            .unwrap()
+        else {
+            panic!("expected Closed outcome");
+        };
+
+        svc.deny_request(&request_id).await.unwrap();
+        let poll = svc
+            .poll_request(&request_id, &request_secret)
+            .await
+            .unwrap();
+        assert_eq!(poll, PollOutcome::Denied);
+
+        // No user was created.
+        assert!(svc
+            .store
+            .get_user_by_name("requester")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn approve_request_twice_fails() {
+        let svc = service();
+        let issued = make_closed_invite(&svc, 1).await;
+        let RedeemOutcome::Closed { request_id, .. } = svc
+            .redeem_invite(&issued.secret, "requester")
+            .await
+            .unwrap()
+        else {
+            panic!("expected Closed outcome");
+        };
+
+        svc.approve_request(&request_id).await.unwrap();
+        let err = svc.approve_request(&request_id).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidRequest { .. }));
+    }
+
+    #[tokio::test]
+    async fn deny_request_unknown_id_fails() {
+        let svc = service();
+        let err = svc.deny_request("nonexistent").await.unwrap_err();
+        assert!(matches!(err, Error::InvalidRequest { .. }));
+    }
+
+    #[tokio::test]
+    async fn poll_request_wrong_secret_fails() {
+        let svc = service();
+        let issued = make_closed_invite(&svc, 1).await;
+        let RedeemOutcome::Closed { request_id, .. } = svc
+            .redeem_invite(&issued.secret, "requester")
+            .await
+            .unwrap()
+        else {
+            panic!("expected Closed outcome");
+        };
+
+        let err = svc
+            .poll_request(&request_id, "ldb_wrong-secret")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Unauthorized { .. }));
+    }
+
+    #[tokio::test]
+    async fn poll_request_unknown_id_and_wrong_secret_are_indistinguishable() {
+        // No existence oracle (specs/05-surfaces.md §3.1): both an unknown
+        // request id and a wrong secret against a real one must produce the
+        // exact same error shape.
+        let svc = service();
+        let issued = make_closed_invite(&svc, 1).await;
+        let RedeemOutcome::Closed { request_id, .. } = svc
+            .redeem_invite(&issued.secret, "requester")
+            .await
+            .unwrap()
+        else {
+            panic!("expected Closed outcome");
+        };
+
+        let unknown_id_err = svc
+            .poll_request("totally-unknown-id", "ldb_whatever")
+            .await
+            .unwrap_err();
+        let wrong_secret_err = svc
+            .poll_request(&request_id, "ldb_wrong-secret")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(unknown_id_err, Error::Unauthorized { .. }));
+        assert!(matches!(wrong_secret_err, Error::Unauthorized { .. }));
+        assert_eq!(unknown_id_err.to_string(), wrong_secret_err.to_string());
+    }
+
+    #[tokio::test]
+    async fn create_invite_with_grants_on_shared_store_then_redeem_grants_access() {
+        let svc = service();
+        let issued = svc
+            .create_invite(
+                InviteMode::Open,
+                &[("docs".to_string(), StoreVisibility::Shared)],
+                1,
+                None,
+                "admin-1",
+            )
+            .await
+            .unwrap();
+        let RedeemOutcome::Open { user, .. } =
+            svc.redeem_invite(&issued.secret, "grantee").await.unwrap()
+        else {
+            panic!("expected Open outcome");
+        };
+        let grants = svc.store.list_grants_for_user(&user.id).await.unwrap();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].store_name, "docs");
     }
 }

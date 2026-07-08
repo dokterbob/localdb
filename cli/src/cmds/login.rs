@@ -27,19 +27,62 @@ use crate::{
 
 const CLIENT_ID: &str = "localdb-cli";
 
-/// `localdb login [--url <base>] [--setup-code <code>] [--no-browser]`
-pub fn run_login(ctx: &CliContext, url: Option<&str>, setup_code: Option<&str>, no_browser: bool) {
+/// `localdb login [--url <base>] [--setup-code <code>] [--no-browser]
+/// [--invite <token>] [--name <name>]`
+///
+/// T6: `--invite` takes an entirely different, browser-free path
+/// (`perform_invite_login`) — see its doc comment for why direct redemption
+/// is primary over forwarding to the `/authorize?invite=` consent page.
+#[allow(clippy::too_many_arguments)]
+pub fn run_login(
+    ctx: &CliContext,
+    url: Option<&str>,
+    setup_code: Option<&str>,
+    no_browser: bool,
+    invite: Option<&str>,
+    name: Option<&str>,
+) {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    rt.block_on(run_login_async(ctx, url, setup_code, no_browser));
+    rt.block_on(run_login_async(
+        ctx, url, setup_code, no_browser, invite, name,
+    ));
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_login_async(
     ctx: &CliContext,
     url: Option<&str>,
     setup_code: Option<&str>,
     no_browser: bool,
+    invite: Option<&str>,
+    name: Option<&str>,
 ) {
     let base_url = resolve_login_base_url(ctx, url).await;
+
+    if let Some(token) = invite {
+        match perform_invite_login(
+            ctx,
+            &base_url,
+            token,
+            name,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        {
+            Ok(joined_name) => {
+                if ctx.json {
+                    print_json(
+                        &json!({ "status": "ok", "base_url": base_url, "name": joined_name }),
+                    );
+                } else {
+                    println!("Logged in to {base_url} as '{joined_name}'.");
+                }
+            }
+            Err(e) => exit_err(&e, ctx.json),
+        }
+        return;
+    }
+
     let opener = |u: &str| webbrowser::open(u).is_ok();
 
     match perform_login(
@@ -61,6 +104,199 @@ pub(crate) async fn run_login_async(
         }
         Err(e) => exit_err(&e, ctx.json),
     }
+}
+
+/// The requested user name for an invite redemption: `--name` if given,
+/// else the OS login name (`$USER`/`%USERNAME%`) as a friendly default so
+/// the common case doesn't require typing a name twice (once to log into
+/// the OS, once to join localdb). Empty/missing either way is a usage
+/// error (exit 2) — there is no further fallback that wouldn't be
+/// surprising.
+fn resolve_requested_name(name: Option<&str>) -> Result<String, Error> {
+    if let Some(n) = name {
+        let trimmed = n.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    if let Some(n) = std::env::var("USER")
+        .ok()
+        .or_else(|| std::env::var("USERNAME").ok())
+        .filter(|s| !s.trim().is_empty())
+    {
+        return Ok(n.trim().to_string());
+    }
+    Err(Error::InvalidRequest {
+        message: "no name given and none could be inferred from the environment; pass --name"
+            .to_string(),
+    })
+}
+
+/// `localdb login --invite <token>` (T6): redeems the invite directly
+/// against `POST /v1/invites/redeem` — no browser round trip needed. This
+/// is the *primary* closed-mode path (the consent page's invite branch,
+/// `server::auth::oauth::handle_invite_authorize`, exists too, but only for
+/// the browser flow; it can't drive a poll loop the way this can). `open`
+/// mode: one request, done. `closed` mode: polls
+/// `GET /v1/invites/requests/{id}` every `poll_interval` until an admin
+/// decides. `poll_interval` is injected (production: 1s) so tests can drive
+/// the loop with a much shorter interval instead of a multi-second sleep.
+async fn perform_invite_login(
+    ctx: &CliContext,
+    base_url: &str,
+    invite_token: &str,
+    name: Option<&str>,
+    poll_interval: std::time::Duration,
+) -> Result<String, Error> {
+    let requested_name = resolve_requested_name(name)?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| Error::Internal {
+            message: format!("cannot build HTTP client: {e}"),
+            correlation_id: "login_invite_client".to_string(),
+        })?;
+
+    let resp = client
+        .post(format!("{base_url}/v1/invites/redeem"))
+        .json(&json!({ "token": invite_token, "name": requested_name }))
+        .send()
+        .await
+        .map_err(|_| Error::DaemonUnreachable)?;
+
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+
+    if status == reqwest::StatusCode::CREATED {
+        // Open mode: the credential is ready immediately.
+        let api_key = body
+            .get("api_key")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::Internal {
+                message: "redeem response is missing api_key".to_string(),
+                correlation_id: "login_invite_open_response".to_string(),
+            })?;
+        persist_api_key(ctx, base_url, api_key)?;
+        return Ok(requested_name);
+    }
+
+    if status == reqwest::StatusCode::ACCEPTED {
+        let request_id = body
+            .get("request_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::Internal {
+                message: "redeem response is missing request_id".to_string(),
+                correlation_id: "login_invite_closed_response".to_string(),
+            })?
+            .to_string();
+        let request_secret = body
+            .get("request_secret")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::Internal {
+                message: "redeem response is missing request_secret".to_string(),
+                correlation_id: "login_invite_closed_response".to_string(),
+            })?
+            .to_string();
+
+        if !ctx.json {
+            println!(
+                "Waiting for admin approval (request id: {request_id})... \
+                 ask an admin to run `localdb invite approve {request_id}`."
+            );
+        }
+
+        let api_key = poll_until_decided(
+            &client,
+            base_url,
+            &request_id,
+            &request_secret,
+            poll_interval,
+        )
+        .await?;
+        persist_api_key(ctx, base_url, &api_key)?;
+        return Ok(requested_name);
+    }
+
+    let message = body
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("invite redemption failed")
+        .to_string();
+    Err(Error::Unauthorized { message })
+}
+
+/// Poll `GET /v1/invites/requests/{id}?secret=...` every `poll_interval`
+/// until the request is decided. Returns the credential on approval;
+/// `denied` is a terminal `Unauthorized` with a clear message, per
+/// specs/05-surfaces.md §2.
+async fn poll_until_decided(
+    client: &reqwest::Client,
+    base_url: &str,
+    request_id: &str,
+    request_secret: &str,
+    poll_interval: std::time::Duration,
+) -> Result<String, Error> {
+    loop {
+        let resp = client
+            .get(format!(
+                "{base_url}/v1/invites/requests/{request_id}?secret={request_secret}"
+            ))
+            .send()
+            .await
+            .map_err(|_| Error::DaemonUnreachable)?;
+        let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+        match body.get("state").and_then(|v| v.as_str()) {
+            Some("approved") => {
+                return body
+                    .get("api_key")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| Error::Internal {
+                        message: "poll response is missing api_key on approval".to_string(),
+                        correlation_id: "login_invite_poll_response".to_string(),
+                    });
+            }
+            Some("denied") => {
+                return Err(Error::Unauthorized {
+                    message: "the access request was denied by an admin".to_string(),
+                });
+            }
+            Some("collected") => {
+                // Should not normally happen (this loop is the one and only
+                // collector), but fail closed rather than loop forever.
+                return Err(Error::Internal {
+                    message: "the request's credential was already collected".to_string(),
+                    correlation_id: "login_invite_poll_already_collected".to_string(),
+                });
+            }
+            _ => {
+                tokio::time::sleep(poll_interval).await;
+            }
+        }
+    }
+}
+
+/// Persist a redeemed invite's API key into `credentials.json` under the
+/// legacy `secret` shape (D1: API keys have no default expiry, unlike the
+/// OAuth access/refresh pair `perform_login` writes).
+fn persist_api_key(ctx: &CliContext, base_url: &str, api_key: &str) -> Result<(), Error> {
+    let config_file = resolved_config_file(ctx).ok_or_else(|| Error::InvalidConfig {
+        message: "cannot resolve the config file path to write credentials.json".to_string(),
+    })?;
+    let credentials_file = crate::credentials::credentials_path(&config_file);
+    let entry = CredentialEntry {
+        secret: Some(api_key.to_string()),
+        access_token: None,
+        refresh_token: None,
+        access_expires_at: None,
+    };
+    crate::credentials::write_entry(&credentials_file, base_url, entry).map_err(|e| {
+        Error::Internal {
+            message: format!("failed to write credentials.json: {e}"),
+            correlation_id: "login_invite_persist_write".to_string(),
+        }
+    })
 }
 
 /// `localdb logout [--url <base>]`
@@ -400,7 +636,7 @@ async fn exchange_code_for_tokens(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use localdb_core::auth::Role;
+    use localdb_core::auth::{AuthStore as _, Role};
     use localdb_core::config::schema::{
         DefaultsConfig, EmbeddingPolicy, IndexingPolicyConfig, RawConfig,
     };
@@ -606,5 +842,194 @@ mod tests {
         assert!(url.contains("redirect_uri=urn%3Aietf%3Awg%3Aoauth%3A2.0%3Aoob"));
         assert!(url.contains("setup_code=ldb_setup"));
         assert!(url.contains("state=state1"));
+    }
+
+    // -----------------------------------------------------------------
+    // T6: `localdb login --invite <token>`
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn perform_invite_login_open_mode_persists_api_key_and_creates_user() {
+        let (dir, state, base_url) = spawn_test_daemon().await;
+        let admin = state
+            .auth()
+            .create_user("admin", Role::Admin)
+            .await
+            .unwrap();
+        let issued = state
+            .auth()
+            .create_invite(
+                localdb_core::auth::InviteMode::Open,
+                &[],
+                1,
+                None,
+                &admin.id,
+            )
+            .await
+            .unwrap();
+        let ctx = ctx_for(&dir);
+
+        let result = perform_invite_login(
+            &ctx,
+            &base_url,
+            &issued.secret,
+            Some("newbie"),
+            std::time::Duration::from_millis(10),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "open-mode invite login should succeed: {:?}",
+            result.err()
+        );
+        assert_eq!(result.unwrap(), "newbie");
+
+        let credentials_file =
+            crate::credentials::credentials_path(&dir.path().join("config.yaml"));
+        let entry = crate::credentials::lookup_entry(&credentials_file, &base_url)
+            .expect("credentials.json must have an entry after invite login");
+        assert!(entry.secret.unwrap().starts_with("ldb_"));
+        assert!(
+            entry.access_token.is_none(),
+            "an invite-redeemed API key has no expiry, unlike the OAuth access-token shape"
+        );
+
+        let user = state.auth_store().get_user_by_name("newbie").await.unwrap();
+        assert!(
+            user.is_some(),
+            "the invite redemption must have created the user"
+        );
+    }
+
+    #[tokio::test]
+    async fn perform_invite_login_open_mode_wrong_token_fails() {
+        let (dir, _state, base_url) = spawn_test_daemon().await;
+        let ctx = ctx_for(&dir);
+
+        let result = perform_invite_login(
+            &ctx,
+            &base_url,
+            "ldb_not-a-real-invite",
+            Some("someone"),
+            std::time::Duration::from_millis(10),
+        )
+        .await;
+        assert!(result.is_err(), "an unknown invite token must fail");
+    }
+
+    #[tokio::test]
+    async fn perform_invite_login_closed_mode_polls_until_admin_approves() {
+        let (dir, state, base_url) = spawn_test_daemon().await;
+        let admin = state
+            .auth()
+            .create_user("admin2", Role::Admin)
+            .await
+            .unwrap();
+        let issued = state
+            .auth()
+            .create_invite(
+                localdb_core::auth::InviteMode::Closed,
+                &[],
+                1,
+                None,
+                &admin.id,
+            )
+            .await
+            .unwrap();
+        let ctx = ctx_for(&dir);
+
+        // Drive the poll loop with a short interval so this test exercises
+        // several real iterations (not just one) before the approval lands.
+        let login_task = tokio::spawn({
+            let ctx = ctx.clone();
+            let base_url = base_url.clone();
+            let token = issued.secret.clone();
+            async move {
+                perform_invite_login(
+                    &ctx,
+                    &base_url,
+                    &token,
+                    Some("closed-newbie"),
+                    std::time::Duration::from_millis(20),
+                )
+                .await
+            }
+        });
+
+        // Wait for the access request to appear, then let the poll loop run
+        // a few iterations before approving.
+        let request_id = loop {
+            let reqs = state.auth_store().list_access_requests().await.unwrap();
+            if let Some(r) = reqs.iter().find(|r| r.requested_name == "closed-newbie") {
+                break r.id.clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(70)).await;
+        state.auth().approve_request(&request_id).await.unwrap();
+
+        let result = login_task.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "closed-mode invite login should eventually succeed once approved: {:?}",
+            result.err()
+        );
+
+        let credentials_file =
+            crate::credentials::credentials_path(&dir.path().join("config.yaml"));
+        let entry = crate::credentials::lookup_entry(&credentials_file, &base_url)
+            .expect("credentials.json must have an entry after approval");
+        assert!(entry.secret.unwrap().starts_with("ldb_"));
+    }
+
+    #[tokio::test]
+    async fn perform_invite_login_closed_mode_denied_fails_with_clear_error() {
+        let (dir, state, base_url) = spawn_test_daemon().await;
+        let admin = state
+            .auth()
+            .create_user("admin3", Role::Admin)
+            .await
+            .unwrap();
+        let issued = state
+            .auth()
+            .create_invite(
+                localdb_core::auth::InviteMode::Closed,
+                &[],
+                1,
+                None,
+                &admin.id,
+            )
+            .await
+            .unwrap();
+        let ctx = ctx_for(&dir);
+
+        let login_task = tokio::spawn({
+            let ctx = ctx.clone();
+            let base_url = base_url.clone();
+            let token = issued.secret.clone();
+            async move {
+                perform_invite_login(
+                    &ctx,
+                    &base_url,
+                    &token,
+                    Some("denied-newbie"),
+                    std::time::Duration::from_millis(10),
+                )
+                .await
+            }
+        });
+
+        let request_id = loop {
+            let reqs = state.auth_store().list_access_requests().await.unwrap();
+            if let Some(r) = reqs.iter().find(|r| r.requested_name == "denied-newbie") {
+                break r.id.clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        state.auth().deny_request(&request_id).await.unwrap();
+
+        let result = login_task.await.unwrap();
+        let err = result.expect_err("a denied request must surface as an error");
+        assert!(matches!(err, Error::Unauthorized { .. }));
     }
 }

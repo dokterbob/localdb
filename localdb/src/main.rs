@@ -142,6 +142,19 @@ pub enum Command {
         /// code from stdin instead.
         #[arg(long = "no-browser")]
         no_browser: bool,
+
+        /// Redeem an invite token instead of an interactive login
+        /// (specs/05-surfaces.md §2, T6): `open`-mode invites complete
+        /// immediately; `closed`-mode invites wait and poll until an admin
+        /// approves or denies. Mutually exclusive with `--setup-code` and
+        /// `--no-browser`'s browser flow — no browser is opened at all.
+        #[arg(long)]
+        invite: Option<String>,
+
+        /// The requested user name for `--invite` (default: the OS login
+        /// name).
+        #[arg(long)]
+        name: Option<String>,
     },
 
     /// Revoke the cached token for a daemon and clear it from
@@ -150,6 +163,53 @@ pub enum Command {
         /// Daemon base URL (default: auto-detected running daemon).
         #[arg(long)]
         url: Option<String>,
+    },
+
+    /// Manage invites and pending access requests (admin only, T6).
+    #[command(subcommand)]
+    Invite(InviteCommand),
+}
+
+/// Invite management subcommands (specs/05-surfaces.md §2, T6).
+#[derive(Debug, Subcommand)]
+pub enum InviteCommand {
+    /// Create an invite. Prints a show-once token and a ready-made consent
+    /// URL.
+    Create {
+        /// `open` (redeem creates the user immediately) or `closed` (redeem
+        /// files a pending access request for admin approval).
+        #[arg(long, default_value = "open")]
+        mode: String,
+        /// Store(s) to grant the resulting user read access to (repeatable;
+        /// must be `shared` stores — `private` stores are rejected).
+        #[arg(long = "store")]
+        stores: Vec<String>,
+        /// Expiry as a human-readable duration (e.g. "7d", "24h", "30m");
+        /// omit for no expiry.
+        #[arg(long)]
+        expires: Option<String>,
+        /// How many times this invite may be redeemed.
+        #[arg(long = "max-uses", default_value = "1")]
+        max_uses: u32,
+    },
+    /// List all invites (no secrets).
+    List,
+    /// Revoke an invite by ID.
+    Revoke {
+        /// Invite ID (see `invite list`).
+        id: String,
+    },
+    /// List pending (and decided) access requests from closed-mode invites.
+    Requests,
+    /// Approve a pending access request, creating its user.
+    Approve {
+        /// Access request ID (see `invite requests`).
+        request_id: String,
+    },
+    /// Deny a pending access request.
+    Deny {
+        /// Access request ID (see `invite requests`).
+        request_id: String,
     },
 }
 
@@ -359,8 +419,30 @@ fn main() {
             url,
             setup_code,
             no_browser,
-        } => cli::run_login(&ctx, url.as_deref(), setup_code.as_deref(), *no_browser),
+            invite,
+            name,
+        } => cli::run_login(
+            &ctx,
+            url.as_deref(),
+            setup_code.as_deref(),
+            *no_browser,
+            invite.as_deref(),
+            name.as_deref(),
+        ),
         Command::Logout { url } => cli::run_logout(&ctx, url.as_deref()),
+        Command::Invite(cmd) => match cmd {
+            InviteCommand::Create {
+                mode,
+                stores,
+                expires,
+                max_uses,
+            } => cli::run_invite_create(&ctx, mode, stores, expires.as_deref(), *max_uses),
+            InviteCommand::List => cli::run_invite_list(&ctx),
+            InviteCommand::Revoke { id } => cli::run_invite_revoke(&ctx, id),
+            InviteCommand::Requests => cli::run_invite_requests(&ctx),
+            InviteCommand::Approve { request_id } => cli::run_invite_approve(&ctx, request_id),
+            InviteCommand::Deny { request_id } => cli::run_invite_deny(&ctx, request_id),
+        },
     }
 }
 

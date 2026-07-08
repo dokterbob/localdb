@@ -199,6 +199,7 @@ pub(super) fn row_to_access_request(row: &libsql::Row) -> Result<AccessRequestRo
     let resulting_user_id: Option<String> = row.get(5).map_err(map_libsql_err)?;
     let created_at: String = row.get(6).map_err(map_libsql_err)?;
     let decided_at: Option<String> = row.get(7).map_err(map_libsql_err)?;
+    let collected_at: Option<String> = row.get(8).map_err(map_libsql_err)?;
     Ok(AccessRequestRow {
         id,
         invite_id,
@@ -208,5 +209,6 @@ pub(super) fn row_to_access_request(row: &libsql::Row) -> Result<AccessRequestRo
         resulting_user_id,
         created_at,
         decided_at,
+        collected_at,
     })
 }

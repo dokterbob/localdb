@@ -15,6 +15,7 @@ mod cmds {
     pub(crate) mod auth;
     pub(crate) mod index;
     pub(crate) mod init;
+    pub(crate) mod invite;
     pub(crate) mod login;
     pub(crate) mod search;
     pub(crate) mod source;
@@ -30,6 +31,10 @@ pub use cmds::auth::{
 };
 pub use cmds::index::run_index;
 pub use cmds::init::run_init;
+pub use cmds::invite::{
+    run_invite_approve, run_invite_create, run_invite_deny, run_invite_list, run_invite_requests,
+    run_invite_revoke,
+};
 pub use cmds::login::{run_login, run_logout};
 pub use cmds::search::run_search;
 pub use cmds::source::{run_source_add, run_source_list, run_source_remove};
