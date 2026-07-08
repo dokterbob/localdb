@@ -73,23 +73,6 @@ impl DocumentIndex {
         }
     }
 
-    /// Pre-populate the index from existing chunk records in the store.
-    ///
-    /// Each unique (uri, resource_id, content_hash, policy_version) combination
-    /// in the store becomes one record.
-    pub fn from_chunk_records(chunks: &[ChunkRecord]) -> Self {
-        let mut records = HashMap::new();
-        for chunk in chunks {
-            records.entry(chunk.uri.clone()).or_insert(DocumentRecord {
-                uri: chunk.uri.clone(),
-                resource_id: chunk.resource_id.clone(),
-                content_hash: chunk.content_hash.clone(),
-                policy_version: chunk.policy_version.clone(),
-            });
-        }
-        Self { records }
-    }
-
     /// Pre-populate the index from lightweight `DocumentRecord`s returned by
     /// `RetrievalStore::list_indexed_documents`. Use this to rehydrate the
     /// incremental-skip index across process runs without loading embeddings.
@@ -1075,7 +1058,6 @@ mod tests {
     use crate::ids::resource_id;
     use crate::store::FakeStore;
     use crate::types::{SourceKind, SourceSpec};
-    use crate::Span;
 
     fn make_ingestion_config(store_id: &str) -> IngestionConfig {
         IngestionConfig {
@@ -1123,38 +1105,6 @@ mod tests {
         let removed = idx.remove("file:///test.md");
         assert!(removed.is_some());
         assert!(idx.is_empty());
-    }
-
-    #[test]
-    fn document_index_from_chunk_records() {
-        use crate::store::ChunkRecord;
-
-        let records = vec![ChunkRecord {
-            id: "chunk-1".to_string(),
-            resource_id: "doc-1".to_string(),
-            store_id: "store-1".to_string(),
-            text: "text".to_string(),
-            span: Span::new(0, 4),
-            heading_path: vec![],
-            embedding: vec![0.1],
-            policy_version: "v1".to_string(),
-            fetched_at: "2026-06-10T12:00:00Z".to_string(),
-            content_hash: "hash-1".to_string(),
-            origin_store: "store-1".to_string(),
-            source_id: "src-1".to_string(),
-            ingestor_kind: "path".to_string(),
-            mime: None,
-            uri: "file:///doc1.md".to_string(),
-            metadata: crate::metadata::Metadata::default(),
-            block_seq: 0,
-            seq_in_block: 0,
-            block_kind: None,
-            window_block_seqs: vec![],
-        }];
-
-        let idx = DocumentIndex::from_chunk_records(&records);
-        assert_eq!(idx.len(), 1);
-        assert!(idx.get("file:///doc1.md").is_some());
     }
 
     // ---------------------------------------------------------------------------
@@ -1549,57 +1499,6 @@ mod tests {
         fn model_id(&self) -> &str {
             "short-embedder"
         }
-    }
-
-    /// A2: DocumentIndex hydrated via from_chunk_records enables incremental skip
-    ///     even when starting from a fresh in-memory index.
-    #[tokio::test]
-    async fn document_index_hydration_enables_incremental_skip() {
-        use crate::store::ChunkRecord;
-
-        // Simulate a previous run: build chunk records as if already indexed.
-        let uri = "file:///docs/existing.md";
-        let content = "Already indexed content.";
-        let hash = content_hash(content);
-        let doc_id = resource_id(uri, &hash);
-
-        let existing_chunk = ChunkRecord {
-            id: "chunk-existing".to_string(),
-            resource_id: doc_id.clone(),
-            store_id: "store-1".to_string(),
-            text: content.to_string(),
-            span: Span::new(0, content.len()),
-            heading_path: vec![],
-            embedding: vec![0.1, 0.2, 0.3, 0.4],
-            policy_version: "policy-v1".to_string(),
-            fetched_at: "2026-06-10T12:00:00Z".to_string(),
-            content_hash: hash.clone(),
-            origin_store: "store-1".to_string(),
-            source_id: "src-1".to_string(),
-            ingestor_kind: "path".to_string(),
-            mime: None,
-            uri: uri.to_string(),
-            metadata: crate::metadata::Metadata::default(),
-            block_seq: 0,
-            seq_in_block: 0,
-            block_kind: None,
-            window_block_seqs: vec![],
-        };
-
-        // Hydrate a fresh DocumentIndex from the stored chunk records.
-        let doc_index = DocumentIndex::from_chunk_records(&[existing_chunk]);
-        assert_eq!(
-            doc_index.len(),
-            1,
-            "index should have one record after hydration"
-        );
-
-        let record = doc_index
-            .get(uri)
-            .expect("record must be present after hydration");
-        assert_eq!(record.content_hash, hash);
-        assert_eq!(record.policy_version, "policy-v1");
-        assert_eq!(record.resource_id, doc_id);
     }
 
     // ---------------------------------------------------------------------------

@@ -1,5 +1,6 @@
 use tempfile::tempdir;
 
+use localdb_core::block::{Block, BlockKind, BlockLocation};
 use localdb_core::store::conformance;
 use localdb_core::store::{ChunkRecord, MetadataFilter};
 use localdb_core::types::{SourceKind, Span, StoreVisibility};
@@ -486,6 +487,212 @@ async fn find_document_errors_when_id_exists_in_multiple_stores() {
         "expected InvalidRequest for ambiguous cross-store document; got: {:?}",
         result.err()
     );
+}
+
+/// Coverage: a per-record write failure *inside* the `upsert_chunks`
+/// transaction (as opposed to the pre-`BEGIN` tenant-ownership check) must
+/// roll back the whole batch, including records that would otherwise have
+/// landed successfully earlier in the same call. Forces an FK violation
+/// (nonexistent `source_id`) on the second record.
+#[tokio::test]
+async fn upsert_chunks_rolls_back_batch_on_write_failure() {
+    let (_dir, db) = setup().await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+
+    let good = make_record("chunk-good", "doc-good", "store-1", vec![1.0, 0.0]);
+    let mut bad = make_record("chunk-bad", "doc-bad", "store-1", vec![0.0, 1.0]);
+    bad.source_id = "nonexistent-src".to_string();
+
+    let result = handle.upsert_chunks(vec![good, bad]).await;
+    assert!(
+        result.is_err(),
+        "FK violation on the second record should surface as an error"
+    );
+
+    let stats = handle.stats().await.unwrap();
+    assert_eq!(
+        stats.chunk_count, 0,
+        "the whole batch must roll back, including the earlier valid record"
+    );
+}
+
+/// Coverage: the standalone `RetrievalStore::upsert_blocks` trait method
+/// (not routed through `upsert_chunks_and_blocks`) writes rows into `blocks`
+/// and supports the `ON CONFLICT ... DO UPDATE` re-upsert path. Exercises
+/// both the `Some(location)` and `None` location branches.
+#[tokio::test]
+async fn upsert_blocks_direct_through_trait() {
+    let (_dir, db) = setup().await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+
+    // The resource row must already exist (written by upsert_chunks).
+    handle
+        .upsert_chunks(vec![make_record(
+            "chunk-1",
+            "doc-blocks",
+            "store-1",
+            vec![1.0, 0.0],
+        )])
+        .await
+        .unwrap();
+
+    let blocks = vec![
+        Block {
+            seq: 0,
+            kind: BlockKind::Paragraph,
+            text: "first block".to_string(),
+            location: Some(BlockLocation {
+                line_start: Some(1),
+                ..Default::default()
+            }),
+        },
+        Block {
+            seq: 1,
+            kind: BlockKind::Heading { level: 2 },
+            text: "second block".to_string(),
+            location: None,
+        },
+    ];
+
+    handle
+        .upsert_blocks("store-1", "doc-blocks", &blocks)
+        .await
+        .unwrap();
+
+    // Re-upsert with changed text to exercise the ON CONFLICT DO UPDATE path.
+    let mut updated = blocks;
+    updated[0].text = "first block, updated".to_string();
+    handle
+        .upsert_blocks("store-1", "doc-blocks", &updated)
+        .await
+        .unwrap();
+}
+
+/// Coverage: `upsert_chunks_and_blocks` performs the same pre-`BEGIN`
+/// tenant-ownership check as `upsert_chunks` — a cross-tenant record must be
+/// rejected before any write is attempted.
+#[tokio::test]
+async fn upsert_chunks_and_blocks_rejects_cross_tenant_record() {
+    let (_dir, db) = setup().await;
+    let handle = db.retrieval_store("store-A").await.unwrap();
+    let result = handle
+        .upsert_chunks_and_blocks(
+            "store-A",
+            "doc-cross",
+            vec![make_record(
+                "chunk-cross",
+                "doc-cross",
+                "store-B",
+                vec![0.5, 0.5],
+            )],
+            &[],
+            None,
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(Error::Internal {
+            correlation_id,
+            ..
+        }) if correlation_id == "store_handle_tenant_violation"
+    ));
+}
+
+/// Coverage: `upsert_chunks_and_blocks` with a non-empty `blocks` slice writes
+/// both chunks and blocks inside the same transaction (all prior conformance
+/// tests exercise this call with `blocks: &[]`, which never touches the block
+/// insert loop).
+#[tokio::test]
+async fn upsert_chunks_and_blocks_writes_blocks_in_same_transaction() {
+    let (_dir, db) = setup().await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+
+    let records = vec![make_record(
+        "chunk-1",
+        "doc-with-blocks",
+        "store-1",
+        vec![1.0, 0.0],
+    )];
+    let blocks = vec![
+        Block {
+            seq: 0,
+            kind: BlockKind::Paragraph,
+            text: "body text".to_string(),
+            location: Some(BlockLocation {
+                page: Some(1),
+                ..Default::default()
+            }),
+        },
+        Block {
+            seq: 1,
+            kind: BlockKind::Quote,
+            text: "quoted text".to_string(),
+            location: None,
+        },
+    ];
+
+    let written = handle
+        .upsert_chunks_and_blocks("store-1", "doc-with-blocks", records, &blocks, None)
+        .await
+        .unwrap();
+    assert_eq!(written, 1);
+}
+
+/// Coverage: `upsert_chunks_inner`'s encoding match dispatches to
+/// `f32_to_vector1bit_sql` for `VectorEncoding::Binary` stores — all other
+/// conformance tests use the default `Float32` encoding.
+#[tokio::test]
+async fn upsert_chunks_with_binary_encoding_round_trips() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("localdb.db");
+    let db = SqliteBackend::open(StoreBackendConfig::local_path(
+        path,
+        2,
+        VectorEncoding::Binary,
+    ))
+    .await
+    .unwrap();
+    db.upsert_store(&StoreRow {
+        id: "store-1".to_string(),
+        name: "store-1".to_string(),
+        visibility: StoreVisibility::Private,
+        backend: "libsql".to_string(),
+        indexing_policy: "{}".to_string(),
+        policy_version: "v1".to_string(),
+        acl: "{}".to_string(),
+        created_at: "2026-06-25T12:00:00Z".to_string(),
+    })
+    .await
+    .unwrap();
+    db.upsert_source(&SourceRow {
+        id: "src-1".to_string(),
+        store_id: "store-1".to_string(),
+        kind: SourceKind::Path,
+        root: Some("/test/binary".to_string()),
+        url: None,
+        include: vec![],
+        exclude: vec![],
+        preset: "prose".to_string(),
+        refresh: None,
+        created_at: "2026-06-25T12:00:00Z".to_string(),
+    })
+    .await
+    .unwrap();
+
+    let handle = db.retrieval_store("store-1").await.unwrap();
+    let written = handle
+        .upsert_chunks(vec![make_record(
+            "bin-chunk-1",
+            "bin-doc-1",
+            "store-1",
+            vec![1.0, -1.0],
+        )])
+        .await
+        .unwrap();
+    assert_eq!(written, 1);
+
+    let stats = handle.stats().await.unwrap();
+    assert_eq!(stats.chunk_count, 1);
 }
 
 fn make_record(id: &str, doc_id: &str, store_id: &str, embedding: Vec<f32>) -> ChunkRecord {

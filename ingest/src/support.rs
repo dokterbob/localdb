@@ -1,11 +1,10 @@
-//! Internal helpers mirrored from `core::ingestion`.
+//! Internal acquisition-side helpers owned by this crate.
 //!
-//! `core::ingestion::{catch_panic, detect_mime, format_unix_secs, secs_to_ymd_hms}`
-//! are private to that module, so they are copied here rather than making
-//! them `pub` in `core` (out of scope for this crate: `core` is owned by a
-//! concurrent workstream). Keep these in sync by hand until issue #117's
-//! later wave deletes `core`'s copies of the file/URL ingestors and this
-//! becomes the one true implementation.
+//! These serve the concrete ingestors (mime detection from paths, mtime
+//! formatting, panic-tolerant parsing). They deliberately live here rather
+//! than as `pub` items in `core`: core stays free of acquisition concerns,
+//! and this crate is the one true implementation since #117 removed the
+//! legacy pipeline's copies.
 
 use std::path::Path;
 
