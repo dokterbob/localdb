@@ -92,9 +92,11 @@ impl Ingestor for UrlIngestor {
                     // URL's previously indexed content: a transient network
                     // failure is not evidence the resource is gone (contrast
                     // with FetchResult::Gone below, which stays silent
-                    // precisely so the sweep deletes).
+                    // precisely so the sweep deletes). SkipReason::Error (not
+                    // Other) so the pipeline counts this as an error rather
+                    // than a benign skip (C8).
                     callback
-                        .on_skipped(url, SkipReason::Other(format!("fetch error: {e}")))
+                        .on_skipped(url, SkipReason::Error(format!("fetch error: {e}")))
                         .await;
                     result.errors += 1;
                     continue;
@@ -134,12 +136,15 @@ impl Ingestor for UrlIngestor {
             let probe = Probe::new(&bytes, Some(url.as_str()), sniffed.as_deref());
 
             // Panic-tolerant parsing — see `file_ingestor` for the rationale.
+            // A panic IS an error (C8, matching the old pipeline's behavior
+            // of folding panics into the error count), so it's reported via
+            // SkipReason::Error rather than the benign-skip counter.
             let parsed =
                 match catch_panic(std::panic::AssertUnwindSafe(|| self.parser.parse(&probe))) {
                     Err(panic_msg) => {
                         tracing::warn!(url = %url, "UrlIngestor: parser panicked: {}", panic_msg);
-                        callback.on_skipped(url, SkipReason::Other(panic_msg)).await;
-                        result.resources_skipped += 1;
+                        callback.on_skipped(url, SkipReason::Error(panic_msg)).await;
+                        result.errors += 1;
                         continue;
                     }
                     Ok(Ok(Some(doc))) => doc,
@@ -150,6 +155,14 @@ impl Ingestor for UrlIngestor {
                     }
                     Ok(Err(e)) => {
                         tracing::warn!(url = %url, "UrlIngestor: parser error: {}", e);
+                        // C7: this arm previously never called on_skipped at
+                        // all, silently orphaning the URL from the
+                        // delete-sweep's "seen" set — a transient parser
+                        // failure would erase the URL's previously indexed
+                        // chunks. Mirror FileIngestor's aliveness rule.
+                        callback
+                            .on_skipped(url, SkipReason::Error(format!("parser error: {e}")))
+                            .await;
                         result.errors += 1;
                         continue;
                     }
@@ -424,6 +437,13 @@ mod tests {
             result.resources_produced, 1,
             "the second URL is still fetched and indexed despite the first URL's error"
         );
+        assert_eq!(cb.skipped.len(), 1);
+        assert!(
+            matches!(&cb.skipped[0].1, SkipReason::Error(msg) if msg.contains("fetch error")),
+            "a fetch error must report SkipReason::Error (not Other) so the pipeline \
+             counts it as an error rather than a benign skip; got: {:?}",
+            cb.skipped[0].1
+        );
     }
 
     #[tokio::test]
@@ -492,9 +512,64 @@ mod tests {
         let mut cb = RecordingCallback::default();
         let result = ingestor.ingest(&source, &mut cb).await.unwrap();
 
-        assert_eq!(result.resources_skipped, 1);
+        // C8: a parser panic is an error, not a benign skip — count it via
+        // `errors`/`SkipReason::Error`, matching `FileIngestor`.
+        assert_eq!(result.resources_skipped, 0);
+        assert_eq!(result.errors, 1);
         assert!(
-            matches!(&cb.skipped[0].1, SkipReason::Other(msg) if msg.contains("simulated parser panic"))
+            matches!(&cb.skipped[0].1, SkipReason::Error(msg) if msg.contains("simulated parser panic"))
+        );
+    }
+
+    /// C7: a parser returning `Err(...)` (as opposed to panicking) must also
+    /// report `on_skipped(SkipReason::Error)` — previously this arm only did
+    /// `result.errors += 1; continue;` with no callback call at all, which
+    /// silently orphaned the URL from the delete-sweep's "seen" set and
+    /// caused a transient parser failure to erase the URL's previously
+    /// indexed chunks.
+    #[tokio::test]
+    async fn parser_error_reports_on_skipped_error_and_stays_alive() {
+        struct FailingParser;
+        impl Parser for FailingParser {
+            fn id(&self) -> &'static str {
+                "failing"
+            }
+            fn parse(&self, _probe: &Probe) -> Result<Option<ParsedDocument>, Error> {
+                Err(Error::Internal {
+                    message: "simulated parser error".to_string(),
+                    correlation_id: "test_parser_error".to_string(),
+                })
+            }
+        }
+
+        let mut script = HashMap::new();
+        script.insert(
+            "https://example.com/bad-parse".to_string(),
+            ScriptedOutcome::Downloaded {
+                bytes: b"whatever".to_vec(),
+                content_type: None,
+            },
+        );
+
+        let ingestor = UrlIngestor::new(
+            Box::new(FailingParser),
+            Box::new(ScriptedFetcher::new(script)),
+        );
+        let source = source_with_urls(&["https://example.com/bad-parse"]);
+        let mut cb = RecordingCallback::default();
+        let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+        assert_eq!(result.errors, 1);
+        assert_eq!(
+            cb.skipped.len(),
+            1,
+            "the parser error must be reported via on_skipped"
+        );
+        assert_eq!(cb.skipped[0].0, "https://example.com/bad-parse");
+        assert!(
+            matches!(&cb.skipped[0].1, SkipReason::Error(msg) if msg.contains("simulated parser error")),
+            "expected SkipReason::Error mentioning the parser error, got: {:?}",
+            cb.skipped[0].1
         );
     }
 }

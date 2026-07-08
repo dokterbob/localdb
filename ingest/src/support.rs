@@ -67,26 +67,20 @@ pub(crate) fn detect_mime(path: &Path) -> Option<String> {
 
 /// Format a Unix timestamp as RFC 3339 (UTC, no sub-second precision).
 ///
-/// Verbatim copy of `core::ingestion::format_unix_secs` (private there),
-/// including its test-cfg fixed-string shortcut, so ingest's own tests get
-/// the same deterministic timestamps core's ingestion tests rely on.
+/// Based on `core::ingestion::format_unix_secs` (private there), but without
+/// its test-cfg fixed-string shortcut: `secs` is a plain input parameter, so
+/// determinism in tests comes from the caller passing a fixed value, not from
+/// a `cfg(test)` branch inside the function under test. A shortcut here meant
+/// this function's own real formatting logic was never exercised by `cargo
+/// test`, only its cfg(test) stand-in.
 pub(crate) fn format_unix_secs(secs: u64) -> String {
-    #[cfg(not(test))]
-    {
-        let (y, mo, d, h, mi, s) = secs_to_ymd_hms(secs);
-        format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, mi, s)
-    }
-    #[cfg(test)]
-    {
-        let _ = secs;
-        "2026-06-10T12:00:00Z".to_string()
-    }
+    let (y, mo, d, h, mi, s) = secs_to_ymd_hms(secs);
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, mi, s)
 }
 
 /// Civil (Gregorian) date/time decomposition of a Unix timestamp.
 ///
 /// Verbatim copy of `core::ingestion::secs_to_ymd_hms` (private there).
-#[cfg(not(test))]
 fn secs_to_ymd_hms(secs: u64) -> (u64, u64, u64, u64, u64, u64) {
     let s = secs % 60;
     let m = (secs / 60) % 60;
@@ -106,6 +100,32 @@ fn secs_to_ymd_hms(secs: u64) -> (u64, u64, u64, u64, u64, u64) {
     let y_adj = if mo <= 2 { y + 1 } else { y };
 
     (y_adj, mo, d, h, m, s)
+}
+
+#[cfg(test)]
+mod format_unix_secs_tests {
+    use super::format_unix_secs;
+
+    #[test]
+    fn epoch_zero_is_1970_01_01() {
+        assert_eq!(format_unix_secs(0), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn leap_day_2024_02_29_is_formatted_correctly() {
+        assert_eq!(format_unix_secs(1_709_164_800), "2024-02-29T00:00:00Z");
+    }
+
+    #[test]
+    fn year_end_boundary_rolls_over_correctly() {
+        assert_eq!(format_unix_secs(1_704_067_199), "2023-12-31T23:59:59Z");
+        assert_eq!(format_unix_secs(1_704_067_200), "2024-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn mid_2026_value_is_formatted_correctly() {
+        assert_eq!(format_unix_secs(1_783_524_645), "2026-07-08T15:30:45Z");
+    }
 }
 
 /// Test doubles shared by `file_ingestor` and `url_ingestor` unit tests.

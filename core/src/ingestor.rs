@@ -89,9 +89,17 @@ pub enum SkipReason {
     Unchanged,
     /// No configured parser supports the item's format.
     Unsupported,
-    /// Skipped for another reason (I/O error tolerated as skip, filtered by
-    /// configuration, ...). The string is a human-readable explanation.
+    /// Skipped for another reason (benign, non-error skip: filtered by
+    /// configuration, ...). The string is a human-readable explanation. Not
+    /// for I/O or parser errors — use [`SkipReason::Error`] for those.
     Other(String),
+    /// Processing failed but the item still exists — keeps the URI alive in
+    /// the delete-sweep (it's a transient failure, not evidence the resource
+    /// is gone) while still being counted as an error rather than a benign
+    /// skip (issue C7/C8: previously such failures were folded into
+    /// `Other`, which under-reported errors as skips). The string is a
+    /// human-readable explanation (read error, parser error, parser panic).
+    Error(String),
 }
 
 /// Callback for receiving resources during ingestion.
@@ -184,6 +192,17 @@ mod tests {
             config: serde_json::json!({ "root": "/tmp/docs" }),
         };
         assert_eq!(source.ingestor_kind, IngestorKind::File);
+    }
+
+    #[test]
+    fn skip_reason_error_is_distinct_from_other() {
+        // C8: `Error` and `Other` must remain distinct variants so callers
+        // (PipelineCallback::on_skipped) can bucket them differently —
+        // `Other` as a benign skip, `Error` as a counted error.
+        let err = SkipReason::Error("boom".to_string());
+        let other = SkipReason::Other("boom".to_string());
+        assert_ne!(err, other);
+        assert_eq!(err, SkipReason::Error("boom".to_string()));
     }
 
     #[test]

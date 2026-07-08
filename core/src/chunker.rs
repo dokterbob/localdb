@@ -865,6 +865,22 @@ fn chunk_table(
         .filter(|l| !l.trim().is_empty())
         .collect();
 
+    if data_rows.is_empty() {
+        // Header-only table block: no data rows to pack, but the header itself is
+        // real content and must not silently vanish from the index. Emit it as a
+        // single chunk rather than falling through to `flush_table_batch` (which
+        // treats an empty `pending` as "nothing to flush").
+        let mut chunks = vec![ChunkOutput::placeholder(
+            header_block,
+            Span::new(0, 0),
+            vec![],
+            block_seq,
+            0,
+        )];
+        finalize_ids(resource_id, &mut chunks);
+        return Ok(chunks);
+    }
+
     let target = config.resolved_target_tokens();
     let mut chunks: Vec<ChunkOutput> = Vec::new();
     let mut seq_in_block = 0u32;
@@ -2093,6 +2109,26 @@ mod tests {
         assert!(chunks[0].text.contains("|---|---|"));
         assert!(chunks[0].text.contains("| Alice | 30 |"));
         assert!(chunks[0].text.contains("| Bob | 25 |"));
+    }
+
+    #[test]
+    fn table_header_only_block_emits_one_chunk_with_header() {
+        // A table block with a header + separator row but NO data rows must still
+        // produce a chunk (the header content must not silently vanish from the index).
+        let md = "| Name | Age |\n|---|---|";
+        let doc_id = resource_id("file:///table_header_only.md", "abc");
+        let cfg = ChunkerConfig::prose();
+        let chunks = chunk_table(&doc_id, md, &cfg, &CharSizer, 2).unwrap();
+        assert_eq!(
+            chunks.len(),
+            1,
+            "header-only table must produce exactly one chunk, got {}",
+            chunks.len()
+        );
+        assert_eq!(chunks[0].text, "| Name | Age |\n|---|---|");
+        assert_eq!(chunks[0].block_seq, 2);
+        assert_eq!(chunks[0].seq_in_block, 0);
+        assert!(!chunks[0].id.is_empty(), "chunk must have a valid id");
     }
 
     #[test]

@@ -96,9 +96,11 @@ impl Ingestor for FileIngestor {
                     // Report via on_skipped so the delete-sweep keeps this
                     // still-existing file's indexed content: only URIs never
                     // reported at all get swept, and a transient read error
-                    // must not delete good chunks.
+                    // must not delete good chunks. SkipReason::Error (not
+                    // Other) so the pipeline counts this as an error rather
+                    // than a benign skip (C8).
                     callback
-                        .on_skipped(&file.uri, SkipReason::Other(format!("read error: {e}")))
+                        .on_skipped(&file.uri, SkipReason::Error(format!("read error: {e}")))
                         .await;
                     result.errors += 1;
                     continue;
@@ -138,18 +140,18 @@ impl Ingestor for FileIngestor {
 
             // Panic-tolerant parsing: a panicking parser must not crash the
             // whole walk. `catch_panic` wraps extraction and the panic is
-            // surfaced via `on_skipped` + `SkipReason::Other` (this trait's
-            // dedicated skip-reason channel) rather than folding it into the
-            // generic error count.
+            // surfaced via `on_skipped` + `SkipReason::Error` (a panic IS an
+            // error, matching the old pipeline's behavior of folding panics
+            // into the error count, C8) rather than the benign-skip counter.
             let parsed = match catch_panic(std::panic::AssertUnwindSafe(|| {
                 self.parser.parse(&probe)
             })) {
                 Err(panic_msg) => {
                     tracing::warn!(uri = %file.uri, "FileIngestor: parser panicked: {}", panic_msg);
                     callback
-                        .on_skipped(&file.uri, SkipReason::Other(panic_msg))
+                        .on_skipped(&file.uri, SkipReason::Error(panic_msg))
                         .await;
-                    result.resources_skipped += 1;
+                    result.errors += 1;
                     continue;
                 }
                 Ok(Ok(Some(doc))) => doc,
@@ -162,9 +164,10 @@ impl Ingestor for FileIngestor {
                 }
                 Ok(Err(e)) => {
                     tracing::warn!(uri = %file.uri, "FileIngestor: parser error: {}", e);
-                    // Same aliveness rule as the read-error path above.
+                    // Same aliveness rule as the read-error path above;
+                    // SkipReason::Error so it's counted as an error (C8).
                     callback
-                        .on_skipped(&file.uri, SkipReason::Other(format!("parser error: {e}")))
+                        .on_skipped(&file.uri, SkipReason::Error(format!("parser error: {e}")))
                         .await;
                     result.errors += 1;
                     continue;
@@ -381,12 +384,61 @@ mod tests {
             result.resources_produced, 1,
             "the non-panicking file is still indexed"
         );
-        assert_eq!(result.resources_skipped, 1);
+        // C8: a parser panic is an error, not a benign skip — it must be
+        // counted in `errors`/`SkipReason::Error`, not
+        // `resources_skipped`/`SkipReason::Other` (matching the old
+        // pipeline, which folded panics into the error count).
+        assert_eq!(result.resources_skipped, 0);
+        assert_eq!(result.errors, 1);
         assert_eq!(cb.skipped.len(), 1);
         assert!(cb.skipped[0].0.ends_with("b.boom"));
         assert!(
-            matches!(&cb.skipped[0].1, SkipReason::Other(msg) if msg.contains("simulated parser panic")),
-            "expected SkipReason::Other with the panic message, got: {:?}",
+            matches!(&cb.skipped[0].1, SkipReason::Error(msg) if msg.contains("simulated parser panic")),
+            "expected SkipReason::Error with the panic message, got: {:?}",
+            cb.skipped[0].1
+        );
+    }
+
+    #[tokio::test]
+    async fn parser_error_is_reported_as_skip_reason_error() {
+        struct FailingParser;
+        impl Parser for FailingParser {
+            fn id(&self) -> &'static str {
+                "failing"
+            }
+            fn parse(&self, probe: &Probe) -> Result<Option<ParsedDocument>, Error> {
+                if probe.path_hint.is_some_and(|p| p.ends_with(".fail")) {
+                    return Err(Error::Internal {
+                        message: "simulated parser error".to_string(),
+                        correlation_id: "test_parser_error".to_string(),
+                    });
+                }
+                let text = String::from_utf8_lossy(probe.bytes()).to_string();
+                Ok(Some(ParsedDocument {
+                    markdown: text,
+                    title: None,
+                    metadata: localdb_core::metadata::DublinCoreMetadata::default(),
+                }))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), "# A\n\nContent A.").unwrap();
+        std::fs::write(dir.path().join("b.fail"), "will error").unwrap();
+
+        let ingestor = FileIngestor::new(Box::new(FailingParser));
+        let source = source_with_root(dir.path().to_str().unwrap());
+        let mut cb = RecordingCallback::default();
+        let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+        assert_eq!(result.resources_produced, 1, "the good file still indexes");
+        assert_eq!(result.errors, 1, "the parser error counts as an error");
+        assert_eq!(cb.skipped.len(), 1);
+        assert!(cb.skipped[0].0.ends_with("b.fail"));
+        assert!(
+            matches!(&cb.skipped[0].1, SkipReason::Error(msg) if msg.contains("simulated parser error")),
+            "parser-error path must report SkipReason::Error so the delete-sweep \
+             keeps this still-present file's indexed content alive; got: {:?}",
             cb.skipped[0].1
         );
     }
@@ -455,7 +507,23 @@ mod tests {
     #[tokio::test]
     async fn mtime_is_formatted_as_rfc3339() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("doc.md"), "# X\n\nY.").unwrap();
+        let path = dir.path().join("doc.md");
+        std::fs::write(&path, "# X\n\nY.").unwrap();
+
+        // `format_unix_secs` no longer has a cfg(test) fixed-string shortcut
+        // (its real formatting logic is exercised directly by
+        // `support::format_unix_secs_tests`), so compute the expected value
+        // from the file's actual mtime via the same crate-local helper the
+        // production code path uses, rather than asserting a hardcoded
+        // string that would be flaky against the real filesystem clock.
+        let expected_secs = std::fs::metadata(&path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let expected = crate::support::format_unix_secs(expected_secs);
 
         let ingestor = FileIngestor::new(Box::new(AllParser));
         let source = source_with_root(dir.path().to_str().unwrap());
@@ -463,11 +531,12 @@ mod tests {
         ingestor.ingest(&source, &mut cb).await.unwrap();
 
         assert_eq!(cb.resources.len(), 1);
-        // ingest is compiled with cfg(test) for its own test runs, so the
-        // mirrored `format_unix_secs` takes its deterministic-string branch
-        // (same trick `core::ingestion` uses for its own tests).
-        assert_eq!(cb.resources[0].added_at, "2026-06-10T12:00:00Z");
-        assert_eq!(cb.resources[0].modified_at, "2026-06-10T12:00:00Z");
+        assert_eq!(cb.resources[0].added_at, expected);
+        assert_eq!(cb.resources[0].modified_at, expected);
+        assert!(
+            expected.ends_with('Z') && expected.contains('T'),
+            "expected an RFC 3339 timestamp, got: {expected}"
+        );
     }
 
     #[cfg(unix)]
@@ -496,6 +565,13 @@ mod tests {
         assert_eq!(
             result.resources_produced, 1,
             "the walk continues past the unreadable file"
+        );
+        assert_eq!(cb.skipped.len(), 1);
+        assert!(
+            matches!(&cb.skipped[0].1, SkipReason::Error(msg) if msg.contains("read error")),
+            "read errors must be reported as SkipReason::Error so the delete-sweep \
+             keeps this still-present file's indexed content alive; got: {:?}",
+            cb.skipped[0].1
         );
     }
 }

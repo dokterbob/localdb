@@ -2,7 +2,7 @@ use localdb_core::metadata::Metadata;
 use localdb_core::types::Span;
 use localdb_core::{ChunkRecord, Error};
 
-use crate::connection::map_libsql_err;
+use crate::connection::{map_libsql_err, parse_metadata_json_lenient};
 
 /// Parse a row produced by the CHUNK_COLS projection in `read.rs`.
 ///
@@ -59,8 +59,9 @@ pub(crate) fn row_to_chunk_record_strict(row: &libsql::Row) -> Result<ChunkRecor
     // Read defensively: rows written before the tagged-`Metadata` migration
     // (#130) hold untagged, flat Dublin Core JSON and fail to deserialize as
     // the tagged enum — fall back to `Metadata::default()` rather than
-    // erroring the whole read.
-    let metadata: Metadata = serde_json::from_str(&metadata_str).unwrap_or_default();
+    // erroring the whole read. A genuine parse failure is logged (issue C4);
+    // see `parse_metadata_json_lenient`.
+    let metadata: Metadata = parse_metadata_json_lenient(&metadata_str, &resource_id);
 
     let block_seq: i64 = row.get(16).map_err(map_libsql_err)?;
     let seq_in_block: i64 = row.get(17).map_err(map_libsql_err)?;

@@ -52,7 +52,35 @@
 -- sources, and resource metadata across that bump instead of re-ingesting
 -- from scratch.
 --
--- Example: sqlite3 /path/to/localdb.db < docs/migrations/v4-to-v5.sql
+-- Run it with `-bail` and check the exit code, so a failed statement is
+-- reported (rather than silently continuing to the next line):
+--
+--   sqlite3 -bail /path/to/localdb.db < docs/migrations/v4-to-v5.sql
+--   echo "exit: $?"   # non-zero means the migration did NOT apply
+--
+-- Transaction safety: the whole script runs inside a single BEGIN
+-- IMMEDIATE/COMMIT transaction, with `PRAGMA user_version = 5` as the LAST
+-- statement before COMMIT. If any statement fails partway through -- or the
+-- process dies -- SQLite rolls back the entire transaction, so the database
+-- is left exactly as it was (still stamped v4, none of the DDL/DML applied)
+-- rather than ending up half-migrated. This was verified empirically with
+-- the sqlite3 CLI: `PRAGMA user_version` DOES participate in and roll back
+-- with the enclosing transaction like ordinary DML, so stamping it last,
+-- inside the same transaction as the rest of the migration, is safe and
+-- sufficient -- there is no need for a separate/later commit of the version
+-- stamp.
+--
+-- Idempotency: re-running this script against an already-migrated (v5)
+-- database is safe but NOT silent -- step 1's `ALTER TABLE chunks DROP
+-- COLUMN block_id` fails with "no such column: block_id" once the column is
+-- already gone. Under `-bail` that failure aborts the script and (per the
+-- transaction safety note above) rolls back the whole transaction, so it is
+-- harmless: you get a non-zero exit code and an unchanged, already-v5
+-- database, not a corrupted one. This is by design -- it is not worth
+-- special-casing step 1 to be silently skippable just to make a script
+-- that should only ever be run once look clean on a second run.
+
+BEGIN IMMEDIATE;
 
 -- 1. Drop the retired block_id column from chunks.
 ALTER TABLE chunks DROP COLUMN block_id;
@@ -77,5 +105,8 @@ WHERE json_valid(metadata_json)
   AND json_extract(metadata_json, '$.kind') IS NULL;
 
 -- 4. Stamp the database as v5 so `localdb` accepts it without triggering the
---    wipe+reinit path on next open.
+--    wipe+reinit path on next open. Last statement before COMMIT -- see the
+--    transaction-safety note above.
 PRAGMA user_version = 5;
+
+COMMIT;

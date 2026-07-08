@@ -5196,6 +5196,7 @@ dependencies = [
  "blake3",
  "libsql",
  "localdb-core",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

@@ -253,6 +253,37 @@ pub(crate) async fn validate_embedding_column(
     Ok(())
 }
 
+/// Deserialize a `resources.metadata_json` column value, warning (rather than
+/// erroring) on a genuine parse failure.
+///
+/// Defensive reads must never error the row: rows written before the
+/// tagged-`Metadata` migration (#130) hold untagged, flat Dublin Core JSON
+/// and legitimately fail to deserialize as the tagged enum — that's expected
+/// and silent by design. The problem (issue C4) is that a *different* kind of
+/// failure — invalid JSON, or JSON of some unrelated shape, e.g. from
+/// corruption or a bug — was indistinguishable from that benign legacy case;
+/// both silently fell back to `T::default()`, discarding whatever real
+/// metadata existed with no trace. This keeps the same fallback behavior but
+/// logs a `tracing::warn!` naming the resource and the parse error on every
+/// failure, so a genuine problem is at least observable.
+pub(crate) fn parse_metadata_json_lenient<T>(metadata_json: &str, resource_ref: &str) -> T
+where
+    T: serde::de::DeserializeOwned + Default,
+{
+    match serde_json::from_str(metadata_json) {
+        Ok(value) => value,
+        Err(e) => {
+            tracing::warn!(
+                resource = resource_ref,
+                error = %e,
+                "failed to parse resources.metadata_json; falling back to default metadata \
+                 (expected for pre-#130 untagged rows, but also fires on genuine corruption)"
+            );
+            T::default()
+        }
+    }
+}
+
 /// Map a libsql error to our error taxonomy.
 ///
 /// "database is locked" / `SQLITE_BUSY` → `RuntimeStateLocked` (exit 4),

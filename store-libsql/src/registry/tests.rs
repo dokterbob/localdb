@@ -461,3 +461,70 @@ async fn metadata_json_round_trips_tagged_document_kind() {
         vec!["Ada Lovelace".to_string()]
     );
 }
+
+/// Regression test for issue C4: a genuinely invalid `metadata_json` value
+/// (syntactically broken JSON, not just untagged-legacy-shape JSON) must
+/// still fall back to `Metadata::default()` rather than erroring the whole
+/// `find_document` lookup — defensive reads must never error the row. The
+/// fallback now also emits a `tracing::warn!` naming the resource id and the
+/// parse error (see `connection::parse_metadata_json_lenient`), but this test
+/// only asserts on the observable behavior: no error, default metadata.
+#[tokio::test]
+async fn find_document_tolerates_invalid_metadata_json() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    api.upsert_source(&make_path_source("src-1", "store-1", "/docs"))
+        .await
+        .unwrap();
+
+    let record = ChunkRecord {
+        id: "chunk-1".to_string(),
+        resource_id: "doc-1".to_string(),
+        store_id: "store-1".to_string(),
+        text: "some chunk text".to_string(),
+        span: Span::new(0, 15),
+        heading_path: vec![],
+        embedding: vec![0.1, 0.2, 0.3, 0.4],
+        policy_version: "v1".to_string(),
+        fetched_at: "2026-07-01T00:00:00Z".to_string(),
+        content_hash: "abc123".to_string(),
+        origin_store: "store-1".to_string(),
+        source_id: "src-1".to_string(),
+        ingestor_kind: "path".to_string(),
+        mime: Some("text/markdown".to_string()),
+        uri: "file:///docs/doc.md".to_string(),
+        metadata: Metadata::default(),
+        block_seq: 0,
+        seq_in_block: 0,
+        block_kind: None,
+        window_block_seqs: vec![],
+    };
+
+    let handle = api.retrieval_store("store-1").await.unwrap();
+    handle.upsert_chunks(vec![record]).await.unwrap();
+
+    // Corrupt the persisted metadata_json directly with syntactically
+    // invalid JSON — this is distinct from the benign legacy-untagged case
+    // (which is still valid JSON, just the wrong shape).
+    let conn = api.conn.conn().await;
+    conn.execute(
+        "UPDATE resources SET metadata_json = ? WHERE id = ?",
+        libsql::params!["{not valid json".to_string(), "doc-1".to_string()],
+    )
+    .await
+    .unwrap();
+    drop(conn);
+
+    let info = api
+        .find_document("doc-1")
+        .await
+        .unwrap()
+        .expect("document must still be found despite invalid metadata_json");
+    assert_eq!(
+        info.metadata,
+        Metadata::default(),
+        "invalid metadata_json must fall back to default metadata, not error the read"
+    );
+}

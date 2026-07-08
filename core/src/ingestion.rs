@@ -473,19 +473,18 @@ pub fn fail_index_job(job: &mut IndexJob, error: String) {
 }
 
 /// Get the current time as an RFC 3339 string.
+///
+/// Only the clock is stubbed under `cfg(test)` (a fixed instant keeps
+/// timestamp-carrying fixtures deterministic); the formatting logic itself is
+/// always compiled and unit-tested via [`format_secs_rfc3339`].
 pub fn now_rfc3339() -> String {
-    // Use a simple implementation that doesn't require chrono.
-    // Falls back to a placeholder in test environments.
     #[cfg(not(test))]
     {
         use std::time::{SystemTime, UNIX_EPOCH};
         let duration = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
-        let secs = duration.as_secs();
-        // Format as RFC 3339 (simplified — no sub-second precision)
-        let (y, mo, d, h, mi, s) = secs_to_ymd_hms(secs);
-        format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, mi, s)
+        format_secs_rfc3339(duration.as_secs())
     }
     #[cfg(test)]
     {
@@ -493,7 +492,13 @@ pub fn now_rfc3339() -> String {
     }
 }
 
-#[cfg(not(test))]
+/// Format a Unix timestamp as RFC 3339 (UTC, no sub-second precision),
+/// without requiring chrono.
+fn format_secs_rfc3339(secs: u64) -> String {
+    let (y, mo, d, h, mi, s) = secs_to_ymd_hms(secs);
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, mi, s)
+}
+
 fn secs_to_ymd_hms(secs: u64) -> (u64, u64, u64, u64, u64, u64) {
     let s = secs % 60;
     let m = (secs / 60) % 60;
@@ -513,6 +518,27 @@ fn secs_to_ymd_hms(secs: u64) -> (u64, u64, u64, u64, u64, u64) {
     let y_adj = if mo <= 2 { y + 1 } else { y };
 
     (y_adj, mo, d, h, m, s)
+}
+
+#[cfg(test)]
+mod format_secs_rfc3339_tests {
+    use super::format_secs_rfc3339;
+
+    #[test]
+    fn epoch_zero_is_1970_01_01() {
+        assert_eq!(format_secs_rfc3339(0), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn leap_day_2024_02_29_is_formatted_correctly() {
+        assert_eq!(format_secs_rfc3339(1_709_164_800), "2024-02-29T00:00:00Z");
+    }
+
+    #[test]
+    fn year_end_boundary_rolls_over_correctly() {
+        assert_eq!(format_secs_rfc3339(1_704_067_199), "2023-12-31T23:59:59Z");
+        assert_eq!(format_secs_rfc3339(1_704_067_200), "2024-01-01T00:00:00Z");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -807,16 +833,41 @@ pub async fn run_source_ingestion(
         seen: std::collections::HashSet::new(),
         discovered_total: 0,
         next_index: 0,
+        skip_error_count: 0,
     };
 
-    ingestor.ingest(&ingest_source, &mut callback).await?;
+    let ingest_result = ingestor.ingest(&ingest_source, &mut callback).await?;
 
     let PipelineCallback {
         mut result,
         seen,
         doc_index,
+        skip_error_count,
         ..
     } = callback;
+
+    // C8: `result.error_count` (below) is already authoritative — every
+    // error path an ingestor takes must report `on_skipped(SkipReason::Error)`
+    // exactly once (which increments `skip_error_count` here and
+    // `result.error_count` above), and `PipelineCallback::on_resource`'s
+    // `Err(e)` arm additionally counts `index_resource` failures the
+    // ingestor never sees. So `ingest_result.errors` (the ingestor's own,
+    // narrower self-report) is intentionally NOT folded into
+    // `result.error_count` here — doing so would double-count every error
+    // the ingestor already surfaced via `on_skipped`. It's used only as a
+    // consistency check: a well-behaved ingestor's own error counter must
+    // exactly match the number of `SkipReason::Error` skips it reported this
+    // run. A mismatch means an ingestor bumped `IngestResult.errors` without
+    // (or instead of) calling `on_skipped(Error)`, silently keeping a dead
+    // URI alive in the sweep (or vice versa) — a bug in that ingestor, not
+    // in the pipeline.
+    debug_assert_eq!(
+        ingest_result.errors, skip_error_count,
+        "ingestor for source {} reported {} internal errors but only {} were \
+         surfaced via on_skipped(SkipReason::Error) — every error path must \
+         report exactly one SkipReason::Error skip",
+        source.id, ingest_result.errors, skip_error_count
+    );
 
     // Delete-sweep: any URI known to this source's doc_index that was neither
     // yielded (on_resource) nor reported skipped (on_skipped) this run is
@@ -894,6 +945,11 @@ struct PipelineCallback<'a> {
     discovered_total: usize,
     /// Running index for `ProgressEvent::DocumentStarted`.
     next_index: usize,
+    /// Count of `on_skipped(SkipReason::Error(_))` calls this run — used
+    /// only to cross-check the ingestor's own `IngestResult.errors` in
+    /// `run_source_ingestion` (see the debug_assert there); NOT folded into
+    /// `result.error_count` twice.
+    skip_error_count: usize,
 }
 
 impl PipelineCallback<'_> {
@@ -1019,6 +1075,22 @@ impl IngestCallback for PipelineCallback<'_> {
                     outcome: crate::progress::DocOutcome::Skipped,
                 });
             }
+            SkipReason::Error(ref msg) => {
+                // C7/C8: processing failed but the item still exists — count
+                // it as an error (not a benign skip) so the CLI summary and
+                // IngestionResult.error_count reflect it accurately. Still
+                // marked "seen" above, so it keeps its URI alive across the
+                // delete-sweep exactly like Unchanged/Other/Unsupported do —
+                // a transient failure must never look like the resource is
+                // gone.
+                tracing::warn!("error processing '{}': {}", uri, msg);
+                self.result.error_count += 1;
+                self.skip_error_count += 1;
+                self.emit(crate::progress::ProgressEvent::DocumentFinished {
+                    uri: uri.to_string(),
+                    outcome: crate::progress::DocOutcome::Error,
+                });
+            }
         }
     }
 }
@@ -1039,9 +1111,24 @@ fn is_uri_from_source(uri: &str, source: &Source) -> bool {
                 .canonicalize()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| root.clone());
+            // Trim any trailing '/' so the boundary check below is
+            // well-defined regardless of whether `root` came in (or
+            // canonicalized) with a trailing separator.
+            let canonical_root = canonical_root.trim_end_matches('/');
             let file_prefix = format!("file://{}", canonical_root);
-            uri.starts_with(&file_prefix)
+            // Boundary-aware match (C0): a plain `starts_with` here would
+            // let a sibling source whose root is a *string* prefix of this
+            // one (e.g. root=/data/blog vs root=/data/blog-drafts) be
+            // misattributed as "from this source". That misattribution is
+            // catastrophic during the delete-sweep in `run_source_ingestion`:
+            // sweeping source A would delete source B's live resources
+            // whenever B's ingestor didn't also run this cycle. Require an
+            // exact match on the root itself, or a match followed by a path
+            // separator, so only true descendants of `root` match.
+            uri == file_prefix || uri.starts_with(&format!("{file_prefix}/"))
         }
+        // Already boundary-safe: exact equality can't suffer the
+        // string-prefix misattribution the path arm above guards against.
         SourceSpec::Url { url, .. } => uri == url.as_str(),
     }
 }
@@ -1623,6 +1710,99 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
+    // C0 — is_uri_from_source boundary-aware matching
+    // ---------------------------------------------------------------------------
+
+    fn path_source(root: &str) -> Source {
+        Source {
+            id: new_ulid(),
+            store_id: "store-1".to_string(),
+            kind: SourceKind::Path,
+            spec: SourceSpec::Path {
+                root: root.to_string(),
+                include: vec![],
+                exclude: vec![],
+            },
+            source_preset: "prose".to_string(),
+        }
+    }
+
+    fn url_source(url: &str) -> Source {
+        Source {
+            id: new_ulid(),
+            store_id: "store-1".to_string(),
+            kind: SourceKind::Url,
+            spec: SourceSpec::Url {
+                url: url.to_string(),
+                refresh_interval_secs: None,
+            },
+            source_preset: "prose".to_string(),
+        }
+    }
+
+    #[test]
+    fn is_uri_from_source_sibling_string_prefix_root_does_not_match() {
+        // Regression (C0): root="/tmp/x/blog" is a *string* prefix of
+        // "/tmp/x/blog-drafts", but the latter is NOT a path descendant of
+        // the former. A plain `starts_with` on the raw prefix would
+        // misattribute blog-drafts's URIs to the "blog" source.
+        let base = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(base.path().join("blog")).unwrap();
+        std::fs::create_dir_all(base.path().join("blog-drafts")).unwrap();
+
+        let blog_root = base.path().join("blog").canonicalize().unwrap();
+        let source = path_source(blog_root.to_str().unwrap());
+
+        // The nested file need not exist; canonicalize only the parent dir.
+        let blog_drafts_root = base.path().join("blog-drafts").canonicalize().unwrap();
+        let sibling_uri = format!("file://{}/draft.md", blog_drafts_root.display());
+
+        assert!(
+            !is_uri_from_source(&sibling_uri, &source),
+            "blog-drafts URI must NOT be attributed to the blog source"
+        );
+    }
+
+    #[test]
+    fn is_uri_from_source_exact_root_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        let source = path_source(canonical.to_str().unwrap());
+        let uri = format!("file://{}", canonical.display());
+        assert!(
+            is_uri_from_source(&uri, &source),
+            "the root URI itself must match its own source"
+        );
+    }
+
+    #[test]
+    fn is_uri_from_source_nested_file_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a").join("b")).unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        let source = path_source(canonical.to_str().unwrap());
+        let uri = format!("file://{}/a/b/note.md", canonical.display());
+        assert!(
+            is_uri_from_source(&uri, &source),
+            "a nested descendant file must match its source's root"
+        );
+    }
+
+    #[test]
+    fn is_uri_from_source_url_exact_match_only() {
+        let source = url_source("https://example.com/blog");
+        assert!(is_uri_from_source("https://example.com/blog", &source));
+        // A URI that is merely a string-prefix-extension of the source URL
+        // must not match either — equality is already boundary-safe here,
+        // but pin the behavior explicitly alongside the path-arm fix.
+        assert!(!is_uri_from_source(
+            "https://example.com/blog-drafts/1",
+            &source
+        ));
+        assert!(!is_uri_from_source("https://example.com/blog/1", &source));
+    }
+
+    // ---------------------------------------------------------------------------
     // Pipeline tests — run_source_ingestion / index_resource
     //
     // Exercises the Ingestor-driven pipeline using a scripted FakeIngestor in
@@ -1775,6 +1955,7 @@ mod tests {
                 let steps: Vec<ScriptStep> = std::mem::take(&mut *self.script.lock().unwrap());
                 let mut produced = 0;
                 let mut skipped = 0;
+                let mut errors = 0;
                 for step in steps {
                     match step {
                         ScriptStep::Discovered(n) => callback.on_discovered(n).await,
@@ -1783,15 +1964,24 @@ mod tests {
                             produced += 1;
                         }
                         ScriptStep::Skipped(uri, reason) => {
+                            // Mirror how a real ingestor bumps its own
+                            // `errors` counter in lockstep with every
+                            // `on_skipped(SkipReason::Error(_))` call (see
+                            // the `run_source_ingestion` debug_assert this
+                            // feeds).
+                            if matches!(reason, SkipReason::Error(_)) {
+                                errors += 1;
+                            } else {
+                                skipped += 1;
+                            }
                             callback.on_skipped(&uri, reason).await;
-                            skipped += 1;
                         }
                     }
                 }
                 Ok(IngestResult {
                     resources_produced: produced,
                     resources_skipped: skipped,
-                    errors: 0,
+                    errors,
                 })
             }
         }
@@ -1908,6 +2098,129 @@ mod tests {
                 "the failing resource counts as an error"
             );
             assert!(result.chunks_written > 0);
+        }
+
+        // -----------------------------------------------------------------
+        // 1b. C8 — SkipReason::Error is counted as an error (not a skip),
+        //     while SkipReason::Unchanged still counts as a skip; both keep
+        //     their URIs alive across the delete-sweep.
+        // -----------------------------------------------------------------
+
+        #[tokio::test]
+        async fn on_skipped_error_counts_as_error_not_skip_and_survives_sweep() {
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let config = make_ingestion_config(store_id);
+            let source = make_source_with_preset(store_id, "prose");
+
+            let error_uri = "file:///docs/transient-failure.md";
+            let unchanged_uri = "file:///docs/unchanged.md";
+
+            // Both URIs already have prior indexed content — the run below
+            // must leave that content in place (they're reported alive via
+            // on_skipped, never seen via on_resource).
+            let error_record = seed_indexed(
+                &store,
+                &embedder,
+                &config,
+                &source,
+                error_uri,
+                "Content that will transiently fail this run.",
+            )
+            .await;
+            let unchanged_record = seed_indexed(
+                &store,
+                &embedder,
+                &config,
+                &source,
+                unchanged_uri,
+                "Content that never changes.",
+            )
+            .await;
+
+            let mut doc_index = DocumentIndex::new();
+            doc_index.upsert(error_record.clone());
+            doc_index.upsert(unchanged_record.clone());
+
+            let good = make_resource(
+                "file:///docs/good.md",
+                "Brand new good content.",
+                &source.id,
+                store_id,
+            );
+
+            let ingestor = FakeIngestor::new(vec![
+                ScriptStep::Discovered(3),
+                ScriptStep::Resource(good),
+                ScriptStep::Skipped(
+                    error_uri.to_string(),
+                    SkipReason::Error("transient read failure".to_string()),
+                ),
+                ScriptStep::Skipped(unchanged_uri.to_string(), SkipReason::Unchanged),
+            ]);
+
+            let (sink, events) = progress_collector();
+            let deps = SourceIngestionDeps {
+                doc_index: &mut doc_index,
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+                progress: Some(sink),
+            };
+            let result = run_source_ingestion(&source, &ingestor, deps)
+                .await
+                .unwrap();
+
+            assert_eq!(result.docs_indexed, 1, "only the new good resource indexes");
+            assert_eq!(
+                result.docs_skipped, 1,
+                "SkipReason::Unchanged still counts as docs_skipped"
+            );
+            assert_eq!(
+                result.error_count, 1,
+                "SkipReason::Error must be counted as an error, not a skip"
+            );
+
+            // Both previously-indexed URIs must survive the delete-sweep.
+            assert!(
+                doc_index.get(error_uri).is_some(),
+                "the errored URI must stay alive in the doc_index"
+            );
+            assert!(
+                doc_index.get(unchanged_uri).is_some(),
+                "the unchanged URI must stay alive in the doc_index"
+            );
+            assert!(
+                !store
+                    .get_chunks_for_resource(&error_record.resource_id)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "the errored URI's existing chunks must not be swept"
+            );
+            assert!(
+                !store
+                    .get_chunks_for_resource(&unchanged_record.resource_id)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "the unchanged URI's existing chunks must not be swept"
+            );
+
+            // Progress event for the errored URI must report DocOutcome::Error,
+            // distinct from DocOutcome::Skipped.
+            let events = events.lock().unwrap();
+            let error_event = events.iter().find_map(|e| match e {
+                ProgressEvent::DocumentFinished { uri, outcome } if uri == error_uri => {
+                    Some(outcome)
+                }
+                _ => None,
+            });
+            assert!(
+                matches!(error_event, Some(DocOutcome::Error)),
+                "expected DocOutcome::Error for the errored URI, got {error_event:?}"
+            );
         }
 
         // -----------------------------------------------------------------
@@ -2255,6 +2568,111 @@ mod tests {
             );
             assert!(doc_index.get(gone_uri).is_none());
             assert!(doc_index.get(kept_uri).is_some());
+        }
+
+        // -----------------------------------------------------------------
+        // 6b. C0 regression: delete-sweep boundary safety across sibling
+        //     path sources whose roots are string prefixes of each other
+        //     (e.g. /data/blog vs /data/blog-drafts). Sweeping source A must
+        //     never delete source B's live resources just because B's root
+        //     string happens to start with A's root string.
+        // -----------------------------------------------------------------
+
+        #[tokio::test]
+        async fn delete_sweep_does_not_cross_sibling_prefix_sources() {
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let config = make_ingestion_config(store_id);
+
+            let base = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(base.path().join("blog")).unwrap();
+            std::fs::create_dir_all(base.path().join("blog-drafts")).unwrap();
+            let blog_root = base.path().join("blog").canonicalize().unwrap();
+            let blog_drafts_root = base.path().join("blog-drafts").canonicalize().unwrap();
+
+            let source_a = Source {
+                id: new_ulid(),
+                store_id: store_id.to_string(),
+                kind: SourceKind::Path,
+                spec: SourceSpec::Path {
+                    root: blog_root.to_str().unwrap().to_string(),
+                    include: vec![],
+                    exclude: vec![],
+                },
+                source_preset: "prose".to_string(),
+            };
+            let source_b = Source {
+                id: new_ulid(),
+                store_id: store_id.to_string(),
+                kind: SourceKind::Path,
+                spec: SourceSpec::Path {
+                    root: blog_drafts_root.to_str().unwrap().to_string(),
+                    include: vec![],
+                    exclude: vec![],
+                },
+                source_preset: "prose".to_string(),
+            };
+
+            let uri_a = format!("file://{}/post.md", blog_root.display());
+            let uri_b = format!("file://{}/draft.md", blog_drafts_root.display());
+
+            // Both sources' documents share the same store-level doc_index —
+            // exactly the shared-store scenario the finding describes.
+            let record_a =
+                seed_indexed(&store, &embedder, &config, &source_a, &uri_a, "Blog post.").await;
+            let record_b = seed_indexed(
+                &store,
+                &embedder,
+                &config,
+                &source_b,
+                &uri_b,
+                "Draft content.",
+            )
+            .await;
+
+            let mut doc_index = DocumentIndex::new();
+            doc_index.upsert(record_a.clone());
+            doc_index.upsert(record_b.clone());
+
+            // Sweep source A only: its ingestor finds nothing at all this
+            // run (simulating, e.g., every file under blog/ having been
+            // deleted). Source B's ingestor does NOT run this cycle.
+            let ingestor = FakeIngestor::new(vec![]);
+            let deps = SourceIngestionDeps {
+                doc_index: &mut doc_index,
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+                progress: None,
+            };
+            let result = run_source_ingestion(&source_a, &ingestor, deps)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                result.docs_deleted, 1,
+                "only source A's own (now-absent) document is swept"
+            );
+            let a_chunks = store
+                .get_chunks_for_resource(&record_a.resource_id)
+                .await
+                .unwrap();
+            assert!(a_chunks.is_empty(), "source A's document must be deleted");
+
+            let b_chunks = store
+                .get_chunks_for_resource(&record_b.resource_id)
+                .await
+                .unwrap();
+            assert!(
+                !b_chunks.is_empty(),
+                "source B's document must survive sweeping source A, even though \
+                 B's root string starts with A's root string"
+            );
+            assert!(
+                doc_index.get(&uri_b).is_some(),
+                "source B's doc_index record must remain"
+            );
         }
 
         // -----------------------------------------------------------------

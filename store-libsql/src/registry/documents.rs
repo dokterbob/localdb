@@ -5,7 +5,7 @@
 //! mapping is done here.
 use localdb_core::{DocumentInfo, Error};
 
-use crate::connection::{map_libsql_err, LibsqlDb};
+use crate::connection::{map_libsql_err, parse_metadata_json_lenient, LibsqlDb};
 
 pub(crate) async fn find_document(
     db: &LibsqlDb,
@@ -55,9 +55,11 @@ fn row_to_document_info(row: &libsql::Row) -> Result<DocumentInfo, Error> {
     let metadata_str: String = row.get(11).map_err(map_libsql_err)?; // metadata_json
                                                                      // Read defensively: rows written before the tagged-`Metadata` migration
                                                                      // (#130) hold untagged, flat Dublin Core JSON — fall back to
-                                                                     // `Metadata::default()` rather than erroring the whole lookup.
+                                                                     // `Metadata::default()` rather than erroring the whole lookup. A
+                                                                     // genuine parse failure is logged (issue C4); see
+                                                                     // `parse_metadata_json_lenient`.
     let metadata: localdb_core::metadata::Metadata =
-        serde_json::from_str(&metadata_str).unwrap_or_default();
+        parse_metadata_json_lenient(&metadata_str, &id);
 
     Ok(DocumentInfo {
         store_id,

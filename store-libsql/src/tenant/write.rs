@@ -42,7 +42,18 @@ pub(crate) async fn delete_by_resource(
     resource_id: &str,
 ) -> Result<usize, Error> {
     let conn = store.conn().conn().await;
-    delete_document_inner(&conn, store.store_id(), resource_id).await
+    conn.execute("BEGIN", ()).await.map_err(map_libsql_err)?;
+    let inner = delete_document_inner(&conn, store.store_id(), resource_id).await;
+    match inner {
+        Ok(count) => {
+            conn.execute("COMMIT", ()).await.map_err(map_libsql_err)?;
+            Ok(count)
+        }
+        Err(e) => {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
 }
 
 /// Connection-level helper: delete all chunks and the resource row for a
@@ -50,8 +61,8 @@ pub(crate) async fn delete_by_resource(
 /// `resources`).
 ///
 /// This is the shared implementation behind both the standalone
-/// `delete_by_resource` (its own autocommit statement pair, used for source
-/// removal / store clearing) and the in-transaction delete performed by
+/// `delete_by_resource` (wrapped in its own BEGIN/COMMIT-or-ROLLBACK, used for
+/// source removal / store clearing) and the in-transaction delete performed by
 /// `upsert_chunks_and_blocks` when replacing a document (issue #79): the
 /// latter runs this against the transaction's own connection, between
 /// `BEGIN` and the replacement insert, so a failure anywhere in that
@@ -85,6 +96,21 @@ pub(crate) async fn delete_by_store(store: &TenantStore, store_id: &str) -> Resu
         ));
     }
     let conn = store.conn().conn().await;
+    conn.execute("BEGIN", ()).await.map_err(map_libsql_err)?;
+    let inner = delete_by_store_inner(&conn, store_id).await;
+    match inner {
+        Ok(chunk_count) => {
+            conn.execute("COMMIT", ()).await.map_err(map_libsql_err)?;
+            Ok(chunk_count)
+        }
+        Err(e) => {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+async fn delete_by_store_inner(conn: &Connection, store_id: &str) -> Result<usize, Error> {
     let chunk_count = conn
         .execute(
             "DELETE FROM chunks WHERE store_id = ?",
@@ -369,4 +395,111 @@ async fn upsert_blocks_inner(
         .map_err(map_libsql_err)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use localdb_core::metadata::Metadata;
+    use localdb_core::types::{SourceKind, Span, StoreVisibility};
+    use localdb_core::{SourceRow, StoreBackend, StoreBackendConfig, StoreRow, VectorEncoding};
+    use tempfile::tempdir;
+
+    use crate::SqliteBackend;
+
+    /// Regression test for issue C4 on the tenant read path
+    /// (`tenant::rows::row_to_chunk_record_strict`, via
+    /// `connection::parse_metadata_json_lenient`): a resource row with
+    /// syntactically invalid `metadata_json` must still be readable through
+    /// `get_chunk` — falling back to `Metadata::default()` — rather than
+    /// erroring the whole read. This exercises the same shared helper that
+    /// `registry::documents::find_document` covers on the registry side
+    /// (`registry::tests::find_document_tolerates_invalid_metadata_json`).
+    #[tokio::test]
+    async fn get_chunk_tolerates_invalid_metadata_json() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("localdb.db");
+        let backend = SqliteBackend::open(StoreBackendConfig::local_path(
+            path,
+            4,
+            VectorEncoding::Float32,
+        ))
+        .await
+        .unwrap();
+
+        backend
+            .upsert_store(&StoreRow {
+                id: "store-1".to_string(),
+                name: "notes".to_string(),
+                visibility: StoreVisibility::Private,
+                backend: "libsql".to_string(),
+                indexing_policy: "{}".to_string(),
+                policy_version: "v1".to_string(),
+                acl: "{}".to_string(),
+                created_at: "2026-07-01T00:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+        backend
+            .upsert_source(&SourceRow {
+                id: "src-1".to_string(),
+                store_id: "store-1".to_string(),
+                kind: SourceKind::Path,
+                root: Some("/docs".to_string()),
+                url: None,
+                include: vec![],
+                exclude: vec![],
+                preset: "prose".to_string(),
+                refresh: None,
+                created_at: "2026-07-01T00:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let handle = backend.retrieval_store("store-1").await.unwrap();
+        let record = localdb_core::ChunkRecord {
+            id: "chunk-1".to_string(),
+            resource_id: "doc-1".to_string(),
+            store_id: "store-1".to_string(),
+            text: "some chunk text".to_string(),
+            span: Span::new(0, 15),
+            heading_path: vec![],
+            embedding: vec![0.1, 0.2, 0.3, 0.4],
+            policy_version: "v1".to_string(),
+            fetched_at: "2026-07-01T00:00:00Z".to_string(),
+            content_hash: "abc123".to_string(),
+            origin_store: "store-1".to_string(),
+            source_id: "src-1".to_string(),
+            ingestor_kind: "path".to_string(),
+            mime: Some("text/markdown".to_string()),
+            uri: "file:///docs/doc.md".to_string(),
+            metadata: Metadata::default(),
+            block_seq: 0,
+            seq_in_block: 0,
+            block_kind: None,
+            window_block_seqs: vec![],
+        };
+        handle.upsert_chunks(vec![record]).await.unwrap();
+
+        // Corrupt the persisted metadata_json directly with syntactically
+        // invalid JSON.
+        let conn = backend.conn.conn().await;
+        conn.execute(
+            "UPDATE resources SET metadata_json = ? WHERE id = ?",
+            libsql::params!["{not valid json".to_string(), "doc-1".to_string()],
+        )
+        .await
+        .unwrap();
+        drop(conn);
+
+        let chunk = handle
+            .get_chunk("chunk-1")
+            .await
+            .unwrap()
+            .expect("chunk must still be found despite invalid metadata_json");
+        assert_eq!(
+            chunk.metadata,
+            Metadata::default(),
+            "invalid metadata_json must fall back to default metadata, not error the read"
+        );
+    }
 }
