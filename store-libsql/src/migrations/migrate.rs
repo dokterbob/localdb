@@ -25,7 +25,7 @@ use super::maintenance::open_for_maintenance;
 use super::runner::{self, AppliedStep};
 use super::table;
 use super::{Migration, MigrationContext};
-use crate::connection::map_libsql_err;
+use crate::connection::{map_libsql_err, validate_embedding_column};
 use crate::schema;
 
 /// The result of one `migrate_store` run.
@@ -140,6 +140,19 @@ async fn migrate_store_with_chain(
             ),
         });
     }
+
+    // Refuse (untouched) if the configured embedding model/encoding doesn't
+    // match what's actually stored in chunks.embedding. `db migrate` derives
+    // `ctx` from config, not from the store itself, and — unlike
+    // `LibsqlDb::open`, which always runs this check — this maintenance path
+    // opens its own connection via `open_for_maintenance` rather than
+    // `open`, so it must run the same check explicitly before rendering any
+    // migration SQL/checksums for what could be the wrong vector shape. Only
+    // reachable here for `BASELINE_VERSION <= current <= head`: the v==0
+    // fresh path above creates the column from `ctx` directly (nothing to
+    // mismatch yet), and the legacy-rebuild path below drops and recreates
+    // every table from `ctx` too.
+    validate_embedding_column(&conn, ctx.embedding_dim, ctx.encoding).await?;
 
     // Verify the EXISTING applied history before applying anything new: a
     // store with pre-existing drift (missing/tampered rows below `current`)
@@ -336,6 +349,40 @@ mod tests {
             }
             other => panic!("expected InvalidConfig, got {other:?}"),
         }
+    }
+
+    // Codex review #152 fix 2: `db migrate` must refuse — untouched — when
+    // the configured embedding shape doesn't match the store's actual
+    // chunks.embedding column, the same way `LibsqlDb::open` always does.
+    #[tokio::test]
+    async fn migrate_store_refuses_and_leaves_db_untouched_on_embedding_dim_mismatch() {
+        let (_dir, path) = test_fixtures::temp_db_path();
+        // Baseline store built with dim 4 / Float32 (test_fixtures::ctx()).
+        test_fixtures::write_baseline_db(&path).await;
+
+        let mismatched_ctx = MigrationContext {
+            embedding_dim: 8,
+            encoding: localdb_core::VectorEncoding::Float32,
+        };
+
+        let before = test_fixtures::dump_db(&path).await;
+        let result = migrate_store(&path, &mismatched_ctx, false).await;
+        let after = test_fixtures::dump_db(&path).await;
+
+        match result {
+            Err(Error::InvalidConfig { message }) => {
+                assert!(
+                    message.contains("mismatch"),
+                    "error should mention mismatch: {message}"
+                );
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+
+        assert_eq!(
+            before, after,
+            "a refused migrate due to an embedding shape mismatch must not mutate the store"
+        );
     }
 
     // Finding 3: existing history must be verified BEFORE pending migrations

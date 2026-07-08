@@ -210,7 +210,15 @@ impl LibsqlDb {
     }
 }
 
-async fn validate_embedding_column(
+/// Refuse if `chunks.embedding`'s actual column type doesn't match what
+/// `(embedding_dim, encoding)` would produce.
+///
+/// Shared by `LibsqlDb::open` (every ordinary open) and
+/// `migrations::migrate::migrate_store` (the maintenance path, which opens
+/// its own connection via `maintenance::open_for_maintenance` rather than
+/// going through `open` — so it must run this same check itself instead of
+/// getting it for free; see that function's call site for why).
+pub(crate) async fn validate_embedding_column(
     conn: &Connection,
     embedding_dim: usize,
     encoding: VectorEncoding,
