@@ -1,3 +1,4 @@
 /target/
 .claude/worktrees/
 .omo/
+.claude/tmp/

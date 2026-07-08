@@ -1,11 +1,38 @@
 //! Golden-file integration tests for the extract crate.
 //!
-//! Each test loads a fixture, runs the default `ChainExtractor`, and asserts
-//! properties of the `ExtractionResult.markdown` string.
+//! Each test loads a fixture, runs it through the default parser chain, and
+//! asserts properties of the resulting `ParsedDocument.markdown` string.
 
-use extract::ChainExtractor;
-use localdb_core::ingestion::DocumentExtractor;
+use extract::{
+    build_chain, default_parser_ids, sniff_mime, ChainParser, ParsedDocument, Parser as _, Probe,
+};
 use localdb_core::Error;
+
+/// Thin test harness around the default parser chain: sniffs a MIME hint and
+/// maps a declined match (`Ok(None)`) to `Error::UnsupportedFormat`, mirroring
+/// the shape the ingestors' bridge code applies in production.
+struct DefaultChain {
+    chain: ChainParser,
+}
+
+impl DefaultChain {
+    fn new() -> Self {
+        Self {
+            chain: build_chain(&default_parser_ids()).unwrap(),
+        }
+    }
+
+    fn extract(&self, bytes: &[u8], filename: Option<&str>) -> Result<ParsedDocument, Error> {
+        let sniffed = sniff_mime(bytes, filename);
+        let probe = Probe::new(bytes, filename, sniffed.as_deref());
+        match self.chain.parse(&probe)? {
+            Some(doc) => Ok(doc),
+            None => Err(Error::UnsupportedFormat {
+                format: "no parser matched the file".to_string(),
+            }),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Markdown golden tests
@@ -14,7 +41,7 @@ use localdb_core::Error;
 #[test]
 fn markdown_fixture_title_extracted() {
     let bytes = include_bytes!("fixtures/simple.md");
-    let ex = ChainExtractor::with_defaults().unwrap();
+    let ex = DefaultChain::new();
     let result = ex.extract(bytes, Some("simple.md")).unwrap();
     assert_eq!(result.title, Some("Introduction".to_string()));
 }
@@ -22,7 +49,7 @@ fn markdown_fixture_title_extracted() {
 #[test]
 fn markdown_fixture_contains_headings() {
     let bytes = include_bytes!("fixtures/simple.md");
-    let ex = ChainExtractor::with_defaults().unwrap();
+    let ex = DefaultChain::new();
     let result = ex.extract(bytes, Some("simple.md")).unwrap();
     // Real Markdown headings must be preserved (not stripped)
     assert!(
@@ -42,7 +69,7 @@ fn markdown_fixture_contains_headings() {
 #[test]
 fn markdown_fixture_contains_code_fence() {
     let bytes = include_bytes!("fixtures/simple.md");
-    let ex = ChainExtractor::with_defaults().unwrap();
+    let ex = DefaultChain::new();
     let result = ex.extract(bytes, Some("simple.md")).unwrap();
     assert!(
         result.markdown.contains("```"),
@@ -57,7 +84,7 @@ fn markdown_fixture_contains_code_fence() {
 #[test]
 fn markdown_fixture_is_passthrough() {
     let raw = include_str!("fixtures/simple.md");
-    let ex = ChainExtractor::with_defaults().unwrap();
+    let ex = DefaultChain::new();
     let result = ex.extract(raw.as_bytes(), Some("simple.md")).unwrap();
     let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
     assert_eq!(
@@ -75,7 +102,7 @@ fn nested_headings_heading_index_paths() {
     use localdb_core::heading_index::{build_heading_index, heading_path_at};
 
     let bytes = include_bytes!("fixtures/nested_headings.md");
-    let ex = ChainExtractor::with_defaults().unwrap();
+    let ex = DefaultChain::new();
     let result = ex.extract(bytes, Some("nested_headings.md")).unwrap();
 
     let idx = build_heading_index(&result.markdown);
@@ -112,7 +139,7 @@ fn nested_headings_heading_index_paths() {
 #[test]
 fn plaintext_fixture_content_present() {
     let bytes = include_bytes!("fixtures/plain.txt");
-    let ex = ChainExtractor::with_defaults().unwrap();
+    let ex = DefaultChain::new();
     let result = ex.extract(bytes, Some("plain.txt")).unwrap();
     assert!(result.title.is_none());
     assert!(
@@ -132,7 +159,7 @@ fn plaintext_fixture_content_present() {
 #[test]
 fn plaintext_fixture_is_passthrough() {
     let raw = include_str!("fixtures/plain.txt");
-    let ex = ChainExtractor::with_defaults().unwrap();
+    let ex = DefaultChain::new();
     let result = ex.extract(raw.as_bytes(), Some("plain.txt")).unwrap();
     let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
     assert_eq!(
@@ -148,7 +175,7 @@ fn plaintext_fixture_is_passthrough() {
 #[test]
 fn html_fixture_title_from_meta_tag() {
     let bytes = include_bytes!("fixtures/article.html");
-    let ex = ChainExtractor::with_defaults().unwrap();
+    let ex = DefaultChain::new();
     let result = ex.extract(bytes, Some("article.html")).unwrap();
     assert_eq!(
         result.title,
@@ -160,7 +187,7 @@ fn html_fixture_title_from_meta_tag() {
 #[test]
 fn html_fixture_article_content_present() {
     let bytes = include_bytes!("fixtures/article.html");
-    let ex = ChainExtractor::with_defaults().unwrap();
+    let ex = DefaultChain::new();
     let result = ex.extract(bytes, Some("article.html")).unwrap();
     // Main content headings
     assert!(
@@ -183,7 +210,7 @@ fn html_fixture_heading_index_paths() {
     use localdb_core::heading_index::{build_heading_index, heading_path_at};
 
     let bytes = include_bytes!("fixtures/article.html");
-    let ex = ChainExtractor::with_defaults().unwrap();
+    let ex = DefaultChain::new();
     let result = ex.extract(bytes, Some("article.html")).unwrap();
 
     let idx = build_heading_index(&result.markdown);
@@ -207,7 +234,7 @@ fn html_fixture_heading_index_paths() {
 #[test]
 fn html_fixture_nav_stripped_or_minimized() {
     let bytes = include_bytes!("fixtures/article.html");
-    let ex = ChainExtractor::with_defaults().unwrap();
+    let ex = DefaultChain::new();
     let result = ex.extract(bytes, Some("article.html")).unwrap();
     // The readability selector should suppress or minimize navigation
     // (It may not be completely empty but the article content must dominate)
@@ -236,7 +263,7 @@ fn scanned_pdf_fixture_returns_err() {
     ))
     .expect("scanned.pdf fixture not found");
 
-    let ex = ChainExtractor::with_defaults().unwrap();
+    let ex = DefaultChain::new();
     let result = ex.extract(&bytes, Some("scanned.pdf"));
     match result {
         Err(Error::UnsupportedFormat { .. }) | Err(Error::ExtractionFailed { .. }) => {}
@@ -255,7 +282,7 @@ fn scanned_pdf_fixture_returns_err() {
 #[test]
 fn epub_fixture_chapters_in_reading_order() {
     let bytes = include_bytes!("fixtures/sample.epub");
-    let ex = ChainExtractor::with_defaults().unwrap();
+    let ex = DefaultChain::new();
     let result = ex.extract(bytes, Some("sample.epub")).unwrap();
 
     let one = result
@@ -275,7 +302,7 @@ fn epub_fixture_chapters_in_reading_order() {
 #[test]
 fn epub_fixture_title_and_metadata() {
     let bytes = include_bytes!("fixtures/sample.epub");
-    let ex = ChainExtractor::with_defaults().unwrap();
+    let ex = DefaultChain::new();
     let result = ex.extract(bytes, Some("sample.epub")).unwrap();
 
     assert_eq!(result.title.as_deref(), Some("The Great Adventure"));
@@ -308,7 +335,7 @@ fn all_text_formats_produce_non_empty_markdown() {
         ),
     ];
 
-    let ex = ChainExtractor::with_defaults().unwrap();
+    let ex = DefaultChain::new();
     for (bytes, name) in fixtures {
         let result = ex
             .extract(bytes, Some(name))

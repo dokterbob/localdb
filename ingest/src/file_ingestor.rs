@@ -1,10 +1,9 @@
 //! File-system ingestor: scans a directory tree, parses each file, and emits
 //! typed [`Resource`]s.
 //!
-//! Full-parity port of `core::ingestion::run_path_source` onto the
-//! [`Ingestor`] trait (issue #117). Behavior is intentionally identical to
-//! `run_path_source` wherever the `Ingestor`/`IngestCallback` contract allows
-//! it to be expressed; deviations are called out inline.
+//! The CLI's concrete [`Ingestor`] for `path`-kind sources (issue #117):
+//! progress hooks, mtime/mime handling, panic-tolerant parsing, and title
+//! merge are all expressed through the `Ingestor`/`IngestCallback` contract.
 
 use extract::sniff_mime;
 use localdb_core::block::{IngestorKind, Resource, ResourceKind};
@@ -23,9 +22,8 @@ use crate::support::{catch_panic, detect_mime, format_unix_secs};
 ///
 /// Reads a directory tree from `source.config["root"]`, optionally filtered by
 /// `source.config["include"]` (array of glob patterns) and
-/// `source.config["exclude"]` (array of glob patterns) — identical config
-/// shape and semantics to `run_path_source` (both call the same
-/// `core::ingestion::enumerate_path_source`).
+/// `source.config["exclude"]` (array of glob patterns), via
+/// `core::ingestion::enumerate_path_source`.
 pub struct FileIngestor {
     /// The parser chain to use for format detection and extraction.
     pub parser: Box<dyn Parser>,
@@ -80,13 +78,12 @@ impl Ingestor for FileIngestor {
             })
             .unwrap_or_default();
 
-        // Same enumeration helper `run_path_source` uses, so directory-walk,
-        // hidden-file, extension and glob filtering behavior is identical by
-        // construction (there's only one implementation).
+        // `enumerate_path_source` owns directory-walk, hidden-file, extension
+        // and glob filtering behavior (shared with any other path-source caller).
         let files = enumerate_path_source(root, &include, &exclude)?;
 
-        // Parity: run_path_source signals `Discovered { total }` right after
-        // enumeration and before processing the first file.
+        // Signal `Discovered { total }` right after enumeration and before
+        // processing the first file.
         callback.on_discovered(files.len()).await;
 
         let mut result = IngestResult::default();
@@ -108,9 +105,9 @@ impl Ingestor for FileIngestor {
                 }
             };
 
-            // mtime -> fetched_at/added_at/modified_at, mirroring
-            // run_path_source's RFC 3339 formatting (falls back to "now" if
-            // the filesystem doesn't report a modified time).
+            // mtime -> fetched_at/added_at/modified_at, formatted as RFC 3339
+            // (falls back to "now" if the filesystem doesn't report a
+            // modified time).
             let fetched_at = file
                 .path
                 .metadata()
@@ -130,23 +127,20 @@ impl Ingestor for FileIngestor {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string());
 
-            // Two distinct mime computations, mirroring the split that exists
-            // in the real pipeline:
-            //  - `detect_mime` (extension-based) is what run_path_source
-            //    stamps onto the stored document/chunk metadata.
-            //  - `extract::sniff_mime` (magic bytes + extension) is what
-            //    `ChainExtractor` — the real `DocumentExtractor` run_path_source
-            //    is wired to in production — feeds into `Probe.sniffed_mime`
-            //    before calling the parser chain.
+            // Two distinct mime computations:
+            //  - `detect_mime` (extension-based) is what gets stamped onto
+            //    the stored document/chunk metadata.
+            //  - `extract::sniff_mime` (magic bytes + extension) feeds into
+            //    `Probe.sniffed_mime` before calling the parser chain.
             let mime = detect_mime(&file.path);
             let sniffed = sniff_mime(&bytes, filename.as_deref());
             let probe = Probe::new(&bytes, file.path.to_str(), sniffed.as_deref());
 
             // Panic-tolerant parsing: a panicking parser must not crash the
-            // whole walk. Mirrors run_path_source's `catch_panic` wrapping of
-            // extraction, but surfaces the panic via `on_skipped` +
-            // `SkipReason::Other` (this trait's dedicated skip-reason
-            // channel) rather than folding it into the generic error count.
+            // whole walk. `catch_panic` wraps extraction and the panic is
+            // surfaced via `on_skipped` + `SkipReason::Other` (this trait's
+            // dedicated skip-reason channel) rather than folding it into the
+            // generic error count.
             let parsed = match catch_panic(std::panic::AssertUnwindSafe(|| {
                 self.parser.parse(&probe)
             })) {
@@ -182,10 +176,9 @@ impl Ingestor for FileIngestor {
             let res_id = resource_id(&file.uri, &hash);
 
             // Title merge: extraction-level title fills `metadata.title` only
-            // when the parser left it `None` — the same rule
-            // `index_document` applies. `Resource.title` mirrors the merged
-            // metadata title (not `parsed.title` directly), so both fields
-            // always agree on which title won.
+            // when the parser left it `None`. `Resource.title` mirrors the
+            // merged metadata title (not `parsed.title` directly), so both
+            // fields always agree on which title won.
             let mut dc = parsed.metadata.clone();
             if dc.title.is_none() {
                 dc.title = parsed.title.clone();
@@ -217,9 +210,8 @@ impl Ingestor for FileIngestor {
                 channel: None,
                 participants: vec![],
                 origin_store: source.store_id.clone(),
-                // Parity fix vs. the pre-existing `core::ingestors::FileIngestor`,
-                // which hardcoded "v1": stamp the policy version the caller
-                // actually requested for this run.
+                // Stamp the policy version the caller actually requested for
+                // this run (not a hardcoded placeholder).
                 policy_version: source.policy_version.clone(),
                 share_path: None,
                 extractor_version: "1.0".to_string(),

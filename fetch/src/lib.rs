@@ -6,6 +6,11 @@ use localdb_core::{
 use reqwest::{Client, StatusCode};
 
 /// HTTP URL fetcher backed by reqwest.
+///
+/// `Clone` (cheap: `reqwest::Client` is internally `Arc`-backed) so callers
+/// can build one client per run and hand each URL-kind source its own boxed
+/// instance without rebuilding the underlying HTTP client per source.
+#[derive(Clone)]
 pub struct HttpUrlFetcher {
     client: Client,
 }

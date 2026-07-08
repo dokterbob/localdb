@@ -739,6 +739,7 @@ dependencies = [
  "extract",
  "fetch",
  "indicatif 0.17.11",
+ "ingest",
  "localdb-core",
  "mcp",
  "reqwest 0.12.28",

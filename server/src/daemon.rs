@@ -819,7 +819,7 @@ mod tests {
         let job = queue
             .submit("store-A", localdb_core::IndexJobScope::Store, move || {
                 // This closure runs on a blocking thread and produces the chunk data.
-                // In real ingestion, this would call run_ingestion_for_source.
+                // In real ingestion, this would call run_source_ingestion.
                 tokio::runtime::Handle::current()
                     .block_on(async {
                         job_state_clone

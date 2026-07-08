@@ -1,9 +1,8 @@
 //! URL ingestor: fetches URLs, parses them, and emits typed [`Resource`]s.
 //!
-//! Full-parity port of `core::ingestion::run_url_source` onto the
-//! [`Ingestor`] trait (issue #117). See `file_ingestor` module docs for the
-//! general porting rationale; deviations from `run_url_source` are called
-//! out inline.
+//! The CLI's concrete [`Ingestor`] for `url`-kind sources (issue #117). See
+//! `file_ingestor` module docs for the general rationale for keeping
+//! acquisition I/O out of `core`.
 
 use extract::sniff_mime;
 use localdb_core::block::{IngestorKind, Resource, ResourceKind};
@@ -21,16 +20,14 @@ use crate::support::catch_panic;
 /// URL ingestor.
 ///
 /// Fetches a list of URLs from `source.config["urls"]` (array of strings).
-/// Optionally supports a single URL via `source.config["url"]`. This is a
-/// superset of `run_url_source`, which only ever drives a single
-/// `SourceSpec::Url { url, .. }` per source; the `urls` (plural) config
-/// predates this port and is preserved as-is.
+/// Optionally supports a single URL via `source.config["url"]`. A `Source`'s
+/// `SourceSpec::Url { url, .. }` only ever carries a single URL; `urls`
+/// (plural) is a superset extension this ingestor also accepts.
 pub struct UrlIngestor {
     /// The parser chain for format detection and extraction.
     pub parser: Box<dyn Parser>,
     /// The HTTP fetcher implementation (the `UrlFetcher` seam stays in
-    /// `core`; this ingestor is injected with it, mirroring how
-    /// `core::ingestors::UrlIngestor` does).
+    /// `core`; this ingestor is injected with it).
     pub fetcher: Box<dyn UrlFetcher>,
 }
 
@@ -73,31 +70,23 @@ impl Ingestor for UrlIngestor {
             });
         }
 
-        // `run_url_source` never emits a `Discovered` progress event (it only
-        // ever drives one URL, so "total" is trivially 1); with `urls`
-        // supporting a batch, reporting the batch size here is a reasonable
-        // extension of the same contract `FileIngestor` follows.
+        // Report the batch size as `Discovered`, matching the contract
+        // `FileIngestor` follows (total known after enumeration).
         callback.on_discovered(urls.len()).await;
 
         let mut result = IngestResult::default();
 
         for url in &urls {
             let fetch_meta = FetchMetadata::default();
-            // Note: like `run_url_source`, conditional-GET metadata is always
-            // the default (no previously-stored ETag/Last-Modified is
-            // threaded in here — `run_url_source` has the same
-            // known gap, marked with a `TODO` in `core::ingestion`).
+            // Note: conditional-GET metadata is always the default here (no
+            // previously-stored ETag/Last-Modified is threaded in) — a known
+            // gap, marked with a `TODO` in `core::ingestion`.
             let fetch_result = match self.fetcher.fetch(url, &fetch_meta).await {
                 Ok(r) => r,
                 Err(e) => {
-                    // Deviation from `run_url_source`: that function
-                    // propagates a fetch error via `?`, aborting the whole
-                    // run — safe there because it only ever handles one URL
-                    // per source. This ingestor supports a batch of URLs, so
-                    // a single fetch failure is counted and the batch
-                    // continues, matching the pre-existing
-                    // `core::ingestors::UrlIngestor` behavior and the test
-                    // plan's "fetch error -> errors counter" requirement.
+                    // A single fetch failure is counted and the batch
+                    // continues rather than aborting the whole run, per the
+                    // test plan's "fetch error -> errors counter" requirement.
                     tracing::warn!(url = %url, "UrlIngestor: fetch error: {}", e);
                     // Report via on_skipped so the delete-sweep keeps this
                     // URL's previously indexed content: a transient network
@@ -138,11 +127,9 @@ impl Ingestor for UrlIngestor {
             };
 
             let filename = url.split('/').next_back().map(|s| s.to_string());
-            // Mirrors `ChainExtractor` (the real `DocumentExtractor`
-            // `run_url_source` is wired to in production): `sniff_mime` over
-            // bytes+filename feeds the parser chain's `Probe`, not the HTTP
-            // `Content-Type` header (which `DocumentExtractor::extract`
-            // never receives either).
+            // `sniff_mime` over bytes+filename feeds the parser chain's
+            // `Probe`, not the HTTP `Content-Type` header (the parser chain
+            // never receives that header either).
             let sniffed = sniff_mime(&bytes, filename.as_deref());
             let probe = Probe::new(&bytes, Some(url.as_str()), sniffed.as_deref());
 
@@ -173,7 +160,7 @@ impl Ingestor for UrlIngestor {
             let res_id = resource_id(url, &hash);
             let now = now_rfc3339();
 
-            // Title merge: same rule as `FileIngestor` / `index_document`.
+            // Title merge: same rule as `FileIngestor` applies.
             let mut dc = parsed.metadata.clone();
             if dc.title.is_none() {
                 dc.title = parsed.title.clone();
@@ -205,9 +192,8 @@ impl Ingestor for UrlIngestor {
                 channel: None,
                 participants: vec![],
                 origin_store: source.store_id.clone(),
-                // Parity fix vs. the pre-existing `core::ingestors::UrlIngestor`,
-                // which hardcoded "v1": stamp the policy version the caller
-                // actually requested for this run.
+                // Stamp the policy version the caller actually requested for
+                // this run (not a hardcoded placeholder).
                 policy_version: source.policy_version.clone(),
                 share_path: None,
                 extractor_version: "1.0".to_string(),
