@@ -19,7 +19,6 @@
 use libsql::Connection;
 
 use super::MigrationContext;
-use crate::vectors::embedding_column_type;
 
 /// Run the full frozen v4 DDL against `conn`.
 ///
@@ -186,12 +185,35 @@ async fn create_blocks(conn: &Connection) -> Result<(), libsql::Error> {
     Ok(())
 }
 
+/// The v4-era `chunks.embedding` column type mapping, inlined verbatim
+/// rather than calling the live `crate::vectors::embedding_column_type`
+/// helper.
+///
+/// This file is the FROZEN v4 baseline (see the module doc comment above) —
+/// it must reproduce exactly what schema version 4 looked like, forever. If
+/// `create_chunks` called the live helper instead, a future change to that
+/// helper's mapping would silently change what this "frozen" baseline
+/// produces too, and the runner's drift guard
+/// (`drift_guard_create_schema_equals_baseline_plus_chain` in `runner.rs`)
+/// would move both sides of its comparison together — this file and
+/// `schema::create_schema`'s output — instead of catching the missing chain
+/// entry a real change to the mapping would require. Copied verbatim from
+/// `vectors::embedding_column_type` as it exists today; pinned against
+/// literal strings by `embedding_column_type_v4_matches_pinned_strings`
+/// below so it can never silently drift either.
+fn embedding_column_type_v4(dim: usize, encoding: localdb_core::VectorEncoding) -> String {
+    match encoding {
+        localdb_core::VectorEncoding::Float32 => format!("F32_BLOB({dim})"),
+        localdb_core::VectorEncoding::Binary => format!("F1BIT_BLOB({dim})"),
+    }
+}
+
 async fn create_chunks(
     conn: &Connection,
     embedding_dim: usize,
     encoding: localdb_core::VectorEncoding,
 ) -> Result<(), libsql::Error> {
-    let col_type = embedding_column_type(embedding_dim, encoding);
+    let col_type = embedding_column_type_v4(embedding_dim, encoding);
     let chunks_ddl = format!(
         "CREATE TABLE IF NOT EXISTS chunks (
             rowid         INTEGER PRIMARY KEY,
@@ -378,6 +400,23 @@ mod tests {
             names.insert(row.get::<String>(0).unwrap());
         }
         names
+    }
+
+    // Codex review #152 fix 3: pin the frozen v4 embedding column mapping
+    // against literal strings, independent of whatever
+    // `crate::vectors::embedding_column_type` currently produces — this is
+    // what makes a future change to the live helper unable to silently drag
+    // the "frozen" baseline along with it.
+    #[test]
+    fn embedding_column_type_v4_matches_pinned_strings() {
+        assert_eq!(
+            embedding_column_type_v4(384, VectorEncoding::Float32),
+            "F32_BLOB(384)"
+        );
+        assert_eq!(
+            embedding_column_type_v4(1024, VectorEncoding::Binary),
+            "F1BIT_BLOB(1024)"
+        );
     }
 
     #[tokio::test]
