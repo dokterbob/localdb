@@ -493,6 +493,177 @@ $ localdb search -s notes --json hybrid search
 
 ---
 
+## `localdb db`
+
+Inspect or migrate a store's schema. See [docs/migrations.md](migrations.md) for
+the full migration walkthrough and the migration-authoring guide, and
+[specs/05-surfaces.md §2.1](../specs/05-surfaces.md#21-schema-migrations) for the
+design.
+
+```
+Inspect or migrate a store's schema (specs/05-surfaces.md §2.1)
+
+Usage: localdb db [OPTIONS] <COMMAND>
+
+Commands:
+  status     Show schema version, pending migrations, and migration history
+  migrate    Apply pending migrations to bring the store up to this binary's head version
+  downgrade  Reverse migrations using stored down-SQL (default: one step back)
+  help       Print this message or the help of the given subcommand(s)
+
+Options:
+      --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
+      --json           Emit JSON output instead of human-readable text
+      --store <NAME>   Operate on this store (repeatable; defaults to all stores)
+  -y, --yes            Skip confirmation prompts for destructive operations
+  -h, --help           Print help
+  -V, --version        Print version
+```
+
+Opening a store never migrates it — a version mismatch on open is refused (exit
+`2`) with a hint pointing at one of these commands. They are the only surfaces
+allowed to change a store's schema version.
+
+**All three subcommands require the daemon to be stopped.** Run against a live
+daemon they exit `4` (`daemon_running`), the same as every other daemon-aware
+write command — the daemon never applies migrations itself:
+
+```
+$ localdb db migrate
+error: daemon is already running
+exit: 4
+```
+
+### `localdb db status`
+
+```
+Show schema version, pending migrations, and migration history
+
+Usage: localdb db status [OPTIONS]
+
+Options:
+      --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
+      --json           Emit JSON output instead of human-readable text
+      --store <NAME>   Operate on this store (repeatable; defaults to all stores)
+  -y, --yes            Skip confirmation prompts for destructive operations
+  -h, --help           Print help
+  -V, --version        Print version
+```
+
+Read-only. Never refuses — a store newer than this binary, or one that predates
+the migration framework entirely, is reportable state, not an error.
+
+```
+$ localdb db status
+schema version: 4 (this binary's head: 4, baseline: 4)
+up to date
+history:
+  v4 baseline  applied 2026-07-01T10:00:00Z  (not downgradable: baseline schema predates the migration framework; cannot downgrade below v4)
+```
+
+With pending migrations the second line becomes
+``2 pending migrations; run `localdb db migrate` ``. `--json` emits
+`current_version`, `head_version`, `baseline_version`, `pending`, `legacy`,
+`too_new`, `table_present`, and a `migrations` history array (per row:
+`version`, `name`, `applied_at`, `downgradable`, `down_unsupported_reason`).
+
+### `localdb db migrate`
+
+```
+Apply pending migrations to bring the store up to this binary's head version
+
+Usage: localdb db migrate [OPTIONS]
+
+Options:
+      --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
+      --json           Emit JSON output instead of human-readable text
+      --store <NAME>   Operate on this store (repeatable; defaults to all stores)
+  -y, --yes            Skip confirmation prompts for destructive operations
+  -h, --help           Print help
+  -V, --version        Print version
+```
+
+Applies every pending migration in ascending order, one transaction per step,
+with per-step progress on stderr, then a summary:
+
+```
+$ localdb db migrate
+applied migration v5 'create_auth_tables' in 12ms
+migrated: v4 -> v5 (1 step applied)
+```
+
+If nothing is pending it prints `already at head (vN)` and exits `0`. If any
+applied migration marks derived data stale (a re-embedding/re-extraction-class
+migration), it ends with a hint — the migration itself never re-indexes:
+
+```
+hint: run `localdb index` to re-index stale content
+```
+
+An ordinary forward migration needs **no confirmation**. A legacy store
+(schema v1–v3, predating the migration baseline) is the exception: migrating it
+is a destructive rebuild — all indexed data is lost — so it prompts first:
+
+```
+$ localdb db migrate
+This store's schema (v2) predates the migration baseline (v4); migrating it erases ALL indexed data and rebuilds from scratch. Continue? [y/N] y
+rebuilt legacy store: v2 -> v4 (all indexed data erased)
+```
+
+Declining leaves the store untouched (prints `Aborted.`, exit `0`). `--yes`
+skips the prompt; a non-interactive session (or `--json`) without `--yes` exits
+`2` (`this command is destructive; re-run with --yes to confirm`). Exits `2`
+without touching anything if the store is newer than this binary (the hint
+points at `db downgrade` or upgrading localdb).
+
+### `localdb db downgrade`
+
+```
+Reverse migrations using stored down-SQL (default: one step back)
+
+Usage: localdb db downgrade [OPTIONS]
+
+Options:
+      --to <VERSION>   Target schema version to downgrade to (default: one step below the current version)
+      --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
+      --json           Emit JSON output instead of human-readable text
+      --store <NAME>   Operate on this store (repeatable; defaults to all stores)
+  -y, --yes            Skip confirmation prompts for destructive operations
+  -h, --help           Print help
+  -V, --version        Print version
+```
+
+Steps the store's schema back to `--to <VERSION>` (default: one step, i.e. the
+current version minus one) by replaying the down-SQL stored in the store's own
+`schema_migrations` table — not the compiled-in chain, which is why an *older*
+localdb binary can downgrade a store a newer binary migrated forward. Always
+requires confirmation (`--yes` to skip; same non-interactive rule as `migrate`):
+
+```
+$ localdb db downgrade --to 5
+This reverses the store's schema to version 5, replaying stored down-SQL and discarding any data or structure introduced by later migrations. Continue? [y/N] y
+downgraded migration v6 'add_access_requests_collected_at_column' in 3ms
+downgraded: v6 -> v5 (1 step)
+```
+
+If any migration on the path to the target has no down-SQL (irreversible; its
+row records a `down_unsupported_reason` instead), the whole downgrade is
+refused up front — exit `2`, nothing changed — naming the blocking migration
+and the nearest reachable target:
+
+```
+$ localdb db downgrade --to 4
+error: invalid config: cannot downgrade past migration 'drop_chunks_block_id' (version 7): chunks.block_id cannot be reconstructed; re-index required after downgrade. Nothing was changed. Downgrade to version 7 instead (`db downgrade --to 7`) to keep it applied and only replay the migrations above it.
+exit: 2
+```
+
+Other refusals (all exit `2`, store untouched): a target below the frozen
+baseline (v4), a target at or above the current version (`nothing to
+downgrade`), and a store with no migration history yet (`run 'localdb db
+migrate' first`).
+
+---
+
 ## `localdb serve`
 
 > **Experimental.** The HTTP daemon is a preview in v0.1.0. See limitations below.

@@ -11,6 +11,7 @@ mod daemon_client;
 mod normalize;
 
 mod cmds {
+    pub(crate) mod db;
     pub(crate) mod index;
     pub(crate) mod init;
     pub(crate) mod search;
@@ -21,6 +22,7 @@ mod cmds {
 }
 
 pub use app_db::AppDb;
+pub use cmds::db::{run_db_downgrade, run_db_migrate, run_db_status};
 pub use cmds::index::run_index;
 pub use cmds::init::run_init;
 pub use cmds::search::run_search;

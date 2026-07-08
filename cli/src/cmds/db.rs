@@ -1,0 +1,376 @@
+//! `localdb db status` / `db migrate` / `db downgrade` — schema-migration
+//! maintenance commands (specs/05-surfaces.md §2.1).
+//!
+//! These are the only surfaces allowed to touch a store's schema version.
+//! Unlike every other command in this crate, they must resolve `(path,
+//! MigrationContext)` from config alone — never through `AppDb::open`, which
+//! refuses on the very version mismatch these commands exist to fix, and
+//! never by constructing an embedder, which can trigger a large model
+//! download just to answer "what version is this store at". See
+//! `app_db::load_config_for_maintenance`'s doc comment.
+
+use localdb_core::{config::loader::ConfigLoader, Error};
+use serde_json::json;
+use store_libsql::{
+    downgrade_store, inspect_schema, migrate_store, MigrationContext, SchemaStatus,
+};
+
+use crate::{
+    app_db::load_config_for_maintenance,
+    daemon_client::{probe_daemon, CliContext, DaemonState},
+    normalize::{confirm_destructive, exit_err, print_json},
+};
+
+/// Refuse with `Error::DaemonRunning` (exit 4) if a daemon is up.
+///
+/// Per specs/05-surfaces.md §2.1: `db status`/`db migrate`/`db downgrade`
+/// are CLI-only and require the daemon to be stopped — unlike `store`/
+/// `source`/`index`/`search`, they never route to the daemon's HTTP API,
+/// because the daemon itself never applies migrations.
+fn refuse_if_daemon_running(ctx: &CliContext, config_loader: &ConfigLoader) {
+    if let DaemonState::Running { .. } =
+        probe_daemon(&config_loader.paths.data_dir, ctx.daemon_url.as_deref())
+    {
+        exit_err(&Error::DaemonRunning, ctx.json);
+    }
+}
+
+/// Statically derive a `MigrationContext` from config — see the module doc
+/// comment and `app_db::load_config_for_maintenance` for why this must not
+/// construct an embedder.
+fn migration_context_from_config(config_loader: &ConfigLoader) -> Result<MigrationContext, Error> {
+    let (embedding_dim, encoding) = embed::infer_dim_encoding(
+        &config_loader.config.defaults.indexing.embedding,
+        &config_loader.config.providers,
+    )
+    .map_err(|e| Error::InvalidConfig {
+        message: format!("cannot determine embedding shape: {e}"),
+    })?;
+    Ok(MigrationContext {
+        embedding_dim,
+        encoding,
+    })
+}
+
+/// Pending-migration count for `db status`: the number of chain entries
+/// between a healthy store's current version and this binary's head.
+///
+/// Zero for a legacy store (below baseline — that's a rebuild, not a
+/// pending-apply count) and zero for a store at or beyond head (nothing
+/// pending; "beyond head" is the too-new case, reported separately).
+///
+/// Pulled out as a pure function of `SchemaStatus` so it's unit-testable
+/// without a real database.
+fn pending_count(status: &SchemaStatus) -> i64 {
+    if status.current_version >= status.baseline_version
+        && status.current_version < status.head_version
+    {
+        status.head_version - status.current_version
+    } else {
+        0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// db status
+// ---------------------------------------------------------------------------
+
+/// `localdb db status`
+pub fn run_db_status(ctx: &CliContext) {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(run_db_status_async(ctx));
+}
+
+pub(crate) async fn run_db_status_async(ctx: &CliContext) {
+    let config_loader = load_config_for_maintenance(ctx);
+    refuse_if_daemon_running(ctx, &config_loader);
+
+    let path = config_loader.paths.db_path();
+    let status = match inspect_schema(&path).await {
+        Ok(s) => s,
+        Err(e) => exit_err(&e, ctx.json),
+    };
+
+    print_status(ctx, &status);
+}
+
+fn print_status(ctx: &CliContext, status: &SchemaStatus) {
+    let pending = pending_count(status);
+    let too_new = status.current_version > status.head_version;
+
+    if ctx.json {
+        let rows: Vec<serde_json::Value> = status
+            .rows
+            .iter()
+            .map(|r| {
+                json!({
+                    "version": r.version,
+                    "name": r.name,
+                    "applied_at": r.applied_at,
+                    "downgradable": r.down_sql.is_some(),
+                    "down_unsupported_reason": r.down_unsupported_reason,
+                })
+            })
+            .collect();
+        print_json(&json!({
+            "current_version": status.current_version,
+            "head_version": status.head_version,
+            "baseline_version": status.baseline_version,
+            "pending": pending,
+            "legacy": status.legacy,
+            "too_new": too_new,
+            "table_present": status.table_present,
+            "migrations": rows,
+        }));
+        return;
+    }
+
+    println!(
+        "schema version: {} (this binary's head: {}, baseline: {})",
+        status.current_version, status.head_version, status.baseline_version
+    );
+    if status.legacy {
+        println!(
+            "legacy store: predates the migration framework (v{}); run `localdb db migrate` \
+             to rebuild it — destructive, all indexed data is lost, then re-run `localdb index`",
+            status.current_version
+        );
+    } else if too_new {
+        println!(
+            "store is newer than this binary (v{} > v{}); run `localdb db downgrade` with this \
+             binary to step it back, or upgrade localdb",
+            status.current_version, status.head_version
+        );
+    } else if pending > 0 {
+        println!(
+            "{pending} pending migration{s}; run `localdb db migrate`",
+            s = if pending == 1 { "" } else { "s" }
+        );
+    } else {
+        println!("up to date");
+    }
+
+    if status.rows.is_empty() {
+        println!("no migration history (schema_migrations table not present)");
+    } else {
+        println!("history:");
+        for row in &status.rows {
+            let downgrade_info = match &row.down_unsupported_reason {
+                Some(reason) => format!("not downgradable: {reason}"),
+                None => "downgradable".to_string(),
+            };
+            println!(
+                "  v{} {}  applied {}  ({downgrade_info})",
+                row.version, row.name, row.applied_at
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// db migrate
+// ---------------------------------------------------------------------------
+
+/// `localdb db migrate`
+pub fn run_db_migrate(ctx: &CliContext) {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(run_db_migrate_async(ctx));
+}
+
+pub(crate) async fn run_db_migrate_async(ctx: &CliContext) {
+    let config_loader = load_config_for_maintenance(ctx);
+    refuse_if_daemon_running(ctx, &config_loader);
+
+    let path = config_loader.paths.db_path();
+    let mctx = match migration_context_from_config(&config_loader) {
+        Ok(c) => c,
+        Err(e) => exit_err(&e, ctx.json),
+    };
+
+    // Pre-inspect (read-only) so we can print a friendly no-op message and
+    // decide whether the legacy-rebuild confirmation prompt is needed —
+    // `migrate_store` itself never prompts; the CLI's confirmation is what
+    // actually authorizes a legacy rebuild's data loss.
+    let pre = match inspect_schema(&path).await {
+        Ok(s) => s,
+        Err(e) => exit_err(&e, ctx.json),
+    };
+
+    if !pre.legacy && pre.current_version == pre.head_version {
+        if ctx.json {
+            print_json(&json!({
+                "status": "ok",
+                "message": format!("already at head (v{})", pre.head_version),
+            }));
+        } else {
+            println!("already at head (v{})", pre.head_version);
+        }
+        return;
+    }
+
+    let allow_legacy_rebuild = if pre.legacy {
+        let prompt = format!(
+            "This store's schema (v{}) predates the migration baseline (v{}); migrating it \
+             erases ALL indexed data and rebuilds from scratch. Continue?",
+            pre.current_version, pre.baseline_version,
+        );
+        if !confirm_destructive(ctx, &prompt) {
+            // Standard aborted-by-user path (mirrors `store remove`, etc.):
+            // `confirm_destructive` already printed "Aborted." to stderr;
+            // just return, leaving the store untouched, exit 0.
+            return;
+        }
+        true
+    } else {
+        false
+    };
+
+    let report = match migrate_store(&path, &mctx, allow_legacy_rebuild).await {
+        Ok(r) => r,
+        Err(e) => exit_err(&e, ctx.json),
+    };
+
+    if ctx.json {
+        print_json(&json!({
+            "status": "ok",
+            "from_version": report.from_version,
+            "to_version": report.to_version,
+            "steps": report.applied.len(),
+            "legacy_rebuilt": report.legacy_rebuilt,
+            "staleness_marked": report.staleness_marked,
+        }));
+        return;
+    }
+
+    if report.legacy_rebuilt {
+        println!(
+            "rebuilt legacy store: v{} -> v{} (all indexed data erased)",
+            report.from_version, report.to_version
+        );
+    } else {
+        println!(
+            "migrated: v{} -> v{} ({} step{} applied)",
+            report.from_version,
+            report.to_version,
+            report.applied.len(),
+            if report.applied.len() == 1 { "" } else { "s" }
+        );
+    }
+    if report.staleness_marked {
+        println!("hint: run `localdb index` to re-index stale content");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// db downgrade
+// ---------------------------------------------------------------------------
+
+/// `localdb db downgrade [--to N]`
+///
+/// Defaults to one step back when `--to` is not given. `downgrade_store`'s
+/// own `target: None` default is the frozen baseline instead — a sensible
+/// default for a library call, but not what specs/05-surfaces.md §2
+/// documents for the CLI ("default: one step"). Rather than changing the
+/// library's default (a program calling it directly might reasonably want
+/// "reset to baseline"), the CLI always resolves an explicit target itself,
+/// so it never actually exercises the library's own `None` branch.
+pub fn run_db_downgrade(ctx: &CliContext, to: Option<i64>) {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(run_db_downgrade_async(ctx, to));
+}
+
+pub(crate) async fn run_db_downgrade_async(ctx: &CliContext, to: Option<i64>) {
+    let config_loader = load_config_for_maintenance(ctx);
+    refuse_if_daemon_running(ctx, &config_loader);
+
+    let path = config_loader.paths.db_path();
+
+    let target = match to {
+        Some(t) => t,
+        None => {
+            let status = match inspect_schema(&path).await {
+                Ok(s) => s,
+                Err(e) => exit_err(&e, ctx.json),
+            };
+            status.current_version - 1
+        }
+    };
+
+    let prompt = format!(
+        "This reverses the store's schema to version {target}, replaying stored down-SQL and \
+         discarding any data or structure introduced by later migrations. Continue?"
+    );
+    if !confirm_destructive(ctx, &prompt) {
+        return;
+    }
+
+    let report = match downgrade_store(&path, Some(target)).await {
+        Ok(r) => r,
+        Err(e) => exit_err(&e, ctx.json),
+    };
+
+    if ctx.json {
+        print_json(&json!({
+            "status": "ok",
+            "from_version": report.from_version,
+            "to_version": report.to_version,
+            "steps": report.steps.len(),
+        }));
+    } else {
+        println!(
+            "downgraded: v{} -> v{} ({} step{})",
+            report.from_version,
+            report.to_version,
+            report.steps.len(),
+            if report.steps.len() == 1 { "" } else { "s" }
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status(
+        current: i64,
+        head: i64,
+        baseline: i64,
+        legacy: bool,
+        table_present: bool,
+    ) -> SchemaStatus {
+        SchemaStatus {
+            current_version: current,
+            head_version: head,
+            baseline_version: baseline,
+            rows: Vec::new(),
+            legacy,
+            table_present,
+        }
+    }
+
+    #[test]
+    fn pending_count_is_zero_when_at_head() {
+        let s = status(4, 4, 4, false, true);
+        assert_eq!(pending_count(&s), 0);
+    }
+
+    #[test]
+    fn pending_count_reports_gap_between_current_and_head() {
+        let s = status(4, 7, 4, false, true);
+        assert_eq!(pending_count(&s), 3);
+    }
+
+    #[test]
+    fn pending_count_is_zero_for_legacy_store_below_baseline() {
+        // A legacy (v1-v3) store needs a rebuild, not an incremental apply —
+        // pending_count must not report a (current..head) gap for it.
+        let s = status(2, 4, 4, true, false);
+        assert_eq!(pending_count(&s), 0);
+    }
+
+    #[test]
+    fn pending_count_is_zero_when_store_is_newer_than_head() {
+        let s = status(9, 4, 4, false, true);
+        assert_eq!(pending_count(&s), 0);
+    }
+}

@@ -27,10 +27,25 @@ Single binary, subcommand tree. Global flags: `--config`, `--json`, `--store <na
 | `add <path|url>...` | Alias for `source add` — add one or more sources to a store | direct write | routed to daemon |
 | `index [--store S] [--source ID] [--strict]` | One-shot scan & index; creates IndexJob | runs job synchronously, progress to stderr | submits job, polls, streams progress |
 | `search <query>... [--limit N] [--content-length N]` | Hybrid search with citations; `--content-length` is a **soft cap** on human-readable snippet chars (default 1000; JSON output always full text) — see §4 for the snapping behavior shared with MCP | embedded read | via API |
+| `db status` | Inspect schema state: current version, head version, pending/unsupported steps. Never refuses, even on a store newer than the binary | reads directly | error `daemon_running` |
+| `db migrate` | Apply pending migrations with per-step progress; legacy v1–v3 rebuild and any other destructive step require confirmation; prints a `localdb index` hint when a weight-class-3 migration ran | direct write | error `daemon_running` |
+| `db downgrade [--to N]` | Reverse migrations down to version `N` (default: one step) using stored down-SQL; requires confirmation; refuses cleanly on a step with `down_unsupported_reason` | direct write | error `daemon_running` |
 
 Output: human-readable by default (citations as `uri:heading_path` + snippet), `--json` emits the
 canonical structures for scripting. The CLI is **command-oriented**; interactive browse is a
 roadmap item with the web UI.
+
+### 2.1 Schema migrations
+
+All schema-version mismatches on open — on every surface, CLI, HTTP daemon, and MCP alike — map
+to `invalid_config` / exit 2 with an actionable hint (§5); no surface auto-migrates on open.
+`db migrate` and `db downgrade` are **CLI-only**: the HTTP daemon and MCP never apply migrations,
+they only ever surface the refusal-with-hint. Both commands require the daemon to be stopped —
+run against a live daemon they fail the same way every other daemon-aware write command does,
+error `daemon_running`, exit 4. Destructive paths (the legacy v1–v3 rebuild inside `db migrate`,
+and `db downgrade`) require explicit confirmation before touching the store. See
+[02-domain-model.md](02-domain-model.md) §9 for the `schema_migrations` table and the
+migration-weight-class design.
 
 ## 3. HTTP API
 

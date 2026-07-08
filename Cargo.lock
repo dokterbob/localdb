@@ -5180,6 +5180,7 @@ name = "store-libsql"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "blake3",
  "libsql",
  "localdb-core",
  "serde_json",
