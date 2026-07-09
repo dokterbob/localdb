@@ -309,6 +309,44 @@ pub(crate) async fn run_db_migrate_async(ctx: &CliContext) {
 // db downgrade
 // ---------------------------------------------------------------------------
 
+/// Pre-validate a resolved downgrade target against `status`, mirroring
+/// `downgrade_store`'s own up-front checks (same order, same wording) —
+/// before `run_db_downgrade_async` asks for destructive confirmation.
+///
+/// An impossible downgrade (already at or below the frozen baseline, or a
+/// target at/above the current version) can only ever fail once it reaches
+/// `downgrade_store`, so demanding a "yes, I'm sure" answer — or, non-
+/// interactively, the generic "re-run with --yes" refusal — for it is
+/// misleading: it implies the operation is destructive-but-possible, not
+/// simply invalid. Checking here lets the CLI surface the real error
+/// instead, without ever prompting.
+///
+/// This is a shortcut, not a replacement: `downgrade_store` remains the
+/// authority and re-validates independently against the live store, so a
+/// TOCTOU race (the store changing between this check and the actual call)
+/// still fails safely there.
+fn validate_downgrade_target(status: &SchemaStatus, target: i64) -> Result<(), Error> {
+    if target < status.baseline_version {
+        return Err(Error::InvalidConfig {
+            message: format!(
+                "cannot downgrade below the frozen baseline version {}: the baseline schema \
+                 predates the migration framework and has no down-SQL to replay",
+                status.baseline_version
+            ),
+        });
+    }
+    if target >= status.current_version {
+        return Err(Error::InvalidConfig {
+            message: format!(
+                "nothing to downgrade: target version {target} must be below the current \
+                 version {}",
+                status.current_version
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// `localdb db downgrade [--to N]`
 ///
 /// Defaults to one step back when `--to` is not given. `downgrade_store`'s
@@ -329,16 +367,18 @@ pub(crate) async fn run_db_downgrade_async(ctx: &CliContext, to: Option<i64>) {
 
     let path = config_loader.paths.db_path();
 
-    let target = match to {
-        Some(t) => t,
-        None => {
-            let status = match inspect_schema(&path).await {
-                Ok(s) => s,
-                Err(e) => exit_err(&e, ctx.json),
-            };
-            status.current_version - 1
-        }
+    // Always inspect first — both to resolve the CLI's own "one step back"
+    // default and to pre-validate the target before the destructive-
+    // confirmation prompt below (see `validate_downgrade_target`).
+    let status = match inspect_schema(&path).await {
+        Ok(s) => s,
+        Err(e) => exit_err(&e, ctx.json),
     };
+    let target = to.unwrap_or(status.current_version - 1);
+
+    if let Err(e) = validate_downgrade_target(&status, target) {
+        exit_err(&e, ctx.json);
+    }
 
     let prompt = format!(
         "This reverses the store's schema to version {target}, replaying stored down-SQL and \
@@ -427,5 +467,37 @@ mod tests {
     fn pending_count_is_zero_for_uninitialized_store() {
         let s = status(0, 4, 4, false, false);
         assert_eq!(pending_count(&s), 0);
+    }
+
+    fn downgrade_status(current: i64, baseline: i64) -> SchemaStatus {
+        status(current, current, baseline, false, true)
+    }
+
+    #[test]
+    fn validate_downgrade_target_rejects_target_below_baseline() {
+        let s = downgrade_status(6, 4);
+        let err = validate_downgrade_target(&s, 3).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("cannot downgrade below the frozen baseline version 4"),
+            "message: {message}"
+        );
+    }
+
+    #[test]
+    fn validate_downgrade_target_rejects_target_at_or_above_current() {
+        let s = downgrade_status(4, 4);
+        let err = validate_downgrade_target(&s, 4).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("nothing to downgrade"),
+            "message: {message}"
+        );
+    }
+
+    #[test]
+    fn validate_downgrade_target_accepts_a_plausible_target() {
+        let s = downgrade_status(7, 4);
+        assert!(validate_downgrade_target(&s, 5).is_ok());
     }
 }

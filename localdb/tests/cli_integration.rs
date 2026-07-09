@@ -1530,6 +1530,11 @@ fn db_migrate_legacy_with_yes_rebuilds_to_head() {
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(v["from_version"].as_i64().unwrap(), 2);
     assert!(v["legacy_rebuilt"].as_bool().unwrap());
+    assert!(
+        v["staleness_marked"].as_bool().unwrap(),
+        "a legacy rebuild erases all indexed content, so JSON should carry \
+         staleness_marked=true: {v}"
+    );
 
     // Verify db status now reports a healthy at-head store.
     let status_output = cmd_with_dir(&dir)
@@ -1540,10 +1545,51 @@ fn db_migrate_legacy_with_yes_rebuilds_to_head() {
         serde_json::from_str(&String::from_utf8_lossy(&status_output.stdout)).unwrap();
     assert_eq!(status["current_version"], status["head_version"]);
     assert!(!status["legacy"].as_bool().unwrap());
+
+    // Same scenario without `--json`: `migrate_store` now sets
+    // `staleness_marked = true` for legacy rebuilds (a recent library
+    // change), so the human-readable path must print the re-index hint —
+    // verify the CLI's existing hint-printing code actually fires for it.
+    let dir2 = TempDir::new().unwrap();
+    write_default_config(&dir2);
+    let data_dir2 = dir2.path().join("data");
+    std::fs::create_dir_all(&data_dir2).unwrap();
+    let db_path2 = data_dir2.join("localdb.db");
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(stamp_user_version(&db_path2, 2));
+
+    let plain_output = cmd_with_dir(&dir2)
+        .args(["--yes", "db", "migrate"])
+        .output()
+        .unwrap();
+    assert!(
+        plain_output.status.success(),
+        "db migrate --yes on a legacy store should succeed; stderr: {}",
+        String::from_utf8_lossy(&plain_output.stderr)
+    );
+    let plain_stdout = String::from_utf8_lossy(&plain_output.stdout);
+    assert!(
+        plain_stdout.contains("rebuilt legacy store"),
+        "stdout: {plain_stdout}"
+    );
+    assert!(
+        plain_stdout.contains("localdb index"),
+        "a confirmed legacy rebuild should print the re-index hint: {plain_stdout}"
+    );
 }
 
 /// `db downgrade --to <current-version> --yes` has nothing to do; the
 /// library's own "nothing to downgrade" `InvalidConfig` maps to exit 2.
+///
+/// Codex review #152 fix 2 reconciliation: before that fix, `--yes` skipped
+/// `confirm_destructive`'s prompt entirely (it always returns `true` for
+/// `--yes`) and the "nothing to downgrade" error only surfaced once
+/// `downgrade_store` itself ran. After the fix, `run_db_downgrade_async`
+/// pre-validates the target (via `validate_downgrade_target`, reusing the
+/// library's own wording) *before* even reaching `confirm_destructive` — so
+/// for this `--yes` case the error now arrives one step earlier, but the
+/// exit code and message are unchanged; no assertion here needed updating.
 #[test]
 fn db_downgrade_nothing_to_do_exits_2() {
     let dir = TempDir::new().unwrap();
@@ -1572,11 +1618,19 @@ fn db_downgrade_nothing_to_do_exits_2() {
     );
 }
 
-/// `db downgrade` without confirmation (non-interactive, no `--yes`) aborts
-/// with exit 2 and leaves the store untouched — downgrades always require
-/// confirmation, even for an otherwise-healthy store.
+/// Codex review #152 fix 2, scenario (b): `--to 4` on a v4 store (already at
+/// baseline/head — nothing to downgrade), non-interactive and without
+/// `--yes`. Before the fix this exited 2 with the generic "re-run with
+/// --yes" refusal from `confirm_destructive`, because the impossible target
+/// was only checked *after* the confirmation gate. After the fix, the CLI
+/// pre-validates the target first and the real "nothing to downgrade" error
+/// surfaces directly — the confirmation prompt is never reached.
+///
+/// (Formerly named `db_downgrade_without_confirmation_aborts`; renamed and
+/// tightened to assert the actual message, not just the exit code, since the
+/// message is exactly what this fix changes.)
 #[test]
-fn db_downgrade_without_confirmation_aborts() {
+fn db_downgrade_to_current_version_without_confirmation_reports_real_error() {
     let dir = TempDir::new().unwrap();
     write_default_config(&dir);
 
@@ -1591,6 +1645,52 @@ fn db_downgrade_without_confirmation_aborts() {
         .unwrap();
 
     assert_eq!(output.status.code().unwrap(), 2);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("nothing to downgrade"),
+        "stderr should surface the real library error, not a generic refusal: {stderr}"
+    );
+    assert!(
+        !stderr.contains("re-run with --yes"),
+        "an impossible downgrade must not demand confirmation for an operation that can only \
+         fail: {stderr}"
+    );
+}
+
+/// Codex review #152 fix 2, scenario (a): `db downgrade` (default target —
+/// no `--to`) on a store already at the frozen baseline, non-interactive and
+/// without `--yes`. The CLI's own default target resolves to
+/// `current_version - 1`, which lands below the baseline for a fresh store
+/// (baseline == head == current here) — pre-validation must catch this and
+/// report the real "cannot downgrade below the frozen baseline" error
+/// directly, never prompting (and never falling back to the generic
+/// "re-run with --yes" refusal).
+#[test]
+fn db_downgrade_default_target_at_baseline_without_confirmation_reports_real_error() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "s1"])
+        .assert()
+        .success();
+
+    let output = cmd_with_dir(&dir)
+        .args(["db", "downgrade"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code().unwrap(), 2);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot downgrade below the frozen baseline"),
+        "stderr should surface the real library error: {stderr}"
+    );
+    assert!(
+        !stderr.contains("re-run with --yes"),
+        "an impossible downgrade must not demand confirmation for an operation that can only \
+         fail: {stderr}"
+    );
 }
 
 /// All three `db` subcommands refuse with exit 4 (`daemon_running`) while a

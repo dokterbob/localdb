@@ -655,8 +655,9 @@ Options:
 Steps the store's schema back to `--to <VERSION>` (default: one step, i.e. the
 current version minus one) by replaying the down-SQL stored in the store's own
 `schema_migrations` table — not the compiled-in chain, which is why an *older*
-localdb binary can downgrade a store a newer binary migrated forward. Always
-requires confirmation (`--yes` to skip; same non-interactive rule as `migrate`):
+localdb binary can downgrade a store a newer binary migrated forward. Requires
+confirmation for every *plausible* downgrade (`--yes` to skip; same
+non-interactive rule as `migrate`):
 
 ```
 $ localdb db downgrade --to 5
@@ -665,21 +666,34 @@ downgraded migration v6 'add_access_requests_collected_at_column' in 3ms
 downgraded: v6 -> v5 (1 step)
 ```
 
-If any migration on the path to the target has no down-SQL (irreversible; its
-row records a `down_unsupported_reason` instead), the whole downgrade is
-refused up front — exit `2`, nothing changed — naming the blocking migration
-and the nearest reachable target:
+An **impossible** target — already at or below the frozen baseline (v4), or a
+`--to` at or above the current version (`nothing to downgrade`) — is checked
+*before* that confirmation prompt and refused immediately, exit `2`, store
+untouched. It never asks "Continue? [y/N]" first: an operation that can only
+fail doesn't need "are you sure":
 
 ```
 $ localdb db downgrade --to 4
+error: invalid config: nothing to downgrade: target version 4 must be below the current version 4
+exit: 2
+```
+
+If any migration on the path to a plausible target has no down-SQL
+(irreversible; its row records a `down_unsupported_reason` instead), the whole
+downgrade is refused — exit `2`, nothing changed — naming the blocking
+migration and the nearest reachable target. This check runs inside
+`downgrade_store` itself (after confirmation), since it depends on which rows
+are actually on the path, not just the target number:
+
+```
+$ localdb db downgrade --to 4
+This reverses the store's schema to version 4, replaying stored down-SQL and discarding any data or structure introduced by later migrations. Continue? [y/N] y
 error: invalid config: cannot downgrade past migration 'drop_chunks_block_id' (version 7): chunks.block_id cannot be reconstructed; re-index required after downgrade. Nothing was changed. Downgrade to version 7 instead (`db downgrade --to 7`) to keep it applied and only replay the migrations above it.
 exit: 2
 ```
 
-Other refusals (all exit `2`, store untouched): a target below the frozen
-baseline (v4), a target at or above the current version (`nothing to
-downgrade`), and a store with no migration history yet (`run 'localdb db
-migrate' first`).
+A store with no migration history yet (`run 'localdb db migrate' first`) is
+also refused inside `downgrade_store`, after confirmation.
 
 ---
 
