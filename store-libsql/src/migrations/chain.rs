@@ -3,7 +3,7 @@
 
 use localdb_core::Error;
 
-use super::Migration;
+use super::{Down, Migration, MigrationContext, Up};
 
 /// The frozen v4 baseline version.
 ///
@@ -14,14 +14,58 @@ use super::Migration;
 /// applied.
 pub const BASELINE_VERSION: i64 = 4;
 
+/// `v5`: drop `chunks.block_id`, swap in the composite
+/// `idx_chunks_store_resource_pos` index, and retag
+/// `resources.metadata_json` from the retired flat Dublin-Core-only shape to
+/// the tagged `Metadata::Document` encoding.
+///
+/// Verbatim port of the manual `docs/migrations/v4-to-v5.sql` script (#151)
+/// this refactor previously shipped as a run-before-upgrading escape hatch —
+/// see that file's history for the full design rationale. The canonical
+/// block reference is now `(store_id, resource_id, block_seq)`, looked up by
+/// sequence number: `blocks.rowid` is not stable across a replace
+/// (delete+insert of a resource mints new block rows), and window chunks
+/// (#129) need to reference a *set* of block sequence numbers, which a
+/// single scalar FK cannot express.
+fn drop_chunks_block_id_and_retag_resource_metadata_up(_ctx: &MigrationContext) -> Vec<String> {
+    vec![
+        "ALTER TABLE chunks DROP COLUMN block_id".to_string(),
+        "DROP INDEX IF EXISTS idx_chunks_store_resource".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_chunks_store_resource_pos \
+         ON chunks(store_id, resource_id, block_seq, seq_in_block)"
+            .to_string(),
+        "UPDATE resources \
+         SET metadata_json = json_set( \
+             metadata_json, \
+             '$.kind', 'document', \
+             '$.page_count', NULL, \
+             '$.word_count', NULL \
+         ) \
+         WHERE json_valid(metadata_json) \
+           AND json_extract(metadata_json, '$.kind') IS NULL"
+            .to_string(),
+    ]
+}
+
 /// The real migration registry.
 ///
-/// Empty in this PR — consumer branches append entries starting at version
-/// `BASELINE_VERSION + 1` (i.e. 5). Because two branches may add migrations
-/// concurrently, whoever lands second is responsible for renumbering their
-/// entries to stay contiguous with whatever landed first.
+/// Consumer branches append entries starting at version `BASELINE_VERSION +
+/// 1` (i.e. 5). Because two branches may add migrations concurrently,
+/// whoever lands second is responsible for renumbering their entries to
+/// stay contiguous with whatever landed first.
 pub fn migrations() -> Vec<Migration> {
-    Vec::new()
+    vec![Migration {
+        version: BASELINE_VERSION + 1,
+        name: "drop_chunks_block_id_and_retag_resource_metadata",
+        summary: "drops chunks.block_id, replaces idx_chunks_store_resource with \
+                  idx_chunks_store_resource_pos, retags resources.metadata_json from the \
+                  retired flat Dublin-Core shape to the tagged Metadata::Document encoding",
+        up: Up::Sql(drop_chunks_block_id_and_retag_resource_metadata_up),
+        down: Down::Unsupported(
+            "chunks.block_id cannot be reconstructed; re-index required after downgrade",
+        ),
+        needs_reindex: true,
+    }]
 }
 
 /// The schema version a database is at once every migration in `chain` has
@@ -135,8 +179,11 @@ mod tests {
     }
 
     #[test]
-    fn head_version_of_empty_real_chain_is_baseline_version() {
-        assert_eq!(head_version(&migrations()), BASELINE_VERSION);
+    fn head_version_of_real_chain_is_baseline_plus_its_length() {
+        assert_eq!(
+            head_version(&migrations()),
+            BASELINE_VERSION + migrations().len() as i64
+        );
     }
 
     #[test]

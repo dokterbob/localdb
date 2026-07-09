@@ -302,7 +302,6 @@ pub(crate) fn map_libsql_err(e: libsql::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::migrations::baseline;
     use tempfile::tempdir;
 
     /// Everything about a database file's on-disk schema state that `open`
@@ -547,12 +546,15 @@ mod tests {
         );
     }
 
-    /// A DB stamped at the pre-#128 v4 schema (old `chunks.block_id` column and
-    /// `idx_chunks_store_resource` index, `user_version=4`) must trigger the
-    /// wipe+reinit path on open, landing on the v5 schema — not error out, and
-    /// not silently keep serving the old shape.
+    /// A DB stamped at the pre-#128 v4 schema (old `chunks.block_id` column
+    /// and `idx_chunks_store_resource` index, `user_version=4`, no
+    /// `schema_migrations` table) is exactly the `Pending` disposition this
+    /// binary's compiled chain now makes reachable (head is 5, one migration
+    /// past baseline) — `LibsqlDb::open` must refuse it with a `db migrate`
+    /// hint and leave it byte-for-byte untouched, not silently wipe and
+    /// reinitialise it the way the pre-framework binary used to.
     #[tokio::test]
-    async fn reopen_with_v4_schema_wipes_and_reinitialises_to_v5() {
+    async fn reopen_with_v4_era_block_id_schema_is_refused_without_mutation() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
         {
@@ -588,49 +590,31 @@ mod tests {
             conn.query("PRAGMA user_version = 4", ()).await.unwrap();
         }
 
-        let db = LibsqlDb::open(&path, 4, localdb_core::VectorEncoding::Float32)
-            .await
-            .unwrap();
+        let before = dump_db(&path).await;
+        let result = LibsqlDb::open(&path, 4, localdb_core::VectorEncoding::Float32).await;
+        let after = dump_db(&path).await;
 
-        let conn = db.conn().await;
-        let version = schema::get_schema_version(&conn).await.unwrap();
-        assert_eq!(version, schema::SCHEMA_VERSION, "should land on v5");
+        match result {
+            Err(Error::InvalidConfig { message }) => {
+                assert!(
+                    message.contains("db migrate"),
+                    "error should point at 'localdb db migrate': {message}"
+                );
+                assert!(
+                    message.contains("behind"),
+                    "error should explain the version is behind this build: {message}"
+                );
+            }
+            Err(other) => panic!("expected InvalidConfig, got: {other:?}"),
+            Ok(_) => panic!(
+                "expected InvalidConfig, but reopen of a pending v4-era block_id schema succeeded"
+            ),
+        }
 
-        // block_id must be gone from the recreated chunks table.
-        let mut rows = conn
-            .query(
-                "SELECT name FROM pragma_table_info('chunks') WHERE name = 'block_id'",
-                (),
-            )
-            .await
-            .unwrap();
-        assert!(
-            rows.next().await.unwrap().is_none(),
-            "block_id column should not exist after v4→v5 reinit"
-        );
-
-        // The new composite index must exist; the old one must not.
-        let mut rows = conn
-            .query(
-                "SELECT name FROM sqlite_master WHERE type='index' AND name = 'idx_chunks_store_resource_pos'",
-                (),
-            )
-            .await
-            .unwrap();
-        assert!(
-            rows.next().await.unwrap().is_some(),
-            "idx_chunks_store_resource_pos should exist after v4→v5 reinit"
-        );
-        let mut rows = conn
-            .query(
-                "SELECT name FROM sqlite_master WHERE type='index' AND name = 'idx_chunks_store_resource'",
-                (),
-            )
-            .await
-            .unwrap();
-        assert!(
-            rows.next().await.unwrap().is_none(),
-            "old idx_chunks_store_resource index should be gone after v4→v5 reinit"
+        assert_eq!(
+            before, after,
+            "a refused open of a pending store must not mutate it at all — block_id, the old \
+             index, and user_version=4 must all still be exactly as they were"
         );
     }
 
@@ -686,10 +670,10 @@ mod tests {
         );
     }
 
-    // -- classify_version: the pure five-way dispatch helper. `Pending` is
-    // unreachable through today's empty real migration chain at the
-    // `LibsqlDb::open` level (head always equals BASELINE_VERSION), so it's
-    // exercised here directly against a synthetic head instead.
+    // -- classify_version: the pure five-way dispatch helper, exercised
+    // directly against a synthetic head (in addition to the real chain's
+    // current head, which `reopen_with_v4_era_block_id_schema_is_refused_
+    // without_mutation` above already exercises `Pending` through).
     #[test]
     fn classify_version_covers_all_five_branches() {
         let baseline = chain::BASELINE_VERSION;
@@ -714,48 +698,64 @@ mod tests {
         );
     }
 
-    // Plan test 12: opening a raw v4 store that predates the migrations
-    // framework (no `schema_migrations` table at all) silently backfills the
-    // bookkeeping table with just the baseline row — pure bookkeeping, no
-    // user-table DDL.
+    // Plan test 12 (superseded): opening a raw v4 store that predates the
+    // migrations framework (no `schema_migrations` table at all) used to be
+    // silently backfilled with just the baseline row when the real chain
+    // was empty — back then `head == BASELINE_VERSION`, so a bare-baseline
+    // store genuinely was `AtHead`. Now that a real chain entry exists, that
+    // same store is `Pending` instead (see
+    // `reopen_with_v4_era_block_id_schema_is_refused_without_mutation`
+    // above), so `AtHead`'s backfill path (`table::ensure_baseline_row`
+    // followed by `checksum::verify_checksums`) is only ever reachable with
+    // *some* bookkeeping already in place.
+    //
+    // This test now pins the resulting behavior for a store that is
+    // fabricated to claim head's `user_version` without ever having run
+    // through the framework (impossible via any real code path once the
+    // chain is non-empty, since reaching head always means `apply_pending`
+    // or `seed_for_fresh_create` ran and left chain-entry rows behind): it
+    // must be refused as corrupt bookkeeping, not silently trusted just
+    // because the version number matches.
     #[tokio::test]
-    async fn silent_backfill_on_healthy_v4_store_without_migrations_table() {
+    async fn at_head_store_missing_chain_entry_rows_is_refused_not_silently_trusted() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
+        let head = chain::head_version(&chain::migrations());
 
-        // Build a raw v4 store the way a pre-framework binary would have:
-        // baseline DDL only, no schema_migrations table.
+        // Build a store with today's head DDL and `user_version` stamped
+        // straight to head, but no `schema_migrations` table at all.
         {
             let db = libsql::Builder::new_local(&path).build().await.unwrap();
             let conn = db.connect().unwrap();
             conn.query("PRAGMA foreign_keys = ON", ()).await.unwrap();
-            let ctx = MigrationContext {
-                embedding_dim: 4,
-                encoding: VectorEncoding::Float32,
-            };
-            baseline::create_baseline_schema(&conn, &ctx).await.unwrap();
+            schema::create_schema(&conn, 4, VectorEncoding::Float32)
+                .await
+                .unwrap();
+            conn.query(&format!("PRAGMA user_version = {head}"), ())
+                .await
+                .unwrap();
         }
 
-        let db = LibsqlDb::open(&path, 4, VectorEncoding::Float32)
-            .await
-            .unwrap();
-        let conn = db.conn().await;
-
-        let rows = table::list_rows_desc_above(&conn, i64::MIN).await.unwrap();
-        assert_eq!(
-            rows.len(),
-            1,
-            "backfill on open should add exactly the baseline row: {rows:?}"
-        );
-        assert_eq!(rows[0].version, chain::BASELINE_VERSION);
-        assert_eq!(rows[0].name, "baseline");
+        match LibsqlDb::open(&path, 4, VectorEncoding::Float32).await {
+            Err(Error::Internal { message, .. }) => {
+                assert!(
+                    message.contains("missing a row"),
+                    "error should explain the bookkeeping is incomplete: {message}"
+                );
+            }
+            Err(other) => panic!("expected Internal, got: {other:?}"),
+            Ok(_) => panic!(
+                "expected Internal error: an at-head store with no chain-entry bookkeeping \
+                 rows must not be silently trusted"
+            ),
+        }
     }
 
     // Plan test 13: a brand-new store created via `LibsqlDb::open` seeds
-    // exactly one bookkeeping row (today's real chain is empty, so that row
-    // is the baseline) and stamps user_version to head.
+    // exactly one bookkeeping row per real chain entry plus the baseline row,
+    // and stamps user_version to head.
     #[tokio::test]
-    async fn fresh_open_seeds_exactly_one_baseline_row() {
+    async fn fresh_open_seeds_baseline_plus_chain_rows() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
 
@@ -767,18 +767,22 @@ mod tests {
         let user_version = schema::get_schema_version(&conn).await.unwrap();
         assert_eq!(user_version, chain::head_version(&chain::migrations()));
         assert_eq!(
-            user_version, 4,
-            "today's empty real chain leaves head == baseline == 4"
+            user_version,
+            chain::BASELINE_VERSION + chain::migrations().len() as i64,
+            "head == baseline + the real chain's length"
         );
 
         let rows = table::list_rows_desc_above(&conn, i64::MIN).await.unwrap();
         assert_eq!(
             rows.len(),
-            1,
-            "real chain is empty; only the baseline row should exist"
+            1 + chain::migrations().len(),
+            "baseline row plus one row per real chain entry should exist"
         );
-        assert_eq!(rows[0].version, chain::BASELINE_VERSION);
-        assert_eq!(rows[0].name, "baseline");
+        assert!(
+            rows.iter()
+                .any(|r| r.version == chain::BASELINE_VERSION && r.name == "baseline"),
+            "baseline row missing: {rows:?}"
+        );
     }
 
     // Codex review #152 fix 1: a database that only got as far as

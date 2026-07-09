@@ -151,13 +151,12 @@ finding zero rows and reporting a no-op "success" while `PRAGMA user_version` st
 ### Behavior change vs. pre-0.x
 
 Older `store-libsql` builds — before this framework — **silently erased and reinitialized** a
-version-mismatched store on open (see `docs/migrations/v4-to-v5.sql` in the
-`refactor/117-parser-ingestor-wiring` branch for the exact wording of that old default: "localdb
-will detect the version mismatch on open, print a warning, and silently wipe and reinitialise
-every table"). That is gone. Every surface now refuses on open; the only way to change a store's
-schema version is the explicit `db migrate` / `db downgrade` commands above, and the one
-remaining destructive path (the legacy v1–v3 rebuild) requires confirmation rather than running
-silently.
+version-mismatched store on open: "localdb will detect the version mismatch on open, print a
+warning, and silently wipe and reinitialise every table" was the old default (see the `refactor/
+117-parser-ingestor-wiring` branch's history for the exact prior wording, since superseded). That
+is gone. Every surface now refuses on open; the only way to change a store's schema version is
+the explicit `db migrate` / `db downgrade` commands above, and the one remaining destructive path
+(the legacy v1–v3 rebuild) requires confirmation rather than running silently.
 
 ---
 
@@ -378,6 +377,12 @@ version of this recipe.
 ---
 
 ## Consumer recipe: PR #151
+
+**Adopted.** `chain::migrations()` now carries this as its first real entry — version 5,
+`drop_chunks_block_id_and_retag_resource_metadata` (the `auth` branch's v5/v6 hadn't landed at
+adoption time, so no renumbering was needed). `docs/migrations/v4-to-v5.sql` and its test
+(`store-libsql/tests/migration_v4_to_v5.rs`) are deleted; `localdb db migrate` replaces the manual
+script. The rest of this section is kept as the historical recipe that produced that entry.
 
 PR #151 / branch `refactor/117-parser-ingestor-wiring` ships a manual `docs/migrations/v4-to-v5.sql`
 script (run by hand with `sqlite3 ... < docs/migrations/v4-to-v5.sql` *before* upgrading the

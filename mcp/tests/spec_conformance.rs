@@ -1,9 +1,7 @@
 //! Spec <-> code conformance test for `get_chunks` (specs/05-surfaces.md §4.1).
 //!
 //! This test parses `specs/05-surfaces.md` *at test-run time* (via a
-//! `CARGO_MANIFEST_DIR`-relative path — the same pattern
-//! `store-libsql/tests/migration_v4_to_v5.rs` uses for
-//! `docs/migrations/v4-to-v5.sql`), extracts the two worked JSON response
+//! `CARGO_MANIFEST_DIR`-relative path), extracts the two worked JSON response
 //! examples from §4.1, drives the real `get_chunks` tool (over a real
 //! `rmcp` client/server pair, mirroring `mcp/tests/mcp_protocol.rs`'s
 //! harness) with the equivalent scenario, and asserts the real response

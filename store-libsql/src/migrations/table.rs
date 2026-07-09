@@ -136,9 +136,27 @@ pub async fn list_rows_desc_above(
     Ok(out)
 }
 
+/// Fetch the row for exactly `version`, if one exists.
+pub async fn find_row(
+    conn: &Connection,
+    version: i64,
+) -> Result<Option<MigrationRow>, libsql::Error> {
+    Ok(list_rows_desc_above(conn, version - 1)
+        .await?
+        .into_iter()
+        .find(|r| r.version == version))
+}
+
 /// Insert one row. Callers are responsible for exactly one of `down_sql` /
 /// `down_unsupported_reason` being `Some` — the table's CHECK constraint
 /// rejects anything else.
+///
+/// Errors on any pre-existing row for the same version (or any other
+/// constraint violation) rather than silently ignoring it — a caller that
+/// needs to tolerate a benign concurrent duplicate (see `runner::seed_all`)
+/// should check via [`find_row`] first and compare checksums itself, rather
+/// than relying on this to paper over a collision it can't distinguish from
+/// genuine corruption.
 pub async fn insert_row(conn: &Connection, row: &MigrationRow) -> Result<(), libsql::Error> {
     let down_sql_json = row
         .down_sql

@@ -1,22 +1,31 @@
 //! End-to-end integration test for the schema-migrations framework
-//! (issue #127) against a fixture chain whose DDL is copied **verbatim**
-//! from the two real in-flight consumer branches, as of 2026-07-08:
+//! (issue #127) against a fixture chain whose DDL was originally copied
+//! **verbatim** from two in-flight consumer branches, as of 2026-07-08:
 //!
-//! - `v5`/`v6` mirror the `auth` branch's `store-libsql/src/schema.rs`:
-//!   `create_auth_tables` (the 7 auth tables + their indexes) and the
-//!   `v5 -> v6` `add_access_requests_collected_at_column` step.
-//! - `v7` mirrors PR #151 / `refactor/117-parser-ingestor-wiring`'s
+//! - `v5`/`v6` mirror the `auth` branch's (issue #98, not yet landed)
+//!   `store-libsql/src/schema.rs`: `create_auth_tables` (the 7 auth tables +
+//!   their indexes) and the `v5 -> v6` `add_access_requests_collected_at_column`
+//!   step.
+//! - `v7` mirrors PR #151 / `refactor/117-parser-ingestor-wiring`'s former
 //!   `docs/migrations/v4-to-v5.sql`: dropping `chunks.block_id`, replacing
 //!   `idx_chunks_store_resource` with `idx_chunks_store_resource_pos`, and
 //!   retagging `resources.metadata_json` from the old flat Dublin-Core shape
 //!   to the tagged `Metadata::Document` shape.
 //!
-//! These fixtures prove the migration machinery (baseline, runner, downgrade)
-//! handles real consumer schema changes both forward and backward, and double
-//! as executable adoption recipes for those branches. The real chain entries
-//! that eventually land in `chain::migrations()` supersede these mirrors —
-//! drift between this file and the source branches is possible and
-//! acceptable until then.
+//! **PR #151 has since landed**: its migration is now the real chain's first
+//! entry, `chain::migrations()`'s version 5
+//! (`drop_chunks_block_id_and_retag_resource_metadata` in `chain.rs`) — not
+//! version 7, since `auth`'s v5/v6 hadn't claimed those slots yet at adoption
+//! time. This file's own `fixture_chain()` deliberately keeps its own
+//! independent v5/v6/v7 numbering rather than reusing `chain::migrations()`:
+//! it exists to exercise the generic runner/downgrade machinery against a
+//! *multi-step* chain (an auth-shaped pair plus a block_id-drop-shaped
+//! step), which is broader coverage than replaying today's one-entry real
+//! chain would give. `migrations::runner::drift_guard_create_schema_equals_baseline_plus_chain`
+//! is the test that pins the real chain (`chain::migrations()`) against
+//! `schema::create_schema` instead; this file's fixtures are intentionally
+//! synthetic and may drift from whatever the real chain looks like at any
+//! given time.
 
 use std::path::{Path, PathBuf};
 
@@ -668,4 +677,71 @@ async fn downgrade_v6_to_v5_removes_only_the_collected_at_column() {
         vec![BASELINE_VERSION + 1],
         "only the v5 row should remain above baseline; the v6 row must be gone"
     );
+}
+
+/// End-to-end proof against the REAL, compiled chain (`chain::migrations()`,
+/// via the public `store_libsql::migrate_store`), not the fixture mirror
+/// above: seed a realistic v4 store (the same `seed_v4_data` fixture the
+/// fixture-chain test uses — two stores, blocks with a `block_id` FK,
+/// untagged flat `metadata_json`), run `migrate_store` exactly the way
+/// `localdb db migrate` does, and confirm it lands on v5 with `block_id`
+/// gone, the composite index swapped in, and `resources.metadata_json`
+/// retagged — while leaving the chunk rows' own data intact.
+#[tokio::test]
+async fn migrate_store_on_real_chain_drops_block_id_and_retags_metadata() {
+    let (_dir, path) = temp_db_path();
+    {
+        let (_db, conn) = open_conn(&path).await;
+        create_baseline_schema(&conn, &ctx()).await.unwrap();
+        seed_v4_data(&conn).await;
+    }
+
+    let report = store_libsql::migrate_store(&path, &ctx(), false)
+        .await
+        .unwrap();
+
+    assert_eq!(report.from_version, BASELINE_VERSION);
+    assert_eq!(report.to_version, BASELINE_VERSION + 1);
+    assert_eq!(
+        report.applied.iter().map(|s| s.version).collect::<Vec<_>>(),
+        vec![BASELINE_VERSION + 1]
+    );
+    assert!(!report.legacy_rebuilt);
+    assert!(
+        report.staleness_marked,
+        "the block_id-drop migration is needs_reindex: true"
+    );
+
+    let (_db, conn) = open_conn(&path).await;
+    assert_eq!(user_version(&conn).await, BASELINE_VERSION + 1);
+    assert!(!column_exists(&conn, "chunks", "block_id").await);
+    assert!(!index_exists(&conn, "idx_chunks_store_resource").await);
+    assert!(index_exists(&conn, "idx_chunks_store_resource_pos").await);
+
+    // Seeded rows preserved.
+    assert_eq!(row_count(&conn, "stores").await, 2);
+    assert_eq!(row_count(&conn, "chunks").await, 4);
+    let mut rows = conn
+        .query(
+            "SELECT store_id, resource_id, text FROM chunks WHERE id = 'chunk-1'",
+            (),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().expect("chunk-1 must survive");
+    let text: String = row.get(2).unwrap();
+    assert_eq!(text, "chunk text 1");
+
+    // metadata_json retagged to the tagged Metadata::Document shape.
+    let mut rows = conn
+        .query("SELECT metadata_json FROM resources WHERE id = 'res-1'", ())
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    let metadata_json: String = row.get(0).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&metadata_json).unwrap();
+    assert_eq!(parsed["kind"], "document");
+    assert!(parsed["page_count"].is_null());
+    assert!(parsed["word_count"].is_null());
+    assert_eq!(parsed["title"], "Doc One");
 }
