@@ -40,8 +40,11 @@ pub struct MigrateReport {
     pub applied: Vec<AppliedStep>,
     /// `true` if this run performed the destructive legacy (v1-v3) rebuild.
     pub legacy_rebuilt: bool,
-    /// `true` if any applied migration is `needs_reindex: true` — the caller
-    /// (the CLI) should print the `localdb index` hint.
+    /// `true` when applied migrations marked reindex work (any applied
+    /// migration is `needs_reindex: true`) OR the store was rebuilt from
+    /// scratch (the destructive legacy v1-v3 rebuild, which erases all
+    /// indexed content) — the caller (the CLI) should print the `localdb
+    /// index` hint.
     pub staleness_marked: bool,
 }
 
@@ -128,7 +131,10 @@ async fn migrate_store_with_chain(
             to_version: head,
             applied: Vec::new(),
             legacy_rebuilt: true,
-            staleness_marked: false,
+            // A confirmed legacy rebuild erases every indexed chunk/
+            // embedding, exactly like the class-3 `needs_reindex` migrations
+            // below — the CLI must print the `localdb index` hint here too.
+            staleness_marked: true,
         });
     }
 
@@ -247,7 +253,11 @@ mod tests {
         assert_eq!(report.to_version, chain::head_version_current());
         assert!(report.legacy_rebuilt);
         assert!(report.applied.is_empty());
-        assert!(!report.staleness_marked);
+        assert!(
+            report.staleness_marked,
+            "a legacy rebuild erases all indexed content, so staleness_marked must be true \
+             so the CLI prints the 'localdb index' hint"
+        );
 
         let (_db, conn) = open_for_maintenance(&path).await.unwrap();
         let v = schema::get_schema_version(&conn).await.unwrap();
