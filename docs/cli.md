@@ -564,8 +564,27 @@ history:
 With pending migrations the second line becomes
 ``2 pending migrations; run `localdb db migrate` ``. `--json` emits
 `current_version`, `head_version`, `baseline_version`, `pending`, `legacy`,
-`too_new`, `table_present`, and a `migrations` history array (per row:
-`version`, `name`, `applied_at`, `downgradable`, `down_unsupported_reason`).
+`too_new`, `uninitialized`, `table_present`, and a `migrations` history array
+(per row: `version`, `name`, `applied_at`, `downgradable`,
+`down_unsupported_reason`).
+
+An existing-but-uninitialized store — a store file that opens fine but has no
+schema at all yet (`PRAGMA user_version` is `0`; a zero-byte file the user
+pointed at is the common case) — is reported distinctly, never as "up to
+date":
+
+```
+$ localdb db status
+schema version: 0 (this binary's head: 4, baseline: 4)
+store exists but is uninitialized (no schema yet); any normal localdb command, or `localdb db migrate`, will initialize it to v4
+```
+
+`--json` sets `"uninitialized": true` for this case. `pending` stays `0`
+rather than reporting `head_version - 0`: an uninitialized store has no
+schema to incrementally apply on top of, only a fresh create (any normal
+command, or `localdb db migrate`, both of which create it fresh at head) — so
+callers should check `uninitialized` before treating `pending == 0` as
+"nothing to do".
 
 ### `localdb db migrate`
 

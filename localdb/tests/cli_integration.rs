@@ -1346,6 +1346,52 @@ fn db_status_missing_store_exits_2() {
     assert_eq!(output.status.code().unwrap(), 2);
 }
 
+/// Codex review #152 fix 1: an existing-but-uninitialized store (a zero-byte
+/// file the user pointed at, `PRAGMA user_version` still 0) must be reported
+/// distinctly, not folded into "up to date" just because `pending == 0`.
+#[test]
+fn db_status_on_uninitialized_store_reports_uninitialized_not_up_to_date() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let db_path = data_dir.join("localdb.db");
+    // A zero-byte file: `open_for_maintenance` only requires `path.is_file()`
+    // to succeed, and a fresh/empty sqlite file reports `PRAGMA user_version`
+    // == 0, exactly like the maintenance path's documented "fresh file"
+    // case (see `migrate_store`'s `current == 0` branch).
+    std::fs::File::create(&db_path).unwrap();
+
+    let output = cmd_with_dir(&dir).args(["db", "status"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "db status on an uninitialized store should exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("uninitialized"),
+        "stdout should mention the store is uninitialized: {stdout}"
+    );
+    assert!(
+        !stdout.contains("up to date"),
+        "an uninitialized store must not be reported as 'up to date': {stdout}"
+    );
+
+    let json_output = cmd_with_dir(&dir)
+        .args(["--json", "db", "status"])
+        .output()
+        .unwrap();
+    assert!(json_output.status.success());
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&json_output.stdout)).unwrap();
+    assert_eq!(v["current_version"].as_i64().unwrap(), 0);
+    assert!(
+        v["uninitialized"].as_bool().unwrap(),
+        "--json output should carry an explicit uninitialized flag: {v}"
+    );
+}
+
 /// `db migrate` on a store already at head is a no-op and exits 0.
 #[test]
 fn db_migrate_noop_at_head() {

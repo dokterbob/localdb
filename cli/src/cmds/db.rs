@@ -56,8 +56,14 @@ fn migration_context_from_config(config_loader: &ConfigLoader) -> Result<Migrati
 /// between a healthy store's current version and this binary's head.
 ///
 /// Zero for a legacy store (below baseline — that's a rebuild, not a
-/// pending-apply count) and zero for a store at or beyond head (nothing
-/// pending; "beyond head" is the too-new case, reported separately).
+/// pending-apply count), zero for a store at or beyond head (nothing
+/// pending; "beyond head" is the too-new case, reported separately), and
+/// zero for an uninitialized store (`current_version == 0` — a store file
+/// that exists but has no schema at all, e.g. a zero-byte file). The
+/// uninitialized case is reported distinctly by `print_status` via its own
+/// `uninitialized` flag rather than as a `pending` gap: there's nothing to
+/// incrementally *apply* to a store with no schema yet, only a fresh create
+/// (`db migrate`, or any normal command).
 ///
 /// Pulled out as a pure function of `SchemaStatus` so it's unit-testable
 /// without a real database.
@@ -97,6 +103,13 @@ pub(crate) async fn run_db_status_async(ctx: &CliContext) {
 fn print_status(ctx: &CliContext, status: &SchemaStatus) {
     let pending = pending_count(status);
     let too_new = status.current_version > status.head_version;
+    // An existing-but-uninitialized store: the file/connection opens fine,
+    // but `PRAGMA user_version` is still 0 — no schema has ever been
+    // created (the maintenance path explicitly supports this, e.g. a
+    // zero-byte file the user pointed at). This must not fall through to
+    // "up to date" just because `pending == 0`: there's no schema to be
+    // "up to date" *with*.
+    let uninitialized = status.current_version == 0;
 
     if ctx.json {
         let rows: Vec<serde_json::Value> = status
@@ -116,9 +129,17 @@ fn print_status(ctx: &CliContext, status: &SchemaStatus) {
             "current_version": status.current_version,
             "head_version": status.head_version,
             "baseline_version": status.baseline_version,
+            // Deliberately left at 0 (not `head_version - 0`) for an
+            // uninitialized store: `pending` counts incremental steps
+            // available to apply on top of an existing schema, and an
+            // uninitialized store has no schema to apply on top of — it
+            // needs a fresh create, not a migration chain. Callers must
+            // check `uninitialized` first; a `pending == 0` alongside
+            // `uninitialized == true` means "needs init", not "up to date".
             "pending": pending,
             "legacy": status.legacy,
             "too_new": too_new,
+            "uninitialized": uninitialized,
             "table_present": status.table_present,
             "migrations": rows,
         }));
@@ -129,7 +150,13 @@ fn print_status(ctx: &CliContext, status: &SchemaStatus) {
         "schema version: {} (this binary's head: {}, baseline: {})",
         status.current_version, status.head_version, status.baseline_version
     );
-    if status.legacy {
+    if uninitialized {
+        println!(
+            "store exists but is uninitialized (no schema yet); any normal localdb command, or \
+             `localdb db migrate`, will initialize it to v{}",
+            status.head_version
+        );
+    } else if status.legacy {
         println!(
             "legacy store: predates the migration framework (v{}); run `localdb db migrate` \
              to rebuild it — destructive, all indexed data is lost, then re-run `localdb index`",
@@ -388,6 +415,17 @@ mod tests {
     #[test]
     fn pending_count_is_zero_when_store_is_newer_than_head() {
         let s = status(9, 4, 4, false, true);
+        assert_eq!(pending_count(&s), 0);
+    }
+
+    // Codex review #152 fix 1: an uninitialized store (current_version == 0,
+    // e.g. an existing zero-byte file) must not report a `head - 0` pending
+    // count — `print_status` reports it via its own `uninitialized` flag
+    // instead, so `pending_count` staying 0 here matters as the honest
+    // building block for that.
+    #[test]
+    fn pending_count_is_zero_for_uninitialized_store() {
+        let s = status(0, 4, 4, false, false);
         assert_eq!(pending_count(&s), 0);
     }
 }
