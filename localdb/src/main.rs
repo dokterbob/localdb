@@ -74,7 +74,8 @@ pub enum Command {
     #[command(subcommand)]
     Source(SourceCommand),
 
-    /// Inspect or migrate a store's schema (specs/05-surfaces.md §2.1).
+    /// Inspect or migrate a store's schema.
+    // See specs/05-surfaces.md §2.1.
     #[command(subcommand)]
     Db(DbCommand),
 
