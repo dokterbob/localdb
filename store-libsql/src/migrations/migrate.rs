@@ -22,6 +22,7 @@ use localdb_core::Error;
 use super::chain::{self, BASELINE_VERSION};
 use super::checksum;
 use super::maintenance::open_for_maintenance;
+use super::progress::{MigrationProgressEvent, MigrationProgressSink};
 use super::runner::{self, AppliedStep};
 use super::table;
 use super::{Migration, MigrationContext};
@@ -60,19 +61,42 @@ pub async fn migrate_store(
     ctx: &MigrationContext,
     allow_legacy_rebuild: bool,
 ) -> Result<MigrateReport, Error> {
-    migrate_store_with_chain(path, ctx, allow_legacy_rebuild, &chain::migrations()).await
+    migrate_store_with_progress(path, ctx, allow_legacy_rebuild, None).await
 }
 
-/// Same as [`migrate_store`], but against an explicit `real_chain` instead of
-/// the compiled registry. This is the seam the fixture-chain tests use to
-/// exercise the incremental-apply path without waiting for real migrations
-/// to land — `migrate_store` itself always calls this with
-/// `chain::migrations()`.
+/// Same as [`migrate_store`], but emits [`MigrationProgressEvent`]s into
+/// `progress` (if given) so a long-running caller (e.g. the CLI's `db
+/// migrate`) can render a live indicator instead of total silence during
+/// minutes of disk I/O. Purely observational — see the `progress` module's
+/// doc comment; `progress: None` behaves identically to [`migrate_store`],
+/// which is in fact a thin wrapper around this function.
+pub async fn migrate_store_with_progress(
+    path: &Path,
+    ctx: &MigrationContext,
+    allow_legacy_rebuild: bool,
+    progress: Option<MigrationProgressSink>,
+) -> Result<MigrateReport, Error> {
+    migrate_store_with_chain(
+        path,
+        ctx,
+        allow_legacy_rebuild,
+        &chain::migrations(),
+        progress,
+    )
+    .await
+}
+
+/// Same as [`migrate_store_with_progress`], but against an explicit
+/// `real_chain` instead of the compiled registry. This is the seam the
+/// fixture-chain tests use to exercise the incremental-apply path without
+/// waiting for real migrations to land — `migrate_store_with_progress`
+/// itself always calls this with `chain::migrations()`.
 async fn migrate_store_with_chain(
     path: &Path,
     ctx: &MigrationContext,
     allow_legacy_rebuild: bool,
     real_chain: &[Migration],
+    progress: Option<MigrationProgressSink>,
 ) -> Result<MigrateReport, Error> {
     let (_db, conn) = open_for_maintenance(path).await?;
 
@@ -83,7 +107,12 @@ async fn migrate_store_with_chain(
 
     if current == 0 {
         // A fresh or 0-byte file the user pointed at: defensible to treat
-        // exactly like a brand-new store.
+        // exactly like a brand-new store. Doesn't step the chain, so there's
+        // no meaningful pending count — a single `Initializing` signal is
+        // enough for the CLI to show *something* rather than silence.
+        if let Some(cb) = &progress {
+            cb(MigrationProgressEvent::Initializing);
+        }
         schema::create_schema(&conn, ctx.embedding_dim, ctx.encoding)
             .await
             .map_err(|e| Error::Internal {
@@ -102,6 +131,9 @@ async fn migrate_store_with_chain(
         runner::seed_for_fresh_create(&conn, real_chain, ctx).await?;
         post_check(&conn, real_chain, ctx).await?;
 
+        if let Some(cb) = &progress {
+            cb(MigrationProgressEvent::Finished);
+        }
         return Ok(MigrateReport {
             from_version: 0,
             to_version: head,
@@ -123,6 +155,11 @@ async fn migrate_store_with_chain(
             });
         }
 
+        // Doesn't step the chain either (drop-and-recreate-at-head), so a
+        // single `RebuildingLegacy` signal is enough.
+        if let Some(cb) = &progress {
+            cb(MigrationProgressEvent::RebuildingLegacy);
+        }
         schema::drop_all_tables(&conn)
             .await
             .map_err(map_libsql_err)?;
@@ -135,6 +172,9 @@ async fn migrate_store_with_chain(
         runner::seed_for_fresh_create(&conn, real_chain, ctx).await?;
         post_check(&conn, real_chain, ctx).await?;
 
+        if let Some(cb) = &progress {
+            cb(MigrationProgressEvent::Finished);
+        }
         return Ok(MigrateReport {
             from_version: current,
             to_version: head,
@@ -182,7 +222,8 @@ async fn migrate_store_with_chain(
         .map_err(map_libsql_err)?;
     checksum::verify_checksums(&conn, real_chain, ctx, current).await?;
 
-    let report = runner::apply_pending(&conn, real_chain, ctx).await?;
+    let report =
+        runner::apply_pending_with_progress(&conn, real_chain, ctx, progress.as_ref()).await?;
     post_check(&conn, real_chain, ctx).await?;
 
     let staleness_marked = report.applied.iter().any(|step| {
@@ -193,6 +234,9 @@ async fn migrate_store_with_chain(
             .unwrap_or(false)
     });
 
+    if let Some(cb) = &progress {
+        cb(MigrationProgressEvent::Finished);
+    }
     Ok(MigrateReport {
         from_version: current,
         to_version: head,
@@ -219,6 +263,26 @@ async fn post_check(
 mod tests {
     use super::*;
     use crate::migrations::{table, test_fixtures};
+    use std::sync::{Arc, Mutex};
+
+    /// A recording [`MigrationProgressSink`] plus a handle to read back every
+    /// event it received, in order — for tests asserting on the progress
+    /// event sequence a `migrate_store_with_chain`/`migrate_store_with_progress`
+    /// call emits.
+    fn recording_sink() -> (
+        MigrationProgressSink,
+        Arc<Mutex<Vec<MigrationProgressEvent>>>,
+    ) {
+        let events: Arc<Mutex<Vec<MigrationProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_for_sink = Arc::clone(&events);
+        let sink: MigrationProgressSink = Arc::new(move |event: MigrationProgressEvent| {
+            events_for_sink
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(event);
+        });
+        (sink, events)
+    }
 
     #[tokio::test]
     async fn migrate_store_refuses_legacy_rebuild_without_confirmation_and_leaves_db_untouched() {
@@ -286,7 +350,7 @@ mod tests {
 
         let chain_migrations = test_fixtures::reversible_chain();
         let report =
-            migrate_store_with_chain(&path, &test_fixtures::ctx(), false, &chain_migrations)
+            migrate_store_with_chain(&path, &test_fixtures::ctx(), false, &chain_migrations, None)
                 .await
                 .unwrap();
 
@@ -304,6 +368,165 @@ mod tests {
         assert!(!report.staleness_marked);
     }
 
+    // Part B.1 (PR #152 comment): `db migrate` against a multi-minute
+    // migration produced total silence — no heartbeat, no step indicator.
+    // These tests pin the progress-event contract the CLI renders from.
+
+    #[tokio::test]
+    async fn migrate_store_with_chain_emits_one_applying_step_per_pending_migration_in_order() {
+        let (_dir, path) = test_fixtures::temp_db_path();
+        test_fixtures::write_baseline_db(&path).await;
+
+        let chain_migrations = test_fixtures::reversible_chain();
+        let (sink, events) = recording_sink();
+
+        migrate_store_with_chain(
+            &path,
+            &test_fixtures::ctx(),
+            false,
+            &chain_migrations,
+            Some(sink),
+        )
+        .await
+        .unwrap();
+
+        let recorded = events.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec![
+                MigrationProgressEvent::Started { total_pending: 3 },
+                MigrationProgressEvent::ApplyingStep {
+                    index: 1,
+                    total: 3,
+                    version: BASELINE_VERSION + 1,
+                    name: chain_migrations[0].name.to_string(),
+                },
+                MigrationProgressEvent::ApplyingStep {
+                    index: 2,
+                    total: 3,
+                    version: BASELINE_VERSION + 2,
+                    name: chain_migrations[1].name.to_string(),
+                },
+                MigrationProgressEvent::ApplyingStep {
+                    index: 3,
+                    total: 3,
+                    version: BASELINE_VERSION + 3,
+                    name: chain_migrations[2].name.to_string(),
+                },
+                MigrationProgressEvent::Finished,
+            ],
+            "expected Started, one ApplyingStep per pending migration (1-based index, in \
+             ascending version order), then Finished"
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_store_with_chain_emits_no_applying_step_when_already_at_head() {
+        let (_dir, path) = test_fixtures::temp_db_path();
+        let chain_migrations = test_fixtures::reversible_chain();
+        test_fixtures::write_baseline_plus_chain(&path, &chain_migrations).await;
+
+        let (sink, events) = recording_sink();
+        let report = migrate_store_with_chain(
+            &path,
+            &test_fixtures::ctx(),
+            false,
+            &chain_migrations,
+            Some(sink),
+        )
+        .await
+        .unwrap();
+
+        assert!(report.applied.is_empty(), "precondition: already at head");
+
+        let recorded = events.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec![
+                MigrationProgressEvent::Started { total_pending: 0 },
+                MigrationProgressEvent::Finished,
+            ],
+            "a no-op-at-head call must emit zero ApplyingStep events"
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_store_with_chain_emits_initializing_signal_on_fresh_create() {
+        let (_dir, path) = test_fixtures::temp_db_path();
+        test_fixtures::touch_empty_db_file(&path);
+
+        let chain_migrations = test_fixtures::reversible_chain();
+        let (sink, events) = recording_sink();
+
+        migrate_store_with_chain(
+            &path,
+            &test_fixtures::ctx(),
+            false,
+            &chain_migrations,
+            Some(sink),
+        )
+        .await
+        .unwrap();
+
+        let recorded = events.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec![
+                MigrationProgressEvent::Initializing,
+                MigrationProgressEvent::Finished,
+            ],
+            "a fresh-create (v0) store must emit a single Initializing signal, not Started/\
+             ApplyingStep — the fresh path doesn't step the chain"
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_store_with_chain_emits_rebuilding_legacy_signal() {
+        let (_dir, path) = test_fixtures::temp_db_path();
+        test_fixtures::stamp_user_version(&path, 2).await;
+
+        let chain_migrations = test_fixtures::reversible_chain();
+        let (sink, events) = recording_sink();
+
+        migrate_store_with_chain(
+            &path,
+            &test_fixtures::ctx(),
+            true,
+            &chain_migrations,
+            Some(sink),
+        )
+        .await
+        .unwrap();
+
+        let recorded = events.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec![
+                MigrationProgressEvent::RebuildingLegacy,
+                MigrationProgressEvent::Finished,
+            ],
+            "a legacy (pre-baseline) rebuild must emit a single RebuildingLegacy signal, not \
+             Started/ApplyingStep — this path doesn't step the chain either"
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_store_with_chain_none_progress_is_a_true_no_op() {
+        // A sanity check that passing `None` (what `migrate_store` always
+        // does) behaves identically to the pre-existing behavior — i.e. this
+        // whole feature is additive and opt-in.
+        let (_dir, path) = test_fixtures::temp_db_path();
+        test_fixtures::write_baseline_db(&path).await;
+
+        let chain_migrations = test_fixtures::reversible_chain();
+        let report =
+            migrate_store_with_chain(&path, &test_fixtures::ctx(), false, &chain_migrations, None)
+                .await
+                .unwrap();
+
+        assert_eq!(report.applied.len(), 3);
+    }
+
     #[tokio::test]
     async fn migrate_store_with_chain_reports_staleness_when_a_migration_needs_reindex() {
         let (_dir, path) = test_fixtures::temp_db_path();
@@ -311,7 +534,7 @@ mod tests {
 
         let chain_migrations = test_fixtures::chain_with_reindex_marker();
         let report =
-            migrate_store_with_chain(&path, &test_fixtures::ctx(), false, &chain_migrations)
+            migrate_store_with_chain(&path, &test_fixtures::ctx(), false, &chain_migrations, None)
                 .await
                 .unwrap();
 
@@ -431,7 +654,8 @@ mod tests {
 
         let before = test_fixtures::dump_db(&path).await;
         let result =
-            migrate_store_with_chain(&path, &test_fixtures::ctx(), false, &two_step_chain).await;
+            migrate_store_with_chain(&path, &test_fixtures::ctx(), false, &two_step_chain, None)
+                .await;
         let after = test_fixtures::dump_db(&path).await;
 
         match result {

@@ -33,6 +33,7 @@ use localdb_core::Error;
 
 use super::chain::{head_version, validate_chain, BASELINE_VERSION};
 use super::checksum::migration_checksum;
+use super::progress::{MigrationProgressEvent, MigrationProgressSink};
 use super::table::{self, MigrationRow};
 use super::{Down, Migration, MigrationContext, Up};
 use crate::connection::map_libsql_err;
@@ -68,6 +69,19 @@ pub async fn apply_pending(
     chain: &[Migration],
     ctx: &MigrationContext,
 ) -> Result<AppliedReport, Error> {
+    apply_pending_with_progress(conn, chain, ctx, None).await
+}
+
+/// Same as [`apply_pending`], but emits [`MigrationProgressEvent`]s into
+/// `progress` (if given) so a long-running caller can render a live
+/// indicator. Purely observational — see `progress`'s module doc comment;
+/// `progress: None` behaves identically to [`apply_pending`].
+pub async fn apply_pending_with_progress(
+    conn: &Connection,
+    chain: &[Migration],
+    ctx: &MigrationContext,
+    progress: Option<&MigrationProgressSink>,
+) -> Result<AppliedReport, Error> {
     validate_chain(chain)?;
 
     table::ensure_table(conn).await.map_err(map_libsql_err)?;
@@ -87,9 +101,25 @@ pub async fn apply_pending(
         });
     }
 
+    let pending: Vec<&Migration> = chain.iter().filter(|m| m.version > current).collect();
+    let total = pending.len();
+    if let Some(cb) = progress {
+        cb(MigrationProgressEvent::Started {
+            total_pending: total,
+        });
+    }
+
     let mut report = AppliedReport::default();
 
-    for migration in chain.iter().filter(|m| m.version > current) {
+    for (i, migration) in pending.into_iter().enumerate() {
+        if let Some(cb) = progress {
+            cb(MigrationProgressEvent::ApplyingStep {
+                index: i + 1,
+                total,
+                version: migration.version,
+                name: migration.name.to_string(),
+            });
+        }
         let started = Instant::now();
 
         // Future migrations touching the DiskANN index `chunks_vec_idx`

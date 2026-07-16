@@ -12,7 +12,7 @@
 use localdb_core::{config::loader::ConfigLoader, Error};
 use serde_json::json;
 use store_libsql::{
-    downgrade_store, inspect_schema, migrate_store, MigrationContext, SchemaStatus,
+    downgrade_store, inspect_schema, migrate_store_with_progress, MigrationContext, SchemaStatus,
 };
 
 use crate::{
@@ -247,7 +247,22 @@ pub(crate) async fn run_db_migrate_async(ctx: &CliContext) {
         false
     };
 
-    let report = match migrate_store(&path, &mctx, allow_legacy_rebuild).await {
+    // `None` in `--json` mode (stdout must stay clean JSON) or when stderr
+    // isn't a terminal, `build_migration_progress_sink` still returns
+    // `Some` for the piped case (bounded plain lines) — see its doc comment.
+    // This is what closes the "total silence during minutes of disk I/O"
+    // gap from PR #152's report: a live heartbeat spinner (or, piped, a
+    // bounded set of step lines) now renders while `migrate_store_with_progress`
+    // runs, instead of nothing until the whole call returns.
+    let progress_sink = crate::progress::build_migration_progress_sink(ctx.json);
+    let report = match migrate_store_with_progress(
+        &path,
+        &mctx,
+        allow_legacy_rebuild,
+        progress_sink,
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => exit_err(&e, ctx.json),
     };

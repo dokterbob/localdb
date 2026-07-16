@@ -19,6 +19,7 @@ pub mod checksum;
 pub mod downgrade;
 pub mod maintenance;
 pub mod migrate;
+pub mod progress;
 pub mod runner;
 pub mod table;
 
