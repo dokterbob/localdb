@@ -90,6 +90,15 @@ async fn migrate_store_with_chain(
                 message: format!("create_schema during migrate (fresh store): {e}"),
                 correlation_id: "libsql_migrate_fresh_create".to_string(),
             })?;
+        // `create_schema` uses `CREATE TABLE IF NOT EXISTS`, so an interrupted
+        // earlier fresh-create that already built `chunks` with a different
+        // embedding shape (and never stamped user_version, so it's still 0)
+        // would otherwise be silently seeded/stamped as if healthy here, and
+        // the next ordinary `open` would then reject a store `migrate` just
+        // finished "successfully". Validate BEFORE seeding/stamping so a
+        // mismatch is refused untouched, exactly like the incremental path
+        // below.
+        validate_embedding_column(&conn, ctx.embedding_dim, ctx.encoding).await?;
         runner::seed_for_fresh_create(&conn, real_chain, ctx).await?;
         post_check(&conn, real_chain, ctx).await?;
 
@@ -455,6 +464,60 @@ mod tests {
                 .iter()
                 .any(|r| r.version == BASELINE_VERSION + 2),
             "no row for the second (pending) migration should have been written"
+        );
+    }
+
+    // C1: the v0 fresh-create path must validate the embedding column BEFORE
+    // seeding/stamping — otherwise an interrupted earlier fresh-create that
+    // already built `chunks` with a different embedding shape (and never
+    // stamped user_version, so it's still 0) gets seeded/stamped as if it
+    // were healthy, and the next ordinary `open` then rejects a store that
+    // `migrate` just finished "successfully".
+    #[tokio::test]
+    async fn migrate_store_on_v0_with_embedding_dim_mismatch_refuses_and_leaves_store_unstamped() {
+        let (_dir, path) = test_fixtures::temp_db_path();
+        test_fixtures::touch_empty_db_file(&path);
+
+        // Simulate the interrupted earlier fresh-create: chunks built with
+        // dim 4, but user_version was never stamped (still 0) and no
+        // bookkeeping rows were ever seeded.
+        {
+            let (_db, conn) = open_for_maintenance(&path).await.unwrap();
+            schema::create_schema(&conn, 4, localdb_core::VectorEncoding::Float32)
+                .await
+                .unwrap();
+        }
+
+        let mismatched_ctx = MigrationContext {
+            embedding_dim: 8,
+            encoding: localdb_core::VectorEncoding::Float32,
+        };
+
+        let before = test_fixtures::dump_db(&path).await;
+        let result = migrate_store(&path, &mismatched_ctx, false).await;
+        let after = test_fixtures::dump_db(&path).await;
+
+        match result {
+            Err(Error::InvalidConfig { message }) => {
+                assert!(
+                    message.contains("mismatch"),
+                    "error should mention mismatch: {message}"
+                );
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+
+        assert_eq!(
+            before, after,
+            "a refused v0 fresh-create migrate due to an embedding shape mismatch must not \
+             mutate the store — in particular, user_version must remain 0 and no \
+             schema_migrations rows may be written"
+        );
+        assert_eq!(after.user_version, 0, "must remain unstamped at v0");
+        assert!(
+            after.migration_rows.is_empty(),
+            "no schema_migrations rows should have been written: {:?}",
+            after.migration_rows
         );
     }
 }

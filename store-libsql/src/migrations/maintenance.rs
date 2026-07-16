@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use libsql::{Builder, Connection, Database};
+use libsql::{Builder, Connection, Database, OpenFlags};
 
 use localdb_core::Error;
 
@@ -58,6 +58,58 @@ pub(crate) async fn open_for_maintenance(path: &Path) -> Result<(Database, Conne
         .await
         .map_err(map_libsql_err)?;
     conn.query("PRAGMA journal_mode=WAL", ())
+        .await
+        .map_err(map_libsql_err)?;
+    conn.query("PRAGMA foreign_keys=ON", ())
+        .await
+        .map_err(map_libsql_err)?;
+
+    Ok((db, conn))
+}
+
+/// Open the libsql database at `path` read-only, for `db status`'s
+/// `inspect_schema` — the one maintenance path that must be a pure read.
+///
+/// Unlike [`open_for_maintenance`] (used by `migrate`/`downgrade`, which
+/// *do* write and so are allowed to switch to WAL), this never runs `PRAGMA
+/// journal_mode=WAL`: that pragma persists a header change to the database
+/// file and creates `-wal`/`-shm` sidecar files, which a read-only status
+/// query must never do. It still sets `busy_timeout` and `foreign_keys` —
+/// both connection-local settings, harmless (and inert, since nothing is
+/// written) on a read-only handle.
+///
+/// Opens with `OpenFlags::SQLITE_OPEN_READ_ONLY` so the connection can't
+/// write to the file even if some future change here accidentally tried to.
+pub(crate) async fn open_for_readonly_inspection(
+    path: &Path,
+) -> Result<(Database, Connection), Error> {
+    if !path.is_file() {
+        return Err(Error::InvalidConfig {
+            message: format!(
+                "no store found at '{}': the database file does not exist. Maintenance \
+                 commands (migrate/downgrade/status) operate on an existing store only.",
+                path.display()
+            ),
+        });
+    }
+
+    let db = Builder::new_local(path)
+        .flags(OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .build()
+        .await
+        .map_err(|e| Error::Internal {
+            message: format!("cannot open store for read-only inspection: {e}"),
+            correlation_id: "libsql_maintenance_open".to_string(),
+        })?;
+
+    let conn = db.connect().map_err(|e| Error::Internal {
+        message: format!("cannot connect to store for read-only inspection: {e}"),
+        correlation_id: "libsql_maintenance_connect".to_string(),
+    })?;
+
+    // Same busy_timeout as open_for_maintenance; deliberately NOT
+    // journal_mode=WAL (see doc comment above).
+    conn.query("PRAGMA busy_timeout=5000", ())
         .await
         .map_err(map_libsql_err)?;
     conn.query("PRAGMA foreign_keys=ON", ())

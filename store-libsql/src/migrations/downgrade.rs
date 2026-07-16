@@ -17,7 +17,7 @@ use libsql::{Connection, TransactionBehavior};
 use localdb_core::Error;
 
 use super::chain::{self, BASELINE_VERSION};
-use super::maintenance::open_for_maintenance;
+use super::maintenance::{open_for_maintenance, open_for_readonly_inspection};
 use super::table::{self, MigrationRow};
 use crate::connection::map_libsql_err;
 use crate::schema;
@@ -98,7 +98,7 @@ pub async fn downgrade_store(path: &Path, target: Option<i64>) -> Result<Downgra
         });
     }
 
-    if !table_exists(&conn, "schema_migrations")
+    if !table::table_exists(&conn, "schema_migrations")
         .await
         .map_err(map_libsql_err)?
     {
@@ -146,6 +146,30 @@ pub async fn downgrade_store(path: &Path, target: Option<i64>) -> Result<Downgra
                 correlation_id: "libsql_migrations_missing_row".to_string(),
             });
         }
+    }
+
+    // The contiguity check above only covers `(target, from_version]` — the
+    // rows this downgrade is about to replay/delete. But `target` itself
+    // stays applied after downgrading (its row, or the baseline row when
+    // `target == BASELINE_VERSION`, is what makes `target` the resulting
+    // version), so that row must already exist too. Without this check, a
+    // store missing exactly its target row would have this downgrade
+    // "succeed", stamp `user_version = target`, and leave behind a store
+    // whose next `open`/`migrate` fails verification because the target's
+    // own row is gone — refuse up front instead, before touching anything.
+    if table::find_row(&conn, target)
+        .await
+        .map_err(map_libsql_err)?
+        .is_none()
+    {
+        return Err(Error::Internal {
+            message: format!(
+                "schema_migrations is missing a row for the downgrade target version {target} \
+                 (it must remain applied after downgrading to it): this store's migration \
+                 bookkeeping is corrupt or incomplete; downgrade refused. Nothing was changed."
+            ),
+            correlation_id: "libsql_migrations_missing_row".to_string(),
+        });
     }
 
     // Refuse up front, before touching anything, if any planned row can't be
@@ -244,27 +268,17 @@ async fn replay_one(tx: &Connection, row: &MigrationRow) -> Result<(), libsql::E
     Ok(())
 }
 
-async fn table_exists(conn: &Connection, name: &str) -> Result<bool, libsql::Error> {
-    let mut rows = conn
-        .query(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
-            libsql::params![name],
-        )
-        .await?;
-    Ok(rows.next().await?.is_some())
-}
-
 /// Read-only schema inspection for `db status`. Never refuses: a store
 /// that's too new, predates the migration framework, or has never been
 /// touched is all reportable state, not an error.
 pub async fn inspect_schema(path: &Path) -> Result<SchemaStatus, Error> {
-    let (_db, conn) = open_for_maintenance(path).await?;
+    let (_db, conn) = open_for_readonly_inspection(path).await?;
 
     let current_version = schema::get_schema_version(&conn)
         .await
         .map_err(map_libsql_err)?;
     let head_version = chain::head_version_current();
-    let table_present = table_exists(&conn, "schema_migrations")
+    let table_present = table::table_exists(&conn, "schema_migrations")
         .await
         .map_err(map_libsql_err)?;
 
@@ -581,6 +595,85 @@ mod tests {
         );
     }
 
+    // -- C5: contiguity check must also cover the TARGET row itself — after
+    // downgrading, `target`'s own `schema_migrations` row (or the baseline
+    // row, when `target == BASELINE_VERSION`) must remain present, since it
+    // stays "applied". The old check only covered `(target+1)..=from_version`
+    // and missed this.
+
+    #[tokio::test]
+    async fn downgrade_store_refuses_when_the_targets_own_row_is_missing_and_leaves_db_untouched() {
+        let (_dir, path) = test_fixtures::temp_db_path();
+        test_fixtures::write_baseline_plus_chain(&path, &test_fixtures::reversible_chain()).await;
+
+        // Target an intermediate version whose OWN row has been deleted —
+        // after downgrading to it, that row must still exist (it's the
+        // still-applied version), but here it's already gone.
+        let target = BASELINE_VERSION + 2;
+        {
+            let (_db, conn) = open_for_maintenance(&path).await.unwrap();
+            table::delete_row(&conn, target).await.unwrap();
+        }
+
+        let before = test_fixtures::dump_db(&path).await;
+        let result = downgrade_store(&path, Some(target)).await;
+        let after = test_fixtures::dump_db(&path).await;
+
+        match result {
+            Err(Error::Internal {
+                message,
+                correlation_id,
+            }) => {
+                assert_eq!(correlation_id, "libsql_migrations_missing_row");
+                assert!(
+                    message.contains(&target.to_string()),
+                    "message should name the missing target version: {message}"
+                );
+            }
+            other => panic!("expected Error::Internal, got {other:?}"),
+        }
+        assert_eq!(
+            before, after,
+            "a refused downgrade must not mutate the store at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn downgrade_store_refuses_when_baseline_row_is_missing_and_leaves_db_untouched() {
+        let (_dir, path) = test_fixtures::temp_db_path();
+        test_fixtures::write_baseline_plus_chain(&path, &test_fixtures::reversible_chain()).await;
+
+        // Default target resolves to BASELINE_VERSION; delete its row (the
+        // frozen baseline row) so it's missing when the downgrade needs it
+        // to remain applied.
+        {
+            let (_db, conn) = open_for_maintenance(&path).await.unwrap();
+            table::delete_row(&conn, BASELINE_VERSION).await.unwrap();
+        }
+
+        let before = test_fixtures::dump_db(&path).await;
+        let result = downgrade_store(&path, None).await;
+        let after = test_fixtures::dump_db(&path).await;
+
+        match result {
+            Err(Error::Internal {
+                message,
+                correlation_id,
+            }) => {
+                assert_eq!(correlation_id, "libsql_migrations_missing_row");
+                assert!(
+                    message.contains(&BASELINE_VERSION.to_string()),
+                    "message should name the missing baseline version: {message}"
+                );
+            }
+            other => panic!("expected Error::Internal, got {other:?}"),
+        }
+        assert_eq!(
+            before, after,
+            "a refused downgrade must not mutate the store at all"
+        );
+    }
+
     #[tokio::test]
     async fn inspect_schema_on_healthy_store_reports_table_present_and_baseline_row() {
         let (_dir, path) = test_fixtures::temp_db_path();
@@ -629,5 +722,49 @@ mod tests {
         assert_eq!(status.current_version, 2);
         assert!(status.legacy);
         assert!(!status.table_present);
+    }
+
+    // C4: `db status`'s read-only backend must be a pure read. Previously
+    // `inspect_schema` went through `open_for_maintenance`, which persists
+    // `PRAGMA journal_mode=WAL` — mutating the store's on-disk journal mode
+    // and creating `-wal`/`-shm` sidecar files as a side effect of a status
+    // query.
+    async fn read_journal_mode(path: &Path) -> String {
+        // Deliberately bypasses both `open_for_maintenance` and
+        // `open_for_readonly_inspection`: querying `PRAGMA journal_mode`
+        // without an `=value` assignment only reports the current mode, it
+        // never changes it, so this is safe to use for both the "before"
+        // and "after" snapshots.
+        let db = libsql::Builder::new_local(path).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        let mut rows = conn.query("PRAGMA journal_mode", ()).await.unwrap();
+        let mode: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        mode.to_ascii_lowercase()
+    }
+
+    #[tokio::test]
+    async fn inspect_schema_does_not_switch_journal_mode_or_create_wal_sidecar() {
+        let (_dir, path) = test_fixtures::temp_db_path();
+        test_fixtures::write_baseline_db(&path).await;
+
+        let before_mode = read_journal_mode(&path).await;
+        assert_ne!(
+            before_mode, "wal",
+            "fixture must start in a non-WAL journal mode for this test to be meaningful"
+        );
+
+        let _status = inspect_schema(&path).await.unwrap();
+
+        let after_mode = read_journal_mode(&path).await;
+        assert_eq!(
+            after_mode, before_mode,
+            "inspect_schema (db status) must not persist a journal_mode change"
+        );
+
+        let wal_sidecar = format!("{}-wal", path.display());
+        assert!(
+            !std::path::Path::new(&wal_sidecar).exists(),
+            "inspect_schema must not create a -wal sidecar file"
+        );
     }
 }

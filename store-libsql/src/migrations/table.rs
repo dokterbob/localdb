@@ -57,6 +57,22 @@ pub async fn ensure_baseline_row(conn: &Connection) -> Result<(), libsql::Error>
     Ok(())
 }
 
+/// Whether a table named `name` exists in `sqlite_master`.
+///
+/// Shared by callers that need to distinguish "the `schema_migrations` table
+/// itself never existed" (a raw pre-framework store) from "the table exists
+/// but a required row is missing" (corrupt bookkeeping) — the two cases must
+/// be handled differently: only the former is safe to silently backfill.
+pub async fn table_exists(conn: &Connection, name: &str) -> Result<bool, libsql::Error> {
+    let mut rows = conn
+        .query(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
+            params![name],
+        )
+        .await?;
+    Ok(rows.next().await?.is_some())
+}
+
 /// The highest applied migration version, or `None` if the table is empty.
 pub async fn max_version(conn: &Connection) -> Result<Option<i64>, libsql::Error> {
     let mut rows = conn
