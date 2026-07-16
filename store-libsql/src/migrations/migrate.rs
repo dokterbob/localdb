@@ -204,9 +204,12 @@ async fn migrate_store_with_chain(
     // `open`, so it must run the same check explicitly before rendering any
     // migration SQL/checksums for what could be the wrong vector shape. Only
     // reachable here for `BASELINE_VERSION <= current <= head`: the v==0
-    // fresh path above creates the column from `ctx` directly (nothing to
-    // mismatch yet), and the legacy-rebuild path below drops and recreates
-    // every table from `ctx` too.
+    // fresh path above now validates explicitly too (see its own comment —
+    // `create_schema`'s `CREATE TABLE IF NOT EXISTS` means an interrupted
+    // earlier fresh-create can leave a mismatched column behind even at
+    // v==0, so there IS something to mismatch there), and the legacy-rebuild
+    // path below drops and recreates every table from `ctx`, so it can never
+    // mismatch.
     validate_embedding_column(&conn, ctx.embedding_dim, ctx.encoding).await?;
 
     // Verify the EXISTING applied history before applying anything new: a

@@ -179,18 +179,36 @@ impl LibsqlDb {
                 });
             }
             VersionDisposition::AtHead => {
-                // Only backfill the baseline row when `schema_migrations`
-                // itself was absent before this open — the raw
-                // pre-framework case. If the table already exists but its
-                // baseline row is missing, that's corrupt bookkeeping: fall
-                // through to `verify_checksums` unmutated so it refuses with
-                // a missing-row error, rather than recreating the row here
-                // and letting a tampered/corrupt store pass as healthy.
+                // Only backfill `schema_migrations` (table + baseline row)
+                // when it was absent before this open AND `head ==
+                // BASELINE_VERSION` — i.e. this build's compiled chain is
+                // itself empty, so a table-absent store reporting
+                // `user_version == head` genuinely is the raw pre-framework
+                // case (a bare-baseline store that just needs bookkeeping
+                // scaffolding). When `head > BASELINE_VERSION`, a
+                // table-absent store claiming `user_version == head` is
+                // fabricated or corrupt: the only real code paths that reach
+                // `head` (`seed_for_fresh_create`/`apply_pending`) always
+                // leave the table and its rows behind, so this can't be a
+                // legitimate pre-framework store. Backfilling it here would
+                // create the table and baseline row only for
+                // `verify_checksums` to immediately refuse it anyway (a
+                // missing row for v{head}) — mutating a store `open` is
+                // about to refuse, violating "open never mutates a store it
+                // refuses". So leave it untouched and let `verify_checksums`
+                // below refuse it with a missing-row error.
+                //
+                // If the table already exists but its baseline row is
+                // missing, that's corrupt bookkeeping regardless of `head`:
+                // fall through to `verify_checksums` unmutated so it refuses
+                // with a missing-row error, rather than recreating the row
+                // here and letting a tampered/corrupt store pass as healthy
+                // (C3).
                 let migrations_table_existed = table::table_exists(&conn, "schema_migrations")
                     .await
                     .map_err(map_libsql_err)?;
-                table::ensure_table(&conn).await.map_err(map_libsql_err)?;
-                if !migrations_table_existed {
+                if !migrations_table_existed && head == chain::BASELINE_VERSION {
+                    table::ensure_table(&conn).await.map_err(map_libsql_err)?;
                     table::ensure_baseline_row(&conn)
                         .await
                         .map_err(map_libsql_err)?;
@@ -769,6 +787,85 @@ mod tests {
                  rows must not be silently trusted"
             ),
         }
+    }
+
+    // Fix 1 (adversarial review, track 4): the fabricated at-head store above
+    // (real chain head > BASELINE_VERSION, no `schema_migrations` table) must
+    // be refused WITHOUT `open` having created the table (or its baseline
+    // row) first. Before this fix, the `AtHead` branch unconditionally
+    // created the table and — because it was absent — backfilled the
+    // baseline row, then only afterward let `verify_checksums` refuse for the
+    // still-missing v{head} chain-entry row: a store `open` refuses had
+    // already been mutated. This pins that the table stays entirely absent
+    // and `user_version` is untouched.
+    #[tokio::test]
+    async fn at_head_store_with_no_migrations_table_is_refused_without_creating_it() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let head = chain::head_version(&chain::migrations());
+        assert!(
+            head > chain::BASELINE_VERSION,
+            "this test's premise requires a non-empty real chain, so a table-absent \
+             at-head store is never legitimately backfillable"
+        );
+
+        // Build a store with today's head DDL and `user_version` stamped
+        // straight to head, but no `schema_migrations` table at all.
+        {
+            let db = libsql::Builder::new_local(&path).build().await.unwrap();
+            let conn = db.connect().unwrap();
+            conn.query("PRAGMA foreign_keys = ON", ()).await.unwrap();
+            schema::create_schema(&conn, 4, VectorEncoding::Float32)
+                .await
+                .unwrap();
+            conn.query(&format!("PRAGMA user_version = {head}"), ())
+                .await
+                .unwrap();
+        }
+
+        let before = dump_db(&path).await;
+        assert!(
+            !before
+                .master_rows
+                .iter()
+                .any(|(_, name, _)| name == "schema_migrations"),
+            "precondition: schema_migrations must not exist yet"
+        );
+
+        let result = LibsqlDb::open(&path, 4, VectorEncoding::Float32).await;
+        let after = dump_db(&path).await;
+
+        match result {
+            Err(Error::Internal { message, .. }) => {
+                assert!(
+                    message.contains("missing a row"),
+                    "error should explain the bookkeeping is incomplete: {message}"
+                );
+            }
+            Err(other) => panic!("expected Internal, got: {other:?}"),
+            Ok(_) => panic!(
+                "expected Internal error: an at-head store with no chain-entry bookkeeping \
+                 rows must not be silently trusted"
+            ),
+        }
+
+        assert_eq!(
+            before, after,
+            "a refused open of a fabricated table-absent at-head store must not mutate it at \
+             all"
+        );
+        assert!(
+            !after
+                .master_rows
+                .iter()
+                .any(|(_, name, _)| name == "schema_migrations"),
+            "open must not have created schema_migrations while refusing this store: {:?}",
+            after.master_rows
+        );
+        assert_eq!(
+            after.user_version, head,
+            "user_version must remain exactly as stamped, untouched by the refused open"
+        );
     }
 
     // Plan test 13: a brand-new store created via `LibsqlDb::open` seeds

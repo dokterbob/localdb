@@ -138,12 +138,29 @@ pub async fn verify_checksums(
 ) -> Result<(), localdb_core::Error> {
     let head = head_version(chain);
     let required_upper = up_to.min(head);
-    let rows = table::list_rows_desc_above(conn, BASELINE_VERSION - 1)
+    // A table-absent store (the raw pre-framework case, or — after the
+    // `LibsqlDb::open` `AtHead` fix — a fabricated table-absent store this
+    // function is deliberately left to refuse without anything having
+    // created the table for it) has zero rows by definition: querying it
+    // directly would surface a raw "no such table" SQLite error instead of
+    // the intended, actionable "missing a row" completeness error below.
+    // Treat "table doesn't exist" the same as "table exists but is empty".
+    let table_present = table::table_exists(conn, "schema_migrations")
         .await
         .map_err(|e| localdb_core::Error::Internal {
-            message: format!("reading schema_migrations for checksum verification: {e}"),
+            message: format!("checking schema_migrations existence for checksum verification: {e}"),
             correlation_id: "libsql_migrations_checksum_mismatch".to_string(),
         })?;
+    let rows = if table_present {
+        table::list_rows_desc_above(conn, BASELINE_VERSION - 1)
+            .await
+            .map_err(|e| localdb_core::Error::Internal {
+                message: format!("reading schema_migrations for checksum verification: {e}"),
+                correlation_id: "libsql_migrations_checksum_mismatch".to_string(),
+            })?
+    } else {
+        Vec::new()
+    };
 
     let mut seen_versions = std::collections::HashSet::new();
 

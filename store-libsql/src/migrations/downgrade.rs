@@ -767,4 +767,66 @@ mod tests {
             "inspect_schema must not create a -wal sidecar file"
         );
     }
+
+    // Fix 3 (adversarial review, track 4): the tests above only ever exercise
+    // `inspect_schema` against a non-WAL fixture, but EVERY real store is
+    // WAL-mode (`LibsqlDb::open`, and this module's own `open_for_maintenance`,
+    // both set `journal_mode=WAL`). Prove the read-only path also works
+    // correctly, and stays read-only, against a store that's actually in WAL
+    // mode.
+    #[tokio::test]
+    async fn inspect_schema_reads_correctly_against_a_real_wal_mode_store() {
+        let (_dir, path) = test_fixtures::temp_db_path();
+        test_fixtures::write_healthy_baseline_store(&path).await;
+
+        // Establish real WAL mode the same way every ordinary open does:
+        // `open_for_maintenance` sets `journal_mode=WAL` and, because it's a
+        // genuine write-capable connection (not the bare `libsql::Builder`
+        // used by `read_journal_mode`), persists it to the file header and
+        // creates the `-wal`/`-shm` sidecars — exactly what a real store
+        // looks like on disk.
+        {
+            let (_db, _conn) = open_for_maintenance(&path).await.unwrap();
+        }
+
+        let wal_mode_before = read_journal_mode(&path).await;
+        assert_eq!(
+            wal_mode_before, "wal",
+            "precondition: the store must actually be in WAL mode for this test to be \
+             meaningful"
+        );
+
+        let status = inspect_schema(&path).await.unwrap();
+        assert_eq!(
+            status.current_version, BASELINE_VERSION,
+            "inspect_schema must read the store's real current version even in WAL mode"
+        );
+        assert_eq!(status.head_version, chain::head_version_current());
+        assert_eq!(status.baseline_version, BASELINE_VERSION);
+        assert!(status.table_present);
+        assert!(!status.legacy);
+        assert_eq!(status.rows.len(), 1);
+        assert_eq!(status.rows[0].version, BASELINE_VERSION);
+
+        // Read-only inspection must coexist with a WAL store, not downgrade
+        // it: a bare (non-writing) read afterward must still see wal...
+        let wal_mode_after = read_journal_mode(&path).await;
+        assert_eq!(
+            wal_mode_after, "wal",
+            "inspect_schema must not alter the store's journal mode away from wal"
+        );
+
+        // ...and reopening writable (the path any real subsequent command
+        // takes) must likewise still report wal, proving inspect_schema
+        // didn't quietly switch the store to some other mode that only a
+        // fresh writable connection would reveal.
+        let (_db, conn) = open_for_maintenance(&path).await.unwrap();
+        let mut rows = conn.query("PRAGMA journal_mode", ()).await.unwrap();
+        let mode: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(
+            mode.to_ascii_lowercase(),
+            "wal",
+            "reopening writable after inspect_schema must still report wal"
+        );
+    }
 }
