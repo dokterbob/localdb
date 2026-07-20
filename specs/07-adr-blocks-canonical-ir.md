@@ -79,6 +79,51 @@ citation anchors, or chunk boundaries.
    backend can fetch neighboring chunks in the same block, nearby blocks in
    the same resource, and the containing section/hierarchy.
 
+### Ontology axes: kind ⊥ role ⊥ group (2026-07-20)
+
+> Status: `kind` accepted and implemented. `role` and `group` are named future
+> direction, not implemented.
+
+The block ontology has three **orthogonal** axes. Today, only `kind` is specified and
+implemented; `role` and `group` are recorded here as the accepted shape to grow into, so that
+a future layout-aware extractor has a frame to fill in rather than inventing one ad hoc.
+
+- **`kind`** — the structural type of an element: `Heading`, `Text`, `Table`, `Code`, `Image`,
+  and reserved `Message`/`Segment`/`Frontmatter`/`Reference`/`Attachment`. **`Text`** is the
+  coarse running-body-text kind that folds the former `Paragraph`/`Quote`/`List` variants (see
+  "Coarsening the text kind" below). A `kind` names *what an element is*, never its writing
+  style or layout role — this is precisely why the coarse text kind is called `Text`, not
+  `Prose` or `Body`: a pull-quote or an inset are still `Text` in `kind`, just a different
+  `role`.
+- **`role`** — layout function within the page: `Body` (default), plus future
+  `Inset`/`Sidebar`/`Caption`/`PullQuote`/`Footnote`/etc. **Future direction, not
+  implemented.** Only a layout-aware extractor (e.g. a PDF layout parser, an HTML reader with
+  region detection) can populate anything other than `Body`; Markdown-sourced output is always
+  `Body`.
+- **`group`** — article/column containment, for documents that hold more than one logical
+  article or column on a single page (e.g. a newspaper-style layout, a multi-story feed page
+  rendered as one document). **Future direction, not implemented.** No producer exists for it
+  until a layout-aware source is built.
+
+`role` and `group` are deliberately **not** pre-baked into the schema or block types now,
+without a real layout-aware extractor available to validate the shape against actual data;
+adding them later, once such an extractor exists, is an accepted future migration rather than
+a gap in this ADR. They are tracked in a dedicated spec issue — see roadmap follow-ups.
+
+**Markdown is the anchor ontology.** `markdown_to_blocks` is the reference producer of the
+`kind` axis. When other formats eventually move off Markdown-as-IR to native block emission
+(the per-format block emission evolution already described under "Alternatives considered"
+below), those producers must **reproduce this same `kind` ontology** — Markdown's block output
+does not change as a result. This is what keeps `kind` a stable, producer-independent axis.
+
+**Coarsening the text kind.** The concrete `kind`-axis behavior implemented today is the
+coarsening boundary rule: a `Text` block is the run of consecutive running-text content
+(paragraphs, lists, blockquotes, HTML blocks) between structural boundaries — a `Heading`,
+a `Table`/`Code`/`Image` block, or the start/end of the document always breaks a run into a
+new block. See [04-search-pipeline.md](04-search-pipeline.md) §3 ("Block-dispatch rules") for
+the chunker-facing consequences (prose chunking within a `Text` block, headings staying
+discrete and chunked).
+
 ### Canonical Text, Hashing, Embedding
 
 - Every block has a **canonical text** representation, including tables (text
