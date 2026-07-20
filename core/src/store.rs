@@ -92,7 +92,7 @@ pub struct ChunkRecord {
     #[serde(default)]
     pub seq_in_block: u32,
 
-    /// Block kind string (e.g. "paragraph", "heading").
+    /// Block kind string (e.g. "text", "heading").
     ///
     /// `None` for chunks indexed before the Resource/Block architecture
     /// was introduced.
@@ -1093,7 +1093,7 @@ pub mod conformance {
         let blocks = vec![
             Block {
                 seq: 1,
-                kind: BlockKind::Paragraph,
+                kind: BlockKind::Text,
                 text: "second block".to_string(),
                 location: None,
             },

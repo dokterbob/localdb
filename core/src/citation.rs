@@ -46,7 +46,7 @@ pub struct CitationProvenance {
 pub struct CitationBlock {
     /// Block sequence number within the resource (0-indexed).
     pub seq: u32,
-    /// Block kind string (e.g. "paragraph", "heading").
+    /// Block kind string (e.g. "text", "heading").
     ///
     /// `None` for chunks indexed before the Resource/Block architecture.
     #[serde(default)]

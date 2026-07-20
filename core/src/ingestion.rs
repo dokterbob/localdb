@@ -1997,7 +1997,7 @@ mod tests {
                 store_id,
                 vec![Block {
                     seq: 0,
-                    kind: BlockKind::Paragraph,
+                    kind: BlockKind::Text,
                     text: text.to_string(),
                     location: None,
                 }],

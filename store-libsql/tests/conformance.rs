@@ -601,7 +601,7 @@ async fn upsert_blocks_direct_through_trait() {
     let blocks = vec![
         Block {
             seq: 0,
-            kind: BlockKind::Paragraph,
+            kind: BlockKind::Text,
             text: "first block".to_string(),
             location: Some(BlockLocation {
                 line_start: Some(1),
@@ -678,7 +678,7 @@ async fn upsert_chunks_and_blocks_writes_blocks_in_same_transaction() {
     let blocks = vec![
         Block {
             seq: 0,
-            kind: BlockKind::Paragraph,
+            kind: BlockKind::Text,
             text: "body text".to_string(),
             location: Some(BlockLocation {
                 page: Some(1),
@@ -687,7 +687,7 @@ async fn upsert_chunks_and_blocks_writes_blocks_in_same_transaction() {
         },
         Block {
             seq: 1,
-            kind: BlockKind::Quote,
+            kind: BlockKind::Text,
             text: "quoted text".to_string(),
             location: None,
         },

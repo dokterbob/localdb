@@ -114,7 +114,7 @@ pub struct ChunkOutput {
     /// For message-window chunks: all block seqs participating in the window.
     /// Empty for non-message chunks. Mirrors `ChunkLocation::window_block_seqs`.
     pub window_block_seqs: Vec<u32>,
-    /// Block kind string (e.g. "paragraph", "heading"). `None` for flat-document chunks.
+    /// Block kind string (e.g. "text", "heading"). `None` for flat-document chunks.
     pub block_kind: Option<String>,
 }
 
@@ -276,7 +276,7 @@ impl ChunkerConfig {
 ///
 /// Dispatches by block kind:
 /// - `Message`, `Segment` → messages chunker (sliding window over all such blocks).
-/// - `Heading`, `Paragraph`, `Quote`, `List` → prose chunker (per block).
+/// - `Heading`, `Text` → prose chunker (per block).
 /// - `Code` → code chunker (per block).
 /// - `Table` → table chunker (row-based packer; falls back to the code chunker for
 ///   malformed tables — see [`chunk_table`]).
@@ -334,10 +334,7 @@ pub fn chunk_blocks(
 
         let sub_chunks: Vec<ChunkOutput> = match &block.kind {
             // Prose-style blocks: route through code chunker when preset == "code"
-            BlockKind::Heading { .. }
-            | BlockKind::Paragraph
-            | BlockKind::Quote
-            | BlockKind::List { .. } => {
+            BlockKind::Heading { .. } | BlockKind::Text => {
                 if config.preset == "code" {
                     chunk_code(resource_id, &block.text, config, block.seq)?
                 } else {
@@ -1641,7 +1638,7 @@ mod tests {
         // No Message/Segment blocks → 0 chunks.
         let blocks: Vec<crate::block::Block> = vec![crate::block::Block {
             seq: 0,
-            kind: crate::block::BlockKind::Paragraph,
+            kind: crate::block::BlockKind::Text,
             text: "Some intro text.".to_string(),
             location: None,
         }];
@@ -1817,7 +1814,7 @@ mod tests {
 
     #[test]
     fn messages_mixed_blocks_only_sees_message_and_segment() {
-        // Heading + Paragraph + 3 Message + Paragraph + 1 Message
+        // Heading + Text + 3 Message + Text + 1 Message
         // The messages chunker should see only the 4 Message blocks.
         let blocks = vec![
             crate::block::Block {
@@ -1828,7 +1825,7 @@ mod tests {
             },
             crate::block::Block {
                 seq: 1,
-                kind: crate::block::BlockKind::Paragraph,
+                kind: crate::block::BlockKind::Text,
                 text: "Intro paragraph.".to_string(),
                 location: None,
             },
@@ -1837,7 +1834,7 @@ mod tests {
             msg_block(4, "Alice", "2026-01-01T10:02:00Z", "Third message"),
             crate::block::Block {
                 seq: 5,
-                kind: crate::block::BlockKind::Paragraph,
+                kind: crate::block::BlockKind::Text,
                 text: "Interlude paragraph.".to_string(),
                 location: None,
             },
@@ -1965,14 +1962,14 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     #[test]
-    fn code_preset_routes_paragraph_block_through_code_chunker() {
-        // A Paragraph block fed to chunk_blocks with preset="code" must go
+    fn code_preset_routes_text_block_through_code_chunker() {
+        // A Text block fed to chunk_blocks with preset="code" must go
         // through the code (line-packer) path, not the prose (MarkdownSplitter) path.
         // We verify this by checking that the chunks are produced (no panic) and
         // that their spans are valid byte ranges.
         let block = crate::block::Block {
             seq: 0,
-            kind: crate::block::BlockKind::Paragraph,
+            kind: crate::block::BlockKind::Text,
             text: "fn hello() {\n    println!(\"hi\");\n}".to_string(),
             location: None,
         };
@@ -1981,7 +1978,7 @@ mod tests {
         let chunks = chunk_blocks(&doc_id, &[block], &cfg, &CharSizer).unwrap();
         assert!(
             !chunks.is_empty(),
-            "code preset + Paragraph should produce chunks"
+            "code preset + Text should produce chunks"
         );
         for c in &chunks {
             assert!(c.span.start <= c.span.end, "span start <= end");

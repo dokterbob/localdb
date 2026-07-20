@@ -320,7 +320,7 @@ async fn make_handler_with_sequential_chunks(count: u32) -> (McpHandler, String,
             metadata: metadata.clone(),
             block_seq,
             seq_in_block: 0,
-            block_kind: Some("paragraph".to_string()),
+            block_kind: Some("text".to_string()),
             window_block_seqs: vec![],
         });
     }

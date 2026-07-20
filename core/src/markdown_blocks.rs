@@ -99,12 +99,18 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
         Paragraph,
         Code { language: Option<String> },
         Quote,
-        List { ordered: bool },
+        List,
         Table,
         Image { src: Option<String> },
     }
 
     let mut stack: Vec<ActiveBlock> = Vec::new();
+
+    // Running-text accumulator: holds the finished text of each consecutive
+    // running-text element (paragraph, list, blockquote, HTML block). Flushed
+    // into a single `BlockKind::Text` block at structural boundaries (heading,
+    // code, table, image) and once more after the event loop.
+    let mut text_accum: Vec<String> = Vec::new();
 
     // Helper: push a completed block.
     macro_rules! push_block {
@@ -122,12 +128,30 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
         }};
     }
 
+    // Helper: flush the running-text accumulator into a single `Text` block.
+    macro_rules! flush_text {
+        ($blocks:expr, $seq:expr, $accum:expr) => {{
+            if !$accum.is_empty() {
+                let text = $accum.join("\n\n");
+                $blocks.push(Block {
+                    seq: $seq,
+                    kind: BlockKind::Text,
+                    text,
+                    location: None,
+                });
+                $seq += 1;
+                $accum.clear();
+            }
+        }};
+    }
+
     for event in parser {
         match event {
             // ----------------------------------------------------------------
             // Block start events
             // ----------------------------------------------------------------
             Event::Start(Tag::Heading { level, .. }) => {
+                flush_text!(blocks, seq, text_accum);
                 let lv = level as u8;
                 stack.push(ActiveBlock::new(ActiveKind::Heading { level: lv }));
             }
@@ -148,6 +172,7 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                     }
                     pulldown_cmark::CodeBlockKind::Indented => None,
                 };
+                flush_text!(blocks, seq, text_accum);
                 stack.push(ActiveBlock::new(ActiveKind::Code { language: lang }));
             }
 
@@ -155,13 +180,12 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                 stack.push(ActiveBlock::new(ActiveKind::Quote));
             }
 
-            Event::Start(Tag::List(start)) => {
-                stack.push(ActiveBlock::new(ActiveKind::List {
-                    ordered: start.is_some(),
-                }));
+            Event::Start(Tag::List(_start)) => {
+                stack.push(ActiveBlock::new(ActiveKind::List));
             }
 
             Event::Start(Tag::Table(_alignments)) => {
+                flush_text!(blocks, seq, text_accum);
                 stack.push(ActiveBlock::new(ActiveKind::Table));
             }
 
@@ -179,6 +203,7 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                 // image title attribute (not the alt). We store src from dest_url.
                 // The title attribute is stored separately if present.
                 let _ = title; // may use in future
+                flush_text!(blocks, seq, text_accum);
                 stack.push(ActiveBlock::new(ActiveKind::Image { src }));
             }
 
@@ -205,7 +230,7 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                             // propagate the text up rather than emitting a new block.
                             if let Some(parent) = stack.last_mut() {
                                 match parent.kind {
-                                    ActiveKind::Quote | ActiveKind::List { .. } => {
+                                    ActiveKind::Quote | ActiveKind::List => {
                                         if !parent.text.is_empty() {
                                             parent.text.push(" ".to_string());
                                         }
@@ -216,8 +241,11 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                                     _ => {}
                                 }
                             }
-                            // Top-level paragraph: emit it.
-                            push_block!(blocks, seq, BlockKind::Paragraph, text);
+                            // Top-level paragraph: feed the running-text accumulator
+                            // rather than emitting a standalone block.
+                            if !text.is_empty() {
+                                text_accum.push(text);
+                            }
                         }
                         _ => {
                             // Restore — shouldn't happen normally.
@@ -241,18 +269,18 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
             Event::End(TagEnd::BlockQuote(_)) => {
                 if let Some(b) = stack.pop() {
                     let text = b.text.join(" ");
-                    push_block!(blocks, seq, BlockKind::Quote, text);
+                    if !text.is_empty() {
+                        text_accum.push(text);
+                    }
                 }
             }
 
             Event::End(TagEnd::List(_)) => {
                 if let Some(b) = stack.pop() {
-                    let ordered = match b.kind {
-                        ActiveKind::List { ordered } => ordered,
-                        _ => false,
-                    };
                     let text = b.text.join("\n");
-                    push_block!(blocks, seq, BlockKind::List { ordered }, text);
+                    if !text.is_empty() {
+                        text_accum.push(text);
+                    }
                 }
             }
 
@@ -379,29 +407,26 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
             Event::Start(Tag::Item) => {
                 // Add separator before each item except the first.
                 if let Some(b) = stack.last_mut() {
-                    if matches!(b.kind, ActiveKind::List { .. }) && !b.text.is_empty() {
+                    if matches!(b.kind, ActiveKind::List) && !b.text.is_empty() {
                         b.text.push("\n".to_string());
                     }
                 }
             }
 
             Event::Html(t) => {
-                // Flush any open block before emitting an HTML block.
-                // HTML blocks are stand-alone: they do not nest inside a
-                // paragraph or other container.
+                // HTML blocks are running text: drain any open stack blocks'
+                // text into the accumulator, then append this HTML fragment.
+                // Do NOT flush — HTML merges with surrounding paragraphs into
+                // the same `Text` block.
                 while let Some(b) = stack.pop() {
                     let text = b.text.join(" ");
-                    push_block!(blocks, seq, BlockKind::Paragraph, text);
+                    if !text.is_empty() {
+                        text_accum.push(text);
+                    }
                 }
                 let trimmed = t.trim().to_string();
                 if !trimmed.is_empty() {
-                    blocks.push(Block {
-                        seq,
-                        kind: BlockKind::Paragraph,
-                        text: trimmed,
-                        location: None,
-                    });
-                    seq += 1;
+                    text_accum.push(trimmed);
                 }
             }
 
@@ -412,6 +437,10 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
             _ => {}
         }
     }
+
+    // Flush any trailing running text after the event loop ends.
+    flush_text!(blocks, seq, text_accum);
+    let _ = seq; // final increment inside flush_text! is otherwise never read
 
     blocks
 }
@@ -548,9 +577,10 @@ fn main() {}
 ";
 
         let blocks = markdown_to_blocks(md);
-        assert!(
-            blocks.len() >= 5,
-            "expected at least 5 blocks, got {}: {:?}",
+        assert_eq!(
+            blocks.len(),
+            6,
+            "expected 6 blocks (h1, text, h2, text, code, text), got {}: {:?}",
             blocks.len(),
             blocks.iter().map(|b| b.kind.kind_str()).collect::<Vec<_>>()
         );
@@ -574,7 +604,7 @@ fn main() {}
         assert!(h2.is_some(), "expected an h2 heading");
         assert_eq!(h2.unwrap().text, "Setup");
 
-        // Find a code block.
+        // Find a code block — Code still breaks the run into its own block.
         let code = blocks
             .iter()
             .find(|b| matches!(&b.kind, BlockKind::Code { .. }));
@@ -584,16 +614,33 @@ fn main() {}
             assert_eq!(language.as_deref(), Some("rust"));
         }
 
-        // Find a list block.
-        let list = blocks
+        // The list and blockquote fold into the same Text block: no
+        // heading/code/table sits between them.
+        let list_text = blocks
             .iter()
-            .find(|b| matches!(&b.kind, BlockKind::List { .. }));
-        assert!(list.is_some(), "expected a list block");
-        assert!(list.unwrap().text.contains("Item one"));
+            .find(|b| b.kind == BlockKind::Text && b.text.contains("Item one"));
+        assert!(
+            list_text.is_some(),
+            "expected a Text block containing the list"
+        );
+        assert!(
+            list_text.unwrap().text.contains("A blockquote here."),
+            "list and blockquote should fold into the same Text block: {:?}",
+            list_text.unwrap().text
+        );
 
-        // Find a quote block.
-        let quote = blocks.iter().find(|b| matches!(&b.kind, BlockKind::Quote));
-        assert!(quote.is_some(), "expected a blockquote");
+        // Headings and Code still break runs: exactly 3 Text blocks total
+        // (para before h2, para before code, list+quote at the end).
+        let text_blocks: Vec<_> = blocks
+            .iter()
+            .filter(|b| b.kind == BlockKind::Text)
+            .collect();
+        assert_eq!(
+            text_blocks.len(),
+            3,
+            "expected 3 Text blocks: {:?}",
+            text_blocks.iter().map(|b| &b.text).collect::<Vec<_>>()
+        );
     }
 
     /// Verify heading_path_from_blocks output.
@@ -605,11 +652,11 @@ fn main() {}
         // Block at seq 0 is the h1 "Top"
         assert_eq!(heading_path_from_blocks(&blocks, 0), Vec::<String>::new());
 
-        // Paragraph after "# Top" — seq 1 (h1), seq 2 (paragraph)
+        // Paragraph after "# Top" — seq 1 (h1), seq 2 (text block)
         // path should be ["Top"]
         let para_seq = blocks
             .iter()
-            .find(|b| b.kind == BlockKind::Paragraph)
+            .find(|b| b.kind == BlockKind::Text)
             .map(|b| b.seq)
             .unwrap();
         let path = heading_path_from_blocks(&blocks, para_seq);
@@ -623,7 +670,7 @@ fn main() {}
         let deep_text_seq = blocks
             .iter()
             .rev()
-            .find(|b| b.kind == BlockKind::Paragraph)
+            .find(|b| b.kind == BlockKind::Text)
             .map(|b| b.seq)
             .unwrap();
         let deep_path = heading_path_from_blocks(&blocks, deep_text_seq);
@@ -637,19 +684,19 @@ fn main() {}
     fn heading_path_resets_on_new_parent() {
         let md = "# A\n\n## A1\n\n# B\n\nContent.\n";
         let blocks = markdown_to_blocks(md);
-        // After "# B", a paragraph's path should be ["B"], not ["A", "A1"] or ["B", "A1"].
+        // After "# B", a text block's path should be ["B"], not ["A", "A1"] or ["B", "A1"].
         let content_seq = blocks
             .iter()
-            .find(|b| b.kind == BlockKind::Paragraph)
+            .find(|b| b.kind == BlockKind::Text)
             .map(|b| b.seq)
             .unwrap();
         let _path = heading_path_from_blocks(&blocks, content_seq);
         // Content is after "# B" so path = ["B"]
         // Actually content might come before "# B" — verify.
-        // All paragraphs:
+        // All text blocks:
         let paras: Vec<_> = blocks
             .iter()
-            .filter(|b| b.kind == BlockKind::Paragraph)
+            .filter(|b| b.kind == BlockKind::Text)
             .collect();
         let last_para = paras.last().unwrap();
         let path = heading_path_from_blocks(&blocks, last_para.seq);
@@ -658,6 +705,123 @@ fn main() {}
             vec!["B".to_string()],
             "after # B, path must be just [B]; got {:?}",
             path
+        );
+    }
+
+    /// Consecutive paragraphs, a list, and a blockquote with no intervening
+    /// heading/code/table fold into exactly ONE `Text` block.
+    #[test]
+    fn consecutive_running_text_folds_into_one_text_block() {
+        let md = "\
+Para one.
+
+Para two.
+
+Para three.
+
+- List item
+
+> Quote line
+";
+        let blocks = markdown_to_blocks(md);
+        assert_eq!(
+            blocks.len(),
+            1,
+            "expected a single Text block, got {}: {:?}",
+            blocks.len(),
+            blocks.iter().map(|b| b.kind.kind_str()).collect::<Vec<_>>()
+        );
+        assert_eq!(blocks[0].kind, BlockKind::Text);
+        let text = &blocks[0].text;
+        assert!(text.contains("Para one."), "missing para one: {text}");
+        assert!(text.contains("Para two."), "missing para two: {text}");
+        assert!(text.contains("Para three."), "missing para three: {text}");
+        assert!(text.contains("List item"), "missing list item: {text}");
+        assert!(text.contains("Quote line"), "missing quote line: {text}");
+        assert!(
+            text.contains("\n\n"),
+            "expected \\n\\n separators between folded elements: {text}"
+        );
+    }
+
+    /// A heading between two paragraphs breaks the run: each paragraph lands
+    /// in its own `Text` block, with the heading block in between.
+    #[test]
+    fn heading_breaks_text_run_into_separate_blocks() {
+        let md = "# H\n\npara1\n\n## H2\n\npara2\n";
+        let blocks = markdown_to_blocks(md);
+        assert_eq!(
+            blocks.len(),
+            4,
+            "expected h1, text(para1), h2, text(para2); got {}: {:?}",
+            blocks.len(),
+            blocks.iter().map(|b| b.kind.kind_str()).collect::<Vec<_>>()
+        );
+        assert!(matches!(blocks[0].kind, BlockKind::Heading { level: 1 }));
+        assert_eq!(blocks[1].kind, BlockKind::Text);
+        assert_eq!(blocks[1].text, "para1");
+        assert!(matches!(blocks[2].kind, BlockKind::Heading { level: 2 }));
+        assert_eq!(blocks[3].kind, BlockKind::Text);
+        assert_eq!(blocks[3].text, "para2");
+
+        // The two Text blocks are distinct — the heading sits between them.
+        assert_ne!(blocks[1].text, blocks[3].text);
+        assert!(blocks[0].seq < blocks[1].seq);
+        assert!(blocks[1].seq < blocks[2].seq);
+        assert!(blocks[2].seq < blocks[3].seq);
+    }
+
+    /// A fenced code block between two paragraphs breaks the run: Text, Code, Text.
+    #[test]
+    fn code_block_breaks_text_run_into_separate_blocks() {
+        let md = "para1\n\n```\ncode\n```\n\npara2\n";
+        let blocks = markdown_to_blocks(md);
+        let kinds: Vec<&str> = blocks.iter().map(|b| b.kind.kind_str()).collect();
+        assert_eq!(
+            kinds,
+            vec!["text", "code", "text"],
+            "expected Text, Code, Text; got {:?}",
+            kinds
+        );
+        assert_eq!(blocks[0].text, "para1");
+        assert_eq!(blocks[2].text, "para2");
+    }
+
+    /// heading_path resolves correctly for text blocks after multiple
+    /// headings, even though each intervening run is now a single coarse
+    /// `Text` block rather than one block per paragraph.
+    #[test]
+    fn heading_path_resolves_across_coarse_text_blocks() {
+        let md = "# A\n\nIntro under A.\n\n## B\n\nText under B.\n\n### C\n\nText under C.\n";
+        let blocks = markdown_to_blocks(md);
+
+        let text_blocks: Vec<_> = blocks
+            .iter()
+            .filter(|b| b.kind == BlockKind::Text)
+            .collect();
+        assert_eq!(
+            text_blocks.len(),
+            3,
+            "expected 3 Text blocks: {:?}",
+            text_blocks
+        );
+
+        let intro = blocks.iter().find(|b| b.text == "Intro under A.").unwrap();
+        assert_eq!(
+            heading_path_from_blocks(&blocks, intro.seq),
+            vec!["A".to_string()]
+        );
+
+        let under_b = blocks.iter().find(|b| b.text == "Text under B.").unwrap();
+        assert_eq!(
+            heading_path_from_blocks(&blocks, under_b.seq),
+            vec!["A".to_string(), "B".to_string()]
+        );
+
+        let under_c = blocks.iter().find(|b| b.text == "Text under C.").unwrap();
+        assert_eq!(
+            heading_path_from_blocks(&blocks, under_c.seq),
+            vec!["A".to_string(), "B".to_string(), "C".to_string()]
         );
     }
 
@@ -784,7 +948,19 @@ fn main() {}
         let blocks = markdown_to_blocks(md);
         let has_html = blocks.iter().any(|b| b.text.contains("raw HTML content"));
         assert!(has_html, "HTML block must not be silently dropped");
-        assert!(blocks.len() >= 3);
+        // The heading stays discrete; the HTML block merges with the
+        // following paragraph into a single running-text Text block since
+        // nothing structural separates them.
+        assert_eq!(
+            blocks.len(),
+            2,
+            "expected heading + one merged Text block, got {}: {:?}",
+            blocks.len(),
+            blocks.iter().map(|b| b.kind.kind_str()).collect::<Vec<_>>()
+        );
+        assert!(matches!(blocks[0].kind, BlockKind::Heading { level: 1 }));
+        assert_eq!(blocks[1].kind, BlockKind::Text);
+        assert!(blocks[1].text.contains("After paragraph."));
     }
 
     /// Frontmatter with CRLF line endings is detected correctly.

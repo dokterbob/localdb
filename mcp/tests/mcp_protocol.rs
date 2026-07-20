@@ -210,7 +210,7 @@ async fn make_handler_with_multichunk_doc() -> (McpHandler, String) {
             ),
             block_seq,
             seq_in_block,
-            block_kind: Some("paragraph".to_string()),
+            block_kind: Some("text".to_string()),
             window_block_seqs: vec![],
         }
     };
@@ -271,7 +271,7 @@ async fn make_handler_with_tied_chunks(reversed: bool) -> (McpHandler, String) {
             metadata: localdb_core::metadata::Metadata::default(),
             block_seq: 0,
             seq_in_block: 0,
-            block_kind: Some("paragraph".to_string()),
+            block_kind: Some("text".to_string()),
             window_block_seqs: vec![],
         }
     };
@@ -330,7 +330,7 @@ async fn make_handler_with_sequential_chunks(count: u32) -> (McpHandler, String,
             metadata: localdb_core::metadata::Metadata::default(),
             block_seq,
             seq_in_block: 0,
-            block_kind: Some("paragraph".to_string()),
+            block_kind: Some("text".to_string()),
             window_block_seqs: vec![],
         });
     }
@@ -380,7 +380,7 @@ async fn make_handler_with_block_seq_gaps() -> (McpHandler, String) {
             metadata: localdb_core::metadata::Metadata::default(),
             block_seq,
             seq_in_block,
-            block_kind: Some("paragraph".to_string()),
+            block_kind: Some("text".to_string()),
             window_block_seqs: vec![],
         }
     };
@@ -963,7 +963,7 @@ async fn test_get_chunks_happy_path_sorted() {
     assert_eq!(chunks[0]["heading_path"][0], "Section One");
     assert_eq!(chunks[0]["span"]["start"], 0);
     assert_eq!(chunks[0]["span"]["end"], "first chunk text".len());
-    assert_eq!(chunks[0]["block_kind"], "paragraph");
+    assert_eq!(chunks[0]["block_kind"], "text");
 
     assert_eq!(chunks[1]["text"], "second chunk text");
     assert_eq!(chunks[1]["block_seq"], 1);
