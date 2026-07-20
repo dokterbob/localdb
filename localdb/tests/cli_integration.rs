@@ -1279,3 +1279,450 @@ async fn source_add_auto_index_updates_store_policy_version() {
         "policy_version should be updated after source add with changed indexing policy; v1={v1}, v2={v2}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// db status / db migrate / db downgrade — specs/05-surfaces.md §2.1
+//
+// These commands must resolve (db path, embedding shape) from config alone,
+// never through `AppDb::open` (which refuses on the very version mismatch
+// they exist to fix) and never by constructing an embedder. They must also
+// refuse cleanly while a daemon is running, exactly like every other
+// daemon-aware write command (`daemon_running`, exit 4) — unlike `store`/
+// `source`, they never route to the daemon's HTTP API.
+// ---------------------------------------------------------------------------
+
+/// Stamp `PRAGMA user_version = version` on a raw db file at `path`,
+/// bypassing any of the CLI's normal open paths — simulates a legacy
+/// (pre-migration-framework) store for `db migrate` tests.
+async fn stamp_user_version(path: &std::path::Path, version: i64) {
+    let db = libsql::Builder::new_local(path).build().await.unwrap();
+    let conn = db.connect().unwrap();
+    conn.query(&format!("PRAGMA user_version = {version}"), ())
+        .await
+        .unwrap();
+}
+
+#[test]
+fn db_status_on_fresh_healthy_store_reports_current_equals_head() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    // `store add` opens the store via the normal init path, creating the
+    // schema fresh at this binary's head version.
+    cmd_with_dir(&dir)
+        .args(["store", "add", "s1"])
+        .assert()
+        .success();
+
+    let output = cmd_with_dir(&dir)
+        .args(["--json", "db", "status"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "db status should exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|_| panic!("db status --json must emit valid JSON; got: {stdout}"));
+
+    let current = v["current_version"].as_i64().unwrap();
+    let head = v["head_version"].as_i64().unwrap();
+    assert_eq!(current, head, "fresh store should be exactly at head");
+    assert_eq!(current, 4, "current baseline/head is v4 (empty real chain)");
+    assert_eq!(v["pending"].as_i64().unwrap(), 0);
+    assert!(!v["legacy"].as_bool().unwrap());
+}
+
+/// `db status` on a missing store file exits 2 (invalid config), not a panic.
+#[test]
+fn db_status_missing_store_exits_2() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let output = cmd_with_dir(&dir).args(["db", "status"]).output().unwrap();
+    assert_eq!(output.status.code().unwrap(), 2);
+}
+
+/// Codex review #152 fix 1: an existing-but-uninitialized store (a zero-byte
+/// file the user pointed at, `PRAGMA user_version` still 0) must be reported
+/// distinctly, not folded into "up to date" just because `pending == 0`.
+#[test]
+fn db_status_on_uninitialized_store_reports_uninitialized_not_up_to_date() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let db_path = data_dir.join("localdb.db");
+    // A zero-byte file: `open_for_maintenance` only requires `path.is_file()`
+    // to succeed, and a fresh/empty sqlite file reports `PRAGMA user_version`
+    // == 0, exactly like the maintenance path's documented "fresh file"
+    // case (see `migrate_store`'s `current == 0` branch).
+    std::fs::File::create(&db_path).unwrap();
+
+    let output = cmd_with_dir(&dir).args(["db", "status"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "db status on an uninitialized store should exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("uninitialized"),
+        "stdout should mention the store is uninitialized: {stdout}"
+    );
+    assert!(
+        !stdout.contains("up to date"),
+        "an uninitialized store must not be reported as 'up to date': {stdout}"
+    );
+
+    let json_output = cmd_with_dir(&dir)
+        .args(["--json", "db", "status"])
+        .output()
+        .unwrap();
+    assert!(json_output.status.success());
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&json_output.stdout)).unwrap();
+    assert_eq!(v["current_version"].as_i64().unwrap(), 0);
+    assert!(
+        v["uninitialized"].as_bool().unwrap(),
+        "--json output should carry an explicit uninitialized flag: {v}"
+    );
+}
+
+/// `db migrate` on a store already at head is a no-op and exits 0.
+#[test]
+fn db_migrate_noop_at_head() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "s1"])
+        .assert()
+        .success();
+
+    cmd_with_dir(&dir)
+        .args(["db", "migrate"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("already at head"));
+}
+
+/// `db migrate` on an at-head store whose migration bookkeeping has been
+/// tampered with (a stored checksum no longer matches what the compiled
+/// chain would produce) must fail loudly, not report "already at head".
+///
+/// This is the regression test for the bug where `run_db_migrate` decided
+/// "already at head" from a read-only pre-inspect and returned *without*
+/// ever calling `migrate_store` — skipping the checksum/bookkeeping
+/// verification that `migrate_store`'s own no-op-at-head path performs.
+/// Every other command refuses to open a store in this state; `db migrate`
+/// is the one meant to fix/diagnose it, so it must go through the library
+/// even when the pre-inspect says nothing looks pending.
+#[test]
+fn db_migrate_on_corrupted_at_head_store_fails_verification() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    let db_path = data_dir.join("localdb.db");
+
+    // `store add` creates a fresh store at head (v4), seeding
+    // schema_migrations with a valid baseline checksum.
+    cmd_with_dir(&dir)
+        .args(["store", "add", "s1"])
+        .assert()
+        .success();
+
+    // Tamper with the baseline row's stored checksum directly, bypassing
+    // every CLI path — simulates on-disk corruption or an out-of-band edit.
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let db = libsql::Builder::new_local(&db_path).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE schema_migrations SET checksum = 'deadbeef' WHERE version = 4",
+            (),
+        )
+        .await
+        .unwrap();
+    });
+
+    let output = cmd_with_dir(&dir).args(["db", "migrate"]).output().unwrap();
+    assert_ne!(
+        output.status.code().unwrap(),
+        0,
+        "db migrate on a corrupted at-head store must not exit 0; stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("checksum"),
+        "stderr should surface the checksum-mismatch error: {stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("already at head"),
+        "a corrupted at-head store must not be reported as 'already at head'; stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+/// `db migrate` on a legacy (pre-baseline) store without confirmation
+/// aborts (non-interactive + no `--yes` → exit 2 via `confirm_destructive`)
+/// and leaves the store completely untouched.
+#[test]
+fn db_migrate_legacy_without_confirmation_aborts_and_leaves_store_untouched() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let db_path = data_dir.join("localdb.db");
+
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(stamp_user_version(&db_path, 2));
+
+    let output = cmd_with_dir(&dir).args(["db", "migrate"]).output().unwrap();
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "declining (non-interactive, no --yes) must exit 2; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let version = tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let db = libsql::Builder::new_local(&db_path).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        let mut rows = conn.query("PRAGMA user_version", ()).await.unwrap();
+        let v: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        v
+    });
+    assert_eq!(
+        version, 2,
+        "a refused legacy migrate must not touch the store"
+    );
+}
+
+/// `db migrate --yes` on a legacy store rebuilds it to head.
+#[test]
+fn db_migrate_legacy_with_yes_rebuilds_to_head() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let db_path = data_dir.join("localdb.db");
+
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(stamp_user_version(&db_path, 2));
+
+    let output = cmd_with_dir(&dir)
+        .args(["--json", "--yes", "db", "migrate"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "db migrate --yes on a legacy store should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["from_version"].as_i64().unwrap(), 2);
+    assert!(v["legacy_rebuilt"].as_bool().unwrap());
+    assert!(
+        v["staleness_marked"].as_bool().unwrap(),
+        "a legacy rebuild erases all indexed content, so JSON should carry \
+         staleness_marked=true: {v}"
+    );
+
+    // Verify db status now reports a healthy at-head store.
+    let status_output = cmd_with_dir(&dir)
+        .args(["--json", "db", "status"])
+        .output()
+        .unwrap();
+    let status: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&status_output.stdout)).unwrap();
+    assert_eq!(status["current_version"], status["head_version"]);
+    assert!(!status["legacy"].as_bool().unwrap());
+
+    // Same scenario without `--json`: `migrate_store` now sets
+    // `staleness_marked = true` for legacy rebuilds (a recent library
+    // change), so the human-readable path must print the re-index hint —
+    // verify the CLI's existing hint-printing code actually fires for it.
+    let dir2 = TempDir::new().unwrap();
+    write_default_config(&dir2);
+    let data_dir2 = dir2.path().join("data");
+    std::fs::create_dir_all(&data_dir2).unwrap();
+    let db_path2 = data_dir2.join("localdb.db");
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(stamp_user_version(&db_path2, 2));
+
+    let plain_output = cmd_with_dir(&dir2)
+        .args(["--yes", "db", "migrate"])
+        .output()
+        .unwrap();
+    assert!(
+        plain_output.status.success(),
+        "db migrate --yes on a legacy store should succeed; stderr: {}",
+        String::from_utf8_lossy(&plain_output.stderr)
+    );
+    let plain_stdout = String::from_utf8_lossy(&plain_output.stdout);
+    assert!(
+        plain_stdout.contains("rebuilt legacy store"),
+        "stdout: {plain_stdout}"
+    );
+    assert!(
+        plain_stdout.contains("localdb index"),
+        "a confirmed legacy rebuild should print the re-index hint: {plain_stdout}"
+    );
+}
+
+/// `db downgrade --to <current-version> --yes` has nothing to do; the
+/// library's own "nothing to downgrade" `InvalidConfig` maps to exit 2.
+///
+/// Codex review #152 fix 2 reconciliation: before that fix, `--yes` skipped
+/// `confirm_destructive`'s prompt entirely (it always returns `true` for
+/// `--yes`) and the "nothing to downgrade" error only surfaced once
+/// `downgrade_store` itself ran. After the fix, `run_db_downgrade_async`
+/// pre-validates the target (via `validate_downgrade_target`, reusing the
+/// library's own wording) *before* even reaching `confirm_destructive` — so
+/// for this `--yes` case the error now arrives one step earlier, but the
+/// exit code and message are unchanged; no assertion here needed updating.
+#[test]
+fn db_downgrade_nothing_to_do_exits_2() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "s1"])
+        .assert()
+        .success();
+
+    let output = cmd_with_dir(&dir)
+        .args(["--yes", "db", "downgrade", "--to", "4"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "downgrading to the current version should exit 2; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("nothing to downgrade"),
+        "stderr should surface the library's own message: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Codex review #152 fix 2, scenario (b): `--to 4` on a v4 store (already at
+/// baseline/head — nothing to downgrade), non-interactive and without
+/// `--yes`. Before the fix this exited 2 with the generic "re-run with
+/// --yes" refusal from `confirm_destructive`, because the impossible target
+/// was only checked *after* the confirmation gate. After the fix, the CLI
+/// pre-validates the target first and the real "nothing to downgrade" error
+/// surfaces directly — the confirmation prompt is never reached.
+///
+/// (Formerly named `db_downgrade_without_confirmation_aborts`; renamed and
+/// tightened to assert the actual message, not just the exit code, since the
+/// message is exactly what this fix changes.)
+#[test]
+fn db_downgrade_to_current_version_without_confirmation_reports_real_error() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "s1"])
+        .assert()
+        .success();
+
+    let output = cmd_with_dir(&dir)
+        .args(["db", "downgrade", "--to", "4"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code().unwrap(), 2);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("nothing to downgrade"),
+        "stderr should surface the real library error, not a generic refusal: {stderr}"
+    );
+    assert!(
+        !stderr.contains("re-run with --yes"),
+        "an impossible downgrade must not demand confirmation for an operation that can only \
+         fail: {stderr}"
+    );
+}
+
+/// Codex review #152 fix 2, scenario (a): `db downgrade` (default target —
+/// no `--to`) on a store already at the frozen baseline, non-interactive and
+/// without `--yes`. The CLI's own default target resolves to
+/// `current_version - 1`, which lands below the baseline for a fresh store
+/// (baseline == head == current here) — pre-validation must catch this and
+/// report the real "cannot downgrade below the frozen baseline" error
+/// directly, never prompting (and never falling back to the generic
+/// "re-run with --yes" refusal).
+#[test]
+fn db_downgrade_default_target_at_baseline_without_confirmation_reports_real_error() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "s1"])
+        .assert()
+        .success();
+
+    let output = cmd_with_dir(&dir)
+        .args(["db", "downgrade"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code().unwrap(), 2);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot downgrade below the frozen baseline"),
+        "stderr should surface the real library error: {stderr}"
+    );
+    assert!(
+        !stderr.contains("re-run with --yes"),
+        "an impossible downgrade must not demand confirmation for an operation that can only \
+         fail: {stderr}"
+    );
+}
+
+/// All three `db` subcommands refuse with exit 4 (`daemon_running`) while a
+/// daemon is running — per specs/05-surfaces.md §2.1 they are CLI-only and
+/// never route to the daemon's HTTP API, unlike `store`/`source`/`search`.
+#[test]
+fn db_commands_refuse_while_daemon_running() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "s1"])
+        .assert()
+        .success();
+
+    for args in [
+        vec!["db", "status"],
+        vec!["db", "migrate"],
+        vec!["--yes", "db", "migrate"],
+        vec!["--yes", "db", "downgrade"],
+    ] {
+        let output = cmd_with_dir(&dir)
+            .env("LOCALDB_DAEMON_URL", "http://127.0.0.1:19999")
+            .args(&args)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code().unwrap(),
+            4,
+            "`localdb {}` should exit 4 while daemon is running; stderr: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}

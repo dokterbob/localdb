@@ -379,7 +379,57 @@ query performance:
   over `chunks.text`. Filtering by `store_id` is performed on the `chunks` join.
 - **Cascade Chain:** Foreign keys with `ON DELETE CASCADE` across the chain:
   `stores → sources → resources → blocks → chunks`. Deleting a store cleans up everything.
-- **Schema Versioning:** The database uses `PRAGMA user_version` to track the schema version.
-  Pre-release: old schema versions trigger reinitialization (not migration).
+- **Schema Versioning:** A `schema_migrations` table is the **source of truth** for schema
+  version; `PRAGMA user_version` is kept in lockstep as a cheap head marker but is never
+  authoritative. Columns:
+
+  | Column | Notes |
+  |---|---|
+  | `version` | `INTEGER PRIMARY KEY`. Baseline is 4 (`BASELINE_VERSION`, the last pre-migration schema); the chain starts at 5. |
+  | `name` | Short migration identifier. |
+  | `applied_at` | RFC 3339 timestamp. |
+  | `down_sql` | JSON array of statements that reverse this migration, or `NULL` if not mechanically reversible. |
+  | `down_unsupported_reason` | Human-readable reason downgrade past this step is refused, or `NULL` if `down_sql` is set. |
+  | `checksum` | `blake3` over the migration's version, name, rendered up-SQL, and rendered down-SQL (or reason). Verified on every open, bounded to the already-applied prefix before `db migrate` applies anything new, and again over the full chain afterward; a mismatch is an `internal` error, not a silent continue. Verification also requires a row to *exist* for the baseline and every applicable chain version (not just checking whatever rows happen to be present), and that each row's stored `name`/`down_sql`/`down_unsupported_reason` still match the compiled migration even when its `checksum` column reads correctly — a missing or tampered-but-checksum-intact row is treated the same as a checksum mismatch. `db downgrade` similarly requires the row history between its target and the current version to be contiguous before replaying anything. |
+
+  `CHECK` constraint: exactly one of `down_sql` / `down_unsupported_reason` is set per row.
+
+  **Open never migrates**, in either direction, on any surface. A version mismatch on open is a
+  refusal (`invalid_config`, exit 2) with an actionable hint, not an automatic fix:
+  - Legacy `0 < version < 4` (v1–v3): refused; hint points at `localdb db migrate` (which rebuilds
+    destructively, behind a confirmation prompt) or deleting the database. Previously these
+    versions triggered silent reinitialization on open; nothing is silent now.
+  - `4 <= version < head` (pending migrations): refused; hint points at `localdb db migrate`.
+  - `version > head` (store newer than this binary): refused; hint points at
+    `localdb db downgrade` or upgrading localdb.
+
+  Migrations are applied only via the explicit `localdb db migrate` / `localdb db downgrade [--to
+  N]` CLI commands ([05-surfaces.md](05-surfaces.md) §2) — never by the HTTP daemon or MCP, which
+  only ever surface the refusal-with-hint.
+
+  **Downgradable by older binaries:** every migration's rendered down-SQL is stored *as data* in
+  `schema_migrations.down_sql`, so an older binary can replay it without knowing the newer
+  schema. Migrations that are irreversible or expressed as Rust functions instead record
+  `down_unsupported_reason`; `db downgrade` past such a step is refused cleanly, naming the
+  migration and the reason, without touching the store. Freshly created stores are seeded with a
+  `schema_migrations` row (including down-SQL) for every chain migration, so a brand-new store on
+  the latest binary is downgradable too.
+
+  **Three weight classes**, by authoring cost and what's allowed to run inside `db migrate`:
+  1. **Fast schema DDL** — ordinary transactional runner steps.
+  2. **In-DB rebuilds** (FTS5 rebuild, DiskANN index drop + recreate) — single-statement runner
+     steps that may take minutes; acceptable because `db migrate` is explicit and reports
+     per-step progress.
+  3. **Re-embedding / re-extraction** — not runnable by the store itself, since it needs the
+     embedder/extractors that live above `store-libsql`. The migration only *marks* the work
+     (bumps the required `policy_version`/`extractor_version`, truncates derived rows); the
+     existing staleness machinery and incremental `localdb index` do the actual work, resumably
+     and with progress. `db migrate` ends with a `localdb index` hint whenever it applied a
+     migration of this class.
+
+  **Write-twice rule:** `create_schema()` always represents *head* DDL directly (not by replaying
+  the chain) — every migration is written twice, once as a chain entry and once folded into
+  `create_schema()`. A CI drift-guard test asserts baseline schema + chain output is identical to
+  `create_schema()`'s output, so the two can't silently diverge.
 - **Extractor Versioning:** `resources.extractor_version` tracks which parser/ingestor version
   produced the blocks, enabling selective reprocessing when extraction logic improves.

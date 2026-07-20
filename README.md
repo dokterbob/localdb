@@ -212,6 +212,24 @@ The daemon exposes a REST API, plus the same MCP tools over HTTP at `/mcp` (see
 
 ---
 
+## Schema migrations
+
+`store-libsql` tracks its schema version explicitly (`schema_migrations` table). Opening a store
+whose schema is behind, ahead of, or predates this binary's migration framework **refuses** with
+an actionable hint (exit 2) instead of silently rebuilding — run one of:
+
+```bash
+localdb db status              # current version, pending migrations, history — never refuses
+localdb db migrate              # apply pending migrations (confirmation only for a legacy v1-v3 rebuild)
+localdb db downgrade [--to N]   # step back using stored down-SQL (always confirms)
+```
+
+An older `localdb` binary can still downgrade a store a newer binary migrated forward — every
+migration's down-SQL is stored as data in the database itself, not read from compiled code. See
+[docs/migrations.md](docs/migrations.md) for the full walkthrough and the migration-authoring guide.
+
+---
+
 ## What works today
 
 | Area | What is true today |
@@ -244,6 +262,7 @@ Design rationale and planned behavior live in the [specs/](specs/) directory.
 | [docs/http-api.md](docs/http-api.md) | REST endpoint reference, request/response shapes, limitations |
 | [docs/mcp.md](docs/mcp.md) | MCP tool schemas, stdio and HTTP transports, remote setup, example calls |
 | [docs/architecture.md](docs/architecture.md) | Crate layout, storage, search pipeline overview |
+| [docs/migrations.md](docs/migrations.md) | Schema migrations: user-facing `db status`/`migrate`/`downgrade`, and the authoring guide |
 | [specs/01-architecture.md](specs/01-architecture.md) | Workspace layout, embedded-first process model, storage trait |
 | [specs/02-domain-model.md](specs/02-domain-model.md) | Store, Source, Document, Block, Chunk, Citation; content-addressed IDs |
 | [specs/03-config.md](specs/03-config.md) | YAML schema, per-store indexing policy, config vs runtime-state split |
