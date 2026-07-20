@@ -108,7 +108,7 @@ a future layout-aware extractor has a frame to fill in rather than inventing one
 `role` and `group` are deliberately **not** pre-baked into the schema or block types now,
 without a real layout-aware extractor available to validate the shape against actual data;
 adding them later, once such an extractor exists, is an accepted future migration rather than
-a gap in this ADR. They are tracked in a dedicated spec issue — see roadmap follow-ups.
+a gap in this ADR. They are tracked in a dedicated spec issue (#160).
 
 **Markdown is the anchor ontology.** `markdown_to_blocks` is the reference producer of the
 `kind` axis. When other formats eventually move off Markdown-as-IR to native block emission
