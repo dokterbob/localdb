@@ -358,9 +358,17 @@ and score-scale-free. Owning fusion keeps it identical across future backends. *
 score interpolation (needs per-model calibration); backend-native fusion (backend-dependent
 behavior).
 
-- **Filtering:** store filter (one, several, or all stores — fan out per-store queries, fuse
-  with global RRF), plus metadata filters (mime, path prefix, fetched_at range) pushed down
-  to the backend where supported.
+- **Filtering:** store filter (one, several, or all stores). Multi-store queries fan out
+  per-store BM25 + dense queries, then pool each leg's results across all queried stores into
+  one globally rank-ordered list *before* a single RRF pass runs over the two pooled legs —
+  never per-store RRF followed by a merge, which would let every store's local rank-0 chunk tie
+  regardless of true quality (RRF scores are rank-based and scale-free). Fusion identity is the
+  composite `(store_id, chunk_id)`, not `chunk_id` alone: chunk IDs are content-addressed
+  ([02-domain-model.md](02-domain-model.md) §2), so the same document indexed into two stores
+  yields the same chunk_id in both — a `chunk_id`-only key would silently merge two stores'
+  distinct hits. Ties are broken deterministically: `fused_score` descending, then `store_id`
+  ascending, then `chunk_id` ascending. Metadata filters (mime, path prefix, fetched_at range)
+  are pushed down to the backend where supported.
 - **Result shaping:** top-N (default 10) → Citation objects
   ([02-domain-model.md](02-domain-model.md) §6), with per-leg scores retained for debugging
   (`score: {fused, dense, bm25}`). Citations carry a **block reference** and chunk position

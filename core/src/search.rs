@@ -1,8 +1,17 @@
 //! Hybrid search & citations — T08.
 //!
 //! Implements query orchestration: BM25 leg + dense leg (query embedding via Embedder),
-//! RRF fusion (k=60, K=50 per leg), multi-store fan-out with global fusion,
-//! metadata/store filters, and result shaping to Citation objects with per-leg scores.
+//! RRF fusion (k=60, K=50 per leg), multi-store fan-out, metadata/store filters, and
+//! result shaping to Citation objects with per-leg scores.
+//!
+//! Multi-store fusion topology (issue #162): each leg's per-store results are
+//! pooled into one globally rank-ordered list (`pool_leg_results`), and a
+//! *single* RRF pass (`rrf_fuse_global`) runs over the two pooled legs, keyed
+//! on the composite `(store_id, chunk_id)`. Fusing per-store and merging
+//! already-fused scores would be wrong: RRF scores are rank-based and
+//! scale-free, so every store's local rank-0 chunk would tie at the same
+//! score regardless of how weak it actually is relative to other stores'
+//! candidates.
 //!
 //! A no-op rerank seam is left between fuse and shape.
 //!
@@ -68,7 +77,10 @@ pub struct QueryRequest {
 pub struct QueryResponse {
     /// Ranked citation results.
     pub citations: Vec<Citation>,
-    /// Total number of unique chunks considered (before truncation).
+    /// Total number of unique `(store, chunk)` candidates considered globally
+    /// (before truncation to `top_n`). Store IDs partition the pooled legs,
+    /// so this is numerically identical to the old per-store distinct-chunk-id
+    /// sum — it just now counts the composite key directly.
     pub total_candidates: usize,
 }
 
@@ -103,16 +115,26 @@ enum Leg {
     Bm25,
 }
 
-fn add_leg(
-    entries: &mut HashMap<String, FusedChunkEntry>,
+/// Shared RRF accumulation loop, generic over the map key.
+///
+/// `key_fn` extracts the identity a chunk is fused on: plain `chunk_id` for
+/// single-store fusion (`rrf_fuse`), or the composite `(store_id, chunk_id)`
+/// for global fusion (`rrf_fuse_global`) — see those functions' doc comments
+/// for why the key differs.
+fn add_leg<K, F>(
+    entries: &mut HashMap<K, FusedChunkEntry>,
     results: &[SearchResult],
     k: f64,
     leg: Leg,
-) {
+    key_fn: F,
+) where
+    K: Eq + std::hash::Hash,
+    F: Fn(&ChunkRecord) -> K,
+{
     for (rank, result) in results.iter().enumerate() {
         let contribution = rrf_score(rank, k);
         let entry = entries
-            .entry(result.chunk.id.clone())
+            .entry(key_fn(&result.chunk))
             .or_insert_with(|| FusedChunkEntry {
                 chunk: result.chunk.clone(),
                 fused_score: 0.0,
@@ -149,8 +171,8 @@ pub fn rrf_fuse(
 ) -> Vec<FusedChunkEntry> {
     let mut entries: HashMap<String, FusedChunkEntry> = HashMap::new();
 
-    add_leg(&mut entries, dense_results, k, Leg::Dense);
-    add_leg(&mut entries, bm25_results, k, Leg::Bm25);
+    add_leg(&mut entries, dense_results, k, Leg::Dense, |c| c.id.clone());
+    add_leg(&mut entries, bm25_results, k, Leg::Bm25, |c| c.id.clone());
 
     let mut sorted: Vec<FusedChunkEntry> = entries.into_values().collect();
     sorted.sort_by(|a, b| {
@@ -160,6 +182,86 @@ pub fn rrf_fuse(
             .then_with(|| a.chunk.id.cmp(&b.chunk.id))
     });
     sorted
+}
+
+/// Fuse two globally-pooled ranked lists using Reciprocal Rank Fusion, with
+/// fusion identity keyed on the composite `(store_id, chunk_id)` rather than
+/// `chunk_id` alone.
+///
+/// # Why the composite key
+///
+/// Chunk IDs are content-addressed (`core/src/ids.rs`), and the chunks table
+/// is `UNIQUE (store_id, id)` — **not** `UNIQUE (id)` (see
+/// `store-libsql/src/schema.rs`). The same document indexed into two
+/// different stores therefore yields the *same* `chunk_id` in both stores.
+/// Deduping fusion identity on `chunk_id` alone would silently merge two
+/// stores' distinct hits into one entry and mis-attribute the survivor to
+/// whichever store happened to win the `HashMap` insertion race. Keying on
+/// `(store_id, chunk_id)` keeps every store's hit distinct even when the
+/// underlying content — and thus the chunk_id — is identical.
+///
+/// # Precondition
+///
+/// `dense_results` and `bm25_results` must already be globally rank-ordered
+/// across all stores (see [`pool_leg_results`]) — this function does not
+/// re-derive cross-store ranking itself, it only fuses two already-pooled
+/// per-leg rankings using each entry's position in the slice as its rank.
+///
+/// - `dense_results`: pooled, globally-ranked dense leg results (most similar first).
+/// - `bm25_results`: pooled, globally-ranked BM25 leg results (highest score first).
+/// - `k`: RRF smoothing parameter (default `RRF_K = 60`).
+///
+/// Returns fused entries sorted by descending fused score, with deterministic
+/// tie-breaking by `store_id` ascending, then `chunk_id` ascending.
+pub fn rrf_fuse_global(
+    dense_results: &[SearchResult],
+    bm25_results: &[SearchResult],
+    k: f64,
+) -> Vec<FusedChunkEntry> {
+    let mut entries: HashMap<(String, String), FusedChunkEntry> = HashMap::new();
+
+    let key_fn = |c: &ChunkRecord| (c.store_id.clone(), c.id.clone());
+    add_leg(&mut entries, dense_results, k, Leg::Dense, key_fn);
+    add_leg(&mut entries, bm25_results, k, Leg::Bm25, key_fn);
+
+    let mut sorted: Vec<FusedChunkEntry> = entries.into_values().collect();
+    sorted.sort_by(|a, b| {
+        b.fused_score
+            .partial_cmp(&a.fused_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.chunk.store_id.cmp(&b.chunk.store_id))
+            .then_with(|| a.chunk.id.cmp(&b.chunk.id))
+    });
+    sorted
+}
+
+/// Sort one leg's concatenated per-store results into a single global ranking.
+///
+/// Order: `score` descending, then `store_id` ascending, then `chunk_id`
+/// ascending.
+///
+/// # Why `store_id` is load-bearing in the tiebreak
+///
+/// Elsewhere (`rrf_fuse`) a `chunk_id`-only tiebreak is sufficient because
+/// all inputs come from one store. Here inputs are pooled across stores, so
+/// two genuinely different chunks from different stores can legitimately
+/// score identically — and because chunk IDs are content-addressed, two
+/// stores holding the same content produce results with an equal score *and*
+/// an equal `chunk_id`. Without `store_id` in the sort key, that case would
+/// order nondeterministically depending on `Vec` concatenation order.
+///
+/// This produces the rank ordering that [`rrf_fuse_global`] consumes as its
+/// precondition.
+fn pool_leg_results(results: Vec<SearchResult>) -> Vec<SearchResult> {
+    let mut pooled = results;
+    pooled.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.chunk.store_id.cmp(&b.chunk.store_id))
+            .then_with(|| a.chunk.id.cmp(&b.chunk.id))
+    });
+    pooled
 }
 
 // ---------------------------------------------------------------------------
@@ -226,10 +328,10 @@ pub fn shape_citation(fused: FusedChunkEntry, store_id: String, store_name: Stri
 /// Performs:
 /// 1. Embed the query text via the provided `Embedder`.
 /// 2. Fan out BM25 + dense queries to each `StoreHandle` sequentially.
-/// 3. Apply per-store RRF fusion.
-/// 4. Merge results from all stores, sort globally by fused score.
-/// 5. Apply the no-op rerank seam.
-/// 6. Shape the top-N results into `Citation` objects.
+/// 3. Pool each leg's per-store results into one globally rank-ordered list,
+///    then run a single global RRF pass keyed on `(store_id, chunk_id)`.
+/// 4. Apply the no-op rerank seam.
+/// 5. Shape the top-N results into `Citation` objects.
 ///
 /// See specs/04-search-pipeline.md §5.
 pub struct SearchOrchestrator;
@@ -259,10 +361,15 @@ impl SearchOrchestrator {
         // 1. Embed the query text for the dense leg.
         let query_embedding = Self::embed_query(embedder, &request.query).await?;
 
-        // 2. Fan out to each store, collect per-store fused entries with store metadata.
-        let mut all_entries: Vec<(FusedChunkEntry, String, String)> = Vec::new();
+        // 2. Fan out to each store sequentially, accumulating each leg's raw
+        //    per-store results into pools (no per-store fusion — see module doc).
+        let mut dense_pool: Vec<SearchResult> = Vec::new();
+        let mut bm25_pool: Vec<SearchResult> = Vec::new();
+        let mut store_names: HashMap<String, String> = HashMap::new();
 
         for handle in stores {
+            store_names.insert(handle.id.clone(), handle.name.clone());
+
             let (dense_results, bm25_results) = Self::search_store(
                 handle,
                 &query_embedding,
@@ -272,14 +379,26 @@ impl SearchOrchestrator {
             )
             .await?;
 
-            let fused = rrf_fuse(&dense_results, &bm25_results, RRF_K);
+            debug_assert!(
+                dense_results.iter().all(|r| r.chunk.store_id == handle.id)
+                    && bm25_results.iter().all(|r| r.chunk.store_id == handle.id),
+                "store {} returned a chunk whose store_id does not match the handle it was \
+                 fetched from — global fusion identity is keyed on (store_id, chunk_id), so \
+                 every store must stamp its own store_id on the chunks it returns",
+                handle.id
+            );
 
-            for entry in fused {
-                all_entries.push((entry, handle.id.clone(), handle.name.clone()));
-            }
+            dense_pool.extend(dense_results);
+            bm25_pool.extend(bm25_results);
         }
 
-        let total_candidates = all_entries.len();
+        // 3. Pool each leg into one globally rank-ordered list, then run a
+        //    single global RRF pass over the two pooled legs.
+        let pooled_dense = pool_leg_results(dense_pool);
+        let pooled_bm25 = pool_leg_results(bm25_pool);
+        let fused = rrf_fuse_global(&pooled_dense, &pooled_bm25, RRF_K);
+
+        let total_candidates = fused.len();
 
         if total_candidates == 0 {
             return Ok(QueryResponse {
@@ -288,34 +407,21 @@ impl SearchOrchestrator {
             });
         }
 
-        // 3. Global sort: merge all per-store entries and sort by fused score descending,
-        //    with chunk_id as tiebreaker for determinism.
-        all_entries.sort_by(|a, b| {
-            b.0.fused_score
-                .partial_cmp(&a.0.fused_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.chunk.id.cmp(&b.0.chunk.id))
-        });
+        // 4. Rerank seam (no-op) — operates directly on Vec<FusedChunkEntry>;
+        //    store attribution lives in entry.chunk.store_id, so this seam
+        //    survives a future reranker that reorders or drops entries.
+        let reranked = rerank_noop(fused);
 
-        // 4. Rerank seam (no-op): extract entries, pass through, then re-attach store info.
-        let entries_only: Vec<FusedChunkEntry> =
-            all_entries.iter().map(|(e, _, _)| e.clone()).collect();
-        let reranked = rerank_noop(entries_only);
-        // Re-attach store metadata by index (rerank is a no-op so order is unchanged).
-        let final_entries: Vec<(FusedChunkEntry, String, String)> = reranked
-            .into_iter()
-            .enumerate()
-            .map(|(i, entry)| {
-                let (_, sid, sname) = &all_entries[i];
-                (entry, sid.clone(), sname.clone())
-            })
-            .collect();
-
-        // 5. Take top_n and shape into Citations.
-        let citations: Vec<Citation> = final_entries
+        // 5. Take top_n and shape into Citations, resolving each entry's
+        //    store name from its own chunk.store_id.
+        let citations: Vec<Citation> = reranked
             .into_iter()
             .take(top_n)
-            .map(|(entry, sid, sname)| shape_citation(entry, sid, sname))
+            .map(|entry| {
+                let store_id = entry.chunk.store_id.clone();
+                let store_name = store_names.get(&store_id).cloned().unwrap_or_default();
+                shape_citation(entry, store_id, store_name)
+            })
             .collect();
 
         Ok(QueryResponse {
@@ -737,6 +843,522 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Global RRF fusion tests (issue #162)
+    //
+    // `rrf_fuse` fuses one store's two legs; it is unchanged and stays correct
+    // in isolation. The bug is that `SearchOrchestrator::query` called it once
+    // *per store* and merged the already-fused entries — since RRF scores are
+    // rank-based and scale-free, every store's local rank-0 chunk ties at
+    // 2/61 regardless of actual quality. The fix is `rrf_fuse_global`: pool
+    // each leg across all stores first (`pool_leg_results`), then fuse once
+    // over the pooled, globally rank-ordered lists. Because chunk IDs are
+    // content-addressed and the chunks table is `UNIQUE (store_id, id)` (not
+    // `UNIQUE (id)`), the same document indexed into two stores yields the
+    // *same* chunk_id in both stores — so the fusion identity must be the
+    // composite `(store_id, chunk_id)`, never `chunk_id` alone.
+    // -----------------------------------------------------------------------
+
+    /// The SAME chunk_id under two different store_ids must yield two
+    /// distinct fused entries, each carrying its own store's per-leg scores.
+    /// This is the test that falsifies the naive "dedupe on chunk_id"
+    /// approach to global fusion.
+    #[test]
+    fn rrf_fuse_global_same_chunk_id_in_two_stores_stay_distinct() {
+        let chunk_in_store_1 = make_chunk(
+            "shared-id",
+            "doc-1",
+            "store-1",
+            "text in store 1",
+            vec![],
+            "file:///store1/a.md",
+            vec![1.0],
+        );
+        let chunk_in_store_2 = make_chunk(
+            "shared-id",
+            "doc-2",
+            "store-2",
+            "text in store 2",
+            vec![],
+            "file:///store2/a.md",
+            vec![1.0],
+        );
+
+        let dense = vec![make_search_result(chunk_in_store_1.clone(), 0.9)];
+        let bm25 = vec![make_search_result(chunk_in_store_2.clone(), 5.0)];
+
+        let fused = rrf_fuse_global(&dense, &bm25, 60.0);
+
+        assert_eq!(
+            fused.len(),
+            2,
+            "same chunk_id under two different store_ids must yield two distinct entries, got {}",
+            fused.len()
+        );
+
+        let entry_1 = fused
+            .iter()
+            .find(|e| e.chunk.store_id == "store-1")
+            .expect("store-1's entry should be present");
+        assert_eq!(entry_1.chunk.id, "shared-id");
+        assert!(
+            entry_1.dense_score.is_some(),
+            "store-1's entry should carry the dense score"
+        );
+        assert!(
+            entry_1.bm25_score.is_none(),
+            "store-1's entry should not carry store-2's bm25 score"
+        );
+
+        let entry_2 = fused
+            .iter()
+            .find(|e| e.chunk.store_id == "store-2")
+            .expect("store-2's entry should be present");
+        assert_eq!(entry_2.chunk.id, "shared-id");
+        assert!(
+            entry_2.bm25_score.is_some(),
+            "store-2's entry should carry the bm25 score"
+        );
+        assert!(
+            entry_2.dense_score.is_none(),
+            "store-2's entry should not carry store-1's dense score"
+        );
+    }
+
+    /// Mirrors `rrf_fuse_hand_computed_scores`, but chunk-A/chunk-C live in
+    /// store `s1` and chunk-B/chunk-D live in store `s2`. None of these
+    /// chunk_ids collide across stores, so the hand-computed arithmetic must
+    /// be identical to the single-store case.
+    #[test]
+    fn rrf_fuse_global_hand_computed_scores_across_stores() {
+        let chunk_a = make_chunk(
+            "A",
+            "doc-1",
+            "s1",
+            "text A",
+            vec![],
+            "file:///a.md",
+            vec![1.0, 0.0],
+        );
+        let chunk_b = make_chunk(
+            "B",
+            "doc-2",
+            "s2",
+            "text B",
+            vec![],
+            "file:///b.md",
+            vec![0.9, 0.1],
+        );
+        let chunk_c = make_chunk(
+            "C",
+            "doc-3",
+            "s1",
+            "text C",
+            vec![],
+            "file:///c.md",
+            vec![0.8, 0.2],
+        );
+        let chunk_d = make_chunk(
+            "D",
+            "doc-4",
+            "s2",
+            "text D",
+            vec![],
+            "file:///d.md",
+            vec![0.7, 0.3],
+        );
+
+        let dense = vec![
+            make_search_result(chunk_a.clone(), 0.99),
+            make_search_result(chunk_b.clone(), 0.88),
+            make_search_result(chunk_c.clone(), 0.75),
+        ];
+        let bm25 = vec![
+            make_search_result(chunk_a.clone(), 10.0),
+            make_search_result(chunk_b.clone(), 8.0),
+            make_search_result(chunk_d.clone(), 5.0),
+        ];
+
+        let fused = rrf_fuse_global(&dense, &bm25, 60.0);
+
+        // chunk-A should be rank 1: 2/61 ≈ 0.03279
+        assert_eq!(fused[0].chunk.id, "A", "A should be rank 1");
+        assert_eq!(fused[0].chunk.store_id, "s1");
+        // chunk-B should be rank 2: 2/62 ≈ 0.03226
+        assert_eq!(fused[1].chunk.id, "B", "B should be rank 2");
+        assert_eq!(fused[1].chunk.store_id, "s2");
+
+        let expected_a = 1.0 / 61.0 + 1.0 / 61.0;
+        assert!(
+            (fused[0].fused_score - expected_a).abs() < 1e-10,
+            "A's fused score should be 2/61, got {}",
+            fused[0].fused_score
+        );
+
+        let expected_b = 1.0 / 62.0 + 1.0 / 62.0;
+        assert!(
+            (fused[1].fused_score - expected_b).abs() < 1e-10,
+            "B's fused score should be 2/62, got {}",
+            fused[1].fused_score
+        );
+
+        // C (store s1) and D (store s2) tie at 1/63 — store_id tiebreak: s1 < s2.
+        assert_eq!(fused[2].chunk.id, "C");
+        assert_eq!(fused[2].chunk.store_id, "s1");
+        assert_eq!(fused[3].chunk.id, "D");
+        assert_eq!(fused[3].chunk.store_id, "s2");
+
+        let expected_cd = 1.0 / 63.0;
+        assert!(
+            (fused[2].fused_score - expected_cd).abs() < 1e-10,
+            "C's fused score should be 1/63, got {}",
+            fused[2].fused_score
+        );
+        assert!(
+            (fused[3].fused_score - expected_cd).abs() < 1e-10,
+            "D's fused score should be 1/63, got {}",
+            fused[3].fused_score
+        );
+    }
+
+    /// Equal `fused_score` entries must be ordered by `store_id` ascending
+    /// first, then `chunk_id` ascending — never by `chunk_id` alone (see
+    /// `rrf_fuse_global_same_chunk_id_in_two_stores_stay_distinct` for why
+    /// chunk_id can't be the sole fusion/tiebreak key).
+    #[test]
+    fn rrf_fuse_global_tiebreak_orders_by_store_id_then_chunk_id() {
+        let chunk_store2_a = make_chunk(
+            "A",
+            "doc-1",
+            "store-2",
+            "text",
+            vec![],
+            "file:///1.md",
+            vec![1.0],
+        );
+        let chunk_store1_b = make_chunk(
+            "B",
+            "doc-2",
+            "store-1",
+            "text",
+            vec![],
+            "file:///2.md",
+            vec![1.0],
+        );
+        let chunk_store1_d = make_chunk(
+            "D",
+            "doc-3",
+            "store-1",
+            "text",
+            vec![],
+            "file:///3.md",
+            vec![1.0],
+        );
+        let chunk_store1_c = make_chunk(
+            "C",
+            "doc-4",
+            "store-1",
+            "text",
+            vec![],
+            "file:///4.md",
+            vec![1.0],
+        );
+
+        // dense rank0 = store-2/A (1/61), dense rank1 = store-1/D (1/62)
+        let dense = vec![
+            make_search_result(chunk_store2_a.clone(), 0.9),
+            make_search_result(chunk_store1_d.clone(), 0.5),
+        ];
+        // bm25 rank0 = store-1/B (1/61), bm25 rank1 = store-1/C (1/62)
+        let bm25 = vec![
+            make_search_result(chunk_store1_b.clone(), 9.0),
+            make_search_result(chunk_store1_c.clone(), 4.0),
+        ];
+
+        let fused = rrf_fuse_global(&dense, &bm25, 60.0);
+        assert_eq!(fused.len(), 4);
+
+        // 1/61 group: store-1/B before store-2/A — store_id tiebreak wins
+        // even though chunk_id "A" < "B" alphabetically.
+        assert_eq!(
+            (fused[0].chunk.store_id.as_str(), fused[0].chunk.id.as_str()),
+            ("store-1", "B")
+        );
+        assert_eq!(
+            (fused[1].chunk.store_id.as_str(), fused[1].chunk.id.as_str()),
+            ("store-2", "A")
+        );
+
+        // 1/62 group: same store_id, so chunk_id decides — C before D.
+        assert_eq!(
+            (fused[2].chunk.store_id.as_str(), fused[2].chunk.id.as_str()),
+            ("store-1", "C")
+        );
+        assert_eq!(
+            (fused[3].chunk.store_id.as_str(), fused[3].chunk.id.as_str()),
+            ("store-1", "D")
+        );
+
+        let expected_group1 = 1.0 / 61.0;
+        assert!((fused[0].fused_score - expected_group1).abs() < 1e-10);
+        assert!((fused[1].fused_score - expected_group1).abs() < 1e-10);
+
+        let expected_group2 = 1.0 / 62.0;
+        assert!((fused[2].fused_score - expected_group2).abs() < 1e-10);
+        assert!((fused[3].fused_score - expected_group2).abs() < 1e-10);
+    }
+
+    /// Sort order within a single pooled leg: `score` desc, then `store_id`
+    /// asc, then `chunk_id` asc. The equal-score/equal-chunk_id-across-stores
+    /// case proves `store_id` is load-bearing in the sort key — without it,
+    /// two results with identical score AND chunk_id (the same content
+    /// indexed into two stores) would sort nondeterministically.
+    #[test]
+    fn pool_leg_results_orders_by_score_desc_then_store_id_then_chunk_id() {
+        let high = make_search_result(
+            make_chunk(
+                "m",
+                "doc-1",
+                "store-1",
+                "text",
+                vec![],
+                "file:///m.md",
+                vec![1.0],
+            ),
+            0.9,
+        );
+        // Equal score (0.5), different store_id AND different chunk_id.
+        let tie_a_store2 = make_search_result(
+            make_chunk(
+                "b",
+                "doc-2",
+                "store-2",
+                "text",
+                vec![],
+                "file:///b.md",
+                vec![1.0],
+            ),
+            0.5,
+        );
+        let tie_a_store1 = make_search_result(
+            make_chunk(
+                "c",
+                "doc-3",
+                "store-1",
+                "text",
+                vec![],
+                "file:///c.md",
+                vec![1.0],
+            ),
+            0.5,
+        );
+        // Equal score (0.3) AND equal chunk_id, different store_id.
+        let tie_b_store2 = make_search_result(
+            make_chunk(
+                "same-id",
+                "doc-4",
+                "store-2",
+                "text",
+                vec![],
+                "file:///s2.md",
+                vec![1.0],
+            ),
+            0.3,
+        );
+        let tie_b_store1 = make_search_result(
+            make_chunk(
+                "same-id",
+                "doc-5",
+                "store-1",
+                "text",
+                vec![],
+                "file:///s1.md",
+                vec![1.0],
+            ),
+            0.3,
+        );
+
+        let input = vec![
+            tie_a_store2.clone(),
+            high.clone(),
+            tie_b_store1.clone(),
+            tie_a_store1.clone(),
+            tie_b_store2.clone(),
+        ];
+
+        let pooled = pool_leg_results(input);
+
+        let actual: Vec<(&str, &str)> = pooled
+            .iter()
+            .map(|r| (r.chunk.store_id.as_str(), r.chunk.id.as_str()))
+            .collect();
+
+        assert_eq!(
+            actual,
+            vec![
+                ("store-1", "m"),
+                ("store-1", "c"),
+                ("store-2", "b"),
+                ("store-1", "same-id"),
+                ("store-2", "same-id"),
+            ]
+        );
+    }
+
+    /// Headline regression test for issue #162.
+    ///
+    /// OLD topology: `rrf_fuse` called once per store, then the already-fused
+    /// results are merged. Because RRF is rank-based and scale-free, each
+    /// store's local rank-0 chunk gets the *same* score (2/61) regardless of
+    /// how strong that chunk actually is relative to chunks in other
+    /// stores — a mediocre chunk that happens to be alone in its store ties
+    /// the genuinely-best chunk from a store with many strong candidates.
+    /// That is asserted below and must hold both BEFORE and AFTER the #162
+    /// fix, because it exercises `rrf_fuse` directly, which keeps its exact
+    /// existing per-store behavior.
+    ///
+    /// NEW topology: each leg is pooled across all stores into one globally
+    /// rank-ordered list (`pool_leg_results`), then fused once
+    /// (`rrf_fuse_global`). Because ranks are now assigned over the pooled
+    /// list, the weak store's only chunk is correctly ranked behind all
+    /// three stronger chunks from the `rel` store. Both assertions coexist
+    /// in this test so a future reader can see the bug and the fix
+    /// side by side.
+    #[test]
+    fn query_multi_store_true_global_rrf_demotes_weak_stores_rank0_chunk() {
+        // `rel`: three strong chunks, dense + BM25 scores strictly decreasing.
+        let r0 = make_chunk(
+            "r0",
+            "doc-r0",
+            "rel",
+            "text r0",
+            vec![],
+            "file:///r0.md",
+            vec![1.0],
+        );
+        let r1 = make_chunk(
+            "r1",
+            "doc-r1",
+            "rel",
+            "text r1",
+            vec![],
+            "file:///r1.md",
+            vec![1.0],
+        );
+        let r2 = make_chunk(
+            "r2",
+            "doc-r2",
+            "rel",
+            "text r2",
+            vec![],
+            "file:///r2.md",
+            vec![1.0],
+        );
+        // `weak`: one mediocre chunk, alone in its store — local rank-0 by
+        // default, purely because it has no competition within its own store.
+        let w0 = make_chunk(
+            "w0",
+            "doc-w0",
+            "weak",
+            "text w0",
+            vec![],
+            "file:///w0.md",
+            vec![1.0],
+        );
+
+        // -------------------------------------------------------------
+        // OLD topology: rrf_fuse per store, then merge (documents the bug).
+        // -------------------------------------------------------------
+        let rel_dense = vec![
+            make_search_result(r0.clone(), 0.99),
+            make_search_result(r1.clone(), 0.90),
+            make_search_result(r2.clone(), 0.80),
+        ];
+        let rel_bm25 = vec![
+            make_search_result(r0.clone(), 10.0),
+            make_search_result(r1.clone(), 8.0),
+            make_search_result(r2.clone(), 6.0),
+        ];
+        let weak_dense = vec![make_search_result(w0.clone(), 0.50)];
+        let weak_bm25 = vec![make_search_result(w0.clone(), 3.0)];
+
+        let rel_fused_old = rrf_fuse(&rel_dense, &rel_bm25, 60.0);
+        let weak_fused_old = rrf_fuse(&weak_dense, &weak_bm25, 60.0);
+
+        let rel_rank0_old = rel_fused_old.iter().find(|e| e.chunk.id == "r0").unwrap();
+        let weak_rank0_old = weak_fused_old.iter().find(|e| e.chunk.id == "w0").unwrap();
+
+        let expected_rank0_score = 2.0 / 61.0;
+        assert!(
+            (rel_rank0_old.fused_score - expected_rank0_score).abs() < 1e-10,
+            "rel's rank-0 chunk should score exactly 2/61 under the old per-store topology, got {}",
+            rel_rank0_old.fused_score
+        );
+        assert!(
+            (weak_rank0_old.fused_score - expected_rank0_score).abs() < 1e-10,
+            "weak's rank-0 chunk should score exactly 2/61 under the old per-store topology \
+             (THIS IS THE BUG: a mediocre chunk alone in its store ties the genuinely-best \
+             chunk from a store with real competition), got {}",
+            weak_rank0_old.fused_score
+        );
+
+        // -------------------------------------------------------------
+        // NEW topology: pool each leg globally, then a single rrf_fuse_global.
+        // -------------------------------------------------------------
+        let pooled_dense = pool_leg_results(vec![
+            make_search_result(r0.clone(), 0.99),
+            make_search_result(r1.clone(), 0.90),
+            make_search_result(r2.clone(), 0.80),
+            make_search_result(w0.clone(), 0.50),
+        ]);
+        let pooled_bm25 = pool_leg_results(vec![
+            make_search_result(r0.clone(), 10.0),
+            make_search_result(r1.clone(), 8.0),
+            make_search_result(r2.clone(), 6.0),
+            make_search_result(w0.clone(), 3.0),
+        ]);
+
+        let fused_new = rrf_fuse_global(&pooled_dense, &pooled_bm25, 60.0);
+        assert_eq!(fused_new.len(), 4);
+
+        // Weak's chunk must now be ranked strictly last.
+        assert_eq!(
+            fused_new[3].chunk.id,
+            "w0",
+            "weak's chunk must be demoted to last place under true global RRF, got order {:?}",
+            fused_new
+                .iter()
+                .map(|e| e.chunk.id.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let r0_entry = fused_new.iter().find(|e| e.chunk.id == "r0").unwrap();
+        let r1_entry = fused_new.iter().find(|e| e.chunk.id == "r1").unwrap();
+        let r2_entry = fused_new.iter().find(|e| e.chunk.id == "r2").unwrap();
+        let w0_entry = fused_new.iter().find(|e| e.chunk.id == "w0").unwrap();
+
+        assert!(
+            (r0_entry.fused_score - 2.0 / 61.0).abs() < 1e-10,
+            "r0 should be 2/61, got {}",
+            r0_entry.fused_score
+        );
+        assert!(
+            (r1_entry.fused_score - 2.0 / 62.0).abs() < 1e-10,
+            "r1 should be 2/62, got {}",
+            r1_entry.fused_score
+        );
+        assert!(
+            (r2_entry.fused_score - 2.0 / 63.0).abs() < 1e-10,
+            "r2 should be 2/63, got {}",
+            r2_entry.fused_score
+        );
+        assert!(
+            (w0_entry.fused_score - 2.0 / 64.0).abs() < 1e-10,
+            "w0 should be 2/64 — correctly demoted behind all three rel chunks, got {}",
+            w0_entry.fused_score
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Citation shaping tests
     // -----------------------------------------------------------------------
 
@@ -975,6 +1597,26 @@ mod tests {
     #[tokio::test]
     async fn query_multi_store_global_ordering() {
         // Prove that multi-store fan-out produces a globally consistent ordering.
+        //
+        // Discriminating fixture (issue #162): this fixture is deliberately
+        // asymmetric in BM25-leg presence so it can prove a cross-store score
+        // inequality without depending on `FakeEmbedder`'s hash internals (see
+        // `core/src/embedder.rs`). Query "rust programming" is 2 terms; per
+        // `simple_bm25_score` (`core/src/store.rs`), chunk a1's text contains
+        // both terms, so it always scores 2/2 = 1.0 — the uniquely highest BM25
+        // score among these three chunks, i.e. always BM25 rank 0 (contribution
+        // exactly 1/61). Chunk b1's text contains neither term, so its BM25
+        // score is 0.0 and `FakeStore::bm25_search` filters it out of the BM25
+        // leg entirely (contribution 0). Both chunks are always present in the
+        // dense leg (cosine similarity, no score filter), at *some* rank among
+        // the 3 pooled candidates — worst case rank 2 (1/63), best case rank 0
+        // (1/61). That gives a1 a fused-score floor of 1/61 + 1/63 and b1 a
+        // fused-score ceiling of 1/61; since 1/61 + 1/63 > 1/61, a1 must
+        // strictly outscore b1 regardless of how the dense leg (hash-based)
+        // happens to rank them. Exact RRF arithmetic coverage lives in
+        // `query_multi_store_true_global_rrf_demotes_weak_stores_rank0_chunk`;
+        // this test only needs the inequality direction plus the ordering and
+        // candidate-count invariants below.
         let embedder = FakeEmbedder::new(4);
 
         let text_a1 = "rust programming language performance";
@@ -1044,12 +1686,131 @@ mod tests {
         assert!(result.total_candidates > 0);
         assert!(!result.citations.is_empty());
 
+        // All three chunks (a1, b1, b2) are distinct (store_id, chunk_id) keys,
+        // and every one of them appears in at least one leg (a1 and b2 in both
+        // legs, b1 in the dense leg only) — global fusion must therefore
+        // produce exactly 3 candidates.
+        assert_eq!(
+            result.total_candidates, 3,
+            "expected exactly 3 globally-fused candidates (a1, b1, b2)"
+        );
+
         // Results should be ordered by fused score descending
         for i in 0..result.citations.len().saturating_sub(1) {
             assert!(
                 result.citations[i].score.fused >= result.citations[i + 1].score.fused,
                 "citations should be ordered by fused score descending"
             );
+        }
+
+        // Cross-store score inequality (see the fixture comment above for the
+        // bound derivation): a1's guaranteed BM25-rank-0 contribution plus its
+        // worst-case dense contribution must exceed b1's best-case dense-only
+        // contribution, regardless of dense-leg (hash-based) ranking.
+        let a1 = result
+            .citations
+            .iter()
+            .find(|c| c.chunk_id == "a1")
+            .expect("a1 should be present (dense leg always includes it)");
+        let b1 = result
+            .citations
+            .iter()
+            .find(|c| c.chunk_id == "b1")
+            .expect("b1 should be present (dense leg always includes it)");
+        assert!(
+            a1.score.fused > b1.score.fused,
+            "a1 (2/2 BM25 term match, always BM25 rank 0) must strictly outscore b1 \
+             (0/2 BM25 term match, absent from the BM25 leg entirely): a1={}, b1={}",
+            a1.score.fused,
+            b1.score.fused
+        );
+    }
+
+    /// The same chunk_id present in two different stores (e.g. the same
+    /// document indexed into both) must survive as two distinct citations,
+    /// each correctly attributed to its own store. Each chunk's `store_id`
+    /// equals the `StoreHandle.id` of the store holding it — the
+    /// implementation must resolve each citation's store name from the
+    /// chunk's `store_id`, not from positional pairing with the fan-out loop
+    /// (which pooling across stores makes unreliable).
+    #[tokio::test]
+    async fn query_same_chunk_id_present_in_two_stores_both_survive_with_correct_attribution() {
+        let embedder = FakeEmbedder::new(4);
+
+        let text = "shared content across stores";
+        let embedding = embed_text(&embedder, text).await;
+
+        let store_a = FakeStore::new();
+        let chunk_a = make_chunk(
+            "shared-chunk-id",
+            "doc-a",
+            "store-A",
+            text,
+            vec![],
+            "file:///a.md",
+            embedding.clone(),
+        );
+        store_a.upsert_chunks(vec![chunk_a]).await.unwrap();
+
+        let store_b = FakeStore::new();
+        let chunk_b = make_chunk(
+            "shared-chunk-id",
+            "doc-b",
+            "store-B",
+            text,
+            vec![],
+            "file:///b.md",
+            embedding,
+        );
+        store_b.upsert_chunks(vec![chunk_b]).await.unwrap();
+
+        let handles = vec![
+            StoreHandle {
+                id: "store-A".to_string(),
+                name: "Store A".to_string(),
+                store: Arc::new(store_a),
+            },
+            StoreHandle {
+                id: "store-B".to_string(),
+                name: "Store B".to_string(),
+                store: Arc::new(store_b),
+            },
+        ];
+
+        let request = QueryRequest {
+            query: "shared content".to_string(),
+            leg_k: Some(10),
+            top_n: Some(10),
+            filters: vec![],
+        };
+
+        let result = SearchOrchestrator::query(&handles, &embedder, &request)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.total_candidates, 2,
+            "both stores' chunks should be counted as distinct candidates, not deduped away"
+        );
+        assert_eq!(
+            result.citations.len(),
+            2,
+            "both citations should survive — same chunk_id in different stores must not collide"
+        );
+
+        let store_ids: std::collections::HashSet<&str> = result
+            .citations
+            .iter()
+            .map(|c| c.store.id.as_str())
+            .collect();
+        assert_eq!(
+            store_ids,
+            std::collections::HashSet::from(["store-A", "store-B"]),
+            "citations must carry the two distinct store ids, one each"
+        );
+
+        for c in &result.citations {
+            assert_eq!(c.chunk_id, "shared-chunk-id");
         }
     }
 
