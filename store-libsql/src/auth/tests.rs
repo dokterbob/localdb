@@ -43,7 +43,6 @@ async fn insert_store_row(backend: &SqliteBackend, name: &str) {
             backend: "libsql".to_string(),
             indexing_policy: "{}".to_string(),
             policy_version: "v1".to_string(),
-            acl: "{}".to_string(),
             created_at: "2026-06-10T12:00:00Z".to_string(),
         })
         .await

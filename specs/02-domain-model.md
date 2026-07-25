@@ -24,7 +24,7 @@ chunks span multiple `Message`/`Segment` blocks.
 ## 2. Entities
 
 ### Store
-A named knowledge base. Unit of sharing, ACLs, indexing policy, and federation.
+A named knowledge base. Unit of sharing, access control, indexing policy, and federation.
 
 | Field | Notes |
 |---|---|
@@ -33,7 +33,9 @@ A named knowledge base. Unit of sharing, ACLs, indexing policy, and federation.
 | `visibility` | `private` \| `shared`. MVP: only `private` functional; field exists from day one ([01-architecture.md](01-architecture.md) §5). |
 | `backend` | Backend kind + connection info; default `libsql`. |
 | `indexing` | Indexing policy: `{chunking, embedding, parsers}` as one unit ([03-config.md](03-config.md) §2). |
-| `acl` | Reserved; empty in MVP. **Stays reserved and unused** now that auth exists — `StoreGrant` rows, not `acl`, are the real access-control mechanism (D7, see `StoreGrant` below and [05-surfaces.md](05-surfaces.md) §3.1). |
+
+Access control is expressed by `StoreGrant` rows, not a field on `Store` (D7, see `StoreGrant`
+below and [05-surfaces.md](05-surfaces.md) §3.1).
 
 ### Source
 Where a store's content comes from. Each source is driven by an **ingestor** that knows how to

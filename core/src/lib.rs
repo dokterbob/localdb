@@ -66,9 +66,9 @@ pub use snippet::truncate_snippet;
 pub use store::FakeStore;
 pub use store::{ChunkRecord, MetadataFilter, RetrievalStore, SearchResult, StoreStats};
 pub use types::{
-    validate_dc_meta_key, validate_msg_meta_key, AclEntry, BackendConfig, Chunk, ChunkingConfig,
-    Document, EmbeddingConfig, FederationHop, IndexJob, IndexJobScope, IndexJobState,
-    IndexJobStats, IndexingPolicy, Provenance, Source, SourceKind, SourceRef, SourceSpec, Span,
-    Store, StoreVisibility,
+    validate_dc_meta_key, validate_msg_meta_key, BackendConfig, Chunk, ChunkingConfig, Document,
+    EmbeddingConfig, FederationHop, IndexJob, IndexJobScope, IndexJobState, IndexJobStats,
+    IndexingPolicy, Provenance, Source, SourceKind, SourceRef, SourceSpec, Span, Store,
+    StoreVisibility,
 };
 pub use uri::Uri;

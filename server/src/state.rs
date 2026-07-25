@@ -285,7 +285,6 @@ impl AppState {
                     model: "default".to_string(),
                 },
             },
-            acl: vec![],
         })
     }
 

@@ -104,10 +104,6 @@ pub struct Store {
 
     /// Indexing policy: `{chunking, embedding}` as one unit.
     pub indexing: IndexingPolicy,
-
-    /// Reserved; empty in MVP.
-    #[serde(default)]
-    pub acl: Vec<AclEntry>,
 }
 
 /// Visibility of a store.
@@ -177,13 +173,6 @@ pub struct EmbeddingConfig {
     pub provider: String,
     /// Model name or path.
     pub model: String,
-}
-
-/// ACL entry. Reserved; empty in MVP.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AclEntry {
-    pub principal: String,
-    pub role: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -555,7 +544,6 @@ mod tests {
                     model: "default".to_string(),
                 },
             },
-            acl: vec![],
         };
         let json = serde_json::to_string(&store).unwrap();
         let store2: Store = serde_json::from_str(&json).unwrap();

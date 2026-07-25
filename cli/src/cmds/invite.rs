@@ -522,7 +522,6 @@ mod tests {
             backend: "libsql".to_string(),
             indexing_policy: "{}".to_string(),
             policy_version: "v1".to_string(),
-            acl: "{}".to_string(),
             created_at: localdb_core::ingestion::now_rfc3339(),
         };
         db.backend().upsert_store(&store).await.unwrap();
