@@ -16,3 +16,4 @@ tracing = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
 tempfile = "3"
+localdb-core = { path = "../core", features = ["test-support"] }

@@ -1041,16 +1041,21 @@ impl IngestCallback for PipelineCallback<'_> {
     }
 
     async fn on_skipped(&mut self, uri: &str, reason: SkipReason) {
-        self.seen.insert(uri.to_string());
+        // Shadow the raw locator with its normalized form immediately, so
+        // nothing below (the `seen` bookkeeping the delete-sweep reads, or
+        // either progress event) can accidentally reach the un-normalized
+        // `&str`. See `normalize_uri` for why the fallback it uses is safe.
+        let uri = normalize_uri(uri);
+        self.seen.insert(uri.clone());
         self.result.docs_seen += 1;
-        self.start_document(uri);
+        self.start_document(&uri);
 
         match reason {
             SkipReason::Unchanged => {
                 // Still alive, just unchanged — never re-index, never sweep.
                 self.result.docs_skipped += 1;
                 self.emit(crate::progress::ProgressEvent::DocumentFinished {
-                    uri: uri.to_string(),
+                    uri: uri.clone(),
                     outcome: crate::progress::DocOutcome::Skipped,
                 });
             }
@@ -1061,7 +1066,7 @@ impl IngestCallback for PipelineCallback<'_> {
                 // the sweep untouched, neither refreshed nor removed.
                 self.result.unsupported_format_count += 1;
                 self.emit(crate::progress::ProgressEvent::DocumentFinished {
-                    uri: uri.to_string(),
+                    uri: uri.clone(),
                     outcome: crate::progress::DocOutcome::Unsupported,
                 });
             }
@@ -1071,7 +1076,7 @@ impl IngestCallback for PipelineCallback<'_> {
                 // above), so it survives the sweep regardless.
                 self.result.docs_skipped += 1;
                 self.emit(crate::progress::ProgressEvent::DocumentFinished {
-                    uri: uri.to_string(),
+                    uri: uri.clone(),
                     outcome: crate::progress::DocOutcome::Skipped,
                 });
             }
@@ -1087,7 +1092,7 @@ impl IngestCallback for PipelineCallback<'_> {
                 self.result.error_count += 1;
                 self.skip_error_count += 1;
                 self.emit(crate::progress::ProgressEvent::DocumentFinished {
-                    uri: uri.to_string(),
+                    uri: uri.clone(),
                     outcome: crate::progress::DocOutcome::Error,
                 });
             }
@@ -1098,6 +1103,32 @@ impl IngestCallback for PipelineCallback<'_> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Normalize a raw URI/locator string to the same representation
+/// `Resource.uri` carries everywhere else in the pipeline (percent-encoded
+/// path bytes, lower-cased host, etc. — see `core/src/uri.rs`).
+///
+/// This is the single owner of the "parse with raw fallback" invariant: every
+/// caller that needs to compare a raw locator (from an ingestor callback, a
+/// config value, ...) against a `DocumentIndex`/store key must normalize
+/// through this function first, or a raw string containing a space,
+/// non-ASCII character, or non-canonical casing will never match its own
+/// normalized resource and its document will silently survive (or be
+/// dropped from) the delete-sweep incorrectly.
+///
+/// The `unwrap_or_else` fallback to the raw string is provably inert:
+/// `DocumentIndex` is populated only by `on_resource`'s `doc_index.upsert`,
+/// keyed by `resource.uri.as_str()`; every ingestor returns `Err` rather than
+/// reaching `on_resource` if its own `Uri::parse` fails. Every
+/// `DocumentIndex` key is therefore a successful parse's output, and a
+/// string that *fails* to parse here can never equal one. The fallback only
+/// prevents a panic or a dropped bookkeeping entry — it can never cause a
+/// false match.
+fn normalize_uri(raw: &str) -> String {
+    crate::uri::Uri::parse(raw)
+        .map(|u| u.as_str().to_string())
+        .unwrap_or_else(|| raw.to_string())
+}
 
 /// Check if a URI belongs to a given source.
 ///
@@ -1139,11 +1170,10 @@ fn is_uri_from_source(uri: &str, source: &Source) -> bool {
             // `Uri::parse` before handing the `Resource` to core — see
             // ingest/src/file_ingestor.rs). Doing the same here keeps both
             // sides byte-for-byte comparable. If parsing fails for some
-            // reason, fall back to the raw string: a false negative here only
-            // means "don't delete" (safe direction), never a panic.
-            let file_prefix = crate::uri::Uri::parse(&raw_prefix)
-                .map(|u| u.as_str().trim_end_matches('/').to_string())
-                .unwrap_or(raw_prefix);
+            // reason, fall back to the raw string via `normalize_uri`: a
+            // false negative here only means "don't delete" (safe
+            // direction), never a panic.
+            let file_prefix = normalize_uri(&raw_prefix).trim_end_matches('/').to_string();
 
             // Boundary-aware match (C0): a plain `starts_with` here would
             // let a sibling source whose root is a *string* prefix of this
@@ -1158,17 +1188,14 @@ fn is_uri_from_source(uri: &str, source: &Source) -> bool {
         }
         SourceSpec::Url { url, .. } => {
             // Normalize the configured URL the same way the indexed URI was
-            // normalized (`Uri::parse`), so e.g. an uppercase host or a
+            // normalized (`normalize_uri`), so e.g. an uppercase host or a
             // missing trailing slash in config still matches. Already
             // boundary-safe either way: exact equality can't suffer the
             // string-prefix misattribution the path arm above guards
             // against. Falls back to raw comparison if the configured URL
             // fails to parse (should not happen for a validated source, but
             // never worse than the old behavior).
-            match crate::uri::Uri::parse(url) {
-                Some(normalized) => uri == normalized.as_str(),
-                None => uri == url.as_str(),
-            }
+            uri == normalize_uri(url)
         }
     }
 }
@@ -3015,6 +3042,303 @@ mod tests {
                 .await
                 .unwrap();
             assert!(chunks.is_empty());
+        }
+
+        // -----------------------------------------------------------------
+        // 8b. Regression: `on_skipped` inserts the RAW locator the ingestor
+        // handed it into `seen`, while the delete-sweep iterates
+        // `doc_index.uris()` — always the NORMALIZED `Resource.uri`
+        // representation (percent-encoded path bytes, lower-cased host).
+        // When a raw locator differs from its normalized form, `seen`
+        // and the sweep's key space disagree and a live document gets
+        // deleted out from under a skip that should have kept it alive.
+        // -----------------------------------------------------------------
+
+        #[tokio::test]
+        async fn on_skipped_space_in_path_survives_sweep() {
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let config = make_ingestion_config(store_id);
+            let source = make_source_with_preset(store_id, "prose");
+
+            // What a real file ingestor would pass to `on_skipped` — the raw,
+            // non-percent-encoded path.
+            let raw_uri = "file:///docs/my file.md";
+            let normalized_uri = crate::uri::Uri::parse(raw_uri).unwrap();
+            assert_eq!(
+                normalized_uri.as_str(),
+                "file:///docs/my%20file.md",
+                "sanity: the space must be percent-encoded in the normalized form"
+            );
+
+            // Seed prior state exactly as `on_resource` would have written it:
+            // keyed by the NORMALIZED uri (see `Resource.uri.as_str()` at
+            // ingestion.rs:1010).
+            let record = seed_indexed(
+                &store,
+                &embedder,
+                &config,
+                &source,
+                normalized_uri.as_str(),
+                "Space path content.",
+            )
+            .await;
+
+            let mut doc_index = DocumentIndex::new();
+            doc_index.upsert(record.clone());
+
+            // A transient read failure this run: the real ingestor reports it
+            // via the raw (unnormalized) locator string.
+            let ingestor = FakeIngestor::new(vec![ScriptStep::Skipped(
+                raw_uri.to_string(),
+                SkipReason::Error("transient read failure".to_string()),
+            )]);
+
+            let deps = SourceIngestionDeps {
+                doc_index: &mut doc_index,
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+                progress: None,
+            };
+            let result = run_source_ingestion(&source, &ingestor, deps)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                result.docs_deleted, 0,
+                "a transient read error must never delete a live document merely \
+                 because its raw locator and normalized URI differ"
+            );
+            assert!(
+                doc_index.get(normalized_uri.as_str()).is_some(),
+                "the doc_index entry must survive the sweep"
+            );
+            let chunks = store
+                .get_chunks_for_resource(&record.resource_id)
+                .await
+                .unwrap();
+            assert!(
+                !chunks.is_empty(),
+                "the existing chunks must not be swept away"
+            );
+        }
+
+        // -----------------------------------------------------------------
+        // 8c. Same class of bug, `SourceKind::Url`: an uppercase host in the
+        // raw locator an ingestor reports via `on_skipped` (e.g.
+        // `SkipReason::Unchanged`, the steady state for a URL source) must
+        // still match the lower-cased host stored in the doc_index, or the
+        // document is deleted on every unchanged run.
+        // -----------------------------------------------------------------
+
+        #[tokio::test]
+        async fn on_skipped_uppercase_host_survives_sweep() {
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let config = make_ingestion_config(store_id);
+            let source = Source {
+                id: new_ulid(),
+                store_id: store_id.to_string(),
+                kind: SourceKind::Url,
+                spec: SourceSpec::Url {
+                    url: "https://example.com/docs".to_string(),
+                    refresh_interval_secs: None,
+                },
+                source_preset: "prose".to_string(),
+            };
+
+            let normalized_uri = "https://example.com/docs";
+            let record = seed_indexed(
+                &store,
+                &embedder,
+                &config,
+                &source,
+                normalized_uri,
+                "Docs page body.",
+            )
+            .await;
+
+            let mut doc_index = DocumentIndex::new();
+            doc_index.upsert(record.clone());
+
+            // The ingestor's own unchanged-check reports this URL as
+            // unchanged, using the raw (uppercase-host) locator it was
+            // configured with.
+            let raw_uri = "https://Example.com/docs";
+            assert_ne!(
+                raw_uri, normalized_uri,
+                "sanity: the raw locator's host casing must differ from normalized"
+            );
+            let ingestor = FakeIngestor::new(vec![ScriptStep::Skipped(
+                raw_uri.to_string(),
+                SkipReason::Unchanged,
+            )]);
+
+            let deps = SourceIngestionDeps {
+                doc_index: &mut doc_index,
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+                progress: None,
+            };
+            let result = run_source_ingestion(&source, &ingestor, deps)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                result.docs_deleted, 0,
+                "SkipReason::Unchanged must never delete a live document merely \
+                 because the raw locator's host casing differs from the \
+                 normalized, lower-cased host stored in the doc_index"
+            );
+            assert!(doc_index.get(normalized_uri).is_some());
+            let chunks = store
+                .get_chunks_for_resource(&record.resource_id)
+                .await
+                .unwrap();
+            assert!(!chunks.is_empty());
+        }
+
+        // -----------------------------------------------------------------
+        // 8d. `on_skipped`'s progress events must carry the same normalized
+        // URI representation that `on_resource` uses, not the raw locator —
+        // otherwise a progress consumer (CLI output, HTTP job status) can't
+        // correlate a `DocumentStarted`/`DocumentFinished` pair for a
+        // skipped item with the URI actually tracked in the doc_index.
+        // -----------------------------------------------------------------
+
+        #[tokio::test]
+        async fn on_skipped_progress_events_carry_normalized_uri() {
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let config = make_ingestion_config(store_id);
+            let source = make_source_with_preset(store_id, "prose");
+
+            let raw_uri = "file:///docs/My File.MD";
+            let normalized_uri = crate::uri::Uri::parse(raw_uri).unwrap();
+            let normalized_uri = normalized_uri.as_str().to_string();
+            assert_ne!(
+                raw_uri, normalized_uri,
+                "sanity: raw and normalized must differ for this fixture"
+            );
+
+            let mut doc_index = DocumentIndex::new();
+            let ingestor = FakeIngestor::new(vec![ScriptStep::Skipped(
+                raw_uri.to_string(),
+                SkipReason::Unsupported,
+            )]);
+
+            let (sink, events) = progress_collector();
+            let deps = SourceIngestionDeps {
+                doc_index: &mut doc_index,
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+                progress: Some(sink),
+            };
+            let result = run_source_ingestion(&source, &ingestor, deps)
+                .await
+                .unwrap();
+            assert_eq!(result.docs_deleted, 0);
+
+            let events = events.lock().unwrap();
+            let started_uri = events.iter().find_map(|e| match e {
+                ProgressEvent::DocumentStarted { uri, .. } => Some(uri.clone()),
+                _ => None,
+            });
+            let finished_uri = events.iter().find_map(|e| match e {
+                ProgressEvent::DocumentFinished { uri, .. } => Some(uri.clone()),
+                _ => None,
+            });
+            assert_eq!(
+                started_uri.as_deref(),
+                Some(normalized_uri.as_str()),
+                "DocumentStarted must carry the normalized URI, not the raw locator"
+            );
+            assert_eq!(
+                finished_uri.as_deref(),
+                Some(normalized_uri.as_str()),
+                "DocumentFinished must carry the normalized URI, not the raw locator"
+            );
+        }
+
+        // -----------------------------------------------------------------
+        // 8e. Pin the fallback contract: a locator that isn't a parseable URI
+        // at all must never panic the pipeline, and must not disturb an
+        // unrelated, already-indexed document swept in the same run. This
+        // must hold both before and after the `normalize_uri` fix lands.
+        // -----------------------------------------------------------------
+
+        #[tokio::test]
+        async fn on_skipped_unparseable_locator_falls_back_without_panic() {
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let config = make_ingestion_config(store_id);
+            let source = make_source_with_preset(store_id, "prose");
+
+            let other_uri = "file:///docs/other.md";
+            let other_record = seed_indexed(
+                &store,
+                &embedder,
+                &config,
+                &source,
+                other_uri,
+                "Other content.",
+            )
+            .await;
+
+            let mut doc_index = DocumentIndex::new();
+            doc_index.upsert(other_record.clone());
+
+            let bogus = "not a valid uri";
+            let ingestor = FakeIngestor::new(vec![
+                ScriptStep::Skipped(
+                    bogus.to_string(),
+                    SkipReason::Error("garbage locator".to_string()),
+                ),
+                ScriptStep::Skipped(other_uri.to_string(), SkipReason::Unchanged),
+            ]);
+
+            let (sink, events) = progress_collector();
+            let deps = SourceIngestionDeps {
+                doc_index: &mut doc_index,
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+                progress: Some(sink),
+            };
+            let result = run_source_ingestion(&source, &ingestor, deps)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                result.docs_deleted, 0,
+                "an unparseable locator must never panic, and the unrelated \
+                 already-indexed document must survive the sweep"
+            );
+            assert_eq!(result.error_count, 1);
+            let other_chunks = store
+                .get_chunks_for_resource(&other_record.resource_id)
+                .await
+                .unwrap();
+            assert!(!other_chunks.is_empty());
+            assert!(doc_index.get(other_uri).is_some());
+
+            // Fallback contract: a locator that fails URI normalization must
+            // still surface verbatim (identity fallback), never panic.
+            let events = events.lock().unwrap();
+            let bogus_finished = events
+                .iter()
+                .any(|e| matches!(e, ProgressEvent::DocumentFinished { uri, .. } if uri == bogus));
+            assert!(
+                bogus_finished,
+                "the unparseable locator must still surface verbatim via DocumentFinished"
+            );
         }
 
         // -----------------------------------------------------------------
