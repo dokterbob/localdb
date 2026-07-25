@@ -57,11 +57,11 @@ Before applying anything, `db migrate` re-verifies the store's *existing* `schem
 already-applied prefix) and refuses, untouched, if that history is drifted or incomplete — a store
 with corrupted bookkeeping never gets new migrations layered on top of it. Only once that passes
 does it apply every pending migration in order, one transaction per step, with per-step progress on
-stderr (`applied migration v5 'create_auth_tables' in 12ms`). If already at head:
+stderr (`applied migration v6 'create_auth_tables' in 12ms`). If already at head:
 
 ```
 $ localdb db migrate
-already at head (v6)
+already at head (v7)
 ```
 
 If the store is a **legacy** (pre-baseline, v1–v3) store, migrating it means an unconditional
@@ -242,6 +242,16 @@ message, so write it for the person hitting that refusal, not for yourself. Down
 `Unsupported` step is refused cleanly (pre-scanned before anything runs), naming the migration and
 suggesting the nearest reachable `--to` target.
 
+### `ALTER TABLE ... ADD COLUMN` and the drift guard
+
+SQLite's `ALTER TABLE ... ADD COLUMN` splices the new column definition verbatim immediately
+before the original `CREATE TABLE` statement's closing `)`; it does not reformat the stored SQL.
+Because the drift guard byte-compares `sqlite_master` between a fresh `create_schema` and
+baseline+chain, the `create_schema` literal for a table touched by an `ADD COLUMN` migration must
+reproduce that exact splice rather than the naturally-formatted DDL a human would write. See
+`schema.rs`'s `access_requests` literal, which ends `decided_at TEXT\n        , collected_at
+TEXT)` for precisely this reason.
+
 ### `needs_reindex`
 
 Set `true` when applying the migration invalidates already-derived data (chunks, embeddings) in a
@@ -290,89 +300,6 @@ A migration touching the `chunks_vec_idx` DiskANN vector index should start its 
 partial ANN-index construction on transaction rollback is unverified (see the comment in
 `runner.rs`'s `apply_pending`) — an explicit drop-first keeps a retried migration safe regardless
 of that answer.
-
----
-
-## Consumer recipe: `auth` branch
-
-The `auth` branch (issue #98) currently hand-rolls its own migration runner in
-`store-libsql/src/schema.rs`: a `Migration { from, to, run }` struct, a `MIGRATIONS: &[Migration]`
-table, and a `run_migrations` function that walks it — plus an auto-migrate branch inside its own
-`connection.rs`'s `LibsqlDb::open` (`if version != 0 && version < schema::SCHEMA_VERSION { …
-schema::run_migrations(...).await?; }`). Adopting this framework means deleting all of that and
-re-expressing the same two schema changes as chain entries.
-
-### 1. Delete the ad-hoc runner
-
-Remove from `store-libsql/src/schema.rs`: the `Migration` struct, `MigrationFn` type alias,
-`MIGRATIONS` constant, and `run_migrations` function (roughly lines 465–580 as of the branch tip).
-Remove the auto-migrate branch in `connection.rs`'s `LibsqlDb::open` (the `version <
-schema::SCHEMA_VERSION` arm that calls `schema::run_migrations`) — `LibsqlDb::open` never migrates
-under this framework; it only refuses.
-
-### 2. `v5`: `create_auth_tables` as a chain entry
-
-`auth`'s `create_auth_tables` (schema.rs, ~line 314) creates the 7 auth tables: `users`,
-`auth_tokens`, `oauth_clients`, `auth_codes`, `store_grants`, `invites`, `access_requests`. As a
-chain entry:
-
-- `Up::Sql`: the v5-era DDL — the same statements, **without** `access_requests.collected_at`
-  (that column arrives in v6 below; including it here would make the v6 `ALTER TABLE ADD COLUMN`
-  fail with "duplicate column name" on a store that runs v5 and v6 back-to-back). See
-  `store-libsql/tests/real_migrations.rs`'s `v5_create_auth_tables_up` for the exact statements —
-  it mirrors this branch's DDL verbatim (minus the `oauth_clients` seed INSERT, which is DML, not
-  schema, and irrelevant to the migration machinery).
-- `Down::Sql`: `DROP TABLE` the 7 tables (children before parents is not strictly required here —
-  every FK is `CASCADE`/`SET NULL` — but is good practice) plus any indexes SQLite doesn't drop
-  automatically with their table (`DROP TABLE` does drop a table's own indexes, so no separate
-  `DROP INDEX` statements are needed for `idx_auth_tokens_user`, `idx_auth_tokens_family`,
-  `idx_store_grants_user`, `idx_access_requests_invite`).
-- `needs_reindex: false` — purely additive, doesn't touch chunks/embeddings.
-
-### 3. `v6`: `collected_at` as a chain entry
-
-- `Up::Sql`: `ALTER TABLE access_requests ADD COLUMN collected_at TEXT`.
-- `Down::Sql`: `ALTER TABLE access_requests DROP COLUMN collected_at`.
-- The `pragma_table_info` guard in the current `add_access_requests_collected_at_column`
-  (checking whether the column already exists before running the `ALTER TABLE`) becomes
-  **unnecessary** as a chain entry: that guard exists in the current code because the same
-  function runs from two different starting points (a store already at v5 pre-ticket, vs. a store
-  jumping straight from v4 through a `create_auth_tables` that, at HEAD, already includes
-  `collected_at`). A chain entry doesn't have that ambiguity — the chain guarantees this step runs
-  exactly once, from the exact v5 predecessor fixed in step 2 above (which never has
-  `collected_at`). Drop the guard.
-- `needs_reindex: false`.
-
-### 4. Replace the test fixture
-
-`create_pre_auth_schema_v4_for_test` (in `schema.rs`'s `#[cfg(test)]` module) built a v4-only
-database by calling the same per-table DDL helpers `create_schema` uses, minus the auth tables.
-Replace every call site with `store_libsql::migrations::baseline::create_baseline_schema` — that's
-now the canonical "old v4 database" fixture, shared across the whole workspace instead of
-duplicated per-branch.
-
-### 5. Update the tests
-
-- `open` no longer auto-migrates: any test asserting that opening a v4 (or v5) store transparently
-  upgrades it now asserts the opposite — a refusal (`Error::InvalidConfig`, message containing
-  `db migrate` and `predates`/`behind`), with the store's `sqlite_master`/`user_version`/
-  `schema_migrations` state provably unchanged before vs. after (see `connection.rs`'s
-  `reopen_with_legacy_schema_version_is_refused_without_mutation` for the pattern). To actually
-  advance a test fixture, call `store_libsql::migrate_store` directly instead of relying on
-  `open`.
-- Any test whose failure message asserted the old v1–v3 "no migration path" wording is now
-  instead the `db migrate` hint (`"database schema version {v} predates the migration baseline
-  (v4); run 'localdb db migrate' to erase and rebuild it..."`). This is a small, sanctioned
-  amendment to D13 ("never destructive silently") rather than a reversal of it: the rebuild path
-  still exists, is still the only way to bring a legacy store forward, and is still gated behind
-  an explicit confirmation prompt (`cli/src/cmds/db.rs`'s `run_db_migrate_async`) — it just isn't
-  triggered implicitly by `open` anymore.
-
-`store-libsql/tests/real_migrations.rs` mirrors this exact v5/v6 pair (as fixture migrations, not
-the real chain entries) end-to-end — forward application, checking the 7 tables and the
-`collected_at` column land correctly, and backward (down to v5, down to baseline) restoring
-exactly a fresh-baseline schema while preserving pre-seeded v4 data. Treat it as the executable
-version of this recipe.
 
 ---
 

@@ -243,7 +243,7 @@ or denial (T6).
 | `state` | `pending` \| `approved` \| `denied`. |
 | `resulting_user_id` | Set once approved and the `User` row is created. |
 | `created_at`, `decided_at` | RFC 3339; `decided_at` nullable until the request leaves `pending`. |
-| `collected_at` (T6, schema v6) | Nullable RFC 3339. Set exactly once, atomically (`AuthStore::mark_access_request_collected`, mirroring `consume_auth_code`'s single-use guard), the first time a poll observes the `Approved` state and hands back the credential — every later poll observes `AlreadyCollected` instead of re-issuing it. |
+| `collected_at` (T6, schema v7) | Nullable RFC 3339. Set exactly once, atomically (`AuthStore::mark_access_request_collected`, mirroring `consume_auth_code`'s single-use guard), the first time a poll observes the `Approved` state and hands back the credential — every later poll observes `AlreadyCollected` instead of re-issuing it. |
 
 ### StoreGrant
 A normalized row granting one user read access to one `shared`-visibility store (D7). Grants on
@@ -487,17 +487,6 @@ query performance:
   over `chunks.text`. Filtering by `store_id` is performed on the `chunks` join.
 - **Cascade Chain:** Foreign keys with `ON DELETE CASCADE` across the chain:
   `stores → sources → resources → blocks → chunks`. Deleting a store cleans up everything.
-- **Schema Versioning:** The database uses `PRAGMA user_version` to track the schema version.
-  Upgrades are **stepwise and additive-only**: `store-libsql::schema::MIGRATIONS` is an ordered
-  list of `Migration { from, to, run }` steps, each executed inside its own transaction that
-  also bumps `PRAGMA user_version` atomically, so fresh-create and migrate-from-previous converge
-  on an identical schema. A database whose version has no migration path — including any
-  pre-migration-list version — is a **hard error** at startup (`Error::InvalidConfig`) instructing
-  the user to recreate the database or restore from backup; the file is left completely untouched
-  before that error is raised. There is deliberately no silent drop-and-recreate. `SCHEMA_VERSION`
-  bumped `4 → 5` adding the auth tables (`users`, `auth_tokens`, `oauth_clients`, `auth_codes`,
-  `store_grants`, `invites`, `access_requests` — see §2 above) is the first migration step shipped
-  under this runner.
 - **Schema Versioning:** A `schema_migrations` table is the **source of truth** for schema
   version; `PRAGMA user_version` is kept in lockstep as a cheap head marker but is never
   authoritative. Columns:

@@ -885,14 +885,13 @@ the migration framework entirely, is reportable state, not an error.
 
 ```
 $ localdb db status
-schema version: 4 (this binary's head: 4, baseline: 4)
-up to date
+schema version: 4 (this binary's head: 7, baseline: 4)
+3 pending migrations; run `localdb db migrate`
 history:
   v4 baseline  applied 2026-07-01T10:00:00Z  (not downgradable: baseline schema predates the migration framework; cannot downgrade below v4)
 ```
 
-With pending migrations the second line becomes
-``2 pending migrations; run `localdb db migrate` ``. `--json` emits
+When there's nothing pending the second line reads `up to date` instead. `--json` emits
 `current_version`, `head_version`, `baseline_version`, `pending`, `legacy`,
 `too_new`, `uninitialized`, `table_present`, and a `migrations` history array
 (per row: `version`, `name`, `applied_at`, `downgradable`,
@@ -905,8 +904,8 @@ date":
 
 ```
 $ localdb db status
-schema version: 0 (this binary's head: 4, baseline: 4)
-store exists but is uninitialized (no schema yet); any normal localdb command, or `localdb db migrate`, will initialize it to v4
+schema version: 0 (this binary's head: 7, baseline: 4)
+store exists but is uninitialized (no schema yet); any normal localdb command, or `localdb db migrate`, will initialize it to v7
 ```
 
 `--json` sets `"uninitialized": true` for this case. `pending` stays `0`
@@ -937,8 +936,10 @@ with per-step progress on stderr, then a summary:
 
 ```
 $ localdb db migrate
-applied migration v5 'create_auth_tables' in 12ms
-migrated: v4 -> v5 (1 step applied)
+applied migration v5 'drop_chunks_block_id_and_retag_resource_metadata' in 8ms
+applied migration v6 'create_auth_tables' in 12ms
+applied migration v7 'add_access_requests_collected_at_column' in 3ms
+migrated: v4 -> v7 (3 steps applied)
 ```
 
 If nothing is pending it prints `already at head (vN)` and exits `0`. If any
@@ -992,8 +993,9 @@ non-interactive rule as `migrate`):
 ```
 $ localdb db downgrade --to 5
 This reverses the store's schema to version 5, replaying stored down-SQL and discarding any data or structure introduced by later migrations. Continue? [y/N] y
-downgraded migration v6 'add_access_requests_collected_at_column' in 3ms
-downgraded: v6 -> v5 (1 step)
+downgraded migration v7 'add_access_requests_collected_at_column' in 3ms
+downgraded migration v6 'create_auth_tables' in 8ms
+downgraded: v7 -> v5 (2 steps)
 ```
 
 An **impossible** target — already at or below the frozen baseline (v4), or a
