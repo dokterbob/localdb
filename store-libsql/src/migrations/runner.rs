@@ -33,6 +33,7 @@ use localdb_core::Error;
 
 use super::chain::{head_version, validate_chain, BASELINE_VERSION};
 use super::checksum::migration_checksum;
+use super::progress::{MigrationProgressEvent, MigrationProgressSink};
 use super::table::{self, MigrationRow};
 use super::{Down, Migration, MigrationContext, Up};
 use crate::connection::map_libsql_err;
@@ -68,6 +69,19 @@ pub async fn apply_pending(
     chain: &[Migration],
     ctx: &MigrationContext,
 ) -> Result<AppliedReport, Error> {
+    apply_pending_with_progress(conn, chain, ctx, None).await
+}
+
+/// Same as [`apply_pending`], but emits [`MigrationProgressEvent`]s into
+/// `progress` (if given) so a long-running caller can render a live
+/// indicator. Purely observational — see `progress`'s module doc comment;
+/// `progress: None` behaves identically to [`apply_pending`].
+pub async fn apply_pending_with_progress(
+    conn: &Connection,
+    chain: &[Migration],
+    ctx: &MigrationContext,
+    progress: Option<&MigrationProgressSink>,
+) -> Result<AppliedReport, Error> {
     validate_chain(chain)?;
 
     table::ensure_table(conn).await.map_err(map_libsql_err)?;
@@ -87,9 +101,25 @@ pub async fn apply_pending(
         });
     }
 
+    let pending: Vec<&Migration> = chain.iter().filter(|m| m.version > current).collect();
+    let total = pending.len();
+    if let Some(cb) = progress {
+        cb(MigrationProgressEvent::Started {
+            total_pending: total,
+        });
+    }
+
     let mut report = AppliedReport::default();
 
-    for migration in chain.iter().filter(|m| m.version > current) {
+    for (i, migration) in pending.into_iter().enumerate() {
+        if let Some(cb) = progress {
+            cb(MigrationProgressEvent::ApplyingStep {
+                index: i + 1,
+                total,
+                version: migration.version,
+                name: migration.name.to_string(),
+            });
+        }
         let started = Instant::now();
 
         // Future migrations touching the DiskANN index `chunks_vec_idx`
@@ -273,13 +303,46 @@ async fn seed_all(
 ) -> Result<(), libsql::Error> {
     for migration in chain {
         let (down_sql, down_unsupported_reason) = render_down(migration, ctx);
+        let checksum = migration_checksum(migration, ctx);
+
+        // Two processes can race to create the same brand-new store: both
+        // observe `PRAGMA user_version == 0` (in `connection.rs`'s `open`,
+        // outside any transaction) and both reach here to seed the same
+        // chain. `BEGIN IMMEDIATE` serializes their transactions but does
+        // not stop the loser from re-deriving and re-inserting rows the
+        // winner already committed — `table::ensure_baseline_row` already
+        // tolerates exactly this race for the baseline row via its own
+        // `INSERT OR IGNORE`. Do the same here, but only when the existing
+        // row's checksum matches what this seed would have produced: a
+        // mismatch means some *other* row already occupies this version —
+        // genuine corruption, not a benign duplicate — and must still fail
+        // loudly rather than being silently papered over.
+        if let Some(existing) = table::find_row(tx, migration.version).await? {
+            if existing.checksum == checksum {
+                continue;
+            }
+            return Err(libsql::Error::SqliteFailure(
+                0,
+                format!(
+                    "schema_migrations already has a row for version {version} \
+                     ('{existing_name}') that doesn't match migration '{name}' being seeded \
+                     (checksum {existing_checksum} != {checksum}); this is not the benign \
+                     concurrent-fresh-create race seeding tolerates, refusing to overwrite it",
+                    version = migration.version,
+                    existing_name = existing.name,
+                    existing_checksum = existing.checksum,
+                    name = migration.name,
+                ),
+            ));
+        }
+
         let row = MigrationRow {
             version: migration.version,
             name: migration.name.to_string(),
             applied_at: localdb_core::ingestion::now_rfc3339(),
             down_sql,
             down_unsupported_reason,
-            checksum: migration_checksum(migration, ctx),
+            checksum,
         };
         table::insert_row(tx, &row).await?;
     }
@@ -799,15 +862,21 @@ mod tests {
     // 6b. If seeding fails partway, the whole transaction — including the
     // user_version stamp, which is the LAST statement in it — rolls back
     // together, leaving user_version at 0 rather than partially advanced.
+    //
+    // Force the failure with a *mismatching* pre-existing row at the first
+    // chain entry's version, not just any collision: `seed_all` tolerates a
+    // collision whose checksum matches what it would have produced itself
+    // (the benign concurrent-fresh-create race, see
+    // `seed_all_tolerates_a_matching_concurrent_seed_race` below) — only a
+    // checksum mismatch (this row's `checksum: "bogus"` can never match a
+    // real `migration_checksum` output) is treated as genuine corruption and
+    // still fails.
     #[tokio::test]
     async fn seed_for_fresh_create_failure_leaves_user_version_untouched() {
         let (_dir, conn) = open_test_db().await;
         let chain = fixture_chain();
         let c = ctx();
 
-        // Force seed_all (called inside seed_for_fresh_create) to fail: an
-        // existing row at the first chain entry's version makes its INSERT
-        // violate the schema_migrations PRIMARY KEY constraint.
         table::ensure_table(&conn).await.unwrap();
         table::insert_row(
             &conn,
@@ -828,7 +897,7 @@ mod tests {
         let result = seed_for_fresh_create(&conn, &chain, &c).await;
         assert!(
             result.is_err(),
-            "a colliding pre-existing row should make seeding fail"
+            "a mismatching pre-existing row should make seeding fail"
         );
 
         assert_eq!(
@@ -836,6 +905,43 @@ mod tests {
             0,
             "a failed seed must leave user_version at 0, not partially stamped"
         );
+    }
+
+    // 6c. The concurrent-fresh-create race this whole checksum-comparison
+    // exists for: two processes race to create the same brand-new store, so
+    // by the time the second one's `seed_all` runs, rows for every chain
+    // entry (seeded by the first, from the exact same compiled chain and
+    // context) already exist. That must be tolerated as a no-op per row, not
+    // surfaced as an internal error — this is what distinguishes it from
+    // `seed_for_fresh_create_failure_leaves_user_version_untouched` above.
+    #[tokio::test]
+    async fn seed_for_fresh_create_tolerates_a_matching_concurrent_seed_race() {
+        let (_dir, conn) = open_test_db().await;
+        let chain = fixture_chain();
+        let c = ctx();
+
+        // Simulate the "winner": seed the chain once, successfully.
+        seed_for_fresh_create(&conn, &chain, &c).await.unwrap();
+        let head = BASELINE_VERSION + chain.len() as i64;
+        assert_eq!(user_version(&conn).await, head);
+
+        // Simulate the "loser" re-running seed_all's row-by-row logic
+        // directly against the same now-already-seeded connection (standing
+        // in for a second process's transaction observing the same rows
+        // after `BEGIN IMMEDIATE` unblocks it) — every row it would produce
+        // already exists with a matching checksum, so this must succeed as
+        // a no-op rather than erroring on the primary-key collision.
+        seed_all(&conn, &chain, &c)
+            .await
+            .expect("re-seeding identical rows for a concurrent-race loser must be a no-op");
+
+        // Untouched: still exactly one row per chain entry plus baseline,
+        // still at head.
+        assert_eq!(user_version(&conn).await, head);
+        let rows = table::list_rows_desc_above(&conn, BASELINE_VERSION - 1)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), chain.len() + 1);
     }
 
     // 7. apply_pending is a no-op once the database is already at head.

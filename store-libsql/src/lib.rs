@@ -16,5 +16,6 @@ pub use migrations::chain::{head_version_current, BASELINE_VERSION};
 pub use migrations::downgrade::{
     downgrade_store, inspect_schema, DowngradeReport, DowngradeStep, SchemaStatus,
 };
-pub use migrations::migrate::{migrate_store, MigrateReport};
+pub use migrations::migrate::{migrate_store, migrate_store_with_progress, MigrateReport};
+pub use migrations::progress::{MigrationProgressEvent, MigrationProgressSink};
 pub use migrations::MigrationContext;

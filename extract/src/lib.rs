@@ -8,7 +8,6 @@
 //! Re-exports from `localdb_core`:
 //! - [`ChainParser`], [`Parser`], [`Probe`], [`ParsedDocument`] — core chain types.
 
-pub mod chain_extractor;
 pub mod html;
 pub mod markdown;
 pub mod mime;
@@ -17,9 +16,9 @@ pub mod pdf;
 pub mod plaintext;
 pub mod registry;
 
-// Re-export chain types for consumers that wire ExtractBridge.
-pub use chain_extractor::ChainExtractor;
-pub use localdb_core::parser::{ChainParser, DocumentMetadata, ParsedDocument, Parser, Probe};
+// Re-export chain types for consumers driving the parser chain directly.
+pub use localdb_core::metadata::DublinCoreMetadata;
+pub use localdb_core::parser::{ChainParser, ParsedDocument, Parser, Probe};
 pub use mime::sniff_mime;
 pub use registry::{build_chain, default_parser_ids};
 
@@ -90,19 +89,18 @@ pub fn supported_extensions() -> &'static [&'static str] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use localdb_core::ingestion::DocumentExtractor as _;
 
     #[test]
-    fn chain_extractor_unsupported_format_on_binary() {
+    fn default_chain_declines_binary_with_no_recognisable_format() {
         // Non-UTF-8 binary with no recognisable magic bytes declines every
-        // parser in the default chain, hitting the `None => UnsupportedFormat` arm.
-        use localdb_core::Error;
-        let ex = ChainExtractor::with_defaults().unwrap();
+        // parser in the default chain.
+        let chain = build_chain(&default_parser_ids()).unwrap();
         let binary = b"\xFF\xFE\x00\x01some binary garbage that is not utf-8";
-        let err = ex.extract(binary, None).unwrap_err();
+        let sniffed = sniff_mime(binary, None);
+        let probe = Probe::new(binary, None, sniffed.as_deref());
         assert!(
-            matches!(err, Error::UnsupportedFormat { .. }),
-            "expected UnsupportedFormat, got: {err:?}"
+            chain.parse(&probe).unwrap().is_none(),
+            "the default chain should decline unrecognisable binary content"
         );
     }
 

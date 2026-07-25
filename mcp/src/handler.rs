@@ -63,9 +63,10 @@ impl McpHandler {
         tools::tool_get_document(&self.stores, args).await
     }
 
-    /// Fetch a document's chunks in order, paginated by offset/limit.
+    /// Fetch a document's chunks in order, paginated by offset/limit or by
+    /// an anchor (anchor_chunk_id / anchor_block_seq) centered window.
     #[tool(
-        description = "Fetch a document's chunks in order (block_seq, seq_in_block), paginated by offset/limit."
+        description = "Fetch a document's chunks in order (block_seq, seq_in_block), paginated by offset/limit, or by an anchor_chunk_id/anchor_block_seq centered window (mutually exclusive with offset and with each other)."
     )]
     async fn get_chunks(&self, Parameters(args): Parameters<GetChunksArgs>) -> CallToolResult {
         tools::tool_get_chunks(&self.stores, args).await

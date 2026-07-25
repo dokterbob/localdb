@@ -29,21 +29,49 @@ use super::chain::{head_version, BASELINE_VERSION};
 use super::table;
 use super::{Down, Migration, MigrationContext, Up};
 
+/// Frame a list of rendered SQL statements so that concatenating the frames
+/// cannot collide with a different split of the same overall text.
+///
+/// Each statement is prefixed with its own byte length followed by a NUL
+/// separator (`{len}\0{stmt}`), then all frames are concatenated. This is a
+/// standard length-prefixed ("netstring"-style) encoding: because each
+/// statement's length is recorded immediately before it, the frame
+/// boundaries are unambiguous no matter what bytes (including NULs or
+/// newlines) the statement itself contains. In particular, a single
+/// statement `"A\nB"` frames as `"3\0A\nB"`, while two statements `"A"`,
+/// `"B"` frame as `"1\0A1\0B"` — different strings, so they can never hash
+/// the same way a naive `.join("\n")` would.
+fn frame_statements(statements: &[String]) -> String {
+    let mut framed = String::new();
+    for stmt in statements {
+        framed.push_str(&stmt.len().to_string());
+        framed.push('\0');
+        framed.push_str(stmt);
+    }
+    framed
+}
+
 /// Blake3 hex digest of a migration's identity plus its rendered up/down
 /// steps.
 ///
 /// Input is `version\0name\0<rendered-up>\0<rendered-down-or-reason>`:
-/// - rendered-up: `Up::Sql` statements rendered via `ctx` and joined with
-///   `\n`; `Up::Rust` uses the step's `checksum_repr()` verbatim.
-/// - rendered-down: `Down::Sql` statements rendered via `ctx` and joined
-///   with `\n`; `Down::Unsupported` uses the reason string verbatim.
+/// - rendered-up: `Up::Sql` statements rendered via `ctx`, each length-prefix
+///   framed (see [`frame_statements`]) and concatenated; `Up::Rust` uses the
+///   step's `checksum_repr()` verbatim.
+/// - rendered-down: `Down::Sql` statements rendered via `ctx`, framed the
+///   same way; `Down::Unsupported` uses the reason string verbatim.
+///
+/// Framing each statement by its own length (rather than joining them with a
+/// plain separator like `\n`) ensures two different statement splits of the
+/// same overall SQL text — e.g. `["A\nB"]` vs. `["A", "B"]` — never produce
+/// the same checksum, even though a naive join would render them identically.
 pub fn migration_checksum(m: &Migration, ctx: &MigrationContext) -> String {
     let rendered_up = match &m.up {
-        Up::Sql(render) => render(ctx).join("\n"),
+        Up::Sql(render) => frame_statements(&render(ctx)),
         Up::Rust(step) => step.checksum_repr().to_string(),
     };
     let rendered_down = match &m.down {
-        Down::Sql(render) => render(ctx).join("\n"),
+        Down::Sql(render) => frame_statements(&render(ctx)),
         Down::Unsupported(reason) => reason.to_string(),
     };
     let input = format!(
@@ -110,12 +138,29 @@ pub async fn verify_checksums(
 ) -> Result<(), localdb_core::Error> {
     let head = head_version(chain);
     let required_upper = up_to.min(head);
-    let rows = table::list_rows_desc_above(conn, BASELINE_VERSION - 1)
+    // A table-absent store (the raw pre-framework case, or — after the
+    // `LibsqlDb::open` `AtHead` fix — a fabricated table-absent store this
+    // function is deliberately left to refuse without anything having
+    // created the table for it) has zero rows by definition: querying it
+    // directly would surface a raw "no such table" SQLite error instead of
+    // the intended, actionable "missing a row" completeness error below.
+    // Treat "table doesn't exist" the same as "table exists but is empty".
+    let table_present = table::table_exists(conn, "schema_migrations")
         .await
         .map_err(|e| localdb_core::Error::Internal {
-            message: format!("reading schema_migrations for checksum verification: {e}"),
+            message: format!("checking schema_migrations existence for checksum verification: {e}"),
             correlation_id: "libsql_migrations_checksum_mismatch".to_string(),
         })?;
+    let rows = if table_present {
+        table::list_rows_desc_above(conn, BASELINE_VERSION - 1)
+            .await
+            .map_err(|e| localdb_core::Error::Internal {
+                message: format!("reading schema_migrations for checksum verification: {e}"),
+                correlation_id: "libsql_migrations_checksum_mismatch".to_string(),
+            })?
+    } else {
+        Vec::new()
+    };
 
     let mut seen_versions = std::collections::HashSet::new();
 
@@ -359,6 +404,66 @@ mod tests {
     #[test]
     fn baseline_checksum_is_deterministic() {
         assert_eq!(baseline_checksum(), baseline_checksum());
+    }
+
+    // C2: `Up::Sql`/`Down::Sql` render to `Vec<String>` (one entry per
+    // statement), but naively joining with `\n` before hashing means a
+    // migration rendered as `["A\nB"]` (one statement containing a literal
+    // newline) and one rendered as `["A", "B"]` (two separate statements)
+    // hash identically — both join to the same `"A\nB"` string. That would
+    // let a shipped migration's statement boundaries be silently
+    // split/merged (changing runtime behavior — e.g. how errors roll back,
+    // or what `replay_one`/the runner execute as separate `tx.execute`
+    // calls) while its checksum still verifies. The checksum must be over a
+    // structured representation that can't collide across statement
+    // boundaries.
+
+    #[test]
+    fn checksum_does_not_collide_across_up_sql_statement_boundaries() {
+        let c = ctx();
+
+        fn up_one_joined_statement(_ctx: &MigrationContext) -> Vec<String> {
+            vec!["A\nB".to_string()]
+        }
+        fn up_two_separate_statements(_ctx: &MigrationContext) -> Vec<String> {
+            vec!["A".to_string(), "B".to_string()]
+        }
+
+        let mut joined = base_migration();
+        joined.up = Up::Sql(up_one_joined_statement);
+        let mut split = base_migration();
+        split.up = Up::Sql(up_two_separate_statements);
+
+        assert_ne!(
+            migration_checksum(&joined, &c),
+            migration_checksum(&split, &c),
+            "a single statement containing '\\n' must not hash the same as two \
+             statements joined by '\\n'"
+        );
+    }
+
+    #[test]
+    fn checksum_does_not_collide_across_down_sql_statement_boundaries() {
+        let c = ctx();
+
+        fn down_one_joined_statement(_ctx: &MigrationContext) -> Vec<String> {
+            vec!["A\nB".to_string()]
+        }
+        fn down_two_separate_statements(_ctx: &MigrationContext) -> Vec<String> {
+            vec!["A".to_string(), "B".to_string()]
+        }
+
+        let mut joined = base_migration();
+        joined.down = Down::Sql(down_one_joined_statement);
+        let mut split = base_migration();
+        split.down = Down::Sql(down_two_separate_statements);
+
+        assert_ne!(
+            migration_checksum(&joined, &c),
+            migration_checksum(&split, &c),
+            "a single statement containing '\\n' must not hash the same as two \
+             statements joined by '\\n'"
+        );
     }
 
     async fn open_test_db() -> (tempfile::TempDir, libsql::Connection) {

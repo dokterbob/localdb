@@ -15,7 +15,6 @@ pub mod heading_index;
 pub mod ids;
 pub mod ingestion;
 pub mod ingestor;
-pub mod ingestors;
 pub mod markdown_blocks;
 pub mod metadata;
 pub mod parser;
@@ -42,21 +41,20 @@ pub use embedder::{
     DocumentChunks, EmbeddedDocument, Embedder, FakeEmbedder, TokenCounter, VectorEncoding,
 };
 pub use error::Error;
-pub use ids::{chunk_id, content_hash, document_id, new_ulid};
+pub use ids::{chunk_id, content_hash, new_ulid, resource_id};
 pub use ingestion::{
-    complete_index_job, create_index_job, enumerate_path_source, fail_index_job, index_document,
-    is_store_stale, run_ingestion_for_source, start_index_job, DocumentExtractor, DocumentIndex,
-    DocumentInput, DocumentRecord, ExtractionResult, FetchMetadata, FetchResult, FoundFile,
-    IngestionConfig, IngestionResult, UrlFetcher,
+    complete_index_job, create_index_job, enumerate_path_source, fail_index_job, index_resource,
+    is_store_stale, run_source_ingestion, start_index_job, DocumentIndex, DocumentRecord,
+    FetchMetadata, FetchResult, FoundFile, IndexResourceDeps, IngestionConfig, IngestionResult,
+    SourceIngestionDeps, UrlFetcher,
 };
 pub use ingestor::{
     ConfigField, ConfigFieldType, IngestCallback, IngestResult, IngestSource, Ingestor,
     IngestorConfig,
 };
-pub use ingestors::{FileIngestor, UrlIngestor};
 pub use markdown_blocks::{heading_path_from_blocks, markdown_to_blocks};
 pub use metadata::{ConversationMetadata, DublinCoreMetadata, Metadata, TranscriptionMetadata};
-pub use parser::{ChainParser, DocumentMetadata, ParsedDocument, Parser, Probe, PROBE_HEADER_LEN};
+pub use parser::{ChainParser, ParsedDocument, Parser, Probe, PROBE_HEADER_LEN};
 pub use progress::{DocOutcome, ProgressEvent, ProgressSink};
 pub use search::{
     rerank_noop, rrf_fuse, rrf_score, shape_citation, FusedChunkEntry, QueryRequest, QueryResponse,

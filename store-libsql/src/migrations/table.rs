@@ -57,6 +57,22 @@ pub async fn ensure_baseline_row(conn: &Connection) -> Result<(), libsql::Error>
     Ok(())
 }
 
+/// Whether a table named `name` exists in `sqlite_master`.
+///
+/// Shared by callers that need to distinguish "the `schema_migrations` table
+/// itself never existed" (a raw pre-framework store) from "the table exists
+/// but a required row is missing" (corrupt bookkeeping) — the two cases must
+/// be handled differently: only the former is safe to silently backfill.
+pub async fn table_exists(conn: &Connection, name: &str) -> Result<bool, libsql::Error> {
+    let mut rows = conn
+        .query(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
+            params![name],
+        )
+        .await?;
+    Ok(rows.next().await?.is_some())
+}
+
 /// The highest applied migration version, or `None` if the table is empty.
 pub async fn max_version(conn: &Connection) -> Result<Option<i64>, libsql::Error> {
     let mut rows = conn
@@ -136,9 +152,27 @@ pub async fn list_rows_desc_above(
     Ok(out)
 }
 
+/// Fetch the row for exactly `version`, if one exists.
+pub async fn find_row(
+    conn: &Connection,
+    version: i64,
+) -> Result<Option<MigrationRow>, libsql::Error> {
+    Ok(list_rows_desc_above(conn, version - 1)
+        .await?
+        .into_iter()
+        .find(|r| r.version == version))
+}
+
 /// Insert one row. Callers are responsible for exactly one of `down_sql` /
 /// `down_unsupported_reason` being `Some` — the table's CHECK constraint
 /// rejects anything else.
+///
+/// Errors on any pre-existing row for the same version (or any other
+/// constraint violation) rather than silently ignoring it — a caller that
+/// needs to tolerate a benign concurrent duplicate (see `runner::seed_all`)
+/// should check via [`find_row`] first and compare checksums itself, rather
+/// than relying on this to paper over a collision it can't distinguish from
+/// genuine corruption.
 pub async fn insert_row(conn: &Connection, row: &MigrationRow) -> Result<(), libsql::Error> {
     let down_sql_json = row
         .down_sql

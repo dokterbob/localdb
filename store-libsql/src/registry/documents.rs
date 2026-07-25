@@ -5,7 +5,7 @@
 //! mapping is done here.
 use localdb_core::{DocumentInfo, Error};
 
-use crate::connection::{map_libsql_err, LibsqlDb};
+use crate::connection::{map_libsql_err, parse_metadata_json_lenient, LibsqlDb};
 
 pub(crate) async fn find_document(
     db: &LibsqlDb,
@@ -14,7 +14,6 @@ pub(crate) async fn find_document(
     let conn = db.conn().await;
     // Column mapping from resources → DocumentInfo:
     //   resources.id           → DocumentInfo.id
-    //   resources.ingestor_kind → DocumentInfo.source_kind
     //   resources.added_at     → DocumentInfo.fetched_at
     //   resources.metadata_json → DocumentInfo.metadata
     let mut rows = conn
@@ -45,7 +44,7 @@ fn row_to_document_info(row: &libsql::Row) -> Result<DocumentInfo, Error> {
     let store_id: String = row.get(0).map_err(map_libsql_err)?;
     let id: String = row.get(1).map_err(map_libsql_err)?;
     let source_id: String = row.get(2).map_err(map_libsql_err)?;
-    let source_kind: String = row.get(3).map_err(map_libsql_err)?; // ingestor_kind
+    let ingestor_kind: String = row.get(3).map_err(map_libsql_err)?;
     let uri: String = row.get(4).map_err(map_libsql_err)?;
     let title: Option<String> = row.get(5).map_err(map_libsql_err)?;
     let mime: Option<String> = row.get(6).map_err(map_libsql_err)?;
@@ -54,17 +53,19 @@ fn row_to_document_info(row: &libsql::Row) -> Result<DocumentInfo, Error> {
     let origin_store: String = row.get(9).map_err(map_libsql_err)?;
     let policy_version: String = row.get(10).map_err(map_libsql_err)?;
     let metadata_str: String = row.get(11).map_err(map_libsql_err)?; // metadata_json
-    let metadata: localdb_core::DocumentMetadata =
-        serde_json::from_str(&metadata_str).map_err(|e| Error::Internal {
-            message: format!("invalid resource metadata JSON for '{id}': {e}"),
-            correlation_id: "runtime_state_find_doc_meta".to_string(),
-        })?;
+                                                                     // Read defensively: rows written before the tagged-`Metadata` migration
+                                                                     // (#130) hold untagged, flat Dublin Core JSON — fall back to
+                                                                     // `Metadata::default()` rather than erroring the whole lookup. A
+                                                                     // genuine parse failure is logged (issue C4); see
+                                                                     // `parse_metadata_json_lenient`.
+    let metadata: localdb_core::metadata::Metadata =
+        parse_metadata_json_lenient(&metadata_str, &id);
 
     Ok(DocumentInfo {
         store_id,
         id,
         source_id,
-        source_kind,
+        ingestor_kind,
         uri,
         title,
         mime,

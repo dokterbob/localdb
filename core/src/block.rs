@@ -161,13 +161,11 @@ pub enum BlockKind {
     Heading {
         level: u8,
     },
-    Paragraph,
+    /// Coarse run of consecutive running-text content (paragraphs, lists,
+    /// blockquotes, HTML blocks) between structural boundaries.
+    Text,
     Code {
         language: Option<String>,
-    },
-    Quote,
-    List {
-        ordered: bool,
     },
     Table {
         headers: Vec<String>,
@@ -208,10 +206,8 @@ impl BlockKind {
     pub fn kind_str(&self) -> &'static str {
         match self {
             BlockKind::Heading { .. } => "heading",
-            BlockKind::Paragraph => "paragraph",
+            BlockKind::Text => "text",
             BlockKind::Code { .. } => "code",
-            BlockKind::Quote => "quote",
-            BlockKind::List { .. } => "list",
             BlockKind::Table { .. } => "table",
             BlockKind::Message { .. } => "message",
             BlockKind::Segment { .. } => "segment",
@@ -322,12 +318,10 @@ mod tests {
     fn block_kind_all_variants_serialize() {
         let variants: Vec<BlockKind> = vec![
             BlockKind::Heading { level: 1 },
-            BlockKind::Paragraph,
+            BlockKind::Text,
             BlockKind::Code {
                 language: Some("rust".to_string()),
             },
-            BlockKind::Quote,
-            BlockKind::List { ordered: true },
             BlockKind::Table {
                 headers: vec!["A".to_string()],
                 rows: 5,
@@ -426,13 +420,23 @@ mod tests {
     fn block_roundtrip() {
         let block = Block {
             seq: 0,
-            kind: BlockKind::Paragraph,
+            kind: BlockKind::Text,
             text: "Hello, world!".to_string(),
             location: None,
         };
         let json = serde_json::to_string(&block).unwrap();
         let block2: Block = serde_json::from_str(&json).unwrap();
         assert_eq!(block, block2);
+    }
+
+    #[test]
+    fn block_kind_text_roundtrip() {
+        let kind = BlockKind::Text;
+        let json = serde_json::to_string(&kind).unwrap();
+        assert_eq!(json, "{\"type\":\"text\"}");
+        let kind2: BlockKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(kind, kind2);
+        assert_eq!(kind.kind_str(), "text");
     }
 
     #[test]

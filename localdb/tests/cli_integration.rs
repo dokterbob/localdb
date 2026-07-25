@@ -514,7 +514,7 @@ fn end_to_end_init_store_source_index_search() {
     // Citation must have the FULL canonical shape from specs/02-domain-model.md §6.
     let cit = &citations[0];
     assert!(cit.get("chunk_id").is_some(), "missing chunk_id");
-    assert!(cit.get("document_id").is_some(), "missing document_id");
+    assert!(cit.get("resource_id").is_some(), "missing resource_id");
     assert!(cit.get("uri").is_some(), "missing uri");
     assert!(cit.get("snippet").is_some(), "missing snippet");
     assert!(cit.get("score").is_some(), "missing score");
@@ -524,10 +524,25 @@ fn end_to_end_init_store_source_index_search() {
     assert!(store.get("id").is_some(), "store.id missing");
     assert!(store.get("name").is_some(), "store.name missing");
 
-    // span: {start, end}
-    let span = cit.get("span").expect("missing span field");
-    assert!(span.get("start").is_some(), "span.start missing");
-    assert!(span.get("end").is_some(), "span.end missing");
+    // block: {seq, kind}
+    let block = cit.get("block").expect("missing block field");
+    assert!(block.get("seq").is_some(), "block.seq missing");
+    assert!(block.get("kind").is_some(), "block.kind missing");
+
+    // chunk_position: {seq_in_block}
+    let chunk_position = cit
+        .get("chunk_position")
+        .expect("missing chunk_position field");
+    assert!(
+        chunk_position.get("seq_in_block").is_some(),
+        "chunk_position.seq_in_block missing"
+    );
+
+    // location: {span: {start, end}, window_block_seqs?}
+    let location = cit.get("location").expect("missing location field");
+    let span = location.get("span").expect("missing location.span field");
+    assert!(span.get("start").is_some(), "location.span.start missing");
+    assert!(span.get("end").is_some(), "location.span.end missing");
 
     // heading_path (array, may be empty)
     assert!(
@@ -1331,7 +1346,10 @@ fn db_status_on_fresh_healthy_store_reports_current_equals_head() {
     let current = v["current_version"].as_i64().unwrap();
     let head = v["head_version"].as_i64().unwrap();
     assert_eq!(current, head, "fresh store should be exactly at head");
-    assert_eq!(current, 4, "current baseline/head is v4 (empty real chain)");
+    assert_eq!(
+        current, 5,
+        "current baseline/head is v5 (baseline v4 + the block_id-drop migration)"
+    );
     assert_eq!(v["pending"].as_i64().unwrap(), 0);
     assert!(!v["legacy"].as_bool().unwrap());
 }
@@ -1579,6 +1597,21 @@ fn db_migrate_legacy_with_yes_rebuilds_to_head() {
     );
 }
 
+/// Read `current_version` off a fresh store's `db status --json`, without
+/// hardcoding it: the real migration chain (`store-libsql/src/migrations/
+/// chain.rs`) grows over time, so a fresh store's head — and therefore its
+/// current version — isn't a fixed literal across the codebase's lifetime.
+fn fresh_store_current_version(dir: &TempDir) -> i64 {
+    let output = cmd_with_dir(dir)
+        .args(["--json", "db", "status"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|_| panic!("db status --json must emit valid JSON; got: {stdout}"));
+    v["current_version"].as_i64().unwrap()
+}
+
 /// `db downgrade --to <current-version> --yes` has nothing to do; the
 /// library's own "nothing to downgrade" `InvalidConfig` maps to exit 2.
 ///
@@ -1599,9 +1632,10 @@ fn db_downgrade_nothing_to_do_exits_2() {
         .args(["store", "add", "s1"])
         .assert()
         .success();
+    let current = fresh_store_current_version(&dir);
 
     let output = cmd_with_dir(&dir)
-        .args(["--yes", "db", "downgrade", "--to", "4"])
+        .args(["--yes", "db", "downgrade", "--to", &current.to_string()])
         .output()
         .unwrap();
 
@@ -1618,8 +1652,8 @@ fn db_downgrade_nothing_to_do_exits_2() {
     );
 }
 
-/// Codex review #152 fix 2, scenario (b): `--to 4` on a v4 store (already at
-/// baseline/head — nothing to downgrade), non-interactive and without
+/// Codex review #152 fix 2, scenario (b): `--to <current>` on a fresh store
+/// (already at head — nothing to downgrade), non-interactive and without
 /// `--yes`. Before the fix this exited 2 with the generic "re-run with
 /// --yes" refusal from `confirm_destructive`, because the impossible target
 /// was only checked *after* the confirmation gate. After the fix, the CLI
@@ -1638,9 +1672,10 @@ fn db_downgrade_to_current_version_without_confirmation_reports_real_error() {
         .args(["store", "add", "s1"])
         .assert()
         .success();
+    let current = fresh_store_current_version(&dir);
 
     let output = cmd_with_dir(&dir)
-        .args(["db", "downgrade", "--to", "4"])
+        .args(["db", "downgrade", "--to", &current.to_string()])
         .output()
         .unwrap();
 
@@ -1657,16 +1692,25 @@ fn db_downgrade_to_current_version_without_confirmation_reports_real_error() {
     );
 }
 
-/// Codex review #152 fix 2, scenario (a): `db downgrade` (default target —
-/// no `--to`) on a store already at the frozen baseline, non-interactive and
-/// without `--yes`. The CLI's own default target resolves to
-/// `current_version - 1`, which lands below the baseline for a fresh store
-/// (baseline == head == current here) — pre-validation must catch this and
-/// report the real "cannot downgrade below the frozen baseline" error
-/// directly, never prompting (and never falling back to the generic
-/// "re-run with --yes" refusal).
+/// Codex review #152 fix 2, scenario (a): an explicit `--to` below the
+/// frozen baseline, non-interactive and without `--yes`, must be rejected by
+/// `validate_downgrade_target` before `confirm_destructive` ever prompts.
+///
+/// This no longer uses the CLI's *default* (no `--to`) target to reach the
+/// below-baseline case, unlike the original version of this test: the
+/// default resolves to `current_version - 1`, which only lands below the
+/// frozen baseline (v4) when `current_version == baseline_version` — true
+/// for a fresh store back when the real migration chain was empty, but not
+/// anymore. The chain's first entry
+/// (`drop_chunks_block_id_and_retag_resource_metadata`) is `Down::Unsupported`,
+/// so a real store can never legitimately be downgraded back down to
+/// exactly the baseline in the first place — there is no CLI-reachable
+/// store left for which the *default* target computation lands below
+/// baseline. An explicit out-of-range `--to` exercises the same
+/// `validate_downgrade_target` branch regardless of how the target was
+/// derived.
 #[test]
-fn db_downgrade_default_target_at_baseline_without_confirmation_reports_real_error() {
+fn db_downgrade_explicit_target_below_baseline_without_confirmation_reports_real_error() {
     let dir = TempDir::new().unwrap();
     write_default_config(&dir);
 
@@ -1676,7 +1720,7 @@ fn db_downgrade_default_target_at_baseline_without_confirmation_reports_real_err
         .success();
 
     let output = cmd_with_dir(&dir)
-        .args(["db", "downgrade"])
+        .args(["db", "downgrade", "--to", "3"])
         .output()
         .unwrap();
 

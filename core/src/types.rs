@@ -190,7 +190,7 @@ pub struct Source {
     pub spec: SourceSpec,
 
     /// Which indexing preset applies ("prose", "messages", "code").
-    pub source_kind_preset: String,
+    pub source_preset: String,
 }
 
 /// Source kind.
@@ -354,16 +354,16 @@ pub fn validate_msg_meta_key(key: &str) -> Result<(), String> {
 
 /// The retrieval unit: what gets embedded and indexed.
 ///
-/// ID is content-addressed: `blake3(document_id || chunk_text || span)`.
+/// ID is content-addressed: `blake3(resource_id || chunk_text || span)`.
 ///
 /// See specs/02-domain-model.md §2.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Chunk {
-    /// Content-addressed ID: `blake3(document_id || chunk_text || span_start || span_end)`.
+    /// Content-addressed ID: `blake3(resource_id || chunk_text || span_start || span_end)`.
     pub id: ContentId,
 
     /// Parent document ID.
-    pub document_id: ContentId,
+    pub resource_id: ContentId,
 
     /// Owning store ID.
     pub store_id: UlidId,
@@ -385,6 +385,11 @@ pub struct Chunk {
     /// Provenance copied from document.
     /// Chunks must be self-describing for federation.
     pub provenance: Provenance,
+
+    /// For message-window chunks: all block seqs participating in the window.
+    /// Empty for non-window chunks (the common case).
+    #[serde(default)]
+    pub window_block_seqs: Vec<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -439,7 +444,7 @@ pub enum IndexJobScope {
     /// One source.
     Source { source_id: UlidId },
     /// One document.
-    Document { document_id: ContentId },
+    Document { resource_id: ContentId },
 }
 
 /// State of an index job: pending → running → done | failed.
@@ -472,7 +477,7 @@ pub struct IndexJobStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::{chunk_id, content_hash, document_id, new_ulid};
+    use crate::ids::{chunk_id, content_hash, new_ulid, resource_id};
 
     fn make_provenance() -> Provenance {
         Provenance {
@@ -563,7 +568,7 @@ mod tests {
                 include: vec!["**/*.md".to_string()],
                 exclude: vec![".git/**".to_string()],
             },
-            source_kind_preset: "prose".to_string(),
+            source_preset: "prose".to_string(),
         };
         let json = serde_json::to_string(&source).unwrap();
         let source2: Source = serde_json::from_str(&json).unwrap();
@@ -580,7 +585,7 @@ mod tests {
                 url: "https://example.com/docs".to_string(),
                 refresh_interval_secs: Some(3600),
             },
-            source_kind_preset: "prose".to_string(),
+            source_preset: "prose".to_string(),
         };
         let json = serde_json::to_string(&source).unwrap();
         let source2: Source = serde_json::from_str(&json).unwrap();
@@ -593,7 +598,7 @@ mod tests {
     fn document_serializes_roundtrip() {
         let hash = content_hash("some document content");
         let doc = Document {
-            id: document_id("file:///docs/readme.md", &hash),
+            id: resource_id("file:///docs/readme.md", &hash),
             source_id: new_ulid(),
             store_id: new_ulid(),
             uri: "file:///docs/readme.md".to_string(),
@@ -626,7 +631,7 @@ mod tests {
         meta.insert("msg.channel".to_string(), serde_json::json!("#general"));
 
         let doc = Document {
-            id: document_id("imap://acct/folder;uid=1", &hash),
+            id: resource_id("imap://acct/folder;uid=1", &hash),
             source_id: new_ulid(),
             store_id: new_ulid(),
             uri: "imap://acct/folder;uid=1".to_string(),
@@ -650,7 +655,7 @@ mod tests {
         meta.insert("msg.unknown_key".to_string(), serde_json::json!("value"));
 
         let doc = Document {
-            id: document_id("file:///test.md", &hash),
+            id: resource_id("file:///test.md", &hash),
             source_id: new_ulid(),
             store_id: new_ulid(),
             uri: "file:///test.md".to_string(),
@@ -675,7 +680,7 @@ mod tests {
         meta.insert("app_specific".to_string(), serde_json::json!(42));
 
         let doc = Document {
-            id: document_id("file:///test.md", &hash),
+            id: resource_id("file:///test.md", &hash),
             source_id: new_ulid(),
             store_id: new_ulid(),
             uri: "file:///test.md".to_string(),
@@ -712,24 +717,52 @@ mod tests {
 
     #[test]
     fn chunk_serializes_roundtrip() {
-        let doc_id = document_id("file:///docs/api.md", &content_hash("doc content"));
+        let doc_id = resource_id("file:///docs/api.md", &content_hash("doc content"));
         let text = "This is a chunk of text.";
         let span = Span::new(0, text.len());
-        let id = chunk_id(&doc_id, text, span.start, span.end, 0);
+        let id = chunk_id(&doc_id, 0, text, 0);
 
         let chunk = Chunk {
             id,
-            document_id: doc_id,
+            resource_id: doc_id,
             store_id: new_ulid(),
             text: text.to_string(),
             span,
             heading_path: vec!["API".to_string(), "Introduction".to_string()],
             policy_version: "abc123def456".to_string(),
             provenance: make_provenance(),
+            window_block_seqs: vec![],
         };
         let json = serde_json::to_string(&chunk).unwrap();
         let chunk2: Chunk = serde_json::from_str(&json).unwrap();
         assert_eq!(chunk, chunk2);
+    }
+
+    #[test]
+    fn chunk_window_block_seqs_defaults_empty_on_missing_field() {
+        // Old JSON, written before window_block_seqs existed, must still deserialize.
+        let doc_id = resource_id("file:///docs/api.md", &content_hash("doc content"));
+        let text = "This is a chunk of text.";
+        let json = format!(
+            r#"{{
+                "id": "{id}",
+                "resource_id": "{doc_id}",
+                "store_id": "store-1",
+                "text": "{text}",
+                "span": {{"start": 0, "end": {len}}},
+                "policy_version": "v1",
+                "provenance": {{
+                    "origin_store": "store-1",
+                    "source_ref": {{"id": "src-1", "kind": "path"}},
+                    "fetched_at": "2026-06-10T12:00:00Z",
+                    "content_hash": "abc123"
+                }}
+            }}"#,
+            id = chunk_id(&doc_id, 0, text, 0),
+            len = text.len(),
+        );
+        let chunk: Chunk = serde_json::from_str(&json).unwrap();
+        assert!(chunk.window_block_seqs.is_empty());
     }
 
     // --- IndexJob tests ---
@@ -793,9 +826,9 @@ mod tests {
 
     #[test]
     fn index_job_scope_document_roundtrip() {
-        let doc_id = document_id("file:///test.md", &content_hash("content"));
+        let doc_id = resource_id("file:///test.md", &content_hash("content"));
         let scope = IndexJobScope::Document {
-            document_id: doc_id,
+            resource_id: doc_id,
         };
         let json = serde_json::to_string(&scope).unwrap();
         let scope2: IndexJobScope = serde_json::from_str(&json).unwrap();

@@ -1,6 +1,7 @@
 //! HTML parser: chain-of-responsibility wrapper around `crate::html::extract_html`.
 
-use localdb_core::parser::{DocumentMetadata, ParsedDocument, Parser, Probe};
+use localdb_core::metadata::DublinCoreMetadata;
+use localdb_core::parser::{ParsedDocument, Parser, Probe};
 use localdb_core::Error;
 
 /// Handles HTML identified by extension (`.html`, `.htm`, `.xhtml`) or a
@@ -42,10 +43,10 @@ impl Parser for HtmlParser {
 
         let (markdown, title) = crate::html::extract_html(text)?;
 
-        let dc = DocumentMetadata {
+        let dc = DublinCoreMetadata {
             title: title.clone(),
             format: probe.sniffed_mime.map(|s| s.to_string()),
-            ..DocumentMetadata::default()
+            ..DublinCoreMetadata::default()
         };
 
         Ok(Some(ParsedDocument {

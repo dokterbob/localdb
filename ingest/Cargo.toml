@@ -1,19 +1,18 @@
 [package]
-name = "store-libsql"
+name = "ingest"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "Content-acquisition ingestors implementing core::ingestor::Ingestor (file, URL)"
 
 [dependencies]
 localdb-core = { path = "../core" }
-libsql = "0.10.0-pre.4"
-tokio = { workspace = true }
+extract = { path = "../extract" }
 async-trait = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-blake3 = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros"] }
+tempfile = "3"

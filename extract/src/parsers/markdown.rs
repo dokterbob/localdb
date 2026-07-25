@@ -1,6 +1,7 @@
 //! Markdown parser: chain-of-responsibility wrapper around `crate::markdown::extract_markdown`.
 
-use localdb_core::parser::{DocumentMetadata, ParsedDocument, Parser, Probe};
+use localdb_core::metadata::DublinCoreMetadata;
+use localdb_core::parser::{ParsedDocument, Parser, Probe};
 use localdb_core::Error;
 
 /// Handles Markdown identified by a known extension.
@@ -38,10 +39,10 @@ impl Parser for MarkdownParser {
 
         let (markdown, title) = crate::markdown::extract_markdown(text)?;
 
-        let dc = DocumentMetadata {
+        let dc = DublinCoreMetadata {
             title: title.clone(),
             format: probe.sniffed_mime.map(|s| s.to_string()),
-            ..DocumentMetadata::default()
+            ..DublinCoreMetadata::default()
         };
 
         Ok(Some(ParsedDocument {

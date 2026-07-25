@@ -131,10 +131,10 @@ block-appropriate chunks.
 
 | Block kinds | Chunker | Behavior |
 |---|---|---|
-| `Heading`, `Paragraph`, `Quote`, `List` | prose chunker | `MarkdownSplitter` subdivides within the block on semantic boundaries (sentences, words); target ≈ 256 tokens, overlap ≈ 0 tokens. |
+| `Heading`, `Text` | prose chunker | `MarkdownSplitter` subdivides within the block on semantic boundaries (sentences, words); target ≈ 256 tokens, overlap ≈ 0 tokens. |
 | `Code` | code chunker | Line-based subdivision within the block; target ≈ 60 lines. |
 | `Message`, `Segment` | messages chunker | Multi-block windowed: sliding window over consecutive Message/Segment blocks (see below). |
-| `Table` | table-aware chunker | Row-based subdivision; one or more rows per chunk. |
+| `Table` | table chunker | Row-based packing: rows are packed into chunks under the token target; every chunk re-emits the header row and separator so each chunk is a standalone valid table (see below). |
 | `Reference`, `Attachment`, `Frontmatter`, `Image` | one chunk per block | These block types are typically small; no further subdivision. |
 
 The source-level preset (from config or the `--preset` CLI flag) acts as a hint for
@@ -145,12 +145,40 @@ explicitly span multiple consecutive `Message`/`Segment` blocks. This invariant 
 `heading_path` attribution deterministic (see below) and ensures context-expansion
 queries are well-defined.
 
+**Coarse `Text` blocks:** `markdown_to_blocks` emits **one** `Text` block per run of
+consecutive running-text content — paragraphs, lists, blockquotes, HTML blocks — between
+structural boundaries (a `Heading`, a `Table`/`Code`/`Image` block, or the start/end of the
+document). Block sizing is therefore purely structural, driven by element boundaries, not by
+a token target; the prose chunker restores token-sizing by splitting a `Text` block into one
+or more prose chunks via `MarkdownSplitter`. This is what lets prose chunks approach the
+~256-token target instead of producing one tiny chunk per paragraph (the #158 fix) — a
+multi-paragraph run of running text is chunked together, not paragraph-by-paragraph.
+**Headings remain discrete blocks and are still chunked** — a `Heading` block is never folded
+into an adjacent `Text` run, because it feeds the contextual embedder's document context and
+`heading_path` attribution (see below). Filtering headings out of *search results* is a
+separate, future search-side concern, not a chunking-time decision.
+
 ### heading_path attribution
 
 `heading_path` is derived from the block tree: heading blocks that precede a content block
 in the resource's ordered block sequence are collected into the path for all chunks produced
 from that content block. There is no re-parsing of Markdown — the heading structure comes
 directly from the block representation.
+
+### Source preset override
+
+`IngestionConfig` carries a `source_preset` field (`prose` (default) | `code` | `messages`),
+resolved from the source's config (the source-level `preset` key,
+[03-config.md](03-config.md) §2) or the CLI's `--preset` flag. Per-file automatic preset
+routing — `preset_for`, which inspects a resource's `uri` and `mime` hint to route e.g.
+JSON/YAML/lockfiles to the `code` preset — applies **only** when the source preset is the
+default `prose`. An explicit `code` or `messages` source preset is authoritative and wins
+over per-file detection: a source configured as `code` chunks every file in it with the code
+chunker regardless of what `preset_for` would otherwise guess, and likewise a `messages`
+source always uses the messages chunker. This preserves useful per-file auto-detection for
+the common (prose) case while giving explicit non-default presets full, unambiguous control —
+needed for message/transcript sources where `preset_for`'s filename/mime heuristics do not
+apply.
 
 ### Messages chunker
 
@@ -161,6 +189,31 @@ The `messages` preset is implemented as a sliding window over `Message`/`Segment
 - Windows are additionally bounded by token count so that no single chunk exceeds the
   embedding model's context limit.
 - Each window chunk carries the `heading_path` of the containing thread/resource.
+- **`window_block_seqs`:** each window chunk records the `block_seq` of every member block it
+  spans in its `location` (`location_json = {start, end, window_block_seqs?}`), not just the
+  denormalized `block_seq` of its first member — so context-expansion and `get_chunks`
+  consumers can resolve every block a multi-block chunk touches.
+- **Chunk ids after fix-up:** chunk ids are computed **after** the window fix-up pass (the
+  pass that shrinks a window from the end to fit the token budget, or to keep the last window
+  from running past the end of the turn sequence — see `chunk_messages`) — so the
+  content-addressed id (§4 below;
+  [02-domain-model.md](02-domain-model.md) §3) reflects the window's final membership, not a
+  pre-fix-up candidate window.
+
+### Table chunker
+
+`Table` blocks are chunked by a dedicated row-based packer, not routed through the code
+chunker:
+
+- Rows are packed greedily into successive chunks, filling each chunk up to the (prose)
+  token target.
+- Every chunk re-emits the table's header row and the `|---|` separator row, so each chunk is
+  a valid, independently renderable Markdown table — a chunk is never dependent on a sibling
+  chunk to parse correctly.
+- **Oversized single row:** a single data row that alone exceeds the token target cannot be
+  packed into a standalone valid chunk at the target size; it falls back to `chunk_code`'s
+  long-line split (see below), preserving the invariant that no single chunk grows
+  unbounded.
 
 ### Prose chunker details
 
@@ -276,6 +329,18 @@ embedder, and parser list change **together** — there is no partial invalidati
 ([03-config.md](03-config.md) §2). The `parsers` list is hashed **order-sensitively**
 (unlike `chunking`/`embedding`, which use order-independent key serialization), so
 reordering parsers alone marks the store stale and schedules a reindex.
+
+The `chunking` sub-policy embeds a chunking algorithm identifier as part of what gets hashed;
+bumping it forces a reindex even when no user-visible config field changed. Current value:
+**`textsplitter-md-v5`** (bumped from `v4`). The `v5` bump covers the coarse `Text` block
+ontology — `markdown_to_blocks` now emits one `Text` block per run of consecutive running-text
+content, so prose chunks pack toward the ~256-token target instead of one-tiny-chunk-per-
+paragraph (§3 above, "Coarse `Text` blocks"; the #158 fix), silently altering chunk boundaries.
+The prior `v4` bump (from `v3`) covered two changes at once: the new `Chunk.id` formula —
+`blake3(resource_id ‖ block_seq ‖ chunk_text ‖ seq_in_block)`
+([02-domain-model.md](02-domain-model.md) §2, Chunk) — and the addition of the table chunker.
+Any of these changes alone would silently alter chunk boundaries and/or ids without a policy
+bump, defeating incremental re-index's staleness detection.
 
 `content_hash` is a blake3 hash of the ordered canonical texts of all blocks in a resource
 (not of a Markdown string). `extractor_version` on resources enables selective reprocessing

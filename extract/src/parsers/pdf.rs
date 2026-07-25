@@ -1,6 +1,7 @@
 //! PDF parser: chain-of-responsibility wrapper around `crate::pdf::extract_pdf`.
 
-use localdb_core::parser::{DocumentMetadata, ParsedDocument, Parser, Probe};
+use localdb_core::metadata::DublinCoreMetadata;
+use localdb_core::parser::{ParsedDocument, Parser, Probe};
 use localdb_core::Error;
 
 /// Handles PDFs identified by magic bytes (`%PDF-`) or the `.pdf` extension.
@@ -27,7 +28,7 @@ impl Parser for PdfParser {
 
         let (markdown, title) = crate::pdf::extract_pdf(probe.bytes())?;
 
-        let mut dc = DocumentMetadata::default();
+        let mut dc = DublinCoreMetadata::default();
         if let Some(mime) = probe.sniffed_mime {
             dc.format = Some(mime.to_string());
         }

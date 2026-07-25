@@ -12,7 +12,7 @@
 use localdb_core::{config::loader::ConfigLoader, Error};
 use serde_json::json;
 use store_libsql::{
-    downgrade_store, inspect_schema, migrate_store, MigrationContext, SchemaStatus,
+    downgrade_store, inspect_schema, migrate_store_with_progress, MigrationContext, SchemaStatus,
 };
 
 use crate::{
@@ -247,7 +247,22 @@ pub(crate) async fn run_db_migrate_async(ctx: &CliContext) {
         false
     };
 
-    let report = match migrate_store(&path, &mctx, allow_legacy_rebuild).await {
+    // `None` in `--json` mode (stdout must stay clean JSON) or when stderr
+    // isn't a terminal, `build_migration_progress_sink` still returns
+    // `Some` for the piped case (bounded plain lines) — see its doc comment.
+    // This is what closes the "total silence during minutes of disk I/O"
+    // gap from PR #152's report: a live heartbeat spinner (or, piped, a
+    // bounded set of step lines) now renders while `migrate_store_with_progress`
+    // runs, instead of nothing until the whole call returns.
+    let progress_sink = crate::progress::build_migration_progress_sink(ctx.json);
+    let report = match migrate_store_with_progress(
+        &path,
+        &mctx,
+        allow_legacy_rebuild,
+        progress_sink,
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => exit_err(&e, ctx.json),
     };
@@ -313,13 +328,14 @@ pub(crate) async fn run_db_migrate_async(ctx: &CliContext) {
 /// `downgrade_store`'s own up-front checks (same order, same wording) —
 /// before `run_db_downgrade_async` asks for destructive confirmation.
 ///
-/// An impossible downgrade (already at or below the frozen baseline, or a
-/// target at/above the current version) can only ever fail once it reaches
-/// `downgrade_store`, so demanding a "yes, I'm sure" answer — or, non-
-/// interactively, the generic "re-run with --yes" refusal — for it is
-/// misleading: it implies the operation is destructive-but-possible, not
-/// simply invalid. Checking here lets the CLI surface the real error
-/// instead, without ever prompting.
+/// An impossible downgrade (already at or below the frozen baseline, a
+/// target at/above the current version, or an irreversible migration in
+/// `(target, current_version]` — one whose `down_unsupported_reason` is
+/// set) can only ever fail once it reaches `downgrade_store`, so demanding a
+/// "yes, I'm sure" answer — or, non-interactively, the generic "re-run with
+/// --yes" refusal — for it is misleading: it implies the operation is
+/// destructive-but-possible, not simply invalid. Checking here lets the CLI
+/// surface the real error instead, without ever prompting.
 ///
 /// This is a shortcut, not a replacement: `downgrade_store` remains the
 /// authority and re-validates independently against the live store, so a
@@ -344,6 +360,34 @@ fn validate_downgrade_target(status: &SchemaStatus, target: i64) -> Result<(), E
             ),
         });
     }
+
+    // Mirror `downgrade_store`'s own pre-scan for `down_unsupported_reason`
+    // rows in `(target, current_version]` — same range, same message. An
+    // irreversible migration in that range means `downgrade_store` will
+    // refuse no matter what, so surface its real error here too, before
+    // `run_db_downgrade_async` asks for destructive confirmation for an
+    // operation that was never possible. When more than one blocking row
+    // falls in range, name the highest-versioned one (the nearest reachable
+    // target), matching `downgrade_store`'s own selection.
+    if let Some(blocked) = status
+        .rows
+        .iter()
+        .filter(|r| r.version > target && r.version <= status.current_version)
+        .filter(|r| r.down_unsupported_reason.is_some())
+        .max_by_key(|r| r.version)
+    {
+        let reason = blocked.down_unsupported_reason.as_deref().unwrap_or("");
+        return Err(Error::InvalidConfig {
+            message: format!(
+                "cannot downgrade past migration '{name}' (version {version}): {reason}. \
+                 Nothing was changed. Downgrade to version {version} instead (`db downgrade \
+                 --to {version}`) to keep it applied and only replay the migrations above it.",
+                name = blocked.name,
+                version = blocked.version,
+            ),
+        });
+    }
+
     Ok(())
 }
 
@@ -498,6 +542,75 @@ mod tests {
     #[test]
     fn validate_downgrade_target_accepts_a_plausible_target() {
         let s = downgrade_status(7, 4);
+        assert!(validate_downgrade_target(&s, 5).is_ok());
+    }
+
+    fn unsupported_row(
+        version: i64,
+        name: &str,
+        reason: &str,
+    ) -> store_libsql::migrations::table::MigrationRow {
+        store_libsql::migrations::table::MigrationRow {
+            version,
+            name: name.to_string(),
+            applied_at: "2026-01-01T00:00:00Z".to_string(),
+            down_sql: None,
+            down_unsupported_reason: Some(reason.to_string()),
+            checksum: "deadbeef".to_string(),
+        }
+    }
+
+    // C6: an unsupported (irreversible) migration inside (target,
+    // current_version] must fail *before* `run_db_downgrade_async` ever asks
+    // for destructive confirmation — `downgrade_store` would refuse anyway,
+    // but only after the misleading prompt. See `validate_downgrade_target`'s
+    // doc comment.
+    #[test]
+    fn validate_downgrade_target_rejects_target_below_unsupported_migration_in_range() {
+        let mut s = downgrade_status(7, 4);
+        s.rows = vec![unsupported_row(
+            6,
+            "widen_embeddings",
+            "column widened irreversibly",
+        )];
+
+        let err = validate_downgrade_target(&s, 5).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("cannot downgrade past migration 'widen_embeddings' (version 6)"),
+            "message: {message}"
+        );
+        assert!(
+            message.contains("column widened irreversibly"),
+            "message: {message}"
+        );
+        assert!(
+            message.contains("Nothing was changed."),
+            "message: {message}"
+        );
+        assert!(
+            message.contains("db downgrade --to 6"),
+            "message: {message}"
+        );
+    }
+
+    #[test]
+    fn validate_downgrade_target_ignores_unsupported_migration_above_current_version() {
+        // A row above current_version can never be in the replay range, so
+        // it must be irrelevant even though `down_unsupported_reason` is set.
+        let mut s = downgrade_status(7, 4);
+        s.rows = vec![unsupported_row(9, "future_migration", "n/a")];
+
+        assert!(validate_downgrade_target(&s, 5).is_ok());
+    }
+
+    #[test]
+    fn validate_downgrade_target_ignores_unsupported_migration_at_or_below_target() {
+        // A row at or below the requested target is being kept applied, not
+        // replayed, so it must not block the downgrade.
+        let mut s = downgrade_status(7, 4);
+        s.rows = vec![unsupported_row(5, "kept_migration", "n/a")];
+
         assert!(validate_downgrade_target(&s, 5).is_ok());
     }
 }

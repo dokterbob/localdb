@@ -149,6 +149,14 @@ impl LibsqlDb {
                         message: format!("create_schema: {e}"),
                         correlation_id: "libsql_db_schema".to_string(),
                     })?;
+                // `create_schema` uses `CREATE TABLE IF NOT EXISTS`, so an
+                // interrupted earlier fresh-create that already built
+                // `chunks` with a different embedding shape (and never
+                // stamped user_version, so it's still 0) would otherwise be
+                // silently seeded/stamped as if healthy here. Validate BEFORE
+                // seeding/stamping so a mismatch is refused untouched instead
+                // of stamped-then-rejected on the next open.
+                validate_embedding_column(&conn, embedding_dim, encoding).await?;
                 runner::seed_for_fresh_create(&conn, &chain::migrations(), &ctx).await?;
             }
             VersionDisposition::Legacy => {
@@ -171,10 +179,40 @@ impl LibsqlDb {
                 });
             }
             VersionDisposition::AtHead => {
-                table::ensure_table(&conn).await.map_err(map_libsql_err)?;
-                table::ensure_baseline_row(&conn)
+                // Only backfill `schema_migrations` (table + baseline row)
+                // when it was absent before this open AND `head ==
+                // BASELINE_VERSION` — i.e. this build's compiled chain is
+                // itself empty, so a table-absent store reporting
+                // `user_version == head` genuinely is the raw pre-framework
+                // case (a bare-baseline store that just needs bookkeeping
+                // scaffolding). When `head > BASELINE_VERSION`, a
+                // table-absent store claiming `user_version == head` is
+                // fabricated or corrupt: the only real code paths that reach
+                // `head` (`seed_for_fresh_create`/`apply_pending`) always
+                // leave the table and its rows behind, so this can't be a
+                // legitimate pre-framework store. Backfilling it here would
+                // create the table and baseline row only for
+                // `verify_checksums` to immediately refuse it anyway (a
+                // missing row for v{head}) — mutating a store `open` is
+                // about to refuse, violating "open never mutates a store it
+                // refuses". So leave it untouched and let `verify_checksums`
+                // below refuse it with a missing-row error.
+                //
+                // If the table already exists but its baseline row is
+                // missing, that's corrupt bookkeeping regardless of `head`:
+                // fall through to `verify_checksums` unmutated so it refuses
+                // with a missing-row error, rather than recreating the row
+                // here and letting a tampered/corrupt store pass as healthy
+                // (C3).
+                let migrations_table_existed = table::table_exists(&conn, "schema_migrations")
                     .await
                     .map_err(map_libsql_err)?;
+                if !migrations_table_existed && head == chain::BASELINE_VERSION {
+                    table::ensure_table(&conn).await.map_err(map_libsql_err)?;
+                    table::ensure_baseline_row(&conn)
+                        .await
+                        .map_err(map_libsql_err)?;
+                }
                 checksum::verify_checksums(&conn, &chain::migrations(), &ctx, head).await?;
 
                 schema::create_schema(&conn, embedding_dim, encoding)
@@ -253,6 +291,37 @@ pub(crate) async fn validate_embedding_column(
     Ok(())
 }
 
+/// Deserialize a `resources.metadata_json` column value, warning (rather than
+/// erroring) on a genuine parse failure.
+///
+/// Defensive reads must never error the row: rows written before the
+/// tagged-`Metadata` migration (#130) hold untagged, flat Dublin Core JSON
+/// and legitimately fail to deserialize as the tagged enum — that's expected
+/// and silent by design. The problem (issue C4) is that a *different* kind of
+/// failure — invalid JSON, or JSON of some unrelated shape, e.g. from
+/// corruption or a bug — was indistinguishable from that benign legacy case;
+/// both silently fell back to `T::default()`, discarding whatever real
+/// metadata existed with no trace. This keeps the same fallback behavior but
+/// logs a `tracing::warn!` naming the resource and the parse error on every
+/// failure, so a genuine problem is at least observable.
+pub(crate) fn parse_metadata_json_lenient<T>(metadata_json: &str, resource_ref: &str) -> T
+where
+    T: serde::de::DeserializeOwned + Default,
+{
+    match serde_json::from_str(metadata_json) {
+        Ok(value) => value,
+        Err(e) => {
+            tracing::warn!(
+                resource = resource_ref,
+                error = %e,
+                "failed to parse resources.metadata_json; falling back to default metadata \
+                 (expected for pre-#130 untagged rows, but also fires on genuine corruption)"
+            );
+            T::default()
+        }
+    }
+}
+
 /// Map a libsql error to our error taxonomy.
 ///
 /// "database is locked" / `SQLITE_BUSY` → `RuntimeStateLocked` (exit 4),
@@ -271,7 +340,6 @@ pub(crate) fn map_libsql_err(e: libsql::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::migrations::baseline;
     use tempfile::tempdir;
 
     /// Everything about a database file's on-disk schema state that `open`
@@ -516,6 +584,78 @@ mod tests {
         );
     }
 
+    /// A DB stamped at the pre-#128 v4 schema (old `chunks.block_id` column
+    /// and `idx_chunks_store_resource` index, `user_version=4`, no
+    /// `schema_migrations` table) is exactly the `Pending` disposition this
+    /// binary's compiled chain now makes reachable (head is 5, one migration
+    /// past baseline) — `LibsqlDb::open` must refuse it with a `db migrate`
+    /// hint and leave it byte-for-byte untouched, not silently wipe and
+    /// reinitialise it the way the pre-framework binary used to.
+    #[tokio::test]
+    async fn reopen_with_v4_era_block_id_schema_is_refused_without_mutation() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        {
+            let db = libsql::Builder::new_local(&path).build().await.unwrap();
+            let conn = db.connect().unwrap();
+            // Old (v4) chunks table shape: has block_id, old index name.
+            conn.execute(
+                "CREATE TABLE chunks (
+                    rowid         INTEGER PRIMARY KEY,
+                    store_id      TEXT NOT NULL,
+                    id            TEXT NOT NULL,
+                    resource_id   TEXT NOT NULL,
+                    block_id      INTEGER NOT NULL,
+                    block_seq     INTEGER NOT NULL,
+                    seq_in_block  INTEGER NOT NULL DEFAULT 0,
+                    block_kind    TEXT,
+                    text          TEXT NOT NULL,
+                    heading_path  TEXT NOT NULL,
+                    embedding     F32_BLOB(4) NOT NULL,
+                    location_json TEXT,
+                    UNIQUE (store_id, id)
+                )",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "CREATE INDEX idx_chunks_store_resource ON chunks(store_id, resource_id)",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.query("PRAGMA user_version = 4", ()).await.unwrap();
+        }
+
+        let before = dump_db(&path).await;
+        let result = LibsqlDb::open(&path, 4, localdb_core::VectorEncoding::Float32).await;
+        let after = dump_db(&path).await;
+
+        match result {
+            Err(Error::InvalidConfig { message }) => {
+                assert!(
+                    message.contains("db migrate"),
+                    "error should point at 'localdb db migrate': {message}"
+                );
+                assert!(
+                    message.contains("behind"),
+                    "error should explain the version is behind this build: {message}"
+                );
+            }
+            Err(other) => panic!("expected InvalidConfig, got: {other:?}"),
+            Ok(_) => panic!(
+                "expected InvalidConfig, but reopen of a pending v4-era block_id schema succeeded"
+            ),
+        }
+
+        assert_eq!(
+            before, after,
+            "a refused open of a pending store must not mutate it at all — block_id, the old \
+             index, and user_version=4 must all still be exactly as they were"
+        );
+    }
+
     #[tokio::test]
     async fn fresh_db_and_reopen_both_succeed() {
         let dir = tempdir().unwrap();
@@ -568,10 +708,10 @@ mod tests {
         );
     }
 
-    // -- classify_version: the pure five-way dispatch helper. `Pending` is
-    // unreachable through today's empty real migration chain at the
-    // `LibsqlDb::open` level (head always equals BASELINE_VERSION), so it's
-    // exercised here directly against a synthetic head instead.
+    // -- classify_version: the pure five-way dispatch helper, exercised
+    // directly against a synthetic head (in addition to the real chain's
+    // current head, which `reopen_with_v4_era_block_id_schema_is_refused_
+    // without_mutation` above already exercises `Pending` through).
     #[test]
     fn classify_version_covers_all_five_branches() {
         let baseline = chain::BASELINE_VERSION;
@@ -596,48 +736,143 @@ mod tests {
         );
     }
 
-    // Plan test 12: opening a raw v4 store that predates the migrations
-    // framework (no `schema_migrations` table at all) silently backfills the
-    // bookkeeping table with just the baseline row — pure bookkeeping, no
-    // user-table DDL.
+    // Plan test 12 (superseded): opening a raw v4 store that predates the
+    // migrations framework (no `schema_migrations` table at all) used to be
+    // silently backfilled with just the baseline row when the real chain
+    // was empty — back then `head == BASELINE_VERSION`, so a bare-baseline
+    // store genuinely was `AtHead`. Now that a real chain entry exists, that
+    // same store is `Pending` instead (see
+    // `reopen_with_v4_era_block_id_schema_is_refused_without_mutation`
+    // above), so `AtHead`'s backfill path (`table::ensure_baseline_row`
+    // followed by `checksum::verify_checksums`) is only ever reachable with
+    // *some* bookkeeping already in place.
+    //
+    // This test now pins the resulting behavior for a store that is
+    // fabricated to claim head's `user_version` without ever having run
+    // through the framework (impossible via any real code path once the
+    // chain is non-empty, since reaching head always means `apply_pending`
+    // or `seed_for_fresh_create` ran and left chain-entry rows behind): it
+    // must be refused as corrupt bookkeeping, not silently trusted just
+    // because the version number matches.
     #[tokio::test]
-    async fn silent_backfill_on_healthy_v4_store_without_migrations_table() {
+    async fn at_head_store_missing_chain_entry_rows_is_refused_not_silently_trusted() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
+        let head = chain::head_version(&chain::migrations());
 
-        // Build a raw v4 store the way a pre-framework binary would have:
-        // baseline DDL only, no schema_migrations table.
+        // Build a store with today's head DDL and `user_version` stamped
+        // straight to head, but no `schema_migrations` table at all.
         {
             let db = libsql::Builder::new_local(&path).build().await.unwrap();
             let conn = db.connect().unwrap();
             conn.query("PRAGMA foreign_keys = ON", ()).await.unwrap();
-            let ctx = MigrationContext {
-                embedding_dim: 4,
-                encoding: VectorEncoding::Float32,
-            };
-            baseline::create_baseline_schema(&conn, &ctx).await.unwrap();
+            schema::create_schema(&conn, 4, VectorEncoding::Float32)
+                .await
+                .unwrap();
+            conn.query(&format!("PRAGMA user_version = {head}"), ())
+                .await
+                .unwrap();
         }
 
-        let db = LibsqlDb::open(&path, 4, VectorEncoding::Float32)
-            .await
-            .unwrap();
-        let conn = db.conn().await;
+        match LibsqlDb::open(&path, 4, VectorEncoding::Float32).await {
+            Err(Error::Internal { message, .. }) => {
+                assert!(
+                    message.contains("missing a row"),
+                    "error should explain the bookkeeping is incomplete: {message}"
+                );
+            }
+            Err(other) => panic!("expected Internal, got: {other:?}"),
+            Ok(_) => panic!(
+                "expected Internal error: an at-head store with no chain-entry bookkeeping \
+                 rows must not be silently trusted"
+            ),
+        }
+    }
 
-        let rows = table::list_rows_desc_above(&conn, i64::MIN).await.unwrap();
-        assert_eq!(
-            rows.len(),
-            1,
-            "backfill on open should add exactly the baseline row: {rows:?}"
+    // Fix 1 (adversarial review, track 4): the fabricated at-head store above
+    // (real chain head > BASELINE_VERSION, no `schema_migrations` table) must
+    // be refused WITHOUT `open` having created the table (or its baseline
+    // row) first. Before this fix, the `AtHead` branch unconditionally
+    // created the table and — because it was absent — backfilled the
+    // baseline row, then only afterward let `verify_checksums` refuse for the
+    // still-missing v{head} chain-entry row: a store `open` refuses had
+    // already been mutated. This pins that the table stays entirely absent
+    // and `user_version` is untouched.
+    #[tokio::test]
+    async fn at_head_store_with_no_migrations_table_is_refused_without_creating_it() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let head = chain::head_version(&chain::migrations());
+        assert!(
+            head > chain::BASELINE_VERSION,
+            "this test's premise requires a non-empty real chain, so a table-absent \
+             at-head store is never legitimately backfillable"
         );
-        assert_eq!(rows[0].version, chain::BASELINE_VERSION);
-        assert_eq!(rows[0].name, "baseline");
+
+        // Build a store with today's head DDL and `user_version` stamped
+        // straight to head, but no `schema_migrations` table at all.
+        {
+            let db = libsql::Builder::new_local(&path).build().await.unwrap();
+            let conn = db.connect().unwrap();
+            conn.query("PRAGMA foreign_keys = ON", ()).await.unwrap();
+            schema::create_schema(&conn, 4, VectorEncoding::Float32)
+                .await
+                .unwrap();
+            conn.query(&format!("PRAGMA user_version = {head}"), ())
+                .await
+                .unwrap();
+        }
+
+        let before = dump_db(&path).await;
+        assert!(
+            !before
+                .master_rows
+                .iter()
+                .any(|(_, name, _)| name == "schema_migrations"),
+            "precondition: schema_migrations must not exist yet"
+        );
+
+        let result = LibsqlDb::open(&path, 4, VectorEncoding::Float32).await;
+        let after = dump_db(&path).await;
+
+        match result {
+            Err(Error::Internal { message, .. }) => {
+                assert!(
+                    message.contains("missing a row"),
+                    "error should explain the bookkeeping is incomplete: {message}"
+                );
+            }
+            Err(other) => panic!("expected Internal, got: {other:?}"),
+            Ok(_) => panic!(
+                "expected Internal error: an at-head store with no chain-entry bookkeeping \
+                 rows must not be silently trusted"
+            ),
+        }
+
+        assert_eq!(
+            before, after,
+            "a refused open of a fabricated table-absent at-head store must not mutate it at \
+             all"
+        );
+        assert!(
+            !after
+                .master_rows
+                .iter()
+                .any(|(_, name, _)| name == "schema_migrations"),
+            "open must not have created schema_migrations while refusing this store: {:?}",
+            after.master_rows
+        );
+        assert_eq!(
+            after.user_version, head,
+            "user_version must remain exactly as stamped, untouched by the refused open"
+        );
     }
 
     // Plan test 13: a brand-new store created via `LibsqlDb::open` seeds
-    // exactly one bookkeeping row (today's real chain is empty, so that row
-    // is the baseline) and stamps user_version to head.
+    // exactly one bookkeeping row per real chain entry plus the baseline row,
+    // and stamps user_version to head.
     #[tokio::test]
-    async fn fresh_open_seeds_exactly_one_baseline_row() {
+    async fn fresh_open_seeds_baseline_plus_chain_rows() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
 
@@ -649,18 +884,22 @@ mod tests {
         let user_version = schema::get_schema_version(&conn).await.unwrap();
         assert_eq!(user_version, chain::head_version(&chain::migrations()));
         assert_eq!(
-            user_version, 4,
-            "today's empty real chain leaves head == baseline == 4"
+            user_version,
+            chain::BASELINE_VERSION + chain::migrations().len() as i64,
+            "head == baseline + the real chain's length"
         );
 
         let rows = table::list_rows_desc_above(&conn, i64::MIN).await.unwrap();
         assert_eq!(
             rows.len(),
-            1,
-            "real chain is empty; only the baseline row should exist"
+            1 + chain::migrations().len(),
+            "baseline row plus one row per real chain entry should exist"
         );
-        assert_eq!(rows[0].version, chain::BASELINE_VERSION);
-        assert_eq!(rows[0].name, "baseline");
+        assert!(
+            rows.iter()
+                .any(|r| r.version == chain::BASELINE_VERSION && r.name == "baseline"),
+            "baseline row missing: {rows:?}"
+        );
     }
 
     // Codex review #152 fix 1: a database that only got as far as
@@ -760,6 +999,126 @@ mod tests {
         assert_eq!(
             before, after,
             "a refused open due to checksum drift must not mutate the store"
+        );
+    }
+
+    // C1: same latent bug as migrate.rs's v0 branch, but in `open`'s `Fresh`
+    // disposition — a store that only got as far as `create_schema` (chunks
+    // built with dim 4, user_version still 0, simulating an interrupted
+    // earlier fresh-create) must be refused when reopened with a mismatched
+    // dim, and refused BEFORE `seed_for_fresh_create` stamps user_version to
+    // head — not stamped-then-rejected on the next open.
+    #[tokio::test]
+    async fn open_refuses_and_leaves_store_unstamped_on_fresh_create_recovery_dim_mismatch() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        {
+            let db = libsql::Builder::new_local(&path).build().await.unwrap();
+            let conn = db.connect().unwrap();
+            conn.query("PRAGMA foreign_keys = ON", ()).await.unwrap();
+            schema::create_schema(&conn, 4, VectorEncoding::Float32)
+                .await
+                .unwrap();
+        }
+
+        let before = dump_db(&path).await;
+        let result = LibsqlDb::open(&path, 8, VectorEncoding::Float32).await;
+        let after = dump_db(&path).await;
+
+        match result {
+            Err(Error::InvalidConfig { message }) => {
+                assert!(
+                    message.contains("mismatch"),
+                    "error should mention mismatch: {message}"
+                );
+            }
+            Err(other) => panic!("expected InvalidConfig, got: {other:?}"),
+            Ok(_) => panic!("expected InvalidConfig, but reopen with mismatched dim succeeded"),
+        }
+
+        assert_eq!(
+            before, after,
+            "a refused fresh-create recovery due to an embedding shape mismatch must not \
+             mutate the store — user_version must remain 0 and no schema_migrations rows \
+             may be written"
+        );
+        assert_eq!(after.user_version, 0, "must remain unstamped at v0");
+        assert!(
+            after.migration_rows.is_empty(),
+            "no schema_migrations rows should have been written: {:?}",
+            after.migration_rows
+        );
+    }
+
+    // C3: `AtHead`'s bookkeeping backfill must only apply when
+    // `schema_migrations` was ABSENT before this open (the raw
+    // pre-framework case) — if the table already exists but its baseline row
+    // is missing (corrupt bookkeeping), `open` must refuse via
+    // `verify_checksums`'s missing-row error, not silently recreate the row
+    // and let the store pass as healthy.
+    #[tokio::test]
+    async fn at_head_open_refuses_and_does_not_backfill_baseline_row_when_table_present_but_row_missing(
+    ) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        // Build then close a healthy at-head store (schema_migrations table
+        // present, baseline + chain rows seeded).
+        let db = LibsqlDb::open(&path, 4, VectorEncoding::Float32)
+            .await
+            .unwrap();
+        drop(db);
+
+        // Corrupt bookkeeping: the table exists, but its baseline row is
+        // gone (as opposed to `checksum_drift_on_healthy_store_returns_
+        // internal_error` above, which tampers the row's checksum instead of
+        // deleting it).
+        {
+            let raw_db = libsql::Builder::new_local(&path).build().await.unwrap();
+            let conn = raw_db.connect().unwrap();
+            conn.execute(
+                "DELETE FROM schema_migrations WHERE version = ?",
+                libsql::params![chain::BASELINE_VERSION],
+            )
+            .await
+            .unwrap();
+        }
+
+        let before = dump_db(&path).await;
+        let result = LibsqlDb::open(&path, 4, VectorEncoding::Float32).await;
+        let after = dump_db(&path).await;
+
+        match result {
+            Err(Error::Internal { message, .. }) => {
+                assert!(
+                    message.contains("missing a row"),
+                    "error should explain the bookkeeping is incomplete: {message}"
+                );
+                assert!(
+                    message.contains("baseline"),
+                    "error should name the missing baseline row: {message}"
+                );
+            }
+            Err(other) => panic!("expected Internal, got: {other:?}"),
+            Ok(_) => panic!(
+                "expected Internal error: a store whose schema_migrations table exists but \
+                 whose baseline row is missing must not be silently trusted"
+            ),
+        }
+
+        assert_eq!(
+            before, after,
+            "open must not backfill the baseline row (or otherwise mutate the store) when \
+             schema_migrations already existed but was missing a required row"
+        );
+        assert!(
+            !after
+                .migration_rows
+                .iter()
+                .any(|r| r.version == chain::BASELINE_VERSION),
+            "the baseline row must remain missing, not silently recreated: {:?}",
+            after.migration_rows
         );
     }
 }

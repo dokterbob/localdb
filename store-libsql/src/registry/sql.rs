@@ -37,7 +37,7 @@ pub(super) fn kind_from_sql(s: &str) -> Result<SourceKind, Error> {
         "url" => Ok(SourceKind::Url),
         other => Err(Error::Internal {
             message: format!("unknown source kind in DB: {other}"),
-            correlation_id: "rt_source_kind".to_string(),
+            correlation_id: "rt_sources_kind".to_string(),
         }),
     }
 }
