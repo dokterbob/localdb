@@ -24,6 +24,24 @@
 //! This test only composes `ingest::FileIngestor` with
 //! `core::ingestion::run_source_ingestion` (the two crates that must both be
 //! involved to observe the bug); it makes no production changes.
+//!
+//! # What this still proves, and what it no longer can
+//!
+//! The description above is the bug as it existed before `on_skipped` took a
+//! `&Uri`. It is kept because it explains *why* this test exists and why the
+//! fixture filename contains a space. Be precise about its current value,
+//! though: once `FileIngestor` shares one `file.uri: Uri` between
+//! `on_resource` and `on_skipped`, the raw-vs-normalized divergence is
+//! unrepresentable *through this ingestor*, so removing the space from the
+//! fixture would no longer change the outcome.
+//!
+//! What it does still guard, end to end and with real filesystem I/O, is the
+//! invariant that made the original bug destructive: **an ingestor must report
+//! a failed read via `on_skipped`, and a resource so reported must survive the
+//! delete-sweep.** Deleting the `on_skipped(&file.uri, SkipReason::Error(..))`
+//! call in `file_ingestor.rs`'s read-error arm fails this test in both debug
+//! (the `debug_assert_eq!` on `errors == skip_error_count`) and release (the
+//! `error_count == 1` assertion below) — verified by mutation.
 
 use std::os::unix::fs::PermissionsExt;
 

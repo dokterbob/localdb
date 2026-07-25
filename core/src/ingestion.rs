@@ -299,14 +299,27 @@ fn enumerate_dir(
             let abs_path = path.canonicalize().unwrap_or(path.clone());
             // `Uri::from_file_path` percent-encodes correctly (spaces,
             // non-ASCII, `#`, `?`, ...), unlike the old lossy
-            // `format!("file://{}", path.display())`. It only returns `None`
-            // for a non-absolute path, which `abs_path` isn't expected to be
-            // given the `canonicalize()` above — but fall back defensively
-            // rather than panic or silently drop the file.
-            let uri = Uri::from_file_path(&abs_path).unwrap_or_else(|| {
-                let fallback = format!("file://{}", abs_path.display());
-                Uri::parse(&fallback).expect("fallback file:// URI must parse")
-            });
+            // `format!("file://{}", path.display())`. It returns `None` only
+            // for a non-absolute path, which `abs_path` is not — *unless*
+            // `canonicalize()` above failed (the file was moved or deleted
+            // between `is_file()` and here) and the source's configured root
+            // was itself relative, which `normalize_path_source` permits.
+            //
+            // Error out rather than panicking or silently dropping the file.
+            // Dropping it would be the worse of the two: the file would never
+            // be reported to the pipeline, so the delete-sweep would treat its
+            // still-live document as gone and delete it — exactly the data
+            // loss this module's normalization work exists to prevent.
+            // Returning `Err` aborts the run before the sweep, so nothing is
+            // deleted on the strength of an incomplete enumeration.
+            let uri = Uri::from_file_path(&abs_path).ok_or_else(|| Error::Internal {
+                message: format!(
+                    "cannot build a file:// URI for non-absolute path '{}' \
+                     (canonicalization failed and the source root is relative)",
+                    abs_path.display()
+                ),
+                correlation_id: "enumerate_dir".to_string(),
+            })?;
             found.push(FoundFile {
                 path: abs_path,
                 uri,
