@@ -369,6 +369,16 @@ behavior).
   distinct hits. Ties are broken deterministically: `fused_score` descending, then `store_id`
   ascending, then `chunk_id` ascending. Metadata filters (mime, path prefix, fetched_at range)
   are pushed down to the backend where supported.
+
+  **Known limitation — cross-store score comparability.** Pooling ranks each leg by its raw
+  backend score. That is sound for the dense leg (cosine similarity is comparable across
+  stores) but only approximate for BM25, whose scores are corpus-relative (per-store IDF and
+  average document length). So a pooled BM25 ranking compares numbers that are not strictly
+  commensurable, and cross-store ordering within that leg is correspondingly approximate.
+  Global pooling is still strictly better than per-store RRF — which gave *every* store's
+  local rank-0 chunk an identical score regardless of quality — but multi-store relevance is
+  not fully solved until scores are calibrated. Tracked by issue #40; see also §"Rejected"
+  above on score interpolation.
 - **Result shaping:** top-N (default 10) → Citation objects
   ([02-domain-model.md](02-domain-model.md) §6), with per-leg scores retained for debugging
   (`score: {fused, dense, bm25}`). Citations carry a **block reference** and chunk position

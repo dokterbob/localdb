@@ -264,6 +264,30 @@ fn pool_leg_results(results: Vec<SearchResult>) -> Vec<SearchResult> {
     pooled
 }
 
+/// Drop any result a store returned that is not stamped with that store's own
+/// `store_id`, preserving the relative order of the rest.
+///
+/// Global fusion identity is the composite `(store_id, chunk_id)` and each
+/// citation's store attribution is resolved from `chunk.store_id`, so a
+/// mis-stamped chunk would be fused under the wrong key and attributed to the
+/// wrong store — or, if its `store_id` matches no queried handle, surface with
+/// an empty store name. No current `RetrievalStore` implementation can produce
+/// one (the libsql read path filters `WHERE c.store_id = ?`), and a `debug_assert!`
+/// in the fan-out loop fails loudly in dev builds if that ever changes. This is
+/// the release-build backstop: `debug_assert!` compiles out, so without it a
+/// mis-stamped chunk would pass through silently.
+///
+/// Dropping rather than relabelling is deliberate. Rewriting `store_id` to the
+/// querying handle's id would make the invariant true by construction, but it
+/// would also disguise a genuine cross-tenant leak as a correctly-attributed
+/// result. Mirrors the same check in `mcp`'s `find_document_chunks`.
+fn retain_own_chunks(results: Vec<SearchResult>, handle: &StoreHandle) -> Vec<SearchResult> {
+    results
+        .into_iter()
+        .filter(|r| r.chunk.store_id == handle.id)
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Rerank seam (no-op in MVP)
 // ---------------------------------------------------------------------------
@@ -388,8 +412,8 @@ impl SearchOrchestrator {
                 handle.id
             );
 
-            dense_pool.extend(dense_results);
-            bm25_pool.extend(bm25_results);
+            dense_pool.extend(retain_own_chunks(dense_results, handle));
+            bm25_pool.extend(retain_own_chunks(bm25_results, handle));
         }
 
         // 3. Pool each leg into one globally rank-ordered list, then run a
@@ -1202,6 +1226,64 @@ mod tests {
                 ("store-2", "same-id"),
             ]
         );
+    }
+
+    /// A store that returns a chunk stamped with someone else's `store_id` has
+    /// its mis-stamped results dropped, not relabelled — otherwise the chunk
+    /// would fuse under the wrong composite key and be attributed to the wrong
+    /// store (or surface with an empty store name).
+    ///
+    /// This is exercised on `retain_own_chunks` directly rather than through
+    /// `SearchOrchestrator::query`, because the fan-out loop's `debug_assert!`
+    /// deliberately panics on this input in dev builds (tests included). The
+    /// filter is the *release*-build backstop for when that assert compiles
+    /// out, so the helper is the only place the drop behavior is observable
+    /// under `cargo test`.
+    #[test]
+    fn retain_own_chunks_drops_results_stamped_with_another_store_id() {
+        let handle = StoreHandle {
+            id: "store-A".to_string(),
+            name: "Store A".to_string(),
+            store: Arc::new(FakeStore::new()),
+        };
+
+        let mine_first = make_search_result(
+            make_chunk("a", "d1", "store-A", "t", vec![], "file:///a.md", vec![1.0]),
+            0.9,
+        );
+        let foreign = make_search_result(
+            make_chunk("x", "d2", "store-B", "t", vec![], "file:///x.md", vec![1.0]),
+            0.8,
+        );
+        let mine_last = make_search_result(
+            make_chunk("b", "d3", "store-A", "t", vec![], "file:///b.md", vec![1.0]),
+            0.7,
+        );
+
+        let kept = retain_own_chunks(vec![mine_first, foreign, mine_last], &handle);
+
+        // The foreign chunk is gone; surviving results keep their relative order.
+        assert_eq!(
+            kept.iter().map(|r| r.chunk.id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        assert!(kept.iter().all(|r| r.chunk.store_id == "store-A"));
+    }
+
+    /// An all-foreign result set collapses to empty rather than leaking.
+    #[test]
+    fn retain_own_chunks_drops_every_foreign_result() {
+        let handle = StoreHandle {
+            id: "store-A".to_string(),
+            name: "Store A".to_string(),
+            store: Arc::new(FakeStore::new()),
+        };
+        let foreign = make_search_result(
+            make_chunk("x", "d1", "store-B", "t", vec![], "file:///x.md", vec![1.0]),
+            0.8,
+        );
+
+        assert!(retain_own_chunks(vec![foreign], &handle).is_empty());
     }
 
     /// Headline regression test for issue #162.
