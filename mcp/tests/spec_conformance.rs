@@ -39,7 +39,7 @@ use localdb_core::{
     types::Span,
     FakeEmbedder,
 };
-use mcp::{handler::McpHandler, AvailableStore, StoreDescriptor};
+use mcp::{handler::McpHandler, AvailableStore, StaticStoreProvider, StoreDescriptor};
 
 // ---------------------------------------------------------------------------
 // Spec extraction
@@ -334,7 +334,12 @@ async fn make_handler_with_sequential_chunks(count: u32) -> (McpHandler, String,
     let available = AvailableStore::from_arc(sd, store);
     let embedder: std::sync::Arc<dyn localdb_core::Embedder> =
         std::sync::Arc::new(FakeEmbedder::new(4));
-    let handler = McpHandler::new(vec![available], embedder, false);
+    let handler = McpHandler::new(
+        std::sync::Arc::new(StaticStoreProvider::new(vec![available])),
+        embedder,
+        false,
+        Some(localdb_core::auth::Principal::local_trust()),
+    );
     (handler, doc_id, ids)
 }
 

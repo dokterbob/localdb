@@ -364,7 +364,12 @@ async fn make_handler_with_sequential_chunks(count: u32) -> (McpHandler, String,
     let available = AvailableStore::from_arc(sd, store);
     let embedder: std::sync::Arc<dyn localdb_core::Embedder> =
         std::sync::Arc::new(FakeEmbedder::new(4));
-    let handler = McpHandler::new(vec![available], embedder, false);
+    let handler = McpHandler::new(
+        std::sync::Arc::new(StaticStoreProvider::new(vec![available])),
+        embedder,
+        false,
+        Some(localdb_core::auth::Principal::local_trust()),
+    );
     (handler, doc_id, ids)
 }
 
@@ -422,7 +427,12 @@ async fn make_handler_with_block_seq_gaps() -> (McpHandler, String) {
     let available = AvailableStore::from_arc(sd, store);
     let embedder: std::sync::Arc<dyn localdb_core::Embedder> =
         std::sync::Arc::new(FakeEmbedder::new(4));
-    let handler = McpHandler::new(vec![available], embedder, false);
+    let handler = McpHandler::new(
+        std::sync::Arc::new(StaticStoreProvider::new(vec![available])),
+        embedder,
+        false,
+        Some(localdb_core::auth::Principal::local_trust()),
+    );
     (handler, doc_id)
 }
 
@@ -543,6 +553,104 @@ async fn test_list_stores_empty() {
     let text = text_of(&result);
     let parsed: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(parsed["stores"].as_array().unwrap().len(), 0);
+}
+
+/// D7 (specs/05-surfaces.md §3.1), protocol-level: every other test in this
+/// file drives `McpHandler` with `Principal::local_trust()`, which is an
+/// admin with `StoreAccess::All` and so bypasses D7 grant filtering
+/// entirely — no test here previously exercised a `member` principal's
+/// grant scoping over the *actual wire protocol* (only
+/// `mcp/src/handler.rs`'s in-crate unit tests drove `filter_visible`
+/// directly, via the `*_inner` methods). On this duplex/stdio-shaped
+/// transport, `default_principal` is the only way a `Principal` reaches the
+/// handler (there's no HTTP request to carry one per-call — see
+/// `McpHandler::principal_for`), so a `member` principal with a grant on
+/// only one of two `shared` stores, passed as `default_principal`, is
+/// sufficient to prove D7 filtering end-to-end through `tools/call`.
+///
+/// Asserts both read paths D7 governs: `list_stores` silently narrows to
+/// the granted store, and `search` naming the ungranted store explicitly is
+/// `forbidden` (not `store_not_found` — the store exists, the caller just
+/// isn't entitled to it).
+#[tokio::test]
+async fn test_member_principal_sees_only_granted_store_via_list_stores_and_search() {
+    let granted_store = std::sync::Arc::new(FakeStore::new());
+    let ungranted_store = std::sync::Arc::new(FakeStore::new());
+    let granted = AvailableStore::from_arc(
+        StoreDescriptor {
+            id: "store-granted".to_string(),
+            name: "store-granted".to_string(),
+            visibility: "shared".to_string(),
+        },
+        granted_store,
+    );
+    let ungranted = AvailableStore::from_arc(
+        StoreDescriptor {
+            id: "store-ungranted".to_string(),
+            name: "store-ungranted".to_string(),
+            visibility: "shared".to_string(),
+        },
+        ungranted_store,
+    );
+
+    let member = localdb_core::auth::Principal {
+        user_id: "u-member".to_string(),
+        name: "member-with-grant".to_string(),
+        role: localdb_core::auth::Role::Member,
+        access: localdb_core::auth::StoreAccess::Granted(
+            ["store-granted".to_string()].into_iter().collect(),
+        ),
+    };
+
+    let embedder: std::sync::Arc<dyn localdb_core::Embedder> =
+        std::sync::Arc::new(FakeEmbedder::new(4));
+    let handler = McpHandler::new(
+        std::sync::Arc::new(StaticStoreProvider::new(vec![granted, ungranted])),
+        embedder,
+        false,
+        Some(member),
+    );
+    let client = client_for(handler).await;
+
+    // list_stores: the ungranted shared store must be invisible.
+    let result = call_tool(&client, "list_stores", json!({}))
+        .await
+        .expect("list_stores succeeds at the protocol level");
+    assert_ne!(result.is_error, Some(true), "should not be a tool error");
+    let text = text_of(&result);
+    let parsed: Value = serde_json::from_str(&text).expect("valid JSON in content");
+    let names: Vec<&str> = parsed["stores"]
+        .as_array()
+        .expect("stores array")
+        .iter()
+        .map(|s| s["name"].as_str().expect("name is a string"))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["store-granted"],
+        "member without a grant on store-ungranted must not see it via list_stores"
+    );
+
+    // search naming the ungranted store explicitly: forbidden, not
+    // store_not_found — the store exists, the grant is just missing.
+    let result = call_tool(
+        &client,
+        "search",
+        json!({ "query": "anything", "stores": ["store-ungranted"] }),
+    )
+    .await
+    .expect("search call completes at the protocol level");
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "search naming an ungranted store must be a tool error"
+    );
+    let text = text_of(&result);
+    let parsed: Value = serde_json::from_str(&text).expect("valid JSON in content");
+    assert_eq!(
+        parsed["error"]["code"], "forbidden",
+        "expected D7 'forbidden', not e.g. store_not_found: {text}"
+    );
 }
 
 // ---------------------------------------------------------------------------

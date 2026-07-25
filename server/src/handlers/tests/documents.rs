@@ -181,7 +181,7 @@ async fn get_document_reconstructs_table_without_duplicated_header() {
 
     let app = crate::daemon::build_router(
         state,
-        vec![],
+        std::sync::Arc::new(mcp::StaticStoreProvider::new(vec![])),
         std::sync::Arc::new(localdb_core::FakeEmbedder::new(128)),
         vec![],
     );

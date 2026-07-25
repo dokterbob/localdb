@@ -419,7 +419,7 @@ async fn seed_chunk(state: &server::AppState, store_name: &str, text: &str, uri:
         .unwrap();
     let chunk = localdb_core::ChunkRecord {
         id: format!("chunk-{store_name}"),
-        document_id: format!("doc-{store_name}"),
+        resource_id: format!("doc-{store_name}"),
         store_id: store_id.clone(),
         text: text.to_string(),
         span: localdb_core::types::Span::new(0, text.len()),
@@ -430,13 +430,14 @@ async fn seed_chunk(state: &server::AppState, store_name: &str, text: &str, uri:
         content_hash: "abc123".to_string(),
         origin_store: store_id.clone(),
         source_id: source.id,
-        source_kind: "path".to_string(),
+        ingestor_kind: "path".to_string(),
         mime: Some("text/plain".to_string()),
         uri: uri.to_string(),
-        metadata: localdb_core::DocumentMetadata::default(),
+        metadata: localdb_core::metadata::Metadata::default(),
         block_seq: 0,
         seq_in_block: 0,
         block_kind: None,
+        window_block_seqs: vec![],
     };
     state
         .backend()
