@@ -2,7 +2,7 @@
 //! (issue #127) against a fixture chain whose DDL was originally copied
 //! **verbatim** from two in-flight consumer branches, as of 2026-07-08:
 //!
-//! - `v5`/`v6` mirror the `auth` branch's (issue #98, not yet landed)
+//! - `v5`/`v6` mirror the `auth` branch's (issue #98) former ad-hoc runner in
 //!   `store-libsql/src/schema.rs`: `create_auth_tables` (the 7 auth tables +
 //!   their indexes) and the `v5 -> v6` `add_access_requests_collected_at_column`
 //!   step.
@@ -12,20 +12,25 @@
 //!   retagging `resources.metadata_json` from the old flat Dublin-Core shape
 //!   to the tagged `Metadata::Document` shape.
 //!
-//! **PR #151 has since landed**: its migration is now the real chain's first
-//! entry, `chain::migrations()`'s version 5
-//! (`drop_chunks_block_id_and_retag_resource_metadata` in `chain.rs`) — not
-//! version 7, since `auth`'s v5/v6 hadn't claimed those slots yet at adoption
-//! time. This file's own `fixture_chain()` deliberately keeps its own
-//! independent v5/v6/v7 numbering rather than reusing `chain::migrations()`:
-//! it exists to exercise the generic runner/downgrade machinery against a
-//! *multi-step* chain (an auth-shaped pair plus a block_id-drop-shaped
-//! step), which is broader coverage than replaying today's one-entry real
-//! chain would give. `migrations::runner::drift_guard_create_schema_equals_baseline_plus_chain`
+//! **Both have since landed, in the opposite order this file's own numbering
+//! implies.** PR #151 landed first, claiming the real chain's `v5`
+//! (`drop_chunks_block_id_and_retag_resource_metadata`). The `auth` branch's
+//! pair landed second and renumbered to `v6`/`v7`
+//! (`create_auth_tables`/`add_access_requests_collected_at_column` in
+//! `chain.rs`) — the reverse of this file's own `fixture_chain()`, which
+//! keeps its **own independent v5/v6/v7 numbering** rather than reusing
+//! `chain::migrations()`: it exists to exercise the generic runner/downgrade
+//! machinery against a *multi-step* chain (an auth-shaped pair plus a
+//! block_id-drop-shaped step), which is broader coverage than replaying the
+//! real chain alone would give, and its numbering is intentionally
+//! decoupled from whichever consumer branch landed in which order.
+//! `migrations::runner::drift_guard_create_schema_equals_baseline_plus_chain`
 //! is the test that pins the real chain (`chain::migrations()`) against
 //! `schema::create_schema` instead; this file's fixtures are intentionally
 //! synthetic and may drift from whatever the real chain looks like at any
-//! given time.
+//! given time. `migrate_store_on_real_chain_drops_block_id_and_retags_metadata`
+//! below is this file's one test that exercises the real, compiled chain
+//! directly rather than the fixture.
 
 use std::path::{Path, PathBuf};
 
@@ -684,9 +689,12 @@ async fn downgrade_v6_to_v5_removes_only_the_collected_at_column() {
 /// above: seed a realistic v4 store (the same `seed_v4_data` fixture the
 /// fixture-chain test uses — two stores, blocks with a `block_id` FK,
 /// untagged flat `metadata_json`), run `migrate_store` exactly the way
-/// `localdb db migrate` does, and confirm it lands on v5 with `block_id`
-/// gone, the composite index swapped in, and `resources.metadata_json`
-/// retagged — while leaving the chunk rows' own data intact.
+/// `localdb db migrate` does, and confirm it lands on head (v7, now that the
+/// real chain also carries the auth branch's `v6`/`v7` entries alongside
+/// PR #151's `v5`) with `block_id` gone, the composite index swapped in,
+/// `resources.metadata_json` retagged, the 7 auth tables plus
+/// `access_requests.collected_at` present, and the built-in `localdb-cli`
+/// OAuth2 client seeded — while leaving the chunk rows' own data intact.
 #[tokio::test]
 async fn migrate_store_on_real_chain_drops_block_id_and_retags_metadata() {
     let (_dir, path) = temp_db_path();
@@ -701,22 +709,57 @@ async fn migrate_store_on_real_chain_drops_block_id_and_retags_metadata() {
         .unwrap();
 
     assert_eq!(report.from_version, BASELINE_VERSION);
-    assert_eq!(report.to_version, BASELINE_VERSION + 1);
+    assert_eq!(report.to_version, BASELINE_VERSION + 3);
     assert_eq!(
         report.applied.iter().map(|s| s.version).collect::<Vec<_>>(),
-        vec![BASELINE_VERSION + 1]
+        vec![
+            BASELINE_VERSION + 1,
+            BASELINE_VERSION + 2,
+            BASELINE_VERSION + 3
+        ]
     );
     assert!(!report.legacy_rebuilt);
     assert!(
         report.staleness_marked,
-        "the block_id-drop migration is needs_reindex: true"
+        "the block_id-drop migration (v5) is needs_reindex: true"
     );
 
     let (_db, conn) = open_conn(&path).await;
-    assert_eq!(user_version(&conn).await, BASELINE_VERSION + 1);
+    assert_eq!(user_version(&conn).await, BASELINE_VERSION + 3);
     assert!(!column_exists(&conn, "chunks", "block_id").await);
     assert!(!index_exists(&conn, "idx_chunks_store_resource").await);
     assert!(index_exists(&conn, "idx_chunks_store_resource_pos").await);
+
+    // v6: the 7 auth tables exist.
+    for table in [
+        "users",
+        "auth_tokens",
+        "oauth_clients",
+        "auth_codes",
+        "store_grants",
+        "invites",
+        "access_requests",
+    ] {
+        assert!(table_exists(&conn, table).await, "missing table {table}");
+    }
+    // v6: the built-in localdb-cli OAuth2 client is seeded.
+    let mut rows = conn
+        .query(
+            "SELECT client_name FROM oauth_clients WHERE id = 'localdb-cli'",
+            (),
+        )
+        .await
+        .unwrap();
+    let row = rows
+        .next()
+        .await
+        .unwrap()
+        .expect("localdb-cli oauth client row must be seeded by v6");
+    let client_name: String = row.get(0).unwrap();
+    assert_eq!(client_name, "localdb CLI");
+
+    // v7: access_requests.collected_at exists.
+    assert!(column_exists(&conn, "access_requests", "collected_at").await);
 
     // Seeded rows preserved.
     assert_eq!(row_count(&conn, "stores").await, 2);

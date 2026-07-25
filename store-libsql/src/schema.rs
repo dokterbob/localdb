@@ -1,29 +1,7 @@
 use libsql::Connection;
-use localdb_core::{Error, VectorEncoding};
+use localdb_core::VectorEncoding;
 
-use crate::connection::map_libsql_err;
 use crate::vectors::embedding_column_type;
-
-/// Schema version stored in `PRAGMA user_version`.
-///
-/// Survives `VACUUM` and doesn't require a separate table. Replaces the
-/// per-store `schema_version` table from the legacy schema.
-///
-/// v4 -> v5 (issue #98): added the auth tables (`users`, `auth_tokens`,
-/// `oauth_clients`, `auth_codes`, `store_grants`, `invites`,
-/// `access_requests`). Purely additive — see `MIGRATIONS` below.
-///
-/// v5 -> v6 (T6, issue #98): added `access_requests.collected_at` — the
-/// atomic "credential handed out exactly once" guard for closed-mode invite
-/// polling (`AuthStore::mark_access_request_collected`). Purely additive.
-///
-/// NOTE(WP0 merge): this constant and the `MIGRATIONS`/`run_migrations`
-/// runner below are pre-#152 auth-branch machinery, preserved as-is for WP1
-/// to fold into `store-libsql/src/migrations/chain.rs` (see
-/// `docs/migrations.md` and CLAUDE.md's "write twice" rule). They are NOT
-/// wired into `create_schema` or `connection.rs::open` — main's
-/// `classify_version`/chain-based dispatch is the only active path.
-pub const SCHEMA_VERSION: i64 = 6;
 
 /// Run the full DDL for the unified database.
 ///
@@ -50,13 +28,7 @@ pub async fn create_schema(
     create_triggers(conn).await?;
     create_sync_state(conn).await?;
     create_credentials(conn).await?;
-    // NOTE(WP0 merge): auth's `create_auth_tables`/`set_user_version` calls
-    // were dropped here rather than wired in — main's doc comment above
-    // (create_schema does NOT touch PRAGMA user_version; fresh-create
-    // callers stamp it via `runner::seed_for_fresh_create`) is the active
-    // invariant post-#152. WP1 must fold `create_auth_tables`'s DDL into
-    // this function (or an equivalent chain migration) as part of
-    // converting the auth schema to the chain framework.
+    create_auth_tables(conn).await?;
     Ok(())
 }
 
@@ -327,8 +299,10 @@ async fn create_credentials(conn: &Connection) -> Result<(), libsql::Error> {
 /// `auth_tokens`, `oauth_clients`, `auth_codes`, `store_grants`, `invites`,
 /// `access_requests`.
 ///
-/// Shared verbatim between fresh `create_schema` and the `4 -> 5` migration
-/// step (`MIGRATIONS`) so both paths converge on an identical schema (D13).
+/// Shared verbatim between fresh `create_schema` and the chain migration
+/// framework's `v6` entry (`create_auth_tables`,
+/// `store-libsql/src/migrations/chain.rs`) so both paths converge on an
+/// identical schema (D13, the write-twice rule — see `docs/migrations.md`).
 /// `oauth_clients`/`auth_codes` have no corresponding `core::auth` Rust types
 /// yet — their DDL ships now (so this is the only migration this feature
 /// ever needs) but the OAuth2 code+PKCE flow lands in a later ticket.
@@ -458,6 +432,17 @@ async fn create_auth_tables(conn: &Connection) -> Result<(), libsql::Error> {
     )
     .await?;
 
+    // The trailing `, collected_at TEXT)` (rather than a normally formatted
+    // `collected_at TEXT` column on its own indented line) is deliberate,
+    // not a typo: `PRAGMA user_version`-migrated stores get this column via
+    // chain.rs's `v7` `ALTER TABLE access_requests ADD COLUMN collected_at
+    // TEXT`, and SQLite's `ADD COLUMN` splices the new column definition in
+    // verbatim immediately before the original statement's closing
+    // parenthesis rather than reformatting the whole statement. To satisfy
+    // the write-twice drift guard (`sqlite_master.sql` must be byte-for-byte
+    // identical between a fresh `create_schema` and baseline+chain), this
+    // literal reproduces that exact splice rather than the "natural"
+    // formatting a human would otherwise write.
     conn.execute(
         "CREATE TABLE IF NOT EXISTS access_requests (
             id                 TEXT PRIMARY KEY NOT NULL,
@@ -467,9 +452,8 @@ async fn create_auth_tables(conn: &Connection) -> Result<(), libsql::Error> {
             state              TEXT NOT NULL DEFAULT 'pending',
             resulting_user_id  TEXT REFERENCES users(id) ON DELETE SET NULL,
             created_at         TEXT NOT NULL,
-            decided_at         TEXT,
-            collected_at       TEXT
-        )",
+            decided_at         TEXT
+        , collected_at TEXT)",
         (),
     )
     .await?;
@@ -480,44 +464,6 @@ async fn create_auth_tables(conn: &Connection) -> Result<(), libsql::Error> {
     )
     .await?;
 
-    Ok(())
-}
-
-/// v5 -> v6 (T6): `access_requests.collected_at` didn't exist in the v5 DDL
-/// above, so a database that already ran `create_auth_tables` at v5 needs an
-/// explicit `ALTER TABLE` to add it. Guarded by a `pragma_table_info` check
-/// (same introspection pattern used elsewhere in this file) rather than
-/// running the `ALTER TABLE` unconditionally: a database that jumps straight
-/// from v4 to the current version runs this step *after* the `4 -> 5` step
-/// above, whose `create_auth_tables` DDL already includes `collected_at` (it
-/// is shared verbatim with a fresh create) — an unconditional `ALTER TABLE`
-/// would then fail with "duplicate column name" on that path. A database
-/// that was already at v5 before this ticket, on the other hand, genuinely
-/// needs the column added here.
-async fn add_access_requests_collected_at_column(conn: &Connection) -> Result<(), libsql::Error> {
-    let mut rows = conn
-        .query(
-            "SELECT COUNT(*) FROM pragma_table_info('access_requests') WHERE name = 'collected_at'",
-            (),
-        )
-        .await?;
-    let already_present: i64 = rows.next().await?.and_then(|r| r.get(0).ok()).unwrap_or(0);
-    if already_present > 0 {
-        return Ok(());
-    }
-    conn.execute(
-        "ALTER TABLE access_requests ADD COLUMN collected_at TEXT",
-        (),
-    )
-    .await?;
-    Ok(())
-}
-
-async fn set_user_version(conn: &Connection) -> Result<(), libsql::Error> {
-    // `PRAGMA user_version = N` is idempotent. Use query() not execute()
-    // because PRAGMAs may return rows.
-    conn.query(&format!("PRAGMA user_version = {SCHEMA_VERSION}"), ())
-        .await?;
     Ok(())
 }
 
@@ -534,99 +480,6 @@ pub(crate) async fn get_schema_version(conn: &Connection) -> Result<i64, libsql:
         Some(row) => row.get::<i64>(0),
         None => Ok(0),
     }
-}
-
-// ---------------------------------------------------------------------------
-// Stepwise migration runner (D13: never destructive)
-// ---------------------------------------------------------------------------
-
-/// A single migration step from schema version `from` to `to`.
-///
-/// `run` performs the additive DDL only — the caller (`run_migrations`) wraps
-/// it in a transaction and bumps `PRAGMA user_version` atomically alongside
-/// it, so a failure partway through leaves the database at the last
-/// successfully completed version, never partially upgraded.
-pub struct Migration {
-    pub from: i64,
-    pub to: i64,
-    run: MigrationFn,
-}
-
-type MigrationFn = for<'a> fn(
-    &'a Connection,
-) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<(), libsql::Error>> + Send + 'a>,
->;
-
-/// Ordered migration list, keyed by the version each step starts from.
-///
-/// Every step reuses the same DDL helper(s) `create_schema` itself calls
-/// where possible, so a freshly created database and a migrated one
-/// converge on an identical schema (D13). A schema version with no entry
-/// here — older than the oldest step, or newer than `SCHEMA_VERSION` — has
-/// no migration path; `run_migrations` returns a hard error rather than
-/// dropping data.
-pub const MIGRATIONS: &[Migration] = &[
-    Migration {
-        from: 4,
-        to: 5,
-        run: |conn| Box::pin(create_auth_tables(conn)),
-    },
-    Migration {
-        from: 5,
-        to: 6,
-        run: |conn| Box::pin(add_access_requests_collected_at_column(conn)),
-    },
-];
-
-/// Migrate `conn` from `current_version` up to `target_version`, one step at
-/// a time, per `MIGRATIONS`.
-///
-/// Each step runs inside its own `BEGIN`/`COMMIT` transaction that also
-/// bumps `PRAGMA user_version`, so a mid-step failure rolls back cleanly and
-/// leaves the prior version's data completely intact — never a silent data
-/// loss (D13). A version with no migration path is a hard error instructing
-/// the user to recreate or reindex, returned *before* any transaction is
-/// opened, so the database is left byte-for-byte untouched.
-pub(crate) async fn run_migrations(
-    conn: &Connection,
-    mut current_version: i64,
-    target_version: i64,
-) -> Result<(), Error> {
-    while current_version < target_version {
-        let step = MIGRATIONS
-            .iter()
-            .find(|m| m.from == current_version)
-            .ok_or_else(|| Error::InvalidConfig {
-                message: format!(
-                    "database schema version {current_version} has no migration path to \
-                     v{target_version}; this build cannot upgrade it automatically — \
-                     delete the database and re-run `localdb index` to recreate it, \
-                     or restore from a backup taken before this version"
-                ),
-            })?;
-
-        conn.execute("BEGIN", ()).await.map_err(map_libsql_err)?;
-        let result: Result<(), libsql::Error> = async {
-            (step.run)(conn).await?;
-            conn.query(&format!("PRAGMA user_version = {}", step.to), ())
-                .await?;
-            Ok(())
-        }
-        .await;
-
-        match result {
-            Ok(()) => {
-                conn.execute("COMMIT", ()).await.map_err(map_libsql_err)?;
-                current_version = step.to;
-            }
-            Err(e) => {
-                let _ = conn.execute("ROLLBACK", ()).await;
-                return Err(map_libsql_err(e));
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Drop all user-created tables, indexes, triggers, and virtual tables so the
@@ -678,28 +531,6 @@ pub(crate) async fn drop_all_tables(conn: &Connection) -> Result<(), libsql::Err
     // Reset user_version to 0.
     conn.query("PRAGMA user_version = 0", ()).await?;
 
-    Ok(())
-}
-
-/// Test-only helper: build the pre-auth (v4) schema directly, without the
-/// auth tables `create_schema` now also creates, and stamp `user_version =
-/// 4`. Used to construct a realistic "old" database for migration tests —
-/// reuses the same per-table DDL functions `create_schema` calls, so it
-/// stays in lockstep with the actual v4 shape instead of duplicating DDL.
-#[cfg(test)]
-pub(crate) async fn create_pre_auth_schema_v4_for_test(
-    conn: &Connection,
-) -> Result<(), libsql::Error> {
-    create_stores(conn).await?;
-    create_sources(conn).await?;
-    create_resources(conn).await?;
-    create_blocks(conn).await?;
-    create_chunks(conn, 4, VectorEncoding::Float32).await?;
-    create_fts(conn).await?;
-    create_triggers(conn).await?;
-    create_sync_state(conn).await?;
-    create_credentials(conn).await?;
-    conn.query("PRAGMA user_version = 4", ()).await?;
     Ok(())
 }
 
@@ -1040,137 +871,6 @@ mod tests {
             row.is_some(),
             "store A's resource should still exist after deleting store B"
         );
-    }
-
-    // -----------------------------------------------------------------
-    // Migration runner (D13: stepwise, never destructive)
-    // -----------------------------------------------------------------
-
-    /// The `4 -> 5` migration adds the auth tables and preserves every
-    /// pre-existing row — the whole point of D13.
-    #[tokio::test]
-    async fn migrate_v4_to_v5_adds_auth_tables_and_preserves_existing_rows() {
-        let (_dir, conn) = open_test_db().await;
-        create_pre_auth_schema_v4_for_test(&conn).await.unwrap();
-
-        // Confirm the auth tables genuinely don't exist yet pre-migration.
-        let names_before = table_names(&conn).await;
-        assert!(
-            !names_before.contains("auth_tokens"),
-            "auth_tokens should not exist before migration"
-        );
-
-        // Real pre-existing data that must survive the migration untouched.
-        insert_two_stores_and_sources(&conn).await;
-        conn.execute(
-            "INSERT INTO resources \
-             (store_id, id, source_id, ingestor_kind, resource_kind, uri, \
-              content_hash, added_at, modified_at, origin_store, policy_version, \
-              metadata_json, extractor_version) \
-             VALUES \
-             ('store-a', 'res-1', 'src-a', 'path', 'file', 'file:///doc.md', \
-              'abc', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', 'store-a', '1', \
-              '{}', '1')",
-            (),
-        )
-        .await
-        .unwrap();
-
-        let v = get_schema_version(&conn).await.unwrap();
-        assert_eq!(v, 4);
-
-        run_migrations(&conn, v, SCHEMA_VERSION).await.unwrap();
-
-        let v_after = get_schema_version(&conn).await.unwrap();
-        assert_eq!(v_after, SCHEMA_VERSION);
-
-        let names_after = table_names(&conn).await;
-        for expected in [
-            "users",
-            "auth_tokens",
-            "oauth_clients",
-            "auth_codes",
-            "store_grants",
-            "invites",
-            "access_requests",
-        ] {
-            assert!(
-                names_after.contains(expected),
-                "expected auth table '{expected}' after migration; have: {names_after:?}"
-            );
-        }
-
-        // Pre-existing rows are untouched.
-        let mut rows = conn.query("SELECT COUNT(*) FROM stores", ()).await.unwrap();
-        let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
-        assert_eq!(count, 2, "both pre-existing stores must survive");
-
-        let mut rows = conn
-            .query("SELECT COUNT(*) FROM resources WHERE id = 'res-1'", ())
-            .await
-            .unwrap();
-        let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
-        assert_eq!(count, 1, "pre-existing resource must survive");
-    }
-
-    /// Migrating an already-current (v5) database is a no-op: the loop body
-    /// never runs because `current_version == target_version`.
-    #[tokio::test]
-    async fn migrate_noop_when_already_current() {
-        let (_dir, conn) = open_test_db().await;
-        create_schema(&conn, 4, VectorEncoding::Float32)
-            .await
-            .unwrap();
-        run_migrations(&conn, SCHEMA_VERSION, SCHEMA_VERSION)
-            .await
-            .unwrap();
-        assert_eq!(get_schema_version(&conn).await.unwrap(), SCHEMA_VERSION);
-    }
-
-    /// Versions 1-3 predate this migration list entirely: there is no step
-    /// starting from them, so `run_migrations` must hard-error rather than
-    /// guess. The database must be left completely untouched — no tables
-    /// dropped, no partial DDL applied, version unchanged.
-    #[tokio::test]
-    async fn versions_with_no_migration_path_error_and_leave_db_untouched() {
-        for old_version in [1i64, 2, 3] {
-            let (_dir, conn) = open_test_db().await;
-            // A pre-v4 database wouldn't have the full v4 shape, but all we
-            // need here is *some* user table plus the stamped version, to
-            // prove nothing about it changes.
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS legacy_marker (id TEXT PRIMARY KEY)",
-                (),
-            )
-            .await
-            .unwrap();
-            conn.execute("INSERT INTO legacy_marker (id) VALUES ('keep-me')", ())
-                .await
-                .unwrap();
-            conn.query(&format!("PRAGMA user_version = {old_version}"), ())
-                .await
-                .unwrap();
-
-            let result = run_migrations(&conn, old_version, SCHEMA_VERSION).await;
-            match result {
-                Err(Error::InvalidConfig { message }) => {
-                    assert!(
-                        message.contains("no migration path"),
-                        "error should explain the lack of a migration path: {message}"
-                    );
-                }
-                other => panic!("expected InvalidConfig for version {old_version}, got: {other:?}"),
-            }
-
-            // Nothing was touched: version unchanged, marker row still there.
-            assert_eq!(get_schema_version(&conn).await.unwrap(), old_version);
-            let mut rows = conn
-                .query("SELECT COUNT(*) FROM legacy_marker", ())
-                .await
-                .unwrap();
-            let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
-            assert_eq!(count, 1, "pre-existing data must be untouched on error");
-        }
     }
 
     /// drop_all_tables leaves the DB empty and with user_version=0.
