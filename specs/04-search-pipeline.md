@@ -371,13 +371,30 @@ behavior).
   are pushed down to the backend where supported.
 
   **Known limitation — cross-store score comparability.** Pooling ranks each leg by its raw
-  backend score. That is sound for the dense leg (cosine similarity is comparable across
-  stores) but only approximate for BM25, whose scores are corpus-relative (per-store IDF and
-  average document length). So a pooled BM25 ranking compares numbers that are not strictly
-  commensurable, and cross-store ordering within that leg is correspondingly approximate.
-  Global pooling is still strictly better than per-store RRF — which gave *every* store's
-  local rank-0 chunk an identical score regardless of quality — but multi-store relevance is
-  not fully solved until scores are calibrated. Tracked by issue #40; see also §"Rejected"
+  backend score, which assumes every store queried together reports that leg's scores on the
+  same scale. Two ways that assumption is imperfect:
+
+  - **BM25** scores are corpus-relative (per-store IDF and average document length), so a
+    pooled BM25 ranking compares numbers that are not strictly commensurable even when every
+    store runs the same backend. Cross-store ordering within that leg is therefore
+    approximate.
+  - **Dense** scores land in `[0, 1]`, but not via one common mapping. `store-libsql`
+    converts distance to score two ways, chosen per store by the encoding its embedder
+    produced: `1 - d/2` from a continuous cosine distance (`VectorEncoding::Float32`), and
+    `1 - d/nbits` from a sign-only binarized Hamming distance (`VectorEncoding::Binary`) —
+    the latter being what the default `pplx-embed-context-v1-0.6b` emits. Same range,
+    different distributions, so pooling across a Binary-encoded and a Float32-encoded store
+    would favor whichever mapping runs hotter rather than whichever store is more relevant.
+    The two shipped models differ in dimensionality (1024 vs 384) so one query cannot
+    currently reach both, but nothing enforces that. Separately, `SearchResult.score`
+    documents the leg as "cosine/dot-product": an unbounded dot-product would swamp a bounded
+    score outright, and is in any case wrong for the default model, whose vectors are
+    unnormalized and which documents cosine as required. Dense scores must be a bounded
+    similarity in `[0, 1]` — a precondition of pooling, not a free choice.
+
+  Global pooling is still strictly better than per-store RRF, which gave *every* store's
+  local rank-0 chunk an identical score regardless of quality. But multi-store relevance is
+  not fully solved until both legs are calibrated. Tracked by issue #40; see also §"Rejected"
   above on score interpolation.
 - **Result shaping:** top-N (default 10) → Citation objects
   ([02-domain-model.md](02-domain-model.md) §6), with per-leg scores retained for debugging
