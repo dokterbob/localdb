@@ -53,10 +53,11 @@ fn drop_chunks_block_id_and_retag_resource_metadata_up(_ctx: &MigrationContext) 
 ///
 /// Ported from the `auth` branch's (issue #98) `store-libsql/src/schema.rs`
 /// `create_auth_tables`, converted from that branch's own ad-hoc
-/// `Migration`/`MIGRATIONS`/`run_migrations` runner to this chain framework
-/// (see `docs/migrations.md`'s "Consumer recipe: `auth` branch"). `auth`'s
-/// v5/v6 slots renumber to v6/v7 here since PR #151 claimed v5 first (see
-/// that doc's "Renumber" note).
+/// `Migration`/`MIGRATIONS`/`run_migrations` runner to this chain framework.
+/// `auth`'s v5/v6 slots renumber to v6/v7 here since PR #151 claimed v5
+/// first — see `docs/migrations.md`'s "Picking the next version". The
+/// round-trip is exercised end to end by
+/// `store-libsql/tests/real_migrations.rs`.
 ///
 /// `access_requests` here does **not** include `collected_at` — that column
 /// arrives in `v7` below. Including it here would make `v7`'s `ALTER TABLE
