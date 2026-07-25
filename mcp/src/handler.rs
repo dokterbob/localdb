@@ -305,9 +305,10 @@ impl McpHandler {
         self.get_document_inner(args, &ctx.extensions).await
     }
 
-    /// Fetch a document's chunks in order, paginated by offset/limit.
+    /// Fetch a document's chunks in order, paginated by offset/limit or by
+    /// an anchor (anchor_chunk_id / anchor_block_seq) centered window.
     #[tool(
-        description = "Fetch a document's chunks in order (block_seq, seq_in_block), paginated by offset/limit."
+        description = "Fetch a document's chunks in order (block_seq, seq_in_block), paginated by offset/limit, or by an anchor_chunk_id/anchor_block_seq centered window (mutually exclusive with offset and with each other)."
     )]
     async fn get_chunks(
         &self,

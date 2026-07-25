@@ -3,6 +3,7 @@ members = [
     "core",
     "extract",
     "fetch",
+    "ingest",
     "store-libsql",
     "embed",
     "server",
@@ -84,6 +85,7 @@ schemars = "1.0"
 localdb-core = { path = "core" }
 extract = { path = "extract" }
 fetch = { path = "fetch" }
+ingest = { path = "ingest" }
 store-libsql = { path = "store-libsql" }
 embed = { path = "embed" }
 server = { path = "server" }

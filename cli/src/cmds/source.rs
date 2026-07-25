@@ -9,8 +9,7 @@ use crate::{
     cmds::index::{run_embedded_index, IndexErrorMode},
     daemon_client::{daemon_request_async, probe_daemon, CliContext, DaemonState},
     normalize::{
-        classify_source, exit_err, looks_like_id, print_json, source_kind_to_string,
-        validate_store_name,
+        classify_source, exit_err, kind_to_string, looks_like_id, print_json, validate_store_name,
     },
 };
 
@@ -147,7 +146,7 @@ pub(crate) async fn run_source_add_async(
             "status": "ok",
             "id": src.id,
             "store": { "name": store_name },
-            "kind": source_kind_to_string(&src.kind),
+            "kind": kind_to_string(&src.kind),
         }));
     } else {
         println!("Added source {} to store '{}'", src.id, store_name);
@@ -243,7 +242,7 @@ pub(crate) async fn run_source_list_async(ctx: &CliContext) {
                     "id": s.id,
                     "store": { "name": store_name },
                     "store_id": s.store_id,
-                    "kind": source_kind_to_string(&s.kind),
+                    "kind": kind_to_string(&s.kind),
                     "root": s.root,
                     "url": s.url,
                     "preset": s.preset,
@@ -256,7 +255,7 @@ pub(crate) async fn run_source_list_async(ctx: &CliContext) {
     } else {
         for s in &sources {
             let loc = s.root.as_deref().or(s.url.as_deref()).unwrap_or("?");
-            println!("{} [{}] {}", s.id, source_kind_to_string(&s.kind), loc);
+            println!("{} [{}] {}", s.id, kind_to_string(&s.kind), loc);
         }
     }
 }

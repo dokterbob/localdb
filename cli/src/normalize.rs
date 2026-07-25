@@ -76,7 +76,7 @@ pub(crate) fn visibility_to_string(visibility: &StoreVisibility) -> &'static str
     }
 }
 
-pub(crate) fn source_kind_to_string(kind: &SourceKind) -> &'static str {
+pub(crate) fn kind_to_string(kind: &SourceKind) -> &'static str {
     match kind {
         SourceKind::Path => "path",
         SourceKind::Url => "url",
@@ -142,7 +142,7 @@ pub fn source_row_to_core_source(src: &SourceRow) -> localdb_core::types::Source
         store_id: src.store_id.clone(),
         kind: src.kind.clone(),
         spec,
-        source_kind_preset: src.preset.clone(),
+        source_preset: src.preset.clone(),
     }
 }
 

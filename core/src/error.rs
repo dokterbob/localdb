@@ -23,9 +23,9 @@ pub enum Error {
     #[error("source not found: {id}")]
     SourceNotFound { id: String },
 
-    /// Unknown document entity.
-    #[error("document not found: {id}")]
-    DocumentNotFound { id: String },
+    /// Unknown document/resource entity.
+    #[error("resource not found: {id}")]
+    ResourceNotFound { id: String },
 
     /// Unknown job entity.
     #[error("job not found: {id}")]
@@ -121,7 +121,7 @@ impl Error {
         match self {
             Error::StoreNotFound { .. } => "store_not_found",
             Error::SourceNotFound { .. } => "source_not_found",
-            Error::DocumentNotFound { .. } => "document_not_found",
+            Error::ResourceNotFound { .. } => "resource_not_found",
             Error::JobNotFound { .. } => "job_not_found",
             Error::RuntimeStateLocked => "runtime_state_locked",
             Error::DaemonRunning => "daemon_running",
@@ -146,7 +146,7 @@ impl Error {
             Error::InvalidConfig { .. } | Error::InvalidRequest { .. } => 2,
             Error::StoreNotFound { .. }
             | Error::SourceNotFound { .. }
-            | Error::DocumentNotFound { .. }
+            | Error::ResourceNotFound { .. }
             | Error::JobNotFound { .. } => 3,
             Error::RuntimeStateLocked | Error::DaemonRunning | Error::IndexInProgress => 4,
             Error::DaemonUnreachable
@@ -177,8 +177,8 @@ mod tests {
                 3,
             ),
             (
-                Error::DocumentNotFound { id: "x".into() },
-                "document_not_found",
+                Error::ResourceNotFound { id: "x".into() },
+                "resource_not_found",
                 3,
             ),
             (Error::JobNotFound { id: "x".into() }, "job_not_found", 3),
@@ -283,7 +283,7 @@ mod tests {
     fn all_not_found_variants_exit_3() {
         assert_eq!(Error::StoreNotFound { id: "s".into() }.exit_code(), 3);
         assert_eq!(Error::SourceNotFound { id: "s".into() }.exit_code(), 3);
-        assert_eq!(Error::DocumentNotFound { id: "s".into() }.exit_code(), 3);
+        assert_eq!(Error::ResourceNotFound { id: "s".into() }.exit_code(), 3);
         assert_eq!(Error::JobNotFound { id: "s".into() }.exit_code(), 3);
     }
 

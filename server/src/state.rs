@@ -745,7 +745,7 @@ mod tests {
 
         let chunk = localdb_core::ChunkRecord {
             id: "chunk-1".to_string(),
-            document_id: "doc-1".to_string(),
+            resource_id: "doc-1".to_string(),
             store_id: store_id.clone(),
             text: "hello world rust programming".to_string(),
             span: localdb_core::types::Span::new(0, 30),
@@ -756,13 +756,14 @@ mod tests {
             content_hash: "abc".to_string(),
             origin_store: store_id.clone(),
             source_id: source.id,
-            source_kind: "path".to_string(),
+            ingestor_kind: "path".to_string(),
             mime: Some("text/plain".to_string()),
             uri: "file:///test.md".to_string(),
-            metadata: localdb_core::DocumentMetadata::default(),
+            metadata: localdb_core::metadata::Metadata::default(),
             block_seq: 0,
             seq_in_block: 0,
             block_kind: None,
+            window_block_seqs: vec![],
         };
 
         let handle = state.backend().retrieval_store(&store_id).await.unwrap();

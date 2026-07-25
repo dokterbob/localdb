@@ -1,5 +1,6 @@
 use tempfile::tempdir;
 
+use localdb_core::block::{Block, BlockKind, BlockLocation};
 use localdb_core::store::conformance;
 use localdb_core::store::{ChunkRecord, MetadataFilter};
 use localdb_core::types::{SourceKind, Span, StoreVisibility};
@@ -76,10 +77,52 @@ async fn upsert_replaces_existing() {
 }
 
 #[tokio::test]
-async fn delete_by_document() {
+async fn delete_by_resource() {
     let (_dir, db) = setup().await;
     let handle = db.retrieval_store("store-1").await.unwrap();
-    conformance::test_delete_by_document(handle.as_ref()).await;
+    conformance::test_delete_by_resource(handle.as_ref()).await;
+}
+
+/// Regression test for issue C1: `delete_by_resource` must remove BOTH the
+/// chunk rows and the resource row atomically. Before the fix, the chunk
+/// DELETE and resource DELETE ran as two separate autocommit statements, so a
+/// process kill between them could leave an orphaned `resources` row with
+/// zero chunks — `list_indexed_documents` would then report the document as
+/// still indexed at a stale `content_hash`. This test asserts that after a
+/// successful `delete_by_resource` call, the resource is gone from both
+/// `stats()` and `list_indexed_documents()`, not just from the chunk count.
+#[tokio::test]
+async fn delete_by_resource_removes_chunks_and_resource_row() {
+    let (_dir, db) = setup().await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+
+    let records = vec![
+        make_record("chunk-1", "doc-1", "store-1", vec![1.0, 0.0]),
+        make_record("chunk-2", "doc-2", "store-1", vec![0.0, 1.0]),
+    ];
+    handle.upsert_chunks(records).await.unwrap();
+
+    let before = handle.list_indexed_documents().await.unwrap();
+    assert!(before.iter().any(|d| d.resource_id == "doc-1"));
+    assert!(before.iter().any(|d| d.resource_id == "doc-2"));
+
+    let deleted = handle.delete_by_resource("doc-1").await.unwrap();
+    assert_eq!(deleted, 1, "should delete 1 chunk from doc-1");
+
+    let stats = handle.stats().await.unwrap();
+    assert_eq!(stats.chunk_count, 1, "only doc-2 chunk remains");
+    assert_eq!(
+        stats.document_count, 1,
+        "doc-1's resource row must be gone, not just its chunks"
+    );
+
+    let after = handle.list_indexed_documents().await.unwrap();
+    assert!(
+        !after.iter().any(|d| d.resource_id == "doc-1"),
+        "doc-1 must not be reported as indexed after delete_by_resource \
+         (would indicate an orphaned resources row with a stale content_hash)"
+    );
+    assert!(after.iter().any(|d| d.resource_id == "doc-2"));
 }
 
 #[tokio::test]
@@ -125,10 +168,24 @@ async fn get_chunk() {
 }
 
 #[tokio::test]
-async fn get_chunks_for_document() {
+async fn window_block_seqs_round_trip() {
     let (_dir, db) = setup().await;
     let handle = db.retrieval_store("store-1").await.unwrap();
-    conformance::test_get_chunks_for_document(handle.as_ref()).await;
+    conformance::test_window_block_seqs_round_trip(handle.as_ref()).await;
+}
+
+#[tokio::test]
+async fn blocks_round_trip_ordered() {
+    let (_dir, db) = setup().await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+    conformance::test_blocks_round_trip_ordered(handle.as_ref()).await;
+}
+
+#[tokio::test]
+async fn get_chunks_for_resource() {
+    let (_dir, db) = setup().await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+    conformance::test_get_chunks_for_resource(handle.as_ref()).await;
 }
 
 #[tokio::test]
@@ -166,12 +223,25 @@ async fn delete_by_store_cross_handle() {
     let deleted = handle_a.delete_by_store("store-A").await.unwrap();
     assert_eq!(deleted, 2, "delete_by_store should remove 2 store-A chunks");
 
-    assert_eq!(handle_a.stats().await.unwrap().chunk_count, 0);
+    let stats_a = handle_a.stats().await.unwrap();
+    assert_eq!(stats_a.chunk_count, 0);
+    // Regression for issue C1: delete_by_store issued its chunk-DELETE and
+    // resource-DELETE as two separate autocommit statements. Assert the
+    // resource rows are gone too (via both document_count and
+    // list_indexed_documents), not just the chunks.
     assert_eq!(
-        handle_b.stats().await.unwrap().chunk_count,
-        1,
-        "store-B should be untouched"
+        stats_a.document_count, 0,
+        "store-A's resource rows must be gone, not just its chunks"
     );
+    assert!(
+        handle_a.list_indexed_documents().await.unwrap().is_empty(),
+        "store-A must report no indexed documents after delete_by_store \
+         (would indicate orphaned resources rows with stale content_hash)"
+    );
+
+    let stats_b = handle_b.stats().await.unwrap();
+    assert_eq!(stats_b.chunk_count, 1, "store-B should be untouched");
+    assert_eq!(stats_b.document_count, 1, "store-B should be untouched");
 }
 
 #[tokio::test]
@@ -394,10 +464,10 @@ async fn replace_document() {
 }
 
 #[tokio::test]
-async fn replace_same_document_id() {
+async fn replace_same_resource_id() {
     let (_dir, db) = setup().await;
     let handle = db.retrieval_store("store-1").await.unwrap();
-    conformance::test_replace_same_document_id(handle.as_ref()).await;
+    conformance::test_replace_same_resource_id(handle.as_ref()).await;
 }
 
 /// Issue #79 (WI-1): the replace delete must run *inside* the same
@@ -433,7 +503,7 @@ async fn replace_rolls_back_old_document_on_write_failure() {
 
     // doc-a's chunk must still be present: the delete must have rolled back
     // along with the failed insert, not already committed on its own.
-    let remaining_a = handle.get_chunks_for_document("doc-a").await.unwrap();
+    let remaining_a = handle.get_chunks_for_resource("doc-a").await.unwrap();
     assert_eq!(
         remaining_a.len(),
         1,
@@ -442,7 +512,7 @@ async fn replace_rolls_back_old_document_on_write_failure() {
     assert_eq!(remaining_a[0].id, "chunk-a1");
 
     // doc-b must be absent — the failed insert must not have partially landed.
-    let remaining_b = handle.get_chunks_for_document("doc-b").await.unwrap();
+    let remaining_b = handle.get_chunks_for_resource("doc-b").await.unwrap();
     assert!(
         remaining_b.is_empty(),
         "doc-b should not have been inserted after a failed replace"
@@ -481,6 +551,285 @@ async fn find_document_errors_when_id_exists_in_multiple_stores() {
     );
 }
 
+/// Coverage: a per-record write failure *inside* the `upsert_chunks`
+/// transaction (as opposed to the pre-`BEGIN` tenant-ownership check) must
+/// roll back the whole batch, including records that would otherwise have
+/// landed successfully earlier in the same call. Forces an FK violation
+/// (nonexistent `source_id`) on the second record.
+#[tokio::test]
+async fn upsert_chunks_rolls_back_batch_on_write_failure() {
+    let (_dir, db) = setup().await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+
+    let good = make_record("chunk-good", "doc-good", "store-1", vec![1.0, 0.0]);
+    let mut bad = make_record("chunk-bad", "doc-bad", "store-1", vec![0.0, 1.0]);
+    bad.source_id = "nonexistent-src".to_string();
+
+    let result = handle.upsert_chunks(vec![good, bad]).await;
+    assert!(
+        result.is_err(),
+        "FK violation on the second record should surface as an error"
+    );
+
+    let stats = handle.stats().await.unwrap();
+    assert_eq!(
+        stats.chunk_count, 0,
+        "the whole batch must roll back, including the earlier valid record"
+    );
+}
+
+/// Coverage: the standalone `RetrievalStore::upsert_blocks` trait method
+/// (not routed through `upsert_chunks_and_blocks`) writes rows into `blocks`
+/// and supports the `ON CONFLICT ... DO UPDATE` re-upsert path. Exercises
+/// both the `Some(location)` and `None` location branches.
+#[tokio::test]
+async fn upsert_blocks_direct_through_trait() {
+    let (_dir, db) = setup().await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+
+    // The resource row must already exist (written by upsert_chunks).
+    handle
+        .upsert_chunks(vec![make_record(
+            "chunk-1",
+            "doc-blocks",
+            "store-1",
+            vec![1.0, 0.0],
+        )])
+        .await
+        .unwrap();
+
+    let blocks = vec![
+        Block {
+            seq: 0,
+            kind: BlockKind::Text,
+            text: "first block".to_string(),
+            location: Some(BlockLocation {
+                line_start: Some(1),
+                ..Default::default()
+            }),
+        },
+        Block {
+            seq: 1,
+            kind: BlockKind::Heading { level: 2 },
+            text: "second block".to_string(),
+            location: None,
+        },
+    ];
+
+    handle
+        .upsert_blocks("store-1", "doc-blocks", &blocks)
+        .await
+        .unwrap();
+
+    // Re-upsert with changed text to exercise the ON CONFLICT DO UPDATE path.
+    let mut updated = blocks;
+    updated[0].text = "first block, updated".to_string();
+    handle
+        .upsert_blocks("store-1", "doc-blocks", &updated)
+        .await
+        .unwrap();
+}
+
+/// Coverage: `upsert_chunks_and_blocks` performs the same pre-`BEGIN`
+/// tenant-ownership check as `upsert_chunks` — a cross-tenant record must be
+/// rejected before any write is attempted.
+#[tokio::test]
+async fn upsert_chunks_and_blocks_rejects_cross_tenant_record() {
+    let (_dir, db) = setup().await;
+    let handle = db.retrieval_store("store-A").await.unwrap();
+    let result = handle
+        .upsert_chunks_and_blocks(
+            "store-A",
+            "doc-cross",
+            vec![make_record(
+                "chunk-cross",
+                "doc-cross",
+                "store-B",
+                vec![0.5, 0.5],
+            )],
+            &[],
+            None,
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(Error::Internal {
+            correlation_id,
+            ..
+        }) if correlation_id == "store_handle_tenant_violation"
+    ));
+}
+
+/// Coverage: `upsert_chunks_and_blocks` with a non-empty `blocks` slice writes
+/// both chunks and blocks inside the same transaction (all prior conformance
+/// tests exercise this call with `blocks: &[]`, which never touches the block
+/// insert loop).
+#[tokio::test]
+async fn upsert_chunks_and_blocks_writes_blocks_in_same_transaction() {
+    let (_dir, db) = setup().await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+
+    let records = vec![make_record(
+        "chunk-1",
+        "doc-with-blocks",
+        "store-1",
+        vec![1.0, 0.0],
+    )];
+    let blocks = vec![
+        Block {
+            seq: 0,
+            kind: BlockKind::Text,
+            text: "body text".to_string(),
+            location: Some(BlockLocation {
+                page: Some(1),
+                ..Default::default()
+            }),
+        },
+        Block {
+            seq: 1,
+            kind: BlockKind::Text,
+            text: "quoted text".to_string(),
+            location: None,
+        },
+    ];
+
+    let written = handle
+        .upsert_chunks_and_blocks("store-1", "doc-with-blocks", records, &blocks, None)
+        .await
+        .unwrap();
+    assert_eq!(written, 1);
+}
+
+/// Regression test for issue C5: the original version of this test only
+/// asserted `upsert_chunks` returned `Ok` and bumped `stats().chunk_count` —
+/// it never actually read the vector back, so silent binary-encoding
+/// corruption (e.g. a bit-order bug in `f32_to_vector1bit_sql` /
+/// `binarize_msb`, or a broken decode path) would still pass. This version
+/// exercises the read path two ways: (1) a `dense_search` query against a
+/// `VectorEncoding::Binary` store, with two chunks whose embeddings binarize
+/// to different bit patterns, asserting each query vector's nearest neighbor
+/// (by Hamming distance, per `vectors::hamming_distance_to_score`) is the
+/// matching chunk with a near-perfect score; (2) `get_chunk`, asserting the
+/// decoded `embedding` — round-tripped through `vector_extract` on the
+/// `F1BIT_BLOB` column — reflects the binarized bits (`vectors::binarize_msb`:
+/// `>= 0.0` → 1, `< 0.0` → 0), not the original float magnitudes.
+#[tokio::test]
+async fn upsert_chunks_with_binary_encoding_round_trips_through_search_and_get_chunk() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("localdb.db");
+    let db = SqliteBackend::open(StoreBackendConfig::local_path(
+        path,
+        2,
+        VectorEncoding::Binary,
+    ))
+    .await
+    .unwrap();
+    db.upsert_store(&StoreRow {
+        id: "store-1".to_string(),
+        name: "store-1".to_string(),
+        visibility: StoreVisibility::Private,
+        backend: "libsql".to_string(),
+        indexing_policy: "{}".to_string(),
+        policy_version: "v1".to_string(),
+        acl: "{}".to_string(),
+        created_at: "2026-06-25T12:00:00Z".to_string(),
+    })
+    .await
+    .unwrap();
+    db.upsert_source(&SourceRow {
+        id: "src-1".to_string(),
+        store_id: "store-1".to_string(),
+        kind: SourceKind::Path,
+        root: Some("/test/binary".to_string()),
+        url: None,
+        include: vec![],
+        exclude: vec![],
+        preset: "prose".to_string(),
+        refresh: None,
+        created_at: "2026-06-25T12:00:00Z".to_string(),
+    })
+    .await
+    .unwrap();
+
+    let handle = db.retrieval_store("store-1").await.unwrap();
+    // Two chunks whose embeddings binarize to opposite bit patterns.
+    // `binarize_msb` thresholds on sign (`>= 0.0` → 1, `< 0.0` → 0), so
+    // `[0.3, -0.7]` → bits `10` and `[-0.2, 0.9]` → bits `01`. Using
+    // non-unit magnitudes (rather than already-binary `±1.0` values) means a
+    // successful round trip must genuinely reflect the *bit*, not just
+    // coincidentally echo back the original float — the decoded embedding
+    // (via `vector_extract` on the `F1BIT_BLOB` column) comes back as `±1.0`
+    // per bit, which differs from these original values whenever the
+    // magnitude isn't already 1.0.
+    let written = handle
+        .upsert_chunks(vec![
+            make_record("bin-chunk-1", "bin-doc-1", "store-1", vec![0.3, -0.7]),
+            make_record("bin-chunk-2", "bin-doc-2", "store-1", vec![-0.2, 0.9]),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(written, 2);
+
+    let stats = handle.stats().await.unwrap();
+    assert_eq!(stats.chunk_count, 2);
+
+    // (1) dense_search: a query vector matching chunk-1's bit pattern should
+    // retrieve chunk-1 as the top (and, with a Hamming distance of 0, near-
+    // perfect) hit, not chunk-2.
+    let hits = handle.dense_search(&[1.0, -1.0], 1, &[]).await.unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].chunk.id, "bin-chunk-1",
+        "query matching chunk-1's bit pattern should retrieve chunk-1"
+    );
+    assert!(
+        hits[0].score > 0.99,
+        "exact-match binary query should score near 1.0 (Hamming distance 0), got {}",
+        hits[0].score
+    );
+
+    // The opposite query vector should instead retrieve chunk-2.
+    let hits2 = handle.dense_search(&[-1.0, 1.0], 1, &[]).await.unwrap();
+    assert_eq!(hits2.len(), 1);
+    assert_eq!(
+        hits2[0].chunk.id, "bin-chunk-2",
+        "query matching chunk-2's bit pattern should retrieve chunk-2"
+    );
+    assert!(
+        hits2[0].score > 0.99,
+        "exact-match binary query should score near 1.0 (Hamming distance 0), got {}",
+        hits2[0].score
+    );
+
+    // (2) get_chunk: the decoded embedding must reflect the binarized bits
+    // (sign → ±1.0), not the original float magnitudes — proving the
+    // stored/decoded F1BIT_BLOB actually carries the right bit pattern
+    // rather than e.g. all-zeros or a reversed encoding.
+    let chunk1 = handle
+        .get_chunk("bin-chunk-1")
+        .await
+        .unwrap()
+        .expect("bin-chunk-1 must be found");
+    assert_eq!(
+        chunk1.embedding,
+        vec![1.0, -1.0],
+        "decoded embedding for [0.3, -0.7] must be the binarized bits [1.0, -1.0], got {:?}",
+        chunk1.embedding
+    );
+
+    let chunk2 = handle
+        .get_chunk("bin-chunk-2")
+        .await
+        .unwrap()
+        .expect("bin-chunk-2 must be found");
+    assert_eq!(
+        chunk2.embedding,
+        vec![-1.0, 1.0],
+        "decoded embedding for [-0.2, 0.9] must be the binarized bits [-1.0, 1.0], got {:?}",
+        chunk2.embedding
+    );
+}
+
 fn make_record(id: &str, doc_id: &str, store_id: &str, embedding: Vec<f32>) -> ChunkRecord {
     let text = format!("text for {id}");
     // Derive a source_id that belongs to this store:
@@ -490,7 +839,7 @@ fn make_record(id: &str, doc_id: &str, store_id: &str, embedding: Vec<f32>) -> C
     let source_id = store_id.replacen("store-", "src-", 1);
     ChunkRecord {
         id: id.to_string(),
-        document_id: doc_id.to_string(),
+        resource_id: doc_id.to_string(),
         store_id: store_id.to_string(),
         text: text.clone(),
         span: Span::new(0, text.len()),
@@ -501,12 +850,13 @@ fn make_record(id: &str, doc_id: &str, store_id: &str, embedding: Vec<f32>) -> C
         content_hash: "abc123".to_string(),
         origin_store: store_id.to_string(),
         source_id,
-        source_kind: "path".to_string(),
+        ingestor_kind: "path".to_string(),
         mime: Some("text/plain".to_string()),
         uri: format!("file:///{store_id}/{doc_id}.md"),
-        metadata: localdb_core::parser::DocumentMetadata::default(),
+        metadata: localdb_core::metadata::Metadata::default(),
         block_seq: 0,
         seq_in_block: 0,
         block_kind: None,
+        window_block_seqs: vec![],
     }
 }

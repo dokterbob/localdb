@@ -2,7 +2,7 @@
 //!
 //! The result is **advisory**: a wrong guess never overrides a parser's own
 //! magic-byte or extension decision. It is passed into `Probe.sniffed_mime`
-//! and written to `DocumentMetadata.format` when a parser doesn't determine it itself.
+//! and written to `DublinCoreMetadata.format` when a parser doesn't determine it itself.
 
 /// Sniff the MIME type from raw bytes and/or filename.
 ///

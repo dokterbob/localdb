@@ -11,7 +11,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::citation::{Citation, CitationProvenance, CitationStore, Score};
+use crate::citation::{
+    ChunkPosition, Citation, CitationBlock, CitationLocation, CitationProvenance, CitationStore,
+    Score,
+};
 use crate::embedder::{DocumentChunks, Embedder};
 use crate::error::Error;
 use crate::store::{ChunkRecord, MetadataFilter, RetrievalStore, SearchResult};
@@ -178,17 +181,27 @@ pub fn rerank_noop(results: Vec<FusedChunkEntry>) -> Vec<FusedChunkEntry> {
 pub fn shape_citation(fused: FusedChunkEntry, store_id: String, store_name: String) -> Citation {
     Citation {
         chunk_id: fused.chunk.id.clone(),
-        document_id: fused.chunk.document_id.clone(),
+        resource_id: fused.chunk.resource_id.clone(),
         store: CitationStore {
             id: store_id,
             name: store_name,
         },
         uri: fused.chunk.uri.clone(),
-        title: fused.chunk.metadata.title.clone(),
+        title: fused.chunk.metadata.title().map(|s| s.to_string()),
         heading_path: fused.chunk.heading_path.clone(),
-        span: Span {
-            start: fused.chunk.span.start,
-            end: fused.chunk.span.end,
+        block: CitationBlock {
+            seq: fused.chunk.block_seq,
+            kind: fused.chunk.block_kind.clone(),
+        },
+        chunk_position: ChunkPosition {
+            seq_in_block: fused.chunk.seq_in_block,
+        },
+        location: CitationLocation {
+            span: Span {
+                start: fused.chunk.span.start,
+                end: fused.chunk.span.end,
+            },
+            window_block_seqs: fused.chunk.window_block_seqs.clone(),
         },
         snippet: fused.chunk.text.clone(),
         score: Score {
@@ -201,8 +214,6 @@ pub fn shape_citation(fused: FusedChunkEntry, store_id: String, store_name: Stri
             content_hash: fused.chunk.content_hash.clone(),
         },
         metadata: fused.chunk.metadata.clone(),
-        block_seq: Some(fused.chunk.block_seq),
-        block_kind: fused.chunk.block_kind.clone(),
     }
 }
 
@@ -376,7 +387,7 @@ mod tests {
     ) -> ChunkRecord {
         ChunkRecord {
             id: id.to_string(),
-            document_id: doc_id.to_string(),
+            resource_id: doc_id.to_string(),
             store_id: store_id.to_string(),
             text: text.to_string(),
             span: Span::new(0, text.len()),
@@ -387,13 +398,14 @@ mod tests {
             content_hash: "abc123".to_string(),
             origin_store: store_id.to_string(),
             source_id: "src-1".to_string(),
-            source_kind: "path".to_string(),
+            ingestor_kind: "path".to_string(),
             mime: Some("text/markdown".to_string()),
             uri: uri.to_string(),
-            metadata: crate::parser::DocumentMetadata::default(),
+            metadata: crate::metadata::Metadata::default(),
             block_seq: 0,
             seq_in_block: 0,
             block_kind: None,
+            window_block_seqs: vec![],
         }
     }
 
@@ -749,7 +761,7 @@ mod tests {
         let citation = shape_citation(entry, "store-A".to_string(), "my-store".to_string());
 
         assert_eq!(citation.chunk_id, "chunk-1");
-        assert_eq!(citation.document_id, "doc-1");
+        assert_eq!(citation.resource_id, "doc-1");
         assert_eq!(citation.store.id, "store-A");
         assert_eq!(citation.store.name, "my-store");
         assert_eq!(citation.uri, "file:///docs/guide.md");
@@ -757,14 +769,55 @@ mod tests {
             citation.heading_path,
             vec!["Overview".to_string(), "Details".to_string()]
         );
-        assert_eq!(citation.span.start, 0);
-        assert_eq!(citation.span.end, "The quick brown fox".len());
+        assert_eq!(citation.location.span.start, 0);
+        assert_eq!(citation.location.span.end, "The quick brown fox".len());
+        assert!(
+            citation.location.window_block_seqs.is_empty(),
+            "non-window chunk should have empty window_block_seqs"
+        );
+        assert_eq!(citation.block.seq, 0);
+        assert_eq!(citation.chunk_position.seq_in_block, 0);
         assert_eq!(citation.snippet, "The quick brown fox");
         assert!((citation.score.fused - 0.0327).abs() < 1e-10);
         assert_eq!(citation.score.dense, Some(0.92));
         assert_eq!(citation.score.bm25, Some(8.5));
         assert_eq!(citation.provenance.fetched_at, "2026-06-10T12:00:00Z");
         assert_eq!(citation.provenance.content_hash, "abc123");
+    }
+
+    /// `shape_citation` must thread `block_seq`/`seq_in_block`/`block_kind`/
+    /// `window_block_seqs` from `ChunkRecord` into the nested
+    /// `block`/`chunk_position`/`location` citation fields (specs/02
+    /// §6): a message-window chunk with non-default values everywhere.
+    #[test]
+    fn shape_citation_carries_block_and_window_fields() {
+        let mut chunk = make_chunk(
+            "chunk-2",
+            "doc-1",
+            "store-A",
+            "window chunk text",
+            vec![],
+            "file:///thread.md",
+            vec![0.1, 0.2],
+        );
+        chunk.block_seq = 5;
+        chunk.seq_in_block = 2;
+        chunk.block_kind = Some("message".to_string());
+        chunk.window_block_seqs = vec![3, 4, 5];
+
+        let entry = FusedChunkEntry {
+            chunk,
+            fused_score: 0.01,
+            dense_score: None,
+            bm25_score: Some(1.0),
+        };
+
+        let citation = shape_citation(entry, "store-A".to_string(), "my-store".to_string());
+
+        assert_eq!(citation.block.seq, 5);
+        assert_eq!(citation.block.kind, Some("message".to_string()));
+        assert_eq!(citation.chunk_position.seq_in_block, 2);
+        assert_eq!(citation.location.window_block_seqs, vec![3, 4, 5]);
     }
 
     #[test]
@@ -804,30 +857,37 @@ mod tests {
         let v: serde_json::Value = serde_json::to_value(&citation).unwrap();
         // Verify canonical shape from specs/02-domain-model.md §6
         assert!(v.get("chunk_id").is_some());
-        assert!(v.get("document_id").is_some());
+        assert!(v.get("resource_id").is_some());
         assert!(v.get("store").is_some());
         assert!(v.get("uri").is_some());
         assert!(v.get("heading_path").is_some());
-        assert!(v.get("span").is_some());
+        assert!(v.get("block").is_some());
+        assert!(v.get("chunk_position").is_some());
+        assert!(v.get("location").is_some());
         assert!(v.get("snippet").is_some());
         assert!(v.get("score").is_some());
         assert!(v.get("provenance").is_some());
         assert!(v["score"].get("fused").is_some());
         assert!(v["score"].get("dense").is_some());
         assert!(v["score"].get("bm25").is_some());
-        assert!(v["span"].get("start").is_some());
-        assert!(v["span"].get("end").is_some());
+        assert!(v["block"].get("seq").is_some());
+        assert!(v["chunk_position"].get("seq_in_block").is_some());
+        assert!(v["location"]["span"].get("start").is_some());
+        assert!(v["location"]["span"].get("end").is_some());
     }
 
     #[test]
     fn shape_citation_carries_metadata() {
         let mut chunk = make_chunk("c1", "d1", "s1", "text", vec![], "file:///a.md", vec![1.0]);
-        chunk.metadata = crate::parser::DocumentMetadata {
-            title: Some("My Title".to_string()),
-            creator: vec!["Bob".to_string()],
-            date: Some("2026-03-01".to_string()),
+        chunk.metadata = crate::metadata::Metadata::Document(crate::metadata::DocumentMetadata {
+            dublin_core: crate::metadata::DublinCoreMetadata {
+                title: Some("My Title".to_string()),
+                creator: vec!["Bob".to_string()],
+                date: Some("2026-03-01".to_string()),
+                ..Default::default()
+            },
             ..Default::default()
-        };
+        });
         let entry = FusedChunkEntry {
             chunk,
             fused_score: 0.5,
@@ -835,9 +895,15 @@ mod tests {
             bm25_score: Some(4.0),
         };
         let citation = shape_citation(entry, "s1".to_string(), "store-one".to_string());
-        assert_eq!(citation.metadata.title.as_deref(), Some("My Title"));
-        assert_eq!(citation.metadata.creator, vec!["Bob".to_string()]);
-        assert_eq!(citation.metadata.date.as_deref(), Some("2026-03-01"));
+        assert_eq!(citation.metadata.title(), Some("My Title"));
+        assert_eq!(
+            citation.metadata.dublin_core().creator,
+            vec!["Bob".to_string()]
+        );
+        assert_eq!(
+            citation.metadata.dublin_core().date.as_deref(),
+            Some("2026-03-01")
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1131,8 +1197,8 @@ mod tests {
             .find(|c| c.chunk_id == "span-chunk")
             .expect("span-chunk should be in results");
 
-        assert_eq!(c.span.start, 42, "span.start should be preserved");
-        assert_eq!(c.span.end, 64, "span.end should be preserved");
+        assert_eq!(c.location.span.start, 42, "span.start should be preserved");
+        assert_eq!(c.location.span.end, 64, "span.end should be preserved");
         assert_eq!(
             c.heading_path,
             vec!["Chapter 1".to_string(), "Section 2".to_string()],

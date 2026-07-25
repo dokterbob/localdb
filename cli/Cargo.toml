@@ -10,6 +10,7 @@ description = "CLI command implementations, thin layer on core / daemon client"
 localdb-core = { path = "../core" }
 store-libsql = { path = "../store-libsql" }
 extract = { path = "../extract" }
+ingest = { path = "../ingest" }
 embed = { path = "../embed", features = ["local-onnx"] }
 fetch = { path = "../fetch" }
 mcp = { path = "../mcp" }

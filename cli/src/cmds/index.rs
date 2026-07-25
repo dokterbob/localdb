@@ -38,7 +38,9 @@ pub(crate) async fn run_embedded_index(
 ) -> Result<IndexSummary, Error> {
     use localdb_core::{
         chunker::ChunkerConfig,
-        ingestion::{run_ingestion_for_source, DocumentIndex, IngestionConfig},
+        ingestion::{run_source_ingestion, DocumentIndex, IngestionConfig, SourceIngestionDeps},
+        ingestor::Ingestor,
+        types::SourceSpec,
     };
 
     macro_rules! warn_or_default {
@@ -109,8 +111,13 @@ pub(crate) async fn run_embedded_index(
         ),
         "warning: cannot create embedder for auto-index: {}"
     );
-    let extractor = warn_or_default!(
-        extract::ChainExtractor::from_ids(&policy.parsers),
+    // Validate the parser chain once up front — fail-fast parity with the
+    // legacy path, which built its single extractor before the loop. Parser
+    // instances are cheap unit structs (not `Clone`), so each source below
+    // rebuilds its own owned chain from the same `policy.parsers` ids rather
+    // than sharing this one.
+    warn_or_default!(
+        extract::build_chain(&policy.parsers),
         "warning: cannot build parser chain for auto-index: {}"
     );
     let handle = warn_or_default!(
@@ -130,19 +137,19 @@ pub(crate) async fn run_embedded_index(
 
     for rt_source in &sources_to_index {
         let source = source_row_to_core_source(rt_source);
-        let chunker = match ChunkerConfig::from_preset(&source.source_kind_preset) {
+        let chunker = match ChunkerConfig::from_preset(&source.source_preset) {
             Ok(chunker) => chunker,
             Err(e) => {
                 summary.errors += 1;
                 if mode.warn() {
                     eprintln!(
                         "warning: invalid chunker preset '{}' for source {}: {}",
-                        source.source_kind_preset, rt_source.id, e
+                        source.source_preset, rt_source.id, e
                     );
                 } else {
                     eprintln!(
                         "error indexing source {}: invalid chunker preset '{}': {}",
-                        rt_source.id, source.source_kind_preset, e
+                        rt_source.id, source.source_preset, e
                     );
                 }
                 continue;
@@ -153,18 +160,29 @@ pub(crate) async fn run_embedded_index(
             ..ingestion_cfg.clone()
         };
         let sink = crate::progress::build_progress_sink(ctx.json);
-        match run_ingestion_for_source(
-            &source,
-            &mut doc_index,
-            handle.as_ref(),
-            embedder.as_ref(),
-            &cfg,
-            &extractor,
-            Some(&url_fetcher),
-            sink,
-        )
-        .await
-        {
+
+        // Build the concrete `Ingestor` for this source's kind — the CLI is
+        // the composition root that wires I/O-owning `ingest` crate types
+        // into the I/O-free `core` pipeline (specs/01-architecture.md §1).
+        let parser_chain =
+            extract::build_chain(&policy.parsers).expect("parser chain already validated above");
+        let ingestor: Box<dyn Ingestor> = match &source.spec {
+            SourceSpec::Path { .. } => Box::new(ingest::FileIngestor::new(Box::new(parser_chain))),
+            SourceSpec::Url { .. } => Box::new(ingest::UrlIngestor::new(
+                Box::new(parser_chain),
+                Box::new(url_fetcher.clone()),
+            )),
+        };
+
+        let deps = SourceIngestionDeps {
+            doc_index: &mut doc_index,
+            store: handle.as_ref(),
+            embedder: embedder.as_ref(),
+            config: &cfg,
+            progress: sink,
+        };
+
+        match run_source_ingestion(&source, ingestor.as_ref(), deps).await {
             Ok(r) => {
                 summary.indexed += r.docs_indexed;
                 summary.skipped += r.docs_skipped;

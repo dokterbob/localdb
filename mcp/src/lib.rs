@@ -29,7 +29,7 @@
 //!   everything else, including cases one might expect to be
 //!   protocol-level. This covers:
 //!   - A missing or wrong-typed *required* argument (`search`'s `query`,
-//!     `get_document`'s `id`, `get_chunks`'s `document_id`). One might
+//!     `get_document`'s `id`, `get_chunks`'s `resource_id`). One might
 //!     expect `Parameters<T>`'s deserialization failure — itself an
 //!     `ErrorData::invalid_params` — to propagate as a protocol error, but
 //!     rmcp's `ToolRouter::call` special-cases it: any `ErrorData` whose

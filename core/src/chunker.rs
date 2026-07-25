@@ -10,9 +10,17 @@
 //! - `code` (interim): simple line-based text packer; the future AST chunker
 //!   (text-splitter::CodeSplitter) will supersede this. See specs/04-search-pipeline.md §2.
 //! - `messages`: sliding-window chunker over `Message`/`Segment` blocks.
+//! - `table` (dispatched by `BlockKind::Table`, not a source-level preset): row-based packer
+//!   that re-emits the header/separator row per chunk; see [`chunk_table`].
 //!
 //! Heading-path attribution uses `heading_index::build_heading_index` internally
 //! within `chunk_prose` over the real Markdown string.
+//!
+//! **Chunk id finalization:** every chunk's content-addressed `id` (`crate::ids::chunk_id`)
+//! is a function of its FINAL `block_seq`/`seq_in_block`, not of span. Chunks are built with
+//! a placeholder id and only assigned a real one by [`finalize_ids`], once those two fields
+//! can no longer change — see the doc comment on `finalize_ids` for the exact points where
+//! that happens for each chunker.
 
 use std::sync::Arc;
 
@@ -91,7 +99,7 @@ fn floor_char_boundary(s: &str, index: usize) -> usize {
 /// Markdown string. `heading_path` is derived from the Markdown heading structure.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChunkOutput {
-    /// Content-addressed chunk ID: `blake3(document_id || text || span)`.
+    /// Content-addressed chunk ID: `blake3(resource_id || text || span)`.
     pub id: ContentId,
     /// Chunk text (a slice of the Markdown string).
     pub text: String,
@@ -106,31 +114,50 @@ pub struct ChunkOutput {
     /// For message-window chunks: all block seqs participating in the window.
     /// Empty for non-message chunks. Mirrors `ChunkLocation::window_block_seqs`.
     pub window_block_seqs: Vec<u32>,
-    /// Block kind string (e.g. "paragraph", "heading"). `None` for flat-document chunks.
+    /// Block kind string (e.g. "text", "heading"). `None` for flat-document chunks.
     pub block_kind: Option<String>,
 }
 
 impl ChunkOutput {
-    /// Construct a single-block, non-windowed chunk (no heading path, seq_in_block=0).
+    /// Construct a single-block, non-windowed chunk with a placeholder id.
     ///
-    /// Convenience constructor that reduces boilerplate in block-dispatch paths.
-    fn single(
-        id: ContentId,
+    /// Convenience constructor that reduces boilerplate in block-dispatch paths. The `id`
+    /// field is left as an empty placeholder — callers MUST run [`finalize_ids`] over the
+    /// batch once `block_seq`/`seq_in_block` are final (see the module-level note on
+    /// [`finalize_ids`]).
+    fn placeholder(
         text: String,
         span: Span,
         heading_path: Vec<String>,
         block_seq: u32,
+        seq_in_block: u32,
     ) -> Self {
         Self {
-            id,
+            id: ContentId::new(),
             text,
             span,
             heading_path,
             block_seq,
-            seq_in_block: 0,
+            seq_in_block,
             window_block_seqs: vec![],
             block_kind: None,
         }
+    }
+}
+
+/// Compute and assign the final content-addressed `id` for every chunk in `chunks`.
+///
+/// Chunk ids are `blake3(resource_id ‖ block_seq ‖ chunk_text ‖ seq_in_block)`
+/// ([`crate::ids::chunk_id`]) — deliberately NOT based on span. `block_seq` and
+/// `seq_in_block` must already hold their FINAL values when this runs: for ordinary
+/// block-dispatched chunks that means after `chunk_blocks`'s per-block loop has assigned
+/// them; for message-window chunks that means after `chunk_messages`'s end-of-sequence
+/// fix-up pass. Calling this more than once on the same (unchanged) chunks is safe —
+/// finalization is idempotent, since the id is a pure function of fields that don't change
+/// afterward.
+fn finalize_ids(resource_id: &str, chunks: &mut [ChunkOutput]) {
+    for c in chunks.iter_mut() {
+        c.id = chunk_id(resource_id, c.block_seq, &c.text, c.seq_in_block);
     }
 }
 
@@ -249,8 +276,10 @@ impl ChunkerConfig {
 ///
 /// Dispatches by block kind:
 /// - `Message`, `Segment` → messages chunker (sliding window over all such blocks).
-/// - `Heading`, `Paragraph`, `Quote`, `List` → prose chunker (per block).
-/// - `Code`, `Table` → code chunker (per block).
+/// - `Heading`, `Text` → prose chunker (per block).
+/// - `Code` → code chunker (per block).
+/// - `Table` → table chunker (row-based packer; falls back to the code chunker for
+///   malformed tables — see [`chunk_table`]).
 /// - `Reference`, `Attachment`, `Frontmatter`, `Image` → single chunk per block.
 ///
 /// For each sub-chunk within a block:
@@ -305,19 +334,18 @@ pub fn chunk_blocks(
 
         let sub_chunks: Vec<ChunkOutput> = match &block.kind {
             // Prose-style blocks: route through code chunker when preset == "code"
-            BlockKind::Heading { .. }
-            | BlockKind::Paragraph
-            | BlockKind::Quote
-            | BlockKind::List { .. } => {
+            BlockKind::Heading { .. } | BlockKind::Text => {
                 if config.preset == "code" {
                     chunk_code(resource_id, &block.text, config, block.seq)?
                 } else {
                     chunk_prose(resource_id, &block.text, config, sizer, block.seq)?
                 }
             }
-            // Code/table blocks
-            BlockKind::Code { .. } | BlockKind::Table { .. } => {
-                chunk_code(resource_id, &block.text, config, block.seq)?
+            // Code blocks
+            BlockKind::Code { .. } => chunk_code(resource_id, &block.text, config, block.seq)?,
+            // Table blocks: dedicated row-based packer (specs/04-search-pipeline.md §3).
+            BlockKind::Table { .. } => {
+                chunk_table(resource_id, &block.text, config, sizer, block.seq)?
             }
             // Single-block pass-through
             BlockKind::Reference { .. }
@@ -325,13 +353,12 @@ pub fn chunk_blocks(
             | BlockKind::Frontmatter { .. }
             | BlockKind::Image { .. } => {
                 let text = &block.text;
-                let id = chunk_id(resource_id, text, 0, text.len(), block.seq);
-                vec![ChunkOutput::single(
-                    id,
+                vec![ChunkOutput::placeholder(
                     text.clone(),
                     crate::types::Span::new(0, text.len()),
                     heading_path.clone(),
                     block.seq,
+                    0,
                 )]
             }
             // Message/Segment already dispatched above
@@ -348,6 +375,13 @@ pub fn chunk_blocks(
             out.push(c);
         }
     }
+
+    // Final pass: every chunk's block_seq/seq_in_block is now settled (block-dispatched
+    // chunks were just finalized above; message-window chunks were finalized inside
+    // `chunk_messages` after its own end-of-sequence fix-up). Compute ids here too —
+    // idempotent for chunks that are already finalized, and the only place ids are
+    // assigned for the single-block pass-through kinds.
+    finalize_ids(resource_id, &mut out);
 
     Ok(out)
 }
@@ -485,15 +519,11 @@ pub fn chunk_messages(
             let kind_str = block.kind.kind_str().to_string();
             for (i, pc) in prose_chunks.into_iter().enumerate() {
                 let prefixed_text = format!("{prefix}{}", pc.text);
-                let id = chunk_id(
-                    resource_id,
-                    &prefixed_text,
-                    i,                       // sub-chunk index as virtual offset
-                    i + prefixed_text.len(), // distinct from other sub-chunks
-                    first_seq,
-                );
+                // Id is a placeholder here — sub-chunk position within the FULL message-chunk
+                // sequence (across all windows) isn't known until the "Fix seq_in_block" pass
+                // below runs; `finalize_ids` computes the real id afterward.
                 out.push(ChunkOutput {
-                    id,
+                    id: ContentId::new(),
                     text: prefixed_text,
                     span: pc.span,
                     heading_path: vec![],
@@ -507,9 +537,9 @@ pub fn chunk_messages(
             let window_text: String = turn_texts[window_start..actual_end].join("\n\n");
             let first_seq = turns[window_start].seq;
             let kind_str = turns[window_start].kind.kind_str().to_string();
-            let id = chunk_id(resource_id, &window_text, 0, window_text.len(), first_seq);
+            // Id is a placeholder — see note above; `finalize_ids` runs after fix-up.
             out.push(ChunkOutput {
-                id,
+                id: ContentId::new(),
                 text: window_text,
                 span: crate::types::Span::new(0, 0), // not meaningful for multi-block windows
                 heading_path: vec![],
@@ -530,10 +560,16 @@ pub fn chunk_messages(
         }
     }
 
-    // Fix seq_in_block: should be the chunk's index within all message chunks.
+    // Fix seq_in_block: should be the chunk's index within all message chunks. This is the
+    // end-of-sequence fix-up pass referenced in specs/04-search-pipeline.md §3 — window chunk
+    // ids MUST be computed after this runs, since a chunk's final `seq_in_block` (and thus its
+    // id) is only settled once every window in the sequence has been produced.
     for (i, c) in out.iter_mut().enumerate() {
         c.seq_in_block = i as u32;
     }
+
+    // Now that block_seq/seq_in_block are final for every message-window chunk, compute ids.
+    finalize_ids(resource_id, &mut out);
 
     Ok(out)
 }
@@ -549,7 +585,7 @@ pub fn chunk_messages(
 /// Heading-path attribution uses `heading_index::build_heading_index` over the
 /// same Markdown string — no Block sidecar needed.
 fn chunk_prose(
-    document_id: &str,
+    resource_id: &str,
     markdown: &str,
     config: &ChunkerConfig,
     sizer: &dyn ChunkSizer,
@@ -579,7 +615,7 @@ fn chunk_prose(
                 max_line_len,
                 "chunk_prose backstop: delegating to chunk_code"
             );
-            return chunk_code(document_id, markdown, config, block_seq);
+            return chunk_code(resource_id, markdown, config, block_seq);
         }
     }
 
@@ -607,20 +643,23 @@ fn chunk_prose(
     let splitter = text_splitter::MarkdownSplitter::new(cfg);
 
     let mut chunks = Vec::new();
-    for (byte_off, chunk) in splitter.chunk_indices(markdown) {
+    for (seq_in_block, (byte_off, chunk)) in splitter.chunk_indices(markdown).enumerate() {
         let start = byte_off;
         let end = byte_off + chunk.len();
         let span = Span::new(start, end);
         let heading_path = crate::heading_index::heading_path_at(&heading_idx, start);
-        let id = chunk_id(document_id, chunk, start, end, block_seq);
-        chunks.push(ChunkOutput::single(
-            id,
+        chunks.push(ChunkOutput::placeholder(
             chunk.to_string(),
             span,
             heading_path,
-            0,
+            block_seq,
+            seq_in_block as u32,
         ));
     }
+
+    // Ids depend on `block_seq`/`seq_in_block`, both final at this point (this function
+    // owns the full ordering of its own output) — see `finalize_ids`.
+    finalize_ids(resource_id, &mut chunks);
 
     Ok(chunks)
 }
@@ -635,7 +674,7 @@ fn chunk_prose(
 /// It will be superseded by `text-splitter::CodeSplitter` (tree-sitter) when
 /// code sources become a focus. See specs/04-search-pipeline.md §2.
 fn chunk_code(
-    document_id: &str,
+    resource_id: &str,
     markdown: &str,
     config: &ChunkerConfig,
     block_seq: u32,
@@ -646,6 +685,7 @@ fn chunk_code(
 
     let target = config.resolved_target_tokens(); // used as char budget
     let mut chunks = Vec::new();
+    let mut seq_in_block = 0u32;
     let mut current_start = 0usize;
     let mut current_end = 0usize;
 
@@ -660,14 +700,14 @@ fn chunk_code(
                 let ce = floor_char_boundary(markdown, current_end);
                 if cs < ce {
                     let chunk_text = &markdown[cs..ce];
-                    let id = chunk_id(document_id, chunk_text, cs, ce, block_seq);
-                    chunks.push(ChunkOutput::single(
-                        id,
+                    chunks.push(ChunkOutput::placeholder(
                         chunk_text.to_string(),
                         Span::new(cs, ce),
                         vec![],
-                        0,
+                        block_seq,
+                        seq_in_block,
                     ));
+                    seq_in_block += 1;
                 }
             }
 
@@ -687,14 +727,14 @@ fn chunk_code(
                 let piece_end = (pos + byte_len).min(line_end);
                 if pos < piece_end {
                     let chunk_text = &markdown[pos..piece_end];
-                    let id = chunk_id(document_id, chunk_text, pos, piece_end, block_seq);
-                    chunks.push(ChunkOutput::single(
-                        id,
+                    chunks.push(ChunkOutput::placeholder(
                         chunk_text.to_string(),
                         Span::new(pos, piece_end),
                         vec![],
-                        0,
+                        block_seq,
+                        seq_in_block,
                     ));
+                    seq_in_block += 1;
                 }
                 pos = piece_end;
             }
@@ -710,14 +750,14 @@ fn chunk_code(
             let ce = floor_char_boundary(markdown, current_end);
             if cs < ce {
                 let chunk_text = &markdown[cs..ce];
-                let id = chunk_id(document_id, chunk_text, cs, ce, block_seq);
-                chunks.push(ChunkOutput::single(
-                    id,
+                chunks.push(ChunkOutput::placeholder(
                     chunk_text.to_string(),
                     Span::new(cs, ce),
                     vec![],
-                    0,
+                    block_seq,
+                    seq_in_block,
                 ));
+                seq_in_block += 1;
             }
             current_start = line_start;
         }
@@ -734,16 +774,18 @@ fn chunk_code(
         let ce = floor_char_boundary(markdown, current_end);
         if cs < ce {
             let chunk_text = &markdown[cs..ce];
-            let id = chunk_id(document_id, chunk_text, cs, ce, block_seq);
-            chunks.push(ChunkOutput::single(
-                id,
+            chunks.push(ChunkOutput::placeholder(
                 chunk_text.to_string(),
                 Span::new(cs, ce),
                 vec![],
-                0,
+                block_seq,
+                seq_in_block,
             ));
         }
     }
+
+    // Ids depend on `block_seq`/`seq_in_block`, both final at this point.
+    finalize_ids(resource_id, &mut chunks);
 
     Ok(chunks)
 }
@@ -758,6 +800,186 @@ fn line_offsets(s: &str) -> impl Iterator<Item = (usize, &str)> {
         let start = offset;
         offset += line.len();
         (start, line)
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Table chunker
+// ---------------------------------------------------------------------------
+
+/// Table chunker: row-based packer for `Table` blocks (specs/04-search-pipeline.md §3).
+///
+/// Expects `markdown` to be a standalone Markdown pipe-table: a header row, a `|---|`-style
+/// separator row, and zero or more data rows. Data rows are packed greedily into successive
+/// chunks under the (prose) token target; EVERY chunk re-emits the header and separator rows,
+/// so each chunk is an independently valid, renderable Markdown table — no chunk depends on a
+/// sibling to parse correctly.
+///
+/// Falls back to [`chunk_code`] (the pre-table-chunker behavior) in two cases:
+/// - The block's text has no recognizable header/separator row (malformed table) — the whole
+///   block is routed through the line-based packer rather than guessing at structure.
+/// - A single data row, combined with the re-emitted header+separator, still exceeds the
+///   token target — it cannot be packed into a standalone valid chunk at the target size, so
+///   that one row alone is split via `chunk_code`'s long-line logic (preserving the
+///   "no unbounded chunk" invariant, at the cost of that fallback chunk not being a
+///   well-formed table row).
+fn chunk_table(
+    resource_id: &str,
+    markdown: &str,
+    config: &ChunkerConfig,
+    sizer: &dyn ChunkSizer,
+    block_seq: u32,
+) -> Result<Vec<ChunkOutput>, Error> {
+    if markdown.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let lines: Vec<&str> = markdown.lines().collect();
+
+    // Header row: first non-blank line. Separator row: the line right after it.
+    let header_idx = lines.iter().position(|l| !l.trim().is_empty());
+    let parsed = header_idx.and_then(|hi| {
+        let si = hi + 1;
+        let sep_line = lines.get(si)?;
+        if lines[hi].contains('|') && is_table_separator_row(sep_line) {
+            Some((hi, si))
+        } else {
+            None
+        }
+    });
+
+    let Some((header_idx, sep_idx)) = parsed else {
+        // Malformed: no recognizable header/separator row. Fall back to the previous,
+        // code-chunker-based behavior rather than guessing at table structure.
+        return chunk_code(resource_id, markdown, config, block_seq);
+    };
+
+    let header_block = format!("{}\n{}", lines[header_idx], lines[sep_idx]);
+
+    let data_rows: Vec<&str> = lines[(sep_idx + 1)..]
+        .iter()
+        .copied()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+
+    if data_rows.is_empty() {
+        // Header-only table block: no data rows to pack, but the header itself is
+        // real content and must not silently vanish from the index. Emit it as a
+        // single chunk rather than falling through to `flush_table_batch` (which
+        // treats an empty `pending` as "nothing to flush").
+        let mut chunks = vec![ChunkOutput::placeholder(
+            header_block,
+            Span::new(0, 0),
+            vec![],
+            block_seq,
+            0,
+        )];
+        finalize_ids(resource_id, &mut chunks);
+        return Ok(chunks);
+    }
+
+    let target = config.resolved_target_tokens();
+    let mut chunks: Vec<ChunkOutput> = Vec::new();
+    let mut seq_in_block = 0u32;
+    let mut pending: Vec<&str> = Vec::new();
+
+    for row in &data_rows {
+        let row = *row;
+        let solo_text = format!("{header_block}\n{row}");
+
+        if sizer.size(&solo_text) > target {
+            // Oversized single row: not even a standalone chunk (header + this one row) fits
+            // under the target. Flush whatever is pending first (so those rows aren't lost or
+            // reordered), then fall back to chunk_code's long-line split for this row alone.
+            flush_table_batch(
+                &header_block,
+                &mut pending,
+                &mut chunks,
+                &mut seq_in_block,
+                block_seq,
+            );
+            let row_chunks = chunk_code(resource_id, row, config, block_seq)?;
+            for mut rc in row_chunks {
+                rc.block_seq = block_seq;
+                rc.seq_in_block = seq_in_block;
+                seq_in_block += 1;
+                chunks.push(rc);
+            }
+            continue;
+        }
+
+        // Row fits alone; try greedily packing it into the current batch.
+        let mut candidate = pending.clone();
+        candidate.push(row);
+        let candidate_text = format!("{header_block}\n{}", candidate.join("\n"));
+        if sizer.size(&candidate_text) <= target {
+            pending.push(row);
+        } else {
+            flush_table_batch(
+                &header_block,
+                &mut pending,
+                &mut chunks,
+                &mut seq_in_block,
+                block_seq,
+            );
+            pending.push(row);
+        }
+    }
+    flush_table_batch(
+        &header_block,
+        &mut pending,
+        &mut chunks,
+        &mut seq_in_block,
+        block_seq,
+    );
+
+    // Ids depend on `block_seq`/`seq_in_block`, both final at this point.
+    finalize_ids(resource_id, &mut chunks);
+
+    Ok(chunks)
+}
+
+/// Flush the pending batch of table data rows into one chunk, re-emitting the header and
+/// separator rows so the chunk is a standalone, valid Markdown table.
+fn flush_table_batch(
+    header_block: &str,
+    pending: &mut Vec<&str>,
+    chunks: &mut Vec<ChunkOutput>,
+    seq_in_block: &mut u32,
+    block_seq: u32,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let text = format!("{header_block}\n{}", pending.join("\n"));
+    chunks.push(ChunkOutput::placeholder(
+        text,
+        Span::new(0, 0), // reconstructed (header re-emitted per chunk); span isn't meaningful
+        vec![],
+        block_seq,
+        *seq_in_block,
+    ));
+    *seq_in_block += 1;
+    pending.clear();
+}
+
+/// Recognize a Markdown table separator row, e.g. `|---|---|` or `| :--- | ---: |`.
+fn is_table_separator_row(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let inner = trimmed.trim_matches('|');
+    if inner.is_empty() {
+        return false;
+    }
+    inner.split('|').all(|cell| {
+        let cell = cell.trim();
+        !cell.is_empty()
+            && cell.contains('-')
+            && cell
+                .chars()
+                .all(|c| c == '-' || c == ':' || c.is_whitespace())
     })
 }
 
@@ -826,7 +1048,7 @@ pub fn preset_for(filename: Option<&str>, mime: Option<&str>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::document_id;
+    use crate::ids::resource_id;
 
     /// Word-count sizer for tests — no model download required.
     struct WordSizer;
@@ -888,7 +1110,7 @@ mod tests {
 
     #[test]
     fn prose_chunk_empty_document_returns_empty() {
-        let doc_id = document_id("file:///test.md", "abc123");
+        let doc_id = resource_id("file:///test.md", "abc123");
         let cfg = ChunkerConfig::prose();
         let result = chunk_prose(&doc_id, "", &cfg, &CharSizer, 0).unwrap();
         assert!(result.is_empty(), "empty doc should produce no chunks");
@@ -897,7 +1119,7 @@ mod tests {
     #[test]
     fn prose_chunk_single_paragraph() {
         let full_text = "Hello, this is a paragraph.";
-        let doc_id = document_id("file:///test.md", "abc");
+        let doc_id = resource_id("file:///test.md", "abc");
         let cfg = ChunkerConfig::prose();
 
         let chunks = chunk_prose(&doc_id, full_text, &cfg, &CharSizer, 0).unwrap();
@@ -911,7 +1133,7 @@ mod tests {
     #[test]
     fn prose_chunk_span_references_markdown() {
         let full_text = "# Introduction\n\nThis is the intro paragraph.";
-        let doc_id = document_id("file:///test.md", "abc");
+        let doc_id = resource_id("file:///test.md", "abc");
         let cfg = ChunkerConfig::prose();
 
         let chunks = chunk_prose(&doc_id, full_text, &cfg, &CharSizer, 0).unwrap();
@@ -932,7 +1154,7 @@ mod tests {
     fn prose_spans_round_trip() {
         let full_text =
             "# Heading One\n\nParagraph one with some words.\n\n## Heading Two\n\nParagraph two here.";
-        let doc_id = document_id("file:///rt.md", "abc");
+        let doc_id = resource_id("file:///rt.md", "abc");
         let cfg = ChunkerConfig::prose();
         let chunks = chunk_prose(&doc_id, full_text, &cfg, &WordSizer, 0).unwrap();
         assert!(!chunks.is_empty());
@@ -951,7 +1173,7 @@ mod tests {
         for i in 0..10 {
             full_text.push_str(&format!("## Section {i}\n\n{para}\n\n"));
         }
-        let doc_id = document_id("file:///long.md", "abc");
+        let doc_id = resource_id("file:///long.md", "abc");
         let cfg = ChunkerConfig {
             preset: "prose".to_string(),
             target_tokens: Some(60),
@@ -981,7 +1203,7 @@ mod tests {
         for i in 0..6 {
             full_text.push_str(&format!("## Section {i}\n\n{para}\n\n"));
         }
-        let doc_id = document_id("file:///order.md", "abc");
+        let doc_id = resource_id("file:///order.md", "abc");
         let cfg = ChunkerConfig {
             preset: "prose".to_string(),
             target_tokens: Some(60),
@@ -996,7 +1218,7 @@ mod tests {
     #[test]
     fn prose_char_sizer_fallback_produces_chunks() {
         let full_text = "# Title\n\nSome prose content here for the char sizer fallback path.";
-        let doc_id = document_id("file:///char.md", "abc");
+        let doc_id = resource_id("file:///char.md", "abc");
         let cfg = ChunkerConfig::prose();
         let chunks = chunk_prose(&doc_id, full_text, &cfg, &CharSizer, 0).unwrap();
         assert!(
@@ -1012,7 +1234,7 @@ mod tests {
         for i in 0..8 {
             full_text.push_str(&format!("## Para {i}\n\n{para}\n\n"));
         }
-        let doc_id = document_id("file:///large.md", "hash");
+        let doc_id = resource_id("file:///large.md", "hash");
         let cfg = ChunkerConfig {
             preset: "prose".to_string(),
             target_tokens: Some(80),
@@ -1031,7 +1253,7 @@ mod tests {
     #[test]
     fn prose_chunk_ids_are_content_addressed() {
         let full_text = "Hello world this is content.";
-        let doc_id = document_id("file:///test.md", "abc");
+        let doc_id = resource_id("file:///test.md", "abc");
         let cfg = ChunkerConfig::prose();
 
         let chunks1 = chunk_prose(&doc_id, full_text, &cfg, &CharSizer, 0).unwrap();
@@ -1048,7 +1270,7 @@ mod tests {
         // The splitter now sees real Markdown — heading_path is derived from the
         // Markdown heading structure, not from a Block sidecar.
         let full_text = "# API\n\nAPI documentation.\n\n# Auth\n\nAuth documentation.";
-        let doc_id = document_id("file:///api.md", "abc");
+        let doc_id = resource_id("file:///api.md", "abc");
         let cfg = ChunkerConfig {
             preset: "prose".to_string(),
             target_tokens: Some(8),
@@ -1088,7 +1310,7 @@ mod tests {
         for i in 0..4 {
             full_text.push_str(&format!("## Section {i}\n\n{para}\n\n"));
         }
-        let doc_id = document_id("file:///overlap_guard.md", "abc");
+        let doc_id = resource_id("file:///overlap_guard.md", "abc");
         let cfg = ChunkerConfig {
             preset: "prose".to_string(),
             target_tokens: Some(80),
@@ -1113,7 +1335,7 @@ mod tests {
     fn prose_oversized_single_atomic_unit_no_panic() {
         let long_word = "a".repeat(2000);
         let full_text = format!("# Title\n\n{long_word}");
-        let doc_id = document_id("file:///oversized.md", "abc");
+        let doc_id = resource_id("file:///oversized.md", "abc");
         let cfg = ChunkerConfig {
             preset: "prose".to_string(),
             target_tokens: Some(20),
@@ -1137,7 +1359,7 @@ mod tests {
         // must be present in chunk text so MarkdownSplitter can split on structure).
         let md =
             "# Section One\n\nContent of section one.\n\n# Section Two\n\nContent of section two.";
-        let doc_id = document_id("file:///structure.md", "abc");
+        let doc_id = resource_id("file:///structure.md", "abc");
         let cfg = ChunkerConfig {
             preset: "prose".to_string(),
             target_tokens: Some(8),
@@ -1160,7 +1382,7 @@ mod tests {
 
     #[test]
     fn code_chunk_empty_returns_empty() {
-        let doc_id = document_id("file:///lib.rs", "abc");
+        let doc_id = resource_id("file:///lib.rs", "abc");
         let cfg = ChunkerConfig::code();
         let chunks = chunk_code(&doc_id, "", &cfg, 0).unwrap();
         assert!(chunks.is_empty());
@@ -1169,7 +1391,7 @@ mod tests {
     #[test]
     fn code_chunk_single_block() {
         let full_text = "fn hello() {\n    println!(\"hi\");\n}";
-        let doc_id = document_id("file:///lib.rs", "abc");
+        let doc_id = resource_id("file:///lib.rs", "abc");
         let cfg = ChunkerConfig::code();
 
         let chunks = chunk_code(&doc_id, full_text, &cfg, 0).unwrap();
@@ -1181,7 +1403,7 @@ mod tests {
     fn code_chunk_large_splits() {
         let line = "let x = some_function_with_long_name(arg1, arg2, arg3);\n";
         let full_text = line.repeat(100); // ~5600 chars
-        let doc_id = document_id("file:///lib.rs", "hash");
+        let doc_id = resource_id("file:///lib.rs", "hash");
         let cfg = ChunkerConfig::code();
 
         let chunks = chunk_code(&doc_id, &full_text, &cfg, 0).unwrap();
@@ -1195,7 +1417,7 @@ mod tests {
     fn code_chunk_spans_round_trip() {
         let line = "let x = 1;\n";
         let full_text = line.repeat(200);
-        let doc_id = document_id("file:///lib.rs", "hash");
+        let doc_id = resource_id("file:///lib.rs", "hash");
         let cfg = ChunkerConfig::code();
         let chunks = chunk_code(&doc_id, &full_text, &cfg, 0).unwrap();
         for c in &chunks {
@@ -1416,7 +1638,7 @@ mod tests {
         // No Message/Segment blocks → 0 chunks.
         let blocks: Vec<crate::block::Block> = vec![crate::block::Block {
             seq: 0,
-            kind: crate::block::BlockKind::Paragraph,
+            kind: crate::block::BlockKind::Text,
             text: "Some intro text.".to_string(),
             location: None,
         }];
@@ -1592,7 +1814,7 @@ mod tests {
 
     #[test]
     fn messages_mixed_blocks_only_sees_message_and_segment() {
-        // Heading + Paragraph + 3 Message + Paragraph + 1 Message
+        // Heading + Text + 3 Message + Text + 1 Message
         // The messages chunker should see only the 4 Message blocks.
         let blocks = vec![
             crate::block::Block {
@@ -1603,7 +1825,7 @@ mod tests {
             },
             crate::block::Block {
                 seq: 1,
-                kind: crate::block::BlockKind::Paragraph,
+                kind: crate::block::BlockKind::Text,
                 text: "Intro paragraph.".to_string(),
                 location: None,
             },
@@ -1612,7 +1834,7 @@ mod tests {
             msg_block(4, "Alice", "2026-01-01T10:02:00Z", "Third message"),
             crate::block::Block {
                 seq: 5,
-                kind: crate::block::BlockKind::Paragraph,
+                kind: crate::block::BlockKind::Text,
                 text: "Interlude paragraph.".to_string(),
                 location: None,
             },
@@ -1740,23 +1962,23 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     #[test]
-    fn code_preset_routes_paragraph_block_through_code_chunker() {
-        // A Paragraph block fed to chunk_blocks with preset="code" must go
+    fn code_preset_routes_text_block_through_code_chunker() {
+        // A Text block fed to chunk_blocks with preset="code" must go
         // through the code (line-packer) path, not the prose (MarkdownSplitter) path.
         // We verify this by checking that the chunks are produced (no panic) and
         // that their spans are valid byte ranges.
         let block = crate::block::Block {
             seq: 0,
-            kind: crate::block::BlockKind::Paragraph,
+            kind: crate::block::BlockKind::Text,
             text: "fn hello() {\n    println!(\"hi\");\n}".to_string(),
             location: None,
         };
-        let doc_id = document_id("file:///test.rs", "abc");
+        let doc_id = resource_id("file:///test.rs", "abc");
         let cfg = ChunkerConfig::code();
         let chunks = chunk_blocks(&doc_id, &[block], &cfg, &CharSizer).unwrap();
         assert!(
             !chunks.is_empty(),
-            "code preset + Paragraph should produce chunks"
+            "code preset + Text should produce chunks"
         );
         for c in &chunks {
             assert!(c.span.start <= c.span.end, "span start <= end");
@@ -1793,6 +2015,270 @@ mod tests {
             assert!(
                 covered_seqs.contains(&i),
                 "turn {i} must appear in at least one window; covered: {covered_seqs:?}"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Chunk id finalization: message-window chunks get ids from FINAL membership
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn message_window_ids_reflect_final_membership_after_fixup() {
+        // Two messages, EACH long enough to exceed the token budget on its own, force
+        // BOTH through chunk_messages' "split a too-long single turn" branch. Each split
+        // pushes its sub-chunks with a branch-local index (0, 1, 2, ...) that only matches
+        // the chunk's true global position for the FIRST message; the second message's
+        // sub-chunks are appended after the first message's, so their local index no
+        // longer matches their final position until the end-of-sequence "Fix seq_in_block"
+        // pass runs. This is exactly the case the finalize-after-fixup design must get
+        // right: ids must be computed from final (fixed-up) seq_in_block, not the
+        // branch-local one.
+        let long_text = "word ".repeat(200);
+        let blocks = vec![
+            msg_block(0, "Alice", "2026-01-01T10:00:00Z", &long_text),
+            msg_block(1, "Bob", "2026-01-01T10:01:00Z", &long_text),
+        ];
+        let cfg = ChunkerConfig {
+            preset: "messages".to_string(),
+            target_tokens: Some(50),
+            overlap_tokens: Some(0),
+            window_turns: Some(6),
+            stride_turns: Some(3),
+        };
+
+        let run1 = chunk_messages("resource-fixup", &blocks, &cfg, &WordSizer).unwrap();
+        let run2 = chunk_messages("resource-fixup", &blocks, &cfg, &WordSizer).unwrap();
+
+        assert!(
+            run1.len() > 2,
+            "expected both long messages to split into multiple sub-chunks each, got {}",
+            run1.len()
+        );
+
+        // (b) stable across two identical chunker runs.
+        assert_eq!(run1.len(), run2.len(), "chunk count must be stable");
+        for (c1, c2) in run1.iter().zip(run2.iter()) {
+            assert_eq!(
+                c1.id, c2.id,
+                "chunk ids must be stable across identical runs"
+            );
+        }
+
+        // (a) unique.
+        let unique_ids: std::collections::HashSet<&str> =
+            run1.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(
+            unique_ids.len(),
+            run1.len(),
+            "all message-window chunk ids must be unique"
+        );
+
+        // (c) derived from FINAL membership: seq_in_block must already be the fixed-up,
+        // sequential index, and each id must equal the formula applied to that final value.
+        for (i, c) in run1.iter().enumerate() {
+            assert_eq!(
+                c.seq_in_block, i as u32,
+                "seq_in_block must be the final, fixed-up index"
+            );
+            let expected =
+                crate::ids::chunk_id("resource-fixup", c.block_seq, &c.text, c.seq_in_block);
+            assert_eq!(
+                c.id, expected,
+                "chunk id must equal ids::chunk_id(resource_id, block_seq, text, seq_in_block) \
+                 computed from the chunk's FINAL block_seq/seq_in_block"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Table chunker tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn table_small_single_chunk_unchanged() {
+        let md = "| Name | Age |\n|---|---|\n| Alice | 30 |\n| Bob | 25 |";
+        let doc_id = resource_id("file:///table.md", "abc");
+        let cfg = ChunkerConfig::prose();
+        let chunks = chunk_table(&doc_id, md, &cfg, &CharSizer, 0).unwrap();
+        assert_eq!(chunks.len(), 1, "small table should fit in a single chunk");
+        assert!(chunks[0].text.contains("| Name | Age |"));
+        assert!(chunks[0].text.contains("|---|---|"));
+        assert!(chunks[0].text.contains("| Alice | 30 |"));
+        assert!(chunks[0].text.contains("| Bob | 25 |"));
+    }
+
+    #[test]
+    fn table_header_only_block_emits_one_chunk_with_header() {
+        // A table block with a header + separator row but NO data rows must still
+        // produce a chunk (the header content must not silently vanish from the index).
+        let md = "| Name | Age |\n|---|---|";
+        let doc_id = resource_id("file:///table_header_only.md", "abc");
+        let cfg = ChunkerConfig::prose();
+        let chunks = chunk_table(&doc_id, md, &cfg, &CharSizer, 2).unwrap();
+        assert_eq!(
+            chunks.len(),
+            1,
+            "header-only table must produce exactly one chunk, got {}",
+            chunks.len()
+        );
+        assert_eq!(chunks[0].text, "| Name | Age |\n|---|---|");
+        assert_eq!(chunks[0].block_seq, 2);
+        assert_eq!(chunks[0].seq_in_block, 0);
+        assert!(!chunks[0].id.is_empty(), "chunk must have a valid id");
+    }
+
+    #[test]
+    fn table_multi_chunk_split_preserves_header() {
+        // header_block = "| A | B |\n|---|---|" = 19 chars; each row "| 1 | 2 |" = 9 chars.
+        // target=40 packs exactly 2 rows per chunk (19+1+9+1+9=39<=40; a 3rd row would be 49>40).
+        let mut md = String::from("| A | B |\n|---|---|\n");
+        let rows: Vec<String> = (0..10).map(|i| format!("| {i} | {i} |")).collect();
+        md.push_str(&rows.join("\n"));
+        let doc_id = resource_id("file:///table_big.md", "abc");
+        let cfg = ChunkerConfig {
+            preset: "prose".to_string(),
+            target_tokens: Some(40),
+            overlap_tokens: Some(0),
+            window_turns: None,
+            stride_turns: None,
+        };
+        let chunks = chunk_table(&doc_id, &md, &cfg, &CharSizer, 0).unwrap();
+        assert!(
+            chunks.len() >= 2,
+            "10 rows under a tight target must split into multiple chunks, got {}",
+            chunks.len()
+        );
+        for c in &chunks {
+            assert!(
+                c.text.contains("| A | B |") && c.text.contains("|---|---|"),
+                "every chunk must re-emit the header/separator; got: {:?}",
+                c.text
+            );
+        }
+        // Every original row must appear in exactly one chunk, in order.
+        let all_rows_text: String = chunks.iter().map(|c| c.text.as_str()).collect();
+        for row in &rows {
+            assert!(
+                all_rows_text.contains(row.as_str()),
+                "row {row:?} must appear in the chunked output"
+            );
+        }
+    }
+
+    #[test]
+    fn table_oversized_single_row_falls_back_to_code_chunker_split() {
+        // A single data row so large that even header+separator+row alone exceeds the
+        // target must be split via chunk_code's long-line logic, not silently over-grown.
+        let huge_cell = "x".repeat(1000);
+        let md = format!("| A |\n|---|\n| {huge_cell} |");
+        let doc_id = resource_id("file:///table_oversized.md", "abc");
+        let cfg = ChunkerConfig {
+            preset: "prose".to_string(),
+            target_tokens: Some(40),
+            overlap_tokens: Some(0),
+            window_turns: None,
+            stride_turns: None,
+        };
+        let chunks = chunk_table(&doc_id, &md, &cfg, &CharSizer, 0).unwrap();
+        assert!(
+            chunks.len() > 1,
+            "oversized single row must be split into multiple bounded chunks, got {}",
+            chunks.len()
+        );
+        for c in &chunks {
+            assert!(
+                c.text.chars().count() <= 2 * cfg.resolved_target_tokens(),
+                "fallback chunk must stay bounded: {} chars",
+                c.text.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn table_malformed_no_pipes_falls_back_to_code_chunker() {
+        // No recognizable header/separator row at all (no `|` characters anywhere) — must
+        // fall back to exactly the previous (code chunker) behavior, not panic or guess.
+        let md = "Name Age\nAlice 30\nBob 25\n";
+        let doc_id = resource_id("file:///table_malformed.md", "abc");
+        let cfg = ChunkerConfig::code();
+        let table_chunks = chunk_table(&doc_id, md, &cfg, &CharSizer, 0).unwrap();
+        let code_chunks = chunk_code(&doc_id, md, &cfg, 0).unwrap();
+        assert_eq!(
+            table_chunks, code_chunks,
+            "malformed table text must fall back to exactly chunk_code's output"
+        );
+    }
+
+    #[test]
+    fn table_malformed_missing_dash_separator_falls_back_to_code_chunker() {
+        // Header row has pipes, but the second line isn't a `---`-style separator —
+        // must be treated as malformed and fall back, not mis-parsed as data.
+        let md = "| A | B |\n| 1 | 2 |\n| 3 | 4 |";
+        let doc_id = resource_id("file:///table_malformed2.md", "abc");
+        let cfg = ChunkerConfig::code();
+        let table_chunks = chunk_table(&doc_id, md, &cfg, &CharSizer, 0).unwrap();
+        let code_chunks = chunk_code(&doc_id, md, &cfg, 0).unwrap();
+        assert_eq!(
+            table_chunks, code_chunks,
+            "missing dash-separator row must fall back to exactly chunk_code's output"
+        );
+    }
+
+    #[test]
+    fn table_token_target_boundary_packs_up_to_exact_target() {
+        // header_block = "| A |\n|---|" = 11 chars; each row "| 1 |" = 5 chars.
+        // 2 rows: 11+1+5+1+5 = 23 (fits exactly at target=23). A 3rd row would be 29 (over).
+        let md = "| A |\n|---|\n| 1 |\n| 2 |\n| 3 |";
+        let doc_id = resource_id("file:///table_boundary.md", "abc");
+        let cfg = ChunkerConfig {
+            preset: "prose".to_string(),
+            target_tokens: Some(23),
+            overlap_tokens: Some(0),
+            window_turns: None,
+            stride_turns: None,
+        };
+        let chunks = chunk_table(&doc_id, md, &cfg, &CharSizer, 0).unwrap();
+        assert_eq!(
+            chunks.len(),
+            2,
+            "rows 1+2 should pack exactly at the boundary, row 3 starts a new chunk"
+        );
+        assert!(chunks[0].text.contains("| 1 |") && chunks[0].text.contains("| 2 |"));
+        assert!(!chunks[0].text.contains("| 3 |"));
+        assert!(chunks[1].text.contains("| 3 |"));
+    }
+
+    #[test]
+    fn table_chunk_ids_are_content_addressed_and_unique() {
+        let mut md = String::from("| A | B |\n|---|---|\n");
+        let rows: Vec<String> = (0..10).map(|i| format!("| {i} | {i} |")).collect();
+        md.push_str(&rows.join("\n"));
+        let doc_id = resource_id("file:///table_ids.md", "abc");
+        let cfg = ChunkerConfig {
+            preset: "prose".to_string(),
+            target_tokens: Some(40),
+            overlap_tokens: Some(0),
+            window_turns: None,
+            stride_turns: None,
+        };
+        let run1 = chunk_table(&doc_id, &md, &cfg, &CharSizer, 3).unwrap();
+        let run2 = chunk_table(&doc_id, &md, &cfg, &CharSizer, 3).unwrap();
+        assert_eq!(run1.len(), run2.len());
+        for (c1, c2) in run1.iter().zip(run2.iter()) {
+            assert_eq!(c1.id, c2.id, "table chunk ids must be deterministic");
+        }
+        let unique_ids: std::collections::HashSet<&str> =
+            run1.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(
+            unique_ids.len(),
+            run1.len(),
+            "table chunk ids must be unique"
+        );
+        for c in &run1 {
+            assert_eq!(
+                c.block_seq, 3,
+                "block_seq must be threaded through to table chunks"
             );
         }
     }

@@ -741,6 +741,7 @@ dependencies = [
  "extract",
  "fetch",
  "indicatif 0.17.11",
+ "ingest",
  "localdb-core",
  "mcp",
  "reqwest 0.12.28",
@@ -2559,6 +2560,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bc150e5ce2330295b8616ce0e3f53250e53af31759a9dbedad1621ba29151847"
 dependencies = [
  "cfb",
+]
+
+[[package]]
+name = "ingest"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "extract",
+ "localdb-core",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -4977,7 +4991,6 @@ dependencies = [
  "localdb-core",
  "mcp",
  "notify-debouncer-mini",
- "reqwest 0.12.28",
  "rmcp",
  "serde",
  "serde_json",
@@ -5195,8 +5208,10 @@ name = "store-libsql"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "blake3",
  "libsql",
  "localdb-core",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

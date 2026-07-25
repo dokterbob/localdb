@@ -81,13 +81,46 @@ pub trait Ingestor: Send + Sync {
     ) -> Result<IngestResult, Error>;
 }
 
+/// Why an ingestor skipped a discovered item without producing a `Resource`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkipReason {
+    /// Content unchanged since the last indexed run (hash/mtime/etag match
+    /// under the same policy version).
+    Unchanged,
+    /// No configured parser supports the item's format.
+    Unsupported,
+    /// Skipped for another reason (benign, non-error skip: filtered by
+    /// configuration, ...). The string is a human-readable explanation. Not
+    /// for I/O or parser errors — use [`SkipReason::Error`] for those.
+    Other(String),
+    /// Processing failed but the item still exists — keeps the URI alive in
+    /// the delete-sweep (it's a transient failure, not evidence the resource
+    /// is gone) while still being counted as an error rather than a benign
+    /// skip (issue C7/C8: previously such failures were folded into
+    /// `Other`, which under-reported errors as skips). The string is a
+    /// human-readable explanation (read error, parser error, parser panic).
+    Error(String),
+}
+
 /// Callback for receiving resources during ingestion.
 ///
 /// This is the streaming interface: the ingestor calls `on_resource` for each
-/// resource it produces, and the caller processes it immediately.
+/// resource it produces, and the caller processes it immediately. The
+/// `on_discovered` / `on_skipped` hooks are optional progress signals with
+/// default no-op implementations so simple ingestors and test callbacks can
+/// ignore them.
 #[async_trait::async_trait]
 pub trait IngestCallback: Send {
     async fn on_resource(&mut self, resource: Resource) -> Result<(), Error>;
+
+    /// Called once the ingestor knows how many items it will consider
+    /// (after enumeration). Streaming ingestors that never know a total
+    /// simply never call this.
+    async fn on_discovered(&mut self, _total: usize) {}
+
+    /// Called for each discovered item the ingestor decides not to turn into
+    /// a `Resource` (unchanged content, unsupported format, ...).
+    async fn on_skipped(&mut self, _uri: &str, _reason: SkipReason) {}
 }
 
 /// Source information passed to an ingestor.
@@ -97,6 +130,10 @@ pub struct IngestSource {
     pub store_id: String,
     pub ingestor_kind: IngestorKind,
     pub config: serde_json::Value,
+    /// Hash of the indexing policy in effect for this run. Ingestors stamp it
+    /// into produced `Resource`s and may use it for incremental-skip checks
+    /// (a policy change invalidates previously indexed content).
+    pub policy_version: String,
 }
 
 /// Result of an ingestion run.
@@ -148,12 +185,24 @@ mod tests {
     #[test]
     fn ingest_source_creation() {
         let source = IngestSource {
+            policy_version: "test-policy".to_string(),
             source_id: "src-1".to_string(),
             store_id: "store-1".to_string(),
             ingestor_kind: IngestorKind::File,
             config: serde_json::json!({ "root": "/tmp/docs" }),
         };
         assert_eq!(source.ingestor_kind, IngestorKind::File);
+    }
+
+    #[test]
+    fn skip_reason_error_is_distinct_from_other() {
+        // C8: `Error` and `Other` must remain distinct variants so callers
+        // (PipelineCallback::on_skipped) can bucket them differently —
+        // `Other` as a benign skip, `Error` as a counted error.
+        let err = SkipReason::Error("boom".to_string());
+        let other = SkipReason::Other("boom".to_string());
+        assert_ne!(err, other);
+        assert_eq!(err, SkipReason::Error("boom".to_string()));
     }
 
     #[test]

@@ -203,41 +203,6 @@ async fn send_once(
     Ok((status, json))
 }
 
-/// Map a non-2xx `(status, json)` pair to our error taxonomy. The server's
-/// error body uses `{code, message}` (see `server/src/error.rs`).
-fn map_error_response(status: reqwest::StatusCode, json: &serde_json::Value) -> Error {
-    let code = json
-        .get("code")
-        .and_then(|e| e.as_str())
-        .unwrap_or("internal");
-    let msg = json
-        .get("message")
-        .and_then(|m| m.as_str())
-        .unwrap_or("daemon error")
-        .to_string();
-
-    match code {
-        "store_not_found" => Error::StoreNotFound { id: msg },
-        "source_not_found" => Error::SourceNotFound { id: msg },
-        "document_not_found" => Error::DocumentNotFound { id: msg },
-        "job_not_found" => Error::JobNotFound { id: msg },
-        "runtime_state_locked" => Error::RuntimeStateLocked,
-        "daemon_running" => Error::DaemonRunning,
-        "daemon_unreachable" => Error::DaemonUnreachable,
-        "invalid_config" => Error::InvalidConfig { message: msg },
-        "invalid_request" => Error::InvalidRequest { message: msg },
-        "index_in_progress" => Error::IndexInProgress,
-        "provider_unavailable" => Error::ProviderUnavailable { message: msg },
-        "model_missing" => Error::ModelMissing { message: msg },
-        "unauthorized" => Error::Unauthorized { message: msg },
-        "forbidden" => Error::Forbidden { message: msg },
-        _ => Error::Internal {
-            message: format!("daemon returned {}: {}", status.as_u16(), msg),
-            correlation_id: "daemon_http".to_string(),
-        },
-    }
-}
-
 /// Redeem `refresh_token` against `base_url`'s `/token` endpoint, returning
 /// the new access token and the rotated `CredentialEntry` to persist, or
 /// `None` if the request failed outright or the daemon rejected it (expired
@@ -382,7 +347,16 @@ pub(crate) async fn daemon_request_async(
             return if status2.is_success() {
                 Ok(json2)
             } else {
-                Err(map_error_response(status2, &json2))
+                let code = json2
+                    .get("code")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("internal");
+                let msg = json2
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("daemon error")
+                    .to_string();
+                Err(decode_daemon_error(code, msg, status2))
             };
         }
         return Err(Error::Unauthorized {
@@ -394,7 +368,53 @@ pub(crate) async fn daemon_request_async(
     if status.is_success() {
         Ok(json)
     } else {
-        Err(map_error_response(status, &json))
+        // Map HTTP error codes to our error types.
+        // The server's error body uses {code, message} (see server/src/error.rs).
+        let code = json
+            .get("code")
+            .and_then(|e| e.as_str())
+            .unwrap_or("internal");
+        let msg = json
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("daemon error")
+            .to_string();
+
+        Err(decode_daemon_error(code, msg, status))
+    }
+}
+
+/// Map a daemon HTTP error body's stable `code` string (see
+/// `server/src/error.rs` and specs/05-surfaces.md §5) to a `core::Error`.
+///
+/// Extracted as a pure function so the code -> variant mapping (including
+/// the legacy-code fallback below) can be unit-tested without an HTTP round
+/// trip.
+fn decode_daemon_error(code: &str, msg: String, status: reqwest::StatusCode) -> Error {
+    match code {
+        "store_not_found" => Error::StoreNotFound { id: msg },
+        "source_not_found" => Error::SourceNotFound { id: msg },
+        "resource_not_found" => Error::ResourceNotFound { id: msg },
+        // Legacy code string from a stale daemon predating the
+        // resource_not_found rename (specs/05-surfaces.md §5); a v5+
+        // CLI may still talk to an older daemon binary, so keep
+        // decoding it to the same variant.
+        "document_not_found" => Error::ResourceNotFound { id: msg },
+        "job_not_found" => Error::JobNotFound { id: msg },
+        "runtime_state_locked" => Error::RuntimeStateLocked,
+        "daemon_running" => Error::DaemonRunning,
+        "daemon_unreachable" => Error::DaemonUnreachable,
+        "invalid_config" => Error::InvalidConfig { message: msg },
+        "invalid_request" => Error::InvalidRequest { message: msg },
+        "index_in_progress" => Error::IndexInProgress,
+        "provider_unavailable" => Error::ProviderUnavailable { message: msg },
+        "model_missing" => Error::ModelMissing { message: msg },
+        "unauthorized" => Error::Unauthorized { message: msg },
+        "forbidden" => Error::Forbidden { message: msg },
+        _ => Error::Internal {
+            message: format!("daemon returned {}: {}", status.as_u16(), msg),
+            correlation_id: "daemon_http".to_string(),
+        },
     }
 }
 
@@ -930,6 +950,39 @@ mod tests {
             Some("old_access"),
             "a failed refresh should still hand back the stale cached token \
              (best effort) rather than nothing at all"
+        );
+    }
+
+    #[test]
+    fn decode_daemon_error_maps_resource_not_found() {
+        let err = decode_daemon_error(
+            "resource_not_found",
+            "doc-1".to_string(),
+            reqwest::StatusCode::NOT_FOUND,
+        );
+        assert_eq!(
+            err,
+            Error::ResourceNotFound {
+                id: "doc-1".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn decode_daemon_error_accepts_legacy_document_not_found_code() {
+        // A stale daemon (pre-rename) may still emit the legacy
+        // "document_not_found" code string; the CLI must decode it to the
+        // same `ResourceNotFound` variant a current daemon would produce.
+        let err = decode_daemon_error(
+            "document_not_found",
+            "doc-1".to_string(),
+            reqwest::StatusCode::NOT_FOUND,
+        );
+        assert_eq!(
+            err,
+            Error::ResourceNotFound {
+                id: "doc-1".to_string()
+            }
         );
     }
 }

@@ -16,13 +16,26 @@ use crate::vectors::embedding_column_type;
 /// v5 -> v6 (T6, issue #98): added `access_requests.collected_at` — the
 /// atomic "credential handed out exactly once" guard for closed-mode invite
 /// polling (`AuthStore::mark_access_request_collected`). Purely additive.
+///
+/// NOTE(WP0 merge): this constant and the `MIGRATIONS`/`run_migrations`
+/// runner below are pre-#152 auth-branch machinery, preserved as-is for WP1
+/// to fold into `store-libsql/src/migrations/chain.rs` (see
+/// `docs/migrations.md` and CLAUDE.md's "write twice" rule). They are NOT
+/// wired into `create_schema` or `connection.rs::open` — main's
+/// `classify_version`/chain-based dispatch is the only active path.
 pub const SCHEMA_VERSION: i64 = 6;
 
 /// Run the full DDL for the unified database.
 ///
 /// Idempotent: safe to call on an already-created database. Does NOT set
 /// connection-level PRAGMAs (`journal_mode`, `foreign_keys`, `busy_timeout`)
-/// — that is the caller's responsibility (see `db::LibsqlDb::open`).
+/// — that is the caller's responsibility (see `db::LibsqlDb::open`). Also
+/// does NOT touch `PRAGMA user_version`: fresh-create callers
+/// (`connection.rs`'s `Fresh` branch, `migrate.rs`'s v==0 and legacy-rebuild
+/// paths) stamp it themselves, as the LAST step of
+/// `runner::seed_for_fresh_create`'s seeding transaction, only after the
+/// `schema_migrations` rows exist — see that function's doc comment for why
+/// the ordering matters.
 pub async fn create_schema(
     conn: &Connection,
     embedding_dim: usize,
@@ -37,8 +50,13 @@ pub async fn create_schema(
     create_triggers(conn).await?;
     create_sync_state(conn).await?;
     create_credentials(conn).await?;
-    create_auth_tables(conn).await?;
-    set_user_version(conn).await?;
+    // NOTE(WP0 merge): auth's `create_auth_tables`/`set_user_version` calls
+    // were dropped here rather than wired in — main's doc comment above
+    // (create_schema does NOT touch PRAGMA user_version; fresh-create
+    // callers stamp it via `runner::seed_for_fresh_create`) is the active
+    // invariant post-#152. WP1 must fold `create_auth_tables`'s DDL into
+    // this function (or an equivalent chain migration) as part of
+    // converting the auth schema to the chain framework.
     Ok(())
 }
 
@@ -197,7 +215,6 @@ async fn create_chunks(
             store_id      TEXT NOT NULL,
             id            TEXT NOT NULL,
             resource_id   TEXT NOT NULL,
-            block_id      INTEGER NOT NULL,
             block_seq     INTEGER NOT NULL,
             seq_in_block  INTEGER NOT NULL DEFAULT 0,
             block_kind    TEXT,
@@ -212,8 +229,12 @@ async fn create_chunks(
     );
     conn.execute(&chunks_ddl, ()).await?;
 
+    // Canonical block reference is (store_id, resource_id, block_seq) — see
+    // schema v5 (#128): no block_id/rowid FK. This composite index supports
+    // both per-document chunk listing and block-scoped context expansion.
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_chunks_store_resource ON chunks(store_id, resource_id)",
+        "CREATE INDEX IF NOT EXISTS idx_chunks_store_resource_pos \
+         ON chunks(store_id, resource_id, block_seq, seq_in_block)",
         (),
     )
     .await?;
@@ -502,8 +523,11 @@ async fn set_user_version(conn: &Connection) -> Result<(), libsql::Error> {
 
 /// Read the schema version from `PRAGMA user_version`.
 ///
-/// Returns `0` on a freshly-created (un-touched) database. Returns the value
-/// last set by `set_user_version` (or any other writer) on an initialized one.
+/// Returns `0` on a freshly-created (un-touched) database, and on one where
+/// `create_schema` has run but nothing has stamped a version yet (see that
+/// function's doc comment). Returns the value last stamped by
+/// `runner::seed_for_fresh_create`, the migration runner, or downgrade (or
+/// any other writer) on an initialized one.
 pub(crate) async fn get_schema_version(conn: &Connection) -> Result<i64, libsql::Error> {
     let mut rows = conn.query("PRAGMA user_version", ()).await?;
     match rows.next().await? {
@@ -602,6 +626,58 @@ pub(crate) async fn run_migrations(
             }
         }
     }
+    Ok(())
+}
+
+/// Drop all user-created tables, indexes, triggers, and virtual tables so the
+/// schema can be cleanly recreated from scratch.
+///
+/// No longer called from `LibsqlDb::open` — a version-mismatched store is
+/// never mutated on open (see `connection.rs`). This is the primitive behind
+/// the explicit legacy-rebuild path in `migrations::migrate::migrate_store`
+/// (for pre-baseline v1-v3 stores, where the user has explicitly opted into
+/// erasing and rebuilding the database via `allow_legacy_rebuild`).
+pub(crate) async fn drop_all_tables(conn: &Connection) -> Result<(), libsql::Error> {
+    // Collect all triggers first, then drop them.
+    let mut triggers = Vec::new();
+    {
+        let mut rows = conn
+            .query("SELECT name FROM sqlite_master WHERE type = 'trigger'", ())
+            .await?;
+        while let Some(row) = rows.next().await? {
+            triggers.push(row.get::<String>(0)?);
+        }
+    }
+    for name in &triggers {
+        conn.execute(&format!("DROP TRIGGER IF EXISTS \"{name}\""), ())
+            .await?;
+    }
+
+    // Collect all virtual tables (fts5 etc.) and regular tables.
+    let mut tables = Vec::new();
+    {
+        let mut rows = conn
+            .query(
+                "SELECT name FROM sqlite_master WHERE type IN ('table', 'view') \
+                 AND name NOT LIKE 'sqlite_%'",
+                (),
+            )
+            .await?;
+        while let Some(row) = rows.next().await? {
+            tables.push(row.get::<String>(0)?);
+        }
+    }
+    // Disable FK enforcement during the drop cascade so order doesn't matter.
+    conn.execute("PRAGMA foreign_keys = OFF", ()).await?;
+    for name in &tables {
+        conn.execute(&format!("DROP TABLE IF EXISTS \"{name}\""), ())
+            .await?;
+    }
+    conn.execute("PRAGMA foreign_keys = ON", ()).await?;
+
+    // Reset user_version to 0.
+    conn.query("PRAGMA user_version = 0", ()).await?;
+
     Ok(())
 }
 
@@ -754,7 +830,7 @@ mod tests {
             "idx_resources_store_uri",
             "idx_resources_source_id",
             "idx_blocks_resource",
-            "idx_chunks_store_resource",
+            "idx_chunks_store_resource_pos",
             "chunks_vec_idx",
             "idx_auth_tokens_user",
             "idx_auth_tokens_family",
@@ -783,14 +859,23 @@ mod tests {
         }
     }
 
+    /// `create_schema` alone must NOT stamp `user_version` — only
+    /// `runner::seed_for_fresh_create` does, as the last step of its own
+    /// seeding transaction (see `create_schema`'s doc comment for why the
+    /// ordering matters: it's what makes an interruption between the two
+    /// re-classify as `Fresh` on the next open, instead of landing at "head
+    /// but missing bookkeeping rows").
     #[tokio::test]
-    async fn user_version_set_to_schema_version() {
+    async fn create_schema_leaves_user_version_untouched() {
         let (_dir, conn) = open_test_db().await;
         create_schema(&conn, 4, VectorEncoding::Float32)
             .await
             .unwrap();
         let v = get_schema_version(&conn).await.unwrap();
-        assert_eq!(v, SCHEMA_VERSION);
+        assert_eq!(
+            v, 0,
+            "create_schema must not stamp user_version; seeding does"
+        );
     }
 
     #[tokio::test]
@@ -1086,5 +1171,48 @@ mod tests {
             let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
             assert_eq!(count, 1, "pre-existing data must be untouched on error");
         }
+    }
+
+    /// drop_all_tables leaves the DB empty and with user_version=0.
+    #[tokio::test]
+    async fn drop_all_tables_resets_db() {
+        let (_dir, conn) = open_test_db().await;
+        create_schema(&conn, 4, VectorEncoding::Float32)
+            .await
+            .unwrap();
+
+        drop_all_tables(&conn).await.unwrap();
+
+        // No user tables remain.
+        let names = table_names(&conn).await;
+        assert!(
+            names.is_empty(),
+            "all tables should be dropped; remaining: {names:?}"
+        );
+
+        // user_version is reset.
+        let v = get_schema_version(&conn).await.unwrap();
+        assert_eq!(v, 0, "user_version should be 0 after drop_all_tables");
+    }
+
+    /// After drop_all_tables, create_schema succeeds again (full
+    /// reinitialisation). `user_version` stays at 0 throughout — neither
+    /// `drop_all_tables` (it resets to 0) nor `create_schema` (it never
+    /// stamps) touches it; only seeding would.
+    #[tokio::test]
+    async fn drop_and_recreate_schema_succeeds() {
+        let (_dir, conn) = open_test_db().await;
+        create_schema(&conn, 4, VectorEncoding::Float32)
+            .await
+            .unwrap();
+        drop_all_tables(&conn).await.unwrap();
+        create_schema(&conn, 4, VectorEncoding::Float32)
+            .await
+            .unwrap();
+        let v = get_schema_version(&conn).await.unwrap();
+        assert_eq!(
+            v, 0,
+            "create_schema alone never stamps user_version, even after a drop+recreate cycle"
+        );
     }
 }

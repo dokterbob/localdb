@@ -27,7 +27,6 @@ notify-debouncer-mini = "0.4"
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
-reqwest = { version = "0.12", features = ["json"], default-features = false }
 
 # `FakeAuthStore` for oauth.rs's unit tests (T7) — exercises
 # `validate_authorize_params` against an in-memory `AuthService` instead of a

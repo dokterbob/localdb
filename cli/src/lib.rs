@@ -13,6 +13,7 @@ mod normalize;
 
 mod cmds {
     pub(crate) mod auth;
+    pub(crate) mod db;
     pub(crate) mod index;
     pub(crate) mod init;
     pub(crate) mod invite;
@@ -29,6 +30,7 @@ pub use cmds::auth::{
     run_key_create, run_key_list, run_key_revoke, run_user_add, run_user_list, run_user_remove,
     run_user_set_role,
 };
+pub use cmds::db::{run_db_downgrade, run_db_migrate, run_db_status};
 pub use cmds::index::run_index;
 pub use cmds::init::run_init;
 pub use cmds::invite::{

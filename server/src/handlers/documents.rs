@@ -5,7 +5,7 @@ use axum::{
 use serde::Serialize;
 
 use localdb_core::auth::Principal;
-use localdb_core::parser::DocumentMetadata;
+use localdb_core::metadata::Metadata;
 use localdb_core::Error as CoreError;
 
 use super::require_principal;
@@ -23,12 +23,12 @@ pub struct DocumentRecord {
     pub content_hash: String,
     pub fetched_at: String,
     pub normalized_text: String,
-    pub metadata: DocumentMetadata,
+    pub metadata: Metadata,
 }
 
 /// `GET /v1/documents/{id}`: readable like its owning store (D7). A
 /// document in a store the caller cannot read is masked as
-/// `document_not_found` when the *document itself* is unknown, but as
+/// `resource_not_found` when the *document itself* is unknown, but as
 /// `forbidden` (403) when it exists in a store the caller cannot read —
 /// same 403-over-404 consistency point as `handlers::stores::get_store`.
 pub async fn get_document(
@@ -42,7 +42,7 @@ pub async fn get_document(
         .find_document(&doc_id)
         .await
         .map_err(ApiError)?
-        .ok_or(ApiError(CoreError::DocumentNotFound { id: doc_id.clone() }))?;
+        .ok_or(ApiError(CoreError::ResourceNotFound { id: doc_id.clone() }))?;
 
     // A dangling `store_id` (no owning store row) is not expected in
     // practice — cascade deletes remove documents with their store — but if
@@ -67,14 +67,34 @@ pub async fn get_document(
         .await
         .map_err(ApiError)?;
     let chunks = handle
-        .get_chunks_for_document(&info.id)
+        .get_chunks_for_resource(&info.id)
         .await
         .map_err(ApiError)?;
-    let normalized_text = chunks
-        .iter()
-        .map(|c| c.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let blocks = handle
+        .get_blocks_for_resource(&info.id)
+        .await
+        .map_err(ApiError)?;
+    // Reconstruct from `blocks` when available: each block's canonical text
+    // is persisted exactly once, so joining these avoids duplicating the
+    // header/separator row that the table chunker (spec 04 §3, intentional)
+    // re-emits in every chunk of a multi-chunk table. Falls back to the
+    // legacy chunk-text join when `blocks` is empty (rows indexed before the
+    // Resource/Block architecture existed never persisted blocks). Joined
+    // with "\n\n", matching the blank-line separation Markdown extraction
+    // strips out between sibling blocks.
+    let normalized_text = if blocks.is_empty() {
+        chunks
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        blocks
+            .iter()
+            .map(|b| b.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
     Ok(Json(DocumentRecord {
         id: info.id,
         uri: info.uri,
