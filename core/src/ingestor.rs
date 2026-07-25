@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::block::{IngestorKind, Resource};
 use crate::error::Error;
+use crate::uri::Uri;
 
 /// Configuration field descriptor for an ingestor's setup.
 ///
@@ -120,7 +121,18 @@ pub trait IngestCallback: Send {
 
     /// Called for each discovered item the ingestor decides not to turn into
     /// a `Resource` (unchanged content, unsupported format, ...).
-    async fn on_skipped(&mut self, _uri: &str, _reason: SkipReason) {}
+    ///
+    /// `core` owns identity/normalization for every locator that flows
+    /// through the pipeline (see `core::ingestion::normalize_uri` and
+    /// `Uri`'s own construction guarantees) — a `Uri` reaching this method is
+    /// already canonical (percent-encoded path bytes, lower-cased host,
+    /// etc.), the same representation `Resource.uri` carries on the
+    /// `on_resource` path. An ingestor is never required to normalize a
+    /// locator itself to stay correct: it only has to produce a valid `Uri`
+    /// in the first place (typically by building one with `Uri::parse` /
+    /// `Uri::from_file_path` up front and reusing it), never a raw string
+    /// that core then has to reconcile against its own bookkeeping.
+    async fn on_skipped(&mut self, _uri: &Uri, _reason: SkipReason) {}
 }
 
 /// Source information passed to an ingestor.

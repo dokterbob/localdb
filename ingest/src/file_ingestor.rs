@@ -99,10 +99,7 @@ impl Ingestor for FileIngestor {
                     // Other) so the pipeline counts this as an error rather
                     // than a benign skip (C8).
                     callback
-                        .on_skipped(
-                            file.uri.as_str(),
-                            SkipReason::Error(format!("read error: {e}")),
-                        )
+                        .on_skipped(&file.uri, SkipReason::Error(format!("read error: {e}")))
                         .await;
                     result.errors += 1;
                     continue;
@@ -161,7 +158,7 @@ impl Ingestor for FileIngestor {
                 Err(panic_msg) => {
                     tracing::warn!(uri = %file.uri, "FileIngestor: parser panicked: {}", panic_msg);
                     callback
-                        .on_skipped(file.uri.as_str(), SkipReason::Error(panic_msg))
+                        .on_skipped(&file.uri, SkipReason::Error(panic_msg))
                         .await;
                     result.errors += 1;
                     continue;
@@ -169,7 +166,7 @@ impl Ingestor for FileIngestor {
                 Ok(Ok(Some(doc))) => doc,
                 Ok(Ok(None)) => {
                     callback
-                        .on_skipped(file.uri.as_str(), SkipReason::Unsupported)
+                        .on_skipped(&file.uri, SkipReason::Unsupported)
                         .await;
                     result.resources_skipped += 1;
                     continue;
@@ -179,10 +176,7 @@ impl Ingestor for FileIngestor {
                     // Same aliveness rule as the read-error path above;
                     // SkipReason::Error so it's counted as an error (C8).
                     callback
-                        .on_skipped(
-                            file.uri.as_str(),
-                            SkipReason::Error(format!("parser error: {e}")),
-                        )
+                        .on_skipped(&file.uri, SkipReason::Error(format!("parser error: {e}")))
                         .await;
                     result.errors += 1;
                     continue;
