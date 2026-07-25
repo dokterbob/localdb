@@ -800,13 +800,19 @@ mod tests {
         let ctx = ctx_for(&dir);
 
         let opener = fake_browser_opener(api_key);
+        // 45s, not the 10s the sibling happy-path test uses: this is a
+        // liveness budget, not an assertion. The spawn-daemon + browser-login
+        // round trip measures ~8s idle but ~15s on a loaded machine, so a 10s
+        // budget turns CPU contention into a spurious "timed out waiting for
+        // the browser to complete login" failure. Nothing here asserts on
+        // elapsed time; raising the ceiling only stops the test giving up early.
         perform_login(
             &ctx,
             &base_url,
             None,
             false,
             opener,
-            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(45),
         )
         .await
         .unwrap();
