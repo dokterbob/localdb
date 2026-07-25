@@ -1,4 +1,5 @@
 use std::fmt;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -15,6 +16,16 @@ impl Uri {
     /// Returns `None` if the string is not a valid URL.
     pub fn parse(s: &str) -> Option<Self> {
         url::Url::parse(s).ok().map(Uri)
+    }
+
+    /// Build a `file://` URI from an absolute filesystem path.
+    ///
+    /// Percent-encodes the path correctly (spaces, non-ASCII bytes, `#`, `?`,
+    /// etc.), unlike `format!("file://{}", path.display())`. Returns `None`
+    /// if `path` is not absolute (the only failure mode of
+    /// `url::Url::from_file_path`).
+    pub fn from_file_path(path: &Path) -> Option<Self> {
+        url::Url::from_file_path(path).ok().map(Uri)
     }
 
     /// The underlying `url::Url`.
@@ -128,6 +139,30 @@ mod tests {
     fn serde_rejects_invalid() {
         let result: Result<Uri, _> = serde_json::from_str("\"not a url\"");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn from_file_path_builds_file_uri() {
+        let uri = Uri::from_file_path(Path::new("/home/user/docs/test.md")).unwrap();
+        assert_eq!(uri.scheme(), "file");
+        assert_eq!(uri.as_str(), "file:///home/user/docs/test.md");
+    }
+
+    #[test]
+    fn from_file_path_rejects_relative_path() {
+        assert!(Uri::from_file_path(Path::new("relative/path.md")).is_none());
+    }
+
+    #[test]
+    fn from_file_path_encodes_space() {
+        let uri = Uri::from_file_path(Path::new("/home/user/my file.md")).unwrap();
+        assert_eq!(uri.as_str(), "file:///home/user/my%20file.md");
+    }
+
+    #[test]
+    fn from_file_path_encodes_non_ascii() {
+        let uri = Uri::from_file_path(Path::new("/home/user/中文.md")).unwrap();
+        assert!(uri.as_str().contains("%E4%B8%AD%E6%96%87"));
     }
 
     #[test]

@@ -30,6 +30,7 @@ use crate::types::{
     Chunk, IndexJob, IndexJobScope, IndexJobState, IndexJobStats, Provenance, Source, SourceRef,
     SourceSpec,
 };
+use crate::uri::Uri;
 
 // ---------------------------------------------------------------------------
 // DocumentRecord — tracks what was last indexed for a URI
@@ -209,7 +210,7 @@ pub struct FoundFile {
     /// Absolute file path.
     pub path: std::path::PathBuf,
     /// Canonical file URI: `file:///absolute/path`.
-    pub uri: String,
+    pub uri: Uri,
 }
 
 /// Enumerate files in a `path`-kind source, applying include/exclude globs.
@@ -296,7 +297,16 @@ fn enumerate_dir(
             }
 
             let abs_path = path.canonicalize().unwrap_or(path.clone());
-            let uri = format!("file://{}", abs_path.display());
+            // `Uri::from_file_path` percent-encodes correctly (spaces,
+            // non-ASCII, `#`, `?`, ...), unlike the old lossy
+            // `format!("file://{}", path.display())`. It only returns `None`
+            // for a non-absolute path, which `abs_path` isn't expected to be
+            // given the `canonicalize()` above — but fall back defensively
+            // rather than panic or silently drop the file.
+            let uri = Uri::from_file_path(&abs_path).unwrap_or_else(|| {
+                let fallback = format!("file://{}", abs_path.display());
+                Uri::parse(&fallback).expect("fallback file:// URI must parse")
+            });
             found.push(FoundFile {
                 path: abs_path,
                 uri,
@@ -1534,7 +1544,8 @@ mod tests {
         let root = dir.path().to_str().unwrap();
         let files = enumerate_path_source(root, &[], &[]).unwrap();
         assert_eq!(files.len(), 1);
-        assert!(files[0].uri.starts_with("file://"));
+        assert_eq!(files[0].uri.scheme(), "file");
+        assert!(files[0].uri.as_str().starts_with("file://"));
     }
 
     #[test]
@@ -2791,11 +2802,11 @@ mod tests {
             };
 
             // Enumerate for real — this is exactly how the URI the doc_index
-            // stores is shaped in production (raw `file://<abs_path>` fed
-            // through `Uri::parse` by the file ingestor).
+            // stores is shaped in production (`FoundFile.uri` is already a
+            // normalized `Uri`, built via `Uri::from_file_path`).
             let found = enumerate_path_source(root.to_str().unwrap(), &[], &[]).unwrap();
             assert_eq!(found.len(), 1);
-            let normalized_uri = crate::uri::Uri::parse(&found[0].uri).unwrap();
+            let normalized_uri = &found[0].uri;
             assert!(
                 normalized_uri.as_str().contains("My%20Docs"),
                 "sanity: the space must be percent-encoded in the indexed URI"
