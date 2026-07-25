@@ -45,16 +45,9 @@ impl Uri {
 
     /// Display with percent-decoded path components for human readability.
     pub fn display_decoded(&self) -> String {
-        let decoded = url::form_urlencoded::parse(self.0.path().as_bytes())
-            .map(|(k, v)| {
-                if v.is_empty() {
-                    k.into_owned()
-                } else {
-                    format!("{k}={v}")
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("");
+        let decoded = percent_encoding::percent_decode_str(self.0.path())
+            .decode_utf8_lossy()
+            .into_owned();
 
         if let Some(host) = self.0.host_str() {
             format!("{}://{}{}", self.0.scheme(), host, decoded)
@@ -62,6 +55,22 @@ impl Uri {
             format!("{}:{}", self.0.scheme(), decoded)
         }
     }
+}
+
+/// Percent-decode a URI string for human-readable display.
+///
+/// `ProgressEvent::DocumentStarted`/`DocumentFinished` carry a raw `String`
+/// (always `Uri::as_str()` under the hood, but the event type predates
+/// `Uri` and isn't worth widening just for display). Surface crates like
+/// `cli` must not re-implement percent-decoding themselves — see
+/// `specs/01-architecture.md §1` — so this free function does the decoding
+/// on their behalf. Falls back to `raw` unchanged if it does not parse as a
+/// URI (defensive; every current caller passes an already-valid
+/// `Uri::as_str()`).
+pub fn display_decoded_uri(raw: &str) -> String {
+    Uri::parse(raw)
+        .map(|uri| uri.display_decoded())
+        .unwrap_or_else(|| raw.to_string())
 }
 
 impl fmt::Display for Uri {
@@ -125,6 +134,92 @@ mod tests {
         let uri = Uri::parse("file:///home/user/my%20file.md").unwrap();
         let decoded = uri.display_decoded();
         assert!(decoded.contains("my file.md"));
+    }
+
+    // The four cases below prove `display_decoded` uses real path
+    // percent-decoding, not `url::form_urlencoded::parse` (form-data
+    // decoding). `url::Url::from_file_path` — the constructor `FoundFile`
+    // actually uses — does NOT percent-encode `&`, `=`, or `+` in a path,
+    // since none of them require escaping there per RFC 3986; they pass
+    // through literally. That is exactly what breaks the old decoder,
+    // which treats the whole path as a `key=value&key=value` form body:
+    //
+    //   - `&` is treated as a pair separator and silently dropped:
+    //     "foo&bar.md" -> "foobar.md".
+    //   - `+` is treated as an encoded space: "foo+bar.md" -> "foo bar.md".
+    //   - a lone `=` happens to round-trip UNLESS its value half is empty
+    //     (i.e. the path ends in `=`), in which case the trailing `=` is
+    //     dropped entirely: "notes=" -> "notes".
+    //   - a lone non-ASCII sequence also happens to round-trip under the
+    //     old code (form_urlencoded percent-decodes UTF-8 correctly too),
+    //     so to demonstrate a real failure it must appear alongside a
+    //     literal `+`, which still gets corrupted into a space.
+    //
+    // Each assertion below was verified against the old
+    // `form_urlencoded::parse`-based implementation and confirmed to fail;
+    // see the commit message for the verbatim before/after output.
+
+    #[test]
+    fn display_decoded_ampersand_in_filename() {
+        let uri = Uri::from_file_path(Path::new("/home/user/foo&bar.md")).unwrap();
+        let decoded = uri.display_decoded();
+        // Old: "file:/home/user/foobar.md" (the `&` and everything it was
+        // "separating" got silently merged away).
+        assert!(
+            decoded.contains("foo&bar.md"),
+            "expected 'foo&bar.md', got: {decoded}"
+        );
+    }
+
+    #[test]
+    fn display_decoded_trailing_equals_in_filename() {
+        let uri = Uri::from_file_path(Path::new("/home/user/notes=")).unwrap();
+        let decoded = uri.display_decoded();
+        // Old: "file:/home/user/notes" (the trailing `=` vanished because
+        // form_urlencoded treats it as a key/value separator with an empty
+        // value, and an empty value is dropped by the old `if v.is_empty()`
+        // branch).
+        assert!(
+            decoded.ends_with("notes="),
+            "expected trailing '=' to survive, got: {decoded}"
+        );
+    }
+
+    #[test]
+    fn display_decoded_literal_plus_not_turned_into_space() {
+        let uri = Uri::from_file_path(Path::new("/home/user/foo+bar.md")).unwrap();
+        let decoded = uri.display_decoded();
+        // Old: "file:/home/user/foo bar.md" (form_urlencoded decodes a
+        // literal `+` byte as an encoded space).
+        assert!(
+            decoded.contains("foo+bar.md"),
+            "expected 'foo+bar.md', got: {decoded}"
+        );
+    }
+
+    #[test]
+    fn display_decoded_non_ascii_with_plus() {
+        let uri = Uri::from_file_path(Path::new("/home/user/café+notes.md")).unwrap();
+        let decoded = uri.display_decoded();
+        // Old: "file:/home/user/café notes.md" — the percent-encoded 'é'
+        // decodes fine on its own, but the literal `+` still gets turned
+        // into a space, corrupting the non-ASCII filename.
+        assert!(
+            decoded.contains("café+notes.md"),
+            "expected 'café+notes.md', got: {decoded}"
+        );
+    }
+
+    #[test]
+    fn display_decoded_uri_str_decodes_a_valid_uri_string() {
+        let raw = "file:///home/user/my%20file.md";
+        assert_eq!(display_decoded_uri(raw), "file:/home/user/my file.md");
+    }
+
+    #[test]
+    fn display_decoded_uri_str_falls_back_on_unparseable_input() {
+        let raw = "not a uri at all";
+        assert_eq!(display_decoded_uri(raw), raw);
     }
 
     #[test]

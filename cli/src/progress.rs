@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use indicatif::{ProgressBar, ProgressStyle};
 use localdb_core::progress::{DocOutcome, ProgressEvent, ProgressSink};
+use localdb_core::uri::display_decoded_uri;
 use store_libsql::{MigrationProgressEvent, MigrationProgressSink};
 
 fn lock_or_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -88,7 +89,8 @@ fn tty_sink_parts() -> TtySinkParts {
         ProgressEvent::DocumentStarted { uri, .. } => {
             let guard = lock_or_poison(&pb_for_sink);
             if let Some(bar) = guard.as_ref() {
-                let name = uri.rsplit('/').next().unwrap_or(&uri).to_string();
+                let decoded = display_decoded_uri(&uri);
+                let name = decoded.rsplit('/').next().unwrap_or(&decoded).to_string();
                 bar.set_message(name);
             }
         }
@@ -476,6 +478,29 @@ mod tests {
         }));
 
         assert!(result.is_ok());
+    }
+
+    // Part B: `DocumentStarted` carries the raw `Uri::as_str()` string
+    // (percent-encoded), but the progress bar must show a human-readable
+    // name — decode before extracting the trailing path segment, don't
+    // display "my%20file.md" for a file literally named "my file.md".
+    #[test]
+    fn tty_sink_decodes_percent_encoded_uri_for_display() {
+        let (sink, pb, _) = tty_sink_parts();
+        sink(ProgressEvent::SourceStarted {
+            source_id: "s1".to_string(),
+            location: "/tmp/test".to_string(),
+        });
+        sink(ProgressEvent::Discovered { total: 1 });
+        sink(ProgressEvent::DocumentStarted {
+            uri: "file:///tmp/test/my%20file.md".to_string(),
+            index: 0,
+            total: 1,
+        });
+
+        let guard = lock_or_poison(&pb);
+        let bar = guard.as_ref().expect("bar should exist after Discovered");
+        assert_eq!(bar.message(), "my file.md");
     }
 
     // -- `db migrate` progress rendering (Part B.1) -------------------------
