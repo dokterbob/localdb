@@ -15,6 +15,7 @@
 
 #![cfg(feature = "local-onnx")]
 
+use embed::cuda_ep::CudaPreference;
 use embed::PplxContextOnnxEmbedder;
 use localdb_core::{DocumentChunks, Embedder};
 
@@ -36,8 +37,8 @@ fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "slow: downloads ~706 MB of quantized ONNX model files on first run; run with --ignored"]
 async fn pplx_embed_context_oversized_document_windowed() {
-    let embedder =
-        PplxContextOnnxEmbedder::new(None, false).expect("create PplxContextOnnxEmbedder");
+    let embedder = PplxContextOnnxEmbedder::new(None, false, CudaPreference::Disabled)
+        .expect("create PplxContextOnnxEmbedder");
 
     // Each repetition of this sentence is ~10 tokens; 500 reps ≈ 5 000 tokens per chunk.
     // A single such chunk already exceeds 4 096 → windowing splits the chunks apart.
@@ -74,8 +75,8 @@ async fn pplx_embed_context_oversized_document_windowed() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "slow: downloads ~706 MB of quantized ONNX model files on first run; run with --ignored"]
 async fn pplx_embed_context_late_chunking_four_chunks() {
-    let embedder =
-        PplxContextOnnxEmbedder::new(None, true).expect("create PplxContextOnnxEmbedder");
+    let embedder = PplxContextOnnxEmbedder::new(None, true, CudaPreference::Disabled)
+        .expect("create PplxContextOnnxEmbedder");
 
     assert_eq!(embedder.embedding_dim(), 1024);
     assert_eq!(embedder.model_id(), "pplx-embed-context-v1-0.6b");

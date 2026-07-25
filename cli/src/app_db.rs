@@ -238,6 +238,7 @@ mod tests {
         defaults.indexing.embedding = EmbeddingPolicy {
             provider: "fake".into(),
             model: "default".into(),
+            ..Default::default()
         };
         let config = RawConfig {
             version: 1,

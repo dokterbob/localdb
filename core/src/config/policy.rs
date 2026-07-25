@@ -77,6 +77,7 @@ mod tests {
             embedding: EmbeddingPolicy {
                 model: model.to_string(),
                 provider: provider.to_string(),
+                ..Default::default()
             },
             ..Default::default()
         }

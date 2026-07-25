@@ -25,16 +25,24 @@ defaults:                 # global indexing policy; stores inherit
       preset_overrides: {}     # per-source-kind tweaks, see §2
     embedding:
       model: pplx-embed-context-v1-0.6b  # see 04-search-pipeline.md §4
-      provider: local                    # local | local-coreml | local-onnx |
+      provider: local                    # local | local-coreml | local-onnx | local-cuda |
                                          #   openai-compatible | perplexity | voyage
+      ort_library: ~                     # advanced escape hatch: path to a system ONNX
+                                         #   Runtime shared library (ORT_DYLIB_PATH env var
+                                         #   takes precedence); requires ONNX Runtime >= 1.24;
+                                         #   only consulted by local/local-onnx/local-cuda.
       # pplx-embed-context-v1-0.6b (default): context-aware late-chunking, runs locally,
       #   MIT-licensed public repo — no API key or token required. Downloads ~706 MB
       #   (quantized ONNX) from HuggingFace on first use.
       # Local provider variants (see §7):
       #   local (default): AUTO — on Apple Silicon macOS built with the local-coreml
-      #     feature, uses the CoreML ANE/GPU backend; otherwise falls back to ONNX (CPU).
+      #     feature, uses the CoreML ANE/GPU backend; on Linux x86_64 with an NVIDIA stack
+      #     detected, downloads the CUDA-enabled ONNX Runtime (~196 MB, one-time) and prefers
+      #     the CUDA execution provider with automatic CPU fallback; otherwise ONNX (CPU).
       #   local-coreml: force CoreML; hard error if unavailable (no fallback).
       #   local-onnx: force ONNX (CPU). Existing local-onnx configs keep working unchanged.
+      #   local-cuda: force the CUDA execution provider (Linux x86_64 with an NVIDIA GPU
+      #     only); hard error if the CUDA stack is unavailable (no CPU fallback).
       # Local alternatives: model: pplx-embed-v1-0.6b (1024-dim, non-context, gated — needs
       #   HF_TOKEN, ~2.4 GB); model: bge-small-en-v1.5 (384-dim, no creds).
       # Hosted alternative: provider: perplexity, model: pplx-embed-context-v1
@@ -139,23 +147,44 @@ in the unified database, keyed by `(ingestor_kind, source_id, key)`. The values 
 encrypted (details TBD per ingestor). Interactive credential setup is handled by the ingestor's
 setup flow in `cli`, not by YAML config.
 
-## 7. Local embedding provider selection (`local` / `local-coreml` / `local-onnx`)
+## 7. Local embedding provider selection (`local` / `local-coreml` / `local-onnx` / `local-cuda`)
 
-The default local model `pplx-embed-context-v1-0.6b` can run on two backends; three `provider`
+The default local model `pplx-embed-context-v1-0.6b` can run on three backends; four `provider`
 values select between them:
 
 | Provider | Backend | Behavior |
 |---|---|---|
-| `local` (default) | auto | On Apple Silicon macOS built with the `local-coreml` cargo feature, when the CoreML bundle is loadable, runs on the **CoreML (ANE/GPU)** backend. Otherwise — non-macOS, feature not built, or a CoreML load failure — transparently falls back to **ONNX (CPU)**. |
+| `local` (default) | auto | On Apple Silicon macOS built with the `local-coreml` cargo feature, when the CoreML bundle is loadable, runs on the **CoreML (ANE/GPU)** backend. On Linux x86_64, when a complete NVIDIA driver + CUDA 12.x + cuDNN 9 stack is detected, downloads the CUDA-enabled ONNX Runtime (~196 MB, one-time) and prefers the **CUDA execution provider**, with automatic fallback to CPU if the EP fails to register. Otherwise — non-macOS/non-Linux-x86_64, feature not built, no CUDA stack, or a load failure — transparently falls back to **ONNX (CPU)**. |
 | `local-coreml` | CoreML (ANE/GPU) | Forces CoreML. **Hard error** if unavailable (non-macOS, feature off, or load failure) — there is no fallback. |
-| `local-onnx` | ONNX (CPU) | Forces ONNX. Existing `local-onnx` configs keep working unchanged. |
+| `local-onnx` | ONNX (CPU) | Forces ONNX, CPU-only, regardless of what hardware is available (the metered-connection / "never touch CUDA" opt-out). Existing `local-onnx` configs keep working unchanged. |
+| `local-cuda` | ONNX + CUDA execution provider | Forces the CUDA execution provider. Linux x86_64 with an NVIDIA GPU only. **Hard error** if the CUDA stack is unavailable or the ~196 MB CUDA ONNX Runtime download fails — there is no CPU fallback, since the caller specifically asked for GPU acceleration. |
 
 The CoreML backend is macOS-only and gated behind the opt-in `local-coreml` cargo feature; default
 builds are ONNX-only and unaffected. Building `--features local-coreml` requires **Rust ≥ 1.85**.
+The CUDA execution provider is available under the `local-onnx` cargo feature on any target — the
+`local`/`local-onnx`/`local-cuda` providers all share the same ONNX Runtime plumbing
+(`embed::ort_runtime`, `embed::cuda_ep`); only linux/x86_64 hosts can actually load the CUDA-flavored
+runtime. `embedding.ort_library` (see §1) is an advanced escape hatch shared by all three ONNX-backed
+providers, letting a packager point at a system ONNX Runtime build instead of the auto-downloaded one.
 
-**Index interchangeability.** Both backends share `model_id = pplx-embed-context-v1-0.6b`, are
+**Runtime acquisition.** The ONNX Runtime shared library itself is downloaded from a sha256-pinned
+flavor table (`embed::ort_download`) the first time it is needed, not embedded in the `localdb`
+binary at build time — one release binary serves CPU-only Linux/macOS and Linux+CUDA alike,
+instead of every binary carrying a fixed library most installs never load. Downloads land under
+`<cache_dir>/localdb/ort/<version>/` (CPU flavors) or `<version>-cuda/` (the CUDA flavor) and are
+skipped entirely — no network access — once matching, verified payloads already exist there,
+including ones placed by hand for an offline install (see [docs/install.md](../docs/install.md)).
+`ORT_DYLIB_PATH` (env) and `ort_library` (§1, above) both bypass the download and `dlopen` a
+caller-supplied library instead, in that precedence order.
+
+**Index interchangeability.** All three backends share `model_id = pplx-embed-context-v1-0.6b`, are
 1024-dim, and emit binary-quantized vectors (`VectorEncoding::Binary`). Only the sign survives
-binarization; measured cosine parity is ~0.995–0.9995 and per-dimension sign agreement ~98–99%
-(the ~1–2% of flips are near-zero dimensions that round to a different int8 sign under fp16). An
-index built by one backend is queryable by the other — switching providers requires **no reindex**
-and does not change the `policy_version` ([04-search-pipeline.md](04-search-pipeline.md) §4).
+binarization; measured CoreML/ONNX cosine parity is ~0.995–0.9995 and per-dimension sign agreement
+~98–99% (the ~1–2% of flips are near-zero dimensions that round to a different int8 sign under
+fp16). The CUDA execution provider runs the identical ONNX graph as the CPU execution provider, so
+its output is expected to be bit-identical (no cross-backend quantization to compare) — **this
+parity has not yet been measured on real CUDA hardware**; `scripts/cuda-verify.sh` runs a top-5
+overlap check for exactly this, pending someone with an NVIDIA machine executing it (see
+[docs/release-engineering.md](../docs/release-engineering.md)). An index built by one backend is
+queryable by any other — switching providers requires **no reindex** and does not change the
+`policy_version` ([04-search-pipeline.md](04-search-pipeline.md) §4).

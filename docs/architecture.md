@@ -201,9 +201,9 @@ the CoreML bundle is additionally fetched from `dokterbob/pplx-embed-coreml` (XE
 `hf-hub` 1.0). Subsequent runs use the cached model.
 
 `--features local-onnx` builds (the default on Linux; the ONNX fallback on macOS) additionally
-populate `<cache_dir>/localdb/ort/<version>/` on first use with the embedded ONNX Runtime
-shared library — a separate, sibling directory to `models/`, not configurable via `paths.*`.
-See [Platform notes: ONNX Runtime loading](#platform-notes).
+populate `<cache_dir>/localdb/ort/<version>/` (or `<version>-cuda/` for the CUDA flavor) on
+first use with a downloaded ONNX Runtime shared library — a separate, sibling directory to
+`models/`, not configurable via `paths.*`. See [Platform notes: ONNX Runtime loading](#platform-notes).
 
 ---
 
@@ -238,45 +238,106 @@ unavailable); `local-onnx` forces ONNX. CoreML and ONNX vectors are index-interc
 sign agreement), so switching backends needs no reindex. See [specs/03-config.md](../specs/03-config.md) §7 and
 [specs/04-search-pipeline.md](../specs/04-search-pipeline.md) §4.
 
-**ONNX Runtime loading (`local-onnx`, all platforms).** `embed`'s `ort` dependency uses the
-`load-dynamic` feature — the `localdb` executable links no ONNX Runtime ABI at all and instead
-`dlopen`s a shared library at a path chosen at runtime. `embed/build.rs` downloads *Microsoft's
-official* ONNX Runtime release (pinned to 1.24.4) for the build's target platform
-(`linux-x64`, `linux-aarch64`, `osx-arm64`), verifies it against a pinned sha256, and embeds it
-into the `embed` crate via `include_bytes!`. On first construction of any local-ONNX embedder,
-`embed::ort_runtime::ensure_ort_initialized` extracts that embedded library to
-`<cache_dir>/localdb/ort/<version>/` (mirroring the model-cache convention; idempotent —
-skipped if an up-to-date copy is already there) and calls `ort::init_from` on it before any
-other `ort` API is touched. Embedding the runtime grows the `localdb` binary by roughly
-12–20 MB depending on platform (measured: +11.8 MiB on macOS arm64, where it also replaced
-the previous statically-linked archive); the compressed release tarballs grow less.
+**ONNX Runtime loading (`local-onnx`, all platforms; issue #76).** `embed`'s `ort` dependency
+uses the `load-dynamic` feature — the `localdb` executable links no ONNX Runtime ABI at all and
+instead `dlopen`s a shared library at a path chosen at runtime. Historically (pre-#76) that
+library was downloaded *at build time* and baked into the binary via `include_bytes!`
+(`embed/build.rs`). `embed/build.rs` is now **deleted**: instead, `embed::ort_download` holds a
+sha256-pinned "flavor table" of Microsoft's official ONNX Runtime release tarballs, and
+`embed::ort_runtime::ensure_ort_initialized` downloads (or reuses an already-verified cached
+copy of) the process's chosen flavor the first time any local-ONNX embedder is constructed,
+before calling `ort::init_from` on it — before any other `ort` API is touched. One release
+binary now serves every target the flavor table knows about, instead of a fixed CPU library
+baked in regardless of what the running machine needs.
 
-Two overrides exist for power users / distro packagers who want to supply their own ONNX
-Runtime instead of the embedded one:
-- `ORT_DYLIB_PATH` (runtime env var): `ensure_ort_initialized` honours this directly and
-  `dlopen`s that path instead of extracting the embedded copy.
-- `LOCALDB_ORT_LIB` (build-time env var, read by `embed/build.rs`): points the *build* at a
-  local ONNX Runtime library to embed instead of downloading one (offline/distro builds).
+The flavor table (all pinned to ONNX Runtime 1.24.4) has four entries:
 
-Both overrides require ONNX Runtime **≥ 1.24** — `fastembed`'s own (unconditional) `ort`
-dependency declaration requests the `api-24` feature regardless of which `fastembed` features
-we enable, so despite `embed`'s own `ort` dependency line specifying no `api-*` feature, Cargo
-feature unification still enables `api-24` for the whole build. This is why the pinned embedded
-version is exactly 1.24.4, not an older 1.17–1.23 release.
+| Flavor | Target | Approx. download | Cache subdirectory |
+|---|---|---|---|
+| CPU | `linux-x64` | ~8 MB | `<cache_dir>/localdb/ort/1.24.4/` |
+| CPU | `linux-aarch64` | ~7 MB | `<cache_dir>/localdb/ort/1.24.4/` |
+| CPU | `osx-arm64` | ~30 MB | `<cache_dir>/localdb/ort/1.24.4/` |
+| CUDA | `linux-x64` only | ~196 MB | `<cache_dir>/localdb/ort/1.24.4-cuda/` |
 
-Why this exists: `ort`'s `download-binaries` feature (the previous approach) statically links
-pyke.io's prebuilt ONNX Runtime archive into `ort-sys`. That archive is built with GCC 14 on
-Ubuntu 24.04 and references `__isoc23_strtol*` symbols, giving the *release binary itself* a
-`GLIBC_2.38` floor — it refused to start on glibc-2.35 distros (Linux Mint 21.x, Ubuntu 22.04).
-It was also ABI-incompatible with GCC-11 libstdc++ when built on ubuntu-22.04. See
+The CUDA flavor bundles three libraries (the core runtime, the shared provider bridge, and
+`libonnxruntime_providers_cuda.so`) and deliberately excludes the TensorRT provider. CPU and
+CUDA flavors live in sibling `ort/<version>/` and `ort/<version>-cuda/` cache directories so
+they never collide, and a process commits to exactly one flavor for its lifetime (`ort`'s
+`init_from`/`.commit()` can only meaningfully run once) — see `embed/src/ort_runtime.rs`'s
+module docs for the "once-only" state machine, including why a failed CUDA *download* must not
+block a subsequent CPU fallback attempt in the same process (automatic `local` mode's behavior).
+The CPU flavor's cache directory and file names are byte-identical to the old build-time-embedded
+extraction path, so **existing user caches from before issue #76 remain valid pre-seeds** — no
+migration, no re-download.
+
+**Override precedence**, honoured regardless of flavor, in priority order:
+1. `ORT_DYLIB_PATH` (runtime env var) — existing power-user / system-package escape hatch.
+2. `embedding.ort_library` (config key, see [specs/03-config.md](../specs/03-config.md) §1) —
+   the packager-facing equivalent, threaded through by the embedder factory.
+3. Runtime download of the requested flavor's pinned payloads (the default).
+
+A caller supplying either override is assumed to know what they are doing (e.g. pointing at a
+distro package or a GPU build the flavor table doesn't know about) — overrides bypass
+flavor-specific download logic entirely. Both overrides require ONNX Runtime **≥ 1.24**:
+`fastembed`'s own (unconditional) `ort` dependency declaration requests the `api-24` feature
+regardless of which `fastembed` features we enable, so Cargo feature unification enables
+`api-24` for the whole build even though `embed`'s own `ort` dependency line specifies no
+`api-*` feature. This is why the pinned flavor-table version is exactly 1.24.4, not an older
+1.17–1.23 release.
+
+**Offline / air-gapped installs.** Since `ensure_downloaded` treats "payloads already present
+with matching sha256" as success without touching the network, pre-seeding a machine is just
+placing the expected files at the expected cache path before first use (exact paths and file
+names: [docs/install.md](install.md)). This is the same mechanism that makes existing pre-#76
+CPU caches valid without migration.
+
+**Why no silent system-ORT scanning.** `embed` never probes `/usr/lib`, `ldconfig`, or similar
+for a pre-installed ONNX Runtime and quietly adopts it: the flavor table requires ONNX Runtime
+**≥ 1.24** (via the `api-24` feature unification above), and a system package's exact version,
+build flavor (CPU vs. CUDA-enabled), and ABI are unknowable without asking the user — silently
+picking the wrong one would misattribute a load failure or, worse, a wrong-execution-provider
+success to the wrong cause. `ORT_DYLIB_PATH` / `embedding.ort_library` exist precisely so an
+operator who *does* have a suitable system library can point at it explicitly instead.
+
+**Why not `ort`'s `download-binaries` feature.** That feature (and any `api-*` default feature)
+statically links pyke.io's prebuilt ONNX Runtime archive into `ort-sys`. That archive is built
+with GCC 14 on Ubuntu 24.04 and references `__isoc23_strtol*` symbols, giving the *release binary
+itself* a `GLIBC_2.38` floor — it refused to start on glibc-2.35 distros (Linux Mint 21.x, Ubuntu
+22.04). It was also ABI-incompatible with GCC-11 libstdc++ when built on ubuntu-22.04. See
 [issue #133](https://github.com/dokterbob/localdb/issues/133) and
-[pykeio/ort#523](https://github.com/pykeio/ort/issues/523) (unresolved upstream). The Microsoft
-official Linux builds we embed instead float at `GLIBC_2.27` / `GLIBCXX_3.4.22` / `CXXABI_1.3.11`
-(verified via `objdump -T`), comfortably under Ubuntu 22.04's `GLIBC_2.35` baseline; the
-embedded macOS dylib declares a minimum of macOS 14.0 (`LC_BUILD_VERSION`). Because our own
+[pykeio/ort#523](https://github.com/pykeio/ort/issues/523) (unresolved upstream) — this
+constraint predates and is independent of issue #76's move to runtime download, and applies
+identically to `ort/cuda` (the CUDA support here dlopens Microsoft's official CUDA execution
+provider library ourselves; it never links `ort`'s own CUDA bindings). The Microsoft official
+Linux builds this flavor table downloads instead float at `GLIBC_2.27` / `GLIBCXX_3.4.22` /
+`CXXABI_1.3.11` (verified via `objdump -T`), comfortably under Ubuntu 22.04's `GLIBC_2.35`
+baseline; the macOS dylib declares a minimum of macOS 14.0 (`LC_BUILD_VERSION`). Because our own
 Rust code still inherits the *build machine's* glibc floor independent of this mechanism, the
-release and CI workflows also pin Linux builds to `ubuntu-22.04` (not `ubuntu-latest`) and
-verify both the `localdb` binary and the embedded `.so` stay at or below `GLIBC_2.35`.
+release workflow still pins Linux builds to `ubuntu-22.04` (not `ubuntu-latest`); the
+glibc/libstdc++ floor check against the *downloaded* ONNX Runtime libraries (formerly an
+objdump step in the release workflow against the embedded `.so`) now lives in `ci.yml`'s
+`ort-download` job, which runs on every PR against real downloaded artifacts on a GPU-less
+`ubuntu-22.04` runner.
+
+**Migration note.** `LOCALDB_ORT_LIB` (the build-time env var `embed/build.rs` used to read, to
+embed a local ONNX Runtime library instead of downloading one for an offline/distro build) no
+longer exists — `embed/build.rs` itself is deleted. The equivalent today is either
+`ORT_DYLIB_PATH` (env, for a single run) or `embedding.ort_library` (config, persistent) pointed
+at an already-installed library, or pre-seeding the download cache as described above.
+
+**CUDA execution provider (Linux x86_64, issue #76).** `embed::cuda_ep` implements a cheap,
+file-level detection ladder before ever attempting a CUDA download: (1) an NVIDIA driver
+(`/proc/driver/nvidia/version`, `/dev/nvidiactl`, or `ldconfig -p` listing `libcuda.so.1`), then
+(2) the CUDA 12.x runtime (`libcudart.so.12` via `ldconfig -p`), then (3) cuDNN 9
+(`libcudnn.so.9` via `ldconfig -p` — the piece most commonly missing, since it ships separately
+from both the driver and the CUDA toolkit metapackages). A stack that passes all three rungs
+still goes through a ground-truth `ort` execution-provider registration probe
+(`embed::cuda_ep::probe_cuda`) before being trusted. Three provider values consume this:
+`local-onnx` never attempts CUDA; `local` (automatic) prefers CUDA when the ladder passes but
+silently falls back to CPU on any failure; `local-cuda` requires CUDA and hard-errors (exit
+code 5, `ProviderUnavailable`) with no fallback if the stack is incomplete or registration
+fails — checked *before* any download is attempted. See
+[specs/03-config.md](../specs/03-config.md) §7 for the full provider table.
 
 ---
 
@@ -314,6 +375,16 @@ proxied stdio mode always exposes the daemon's full store set regardless of
 `--store`; a non-fatal warning is printed to stderr. Building client-side
 re-filtering for this was rejected as not worth the complexity in v1. See
 [docs/mcp.md](mcp.md#daemon-proxied-stdio) and [specs/05-surfaces.md](../specs/05-surfaces.md) §4.2.
+
+**8. CUDA execution provider is untested on real NVIDIA hardware.** ([issue #76](https://github.com/dokterbob/localdb/issues/76))
+The `local-cuda` provider, `local` mode's automatic CUDA preference, and the CPU/CUDA index
+parity claim in [specs/03-config.md](../specs/03-config.md) §7 are all exercised in CI only on
+GPU-less runners (`ci.yml`'s `ort-download` job asserts the CUDA-flavored ONNX Runtime
+downloads, verifies, and fails *cleanly* without a GPU — it cannot exercise a real EP
+registration or actual inference). `scripts/cuda-verify.sh` is a one-shot manual verification
+kit for someone with NVIDIA hardware to run against a release tarball; until that run happens
+and this note is updated with the result, treat GPU execution and CPU/CUDA output parity as
+unverified, not merely untested-in-CI.
 
 ---
 

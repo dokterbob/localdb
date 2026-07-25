@@ -101,8 +101,13 @@ mod bench_impl {
         // Load model
         print!("Loading model... ");
         let load_start = Instant::now();
-        let embedder = OnnxEmbedder::new(ModelChoice::BgeSmallEnV15, None, true)
-            .expect("failed to load ONNX model");
+        let embedder = OnnxEmbedder::new(
+            ModelChoice::BgeSmallEnV15,
+            None,
+            true,
+            embed::cuda_ep::CudaPreference::Disabled,
+        )
+        .expect("failed to load ONNX model");
         let load_time = load_start.elapsed();
         println!("done ({:.1}s)", load_time.as_secs_f64());
         println!(

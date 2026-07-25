@@ -110,11 +110,25 @@ impl PplxOnnxEmbedder {
     /// model cache (`~/Library/Caches/localdb/models/` on macOS).
     ///
     /// `show_progress`: emit download progress via `tracing::info!`.
-    pub fn new(cache_dir: Option<PathBuf>, show_progress: bool) -> Result<Self, EmbedError> {
-        // Extract/dlopen the embedded ONNX Runtime (idempotent) before any `ort` API use
-        // below, and before the (potentially multi-GB) model download so ORT setup failures
-        // surface fast.
-        crate::ort_runtime::ensure_ort_initialized()?;
+    /// `cuda`: how eagerly to register the CUDA execution provider (see
+    /// [`crate::cuda_ep::CudaPreference`]).
+    pub fn new(
+        cache_dir: Option<PathBuf>,
+        show_progress: bool,
+        cuda: crate::cuda_ep::CudaPreference,
+    ) -> Result<Self, EmbedError> {
+        // Download/dlopen the ONNX Runtime (idempotent) before any `ort` API use below, and
+        // before the (potentially multi-GB) model download so ORT setup failures surface fast.
+        //
+        // Second-line, idempotent guard: the factory has already decided the process-wide
+        // flavor + `embedding.ort_library` override before constructing the first embedder.
+        // `None` here is safe — the override only matters on the first call in the process.
+        let flavor = match cuda {
+            crate::cuda_ep::CudaPreference::Disabled => crate::ort_runtime::OrtFlavor::Cpu,
+            crate::cuda_ep::CudaPreference::Preferred
+            | crate::cuda_ep::CudaPreference::Required => crate::ort_runtime::OrtFlavor::Cuda,
+        };
+        crate::ort_runtime::ensure_ort_initialized(flavor, None)?;
 
         let model_dir = cache_dir
             .unwrap_or_else(crate::model_cache::ModelCache::default_cache_dir)
@@ -150,6 +164,8 @@ impl PplxOnnxEmbedder {
         info!(model = "pplx-embed-v1-0.6b", "loading ORT session");
         let session = ort::session::Session::builder()
             .map_err(|e| EmbedError::Internal(format!("ORT SessionBuilder: {e}")))?
+            .with_execution_providers(crate::cuda_ep::dispatch_list(cuda))
+            .map_err(|e| EmbedError::Internal(format!("ORT with_execution_providers: {e}")))?
             // ORT defaults its intra-op pool to physical core count; pin it to logical
             // cores so all of them engage during embedding. (Relies on the non-OpenMP
             // pyke prebuilt binary — OpenMP builds ignore this and need OMP_NUM_THREADS.)

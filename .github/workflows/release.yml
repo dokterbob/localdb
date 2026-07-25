@@ -33,8 +33,9 @@ jobs:
 
           # Linux x86_64 (native). Pinned to ubuntu-22.04 (not ubuntu-latest): our own Rust
           # code inherits the build machine's glibc floor, so building on a newer Ubuntu
-          # would re-introduce issue #133 even though the embedded ONNX Runtime (build.rs)
-          # is no longer the culprit. See "Verify glibc floor" step below.
+          # would re-introduce issue #133 even though the ONNX Runtime is no longer embedded
+          # at build time (issue #76 deleted embed/build.rs; it's downloaded lazily at
+          # runtime instead). See "Verify glibc floor" step below.
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             cross: false
@@ -119,13 +120,16 @@ jobs:
           fi
 
       - name: Verify glibc floor (Linux)
-        # Two independent glibc floors matter here (issue #133):
-        #   1. Our own Rust code — set by the build machine, hence pinning both Linux
-        #      matrix entries to ubuntu-22.04 above.
-        #   2. The embedded ONNX Runtime .so (embed/build.rs downloads Microsoft's official
-        #      build, verified offline to floor at GLIBC_2.27) — re-checked here as a
-        #      regression guard in case the pinned version/asset ever changes.
-        # Ubuntu 22.04 ships glibc 2.35, so both must stay at or below that.
+        # Only one glibc floor matters here now (issue #133): our own Rust code, set by the
+        # build machine — hence pinning both Linux matrix entries to ubuntu-22.04 above.
+        # Ubuntu 22.04 ships glibc 2.35, so the release binary must stay at or below that.
+        #
+        # The *other* half of #133's original guarantee — the embedded ONNX Runtime .so's own
+        # glibc floor — no longer applies to this workflow: issue #76 deleted embed/build.rs,
+        # so release binaries no longer embed any ONNX Runtime at all (it's downloaded lazily
+        # on first use from a sha256-pinned flavor table; see embed/src/ort_download.rs). That
+        # guarantee now lives in ci.yml's `ort-download` job, which downloads each flavor and
+        # objdump-checks it directly.
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
@@ -153,13 +157,6 @@ jobs:
           }
 
           check_glibc_floor "target/${{ matrix.target }}/release/localdb"
-
-          ORT_LIB=$(find target -path '*embed-*/out/*libonnxruntime*' -type f | head -1)
-          if [ -z "$ORT_LIB" ]; then
-            echo "ERROR: expected an embedded libonnxruntime under target/ for a local-onnx release build" >&2
-            exit 1
-          fi
-          check_glibc_floor "$ORT_LIB"
 
       - name: Package tarball
         run: |
@@ -218,10 +215,11 @@ jobs:
       fail-fast: false
       matrix:
         # ubuntu-22.04: proves the glibc-2.35 scenario from issue #133 (≈ Linux Mint 21.x)
-        # end-to-end (extraction + dlopen + index + search), not just at link time.
+        # end-to-end (download + dlopen + index + search), not just at link time.
         # ubuntu-latest: a current Linux, for good measure.
-        # macos-latest: the embedded-runtime mechanism is identical on macOS now, so it
-        # gets the same end-to-end proof.
+        # macos-latest: the runtime-download mechanism (issue #76) is identical on macOS now
+        # (same flavor-table download, different cache path/lib name), so it gets the same
+        # end-to-end proof — see smoke_test.sh for the OS-specific cache paths.
         os: [ubuntu-22.04, ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:

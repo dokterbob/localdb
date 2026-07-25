@@ -179,6 +179,7 @@ mod tests {
         yaml_config.defaults.indexing.embedding = EmbeddingPolicy {
             provider: "perplexity".to_string(),
             model: "default".to_string(),
+            ..Default::default()
         };
         let (_dir, state) = make_state(yaml_config).await;
 
@@ -206,6 +207,7 @@ mod tests {
         yaml_config.defaults.indexing.embedding = EmbeddingPolicy {
             provider: "fake".to_string(),
             model: "default".to_string(),
+            ..Default::default()
         };
         let (_dir, state) = make_state(yaml_config).await;
         state.add_store("notes", "private").await.unwrap();

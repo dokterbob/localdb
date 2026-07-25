@@ -40,19 +40,19 @@ const SHAPES: &[ShapeRule] = &[
         encoding: VectorEncoding::Float32,
     },
     ShapeRule {
-        providers: &["local", "local-coreml", "local-onnx"],
+        providers: &["local", "local-coreml", "local-onnx", "local-cuda"],
         model: Some("pplx-embed-context-v1-0.6b"),
         dim: 1024,
         encoding: VectorEncoding::Binary,
     },
     ShapeRule {
-        providers: &["local", "local-onnx"],
+        providers: &["local", "local-onnx", "local-cuda"],
         model: Some("pplx-embed-v1-0.6b"),
         dim: 1024,
         encoding: VectorEncoding::Binary,
     },
     ShapeRule {
-        providers: &["local", "local-onnx"],
+        providers: &["local", "local-onnx", "local-cuda"],
         model: Some("bge-small-en-v1.5"),
         dim: 384,
         encoding: VectorEncoding::Float32,
@@ -94,7 +94,7 @@ pub fn infer_dim_encoding(
             EmbedError::Internal(format!(
                 "cannot infer embedding shape for provider '{}' model '{}'. \
                  Supported providers: 'fake', 'local', 'local-coreml', 'local-onnx', \
-                 'openai-compatible', 'perplexity', 'voyage'.",
+                 'local-cuda', 'openai-compatible', 'perplexity', 'voyage'.",
                 policy.provider, policy.model,
             ))
         })
@@ -116,6 +116,7 @@ pub fn create_embedder(
         "local-onnx" => create_onnx(policy, models_dir),
         #[cfg(not(feature = "local-onnx"))]
         "local-onnx" => create_onnx_unavailable(),
+        "local-cuda" => create_cuda(policy, models_dir),
         "openai-compatible" => create_openai_compatible(policy, providers),
         "perplexity" => create_perplexity(providers),
         "voyage" => create_voyage(providers),
@@ -134,7 +135,7 @@ fn create_fake(policy: &EmbeddingPolicy) -> Result<BoxedEmbedder, EmbedError> {
 fn unknown_provider(unknown: &str) -> Result<BoxedEmbedder, EmbedError> {
     Err(EmbedError::Internal(format!(
         "unknown provider: '{unknown}'. \
-         Supported: 'fake', 'local', 'local-coreml', 'local-onnx', \
+         Supported: 'fake', 'local', 'local-coreml', 'local-onnx', 'local-cuda', \
          'openai-compatible', 'perplexity', 'voyage'."
     )))
 }
@@ -270,28 +271,47 @@ fn create_onnx_unavailable() -> Result<BoxedEmbedder, EmbedError> {
     ))
 }
 
+/// Thin CPU-only wrapper around [`create_onnx_with`], used by the explicit `local-onnx`
+/// provider (the metered-connection / "never touch CUDA" opt-out — CPU-only by definition,
+/// regardless of what hardware is available).
 #[cfg(feature = "local-onnx")]
 fn create_onnx(
     policy: &EmbeddingPolicy,
     models_dir: Option<&Path>,
 ) -> Result<BoxedEmbedder, EmbedError> {
-    // Idempotent: extracts/dlopens the embedded ONNX Runtime once per process. Also called
-    // at the top of each embedder constructor below (OnnxEmbedder::new etc.) so that direct
-    // construction (tests, examples) doesn't skip it — the OnceLock makes the repeat cheap.
-    crate::ort_runtime::ensure_ort_initialized()?;
+    create_onnx_with(policy, models_dir, crate::cuda_ep::CudaPreference::Disabled)
+}
+
+#[cfg(feature = "local-onnx")]
+fn create_onnx_with(
+    policy: &EmbeddingPolicy,
+    models_dir: Option<&Path>,
+    cuda: crate::cuda_ep::CudaPreference,
+) -> Result<BoxedEmbedder, EmbedError> {
+    // Idempotent: downloads/dlopens the ONNX Runtime once per process. Also called at the top
+    // of each embedder constructor below (OnnxEmbedder::new etc.) so that direct construction
+    // (tests, examples) doesn't skip it — the once-only init makes the repeat cheap.
+    let flavor = match cuda {
+        crate::cuda_ep::CudaPreference::Disabled => crate::ort_runtime::OrtFlavor::Cpu,
+        crate::cuda_ep::CudaPreference::Preferred | crate::cuda_ep::CudaPreference::Required => {
+            crate::ort_runtime::OrtFlavor::Cuda
+        }
+    };
+    crate::ort_runtime::ensure_ort_initialized(flavor, policy.ort_library.as_deref())?;
     let cache_dir = models_dir.map(|p| p.to_path_buf());
     match policy.model.as_str() {
         "pplx-embed-context-v1-0.6b" => {
-            let embedder = crate::pplx_context_onnx::PplxContextOnnxEmbedder::new(cache_dir, true)?;
+            let embedder =
+                crate::pplx_context_onnx::PplxContextOnnxEmbedder::new(cache_dir, true, cuda)?;
             Ok(Box::new(embedder))
         }
         "pplx-embed-v1-0.6b" => {
-            let embedder = crate::pplx_onnx::PplxOnnxEmbedder::new(cache_dir, true)?;
+            let embedder = crate::pplx_onnx::PplxOnnxEmbedder::new(cache_dir, true, cuda)?;
             Ok(Box::new(embedder))
         }
         "bge-small-en-v1.5" => {
             use crate::onnx::{ModelChoice, OnnxEmbedder};
-            let embedder = OnnxEmbedder::new(ModelChoice::BgeSmallEnV15, cache_dir, true)?;
+            let embedder = OnnxEmbedder::new(ModelChoice::BgeSmallEnV15, cache_dir, true, cuda)?;
             Ok(Box::new(embedder))
         }
         unknown => Err(EmbedError::Internal(format!(
@@ -299,6 +319,143 @@ fn create_onnx(
              Supported: 'pplx-embed-context-v1-0.6b', 'pplx-embed-v1-0.6b', 'bge-small-en-v1.5'."
         ))),
     }
+}
+
+/// Explicit `local-cuda` provider: forces the CUDA execution provider. Linux x86_64 with an
+/// NVIDIA GPU only — hard error (no CPU fallback) if the CUDA stack is unavailable, since the
+/// caller specifically asked for GPU acceleration.
+fn create_cuda(
+    policy: &EmbeddingPolicy,
+    models_dir: Option<&Path>,
+) -> Result<BoxedEmbedder, EmbedError> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        create_cuda_with_status(crate::cuda_ep::detect_cuda_stack(), policy, models_dir)
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        let _ = (policy, models_dir);
+        // ProviderError (not Internal): maps to core's ProviderUnavailable → exit code 5
+        // ("unavailable", specs/05-surfaces.md §5) rather than 1.
+        Err(EmbedError::ProviderError {
+            provider: "local-cuda".to_string(),
+            message: "provider 'local-cuda' requires Linux x86_64 with an NVIDIA GPU. \
+                      Use provider 'local' (auto-detects, CPU fallback) or 'local-onnx' instead."
+                .to_string(),
+        })
+    }
+}
+
+/// Core of [`create_cuda`], parameterized over an already-known [`CudaStackStatus`] so it's
+/// unit-testable on every platform (including this macOS dev machine) with injected statuses —
+/// without needing a real Linux/CUDA host to exercise [`detect_cuda_stack`]'s real branch.
+///
+/// Errors on any non-`Ok` status *before* touching `ensure_ort_initialized` or any download —
+/// by construction, the early return happens before any of that code is reached, so a
+/// `DriverMissing`/`CudartMissing`/`CudnnMissing` status can never trigger the ~196 MB CUDA
+/// ONNX Runtime download.
+///
+/// [`CudaStackStatus`]: crate::cuda_ep::CudaStackStatus
+/// [`detect_cuda_stack`]: crate::cuda_ep::detect_cuda_stack
+#[cfg_attr(
+    not(all(target_os = "linux", target_arch = "x86_64")),
+    allow(
+        dead_code,
+        reason = "only called from create_cuda's linux/x86_64 branch; exercised directly by \
+                   cross-platform unit tests on every other target"
+    )
+)]
+fn create_cuda_with_status(
+    status: crate::cuda_ep::CudaStackStatus,
+    policy: &EmbeddingPolicy,
+    models_dir: Option<&Path>,
+) -> Result<BoxedEmbedder, EmbedError> {
+    if let Some(err) = cuda_stack_error(status) {
+        return Err(err);
+    }
+    create_cuda_after_stack_ok(policy, models_dir)
+}
+
+/// Pure decision over an already-known [`CudaStackStatus`](crate::cuda_ep::CudaStackStatus):
+/// `None` when the stack looks complete (caller should proceed), `Some(err)` with the
+/// canonical actionable message otherwise.
+#[cfg_attr(
+    not(all(target_os = "linux", target_arch = "x86_64")),
+    allow(
+        dead_code,
+        reason = "only called from create_cuda_with_status on linux/x86_64; exercised directly \
+                   by cross-platform unit tests on every other target"
+    )
+)]
+fn cuda_stack_error(status: crate::cuda_ep::CudaStackStatus) -> Option<EmbedError> {
+    if status == crate::cuda_ep::CudaStackStatus::Ok {
+        return None;
+    }
+    let (cause, hint) = crate::cuda_ep::stack_status_cause_and_hint(status);
+    // ProviderError (not Internal): maps to core's ProviderUnavailable → exit code 5
+    // ("unavailable", specs/05-surfaces.md §5) rather than 1.
+    Some(EmbedError::ProviderError {
+        provider: "local-cuda".to_string(),
+        message: crate::cuda_ep::cuda_unavailable_error(cause, hint),
+    })
+}
+
+/// Runs once the cheap detection ladder has already reported [`CudaStackStatus::Ok`]: inits
+/// the CUDA-flavored ONNX Runtime, ground-truths it with [`probe_cuda`], then constructs the
+/// embedder with [`CudaPreference::Required`] (hard error on EP registration failure — no
+/// silent CPU fallback for the explicit `local-cuda` provider).
+///
+/// [`CudaStackStatus::Ok`]: crate::cuda_ep::CudaStackStatus::Ok
+/// [`probe_cuda`]: crate::cuda_ep::probe_cuda
+/// [`CudaPreference::Required`]: crate::cuda_ep::CudaPreference::Required
+#[cfg(feature = "local-onnx")]
+#[cfg_attr(
+    not(all(target_os = "linux", target_arch = "x86_64")),
+    allow(
+        dead_code,
+        reason = "only called from create_cuda_with_status on linux/x86_64; exercised directly \
+                   by cross-platform unit tests on every other target"
+    )
+)]
+fn create_cuda_after_stack_ok(
+    policy: &EmbeddingPolicy,
+    models_dir: Option<&Path>,
+) -> Result<BoxedEmbedder, EmbedError> {
+    crate::ort_runtime::ensure_ort_initialized(
+        crate::ort_runtime::OrtFlavor::Cuda,
+        policy.ort_library.as_deref(),
+    )?;
+    crate::cuda_ep::probe_cuda().map_err(|e| EmbedError::ProviderError {
+        provider: "local-cuda".to_string(),
+        message: crate::cuda_ep::cuda_unavailable_error(&e, None),
+    })?;
+    create_onnx_with(policy, models_dir, crate::cuda_ep::CudaPreference::Required)
+}
+
+#[cfg(not(feature = "local-onnx"))]
+#[cfg_attr(
+    not(all(target_os = "linux", target_arch = "x86_64")),
+    allow(
+        dead_code,
+        reason = "only called from create_cuda_with_status on linux/x86_64; exercised directly \
+                   by cross-platform unit tests on every other target"
+    )
+)]
+fn create_cuda_after_stack_ok(
+    policy: &EmbeddingPolicy,
+    models_dir: Option<&Path>,
+) -> Result<BoxedEmbedder, EmbedError> {
+    let _ = (policy, models_dir);
+    // ProviderError (not Internal): a binary built without `local-onnx` genuinely can't provide
+    // 'local-cuda' — "unavailable" (exit code 5) fits the user experience better than "internal
+    // error" (exit code 1), and matches every other local-cuda-unavailability arm in this file
+    // (see `create_cuda`'s and `cuda_stack_error`'s ProviderError uses above).
+    Err(EmbedError::ProviderError {
+        provider: "local-cuda".to_string(),
+        message: "provider 'local-cuda' requires the 'local-onnx' feature flag. \
+                  Rebuild with `--features local-onnx`."
+            .to_string(),
+    })
 }
 
 #[allow(clippy::needless_return)]
@@ -347,6 +504,12 @@ fn create_local_auto(
     {
         #[cfg(feature = "local-onnx")]
         {
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            {
+                if let Some(result) = try_local_auto_cuda(policy, models_dir) {
+                    return result;
+                }
+            }
             return create_onnx(policy, models_dir);
         }
         #[cfg(not(feature = "local-onnx"))]
@@ -362,6 +525,177 @@ fn create_local_auto(
     }
 }
 
+/// Automatic ("local") mode's linux/x86_64 CUDA attempt: `Some(Ok(embedder))` once CUDA is
+/// loaded and construction is attempted, `None` (having already logged why via `tracing`) when
+/// CUDA isn't even attempted — the caller falls through to the normal CPU ONNX path only in
+/// the `None` case.
+///
+/// Falling back to CPU is only sound when the process either hasn't committed to a flavor yet,
+/// or has *already* committed to `Cpu` (in which case "falling back" just means reusing the
+/// runtime that's already loaded — see [`cuda_init_fallback_allowed`]). Once the process commits
+/// to `Cuda`, the process-wide runtime is irreversibly the CUDA-flavored library (see
+/// `ort_runtime.rs`'s once-only/flavor-committed semantics), so a later construction failure
+/// (e.g. the model download itself failing) must be surfaced as an error rather than silently
+/// retried as `OrtFlavor::Cpu` — that retry would itself fail with "already initialized as
+/// Cuda". This is why only [`detect_cuda_stack`] failures, and [`ensure_ort_initialized`]
+/// failures that left the process uncommitted or already-`Cpu` (see
+/// [`cuda_init_fallback_allowed`]), return `None` here; a [`create_onnx_with`] failure after a
+/// successful CUDA commit — or an [`ensure_ort_initialized`] failure that committed the process
+/// to `Cuda` (e.g. a `dlopen` error, per `ort_runtime.rs`'s `InitAttempt::Committed`) — is
+/// returned as `Some(Err(..))` instead, since a CPU fallback attempted in that case would itself
+/// deterministically fail the flavor-mismatch check.
+///
+/// No [`probe_cuda`] ground-truth check either (unlike `local-cuda`'s
+/// [`create_cuda_after_stack_ok`]): once the CUDA-flavored runtime is loaded,
+/// [`CudaPreference::Preferred`]'s EP registration is allowed to fail silently at the `ort`
+/// session level (see `cuda_ep.rs`'s module docs) — exactly the "nice-to-have GPU, transparent
+/// CPU fallback" behavior automatic mode wants.
+///
+/// [`ensure_ort_initialized`]: crate::ort_runtime::ensure_ort_initialized
+/// [`detect_cuda_stack`]: crate::cuda_ep::detect_cuda_stack
+/// [`probe_cuda`]: crate::cuda_ep::probe_cuda
+/// [`CudaPreference::Preferred`]: crate::cuda_ep::CudaPreference::Preferred
+#[cfg(all(feature = "local-onnx", target_os = "linux", target_arch = "x86_64"))]
+fn try_local_auto_cuda(
+    policy: &EmbeddingPolicy,
+    models_dir: Option<&Path>,
+) -> Option<Result<BoxedEmbedder, EmbedError>> {
+    let status = crate::cuda_ep::detect_cuda_stack();
+    if !should_attempt_cuda_auto(status) {
+        tracing::info!(
+            ?status,
+            "no complete NVIDIA/CUDA stack detected; using CPU ONNX Runtime"
+        );
+        return None;
+    }
+
+    if let Err(e) = crate::ort_runtime::ensure_ort_initialized(
+        crate::ort_runtime::OrtFlavor::Cuda,
+        policy.ort_library.as_deref(),
+    ) {
+        // F1/F2: a failed `ensure_ort_initialized(Cuda, ..)` call permits CPU fallback in two
+        // distinct cases, both read from `committed_flavor()` immediately after the failure:
+        //
+        // - `None` — the attempt never committed the process to a flavor at all (e.g. the CUDA
+        //   download itself failed, `InitAttempt::NotAttempted` in `ort_runtime.rs`). A fresh
+        //   `ensure_ort_initialized(Cpu, ..)` is free to proceed normally.
+        // - `Some(Cpu)` — the process had *already* committed to `Cpu` before this call even ran
+        //   (e.g. a long-lived daemon process constructed a `local-onnx` embedder earlier). The
+        //   `Cuda` request above failed immediately on `ort_runtime`'s flavor-mismatch check
+        //   without changing the committed flavor, so `Cpu` is still exactly what's loaded —
+        //   falling back reuses the already-`dlopen`ed CPU runtime and `ensure_ort_initialized`
+        //   is idempotent for a matching flavor, so this is not just safe, it's a no-op.
+        //
+        // Only `Some(Cuda)` blocks fallback: the *failed* attempt itself committed the process
+        // to `Cuda` (e.g. `ort::init_from`/dlopen failed after being invoked —
+        // `InitAttempt::Committed(Err(..))`), so the process is now permanently Cuda-flavored
+        // and a subsequent `ensure_ort_initialized(Cpu, ..)` would die on the flavor-mismatch
+        // check instead of actually falling back — surface the real error instead of lying
+        // about a fallback that can't happen.
+        let committed = crate::ort_runtime::committed_flavor();
+        if cuda_init_fallback_allowed(committed) {
+            match committed {
+                None => tracing::warn!(
+                    error = %e,
+                    "CUDA-flavored ONNX Runtime initialization failed before committing the \
+                     process to a flavor; falling back to CPU"
+                ),
+                Some(crate::ort_runtime::OrtFlavor::Cpu) => tracing::warn!(
+                    error = %e,
+                    "CUDA-flavored ONNX Runtime initialization failed, but the process was \
+                     already committed to the CPU flavor (e.g. an earlier local-onnx embedder \
+                     in this process); reusing the already-loaded CPU runtime"
+                ),
+                Some(crate::ort_runtime::OrtFlavor::Cuda) => unreachable!(
+                    "cuda_init_fallback_allowed(Some(Cuda)) is always false, so this arm is \
+                     never reached"
+                ),
+            }
+            return None;
+        }
+        tracing::error!(
+            error = %e,
+            "CUDA-flavored ONNX Runtime failed to initialize after committing the process to \
+             the CUDA flavor; CPU fallback is no longer possible in this process"
+        );
+        return Some(Err(e));
+    }
+
+    tracing::info!(
+        "NVIDIA/CUDA stack detected; using CUDA-enabled ONNX Runtime \
+         (CUDA preferred, automatic CPU fallback)"
+    );
+    // The CUDA flavor is now committed for the rest of the process — any failure past this
+    // point can no longer fall back to a Cpu-flavored init (see doc comment above), so it is
+    // surfaced as an error rather than swallowed into another `None`.
+    Some(create_onnx_with(
+        policy,
+        models_dir,
+        crate::cuda_ep::CudaPreference::Preferred,
+    ))
+}
+
+/// F1/F2: whether a failed `ensure_ort_initialized(Cuda, ..)` call still permits falling back to
+/// a CPU init in the same process, given the flavor (if any) the process is committed to
+/// *immediately after* that failed attempt — i.e. `crate::ort_runtime::committed_flavor()` read
+/// right after the failure.
+///
+/// Mirrors `ort_runtime.rs`'s `InitAttempt`/`record_attempt` state machine from the caller's
+/// side, and allows fallback in two cases:
+///
+/// - `None` — the attempt left the process uncommitted (e.g. the CUDA download itself failed,
+///   `InitAttempt::NotAttempted`): a fresh `OrtFlavor::Cpu` init can safely proceed.
+/// - `Some(Cpu)` — the process had *already* committed to `Cpu` before this `Cuda` attempt even
+///   ran (e.g. a long-lived daemon constructed a `local-onnx` embedder earlier, then a later
+///   `local`/automatic request finds a healthy NVIDIA stack and tries `Cuda` anyway). The
+///   `Cuda` request fails immediately on the flavor-mismatch check without changing the
+///   committed flavor, so `Cpu` is still exactly what's loaded — "falling back" just reuses the
+///   already-`dlopen`ed CPU runtime, and `ensure_ort_initialized(Cpu, ..)` is idempotent for a
+///   flavor that's already committed.
+///
+/// Only `Some(Cuda)` blocks fallback: the failed attempt itself committed the process to `Cuda`
+/// (e.g. `ort::init_from`/dlopen itself failed after being invoked, `InitAttempt::Committed`),
+/// so the process is now permanently Cuda-flavored; a CPU retry would not actually fall back, it
+/// would just fail `ort_runtime`'s flavor-mismatch check with a confusing second error instead of
+/// the real one. Factored out as a pure function over an already-read `Option<OrtFlavor>` (rather
+/// than reading `committed_flavor()` itself) so it's unit-testable without touching `ort`, the
+/// filesystem, or the network.
+#[cfg_attr(
+    not(all(feature = "local-onnx", target_os = "linux", target_arch = "x86_64")),
+    allow(
+        dead_code,
+        reason = "only consulted from try_local_auto_cuda (local-onnx, linux/x86_64); exercised \
+                   directly by cross-platform unit tests on every other target/feature combo"
+    )
+)]
+fn cuda_init_fallback_allowed(
+    committed_after_failure: Option<crate::ort_runtime::OrtFlavor>,
+) -> bool {
+    !matches!(
+        committed_after_failure,
+        Some(crate::ort_runtime::OrtFlavor::Cuda)
+    )
+}
+
+/// Whether automatic ("local") mode should even attempt the CUDA execution provider, given an
+/// already-known [`CudaStackStatus`](crate::cuda_ep::CudaStackStatus) — the linux/x86_64
+/// branch's decision, factored out as a pure function so it's unit-testable on every platform
+/// (including this macOS dev machine) without a real Linux/CUDA host. `false` for any status
+/// short of [`Ok`](crate::cuda_ep::CudaStackStatus::Ok) means [`try_local_auto_cuda`] returns
+/// before ever calling [`ensure_ort_initialized`](crate::ort_runtime::ensure_ort_initialized) —
+/// i.e. before any CUDA ONNX Runtime download could be triggered.
+#[cfg_attr(
+    not(all(target_os = "linux", target_arch = "x86_64")),
+    allow(
+        dead_code,
+        reason = "only consulted from try_local_auto_cuda on linux/x86_64; exercised directly \
+                   by cross-platform unit tests on every other target"
+    )
+)]
+fn should_attempt_cuda_auto(status: crate::cuda_ep::CudaStackStatus) -> bool {
+    status == crate::cuda_ep::CudaStackStatus::Ok
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,6 +705,7 @@ mod tests {
         EmbeddingPolicy {
             provider: provider.to_string(),
             model: model.to_string(),
+            ..Default::default()
         }
     }
 
@@ -549,6 +884,228 @@ mod tests {
         assert!(
             matches!(err, EmbedError::Internal(_)),
             "unknown provider should fail, got: {err:?}"
+        );
+    }
+
+    // --- local-cuda provider ---------------------------------------------------------------
+
+    #[test]
+    fn infer_dim_encoding_local_cuda_pairs() {
+        let cases = [
+            (
+                "local-cuda",
+                "pplx-embed-context-v1-0.6b",
+                1024,
+                VectorEncoding::Binary,
+            ),
+            (
+                "local-cuda",
+                "pplx-embed-v1-0.6b",
+                1024,
+                VectorEncoding::Binary,
+            ),
+            (
+                "local-cuda",
+                "bge-small-en-v1.5",
+                384,
+                VectorEncoding::Float32,
+            ),
+        ];
+        for (provider, model, expected_dim, expected_encoding) in cases {
+            let policy = fake_policy(provider, model);
+            let (dim, encoding) = infer_dim_encoding(&policy, &[]).unwrap();
+            assert_eq!(dim, expected_dim, "{provider}/{model} dim");
+            assert_eq!(encoding, expected_encoding, "{provider}/{model} encoding");
+
+            // Parity with 'local'/'local-onnx': switching providers must never change shape.
+            let local_policy = fake_policy("local", model);
+            let (local_dim, local_encoding) = infer_dim_encoding(&local_policy, &[]).unwrap();
+            assert_eq!(dim, local_dim, "{model}: local-cuda dim should match local");
+            assert_eq!(
+                encoding, local_encoding,
+                "{model}: local-cuda encoding should match local"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_provider_error_lists_local_cuda() {
+        let policy = fake_policy("nonexistent", "model");
+        let err = create_embedder(&policy, &[], None).err().unwrap();
+        assert!(
+            err.to_string().contains("local-cuda"),
+            "unknown-provider error should list 'local-cuda' among supported providers: {err}"
+        );
+
+        let err2 = infer_dim_encoding(&policy, &[]).unwrap_err();
+        assert!(
+            err2.to_string().contains("local-cuda"),
+            "infer_dim_encoding's error should also list 'local-cuda': {err2}"
+        );
+    }
+
+    #[test]
+    fn local_cuda_on_unsupported_target_returns_actionable_error() {
+        // This test runs on the current (macOS) dev machine — not linux/x86_64 — so
+        // `create_cuda` must take its "unsupported target" branch unconditionally.
+        let policy = fake_policy("local-cuda", "bge-small-en-v1.5");
+        let err = create_embedder(&policy, &[], None).err().unwrap();
+        let msg = err.to_string();
+
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        {
+            assert!(
+                msg.contains("Linux x86_64"),
+                "error should name the required platform: {msg}"
+            );
+            assert!(
+                msg.contains("'local'") && msg.contains("'local-onnx'"),
+                "error should suggest the 'local' and 'local-onnx' alternatives: {msg}"
+            );
+        }
+        // On an actual linux/x86_64 CI runner (no NVIDIA stack), `create_cuda` instead takes
+        // the missing-driver path exercised by `create_cuda_with_status_*` below — still an
+        // error, just a different (also actionable) message.
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            assert!(!msg.is_empty());
+        }
+    }
+
+    /// Injected-status coverage of `create_cuda_with_status`, runnable on every platform
+    /// (including this macOS dev machine): a `DriverMissing`/`CudartMissing`/`CudnnMissing`
+    /// status must produce an actionable error naming the missing piece, and — by the
+    /// function's own structure (`cuda_stack_error` short-circuits before
+    /// `ensure_ort_initialized`/any download is ever reached) — must do so without attempting
+    /// the ~196 MB CUDA ONNX Runtime download. There is no real download call left to
+    /// accidentally hit in this branch, so "before any download" is a structural guarantee
+    /// here, not something exercised via a filesystem assertion.
+    #[test]
+    fn local_cuda_missing_driver_errors_before_download() {
+        use crate::cuda_ep::CudaStackStatus;
+
+        let policy = fake_policy("local-cuda", "bge-small-en-v1.5");
+        let err = create_cuda_with_status(CudaStackStatus::DriverMissing, &policy, None)
+            .err()
+            .unwrap();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("driver"),
+            "error should name the missing driver: {msg}"
+        );
+    }
+
+    #[test]
+    fn create_cuda_with_status_cudart_missing_names_cudart() {
+        use crate::cuda_ep::CudaStackStatus;
+
+        let policy = fake_policy("local-cuda", "bge-small-en-v1.5");
+        let err = create_cuda_with_status(CudaStackStatus::CudartMissing, &policy, None)
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("libcudart"));
+    }
+
+    #[test]
+    fn create_cuda_with_status_cudnn_missing_names_cudnn() {
+        use crate::cuda_ep::CudaStackStatus;
+
+        let policy = fake_policy("local-cuda", "bge-small-en-v1.5");
+        let err = create_cuda_with_status(CudaStackStatus::CudnnMissing, &policy, None)
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("libcudnn"));
+    }
+
+    /// F6(a): a binary built without `local-onnx` genuinely can't provide 'local-cuda' — that's
+    /// "unavailable" (ProviderError, exit code 5), matching every other local-cuda-unavailability
+    /// arm, not "internal error" (exit code 1). Only compiled when `local-onnx` is disabled,
+    /// mirroring `create_cuda_after_stack_ok`'s own cfg-gating.
+    #[cfg(not(feature = "local-onnx"))]
+    #[test]
+    fn create_cuda_after_stack_ok_without_local_onnx_is_provider_error() {
+        let policy = fake_policy("local-cuda", "bge-small-en-v1.5");
+        let err = create_cuda_after_stack_ok(&policy, None).err().unwrap();
+        match err {
+            EmbedError::ProviderError { provider, message } => {
+                assert_eq!(provider, "local-cuda");
+                assert!(message.contains("local-onnx"));
+            }
+            other => panic!(
+                "missing local-onnx feature should be ProviderError (exit 5), not {other:?} \
+                 (exit 1)"
+            ),
+        }
+    }
+
+    #[test]
+    fn cuda_stack_error_is_none_only_for_ok_status() {
+        use crate::cuda_ep::CudaStackStatus;
+
+        assert!(cuda_stack_error(CudaStackStatus::Ok).is_none());
+        for status in [
+            CudaStackStatus::DriverMissing,
+            CudaStackStatus::CudartMissing,
+            CudaStackStatus::CudnnMissing,
+        ] {
+            assert!(
+                cuda_stack_error(status).is_some(),
+                "{status:?} should produce Some(error)"
+            );
+        }
+    }
+
+    /// Automatic ("local") mode's linux/x86_64 CUDA-attempt decision, tested here as a pure
+    /// function so it runs on every platform (including this macOS dev machine) without a real
+    /// Linux/CUDA host. `false` for any non-`Ok` status means `try_local_auto_cuda` returns
+    /// `None` before ever calling `ensure_ort_initialized` — i.e. before the CUDA ONNX Runtime
+    /// download could be triggered — so automatic mode without a driver never attempts it.
+    #[test]
+    fn local_auto_without_driver_never_downloads_cuda() {
+        use crate::cuda_ep::CudaStackStatus;
+
+        assert!(should_attempt_cuda_auto(CudaStackStatus::Ok));
+        for status in [
+            CudaStackStatus::DriverMissing,
+            CudaStackStatus::CudartMissing,
+            CudaStackStatus::CudnnMissing,
+        ] {
+            assert!(
+                !should_attempt_cuda_auto(status),
+                "{status:?} must not attempt the CUDA path"
+            );
+        }
+    }
+
+    /// F1/F2: the CPU-fallback decision after a failed `ensure_ort_initialized(Cuda, ..)` call
+    /// must key off which flavor (if any) the process is committed to immediately after that
+    /// failure, not just "did it return Err". See `ort_runtime.rs`'s `InitAttempt`/
+    /// `record_attempt` state machine: an uncommitted failure (e.g. the CUDA download itself
+    /// failed) leaves the process free to try CPU; a failure that left the process already
+    /// committed to `Cpu` (e.g. a long-lived daemon process had already constructed a
+    /// `local-onnx` embedder before this `Cuda` attempt ran) means CPU fallback is not just
+    /// permitted but exactly correct — the CPU runtime is already loaded and idempotent to
+    /// re-request. Only a failure that committed the process to `Cuda` itself (e.g. a `dlopen`
+    /// error) permanently flavors the process such that a CPU retry can no longer actually fall
+    /// back — it would just fail the flavor-mismatch check instead.
+    #[test]
+    fn cuda_init_fallback_allowed_when_uncommitted_or_already_cpu() {
+        use crate::ort_runtime::OrtFlavor;
+
+        assert!(
+            cuda_init_fallback_allowed(None),
+            "an uncommitted failure (e.g. a failed download) must permit CPU fallback"
+        );
+        assert!(
+            cuda_init_fallback_allowed(Some(OrtFlavor::Cpu)),
+            "a failure that left the process already committed to Cpu (e.g. a daemon that \
+             already constructed a local-onnx embedder) must permit reusing the loaded CPU \
+             runtime"
+        );
+        assert!(
+            !cuda_init_fallback_allowed(Some(OrtFlavor::Cuda)),
+            "a committed failure (e.g. a dlopen error) must not permit CPU fallback — the \
+             process is now permanently Cuda-flavored"
         );
     }
 }

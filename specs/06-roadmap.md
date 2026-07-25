@@ -57,6 +57,20 @@ Then: **Homebrew** formula with `brew services` (launchd) for the daemon; **syst
 Linux; web UI assets embedded in the binary at Phase 3. Model files are never bundled
 ([04-search-pipeline.md](04-search-pipeline.md) §4).
 
+**CUDA acceleration: implemented** ([issue #76](https://github.com/dokterbob/localdb/issues/76)).
+The `local-cuda` provider and `local` mode's automatic CUDA preference on Linux x86_64 ship via
+the runtime-download "flavor table" in `embed::ort_download` — no separate release artifact.
+GPU execution has not yet been verified on real NVIDIA hardware; see
+[docs/architecture.md#known-gaps](../docs/architecture.md#known-gaps) and
+`scripts/cuda-verify.sh`.
+
+**Future flavor-table row: AMD/ROCm.** The same runtime-download mechanism that added CUDA
+could add a ROCm-accelerated flavor for AMD GPUs, but Microsoft ships no official ROCm
+prebuilts — unlike CPU and CUDA, there is no upstream release tarball to pin and sha-verify.
+Adding this would require self-hosting ONNX Runtime ROCm builds (build infrastructure, our own
+signing/hosting, and a maintenance commitment this project does not yet have), so it stays
+unscheduled rather than joining the table alongside CPU/CUDA.
+
 ## 5. Consolidated "later" list
 
 Deferred items referenced by other specs, in one place: reranking stage; SSE job streaming;

@@ -403,6 +403,7 @@ mod tests {
         yaml_config.defaults.indexing.embedding = localdb_core::config::schema::EmbeddingPolicy {
             provider: "fake".to_string(),
             model: "default".to_string(),
+            ..Default::default()
         };
         let queue = crate::job_queue::JobQueue::new();
         let state = AppState::new(
@@ -719,6 +720,7 @@ mod tests {
                     embedding: localdb_core::config::schema::EmbeddingPolicy {
                         provider: "fake".to_string(),
                         model: "default".to_string(),
+                        ..Default::default()
                     },
                     ..Default::default()
                 },
