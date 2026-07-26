@@ -7,7 +7,7 @@ use serde_json::json;
 use crate::{
     app_db::load_app_db,
     daemon_client::{probe_daemon, CliContext, DaemonState},
-    normalize::{exit_err, print_json, visibility_to_string},
+    normalize::{exit_err, print_json},
 };
 
 /// `localdb serve` — start the HTTP daemon (specs/05-surfaces.md §3).
@@ -68,7 +68,7 @@ pub fn run_mcp(ctx: &CliContext, allow_write: bool) {
 }
 
 pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
-    use mcp::{proxy::ProxyHandler, AvailableStore, McpHandler, StoreDescriptor};
+    use mcp::{proxy::ProxyHandler, McpHandler};
 
     // `load_app_db` is unconditional here — same sequencing as
     // `search.rs`'s `run_search_async` — since `probe_daemon` needs
@@ -94,15 +94,30 @@ pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
                  the daemon's full store set will be used instead"
             );
         }
-        // Connect and serve are separate calls (`ProxyHandler::connect` then
-        // `mcp::serve_proxied_stdio`, rather than one moded entrypoint) so a
+        // Attach the caller's bearer credential (LOCALDB_API_KEY, else
+        // credentials.json keyed by the daemon base URL — specs/03-config.md
+        // §6) so proxied stdio MCP works against an auth-enforcing daemon.
+        // `None` (no credential available) is fine against an open-mode
+        // daemon; an enforcing daemon answers 401 and the handshake fails.
+        //
+        // Unlike `daemon_request_async`, this is a long-lived stdio<->HTTP
+        // proxy handshake with no cheap way to retry mid-stream on a 401, so
+        // the bearer is resolved through `ensure_fresh_bearer` instead of
+        // `resolve_bearer`/`bearer_for_request`: if the cached access token
+        // is already expired and a refresh token is on hand, it proactively
+        // redeems it (persisting the rotated pair to credentials.json)
+        // *before* connecting, rather than handing the daemon a token that's
+        // certain to be rejected.
+        let bearer = crate::daemon_client::ensure_fresh_bearer(ctx, &base_url).await;
+        // Connect and serve are separate calls (`ProxyHandler::connect_with_auth`
+        // then `mcp::serve_proxied_stdio`, rather than one moded entrypoint) so a
         // failure to reach the daemon at all — it went away between
         // `probe_daemon` and here, or `LOCALDB_DAEMON_URL` points at a stale
         // endpoint — maps to the same `daemon_unreachable`/exit-5 outcome as
         // every other daemon-backed CLI path, instead of `internal`/exit-1.
         // Only a failure in the stdio loop *after* a successful proxy
         // connection (a much rarer case) still falls back to `internal`.
-        let handler = match ProxyHandler::connect(&base_url).await {
+        let handler = match ProxyHandler::connect_with_auth(&base_url, bearer).await {
             Ok(handler) => handler,
             Err(_) => {
                 exit_err(&Error::DaemonUnreachable, ctx.json);
@@ -120,19 +135,6 @@ pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
         return;
     }
 
-    let runtime_stores = match db.backend().list_stores().await {
-        Ok(s) => s,
-        Err(e) => exit_err(&e, ctx.json),
-    };
-
-    // Same store resolution as `localdb search`: runtime stores only,
-    // narrowed by --store flags when given.
-    let store_names: Vec<String> = if ctx.stores.is_empty() {
-        runtime_stores.iter().map(|s| s.name.clone()).collect()
-    } else {
-        ctx.stores.clone()
-    };
-
     let embed_policy = &config_loader.config.defaults.indexing.embedding;
     let models_dir = config_loader.paths.models_dir.clone();
     let embedder = match embed::create_embedder(
@@ -144,23 +146,26 @@ pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
         Err(e) => exit_err(&Error::from(e), ctx.json),
     };
 
-    let mut available: Vec<AvailableStore> = Vec::new();
-    for name in &store_names {
-        if let Some(store_row) = runtime_stores.iter().find(|s| s.name == *name) {
-            let descriptor = StoreDescriptor {
-                id: store_row.id.clone(),
-                name: store_row.name.clone(),
-                visibility: visibility_to_string(&store_row.visibility).to_string(),
-            };
-            let handle = match db.backend().retrieval_store(&store_row.id).await {
-                Ok(handle) => handle,
-                Err(e) => exit_err(&e, ctx.json),
-            };
-            available.push(AvailableStore::from_arc(descriptor, handle));
-        }
-    }
+    // Realtime store resolution (T2): rather than snapshotting the runtime
+    // store list once here, `AppDbStoreProvider` re-derives it from the DB
+    // on every tool call, narrowed by `--store` flags when given (empty
+    // means "all runtime stores, whatever they are at call time"). A store
+    // added later (e.g. by a concurrent `localdb store add`, or another
+    // process sharing the same WAL-mode database) is therefore visible
+    // without restarting this stdio process.
+    let provider: std::sync::Arc<dyn mcp::StoreProvider> = std::sync::Arc::new(
+        crate::app_db::AppDbStoreProvider::new(std::sync::Arc::new(db), ctx.stores.clone()),
+    );
 
-    let handler = McpHandler::new(available, std::sync::Arc::from(embedder), allow_write);
+    // Embedded stdio MCP stays unauthenticated (D8, specs/05-surfaces.md §4):
+    // the caller is already trusted as local-files-equivalent, so every tool
+    // call runs as the local-trust principal.
+    let handler = McpHandler::new(
+        provider,
+        std::sync::Arc::from(embedder),
+        allow_write,
+        Some(localdb_core::auth::Principal::local_trust()),
+    );
 
     if let Err(e) = mcp::serve_embedded_stdio(handler).await {
         exit_err(

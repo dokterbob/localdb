@@ -28,6 +28,7 @@ pub async fn create_schema(
     create_triggers(conn).await?;
     create_sync_state(conn).await?;
     create_credentials(conn).await?;
+    create_auth_tables(conn).await?;
     Ok(())
 }
 
@@ -294,6 +295,178 @@ async fn create_credentials(conn: &Connection) -> Result<(), libsql::Error> {
     Ok(())
 }
 
+/// DDL for the auth subsystem (issue #98, D1/D5/D7/D13): `users`,
+/// `auth_tokens`, `oauth_clients`, `auth_codes`, `store_grants`, `invites`,
+/// `access_requests`.
+///
+/// Shared verbatim between fresh `create_schema` and the chain migration
+/// framework's `v6` entry (`create_auth_tables`,
+/// `store-libsql/src/migrations/chain.rs`) so both paths converge on an
+/// identical schema (D13, the write-twice rule — see `docs/migrations.md`).
+/// `oauth_clients`/`auth_codes` have no corresponding `core::auth` Rust types
+/// yet — their DDL ships now (so this is the only migration this feature
+/// ever needs) but the OAuth2 code+PKCE flow lands in a later ticket.
+async fn create_auth_tables(conn: &Connection) -> Result<(), libsql::Error> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS users (
+            id         TEXT PRIMARY KEY NOT NULL,
+            name       TEXT NOT NULL UNIQUE,
+            role       TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )",
+        (),
+    )
+    .await?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS auth_tokens (
+            id            TEXT PRIMARY KEY NOT NULL,
+            user_id       TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            kind          TEXT NOT NULL,
+            secret_hash   TEXT NOT NULL UNIQUE,
+            expires_at    TEXT,
+            last_used_at  TEXT,
+            revoked_at    TEXT,
+            created_at    TEXT NOT NULL,
+            family_id     TEXT,
+            rotated_from  TEXT
+        )",
+        (),
+    )
+    .await?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_auth_tokens_user ON auth_tokens(user_id)",
+        (),
+    )
+    .await?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_auth_tokens_family ON auth_tokens(family_id)",
+        (),
+    )
+    .await?;
+
+    // OAuth2 dynamic client registration (RFC 7591) — client rows are not
+    // written until a later ticket implements the `/register` route, but the
+    // table ships now per D13 (one migration for the whole auth feature).
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS oauth_clients (
+            id            TEXT PRIMARY KEY NOT NULL,
+            client_name   TEXT,
+            redirect_uris TEXT NOT NULL DEFAULT '[]',
+            created_at    TEXT NOT NULL
+        )",
+        (),
+    )
+    .await?;
+
+    // Seed the built-in `localdb-cli` public client (T4,
+    // `localdb_core::auth::LOCALDB_CLI_CLIENT_ID`). Its recognition and
+    // redirect-uri policy (RFC 8252 §7.3 loopback exception) are pure-core
+    // logic (`localdb_core::auth::validate_redirect_uri`) — this row exists
+    // solely so `auth_codes.client_id`'s FK constraint is satisfiable when
+    // `/authorize` issues a code for it; `redirect_uris` is left empty here
+    // since the actual policy is enforced in `core`, not read from this row.
+    conn.execute(
+        "INSERT OR IGNORE INTO oauth_clients (id, client_name, redirect_uris, created_at)
+         VALUES ('localdb-cli', 'localdb CLI', '[]', '1970-01-01T00:00:00Z')",
+        (),
+    )
+    .await?;
+
+    // OAuth2 authorization codes (code+PKCE flow, later ticket).
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS auth_codes (
+            id                    TEXT PRIMARY KEY NOT NULL,
+            client_id             TEXT NOT NULL REFERENCES oauth_clients(id) ON DELETE CASCADE,
+            user_id               TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            code_hash             TEXT NOT NULL UNIQUE,
+            code_challenge        TEXT NOT NULL,
+            code_challenge_method TEXT NOT NULL DEFAULT 'S256',
+            redirect_uri          TEXT NOT NULL,
+            expires_at            TEXT NOT NULL,
+            consumed_at           TEXT,
+            created_at            TEXT NOT NULL
+        )",
+        (),
+    )
+    .await?;
+
+    // Store-name/user-id grants (D7). The composite primary key doubles as
+    // the required UNIQUE (store, user) index. FK to `stores(name)` (which
+    // is UNIQUE — see `create_stores`) cascades grant cleanup on store
+    // deletion.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS store_grants (
+            store_name TEXT NOT NULL REFERENCES stores(name) ON DELETE CASCADE,
+            user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            granted_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (store_name, user_id)
+        )",
+        (),
+    )
+    .await?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_store_grants_user ON store_grants(user_id)",
+        (),
+    )
+    .await?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS invites (
+            id           TEXT PRIMARY KEY NOT NULL,
+            token_hash   TEXT NOT NULL UNIQUE,
+            mode         TEXT NOT NULL,
+            store_grants TEXT NOT NULL DEFAULT '[]',
+            max_uses     INTEGER NOT NULL DEFAULT 1,
+            uses         INTEGER NOT NULL DEFAULT 0,
+            expires_at   TEXT,
+            revoked_at   TEXT,
+            created_by   TEXT NOT NULL,
+            created_at   TEXT NOT NULL
+        )",
+        (),
+    )
+    .await?;
+
+    // The trailing `, collected_at TEXT)` (rather than a normally formatted
+    // `collected_at TEXT` column on its own indented line) is deliberate,
+    // not a typo: `PRAGMA user_version`-migrated stores get this column via
+    // chain.rs's `v7` `ALTER TABLE access_requests ADD COLUMN collected_at
+    // TEXT`, and SQLite's `ADD COLUMN` splices the new column definition in
+    // verbatim immediately before the original statement's closing
+    // parenthesis rather than reformatting the whole statement. To satisfy
+    // the write-twice drift guard (`sqlite_master.sql` must be byte-for-byte
+    // identical between a fresh `create_schema` and baseline+chain), this
+    // literal reproduces that exact splice rather than the "natural"
+    // formatting a human would otherwise write.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS access_requests (
+            id                 TEXT PRIMARY KEY NOT NULL,
+            invite_id          TEXT NOT NULL REFERENCES invites(id) ON DELETE CASCADE,
+            requested_name     TEXT NOT NULL,
+            secret_hash        TEXT NOT NULL,
+            state              TEXT NOT NULL DEFAULT 'pending',
+            resulting_user_id  TEXT REFERENCES users(id) ON DELETE SET NULL,
+            created_at         TEXT NOT NULL,
+            decided_at         TEXT
+        , collected_at TEXT)",
+        (),
+    )
+    .await?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_access_requests_invite ON access_requests(invite_id)",
+        (),
+    )
+    .await?;
+
+    Ok(())
+}
+
 /// Read the schema version from `PRAGMA user_version`.
 ///
 /// Returns `0` on a freshly-created (un-touched) database, and on one where
@@ -459,6 +632,13 @@ mod tests {
             "chunks_fts",
             "sync_state",
             "credentials",
+            "users",
+            "auth_tokens",
+            "oauth_clients",
+            "auth_codes",
+            "store_grants",
+            "invites",
+            "access_requests",
         ] {
             assert!(
                 names.contains(expected),
@@ -483,6 +663,10 @@ mod tests {
             "idx_blocks_resource",
             "idx_chunks_store_resource_pos",
             "chunks_vec_idx",
+            "idx_auth_tokens_user",
+            "idx_auth_tokens_family",
+            "idx_store_grants_user",
+            "idx_access_requests_invite",
         ] {
             assert!(
                 names.contains(expected),

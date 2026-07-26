@@ -27,7 +27,6 @@ async fn setup() -> (tempfile::TempDir, SqliteBackend) {
                 backend: "libsql".to_string(),
                 indexing_policy: "{}".to_string(),
                 policy_version: "v1".to_string(),
-                acl: "{}".to_string(),
                 created_at: "2026-06-25T12:00:00Z".to_string(),
             })
             .await
@@ -345,7 +344,6 @@ async fn reopen_with_same_encoding_succeeds() {
             backend: "libsql".to_string(),
             indexing_policy: "{}".to_string(),
             policy_version: "v1".to_string(),
-            acl: "{}".to_string(),
             created_at: "2026-06-25T12:00:00Z".to_string(),
         })
         .await
@@ -731,7 +729,6 @@ async fn upsert_chunks_with_binary_encoding_round_trips_through_search_and_get_c
         backend: "libsql".to_string(),
         indexing_policy: "{}".to_string(),
         policy_version: "v1".to_string(),
-        acl: "{}".to_string(),
         created_at: "2026-06-25T12:00:00Z".to_string(),
     })
     .await

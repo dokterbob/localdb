@@ -316,6 +316,7 @@ mod tests {
             yes: true,
             daemon_url: None,
             config_env: None,
+            api_key: None,
         };
         assert!(confirm_destructive(&ctx, "Are you sure?"));
     }

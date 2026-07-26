@@ -1,20 +1,25 @@
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::{
-    routing::{delete, get, post},
+    middleware,
+    routing::{delete, get, patch, post},
     Router,
 };
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
 use localdb_core::{
-    config::{loader::ResolvedPaths, schema::RawConfig},
+    auth::Principal,
+    config::{
+        loader::ResolvedPaths,
+        schema::{RawConfig, ServerAuthMode},
+    },
     Embedder, Error,
 };
 
 use crate::{
+    auth::{self, middleware::require_auth, AuthMode},
     handlers,
     job_queue::JobQueue,
     mcp_bridge,
@@ -53,37 +58,53 @@ impl std::fmt::Debug for DaemonHandle {
 /// Steps:
 /// 1. Bind the Unix discovery socket (fails fast if another daemon is running).
 /// 2. Bind the TCP listener at the configured `server.bind`/`server.port`. Any
-///    bind address is accepted (specs/05-surfaces.md §3); binding to all
-///    interfaces logs a warning since the daemon has no authentication.
-/// 3. Record the daemon's client-reachable base URL in `daemon.url` so CLI/MCP
+///    bind address is accepted (specs/05-surfaces.md §3) except `auth: off`
+///    combined with a non-loopback bind (a hard `invalid_config` error, see
+///    `resolve_auth_mode`); binding to all interfaces logs a warning.
+/// 3. Resolve the auth mode from `server.auth` + the *actually-bound*
+///    address, build the state, and — when auth is enforced with zero users —
+///    print the one-time setup code to stderr (D3b).
+/// 4. Record the daemon's client-reachable base URL in `daemon.url` so CLI/MCP
 ///    discovery finds it regardless of the configured bind address or port.
+///
+/// Config is read once here at startup; there is no hot-reload
+/// (specs/03-config.md §5 — the file-watcher-based reload was removed in T3).
 pub async fn start_daemon(
     options: DaemonOptions,
 ) -> Result<(DaemonHandle, impl std::future::Future<Output = ()>), Error> {
     let bind_addr = options.config.server.bind.as_str();
     let port = options.config.server.port;
     let socket_guard = bind_socket_guard(&options)?;
-    let (state, url_scheduler) = build_daemon_state(&options).await?;
-    let (mcp_stores, mcp_embedder) = mcp_bridge::build_available_stores(&state).await?;
-    // Bind first so `mcp_allowed_hosts` sees the actually-bound address
-    // (wildcard aliases like `"0"`/`"[::]"` only resolve to a concrete
-    // `SocketAddr` after binding — same reasoning as `warn_if_unspecified`
-    // and `client_base_url`, both of which also key off `bound_addr` rather
-    // than the raw config string). `build_available_stores`'s embedder is a
-    // `LazyEmbedder` and doesn't block on model loading, so reordering the
-    // (cheap) router construction after the bind doesn't delay startup.
+    // Bind first so `resolve_auth_mode` and `mcp_allowed_hosts` see the
+    // actually-bound address (wildcard aliases like `"0"`/`"[::]"` only
+    // resolve to a concrete `SocketAddr` after binding — same reasoning as
+    // `warn_if_unspecified` and `client_base_url`, both of which also key
+    // off `bound_addr` rather than the raw config string).
     let (listener, bound_addr) = bind_tcp_listener(bind_addr, port).await?;
     warn_if_unspecified(bound_addr);
+    let auth_mode = resolve_auth_mode(bound_addr, options.config.server.auth)?;
+    let (state, url_scheduler) = build_daemon_state(&options, auth_mode).await?;
+    if let Some(setup_code) = auth::generate_setup_code_if_needed(&state).await? {
+        // D3b: shown exactly once, plaintext never persisted (only its hash,
+        // in AppState). Redeemed via `/authorize` starting with T4.
+        eprintln!(
+            "No users exist yet and authentication is enforced.\n\
+             One-time setup code (use it to create the first admin account; \
+             shown only once):\n\n    {setup_code}\n"
+        );
+    }
+    let mcp_provider: Arc<dyn mcp::StoreProvider> =
+        Arc::new(mcp_bridge::AppStateStoreProvider::new(state.clone()));
+    let mcp_embedder = mcp_bridge::build_mcp_embedder(&state);
     let router = build_router(
         state.clone(),
-        mcp_stores,
+        mcp_provider,
         mcp_embedder,
         mcp_allowed_hosts(bound_addr),
     );
     let url_file_guard =
         UrlFileGuard::new(&options.paths.url_path(), &client_base_url(bound_addr))?;
 
-    spawn_config_watcher(options.paths.config_file.clone(), state.clone());
     spawn_url_scheduler(&state, url_scheduler);
 
     let handle = DaemonHandle {
@@ -101,6 +122,7 @@ fn bind_socket_guard(options: &DaemonOptions) -> Result<SocketGuard, Error> {
 
 async fn build_daemon_state(
     options: &DaemonOptions,
+    auth_mode: AuthMode,
 ) -> Result<(AppState, UrlRefreshScheduler), Error> {
     let queue = JobQueue::new();
     let url_scheduler = UrlRefreshScheduler::new(queue.clone());
@@ -109,10 +131,42 @@ async fn build_daemon_state(
         options.paths.data_dir.clone(),
         queue.clone(),
         url_scheduler.clone(),
+        auth_mode,
     )
     .await?;
 
     Ok((state, url_scheduler))
+}
+
+/// Resolve the effective [`AuthMode`] from the configured `server.auth` and
+/// the **actually-bound** address (D4, specs/05-surfaces.md §3):
+///
+/// | `server.auth` | loopback bind | non-loopback bind |
+/// |---|---|---|
+/// | `auto` (default) | `Open` | `Enforced` |
+/// | `required` | `Enforced` | `Enforced` |
+/// | `off` | `Open` | hard error (`invalid_config`) — the daemon refuses to start rather than exposing an unauthenticated surface to a network |
+///
+/// Keyed off the bound `SocketAddr` (not the raw config string) so wildcard
+/// aliases resolve correctly; an unspecified bind (`0.0.0.0`/`::`) is
+/// non-loopback for this purpose. The wildcard-bind startup *warning*
+/// (`warn_if_unspecified`) applies independently, regardless of auth mode.
+pub fn resolve_auth_mode(bound: SocketAddr, mode_cfg: ServerAuthMode) -> Result<AuthMode, Error> {
+    let loopback = bound.ip().is_loopback();
+    match mode_cfg {
+        ServerAuthMode::Required => Ok(AuthMode::Enforced),
+        ServerAuthMode::Auto if loopback => Ok(AuthMode::Open),
+        ServerAuthMode::Auto => Ok(AuthMode::Enforced),
+        ServerAuthMode::Off if loopback => Ok(AuthMode::Open),
+        ServerAuthMode::Off => Err(Error::InvalidConfig {
+            message: format!(
+                "server.auth is 'off' but the daemon is bound to the non-loopback address {} — \
+                 refusing to expose an unauthenticated surface to a network. Use a loopback \
+                 bind, or set server.auth to 'auto' or 'required'.",
+                bound.ip()
+            ),
+        }),
+    }
 }
 
 async fn bind_tcp_listener(bind_addr: &str, port: u16) -> Result<(TcpListener, SocketAddr), Error> {
@@ -132,15 +186,6 @@ async fn bind_tcp_listener(bind_addr: &str, port: u16) -> Result<(TcpListener, S
     info!("daemon listening on {}", bound_addr);
 
     Ok((listener, bound_addr))
-}
-
-fn spawn_config_watcher(config_file_path: PathBuf, state: AppState) {
-    tokio::spawn(async move {
-        let result = run_config_watcher(config_file_path, state).await;
-        if let Err(e) = result {
-            error!("config watcher failed: {}", e);
-        }
-    });
 }
 
 fn spawn_url_scheduler(state: &AppState, url_scheduler: UrlRefreshScheduler) {
@@ -196,21 +241,46 @@ async fn server_future(listener: TcpListener, router: Router) {
 ///   GET /documents/{id}, POST /search,
 ///   POST /jobs, GET /jobs/{id}, GET /status, GET /config.
 ///
-/// `mcp_stores`/`mcp_embedder` are the startup-time snapshot built by
-/// `mcp_bridge::build_available_stores` (specs/05-surfaces.md §4) — see
-/// that function's doc comment for why `/mcp` doesn't see stores added
-/// later via `/v1/stores` without a restart. `nest_service` (rather than
-/// `route_service`) matches the mount pattern rmcp's own test suite uses
-/// for `StreamableHttpService` and composes fine with a `Router<AppState>`
-/// that also has `.with_state` routes: the mounted service handles
-/// `Request` directly and needs no state extraction.
+/// `mcp_provider` is realtime (specs/05-surfaces.md §4): it resolves the
+/// current store list fresh on every `/mcp` tool call rather than from a
+/// snapshot taken once at construction, so a store added later via
+/// `POST /v1/stores` is visible on the very next MCP call — see
+/// `mcp_bridge::AppStateStoreProvider` and `mcp::store_provider`'s design
+/// rationale (D12). `nest_service` (rather than `route_service`) matches the
+/// mount pattern rmcp's own test suite uses for `StreamableHttpService` and
+/// composes fine with a `Router<AppState>` that also has `.with_state`
+/// routes: the mounted service handles `Request` directly and needs no
+/// state extraction.
+///
+/// Auth (specs/05-surfaces.md §3.1): the `require_auth` middleware layer is
+/// applied *after* the `/mcp` `nest_service`, so it wraps every `/v1/*`
+/// route AND the MCP mount. `/authorize`, `/token`, `/revoke` (T4),
+/// `/register` (T7 DCR), and the two `/.well-known/oauth-*` discovery routes
+/// (T7) are built as a **separate, unlayered router** and merged in
+/// afterwards — they *are* the auth flow itself (specs/05-surfaces.md §3.1's
+/// public-routes table) and must be reachable without a bearer token. This
+/// is also the trigger for zero-config MCP client onboarding: a 401 from the
+/// protected router now carries `WWW-Authenticate: Bearer
+/// resource_metadata="<base>/.well-known/oauth-protected-resource"`
+/// (`auth::middleware::require_auth`), which a stock MCP client follows to
+/// this router's discovery routes, then to `/register`, then to the
+/// existing code+PKCE flow. The MCP handler's
+/// default principal follows the protected router's mode: `Open` passes
+/// `local_trust` (requests carry it anyway via the middleware, but embedded
+/// construction paths share this signature), while `Enforced` passes `None`
+/// so a missing request-extension `Principal` fails closed inside the tool
+/// handlers rather than granting full access.
 pub fn build_router(
     state: AppState,
-    mcp_stores: Vec<mcp::AvailableStore>,
+    mcp_provider: Arc<dyn mcp::StoreProvider>,
     mcp_embedder: Arc<dyn Embedder>,
     mcp_allowed_hosts: Vec<String>,
 ) -> Router {
-    Router::new()
+    let mcp_default_principal = match state.auth_mode() {
+        AuthMode::Open => Some(Principal::local_trust()),
+        AuthMode::Enforced => None,
+    };
+    let protected = Router::new()
         .route(
             "/v1/stores",
             get(handlers::list_stores).post(handlers::create_store),
@@ -232,19 +302,90 @@ pub fn build_router(
         .route("/v1/jobs/{id}", get(handlers::get_job))
         .route("/v1/status", get(handlers::get_status))
         .route("/v1/config", get(handlers::get_config))
-        .with_state(state)
+        .route("/v1/auth/me", get(handlers::get_me))
+        .route(
+            "/v1/users",
+            get(handlers::list_users).post(handlers::create_user),
+        )
+        .route(
+            "/v1/users/{id}",
+            patch(handlers::patch_user).delete(handlers::delete_user),
+        )
+        .route(
+            "/v1/users/{id}/keys",
+            get(handlers::list_keys).post(handlers::create_key),
+        )
+        .route("/v1/keys/{id}", delete(handlers::revoke_key))
+        .route(
+            "/v1/stores/{name}/grants",
+            get(handlers::list_grants).post(handlers::create_grant),
+        )
+        .route(
+            "/v1/stores/{name}/grants/{user}",
+            delete(handlers::delete_grant),
+        )
+        .route(
+            "/v1/invites",
+            get(handlers::list_invites).post(handlers::create_invite),
+        )
+        .route("/v1/invites/{id}", delete(handlers::revoke_invite))
+        .route("/v1/invites/requests", get(handlers::list_access_requests))
+        .route(
+            "/v1/invites/requests/{id}/approve",
+            post(handlers::approve_access_request),
+        )
+        .route(
+            "/v1/invites/requests/{id}/deny",
+            post(handlers::deny_access_request),
+        )
+        .with_state(state.clone())
         .nest_service(
             "/mcp",
-            mcp::build_streamable_http_service(mcp_stores, mcp_embedder, mcp_allowed_hosts),
+            mcp::build_streamable_http_service(
+                mcp_provider,
+                mcp_embedder,
+                mcp_allowed_hosts,
+                mcp_default_principal,
+            ),
         )
+        // Applied after `.nest_service` so the auth layer wraps `/mcp` too.
+        .layer(middleware::from_fn_with_state(state.clone(), require_auth));
+
+    let public = Router::new()
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(handlers::oauth_protected_resource),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(handlers::oauth_authorization_server),
+        )
+        .route(
+            "/authorize",
+            get(auth::oauth::get_authorize).post(auth::oauth::post_authorize),
+        )
+        .route("/token", post(auth::oauth::post_token))
+        .route("/revoke", post(auth::oauth::post_revoke))
+        .route("/register", post(auth::register::post_register))
+        .route("/v1/invites/redeem", post(handlers::redeem_invite_public))
+        .route(
+            "/v1/invites/requests/{id}",
+            get(handlers::poll_access_request),
+        )
+        .with_state(state);
+
+    public.merge(protected)
 }
 
 /// Warn when the actually-bound address is unspecified (all interfaces).
 ///
-/// Per specs/05-surfaces.md §3: the daemon has no authentication, so binding to
-/// all interfaces makes it reachable from any network the machine is on. Binding
-/// to a specific non-loopback address (e.g. a LAN/VPN IP) is treated as a
-/// deliberate trust decision and doesn't warn.
+/// Per specs/05-surfaces.md §3: binding to all interfaces makes the daemon
+/// reachable from any network the machine is on — the one case a user could
+/// plausibly not realize how exposed it makes them. The warning applies
+/// regardless of auth mode (an `auto`/`required` wildcard bind is enforced
+/// but still network-reachable). Binding to a specific non-loopback address
+/// (e.g. a LAN/VPN IP) is treated as a deliberate trust decision and doesn't
+/// warn.
 ///
 /// This checks the address the OS actually bound (`SocketAddr::ip().is_unspecified()`)
 /// rather than the raw config string, so wildcard aliases the string form can't see —
@@ -253,8 +394,8 @@ fn warn_if_unspecified(bound_addr: SocketAddr) {
     if bound_addr.ip().is_unspecified() {
         warn!(
             bind = %bound_addr.ip(),
-            "binding to all interfaces ({}); the daemon has no authentication and will be \
-             reachable from any network this machine is on",
+            "binding to all interfaces ({}); the daemon will be reachable from any network \
+             this machine is on",
             bound_addr.ip()
         );
     }
@@ -316,43 +457,6 @@ fn client_base_url(bound_addr: SocketAddr) -> String {
     }
 }
 
-/// Watch the config file for changes and reload the YAML config snapshot.
-///
-/// Non-fatal: logs errors but does not stop the daemon.
-async fn run_config_watcher(config_file: PathBuf, state: AppState) -> Result<(), Error> {
-    let parent = config_file.parent().ok_or_else(|| Error::InvalidConfig {
-        message: "config file has no parent directory".to_string(),
-    })?;
-
-    let (mut rx, _handle) =
-        crate::watcher::watch_path(parent, 300).map_err(|e| Error::Internal {
-            message: format!(
-                "cannot start config watcher for '{}': {e}",
-                config_file.display()
-            ),
-            correlation_id: "daemon_config_reload".into(),
-        })?;
-
-    info!("config watcher started for: {}", config_file.display());
-
-    while let Some(event) = rx.recv().await {
-        if event.path == config_file {
-            info!("config file changed, reloading: {}", config_file.display());
-            match reload_config_file(&config_file) {
-                Ok(new_config) => {
-                    state.reload_yaml_config(new_config).await;
-                    info!("config reloaded successfully");
-                }
-                Err(e) => {
-                    error!("config reload failed: {}", e);
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
 /// Parse a human-readable refresh interval string (e.g. "24h", "30m", "3600s") to seconds.
 ///
 /// Returns `None` if the string is unparseable, empty, or would overflow `u64`.
@@ -373,50 +477,11 @@ pub fn parse_refresh_interval(s: &str) -> Option<u64> {
     }
 }
 
-/// Read and parse the config file.
-fn reload_config_file(path: &Path) -> Result<RawConfig, Error> {
-    let contents = std::fs::read_to_string(path).map_err(|e| Error::Internal {
-        message: format!("cannot read config file '{}': {e}", path.display()),
-        correlation_id: "daemon_config_reload".into(),
-    })?;
-    let config: RawConfig = serde_yaml::from_str(&contents).map_err(|e| Error::Internal {
-        message: format!("cannot parse config file '{}': {e}", path.display()),
-        correlation_id: "daemon_config_reload".into(),
-    })?;
-    Ok(config)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
 
-    async fn make_state() -> (TempDir, AppState) {
-        let dir = tempfile::tempdir().unwrap();
-        let mut yaml_config = RawConfig {
-            version: 1,
-            server: Default::default(),
-            paths: Default::default(),
-            defaults: Default::default(),
-            providers: vec![],
-        };
-        yaml_config.defaults.indexing.embedding = localdb_core::config::schema::EmbeddingPolicy {
-            provider: "fake".to_string(),
-            model: "default".to_string(),
-        };
-        let queue = crate::job_queue::JobQueue::new();
-        let state = AppState::new(
-            yaml_config,
-            dir.path().to_path_buf(),
-            queue.clone(),
-            crate::scheduler::UrlRefreshScheduler::new(queue),
-        )
-        .await
-        .unwrap();
-        (dir, state)
-    }
-
-    fn make_resolved_paths(dir: &Path) -> ResolvedPaths {
+    fn make_resolved_paths(dir: &std::path::Path) -> ResolvedPaths {
         ResolvedPaths {
             config_file: dir.join("config.yaml"),
             data_dir: dir.join("data"),
@@ -537,32 +602,91 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn run_config_watcher_returns_invalid_config_when_path_has_no_parent() {
-        let (_dir, state) = make_state().await;
+    // --- resolve_auth_mode (D4 matrix) ---
 
-        let err = run_config_watcher(PathBuf::new(), state).await.unwrap_err();
+    fn loopback() -> SocketAddr {
+        "127.0.0.1:7700".parse().unwrap()
+    }
 
-        assert!(
-            matches!(err, Error::InvalidConfig { .. }),
-            "expected InvalidConfig, got: {:?}",
-            err
+    /// TEST-NET-1 (RFC 5737): guaranteed non-routable, safe as a plain
+    /// `SocketAddr` without binding — same trick as the `mcp_allowed_hosts`
+    /// tests above.
+    fn non_loopback() -> SocketAddr {
+        "192.0.2.1:7700".parse().unwrap()
+    }
+
+    #[test]
+    fn resolve_auth_mode_auto_loopback_is_open() {
+        assert_eq!(
+            resolve_auth_mode(loopback(), ServerAuthMode::Auto).unwrap(),
+            AuthMode::Open
         );
     }
 
     #[test]
-    fn reload_config_file_maps_parse_errors_to_internal() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.yaml");
-        std::fs::write(&path, "::not-yaml::").unwrap();
-
-        let err = reload_config_file(&path).unwrap_err();
-
-        assert!(
-            matches!(err, Error::Internal { ref correlation_id, .. } if correlation_id == "daemon_config_reload"),
-            "expected Internal with daemon_config_reload correlation id, got: {:?}",
-            err
+    fn resolve_auth_mode_auto_non_loopback_is_enforced() {
+        assert_eq!(
+            resolve_auth_mode(non_loopback(), ServerAuthMode::Auto).unwrap(),
+            AuthMode::Enforced
         );
+    }
+
+    #[test]
+    fn resolve_auth_mode_auto_ipv6_loopback_is_open() {
+        assert_eq!(
+            resolve_auth_mode("[::1]:7700".parse().unwrap(), ServerAuthMode::Auto).unwrap(),
+            AuthMode::Open
+        );
+    }
+
+    #[test]
+    fn resolve_auth_mode_auto_wildcard_is_enforced() {
+        // An unspecified bind is reachable from any network — non-loopback
+        // for enforcement purposes.
+        assert_eq!(
+            resolve_auth_mode("0.0.0.0:7700".parse().unwrap(), ServerAuthMode::Auto).unwrap(),
+            AuthMode::Enforced
+        );
+    }
+
+    #[test]
+    fn resolve_auth_mode_required_loopback_is_enforced() {
+        assert_eq!(
+            resolve_auth_mode(loopback(), ServerAuthMode::Required).unwrap(),
+            AuthMode::Enforced
+        );
+    }
+
+    #[test]
+    fn resolve_auth_mode_required_non_loopback_is_enforced() {
+        assert_eq!(
+            resolve_auth_mode(non_loopback(), ServerAuthMode::Required).unwrap(),
+            AuthMode::Enforced
+        );
+    }
+
+    #[test]
+    fn resolve_auth_mode_off_loopback_is_open() {
+        assert_eq!(
+            resolve_auth_mode(loopback(), ServerAuthMode::Off).unwrap(),
+            AuthMode::Open
+        );
+    }
+
+    #[test]
+    fn resolve_auth_mode_off_non_loopback_is_invalid_config() {
+        let err = resolve_auth_mode(non_loopback(), ServerAuthMode::Off).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidConfig { ref message } if message.contains("192.0.2.1")),
+            "expected InvalidConfig naming the bind address, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_auth_mode_off_wildcard_is_invalid_config() {
+        let err =
+            resolve_auth_mode("0.0.0.0:7700".parse().unwrap(), ServerAuthMode::Off).unwrap_err();
+        assert!(matches!(err, Error::InvalidConfig { .. }));
     }
 
     // --- Daemon startup ---
@@ -578,6 +702,7 @@ mod tests {
             server: localdb_core::config::schema::ServerConfig {
                 bind: "127.0.0.1".to_string(),
                 port: 0, // let OS assign a free port
+                ..Default::default()
             },
             paths: Default::default(),
             defaults: Default::default(),
@@ -618,6 +743,7 @@ mod tests {
             server: localdb_core::config::schema::ServerConfig {
                 bind: "127.0.0.1".to_string(),
                 port: 0, // let OS assign a free port
+                ..Default::default()
             },
             paths: Default::default(),
             defaults: Default::default(),
@@ -731,6 +857,7 @@ mod tests {
             dir_real.to_path_buf(),
             queue.clone(),
             UrlRefreshScheduler::new(queue.clone()),
+            AuthMode::Open,
         )
         .await
         .unwrap();
@@ -870,7 +997,12 @@ mod tests {
         // `vec![]` disables the Host check entirely (see `mcp_allowed_hosts`);
         // this test only drives `/v1/search` via `oneshot`, never `/mcp`, so
         // the allowlist behavior itself is untested here.
-        let app = build_router(state, vec![], Arc::new(FakeEmbedder::new(1)), vec![]);
+        let app = build_router(
+            state,
+            Arc::new(mcp::StaticStoreProvider::new(vec![])),
+            Arc::new(FakeEmbedder::new(1)),
+            vec![],
+        );
 
         use axum::body::Body;
         use axum::http::Request;
@@ -932,6 +1064,7 @@ mod tests {
             dir.path().to_path_buf(),
             queue.clone(),
             UrlRefreshScheduler::new(queue),
+            AuthMode::Open,
         )
         .await
         .unwrap();
@@ -939,7 +1072,7 @@ mod tests {
         // this test only drives `/v1/status` via `oneshot`, never `/mcp`.
         let app = build_router(
             state,
-            vec![],
+            Arc::new(mcp::StaticStoreProvider::new(vec![])),
             Arc::new(localdb_core::FakeEmbedder::new(1)),
             vec![],
         );

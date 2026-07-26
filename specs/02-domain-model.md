@@ -1,6 +1,6 @@
 # Spec 02 — Canonical Domain Model
 
-> Status: accepted draft, revised 2026-06-30. All entities live in the `core` crate and are
+> Status: accepted draft, revised 2026-07-07. All entities live in the `core` crate and are
 > shared by every surface. Field lists are normative for meaning, not for exact Rust types.
 >
 > **Supersedes:** the Markdown-native IR model (commit `3da56d0`). The block model is
@@ -24,7 +24,7 @@ chunks span multiple `Message`/`Segment` blocks.
 ## 2. Entities
 
 ### Store
-A named knowledge base. Unit of sharing, ACLs, indexing policy, and federation.
+A named knowledge base. Unit of sharing, access control, indexing policy, and federation.
 
 | Field | Notes |
 |---|---|
@@ -33,7 +33,9 @@ A named knowledge base. Unit of sharing, ACLs, indexing policy, and federation.
 | `visibility` | `private` \| `shared`. MVP: only `private` functional; field exists from day one ([01-architecture.md](01-architecture.md) §5). |
 | `backend` | Backend kind + connection info; default `libsql`. |
 | `indexing` | Indexing policy: `{chunking, embedding, parsers}` as one unit ([03-config.md](03-config.md) §2). |
-| `acl` | Reserved; empty in MVP. |
+
+Access control is expressed by `StoreGrant` rows, not a field on `Store` (D7, see `StoreGrant`
+below and [05-surfaces.md](05-surfaces.md) §3.1).
 
 ### Source
 Where a store's content comes from. Each source is driven by an **ingestor** that knows how to
@@ -180,6 +182,78 @@ store / one source / one resource), `state` (`pending` → `running` → `done` 
 `stats` (resources seen/indexed/deleted, chunks written), `error`, timestamps. Embedded mode
 runs jobs synchronously but still records them; the daemon queues them
 ([05-surfaces.md](05-surfaces.md) §3).
+
+### User
+An authenticated principal. Lives in `core::auth`; persisted via the `AuthStore` trait
+([05-surfaces.md](05-surfaces.md) §3.1).
+
+| Field | Notes |
+|---|---|
+| `id` | ULID. |
+| `name` | Human-readable, unique per instance. |
+| `role` | `admin` \| `member`. Admins see and manage every store; members see/search only `shared` stores they hold a `StoreGrant` for (D7). |
+| `created_at` | RFC 3339. |
+
+### AuthToken
+An issued credential. Access, refresh, and API-key tokens all share one table/type
+(`kind` discriminates), since they differ only in TTL, rotation behavior, and issuance flow, not
+in shape (D1).
+
+| Field | Notes |
+|---|---|
+| `id` | ULID. |
+| `user_id` | Owning user. |
+| `kind` | `access` \| `refresh` \| `api_key`. Access tokens: 1h TTL. Refresh tokens: 30d TTL, rotated on every use. API keys: no default expiry. |
+| `secret_hash` | blake3 hash of the opaque, `ldb_`-prefixed, 32-byte `OsRng` secret. The secret itself is shown once at issuance and never persisted. |
+| `expires_at` | Nullable — unset for API keys. |
+| `last_used_at` | Updated on each successful authentication; primarily meaningful for API keys. |
+| `revoked_at` | Nullable; set on explicit revocation or reuse-detected rotation (below). |
+| `family_id` | Groups a refresh token with all tokens descended from it via rotation. |
+| `rotated_from` | The `AuthToken.id` this row was rotated from, if any. Presenting an already-rotated (no longer current) refresh token is treated as credential theft: the entire `family_id` is revoked and authentication fails with `Unauthorized`. |
+
+### Invite
+A minted, shareable credential that lets a new user join without an existing admin creating
+their account directly. `store_grants` named against a `private` store are rejected at CREATE
+time (`Error::Forbidden`, reusing D7's grant rule) — a bad invite fails loudly for the admin who
+typo'd a store name, not silently for whoever redeems it later. The redeem/approve state machine
+(T6, `core::auth::AuthService::redeem_invite`/`approve_request`/`deny_request`/`poll_request`) is
+described in full in [05-surfaces.md](05-surfaces.md) §2/§3.1.
+
+| Field | Notes |
+|---|---|
+| `id` | ULID. |
+| `token_hash` | blake3 hash of the invite's opaque secret; the secret is shown once, at creation. |
+| `mode` | `open` (redeeming creates the user immediately) \| `closed` (redeeming creates an `AccessRequest` pending admin approval). |
+| `store_grants` | JSON array of store names the resulting user is granted on redemption/approval. |
+| `max_uses`, `uses` | `max_uses` defaults to 1. A use is atomically *reserved* (`AuthStore::try_consume_invite_use`, `UPDATE ... WHERE uses < max_uses`) before the redemption's user-create/access-request-file step and *released* (`AuthStore::release_invite_use`) if that step then fails — see `redeem_invite`'s doc comment. This caps `uses` at `max_uses` even under concurrent redemptions with distinct names, and ensures a failed redemption never permanently burns a use. |
+| `expires_at`, `revoked_at` | Nullable. |
+| `created_by` | Issuing user's ID. |
+| `created_at` | RFC 3339. |
+
+### AccessRequest
+A pending join request created by redeeming a `closed`-mode `Invite`, awaiting admin approval
+or denial (T6).
+
+| Field | Notes |
+|---|---|
+| `id` | ULID. |
+| `invite_id` | The `Invite` this request was made against. |
+| `requested_name` | The name the requester asked for. |
+| `secret_hash` | blake3 hash of the request secret minted at redemption time and shown once to the requester then. This secret is poll-only — it is never promoted to a credential (it travels as a URL query parameter on every poll, which would otherwise leak into access logs/proxies/shell history as a long-lived, live-from-approval-time API key). A *fresh* API key is minted instead, in `AuthService::poll_request`, the first time a poll observes the `Approved` state and collects it — see `collected_at` below. |
+| `state` | `pending` \| `approved` \| `denied`. |
+| `resulting_user_id` | Set once approved and the `User` row is created. |
+| `created_at`, `decided_at` | RFC 3339; `decided_at` nullable until the request leaves `pending`. |
+| `collected_at` (T6, schema v7) | Nullable RFC 3339. Set exactly once, atomically (`AuthStore::mark_access_request_collected`, mirroring `consume_auth_code`'s single-use guard), the first time a poll observes the `Approved` state and hands back the credential — every later poll observes `AlreadyCollected` instead of re-issuing it. |
+
+### StoreGrant
+A normalized row granting one user read access to one `shared`-visibility store (D7). Grants on
+`private` stores are rejected — `private` stores are admin-only and ungrantable.
+
+| Field | Notes |
+|---|---|
+| `store_name`, `user_id` | Composite key; one grant per (store, user) pair. |
+| `granted_by` | The admin user who created the grant. |
+| `created_at` | RFC 3339. |
 
 ## 3. ID scheme
 

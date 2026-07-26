@@ -88,9 +88,46 @@ allowlist alongside `rmcp`'s own `localhost`/`127.0.0.1`/`::1` defaults; a wildc
 bind, `0.0.0.0`/`::`, disables the check entirely, since it already accepts
 connections from any network. See [specs/05-surfaces.md](../specs/05-surfaces.md) §4.2.)
 
-**Known v1 limitation:** the HTTP `/mcp` route snapshots the daemon's stores once at
-startup — a store added later via `POST /v1/stores` won't appear over MCP until the
-daemon restarts.
+Store resolution over `/mcp` is realtime: a store added later via `POST /v1/stores`
+appears on the very next MCP call (`search`, `get_document`, `get_chunks`,
+`list_stores`) — no daemon restart needed.
+
+### Authentication
+
+A daemon bound to a non-loopback address enforces bearer-token auth automatically (see
+[docs/http-api.md](http-api.md#trust-model-and-authentication) for the full mode matrix) —
+`/mcp` is one of the protected routes. Two ways to connect:
+
+**Zero-config discovery (recommended for MCP clients that support it).** Point the client at
+`/mcp` with no credential at all. A stock MCP client (Claude Code and similar) follows the
+standard chain automatically: the first request gets `401` with `WWW-Authenticate: Bearer
+resource_metadata="<base>/.well-known/oauth-protected-resource"`; the client fetches that
+document, follows it to `/.well-known/oauth-authorization-server`, registers itself via
+`POST /register` (RFC 7591 Dynamic Client Registration — no client secret, since this only ever
+mints public clients), and completes the ordinary authorization-code + PKCE flow, opening a
+browser for the human to approve. No token needs to be typed in anywhere. See
+[docs/http-api.md](http-api.md#oauth-discovery--dynamic-client-registration) for the full
+protocol walk-through and the exact JSON shapes.
+
+**Static bearer header (for clients without OAuth discovery support, or scripted/headless
+use).** Mint a credential ahead of time — `localdb login` (interactive browser flow) or
+`localdb key create --user <name>` (long-lived API key, no browser) — and pass it as a static
+header when registering the MCP server:
+
+```
+claude mcp add --transport http localdb http://100.x.y.z:7700/mcp \
+  --header "Authorization: Bearer ldb_..."
+```
+
+Any MCP client that lets you attach a static header to an HTTP transport works the same way.
+
+**Stdio is always unauthenticated.** `localdb mcp` over stdio (embedded, or proxied to a local
+daemon — see [Daemon-proxied stdio](#daemon-proxied-stdio) below) never requires a bearer
+token, regardless of the daemon's own `server.auth` setting: stdio access to the local process
+is already trusted as local-files-equivalent, the same trust boundary as every other
+daemonless CLI command. Auth only applies to the HTTP transport (`/mcp` on a running daemon),
+which is what makes remote access meaningfully different from running `localdb mcp` on the
+same machine as the caller.
 
 ---
 
@@ -103,11 +140,12 @@ own `/mcp` route instead of opening the store a second time. This means:
 - You no longer need to stop `localdb serve` before using `localdb mcp` — the two now
   coexist by design (this replaces earlier v1 guidance that told you to stop the
   daemon first).
-- Proxied mode always exposes whatever store set the daemon had at its own startup —
-  **`--store` narrowing is not honored** when a daemon is running. `localdb mcp
-  --store <name>` against a running daemon prints a non-fatal warning to stderr and
-  serves the daemon's full store set regardless. This is a documented v1 limitation,
-  not a bug — see [specs/05-surfaces.md](../specs/05-surfaces.md) §4.2.
+- Proxied mode always exposes the daemon's current (realtime) full store set —
+  **`--store` narrowing is not honored** when a daemon is running, since the daemon's
+  own `/mcp` route has no notion of a per-stdio-session store filter to apply.
+  `localdb mcp --store <name>` against a running daemon prints a non-fatal warning to
+  stderr and serves the daemon's full store set regardless. This is a documented v1
+  limitation, not a bug — see [specs/05-surfaces.md](../specs/05-surfaces.md) §4.2.
 
 If no daemon is running, `localdb mcp` opens the store(s) embedded in-process exactly
 as before — no behavior change for the common case.

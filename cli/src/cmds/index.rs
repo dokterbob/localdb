@@ -236,7 +236,7 @@ pub(crate) async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, s
         if let Some(sid) = source_id {
             body["source_id"] = serde_json::Value::String(sid.to_string());
         }
-        match daemon_request_async(reqwest::Method::POST, &url, Some(body)).await {
+        match daemon_request_async(ctx, reqwest::Method::POST, &url, Some(body)).await {
             Ok(v) => {
                 if ctx.json {
                     print_json(&v);

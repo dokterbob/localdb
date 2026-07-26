@@ -9,6 +9,7 @@
 //!
 //! Implemented in T11.
 
+pub mod auth;
 pub mod daemon;
 pub mod error;
 pub mod handlers;
@@ -20,7 +21,8 @@ pub mod socket;
 pub mod state;
 pub mod watcher;
 
-pub use daemon::{build_router, start_daemon, DaemonHandle, DaemonOptions};
+pub use auth::AuthMode;
+pub use daemon::{build_router, resolve_auth_mode, start_daemon, DaemonHandle, DaemonOptions};
 pub use error::{ApiError, ErrorResponse};
 pub use job_queue::JobQueue;
 pub use scheduler::UrlRefreshScheduler;

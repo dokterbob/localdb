@@ -13,6 +13,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 rmcp = { workspace = true, features = [
     "server",
     "transport-io",
@@ -21,6 +22,10 @@ rmcp = { workspace = true, features = [
     "client",
     "transport-streamable-http-client-reqwest",
 ] }
+# Reading the `http::request::Parts` rmcp's Streamable HTTP transport
+# injects into tool-call extensions (principal propagation — see
+# `handler::McpHandler::principal_for`). Same major version rmcp pins.
+http = "1"
 
 [dev-dependencies]
 localdb-core = { path = "../core", features = ["test-support"] }

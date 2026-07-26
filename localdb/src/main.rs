@@ -115,6 +115,169 @@ pub enum Command {
         #[arg(long)]
         refresh: Option<String>,
     },
+
+    /// Manage user accounts. Every subcommand routes to a running daemon
+    /// (admin bearer) by default and falls back to a direct database
+    /// read/write when no daemon is reachable; `add` also accepts
+    /// `--direct-db` to bypass a running daemon for lockout recovery.
+    #[command(subcommand)]
+    User(UserCommand),
+
+    /// Manage API keys. Every subcommand routes to a running daemon by
+    /// default (admin bearer, except minting your own key) and falls back
+    /// to a direct database read/write when no daemon is reachable;
+    /// `create` also accepts `--direct-db` to bypass a running daemon for
+    /// lockout recovery.
+    #[command(subcommand)]
+    Key(KeyCommand),
+
+    /// Authenticate against a daemon via OAuth2 (authorization code + PKCE)
+    /// and cache the resulting token in credentials.json.
+    Login {
+        /// Daemon base URL (default: auto-detected running daemon).
+        #[arg(long)]
+        url: Option<String>,
+
+        /// Pre-fill the consent form's one-time setup code (bootstrap);
+        /// the form still requires an explicit submit.
+        #[arg(long = "setup-code")]
+        setup_code: Option<String>,
+
+        /// Don't try to open a browser; print the URL and read a pasted
+        /// code from stdin instead.
+        #[arg(long = "no-browser")]
+        no_browser: bool,
+
+        /// Redeem an invite token instead of an interactive login
+        /// (specs/05-surfaces.md §2, T6): `open`-mode invites complete
+        /// immediately; `closed`-mode invites wait and poll until an admin
+        /// approves or denies. Mutually exclusive with `--setup-code` and
+        /// `--no-browser`'s browser flow — no browser is opened at all.
+        #[arg(long)]
+        invite: Option<String>,
+
+        /// The requested user name for `--invite` (default: the OS login
+        /// name).
+        #[arg(long)]
+        name: Option<String>,
+    },
+
+    /// Revoke the cached token for a daemon and clear it from
+    /// credentials.json.
+    Logout {
+        /// Daemon base URL (default: auto-detected running daemon).
+        #[arg(long)]
+        url: Option<String>,
+    },
+
+    /// Manage invites and pending access requests (admin only, T6).
+    #[command(subcommand)]
+    Invite(InviteCommand),
+}
+
+/// Invite management subcommands (specs/05-surfaces.md §2, T6).
+#[derive(Debug, Subcommand)]
+pub enum InviteCommand {
+    /// Create an invite. Prints a show-once token and a ready-made consent
+    /// URL.
+    Create {
+        /// `open` (redeem creates the user immediately) or `closed` (redeem
+        /// files a pending access request for admin approval).
+        #[arg(long, default_value = "open")]
+        mode: String,
+        /// Store(s) to grant the resulting user read access to (repeatable;
+        /// must be `shared` stores — `private` stores are rejected).
+        #[arg(long = "store")]
+        stores: Vec<String>,
+        /// Expiry as a human-readable duration (e.g. "7d", "24h", "30m");
+        /// omit for no expiry.
+        #[arg(long)]
+        expires: Option<String>,
+        /// How many times this invite may be redeemed.
+        #[arg(long = "max-uses", default_value = "1")]
+        max_uses: u32,
+    },
+    /// List all invites (no secrets).
+    List,
+    /// Revoke an invite by ID.
+    Revoke {
+        /// Invite ID (see `invite list`).
+        id: String,
+    },
+    /// List pending (and decided) access requests from closed-mode invites.
+    Requests,
+    /// Approve a pending access request, creating its user.
+    Approve {
+        /// Access request ID (see `invite requests`).
+        request_id: String,
+    },
+    /// Deny a pending access request.
+    Deny {
+        /// Access request ID (see `invite requests`).
+        request_id: String,
+    },
+}
+
+/// User management subcommands (specs/05-surfaces.md §2).
+#[derive(Debug, Subcommand)]
+pub enum UserCommand {
+    /// Create a user account. Routed to a running daemon (admin bearer) by
+    /// default; falls back to a direct database write when no daemon is
+    /// reachable.
+    Add {
+        /// User name (unique).
+        name: String,
+        /// Create the user with the admin role (default: member).
+        #[arg(long)]
+        admin: bool,
+        /// Write directly to the database even if a daemon is running
+        /// (lockout recovery — bypasses the daemon rather than refusing).
+        #[arg(long = "direct-db")]
+        direct_db: bool,
+    },
+    /// List all user accounts.
+    List,
+    /// Remove a user account.
+    Remove {
+        /// User name.
+        name: String,
+    },
+    /// Change a user's role.
+    SetRole {
+        /// User name.
+        name: String,
+        /// New role: "admin" or "member".
+        role: String,
+    },
+}
+
+/// API key management subcommands (specs/05-surfaces.md §2).
+#[derive(Debug, Subcommand)]
+pub enum KeyCommand {
+    /// Mint an API key for a user. The secret is shown exactly once. Routed
+    /// to a running daemon by default (admin bearer, unless minting a key
+    /// for yourself); falls back to a direct database write when no daemon
+    /// is reachable.
+    Create {
+        /// The user name to mint the key for.
+        #[arg(long)]
+        user: String,
+        /// Write directly to the database even if a daemon is running
+        /// (lockout recovery — bypasses the daemon rather than refusing).
+        #[arg(long = "direct-db")]
+        direct_db: bool,
+    },
+    /// List API keys (metadata only — never secrets).
+    List {
+        /// Restrict to this user's keys (default: every user's).
+        #[arg(long)]
+        user: Option<String>,
+    },
+    /// Revoke an API key by its ID.
+    Revoke {
+        /// The key's ID (see `key list`).
+        id: String,
+    },
 }
 
 /// Store management subcommands.
@@ -131,6 +294,20 @@ pub enum StoreCommand {
     Remove {
         /// Store name or ID.
         name: String,
+    },
+    /// Grant a user read access to a `shared` store (D7).
+    Grant {
+        /// Store name.
+        store: String,
+        /// User name or ID.
+        user: String,
+    },
+    /// Revoke a user's read access to a store.
+    Revoke {
+        /// Store name.
+        store: String,
+        /// User name or ID.
+        user: String,
     },
 }
 
@@ -218,6 +395,9 @@ fn main() {
         config_env: std::env::var("LOCALDB_CONFIG")
             .ok()
             .map(std::path::PathBuf::from),
+        api_key: std::env::var("LOCALDB_API_KEY")
+            .ok()
+            .filter(|s| !s.is_empty()),
     };
 
     match &cli.command {
@@ -229,6 +409,8 @@ fn main() {
             StoreCommand::Add { name } => cli::run_store_add(&ctx, name),
             StoreCommand::List => cli::run_store_list(&ctx),
             StoreCommand::Remove { name } => cli::run_store_remove(&ctx, name),
+            StoreCommand::Grant { store, user } => cli::run_store_grant(&ctx, store, user),
+            StoreCommand::Revoke { store, user } => cli::run_store_revoke(&ctx, store, user),
         },
         Command::Source(cmd) => match cmd {
             SourceCommand::Add { sources, refresh } => {
@@ -261,6 +443,49 @@ fn main() {
                 cli::run_source_add(&ctx, source, refresh.as_deref());
             }
         }
+        Command::User(cmd) => match cmd {
+            UserCommand::Add {
+                name,
+                admin,
+                direct_db,
+            } => cli::run_user_add(&ctx, name, *admin, *direct_db),
+            UserCommand::List => cli::run_user_list(&ctx),
+            UserCommand::Remove { name } => cli::run_user_remove(&ctx, name),
+            UserCommand::SetRole { name, role } => cli::run_user_set_role(&ctx, name, role),
+        },
+        Command::Key(cmd) => match cmd {
+            KeyCommand::Create { user, direct_db } => cli::run_key_create(&ctx, user, *direct_db),
+            KeyCommand::List { user } => cli::run_key_list(&ctx, user.as_deref()),
+            KeyCommand::Revoke { id } => cli::run_key_revoke(&ctx, id),
+        },
+        Command::Login {
+            url,
+            setup_code,
+            no_browser,
+            invite,
+            name,
+        } => cli::run_login(
+            &ctx,
+            url.as_deref(),
+            setup_code.as_deref(),
+            *no_browser,
+            invite.as_deref(),
+            name.as_deref(),
+        ),
+        Command::Logout { url } => cli::run_logout(&ctx, url.as_deref()),
+        Command::Invite(cmd) => match cmd {
+            InviteCommand::Create {
+                mode,
+                stores,
+                expires,
+                max_uses,
+            } => cli::run_invite_create(&ctx, mode, stores, expires.as_deref(), *max_uses),
+            InviteCommand::List => cli::run_invite_list(&ctx),
+            InviteCommand::Revoke { id } => cli::run_invite_revoke(&ctx, id),
+            InviteCommand::Requests => cli::run_invite_requests(&ctx),
+            InviteCommand::Approve { request_id } => cli::run_invite_approve(&ctx, request_id),
+            InviteCommand::Deny { request_id } => cli::run_invite_deny(&ctx, request_id),
+        },
     }
 }
 

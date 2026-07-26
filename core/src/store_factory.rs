@@ -21,7 +21,6 @@ pub fn default_store_row(
             correlation_id: "store_factory_serialize".into(),
         })?,
         policy_version: policy_version.to_string(),
-        acl: "{}".to_string(),
         created_at: now_rfc3339(),
     })
 }
@@ -43,7 +42,6 @@ mod tests {
         assert_eq!(row.backend, "libsql");
         assert_eq!(row.indexing_policy, serde_json::to_string(&policy).unwrap());
         assert_eq!(row.policy_version, "v1");
-        assert_eq!(row.acl, "{}");
         assert_eq!(row.created_at, "2026-06-10T12:00:00Z");
 
         Ok(())

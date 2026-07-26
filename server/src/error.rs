@@ -3,7 +3,7 @@
 //! Maps `localdb_core::Error` to HTTP status codes per specs/05-surfaces.md §5.
 
 use axum::{
-    http::StatusCode,
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -37,7 +37,15 @@ impl IntoResponse for ApiError {
             code: self.0.code().to_string(),
             message: self.0.to_string(),
         };
-        (status, Json(body)).into_response()
+        let mut response = (status, Json(body)).into_response();
+        // D6 (specs/05-surfaces.md §3.1): every 401 MUST carry a
+        // `WWW-Authenticate: Bearer` challenge, wherever it originates.
+        if status == StatusCode::UNAUTHORIZED {
+            response
+                .headers_mut()
+                .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+        }
+        response
     }
 }
 
@@ -66,6 +74,9 @@ pub fn http_status_for(err: &CoreError) -> StatusCode {
         CoreError::ModelMissing { .. } => StatusCode::SERVICE_UNAVAILABLE,
 
         CoreError::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+
+        CoreError::Unauthorized { .. } => StatusCode::UNAUTHORIZED,
+        CoreError::Forbidden { .. } => StatusCode::FORBIDDEN,
     }
 }
 
@@ -181,6 +192,53 @@ mod tests {
                 correlation_id: "abc".into(),
             }),
             StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn unauthorized_response_carries_www_authenticate_bearer() {
+        let response = ApiError(Error::Unauthorized {
+            message: "m".into(),
+        })
+        .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::WWW_AUTHENTICATE)
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer"),
+            "D6: every 401 must carry WWW-Authenticate: Bearer"
+        );
+    }
+
+    #[test]
+    fn forbidden_response_has_no_www_authenticate() {
+        let response = ApiError(Error::Forbidden {
+            message: "m".into(),
+        })
+        .into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(response.headers().get(header::WWW_AUTHENTICATE).is_none());
+    }
+
+    #[test]
+    fn unauthorized_maps_to_401() {
+        assert_eq!(
+            http_status_for(&Error::Unauthorized {
+                message: "m".into()
+            }),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn forbidden_maps_to_403() {
+        assert_eq!(
+            http_status_for(&Error::Forbidden {
+                message: "m".into()
+            }),
+            StatusCode::FORBIDDEN
         );
     }
 }

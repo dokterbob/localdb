@@ -6,12 +6,12 @@
 //! macro-native: `#[tool_router]`/`#[tool_handler]` generates dispatch from
 //! typed argument structs it owns ahead of time. `ProxyHandler` cannot be
 //! macro-native — it has no argument structs of its own and does not know
-//! the upstream's tool set ahead of time (that set is whatever store
-//! snapshot the daemon happened to build at its own startup, see
-//! `server::mcp_bridge::build_available_stores`'s doc comment) — so it just
-//! relays whatever request arrives to the upstream connection and returns
-//! whatever comes back, unexamined. This is the one hand-written
-//! `ServerHandler` impl in the migration, deliberately.
+//! the upstream's tool set ahead of time (that set is whatever the
+//! upstream's `StoreProvider` currently resolves — realtime as of T2, see
+//! `server::mcp_bridge::AppStateStoreProvider`) — so it just relays whatever
+//! request arrives to the upstream connection and returns whatever comes
+//! back, unexamined. This is the one hand-written `ServerHandler` impl in
+//! the migration, deliberately.
 
 use rmcp::{
     model::{
@@ -41,16 +41,32 @@ pub struct ProxyHandler {
 
 impl ProxyHandler {
     /// Connect to `{daemon_base_url}/mcp` and complete the upstream MCP
-    /// `initialize` handshake.
+    /// `initialize` handshake, without a bearer token.
     ///
     /// # Errors
     /// Returns an error if the HTTP transport cannot be constructed or the
     /// upstream handshake fails (e.g. the daemon went down between
     /// `probe_daemon` succeeding in `cli` and this call).
     pub async fn connect(daemon_base_url: &str) -> anyhow::Result<Self> {
-        let transport = StreamableHttpClientTransport::from_config(
-            StreamableHttpClientTransportConfig::with_uri(format!("{daemon_base_url}/mcp")),
-        );
+        Self::connect_with_auth(daemon_base_url, None).await
+    }
+
+    /// Like [`Self::connect`], but attaching `bearer` (the raw `ldb_...`
+    /// secret, **without** the `Bearer ` prefix — rmcp's
+    /// `StreamableHttpClientTransportConfig::auth_header` adds the scheme)
+    /// as the Authorization header on every upstream request. Used by `cli`
+    /// when proxying stdio MCP to a daemon that enforces auth
+    /// (specs/05-surfaces.md §3.1).
+    pub async fn connect_with_auth(
+        daemon_base_url: &str,
+        bearer: Option<String>,
+    ) -> anyhow::Result<Self> {
+        let mut config =
+            StreamableHttpClientTransportConfig::with_uri(format!("{daemon_base_url}/mcp"));
+        if let Some(secret) = bearer {
+            config = config.auth_header(secret);
+        }
+        let transport = StreamableHttpClientTransport::from_config(config);
         let upstream = rmcp::model::ClientInfo::default().serve(transport).await?;
         Ok(Self { upstream })
     }

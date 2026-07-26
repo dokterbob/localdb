@@ -171,7 +171,7 @@ async fn request_daemon_search(
                 .collect(),
         );
     }
-    daemon_request_async(reqwest::Method::POST, &url, Some(body)).await
+    daemon_request_async(ctx, reqwest::Method::POST, &url, Some(body)).await
 }
 
 async fn query_embedded_search(

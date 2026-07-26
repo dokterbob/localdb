@@ -208,7 +208,15 @@ localdb serve   # binds http://127.0.0.1:7700 by default
 ```
 
 The daemon exposes a REST API, plus the same MCP tools over HTTP at `/mcp` (see
-[MCP hookup](#mcp-hookup) above). It is **experimental**: ingestion via `POST /v1/jobs` is currently a no-op. The daemon reads and writes the same unified database as the CLI, so CLI-indexed data is visible to it. See [docs/http-api.md](docs/http-api.md) for endpoint reference and known limitations.
+[MCP hookup](#mcp-hookup) above). It is **experimental**: ingestion via `POST /v1/jobs` is currently a no-op. The daemon reads and writes the same unified database as the CLI, so CLI-indexed data is visible to it.
+
+Bound to loopback (the default), the daemon has no authentication — reachability is the trust
+boundary, same as the files on disk. Bound to any other address (a LAN/Tailscale IP, or
+deliberately `0.0.0.0`), bearer-token auth is enforced automatically: `localdb login` (browser
+OAuth) or `localdb key create` mints a credential, and a stock MCP client can even onboard with
+zero static config via OAuth discovery + Dynamic Client Registration. See
+[docs/http-api.md](docs/http-api.md) for endpoint reference, the trust model, and known
+limitations.
 
 ---
 
@@ -241,9 +249,9 @@ migration's down-SQL is stored as data in the database itself, not read from com
 | YAML-declared stores | Appear in `store list` but **cannot be indexed** (`localdb index` only resolves runtime stores). Use `localdb store add` + `localdb source add` instead. |
 | CLI while daemon runs | CLI and daemon can run concurrently. SQLite WAL and busy_timeout serialise concurrent writes. |
 | MCP while daemon runs | `localdb mcp` now detects a running daemon and proxies to its `/mcp` route automatically, rather than conflicting with it. `--store` narrowing is not honored in proxied mode (v1 limitation — see [docs/mcp.md](docs/mcp.md#daemon-proxied-stdio)). |
-| MCP over HTTP | `/mcp` on the daemon snapshots the store list once at startup — a store added later via `/v1/stores` isn't visible over MCP until restart. |
+| MCP over HTTP | `/mcp` on the daemon resolves stores realtime — a store added later via `/v1/stores` appears on the next MCP call, no restart needed. |
 
-Docs sync: the old Known Gaps entries for source path validation and the macOS bundle ID are resolved in code and reflected in `docs/architecture.md`.
+Docs sync: the old Known Gaps entries for source path validation, the macOS bundle ID, and the MCP store-snapshot staleness are resolved in code and reflected in `docs/architecture.md`.
 
 Design rationale and planned behavior live in the [specs/](specs/) directory.
 

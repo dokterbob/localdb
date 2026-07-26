@@ -49,8 +49,7 @@ pub(super) fn row_to_store(row: &libsql::Row) -> Result<StoreRow, Error> {
     let backend: String = row.get(3).map_err(map_libsql_err)?;
     let indexing_policy: String = row.get(4).map_err(map_libsql_err)?;
     let policy_version: String = row.get(5).map_err(map_libsql_err)?;
-    let acl: String = row.get(6).map_err(map_libsql_err)?;
-    let created_at: String = row.get(7).map_err(map_libsql_err)?;
+    let created_at: String = row.get(6).map_err(map_libsql_err)?;
     Ok(StoreRow {
         id,
         name,
@@ -58,7 +57,6 @@ pub(super) fn row_to_store(row: &libsql::Row) -> Result<StoreRow, Error> {
         backend,
         indexing_policy,
         policy_version,
-        acl,
         created_at,
     })
 }

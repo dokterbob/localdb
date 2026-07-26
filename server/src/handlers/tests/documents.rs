@@ -5,7 +5,8 @@ use axum::{
 use tower::ServiceExt;
 
 use super::common::{
-    json_body, make_app, make_state_with_fake_config, seed_store_a_chunk, SeedChunkInput,
+    json_body, make_app, make_state_with_auth_mode, make_state_with_fake_config,
+    seed_chunk_in_store, seed_store_a_chunk, seed_user_with_key, SeedChunkInput,
 };
 
 #[tokio::test]
@@ -52,7 +53,7 @@ async fn get_document_returns_record_when_indexed() {
 
     let app = crate::daemon::build_router(
         state,
-        vec![],
+        std::sync::Arc::new(mcp::StaticStoreProvider::new(vec![])),
         std::sync::Arc::new(localdb_core::FakeEmbedder::new(1)),
         vec![],
     );
@@ -181,7 +182,7 @@ async fn get_document_reconstructs_table_without_duplicated_header() {
 
     let app = crate::daemon::build_router(
         state,
-        vec![],
+        std::sync::Arc::new(mcp::StaticStoreProvider::new(vec![])),
         std::sync::Arc::new(localdb_core::FakeEmbedder::new(128)),
         vec![],
     );
@@ -213,4 +214,130 @@ async fn get_document_reconstructs_table_without_duplicated_header() {
         normalized_text, table_text,
         "block-based reconstruction should equal the canonical block text exactly"
     );
+}
+
+/// D7 regression test: `GET /v1/documents/{id}` for a document that
+/// genuinely exists, in a `shared` store the caller was never granted
+/// access to, must be `403 Forbidden` — not `404` (which would let a caller
+/// distinguish "unknown id" from "real id, no access" by status code alone)
+/// and not `200` (which would leak the document). See
+/// `handlers::documents::get_document`'s doc comment: masked as
+/// `resource_not_found` only when the document id itself is unknown, but
+/// `forbidden` when it exists in an unreadable store — same 403-over-404
+/// consistency point as `handlers::stores::get_store` and
+/// specs/05-surfaces.md:137's named-but-unreadable-store rule.
+///
+/// Drives a real `AuthMode::Enforced` router with a genuine bearer token
+/// (not `Principal::local_trust()`, which is admin-equivalent and bypasses
+/// D7 entirely) for a `Role::Member` principal holding no grants at all.
+#[tokio::test]
+async fn get_document_without_store_grant_returns_403() {
+    let (_dir, state) = make_state_with_auth_mode(crate::auth::AuthMode::Enforced).await;
+
+    seed_chunk_in_store(
+        &state,
+        "store-shared",
+        "shared",
+        SeedChunkInput {
+            chunk_id: "chunk-secret-1",
+            doc_id: "doc-secret-1",
+            text: "confidential contents the ungranted member must never see",
+            uri: "file:///secret.md",
+            metadata: localdb_core::metadata::Metadata::default(),
+        },
+    )
+    .await;
+
+    let bearer =
+        seed_user_with_key(&state, "member-no-grant", localdb_core::auth::Role::Member).await;
+
+    let app = crate::daemon::build_router(
+        state,
+        std::sync::Arc::new(mcp::StaticStoreProvider::new(vec![])),
+        std::sync::Arc::new(localdb_core::FakeEmbedder::new(128)),
+        vec![],
+    );
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/documents/doc-secret-1")
+                .header("authorization", format!("Bearer {bearer}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = json_body(resp.into_body()).await;
+    assert_eq!(body["code"], "forbidden");
+}
+
+/// Positive counterpart to `get_document_without_store_grant_returns_403`:
+/// a `Role::Member` principal *with* a grant on the document's owning
+/// `shared` store gets the document back, status `200`.
+#[tokio::test]
+async fn get_document_with_store_grant_returns_200() {
+    use localdb_core::types::StoreVisibility;
+
+    let (_dir, state) = make_state_with_auth_mode(crate::auth::AuthMode::Enforced).await;
+
+    seed_chunk_in_store(
+        &state,
+        "store-shared",
+        "shared",
+        SeedChunkInput {
+            chunk_id: "chunk-visible-1",
+            doc_id: "doc-visible-1",
+            text: "contents a granted member may read",
+            uri: "file:///visible.md",
+            metadata: localdb_core::metadata::Metadata::default(),
+        },
+    )
+    .await;
+
+    let admin = state
+        .auth()
+        .create_user("admin-granter", localdb_core::auth::Role::Admin)
+        .await
+        .unwrap();
+    let member = state
+        .auth()
+        .create_user("member-with-grant", localdb_core::auth::Role::Member)
+        .await
+        .unwrap();
+    state
+        .auth()
+        .grant_store(
+            "store-shared",
+            StoreVisibility::Shared,
+            &member.id,
+            &admin.id,
+        )
+        .await
+        .unwrap();
+    let bearer = state.auth().issue_api_key(&member.id).await.unwrap().secret;
+
+    let app = crate::daemon::build_router(
+        state,
+        std::sync::Arc::new(mcp::StaticStoreProvider::new(vec![])),
+        std::sync::Arc::new(localdb_core::FakeEmbedder::new(128)),
+        vec![],
+    );
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/documents/doc-visible-1")
+                .header("authorization", format!("Bearer {bearer}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp.into_body()).await;
+    assert_eq!(body["id"], "doc-visible-1");
 }

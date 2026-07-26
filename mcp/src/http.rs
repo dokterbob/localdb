@@ -12,23 +12,26 @@ use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
 
-use localdb_core::Embedder;
+use localdb_core::{auth::Principal, Embedder};
 
 use crate::handler::McpHandler;
-use crate::tools::AvailableStore;
+use crate::store_provider::StoreProvider;
 
 /// Build the Streamable HTTP tower service serving `McpHandler`.
 ///
-/// `stores` and `embedder` are a startup-time snapshot (see
-/// `server::mcp_bridge::build_available_stores`), not rebuilt per session:
-/// rmcp's service factory below is a synchronous `Fn() -> Result<S,
-/// io::Error>`, so there is no hook to redo the async `AppState` lookups
-/// per HTTP session. The factory clones `stores`/`embedder` per session
-/// instead — cheap, since `AvailableStore::store` and `embedder` are both
-/// already `Arc`-backed — which satisfies the sync boundary without a
-/// `block_on` bridge. A store added later via `/v1/stores` is therefore
-/// invisible over MCP until the daemon restarts; an accepted, documented
-/// gap (specs/05-surfaces.md §4), not something this function works around.
+/// `provider` and `embedder` are shared (`Arc`-cloned) across every HTTP
+/// session the factory below constructs — cheap, since cloning an `Arc`
+/// satisfies rmcp's synchronous service-factory signature (`Fn() -> Result<S,
+/// io::Error>`) without a `block_on` bridge. That synchronous boundary only
+/// ever constrained *construction-time* store resolution (building the
+/// `McpHandler` itself); it says nothing about what an individual tool
+/// method does once the handler exists. Because `provider` is an `Arc<dyn
+/// StoreProvider>` rather than a pre-resolved `Vec<AvailableStore>`,
+/// `McpHandler`'s tool methods (`handler.rs`) call
+/// `provider.available_stores().await` fresh on every call — so a store
+/// added later via `POST /v1/stores` is visible on the very next MCP tool
+/// call, no daemon restart needed. See `store_provider.rs` for the full
+/// design rationale (D12).
 ///
 /// HTTP MCP sessions always run with `allow_write = false`: there is no
 /// CLI-flag equivalent for an HTTP caller, and v1 registers no mutating
@@ -58,10 +61,17 @@ use crate::tools::AvailableStore;
 /// case would silently keep rmcp's localhost-only default and this whole
 /// fix would be a no-op for the one case (non-loopback bind) it exists for.
 /// Do not "simplify" this back to always using `::default()`.
+///
+/// `default_principal` is the fallback identity when a tool call's request
+/// extensions carry no `Principal` (see `handler::McpHandler::principal_for`):
+/// the daemon passes `Some(Principal::local_trust())` in open (unauthenticated)
+/// mode and `None` when auth is enforced, so a request that somehow bypassed
+/// the auth middleware fails closed instead of running with full access.
 pub fn build_streamable_http_service(
-    stores: Vec<AvailableStore>,
+    provider: Arc<dyn StoreProvider>,
     embedder: Arc<dyn Embedder>,
     allowed_hosts: Vec<String>,
+    default_principal: Option<Principal>,
 ) -> StreamableHttpService<McpHandler, LocalSessionManager> {
     let config = if allowed_hosts.is_empty() {
         StreamableHttpServerConfig::default().disable_allowed_hosts()
@@ -69,7 +79,14 @@ pub fn build_streamable_http_service(
         StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts)
     };
     StreamableHttpService::new(
-        move || Ok(McpHandler::new(stores.clone(), embedder.clone(), false)),
+        move || {
+            Ok(McpHandler::new(
+                provider.clone(),
+                embedder.clone(),
+                false,
+                default_principal.clone(),
+            ))
+        },
         Default::default(),
         config,
     )

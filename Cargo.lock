@@ -735,6 +735,8 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 name = "cli"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "axum 0.8.9",
  "embed",
  "extract",
  "fetch",
@@ -743,11 +745,14 @@ dependencies = [
  "localdb-core",
  "mcp",
  "reqwest 0.12.28",
+ "serde",
  "serde_json",
  "server",
  "store-libsql",
  "tempfile",
  "tokio",
+ "url",
+ "webbrowser",
 ]
 
 [[package]]
@@ -2983,9 +2988,11 @@ dependencies = [
  "globset",
  "hex",
  "pulldown-cmark",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2 0.10.9",
  "tempfile",
  "text-splitter",
  "thiserror 2.0.18",
@@ -3147,7 +3154,9 @@ name = "mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum 0.8.9",
+ "http 1.4.2",
  "localdb-core",
  "rmcp",
  "schemars",
@@ -3269,6 +3278,12 @@ dependencies = [
  "portable-atomic-util",
  "rawpointer",
 ]
+
+[[package]]
+name = "ndk-context"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27b02d87554356db9e9a873add8782d4ea6e3e58ea071a9adb9a2e8ddb884a8b"
 
 [[package]]
 name = "new_debug_unreachable"
@@ -4979,12 +4994,12 @@ dependencies = [
  "rmcp",
  "serde",
  "serde_json",
- "serde_yaml",
  "store-libsql",
  "tempfile",
  "tokio",
  "tower 0.5.3",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -6326,6 +6341,22 @@ dependencies = [
  "phf_codegen 0.13.1",
  "string_cache 0.9.0",
  "string_cache_codegen 0.6.1",
+]
+
+[[package]]
+name = "webbrowser"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0fc95580916af1e68ff6a7be07446fc5db73ebf71cf092de939bbf5f7e189f72"
+dependencies = [
+ "core-foundation 0.10.1",
+ "jni",
+ "log",
+ "ndk-context",
+ "objc2",
+ "objc2-foundation",
+ "url",
+ "web-sys",
 ]
 
 [[package]]

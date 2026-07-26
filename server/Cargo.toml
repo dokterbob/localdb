@@ -18,17 +18,20 @@ tower = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+url = { workspace = true }
 
 # File system notification (debounced file watching)
 # Use notify v6 since notify-debouncer-mini 0.4 depends on notify 6
 notify-debouncer-mini = "0.4"
 
-# YAML parsing for config reload
-serde_yaml = { workspace = true }
-
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
+
+# `FakeAuthStore` for oauth.rs's unit tests (T7) — exercises
+# `validate_authorize_params` against an in-memory `AuthService` instead of a
+# real libsql database, mirroring `core::auth::service`'s own test helper.
+localdb-core = { path = "../core", features = ["test-support"] }
 
 # Client-side transport for the `/mcp` route's round-trip integration test
 # (server/tests/mcp_route.rs) — not used by any non-test code, which only

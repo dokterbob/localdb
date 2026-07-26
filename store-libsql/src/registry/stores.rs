@@ -9,15 +9,14 @@ pub(crate) async fn upsert_store(db: &LibsqlDb, store: &StoreRow) -> Result<(), 
     let conn = db.conn().await;
     conn.execute(
         "INSERT INTO stores (id, name, visibility, backend, indexing_policy,
-                policy_version, acl, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                policy_version, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                  name = excluded.name,
                  visibility = excluded.visibility,
                  backend = excluded.backend,
                  indexing_policy = excluded.indexing_policy,
-                 policy_version = excluded.policy_version,
-                 acl = excluded.acl",
+                 policy_version = excluded.policy_version",
         libsql::params![
             store.id.clone(),
             store.name.clone(),
@@ -25,7 +24,6 @@ pub(crate) async fn upsert_store(db: &LibsqlDb, store: &StoreRow) -> Result<(), 
             store.backend.clone(),
             store.indexing_policy.clone(),
             store.policy_version.clone(),
-            store.acl.clone(),
             store.created_at.clone(),
         ],
     )
@@ -51,7 +49,7 @@ pub(crate) async fn get_store(db: &LibsqlDb, id: &str) -> Result<Option<StoreRow
     let mut rows = conn
         .query(
             "SELECT id, name, visibility, backend, indexing_policy,
-                        policy_version, acl, created_at
+                        policy_version, created_at
                  FROM stores WHERE id = ?",
             libsql::params![id.to_string()],
         )
@@ -71,7 +69,7 @@ pub(crate) async fn get_store_by_name(
     let mut rows = conn
         .query(
             "SELECT id, name, visibility, backend, indexing_policy,
-                        policy_version, acl, created_at
+                        policy_version, created_at
                  FROM stores WHERE name = ?",
             libsql::params![name.to_string()],
         )
@@ -88,7 +86,7 @@ pub(crate) async fn list_stores(db: &LibsqlDb) -> Result<Vec<StoreRow>, Error> {
     let mut rows = conn
         .query(
             "SELECT id, name, visibility, backend, indexing_policy,
-                        policy_version, acl, created_at
+                        policy_version, created_at
                  FROM stores ORDER BY name",
             (),
         )

@@ -104,10 +104,6 @@ pub struct Store {
 
     /// Indexing policy: `{chunking, embedding}` as one unit.
     pub indexing: IndexingPolicy,
-
-    /// Reserved; empty in MVP.
-    #[serde(default)]
-    pub acl: Vec<AclEntry>,
 }
 
 /// Visibility of a store.
@@ -116,6 +112,24 @@ pub struct Store {
 pub enum StoreVisibility {
     Private,
     Shared,
+}
+
+impl StoreVisibility {
+    /// Parse the `"private"` / `"shared"` string form used at several
+    /// surfaces (`StoreRow::visibility` rendered to a string,
+    /// `mcp::StoreDescriptor::visibility`) back into the enum, e.g. for D7
+    /// grant/read-access checks (`Principal::can_read_store`) that need the
+    /// typed value rather than the wire string. `None` for anything else —
+    /// callers that must fail safe on an unrecognized value (a bug, since
+    /// both producers only ever emit these two strings) should treat `None`
+    /// as `Private` (deny by default) rather than propagate a panic.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "private" => Some(StoreVisibility::Private),
+            "shared" => Some(StoreVisibility::Shared),
+            _ => None,
+        }
+    }
 }
 
 /// Backend configuration for a store.
@@ -159,13 +173,6 @@ pub struct EmbeddingConfig {
     pub provider: String,
     /// Model name or path.
     pub model: String,
-}
-
-/// ACL entry. Reserved; empty in MVP.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AclEntry {
-    pub principal: String,
-    pub role: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -537,11 +544,24 @@ mod tests {
                     model: "default".to_string(),
                 },
             },
-            acl: vec![],
         };
         let json = serde_json::to_string(&store).unwrap();
         let store2: Store = serde_json::from_str(&json).unwrap();
         assert_eq!(store, store2);
+    }
+
+    #[test]
+    fn store_visibility_parse_roundtrips_wire_strings() {
+        assert_eq!(
+            StoreVisibility::parse("private"),
+            Some(StoreVisibility::Private)
+        );
+        assert_eq!(
+            StoreVisibility::parse("shared"),
+            Some(StoreVisibility::Shared)
+        );
+        assert_eq!(StoreVisibility::parse("public"), None);
+        assert_eq!(StoreVisibility::parse(""), None);
     }
 
     #[test]

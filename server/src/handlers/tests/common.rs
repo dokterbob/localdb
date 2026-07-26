@@ -1,10 +1,12 @@
 use axum::{
+    middleware,
     routing::{delete, get, post},
     Router,
 };
 use serde_json::json;
 use tempfile::TempDir;
 
+use crate::auth::middleware::require_auth;
 use crate::handlers::{
     create_job, create_source, create_store, delete_source, delete_store, get_config, get_document,
     get_job, get_status, get_store, list_sources, list_stores, patch_store, search,
@@ -35,6 +37,7 @@ pub(crate) async fn make_app() -> (TempDir, Router) {
         dir.path().to_path_buf(),
         queue.clone(),
         crate::scheduler::UrlRefreshScheduler::new(queue),
+        crate::auth::AuthMode::Open,
     )
     .await
     .unwrap();
@@ -56,7 +59,12 @@ pub(crate) async fn make_app() -> (TempDir, Router) {
         .route("/v1/jobs/{id}", get(get_job))
         .route("/v1/status", get(get_status))
         .route("/v1/config", get(get_config))
-        .with_state(state);
+        .with_state(state.clone())
+        // Open-mode auth: inserts `Principal::local_trust()` on every
+        // request, matching the real `daemon::build_router` — needed since
+        // handlers now read the request's `Principal` (D7 scoping,
+        // admin-only checks) via `handlers::require_principal`.
+        .layer(middleware::from_fn_with_state(state, require_auth));
 
     (dir, router)
 }
@@ -67,6 +75,17 @@ pub(crate) async fn json_body(body: axum::body::Body) -> serde_json::Value {
 }
 
 pub(crate) async fn make_state_with_fake_config() -> (TempDir, AppState) {
+    make_state_with_auth_mode(crate::auth::AuthMode::Open).await
+}
+
+/// Like `make_state_with_fake_config`, but with an explicit auth mode —
+/// needed to exercise a real, non-`local_trust` `Principal` end to end
+/// (`AuthMode::Enforced`, `require_auth` resolving a bearer token via
+/// `state.auth()`) rather than the `Open` mode's always-admin
+/// `local_trust` short-circuit.
+pub(crate) async fn make_state_with_auth_mode(
+    auth_mode: crate::auth::AuthMode,
+) -> (TempDir, AppState) {
     let dir = tempfile::tempdir().unwrap();
     let yaml_config = localdb_core::config::schema::RawConfig {
         version: 1,
@@ -90,10 +109,23 @@ pub(crate) async fn make_state_with_fake_config() -> (TempDir, AppState) {
         dir.path().to_path_buf(),
         queue.clone(),
         crate::scheduler::UrlRefreshScheduler::new(queue),
+        auth_mode,
     )
     .await
     .unwrap();
     (dir, state)
+}
+
+/// Create a user of `role` and mint an API key through the state's own
+/// `AuthService` — the same persistent database the router serves.
+/// Returns the plaintext bearer secret.
+pub(crate) async fn seed_user_with_key(
+    state: &AppState,
+    name: &str,
+    role: localdb_core::auth::Role,
+) -> String {
+    let user = state.auth().create_user(name, role).await.unwrap();
+    state.auth().issue_api_key(&user.id).await.unwrap().secret
 }
 
 pub(crate) struct SeedChunkInput {
@@ -105,11 +137,23 @@ pub(crate) struct SeedChunkInput {
 }
 
 pub(crate) async fn seed_store_a_chunk(state: &AppState, input: SeedChunkInput) {
+    seed_chunk_in_store(state, "store-A", "private", input).await;
+}
+
+/// Like `seed_store_a_chunk`, but the owning store's name/visibility are
+/// caller-controlled — needed to seed a `shared` store for D7 grant tests
+/// (`grant_store` rejects `private` visibility).
+pub(crate) async fn seed_chunk_in_store(
+    state: &AppState,
+    store_name: &str,
+    visibility: &str,
+    input: SeedChunkInput,
+) {
     use localdb_core::Embedder;
 
-    state.add_store("store-A", "private").await.unwrap();
+    state.add_store(store_name, visibility).await.unwrap();
     let source = state
-        .add_source("store-A", "path", json!({"root": "/tmp"}), "prose", None)
+        .add_source(store_name, "path", json!({"root": "/tmp"}), "prose", None)
         .await
         .unwrap();
     let store_id = source.store_id.clone();

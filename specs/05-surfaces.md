@@ -1,8 +1,8 @@
 # Spec 05 — Surfaces: CLI, HTTP API, MCP
 
-> Status: accepted draft, revised 2026-06-30. All three surfaces sit on the same `core`
-> ([01-architecture.md](01-architecture.md) §1) and return the same Citation shape
-> ([02-domain-model.md](02-domain-model.md) §6) and error taxonomy (§5).
+> Status: accepted draft, revised 2026-07-08 (T6: invite create/redeem/approve). All three
+> surfaces sit on the same `core` ([01-architecture.md](01-architecture.md) §1) and return the
+> same Citation shape ([02-domain-model.md](02-domain-model.md) §6) and error taxonomy (§5).
 
 ## 1. Process-model behavior shared by CLI and MCP
 
@@ -21,12 +21,17 @@ Single binary, subcommand tree. Global flags: `--config`, `--json`, `--store <na
 | `init` | Create config + data dir, first-run model download prompt | full | n/a (refuses if daemon running with different data dir) |
 | `serve` | Run the daemon (HTTP API, watching, refresh, socket) | becomes the daemon | error `daemon_running` |
 | `mcp` | Run MCP server on stdio | embedded core | thin client |
-| `status` | Stores, resource/chunk counts, policy staleness, daemon state | reads directly | queries daemon |
+| `status` | Stores, resource/chunk counts, policy staleness, daemon state — extended to show the caller's identity (user, role) and cached token expiry once auth lands | reads directly | queries daemon |
 | `store add/list/remove` | Manage runtime-owned stores | direct write | routed to daemon |
 | `source add/list/remove` | Manage sources on a store | direct write | routed to daemon |
 | `add <path|url>...` | Alias for `source add` — add one or more sources to a store | direct write | routed to daemon |
 | `index [--store S] [--source ID] [--strict]` | One-shot scan & index; creates IndexJob | runs job synchronously, progress to stderr | submits job, polls, streams progress |
 | `search <query>... [--limit N] [--content-length N]` | Hybrid search with citations; `--content-length` is a **soft cap** on human-readable snippet chars (default 1000; JSON output always full text) — see §4 for the snapping behavior shared with MCP | embedded read | via API |
+| `login [--invite <token>] [--name <name>]` / `logout` | Authenticate against a daemon and cache the resulting token, or revoke and clear it. `login` without `--invite` drives the OAuth2 authorization-code + PKCE browser flow (T4); `login --invite <token>` (T6) redeems the invite directly against `POST /v1/invites/redeem` instead — no browser round trip. `--name` sets the requested user name (default: the OS login name, `$USER`/`%USERNAME%`) | n/a — there is no auth to log into without a daemon (§3.1) | `login` (no `--invite`) exchanges credentials via `/token` and writes `credentials.json` (§6, [03-config.md](03-config.md) §6); `login --invite`: `open`-mode invites persist the redeemed API key immediately; `closed`-mode invites print a "waiting for admin approval" message and poll `GET /v1/invites/requests/{id}` (1s interval) until an admin approves (credential persisted) or denies (clear error, non-zero exit); `logout` calls `/revoke` and clears the cached entry |
+| `user add\|list\|remove\|set-role` | Manage user accounts (admin only) | direct write/read against the unified DB's `users` table — the recovery path when the daemon is unreachable or auth is locked out | routed to daemon, requires an admin bearer token; `user add` also accepts a `--direct-db` flag to bypass a running daemon for lockout recovery |
+| `key create\|list\|revoke` | Manage API keys (`auth_tokens` rows with `kind='api_key'`) for the caller or, as admin, another user | direct write/read | routed to daemon; managing another user's key requires admin (minting your *own* key is always allowed); `key create` also accepts `--direct-db` |
+| `store grant\|revoke` | Grant/revoke a member's read access to a `shared` store (D7); rejected on `private` stores | direct write | routed to daemon, admin only |
+| `invite create\|list\|revoke\|requests\|approve\|deny` | Manage invites and pending access requests (admin only, T6) — §3.1's invite route table | direct write | routed to daemon, admin only |
 | `db status` | Inspect schema state: current version, head version, pending/unsupported steps. Never refuses, even on a store newer than the binary | reads directly | error `daemon_running` |
 | `db migrate` | Apply pending migrations with per-step progress; legacy v1–v3 rebuild and any other destructive step require confirmation; prints a `localdb index` hint when a weight-class-3 migration ran | direct write | error `daemon_running` |
 | `db downgrade [--to N]` | Reverse migrations down to version `N` (default: one step) using stored down-SQL; requires confirmation; refuses cleanly on a step with `down_unsupported_reason` | direct write | error `daemon_running` |
@@ -34,6 +39,29 @@ Single binary, subcommand tree. Global flags: `--config`, `--json`, `--store <na
 Output: human-readable by default (citations as `uri:heading_path` + snippet), `--json` emits the
 canonical structures for scripting. The CLI is **command-oriented**; interactive browse is a
 roadmap item with the web UI.
+
+**Daemon-routed-first, direct-DB fallback (T5):** `user`, `key`, and `store grant/revoke` follow
+the same pattern as `store add/list/remove` (§2 above): when a daemon is reachable, the request
+goes over HTTP with the caller's bearer — admin where the route requires it
+([§3.1](#31-authentication)'s route table — a non-admin bearer gets `forbidden`/exit 6 from the
+daemon, not a CLI-side refusal); otherwise it falls back to a direct, trusted database
+read/write, carrying the same trust assumption as every other daemonless CLI command — whoever
+can open the database file is already trusted. This makes "add a user while the server is up"
+just work over HTTP, the common case, rather than requiring the daemon to be stopped first.
+
+**Break-glass escape hatch:** `user add --direct-db` (and `key create --direct-db`) is the one
+deliberate exception — it forces the direct-DB write even while a daemon is running, for the
+lockout-recovery case where the daemon's own auth is broken or every admin credential has been
+lost. It warns (non-JSON mode) that a daemon is running rather than refusing: SQLite's
+write-ahead log plus busy-timeout already make concurrent access with a live daemon safe (the
+same `runtime_state_locked`/exit 4 outcome as any other contended direct-DB write in the worst
+case), so refusing outright would only get in the way of the one scenario this flag exists for.
+`invite` (T6) follows the same daemon-routed-first, direct-DB-fallback pattern as `user`/`key`
+(no `--direct-db` escape hatch, though — invites aren't a lockout-recovery primitive, so there is
+no reason to force past a running daemon). `invite create` prints the show-once plaintext token
+plus a ready-made consent URL (`{base}/authorize?invite=<token>`, built from the request's own
+`Host` header in the daemon-routed case, or a placeholder pointing at "start a daemon" in the
+direct-DB case, since there is no base URL to build one from without a running daemon).
 
 ### 2.1 Schema migrations
 
@@ -53,18 +81,26 @@ migration-weight-class design.
 daemon. **Rejected:** gRPC (worse curl-ability and browser story for a local tool; can be added
 later if a consumer demands it).
 
-- **Bind & trust:** `127.0.0.1` by default, **no auth in local mode** — documented trust
-  assumption: anything that can reach the bind address is trusted, same boundary as the files
-  themselves. Any bind address is accepted; the daemon does not refuse to start based on it.
-  Binding to a specific non-loopback address (e.g. a LAN or VPN IP) is treated as a deliberate
-  trust decision by the user and starts silently. Binding to all interfaces (`0.0.0.0`, `::`, or
-  any other address form the OS resolves to the unspecified address) logs a warning at startup —
-  checked against the address the OS actually bound, not the raw config string, so aliases the
-  string form can't see are still caught — since it makes the unauthenticated daemon reachable
-  from any network the machine is on and is the one case a user could plausibly not realize how
-  exposed this makes them. The daemon also records its client-reachable base URL (loopback
-  substituted for a wildcard bind) in a discovery file so CLI/MCP clients can find it regardless
-  of bind address or port ([01-architecture.md](01-architecture.md) §3).
+- **Bind & trust:** `127.0.0.1` by default. Auth enforcement is controlled by `server.auth:
+  auto | required | off` (default `auto`) ([03-config.md](03-config.md) §1) — see §3.1 for what
+  "enforced" means. `auto` enforces auth **iff** the daemon is bound to a non-loopback address;
+  loopback (`127.0.0.1` / `::1`) under `auto` stays auth-free, same trust boundary as today:
+  anything that can reach the bind address is trusted, same as the files themselves. `required`
+  always enforces auth regardless of bind address, including loopback. Binding to a specific
+  non-loopback address (e.g. a LAN or VPN IP) is still a deliberate trust decision by the user,
+  but it is now only accepted if auth ends up enforced (`auto` or `required`) — `off` combined
+  with a non-loopback bind is a hard startup error (`invalid_config`): the daemon refuses to
+  start rather than exposing an unauthenticated surface to a network. Binding to all interfaces
+  (`0.0.0.0`, `::`, or any other address form the OS resolves to the unspecified address) logs a
+  warning at startup — checked against the address the OS actually bound, not the raw config
+  string, so aliases the string form can't see are still caught — since it makes the daemon
+  reachable from any network the machine is on and is the one case a user could plausibly not
+  realize how exposed this makes them; this warning applies regardless of auth mode. The daemon
+  also records its client-reachable base URL (loopback substituted for a wildcard bind) in a
+  discovery file so CLI/MCP clients can find it regardless of bind address or port
+  ([01-architecture.md](01-architecture.md) §3). When auth is enforced and zero users exist yet
+  (`AuthStore::count_users() == 0`), `serve` prints a one-time setup code to stdout/stderr so the
+  operator can bootstrap the first admin user (§3.1).
 - **Resources** (`/v1`): `GET/POST /stores`, `GET/PATCH/DELETE /stores/{id}`,
   `GET/POST /stores/{id}/sources`, `POST /search` (body: query, store filter, metadata filters,
   limit; citations carry full `Metadata`), `GET /resources/{id}` (response includes
@@ -75,6 +111,143 @@ later if a consumer demands it).
   job resource is designed so SSE adds a representation, not a new model.
 - **Pagination:** cursor-based (`?cursor=`, `?limit=`) on list endpoints from day one.
 
+### 3.1 Authentication
+
+**Status:** T1 shipped the foundation (`core::auth` types, `AuthStore` trait, `AuthService`, the
+`store-libsql` persistence layer and schema — [02-domain-model.md](02-domain-model.md) §2, §9).
+T2–T4 wired bearer-token enforcement, the `require_auth` middleware, and the OAuth2
+authorization-code + PKCE flow. **T5 lifts the interim "every member gets 403 everywhere" gate**
+(a fail-safe staging measure T3 shipped before store grants existed) and activates the target
+shape described below: per-resource D7 scoping instead of a wholesale role gate, plus the
+user/key/grant management routes themselves. **T6 lands invite management**: the
+create/list/revoke/redeem/approve/deny/poll state machine (`core::auth::AuthService`) and its
+HTTP routes (last two rows below).
+
+**Decision:** bearer tokens (`Authorization: Bearer ldb_...`) on every route under `/v1/*` and
+`/mcp`, once auth is enforced for the daemon (§3). A request with a missing or invalid token gets
+`401` with a `WWW-Authenticate: Bearer` header. A request from an authenticated principal who
+lacks permission for the resource (e.g. a member reading a store they have no grant for, or any
+non-admin route) gets `403`. See §5 for the `unauthorized` (401) / `forbidden` (403) error codes.
+
+**Route table:**
+
+| Routes | Auth |
+|---|---|
+| `GET /.well-known/oauth-protected-resource`, `GET /.well-known/oauth-authorization-server`, `GET\|POST /authorize`, `POST /token`, `POST /revoke`, `POST /register`, `POST /v1/invites/redeem`, `GET /v1/invites/requests/{id}` | Public — no bearer token required (these routes *are* the auth flow, or are the deliberately open invite-redemption/status-check surface). |
+| `GET /v1/stores`, `GET /v1/stores/{name}`, `GET /v1/stores/{name}/sources`, `POST /v1/search`, `GET /v1/documents/{id}`, `GET /v1/auth/me`, `/mcp` | Bearer token required once auth is enforced (§3). Results/visibility are scoped by the principal's store access (D7, [02-domain-model.md](02-domain-model.md) §2): admins see every store; members see only `shared` stores they hold a grant for. A named-but-unreadable store (a direct `GET`, or an explicit `store_filter`/MCP `stores` entry naming one) is **403, not 404** — consistent with the filtered list views, and chosen over 404 so a caller can't use the distinction to fish for private store names; see `handlers::stores::get_store`'s doc comment. |
+| `POST/PATCH/DELETE /v1/stores`, `POST /v1/stores/{name}/sources`, `DELETE /v1/sources/{id}`, `POST /v1/jobs`, `GET /v1/jobs/{id}`, `GET /v1/config` | Bearer token **and** `role = admin`. Members are readers only in this phase — every mutation, plus `GET /v1/config` (server configuration, not store-scoped content), is admin-only regardless of any store grant. |
+| `GET/POST /v1/users`, `PATCH/DELETE /v1/users/{id}`, `GET /v1/users/{id}/keys`, `DELETE /v1/keys/{id}`, `GET/POST /v1/stores/{name}/grants`, `DELETE /v1/stores/{name}/grants/{user}` | Bearer token **and** `role = admin` (`Principal::require_admin`), with one carve-out: `POST /v1/users/{id}/keys` also allows a non-admin principal to mint a key **for themselves** (`id` equal to the caller's own `user_id`) — every other combination (another user's keys, any user/grant list or mutation) is admin-only. |
+| `GET/POST /v1/invites`, `DELETE /v1/invites/{id}`, `GET /v1/invites/requests`, `POST /v1/invites/requests/{id}/approve`, `POST /v1/invites/requests/{id}/deny` (T6) | Bearer token **and** `role = admin`. |
+
+**Guard rails (D7 lockout prevention):** deleting or demoting (`role = admin` → `member`) the
+*last remaining admin* is rejected — `AuthService::delete_user`/`set_user_role` check this
+generically (would the action leave zero admins?), not just for self-targeted calls, so it also
+catches e.g. an admin demoting the only other admin down to zero. Mapped to `invalid_request`
+(400 / CLI exit 2) — the same code already used for other "well-formed request, not allowed given
+current state" cases (e.g. a duplicate user name) — rather than inventing a new taxonomy entry
+for it (§5's codes are stable API). Deleting a user cascades to their tokens and store grants via
+`ON DELETE CASCADE` at the schema level ([02-domain-model.md](02-domain-model.md) §9).
+
+**One-time setup code:** when `localdb serve` starts with auth enforced and no users exist yet
+(`AuthStore::count_users() == 0`), the daemon prints a one-time setup code to stdout/stderr so
+the operator can bootstrap the first admin user without any prior credential.
+
+**Token model:** opaque 32-byte secrets minted from `OsRng`, `ldb_`-prefixed, shown once at
+issuance and stored at rest only as a blake3 hash — never a password anywhere. Access tokens are
+short-lived (1h); refresh tokens (30d) rotate on every use with reuse detection — presenting an
+already-rotated refresh token revokes its entire token family. API keys share the same
+`auth_tokens` table (`kind = 'api_key'`), have no default expiry, and track `last_used_at`. OAuth2
+authorization-code + PKCE (S256) is the flow behind `/authorize` and `/token`, once implemented.
+
+**Dynamic Client Registration (T7, RFC 7591):** `POST /register` is public/unauthenticated, so it
+enforces per-request size caps on registration metadata — at most 5 `redirect_uris`, each at most
+2048 characters, and an optional `client_name` at most 256 characters (`core::auth::client`'s
+`MAX_REGISTRATION_*` constants) — rejected as `400 invalid_client_metadata`/`invalid_redirect_uri`
+(RFC 7591 §3.2.2). These bound a single request's payload, not registration frequency; a global
+registration-count cap or rate limit is a separate, not-yet-implemented concern.
+
+### 3.1.1 Invites (T6, D9)
+
+An invite ([02-domain-model.md](02-domain-model.md) §2) carries a `mode` (`open` | `closed`),
+optional `store_grants` (rejected at CREATE time if any named store is `private`), `max_uses`
+(default 1), and an optional absolute-RFC-3339 `expires_at`. The state machine lives entirely in
+`core::auth::AuthService` (no domain logic in `server`/`cli`, per
+[01-architecture.md](01-architecture.md) §1):
+`create_invite`/`redeem_invite`/`approve_request`/`deny_request`/`poll_request`.
+
+**`POST /v1/invites`** (admin) — body `{"mode": "open"|"closed", "stores": ["name", ...],
+"max_uses": 1, "expires_at": "<RFC3339>"|null}` → `201`:
+
+```json
+{
+  "id": "...", "mode": "open", "store_grants": ["docs"], "max_uses": 1,
+  "expires_at": null, "created_at": "...",
+  "token": "ldb_...", "consent_url": "http://<host>/authorize?invite=ldb_..."
+}
+```
+
+`token` is the show-once plaintext invite secret (blake3-hashed at rest, D1); `consent_url` is
+built from the request's own `Host` header (correct for any bind address/port with no extra
+`AppState` plumbing) and is a ready-made link to the T4 consent page's invite-redemption variant
+(§below). `GET /v1/invites` (admin) lists every invite with no secrets; `DELETE /v1/invites/{id}`
+(admin) revokes one.
+
+**`POST /v1/invites/redeem`** (public — no bearer, D9 device-authorization-grant pattern): body
+`{"token": "<invite secret>", "name": "<requested user name>"}`.
+
+- `open` mode → `201`: `{"user": {"id","name","role","created_at"}, "granted_stores": [...],
+  "api_key": "ldb_..."}` — the user, its grants, and a show-once API key, all created immediately.
+- `closed` mode → `202`: `{"request_id": "...", "request_secret": "ldb_...", "poll":
+  "/v1/invites/requests/{id}?secret=..."}` — a pending `AccessRequest` is filed; `request_secret`
+  is shown once here and doubles as the poll credential below.
+- Unknown/revoked/expired/exhausted invite → `401 unauthorized` (mirrors `redeem_auth_code`'s
+  "don't leak which check failed" convention for this public route); a requested name colliding
+  with an existing user → the existing `400 invalid_request` duplicate-name shape.
+
+**`GET /v1/invites/requests/{id}?secret=<request_secret>`** (public, query-param secret — chosen
+over a header for `curl`-ability and to match the `poll` hint above): `200` with
+`{"state": "pending"}` / `{"state": "denied"}` / `{"state": "approved", "api_key": "ldb_..."}` /
+`{"state": "collected"}`. An unknown `id` and a wrong `secret` against a real one are
+**deliberately indistinguishable** (`401 unauthorized`, identical body) — no existence oracle.
+A **freshly minted** API key is handed back **exactly once**, on the poll that first observes the
+`approved` transition (`AccessRequest.collected_at`, an atomic single-use guard mirroring
+`consume_auth_code`) — every later poll answers `collected` instead of re-issuing a credential.
+`request_secret` itself never becomes a credential: it is poll-only, scoped to proving knowledge
+of this one request, and is deliberately never accepted by `AuthService::authenticate` — minting a
+fresh key at collection time (rather than promoting the request secret, which travels as a URL
+query parameter on every poll and would otherwise become a long-lived credential live from
+approval time even if never collected) is what closes that hole. See
+`AuthService::poll_request`'s doc comment for the full reasoning.
+
+**Admin decision routes:** `GET /v1/invites/requests` (admin) lists every access request across
+every invite (pending, approved, and denied alike; no pagination — this is a small admin-facing
+surface). `POST /v1/invites/requests/{id}/approve` (admin) creates the user + grants (no
+credential is minted here — that happens at the requester's next poll) and returns the new user.
+`POST /v1/invites/requests/{id}/deny` (admin) marks it
+denied; the requester's next poll observes `denied`.
+
+**Concurrency (documented choice):** `redeem_invite` atomically *reserves* a use
+(`AuthStore::try_consume_invite_use`, an `UPDATE ... WHERE uses < max_uses` conditional update)
+before creating the user / filing the access request, and *releases* the reservation
+(`AuthStore::release_invite_use`) if that mint then fails. This closes both hazards: concurrent
+redemptions — even under distinct requested names — can never together push `uses` past
+`max_uses` (the atomic reservation is the gate, not the `users.name` UNIQUE constraint), and a
+redemption that reserves a use but then fails (most commonly a duplicate `requested_name` racing
+`create_user`'s UNIQUE constraint) never permanently burns that use — a caller can retry with a
+different name against the same `max_uses = 1` invite. See `AuthService::redeem_invite`'s doc
+comment for the full reasoning.
+
+**Consent page (T4 seam):** `GET /authorize?invite=<token>` renders an invite-redemption variant
+of the consent form (a "your name" field instead of the setup-code/API-key credential field).
+Submitting it (`server::auth::oauth::handle_invite_authorize`) redeems the invite: `open` mode
+continues the OAuth2 flow as the newly created user (issuing an authorization code exactly like
+the credential-based path), so `localdb login --invite <token>`'s browser fallback, if used, still
+ends in ordinary browser-session tokens; `closed` mode renders a static "request submitted, ask
+your admin" page and issues no code (no admin has approved yet, so there is no user to issue one
+for). The CLI's own `login --invite` (§2) does **not** go through this page — it redeems and, for
+`closed` mode, polls directly against the JSON routes above, since only that path can drive a
+poll loop; the consent-page branch exists for the pure-browser case.
+
 ## 4. MCP
 
 **Decision:** v1 MCP is **read-only**: tools `search` (args: query, optional store names, limit, optional content_length →
@@ -84,6 +257,12 @@ Citation list as structured content; each citation carries full `Metadata`),
 (§4.1) → the resource's chunks in order, paginated),
 `list_stores` (names, visibility, counts). **Mutating tools** (`add_source`, `reindex`, …) are a
 follow-up behind an explicit opt-in flag (`localdb mcp --allow-write`), never on by default.
+
+Once auth is enforced (§3.1), tool results on any authenticated transport are filtered by the
+principal's store access — admins see every store, members only the `shared` stores they hold a
+grant for (D7). The embedded stdio MCP (§4.2, no daemon running) stays unauthenticated: it is
+already trusted as local-files-equivalent, the same trust boundary as every other daemonless
+command.
 
 **Rationale:** the dominant agent use case is retrieval; a read-only surface has a trivially
 auditable blast radius, and write semantics through agents deserve their own design pass.
@@ -225,10 +404,9 @@ MCP is served over two transports, built on the official `rmcp` SDK:
   narrow case was rejected as not worth the complexity in v1. `localdb mcp --store <name>`
   against a running daemon prints a non-fatal warning to stderr and serves the daemon's full
   store set regardless of the flag; this is a documented limitation, not a bug.
-- **HTTP** (`/mcp`, mounted on the daemon alongside its own `/v1` routes): a startup-time
-  snapshot of stores, not rebuilt per session — a store added later via `/v1/stores` is
-  invisible over MCP until the daemon restarts (see `mcp::http::build_streamable_http_service`'s
-  doc comment). HTTP MCP sessions always run with `allow_write = false`.
+- **HTTP** (`/mcp`, mounted on the daemon alongside its own `/v1` routes): built from the
+  daemon's store set at its own startup (see `mcp::http::build_streamable_http_service`'s doc
+  comment). HTTP MCP sessions always run with `allow_write = false`.
 
 Tool registration (the four read-only tools) and business logic are identical on both
 transports and in both stdio modes — only the code path serving the request differs.
@@ -271,6 +449,8 @@ MCP tool error). Codes are stable API:
 | `daemon_running` / `daemon_unreachable` | Process-model conflicts | 409 / 502 |
 | `invalid_config` | Config failed validation (path-precise message) | 422 |
 | `invalid_request` | Bad arguments/body | 400 |
+| `unauthorized` | Missing or invalid bearer token (§3.1) | 401 |
+| `forbidden` | Authenticated, but insufficient permission for the resource (§3.1, D7) | 403 |
 | `unsupported_format` | Extraction can't handle the file type (informational in job stats) | 422 |
 | `extraction_failed` | Recognized, supported format whose contents could not be extracted (corrupt/truncated). Counted in `error_count` in job stats; produces a WARN per file. | 422 |
 | `provider_unavailable` | External embedding endpoint down/misconfigured | 502 |
@@ -279,7 +459,7 @@ MCP tool error). Codes are stable API:
 | `internal` | Bug; includes correlation id, logged with backtrace | 500 |
 
 CLI exit codes: `0` ok, `1` internal, `2` invalid usage/config, `3` not found, `4` conflict/locked,
-`5` unavailable (daemon/provider/model).
+`5` unavailable (daemon/provider/model), `6` permission denied (auth required/insufficient).
 
 ### `localdb index --strict`
 

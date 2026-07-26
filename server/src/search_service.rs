@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use localdb_core::{
-    Citation, Error as CoreError, QueryRequest, SearchOrchestrator, StoreHandle as CoreStoreHandle,
+    auth::Principal, types::StoreVisibility, Citation, Error as CoreError, QueryRequest,
+    SearchOrchestrator, StoreHandle as CoreStoreHandle,
 };
 
 use crate::error::ApiError;
@@ -38,7 +39,19 @@ impl SearchService {
         Self { state }
     }
 
-    pub async fn query(&self, req: SearchRequest) -> Result<SearchResponse, ApiError> {
+    /// D7 store scoping: if `req.store_filter` names specific stores, every
+    /// one of them must exist *and* be readable by `principal` — an
+    /// existing-but-unreadable named store is a 403 (the caller asked for it
+    /// by name and was refused), matching `handlers::stores::get_store`'s
+    /// consistency point. With no filter ("search all visible stores"), the
+    /// full store set is silently narrowed to what `principal` can read —
+    /// there is nothing to be "forbidden" from since nothing specific was
+    /// requested.
+    pub async fn query(
+        &self,
+        req: SearchRequest,
+        principal: &Principal,
+    ) -> Result<SearchResponse, ApiError> {
         if req.query.is_empty() {
             return Err(ApiError(CoreError::InvalidRequest {
                 message: "query cannot be empty".to_string(),
@@ -49,12 +62,17 @@ impl SearchService {
 
         let effective = self.state.effective_config().await?;
         for name in &req.store_filter {
-            if !effective.stores.iter().any(|s| s.name == *name) {
+            let Some(store) = effective.stores.iter().find(|s| s.name == *name) else {
                 return Err(ApiError(CoreError::StoreNotFound { id: name.clone() }));
+            };
+            if !can_read(principal, &store.name, &store.visibility) {
+                return Err(ApiError(CoreError::Forbidden {
+                    message: format!("user '{}' cannot read store '{name}'", principal.name),
+                }));
             }
         }
 
-        let yaml = self.state.yaml_config().await;
+        let yaml = self.state.yaml_config();
         let embed_policy = &yaml.defaults.indexing.embedding;
 
         let embedder: Box<dyn localdb_core::Embedder> =
@@ -65,7 +83,11 @@ impl SearchService {
             })?;
 
         let target_stores: Vec<_> = if req.store_filter.is_empty() {
-            effective.stores.iter().collect()
+            effective
+                .stores
+                .iter()
+                .filter(|s| can_read(principal, &s.name, &s.visibility))
+                .collect()
         } else {
             effective
                 .stores
@@ -123,6 +145,14 @@ impl SearchService {
             next_cursor,
         })
     }
+}
+
+/// D7 read check over an `EffectiveStore`'s string `visibility`, treating an
+/// unrecognized value as `private` (deny by default) — see
+/// `StoreVisibility::parse`'s doc comment.
+fn can_read(principal: &Principal, name: &str, visibility: &str) -> bool {
+    let visibility = StoreVisibility::parse(visibility).unwrap_or(StoreVisibility::Private);
+    principal.can_read_store(name, visibility)
 }
 
 fn parse_cursor(cursor: Option<&str>) -> Result<usize, ApiError> {

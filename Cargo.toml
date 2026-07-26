@@ -49,6 +49,10 @@ ulid = { version = "1", features = ["serde"] }
 
 # Hashing
 blake3 = "1"
+sha2 = "0.10"
+
+# Cryptographically secure randomness (token secrets)
+rand = "0.8"
 
 # Async utilities
 futures = "0.3"

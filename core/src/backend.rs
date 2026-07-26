@@ -40,7 +40,6 @@ pub struct StoreRow {
     pub backend: String,
     pub indexing_policy: String,
     pub policy_version: String,
-    pub acl: String,
     pub created_at: String,
 }
 
