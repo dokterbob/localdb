@@ -129,20 +129,21 @@ to the appropriate crate. No logic of its own. Subcommands: `init`, `serve`, `mc
  └─────────────────────────────────────────────────────────┘
 
  ┌─────────────────────────────────────────────────────────┐
- │                     READ PATH                           │
+ │                        READ PATH                        │
  │                                                         │
  │  query string                                           │
  │       │                                                 │
- │       ├──────────────────────────────────┐              │
- │       ▼                                  ▼              │
- │  BM25 search (FTS5)               dense search (KNN)    │
- │       │                                  │              │
- │       └──────────────┬───────────────────┘              │
- │                      ▼                                  │
- │               RRF fusion (k=60, in core)                │
- │                      │                                  │
- │                      ▼                                  │
- │         top-N Citations  (fused + per-leg scores)       │
+ │       ▼                                                 │
+ │  fan out per store: BM25 (FTS5) + dense (KNN)           │
+ │       │                                                 │
+ │       ▼                                                 │
+ │  pool each leg across all stores (global rank per leg)  │
+ │       │                                                 │
+ │       ▼                                                 │
+ │  single RRF fusion (k=60; key = store_id+chunk_id)      │
+ │       │                                                 │
+ │       ▼                                                 │
+ │  top-N Citations (fused + per-leg scores)               │
  └─────────────────────────────────────────────────────────┘
 ```
 

@@ -154,6 +154,37 @@ pub struct SearchResult {
     /// The score for this result within its leg.
     /// Dense: cosine/dot-product similarity.
     /// BM25: BM25 score.
+    ///
+    /// # Cross-store comparability
+    ///
+    /// Multi-store search pools every queried store's results for a leg into
+    /// one ranking ordered by this raw score, before a single RRF pass (see
+    /// `search::pool_leg_results`). That is only meaningful if every store
+    /// queried together reports that leg's scores on the **same** scale *and*
+    /// with the same distribution. Two ways that can break:
+    ///
+    /// - **Unbounded vs bounded.** This doc permits "cosine/dot-product", but
+    ///   an unbounded dot-product would outrank a bounded cosine similarity
+    ///   regardless of true relevance. Note the default embedding model emits
+    ///   *unnormalized* vectors and documents cosine as required, so a
+    ///   dot-product dense score would be wrong for it independently of
+    ///   pooling. Dense scores must be a bounded similarity in `[0, 1]`.
+    /// - **Same range, different distribution.** `store-libsql` already maps
+    ///   distance to score two ways, chosen per store by the encoding its
+    ///   embedder produced ([`crate::embedder::Embedder::vector_encoding`]):
+    ///   `1 - d/2` from a continuous cosine distance for `Float32`, and
+    ///   `1 - d/nbits` from a sign-only binarized Hamming distance for
+    ///   `Binary` — which is what the default Perplexity local model emits.
+    ///   Both land in `[0, 1]`, but they are not the same distribution, so
+    ///   pooling them together would favor whichever runs hotter rather than
+    ///   whichever is more relevant. The two shipped models differ in
+    ///   dimensionality (1024 vs 384), so a single query cannot currently hit
+    ///   both — but nothing enforces that, and it is not a property to rely on.
+    ///
+    /// BM25 scores are inherently corpus-relative (per-store IDF and average
+    /// document length), so they are only approximately comparable across
+    /// stores even when every store runs the same backend. Calibrating both
+    /// legs is tracked by #40.
     pub score: f32,
 }
 
