@@ -115,26 +115,30 @@ enum Leg {
     Bm25,
 }
 
-/// Shared RRF accumulation loop, generic over the map key.
+/// Fusion identity: the composite `(store_id, chunk_id)`.
 ///
-/// `key_fn` extracts the identity a chunk is fused on: plain `chunk_id` for
-/// single-store fusion (`rrf_fuse`), or the composite `(store_id, chunk_id)`
-/// for global fusion (`rrf_fuse_global`) — see those functions' doc comments
-/// for why the key differs.
-fn add_leg<K, F>(
-    entries: &mut HashMap<K, FusedChunkEntry>,
+/// See [`rrf_fuse_global`] for why `chunk_id` alone is not enough.
+type FusionKey = (String, String);
+
+fn fusion_key(chunk: &ChunkRecord) -> FusionKey {
+    (chunk.store_id.clone(), chunk.id.clone())
+}
+
+/// Accumulate one leg's RRF contributions into `entries`, keyed on
+/// [`FusionKey`].
+///
+/// For each result at 0-indexed rank `r`, add `1 / (k + r + 1)` to that
+/// chunk's fused score. A chunk appearing in only one leg still gets a score.
+fn add_leg(
+    entries: &mut HashMap<FusionKey, FusedChunkEntry>,
     results: &[SearchResult],
     k: f64,
     leg: Leg,
-    key_fn: F,
-) where
-    K: Eq + std::hash::Hash,
-    F: Fn(&ChunkRecord) -> K,
-{
+) {
     for (rank, result) in results.iter().enumerate() {
         let contribution = rrf_score(rank, k);
         let entry = entries
-            .entry(key_fn(&result.chunk))
+            .entry(fusion_key(&result.chunk))
             .or_insert_with(|| FusedChunkEntry {
                 chunk: result.chunk.clone(),
                 fused_score: 0.0,
@@ -149,39 +153,6 @@ fn add_leg<K, F>(
             Leg::Bm25 => entry.bm25_score = Some(result.score as f64),
         }
     }
-}
-
-/// Fuse two ranked lists using Reciprocal Rank Fusion.
-///
-/// - `dense_results`: ranked results from the dense leg (most similar first).
-/// - `bm25_results`: ranked results from the BM25 leg (highest score first).
-/// - `k`: RRF smoothing parameter (default `RRF_K = 60`).
-///
-/// Returns fused entries sorted by descending fused score, with deterministic
-/// tie-breaking by chunk_id (ascending).
-///
-/// # Algorithm
-///
-/// For each result in each leg at 0-indexed rank `r`, add `1 / (k + r + 1)` to the
-/// chunk's fused score. Chunks appearing in only one leg still get a score.
-pub fn rrf_fuse(
-    dense_results: &[SearchResult],
-    bm25_results: &[SearchResult],
-    k: f64,
-) -> Vec<FusedChunkEntry> {
-    let mut entries: HashMap<String, FusedChunkEntry> = HashMap::new();
-
-    add_leg(&mut entries, dense_results, k, Leg::Dense, |c| c.id.clone());
-    add_leg(&mut entries, bm25_results, k, Leg::Bm25, |c| c.id.clone());
-
-    let mut sorted: Vec<FusedChunkEntry> = entries.into_values().collect();
-    sorted.sort_by(|a, b| {
-        b.fused_score
-            .partial_cmp(&a.fused_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.chunk.id.cmp(&b.chunk.id))
-    });
-    sorted
 }
 
 /// Fuse two globally-pooled ranked lists using Reciprocal Rank Fusion, with
@@ -199,6 +170,11 @@ pub fn rrf_fuse(
 /// whichever store happened to win the `HashMap` insertion race. Keying on
 /// `(store_id, chunk_id)` keeps every store's hit distinct even when the
 /// underlying content — and thus the chunk_id — is identical.
+///
+/// For a single-store query the composite key degenerates to plain `chunk_id`
+/// fusion: `store_id` is constant, so it can neither split nor merge entries,
+/// and the `store_id` tiebreak below is a no-op. Single-store search therefore
+/// behaves exactly as it did before global fusion existed.
 ///
 /// # Precondition
 ///
@@ -218,11 +194,10 @@ pub fn rrf_fuse_global(
     bm25_results: &[SearchResult],
     k: f64,
 ) -> Vec<FusedChunkEntry> {
-    let mut entries: HashMap<(String, String), FusedChunkEntry> = HashMap::new();
+    let mut entries: HashMap<FusionKey, FusedChunkEntry> = HashMap::new();
 
-    let key_fn = |c: &ChunkRecord| (c.store_id.clone(), c.id.clone());
-    add_leg(&mut entries, dense_results, k, Leg::Dense, key_fn);
-    add_leg(&mut entries, bm25_results, k, Leg::Bm25, key_fn);
+    add_leg(&mut entries, dense_results, k, Leg::Dense);
+    add_leg(&mut entries, bm25_results, k, Leg::Bm25);
 
     let mut sorted: Vec<FusedChunkEntry> = entries.into_values().collect();
     sorted.sort_by(|a, b| {
@@ -242,13 +217,13 @@ pub fn rrf_fuse_global(
 ///
 /// # Why `store_id` is load-bearing in the tiebreak
 ///
-/// Elsewhere (`rrf_fuse`) a `chunk_id`-only tiebreak is sufficient because
-/// all inputs come from one store. Here inputs are pooled across stores, so
-/// two genuinely different chunks from different stores can legitimately
-/// score identically — and because chunk IDs are content-addressed, two
-/// stores holding the same content produce results with an equal score *and*
-/// an equal `chunk_id`. Without `store_id` in the sort key, that case would
-/// order nondeterministically depending on `Vec` concatenation order.
+/// A `chunk_id`-only tiebreak would suffice if all inputs came from one store.
+/// Here they are pooled across stores, so two genuinely different chunks from
+/// different stores can legitimately score identically — and because chunk IDs
+/// are content-addressed, two stores holding the same content produce results
+/// with an equal score *and* an equal `chunk_id`. Without `store_id` in the
+/// sort key, that case would order nondeterministically depending on `Vec`
+/// concatenation order.
 ///
 /// This produces the rank ordering that [`rrf_fuse_global`] consumes as its
 /// precondition.
@@ -597,7 +572,7 @@ mod tests {
     /// chunk-C: rank 2 in dense only → 1/63
     /// chunk-D: rank 2 in BM25 only → 1/63
     #[test]
-    fn rrf_fuse_hand_computed_scores() {
+    fn rrf_fuse_global_hand_computed_scores_single_store() {
         let chunk_a = make_chunk(
             "A",
             "doc-1",
@@ -646,7 +621,7 @@ mod tests {
             make_search_result(chunk_d.clone(), 5.0),
         ];
 
-        let fused = rrf_fuse(&dense, &bm25, 60.0);
+        let fused = rrf_fuse_global(&dense, &bm25, 60.0);
 
         // chunk-A should be rank 1: 2/61 ≈ 0.03279
         assert_eq!(fused[0].chunk.id, "A", "A should be rank 1");
@@ -706,7 +681,7 @@ mod tests {
 
     /// Tie test: two chunks with identical RRF scores are ordered by chunk_id.
     #[test]
-    fn rrf_fuse_tie_ordering_is_deterministic() {
+    fn rrf_fuse_global_tie_ordering_is_deterministic() {
         // chunk-A in BM25 rank 0 only, chunk-Z in dense rank 0 only → both score 1/61
         let chunk_a = make_chunk(
             "A",
@@ -730,7 +705,7 @@ mod tests {
         let dense = vec![make_search_result(chunk_z.clone(), 0.9)];
         let bm25 = vec![make_search_result(chunk_a.clone(), 5.0)];
 
-        let fused = rrf_fuse(&dense, &bm25, 60.0);
+        let fused = rrf_fuse_global(&dense, &bm25, 60.0);
         assert_eq!(fused.len(), 2);
         // Same score; alphabetical tiebreak: A < Z
         assert_eq!(fused[0].chunk.id, "A");
@@ -739,7 +714,7 @@ mod tests {
 
     /// Single-leg test: if only BM25 has results, they still appear in fused output.
     #[test]
-    fn rrf_fuse_single_leg_only_bm25() {
+    fn rrf_fuse_global_single_leg_only_bm25() {
         let chunk = make_chunk(
             "X",
             "doc-1",
@@ -750,7 +725,7 @@ mod tests {
             vec![1.0],
         );
         let bm25 = vec![make_search_result(chunk.clone(), 7.5)];
-        let fused = rrf_fuse(&[], &bm25, 60.0);
+        let fused = rrf_fuse_global(&[], &bm25, 60.0);
 
         assert_eq!(fused.len(), 1);
         assert_eq!(fused[0].chunk.id, "X");
@@ -762,7 +737,7 @@ mod tests {
 
     /// Single-leg test: if only dense has results, they still appear in fused output.
     #[test]
-    fn rrf_fuse_single_leg_only_dense() {
+    fn rrf_fuse_global_single_leg_only_dense() {
         let chunk = make_chunk(
             "Y",
             "doc-1",
@@ -773,7 +748,7 @@ mod tests {
             vec![1.0],
         );
         let dense = vec![make_search_result(chunk.clone(), 0.85)];
-        let fused = rrf_fuse(&dense, &[], 60.0);
+        let fused = rrf_fuse_global(&dense, &[], 60.0);
 
         assert_eq!(fused.len(), 1);
         assert_eq!(fused[0].chunk.id, "Y");
@@ -783,14 +758,14 @@ mod tests {
 
     /// Empty inputs → empty output.
     #[test]
-    fn rrf_fuse_empty_inputs() {
-        let fused = rrf_fuse(&[], &[], 60.0);
+    fn rrf_fuse_global_empty_inputs() {
+        let fused = rrf_fuse_global(&[], &[], 60.0);
         assert!(fused.is_empty());
     }
 
     /// Single result in each leg (same chunk) → fused score = 2/61.
     #[test]
-    fn rrf_fuse_single_chunk_both_legs() {
+    fn rrf_fuse_global_single_chunk_both_legs() {
         let chunk = make_chunk(
             "X",
             "doc-1",
@@ -802,7 +777,7 @@ mod tests {
         );
         let dense = vec![make_search_result(chunk.clone(), 0.95)];
         let bm25 = vec![make_search_result(chunk.clone(), 9.0)];
-        let fused = rrf_fuse(&dense, &bm25, 60.0);
+        let fused = rrf_fuse_global(&dense, &bm25, 60.0);
 
         assert_eq!(fused.len(), 1);
         let expected = 2.0 / 61.0;
@@ -815,7 +790,7 @@ mod tests {
     /// So chunk-4 is at rank 0 (score 1/61), chunk-3 at rank 1 (1/62), etc.
     /// After RRF fusion the output order must match the input rank order.
     #[test]
-    fn rrf_fuse_multiple_results_ordering() {
+    fn rrf_fuse_global_multiple_results_ordering() {
         // chunks 0..4 created in ascending ID order
         let chunks: Vec<ChunkRecord> = (0..5)
             .map(|i| {
@@ -839,7 +814,7 @@ mod tests {
             .map(|chunk| SearchResult { chunk, score: 1.0 })
             .collect();
 
-        let fused = rrf_fuse(&dense, &[], 60.0);
+        let fused = rrf_fuse_global(&dense, &[], 60.0);
         assert_eq!(fused.len(), 5);
 
         // Fused scores must be strictly decreasing (each chunk is at a unique rank).
@@ -869,10 +844,9 @@ mod tests {
     // -----------------------------------------------------------------------
     // Global RRF fusion tests (issue #162)
     //
-    // `rrf_fuse` fuses one store's two legs; it is unchanged and stays correct
-    // in isolation. The bug is that `SearchOrchestrator::query` called it once
-    // *per store* and merged the already-fused entries — since RRF scores are
-    // rank-based and scale-free, every store's local rank-0 chunk ties at
+    // The historical bug: `SearchOrchestrator::query` fused each store's two
+    // legs on its own and merged the already-fused entries — since RRF scores
+    // are rank-based and scale-free, every store's local rank-0 chunk ties at
     // 2/61 regardless of actual quality. The fix is `rrf_fuse_global`: pool
     // each leg across all stores first (`pool_leg_results`), then fuse once
     // over the pooled, globally rank-ordered lists. Because chunk IDs are
@@ -948,8 +922,9 @@ mod tests {
         );
     }
 
-    /// Mirrors `rrf_fuse_hand_computed_scores`, but chunk-A/chunk-C live in
-    /// store `s1` and chunk-B/chunk-D live in store `s2`. None of these
+    /// Mirrors `rrf_fuse_global_hand_computed_scores_single_store`, but
+    /// chunk-A/chunk-C live in store `s1` and chunk-B/chunk-D live in store
+    /// `s2`. None of these
     /// chunk_ids collide across stores, so the hand-computed arithmetic must
     /// be identical to the single-store case.
     #[test]
@@ -1288,15 +1263,18 @@ mod tests {
 
     /// Headline regression test for issue #162.
     ///
-    /// OLD topology: `rrf_fuse` called once per store, then the already-fused
-    /// results are merged. Because RRF is rank-based and scale-free, each
-    /// store's local rank-0 chunk gets the *same* score (2/61) regardless of
-    /// how strong that chunk actually is relative to chunks in other
-    /// stores — a mediocre chunk that happens to be alone in its store ties
-    /// the genuinely-best chunk from a store with many strong candidates.
-    /// That is asserted below and must hold both BEFORE and AFTER the #162
-    /// fix, because it exercises `rrf_fuse` directly, which keeps its exact
-    /// existing per-store behavior.
+    /// OLD topology: fusion ran once per store, then the already-fused results
+    /// were merged. Because RRF is rank-based and scale-free, each store's
+    /// local rank-0 chunk gets the *same* score (2/61) regardless of how
+    /// strong that chunk actually is relative to chunks in other stores — a
+    /// mediocre chunk that happens to be alone in its store ties the
+    /// genuinely-best chunk from a store with many strong candidates.
+    ///
+    /// That half is reproduced below by calling `rrf_fuse_global` once per
+    /// store, on that store's own results only — which is exactly what the old
+    /// code did. Handed a single store's results the composite key degenerates
+    /// to plain `chunk_id` fusion, so this is a faithful reconstruction of the
+    /// pre-fix behavior and not merely an approximation of it.
     ///
     /// NEW topology: each leg is pooled across all stores into one globally
     /// rank-ordered list (`pool_leg_results`), then fused once
@@ -1348,7 +1326,7 @@ mod tests {
         );
 
         // -------------------------------------------------------------
-        // OLD topology: rrf_fuse per store, then merge (documents the bug).
+        // OLD topology: fuse per store, then merge (documents the bug).
         // -------------------------------------------------------------
         let rel_dense = vec![
             make_search_result(r0.clone(), 0.99),
@@ -1363,8 +1341,8 @@ mod tests {
         let weak_dense = vec![make_search_result(w0.clone(), 0.50)];
         let weak_bm25 = vec![make_search_result(w0.clone(), 3.0)];
 
-        let rel_fused_old = rrf_fuse(&rel_dense, &rel_bm25, 60.0);
-        let weak_fused_old = rrf_fuse(&weak_dense, &weak_bm25, 60.0);
+        let rel_fused_old = rrf_fuse_global(&rel_dense, &rel_bm25, 60.0);
+        let weak_fused_old = rrf_fuse_global(&weak_dense, &weak_bm25, 60.0);
 
         let rel_rank0_old = rel_fused_old.iter().find(|e| e.chunk.id == "r0").unwrap();
         let weak_rank0_old = weak_fused_old.iter().find(|e| e.chunk.id == "w0").unwrap();

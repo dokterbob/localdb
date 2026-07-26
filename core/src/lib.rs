@@ -57,8 +57,8 @@ pub use metadata::{ConversationMetadata, DublinCoreMetadata, Metadata, Transcrip
 pub use parser::{ChainParser, ParsedDocument, Parser, Probe, PROBE_HEADER_LEN};
 pub use progress::{DocOutcome, ProgressEvent, ProgressSink};
 pub use search::{
-    rerank_noop, rrf_fuse, rrf_fuse_global, rrf_score, shape_citation, FusedChunkEntry,
-    QueryRequest, QueryResponse, SearchOrchestrator, StoreHandle,
+    rerank_noop, rrf_fuse_global, rrf_score, shape_citation, FusedChunkEntry, QueryRequest,
+    QueryResponse, SearchOrchestrator, StoreHandle,
 };
 pub use snippet::truncate_snippet;
 #[cfg(any(test, feature = "test-support"))]
