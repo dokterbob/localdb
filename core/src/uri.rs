@@ -44,10 +44,14 @@ impl Uri {
     }
 
     /// Display with percent-decoded path components for human readability.
+    ///
+    /// The decoded text is sanitized (see `sanitize_for_display`) — decoding
+    /// re-materializes whatever bytes the filename actually held, and those
+    /// must never reach a terminal verbatim.
     pub fn display_decoded(&self) -> String {
-        let decoded = percent_encoding::percent_decode_str(self.0.path())
-            .decode_utf8_lossy()
-            .into_owned();
+        let decoded = sanitize_for_display(
+            &percent_encoding::percent_decode_str(self.0.path()).decode_utf8_lossy(),
+        );
 
         if let Some(host) = self.0.host_str() {
             format!("{}://{}{}", self.0.scheme(), host, decoded)
@@ -57,6 +61,25 @@ impl Uri {
     }
 }
 
+/// Replace characters that must never reach a terminal, log line, or progress
+/// bar. A Unix filename may contain any byte but `/` and NUL, so percent-
+/// decoding one for display can otherwise emit live ANSI escapes (`%1B`),
+/// newlines (`%0A`), or bidi overrides that make `annex\u{202E}dm.exe` render
+/// as `annexe.md`. U+FFFD matches what `decode_utf8_lossy` already substitutes
+/// for invalid UTF-8, so the output stays internally consistent.
+///
+/// `char::is_control()` covers C0, C1 and DEL; the bidi ranges are `Cf`, which
+/// it does not cover, hence the explicit arms.
+fn sanitize_for_display(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            c if c.is_control() => '\u{FFFD}',
+            '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' => '\u{FFFD}',
+            c => c,
+        })
+        .collect()
+}
+
 /// Percent-decode a URI string for human-readable display.
 ///
 /// `ProgressEvent::DocumentStarted`/`DocumentFinished` carry a raw `String`
@@ -64,13 +87,16 @@ impl Uri {
 /// `Uri` and isn't worth widening just for display). Surface crates like
 /// `cli` must not re-implement percent-decoding themselves — see
 /// `specs/01-architecture.md §1` — so this free function does the decoding
-/// on their behalf. Falls back to `raw` unchanged if it does not parse as a
-/// URI (defensive; every current caller passes an already-valid
-/// `Uri::as_str()`).
+/// on their behalf. Falls back to `raw` if it does not parse as a URI
+/// (defensive; every current caller passes an already-valid `Uri::as_str()`).
+///
+/// Both arms are run through `sanitize_for_display` — the fallback especially,
+/// since an unparseable input is exactly the case where nothing else has
+/// vetted the bytes.
 pub fn display_decoded_uri(raw: &str) -> String {
     Uri::parse(raw)
         .map(|uri| uri.display_decoded())
-        .unwrap_or_else(|| raw.to_string())
+        .unwrap_or_else(|| sanitize_for_display(raw))
 }
 
 impl fmt::Display for Uri {
@@ -208,6 +234,74 @@ mod tests {
             decoded.contains("café+notes.md"),
             "expected 'café+notes.md', got: {decoded}"
         );
+    }
+
+    // Percent-decoding for display re-materializes whatever bytes the
+    // filename actually held. A Unix filename may contain any byte but `/`
+    // and NUL, so the decoded form can carry live ANSI escapes, newlines, or
+    // bidi overrides straight into a terminal, log line, or progress bar.
+    // Every such character must come out as U+FFFD.
+
+    #[test]
+    fn display_decoded_neutralizes_ansi_escape() {
+        let uri = Uri::parse("file:///home/user/evil%1B%5B2J.md").unwrap();
+        let decoded = uri.display_decoded();
+        assert!(
+            !decoded.contains('\u{1B}'),
+            "a raw ESC must never survive decoding, got: {decoded:?}"
+        );
+        assert!(decoded.contains('\u{FFFD}'), "got: {decoded:?}");
+    }
+
+    #[test]
+    fn display_decoded_neutralizes_newline() {
+        let uri = Uri::parse("file:///home/user/a%0Ab.md").unwrap();
+        let decoded = uri.display_decoded();
+        assert!(!decoded.contains('\n'), "got: {decoded:?}");
+        assert!(decoded.contains("a\u{FFFD}b.md"), "got: {decoded:?}");
+    }
+
+    #[test]
+    fn display_decoded_neutralizes_nul() {
+        let uri = Uri::parse("file:///home/user/a%00b.md").unwrap();
+        let decoded = uri.display_decoded();
+        assert!(!decoded.contains('\0'), "got: {decoded:?}");
+        assert!(decoded.contains("a\u{FFFD}b.md"), "got: {decoded:?}");
+    }
+
+    #[test]
+    fn display_decoded_neutralizes_bidi_override() {
+        // U+202E RIGHT-TO-LEFT OVERRIDE makes `annex\u{202E}dm.exe` render
+        // as `annexe.md`. It is `Cf`, which `char::is_control` does not
+        // cover, hence the explicit range arm in `sanitize_for_display`.
+        let uri = Uri::parse("file:///home/user/annex%E2%80%AEdm.exe").unwrap();
+        let decoded = uri.display_decoded();
+        assert!(!decoded.contains('\u{202E}'), "got: {decoded:?}");
+        assert!(decoded.contains("annex\u{FFFD}dm.exe"), "got: {decoded:?}");
+    }
+
+    #[test]
+    fn display_decoded_leaves_printable_non_ascii_alone() {
+        // Guard against over-sanitizing: ordinary international filenames
+        // must still render as themselves.
+        let uri = Uri::from_file_path(Path::new("/home/user/日本語 café.md")).unwrap();
+        let decoded = uri.display_decoded();
+        assert!(
+            decoded.ends_with("日本語 café.md"),
+            "printable non-ASCII must survive, got: {decoded:?}"
+        );
+        assert!(!decoded.contains('\u{FFFD}'), "got: {decoded:?}");
+    }
+
+    #[test]
+    fn display_decoded_uri_str_sanitizes_the_unparseable_fallback() {
+        // An input that does not parse as a URI is exactly the case where
+        // nothing else has vetted the bytes, so the fallback arm must be
+        // sanitized too.
+        let raw = "not a uri \u{1B}[2J at all";
+        let out = display_decoded_uri(raw);
+        assert!(!out.contains('\u{1B}'), "got: {out:?}");
+        assert_eq!(out, "not a uri \u{FFFD}[2J at all");
     }
 
     #[test]

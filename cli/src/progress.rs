@@ -503,6 +503,36 @@ mod tests {
         assert_eq!(bar.message(), "my file.md");
     }
 
+    // Part B, cont.: decoding for display re-materializes whatever bytes the
+    // filename held. A Unix filename may contain any byte but `/` and NUL, so
+    // `evil\x1b[2J.md` indexes as `evil%1B%5B2J.md` and would decode back
+    // into a live ANSI escape handed straight to `set_message`. The
+    // sanitization lives in `core`'s `display_decoded_uri`; this pins that
+    // the CLI's one decode-then-display path benefits from it.
+    #[test]
+    fn tty_sink_does_not_emit_raw_control_bytes_from_a_decoded_uri() {
+        let (sink, pb, _) = tty_sink_parts();
+        sink(ProgressEvent::SourceStarted {
+            source_id: "s1".to_string(),
+            location: "/tmp/test".to_string(),
+        });
+        sink(ProgressEvent::Discovered { total: 1 });
+        sink(ProgressEvent::DocumentStarted {
+            uri: "file:///tmp/test/evil%1B%5B2J.md".to_string(),
+            index: 0,
+            total: 1,
+        });
+
+        let guard = lock_or_poison(&pb);
+        let bar = guard.as_ref().expect("bar should exist after Discovered");
+        let msg = bar.message();
+        assert!(
+            !msg.contains('\u{1B}'),
+            "a raw ESC must never reach the progress bar, got: {msg:?}"
+        );
+        assert_eq!(msg, "evil\u{FFFD}[2J.md");
+    }
+
     // -- `db migrate` progress rendering (Part B.1) -------------------------
 
     #[test]
