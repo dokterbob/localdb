@@ -273,7 +273,26 @@ FAILED_PATHS=()
 
 trap on_interrupt INT TERM
 
-INPUT_DIR_LEN=${#INPUT_DIR}
+FIND_LIST=$(mktemp)
+cleanup_find_list() { rm -f "$FIND_LIST"; }
+trap cleanup_find_list EXIT
+
+FIND_RC=0
+find "$INPUT_DIR" -type f -iname '*.pdf' -print0 > "$FIND_LIST" || FIND_RC=$?
+FIND_RC=${FIND_RC:-0}
+if [ "$FIND_RC" -ne 0 ]; then
+    warn "find exited with status $FIND_RC — directory listing may be incomplete"
+fi
+
+# `find` on the root directory ("/") produces paths that already start with
+# "/", so no extra separator needs to be stripped; anywhere else, INPUT_DIR
+# itself has no trailing slash and one extra character (the separator) must
+# be sliced off along with it.
+if [ "$INPUT_DIR" = "/" ]; then
+    INPUT_DIR_LEN=0
+else
+    INPUT_DIR_LEN=${#INPUT_DIR}
+fi
 
 while IFS= read -r -d '' src; do
     FOUND=$((FOUND + 1))
@@ -294,7 +313,12 @@ while IFS= read -r -d '' src; do
         continue
     fi
 
-    mkdir -p "$dst_dir"
+    if ! mkdir -p "$dst_dir"; then
+        warn "$rel (failed to create output directory: $dst_dir)"
+        FAILED=$((FAILED + 1))
+        FAILED_PATHS+=("$rel (failed to create output directory: $dst_dir)")
+        continue
+    fi
 
     info "[ocr]  $rel"
     if ocrmypdf "${OCR_BASE_ARGS[@]}" "$src" "$dst"; then
@@ -317,13 +341,13 @@ while IFS= read -r -d '' src; do
             exit 130
         fi
     fi
-done < <(find "$INPUT_DIR" -type f -iname '*.pdf' -print0)
+done < "$FIND_LIST"
 
 # ---- summary ------------------------------------------------------------------
 
 print_summary
 
-if [ "$FAILED" -gt 0 ]; then
+if [ "$FAILED" -gt 0 ] || [ "$FIND_RC" -ne 0 ]; then
     exit 1
 fi
 
