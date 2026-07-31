@@ -105,6 +105,22 @@ required fields to be provided upfront.
 **File and URL ingestors** use the existing `SourceSpec` shape (root/include/exclude for paths,
 url/refresh for URLs) and require no additional interactive setup.
 
+**Feed ingestor** (`ingestor_kind: feed`) likewise needs no interactive setup — it's added via the
+CLI or HTTP API like any other source, never YAML. `config_json` carries `max_entries` and
+`fetch_full_content`; `refresh_interval_secs` lives in the existing `refresh` column, same as
+`url`. Illustrative shape (persisted as JSON; shown here as YAML for readability, consistent with
+§1):
+
+```yaml
+# localdb source add https://blog.example.com/feed.xml --store notes --kind feed --max-entries 50
+max_entries: 50           # cap on entries considered per fetch, applied after date-sort; 0 rejected
+fetch_full_content: true  # default: discovery mode — fetch each entry's linked page as its own
+                           #   Resource. false: single-document mode — the whole feed becomes one
+                           #   Resource assembled from entry summaries. See 02-domain-model.md §2.
+```
+
+See [05-surfaces.md](05-surfaces.md) §2.2 / §3 for the CLI flags and HTTP body shape.
+
 ## 4. File locations
 
 | Item | macOS | Linux |

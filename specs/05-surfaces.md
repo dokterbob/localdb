@@ -47,6 +47,22 @@ and `db downgrade`) require explicit confirmation before touching the store. See
 [02-domain-model.md](02-domain-model.md) §9 for the `schema_migrations` table and the
 migration-weight-class design.
 
+### 2.2 Feed sources
+
+Both `localdb add <url>...` and `localdb source add <url>...` accept `--kind <path|url|feed>` to
+override auto-classification. `--kind feed` requires an `http(s)://` argument — anything else is
+`invalid_request`, exit 2. Two more flags apply only when the effective kind is `feed`:
+`--max-entries <N>` (`0` is rejected) and `--no-fetch-full-content` (selects single-document mode,
+[02-domain-model.md](02-domain-model.md) §2). Passing either flag when the effective kind is not
+`feed` is `invalid_request`, exit 2 — not silently ignored. `--help` for `add`/`source add` notes
+that feed ingestion in the default (discovery) mode fetches every entry's linked page and
+recommends `--max-entries` to bound that.
+
+`source list` (human) renders feed rows as `{id} [feed] {url} (max_entries=…, full_content=on|off)`
+— `…` is the configured integer or `none`. `--json` adds parsed `max_entries` (`null` or integer)
+and `fetch_full_content` (bool), reconstructed from `config_json` (never the raw column), and now
+also surfaces `refresh` for both `url` and `feed` sources.
+
 ## 3. HTTP API
 
 **Decision:** **REST + JSON, the canonical surface for external integrators.** Served only by the
@@ -70,6 +86,13 @@ later if a consumer demands it).
   limit; citations carry full `Metadata`), `GET /resources/{id}` (response includes
   `metadata: Metadata`), `POST /jobs` (index requests), `GET /jobs/{id}`, `GET /status`,
   `GET /config` (resolved config).
+- **Feed sources:** `POST /stores/{id}/sources` accepts `{kind: "feed", spec: {url, max_entries,
+  fetch_full_content}, preset, refresh}` — `spec` mirrors `SourceSpec::Feed`
+  ([02-domain-model.md](02-domain-model.md) §2). Validation failures (`max_entries: 0`, a
+  non-`http(s)` `url`, etc.) are `invalid_request`, 400. `GET .../sources` reconstructs a clean
+  `spec` object per source from `config_json` (never the raw column) and now surfaces `refresh`
+  for both `url` and `feed` sources. Feed's `refresh` is persisted and validated the same as
+  `url`'s but is currently inert — no scheduled refresh runs yet for either kind.
 - **Long-running work:** indexing is a **job resource**: `POST /jobs` → `202` + job; clients poll
   `GET /jobs/{id}`. SSE progress streaming is roadmap ([06-roadmap.md](06-roadmap.md) §5) — the
   job resource is designed so SSE adds a representation, not a new model.
