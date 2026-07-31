@@ -26,7 +26,7 @@ impl Parser for PdfParser {
             return Ok(None);
         }
 
-        let (markdown, title) = crate::pdf::extract_pdf(probe.bytes())?;
+        let extracted = crate::pdf::extract_pdf(probe.bytes())?;
 
         let mut dc = DublinCoreMetadata::default();
         if let Some(mime) = probe.sniffed_mime {
@@ -34,8 +34,8 @@ impl Parser for PdfParser {
         }
 
         Ok(Some(ParsedDocument {
-            markdown,
-            title,
+            markdown: extracted.markdown,
+            title: extracted.title,
             metadata: dc,
         }))
     }

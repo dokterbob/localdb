@@ -1,0 +1,64 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R 6 0 R 8 0 R] /Count 3 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>
+endobj
+4 0 obj
+<< /Length 218 >>
+stream
+BT /F1 11 Tf 72 700 Td (Alpha section) Tj ET
+BT /F1 11 Tf 72 685 Td (The quick brown fox jumps over the lazy dog on page one.) Tj ET
+BT /F1 11 Tf 72 670 Td (This first page discusses alpha topics in plain prose.) Tj ET
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+6 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 7 0 R /Resources << /Font << /F1 5 0 R >> >> >>
+endobj
+7 0 obj
+<< /Length 221 >>
+stream
+BT /F1 11 Tf 72 700 Td (Bravo section) Tj ET
+BT /F1 11 Tf 72 685 Td (Sphinx of black quartz, judge my vow, says page two.) Tj ET
+BT /F1 11 Tf 72 670 Td (The second page continues with bravo material and more prose.) Tj ET
+endstream
+endobj
+8 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 9 0 R /Resources << /Font << /F1 5 0 R >> >> >>
+endobj
+9 0 obj
+<< /Length 211 >>
+stream
+BT /F1 11 Tf 72 700 Td (Charlie section) Tj ET
+BT /F1 11 Tf 72 685 Td (Pack my box with five dozen liquor jugs on page three.) Tj ET
+BT /F1 11 Tf 72 670 Td (The third page concludes with charlie findings.) Tj ET
+endstream
+endobj
+10 0 obj
+<< /Title (Multipage Fixture Title) /Producer (localdb tests) >>
+endobj
+xref
+0 11
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000127 00000 n 
+0000000253 00000 n 
+0000000522 00000 n 
+0000000592 00000 n 
+0000000718 00000 n 
+0000000990 00000 n 
+0000001116 00000 n 
+0000001378 00000 n 
+trailer
+<< /Size 11 /Root 1 0 R /Info 10 0 R >>
+startxref
+1459
+%%EOF
