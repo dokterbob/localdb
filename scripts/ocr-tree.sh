@@ -21,13 +21,26 @@
 #   - In the default mode (no --force-ocr/--redo-ocr/--mode in your passthrough
 #     args), a file is skipped ENTIRELY — no ocrmypdf invocation, no output
 #     written — when it already has a real text layer. This is decided by
-#     sampling the first few pages with `pdftotext`/`pdfinfo` (poppler) before
-#     ocrmypdf ever runs, so already-text-bearing books aren't needlessly
-#     rewritten (ocrmypdf's own `--skip-text` only skips OCR per PAGE — it
-#     still runs the full pipeline, incl. Ghostscript PDF/A conversion, on
-#     every file it's given). `--skip-text` is still appended to the ocrmypdf
-#     call as a second line of defense, for files with a mix of text and
-#     scanned pages that pass the whole-file sample check.
+#     extracting the WHOLE document with `pdftotext` (poppler) before ocrmypdf
+#     ever runs and averaging non-whitespace characters over ALL pages (page
+#     count via `pdfinfo`) rather than sampling just the first few. A ratio
+#     of extracted-text-to-document-length (as used by localdb's own PDF
+#     extractor for whole-document scanned/not classification) does NOT work
+#     for this: a purely image-only page contributes next to nothing to
+#     either side of that ratio, so it can't detect a scanned body appended
+#     after a small amount of real front-matter text — confirmed empirically
+#     against a real scanned book. Averaging per page, over the whole
+#     document, catches that case: a handful of dense real-text pages can't
+#     pull the per-page average above the threshold once diluted across
+#     hundreds of near-empty scanned pages. `--skip-text` is still appended
+#     to the ocrmypdf call as a second line of defense, for any mixed-content
+#     file that still passes the whole-document check. Note this is still a
+#     single whole-file decision: a file where scanned pages are a small
+#     minority (e.g. a few dense real-text pages next to a couple dozen
+#     scanned ones) can still average above the threshold and get skipped
+#     whole. It reliably catches the reported failure mode — a large scanned
+#     body behind a small amount of front matter — but is not a per-page
+#     guarantee.
 #   - If your passthrough args already select a mode (--skip-text, --force-ocr,
 #     --redo-ocr, or --mode), the text-layer pre-check above is skipped
 #     entirely and every discovered file is handed to ocrmypdf — this is how
@@ -54,17 +67,22 @@
 #
 # ASSUMPTIONS
 #
-#   - `ocrmypdf` and poppler's `pdftotext`/`pdfinfo` are on PATH.
+#   - `ocrmypdf` is on PATH. Poppler's `pdftotext`/`pdfinfo` are also
+#     required, but only when the text-layer pre-check will actually run
+#     (default mode; not required if your passthrough args already select a
+#     mode).
 #   - Output paths mirror input paths 1:1, relative to <input_dir>, rooted at
 #     <output_dir>, with the same relative subdirectories and filenames.
+#   - <output_dir> must not be the same as, or nested inside, <input_dir>.
 #
 # EXIT CODES
 #
 #   0   all discovered files were OCR'd or skipped (already had output, or
 #       already had a text layer); zero failures
-#   1   the batch completed but at least one file failed OCR
-#   2   usage/setup error (bad args, missing input dir, ocrmypdf/pdftotext not
-#       found)
+#   1   the batch completed but at least one file failed OCR, or the initial
+#       directory scan itself failed partway through
+#   2   usage/setup error (bad args, missing input dir, output dir overlaps
+#       input dir, ocrmypdf/pdftotext/pdfinfo not found)
 #
 # ---------------------------------------------------------------------------------
 
@@ -72,12 +90,8 @@ set -euo pipefail
 
 # ---- tunables -----------------------------------------------------------------
 
-# How many pages (from the start of the document) to sample when deciding
-# whether a file already has a usable text layer, and how much extracted
-# text (non-whitespace characters, averaged over the sampled pages) counts as
-# "has text". Sampling instead of extracting the whole document keeps the
-# check fast even for large scanned books.
-TEXT_CHECK_SAMPLE_PAGES=5
+# How many non-whitespace characters, averaged over every page of the
+# document, counts as "has a usable text layer".
 TEXT_CHECK_MIN_CHARS_PER_PAGE=100
 
 # ---- helpers ----------------------------------------------------------------
@@ -124,8 +138,11 @@ has_mode_flag() {
     return 1
 }
 
-# Sample the first few pages of a PDF and decide whether it already has a
-# usable text layer. Returns success (0) if it does, failure (1) if it looks
+# Extract the whole document and decide whether it already has a usable text
+# layer, by averaging non-whitespace characters over EVERY page (not just a
+# sample of the first few — that's what let real-text front matter followed
+# by a scanned body slip past undetected and get skipped whole). Returns
+# success (0) if it has a usable text layer, failure (1) if it looks
 # scanned/textless (or if it couldn't be inspected, e.g. corrupt PDF — in
 # which case ocrmypdf is left to fail on it with a proper diagnostic).
 has_text_layer() {
@@ -138,15 +155,11 @@ has_text_layer() {
     if [ "$pages" -eq 0 ]; then
         return 1
     fi
-    local sample=$TEXT_CHECK_SAMPLE_PAGES
-    if [ "$pages" -lt "$sample" ]; then
-        sample=$pages
-    fi
-    local text stripped chars avg
-    text=$(pdftotext -f 1 -l "$sample" "$pdf" - 2>/dev/null || true)
-    stripped=$(printf '%s' "$text" | tr -d '[:space:]')
-    chars=${#stripped}
-    avg=$((chars / sample))
+    local text printable avg
+    text=$(pdftotext "$pdf" - 2>/dev/null || true)
+    printable=$(printf '%s' "$text" | tr -d '[:space:]')
+    printable=${#printable}
+    avg=$((printable / pages))
     [ "$avg" -ge "$TEXT_CHECK_MIN_CHARS_PER_PAGE" ]
 }
 
