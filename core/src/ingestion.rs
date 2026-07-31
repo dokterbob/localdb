@@ -754,6 +754,19 @@ pub async fn index_resource(
         }
     }
 
+    // Page lookup for paginated formats (#103): block seq → location.page,
+    // copied onto each chunk record from its originating block.
+    let page_by_seq: std::collections::HashMap<u32, u32> = resource
+        .blocks
+        .iter()
+        .filter_map(|b| {
+            b.location
+                .as_ref()
+                .and_then(|loc| loc.page)
+                .map(|page| (b.seq, page))
+        })
+        .collect();
+
     let mut records = Vec::with_capacity(chunk_outputs.len());
     for (chunk_out, embedding) in chunk_outputs.iter().zip(embeddings.iter()) {
         let chunk = Chunk {
@@ -778,6 +791,7 @@ pub async fn index_resource(
         record.block_seq = chunk_out.block_seq;
         record.seq_in_block = chunk_out.seq_in_block;
         record.block_kind = chunk_out.block_kind.clone();
+        record.page = page_by_seq.get(&chunk_out.block_seq).copied();
         records.push(record);
     }
 
@@ -1713,6 +1727,7 @@ mod tests {
             block_seq: 0,
             seq_in_block: 0,
             block_kind: None,
+            page: None,
             window_block_seqs: vec![],
         }
     }
@@ -3660,6 +3675,77 @@ mod tests {
             assert!(
                 old_chunks.is_empty(),
                 "replacing with an empty resource must delete the old chunks"
+            );
+        }
+
+        /// #103: `index_resource` copies each block's `location.page` onto the
+        /// chunk records it writes, keyed by block seq.
+        #[tokio::test]
+        async fn index_resource_copies_block_page_onto_chunks() {
+            use crate::block::{Block, BlockKind, BlockLocation};
+
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let source = make_source_with_preset(store_id, "prose");
+            let config = make_ingestion_config(store_id);
+
+            let page_block = |seq: u32, text: &str, page: u32| Block {
+                seq,
+                kind: BlockKind::Text,
+                text: text.to_string(),
+                location: Some(BlockLocation {
+                    page: Some(page),
+                    ..Default::default()
+                }),
+            };
+
+            let blocks = vec![
+                page_block(0, "Alpha content lives on the first page here.", 1),
+                page_block(1, "Bravo content lives on the second page here.", 2),
+                // A block with no location at all: its chunks must get page None.
+                Block {
+                    seq: 2,
+                    kind: BlockKind::Text,
+                    text: "Charlie content has no page info recorded.".to_string(),
+                    location: None,
+                },
+            ];
+
+            let resource = make_resource_with_blocks(
+                "file:///docs/paged.pdf",
+                &source.id,
+                store_id,
+                blocks,
+            );
+            let deps = IndexResourceDeps {
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+            };
+            let written = index_resource(&resource, &source, None, &deps)
+                .await
+                .unwrap();
+            assert!(written >= 3, "expected at least one chunk per block");
+
+            let chunks = store
+                .get_chunks_for_resource(&resource.id)
+                .await
+                .unwrap();
+
+            // Each chunk's page is that of its originating block seq.
+            let page_for_seq = |seq: u32| -> Vec<Option<u32>> {
+                chunks
+                    .iter()
+                    .filter(|c| c.block_seq == seq)
+                    .map(|c| c.page)
+                    .collect()
+            };
+            assert!(page_for_seq(0).iter().all(|p| *p == Some(1)), "block 0 → page 1");
+            assert!(page_for_seq(1).iter().all(|p| *p == Some(2)), "block 1 → page 2");
+            assert!(
+                page_for_seq(2).iter().all(|p| p.is_none()),
+                "block 2 has no location → page None"
             );
         }
     }

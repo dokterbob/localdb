@@ -236,7 +236,7 @@ Every search hit, on every surface, resolves to the same citation structure:
   "resource_id": "...",
   "uri": "...",
   "title": "...",
-  "block": { "seq": 3, "kind": "paragraph" },
+  "block": { "seq": 3, "kind": "paragraph", "page": 12 },
   "chunk_position": { "seq_in_block": 0 },
   "location": {
     "span": { "start": 120, "end": 512 },
@@ -251,9 +251,17 @@ carries `chunk_id`, `store: {id, name}`, `heading_path`, `snippet` (chunk text, 
 the full `score: {fused, dense, bm25}` breakdown, `provenance: {fetched_at, content_hash}`, and
 `metadata` (the tagged `Metadata` enum — Dublin Core base + resource-kind-specific fields, §7).
 There is no top-level `document_id`, `block_seq`, `block_kind`, or `span` — those are superseded by
-`resource_id`, the nested `block {seq, kind}`, `chunk_position {seq_in_block}`, and
+`resource_id`, the nested `block {seq, kind, page}`, `chunk_position {seq_in_block}`, and
 `location {span, window_block_seqs}` respectively. `window_block_seqs` is present only for
 message-window chunks (§2); absent otherwise.
+
+`block.page` is the 1-indexed page number for paginated source formats (today: PDF), copied
+from the originating block's `location.page` (§2b); absent for non-paginated formats and for
+chunks indexed before page plumbing existed. **Page attribution rule:** a block's page is the
+page containing its *first contributing byte* in the extracted Markdown. Blocks are never
+split at page boundaries — a paragraph or coarse `Text` run that crosses a page break carries
+the page it starts on. (Splitting would fight the coarse-`Text` run packing (#158), which
+packs chunks within blocks.)
 
 Surface mappings — defined here once, referenced by [05-surfaces.md](05-surfaces.md):
 **HTTP** returns the structure verbatim as JSON. **CLI** renders `uri` + heading path + snippet

@@ -49,6 +49,7 @@ impl Parser for MarkdownParser {
             markdown,
             title,
             metadata: dc,
+            page_starts: Vec::new(),
         }))
     }
 }

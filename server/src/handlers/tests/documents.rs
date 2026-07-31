@@ -166,6 +166,7 @@ async fn get_document_reconstructs_table_without_duplicated_header() {
             block_seq: co.block_seq,
             seq_in_block: co.seq_in_block,
             block_kind: co.block_kind.clone(),
+            page: None,
             window_block_seqs: co.window_block_seqs.clone(),
         })
         .collect();

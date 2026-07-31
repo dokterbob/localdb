@@ -50,6 +50,7 @@ impl Parser for OfficeParser {
             markdown: result.markdown,
             title,
             metadata: dc,
+            page_starts: Vec::new(),
         }))
     }
 }

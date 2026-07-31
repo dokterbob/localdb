@@ -92,6 +92,7 @@ fn make_record(store_id: &str, source_id: &str, idx: usize) -> ChunkRecord {
         block_seq: 0,
         seq_in_block: 0,
         block_kind: None,
+        page: None,
         window_block_seqs: vec![],
     }
 }

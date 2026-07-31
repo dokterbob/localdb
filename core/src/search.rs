@@ -293,6 +293,7 @@ pub fn shape_citation(fused: FusedChunkEntry, store_id: String, store_name: Stri
         block: CitationBlock {
             seq: fused.chunk.block_seq,
             kind: fused.chunk.block_kind.clone(),
+            page: fused.chunk.page,
         },
         chunk_position: ChunkPosition {
             seq_in_block: fused.chunk.seq_in_block,
@@ -510,6 +511,7 @@ mod tests {
             block_seq: 0,
             seq_in_block: 0,
             block_kind: None,
+            page: None,
             window_block_seqs: vec![],
         }
     }

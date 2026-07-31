@@ -821,6 +821,7 @@ mod get_document_tests {
                 block_seq: 0,
                 seq_in_block: 0,
                 block_kind: None,
+                page: None,
                 window_block_seqs: vec![],
             }
         };
@@ -947,6 +948,7 @@ mod get_document_tests {
                 block_seq: co.block_seq,
                 seq_in_block: co.seq_in_block,
                 block_kind: co.block_kind.clone(),
+                page: None,
                 window_block_seqs: co.window_block_seqs.clone(),
             })
             .collect();
@@ -1036,6 +1038,7 @@ mod tests {
             block_seq: 0,
             seq_in_block: 0,
             block_kind: None,
+            page: None,
             window_block_seqs: vec![],
         }
     }
@@ -1329,7 +1332,11 @@ mod tests {
             uri: uri.to_string(),
             title: None,
             heading_path: vec![],
-            block: CitationBlock { seq: 0, kind: None },
+            block: CitationBlock {
+                seq: 0,
+                kind: None,
+                page: None,
+            },
             chunk_position: ChunkPosition { seq_in_block: 0 },
             location: CitationLocation {
                 span: Span::new(0, 4),

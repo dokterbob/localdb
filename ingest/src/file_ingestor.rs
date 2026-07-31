@@ -11,7 +11,7 @@ use localdb_core::error::Error;
 use localdb_core::ids::resource_id;
 use localdb_core::ingestion::{enumerate_path_source, now_rfc3339};
 use localdb_core::ingestor::{IngestCallback, IngestResult, IngestSource, Ingestor, SkipReason};
-use localdb_core::markdown_blocks::{compute_blocks_hash, markdown_to_blocks};
+use localdb_core::markdown_blocks::{compute_blocks_hash, markdown_to_blocks_with_pages};
 use localdb_core::metadata::{DocumentMetadata, Metadata};
 use localdb_core::parser::{Parser, Probe};
 
@@ -183,7 +183,9 @@ impl Ingestor for FileIngestor {
                 }
             };
 
-            let blocks = markdown_to_blocks(&parsed.markdown);
+            // Page stamping (#103): `page_starts` is empty for non-paginated
+            // formats, in which case this is plain `markdown_to_blocks`.
+            let blocks = markdown_to_blocks_with_pages(&parsed.markdown, &parsed.page_starts);
             let hash = compute_blocks_hash(&blocks);
             let res_id = resource_id(file.uri.as_str(), &hash);
 
@@ -269,6 +271,7 @@ mod tests {
                 markdown: text,
                 title: None,
                 metadata: localdb_core::metadata::DublinCoreMetadata::default(),
+                page_starts: Vec::new(),
             }))
         }
     }
@@ -287,6 +290,7 @@ mod tests {
                     markdown: text,
                     title: None,
                     metadata: localdb_core::metadata::DublinCoreMetadata::default(),
+                    page_starts: Vec::new(),
                 }))
             } else {
                 Ok(None)
@@ -309,6 +313,32 @@ mod tests {
                 markdown: text,
                 title: None,
                 metadata: localdb_core::metadata::DublinCoreMetadata::default(),
+                page_starts: Vec::new(),
+            }))
+        }
+    }
+
+    /// Emits a fixed 3-page Markdown document with `page_starts`, regardless
+    /// of input — exercises the FileIngestor → `markdown_to_blocks_with_pages`
+    /// page-stamping path (#103) hermetically.
+    struct PagedParser;
+    impl Parser for PagedParser {
+        fn id(&self) -> &'static str {
+            "paged"
+        }
+        fn parse(&self, _probe: &Probe) -> Result<Option<ParsedDocument>, Error> {
+            // Headings break the run into separate blocks so each page's
+            // content is its own block (a flat run would fold into one block
+            // on page 1 — the coarse-Text packing rule, #158).
+            let markdown = "# One\n\nAlpha body on page one.\n\n# Two\n\nBravo body on page two.\n\n# Three\n\nCharlie body on page three.\n"
+                .to_string();
+            let p2 = markdown.find("# Two").unwrap();
+            let p3 = markdown.find("# Three").unwrap();
+            Ok(Some(ParsedDocument {
+                markdown,
+                title: None,
+                metadata: localdb_core::metadata::DublinCoreMetadata::default(),
+                page_starts: vec![(0, 1), (p2, 2), (p3, 3)],
             }))
         }
     }
@@ -368,6 +398,72 @@ mod tests {
             // Parity fix: policy_version comes from the source, not "v1".
             assert_eq!(res.policy_version, "policy-xyz");
         }
+    }
+
+    /// #103 end-to-end: a parser emitting `page_starts` produces a resource
+    /// whose blocks carry the correct per-page `location.page`.
+    #[tokio::test]
+    async fn page_starts_flow_into_resource_block_locations() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("doc.pdf"), b"ignored by PagedParser").unwrap();
+
+        let ingestor = FileIngestor::new(Box::new(PagedParser));
+        let source = source_with_root(dir.path().to_str().unwrap());
+        let mut cb = RecordingCallback::default();
+        ingestor.ingest(&source, &mut cb).await.unwrap();
+
+        assert_eq!(cb.resources.len(), 1);
+        let res = &cb.resources[0];
+        let page_of = |needle: &str| {
+            res.blocks
+                .iter()
+                .find(|b| b.text.contains(needle))
+                .and_then(|b| b.location.as_ref())
+                .and_then(|l| l.page)
+        };
+        assert_eq!(page_of("Alpha"), Some(1));
+        assert_eq!(page_of("Bravo"), Some(2));
+        assert_eq!(page_of("Charlie"), Some(3));
+    }
+
+    /// #103 end-to-end through the real `extract` parser chain on the vendored
+    /// synthetic 3-page PDF fixture: every block resolves to a page, and the
+    /// distinctive per-page text lands on the expected page.
+    #[tokio::test]
+    async fn real_pdf_fixture_stamps_block_pages() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../extract/tests/fixtures/multipage.pdf");
+        let bytes = std::fs::read(&fixture).expect("multipage.pdf fixture must exist");
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("multipage.pdf"), &bytes).unwrap();
+
+        let chain = extract::build_chain(&extract::default_parser_ids()).unwrap();
+        let ingestor = FileIngestor::new(Box::new(chain));
+        let source = source_with_root(dir.path().to_str().unwrap());
+        let mut cb = RecordingCallback::default();
+        ingestor.ingest(&source, &mut cb).await.unwrap();
+
+        assert_eq!(cb.resources.len(), 1, "the PDF should produce one resource");
+        let res = &cb.resources[0];
+        assert!(!res.blocks.is_empty());
+        // Every block carries a page (the whole doc is paginated).
+        assert!(
+            res.blocks
+                .iter()
+                .all(|b| b.location.as_ref().and_then(|l| l.page).is_some()),
+            "every block of a PDF resource must carry a page"
+        );
+        let page_of = |needle: &str| {
+            res.blocks
+                .iter()
+                .find(|b| b.text.contains(needle))
+                .and_then(|b| b.location.as_ref())
+                .and_then(|l| l.page)
+        };
+        assert_eq!(page_of("quick brown fox"), Some(1));
+        assert_eq!(page_of("Sphinx of black quartz"), Some(2));
+        assert_eq!(page_of("Pack my box"), Some(3));
     }
 
     #[tokio::test]
@@ -511,6 +607,7 @@ mod tests {
                     markdown: text,
                     title: None,
                     metadata: localdb_core::metadata::DublinCoreMetadata::default(),
+                    page_starts: Vec::new(),
                 }))
             }
         }
@@ -558,6 +655,7 @@ mod tests {
                         title: metadata_title,
                         ..Default::default()
                     },
+                    page_starts: Vec::new(),
                 }))
             }
         }

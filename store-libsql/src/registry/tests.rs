@@ -422,6 +422,7 @@ async fn metadata_json_round_trips_tagged_document_kind() {
         block_seq: 0,
         seq_in_block: 0,
         block_kind: None,
+        page: None,
         window_block_seqs: vec![],
     };
 
@@ -499,6 +500,7 @@ async fn find_document_tolerates_invalid_metadata_json() {
         block_seq: 0,
         seq_in_block: 0,
         block_kind: None,
+        page: None,
         window_block_seqs: vec![],
     };
 

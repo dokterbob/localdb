@@ -152,6 +152,7 @@ async fn make_handler_with_seeded_store() -> (McpHandler, String, String) {
         block_seq: 0,
         seq_in_block: 0,
         block_kind: None,
+        page: None,
         window_block_seqs: vec![],
     };
 
@@ -211,6 +212,7 @@ async fn make_handler_with_multichunk_doc() -> (McpHandler, String) {
             block_seq,
             seq_in_block,
             block_kind: Some("text".to_string()),
+            page: None,
             window_block_seqs: vec![],
         }
     };
@@ -272,6 +274,7 @@ async fn make_handler_with_tied_chunks(reversed: bool) -> (McpHandler, String) {
             block_seq: 0,
             seq_in_block: 0,
             block_kind: Some("text".to_string()),
+            page: None,
             window_block_seqs: vec![],
         }
     };
@@ -331,6 +334,7 @@ async fn make_handler_with_sequential_chunks(count: u32) -> (McpHandler, String,
             block_seq,
             seq_in_block: 0,
             block_kind: Some("text".to_string()),
+            page: None,
             window_block_seqs: vec![],
         });
     }
@@ -381,6 +385,7 @@ async fn make_handler_with_block_seq_gaps() -> (McpHandler, String) {
             block_seq,
             seq_in_block,
             block_kind: Some("text".to_string()),
+            page: None,
             window_block_seqs: vec![],
         }
     };
@@ -652,6 +657,7 @@ collector, which keeps runtime performance predictable and fast.";
         block_seq: 0,
         seq_in_block: 0,
         block_kind: None,
+        page: None,
         window_block_seqs: vec![],
     };
     store.upsert_chunks(vec![record]).await.unwrap();
@@ -799,6 +805,7 @@ async fn test_search_limit_respected() {
             block_seq: 0,
             seq_in_block: 0,
             block_kind: None,
+            page: None,
             window_block_seqs: vec![],
         });
     }

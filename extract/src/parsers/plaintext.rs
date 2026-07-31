@@ -85,6 +85,7 @@ impl Parser for PlaintextParser {
             markdown,
             title,
             metadata: dc,
+            page_starts: Vec::new(),
         }))
     }
 }

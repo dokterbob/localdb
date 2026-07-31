@@ -240,15 +240,21 @@ async fn upsert_chunks_inner(
                 message: format!("upsert_chunks heading_path serialize: {e}"),
                 correlation_id: "store_handle_upsert_heading".to_string(),
             })?;
-        // location_json shape: `{"start": N, "end": N, "window_block_seqs": [..]}`.
-        // `window_block_seqs` is included only for message-window chunks (#129) —
-        // plain chunks keep the original `{start, end}` shape.
+        // location_json shape:
+        // `{"start": N, "end": N, "window_block_seqs": [..], "page": N}`.
+        // `window_block_seqs` is included only for message-window chunks (#129)
+        // and `page` only for paginated formats (#103); a plain chunk keeps the
+        // original `{start, end}` shape. Missing keys read back as their
+        // defaults (empty / None) — no schema/DDL change (#103).
         let mut location_value = serde_json::json!({
             "start": record.span.start,
             "end": record.span.end,
         });
         if !record.window_block_seqs.is_empty() {
             location_value["window_block_seqs"] = serde_json::json!(record.window_block_seqs);
+        }
+        if let Some(page) = record.page {
+            location_value["page"] = serde_json::json!(page);
         }
         let location_json =
             serde_json::to_string(&location_value).map_err(|e| Error::Internal {
@@ -476,6 +482,7 @@ mod tests {
             block_seq: 0,
             seq_in_block: 0,
             block_kind: None,
+            page: None,
             window_block_seqs: vec![],
         };
         handle.upsert_chunks(vec![record]).await.unwrap();

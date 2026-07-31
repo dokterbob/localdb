@@ -83,6 +83,12 @@ pub struct ParsedDocument {
     /// tagged `crate::metadata::Metadata` enum) as a JSON-encoded column in
     /// the libsql store.
     pub metadata: crate::metadata::DublinCoreMetadata,
+    /// For paginated source formats (today: PDF): `(byte_offset, page_number)`
+    /// for every page that contributed content, ascending in both fields.
+    /// `byte_offset` indexes into `markdown`; `page_number` is 1-based.
+    /// Empty for non-paginated formats — block building then leaves
+    /// `Block.location` untouched.
+    pub page_starts: Vec<(usize, u32)>,
 }
 
 // ---------------------------------------------------------------------------

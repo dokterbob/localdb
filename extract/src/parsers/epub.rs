@@ -93,6 +93,7 @@ impl Parser for EpubParser {
             markdown,
             title,
             metadata,
+            page_starts: Vec::new(),
         }))
     }
 }

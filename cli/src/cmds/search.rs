@@ -112,7 +112,13 @@ pub(crate) fn print_search_output(out: SearchOutput, content_length: usize, json
                     for (i, cit) in citations.iter().enumerate() {
                         let uri = cit.get("uri").and_then(|u| u.as_str()).unwrap_or("?");
                         let snippet = cit.get("snippet").and_then(|s| s.as_str()).unwrap_or("");
-                        println!("{}. {}", i + 1, uri);
+                        let page = cit
+                            .get("block")
+                            .and_then(|b| b.get("page"))
+                            .and_then(|p| p.as_u64())
+                            .map(|p| format!(" (p.{p})"))
+                            .unwrap_or_default();
+                        println!("{}. {}{}", i + 1, uri, page);
                         println!("   {}", format_snippet(snippet, content_length));
                         println!();
                     }
@@ -136,7 +142,12 @@ pub(crate) fn print_search_output(out: SearchOutput, content_length: usize, json
                     } else {
                         format!(" > {}", citation.heading_path.join(" > "))
                     };
-                    println!("{}. {}{}", i + 1, citation.uri, heading);
+                    let page = citation
+                        .block
+                        .page
+                        .map(|p| format!(" (p.{p})"))
+                        .unwrap_or_default();
+                    println!("{}. {}{}{}", i + 1, citation.uri, heading, page);
                     println!("   {}", format_snippet(&citation.snippet, content_length));
                     println!();
                 }

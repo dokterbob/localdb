@@ -10,7 +10,7 @@ use localdb_core::error::Error;
 use localdb_core::ids::resource_id;
 use localdb_core::ingestion::{now_rfc3339, FetchMetadata, FetchResult, UrlFetcher};
 use localdb_core::ingestor::{IngestCallback, IngestResult, IngestSource, Ingestor, SkipReason};
-use localdb_core::markdown_blocks::{compute_blocks_hash, markdown_to_blocks};
+use localdb_core::markdown_blocks::{compute_blocks_hash, markdown_to_blocks_with_pages};
 use localdb_core::metadata::{DocumentMetadata, Metadata};
 use localdb_core::parser::{Parser, Probe};
 use localdb_core::uri::Uri;
@@ -188,7 +188,9 @@ impl Ingestor for UrlIngestor {
                     }
                 };
 
-            let blocks = markdown_to_blocks(&parsed.markdown);
+            // Page stamping (#103): `page_starts` is empty for non-paginated
+            // formats, in which case this is plain `markdown_to_blocks`.
+            let blocks = markdown_to_blocks_with_pages(&parsed.markdown, &parsed.page_starts);
             let hash = compute_blocks_hash(&blocks);
             let res_id = resource_id(url, &hash);
             let now = now_rfc3339();
@@ -257,6 +259,7 @@ mod tests {
                 markdown: text,
                 title: None,
                 metadata: localdb_core::metadata::DublinCoreMetadata::default(),
+                page_starts: Vec::new(),
             }))
         }
     }

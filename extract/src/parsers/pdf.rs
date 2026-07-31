@@ -37,6 +37,7 @@ impl Parser for PdfParser {
             markdown: extracted.markdown,
             title: extracted.title,
             metadata: dc,
+            page_starts: extracted.page_starts,
         }))
     }
 }
