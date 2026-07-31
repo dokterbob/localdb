@@ -398,8 +398,10 @@ fn catch_panic<T>(
     label: &str,
     f: impl FnOnce() -> Result<T, Error> + std::panic::UnwindSafe,
 ) -> Result<T, Error> {
-    // Suppress the default panic hook's stderr output for expected third-party panics
-    // (e.g. pdf-extract on malformed PDFs).  The caller emits a clean WARN line instead.
+    // Suppress the default panic hook's stderr output for any unexpected
+    // third-party parser panic on malformed input. The caller emits a clean
+    // WARN line instead. (The PDF path no longer panics — pdf_oxide returns
+    // errors — but this stays as belt-and-braces for every parser.)
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let result = std::panic::catch_unwind(f);

@@ -316,6 +316,17 @@ proxied stdio mode always exposes the daemon's full store set regardless of
 re-filtering for this was rejected as not worth the complexity in v1. See
 [docs/mcp.md](mcp.md#daemon-proxied-stdio) and [specs/05-surfaces.md](../specs/05-surfaces.md) §4.2.
 
+**8. `extractor_version` is dead code; PDF reindex relies on the content hash.**
+The `extractor_version` field is hardcoded (`"1"` in both ingestors and in
+`store-libsql`'s resource upsert) and is never read by the skip-check — that
+check keys only on `content_hash`. The `pdf-extract` → `pdf_oxide` swap changes
+the extracted text of every PDF, so the content hash changes and PDFs re-index
+automatically on the next `localdb index` (picking up page citations and better
+text). The residual risk: if a new parser ever produces *byte-identical* text
+for some PDF, its hash is unchanged and that document stays stale (and page-less)
+with no re-extraction. Threading a real per-parser `extractor_version` into the
+skip-check is a deferred follow-up (cross-ref [#47](https://github.com/dokterbob/localdb/issues/47)).
+
 ---
 
 ## Deferred design decisions {#design-decisions}
