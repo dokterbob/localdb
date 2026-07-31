@@ -226,7 +226,12 @@ if ! command -v ocrmypdf &>/dev/null; then
     exit 2
 fi
 
-if ! command -v pdftotext &>/dev/null || ! command -v pdfinfo &>/dev/null; then
+SKIP_TEXTED_FILES=0
+if ! has_mode_flag; then
+    SKIP_TEXTED_FILES=1
+fi
+
+if [ "$SKIP_TEXTED_FILES" -eq 1 ] && { ! command -v pdftotext &>/dev/null || ! command -v pdfinfo &>/dev/null; }; then
     err "pdftotext/pdfinfo (poppler) not found on PATH — required for the text-layer skip check"
     exit 2
 fi
@@ -238,6 +243,11 @@ mkdir -p "$OUTPUT_DIR" || { err "failed to create output directory: $OUTPUT_DIR"
 INPUT_DIR="$(cd "$INPUT_DIR" && pwd)"
 OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
 
+if [[ "$OUTPUT_DIR" == "$INPUT_DIR" || "$OUTPUT_DIR" == "$INPUT_DIR"/* ]]; then
+    err "output directory must not be inside the input directory: $OUTPUT_DIR"
+    exit 2
+fi
+
 info "Input:  $INPUT_DIR"
 info "Output: $OUTPUT_DIR"
 
@@ -246,10 +256,8 @@ if [ "${#EXTRA_ARGS[@]}" -gt 0 ]; then
     OCR_BASE_ARGS+=("${EXTRA_ARGS[@]}")
 fi
 
-SKIP_TEXTED_FILES=0
-if ! has_mode_flag; then
+if [ "$SKIP_TEXTED_FILES" -eq 1 ]; then
     OCR_BASE_ARGS+=(--skip-text)
-    SKIP_TEXTED_FILES=1
 fi
 
 info "ocrmypdf args: ${OCR_BASE_ARGS[*]:-<none>}"
