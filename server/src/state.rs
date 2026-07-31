@@ -39,6 +39,12 @@ pub struct SourceRecord {
     pub kind: String,
     pub spec: serde_json::Value,
     pub preset: String,
+    /// Raw refresh-interval string as given at creation time (e.g. "24h").
+    /// Persisted for url and feed sources; `None` otherwise. #116: surfaced
+    /// here so both surfaces (server response, `cli source list --json`)
+    /// can report it without a separate lookup.
+    #[serde(default)]
+    pub refresh: Option<String>,
 }
 
 /// Shared application state for all handlers.
@@ -276,9 +282,16 @@ impl AppState {
             None => None,
         };
 
-        if refresh.is_some() && kind_enum != localdb_core::types::SourceKind::Url {
+        // #116: feed sources persist+validate `refresh` like url sources, but
+        // scheduler registration below stays url-only — feed refresh is
+        // inert until the scheduler is extended (same stub status as the
+        // pre-existing url refresh scheduling).
+        if refresh.is_some()
+            && kind_enum != localdb_core::types::SourceKind::Url
+            && kind_enum != localdb_core::types::SourceKind::Feed
+        {
             return Err(Error::InvalidRequest {
-                message: "refresh is only supported for URL sources".to_string(),
+                message: "refresh is only supported for URL and feed sources".to_string(),
             });
         }
 
@@ -314,6 +327,7 @@ impl AppState {
             kind: kind.to_string(),
             spec,
             preset: preset.to_string(),
+            refresh: refresh.map(|s| s.to_string()),
         })
     }
 
@@ -447,6 +461,7 @@ fn source_row_to_record(row: SourceRow) -> Result<SourceRecord, Error> {
         kind,
         spec,
         preset: row.preset,
+        refresh: row.refresh,
     })
 }
 
@@ -853,6 +868,152 @@ mod tests {
             0,
             "url_scheduler should have 0 sources after remove_source"
         );
+    }
+
+    // --- #116: feed sources ---
+
+    #[tokio::test]
+    async fn add_feed_source_persists_clean_spec_and_config_json() {
+        let (_dir, state) = make_state().await;
+        state.add_store("notes", "private").await.unwrap();
+        let source = state
+            .add_source(
+                "notes",
+                "feed",
+                serde_json::json!({
+                    "url": "https://example.com/feed.xml",
+                    "max_entries": 25,
+                    "fetch_full_content": false,
+                }),
+                "prose",
+                None,
+            )
+            .await
+            .unwrap();
+
+        let fetched = state.get_source(&source.id).await.unwrap();
+        assert_eq!(fetched.kind, "feed");
+        assert_eq!(fetched.spec["url"], "https://example.com/feed.xml");
+        assert_eq!(fetched.spec["max_entries"], 25);
+        assert_eq!(fetched.spec["fetch_full_content"], false);
+        // Never leak the raw config_json blob through the reconstructed spec.
+        assert!(fetched.spec.get("config_json").is_none());
+    }
+
+    #[tokio::test]
+    async fn add_feed_source_bad_url_is_rejected() {
+        let (_dir, state) = make_state().await;
+        state.add_store("notes", "private").await.unwrap();
+        let result = state
+            .add_source(
+                "notes",
+                "feed",
+                serde_json::json!({"url": "ftp://example.com/feed.xml"}),
+                "prose",
+                None,
+            )
+            .await;
+        assert!(matches!(result, Err(Error::InvalidRequest { .. })));
+        assert!(state.list_sources("notes").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn add_feed_source_max_entries_zero_is_rejected() {
+        let (_dir, state) = make_state().await;
+        state.add_store("notes", "private").await.unwrap();
+        let result = state
+            .add_source(
+                "notes",
+                "feed",
+                serde_json::json!({
+                    "url": "https://example.com/feed.xml",
+                    "max_entries": 0,
+                }),
+                "prose",
+                None,
+            )
+            .await;
+        assert!(matches!(result, Err(Error::InvalidRequest { .. })));
+        assert!(state.list_sources("notes").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn add_feed_source_refresh_is_accepted_and_surfaced() {
+        let (_dir, state) = make_state().await;
+        state.add_store("notes", "private").await.unwrap();
+        let source = state
+            .add_source(
+                "notes",
+                "feed",
+                serde_json::json!({"url": "https://example.com/feed.xml"}),
+                "prose",
+                Some("1h"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(source.refresh.as_deref(), Some("1h"));
+
+        let fetched = state.get_source(&source.id).await.unwrap();
+        assert_eq!(fetched.refresh.as_deref(), Some("1h"));
+    }
+
+    #[tokio::test]
+    async fn add_feed_source_does_not_register_with_url_scheduler() {
+        // Feed refresh is persisted+validated but inert (#116) — the
+        // scheduler stays url-only, same stub status as pre-existing url
+        // refresh scheduling.
+        let (_dir, state) = make_state().await;
+        state.add_store("notes", "private").await.unwrap();
+        state
+            .add_source(
+                "notes",
+                "feed",
+                serde_json::json!({"url": "https://example.com/feed.xml"}),
+                "prose",
+                Some("1h"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(state.scheduler_source_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn add_source_same_url_across_kinds_is_rejected_known_limitation() {
+        // Known limitation (#116): `idx_sources_store_url` is UNIQUE on
+        // (store_id, url) regardless of kind, so a url source and a feed
+        // source can never coexist on the same URL within a store even
+        // though they index semantically different content (raw page vs.
+        // feed entries). This pins the current cross-kind ownership
+        // behavior; making the constraint kind-aware is a follow-up, not
+        // part of #116.
+        let (_dir, state) = make_state().await;
+        state.add_store("notes", "private").await.unwrap();
+        state
+            .add_source(
+                "notes",
+                "url",
+                serde_json::json!({"url": "https://example.com/same"}),
+                "prose",
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = state
+            .add_source(
+                "notes",
+                "feed",
+                serde_json::json!({"url": "https://example.com/same"}),
+                "prose",
+                None,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(Error::InvalidRequest { .. })),
+            "expected InvalidRequest (duplicate URL across kinds), got: {:?}",
+            result
+        );
+        assert_eq!(state.list_sources("notes").await.unwrap().len(), 1);
     }
 
     #[tokio::test]

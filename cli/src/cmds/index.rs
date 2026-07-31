@@ -172,24 +172,10 @@ pub(crate) async fn run_embedded_index(
                 Box::new(parser_chain),
                 Box::new(url_fetcher.clone()),
             )),
-            // TODO(T116): replace with
-            // `Box::new(ingest::FeedIngestor::new(Box::new(parser_chain), Box::new(url_fetcher.clone())))`
-            // once the ingest crate lands FeedIngestor.
-            SourceSpec::Feed { .. } => {
-                summary.errors += 1;
-                if mode.warn() {
-                    eprintln!(
-                        "warning: feed ingestion not yet wired for source {}",
-                        rt_source.id
-                    );
-                } else {
-                    eprintln!(
-                        "error indexing source {}: feed ingestion not yet wired",
-                        rt_source.id
-                    );
-                }
-                continue;
-            }
+            SourceSpec::Feed { .. } => Box::new(ingest::FeedIngestor::new(
+                Box::new(parser_chain),
+                Box::new(url_fetcher.clone()),
+            )),
         };
 
         let deps = SourceIngestionDeps {
