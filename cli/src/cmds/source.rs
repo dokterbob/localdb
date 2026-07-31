@@ -47,6 +47,22 @@ pub(crate) fn resolve_source_add_kind(
         });
     }
 
+    // An explicit `--kind url` bypasses `classify_source`, which is what
+    // normally guarantees a url-kind arg is `http(s)://`-shaped. Without this
+    // check, `source add /tmp/docs --kind url` would persist (exit 0) a url
+    // source whose locator can never parse — auto-index only warns, so the
+    // source would sit permanently unindexable. Mirror the feed arm's scheme
+    // requirement here; `--kind path` stays unrestricted (any string can be
+    // a path).
+    if kind == "url"
+        && kind_override.is_some()
+        && !(source_arg.starts_with("http://") || source_arg.starts_with("https://"))
+    {
+        return Err(Error::InvalidRequest {
+            message: format!("url source must be http(s): '{source_arg}'"),
+        });
+    }
+
     if kind == "feed" {
         let feed_spec = json!({
             "url": source_arg,
@@ -684,11 +700,31 @@ mod tests {
 
     #[test]
     fn resolve_source_add_kind_override_bypasses_classification() {
-        // A URL-shaped string can be forced to "path" and vice versa: #116
-        // says `--kind` overrides classification uniformly.
+        // A URL-shaped string can be forced to "path": #116 says `--kind`
+        // overrides classification uniformly. (The reverse — forcing a
+        // non-URL string to "url" — is rejected; see the scheme-check tests
+        // below.)
         let (kind, _) =
             resolve_source_add_kind("https://example.com/page", Some("path"), None, false).unwrap();
         assert_eq!(kind, "path");
+    }
+
+    #[test]
+    fn resolve_source_add_kind_rejects_kind_url_non_http_arg() {
+        // Explicit `--kind url` bypasses classify_source's http(s) shape
+        // guarantee; without a scheme check it would persist a url source
+        // that can never be indexed (auto-index only warns, exit 0).
+        let err = resolve_source_add_kind("/tmp/docs", Some("url"), None, false).unwrap_err();
+        assert!(matches!(err, Error::InvalidRequest { .. }));
+        assert!(err.to_string().contains("must be http(s)"));
+    }
+
+    #[test]
+    fn resolve_source_add_kind_accepts_kind_url_http_arg() {
+        let (kind, parsed) =
+            resolve_source_add_kind("https://example.com/page", Some("url"), None, false).unwrap();
+        assert_eq!(kind, "url");
+        assert!(parsed.is_none());
     }
 
     // --- source list formatting ---

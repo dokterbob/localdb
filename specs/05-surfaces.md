@@ -59,7 +59,7 @@ that feed ingestion in the default (discovery) mode fetches every entry's linked
 recommends `--max-entries` to bound that.
 
 `source list` (human) renders feed rows as `{id} [feed] {url} (max_entries=…, full_content=on|off)`
-— `…` is the configured integer or `none`. `--json` adds parsed `max_entries` (`null` or integer)
+— `…` is the configured integer or `unbounded`. `--json` adds parsed `max_entries` (`null` or integer)
 and `fetch_full_content` (bool), reconstructed from `config_json` (never the raw column), and now
 also surfaces `refresh` for both `url` and `feed` sources.
 

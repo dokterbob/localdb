@@ -206,10 +206,27 @@ pub fn parse_source_spec(kind: &str, spec: &serde_json::Value) -> Result<ParsedS
                     message: format!("feed source 'url' must be http(s): '{url}'"),
                 });
             }
-            let max_entries = spec
-                .get("max_entries")
-                .and_then(|v| v.as_u64())
-                .map(|n| n as u32);
+            // Strict decode: a present, non-null `max_entries` must be an
+            // integer that fits u32. `as_u64()` alone would silently treat
+            // negatives/floats as absent and `as u32` would truncate huge
+            // values (e.g. 4294967297 -> 1), mutating the caller's stated
+            // intent instead of rejecting it — this arm is the single
+            // validation authority for both CLI and HTTP surfaces.
+            let max_entries = match spec.get("max_entries") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(v) => match v.as_u64().filter(|&n| n <= u64::from(u32::MAX)) {
+                    Some(n) => Some(n as u32),
+                    None => {
+                        return Err(Error::InvalidRequest {
+                            message: format!(
+                                "feed source 'max_entries' must be a positive integer no \
+                                 greater than {}: {v}",
+                                u32::MAX
+                            ),
+                        })
+                    }
+                },
+            };
             let max_entries = validate_max_entries(max_entries)?;
             let fetch_full_content = spec
                 .get("fetch_full_content")
@@ -519,6 +536,43 @@ mod tests {
         });
         let err = parse_source_spec("feed", &spec).unwrap_err();
         assert!(matches!(err, Error::InvalidRequest { .. }));
+    }
+
+    /// A present, non-null `max_entries` that is not a u32-representable
+    /// integer must be rejected, never silently truncated (4294967297 -> 1)
+    /// or treated as absent (negative/float/string). Only reachable via the
+    /// HTTP surface — clap's u32 parser guards the CLI — but this arm is the
+    /// single validation authority for both.
+    #[test]
+    fn parse_source_spec_feed_max_entries_non_u32_rejected_not_truncated() {
+        for bad in [
+            serde_json::json!(u64::from(u32::MAX) + 2),
+            serde_json::json!(-5),
+            serde_json::json!(2.5),
+            serde_json::json!("25"),
+        ] {
+            let spec = serde_json::json!({
+                "url": "https://example.com/feed.xml",
+                "max_entries": bad,
+            });
+            let err = parse_source_spec("feed", &spec).unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidRequest { .. }),
+                "expected InvalidRequest for max_entries={bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_source_spec_feed_max_entries_explicit_null_is_unbounded() {
+        let spec = serde_json::json!({
+            "url": "https://example.com/feed.xml",
+            "max_entries": null,
+        });
+        let parsed = parse_source_spec("feed", &spec).unwrap();
+        let config = parse_feed_config_json(parsed.config_json.as_deref());
+        assert_eq!(config.max_entries, None);
+        assert!(config.fetch_full_content);
     }
 
     // --- parse_feed_config_json / build_feed_config_json ---
