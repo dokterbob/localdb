@@ -287,7 +287,7 @@ pub(crate) async fn list_indexed_documents(
     // `resources.id` maps back to `DocumentRecord.resource_id`.
     let mut rows = conn
         .query(
-            "SELECT id, uri, content_hash, policy_version
+            "SELECT id, uri, content_hash, policy_version, source_id
              FROM resources WHERE store_id = ?",
             params![store.store_id().to_string()],
         )
@@ -300,6 +300,7 @@ pub(crate) async fn list_indexed_documents(
             uri: row.get(1).map_err(map_libsql_err)?,
             content_hash: row.get(2).map_err(map_libsql_err)?,
             policy_version: row.get(3).map_err(map_libsql_err)?,
+            source_id: row.get(4).map_err(map_libsql_err)?,
         });
     }
     Ok(out)

@@ -595,6 +595,7 @@ impl RetrievalStore for FakeStore {
             seen.entry(chunk.uri.clone()).or_insert(DocumentRecord {
                 uri: chunk.uri.clone(),
                 resource_id: chunk.resource_id.clone(),
+                source_id: chunk.source_id.clone(),
                 content_hash: chunk.content_hash.clone(),
                 policy_version: chunk.policy_version.clone(),
             });

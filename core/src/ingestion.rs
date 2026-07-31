@@ -47,6 +47,10 @@ pub struct DocumentRecord {
     pub uri: String,
     /// Content-addressed document ID from last indexing.
     pub resource_id: String,
+    /// ID of the source that last indexed this document — the delete-sweep's
+    /// ownership key. Persisted as `resources.source_id` (baseline schema),
+    /// so rehydrated indexes know it for every row ever written.
+    pub source_id: String,
     /// blake3 content hash of normalized text from last indexing.
     pub content_hash: String,
     /// The policy version that was used to index this document.
@@ -895,11 +899,23 @@ pub async fn run_source_ingestion(
     // Delete-sweep: any URI known to this source's doc_index that was neither
     // yielded (on_resource) nor reported skipped (on_skipped) this run is
     // gone — delete it. A deleted file simply isn't enumerated again; a Gone
-    // URL is simply never yielded. Restricting to `is_uri_from_source` guards
-    // against sweeping another source's URIs out of a shared doc_index.
+    // URL is simply never yielded.
+    //
+    // Ownership is decided by `source_id`, never by comparing URI strings
+    // against the source's configured root/URL. The doc_index is store-wide,
+    // and URI-shape heuristics misattribute rows across sources: a root that
+    // is a string prefix of a sibling's (`/data/blog` vs `/data/blog-drafts`),
+    // or percent-encoding twins (a literal `foo%23` directory vs a `foo#`
+    // directory, whose canonical URIs are byte-identical), would let sweeping
+    // one source delete another source's live documents. `source_id` is exact:
+    // it is persisted per resource (baseline schema), rehydrated by
+    // `list_indexed_documents`, and immune to encoding.
     let existing_uris = doc_index.uris();
     for uri in existing_uris {
-        if !is_uri_from_source(&uri, source) {
+        let owned_by_this_source = doc_index
+            .get(&uri)
+            .is_some_and(|record| record.source_id == source.id);
+        if !owned_by_this_source {
             continue;
         }
         if seen.contains(&uri) {
@@ -1032,6 +1048,7 @@ impl IngestCallback for PipelineCallback<'_> {
                 self.doc_index.upsert(DocumentRecord {
                     uri: uri.clone(),
                     resource_id: resource.id.clone(),
+                    source_id: resource.source_id.clone(),
                     content_hash: resource.content_hash.clone(),
                     policy_version: self.config.policy_version.clone(),
                 });
@@ -1065,9 +1082,7 @@ impl IngestCallback for PipelineCallback<'_> {
 
     async fn on_skipped(&mut self, uri: &Uri, reason: SkipReason) {
         // `uri` is already canonical by construction (see `Ingestor::on_skipped`'s
-        // doc comment) — no normalization step belongs here. `normalize_uri`
-        // still exists, but only for reconciling raw, config-supplied
-        // strings (`is_uri_from_source`), never for a `Uri` already in hand.
+        // doc comment) — no normalization step belongs here.
         let uri = uri.as_str();
         self.seen.insert(uri.to_string());
         self.result.docs_seen += 1;
@@ -1124,132 +1139,6 @@ impl IngestCallback for PipelineCallback<'_> {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Normalize a raw URI/locator string to the same representation
-/// `Resource.uri` carries everywhere else in the pipeline (percent-encoded
-/// path bytes, lower-cased host, etc. — see `core/src/uri.rs`).
-///
-/// `on_skipped` no longer needs this: its `uri: &Uri` parameter is canonical
-/// by construction (see `Ingestor::on_skipped`'s doc comment), so there is no
-/// raw-locator-from-an-ingestor-callback case left to normalize. The
-/// remaining, permanent caller is `is_uri_from_source`, which compares a
-/// `DocumentIndex`/store key (always normalized) against a `root`/`url`
-/// string pulled straight from `SourceSpec` config — inherently raw, since it
-/// was never round-tripped through a `Uri` — before this function runs it
-/// through the same `Uri::parse` pipeline. Skipping that step would let a
-/// raw string containing a space, non-ASCII character, or non-canonical
-/// casing fail to match its own normalized resource, silently under- or
-/// over-sweeping on delete.
-///
-/// The `unwrap_or_else` fallback to the raw string is provably inert:
-/// `DocumentIndex` is populated only by `on_resource`'s `doc_index.upsert`,
-/// keyed by `resource.uri.as_str()`; every ingestor returns `Err` rather than
-/// reaching `on_resource` if its own `Uri::parse` fails. Every
-/// `DocumentIndex` key is therefore a successful parse's output, and a
-/// string that *fails* to parse here can never equal one. The fallback only
-/// prevents a panic or a dropped bookkeeping entry — it can never cause a
-/// false match.
-fn normalize_uri(raw: &str) -> String {
-    crate::uri::Uri::parse(raw)
-        .map(|u| u.as_str().to_string())
-        .unwrap_or_else(|| raw.to_string())
-}
-
-/// Check if a URI belongs to a given source.
-///
-/// For path sources, checks if the URI starts with `file://` + canonical root path.
-/// For URL sources, checks if the URI matches the source URL.
-///
-/// # Normalization (delete-sweep false-negative fix)
-///
-/// `uri` here is always one already stored in the `DocumentIndex`/store — i.e.
-/// `Resource.uri.as_str()`, which is a *normalized* `url::Url` string (percent
-/// -encoded path bytes, lower-cased host, a trailing `/` added when the URL
-/// crate considers the path empty, etc. — see `core/src/uri.rs`). Both arms
-/// below MUST compare against that same normalized representation, not a raw
-/// string built from config/filesystem data, or a root/URL containing a space,
-/// non-ASCII character, or non-canonical casing/trailing-slash would never
-/// match its own indexed resources and its documents would never be swept on
-/// delete (silent under-deletion). Normalization only changes byte
-/// *representation*, never decodes `/` vs `%2F`, so the boundary-aware
-/// string comparison (exact match, or match immediately followed by a literal
-/// `/`) remains sound: a percent-encoded slash in a URI can never be mistaken
-/// for a path boundary.
-///
-/// For the path arm, "the same representation" means *the same constructor*:
-/// `enumerate_dir` builds every stored URI with `Uri::from_file_path`, which
-/// percent-encodes the whole path including the reserved delimiters `#`, `?`
-/// and `%`. `Uri::parse` does not — there those characters open a fragment or
-/// query and truncate the path — so a prefix built by parsing
-/// `format!("file://{root}")` diverges from the stored URIs for exactly those
-/// roots. This function must therefore use `Uri::from_file_path` too.
-fn is_uri_from_source(uri: &str, source: &Source) -> bool {
-    match &source.spec {
-        SourceSpec::Path { root, .. } => {
-            // Resolve canonical root path (handles macOS /var -> /private/var symlink etc.)
-            let canonical_root = std::path::Path::new(root)
-                .canonicalize()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| root.clone());
-            // Trim any trailing '/' so the boundary check below is
-            // well-defined regardless of whether `root` came in (or
-            // canonicalized) with a trailing separator.
-            let canonical_root = canonical_root.trim_end_matches('/');
-
-            // Canonical prefix: byte-identical to how `enumerate_dir` builds
-            // every URI it stores. `None` when the root is not absolute —
-            // possible only if `canonicalize()` failed above and the
-            // configured root was relative, since `normalize_path_source`
-            // never absolutizes. A missing prefix just means this branch
-            // can't match; the legacy one below still can.
-            let canonical_prefix =
-                crate::uri::Uri::from_file_path(std::path::Path::new(canonical_root))
-                    .map(|u| u.as_str().trim_end_matches('/').to_string());
-
-            // Legacy prefix: the `Uri::parse` form that records indexed
-            // *before* the `Uri::from_file_path` switch were stored under.
-            // For any root without `#`, `?` or `%` this is byte-identical to
-            // the canonical prefix, so keeping it is a no-op for normal
-            // sources; for the affected roots it is what lets one
-            // post-upgrade run still sweep pre-upgrade records instead of
-            // orphaning them permanently. If parsing fails for some reason,
-            // `normalize_uri` falls back to the raw string: a false negative
-            // here only means "don't delete" (safe direction), never a panic.
-            let legacy_prefix = normalize_uri(&format!("file://{canonical_root}"))
-                .trim_end_matches('/')
-                .to_string();
-
-            // Boundary-aware match (C0): a plain `starts_with` here would
-            // let a sibling source whose root is a *string* prefix of this
-            // one (e.g. root=/data/blog vs root=/data/blog-drafts) be
-            // misattributed as "from this source". That misattribution is
-            // catastrophic during the delete-sweep in `run_source_ingestion`:
-            // sweeping source A would delete source B's live resources
-            // whenever B's ingestor didn't also run this cycle. Require an
-            // exact match on the root itself, or a match followed by a path
-            // separator, so only true descendants of `root` match.
-            let matches_prefix = |p: &str| uri == p || uri.starts_with(&format!("{p}/"));
-
-            canonical_prefix.as_deref().is_some_and(matches_prefix)
-                || matches_prefix(&legacy_prefix)
-        }
-        SourceSpec::Url { url, .. } => {
-            // Normalize the configured URL the same way the indexed URI was
-            // normalized (`normalize_uri`), so e.g. an uppercase host or a
-            // missing trailing slash in config still matches. Already
-            // boundary-safe either way: exact equality can't suffer the
-            // string-prefix misattribution the path arm above guards
-            // against. Falls back to raw comparison if the configured URL
-            // fails to parse (should not happen for a validated source, but
-            // never worse than the old behavior).
-            uri == normalize_uri(url)
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1287,6 +1176,7 @@ mod tests {
         let rec = DocumentRecord {
             uri: "file:///test.md".to_string(),
             resource_id: "doc-id-1".to_string(),
+            source_id: "src-1".to_string(),
             content_hash: "hash-1".to_string(),
             policy_version: "v1".to_string(),
         };
@@ -1301,6 +1191,7 @@ mod tests {
         let rec = DocumentRecord {
             uri: "file:///test.md".to_string(),
             resource_id: "doc-id-1".to_string(),
+            source_id: "src-1".to_string(),
             content_hash: "hash-1".to_string(),
             policy_version: "v1".to_string(),
         };
@@ -1827,300 +1718,6 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // C0 — is_uri_from_source boundary-aware matching
-    // ---------------------------------------------------------------------------
-
-    fn path_source(root: &str) -> Source {
-        Source {
-            id: new_ulid(),
-            store_id: "store-1".to_string(),
-            kind: SourceKind::Path,
-            spec: SourceSpec::Path {
-                root: root.to_string(),
-                include: vec![],
-                exclude: vec![],
-            },
-            source_preset: "prose".to_string(),
-        }
-    }
-
-    fn url_source(url: &str) -> Source {
-        Source {
-            id: new_ulid(),
-            store_id: "store-1".to_string(),
-            kind: SourceKind::Url,
-            spec: SourceSpec::Url {
-                url: url.to_string(),
-                refresh_interval_secs: None,
-            },
-            source_preset: "prose".to_string(),
-        }
-    }
-
-    #[test]
-    fn is_uri_from_source_sibling_string_prefix_root_does_not_match() {
-        // Regression (C0): root="/tmp/x/blog" is a *string* prefix of
-        // "/tmp/x/blog-drafts", but the latter is NOT a path descendant of
-        // the former. A plain `starts_with` on the raw prefix would
-        // misattribute blog-drafts's URIs to the "blog" source.
-        let base = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(base.path().join("blog")).unwrap();
-        std::fs::create_dir_all(base.path().join("blog-drafts")).unwrap();
-
-        let blog_root = base.path().join("blog").canonicalize().unwrap();
-        let source = path_source(blog_root.to_str().unwrap());
-
-        // The nested file need not exist; canonicalize only the parent dir.
-        let blog_drafts_root = base.path().join("blog-drafts").canonicalize().unwrap();
-        let sibling_uri = format!("file://{}/draft.md", blog_drafts_root.display());
-
-        assert!(
-            !is_uri_from_source(&sibling_uri, &source),
-            "blog-drafts URI must NOT be attributed to the blog source"
-        );
-    }
-
-    #[test]
-    fn is_uri_from_source_exact_root_matches() {
-        let dir = tempfile::tempdir().unwrap();
-        let canonical = dir.path().canonicalize().unwrap();
-        let source = path_source(canonical.to_str().unwrap());
-        let uri = format!("file://{}", canonical.display());
-        assert!(
-            is_uri_from_source(&uri, &source),
-            "the root URI itself must match its own source"
-        );
-    }
-
-    #[test]
-    fn is_uri_from_source_nested_file_matches() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("a").join("b")).unwrap();
-        let canonical = dir.path().canonicalize().unwrap();
-        let source = path_source(canonical.to_str().unwrap());
-        let uri = format!("file://{}/a/b/note.md", canonical.display());
-        assert!(
-            is_uri_from_source(&uri, &source),
-            "a nested descendant file must match its source's root"
-        );
-    }
-
-    #[test]
-    fn is_uri_from_source_url_exact_match_only() {
-        let source = url_source("https://example.com/blog");
-        assert!(is_uri_from_source("https://example.com/blog", &source));
-        // A URI that is merely a string-prefix-extension of the source URL
-        // must not match either — equality is already boundary-safe here,
-        // but pin the behavior explicitly alongside the path-arm fix.
-        assert!(!is_uri_from_source(
-            "https://example.com/blog-drafts/1",
-            &source
-        ));
-        assert!(!is_uri_from_source("https://example.com/blog/1", &source));
-    }
-
-    // ---------------------------------------------------------------------------
-    // Normalization fix — path root / config URL must compare against the same
-    // normalized representation the indexed URIs use (percent-encoding, host
-    // case-folding, url-crate trailing-slash-on-empty-path), or the
-    // delete-sweep silently never matches (under-deletion).
-    // ---------------------------------------------------------------------------
-
-    /// Pin exactly what `url::Url` (via `crate::uri::Uri`) does to a `file://`
-    /// URI built from a path containing a space and to an `https://` URI with
-    /// an uppercase host — this is the normalization the fix must match.
-    #[test]
-    fn uri_normalization_pins_percent_encoding_and_host_lowercasing() {
-        let file_uri = crate::uri::Uri::parse("file:///a/My Docs/x.md").unwrap();
-        assert_eq!(file_uri.as_str(), "file:///a/My%20Docs/x.md");
-
-        let http_uri = crate::uri::Uri::parse("https://EXAMPLE.com/Path").unwrap();
-        assert_eq!(http_uri.as_str(), "https://example.com/Path");
-
-        let no_path_uri = crate::uri::Uri::parse("https://example.com").unwrap();
-        assert_eq!(no_path_uri.as_str(), "https://example.com/");
-    }
-
-    #[test]
-    fn is_uri_from_source_path_root_with_space_matches_percent_encoded_resource_uri() {
-        // Regression: a root containing a space (or any percent-encodable
-        // char) previously never matched its own resources' normalized
-        // URIs, so a deleted file under it was never swept.
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("My Docs")).unwrap();
-        let root = dir.path().join("My Docs").canonicalize().unwrap();
-        let source = path_source(root.to_str().unwrap());
-
-        // Build the resource URI exactly the way enumerate_path_source +
-        // FileIngestor do: raw `file://<abs_path>` then `Uri::parse`.
-        let raw = format!("file://{}/notes.md", root.display());
-        let resource_uri = crate::uri::Uri::parse(&raw).unwrap();
-
-        assert!(
-            is_uri_from_source(resource_uri.as_str(), &source),
-            "space-containing root must match its own percent-encoded resource URI"
-        );
-    }
-
-    #[test]
-    fn is_uri_from_source_path_root_itself_with_space_matches() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("My Docs")).unwrap();
-        let root = dir.path().join("My Docs").canonicalize().unwrap();
-        let source = path_source(root.to_str().unwrap());
-
-        let raw = format!("file://{}", root.display());
-        let resource_uri = crate::uri::Uri::parse(&raw).unwrap();
-
-        assert!(is_uri_from_source(resource_uri.as_str(), &source));
-    }
-
-    // -----------------------------------------------------------------
-    // Reserved-delimiter roots (`#`, `?`, `%`). `Uri::from_file_path` —
-    // what `enumerate_dir` uses to build every stored URI — percent-encodes
-    // these (`#`->`%23`, `?`->`%3F`, `%`->`%25`). `Uri::parse` does not:
-    // there they are *delimiters* that truncate the path into a fragment or
-    // query. So the prefix this function compares against must be built with
-    // the same constructor, or a source rooted at such a path never matches
-    // its own records and its deleted files are never swept.
-    //
-    // Unix-only: `#` and `?` are not legal in Windows filenames (cf.
-    // `ingest/tests/file_ingestor_sweep_regression.rs`).
-    // -----------------------------------------------------------------
-
-    #[cfg(unix)]
-    #[test]
-    fn is_uri_from_source_path_root_with_hash_matches_enumerated_resource_uri() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("my#notes")).unwrap();
-        std::fs::write(dir.path().join("my#notes").join("note.md"), b"x").unwrap();
-        let root = dir.path().join("my#notes").canonicalize().unwrap();
-        let source = path_source(root.to_str().unwrap());
-
-        // Enumerate for real: this is byte-for-byte the URI that gets stored.
-        let found = enumerate_path_source(root.to_str().unwrap(), &[], &[]).unwrap();
-        assert_eq!(found.len(), 1);
-        let uri = found[0].uri.as_str();
-        assert!(
-            uri.contains("my%23notes"),
-            "sanity: `#` must be percent-encoded in the indexed URI, got: {uri}"
-        );
-
-        assert!(
-            is_uri_from_source(uri, &source),
-            "a `#`-containing root must match its own enumerated resource URI"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn is_uri_from_source_path_root_with_question_mark_matches_enumerated_resource_uri() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("what?now")).unwrap();
-        std::fs::write(dir.path().join("what?now").join("note.md"), b"x").unwrap();
-        let root = dir.path().join("what?now").canonicalize().unwrap();
-        let source = path_source(root.to_str().unwrap());
-
-        let found = enumerate_path_source(root.to_str().unwrap(), &[], &[]).unwrap();
-        assert_eq!(found.len(), 1);
-        let uri = found[0].uri.as_str();
-        assert!(
-            uri.contains("what%3Fnow"),
-            "sanity: `?` must be percent-encoded in the indexed URI, got: {uri}"
-        );
-
-        assert!(
-            is_uri_from_source(uri, &source),
-            "a `?`-containing root must match its own enumerated resource URI"
-        );
-    }
-
-    /// Pin (not guard): URIs indexed *before* the `Uri::from_file_path`
-    /// switch stored the `Uri::parse` form, where `#` opened a fragment and
-    /// the stored URI is `file://…/my` + `#notes/note.md`. The legacy prefix
-    /// branch keeps matching those so one post-upgrade run still sweeps them
-    /// instead of orphaning them forever.
-    #[cfg(unix)]
-    #[test]
-    fn is_uri_from_source_path_root_with_hash_still_matches_legacy_parse_form_uri() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("my#notes")).unwrap();
-        let root = dir.path().join("my#notes").canonicalize().unwrap();
-        let source = path_source(root.to_str().unwrap());
-
-        let legacy = crate::uri::Uri::parse(&format!("file://{}/note.md", root.display())).unwrap();
-        assert!(
-            legacy.as_str().contains('#'),
-            "sanity: the legacy form keeps a literal `#`, got: {}",
-            legacy.as_str()
-        );
-
-        assert!(
-            is_uri_from_source(legacy.as_str(), &source),
-            "pre-existing records in the legacy `Uri::parse` form must stay sweepable"
-        );
-    }
-
-    #[test]
-    fn is_uri_from_source_url_uppercase_host_matches_normalized_resource_uri() {
-        // Config says "EXAMPLE.com"; the indexed resource URI (as it would
-        // have been normalized by Uri::parse when the resource was fetched)
-        // is lower-cased. The comparison must normalize the config side too.
-        let source = url_source("https://EXAMPLE.com/blog");
-        let resource_uri = crate::uri::Uri::parse("https://EXAMPLE.com/blog").unwrap();
-        assert_eq!(resource_uri.as_str(), "https://example.com/blog");
-        assert!(is_uri_from_source(resource_uri.as_str(), &source));
-    }
-
-    #[test]
-    fn is_uri_from_source_url_missing_trailing_slash_matches_normalized_resource_uri() {
-        // url::Url adds a trailing "/" when the path is empty; config
-        // omitting it must still match the normalized indexed URI.
-        let source = url_source("https://example.com");
-        let resource_uri = crate::uri::Uri::parse("https://example.com").unwrap();
-        assert_eq!(resource_uri.as_str(), "https://example.com/");
-        assert!(is_uri_from_source(resource_uri.as_str(), &source));
-    }
-
-    #[test]
-    fn is_uri_from_source_percent_encoded_slash_cannot_fake_a_path_boundary() {
-        // A literal "%2F" (percent-encoded '/') appearing right after the
-        // root string must NOT be treated as a path separator: comparison is
-        // purely string-level (never percent-decoded), so "root%2Fevil" is
-        // correctly rejected as a distinct, non-descendant string — the
-        // boundary check requires an actual '/' byte immediately after the
-        // root, not a decoded one.
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("blog")).unwrap();
-        let root = dir.path().join("blog").canonicalize().unwrap();
-        let source = path_source(root.to_str().unwrap());
-
-        let fake_uri = format!("file://{}%2Fevil", root.display());
-        assert!(
-            !is_uri_from_source(&fake_uri, &source),
-            "a percent-encoded slash must not be treated as a path boundary"
-        );
-    }
-
-    #[test]
-    fn is_uri_from_source_sibling_string_prefix_root_still_does_not_match_after_normalization() {
-        // Re-pin C0 alongside the normalization fix: normalizing both sides
-        // must not reintroduce the sibling string-prefix bug.
-        let base = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(base.path().join("blog")).unwrap();
-        std::fs::create_dir_all(base.path().join("blog-drafts")).unwrap();
-
-        let blog_root = base.path().join("blog").canonicalize().unwrap();
-        let source = path_source(blog_root.to_str().unwrap());
-
-        let blog_drafts_root = base.path().join("blog-drafts").canonicalize().unwrap();
-        let raw = format!("file://{}/draft.md", blog_drafts_root.display());
-        let sibling_uri = crate::uri::Uri::parse(&raw).unwrap();
-
-        assert!(!is_uri_from_source(sibling_uri.as_str(), &source));
-    }
-
-    // ---------------------------------------------------------------------------
     // Pipeline tests — run_source_ingestion / index_resource
     //
     // Exercises the Ingestor-driven pipeline using a scripted FakeIngestor in
@@ -2229,6 +1826,7 @@ mod tests {
             DocumentRecord {
                 uri: uri.to_string(),
                 resource_id: resource.id.clone(),
+                source_id: source.id.clone(),
                 content_hash: resource.content_hash.clone(),
                 policy_version: config.policy_version.clone(),
             }
@@ -2901,8 +2499,8 @@ mod tests {
 
         // -----------------------------------------------------------------
         // 5b. Regression: delete-sweep must fire for a file under a
-        // space-containing root. Before the normalization fix,
-        // `is_uri_from_source`'s Path arm built its prefix from the raw
+        // space-containing root. Before the sweep filtered by `source_id`,
+        // it matched URIs against a prefix built from the raw
         // (non-percent-encoded) canonical root, which never matched the
         // percent-encoded `Resource.uri` a real file ingestor produces —
         // so a deleted file under such a root was silently never swept
@@ -2988,10 +2586,12 @@ mod tests {
         }
 
         /// Same shape as the space-root sweep above, but with a reserved URI
-        /// delimiter in the root. `Uri::from_file_path` encodes `#` as `%23`;
-        /// a prefix built with `Uri::parse` truncates at it into a fragment,
-        /// so the two sides diverge and the sweep silently skips the record —
-        /// the deleted file's chunks stay searchable forever.
+        /// delimiter in the root. `Uri::from_file_path` encodes `#` as `%23`,
+        /// while URI-shape heuristics built on `Uri::parse` truncate at `#`
+        /// (it opens a fragment) — historically that divergence made the
+        /// sweep silently skip such records, leaving the deleted file's
+        /// chunks searchable forever. Ownership by `source_id` is immune to
+        /// the root's encoding; this pins that.
         #[cfg(unix)]
         #[tokio::test]
         async fn delete_sweep_removes_file_under_hash_containing_root() {
@@ -3165,6 +2765,115 @@ mod tests {
                 !b_chunks.is_empty(),
                 "source B's document must survive sweeping source A, even though \
                  B's root string starts with A's root string"
+            );
+            assert!(
+                doc_index.get(&uri_b).is_some(),
+                "source B's doc_index record must remain"
+            );
+        }
+
+        /// Percent-encoding twin roots: source A's root is the *literal*
+        /// directory name `foo%23`, source B's root is `foo#`. B's documents
+        /// are stored under `file://…/foo%23/…` (canonical
+        /// `Uri::from_file_path` encodes `#` as `%23`) — byte-identical to
+        /// what a `Uri::parse`-built prefix for A's root produces, since
+        /// `%23` is already a valid percent-encoding that `Url::parse`
+        /// preserves. Any string-prefix heuristic therefore attributes B's
+        /// live rows to A, and sweeping only source A deletes B's documents.
+        /// The sweep must decide ownership by `source_id`, not by URI shape.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn delete_sweep_does_not_cross_percent_encoded_twin_roots() {
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let config = make_ingestion_config(store_id);
+
+            let base = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(base.path().join("foo%23")).unwrap();
+            std::fs::create_dir_all(base.path().join("foo#")).unwrap();
+            std::fs::write(
+                base.path().join("foo#").join("doc.md"),
+                b"Twin root content.",
+            )
+            .unwrap();
+            let root_a = base.path().join("foo%23").canonicalize().unwrap();
+            let root_b = base.path().join("foo#").canonicalize().unwrap();
+
+            let source_a = Source {
+                id: new_ulid(),
+                store_id: store_id.to_string(),
+                kind: SourceKind::Path,
+                spec: SourceSpec::Path {
+                    root: root_a.to_str().unwrap().to_string(),
+                    include: vec![],
+                    exclude: vec![],
+                },
+                source_preset: "prose".to_string(),
+            };
+            let source_b = Source {
+                id: new_ulid(),
+                store_id: store_id.to_string(),
+                kind: SourceKind::Path,
+                spec: SourceSpec::Path {
+                    root: root_b.to_str().unwrap().to_string(),
+                    include: vec![],
+                    exclude: vec![],
+                },
+                source_preset: "prose".to_string(),
+            };
+
+            // Enumerate B's root for real, so the stored URI is shaped exactly
+            // as production shapes it.
+            let found = enumerate_path_source(root_b.to_str().unwrap(), &[], &[]).unwrap();
+            assert_eq!(found.len(), 1);
+            let uri_b = found[0].uri.as_str().to_string();
+            assert!(
+                uri_b.contains("foo%23/"),
+                "sanity: B's canonical URI must encode `#` as `%23`, making it \
+                 collide with A's literal `foo%23` root"
+            );
+
+            let record_b = seed_indexed(
+                &store,
+                &embedder,
+                &config,
+                &source_b,
+                &uri_b,
+                "Twin root content.",
+            )
+            .await;
+
+            let mut doc_index = DocumentIndex::new();
+            doc_index.upsert(record_b.clone());
+
+            // Sweep source A only (its directory is empty; B does not run
+            // this cycle — e.g. `index --source A`).
+            let ingestor = FakeIngestor::new(vec![]);
+            let deps = SourceIngestionDeps {
+                doc_index: &mut doc_index,
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+                progress: None,
+            };
+            let result = run_source_ingestion(&source_a, &ingestor, deps)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                result.docs_deleted, 0,
+                "sweeping source A must not delete source B's live document, \
+                 even though A's literal `foo%23` root and B's encoded `foo#` \
+                 root produce byte-identical URI prefixes"
+            );
+            let b_chunks = store
+                .get_chunks_for_resource(&record_b.resource_id)
+                .await
+                .unwrap();
+            assert!(
+                !b_chunks.is_empty(),
+                "source B's chunks must survive sweeping source A"
             );
             assert!(
                 doc_index.get(&uri_b).is_some(),
