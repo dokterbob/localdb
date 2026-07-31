@@ -159,9 +159,10 @@ fn xmp_title(doc: &PdfDocument) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-/// Decode a PDF text string: UTF-16BE with BOM, UTF-8, or byte-per-char
-/// (PDFDocEncoding approximated as Latin-1 — exact for ASCII, close enough
-/// for a title).
+/// Decode a PDF text string (PDF spec ISO 32000-1 §7.9.2.2): UTF-16BE when it
+/// carries the `FE FF` BOM, otherwise PDFDocEncoding. UTF-8 is not a PDF text
+/// string encoding, but real-world producers emit it, so we try it first for
+/// the non-BOM case and fall back to PDFDocEncoding.
 fn decode_pdf_text_string(bytes: &[u8]) -> String {
     if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
         let units: Vec<u16> = bytes[2..]
@@ -172,7 +173,31 @@ fn decode_pdf_text_string(bytes: &[u8]) -> String {
     } else if let Ok(s) = std::str::from_utf8(bytes) {
         s.to_string()
     } else {
-        bytes.iter().map(|&b| b as char).collect()
+        bytes.iter().map(|&b| pdf_doc_encoding_char(b)).collect()
+    }
+}
+
+/// Map one PDFDocEncoding byte to its Unicode scalar (PDF spec ISO 32000-1
+/// Annex D.2). `0x00–0x7F` is ASCII and `0xA1–0xFF` matches Latin-1; only the
+/// `0x80–0xA0` block and a few undefined slots differ — casting the byte
+/// straight to `char` (Latin-1) mangles those (e.g. `0x80` is a bullet `•`,
+/// not U+0080). Undefined code points map to U+FFFD.
+fn pdf_doc_encoding_char(b: u8) -> char {
+    // The 0x80..=0xA0 block, in order. `\u{FFFD}` marks the two undefined
+    // slots (0x9F and 0xAD is handled below).
+    const HIGH: [char; 33] = [
+        '\u{2022}', '\u{2020}', '\u{2021}', '\u{2026}', '\u{2014}', '\u{2013}', '\u{0192}',
+        '\u{2044}', '\u{2039}', '\u{203A}', '\u{2212}', '\u{2030}', '\u{201E}', '\u{201C}',
+        '\u{201D}', '\u{2018}', '\u{2019}', '\u{201A}', '\u{2122}', '\u{FB01}', '\u{FB02}',
+        '\u{0141}', '\u{0152}', '\u{0160}', '\u{0178}', '\u{017D}', '\u{0131}', '\u{0142}',
+        '\u{0153}', '\u{0161}', '\u{017E}', '\u{FFFD}', '\u{20AC}',
+    ];
+    match b {
+        0x80..=0xA0 => HIGH[(b - 0x80) as usize],
+        // Undefined in PDFDocEncoding (soft hyphen slot).
+        0xAD => '\u{FFFD}',
+        // 0x00..=0x7F ASCII and 0xA1..=0xFF (minus 0xAD) match Latin-1.
+        _ => b as char,
     }
 }
 
@@ -352,8 +377,26 @@ mod tests {
     }
 
     #[test]
-    fn decode_pdf_text_string_handles_latin1_bytes() {
-        // 0xE9 = é in Latin-1; invalid as standalone UTF-8.
+    fn decode_pdf_text_string_handles_high_latin1_bytes() {
+        // 0xE9 = é: PDFDocEncoding matches Latin-1 for 0xA1..=0xFF. Invalid as
+        // standalone UTF-8, so this exercises the PDFDocEncoding fallback.
         assert_eq!(decode_pdf_text_string(&[0x63, 0x61, 0x66, 0xE9]), "café");
+    }
+
+    #[test]
+    fn decode_pdf_text_string_maps_pdfdocencoding_high_block() {
+        // 0x80 is a bullet in PDFDocEncoding, NOT the Latin-1 control U+0080.
+        assert_eq!(decode_pdf_text_string(&[0x80]), "•");
+        // 0xA0 is the Euro sign in PDFDocEncoding.
+        assert_eq!(decode_pdf_text_string(&[0xA0]), "€");
+        // A word using the fi-ligature slot (0x93).
+        assert_eq!(decode_pdf_text_string(&[0x93]), "ﬁ");
+    }
+
+    #[test]
+    fn pdf_doc_encoding_char_ascii_and_undefined() {
+        assert_eq!(pdf_doc_encoding_char(b'A'), 'A');
+        assert_eq!(pdf_doc_encoding_char(0xAD), '\u{FFFD}'); // undefined slot
+        assert_eq!(pdf_doc_encoding_char(0x9F), '\u{FFFD}'); // undefined slot
     }
 }

@@ -512,16 +512,30 @@ pub fn markdown_to_blocks_with_pages(markdown: &str, page_starts: &[(usize, u32)
 // compute_blocks_hash
 // ---------------------------------------------------------------------------
 
-/// Compute a content hash from block kind and text, joined with separators.
+/// Compute a content hash from block kind, text, and page, joined with separators.
 ///
 /// Each block contributes `"kind:text"` and entries are separated by `\x00`
 /// (NUL byte) to prevent cross-block collisions. Including the block kind
 /// ensures that structural changes (e.g. paragraph→heading with same text)
 /// trigger re-indexing.
+///
+/// When a block carries a page number (paginated formats — PDF, #103) it is
+/// folded in as a `\x01p{page}` suffix, so a **repagination that leaves the
+/// text and kinds unchanged still changes the hash** and re-indexes — otherwise
+/// the skip-check (which keys on this hash) would leave stored citations on
+/// their old, now-wrong pages. Blocks without a page (every non-paginated
+/// format) contribute no suffix, so their hashes are unchanged from before this
+/// addition — no spurious global reindex.
 pub fn compute_blocks_hash(blocks: &[Block]) -> String {
     let combined: String = blocks
         .iter()
-        .map(|b| format!("{}:{}", b.kind.kind_str(), b.text))
+        .map(|b| {
+            let base = format!("{}:{}", b.kind.kind_str(), b.text);
+            match b.location.as_ref().and_then(|loc| loc.page) {
+                Some(page) => format!("{base}\x01p{page}"),
+                None => base,
+            }
+        })
         .collect::<Vec<_>>()
         .join("\x00");
     content_hash(&combined)
@@ -1116,6 +1130,66 @@ Para three.
             Some(5),
             "content before the first page start attributes to the first page"
         );
+    }
+
+    /// #103 fingerprint: a repagination (same text/kinds, different page)
+    /// changes `compute_blocks_hash`, so the skip-check re-indexes instead of
+    /// leaving citations on stale pages.
+    #[test]
+    fn blocks_hash_changes_with_page() {
+        let block = |page: Option<u32>| Block {
+            seq: 0,
+            kind: BlockKind::Text,
+            text: "Identical body text.".to_string(),
+            location: page.map(|p| BlockLocation {
+                page: Some(p),
+                ..Default::default()
+            }),
+        };
+        let h1 = compute_blocks_hash(&[block(Some(1))]);
+        let h2 = compute_blocks_hash(&[block(Some(2))]);
+        assert_ne!(h1, h2, "moving a block to a new page must change the hash");
+    }
+
+    /// A block with no page (every non-paginated format) hashes identically to
+    /// before page folding — the suffix is added only when a page is present,
+    /// so there is no spurious global reindex.
+    #[test]
+    fn blocks_hash_unchanged_without_page() {
+        let paged = Block {
+            seq: 0,
+            kind: BlockKind::Text,
+            text: "Body.".to_string(),
+            location: Some(BlockLocation {
+                page: None,
+                ..Default::default()
+            }),
+        };
+        let no_loc = Block {
+            seq: 0,
+            kind: BlockKind::Text,
+            text: "Body.".to_string(),
+            location: None,
+        };
+        // A location with page=None contributes no suffix, matching a block
+        // with no location at all and the pre-#103 `{kind}:{text}` hash.
+        assert_eq!(
+            compute_blocks_hash(&[paged]),
+            compute_blocks_hash(&[no_loc])
+        );
+        assert_eq!(
+            compute_blocks_hash(&[no_loc_block("Body.")]),
+            content_hash("text:Body.")
+        );
+    }
+
+    fn no_loc_block(text: &str) -> Block {
+        Block {
+            seq: 0,
+            kind: BlockKind::Text,
+            text: text.to_string(),
+            location: None,
+        }
     }
 
     /// Frontmatter with CRLF line endings is detected correctly.

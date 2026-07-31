@@ -60,13 +60,17 @@ The `release.yml` `Verify no unexpected dynamic dependencies` step enforces this
 
 ## MSRV
 
-| Platform | Minimum Rust version | Reason |
-|---|---|---|
-| Linux | 1.82 | workspace MSRV |
-| macOS | 1.85 | edition-2024 `hf-hub` 1.0 pulled in by CoreML path |
+The workspace MSRV is **Rust 1.88** on every platform, declared as `rust-version`
+in the root `Cargo.toml`.
 
-CI uses `dtolnay/rust-toolchain@stable` and the `macos-14` `coreml` job already uses ≥1.85,
-so CI is unaffected. Only the source-install instructions note the split MSRV.
+| Component | Floor | Reason |
+|---|---|---|
+| Workspace (all platforms) | 1.88 | `image` 0.25 pulled in by the `pdf_oxide` PDF parser requires 1.88 |
+| macOS CoreML path | 1.85 | edition-2024 `hf-hub` 1.0 (subsumed by the 1.88 workspace floor) |
+| Linux (historical) | 1.82 | pre-`pdf_oxide` workspace floor (subsumed) |
+
+CI uses `dtolnay/rust-toolchain@stable`, which is well past 1.88, so CI is unaffected.
+The 1.88 floor is uniform now — there is no longer a per-platform split.
 
 ## Tarball naming
 

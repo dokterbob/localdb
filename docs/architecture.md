@@ -230,7 +230,8 @@ model can run on Apple's ANE/GPU via a CoreML backend in `embed`, behind the opt
 `cargo build -p localdb --features local-coreml`. Because the feature pulls edition-2024
 dependencies (`hf-hub` 1.0), it requires **Rust ≥ 1.85**; the workspace `rust-version` is `1.85`.
 Default builds (feature off) are unaffected and remain ONNX-only — Linux and CI default builds
-never touch any CoreML code.
+never touch any CoreML code. (Since the `pdf_oxide` PDF parser landed, the workspace
+`rust-version` is `1.88` on all platforms — the CoreML 1.85 floor is subsumed.)
 
 The default `local` provider auto-selects CoreML on Apple Silicon when the feature is built and
 the bundle loads, otherwise falls back to ONNX (CPU). `local-coreml` forces CoreML (hard error if
@@ -322,10 +323,13 @@ The `extractor_version` field is hardcoded (`"1"` in both ingestors and in
 check keys only on `content_hash`. The `pdf-extract` → `pdf_oxide` swap changes
 the extracted text of every PDF, so the content hash changes and PDFs re-index
 automatically on the next `localdb index` (picking up page citations and better
-text). The residual risk: if a new parser ever produces *byte-identical* text
-for some PDF, its hash is unchanged and that document stays stale (and page-less)
-with no re-extraction. Threading a real per-parser `extractor_version` into the
-skip-check is a deferred follow-up (cross-ref [#47](https://github.com/dokterbob/localdb/issues/47)).
+text). `compute_blocks_hash` folds in each block's page, so a *repagination*
+that leaves text and kinds unchanged also changes the hash and re-indexes. The
+one residual gap: if a future parser change produces *byte-identical* text **and
+identical pages** for some PDF, the hash is unchanged and that document is not
+re-extracted. Threading a real per-parser `extractor_version` into the
+skip-check would close that last axis and is a deferred follow-up (cross-ref
+[#47](https://github.com/dokterbob/localdb/issues/47)).
 
 ---
 
