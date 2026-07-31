@@ -134,6 +134,7 @@ pub(crate) mod test_doubles {
     use localdb_core::block::Resource;
     use localdb_core::error::Error;
     use localdb_core::ingestor::{IngestCallback, SkipReason};
+    use localdb_core::uri::Uri;
 
     /// Records every callback invocation for assertions, instead of silently
     /// dropping progress signals the way a minimal fake normally would.
@@ -155,8 +156,8 @@ pub(crate) mod test_doubles {
             self.discovered.push(total);
         }
 
-        async fn on_skipped(&mut self, uri: &str, reason: SkipReason) {
-            self.skipped.push((uri.to_string(), reason));
+        async fn on_skipped(&mut self, uri: &Uri, reason: SkipReason) {
+            self.skipped.push((uri.as_str().to_string(), reason));
         }
     }
 }

@@ -14,7 +14,6 @@ use localdb_core::ingestor::{IngestCallback, IngestResult, IngestSource, Ingesto
 use localdb_core::markdown_blocks::{compute_blocks_hash, markdown_to_blocks};
 use localdb_core::metadata::{DocumentMetadata, Metadata};
 use localdb_core::parser::{Parser, Probe};
-use localdb_core::uri::Uri;
 
 use crate::support::{catch_panic, detect_mime, format_unix_secs};
 
@@ -186,7 +185,7 @@ impl Ingestor for FileIngestor {
 
             let blocks = markdown_to_blocks(&parsed.markdown);
             let hash = compute_blocks_hash(&blocks);
-            let res_id = resource_id(&file.uri, &hash);
+            let res_id = resource_id(file.uri.as_str(), &hash);
 
             // Title merge: extraction-level title fills `metadata.title` only
             // when the parser left it `None`. `Resource.title` mirrors the
@@ -204,10 +203,7 @@ impl Ingestor for FileIngestor {
                 source_id: source.source_id.clone(),
                 ingestor_kind: IngestorKind::File,
                 resource_kind: ResourceKind::Document,
-                uri: Uri::parse(&file.uri).ok_or_else(|| Error::Internal {
-                    message: format!("FileIngestor: invalid URI '{}'", file.uri),
-                    correlation_id: "file_ingestor_uri".to_string(),
-                })?,
+                uri: file.uri.clone(),
                 external_id: None,
                 external_etag: None,
                 content_hash: hash,

@@ -70,13 +70,33 @@ impl Ingestor for UrlIngestor {
             });
         }
 
+        // Parse every configured URL into a canonical `Uri` up front, before
+        // any fetching starts. `on_skipped` now takes `&Uri` (core owns
+        // identity/normalization; see `Ingestor::on_skipped`'s doc comment),
+        // and every skip site below as well as the resource-construction
+        // site need one — hoisting this here means each URL is parsed
+        // exactly once and shared by all of them, and an unparseable config
+        // URL fails the whole run fast (a single `Error::Internal` before
+        // any I/O), rather than surfacing deep in the loop only once that
+        // particular URL's turn came up.
+        let urls: Vec<(String, Uri)> = urls
+            .into_iter()
+            .map(|u| {
+                let uri = Uri::parse(&u).ok_or_else(|| Error::Internal {
+                    message: format!("UrlIngestor: invalid URI '{}'", u),
+                    correlation_id: "url_ingestor_uri".to_string(),
+                })?;
+                Ok((u, uri))
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+
         // Report the batch size as `Discovered`, matching the contract
         // `FileIngestor` follows (total known after enumeration).
         callback.on_discovered(urls.len()).await;
 
         let mut result = IngestResult::default();
 
-        for url in &urls {
+        for (url, uri) in &urls {
             let fetch_meta = FetchMetadata::default();
             // Note: conditional-GET metadata is always the default here (no
             // previously-stored ETag/Last-Modified is threaded in) — a known
@@ -96,7 +116,7 @@ impl Ingestor for UrlIngestor {
                     // Other) so the pipeline counts this as an error rather
                     // than a benign skip (C8).
                     callback
-                        .on_skipped(url, SkipReason::Error(format!("fetch error: {e}")))
+                        .on_skipped(uri, SkipReason::Error(format!("fetch error: {e}")))
                         .await;
                     result.errors += 1;
                     continue;
@@ -110,7 +130,7 @@ impl Ingestor for UrlIngestor {
                     ..
                 } => (bytes, content_type),
                 FetchResult::NotModified => {
-                    callback.on_skipped(url, SkipReason::Unchanged).await;
+                    callback.on_skipped(uri, SkipReason::Unchanged).await;
                     result.resources_skipped += 1;
                     continue;
                 }
@@ -143,13 +163,13 @@ impl Ingestor for UrlIngestor {
                 match catch_panic(std::panic::AssertUnwindSafe(|| self.parser.parse(&probe))) {
                     Err(panic_msg) => {
                         tracing::warn!(url = %url, "UrlIngestor: parser panicked: {}", panic_msg);
-                        callback.on_skipped(url, SkipReason::Error(panic_msg)).await;
+                        callback.on_skipped(uri, SkipReason::Error(panic_msg)).await;
                         result.errors += 1;
                         continue;
                     }
                     Ok(Ok(Some(doc))) => doc,
                     Ok(Ok(None)) => {
-                        callback.on_skipped(url, SkipReason::Unsupported).await;
+                        callback.on_skipped(uri, SkipReason::Unsupported).await;
                         result.resources_skipped += 1;
                         continue;
                     }
@@ -161,7 +181,7 @@ impl Ingestor for UrlIngestor {
                         // failure would erase the URL's previously indexed
                         // chunks. Mirror FileIngestor's aliveness rule.
                         callback
-                            .on_skipped(url, SkipReason::Error(format!("parser error: {e}")))
+                            .on_skipped(uri, SkipReason::Error(format!("parser error: {e}")))
                             .await;
                         result.errors += 1;
                         continue;
@@ -186,10 +206,7 @@ impl Ingestor for UrlIngestor {
                 source_id: source.source_id.clone(),
                 ingestor_kind: IngestorKind::Url,
                 resource_kind: ResourceKind::Document,
-                uri: Uri::parse(url).ok_or_else(|| Error::Internal {
-                    message: format!("UrlIngestor: invalid URI '{}'", url),
-                    correlation_id: "url_ingestor_uri".to_string(),
-                })?,
+                uri: uri.clone(),
                 external_id: None,
                 external_etag: None,
                 content_hash: hash,
@@ -324,6 +341,56 @@ mod tests {
         let mut cb = RecordingCallback::default();
         let result = ingestor.ingest(&source, &mut cb).await;
         assert!(result.is_err(), "missing url should error");
+    }
+
+    /// `Ingestor::on_skipped` now takes `&Uri`, so `UrlIngestor` must hold a
+    /// canonical `Uri` for every configured URL before it can report
+    /// anything through the callback. This test pins the resulting
+    /// fail-fast contract: an unparseable config URL is rejected by the
+    /// `Uri::parse` hoisted to the top of `ingest()`, before any network
+    /// I/O — not discovered lazily once that URL's turn comes up in the
+    /// loop. A well-formed URL earlier in the batch does not get fetched
+    /// either: the whole run fails as one unit, which is the direct
+    /// replacement for the old core-level
+    /// `on_skipped_unparseable_locator_falls_back_without_panic` test (that
+    /// test's raw-string fallback path is unreachable now that
+    /// `on_skipped` no longer accepts anything but an already-valid `Uri`).
+    #[tokio::test]
+    async fn invalid_config_url_fails_fast() {
+        let content = b"# OK\n\nBody.\n".to_vec();
+        let mut script = HashMap::new();
+        script.insert(
+            "https://example.com/ok".to_string(),
+            ScriptedOutcome::Downloaded {
+                bytes: content,
+                content_type: None,
+            },
+        );
+        let fetcher = ScriptedFetcher::new(script);
+
+        let ingestor = UrlIngestor::new(Box::new(AllParser), Box::new(fetcher));
+        // The first URL is well-formed; the second is not a parseable URI at
+        // all ("not a valid uri" has no scheme).
+        let source = source_with_urls(&["https://example.com/ok", "not a valid uri"]);
+        let mut cb = RecordingCallback::default();
+        let result = ingestor.ingest(&source, &mut cb).await;
+
+        assert!(
+            result.is_err(),
+            "an unparseable config URL must fail the whole run, not just its own entry"
+        );
+        assert!(
+            cb.resources.is_empty(),
+            "fail-fast happens before any URL is fetched or yielded"
+        );
+        assert!(
+            cb.skipped.is_empty(),
+            "fail-fast happens before any on_skipped call, including for the good URL"
+        );
+        assert!(
+            cb.discovered.is_empty(),
+            "fail-fast happens before on_discovered — no URL is ever queried"
+        );
     }
 
     #[tokio::test]

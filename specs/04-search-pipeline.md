@@ -52,6 +52,12 @@ File deleted / URL gone (404 or 410 after retry) / source removed → delete tha
 chunks and the resource itself from the backend. Deletes are data-modifying: ≥ 90% coverage
 gate ([01-architecture.md](01-architecture.md) §7).
 
+A resource stays alive across a run if it is observed via **either** `on_resource` or
+`on_skipped` — the delete-sweep removes only a URI that neither hook reported this run.
+`on_skipped` takes an already-canonical `Uri`, the same representation `on_resource`'s
+`Resource.uri` carries, so both hooks populate the sweep's "seen" set in one consistent key
+space.
+
 ## 2. Extraction (v1 matrix)
 
 The parser chain is an implementation detail of the `file` and `url` ingestors. Parsers
