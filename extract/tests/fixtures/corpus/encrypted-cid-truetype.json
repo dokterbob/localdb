@@ -1,0 +1,12 @@
+{
+  "file": "encrypted-cid-truetype.pdf",
+  "expect": "any",
+  "pages": 2,
+  "page_phrases": {
+    "1": ["Invoice# INV-000050", "Hedwig Tech Sagl"],
+    "2": []
+  },
+  "forbid_substrings": ["�"],
+  "title_contains": null,
+  "notes": "RC4-encrypted PDF with a CID/TrueType embedded font; page 1 renders a Swiss invoice from 'Hedwig Tech Sagl' (Lugano, Switzerland) billed to 'Plan B Network SA', invoice INV-000050 dated 22/11/2024, subject 'PlanB network lesson Invoice', line item 'Time & Material for 3h lesson in Lugano University', total CHF574.01 with a CHF0.00 balance due; also includes a Bitcoin address and Signal contact in the notes footer. Page 2 renders as a fully blank white page (only a footer page number '2' and a horizontal rule) with no other extractable text -- page_phrases for page 2 is intentionally empty. Extraction may legitimately fail given RC4 encryption; test only needs to avoid mojibake ('�') and a panic."
+}

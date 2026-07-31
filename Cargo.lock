@@ -1701,6 +1701,7 @@ dependencies = [
  "pulldown-cmark",
  "rbook",
  "scraper 0.27.0",
+ "serde_json",
  "tracing",
  "zip 2.4.2",
 ]

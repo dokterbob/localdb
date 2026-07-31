@@ -235,7 +235,10 @@ pub fn markdown_to_blocks_with_pages(markdown: &str, page_starts: &[(usize, u32)
                     pulldown_cmark::CodeBlockKind::Indented => None,
                 };
                 flush_text!(blocks, seq, text_accum);
-                stack.push(ActiveBlock::new(ActiveKind::Code { language: lang }, offset));
+                stack.push(ActiveBlock::new(
+                    ActiveKind::Code { language: lang },
+                    offset,
+                ));
             }
 
             Event::Start(Tag::BlockQuote(_)) => {
@@ -368,7 +371,13 @@ pub fn markdown_to_blocks_with_pages(markdown: &str, page_starts: &[(usize, u32)
                         lines.extend(b.table_rows.iter().map(|r| render_row(r)));
                         lines.join("\n")
                     };
-                    push_block!(blocks, seq, BlockKind::Table { headers, rows }, text, b.start);
+                    push_block!(
+                        blocks,
+                        seq,
+                        BlockKind::Table { headers, rows },
+                        text,
+                        b.start
+                    );
                 }
             }
 

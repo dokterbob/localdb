@@ -3712,12 +3712,8 @@ mod tests {
                 },
             ];
 
-            let resource = make_resource_with_blocks(
-                "file:///docs/paged.pdf",
-                &source.id,
-                store_id,
-                blocks,
-            );
+            let resource =
+                make_resource_with_blocks("file:///docs/paged.pdf", &source.id, store_id, blocks);
             let deps = IndexResourceDeps {
                 store: &store,
                 embedder: &embedder,
@@ -3728,10 +3724,7 @@ mod tests {
                 .unwrap();
             assert!(written >= 3, "expected at least one chunk per block");
 
-            let chunks = store
-                .get_chunks_for_resource(&resource.id)
-                .await
-                .unwrap();
+            let chunks = store.get_chunks_for_resource(&resource.id).await.unwrap();
 
             // Each chunk's page is that of its originating block seq.
             let page_for_seq = |seq: u32| -> Vec<Option<u32>> {
@@ -3741,8 +3734,14 @@ mod tests {
                     .map(|c| c.page)
                     .collect()
             };
-            assert!(page_for_seq(0).iter().all(|p| *p == Some(1)), "block 0 → page 1");
-            assert!(page_for_seq(1).iter().all(|p| *p == Some(2)), "block 1 → page 2");
+            assert!(
+                page_for_seq(0).iter().all(|p| *p == Some(1)),
+                "block 0 → page 1"
+            );
+            assert!(
+                page_for_seq(1).iter().all(|p| *p == Some(2)),
+                "block 1 → page 2"
+            );
             assert!(
                 page_for_seq(2).iter().all(|p| p.is_none()),
                 "block 2 has no location → page None"
