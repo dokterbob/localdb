@@ -9,9 +9,12 @@
 //! mtime/mime handling, panic tolerance, title merge, and conditional-fetch
 //! skip/delete semantics.
 
+pub mod feed_ingestor;
 pub mod file_ingestor;
 pub mod support;
 pub mod url_ingestor;
+pub(crate) mod url_pipeline;
 
+pub use feed_ingestor::FeedIngestor;
 pub use file_ingestor::FileIngestor;
 pub use url_ingestor::UrlIngestor;

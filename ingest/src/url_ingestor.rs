@@ -4,18 +4,14 @@
 //! `file_ingestor` module docs for the general rationale for keeping
 //! acquisition I/O out of `core`.
 
-use extract::sniff_mime;
-use localdb_core::block::{IngestorKind, Resource, ResourceKind};
+use localdb_core::block::IngestorKind;
 use localdb_core::error::Error;
-use localdb_core::ids::resource_id;
-use localdb_core::ingestion::{now_rfc3339, FetchMetadata, FetchResult, UrlFetcher};
+use localdb_core::ingestion::UrlFetcher;
 use localdb_core::ingestor::{IngestCallback, IngestResult, IngestSource, Ingestor, SkipReason};
-use localdb_core::markdown_blocks::{compute_blocks_hash, markdown_to_blocks};
-use localdb_core::metadata::{DocumentMetadata, Metadata};
-use localdb_core::parser::{Parser, Probe};
+use localdb_core::parser::Parser;
 use localdb_core::uri::Uri;
 
-use crate::support::catch_panic;
+use crate::url_pipeline::{process_url, ResourceEnrichment, UrlOutcome};
 
 /// URL ingestor.
 ///
@@ -95,143 +91,31 @@ impl Ingestor for UrlIngestor {
         callback.on_discovered(urls.len()).await;
 
         let mut result = IngestResult::default();
+        let enrichment = ResourceEnrichment::default();
 
         for (url, uri) in &urls {
-            let fetch_meta = FetchMetadata::default();
-            // Note: conditional-GET metadata is always the default here (no
-            // previously-stored ETag/Last-Modified is threaded in) — a known
-            // gap, marked with a `TODO` in `core::ingestion`.
-            let fetch_result = match self.fetcher.fetch(url, &fetch_meta).await {
-                Ok(r) => r,
-                Err(e) => {
-                    // A single fetch failure is counted and the batch
-                    // continues rather than aborting the whole run, per the
-                    // test plan's "fetch error -> errors counter" requirement.
-                    tracing::warn!(url = %url, "UrlIngestor: fetch error: {}", e);
-                    // Report via on_skipped so the delete-sweep keeps this
-                    // URL's previously indexed content: a transient network
-                    // failure is not evidence the resource is gone (contrast
-                    // with FetchResult::Gone below, which stays silent
-                    // precisely so the sweep deletes). SkipReason::Error (not
-                    // Other) so the pipeline counts this as an error rather
-                    // than a benign skip (C8).
-                    callback
-                        .on_skipped(uri, SkipReason::Error(format!("fetch error: {e}")))
-                        .await;
-                    result.errors += 1;
-                    continue;
-                }
-            };
+            let outcome = process_url(
+                self.parser.as_ref(),
+                self.fetcher.as_ref(),
+                url,
+                uri,
+                source,
+                IngestorKind::Url,
+                &enrichment,
+                callback,
+                &mut result,
+            )
+            .await?;
 
-            let (bytes, content_type) = match fetch_result {
-                FetchResult::Downloaded {
-                    bytes,
-                    content_type,
-                    ..
-                } => (bytes, content_type),
-                FetchResult::NotModified => {
-                    callback.on_skipped(uri, SkipReason::Unchanged).await;
-                    result.resources_skipped += 1;
-                    continue;
-                }
-                FetchResult::Gone => {
-                    // The resource is confirmed absent (404/410 after
-                    // retry). Do NOT yield a Resource and do NOT call
-                    // `on_skipped`: the pipeline's delete-sweep treats every
-                    // URI reported via `on_resource`/`on_skipped` as still
-                    // alive, and removes indexed content only for URIs that
-                    // were never reported. Staying silent here is what gets
-                    // this URI's chunks deleted (specs/01-architecture.md,
-                    // ingestion pipeline shape).
-                    tracing::info!(url = %url, "UrlIngestor: URL is gone (404/410)");
-                    continue;
-                }
-            };
-
-            let filename = url.split('/').next_back().map(|s| s.to_string());
-            // `sniff_mime` over bytes+filename feeds the parser chain's
-            // `Probe`, not the HTTP `Content-Type` header (the parser chain
-            // never receives that header either).
-            let sniffed = sniff_mime(&bytes, filename.as_deref());
-            let probe = Probe::new(&bytes, Some(url.as_str()), sniffed.as_deref());
-
-            // Panic-tolerant parsing — see `file_ingestor` for the rationale.
-            // A panic IS an error (C8, matching the old pipeline's behavior
-            // of folding panics into the error count), so it's reported via
-            // SkipReason::Error rather than the benign-skip counter.
-            let parsed =
-                match catch_panic(std::panic::AssertUnwindSafe(|| self.parser.parse(&probe))) {
-                    Err(panic_msg) => {
-                        tracing::warn!(url = %url, "UrlIngestor: parser panicked: {}", panic_msg);
-                        callback.on_skipped(uri, SkipReason::Error(panic_msg)).await;
-                        result.errors += 1;
-                        continue;
-                    }
-                    Ok(Ok(Some(doc))) => doc,
-                    Ok(Ok(None)) => {
-                        callback.on_skipped(uri, SkipReason::Unsupported).await;
-                        result.resources_skipped += 1;
-                        continue;
-                    }
-                    Ok(Err(e)) => {
-                        tracing::warn!(url = %url, "UrlIngestor: parser error: {}", e);
-                        // C7: this arm previously never called on_skipped at
-                        // all, silently orphaning the URL from the
-                        // delete-sweep's "seen" set — a transient parser
-                        // failure would erase the URL's previously indexed
-                        // chunks. Mirror FileIngestor's aliveness rule.
-                        callback
-                            .on_skipped(uri, SkipReason::Error(format!("parser error: {e}")))
-                            .await;
-                        result.errors += 1;
-                        continue;
-                    }
-                };
-
-            let blocks = markdown_to_blocks(&parsed.markdown);
-            let hash = compute_blocks_hash(&blocks);
-            let res_id = resource_id(url, &hash);
-            let now = now_rfc3339();
-
-            // Title merge: same rule as `FileIngestor` applies.
-            let mut dc = parsed.metadata.clone();
-            if dc.title.is_none() {
-                dc.title = parsed.title.clone();
+            if outcome == UrlOutcome::Unsupported {
+                // `process_url` deliberately does not report Unsupported —
+                // that's the caller's call. `UrlIngestor` reports it
+                // immediately, matching its pre-refactor behavior exactly
+                // (contrast `FeedIngestor`, which attempts an
+                // embedded-content fallback first).
+                callback.on_skipped(uri, SkipReason::Unsupported).await;
+                result.resources_skipped += 1;
             }
-            let title = dc.title.clone();
-
-            let resource = Resource {
-                id: res_id,
-                store_id: source.store_id.clone(),
-                source_id: source.source_id.clone(),
-                ingestor_kind: IngestorKind::Url,
-                resource_kind: ResourceKind::Document,
-                uri: uri.clone(),
-                external_id: None,
-                external_etag: None,
-                content_hash: hash,
-                title,
-                mime: content_type,
-                metadata: Metadata::Document(DocumentMetadata {
-                    dublin_core: dc,
-                    ..Default::default()
-                }),
-                added_at: now.clone(),
-                modified_at: now,
-                thread_id: None,
-                channel: None,
-                participants: vec![],
-                origin_store: source.store_id.clone(),
-                // Stamp the policy version the caller actually requested for
-                // this run (not a hardcoded placeholder).
-                policy_version: source.policy_version.clone(),
-                share_path: None,
-                extractor_version: "1.0".to_string(),
-                blocks,
-            };
-
-            callback.on_resource(resource).await?;
-            result.resources_produced += 1;
         }
 
         Ok(result)
@@ -242,7 +126,8 @@ impl Ingestor for UrlIngestor {
 mod tests {
     use super::*;
     use crate::support::test_doubles::RecordingCallback;
-    use localdb_core::parser::{ChainParser, ParsedDocument};
+    use localdb_core::ingestion::{FetchMetadata, FetchResult};
+    use localdb_core::parser::{ChainParser, ParsedDocument, Probe};
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -637,6 +522,80 @@ mod tests {
             matches!(&cb.skipped[0].1, SkipReason::Error(msg) if msg.contains("simulated parser error")),
             "expected SkipReason::Error mentioning the parser error, got: {:?}",
             cb.skipped[0].1
+        );
+    }
+
+    /// Full-struct `Resource` equality, pinning the `process_url` refactor
+    /// (issue #116, `url_pipeline` extraction) as behavior-preserving: every
+    /// field must match the exact `Resource` `UrlIngestor` produced before
+    /// the extraction, including `external_id: None`, `external_etag: None`,
+    /// and `added_at == modified_at` (both the same `now_rfc3339()` call).
+    #[tokio::test]
+    async fn resource_full_struct_equality_pins_pre_refactor_shape() {
+        use localdb_core::block::{Resource, ResourceKind};
+        use localdb_core::markdown_blocks::{compute_blocks_hash, markdown_to_blocks};
+        use localdb_core::metadata::{DocumentMetadata, DublinCoreMetadata, Metadata};
+
+        let content = b"# Pinned Title\n\nPinned body text.\n".to_vec();
+        let mut script = HashMap::new();
+        script.insert(
+            "https://example.com/pinned".to_string(),
+            ScriptedOutcome::Downloaded {
+                bytes: content,
+                content_type: Some("text/markdown".to_string()),
+            },
+        );
+
+        let ingestor =
+            UrlIngestor::new(Box::new(AllParser), Box::new(ScriptedFetcher::new(script)));
+        let source = IngestSource {
+            policy_version: "policy-pin".to_string(),
+            source_id: "src-pin".to_string(),
+            store_id: "store-pin".to_string(),
+            ingestor_kind: IngestorKind::Url,
+            config: serde_json::json!({"url": "https://example.com/pinned"}),
+        };
+        let mut cb = RecordingCallback::default();
+        let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+        assert_eq!(result.resources_produced, 1);
+        assert_eq!(cb.resources.len(), 1);
+
+        let markdown = "# Pinned Title\n\nPinned body text.\n";
+        let blocks = markdown_to_blocks(markdown);
+        let hash = compute_blocks_hash(&blocks);
+        let uri = Uri::parse("https://example.com/pinned").unwrap();
+        let expected = Resource {
+            id: localdb_core::ids::resource_id("https://example.com/pinned", &hash),
+            store_id: "store-pin".to_string(),
+            source_id: "src-pin".to_string(),
+            ingestor_kind: IngestorKind::Url,
+            resource_kind: ResourceKind::Document,
+            uri,
+            external_id: None,
+            external_etag: None,
+            content_hash: hash,
+            title: None,
+            mime: Some("text/markdown".to_string()),
+            metadata: Metadata::Document(DocumentMetadata {
+                dublin_core: DublinCoreMetadata::default(),
+                ..Default::default()
+            }),
+            added_at: localdb_core::ingestion::now_rfc3339(),
+            modified_at: localdb_core::ingestion::now_rfc3339(),
+            thread_id: None,
+            channel: None,
+            participants: vec![],
+            origin_store: "store-pin".to_string(),
+            policy_version: "policy-pin".to_string(),
+            share_path: None,
+            extractor_version: "1.0".to_string(),
+            blocks,
+        };
+
+        assert_eq!(cb.resources[0], expected);
+        assert_eq!(
+            cb.resources[0].added_at, cb.resources[0].modified_at,
+            "added_at and modified_at must be the same now_rfc3339() string"
         );
     }
 }
