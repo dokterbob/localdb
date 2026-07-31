@@ -815,7 +815,9 @@ pub struct SourceIngestionDeps<'a> {
 /// the run. After `ingestor.ingest()` returns, runs the delete-sweep: any URI
 /// previously indexed for this source that was neither yielded nor reported via
 /// `on_skipped` this run is deleted — this is how a file deletion, source
-/// removal, or (once ingestors report it) a Gone URL is swept.
+/// removal, or (once ingestors report it) a Gone URL is swept. Feed sources
+/// (`SourceSpec::Feed`) are exempt from the sweep — see the comment at the
+/// sweep loop below for why.
 pub async fn run_source_ingestion(
     source: &Source,
     ingestor: &dyn Ingestor,
@@ -910,21 +912,34 @@ pub async fn run_source_ingestion(
     // one source delete another source's live documents. `source_id` is exact:
     // it is persisted per resource (baseline schema), rehydrated by
     // `list_indexed_documents`, and immune to encoding.
-    let existing_uris = doc_index.uris();
-    for uri in existing_uris {
-        let owned_by_this_source = doc_index
-            .get(&uri)
-            .is_some_and(|record| record.source_id == source.id);
-        if !owned_by_this_source {
-            continue;
-        }
-        if seen.contains(&uri) {
-            continue;
-        }
-        if let Some(old_record) = doc_index.remove(&uri) {
-            let deleted = store.delete_by_resource(&old_record.resource_id).await?;
-            if deleted > 0 {
-                result.docs_deleted += 1;
+    // C1: feed sources are exempt from the delete-sweep. A feed only ever
+    // exposes its most-recent N entries (an Atom/RSS document is a bounded
+    // window, not a full archive listing) — an entry's absence from this
+    // run means only "it scrolled off the feed," not "it was deleted at the
+    // origin." Sweeping on that basis would delete everything the feed
+    // previously contributed as soon as it aged out of the window, and a
+    // feed-level 304 Not Modified (zero callbacks at all) would make the
+    // sweep delete the *entire* source on every unchanged poll. Path and
+    // url sources have no such windowing — their ingestor enumerates the
+    // full current state every run — so absence there really does mean
+    // deletion and the sweep must still run for them.
+    if !matches!(source.spec, SourceSpec::Feed { .. }) {
+        let existing_uris = doc_index.uris();
+        for uri in existing_uris {
+            let owned_by_this_source = doc_index
+                .get(&uri)
+                .is_some_and(|record| record.source_id == source.id);
+            if !owned_by_this_source {
+                continue;
+            }
+            if seen.contains(&uri) {
+                continue;
+            }
+            if let Some(old_record) = doc_index.remove(&uri) {
+                let deleted = store.delete_by_resource(&old_record.resource_id).await?;
+                if deleted > 0 {
+                    result.docs_deleted += 1;
+                }
             }
         }
     }
@@ -943,6 +958,7 @@ fn source_location(source: &Source) -> String {
     match &source.spec {
         SourceSpec::Path { root, .. } => root.clone(),
         SourceSpec::Url { url, .. } => url.clone(),
+        SourceSpec::Feed { url, .. } => url.clone(),
     }
 }
 
@@ -2978,6 +2994,147 @@ mod tests {
                 .await
                 .unwrap();
             assert!(chunks.is_empty());
+        }
+
+        // -----------------------------------------------------------------
+        // 8f. C1: feed sources are exempt from the delete-sweep. A feed only
+        // ever exposes its most-recent N entries, so a zero-callback run
+        // (absent entries scrolled off the window, or a feed-level 304 Not
+        // Modified) must NOT delete previously-indexed entries — unlike the
+        // identically-shaped zero-callback scenario for a url source, which
+        // must still sweep normally (test 8 above covers that alone; this
+        // test additionally proves the two behaviors coexist correctly in
+        // the same store/doc_index).
+        // -----------------------------------------------------------------
+
+        #[tokio::test]
+        async fn feed_source_zero_callback_run_is_not_swept_but_url_source_still_sweeps() {
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let config = make_ingestion_config(store_id);
+
+            let feed_source = Source {
+                id: new_ulid(),
+                store_id: store_id.to_string(),
+                kind: SourceKind::Feed,
+                spec: SourceSpec::Feed {
+                    url: "https://example.com/feed.xml".to_string(),
+                    max_entries: None,
+                    fetch_full_content: true,
+                    refresh_interval_secs: None,
+                },
+                source_preset: "prose".to_string(),
+            };
+            let url_source = Source {
+                id: new_ulid(),
+                store_id: store_id.to_string(),
+                kind: SourceKind::Url,
+                spec: SourceSpec::Url {
+                    url: "https://example.com/page".to_string(),
+                    refresh_interval_secs: None,
+                },
+                source_preset: "prose".to_string(),
+            };
+
+            let feed_entry_uri = "https://example.com/feed.xml#entry:1";
+            let url_uri = "https://example.com/page";
+
+            let feed_record = seed_indexed(
+                &store,
+                &embedder,
+                &config,
+                &feed_source,
+                feed_entry_uri,
+                "Feed entry body.",
+            )
+            .await;
+            let url_record = seed_indexed(
+                &store,
+                &embedder,
+                &config,
+                &url_source,
+                url_uri,
+                "Page body.",
+            )
+            .await;
+
+            let mut doc_index = DocumentIndex::new();
+            doc_index.upsert(feed_record.clone());
+            doc_index.upsert(url_record.clone());
+
+            // Both runs' ingestors yield nothing at all — for the feed this
+            // mirrors a feed-level 304 Not Modified (zero callbacks) or the
+            // entry simply having scrolled off the feed's window; for the
+            // url source it mirrors a 404/410 Gone.
+            let feed_ingestor = FakeIngestor::new(vec![]);
+            let deps = SourceIngestionDeps {
+                doc_index: &mut doc_index,
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+                progress: None,
+            };
+            let feed_result = run_source_ingestion(&feed_source, &feed_ingestor, deps)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                feed_result.docs_deleted, 0,
+                "feed sources are exempt from the delete-sweep — a zero-callback \
+                 run must not delete"
+            );
+            let feed_chunks = store
+                .get_chunks_for_resource(&feed_record.resource_id)
+                .await
+                .unwrap();
+            assert!(
+                !feed_chunks.is_empty(),
+                "feed entry's chunks must survive an unswept run"
+            );
+            assert!(doc_index.get(feed_entry_uri).is_some());
+
+            let url_ingestor = FakeIngestor::new(vec![]);
+            let deps = SourceIngestionDeps {
+                doc_index: &mut doc_index,
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+                progress: None,
+            };
+            let url_result = run_source_ingestion(&url_source, &url_ingestor, deps)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                url_result.docs_deleted, 1,
+                "a url source in the very same store/doc_index still sweeps normally"
+            );
+            let url_chunks = store
+                .get_chunks_for_resource(&url_record.resource_id)
+                .await
+                .unwrap();
+            assert!(
+                url_chunks.is_empty(),
+                "swept url resource's chunks must be gone"
+            );
+        }
+
+        #[tokio::test]
+        async fn source_location_feed_arm_returns_url() {
+            let source = Source {
+                id: new_ulid(),
+                store_id: "store-1".to_string(),
+                kind: SourceKind::Feed,
+                spec: SourceSpec::Feed {
+                    url: "https://example.com/feed.xml".to_string(),
+                    max_entries: None,
+                    fetch_full_content: true,
+                    refresh_interval_secs: None,
+                },
+                source_preset: "prose".to_string(),
+            };
+            assert_eq!(source_location(&source), "https://example.com/feed.xml");
         }
 
         // -----------------------------------------------------------------

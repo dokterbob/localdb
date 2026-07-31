@@ -261,8 +261,14 @@ impl AppState {
                 id: store_name.to_string(),
             })?;
         let store_id = store_row.id;
-        let (kind_enum, root, url, include, exclude) =
-            localdb_core::source::parse_source_spec(kind, &spec)?;
+        let localdb_core::source::ParsedSourceSpec {
+            kind: kind_enum,
+            root,
+            url,
+            include,
+            exclude,
+            config_json,
+        } = localdb_core::source::parse_source_spec(kind, &spec)?;
 
         // Validate refresh interval before persisting anything.
         let interval_secs = match refresh {
@@ -288,6 +294,7 @@ impl AppState {
             preset: preset.to_string(),
             refresh: refresh.map(|s| s.to_string()),
             created_at: now_rfc3339(),
+            config_json,
         };
         self.inner.backend.upsert_source(&source_row).await?;
 
@@ -412,6 +419,26 @@ fn source_row_to_record(row: SourceRow) -> Result<SourceRecord, Error> {
                 correlation_id: "server_source_row_url".to_string(),
             })?;
             ("url".to_string(), serde_json::json!({"url": url}))
+        }
+        // Mechanical fix to keep this match exhaustive after adding
+        // `SourceKind::Feed` (issue #116) — full feed HTTP wiring
+        // (scheduler registration, refresh handling) is done elsewhere;
+        // this only shapes the JSON `spec` for list/get responses.
+        localdb_core::types::SourceKind::Feed => {
+            let url = row.url.ok_or_else(|| Error::Internal {
+                message: format!("feed source '{}' has no url", row.id),
+                correlation_id: "server_source_row_feed".to_string(),
+            })?;
+            let feed_config =
+                localdb_core::source::parse_feed_config_json(row.config_json.as_deref());
+            (
+                "feed".to_string(),
+                serde_json::json!({
+                    "url": url,
+                    "max_entries": feed_config.max_entries,
+                    "fetch_full_content": feed_config.fetch_full_content,
+                }),
+            )
         }
     };
     Ok(SourceRecord {

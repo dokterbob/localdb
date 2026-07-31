@@ -80,6 +80,7 @@ pub(crate) fn kind_to_string(kind: &SourceKind) -> &'static str {
     match kind {
         SourceKind::Path => "path",
         SourceKind::Url => "url",
+        SourceKind::Feed => "feed",
     }
 }
 
@@ -125,16 +126,39 @@ pub(crate) fn looks_like_id(s: &str) -> bool {
 pub fn source_row_to_core_source(src: &SourceRow) -> localdb_core::types::Source {
     use localdb_core::types::{Source, SourceSpec};
 
+    // C5: `refresh` is stored as the raw human-readable string the user
+    // gave `localdb source add --refresh` (e.g. "24h"), validated at write
+    // time but never converted to seconds for storage — the seconds value
+    // must be recomputed here on every read. Tolerant: a row that somehow
+    // holds an invalid string (should never happen post-validation, but
+    // this is a read path and must not panic/error on stale data) falls
+    // back to `None` rather than failing the whole reconstruction.
+    let refresh_interval_secs = src
+        .refresh
+        .as_deref()
+        .and_then(|s| localdb_core::config::validate_refresh_interval(s).ok())
+        .flatten();
+
     let spec = match src.kind {
         SourceKind::Url => SourceSpec::Url {
             url: src.url.clone().unwrap_or_default(),
-            refresh_interval_secs: None,
+            refresh_interval_secs,
         },
         SourceKind::Path => SourceSpec::Path {
             root: src.root.clone().unwrap_or_default(),
             include: src.include.clone(),
             exclude: src.exclude.clone(),
         },
+        SourceKind::Feed => {
+            let feed_config =
+                localdb_core::source::parse_feed_config_json(src.config_json.as_deref());
+            SourceSpec::Feed {
+                url: src.url.clone().unwrap_or_default(),
+                max_entries: feed_config.max_entries,
+                fetch_full_content: feed_config.fetch_full_content,
+                refresh_interval_secs,
+            }
+        }
     };
 
     Source {
@@ -255,6 +279,7 @@ mod tests {
             preset: "prose".into(),
             refresh: None,
             created_at: now_rfc3339(),
+            config_json: None,
         };
         let core = source_row_to_core_source(&src);
         assert_eq!(core.id, "src-1");
@@ -281,12 +306,174 @@ mod tests {
             preset: "prose".into(),
             refresh: None,
             created_at: now_rfc3339(),
+            config_json: None,
         };
         let core = source_row_to_core_source(&src);
         match &core.spec {
             SourceSpec::Url { url, .. } => assert_eq!(url, "https://example.com"),
             _ => panic!("expected url spec"),
         }
+    }
+
+    #[test]
+    fn convert_url_source_parses_refresh_column_into_interval_secs() {
+        use localdb_core::types::SourceSpec;
+        let src = SourceRow {
+            id: "src-2b".into(),
+            store_id: "store-id".into(),
+            kind: SourceKind::Url,
+            root: None,
+            url: Some("https://example.com".into()),
+            include: vec![],
+            exclude: vec![],
+            preset: "prose".into(),
+            refresh: Some("24h".into()),
+            created_at: now_rfc3339(),
+            config_json: None,
+        };
+        let core = source_row_to_core_source(&src);
+        match &core.spec {
+            SourceSpec::Url {
+                refresh_interval_secs,
+                ..
+            } => assert_eq!(*refresh_interval_secs, Some(86400)),
+            _ => panic!("expected url spec"),
+        }
+    }
+
+    #[test]
+    fn convert_url_source_tolerates_invalid_refresh_string() {
+        // Defensive: a row that somehow holds an invalid refresh string
+        // (should never happen post-validation) must not panic on read —
+        // it falls back to `None` rather than erroring reconstruction.
+        use localdb_core::types::SourceSpec;
+        let src = SourceRow {
+            id: "src-2c".into(),
+            store_id: "store-id".into(),
+            kind: SourceKind::Url,
+            root: None,
+            url: Some("https://example.com".into()),
+            include: vec![],
+            exclude: vec![],
+            preset: "prose".into(),
+            refresh: Some("not-a-duration".into()),
+            created_at: now_rfc3339(),
+            config_json: None,
+        };
+        let core = source_row_to_core_source(&src);
+        match &core.spec {
+            SourceSpec::Url {
+                refresh_interval_secs,
+                ..
+            } => assert_eq!(*refresh_interval_secs, None),
+            _ => panic!("expected url spec"),
+        }
+    }
+
+    #[test]
+    fn convert_feed_source_reconstructs_spec_from_config_json_and_refresh() {
+        use localdb_core::types::SourceSpec;
+        let src = SourceRow {
+            id: "src-3".into(),
+            store_id: "store-id".into(),
+            kind: SourceKind::Feed,
+            root: None,
+            url: Some("https://example.com/feed.xml".into()),
+            include: vec![],
+            exclude: vec![],
+            preset: "prose".into(),
+            refresh: Some("1h".into()),
+            created_at: now_rfc3339(),
+            config_json: Some(r#"{"max_entries":25,"fetch_full_content":false}"#.into()),
+        };
+        let core = source_row_to_core_source(&src);
+        assert_eq!(core.kind, SourceKind::Feed);
+        match &core.spec {
+            SourceSpec::Feed {
+                url,
+                max_entries,
+                fetch_full_content,
+                refresh_interval_secs,
+            } => {
+                assert_eq!(url, "https://example.com/feed.xml");
+                assert_eq!(*max_entries, Some(25));
+                assert!(!fetch_full_content);
+                assert_eq!(*refresh_interval_secs, Some(3600));
+            }
+            _ => panic!("expected feed spec"),
+        }
+    }
+
+    #[test]
+    fn convert_feed_source_tolerates_null_config_json() {
+        use localdb_core::types::SourceSpec;
+        let src = SourceRow {
+            id: "src-4".into(),
+            store_id: "store-id".into(),
+            kind: SourceKind::Feed,
+            root: None,
+            url: Some("https://example.com/feed.xml".into()),
+            include: vec![],
+            exclude: vec![],
+            preset: "prose".into(),
+            refresh: None,
+            created_at: now_rfc3339(),
+            config_json: None,
+        };
+        let core = source_row_to_core_source(&src);
+        match &core.spec {
+            SourceSpec::Feed {
+                max_entries,
+                fetch_full_content,
+                refresh_interval_secs,
+                ..
+            } => {
+                assert_eq!(*max_entries, None);
+                assert!(fetch_full_content, "must default to true");
+                assert_eq!(*refresh_interval_secs, None);
+            }
+            _ => panic!("expected feed spec"),
+        }
+    }
+
+    #[test]
+    fn convert_feed_source_tolerates_malformed_config_json() {
+        use localdb_core::types::SourceSpec;
+        let src = SourceRow {
+            id: "src-5".into(),
+            store_id: "store-id".into(),
+            kind: SourceKind::Feed,
+            root: None,
+            url: Some("https://example.com/feed.xml".into()),
+            include: vec![],
+            exclude: vec![],
+            preset: "prose".into(),
+            refresh: None,
+            created_at: now_rfc3339(),
+            config_json: Some("{not valid json".into()),
+        };
+        let core = source_row_to_core_source(&src);
+        match &core.spec {
+            SourceSpec::Feed {
+                max_entries,
+                fetch_full_content,
+                ..
+            } => {
+                assert_eq!(*max_entries, None);
+                assert!(
+                    fetch_full_content,
+                    "malformed config_json must fall back to true"
+                );
+            }
+            _ => panic!("expected feed spec"),
+        }
+    }
+
+    #[test]
+    fn kind_to_string_maps_all_kinds() {
+        assert_eq!(kind_to_string(&SourceKind::Path), "path");
+        assert_eq!(kind_to_string(&SourceKind::Url), "url");
+        assert_eq!(kind_to_string(&SourceKind::Feed), "feed");
     }
 
     #[test]

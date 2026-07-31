@@ -135,6 +135,7 @@ pub(crate) async fn run_source_add_async(
         preset: "prose".to_string(),
         refresh: refresh.map(|s| s.to_string()),
         created_at: now_rfc3339(),
+        config_json: None,
     };
 
     if let Err(e) = db.backend().upsert_source(&src).await {
