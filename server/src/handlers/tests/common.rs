@@ -101,7 +101,7 @@ pub(crate) struct SeedChunkInput {
     pub(crate) doc_id: &'static str,
     pub(crate) text: &'static str,
     pub(crate) uri: &'static str,
-    pub(crate) metadata: localdb_core::DocumentMetadata,
+    pub(crate) metadata: localdb_core::metadata::Metadata,
 }
 
 pub(crate) async fn seed_store_a_chunk(state: &AppState, input: SeedChunkInput) {
@@ -130,7 +130,7 @@ pub(crate) async fn seed_store_a_chunk(state: &AppState, input: SeedChunkInput) 
         .unwrap();
     let chunk = localdb_core::ChunkRecord {
         id: input.chunk_id.to_string(),
-        document_id: input.doc_id.to_string(),
+        resource_id: input.doc_id.to_string(),
         store_id: store_id.clone(),
         text: input.text.to_string(),
         span: localdb_core::types::Span::new(0, input.text.len()),
@@ -141,13 +141,14 @@ pub(crate) async fn seed_store_a_chunk(state: &AppState, input: SeedChunkInput) 
         content_hash: "abc123".to_string(),
         origin_store: store_id.clone(),
         source_id: source.id,
-        source_kind: "path".to_string(),
+        ingestor_kind: "path".to_string(),
         mime: Some("text/plain".to_string()),
         uri: input.uri.to_string(),
         metadata: input.metadata,
         block_seq: 0,
         seq_in_block: 0,
         block_kind: None,
+        window_block_seqs: vec![],
     };
     state
         .backend()

@@ -15,8 +15,9 @@ things to version and install instead of one).
 
 | Crate | Contents |
 |---|---|
-| `core` | Domain model (stores, sources, resources, blocks, chunks, citations, index jobs), ingestor trait (`Ingestor`, `IngestorKind`), search orchestration, indexing policy, the `RetrievalStore` trait, the `Embedder` trait, error taxonomy. No I/O frameworks. |
+| `core` | Domain model (stores, sources, resources, blocks, chunks, citations, index jobs), the `Ingestor` trait contract and `IngestorKind` enum, the ingestion pipeline (`run_source_ingestion`, `index_resource`), search orchestration, indexing policy, the `RetrievalStore` trait, the `Embedder` trait, error taxonomy. **No I/O**: `core` drives ingestion only through a caller-supplied `&dyn Ingestor`; it never opens a file, socket, or HTTP client itself. |
 | `extract` | Format detection and extraction → blocks (Markdown, plain text, HTML, text-layer PDF in v1). Implementation detail of the file ingestor. |
+| `ingest` | Concrete `Ingestor` implementations: `FileIngestor`, `UrlIngestor`, and future connectors (Atom/RSS, Notion, Telegram, Signal, HackMD, email, transcription). Depends on `core` + `extract`. Owns all acquisition I/O — filesystem reads, HTTP clients, credential prompts. |
 | `store-libsql` | libsql implementation of `RetrievalStore` (DiskANN vectors + FTS5). |
 | `embed` | `Embedder` implementations: local ONNX (fastembed-class), OpenAI-compatible HTTP provider, contextualized-embedding providers. Model download/cache management. |
 | `server` | HTTP API (axum or similar), daemon runtime: file watching, URL refresh scheduling, job queue, unix socket. |
@@ -27,7 +28,11 @@ things to version and install instead of one).
 **Invariant:** all surfaces (CLI, HTTP, MCP) sit on the same `core`; no retrieval, indexing, or
 domain logic is implemented in a surface crate — one shared core beats duplicated logic.
 
-**Ingestor crate boundary:** the `Ingestor` trait lives in `core` (contract: yields `Resource`s). Concrete ingestor implementations, terminal interaction, credential prompts, HTTP/API clients, and source-specific setup live outside `core`. The `file` and `url` ingestors currently live alongside `cli`; future connectors may live in dedicated crates.
+**Ingestor crate boundary:** the `Ingestor` trait and the ingestion pipeline that drives it (`run_source_ingestion`, `index_resource`) live in `core` — the contract and the orchestration, never the I/O. Concrete ingestor implementations (`FileIngestor`, `UrlIngestor`, and future connectors), terminal interaction, credential prompts, HTTP/API clients, and source-specific setup live in the `ingest` crate. The CLI constructs the concrete ingestor for a given `SourceSpec` and passes it into `core::run_source_ingestion` as `&dyn Ingestor`; this restores the "no I/O in `core`" invariant, which the prior `core::ingestors::*` modules violated by calling `std::fs::read` directly (issue #117). **Rejected:** leaving concrete ingestors in `core` or scattering them across `cli` — either reintroduces I/O into the domain layer or duplicates ingestor construction per surface.
+
+`core` owns normalizing locators for identity and delete-sweep decisions: every `Uri` reaching the pipeline (via `on_resource`'s `Resource.uri` or `on_skipped`'s `uri` parameter) is canonical by construction, and an ingestor is never required to normalize one itself to stay correct — it only has to produce a valid `Uri` in the first place.
+
+**Ingestion pipeline shape:** the CLI builds one concrete ingestor per `SourceSpec`, then calls `core::run_source_ingestion(source, &dyn Ingestor, deps)`. The ingestor streams `Resource`s one at a time through an `IngestCallback` — no buffering of an entire source's resources in memory. Per resource, `core` runs: skip-check (unchanged content hash) → chunk → embed → `upsert_chunks_and_blocks` (crash-safe A6 ordering — embed before delete, delete-and-insert in a single replace transaction, issue #79). Per-resource errors become stats counters and progress events, not aborts of the run. `IngestCallback` provides default-no-op `on_discovered(total)` and `on_skipped(uri, SkipReason)` hooks so ingestors can report enumeration size and pre-filtered items without every implementation having to wire them up. After `ingest()` returns, `core` runs the delete-sweep: URIs seen in a prior run but not this one — including URLs the ingestor reports `Gone` — are deleted. This single pipeline replaces the legacy `index_document` extraction pipeline, which extracted and buffered per-document logic directly inside `core`.
 
 ## 2. Surface ordering & storage default
 

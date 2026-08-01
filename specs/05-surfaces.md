@@ -27,10 +27,25 @@ Single binary, subcommand tree. Global flags: `--config`, `--json`, `--store <na
 | `add <path|url>...` | Alias for `source add` — add one or more sources to a store | direct write | routed to daemon |
 | `index [--store S] [--source ID] [--strict]` | One-shot scan & index; creates IndexJob | runs job synchronously, progress to stderr | submits job, polls, streams progress |
 | `search <query>... [--limit N] [--content-length N]` | Hybrid search with citations; `--content-length` is a **soft cap** on human-readable snippet chars (default 1000; JSON output always full text) — see §4 for the snapping behavior shared with MCP | embedded read | via API |
+| `db status` | Inspect schema state: current version, head version, pending/unsupported steps. Never refuses, even on a store newer than the binary | reads directly | error `daemon_running` |
+| `db migrate` | Apply pending migrations with per-step progress; legacy v1–v3 rebuild and any other destructive step require confirmation; prints a `localdb index` hint when a weight-class-3 migration ran | direct write | error `daemon_running` |
+| `db downgrade [--to N]` | Reverse migrations down to version `N` (default: one step) using stored down-SQL; requires confirmation; refuses cleanly on a step with `down_unsupported_reason` | direct write | error `daemon_running` |
 
 Output: human-readable by default (citations as `uri:heading_path` + snippet), `--json` emits the
 canonical structures for scripting. The CLI is **command-oriented**; interactive browse is a
 roadmap item with the web UI.
+
+### 2.1 Schema migrations
+
+All schema-version mismatches on open — on every surface, CLI, HTTP daemon, and MCP alike — map
+to `invalid_config` / exit 2 with an actionable hint (§5); no surface auto-migrates on open.
+`db migrate` and `db downgrade` are **CLI-only**: the HTTP daemon and MCP never apply migrations,
+they only ever surface the refusal-with-hint. Both commands require the daemon to be stopped —
+run against a live daemon they fail the same way every other daemon-aware write command does,
+error `daemon_running`, exit 4. Destructive paths (the legacy v1–v3 rebuild inside `db migrate`,
+and `db downgrade`) require explicit confirmation before touching the store. See
+[02-domain-model.md](02-domain-model.md) §9 for the `schema_migrations` table and the
+migration-weight-class design.
 
 ## 3. HTTP API
 
@@ -65,7 +80,8 @@ later if a consumer demands it).
 **Decision:** v1 MCP is **read-only**: tools `search` (args: query, optional store names, limit, optional content_length →
 Citation list as structured content; each citation carries full `Metadata`),
 `get_document` (id or uri → block texts + `metadata: Metadata`),
-`get_chunks` (document_id, optional offset/limit → the document's chunks in order, paginated),
+`get_chunks` (resource_id, optional offset/limit, or optional anchor_chunk_id/anchor_block_seq
+(§4.1) → the resource's chunks in order, paginated),
 `list_stores` (names, visibility, counts). **Mutating tools** (`add_source`, `reindex`, …) are a
 follow-up behind an explicit opt-in flag (`localdb mcp --allow-write`), never on by default.
 
@@ -80,18 +96,44 @@ Resources/prompts: none in v1; resources are reachable via `get_document` / `get
 
 ### 4.1 `get_chunks`
 
-Returns a document's chunks in storage order — `(block_seq, seq_in_block)` — with pagination.
-Args: `document_id` (required), `offset` (integer ≥ 0, default 0), `limit` (integer 1..=200,
+Returns a resource's chunks in storage order — `(block_seq, seq_in_block)` — with pagination.
+Args: `resource_id` (required), `offset` (integer ≥ 0, default 0), `limit` (integer 1..=200,
 default 50). Like `get_document`, `uri`-based lookup is not supported in v1 — callers must use a
-document ID obtained from a prior `search` or `get_document` call. Unknown `document_id` →
-`document_not_found`. An `offset` past the end of the chunk list returns an empty `chunks` array,
+resource ID obtained from a prior `search` or `get_document` call. Unknown `resource_id` →
+`resource_not_found`. An `offset` past the end of the chunk list returns an empty `chunks` array,
 not an error — this is not a usage mistake worth surfacing as one.
 
-Response shape:
+**Anchor-relative pagination (#146):** as an alternative to `offset`, `get_chunks` accepts
+`anchor_chunk_id` (string) or `anchor_block_seq` (integer ≥ 0). `offset`, `anchor_chunk_id`,
+and `anchor_block_seq` are mutually exclusive — passing more than one of the three is a
+tool-level `invalid_request` error, not a silent precedence rule.
+
+Anchor resolution runs over the resource's full chunk list, sorted the same way as the
+plain-`offset` path — `(block_seq, seq_in_block)`:
+
+- `anchor_chunk_id` resolves to the chunk with that exact `chunk_id`. Unknown
+  `anchor_chunk_id` → `chunk_not_found`.
+- `anchor_block_seq` resolves via lower-bound: the first chunk with `block_seq >=
+  anchor_block_seq`, tie-broken by the lowest `seq_in_block` at that `block_seq`. If
+  `anchor_block_seq` is past every block in the resource (no chunk satisfies the lower-bound),
+  this is also `chunk_not_found`.
+
+Once an anchor resolves to a position in the full chunk list, the response window is `limit`
+chunks **centered** on that position — the anchor sits at, or as close as possible to, the
+middle of the returned page — clamped at the start/end of the resource's chunk list. The
+window never shrinks below `limit` chunks purely because the anchor is near an edge (it
+shifts toward the interior instead); it only returns fewer than `limit` chunks when the
+resource has fewer than `limit` chunks in total. The response's `offset` field reports the
+effective offset the returned window corresponds to (as if the caller had passed that
+`offset` directly), and a new `anchor_index` field reports the 0-based index of the anchor
+chunk within the returned `chunks` array — `null` when the request used plain `offset`
+pagination instead of an anchor.
+
+Response shape (plain `offset` pagination):
 
 ```json
 {
-  "document_id": "...",
+  "resource_id": "...",
   "uri": "...",
   "title": "...",
   "store": { "id": "...", "name": "..." },
@@ -99,6 +141,7 @@ Response shape:
   "offset": 0,
   "limit": 0,
   "returned": 0,
+  "anchor_index": null,
   "chunks": [
     {
       "chunk_id": "...",
@@ -112,6 +155,45 @@ Response shape:
   ]
 }
 ```
+
+**Anchor example:** a resource with 20 chunks (`block_seq` 0–19, one chunk per block),
+requested with `anchor_chunk_id` set to the `block_seq = 10` chunk and `limit: 5`. With an
+odd `limit`, centering puts 2 chunks before the anchor and 2 after, so the returned window
+covers `block_seq` 8–12, `offset` is 8 (the position of the first returned chunk in the full
+ordered list), and the anchor is the 3rd of the 5 returned chunks (`anchor_index: 2`):
+
+Request:
+
+```json
+{ "resource_id": "...", "anchor_chunk_id": "...", "limit": 5 }
+```
+
+Response:
+
+```json
+{
+  "resource_id": "...",
+  "uri": "...",
+  "title": "...",
+  "store": { "id": "...", "name": "..." },
+  "total_chunks": 20,
+  "offset": 8,
+  "limit": 5,
+  "returned": 5,
+  "anchor_index": 2,
+  "chunks": [
+    { "chunk_id": "...", "block_seq": 8, "seq_in_block": 0, "block_kind": "...", "span": { "start": 0, "end": 0 }, "heading_path": ["..."], "text": "..." },
+    { "chunk_id": "...", "block_seq": 9, "seq_in_block": 0, "block_kind": "...", "span": { "start": 0, "end": 0 }, "heading_path": ["..."], "text": "..." },
+    { "chunk_id": "...", "block_seq": 10, "seq_in_block": 0, "block_kind": "...", "span": { "start": 0, "end": 0 }, "heading_path": ["..."], "text": "..." },
+    { "chunk_id": "...", "block_seq": 11, "seq_in_block": 0, "block_kind": "...", "span": { "start": 0, "end": 0 }, "heading_path": ["..."], "text": "..." },
+    { "chunk_id": "...", "block_seq": 12, "seq_in_block": 0, "block_kind": "...", "span": { "start": 0, "end": 0 }, "heading_path": ["..."], "text": "..." }
+  ]
+}
+```
+
+If the same `anchor_chunk_id` (`block_seq = 10`) were requested with `limit: 30` against
+this 20-chunk resource, the window would clamp to the whole list: `offset: 0`,
+`returned: 20`, `anchor_index: 10`.
 
 `content_length` (default 400) is a **soft cap**, not a hard truncation point: the JSON
 citation payload always carries the full, untruncated snippet — only the human-readable
@@ -162,7 +244,7 @@ at all:
   result.
 - **Tool-level** (`CallToolResult { isError: true, .. }`): everything else — including cases
   one might expect to be protocol-level. A missing or wrong-typed *required* argument (e.g.
-  `search`'s `query`, `get_chunks`'s `document_id`) fails `rmcp`'s `Parameters<T>`
+  `search`'s `query`, `get_chunks`'s `resource_id`) fails `rmcp`'s `Parameters<T>`
   deserialization, which itself produces a protocol-level `ErrorData::invalid_params` — but
   `rmcp` 1.8.0's tool router downgrades that specific case to a tool-level result via
   `into_tool_argument_error`, so the caller's MCP client can render it like any other tool
@@ -184,7 +266,7 @@ MCP tool error). Codes are stable API:
 
 | Code | Meaning | HTTP |
 |---|---|---|
-| `store_not_found` / `source_not_found` / `resource_not_found` / `job_not_found` | Unknown entity | 404 |
+| `store_not_found` / `source_not_found` / `resource_not_found` / `job_not_found` / `chunk_not_found` | Unknown entity | 404 |
 | `runtime_state_locked` | Unified database locked by another process (busy timeout exceeded) | 409 |
 | `daemon_running` / `daemon_unreachable` | Process-model conflicts | 409 / 502 |
 | `invalid_config` | Config failed validation (path-precise message) | 422 |

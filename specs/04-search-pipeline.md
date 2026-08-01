@@ -52,6 +52,12 @@ File deleted / URL gone (404 or 410 after retry) / source removed → delete tha
 chunks and the resource itself from the backend. Deletes are data-modifying: ≥ 90% coverage
 gate ([01-architecture.md](01-architecture.md) §7).
 
+A resource stays alive across a run if it is observed via **either** `on_resource` or
+`on_skipped` — the delete-sweep removes only a URI that neither hook reported this run.
+`on_skipped` takes an already-canonical `Uri`, the same representation `on_resource`'s
+`Resource.uri` carries, so both hooks populate the sweep's "seen" set in one consistent key
+space.
+
 ## 2. Extraction (v1 matrix)
 
 The parser chain is an implementation detail of the `file` and `url` ingestors. Parsers
@@ -131,10 +137,10 @@ block-appropriate chunks.
 
 | Block kinds | Chunker | Behavior |
 |---|---|---|
-| `Heading`, `Paragraph`, `Quote`, `List` | prose chunker | `MarkdownSplitter` subdivides within the block on semantic boundaries (sentences, words); target ≈ 256 tokens, overlap ≈ 0 tokens. |
+| `Heading`, `Text` | prose chunker | `MarkdownSplitter` subdivides within the block on semantic boundaries (sentences, words); target ≈ 256 tokens, overlap ≈ 0 tokens. |
 | `Code` | code chunker | Line-based subdivision within the block; target ≈ 60 lines. |
 | `Message`, `Segment` | messages chunker | Multi-block windowed: sliding window over consecutive Message/Segment blocks (see below). |
-| `Table` | table-aware chunker | Row-based subdivision; one or more rows per chunk. |
+| `Table` | table chunker | Row-based packing: rows are packed into chunks under the token target; every chunk re-emits the header row and separator so each chunk is a standalone valid table (see below). |
 | `Reference`, `Attachment`, `Frontmatter`, `Image` | one chunk per block | These block types are typically small; no further subdivision. |
 
 The source-level preset (from config or the `--preset` CLI flag) acts as a hint for
@@ -145,12 +151,40 @@ explicitly span multiple consecutive `Message`/`Segment` blocks. This invariant 
 `heading_path` attribution deterministic (see below) and ensures context-expansion
 queries are well-defined.
 
+**Coarse `Text` blocks:** `markdown_to_blocks` emits **one** `Text` block per run of
+consecutive running-text content — paragraphs, lists, blockquotes, HTML blocks — between
+structural boundaries (a `Heading`, a `Table`/`Code`/`Image` block, or the start/end of the
+document). Block sizing is therefore purely structural, driven by element boundaries, not by
+a token target; the prose chunker restores token-sizing by splitting a `Text` block into one
+or more prose chunks via `MarkdownSplitter`. This is what lets prose chunks approach the
+~256-token target instead of producing one tiny chunk per paragraph (the #158 fix) — a
+multi-paragraph run of running text is chunked together, not paragraph-by-paragraph.
+**Headings remain discrete blocks and are still chunked** — a `Heading` block is never folded
+into an adjacent `Text` run, because it feeds the contextual embedder's document context and
+`heading_path` attribution (see below). Filtering headings out of *search results* is a
+separate, future search-side concern, not a chunking-time decision.
+
 ### heading_path attribution
 
 `heading_path` is derived from the block tree: heading blocks that precede a content block
 in the resource's ordered block sequence are collected into the path for all chunks produced
 from that content block. There is no re-parsing of Markdown — the heading structure comes
 directly from the block representation.
+
+### Source preset override
+
+`IngestionConfig` carries a `source_preset` field (`prose` (default) | `code` | `messages`),
+resolved from the source's config (the source-level `preset` key,
+[03-config.md](03-config.md) §2) or the CLI's `--preset` flag. Per-file automatic preset
+routing — `preset_for`, which inspects a resource's `uri` and `mime` hint to route e.g.
+JSON/YAML/lockfiles to the `code` preset — applies **only** when the source preset is the
+default `prose`. An explicit `code` or `messages` source preset is authoritative and wins
+over per-file detection: a source configured as `code` chunks every file in it with the code
+chunker regardless of what `preset_for` would otherwise guess, and likewise a `messages`
+source always uses the messages chunker. This preserves useful per-file auto-detection for
+the common (prose) case while giving explicit non-default presets full, unambiguous control —
+needed for message/transcript sources where `preset_for`'s filename/mime heuristics do not
+apply.
 
 ### Messages chunker
 
@@ -161,6 +195,31 @@ The `messages` preset is implemented as a sliding window over `Message`/`Segment
 - Windows are additionally bounded by token count so that no single chunk exceeds the
   embedding model's context limit.
 - Each window chunk carries the `heading_path` of the containing thread/resource.
+- **`window_block_seqs`:** each window chunk records the `block_seq` of every member block it
+  spans in its `location` (`location_json = {start, end, window_block_seqs?}`), not just the
+  denormalized `block_seq` of its first member — so context-expansion and `get_chunks`
+  consumers can resolve every block a multi-block chunk touches.
+- **Chunk ids after fix-up:** chunk ids are computed **after** the window fix-up pass (the
+  pass that shrinks a window from the end to fit the token budget, or to keep the last window
+  from running past the end of the turn sequence — see `chunk_messages`) — so the
+  content-addressed id (§4 below;
+  [02-domain-model.md](02-domain-model.md) §3) reflects the window's final membership, not a
+  pre-fix-up candidate window.
+
+### Table chunker
+
+`Table` blocks are chunked by a dedicated row-based packer, not routed through the code
+chunker:
+
+- Rows are packed greedily into successive chunks, filling each chunk up to the (prose)
+  token target.
+- Every chunk re-emits the table's header row and the `|---|` separator row, so each chunk is
+  a valid, independently renderable Markdown table — a chunk is never dependent on a sibling
+  chunk to parse correctly.
+- **Oversized single row:** a single data row that alone exceeds the token target cannot be
+  packed into a standalone valid chunk at the target size; it falls back to `chunk_code`'s
+  long-line split (see below), preserving the invariant that no single chunk grows
+  unbounded.
 
 ### Prose chunker details
 
@@ -277,6 +336,18 @@ embedder, and parser list change **together** — there is no partial invalidati
 (unlike `chunking`/`embedding`, which use order-independent key serialization), so
 reordering parsers alone marks the store stale and schedules a reindex.
 
+The `chunking` sub-policy embeds a chunking algorithm identifier as part of what gets hashed;
+bumping it forces a reindex even when no user-visible config field changed. Current value:
+**`textsplitter-md-v5`** (bumped from `v4`). The `v5` bump covers the coarse `Text` block
+ontology — `markdown_to_blocks` now emits one `Text` block per run of consecutive running-text
+content, so prose chunks pack toward the ~256-token target instead of one-tiny-chunk-per-
+paragraph (§3 above, "Coarse `Text` blocks"; the #158 fix), silently altering chunk boundaries.
+The prior `v4` bump (from `v3`) covered two changes at once: the new `Chunk.id` formula —
+`blake3(resource_id ‖ block_seq ‖ chunk_text ‖ seq_in_block)`
+([02-domain-model.md](02-domain-model.md) §2, Chunk) — and the addition of the table chunker.
+Any of these changes alone would silently alter chunk boundaries and/or ids without a policy
+bump, defeating incremental re-index's staleness detection.
+
 `content_hash` is a blake3 hash of the ordered canonical texts of all blocks in a resource
 (not of a Markdown string). `extractor_version` on resources enables selective reprocessing
 when parser or `markdown_to_blocks()` logic improves, without requiring a full
@@ -293,9 +364,44 @@ and score-scale-free. Owning fusion keeps it identical across future backends. *
 score interpolation (needs per-model calibration); backend-native fusion (backend-dependent
 behavior).
 
-- **Filtering:** store filter (one, several, or all stores — fan out per-store queries, fuse
-  with global RRF), plus metadata filters (mime, path prefix, fetched_at range) pushed down
-  to the backend where supported.
+- **Filtering:** store filter (one, several, or all stores). Multi-store queries fan out
+  per-store BM25 + dense queries, then pool each leg's results across all queried stores into
+  one globally rank-ordered list *before* a single RRF pass runs over the two pooled legs —
+  never per-store RRF followed by a merge, which would let every store's local rank-0 chunk tie
+  regardless of true quality (RRF scores are rank-based and scale-free). Fusion identity is the
+  composite `(store_id, chunk_id)`, not `chunk_id` alone: chunk IDs are content-addressed
+  ([02-domain-model.md](02-domain-model.md) §2), so the same document indexed into two stores
+  yields the same chunk_id in both — a `chunk_id`-only key would silently merge two stores'
+  distinct hits. Ties are broken deterministically: `fused_score` descending, then `store_id`
+  ascending, then `chunk_id` ascending. Metadata filters (mime, path prefix, fetched_at range)
+  are pushed down to the backend where supported.
+
+  **Known limitation — cross-store score comparability.** Pooling ranks each leg by its raw
+  backend score, which assumes every store queried together reports that leg's scores on the
+  same scale. Two ways that assumption is imperfect:
+
+  - **BM25** scores are corpus-relative (per-store IDF and average document length), so a
+    pooled BM25 ranking compares numbers that are not strictly commensurable even when every
+    store runs the same backend. Cross-store ordering within that leg is therefore
+    approximate.
+  - **Dense** scores land in `[0, 1]`, but not via one common mapping. `store-libsql`
+    converts distance to score two ways, chosen per store by the encoding its embedder
+    produced: `1 - d/2` from a continuous cosine distance (`VectorEncoding::Float32`), and
+    `1 - d/nbits` from a sign-only binarized Hamming distance (`VectorEncoding::Binary`) —
+    the latter being what the default `pplx-embed-context-v1-0.6b` emits. Same range,
+    different distributions, so pooling across a Binary-encoded and a Float32-encoded store
+    would favor whichever mapping runs hotter rather than whichever store is more relevant.
+    The two shipped models differ in dimensionality (1024 vs 384) so one query cannot
+    currently reach both, but nothing enforces that. Separately, `SearchResult.score`
+    documents the leg as "cosine/dot-product": an unbounded dot-product would swamp a bounded
+    score outright, and is in any case wrong for the default model, whose vectors are
+    unnormalized and which documents cosine as required. Dense scores must be a bounded
+    similarity in `[0, 1]` — a precondition of pooling, not a free choice.
+
+  Global pooling is still strictly better than per-store RRF, which gave *every* store's
+  local rank-0 chunk an identical score regardless of quality. But multi-store relevance is
+  not fully solved until both legs are calibrated. Tracked by issue #40; see also §"Rejected"
+  above on score interpolation.
 - **Result shaping:** top-N (default 10) → Citation objects
   ([02-domain-model.md](02-domain-model.md) §6), with per-leg scores retained for debugging
   (`score: {fused, dense, bm25}`). Citations carry a **block reference** and chunk position

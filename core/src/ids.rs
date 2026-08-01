@@ -34,7 +34,7 @@ pub fn new_ulid() -> UlidId {
 /// # Arguments
 /// * `canonical_source_uri` - The canonical URI of the source (e.g. `file:///path/to/file`).
 /// * `content_hash` - The blake3 hash of the normalized extracted text (as hex string).
-pub fn document_id(canonical_source_uri: &str, content_hash: &str) -> ContentId {
+pub fn resource_id(canonical_source_uri: &str, content_hash: &str) -> ContentId {
     let mut hasher = blake3::Hasher::new();
     hasher.update(canonical_source_uri.as_bytes());
     hasher.update(content_hash.as_bytes());
@@ -51,29 +51,40 @@ pub fn content_hash(text: &str) -> String {
 
 /// Derive a content-addressed ID for a Chunk.
 ///
-/// The ID is `blake3(document_id || chunk_text || span_start || span_end || block_seq)`.
-/// Stable across re-runs over identical content.
+/// The ID is `blake3(resource_id ‖ block_seq ‖ chunk_text ‖ seq_in_block)`, hashed in
+/// exactly that order. Stable across re-runs over identical content.
+///
+/// Span (byte offsets) is deliberately NOT an input: spans are block-relative and can
+/// shift slightly between runs (e.g. due to whitespace-normalization tweaks) without the
+/// chunk's actual membership changing, which would otherwise needlessly churn IDs. Instead,
+/// `block_seq` and `seq_in_block` — the chunk's *final* position once block dispatch and any
+/// fix-up pass (e.g. the message-window shrink-to-fit) have settled — anchor identity, so IDs
+/// must be computed only after both are final. See specs/02-domain-model.md §2/§3 and
+/// specs/04-search-pipeline.md §3.
+///
+/// Integer components are hashed as little-endian bytes (`u32::to_le_bytes`) — an arbitrary
+/// but fixed choice; what matters is that it never changes without a policy-version bump
+/// (`core::config::policy`).
 ///
 /// # Arguments
-/// * `document_id` - The content-addressed ID of the parent document.
+/// * `resource_id` - The content-addressed ID of the parent document.
+/// * `block_seq` - Sequence number of the parent block within the resource. Prevents
+///   collisions when two blocks in the same document contain identical chunk text, and
+///   distinguishes message-window chunks (keyed off their first member block's seq).
 /// * `chunk_text` - The text content of the chunk.
-/// * `span_start` - Start byte offset in the normalized document text.
-/// * `span_end` - End byte offset in the normalized document text.
-/// * `block_seq` - Block sequence number; prevents collisions when two blocks
-///   in the same document contain identical text at the same block-local offset.
+/// * `seq_in_block` - The chunk's final position within its block (0-indexed). Distinguishes
+///   multiple chunks produced from the same block that happen to share text.
 pub fn chunk_id(
-    document_id: &str,
-    chunk_text: &str,
-    span_start: usize,
-    span_end: usize,
+    resource_id: &str,
     block_seq: u32,
+    chunk_text: &str,
+    seq_in_block: u32,
 ) -> ContentId {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(document_id.as_bytes());
-    hasher.update(chunk_text.as_bytes());
-    hasher.update(&span_start.to_le_bytes());
-    hasher.update(&span_end.to_le_bytes());
+    hasher.update(resource_id.as_bytes());
     hasher.update(&block_seq.to_le_bytes());
+    hasher.update(chunk_text.as_bytes());
+    hasher.update(&seq_in_block.to_le_bytes());
     hasher.finalize().to_hex().to_string()
 }
 
@@ -106,21 +117,21 @@ mod tests {
     // --- Document ID stability ---
 
     #[test]
-    fn same_content_produces_same_document_id() {
+    fn same_content_produces_same_resource_id() {
         let uri = "file:///home/user/docs/notes.md";
         let hash = content_hash("Hello, world!");
-        let id1 = document_id(uri, &hash);
-        let id2 = document_id(uri, &hash);
+        let id1 = resource_id(uri, &hash);
+        let id2 = resource_id(uri, &hash);
         assert_eq!(id1, id2, "same content must produce same document ID");
     }
 
     #[test]
-    fn different_content_produces_different_document_id() {
+    fn different_content_produces_different_resource_id() {
         let uri = "file:///home/user/docs/notes.md";
         let hash1 = content_hash("Hello, world!");
         let hash2 = content_hash("Goodbye, world!");
-        let id1 = document_id(uri, &hash1);
-        let id2 = document_id(uri, &hash2);
+        let id1 = resource_id(uri, &hash1);
+        let id2 = resource_id(uri, &hash2);
         assert_ne!(
             id1, id2,
             "changed content must produce a different document ID"
@@ -128,10 +139,10 @@ mod tests {
     }
 
     #[test]
-    fn different_uri_produces_different_document_id() {
+    fn different_uri_produces_different_resource_id() {
         let hash = content_hash("Same content");
-        let id1 = document_id("file:///path/a.md", &hash);
-        let id2 = document_id("file:///path/b.md", &hash);
+        let id1 = resource_id("file:///path/a.md", &hash);
+        let id2 = resource_id("file:///path/b.md", &hash);
         assert_ne!(
             id1, id2,
             "different URIs with same content must produce different document IDs"
@@ -139,9 +150,9 @@ mod tests {
     }
 
     #[test]
-    fn document_id_is_hex_string() {
+    fn resource_id_is_hex_string() {
         let hash = content_hash("test");
-        let id = document_id("file:///test.md", &hash);
+        let id = resource_id("file:///test.md", &hash);
         assert!(
             id.chars().all(|c| c.is_ascii_hexdigit()),
             "document ID must be a hex string"
@@ -176,35 +187,38 @@ mod tests {
 
     #[test]
     fn same_content_produces_same_chunk_id() {
-        let doc_id = document_id("file:///notes.md", &content_hash("doc text"));
-        let id1 = chunk_id(&doc_id, "chunk text here", 0, 15, 0);
-        let id2 = chunk_id(&doc_id, "chunk text here", 0, 15, 0);
+        let doc_id = resource_id("file:///notes.md", &content_hash("doc text"));
+        let id1 = chunk_id(&doc_id, 0, "chunk text here", 0);
+        let id2 = chunk_id(&doc_id, 0, "chunk text here", 0);
         assert_eq!(id1, id2, "same inputs must produce same chunk ID");
     }
 
     #[test]
     fn changed_chunk_text_produces_different_chunk_id() {
-        let doc_id = document_id("file:///notes.md", &content_hash("doc text"));
-        let id1 = chunk_id(&doc_id, "original chunk", 0, 14, 0);
-        let id2 = chunk_id(&doc_id, "modified chunk", 0, 14, 0);
+        let doc_id = resource_id("file:///notes.md", &content_hash("doc text"));
+        let id1 = chunk_id(&doc_id, 0, "original chunk", 0);
+        let id2 = chunk_id(&doc_id, 0, "modified chunk", 0);
         assert_ne!(id1, id2, "changed chunk text must produce different ID");
     }
 
     #[test]
-    fn changed_span_produces_different_chunk_id() {
-        let doc_id = document_id("file:///notes.md", &content_hash("doc text"));
+    fn changed_seq_in_block_produces_different_chunk_id() {
+        let doc_id = resource_id("file:///notes.md", &content_hash("doc text"));
         let text = "chunk text";
-        let id1 = chunk_id(&doc_id, text, 0, 10, 0);
-        let id2 = chunk_id(&doc_id, text, 5, 15, 0); // different span
-        assert_ne!(id1, id2, "changed span must produce different chunk ID");
+        let id1 = chunk_id(&doc_id, 0, text, 0);
+        let id2 = chunk_id(&doc_id, 0, text, 1); // different seq_in_block
+        assert_ne!(
+            id1, id2,
+            "changed seq_in_block must produce different chunk ID"
+        );
     }
 
     #[test]
-    fn changed_document_id_produces_different_chunk_id() {
-        let doc_id1 = document_id("file:///doc1.md", &content_hash("content1"));
-        let doc_id2 = document_id("file:///doc2.md", &content_hash("content2"));
-        let id1 = chunk_id(&doc_id1, "same text", 0, 9, 0);
-        let id2 = chunk_id(&doc_id2, "same text", 0, 9, 0);
+    fn changed_resource_id_produces_different_chunk_id() {
+        let doc_id1 = resource_id("file:///doc1.md", &content_hash("content1"));
+        let doc_id2 = resource_id("file:///doc2.md", &content_hash("content2"));
+        let id1 = chunk_id(&doc_id1, 0, "same text", 0);
+        let id2 = chunk_id(&doc_id2, 0, "same text", 0);
         assert_ne!(
             id1, id2,
             "different document must produce different chunk ID"
@@ -213,8 +227,8 @@ mod tests {
 
     #[test]
     fn chunk_id_is_hex_string() {
-        let doc_id = document_id("file:///test.md", &content_hash("test"));
-        let id = chunk_id(&doc_id, "chunk", 0, 5, 0);
+        let doc_id = resource_id("file:///test.md", &content_hash("test"));
+        let id = chunk_id(&doc_id, 0, "chunk", 0);
         assert!(
             id.chars().all(|c| c.is_ascii_hexdigit()),
             "chunk ID must be a hex string"
@@ -224,10 +238,10 @@ mod tests {
 
     #[test]
     fn different_block_seq_produces_different_chunk_id() {
-        let doc_id = document_id("file:///notes.md", &content_hash("doc text"));
-        // Same text and span, different block_seq → different IDs.
-        let id1 = chunk_id(&doc_id, "identical text", 0, 14, 0);
-        let id2 = chunk_id(&doc_id, "identical text", 0, 14, 1);
+        let doc_id = resource_id("file:///notes.md", &content_hash("doc text"));
+        // Same text and seq_in_block, different block_seq → different IDs.
+        let id1 = chunk_id(&doc_id, 0, "identical text", 0);
+        let id2 = chunk_id(&doc_id, 1, "identical text", 0);
         assert_ne!(
             id1, id2,
             "different block_seq must produce different chunk ID"
@@ -237,13 +251,13 @@ mod tests {
     // --- Cross-type stability ---
 
     #[test]
-    fn document_id_stable_across_reruns() {
+    fn resource_id_stable_across_reruns() {
         // Simulates indexing the same file twice
         let uri = "file:///data/report.md";
         let text = "# Report\n\nSome content here.";
         let hash = content_hash(text);
-        let id_run1 = document_id(uri, &hash);
-        let id_run2 = document_id(uri, &hash);
+        let id_run1 = resource_id(uri, &hash);
+        let id_run2 = resource_id(uri, &hash);
         assert_eq!(
             id_run1, id_run2,
             "document ID must be stable across re-runs"
@@ -255,10 +269,10 @@ mod tests {
         let uri = "file:///data/report.md";
         let text = "# Report\n\nSome content here.";
         let hash = content_hash(text);
-        let doc_id = document_id(uri, &hash);
+        let doc_id = resource_id(uri, &hash);
         let chunk_text = "Some content here.";
-        let id_run1 = chunk_id(&doc_id, chunk_text, 12, 30, 0);
-        let id_run2 = chunk_id(&doc_id, chunk_text, 12, 30, 0);
+        let id_run1 = chunk_id(&doc_id, 0, chunk_text, 0);
+        let id_run2 = chunk_id(&doc_id, 0, chunk_text, 0);
         assert_eq!(id_run1, id_run2, "chunk ID must be stable across re-runs");
     }
 }

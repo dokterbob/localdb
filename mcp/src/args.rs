@@ -7,7 +7,7 @@
 //! tool method body ever runs.
 //!
 //! A missing/wrong-typed *required* field (a non-`Option` field: `query` on
-//! [`SearchArgs`], `id` on [`GetDocumentArgs`], `document_id` on
+//! [`SearchArgs`], `id` on [`GetDocumentArgs`], `resource_id` on
 //! [`GetChunksArgs`]) fails at this deserialization step — but that surfaces
 //! as a **tool-level** `CallToolResult` error (rmcp downgrades it via
 //! `into_tool_argument_error`; it does *not* propagate as a protocol-level
@@ -84,11 +84,11 @@ pub struct GetDocumentArgs {
 /// Arguments for the `get_chunks` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetChunksArgs {
-    /// Document ID (content-addressed blake3 hash). Missing or non-string
+    /// Resource ID (content-addressed blake3 hash). Missing or non-string
     /// input fails deserialization (a tool-level "failed to deserialize
     /// parameters" error, see `lib.rs`).
-    #[schemars(description = "Document ID (content-addressed blake3 hash)")]
-    pub document_id: String,
+    #[schemars(description = "Resource ID (content-addressed blake3 hash)")]
+    pub resource_id: String,
 
     /// Number of chunks to skip before the first returned chunk (default: 0).
     #[serde(default)]
@@ -105,4 +105,24 @@ pub struct GetChunksArgs {
         range(min = 1, max = 200)
     )]
     pub limit: Option<i64>,
+
+    /// Anchor pagination (#146): resolve to the chunk with this exact
+    /// `chunk_id`, then return a window of `limit` chunks centered on it.
+    /// Mutually exclusive with `offset` and `anchor_block_seq`.
+    #[serde(default)]
+    #[schemars(
+        description = "Resolve to the chunk with this exact chunk_id, then return a window of `limit` chunks centered on it. Mutually exclusive with `offset` and `anchor_block_seq`."
+    )]
+    pub anchor_chunk_id: Option<String>,
+
+    /// Anchor pagination (#146): resolve via lower-bound to the first chunk
+    /// with `block_seq >= anchor_block_seq` (tie-broken by lowest
+    /// `seq_in_block`), then return a window of `limit` chunks centered on
+    /// it. Mutually exclusive with `offset` and `anchor_chunk_id`.
+    #[serde(default)]
+    #[schemars(
+        description = "Resolve via lower-bound to the first chunk with block_seq >= anchor_block_seq (tie-broken by lowest seq_in_block), then return a window of `limit` chunks centered on it. Mutually exclusive with `offset` and `anchor_chunk_id`.",
+        range(min = 0)
+    )]
+    pub anchor_block_seq: Option<u32>,
 }

@@ -170,24 +170,39 @@ pub(crate) async fn daemon_request_async(
             .unwrap_or("daemon error")
             .to_string();
 
-        Err(match code {
-            "store_not_found" => Error::StoreNotFound { id: msg },
-            "source_not_found" => Error::SourceNotFound { id: msg },
-            "document_not_found" => Error::DocumentNotFound { id: msg },
-            "job_not_found" => Error::JobNotFound { id: msg },
-            "runtime_state_locked" => Error::RuntimeStateLocked,
-            "daemon_running" => Error::DaemonRunning,
-            "daemon_unreachable" => Error::DaemonUnreachable,
-            "invalid_config" => Error::InvalidConfig { message: msg },
-            "invalid_request" => Error::InvalidRequest { message: msg },
-            "index_in_progress" => Error::IndexInProgress,
-            "provider_unavailable" => Error::ProviderUnavailable { message: msg },
-            "model_missing" => Error::ModelMissing { message: msg },
-            _ => Error::Internal {
-                message: format!("daemon returned {}: {}", status.as_u16(), msg),
-                correlation_id: "daemon_http".to_string(),
-            },
-        })
+        Err(decode_daemon_error(code, msg, status))
+    }
+}
+
+/// Map a daemon HTTP error body's stable `code` string (see
+/// `server/src/error.rs` and specs/05-surfaces.md §5) to a `core::Error`.
+///
+/// Extracted as a pure function so the code -> variant mapping (including
+/// the legacy-code fallback below) can be unit-tested without an HTTP round
+/// trip.
+fn decode_daemon_error(code: &str, msg: String, status: reqwest::StatusCode) -> Error {
+    match code {
+        "store_not_found" => Error::StoreNotFound { id: msg },
+        "source_not_found" => Error::SourceNotFound { id: msg },
+        "resource_not_found" => Error::ResourceNotFound { id: msg },
+        // Legacy code string from a stale daemon predating the
+        // resource_not_found rename (specs/05-surfaces.md §5); a v5+
+        // CLI may still talk to an older daemon binary, so keep
+        // decoding it to the same variant.
+        "document_not_found" => Error::ResourceNotFound { id: msg },
+        "job_not_found" => Error::JobNotFound { id: msg },
+        "runtime_state_locked" => Error::RuntimeStateLocked,
+        "daemon_running" => Error::DaemonRunning,
+        "daemon_unreachable" => Error::DaemonUnreachable,
+        "invalid_config" => Error::InvalidConfig { message: msg },
+        "invalid_request" => Error::InvalidRequest { message: msg },
+        "index_in_progress" => Error::IndexInProgress,
+        "provider_unavailable" => Error::ProviderUnavailable { message: msg },
+        "model_missing" => Error::ModelMissing { message: msg },
+        _ => Error::Internal {
+            message: format!("daemon returned {}: {}", status.as_u16(), msg),
+            correlation_id: "daemon_http".to_string(),
+        },
     }
 }
 
@@ -269,6 +284,39 @@ mod tests {
         assert!(
             !url_path.exists(),
             "stale discovery URL file should be removed"
+        );
+    }
+
+    #[test]
+    fn decode_daemon_error_maps_resource_not_found() {
+        let err = decode_daemon_error(
+            "resource_not_found",
+            "doc-1".to_string(),
+            reqwest::StatusCode::NOT_FOUND,
+        );
+        assert_eq!(
+            err,
+            Error::ResourceNotFound {
+                id: "doc-1".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn decode_daemon_error_accepts_legacy_document_not_found_code() {
+        // A stale daemon (pre-rename) may still emit the legacy
+        // "document_not_found" code string; the CLI must decode it to the
+        // same `ResourceNotFound` variant a current daemon would produce.
+        let err = decode_daemon_error(
+            "document_not_found",
+            "doc-1".to_string(),
+            reqwest::StatusCode::NOT_FOUND,
+        );
+        assert_eq!(
+            err,
+            Error::ResourceNotFound {
+                id: "doc-1".to_string()
+            }
         );
     }
 }

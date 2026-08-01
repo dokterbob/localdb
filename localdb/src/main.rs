@@ -74,6 +74,11 @@ pub enum Command {
     #[command(subcommand)]
     Source(SourceCommand),
 
+    /// Inspect or migrate a store's schema.
+    // See specs/05-surfaces.md §2.1.
+    #[command(subcommand)]
+    Db(DbCommand),
+
     /// Run a one-shot scan-and-index job.
     Index {
         /// Limit to a specific source (by ID).
@@ -126,6 +131,39 @@ pub enum StoreCommand {
     Remove {
         /// Store name or ID.
         name: String,
+    },
+}
+
+/// Schema-migration maintenance subcommands (specs/05-surfaces.md §2.1).
+///
+/// CLI-only: the HTTP daemon and MCP never apply migrations themselves —
+/// they only ever surface the refusal-with-hint that `LibsqlDb::open`
+/// produces on a version mismatch. All three subcommands refuse with
+/// `daemon_running` (exit 4) while the daemon is up, the same way every
+/// other daemon-aware write command does.
+#[derive(Debug, Subcommand)]
+pub enum DbCommand {
+    /// Show schema version, pending migrations, and migration history.
+    ///
+    /// Never refuses, even on a store newer than this binary or one that
+    /// predates the migration framework entirely.
+    Status,
+
+    /// Apply pending migrations to bring the store up to this binary's head version.
+    ///
+    /// A legacy (pre-migration-framework, v1-v3) store requires confirmation
+    /// before its destructive rebuild (all indexed data is lost); an
+    /// ordinary forward migration needs no confirmation.
+    Migrate,
+
+    /// Reverse migrations using stored down-SQL (default: one step back).
+    ///
+    /// Always requires confirmation. Refuses cleanly, without changing
+    /// anything, if a migration on the way to `--to` has no down path.
+    Downgrade {
+        /// Target schema version to downgrade to (default: one step below the current version).
+        #[arg(long, value_name = "VERSION")]
+        to: Option<i64>,
     },
 }
 
@@ -207,6 +245,11 @@ fn main() {
                 }
             }
         },
+        Command::Db(cmd) => match cmd {
+            DbCommand::Status => cli::run_db_status(&ctx),
+            DbCommand::Migrate => cli::run_db_migrate(&ctx),
+            DbCommand::Downgrade { to } => cli::run_db_downgrade(&ctx, *to),
+        },
         Command::Index { source, strict } => cli::run_index(&ctx, source.as_deref(), *strict),
         Command::Search {
             query,
@@ -240,7 +283,7 @@ mod tests {
         let subcommand_names: Vec<&str> = cmd.get_subcommands().map(|sc| sc.get_name()).collect();
 
         for expected in &[
-            "init", "serve", "mcp", "status", "store", "source", "index", "search", "add",
+            "init", "serve", "mcp", "status", "store", "source", "db", "index", "search", "add",
         ] {
             assert!(
                 subcommand_names.contains(expected),
@@ -295,6 +338,66 @@ mod tests {
                 "source {expected} subcommand missing; found: {sub_names:?}",
             );
         }
+    }
+
+    /// Verify the db subcommands are present.
+    #[test]
+    fn db_subcommands_present() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let db_cmd = cmd
+            .get_subcommands()
+            .find(|sc| sc.get_name() == "db")
+            .expect("db subcommand missing");
+
+        let sub_names: Vec<&str> = db_cmd.get_subcommands().map(|sc| sc.get_name()).collect();
+
+        for expected in &["status", "migrate", "downgrade"] {
+            assert!(
+                sub_names.contains(expected),
+                "db {expected} subcommand missing; found: {sub_names:?}",
+            );
+        }
+    }
+
+    /// `localdb db downgrade --to N` parses `N` as an `i64`.
+    #[test]
+    fn db_downgrade_to_flag_parses_i64() {
+        let cli = Cli::try_parse_from(["localdb", "db", "downgrade", "--to", "3"]).unwrap();
+        if let Command::Db(DbCommand::Downgrade { to }) = cli.command {
+            assert_eq!(to, Some(3));
+        } else {
+            panic!("expected Db(Downgrade) command");
+        }
+    }
+
+    /// `localdb db downgrade` without `--to` parses to `None` (CLI resolves
+    /// the one-step-back default itself, not the library's baseline default).
+    #[test]
+    fn db_downgrade_without_to_defaults_to_none() {
+        let cli = Cli::try_parse_from(["localdb", "db", "downgrade"]).unwrap();
+        if let Command::Db(DbCommand::Downgrade { to }) = cli.command {
+            assert_eq!(to, None);
+        } else {
+            panic!("expected Db(Downgrade) command");
+        }
+    }
+
+    /// `localdb db status` and `localdb db migrate` parse with no arguments.
+    #[test]
+    fn db_status_and_migrate_parse() {
+        assert!(matches!(
+            Cli::try_parse_from(["localdb", "db", "status"])
+                .unwrap()
+                .command,
+            Command::Db(DbCommand::Status)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["localdb", "db", "migrate"])
+                .unwrap()
+                .command,
+            Command::Db(DbCommand::Migrate)
+        ));
     }
 
     /// Unquoted multi-word query is joined into a single string.

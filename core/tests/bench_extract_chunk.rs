@@ -26,11 +26,14 @@ mod bench_extract_chunk {
 
         // Extract
         let t_extract = Instant::now();
-        let extractor = extract::ChainExtractor::with_defaults().expect("build extractor");
-        use localdb_core::ingestion::DocumentExtractor as _;
-        let extraction = extractor
-            .extract(&bytes, Some(filename))
-            .expect("extraction failed");
+        use extract::Parser as _;
+        let chain = extract::build_chain(&extract::default_parser_ids()).expect("build chain");
+        let sniffed = extract::sniff_mime(&bytes, Some(filename));
+        let probe = extract::Probe::new(&bytes, Some(filename), sniffed.as_deref());
+        let extraction = chain
+            .parse(&probe)
+            .expect("extraction failed")
+            .expect("no parser matched the file");
         let extract_ms = t_extract.elapsed().as_millis();
         let markdown_bytes = extraction.markdown.len();
         let inflation = markdown_bytes as f64 / bytes.len() as f64;

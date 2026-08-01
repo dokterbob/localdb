@@ -27,8 +27,7 @@ pub(crate) fn build_filter_clauses(filters: &[MetadataFilter]) -> String {
             MetadataFilter::FetchedAfter(v) => push_filter(&mut clauses, "r.added_at >=", v),
             MetadataFilter::FetchedBefore(v) => push_filter(&mut clauses, "r.added_at <=", v),
             MetadataFilter::SourceId(v) => push_filter(&mut clauses, "r.source_id =", v),
-            // `document_id` in core maps to `resource_id` in the schema.
-            MetadataFilter::DocumentId(v) => push_filter(&mut clauses, "c.resource_id =", v),
+            MetadataFilter::ResourceId(v) => push_filter(&mut clauses, "c.resource_id =", v),
             MetadataFilter::PolicyVersion(v) => push_filter(&mut clauses, "r.policy_version =", v),
         }
     }

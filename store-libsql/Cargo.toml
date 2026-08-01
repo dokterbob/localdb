@@ -10,8 +10,10 @@ localdb-core = { path = "../core" }
 libsql = "0.10.0-pre.4"
 tokio = { workspace = true }
 async-trait = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+blake3 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

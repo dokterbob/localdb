@@ -3,6 +3,7 @@ members = [
     "core",
     "extract",
     "fetch",
+    "ingest",
     "store-libsql",
     "embed",
     "server",
@@ -62,6 +63,7 @@ libsql = "=0.10.0-pre.4"
 
 # URL parsing
 url = "2"
+percent-encoding = "2"
 
 # Hashing for policy_version
 hex = "0.4"
@@ -80,6 +82,7 @@ schemars = "1.0"
 localdb-core = { path = "core" }
 extract = { path = "extract" }
 fetch = { path = "fetch" }
+ingest = { path = "ingest" }
 store-libsql = { path = "store-libsql" }
 embed = { path = "embed" }
 server = { path = "server" }

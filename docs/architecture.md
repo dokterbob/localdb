@@ -52,6 +52,18 @@ backends emit index-interchangeable vectors. See
 
 The `RetrievalStore` trait implementation backed by libsql (DiskANN vectors + FTS5 BM25). A single unified database file at `<data_dir>/localdb.db` holds everything. BM25 full-text search uses SQLite's FTS5 virtual table. Dense search uses the DiskANN vector index (`libsql_vector_idx`). RRF fusion is done in `core`. See [specs/01-architecture.md](../specs/01-architecture.md) §2.
 
+Schema changes go through an explicit migrations runner (`store-libsql/src/migrations/`): a
+frozen baseline DDL snapshot (`baseline.rs`, `PRAGMA user_version = 4`) plus a linear, numbered
+chain of `Migration` entries applied one transaction at a time. A `schema_migrations` table is
+the source of truth for version, with `PRAGMA user_version` kept as a cheap, non-authoritative
+marker. **Opening a store never migrates it, in either direction** — a version mismatch on open
+is refused with an actionable hint, on every surface (CLI, HTTP daemon, MCP alike). The only way
+to change a store's schema version is `localdb db migrate` / `localdb db downgrade [--to N]`
+(CLI-only; `db status` is read-only and never refuses). See
+[docs/migrations.md](migrations.md) for the full user-facing and authoring guide, and
+[specs/02-domain-model.md](../specs/02-domain-model.md) §9 /
+[specs/05-surfaces.md](../specs/05-surfaces.md) §2.1 for the design.
+
 ### `cli`
 
 Command implementations. A thin layer on `core` and the daemon client; no business logic.
@@ -112,20 +124,21 @@ to the appropriate crate. No logic of its own. Subcommands: `init`, `serve`, `mc
  └─────────────────────────────────────────────────────────┘
 
  ┌─────────────────────────────────────────────────────────┐
- │                     READ PATH                           │
+ │                        READ PATH                        │
  │                                                         │
  │  query string                                           │
  │       │                                                 │
- │       ├──────────────────────────────────┐              │
- │       ▼                                  ▼              │
- │  BM25 search (FTS5)               dense search (KNN)    │
- │       │                                  │              │
- │       └──────────────┬───────────────────┘              │
- │                      ▼                                  │
- │               RRF fusion (k=60, in core)                │
- │                      │                                  │
- │                      ▼                                  │
- │         top-N Citations  (fused + per-leg scores)       │
+ │       ▼                                                 │
+ │  fan out per store: BM25 (FTS5) + dense (KNN)           │
+ │       │                                                 │
+ │       ▼                                                 │
+ │  pool each leg across all stores (global rank per leg)  │
+ │       │                                                 │
+ │       ▼                                                 │
+ │  single RRF fusion (k=60; key = store_id+chunk_id)      │
+ │       │                                                 │
+ │       ▼                                                 │
+ │  top-N Citations (fused + per-leg scores)               │
  └─────────────────────────────────────────────────────────┘
 ```
 

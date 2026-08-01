@@ -186,6 +186,29 @@ pub(crate) async fn load_app_db_lenient(ctx: &CliContext) -> (ConfigLoader, AppD
     (config_loader, db)
 }
 
+/// Load config only — no store open, no embedder construction.
+///
+/// Used exclusively by the `db status`/`db migrate`/`db downgrade`
+/// maintenance commands (specs/05-surfaces.md §2.1). Those commands must
+/// never go through `AppDb::open`/`SqliteBackend::open`: `LibsqlDb::open`
+/// refuses on a schema-version mismatch, which is exactly the state these
+/// commands exist to repair. They must also never construct an embedder —
+/// the default `local` provider would trigger a one-time ~706 MB model
+/// download just to inspect or migrate a store's schema. `embed::infer_dim_encoding`
+/// gives the `(embedding_dim, encoding)` pair a `MigrationContext` needs from
+/// config alone, the same cheap static lookup `AppDb::open` itself uses
+/// before ever touching the embedder.
+pub(crate) fn load_config_for_maintenance(ctx: &CliContext) -> ConfigLoader {
+    let options = LoadOptions {
+        config_path: ctx.config.clone(),
+        ..Default::default()
+    };
+    match load_config(&options, ctx.config_env.as_deref()) {
+        Ok(c) => c,
+        Err(e) => exit_err(&e, ctx.json),
+    }
+}
+
 /// Resolve the target store name from --store flags or runtime DB.
 pub(crate) async fn resolve_store_name(ctx: &CliContext, db: &AppDb) -> String {
     if let Some(name) = ctx.stores.first() {

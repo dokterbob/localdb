@@ -59,7 +59,6 @@ pub fn f32_to_vector1bit_sql(v: &[f32]) -> String {
 }
 
 /// Format a raw query vector for the appropriate encoding.
-#[allow(dead_code)] // used in Wave 4 (search methods)
 pub fn query_vector_sql(v: &[f32], encoding: VectorEncoding) -> String {
     match encoding {
         VectorEncoding::Float32 => f32_to_vector32_sql(v),
@@ -78,7 +77,6 @@ pub fn embedding_column_type(dim: usize, encoding: VectorEncoding) -> String {
 /// Convert a cosine distance (from `vector_distance_cos`) to a similarity score [0, 1].
 ///
 /// Cosine distance = 1 - cosine_similarity, range [0, 2].
-#[allow(dead_code)] // used in Wave 4 (dense_search)
 pub fn cosine_distance_to_score(distance: f64) -> f32 {
     (1.0 - distance / 2.0) as f32
 }
@@ -86,7 +84,6 @@ pub fn cosine_distance_to_score(distance: f64) -> f32 {
 /// Convert a Hamming distance to a similarity score [0, 1].
 ///
 /// Hamming distance = number of differing bits. Range [0, nbits].
-#[allow(dead_code)] // used in Wave 4 (dense_search with Binary encoding)
 pub fn hamming_distance_to_score(distance: f64, nbits: usize) -> f32 {
     (1.0 - distance / nbits as f64) as f32
 }

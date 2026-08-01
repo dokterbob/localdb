@@ -794,7 +794,7 @@ mod tests {
         let job_store_id = store_id.clone();
         let chunks = vec![ChunkRecord {
             id: "watcher-chunk-1".to_string(),
-            document_id: "watcher-doc-1".to_string(),
+            resource_id: "watcher-doc-1".to_string(),
             store_id: store_id.clone(),
             text: updated_text.to_string(),
             span: localdb_core::types::Span::new(0, updated_text.len()),
@@ -805,20 +805,21 @@ mod tests {
             content_hash: "watcher-hash-1".to_string(),
             origin_store: store_id.clone(),
             source_id: source.id,
-            source_kind: "path".to_string(),
+            ingestor_kind: "path".to_string(),
             mime: Some("text/markdown".to_string()),
             uri: format!("file://{}", watched_file.display()),
-            metadata: localdb_core::DocumentMetadata::default(),
+            metadata: localdb_core::metadata::Metadata::default(),
             block_seq: 0,
             seq_in_block: 0,
             block_kind: None,
+            window_block_seqs: vec![],
         }];
 
         // Submit a job that upserts the chunk (simulating real ingestion).
         let job = queue
             .submit("store-A", localdb_core::IndexJobScope::Store, move || {
                 // This closure runs on a blocking thread and produces the chunk data.
-                // In real ingestion, this would call run_ingestion_for_source.
+                // In real ingestion, this would call run_source_ingestion.
                 tokio::runtime::Handle::current()
                     .block_on(async {
                         job_state_clone

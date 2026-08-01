@@ -14,7 +14,7 @@
 
 use tempfile::tempdir;
 
-use localdb_core::parser::DocumentMetadata;
+use localdb_core::metadata::Metadata;
 use localdb_core::store::ChunkRecord;
 use localdb_core::types::{SourceKind, Span, StoreVisibility};
 use localdb_core::{SourceRow, StoreBackend, StoreBackendConfig, StoreRow, VectorEncoding};
@@ -74,7 +74,7 @@ fn make_record(store_id: &str, source_id: &str, idx: usize) -> ChunkRecord {
     let text = format!("chunk {idx} of {store_id} alpha beta gamma");
     ChunkRecord {
         id: format!("chunk-{store_id}-{idx}"),
-        document_id: format!("doc-{store_id}"),
+        resource_id: format!("doc-{store_id}"),
         store_id: store_id.to_string(),
         text: text.clone(),
         span: Span::new(idx * 100, idx * 100 + text.len()),
@@ -85,13 +85,14 @@ fn make_record(store_id: &str, source_id: &str, idx: usize) -> ChunkRecord {
         content_hash: format!("hash-{store_id}"),
         origin_store: store_id.to_string(),
         source_id: source_id.to_string(),
-        source_kind: "path".to_string(),
+        ingestor_kind: "path".to_string(),
         mime: Some("text/plain".to_string()),
         uri: format!("file:///data/{store_id}/doc.md"),
-        metadata: DocumentMetadata::default(),
+        metadata: Metadata::default(),
         block_seq: 0,
         seq_in_block: 0,
         block_kind: None,
+        window_block_seqs: vec![],
     }
 }
 

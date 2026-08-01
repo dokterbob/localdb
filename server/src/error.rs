@@ -46,7 +46,7 @@ pub fn http_status_for(err: &CoreError) -> StatusCode {
     match err {
         CoreError::StoreNotFound { .. }
         | CoreError::SourceNotFound { .. }
-        | CoreError::DocumentNotFound { .. }
+        | CoreError::ResourceNotFound { .. }
         | CoreError::JobNotFound { .. } => StatusCode::NOT_FOUND,
 
         CoreError::RuntimeStateLocked | CoreError::DaemonRunning | CoreError::IndexInProgress => {
@@ -86,7 +86,7 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         assert_eq!(
-            http_status_for(&Error::DocumentNotFound { id: "x".into() }),
+            http_status_for(&Error::ResourceNotFound { id: "x".into() }),
             StatusCode::NOT_FOUND
         );
         assert_eq!(
