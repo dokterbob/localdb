@@ -262,6 +262,41 @@ async fn create_feed_source_max_entries_zero_returns_400() {
 }
 
 #[tokio::test]
+async fn create_feed_source_string_fetch_full_content_returns_400() {
+    let (_dir, app) = make_app().await;
+    create_store_named(&app, "docs").await;
+
+    // A mistyped (string) fetch_full_content must be rejected, not silently
+    // treated as absent — `as_bool()` would default discovery mode ON
+    // against the caller's stated intent.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/stores/docs/sources")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "kind": "feed",
+                        "spec": {
+                            "url": "https://example.com/feed.xml",
+                            "fetch_full_content": "false",
+                        },
+                        "preset": "prose",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(resp.into_body()).await;
+    assert_eq!(body["code"], "invalid_request");
+}
+
+#[tokio::test]
 async fn create_source_unknown_kind_still_rejected() {
     let (_dir, app) = make_app().await;
     create_store_named(&app, "docs").await;

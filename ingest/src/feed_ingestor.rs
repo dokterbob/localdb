@@ -133,7 +133,7 @@ impl Ingestor for FeedIngestor {
                 .build()
                 .parse(bytes.as_slice())
         }));
-        let feed: Feed = match parse_outcome {
+        let mut feed: Feed = match parse_outcome {
             Err(panic_msg) => {
                 tracing::warn!(url = %feed_url, "FeedIngestor: feed parser panicked: {}", panic_msg);
                 callback
@@ -156,10 +156,11 @@ impl Ingestor for FeedIngestor {
             Ok(Ok(feed)) => feed,
         };
 
-        // Partial move: only the `entries` field is taken here, so
-        // `feed.title` / `feed.description` remain usable below (single-doc
+        // `mem::take`, not `.clone()`: a large feed's entries would otherwise
+        // exist twice at peak. Only `entries` is moved out — `feed.title` /
+        // `feed.description` / `feed.updated` remain usable below (single-doc
         // mode needs them).
-        let mut entries = feed.entries.clone();
+        let mut entries = std::mem::take(&mut feed.entries);
 
         // Stable-sort DESC by published.or(updated); `None` dates sort last.
         // Never `sort_unstable_by` — and always sort BEFORE truncating: an
@@ -198,11 +199,20 @@ impl Ingestor for FeedIngestor {
             callback.on_discovered(1).await;
             let feed_title_text = feed_title_or_default(&feed);
             let markdown = build_single_doc_markdown(&feed, &feed_title_text, &entries);
+            // `modified_at` comes from the feed when it says anything:
+            // `feed.updated`, else the newest entry's date (entries are
+            // already sorted DESC on published.or(updated), so that's the
+            // first entry's sort key), else ingestion-time now().
+            let modified_at_override = feed
+                .updated
+                .or_else(|| entries.first().and_then(|e| e.published.or(e.updated)))
+                .map(|d| d.to_rfc3339());
             let enrichment = ResourceEnrichment {
                 external_id: None,
                 title_fallback: Some(feed_title_text),
                 creator: Vec::new(),
                 date: None,
+                modified_at_override,
                 provenance_source: Some(feed_url.clone()),
                 capture_etag: false,
             };
@@ -228,6 +238,25 @@ impl Ingestor for FeedIngestor {
 // ---------------------------------------------------------------------------
 // Discovery mode — per-entry processing
 // ---------------------------------------------------------------------------
+
+/// Human-usable display string for a feed-rs `Person`, or `None` if it has
+/// nothing usable. feed-rs hardcodes `Person.name` to the literal string
+/// `"author"` for RSS 2.0 `<author>` elements and puts the element's actual
+/// text (an email, possibly `email (Name)`) in `Person.email` (verified
+/// against feed-rs `parser/rss2/mod.rs::handle_contact`) — so that
+/// placeholder must never leak into creator/byline output; the email field
+/// is the real value there.
+fn person_display(p: &feed_rs::model::Person) -> Option<String> {
+    let name = p.name.trim();
+    if !name.is_empty() && name != "author" {
+        return Some(name.to_string());
+    }
+    p.email
+        .as_deref()
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(String::from)
+}
 
 /// First entry link with `rel` `None` or `"alternate"` (RSS `<link>` maps to
 /// `rel: None`; Atom defaults an omitted `rel` to `"alternate"` itself —
@@ -272,8 +301,17 @@ async fn process_discovery_entry(
     result: &mut IngestResult,
 ) -> Result<(), Error> {
     let link_href = select_entry_link(entry).map(|l| l.href.clone());
-    let (locator, uri, has_link) = match link_href.as_deref().map(Uri::parse) {
-        Some(Some(parsed)) => (link_href.clone().unwrap(), parsed, true),
+    // A parsed link is the resource identity either way (stable, matching
+    // the "URI keys off the feed-declared link" contract), but only an
+    // http(s) one is *fetchable*: `Uri::parse` happily accepts `mailto:` /
+    // `ftp:` links, and handing those to the HTTP fetcher would fail as a
+    // transient FetchError every run — which never falls back, so the
+    // entry's embedded content would never be indexed at all.
+    let (locator, uri, fetchable) = match link_href.as_deref().map(Uri::parse) {
+        Some(Some(parsed)) => {
+            let fetchable = matches!(parsed.scheme(), "http" | "https");
+            (link_href.clone().unwrap(), parsed, fetchable)
+        }
         // Absent or unparseable link -> synthetic fragment URI. Untrusted
         // entry data must never abort the run.
         _ => {
@@ -286,18 +324,17 @@ async fn process_discovery_entry(
     let enrichment = ResourceEnrichment {
         external_id: Some(entry.id.clone()),
         title_fallback: entry.title.as_ref().map(|t| t.content.clone()),
-        creator: entry
-            .authors
-            .iter()
-            .map(|p| p.name.trim().to_string())
-            .filter(|n| !n.is_empty())
-            .collect(),
+        creator: entry.authors.iter().filter_map(person_display).collect(),
         date: entry.published.or(entry.updated).map(|d| d.to_rfc3339()),
+        // The feed's own modification claim, preferring `updated` (that's
+        // what it means) over `published`; `dc.date` above keeps the
+        // opposite preference (creation/publication semantics).
+        modified_at_override: entry.updated.or(entry.published).map(|d| d.to_rfc3339()),
         provenance_source: Some(feed_url.to_string()),
         capture_etag: true,
     };
 
-    let needs_fallback = if has_link {
+    let needs_fallback = if fetchable {
         // Asymmetric fallback (pinned): transient failures (FetchError,
         // ParseFailed) already reported themselves as errors — no fallback,
         // so the last good index stays put instead of flip-flopping between
@@ -318,7 +355,8 @@ async fn process_discovery_entry(
         .await?;
         matches!(outcome, UrlOutcome::Gone | UrlOutcome::Unsupported)
     } else {
-        // Link-less entries never fetch — straight to embedded content.
+        // Link-less and non-http(s)-linked entries never fetch — straight
+        // to embedded content.
         true
     };
 
@@ -389,17 +427,28 @@ fn route_text(content_type: &MediaTypeBuf, body: &str) -> Option<(String, Option
 /// `entry.content` (if it has a body — `<content src=...>` has `body: None`
 /// and is treated as absent, never fetched) then `entry.summary`, routed by
 /// declared type. Returns `(markdown, extracted_title, mime_essence)`.
+///
+/// A piece whose extracted Markdown trims empty is unusable and falls
+/// through to the next piece in the chain, exactly like an unroutable type:
+/// a 0-block Resource with a changed content hash reaches core's
+/// `index_resource` empty-chunks arm, which *deletes* the previously indexed
+/// document — an entry whose `<content>` extracts to nothing must fall back
+/// to its summary/title instead of erasing them.
 fn entry_routed_content(entry: &Entry) -> Option<(String, Option<String>, String)> {
     if let Some(content) = &entry.content {
         if let Some(body) = &content.body {
             if let Some((md, title)) = route_text(&content.content_type, body) {
-                return Some((md, title, content.content_type.essence().to_string()));
+                if !md.trim().is_empty() {
+                    return Some((md, title, content.content_type.essence().to_string()));
+                }
             }
         }
     }
     if let Some(summary) = &entry.summary {
         if let Some((md, title)) = route_text(&summary.content_type, &summary.content) {
-            return Some((md, title, summary.content_type.essence().to_string()));
+            if !md.trim().is_empty() {
+                return Some((md, title, summary.content_type.essence().to_string()));
+            }
         }
     }
     None
@@ -476,12 +525,7 @@ fn build_single_doc_markdown(feed: &Feed, feed_title_text: &str, entries: &[Entr
         // template — and therefore the whole single-doc content hash —
         // churn on every title tweak even when nothing else changed.
         let mut byline_parts: Vec<String> = Vec::new();
-        let author_names: Vec<String> = entry
-            .authors
-            .iter()
-            .map(|p| p.name.trim().to_string())
-            .filter(|n| !n.is_empty())
-            .collect();
+        let author_names: Vec<String> = entry.authors.iter().filter_map(person_display).collect();
         if !author_names.is_empty() {
             byline_parts.push(format!("By {}", author_names.join(", ")));
         }

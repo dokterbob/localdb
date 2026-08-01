@@ -1218,6 +1218,238 @@ async fn entry_link_redirect_resource_uri_is_pre_redirect_link() {
 }
 
 // ---------------------------------------------------------------------------
+// Non-http(s) entry links: never fetched, embedded content at the link URI
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn mailto_link_entry_uses_embedded_content_at_link_uri_no_fetch() {
+    let items = r#"<item><title>Mail Entry</title><link>mailto:someone@example.com</link><guid>m1</guid><pubDate>Mon, 05 Jan 2026 00:00:00 GMT</pubDate><description>Mail body text</description></item>"#;
+    let feed_xml = rss2_feed("", items);
+    let mut script = HashMap::new();
+    script.insert(
+        "https://feed.example.com/feed.xml".to_string(),
+        ScriptedOutcome::text(&feed_xml),
+    );
+    let (ingestor, fetcher) = ingestor_with(script);
+    let source = source_for("https://feed.example.com/feed.xml", None, true);
+    let mut cb = RecordingCallback::default();
+    let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+    // A mailto: link parses as a valid Uri but is not fetchable — handing it
+    // to the HTTP fetcher would be a transient FetchError every run (which
+    // never falls back), so the entry's embedded content would never index.
+    assert_eq!(result.errors, 0);
+    assert_eq!(result.resources_produced, 1);
+    // The parsed link stays the resource identity (stable, feed-declared).
+    assert_eq!(cb.resources[0].uri.as_str(), "mailto:someone@example.com");
+    let text = cb.resources[0]
+        .blocks
+        .iter()
+        .map(|b| b.text.clone())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(text.contains("Mail body text"));
+    assert_eq!(
+        fetcher.calls.lock().unwrap().len(),
+        1,
+        "only the feed itself is fetched, never the mailto link"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// RSS <author>: feed-rs's literal "author" placeholder must not leak
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn rss_author_placeholder_name_falls_back_to_email_in_creator() {
+    let items = r#"<item><title>E1</title><guid>e1</guid><author>jane@example.com (Jane Doe)</author><pubDate>Mon, 05 Jan 2026 00:00:00 GMT</pubDate><description>Body</description></item>"#;
+    let feed_xml = rss2_feed("", items);
+    let mut script = HashMap::new();
+    script.insert(
+        "https://feed.example.com/feed.xml".to_string(),
+        ScriptedOutcome::text(&feed_xml),
+    );
+    let (ingestor, _fetcher) = ingestor_with(script);
+    let source = source_for("https://feed.example.com/feed.xml", None, true);
+    let mut cb = RecordingCallback::default();
+    ingestor.ingest(&source, &mut cb).await.unwrap();
+
+    assert_eq!(cb.resources.len(), 1);
+    assert_eq!(
+        cb.resources[0].metadata.dublin_core().creator,
+        vec!["jane@example.com (Jane Doe)".to_string()],
+        "RSS <author> value lives in Person.email; the hardcoded \
+         Person.name placeholder \"author\" must never appear as a creator"
+    );
+}
+
+#[tokio::test]
+async fn single_doc_rss_author_byline_uses_email_not_placeholder() {
+    let items = r#"<item><title>E1</title><guid>e1</guid><author>jane@example.com (Jane Doe)</author><pubDate>Mon, 05 Jan 2026 00:00:00 GMT</pubDate><description>Body</description></item>"#;
+    let feed_xml = rss2_feed("", items);
+    let mut script = HashMap::new();
+    script.insert(
+        "https://feed.example.com/feed.xml".to_string(),
+        ScriptedOutcome::text(&feed_xml),
+    );
+    let (ingestor, _fetcher) = ingestor_with(script);
+    let source = source_for("https://feed.example.com/feed.xml", None, false);
+    let mut cb = RecordingCallback::default();
+    ingestor.ingest(&source, &mut cb).await.unwrap();
+
+    let text = cb.resources[0]
+        .blocks
+        .iter()
+        .map(|b| b.text.clone())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        text.contains("By jane@example.com (Jane Doe)"),
+        "byline must carry the real author value: {text}"
+    );
+    assert!(
+        !text.contains("By author"),
+        "the literal \"author\" placeholder must not leak into the byline: {text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Empty extracted bodies fall through the content -> summary -> title chain
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn empty_extracted_content_falls_back_to_summary() {
+    let entries = r#"<entry><title>E1</title><id>urn:e1</id><updated>2026-01-05T00:00:00Z</updated><content type="html">&lt;p&gt; &lt;/p&gt;</content><summary>Fallback summary text</summary></entry>"#;
+    let feed_xml = atom_feed(entries);
+    let mut script = HashMap::new();
+    script.insert(
+        "https://feed.example.com/feed.xml".to_string(),
+        ScriptedOutcome::text(&feed_xml),
+    );
+    let (ingestor, _fetcher) = ingestor_with(script);
+    let source = source_for("https://feed.example.com/feed.xml", None, true);
+    let mut cb = RecordingCallback::default();
+    let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+    // A <content> that extracts to empty Markdown must not win the chain: a
+    // 0-block Resource with a changed hash reaches core's empty-chunks arm,
+    // which deletes the previously indexed document for this URI.
+    assert_eq!(result.resources_produced, 1);
+    assert_eq!(result.errors, 0);
+    let text = cb.resources[0]
+        .blocks
+        .iter()
+        .map(|b| b.text.clone())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        text.contains("Fallback summary text"),
+        "empty content must fall through to the summary: {text}"
+    );
+    assert!(!cb.resources[0].blocks.is_empty());
+}
+
+#[tokio::test]
+async fn empty_content_and_summary_fall_back_to_title_only() {
+    let entries = r#"<entry><title>Only A Title</title><id>urn:e1</id><updated>2026-01-05T00:00:00Z</updated><content type="html">&lt;div&gt;&lt;/div&gt;</content><summary>   </summary></entry>"#;
+    let feed_xml = atom_feed(entries);
+    let mut script = HashMap::new();
+    script.insert(
+        "https://feed.example.com/feed.xml".to_string(),
+        ScriptedOutcome::text(&feed_xml),
+    );
+    let (ingestor, _fetcher) = ingestor_with(script);
+    let source = source_for("https://feed.example.com/feed.xml", None, true);
+    let mut cb = RecordingCallback::default();
+    let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+    assert_eq!(result.resources_produced, 1);
+    assert_eq!(result.errors, 0);
+    assert!(
+        !cb.resources[0].blocks.is_empty(),
+        "an emitted resource must always have non-empty blocks"
+    );
+    let text = cb.resources[0]
+        .blocks
+        .iter()
+        .map(|b| b.text.clone())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(text.contains("Only A Title"));
+}
+
+// ---------------------------------------------------------------------------
+// modified_at from feed timestamps (added_at stays ingestion-time)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn modified_at_prefers_updated_while_dc_date_prefers_published() {
+    let entries = r#"<entry><title>E1</title><id>urn:e1</id><updated>2026-01-05T00:00:00Z</updated><published>2026-01-04T00:00:00Z</published><summary>Body</summary></entry>"#;
+    let feed_xml = atom_feed(entries);
+    let mut script = HashMap::new();
+    script.insert(
+        "https://feed.example.com/feed.xml".to_string(),
+        ScriptedOutcome::text(&feed_xml),
+    );
+    let (ingestor, _fetcher) = ingestor_with(script);
+    let source = source_for("https://feed.example.com/feed.xml", None, true);
+    let mut cb = RecordingCallback::default();
+    ingestor.ingest(&source, &mut cb).await.unwrap();
+
+    let res = &cb.resources[0];
+    // modified_at = updated.or(published) (modification semantics);
+    // dc.date = published.or(updated) (creation/publication semantics).
+    assert_eq!(res.modified_at, "2026-01-05T00:00:00+00:00");
+    assert_eq!(
+        res.metadata.dublin_core().date.as_deref(),
+        Some("2026-01-04T00:00:00+00:00")
+    );
+    assert_ne!(
+        res.added_at, res.modified_at,
+        "added_at records when our store saw the entry, not the feed's date"
+    );
+}
+
+#[tokio::test]
+async fn no_entry_dates_added_at_equals_modified_at() {
+    let items =
+        r#"<item><title>No Dates</title><guid>e1</guid><description>Body</description></item>"#;
+    let feed_xml = rss2_feed("", items);
+    let mut script = HashMap::new();
+    script.insert(
+        "https://feed.example.com/feed.xml".to_string(),
+        ScriptedOutcome::text(&feed_xml),
+    );
+    let (ingestor, _fetcher) = ingestor_with(script);
+    let source = source_for("https://feed.example.com/feed.xml", None, true);
+    let mut cb = RecordingCallback::default();
+    ingestor.ingest(&source, &mut cb).await.unwrap();
+
+    let res = &cb.resources[0];
+    assert_eq!(res.added_at, res.modified_at);
+}
+
+#[tokio::test]
+async fn single_doc_modified_at_from_feed_updated() {
+    // atom_feed's fixture declares <updated>2026-01-01T00:00:00Z</updated>
+    // at feed level; the entry is newer — feed.updated still wins.
+    let entries = r#"<entry><title>E1</title><id>urn:e1</id><updated>2026-01-05T00:00:00Z</updated><summary>Body</summary></entry>"#;
+    let feed_xml = atom_feed(entries);
+    let mut script = HashMap::new();
+    script.insert(
+        "https://feed.example.com/feed.xml".to_string(),
+        ScriptedOutcome::text(&feed_xml),
+    );
+    let (ingestor, _fetcher) = ingestor_with(script);
+    let source = source_for("https://feed.example.com/feed.xml", None, false);
+    let mut cb = RecordingCallback::default();
+    ingestor.ingest(&source, &mut cb).await.unwrap();
+
+    assert_eq!(cb.resources.len(), 1);
+    assert_eq!(cb.resources[0].modified_at, "2026-01-01T00:00:00+00:00");
+}
+
+// ---------------------------------------------------------------------------
 // Large feed smoke test
 // ---------------------------------------------------------------------------
 

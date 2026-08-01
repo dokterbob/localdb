@@ -55,7 +55,8 @@ pub(crate) enum UrlOutcome {
 ///
 /// `Default` reproduces `UrlIngestor`'s pre-refactor behavior exactly: no
 /// external id, no title fallback (the page's own title or Dublin Core title
-/// wins or the field stays `None`), no injected creator/date/provenance, and
+/// wins or the field stays `None`), no injected creator/date/provenance,
+/// `added_at == modified_at` (no `modified_at_override`), and
 /// `external_etag` always `None` (a bare `UrlIngestor` never threads
 /// conditional-fetch state through `Resource`).
 #[derive(Default)]
@@ -70,9 +71,16 @@ pub(crate) struct ResourceEnrichment {
     /// non-empty (left as extracted by the parser when empty).
     pub creator: Vec<String>,
     /// Metadata date (RFC 3339) to stamp into `DublinCoreMetadata::date` when
-    /// present. Never used for `Resource.added_at`/`modified_at`, which are
-    /// always the same `now_rfc3339()` call regardless of enrichment.
+    /// present. Never used for `Resource.added_at`/`modified_at` — see
+    /// `modified_at_override` for the only enrichment that touches those.
     pub date: Option<String>,
+    /// Value (RFC 3339) for `Resource.modified_at` when the source system
+    /// carries its own modification timestamp (e.g. a feed entry's
+    /// `updated`). `None` keeps the pre-enrichment behavior: `added_at` and
+    /// `modified_at` are the same `now_rfc3339()` call. `added_at` is always
+    /// ingestion-time `now()` regardless — it records when *our store* first
+    /// saw the resource, not when the source last changed it.
+    pub modified_at_override: Option<String>,
     /// Provenance source (e.g. the owning feed's URL) to stamp into
     /// `DublinCoreMetadata::source` when present.
     pub provenance_source: Option<String>,
@@ -265,7 +273,7 @@ pub(crate) fn build_resource(
             ..Default::default()
         }),
         added_at: now.clone(),
-        modified_at: now,
+        modified_at: enrich.modified_at_override.clone().unwrap_or(now),
         thread_id: None,
         channel: None,
         participants: vec![],

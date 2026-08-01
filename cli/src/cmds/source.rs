@@ -51,16 +51,18 @@ pub(crate) fn resolve_source_add_kind(
     // normally guarantees a url-kind arg is `http(s)://`-shaped. Without this
     // check, `source add /tmp/docs --kind url` would persist (exit 0) a url
     // source whose locator can never parse — auto-index only warns, so the
-    // source would sit permanently unindexable. Mirror the feed arm's scheme
-    // requirement here; `--kind path` stays unrestricted (any string can be
-    // a path).
-    if kind == "url"
-        && kind_override.is_some()
-        && !(source_arg.starts_with("http://") || source_arg.starts_with("https://"))
-    {
-        return Err(Error::InvalidRequest {
-            message: format!("url source must be http(s): '{source_arg}'"),
-        });
+    // source would sit permanently unindexable. Full parse, not a prefix
+    // check (`https://[` and bare `https://` pass a prefix check but can
+    // never parse), mirroring the feed arm's validation; `--kind path` stays
+    // unrestricted (any string can be a path).
+    if kind == "url" && kind_override.is_some() {
+        let scheme_ok = localdb_core::uri::Uri::parse(source_arg)
+            .is_some_and(|u| matches!(u.scheme(), "http" | "https"));
+        if !scheme_ok {
+            return Err(Error::InvalidRequest {
+                message: format!("url source must be a valid http(s) URL: '{source_arg}'"),
+            });
+        }
     }
 
     if kind == "feed" {
@@ -716,7 +718,20 @@ mod tests {
         // that can never be indexed (auto-index only warns, exit 0).
         let err = resolve_source_add_kind("/tmp/docs", Some("url"), None, false).unwrap_err();
         assert!(matches!(err, Error::InvalidRequest { .. }));
-        assert!(err.to_string().contains("must be http(s)"));
+        assert!(err.to_string().contains("must be a valid http(s) URL"));
+    }
+
+    #[test]
+    fn resolve_source_add_kind_rejects_kind_url_unparseable_http_prefixed_arg() {
+        // Right prefix, but not a parseable URL (unclosed IPv6 bracket /
+        // empty host) — a prefix-only check would persist these.
+        for bad in ["https://[", "https://", "http://"] {
+            let err = resolve_source_add_kind(bad, Some("url"), None, false).unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidRequest { .. }),
+                "expected InvalidRequest for arg={bad}"
+            );
+        }
     }
 
     #[test]

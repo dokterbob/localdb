@@ -201,9 +201,15 @@ pub fn parse_source_spec(kind: &str, spec: &serde_json::Value) -> Result<ParsedS
                 .ok_or_else(|| Error::InvalidRequest {
                     message: "feed source requires 'url'".to_string(),
                 })?;
-            if !(url.starts_with("http://") || url.starts_with("https://")) {
+            // Full parse, not a prefix check: `https://[` and bare `https://`
+            // start with the right prefix but fail `url::Url::parse`, and a
+            // prefix-validated row would persist a source whose every index
+            // run fails whole-source at the ingestor's fail-fast Uri::parse.
+            let scheme_ok = crate::uri::Uri::parse(&url)
+                .is_some_and(|u| matches!(u.scheme(), "http" | "https"));
+            if !scheme_ok {
                 return Err(Error::InvalidRequest {
-                    message: format!("feed source 'url' must be http(s): '{url}'"),
+                    message: format!("feed source 'url' must be a valid http(s) URL: '{url}'"),
                 });
             }
             // Strict decode: a present, non-null `max_entries` must be an
@@ -228,10 +234,19 @@ pub fn parse_source_spec(kind: &str, spec: &serde_json::Value) -> Result<ParsedS
                 },
             };
             let max_entries = validate_max_entries(max_entries)?;
-            let fetch_full_content = spec
-                .get("fetch_full_content")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
+            // Strict decode, mirroring `max_entries`: `as_bool()` alone would
+            // treat a mistyped value (e.g. the string "false") as absent and
+            // silently default discovery mode ON against the caller's stated
+            // intent.
+            let fetch_full_content = match spec.get("fetch_full_content") {
+                None | Some(serde_json::Value::Null) => true,
+                Some(serde_json::Value::Bool(b)) => *b,
+                Some(v) => {
+                    return Err(Error::InvalidRequest {
+                        message: format!("feed source 'fetch_full_content' must be a boolean: {v}"),
+                    })
+                }
+            };
             let config_json = build_feed_config_json(max_entries, fetch_full_content);
             Ok(ParsedSourceSpec {
                 kind: SourceKind::Feed,
@@ -524,8 +539,70 @@ mod tests {
         let err = parse_source_spec("feed", &spec).unwrap_err();
         assert_eq!(
             err,
-            invalid_request("feed source 'url' must be http(s): 'ftp://example.com/feed.xml'")
+            invalid_request(
+                "feed source 'url' must be a valid http(s) URL: 'ftp://example.com/feed.xml'"
+            )
         );
+    }
+
+    /// Prefix-only validation (`starts_with("https://")`) would accept these:
+    /// they carry the right scheme prefix but fail a full `url::Url::parse`
+    /// (empty host, unclosed IPv6 bracket) — a persisted row would then fail
+    /// every index run whole-source at the ingestor's fail-fast parse.
+    #[test]
+    fn parse_source_spec_feed_unparseable_http_prefixed_url_rejected() {
+        for bad in ["https://", "https://[", "http://"] {
+            let spec = serde_json::json!({ "url": bad });
+            let err = parse_source_spec("feed", &spec).unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidRequest { .. }),
+                "expected InvalidRequest for url={bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_source_spec_feed_mailto_url_rejected() {
+        let spec = serde_json::json!({"url": "mailto:x@y"});
+        let err = parse_source_spec("feed", &spec).unwrap_err();
+        assert_eq!(
+            err,
+            invalid_request("feed source 'url' must be a valid http(s) URL: 'mailto:x@y'")
+        );
+    }
+
+    /// A present, non-null `fetch_full_content` that is not a JSON boolean
+    /// must be rejected — `as_bool()` alone treats the string "false" as
+    /// absent and silently enables discovery mode against the caller's
+    /// stated intent (HTTP surface; clap guards the CLI).
+    #[test]
+    fn parse_source_spec_feed_non_bool_fetch_full_content_rejected() {
+        for bad in [
+            serde_json::json!("false"),
+            serde_json::json!(0),
+            serde_json::json!([true]),
+        ] {
+            let spec = serde_json::json!({
+                "url": "https://example.com/feed.xml",
+                "fetch_full_content": bad,
+            });
+            let err = parse_source_spec("feed", &spec).unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidRequest { .. }),
+                "expected InvalidRequest for fetch_full_content={bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_source_spec_feed_explicit_null_fetch_full_content_is_default_true() {
+        let spec = serde_json::json!({
+            "url": "https://example.com/feed.xml",
+            "fetch_full_content": null,
+        });
+        let parsed = parse_source_spec("feed", &spec).unwrap();
+        let config = parse_feed_config_json(parsed.config_json.as_deref());
+        assert!(config.fetch_full_content);
     }
 
     #[test]

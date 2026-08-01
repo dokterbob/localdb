@@ -156,6 +156,16 @@ appears in it.
 **Both modes:** entries are stable-sorted by `published.or(updated)` descending (entries with
 neither date sort last, stable among themselves), then truncated to `max_entries`.
 
+**Timestamps.** Feed-produced Resources map times as follows. `added_at` is always ingestion-time
+`now()` — it records when *our store* first saw the resource, never a feed-claimed date.
+`modified_at` comes from the feed when it says anything: per entry `updated.or(published)`
+(discovery mode and the embedded fallback), and in single-document mode `feed.updated`, else the
+newest entry's date, else `now()`. Creation/publication stays in `dublin_core.date` =
+`published.or(updated)` (the conventional DC slot) — note the opposite preference order from
+`modified_at`, matching each field's semantics. Like all enrichment, an already-indexed entry
+whose content hash is unchanged does not retroactively pick these up (the pipeline's
+incremental-skip runs before any store write).
+
 **Fallback and error handling:**
 - Discovery mode, entry-link fetch returns `Gone`/`Unsupported`: falls back to indexing the
   entry's own embedded content/summary at the same URI, instead of dropping the entry.

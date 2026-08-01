@@ -359,6 +359,14 @@ Same story as `url`'s `refresh_interval_secs`: the value round-trips through con
 but no scheduler reads it back to trigger a re-fetch — scheduled refresh is daemon-side work not
 yet built for either source kind.
 
+**13. Enrichment metadata changes don't persist while content is unchanged.** ([#176](https://github.com/dokterbob/localdb/issues/176))
+The pipeline's incremental skip (`core/src/ingestion.rs`, `on_resource`) returns on a
+`content_hash` + `policy_version` match before any store write, and metadata is never compared —
+so corrected feed dates/authors/external ids (and the feed-derived `modified_at`) never reach the
+store for an already-indexed document until its content bytes change. Fixing this needs a core
+skip-contract change (metadata-aware compare, or a metadata-only store update that skips
+re-embedding); see the issue for the design options.
+
 ---
 
 ## Deferred design decisions {#design-decisions}
