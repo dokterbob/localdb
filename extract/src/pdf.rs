@@ -160,9 +160,17 @@ fn xmp_title(doc: &PdfDocument) -> Option<String> {
 }
 
 /// Decode a PDF text string (PDF spec ISO 32000-1 §7.9.2.2): UTF-16BE when it
-/// carries the `FE FF` BOM, otherwise PDFDocEncoding. UTF-8 is not a PDF text
-/// string encoding, but real-world producers emit it, so we try it first for
-/// the non-BOM case and fall back to PDFDocEncoding.
+/// carries the `FE FF` BOM, UTF-8 when it carries the PDF 2.0 `EF BB BF` BOM,
+/// otherwise PDFDocEncoding. UTF-8 is not a PDF text string encoding, but
+/// real-world producers emit it without a BOM, so we try it for the non-BOM
+/// case and fall back to PDFDocEncoding.
+///
+/// The UTF-8 fast path is guarded: it is only taken when the bytes contain no
+/// `0x18..=0x1F` byte. Those bytes are valid ASCII controls (so `from_utf8`
+/// would accept them and shadow the table), but in PDFDocEncoding they are
+/// accent modifiers (BREVE, CARON, …). A genuine UTF-8 title never contains
+/// literal C0 controls, so their presence means the string is PDFDocEncoding
+/// and must go straight to the table.
 fn decode_pdf_text_string(bytes: &[u8]) -> String {
     if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
         let units: Vec<u16> = bytes[2..]
@@ -170,19 +178,30 @@ fn decode_pdf_text_string(bytes: &[u8]) -> String {
             .map(|c| u16::from_be_bytes([c[0], c[1]]))
             .collect();
         String::from_utf16_lossy(&units)
-    } else if let Ok(s) = std::str::from_utf8(bytes) {
-        s.to_string()
+    } else if bytes.len() >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF {
+        String::from_utf8_lossy(&bytes[3..]).into_owned()
+    } else if !bytes.iter().any(|&b| (0x18..=0x1F).contains(&b)) {
+        if let Ok(s) = std::str::from_utf8(bytes) {
+            return s.to_string();
+        }
+        bytes.iter().map(|&b| pdf_doc_encoding_char(b)).collect()
     } else {
         bytes.iter().map(|&b| pdf_doc_encoding_char(b)).collect()
     }
 }
 
 /// Map one PDFDocEncoding byte to its Unicode scalar (PDF spec ISO 32000-1
-/// Annex D.2). `0x00–0x7F` is ASCII and `0xA1–0xFF` matches Latin-1; only the
-/// `0x80–0xA0` block and a few undefined slots differ — casting the byte
-/// straight to `char` (Latin-1) mangles those (e.g. `0x80` is a bullet `•`,
-/// not U+0080). Undefined code points map to U+FFFD.
+/// Annex D.2). `0x00–0x7F` is ASCII and `0xA1–0xFF` matches Latin-1 with a few
+/// exceptions; the `0x18–0x1F` and `0x80–0xA0` blocks and a few undefined slots
+/// differ — casting the byte straight to `char` (Latin-1) mangles those (e.g.
+/// `0x80` is a bullet `•`, not U+0080, and `0x18` is a BREVE, not a C0 control).
+/// Undefined code points map to U+FFFD.
 fn pdf_doc_encoding_char(b: u8) -> char {
+    // The 0x18..=0x1F block: accent modifiers, in order.
+    const LOW: [char; 8] = [
+        '\u{02D8}', '\u{02C7}', '\u{02C6}', '\u{02D9}', '\u{02DD}', '\u{02DB}', '\u{02DA}',
+        '\u{02DC}',
+    ];
     // The 0x80..=0xA0 block, in order. `\u{FFFD}` marks the two undefined
     // slots (0x9F and 0xAD is handled below).
     const HIGH: [char; 33] = [
@@ -193,9 +212,10 @@ fn pdf_doc_encoding_char(b: u8) -> char {
         '\u{0153}', '\u{0161}', '\u{017E}', '\u{FFFD}', '\u{20AC}',
     ];
     match b {
+        0x18..=0x1F => LOW[(b - 0x18) as usize],
         0x80..=0xA0 => HIGH[(b - 0x80) as usize],
-        // Undefined in PDFDocEncoding (soft hyphen slot).
-        0xAD => '\u{FFFD}',
+        // Undefined in PDFDocEncoding.
+        0x7F | 0xAD => '\u{FFFD}',
         // 0x00..=0x7F ASCII and 0xA1..=0xFF (minus 0xAD) match Latin-1.
         _ => b as char,
     }
@@ -398,5 +418,47 @@ mod tests {
         assert_eq!(pdf_doc_encoding_char(b'A'), 'A');
         assert_eq!(pdf_doc_encoding_char(0xAD), '\u{FFFD}'); // undefined slot
         assert_eq!(pdf_doc_encoding_char(0x9F), '\u{FFFD}'); // undefined slot
+        assert_eq!(pdf_doc_encoding_char(0x7F), '\u{FFFD}'); // undefined slot
+    }
+
+    #[test]
+    fn pdf_doc_encoding_char_low_accent_modifiers() {
+        // The 0x18..=0x1F block: accent modifiers, NOT the C0 controls that a
+        // straight Latin-1 cast (or a UTF-8 fast path) would produce.
+        assert_eq!(pdf_doc_encoding_char(0x18), '\u{02D8}'); // BREVE
+        assert_eq!(pdf_doc_encoding_char(0x19), '\u{02C7}'); // CARON
+        assert_eq!(pdf_doc_encoding_char(0x1A), '\u{02C6}'); // MODIFIER CIRCUMFLEX
+        assert_eq!(pdf_doc_encoding_char(0x1B), '\u{02D9}'); // DOT ABOVE
+        assert_eq!(pdf_doc_encoding_char(0x1C), '\u{02DD}'); // DOUBLE ACUTE
+        assert_eq!(pdf_doc_encoding_char(0x1D), '\u{02DB}'); // OGONEK
+        assert_eq!(pdf_doc_encoding_char(0x1E), '\u{02DA}'); // RING ABOVE
+        assert_eq!(pdf_doc_encoding_char(0x1F), '\u{02DC}'); // SMALL TILDE
+    }
+
+    #[test]
+    fn decode_pdf_text_string_low_control_routes_to_pdfdocencoding() {
+        // 0x18 is valid ASCII, so `from_utf8` would accept it and return
+        // U+0018 — the exact shadowing bug. The guard must route it to the
+        // PDFDocEncoding table, yielding U+02D8 (BREVE), not U+0018.
+        let decoded = decode_pdf_text_string(&[0x18]);
+        assert_eq!(decoded, "\u{02D8}");
+        assert_ne!(decoded, "\u{0018}");
+    }
+
+    #[test]
+    fn decode_pdf_text_string_honors_utf8_bom() {
+        // PDF 2.0 EF BB BF UTF-8 BOM: strip it and decode the remainder.
+        let bytes = [0xEF, 0xBB, 0xBF, 0x63, 0x61, 0x66, 0xC3, 0xA9]; // "café"
+        assert_eq!(decode_pdf_text_string(&bytes), "café");
+    }
+
+    #[test]
+    fn decode_pdf_text_string_keeps_utf8_without_bom() {
+        // Common producer behavior: UTF-8 without BOM and without C0 controls
+        // must survive via the fast path, not become mojibake.
+        assert_eq!(
+            decode_pdf_text_string(&[0x63, 0x61, 0x66, 0xC3, 0xA9]),
+            "café"
+        );
     }
 }
