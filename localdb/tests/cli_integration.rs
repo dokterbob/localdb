@@ -1770,3 +1770,1584 @@ fn db_commands_refuse_while_daemon_running() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Multi-store `--store` scope — specs/05-surfaces.md §2.2, issue #178
+//
+// Before the fix, every command except `search`/`mcp` called a helper that
+// used `ctx.stores.first()` and otherwise picked an ARBITRARY store
+// (`list_stores()[0]`) when `--store` was omitted. These tests create three
+// stores (`books`, `default`, `research`) and exercise the resolution rules
+// in the §2.2 table: `-s` is repeatable, every name is validated and
+// resolved (not just the first), unknown names are exit 3, and each
+// command's no-`-s` default is deterministic rather than "whichever store
+// sorts first".
+// ---------------------------------------------------------------------------
+
+/// Create three stores — `books`, `default`, `research` — each seeded with
+/// one path source pointing at its own fixture directory (auto-indexed via
+/// `source add`, so `index` has real, if trivial, work to do per store).
+/// Returns each store's fixture directory so callers can assert on exact
+/// paths rather than just counts.
+fn setup_multi_store(dir: &TempDir) -> std::collections::HashMap<&'static str, std::path::PathBuf> {
+    write_default_config(dir);
+    let mut fixtures = std::collections::HashMap::new();
+    for name in ["books", "default", "research"] {
+        cmd_with_dir(dir)
+            .args(["store", "add", name])
+            .assert()
+            .success();
+
+        let fixture = dir.path().join(format!("{name}-docs"));
+        std::fs::create_dir_all(&fixture).unwrap();
+        std::fs::write(
+            fixture.join("doc.md"),
+            format!("# {name}\n\nDocument for store {name}.\n"),
+        )
+        .unwrap();
+
+        cmd_with_dir(dir)
+            .args(["--store", name, "source", "add", fixture.to_str().unwrap()])
+            .assert()
+            .success();
+
+        fixtures.insert(name, fixture);
+    }
+    fixtures
+}
+
+/// Headline regression test for issue #178: `source list` with no `--store`
+/// must NOT silently resolve to an arbitrary store (the pre-fix behavior
+/// picked `list_stores()[0]`, which in practice was often not `default`).
+/// It must deterministically resolve to the store named `default`
+/// (specs/05-surfaces.md §2.2) — proven here by showing the bare invocation
+/// differs from `-s books` and is identical to the explicit `-s default`.
+#[test]
+fn source_list_no_store_flag_is_default_store_not_arbitrary_178() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+
+    let bare = cmd_with_dir(&dir)
+        .args(["--json", "source", "list"])
+        .output()
+        .unwrap();
+    assert!(bare.status.success());
+    let bare_v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&bare.stdout)).unwrap();
+
+    let explicit_books = cmd_with_dir(&dir)
+        .args(["--json", "--store", "books", "source", "list"])
+        .output()
+        .unwrap();
+    assert!(explicit_books.status.success());
+    let books_v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&explicit_books.stdout)).unwrap();
+
+    // The headline #178 assertion: omitting --store must not be equivalent
+    // to picking an arbitrary other store (here, `books`).
+    assert_ne!(
+        bare_v, books_v,
+        "issue #178 regression: `source list` with no --store must not silently \
+         resolve to an arbitrary store (e.g. `books`); got identical output: {bare_v}"
+    );
+
+    // And it must positively be the `default` store's view, not just "some
+    // other store".
+    let explicit_default = cmd_with_dir(&dir)
+        .args(["--json", "--store", "default", "source", "list"])
+        .output()
+        .unwrap();
+    assert!(explicit_default.status.success());
+    let default_v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&explicit_default.stdout)).unwrap();
+    assert_eq!(
+        bare_v, default_v,
+        "no --store should resolve deterministically to the store named 'default'"
+    );
+}
+
+/// `source add` with no `--store` lands in the store named `default`
+/// (specs/05-surfaces.md §2.2), verified by re-listing that store's sources.
+#[test]
+fn source_add_no_store_flag_lands_in_default_store() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir); // each of books/default/research already has 1 source
+
+    let fixture = dir.path().join("extra-docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    cmd_with_dir(&dir)
+        .args(["source", "add", fixture.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let output = cmd_with_dir(&dir)
+        .args(["--json", "--store", "default", "source", "list"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    let sources = v["sources"].as_array().expect("sources must be an array");
+    assert_eq!(
+        sources.len(),
+        2,
+        "default store should now hold its original source plus the new one: {v}"
+    );
+    assert!(
+        sources
+            .iter()
+            .any(|s| s["root"].as_str() == Some(fixture.to_str().unwrap())),
+        "the newly added source should be on 'default': {v}"
+    );
+
+    // The other two stores must be untouched by the bare `source add`.
+    let books_output = cmd_with_dir(&dir)
+        .args(["--json", "--store", "books", "source", "list"])
+        .output()
+        .unwrap();
+    let books_v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&books_output.stdout)).unwrap();
+    assert_eq!(
+        books_v["sources"].as_array().unwrap().len(),
+        1,
+        "books should be untouched by a bare `source add`: {books_v}"
+    );
+}
+
+/// `source add` with no `--store` requires a store literally named `default`
+/// — this fires even when exactly one store exists under a different name,
+/// per specs/05-surfaces.md §2.2 ("predictability wins over guessing the
+/// sole store").
+#[test]
+fn source_add_no_store_flag_exits_2_even_with_exactly_one_other_store() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    cmd_with_dir(&dir)
+        .args(["store", "add", "onlystore"])
+        .assert()
+        .success();
+
+    let fixture = dir.path().join("docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .args(["source", "add", fixture.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no store named 'default'; pass --store <name>"),
+        "stderr: {stderr}"
+    );
+}
+
+/// After `store remove default`, a bare `source add` (no `--store`) exits 2
+/// and the message names `--store` — the store set genuinely has no
+/// `default` member anymore, distinct from the "never had one" case above.
+#[test]
+fn source_add_no_store_flag_after_default_removed_exits_2() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "remove", "--yes", "default"])
+        .assert()
+        .success();
+
+    let fixture = dir.path().join("orphan-docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .args(["source", "add", fixture.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--store"),
+        "error message should name --store; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("no store named 'default'"),
+        "stderr: {stderr}"
+    );
+}
+
+/// `source list` output gains a store-name column only when more than one
+/// store is in scope (specs/05-surfaces.md §2.2); with exactly one store the
+/// output is byte-identical to the pre-multi-store format.
+#[test]
+fn source_list_shows_store_column_only_when_multi_store_in_scope() {
+    let dir = TempDir::new().unwrap();
+    let fixtures = setup_multi_store(&dir);
+    let books_fixture = fixtures.get("books").unwrap().to_str().unwrap();
+
+    // Exactly one store in scope: no column.
+    let single = cmd_with_dir(&dir)
+        .args(["--store", "books", "source", "list"])
+        .output()
+        .unwrap();
+    assert!(single.status.success());
+    let single_stdout = String::from_utf8_lossy(&single.stdout);
+    let single_lines: Vec<&str> = single_stdout.lines().collect();
+    assert_eq!(single_lines.len(), 1, "stdout: {single_stdout}");
+    assert!(
+        single_lines[0].ends_with(&format!("[path] {books_fixture}")),
+        "single-store line must be `{{id}} [path] {{loc}}` with no store column: {}",
+        single_lines[0]
+    );
+    assert!(
+        !single_lines[0].starts_with("books"),
+        "single-store output must not carry a store-name column: {}",
+        single_lines[0]
+    );
+
+    // More than one store in scope: a store-name column appears, padded to
+    // the widest name in scope ("default", 7 chars) + 2 spaces — matching
+    // the worked example in specs/05-surfaces.md §2.2.
+    let multi = cmd_with_dir(&dir)
+        .args(["--store", "books", "--store", "default", "source", "list"])
+        .output()
+        .unwrap();
+    assert!(multi.status.success());
+    let multi_stdout = String::from_utf8_lossy(&multi.stdout);
+    let multi_lines: Vec<&str> = multi_stdout.lines().collect();
+    assert_eq!(multi_lines.len(), 2, "stdout: {multi_stdout}");
+    assert!(
+        multi_lines.iter().any(|l| l.starts_with("books    ")),
+        "expected a 'books' line padded to width 9: {multi_lines:?}"
+    );
+    assert!(
+        multi_lines.iter().any(|l| l.starts_with("default  ")),
+        "expected a 'default' line padded to width 9: {multi_lines:?}"
+    );
+}
+
+/// `index` with no `--store` touches every store, not just the first —
+/// verified via the multi-store `--json` shape (`{"stores": [...], "total":
+/// {...}}`, specs/05-surfaces.md §2.2).
+#[test]
+fn index_no_store_flag_touches_all_stores() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["--json", "index"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index with no --store should exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|_| panic!("index --json must emit valid JSON; got: {stdout}"));
+
+    let stores = v["stores"]
+        .as_array()
+        .expect("multi-store index --json must have a 'stores' array");
+    let names: std::collections::HashSet<&str> = stores
+        .iter()
+        .map(|s| s["store"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        ["books", "default", "research"].into_iter().collect(),
+        "index with no --store should touch every store; got: {v}"
+    );
+    assert!(
+        v.get("total").is_some(),
+        "multi-store index --json must include a combined 'total': {v}"
+    );
+}
+
+/// `db migrate` is not store-scoped (specs/05-surfaces.md §2.1/§2.2): passing
+/// `--store` at all, even in a multi-store database, must exit 2 rather than
+/// silently migrating (or being interpreted as migrating) just one store.
+#[test]
+fn db_migrate_with_store_flag_exits_2() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["db", "migrate", "--store", "books"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--store is not applicable"),
+        "stderr: {stderr}"
+    );
+}
+
+/// `-s`/`--store` is repeatable and every name is resolved, not truncated to
+/// the first (the exact #178 failure mode for explicit multi-name usage):
+/// `source list -s books -s research` must return sources from both stores.
+#[test]
+fn source_list_repeated_store_flags_returns_both_not_just_first() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args([
+            "--json", "--store", "books", "--store", "research", "source", "list",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    let sources = v["sources"].as_array().expect("sources must be an array");
+    let store_names: std::collections::HashSet<&str> = sources
+        .iter()
+        .map(|s| s["store"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        store_names,
+        ["books", "research"].into_iter().collect(),
+        "repeated -s flags must resolve every name, not just the first: {v}"
+    );
+}
+
+// -- Error branches on data-modifying paths (source add/remove, index) -----
+// coverage gate: data-modifying paths must be >=90% (CLAUDE.md).
+
+/// `source add --store <unknown>` exits 3 (store_not_found), even though the
+/// implicit-default resolution would otherwise apply.
+#[test]
+fn source_add_unknown_store_exits_3() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+    let fixture = dir.path().join("unknown-docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .args([
+            "--store",
+            "nosuchstore",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code().unwrap(), 3);
+}
+
+/// `source add --store ../evil` exits 2 (invalid/traversal store name),
+/// rejected before any store lookup is attempted.
+#[test]
+fn source_add_traversal_store_name_exits_2() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+    let fixture = dir.path().join("evil-docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .args([
+            "--store",
+            "../evil",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code().unwrap(), 2);
+}
+
+/// `source remove --store <unknown> <id>` exits 3.
+#[test]
+fn source_remove_unknown_store_exits_3() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args([
+            "--store",
+            "nosuchstore",
+            "source",
+            "remove",
+            "01ABCDEFGHIJKLMNOPQRSTUVWX",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code().unwrap(), 3);
+}
+
+/// `source remove --store ../evil <id>` exits 2.
+#[test]
+fn source_remove_traversal_store_name_exits_2() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args([
+            "--store",
+            "../evil",
+            "source",
+            "remove",
+            "01ABCDEFGHIJKLMNOPQRSTUVWX",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code().unwrap(), 2);
+}
+
+/// `index --store <unknown>` exits 3.
+#[test]
+fn index_unknown_store_exits_3() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["--store", "nosuchstore", "index"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code().unwrap(), 3);
+}
+
+/// `index --store ../evil` exits 2.
+#[test]
+fn index_traversal_store_name_exits_2() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["--store", "../evil", "index"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code().unwrap(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Coverage gate: data-modifying paths (source.rs, index.rs) must be >=90%
+// line coverage (specs/01-architecture.md §7 / CLAUDE.md). The tests below
+// close gaps found via `cargo llvm-cov report --text` after the store-scope
+// defaults rework (#178/#118/#144).
+// ---------------------------------------------------------------------------
+
+/// Requests recorded by [`start_recording_mock_server`]: one `(start_line,
+/// json_body)` pair per request received, in arrival order.
+type RecordedRequests = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+/// Spin up a minimal mock HTTP server that answers every request with the
+/// same fixed status line + JSON body, recording each request's start-line
+/// and raw JSON body (if any) for assertions. Unlike `start_mock_daemon`'s
+/// inline callers above, this variant also captures the request body so
+/// tests can assert on what the CLI actually sent (e.g. the `spec` object
+/// for url-kind sources).
+fn start_recording_mock_server(
+    status_line: &'static str,
+    body: &'static str,
+) -> (u16, RecordedRequests) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    let (listener, port) = start_mock_daemon();
+    let received: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let received_clone = received.clone();
+
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).is_err() {
+                continue;
+            }
+            let path = request_line.trim().to_string();
+
+            let mut content_length: usize = 0;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() || line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body_buf = vec![0u8; content_length];
+            let req_body = if content_length > 0 && reader.read_exact(&mut body_buf).is_ok() {
+                String::from_utf8_lossy(&body_buf).to_string()
+            } else {
+                String::new()
+            };
+
+            received_clone.lock().unwrap().push((path, req_body));
+
+            let response = format!(
+                "{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                status_line,
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    (port, received)
+}
+
+// -- source add: local (non-daemon) error/success branches -----------------
+
+/// `source add <nonexistent path>` exits 2 (`normalize_path_source` fails).
+#[test]
+fn source_add_nonexistent_path_exits_2() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "s1"])
+        .assert()
+        .success();
+
+    let missing = dir.path().join("does-not-exist-at-all");
+    let output = cmd_with_dir(&dir)
+        .args(["--store", "s1", "source", "add", missing.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "adding a nonexistent path should exit 2; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `source add --refresh <garbage>` exits 2 (`validate_refresh_interval`
+/// fails) before the source row is ever created.
+#[test]
+fn source_add_invalid_refresh_interval_exits_2() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "s1"])
+        .assert()
+        .success();
+
+    let fixture = dir.path().join("docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .args([
+            "--store",
+            "s1",
+            "source",
+            "add",
+            "--refresh",
+            "not-a-duration",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "invalid --refresh value should exit 2; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `source add <url>` (no daemon) creates a url-kind source locally. The
+/// target host refuses the connection immediately (nothing listens on
+/// 127.0.0.1:1), so the WarnAndContinue auto-index step fails quietly — the
+/// command itself must still succeed and the source must be persisted with
+/// `kind: url`.
+#[test]
+fn source_add_url_kind_local_creates_url_source() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "webstore"])
+        .assert()
+        .success();
+
+    let output = cmd_with_dir(&dir)
+        .args([
+            "--json",
+            "--store",
+            "webstore",
+            "source",
+            "add",
+            "http://127.0.0.1:1/doc.txt",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "adding a url source should succeed even if the fetch later fails; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert_eq!(v["kind"].as_str().unwrap(), "url");
+
+    let list = cmd_with_dir(&dir)
+        .args(["--json", "--store", "webstore", "source", "list"])
+        .output()
+        .unwrap();
+    let lv: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&list.stdout)).unwrap();
+    let sources = lv["sources"].as_array().unwrap();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0]["kind"].as_str().unwrap(), "url");
+    assert_eq!(
+        sources[0]["url"].as_str().unwrap(),
+        "http://127.0.0.1:1/doc.txt"
+    );
+    assert!(sources[0]["root"].is_null());
+}
+
+/// A source root that becomes unreadable between `source add` and its
+/// auto-index step surfaces as a warning (WarnAndContinue mode), not a
+/// command failure: `run_source_ingestion` returns `Err`, which
+/// `run_embedded_index_with` folds into the summary and reports via
+/// `eprintln!` rather than propagating.
+#[test]
+#[cfg(unix)]
+fn source_add_auto_index_permission_denied_warns_but_succeeds() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "permstore"])
+        .assert()
+        .success();
+
+    let fixture = dir.path().join("perm-docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+    std::fs::write(fixture.join("note.md"), "# Note\n\nhello\n").unwrap();
+    std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .args([
+            "--store",
+            "permstore",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    // Restore permissions immediately so `TempDir`'s Drop can clean up even
+    // if an assertion below fails.
+    let _ = std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o755));
+
+    assert!(
+        output.status.success(),
+        "source add should still succeed; auto-index errors only warn. stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("warning: auto-index error for source"),
+        "expected an auto-index warning in stderr; got: {stderr}"
+    );
+}
+
+// -- source add: daemon-routing branches ------------------------------------
+
+/// `source add <url>` with a daemon running, non-`--json`: exercises the
+/// url-kind `spec` shape (`{"url": ...}`) and the plain-text success print
+/// (`Added source ... (via daemon)`), both cold in the pre-existing
+/// `source_add_routes_to_daemon_without_panic` test (which only used
+/// `--json` and a path source).
+#[test]
+fn source_add_daemon_url_kind_non_json_prints_and_sends_url_spec() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let body = r#"{"id":"01ABCDEFGHIJKLMNOPQRSTUVWX","store":"mystore","kind":"url"}"#;
+    let (port, received) = start_recording_mock_server("HTTP/1.1 200 OK", body);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args([
+            "source",
+            "add",
+            "--store",
+            "mystore",
+            "https://example.com/page",
+        ])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "daemon-routed source add should succeed; stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("Added source 01ABCDEFGHIJKLMNOPQRSTUVWX to store 'mystore' (via daemon)"),
+        "expected non-json daemon success line; got: {stdout}"
+    );
+
+    let reqs = received.lock().unwrap();
+    assert!(
+        !reqs.is_empty(),
+        "mock daemon should have received a request"
+    );
+    let (path, req_body) = &reqs[0];
+    assert!(path.contains("/v1/stores/mystore/sources"), "path: {path}");
+    let body_json: serde_json::Value = serde_json::from_str(req_body).unwrap();
+    assert_eq!(body_json["kind"].as_str().unwrap(), "url");
+    assert_eq!(
+        body_json["spec"]["url"].as_str().unwrap(),
+        "https://example.com/page"
+    );
+}
+
+/// `source add` with a daemon running that responds with an error status:
+/// the CLI must map the error body to the matching exit code (3 for
+/// `store_not_found`), exercising the `Err(e) => exit_err(...)` arm.
+#[test]
+fn source_add_daemon_error_response_exits_3() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let body = r#"{"code":"store_not_found","message":"no such store"}"#;
+    let (port, _received) = start_recording_mock_server("HTTP/1.1 404 Not Found", body);
+
+    let fixture = dir.path().join("docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args([
+            "--json",
+            "source",
+            "add",
+            "--store",
+            "nosuchstore",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        3,
+        "daemon store_not_found error should exit 3; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// -- source list: empty-scope messages --------------------------------------
+
+/// `source list` on a single, empty store prints the single-store message.
+#[test]
+fn source_list_single_store_empty_prints_singular_message() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "empty1"])
+        .assert()
+        .success();
+
+    cmd_with_dir(&dir)
+        .args(["--store", "empty1", "source", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No sources on store 'empty1'."));
+}
+
+/// `source list` across more than one empty store prints the plural,
+/// scope-wide message rather than naming any single store.
+#[test]
+fn source_list_multi_store_empty_prints_scope_message() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "empty1"])
+        .assert()
+        .success();
+    cmd_with_dir(&dir)
+        .args(["store", "add", "empty2"])
+        .assert()
+        .success();
+
+    cmd_with_dir(&dir)
+        .args(["--store", "empty1", "--store", "empty2", "source", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No sources in scope."));
+}
+
+// -- source remove: local (non-daemon) branches ------------------------------
+
+/// `source remove <path>` with no `--store` and no daemon running exits 2
+/// (D3: a path/url argument can't fall back to the implicit default store).
+#[test]
+fn source_remove_path_no_store_flag_exits_2() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["source", "remove", "/some/fake/path"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "source remove by path with no --store should exit 2; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("requires --store"),
+        "expected the requires---store message; got: {stderr}"
+    );
+}
+
+/// `source remove <ulid>` (single match) succeeds and prints the single-line
+/// non-json format; the source is actually gone afterwards.
+#[test]
+fn source_remove_by_ulid_success_prints_removed_and_deletes() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "rs1"])
+        .assert()
+        .success();
+
+    let fixture = dir.path().join("docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    let add_out = cmd_with_dir(&dir)
+        .args([
+            "--json",
+            "--store",
+            "rs1",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let add_v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&add_out.stdout)).unwrap();
+    let id = add_v["id"].as_str().unwrap().to_string();
+
+    cmd_with_dir(&dir)
+        .args(["--store", "rs1", "source", "remove", &id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("Removed source: {id}")));
+
+    cmd_with_dir(&dir)
+        .args(["--store", "rs1", "source", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No sources on store 'rs1'."));
+}
+
+/// `source remove --json <ulid>` (single match) prints the flat
+/// `{"status": "ok", "id": ...}` shape.
+#[test]
+fn source_remove_by_ulid_json_output_shape() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "rs2"])
+        .assert()
+        .success();
+
+    let fixture = dir.path().join("docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    let add_out = cmd_with_dir(&dir)
+        .args([
+            "--json",
+            "--store",
+            "rs2",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let add_v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&add_out.stdout)).unwrap();
+    let id = add_v["id"].as_str().unwrap().to_string();
+
+    let output = cmd_with_dir(&dir)
+        .args(["--json", "--store", "rs2", "source", "remove", &id])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert_eq!(v["status"].as_str().unwrap(), "ok");
+    assert_eq!(v["id"].as_str().unwrap(), id);
+}
+
+/// `source remove <ulid>` for a ulid that simply doesn't exist locally
+/// (`get_source` returns `Ok(None)`) exits 3 — distinct from the
+/// `find_source_by_root_or_url` not-found path already covered by
+/// `source_remove_not_found_exits_3`.
+#[test]
+fn source_remove_by_ulid_not_found_locally_exits_3() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "rs3"])
+        .assert()
+        .success();
+
+    let output = cmd_with_dir(&dir)
+        .args([
+            "--store",
+            "rs3",
+            "source",
+            "remove",
+            "01ABCDEFGHIJKLMNOPQRSTUVWX",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code().unwrap(), 3);
+}
+
+/// D2: a ulid that resolves to a real source, but whose owning store is not
+/// in the resolved scope, is reported as not-found rather than leaking
+/// cross-store existence.
+#[test]
+fn source_remove_by_ulid_store_not_in_scope_exits_3() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "storeA"])
+        .assert()
+        .success();
+    cmd_with_dir(&dir)
+        .args(["store", "add", "storeB"])
+        .assert()
+        .success();
+
+    let fixture = dir.path().join("docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    let add_out = cmd_with_dir(&dir)
+        .args([
+            "--json",
+            "--store",
+            "storeA",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let add_v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&add_out.stdout)).unwrap();
+    let id = add_v["id"].as_str().unwrap().to_string();
+
+    // The source belongs to storeA; scoping the remove to storeB only must
+    // not find it.
+    let output = cmd_with_dir(&dir)
+        .args(["--store", "storeB", "source", "remove", &id])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code().unwrap(),
+        3,
+        "removing a ulid whose store is out of scope should exit 3 (not found); stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `source remove <path>` scoped to two stores that both have a source at
+/// that same path deletes both, printing one line per store (non-json,
+/// `deleted.len() > 1` branch).
+#[test]
+fn source_remove_by_path_across_two_stores_deletes_both_text() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "m1"])
+        .assert()
+        .success();
+    cmd_with_dir(&dir)
+        .args(["store", "add", "m2"])
+        .assert()
+        .success();
+
+    let fixture = dir.path().join("shared-docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    cmd_with_dir(&dir)
+        .args(["--store", "m1", "source", "add", fixture.to_str().unwrap()])
+        .assert()
+        .success();
+    cmd_with_dir(&dir)
+        .args(["--store", "m2", "source", "add", fixture.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let output = cmd_with_dir(&dir)
+        .args([
+            "--store",
+            "m1",
+            "--store",
+            "m2",
+            "source",
+            "remove",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "removing a shared path across two stores should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("from store 'm1'") && stdout.contains("from store 'm2'"),
+        "expected a per-store removal line for each store; got: {stdout}"
+    );
+}
+
+/// Same scenario as above, but `--json`: verifies the `{"results": [...]}`
+/// multi-delete shape.
+#[test]
+fn source_remove_by_path_across_two_stores_json_results_array() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "m1"])
+        .assert()
+        .success();
+    cmd_with_dir(&dir)
+        .args(["store", "add", "m2"])
+        .assert()
+        .success();
+
+    let fixture = dir.path().join("shared-docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    cmd_with_dir(&dir)
+        .args(["--store", "m1", "source", "add", fixture.to_str().unwrap()])
+        .assert()
+        .success();
+    cmd_with_dir(&dir)
+        .args(["--store", "m2", "source", "add", fixture.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let output = cmd_with_dir(&dir)
+        .args([
+            "--json",
+            "--store",
+            "m1",
+            "--store",
+            "m2",
+            "source",
+            "remove",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert_eq!(v["status"].as_str().unwrap(), "ok");
+    let results = v["results"].as_array().expect("results must be an array");
+    assert_eq!(results.len(), 2);
+    let store_names: std::collections::HashSet<&str> = results
+        .iter()
+        .map(|r| r["store"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(store_names, ["m1", "m2"].into_iter().collect());
+}
+
+// -- source remove: daemon-routing success branch ----------------------------
+
+/// `source remove <ulid>` with a daemon actually responding 200 (not just
+/// unreachable, as the existing regression test uses): exercises the
+/// `Ok(v)` success arm for both `--json` and plain-text output.
+#[test]
+fn source_remove_daemon_success_json_and_text() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let body = r#"{"status":"ok","id":"01ABCDEFGHIJKLMNOPQRSTUVWX"}"#;
+    let (port, received) = start_recording_mock_server("HTTP/1.1 200 OK", body);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let json_out = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["--json", "source", "remove", "01ABCDEFGHIJKLMNOPQRSTUVWX"])
+        .output()
+        .unwrap();
+    assert!(
+        json_out.status.success(),
+        "daemon-routed source remove --json should succeed; stderr: {}",
+        String::from_utf8_lossy(&json_out.stderr)
+    );
+    let jv: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&json_out.stdout)).unwrap();
+    assert_eq!(jv["id"].as_str().unwrap(), "01ABCDEFGHIJKLMNOPQRSTUVWX");
+
+    let text_out = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["source", "remove", "01ABCDEFGHIJKLMNOPQRSTUVWX"])
+        .output()
+        .unwrap();
+    assert!(text_out.status.success());
+    let stdout = String::from_utf8_lossy(&text_out.stdout);
+    assert!(
+        stdout.contains("Removed source: 01ABCDEFGHIJKLMNOPQRSTUVWX (via daemon)"),
+        "expected non-json daemon removal line; got: {stdout}"
+    );
+
+    let reqs = received.lock().unwrap();
+    assert_eq!(reqs.len(), 2, "expected exactly two DELETE requests");
+    for (path, _) in reqs.iter() {
+        assert!(
+            path.starts_with("DELETE "),
+            "expected a DELETE, got: {path}"
+        );
+        assert!(path.contains("/v1/sources/01ABCDEFGHIJKLMNOPQRSTUVWX"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// index.rs coverage gap-fills
+// ---------------------------------------------------------------------------
+
+/// `index --source <unknown-id>` (embedded, single store) exits 3 —
+/// `run_embedded_index_with`'s `StrictExit`-mode `SourceNotFound` arm,
+/// propagated through `run_index_async`'s `exit_err`.
+#[test]
+fn index_unknown_source_id_exits_3() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "s1"])
+        .assert()
+        .success();
+
+    let output = cmd_with_dir(&dir)
+        .args([
+            "--store",
+            "s1",
+            "index",
+            "--source",
+            "01NOSUCHSOURCEIDXXXXXX",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code().unwrap(),
+        3,
+        "index --source <unknown> should exit 3; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `index` on a store with zero sources reports "no sources to index"
+/// rather than an empty/zeroed summary.
+#[test]
+fn index_store_with_no_sources_reports_no_sources_message() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "emptystore"])
+        .assert()
+        .success();
+
+    cmd_with_dir(&dir)
+        .args(["--store", "emptystore", "index"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "No sources to index on store 'emptystore'.",
+        ));
+}
+
+/// A source root that's unreadable at explicit-`index` time (as opposed to
+/// at `source add` auto-index time) is a `StrictExit`-mode error: it's
+/// counted, printed via the non-warn `eprintln!` arm, and — combined with
+/// `--strict` — forces exit 2. No existing test exercised `--strict`'s
+/// actual failure path at all.
+#[test]
+#[cfg(unix)]
+fn index_permission_denied_root_with_strict_exits_2() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "permstore2"])
+        .assert()
+        .success();
+
+    let fixture = dir.path().join("perm-docs2");
+    std::fs::create_dir_all(&fixture).unwrap();
+    std::fs::write(fixture.join("note.md"), "# Note\n\nhello\n").unwrap();
+
+    cmd_with_dir(&dir)
+        .args([
+            "--store",
+            "permstore2",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .args(["--store", "permstore2", "index", "--strict"])
+        .output()
+        .unwrap();
+
+    let _ = std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o755));
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "index --strict should exit 2 when a source root became unreadable; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("error indexing source"),
+        "expected the strict-mode error line in stderr; got: {stderr}"
+    );
+}
+
+/// A source row with a preset that isn't a recognized chunker preset (only
+/// reachable by writing the row directly — the CLI always writes
+/// `preset: "prose"`, so this defends against rows created through another
+/// surface, e.g. a future daemon API accepting an arbitrary preset) is
+/// counted as an indexing error rather than panicking or aborting the run.
+#[tokio::test]
+async fn index_reports_error_for_source_with_invalid_chunker_preset() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "presetstore"])
+        .assert()
+        .success();
+
+    let data_dir = dir.path().join("data");
+    let db_path = data_dir.join("localdb.db");
+    let db = libsql::Builder::new_local(&db_path).build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    let store_id: String = {
+        let mut rows = conn
+            .query(
+                "SELECT id FROM stores WHERE name = ?",
+                libsql::params!["presetstore".to_string()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("store row must exist");
+        row.get(0).unwrap()
+    };
+
+    conn.execute(
+        "INSERT INTO sources (id, store_id, kind, root, url, include, exclude, preset, refresh, created_at)
+         VALUES (?1, ?2, 'path', ?3, NULL, '[]', '[]', ?4, NULL, ?5)",
+        libsql::params![
+            "01BOGUSPRESETSOURCEID0001".to_string(),
+            store_id,
+            "/nonexistent-root".to_string(),
+            "not-a-real-preset".to_string(),
+            "2024-01-01T00:00:00Z".to_string(),
+        ],
+    )
+    .await
+    .unwrap();
+    drop(conn);
+    drop(db);
+
+    let output = cmd_with_dir(&dir)
+        .args(["--store", "presetstore", "index"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid chunker preset"),
+        "expected an invalid-chunker-preset error in stderr; got: {stderr}"
+    );
+}
+
+/// `index` fails fast (exit 2, `InvalidConfig`) when the configured
+/// embedding provider can't be constructed — e.g. `perplexity` with no
+/// matching `providers:` block. This is the direct (non-daemon,
+/// non-auto-index) embedder-build call in `run_index_async`, distinct from
+/// the auto-index path's `warn_or_default!`-wrapped one.
+#[test]
+fn index_embedder_creation_failure_exits_2() {
+    let dir = TempDir::new().unwrap();
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let config = format!(
+        "version: 1\npaths:\n  data: {}\ndefaults:\n  indexing:\n    embedding:\n      provider: perplexity\n      model: pplx-embed-context-v1\n",
+        data_dir.to_string_lossy()
+    );
+    std::fs::write(dir.path().join("config.yaml"), &config).unwrap();
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "pstore"])
+        .assert()
+        .success();
+
+    let output = cmd_with_dir(&dir)
+        .args(["--store", "pstore", "index"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "index with an unconfigured provider should exit 2; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// -- index: daemon-routing (run_daemon_index) --------------------------------
+
+/// `index --json --source <id>` with a daemon running, single store in
+/// scope: exercises the unwrapped single-submission JSON print and the
+/// `source_id` field being folded into the request body.
+#[test]
+fn index_daemon_single_store_json_includes_source_id() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "onlystore"])
+        .assert()
+        .success();
+
+    let body = r#"{"id":"job-1","status":"queued"}"#;
+    let (port, received) = start_recording_mock_server("HTTP/1.1 200 OK", body);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["--json", "index", "--source", "src-123"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "daemon-routed index submission should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert_eq!(v["id"].as_str().unwrap(), "job-1");
+    assert!(
+        v.get("jobs").is_none(),
+        "single-store index --json must not wrap in a jobs array"
+    );
+
+    let reqs = received.lock().unwrap();
+    assert_eq!(reqs.len(), 1);
+    let (path, req_body) = &reqs[0];
+    assert!(path.contains("/v1/jobs"), "path: {path}");
+    let body_json: serde_json::Value = serde_json::from_str(req_body).unwrap();
+    assert_eq!(body_json["store_name"].as_str().unwrap(), "onlystore");
+    assert_eq!(body_json["source_id"].as_str().unwrap(), "src-123");
+}
+
+/// `index --json` with a daemon running and more than one store in scope:
+/// wraps submissions into `{"jobs": [...], }`, each entry tagged with its
+/// store name.
+#[test]
+fn index_daemon_multi_store_json_wraps_with_store_field() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "alpha"])
+        .assert()
+        .success();
+    cmd_with_dir(&dir)
+        .args(["store", "add", "beta"])
+        .assert()
+        .success();
+
+    let body = r#"{"id":"job-x","status":"queued"}"#;
+    let (port, received) = start_recording_mock_server("HTTP/1.1 200 OK", body);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["--json", "index"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "daemon-routed multi-store index should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    let jobs = v["jobs"].as_array().expect("jobs must be an array");
+    assert_eq!(jobs.len(), 2);
+    let store_names: std::collections::HashSet<&str> =
+        jobs.iter().map(|j| j["store"].as_str().unwrap()).collect();
+    assert_eq!(store_names, ["alpha", "beta"].into_iter().collect());
+
+    let reqs = received.lock().unwrap();
+    assert_eq!(reqs.len(), 2);
+}
+
+/// `index` (non-json) with a daemon running and a single store in scope
+/// prints the plain "submitted to daemon" line without a store prefix.
+#[test]
+fn index_daemon_single_store_text_output() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "onlystore2"])
+        .assert()
+        .success();
+
+    let body = r#"{"id":"job-2","status":"queued"}"#;
+    let (port, _received) = start_recording_mock_server("HTTP/1.1 200 OK", body);
+
+    cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .arg("index")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Index job submitted to daemon: job-2 (poll with status)",
+        ));
+}
+
+/// `index` (non-json) with a daemon running and more than one store in
+/// scope prefixes each submission line with its store name.
+#[test]
+fn index_daemon_multi_store_text_output_prefixes_store_name() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "gamma"])
+        .assert()
+        .success();
+    cmd_with_dir(&dir)
+        .args(["store", "add", "delta"])
+        .assert()
+        .success();
+
+    let body = r#"{"id":"job-3","status":"queued"}"#;
+    let (port, _received) = start_recording_mock_server("HTTP/1.1 200 OK", body);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .arg("index")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout
+            .contains("Index job submitted to daemon for store 'gamma': job-3 (poll with status)")
+            && stdout.contains(
+                "Index job submitted to daemon for store 'delta': job-3 (poll with status)"
+            ),
+        "expected a per-store submission line for each store; got: {stdout}"
+    );
+}
+
+/// `index` with a daemon running that rejects the submission: the CLI must
+/// map the error and exit non-zero rather than continuing to submit further
+/// stores' jobs.
+#[test]
+fn index_daemon_submission_error_exits_nonzero() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    cmd_with_dir(&dir)
+        .args(["store", "add", "errstore"])
+        .assert()
+        .success();
+
+    let body = r#"{"code":"store_not_found","message":"errstore"}"#;
+    let (port, _received) = start_recording_mock_server("HTTP/1.1 404 Not Found", body);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["--json", "index"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code().unwrap(),
+        3,
+        "daemon job-submission error should exit 3; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

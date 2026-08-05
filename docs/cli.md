@@ -18,7 +18,8 @@ These flags are accepted by every subcommand.
 |---|---|
 | `--config <PATH>` | Path to the config file. Default: the platform config dir — `~/Library/Application Support/com.localdb.localdb.localdb/config.yaml` on macOS, `~/.config/localdb/config.yaml` on Linux. Can also be set via the `LOCALDB_CONFIG` environment variable. |
 | `--json` | Emit machine-readable JSON instead of human-readable text. All JSON shapes are stable API. |
-| `--store <NAME>` | Operate only on the named store. Repeatable to target multiple stores; omit to target all stores. |
+| `-s, --store <NAME>` | Operate on this store; repeatable. Default when omitted depends on the command: **all stores** for `search`/`status`/`store list`/`index`; the store named `default` for `source add`/`list`/`remove` and the `add` alias (exit 2 if absent); **rejected outright** (exit 2) for `db status`/`migrate`/`downgrade`. See [specs/05-surfaces.md §2.2](../specs/05-surfaces.md#22-store-scope). |
+| `-y, --yes` | Skip confirmation prompts for destructive operations (`db migrate` legacy rebuild, `db downgrade`). |
 | `-h, --help` | Print help. |
 | `-V, --version` | Print version. |
 
@@ -53,8 +54,9 @@ Usage: localdb init [OPTIONS]
 Options:
       --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
       --json           Emit JSON output instead of human-readable text
-      --store <NAME>   Operate on this store (repeatable; defaults to all stores)
-  -h, --help           Print help
+  -s, --store <NAME>   Operate on this store (repeatable); default depends on the subcommand
+  -y, --yes            Skip confirmation prompts for destructive operations
+  -h, --help           Print help (see more with '--help')
   -V, --version        Print version
 ```
 
@@ -97,8 +99,9 @@ Usage: localdb status [OPTIONS]
 Options:
       --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
       --json           Emit JSON output instead of human-readable text
-      --store <NAME>   Operate on this store (repeatable; defaults to all stores)
-  -h, --help           Print help
+  -s, --store <NAME>   Operate on this store (repeatable); default depends on the subcommand
+  -y, --yes            Skip confirmation prompts for destructive operations
+  -h, --help           Print help (see more with '--help')
   -V, --version        Print version
 ```
 
@@ -145,8 +148,9 @@ Commands:
 Options:
       --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
       --json           Emit JSON output instead of human-readable text
-      --store <NAME>   Operate on this store (repeatable; defaults to all stores)
-  -h, --help           Print help
+  -s, --store <NAME>   Operate on this store (repeatable); default depends on the subcommand
+  -y, --yes            Skip confirmation prompts for destructive operations
+  -h, --help           Print help (see more with '--help')
   -V, --version        Print version
 ```
 
@@ -163,8 +167,9 @@ Arguments:
 Options:
       --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
       --json           Emit JSON output instead of human-readable text
-      --store <NAME>   Operate on this store (repeatable; defaults to all stores)
-  -h, --help           Print help
+  -s, --store <NAME>   Operate on this store (repeatable); default depends on the subcommand
+  -y, --yes            Skip confirmation prompts for destructive operations
+  -h, --help           Print help (see more with '--help')
   -V, --version        Print version
 ```
 
@@ -192,8 +197,9 @@ Usage: localdb store list [OPTIONS]
 Options:
       --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
       --json           Emit JSON output instead of human-readable text
-      --store <NAME>   Operate on this store (repeatable; defaults to all stores)
-  -h, --help           Print help
+  -s, --store <NAME>   Operate on this store (repeatable); default depends on the subcommand
+  -y, --yes            Skip confirmation prompts for destructive operations
+  -h, --help           Print help (see more with '--help')
   -V, --version        Print version
 ```
 
@@ -228,8 +234,9 @@ Arguments:
 Options:
       --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
       --json           Emit JSON output instead of human-readable text
-      --store <NAME>   Operate on this store (repeatable; defaults to all stores)
-  -h, --help           Print help
+  -s, --store <NAME>   Operate on this store (repeatable); default depends on the subcommand
+  -y, --yes            Skip confirmation prompts for destructive operations
+  -h, --help           Print help (see more with '--help')
   -V, --version        Print version
 ```
 
@@ -245,7 +252,9 @@ exit: 3
 
 ## `localdb source`
 
-Manage sources on a store.
+Manage sources on a store. `add`/`list`/`remove` default to the store named
+`default` when `--store` is omitted, and exit `2` if no store named `default`
+exists (specs/05-surfaces.md §2.2).
 
 ```
 Manage sources on a store
@@ -261,8 +270,9 @@ Commands:
 Options:
       --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
       --json           Emit JSON output instead of human-readable text
-      --store <NAME>   Operate on this store (repeatable; defaults to all stores)
-  -h, --help           Print help
+  -s, --store <NAME>   Operate on this store (repeatable); default depends on the subcommand
+  -y, --yes            Skip confirmation prompts for destructive operations
+  -h, --help           Print help (see more with '--help')
   -V, --version        Print version
 ```
 
@@ -271,21 +281,25 @@ Options:
 ```
 Add a new source to a store
 
-Usage: localdb source add [OPTIONS] <SOURCE>
+Usage: localdb source add [OPTIONS] <SOURCES>...
 
 Arguments:
-  <SOURCE>  Source path or URL
+  <SOURCES>...  Source paths or URLs (one or more)
 
 Options:
-      --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
-      --json           Emit JSON output instead of human-readable text
-      --store <NAME>   Operate on this store (repeatable; defaults to all stores)
-  -h, --help           Print help
-  -V, --version        Print version
+      --config <PATH>      Path to config file (default: platform data dir / localdb / config.yaml)
+      --refresh <REFRESH>  Refresh interval for URL sources (e.g. "1h", "30m", "3600")
+      --json               Emit JSON output instead of human-readable text
+  -s, --store <NAME>       Operate on this store (repeatable); default depends on the subcommand
+  -y, --yes                Skip confirmation prompts for destructive operations
+  -h, --help               Print help (see more with '--help')
+  -V, --version            Print version
 ```
 
-Registers a filesystem path (or URL) as a source for the given store. The
-`--store` flag is required.
+Registers one or more filesystem paths (or URLs) as sources for a store.
+`--store` is repeatable; omit it and the source is added to the store named
+`default` (exit `2` if no such store exists) — it is never guessed from
+whatever stores happen to exist (specs/05-surfaces.md §2.2).
 
 **Note:** path existence is not validated at registration time — `source add
 /does/not/exist` succeeds (exit 0). The error surfaces at `index` time.
@@ -305,10 +319,16 @@ Usage: localdb source list [OPTIONS]
 Options:
       --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
       --json           Emit JSON output instead of human-readable text
-      --store <NAME>   Operate on this store (repeatable; defaults to all stores)
-  -h, --help           Print help
+  -s, --store <NAME>   Operate on this store (repeatable); default depends on the subcommand
+  -y, --yes            Skip confirmation prompts for destructive operations
+  -h, --help           Print help (see more with '--help')
   -V, --version        Print version
 ```
+
+Omit `--store` and this lists the store named `default` (exit `2` if no such
+store exists); pass `--store` (repeatable) to list one or more specific
+stores. A store-name column appears in the output only when more than one
+store is in scope (specs/05-surfaces.md §2.2).
 
 ```
 $ localdb source list --store notes
@@ -336,20 +356,25 @@ $ localdb source list --store notes --json
 ```
 Remove a source from a store
 
-Usage: localdb source remove [OPTIONS] <ID>
+Usage: localdb source remove [OPTIONS] <IDS>...
 
 Arguments:
-  <ID>  Source ID
+  <IDS>...  Source IDs, paths, or URLs (one or more)
 
 Options:
       --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
       --json           Emit JSON output instead of human-readable text
-      --store <NAME>   Operate on this store (repeatable; defaults to all stores)
-  -h, --help           Print help
+  -s, --store <NAME>   Operate on this store (repeatable); default depends on the subcommand
+  -y, --yes            Skip confirmation prompts for destructive operations
+  -h, --help           Print help (see more with '--help')
   -V, --version        Print version
 ```
 
-The `<ID>` is the ULID shown by `source list`.
+A `<ID>` may be the ULID shown by `source list`, or a source's path/URL —
+removing by path/url requires an explicit `--store` (it is never resolved
+against the implicit `default` store). Omitting `--store` when removing by
+ULID defaults to the store named `default`, same as `source add`/`list`
+(specs/05-surfaces.md §2.2).
 
 ---
 
@@ -366,14 +391,24 @@ Options:
       --config <PATH>       Path to config file (default: platform data dir / localdb / config.yaml)
       --source <SOURCE_ID>  Limit to a specific source (by ID)
       --json                Emit JSON output instead of human-readable text
-      --store <NAME>        Operate on this store (repeatable; defaults to all stores)
-  -h, --help                Print help
+      --strict              Exit with code 2 if any document failed extraction (never aborts mid-run)
+  -s, --store <NAME>        Operate on this store (repeatable); default depends on the subcommand
+  -y, --yes                 Skip confirmation prompts for destructive operations
+  -h, --help                Print help (see more with '--help')
   -V, --version             Print version
 ```
 
+Omit `--store` and every store in the database is indexed; pass `--store`
+(repeatable) to index only specific stores. Indexing more than one store
+prints a `[store]`-prefixed line per store plus a combined `Total:` line
+(`--json` wraps into `{"stores": [...], "total": {...}}`); a single store in
+scope keeps the original unprefixed output (specs/05-surfaces.md §2.2).
+
 Walks every registered source for the targeted store(s), extracts and chunks
 documents, and writes them to the unified libsql database on disk
-(`<data_dir>/localdb.db`). Progress is printed to stdout.
+(`<data_dir>/localdb.db`). Progress is printed to stderr; the final summary
+goes to stdout (or is omitted from stdout entirely in `--json` mode until the
+summary JSON itself).
 
 **Embeddings:** the CLI calls `embed::create_embedder` from the config policy.
 The default embedder (`pplx-embed-context-v1-0.6b`, local ONNX) is downloaded
@@ -401,21 +436,36 @@ Hybrid search with citations
 Usage: localdb search [OPTIONS] <QUERY>...
 
 Arguments:
-  <QUERY>...  Natural language query (no quotes needed; flags must precede the query)
+  <QUERY>...  Natural language query (no quotes needed; everything after the options is treated as the query)
 
 Options:
-      --config <PATH>   Path to config file (default: platform data dir / localdb / config.yaml)
-      --limit <LIMIT>   Maximum number of results to return [default: 10]
-      --json            Emit JSON output instead of human-readable text
-  -s, --store <NAME>    Operate on this store (repeatable; defaults to all stores)
-  -h, --help            Print help
-  -V, --version         Print version
+      --config <PATH>
+          Path to config file (default: platform data dir / localdb / config.yaml)
+      --limit <LIMIT>
+          Maximum number of results to return (must be >= 1) [default: 3]
+      --content-length <CONTENT_LENGTH>
+          Max characters of snippet text shown per result in human-readable output [default: 1000]
+      --json
+          Emit JSON output instead of human-readable text
+  -s, --store <NAME>
+          Operate on this store (repeatable); default depends on the subcommand
+  -y, --yes
+          Skip confirmation prompts for destructive operations
+  -h, --help
+          Print help (see more with '--help')
+  -V, --version
+          Print version
 ```
 
-> **Options-first:** flags (`--limit`, `--store`, `-s`, `--json`) must appear
-> **before** the query words. Anything after the first query word is captured
-> verbatim as query text — so `localdb search --limit 5 rank fusion` works, but
-> `localdb search rank fusion --limit 5` treats `--limit 5` as part of the query.
+Omit `--store` and every store is searched; pass `--store` (repeatable) to
+narrow to specific stores (specs/05-surfaces.md §2.2) — unchanged behavior,
+listed here for completeness.
+
+> **Options-first:** flags (`--limit`, `--content-length`, `--store`, `-s`,
+> `--json`) must appear **before** the query words. Anything after the first
+> query word is captured verbatim as query text — so `localdb search --limit 5
+> rank fusion` works, but `localdb search rank fusion --limit 5` treats
+> `--limit 5` as part of the query.
 
 Runs hybrid BM25 + dense-vector search across the targeted stores and returns
 ranked citations. The Citation JSON shape is documented in
@@ -495,34 +545,45 @@ $ localdb search -s notes --json hybrid search
 
 ## `localdb db`
 
-Inspect or migrate a store's schema. See [docs/migrations.md](migrations.md) for
+Inspect or migrate the database schema. See [docs/migrations.md](migrations.md) for
 the full migration walkthrough and the migration-authoring guide, and
 [specs/05-surfaces.md §2.1](../specs/05-surfaces.md#21-schema-migrations) for the
 design.
 
 ```
-Inspect or migrate a store's schema (specs/05-surfaces.md §2.1)
+Inspect or migrate the database schema (specs/05-surfaces.md §2.1)
 
 Usage: localdb db [OPTIONS] <COMMAND>
 
 Commands:
   status     Show schema version, pending migrations, and migration history
-  migrate    Apply pending migrations to bring the store up to this binary's head version
+  migrate    Apply pending migrations to bring the database up to this binary's head version
   downgrade  Reverse migrations using stored down-SQL (default: one step back)
   help       Print this message or the help of the given subcommand(s)
 
 Options:
       --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
       --json           Emit JSON output instead of human-readable text
-      --store <NAME>   Operate on this store (repeatable; defaults to all stores)
+  -s, --store <NAME>   Operate on this store (repeatable); default depends on the subcommand
   -y, --yes            Skip confirmation prompts for destructive operations
-  -h, --help           Print help
+  -h, --help           Print help (see more with '--help')
   -V, --version        Print version
 ```
 
 Opening a store never migrates it — a version mismatch on open is refused (exit
 `2`) with a hint pointing at one of these commands. They are the only surfaces
 allowed to change a store's schema version.
+
+**None of the three subcommands are store-scoped.** They operate on the whole
+database file passed via `--config`/the default data dir, not a single named
+store, so `--store`/`-s` is **rejected outright** — exit `2` — rather than
+silently ignored (specs/05-surfaces.md §2.2):
+
+```
+$ localdb db status --store notes
+error: invalid request: `db` commands operate on the whole database file; --store is not applicable
+exit: 2
+```
 
 **All three subcommands require the daemon to be stopped.** Run against a live
 daemon they exit `4` (`daemon_running`), the same as every other daemon-aware
@@ -544,9 +605,9 @@ Usage: localdb db status [OPTIONS]
 Options:
       --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
       --json           Emit JSON output instead of human-readable text
-      --store <NAME>   Operate on this store (repeatable; defaults to all stores)
+  -s, --store <NAME>   Operate on this store (repeatable); default depends on the subcommand
   -y, --yes            Skip confirmation prompts for destructive operations
-  -h, --help           Print help
+  -h, --help           Print help (see more with '--help')
   -V, --version        Print version
 ```
 
@@ -589,16 +650,16 @@ callers should check `uninitialized` before treating `pending == 0` as
 ### `localdb db migrate`
 
 ```
-Apply pending migrations to bring the store up to this binary's head version
+Apply pending migrations to bring the database up to this binary's head version
 
 Usage: localdb db migrate [OPTIONS]
 
 Options:
       --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
       --json           Emit JSON output instead of human-readable text
-      --store <NAME>   Operate on this store (repeatable; defaults to all stores)
+  -s, --store <NAME>   Operate on this store (repeatable); default depends on the subcommand
   -y, --yes            Skip confirmation prompts for destructive operations
-  -h, --help           Print help
+  -h, --help           Print help (see more with '--help')
   -V, --version        Print version
 ```
 
@@ -643,12 +704,12 @@ Reverse migrations using stored down-SQL (default: one step back)
 Usage: localdb db downgrade [OPTIONS]
 
 Options:
-      --to <VERSION>   Target schema version to downgrade to (default: one step below the current version)
       --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
+      --to <VERSION>   Target schema version to downgrade to (default: one step below the current version)
       --json           Emit JSON output instead of human-readable text
-      --store <NAME>   Operate on this store (repeatable; defaults to all stores)
+  -s, --store <NAME>   Operate on this store (repeatable); default depends on the subcommand
   -y, --yes            Skip confirmation prompts for destructive operations
-  -h, --help           Print help
+  -h, --help           Print help (see more with '--help')
   -V, --version        Print version
 ```
 
@@ -711,8 +772,9 @@ Usage: localdb serve [OPTIONS]
 Options:
       --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
       --json           Emit JSON output instead of human-readable text
-      --store <NAME>   Operate on this store (repeatable; defaults to all stores)
-  -h, --help           Print help
+  -s, --store <NAME>   Operate on this store (repeatable); default depends on the subcommand
+  -y, --yes            Skip confirmation prompts for destructive operations
+  -h, --help           Print help (see more with '--help')
   -V, --version        Print version
 ```
 
@@ -777,8 +839,13 @@ Options:
       --json
           Emit JSON output instead of human-readable text
 
-      --store <NAME>
-          Operate on this store (repeatable; defaults to all stores)
+  -s, --store <NAME>
+          Operate on this store (repeatable); default depends on the subcommand.
+          
+          Omitted, this means "all stores" for `search`/`status`/`store list`/ `index`; the store named `default` for `source`/`add` (exit 2 if absent); and is rejected outright for `db` subcommands (exit 2). See `--help` on the specific subcommand for its exact rule.
+
+  -y, --yes
+          Skip confirmation prompts for destructive operations
 
   -h, --help
           Print help (see a summary with '-h')
@@ -788,8 +855,11 @@ Options:
 ```
 
 Starts a JSON-RPC 2.0 MCP server on stdin/stdout, using embedded mode (no daemon
-required). The server is fully functional in v0.1.0 and exposes three read-only
-tools: `search`, `get_document`, and `list_stores`.
+required). The server is fully functional in v0.1.0 and exposes four read-only
+tools: `search`, `get_document`, `get_chunks`, and `list_stores`. Omitting
+`--store` exposes every store; pass `--store` (repeatable) to narrow the set
+(not honored when proxying to a running daemon — see
+[docs/mcp.md](mcp.md#daemon-proxied-stdio)).
 
 `--allow-write` is accepted on the command line for forward compatibility but all
 mutating tool calls are rejected in v1.

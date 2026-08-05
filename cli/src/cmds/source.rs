@@ -1,16 +1,14 @@
 use localdb_core::{
     ids::new_ulid, ingestion::now_rfc3339, source::normalize_path_source, types::SourceKind, Error,
-    SourceRow,
+    SourceRow, StoreRow,
 };
 use serde_json::json;
 
 use crate::{
-    app_db::{load_app_db, resolve_store_name},
+    app_db::{load_app_db, resolve_store_scope, resolve_store_scope_names, StoreScopePolicy},
     cmds::index::{run_embedded_index, IndexErrorMode},
     daemon_client::{daemon_request_async, probe_daemon, CliContext, DaemonState},
-    normalize::{
-        classify_source, exit_err, kind_to_string, looks_like_id, print_json, validate_store_name,
-    },
+    normalize::{classify_source, exit_err, kind_to_string, looks_like_id, print_json},
 };
 
 /// `localdb source add <path-or-url>`
@@ -25,72 +23,17 @@ pub(crate) async fn run_source_add_async(
     refresh: Option<&str>,
 ) {
     let (config_loader, db) = load_app_db(ctx).await;
-    let data_dir = &config_loader.paths.data_dir;
 
-    // A9-safety: validate the --store name if given explicitly.
-    if let Some(store_name) = ctx.stores.first() {
-        if let Err(e) = validate_store_name(store_name) {
-            exit_err(&e, ctx.json);
-        }
-    }
+    // Per specs/05-surfaces.md §2: route to daemon when running. Probed before
+    // store resolution because the two paths resolve scope differently — the
+    // daemon owns its own store set (see `resolve_store_scope_names`).
+    let daemon_state = probe_daemon(&config_loader.paths.data_dir, ctx.daemon_url.as_deref());
 
-    let store_name = resolve_store_name(ctx, &db).await;
+    let (kind, _root, url) = classify_source(source_arg);
 
-    // Per specs/05-surfaces.md §2: route to daemon when running.
-    if let DaemonState::Running { base_url } = probe_daemon(data_dir, ctx.daemon_url.as_deref()) {
-        let (kind, _root, url) = classify_source(source_arg);
-        // The handler's CreateSourceRequest expects {kind, spec, preset} where
-        // spec is a nested object (see server/src/handlers.rs CreateSourceRequest).
-        // Apply the same path normalization as embedded mode (#14, #7, #4).
-        let spec = if kind == "path" {
-            match normalize_path_source(source_arg) {
-                Ok((root, include, exclude)) => {
-                    json!({ "root": root, "include": include, "exclude": exclude })
-                }
-                Err(e) => exit_err(&e, ctx.json),
-            }
-        } else {
-            json!({ "url": url })
-        };
-        let url_str = format!("{}/v1/stores/{}/sources", base_url, store_name);
-        let body = json!({
-            "kind": kind,
-            "spec": spec,
-            "preset": "prose",
-            "refresh": refresh,
-        });
-        match daemon_request_async(reqwest::Method::POST, &url_str, Some(body)).await {
-            Ok(v) => {
-                if ctx.json {
-                    print_json(&v);
-                } else {
-                    println!(
-                        "Added source {} to store '{}' (via daemon)",
-                        v.get("id").and_then(|i| i.as_str()).unwrap_or("?"),
-                        store_name
-                    );
-                }
-                return;
-            }
-            Err(e) => exit_err(&e, ctx.json),
-        }
-    }
-
-    // #13: Verify store exists in runtime DB (exit 3 if not found).
-    let rt_store = match db.backend().get_store_by_name(&store_name).await {
-        Ok(None) => exit_err(
-            &Error::StoreNotFound {
-                id: store_name.clone(),
-            },
-            ctx.json,
-        ),
-        Err(e) => exit_err(&e, ctx.json),
-        Ok(Some(s)) => s,
-    };
-
-    let (kind, _root_str, url_str2) = classify_source(source_arg);
-
-    // Normalize path sources: validate existence, promote single files, apply excludes.
+    // Normalize path sources: validate existence, promote single files, apply
+    // excludes. Store-independent, so this runs once regardless of how many
+    // stores are in scope.
     let (actual_root, include_globs, exclude_globs) = if kind == "path" {
         match normalize_path_source(source_arg) {
             Ok(v) => v,
@@ -116,50 +59,99 @@ pub(crate) async fn run_source_add_async(
         );
     }
 
-    let src = SourceRow {
-        id: new_ulid(),
-        store_id: rt_store.id.clone(),
-        kind: match kind {
-            "url" => SourceKind::Url,
-            "path" => SourceKind::Path,
-            _ => SourceKind::Path,
-        },
-        root: if kind == "path" {
-            Some(actual_root)
+    if let DaemonState::Running { ref base_url } = daemon_state {
+        // Names only — the daemon is the authority on which stores exist.
+        for store_name in resolve_store_scope_names(ctx) {
+            // The handler's CreateSourceRequest expects {kind, spec, preset}
+            // where spec is a nested object (see server/src/handlers.rs
+            // CreateSourceRequest).
+            let spec = if kind == "path" {
+                json!({ "root": actual_root, "include": include_globs, "exclude": exclude_globs })
+            } else {
+                json!({ "url": url })
+            };
+            let url_str = format!("{}/v1/stores/{}/sources", base_url, store_name);
+            let body = json!({
+                "kind": kind,
+                "spec": spec,
+                "preset": "prose",
+                "refresh": refresh,
+            });
+            match daemon_request_async(reqwest::Method::POST, &url_str, Some(body)).await {
+                Ok(v) => {
+                    if ctx.json {
+                        print_json(&v);
+                    } else {
+                        println!(
+                            "Added source {} to store '{}' (via daemon)",
+                            v.get("id").and_then(|i| i.as_str()).unwrap_or("?"),
+                            store_name
+                        );
+                    }
+                }
+                Err(e) => exit_err(&e, ctx.json),
+            }
+        }
+        return;
+    }
+
+    // specs/05-surfaces.md §2.2: bare invocation -> store named "default";
+    // `-s` (repeatable) always wins and is validated/resolved/deduped here.
+    let rows = resolve_store_scope(ctx, &db, StoreScopePolicy::DefaultStore).await;
+
+    // Sources that were added locally and need auto-indexing, deferred until
+    // after `db`/`config_loader` are dropped (`run_embedded_index` opens its
+    // own `AppDb`).
+    let mut to_index: Vec<(StoreRow, String)> = Vec::new();
+
+    for row in &rows {
+        let src = SourceRow {
+            id: new_ulid(),
+            store_id: row.id.clone(),
+            kind: match kind {
+                "url" => SourceKind::Url,
+                "path" => SourceKind::Path,
+                _ => SourceKind::Path,
+            },
+            root: if kind == "path" {
+                Some(actual_root.clone())
+            } else {
+                None
+            },
+            url: url.map(|s| s.to_string()),
+            include: include_globs.clone(),
+            exclude: exclude_globs.clone(),
+            preset: "prose".to_string(),
+            refresh: refresh.map(|s| s.to_string()),
+            created_at: now_rfc3339(),
+        };
+
+        if let Err(e) = db.backend().upsert_source(&src).await {
+            exit_err(&e, ctx.json);
+        }
+
+        if ctx.json {
+            print_json(&json!({
+                "status": "ok",
+                "id": src.id,
+                "store": { "name": row.name },
+                "kind": kind_to_string(&src.kind),
+            }));
         } else {
-            None
-        },
-        url: url_str2.map(|s| s.to_string()),
-        include: include_globs,
-        exclude: exclude_globs,
-        preset: "prose".to_string(),
-        refresh: refresh.map(|s| s.to_string()),
-        created_at: now_rfc3339(),
-    };
+            println!("Added source {} to store '{}'", src.id, row.name);
+        }
 
-    if let Err(e) = db.backend().upsert_source(&src).await {
-        exit_err(&e, ctx.json);
+        // #2: Auto-index after source add.
+        if kind == "path" || kind == "url" {
+            to_index.push((row.clone(), src.id.clone()));
+        }
     }
 
-    if ctx.json {
-        print_json(&json!({
-            "status": "ok",
-            "id": src.id,
-            "store": { "name": store_name },
-            "kind": kind_to_string(&src.kind),
-        }));
-    } else {
-        println!("Added source {} to store '{}'", src.id, store_name);
-    }
-
-    // #2: Auto-index after source add.
     // Drop the db handle before re-entering the index path, which opens its own.
-    let src_id = src.id.clone();
-    let rt_store_clone = rt_store.clone();
     drop(db);
     drop(config_loader);
 
-    if kind == "path" || kind == "url" {
+    for (row, src_id) in &to_index {
         if !ctx.json {
             eprintln!("Auto-indexing source {} ...", src_id);
         }
@@ -167,15 +159,15 @@ pub(crate) async fn run_source_add_async(
         let index_ctx = CliContext {
             config: ctx.config.clone(),
             json: ctx.json,
-            stores: vec![store_name.clone()],
+            stores: vec![row.name.clone()],
             yes: false,
             daemon_url: ctx.daemon_url.clone(),
             config_env: ctx.config_env.clone(),
         };
         if let Err(e) = run_embedded_index(
             &index_ctx,
-            &rt_store_clone,
-            Some(&src_id),
+            row,
+            Some(src_id),
             IndexErrorMode::WarnAndContinue,
         )
         .await
@@ -184,6 +176,7 @@ pub(crate) async fn run_source_add_async(
         }
     }
 }
+
 /// `localdb source list`
 pub fn run_source_list(ctx: &CliContext) {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -193,50 +186,25 @@ pub fn run_source_list(ctx: &CliContext) {
 pub(crate) async fn run_source_list_async(ctx: &CliContext) {
     let (_, db) = load_app_db(ctx).await;
 
-    // A9-safety: validate --store name if given explicitly.
-    if let Some(store_name) = ctx.stores.first() {
-        if let Err(e) = validate_store_name(store_name) {
-            exit_err(&e, ctx.json);
-        }
-    }
+    // specs/05-surfaces.md §2.2: bare invocation -> store named "default".
+    let rows = resolve_store_scope(ctx, &db, StoreScopePolicy::DefaultStore).await;
 
-    let store_name = resolve_store_name(ctx, &db).await;
-
-    // D1: verify store exists before listing sources.
-    if let Some(explicit) = ctx.stores.first() {
-        match db.backend().get_store_by_name(explicit).await {
-            Ok(None) => exit_err(
-                &Error::StoreNotFound {
-                    id: explicit.clone(),
-                },
-                ctx.json,
-            ),
+    let mut all: Vec<(String, SourceRow)> = Vec::new();
+    for row in &rows {
+        let sources = match db.backend().list_sources(&row.id).await {
+            Ok(s) => s,
             Err(e) => exit_err(&e, ctx.json),
-            Ok(Some(_)) => {}
+        };
+        for s in sources {
+            all.push((row.name.clone(), s));
         }
     }
-
-    let store_row = match db.backend().get_store_by_name(&store_name).await {
-        Ok(Some(s)) => s,
-        Ok(None) => exit_err(
-            &Error::StoreNotFound {
-                id: store_name.clone(),
-            },
-            ctx.json,
-        ),
-        Err(e) => exit_err(&e, ctx.json),
-    };
-
-    let sources = match db.backend().list_sources(&store_row.id).await {
-        Ok(s) => s,
-        Err(e) => exit_err(&e, ctx.json),
-    };
 
     if ctx.json {
         // D4: include store as an object matching the citation shape.
-        let json_sources: Vec<serde_json::Value> = sources
+        let json_sources: Vec<serde_json::Value> = all
             .iter()
-            .map(|s| {
+            .map(|(store_name, s)| {
                 json!({
                     "id": s.id,
                     "store": { "name": store_name },
@@ -249,13 +217,53 @@ pub(crate) async fn run_source_list_async(ctx: &CliContext) {
             })
             .collect();
         print_json(&json!({ "sources": json_sources }));
-    } else if sources.is_empty() {
-        println!("No sources on store '{}'.", store_name);
-    } else {
-        for s in &sources {
-            let loc = s.root.as_deref().or(s.url.as_deref()).unwrap_or("?");
-            println!("{} [{}] {}", s.id, kind_to_string(&s.kind), loc);
+        return;
+    }
+
+    if all.is_empty() {
+        if rows.len() == 1 {
+            println!("No sources on store '{}'.", rows[0].name);
+        } else {
+            println!("No sources in scope.");
         }
+        return;
+    }
+
+    // Output gains a store-name column only when more than one store is in
+    // scope; a single store in scope keeps the pre-existing output format
+    // (specs/05-surfaces.md §2.2).
+    let col_width = store_column_width(rows.iter().map(|r| r.name.as_str()));
+    for (store_name, s) in &all {
+        let store_col = if rows.len() > 1 {
+            Some(store_name.as_str())
+        } else {
+            None
+        };
+        println!("{}", format_source_line(store_col, col_width, s));
+    }
+}
+
+/// Width of the store-name column: longest name in scope plus two spaces of
+/// separation before the source line begins. Only used when `>1` store is in
+/// scope; callers pass `0` (ignored) otherwise.
+fn store_column_width<'a>(names: impl Iterator<Item = &'a str>) -> usize {
+    names.map(str::len).max().unwrap_or(0) + 2
+}
+
+/// Format a single `source list` line, with or without a leading store-name
+/// column. `col_width` is only consulted when `store_name` is `Some`.
+fn format_source_line(store_name: Option<&str>, col_width: usize, src: &SourceRow) -> String {
+    let loc = src.root.as_deref().or(src.url.as_deref()).unwrap_or("?");
+    match store_name {
+        Some(name) => format!(
+            "{:<width$}{} [{}] {}",
+            name,
+            src.id,
+            kind_to_string(&src.kind),
+            loc,
+            width = col_width
+        ),
+        None => format!("{} [{}] {}", src.id, kind_to_string(&src.kind), loc),
     }
 }
 
@@ -266,33 +274,29 @@ pub fn run_source_remove(ctx: &CliContext, id: &str) {
 }
 
 pub(crate) async fn run_source_remove_async(ctx: &CliContext, id: &str) {
-    // A9-safety: validate --store name if given explicitly.
-    if let Some(store_name) = ctx.stores.first() {
-        if let Err(e) = validate_store_name(store_name) {
-            exit_err(&e, ctx.json);
-        }
-    }
-
     let (config_loader, db) = load_app_db(ctx).await;
-    let data_dir = &config_loader.paths.data_dir;
 
-    // D1: verify the store exists if --store was given explicitly.
-    if let Some(explicit) = ctx.stores.first() {
-        match db.backend().get_store_by_name(explicit).await {
-            Ok(None) => exit_err(
-                &Error::StoreNotFound {
-                    id: explicit.clone(),
-                },
-                ctx.json,
-            ),
-            Err(e) => exit_err(&e, ctx.json),
-            Ok(Some(_)) => {}
-        }
+    // #3: If the argument looks like a path or URL (not a ULID/UUID), it must
+    // be resolved against a specific store's sources, so an explicit --store
+    // is required; a bare invocation must not silently fall back to the
+    // implicit "default" store scope for this case (specs/05-surfaces.md
+    // §2.2 still requires callers to say which store's path/url they mean).
+    if !looks_like_id(id) && ctx.stores.is_empty() {
+        exit_err(
+            &Error::InvalidRequest {
+                message: "source remove by path/url requires --store; pass --store <name> or use the source ULID".into(),
+            },
+            ctx.json,
+        );
     }
 
-    // Per specs/05-surfaces.md §2: route to daemon when running.
-    if let DaemonState::Running { base_url } = probe_daemon(data_dir, ctx.daemon_url.as_deref()) {
-        // Route is DELETE /v1/sources/{id} (see server/src/daemon.rs build_router).
+    // Per specs/05-surfaces.md §2: route to daemon when running. The DELETE
+    // route is store-agnostic (`/v1/sources/{id}`), so this fires once
+    // regardless of how many stores are in scope — and, since the daemon owns
+    // its own store set, it must run before any local store resolution.
+    if let DaemonState::Running { base_url } =
+        probe_daemon(&config_loader.paths.data_dir, ctx.daemon_url.as_deref())
+    {
         let url = format!("{}/v1/sources/{}", base_url, id);
         match daemon_request_async(reqwest::Method::DELETE, &url, None).await {
             Ok(v) => {
@@ -307,78 +311,128 @@ pub(crate) async fn run_source_remove_async(ctx: &CliContext, id: &str) {
         }
     }
 
-    // #3: Resolve the source ID. If the argument looks like a path or URL
-    // (not a ULID/UUID), look it up by root/url field.
-    let explicit_store = ctx.stores.first().map(|s| s.as_str());
-    if !looks_like_id(id) && explicit_store.is_none() {
-        exit_err(
-            &Error::InvalidRequest {
-                message: "source remove by path/url requires --store; pass --store <name> or use the source ULID".into(),
-            },
-            ctx.json,
-        );
-    }
-    let resolved_store_id = match explicit_store {
-        Some(name) => Some(match db.resolve_store_id(name).await {
-            Ok(id) => id,
-            Err(e) => exit_err(&e, ctx.json),
-        }),
-        None => None,
-    };
-    let resolved_id: String = if !looks_like_id(id) {
-        let Some(store_id) = resolved_store_id.as_deref() else {
-            exit_err(
-                &Error::InvalidRequest {
-                    message: "source remove by path/url requires --store; pass --store <name> or use the source ULID".into(),
-                },
-                ctx.json,
-            );
-        };
-        match db.backend().find_source_by_root_or_url(id, store_id).await {
-            Ok(Some(src)) => src.id,
+    // specs/05-surfaces.md §2.2: bare invocation -> store named "default".
+    let rows = resolve_store_scope(ctx, &db, StoreScopePolicy::DefaultStore).await;
+
+    // Resolve (store, source_id) matches within the scoped stores.
+    let matches: Vec<(StoreRow, String)> = if looks_like_id(id) {
+        // A global ID is inherently single-store: fetch it once, then check
+        // that the store it actually belongs to is in scope (D2).
+        let src = match db.backend().get_source(id).await {
+            Ok(Some(s)) => s,
             Ok(None) => exit_err(&Error::SourceNotFound { id: id.to_string() }, ctx.json),
             Err(e) => exit_err(&e, ctx.json),
+        };
+        match rows.iter().find(|r| r.id == src.store_id) {
+            Some(row) => vec![(row.clone(), src.id)],
+            None => exit_err(&Error::SourceNotFound { id: id.to_string() }, ctx.json),
         }
     } else {
-        id.to_string()
+        // Path/url: look it up per resolved store; a matching root/url can
+        // in principle exist in more than one store in scope.
+        let mut found = Vec::new();
+        for row in &rows {
+            match db.backend().find_source_by_root_or_url(id, &row.id).await {
+                Ok(Some(src)) => found.push((row.clone(), src.id)),
+                Ok(None) => {}
+                Err(e) => exit_err(&e, ctx.json),
+            }
+        }
+        if found.is_empty() {
+            exit_err(&Error::SourceNotFound { id: id.to_string() }, ctx.json);
+        }
+        found
     };
 
-    // D2: If --store was given, verify the source belongs to that store.
-    if let Some(expected_store_id) = resolved_store_id.as_deref() {
-        match db.backend().get_source(&resolved_id).await {
-            Ok(Some(src)) if src.store_id != expected_store_id => {
-                exit_err(
-                    &Error::SourceNotFound {
-                        id: resolved_id.clone(),
-                    },
-                    ctx.json,
-                );
-            }
-            Ok(None) => exit_err(
+    let mut deleted: Vec<(String, String)> = Vec::new();
+    for (row, source_id) in &matches {
+        match db.backend().delete_source(source_id).await {
+            Ok(true) => deleted.push((row.name.clone(), source_id.clone())),
+            Ok(false) => exit_err(
                 &Error::SourceNotFound {
-                    id: resolved_id.clone(),
+                    id: source_id.clone(),
                 },
                 ctx.json,
             ),
             Err(e) => exit_err(&e, ctx.json),
-            Ok(Some(_)) => {}
         }
     }
 
-    match db.backend().delete_source(&resolved_id).await {
-        Ok(true) => {}
-        Ok(false) => exit_err(
-            &Error::SourceNotFound {
-                id: resolved_id.clone(),
+    if ctx.json {
+        if deleted.len() == 1 {
+            print_json(&json!({ "status": "ok", "id": deleted[0].1 }));
+        } else {
+            let results: Vec<serde_json::Value> = deleted
+                .iter()
+                .map(|(name, sid)| json!({ "id": sid, "store": { "name": name } }))
+                .collect();
+            print_json(&json!({ "status": "ok", "results": results }));
+        }
+    } else if deleted.len() == 1 {
+        println!("Removed source: {}", deleted[0].1);
+    } else {
+        for (name, sid) in &deleted {
+            println!("Removed source: {} from store '{}'", sid, name);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use localdb_core::ingestion::now_rfc3339;
+
+    fn test_source_row(root: Option<&str>, url: Option<&str>) -> SourceRow {
+        SourceRow {
+            id: "01HRQHB7FN3WMX4AZDV3S9VCTZ".to_string(),
+            store_id: "store-1".to_string(),
+            kind: if root.is_some() {
+                SourceKind::Path
+            } else {
+                SourceKind::Url
             },
-            ctx.json,
-        ),
-        Err(e) => exit_err(&e, ctx.json),
+            root: root.map(str::to_string),
+            url: url.map(str::to_string),
+            include: vec![],
+            exclude: vec![],
+            preset: "prose".to_string(),
+            refresh: None,
+            created_at: now_rfc3339(),
+        }
     }
 
-    if ctx.json {
-        print_json(&json!({ "status": "ok", "id": resolved_id }));
-    } else {
-        println!("Removed source: {}", resolved_id);
+    #[test]
+    fn format_source_line_single_store_matches_legacy_format() {
+        let src = test_source_row(Some("/Volumes/Archive/books"), None);
+        let line = format_source_line(None, 0, &src);
+        assert_eq!(
+            line,
+            "01HRQHB7FN3WMX4AZDV3S9VCTZ [path] /Volumes/Archive/books"
+        );
+    }
+
+    #[test]
+    fn format_source_line_multi_store_prefixes_padded_name() {
+        let src = test_source_row(Some("/Volumes/Archive/books"), None);
+        let width = store_column_width(["books", "default"].into_iter());
+        assert_eq!(width, 9); // "default" (7) + 2
+        let line = format_source_line(Some("books"), width, &src);
+        assert_eq!(
+            line,
+            "books    01HRQHB7FN3WMX4AZDV3S9VCTZ [path] /Volumes/Archive/books"
+        );
+    }
+
+    #[test]
+    fn format_source_line_falls_back_to_url_when_no_root() {
+        let src = test_source_row(None, Some("https://example.com"));
+        let line = format_source_line(None, 0, &src);
+        assert_eq!(line, "01HRQHB7FN3WMX4AZDV3S9VCTZ [url] https://example.com");
+    }
+
+    #[test]
+    fn store_column_width_uses_longest_name_plus_two() {
+        assert_eq!(store_column_width(["a", "bb", "ccc"].into_iter()), 5);
+        assert_eq!(store_column_width(std::iter::empty()), 2);
     }
 }

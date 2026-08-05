@@ -23,13 +23,13 @@ Single binary, subcommand tree. Global flags: `--config`, `--json`, `--store <na
 | `mcp` | Run MCP server on stdio | embedded core | thin client |
 | `status` | Stores, resource/chunk counts, policy staleness, daemon state | reads directly | queries daemon |
 | `store add/list/remove` | Manage runtime-owned stores | direct write | routed to daemon |
-| `source add/list/remove` | Manage sources on a store | direct write | routed to daemon |
-| `add <path|url>...` | Alias for `source add` — add one or more sources to a store | direct write | routed to daemon |
-| `index [--store S] [--source ID] [--strict]` | One-shot scan & index; creates IndexJob | runs job synchronously, progress to stderr | submits job, polls, streams progress |
+| `source add/list/remove` | Manage sources on a store; defaults to the store named `default` if `-s` is omitted, exit 2 if absent (§2.2) | direct write | routed to daemon |
+| `add <path|url>...` | Alias for `source add` — add one or more sources to a store; same `default`-store rule as `source add` (§2.2) | direct write | routed to daemon |
+| `index [--store S]... [--source ID] [--strict]` | One-shot scan & index; creates IndexJob; all stores if `-s` is omitted (§2.2) | runs job synchronously, progress to stderr | submits job, polls, streams progress |
 | `search <query>... [--limit N] [--content-length N]` | Hybrid search with citations; `--content-length` is a **soft cap** on human-readable snippet chars (default 1000; JSON output always full text) — see §4 for the snapping behavior shared with MCP | embedded read | via API |
-| `db status` | Inspect schema state: current version, head version, pending/unsupported steps. Never refuses, even on a store newer than the binary | reads directly | error `daemon_running` |
-| `db migrate` | Apply pending migrations with per-step progress; legacy v1–v3 rebuild and any other destructive step require confirmation; prints a `localdb index` hint when a weight-class-3 migration ran | direct write | error `daemon_running` |
-| `db downgrade [--to N]` | Reverse migrations down to version `N` (default: one step) using stored down-SQL; requires confirmation; refuses cleanly on a step with `down_unsupported_reason` | direct write | error `daemon_running` |
+| `db status` | Inspect schema state: current version, head version, pending/unsupported steps. Never refuses, even on a store newer than the binary; not store-scoped, `-s` is rejected, exit 2 (§2.2) | reads directly | error `daemon_running` |
+| `db migrate` | Apply pending migrations with per-step progress; legacy v1–v3 rebuild and any other destructive step require confirmation; prints a `localdb index` hint when a weight-class-3 migration ran; not store-scoped, `-s` is rejected, exit 2 (§2.2) | direct write | error `daemon_running` |
+| `db downgrade [--to N]` | Reverse migrations down to version `N` (default: one step) using stored down-SQL; requires confirmation; refuses cleanly on a step with `down_unsupported_reason`; not store-scoped, `-s` is rejected, exit 2 (§2.2) | direct write | error `daemon_running` |
 
 Output: human-readable by default (citations as `uri:heading_path` + snippet), `--json` emits the
 canonical structures for scripting. The CLI is **command-oriented**; interactive browse is a
@@ -46,6 +46,43 @@ error `daemon_running`, exit 4. Destructive paths (the legacy v1–v3 rebuild in
 and `db downgrade`) require explicit confirmation before touching the store. See
 [02-domain-model.md](02-domain-model.md) §9 for the `schema_migrations` table and the
 migration-weight-class design.
+
+### 2.2 Store scope
+
+`--store <name>` is **repeatable**; every name passed is validated and resolved, not just the
+first. An unknown name is `store_not_found`, exit 3. When explicit, `-s` always wins over any
+default below. When `-s` is omitted, the default depends on the command:
+
+| Command | `-s` omitted | Rationale |
+|---|---|---|
+| `search`, `status`, `store list` | **all stores** | already correct — no change |
+| `index` | **all stores** | idempotent and re-runnable; "refresh everything" is the common workflow |
+| `source add`/`list`/`remove`, `add` alias | **store named `default`**; **exit 2** if absent | mutations must never guess; `list` stays consistent with its siblings |
+| `db status`/`migrate`/`downgrade` | n/a — **exit 2 if `-s` is passed** | not store-scoped; silently ignoring a flag the user believed in is the #178 failure mode again |
+
+Additional rules:
+
+- An empty resolved store set under an all-stores policy (no stores configured at all) is exit 2,
+  not a silent no-op.
+- `source add`/`remove` (and the `add` alias) error text when the `default` store is missing is
+  `no store named 'default'; pass --store <name>`. This fires even when exactly one store exists
+  under a different name — predictability wins over guessing the sole store.
+- Output gains a store-name column only when more than one store is in scope; a single store in
+  scope keeps the pre-existing output format so existing scripts don't break:
+
+  ```
+  $ localdb source list -s books          # 1 store in scope — unchanged
+  01KWEZN72M... [path] /Volumes/Archive/books
+
+  $ localdb source list -s books -s default   # >1 in scope — column appears
+  books    01KWEZN72M... [path] /Volumes/Archive/books
+  default  01KWEXGA9Y... [path] nextcloud
+  ```
+
+- `index` across multiple stores emits one summary per store plus a combined total; `--json`
+  emits an array of per-store summaries. `--strict` exits 2 if **any** store reported errors, but
+  every store still runs to completion first — consistent with the "`--strict` never aborts
+  mid-run" rule (see "`localdb index --strict`" under §5).
 
 ## 3. HTTP API
 
@@ -79,9 +116,9 @@ later if a consumer demands it).
 
 **Decision:** v1 MCP is **read-only**: tools `search` (args: query, optional store names, limit, optional content_length →
 Citation list as structured content; each citation carries full `Metadata`),
-`get_document` (id or uri → block texts + `metadata: Metadata`),
-`get_chunks` (resource_id, optional offset/limit, or optional anchor_chunk_id/anchor_block_seq
-(§4.1) → the resource's chunks in order, paginated),
+`get_document` (id or uri, optional store → block texts + `metadata: Metadata`),
+`get_chunks` (resource_id, optional store, optional offset/limit, or optional
+anchor_chunk_id/anchor_block_seq (§4.1) → the resource's chunks in order, paginated),
 `list_stores` (names, visibility, counts). **Mutating tools** (`add_source`, `reindex`, …) are a
 follow-up behind an explicit opt-in flag (`localdb mcp --allow-write`), never on by default.
 
@@ -93,6 +130,15 @@ Citations cross MCP as structured tool results (the JSON shape from
 [02-domain-model.md](02-domain-model.md) §6), with a short text rendering alongside for
 non-structured clients (text rendering includes `creator · date` where present).
 Resources/prompts: none in v1; resources are reachable via `get_document` / `get_chunks`.
+
+**Store disambiguation (#144).** `get_document` and `get_chunks` both accept an optional
+`store` argument: a store **id or name**, resolved the same way as `search`'s `stores`
+argument. A `search` citation carries the store it came from (`store.id` / `store.name`),
+so a client can round-trip a citation back into either tool without ambiguity. Unknown
+store → `store_not_found`. When `store` is **omitted**, both tools scan every available
+store and return the first match — the pre-#144 behavior, retained for backward
+compatibility. Omitting it when the same document id exists in more than one store is
+therefore a coin flip; pass `store` whenever the id's origin is known.
 
 ### 4.1 `get_chunks`
 

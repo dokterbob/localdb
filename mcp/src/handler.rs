@@ -58,7 +58,9 @@ impl McpHandler {
     }
 
     /// Fetch the normalized text and metadata for a document by its ID.
-    #[tool(description = "Fetch the normalized text and metadata for a document by its ID or URI.")]
+    #[tool(
+        description = "Fetch the normalized text and metadata for a document by its ID or URI. Pass 'store' (id or name, e.g. from a search citation) to disambiguate when the same document id exists in multiple stores."
+    )]
     async fn get_document(&self, Parameters(args): Parameters<GetDocumentArgs>) -> CallToolResult {
         tools::tool_get_document(&self.stores, args).await
     }
@@ -66,7 +68,7 @@ impl McpHandler {
     /// Fetch a document's chunks in order, paginated by offset/limit or by
     /// an anchor (anchor_chunk_id / anchor_block_seq) centered window.
     #[tool(
-        description = "Fetch a document's chunks in order (block_seq, seq_in_block), paginated by offset/limit, or by an anchor_chunk_id/anchor_block_seq centered window (mutually exclusive with offset and with each other)."
+        description = "Fetch a document's chunks in order (block_seq, seq_in_block), paginated by offset/limit, or by an anchor_chunk_id/anchor_block_seq centered window (mutually exclusive with offset and with each other). Pass 'store' (id or name, e.g. from a search citation) to disambiguate when the same document id exists in multiple stores."
     )]
     async fn get_chunks(&self, Parameters(args): Parameters<GetChunksArgs>) -> CallToolResult {
         tools::tool_get_chunks(&self.stores, args).await

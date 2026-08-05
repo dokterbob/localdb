@@ -209,20 +209,137 @@ pub(crate) fn load_config_for_maintenance(ctx: &CliContext) -> ConfigLoader {
     }
 }
 
-/// Resolve the target store name from --store flags or runtime DB.
-pub(crate) async fn resolve_store_name(ctx: &CliContext, db: &AppDb) -> String {
-    if let Some(name) = ctx.stores.first() {
-        return name.clone();
+/// Name of the implicit default store used by `DefaultStore`-scoped commands
+/// (`source add`/`list`/`remove`) when no `--store` flag is given.
+pub(crate) const DEFAULT_STORE_NAME: &str = "default";
+
+/// How a command resolves its target store(s) when no explicit `--store`
+/// flags narrow the scope.
+pub(crate) enum StoreScopePolicy {
+    /// No `--store` -> every store in the database (search, index, status).
+    AllStores,
+    /// No `--store` -> exactly the store named "default" (source add/list/remove).
+    DefaultStore,
+}
+
+/// Reject `--store` on commands that operate on the whole database file
+/// (`db status`/`db migrate`/`db downgrade`), per specs/05-surfaces.md §2.2.
+///
+/// This is a standalone, `AppDb`-free counterpart to `resolve_store_scope`
+/// rather than a third `StoreScopePolicy` variant: those commands never open
+/// an `AppDb` (see `load_config_for_maintenance`'s doc comment above), so
+/// they have no handle to pass the async resolver. Exits the process (via
+/// `exit_err`) on error; see `reject_store_flag_inner` for the pure check.
+pub(crate) fn reject_store_flag(ctx: &CliContext) {
+    if let Err(e) = reject_store_flag_inner(ctx) {
+        exit_err(&e, ctx.json);
     }
-    match db.backend().list_stores().await {
-        Ok(stores) if !stores.is_empty() => stores[0].name.clone(),
-        Ok(_) => exit_err(
-            &Error::InvalidRequest {
-                message: "no stores; run `localdb store add <name>` or pass --store".to_string(),
-            },
-            ctx.json,
-        ),
+}
+
+/// Pure decision logic behind `reject_store_flag`, factored out so the
+/// rejection can be unit-tested without going through `exit_err`'s
+/// `process::exit`.
+fn reject_store_flag_inner(ctx: &CliContext) -> Result<(), Error> {
+    if ctx.stores.is_empty() {
+        return Ok(());
+    }
+    Err(Error::InvalidRequest {
+        message: "`db` commands operate on the whole database file; --store is not applicable"
+            .to_string(),
+    })
+}
+
+/// Resolve a `DefaultStore`-policy scope to store *names* only, without
+/// consulting the local database.
+///
+/// Used by the daemon-routing paths (`source add`/`remove` when a daemon is
+/// running). The daemon owns its own store set — it runs an in-memory store,
+/// so CLI-indexed libsql data is invisible to it and vice versa (see
+/// `docs/architecture.md#known-gaps`). Resolving `StoreRow`s out of the local
+/// file before proxying would reject every store that exists only in the
+/// daemon, so these paths validate the names and let the daemon be the
+/// authority on existence (its 404 surfaces as `store_not_found`).
+///
+/// Names are validated (A9 traversal-safety) and deduped, order preserved;
+/// an empty `--store` set yields the implicit `default` store.
+pub(crate) fn resolve_store_scope_names(ctx: &CliContext) -> Vec<String> {
+    for name in &ctx.stores {
+        if let Err(e) = crate::normalize::validate_store_name(name) {
+            exit_err(&e, ctx.json);
+        }
+    }
+    if ctx.stores.is_empty() {
+        return vec![DEFAULT_STORE_NAME.to_string()];
+    }
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    ctx.stores
+        .iter()
+        .filter(|n| seen.insert(n.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Resolve the set of stores a command should operate on, from `--store`
+/// flags and/or the resolution policy. Exits the process (via `exit_err`) on
+/// any error; see `resolve_store_scope_inner` for the pure decision logic.
+pub(crate) async fn resolve_store_scope(
+    ctx: &CliContext,
+    db: &AppDb,
+    policy: StoreScopePolicy,
+) -> Vec<StoreRow> {
+    match resolve_store_scope_inner(ctx, db, policy).await {
+        Ok(rows) => rows,
         Err(e) => exit_err(&e, ctx.json),
+    }
+}
+
+/// Pure decision logic behind `resolve_store_scope`, factored out so each
+/// branch can be unit-tested without going through `exit_err`'s
+/// `process::exit`.
+async fn resolve_store_scope_inner(
+    ctx: &CliContext,
+    db: &AppDb,
+    policy: StoreScopePolicy,
+) -> Result<Vec<StoreRow>, Error> {
+    for name in &ctx.stores {
+        crate::normalize::validate_store_name(name)?;
+    }
+
+    if !ctx.stores.is_empty() {
+        let mut rows: Vec<StoreRow> = Vec::new();
+        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for name in &ctx.stores {
+            let row = db
+                .backend()
+                .get_store_by_name(name)
+                .await?
+                .ok_or_else(|| Error::StoreNotFound { id: name.clone() })?;
+            if seen_ids.insert(row.id.clone()) {
+                rows.push(row);
+            }
+        }
+        return Ok(rows);
+    }
+
+    match policy {
+        StoreScopePolicy::AllStores => {
+            let stores = db.backend().list_stores().await?;
+            if stores.is_empty() {
+                return Err(Error::InvalidRequest {
+                    message: "no stores; run `localdb store add <name>` or pass --store"
+                        .to_string(),
+                });
+            }
+            Ok(stores)
+        }
+        StoreScopePolicy::DefaultStore => {
+            match db.backend().get_store_by_name(DEFAULT_STORE_NAME).await? {
+                Some(row) => Ok(vec![row]),
+                None => Err(Error::InvalidRequest {
+                    message: "no store named 'default'; pass --store <name>".to_string(),
+                }),
+            }
+        }
     }
 }
 
@@ -293,6 +410,132 @@ mod tests {
         assert_eq!(stores.len(), 1);
         assert_eq!(stores[0].name, "mystore");
         assert!(db.backend().delete_store(&id).await.unwrap());
+    }
+
+    fn test_ctx(stores: Vec<&str>) -> CliContext {
+        CliContext {
+            config: None,
+            json: false,
+            stores: stores.into_iter().map(String::from).collect(),
+            yes: false,
+            daemon_url: None,
+            config_env: None,
+        }
+    }
+
+    #[test]
+    fn reject_store_flag_inner_with_store_errors() {
+        let ctx = test_ctx(vec!["a"]);
+        let err = reject_store_flag_inner(&ctx).unwrap_err();
+        assert_eq!(
+            err,
+            Error::InvalidRequest {
+                message:
+                    "`db` commands operate on the whole database file; --store is not applicable"
+                        .to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn reject_store_flag_inner_without_store_is_ok() {
+        let ctx = test_ctx(vec![]);
+        assert!(reject_store_flag_inner(&ctx).is_ok());
+    }
+
+    #[tokio::test]
+    async fn scope_explicit_names_resolved_in_order_and_deduped() {
+        let dir = TempDir::new().unwrap();
+        let db = tmp_app_db(&dir).await;
+        let a = test_store_row("a", &db);
+        let b = test_store_row("b", &db);
+        db.backend().upsert_store(&a).await.unwrap();
+        db.backend().upsert_store(&b).await.unwrap();
+
+        let ctx = test_ctx(vec!["a", "b", "a"]);
+        let rows = resolve_store_scope_inner(&ctx, &db, StoreScopePolicy::AllStores)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "a");
+        assert_eq!(rows[1].name, "b");
+    }
+
+    #[tokio::test]
+    async fn scope_explicit_unknown_name_errors_store_not_found() {
+        let dir = TempDir::new().unwrap();
+        let db = tmp_app_db(&dir).await;
+        let ctx = test_ctx(vec!["nope"]);
+        let err = resolve_store_scope_inner(&ctx, &db, StoreScopePolicy::AllStores)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            Error::StoreNotFound {
+                id: "nope".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn scope_explicit_traversal_name_rejected_by_validate_store_name() {
+        let dir = TempDir::new().unwrap();
+        let db = tmp_app_db(&dir).await;
+        let ctx = test_ctx(vec!["../evil"]);
+        let err = resolve_store_scope_inner(&ctx, &db, StoreScopePolicy::AllStores)
+            .await
+            .unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[tokio::test]
+    async fn scope_all_stores_empty_errors_no_stores() {
+        let dir = TempDir::new().unwrap();
+        let db = tmp_app_db(&dir).await;
+        let ctx = test_ctx(vec![]);
+        let err = resolve_store_scope_inner(&ctx, &db, StoreScopePolicy::AllStores)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            Error::InvalidRequest {
+                message: "no stores; run `localdb store add <name>` or pass --store".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn scope_default_store_missing_with_other_store_present_errors() {
+        let dir = TempDir::new().unwrap();
+        let db = tmp_app_db(&dir).await;
+        let other = test_store_row("other", &db);
+        db.backend().upsert_store(&other).await.unwrap();
+
+        let ctx = test_ctx(vec![]);
+        let err = resolve_store_scope_inner(&ctx, &db, StoreScopePolicy::DefaultStore)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            Error::InvalidRequest {
+                message: "no store named 'default'; pass --store <name>".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn scope_default_store_present_returns_it() {
+        let dir = TempDir::new().unwrap();
+        let db = tmp_app_db(&dir).await;
+        let default_row = test_store_row(DEFAULT_STORE_NAME, &db);
+        db.backend().upsert_store(&default_row).await.unwrap();
+
+        let ctx = test_ctx(vec![]);
+        let rows = resolve_store_scope_inner(&ctx, &db, StoreScopePolicy::DefaultStore)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, DEFAULT_STORE_NAME);
     }
 
     #[tokio::test]

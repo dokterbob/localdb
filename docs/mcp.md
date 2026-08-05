@@ -214,6 +214,10 @@ Fetch the normalized text and metadata for a document by its ID.
     "uri": {
       "type": ["string", "null"],
       "description": "Document URI (e.g. file:///path/to/doc or URL)"
+    },
+    "store": {
+      "type": ["string", "null"],
+      "description": "Store id or name to restrict the lookup to (e.g. the store.id or store.name from a search result's citation). Defaults to scanning all available stores and returning the first match."
     }
   }
 }
@@ -223,6 +227,13 @@ Fetch the normalized text and metadata for a document by its ID.
 > from a `search` citation. Sending a `uri` without `id` returns `isError: true` with the
 > message: `"uri-based get_document is not supported in v1; use the document 'id'
 > from a search result"`.
+
+> **Store disambiguation (#144):** pass `store` — the `store.id` or `store.name`
+> from a search citation — when the document `id` might exist in more than one
+> store; it is resolved the same way as `search`'s `stores` argument, and an
+> unknown `store` returns `store_not_found`. Omitting `store` scans every
+> available store and returns the first match, which is ambiguous (effectively
+> a coin flip) if the id exists in more than one.
 
 **Example call:**
 
@@ -249,7 +260,7 @@ Fetch the normalized text and metadata for a document by its ID.
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"chunk_count\": 1,\n  \"document_id\": \"a9bb80b7...\",\n  \"provenance\": { \"content_hash\": \"929258b8...\", \"fetched_at\": \"2026-06-11T14:17:30Z\" },\n  \"store\": { \"id\": \"01KTVGQ62...\", \"name\": \"notes\" },\n  \"text\": \"Meeting 2026-06-02: decided to adopt reciprocal rank fusion...\",\n  \"title\": null,\n  \"uri\": \"file:///home/user/notes/meeting.txt\"\n}"
+        "text": "{\n  \"chunk_count\": 1,\n  \"resource_id\": \"a9bb80b7...\",\n  \"provenance\": { \"content_hash\": \"929258b8...\", \"fetched_at\": \"2026-06-11T14:17:30Z\" },\n  \"store\": { \"id\": \"01KTVGQ62...\", \"name\": \"notes\" },\n  \"text\": \"Meeting 2026-06-02: decided to adopt reciprocal rank fusion...\",\n  \"title\": null,\n  \"uri\": \"file:///home/user/notes/meeting.txt\"\n}"
       }
     ]
   }
@@ -269,11 +280,11 @@ by `offset`/`limit`. Use this to page through a long document after finding it v
 ```json
 {
   "type": "object",
-  "required": ["document_id"],
+  "required": ["resource_id"],
   "properties": {
-    "document_id": {
+    "resource_id": {
       "type": "string",
-      "description": "Document ID (content-addressed blake3 hash)"
+      "description": "Resource ID (content-addressed blake3 hash)"
     },
     "offset": {
       "type": ["integer", "null"],
@@ -285,15 +296,24 @@ by `offset`/`limit`. Use this to page through a long document after finding it v
       "minimum": 1,
       "maximum": 200,
       "description": "Maximum number of chunks to return (default: 50, max: 200)"
+    },
+    "store": {
+      "type": ["string", "null"],
+      "description": "Store id or name to restrict the lookup to (e.g. the store.id or store.name from a search result's citation). Defaults to scanning all available stores and returning the first match."
     }
   }
 }
 ```
 
-> Like `get_document`, `uri`-based lookup is not supported — use a `document_id`
-> obtained from a prior `search` or `get_document` call. An unknown `document_id`
-> returns `document_not_found`. An `offset` past the end of the chunk list returns an
+> Like `get_document`, `uri`-based lookup is not supported — use a `resource_id`
+> obtained from a prior `search` or `get_document` call. An unknown `resource_id`
+> returns `resource_not_found`. An `offset` past the end of the chunk list returns an
 > empty `chunks` array, not an error.
+
+> **Store disambiguation (#144):** pass `store` — the `store.id` or `store.name`
+> from a search citation — when the resource id might exist in more than one
+> store; resolved the same way as `get_document`'s `store` argument. Omitting
+> it scans every available store and returns the first match.
 
 **Example call:**
 
@@ -304,7 +324,7 @@ by `offset`/`limit`. Use this to page through a long document after finding it v
   "method": "tools/call",
   "params": {
     "name": "get_chunks",
-    "arguments": { "document_id": "a9bb80b7...", "offset": 0, "limit": 50 }
+    "arguments": { "resource_id": "a9bb80b7...", "offset": 0, "limit": 50 }
   }
 }
 ```
@@ -320,7 +340,7 @@ by `offset`/`limit`. Use this to page through a long document after finding it v
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"document_id\": \"a9bb80b7...\",\n  \"uri\": \"file:///home/user/notes/meeting.txt\",\n  \"title\": null,\n  \"store\": { \"id\": \"01KTVGQ62...\", \"name\": \"notes\" },\n  \"total_chunks\": 1,\n  \"offset\": 0,\n  \"limit\": 50,\n  \"returned\": 1,\n  \"chunks\": [\n    {\n      \"chunk_id\": \"eff4065c...\",\n      \"block_seq\": 0,\n      \"seq_in_block\": 0,\n      \"block_kind\": null,\n      \"span\": { \"start\": 0, \"end\": 138 },\n      \"heading_path\": [],\n      \"text\": \"Meeting 2026-06-02: decided to adopt reciprocal rank fusion...\"\n    }\n  ]\n}"
+        "text": "{\n  \"resource_id\": \"a9bb80b7...\",\n  \"uri\": \"file:///home/user/notes/meeting.txt\",\n  \"title\": null,\n  \"store\": { \"id\": \"01KTVGQ62...\", \"name\": \"notes\" },\n  \"total_chunks\": 1,\n  \"offset\": 0,\n  \"limit\": 50,\n  \"returned\": 1,\n  \"anchor_index\": null,\n  \"chunks\": [\n    {\n      \"chunk_id\": \"eff4065c...\",\n      \"block_seq\": 0,\n      \"seq_in_block\": 0,\n      \"block_kind\": null,\n      \"span\": { \"start\": 0, \"end\": 138 },\n      \"heading_path\": [],\n      \"text\": \"Meeting 2026-06-02: decided to adopt reciprocal rank fusion...\"\n    }\n  ]\n}"
       }
     ]
   }
