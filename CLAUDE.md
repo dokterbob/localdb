@@ -19,6 +19,11 @@ All five commands run in CI (`.github/workflows/ci.yml`).
 Design rationale and enforcement detail: `specs/01-architecture.md §7`.
 Default workflow is **TDD** — write the failing test first.
 
+**Reclaim disk under pressure:** these caches are regenerable — delete them instead of `cargo clean`,
+which also wipes the dependency cache and costs a full rebuild (~15 min for this workspace):
+- `rm -rf target/debug/incremental` — incremental compilation cache; safe to delete any time.
+- `rm -rf target/llvm-cov-target` — `cargo llvm-cov`'s separate instrumented build tree; delete after a coverage run.
+
 ## Crate map
 
 | Crate | Role |
