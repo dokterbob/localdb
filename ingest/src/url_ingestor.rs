@@ -107,14 +107,40 @@ impl Ingestor for UrlIngestor {
             )
             .await?;
 
-            if outcome == UrlOutcome::Unsupported {
-                // `process_url` deliberately does not report Unsupported —
-                // that's the caller's call. `UrlIngestor` reports it
-                // immediately, matching its pre-refactor behavior exactly
-                // (contrast `FeedIngestor`, which attempts an
-                // embedded-content fallback first).
-                callback.on_skipped(uri, SkipReason::Unsupported).await;
-                result.resources_skipped += 1;
+            match outcome {
+                UrlOutcome::Unsupported => {
+                    // `process_url` deliberately does not report
+                    // Unsupported — that's the caller's call. `UrlIngestor`
+                    // reports it immediately (contrast `FeedIngestor`, which
+                    // attempts an embedded-content fallback first).
+                    callback.on_skipped(uri, SkipReason::Unsupported).await;
+                    result.resources_skipped += 1;
+                }
+                UrlOutcome::Empty => {
+                    // Deliberate behavior change for `url` sources (Codex
+                    // review finding F1): a page that fetches 200 but
+                    // extracts to empty Markdown used to flow through as an
+                    // empty `Resource`, silently erasing any previously
+                    // indexed content for this URI and reporting it as
+                    // indexed. `process_url` now catches this before
+                    // `on_resource` and returns `Empty` without reporting —
+                    // `UrlIngestor` reports it here as `SkipReason::Other`
+                    // (NOT `Unsupported`): the parser accepted the format
+                    // and returned content, it was just empty, which is a
+                    // different condition than "no parser handles this
+                    // format" and must land in `docs_skipped`, not
+                    // `unsupported_format_count` (see
+                    // `specs/05-surfaces.md`'s definition of
+                    // `unsupported_format`).
+                    callback
+                        .on_skipped(
+                            uri,
+                            SkipReason::Other("extraction produced no content".to_string()),
+                        )
+                        .await;
+                    result.resources_skipped += 1;
+                }
+                _ => {}
             }
         }
 
@@ -432,6 +458,52 @@ mod tests {
                 "https://example.com/unsupported".to_string(),
                 SkipReason::Unsupported
             )]
+        );
+    }
+
+    /// Codex review finding F1: a page that fetches 200 but extracts to
+    /// empty Markdown must not flow through as an empty `Resource` (which
+    /// would silently delete any previously indexed content for the URI —
+    /// see `core::ingestion::index_resource`'s empty-chunks arm). It must be
+    /// reported as `SkipReason::Other`, NOT `SkipReason::Unsupported`: the
+    /// parser accepted the format and returned content, it was just empty —
+    /// a different condition from "no parser handles this format", and the
+    /// two feed different counters (`docs_skipped` vs
+    /// `unsupported_format_count`) that the CLI reports separately.
+    #[tokio::test]
+    async fn empty_extraction_is_skipped_as_other_not_unsupported() {
+        let mut script = HashMap::new();
+        script.insert(
+            "https://example.com/empty".to_string(),
+            ScriptedOutcome::Downloaded {
+                bytes: Vec::new(),
+                content_type: None,
+            },
+        );
+
+        let ingestor =
+            UrlIngestor::new(Box::new(AllParser), Box::new(ScriptedFetcher::new(script)));
+        let source = source_with_urls(&["https://example.com/empty"]);
+        let mut cb = RecordingCallback::default();
+        let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+        assert_eq!(
+            result.resources_produced, 0,
+            "an empty extraction must never be indexed"
+        );
+        assert!(
+            cb.resources.is_empty(),
+            "no Resource must ever be produced for an empty extraction"
+        );
+        assert_eq!(result.resources_skipped, 1);
+        assert_eq!(result.errors, 0, "an empty extraction is not an error");
+        assert_eq!(cb.skipped.len(), 1);
+        assert_eq!(cb.skipped[0].0, "https://example.com/empty");
+        assert!(
+            matches!(&cb.skipped[0].1, SkipReason::Other(_)),
+            "an empty extraction must report SkipReason::Other (docs_skipped), \
+             not SkipReason::Unsupported (unsupported_format_count) — got: {:?}",
+            cb.skipped[0].1
         );
     }
 

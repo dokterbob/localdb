@@ -2044,6 +2044,57 @@ mod tests {
         }
 
         // -----------------------------------------------------------------
+        // 1a. Codex review finding F1 (ingest/url_pipeline.rs) — an
+        //     accepted-but-empty extraction reports `SkipReason::Other` and
+        //     must land in `docs_skipped`, NOT `unsupported_format_count`:
+        //     the two counters mean different things ("extraction produced
+        //     nothing" vs "no parser handles this format") and the CLI
+        //     reports them as separate fields.
+        // -----------------------------------------------------------------
+
+        #[tokio::test]
+        async fn skip_reason_other_counts_as_docs_skipped_not_unsupported() {
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let config = make_ingestion_config(store_id);
+            let source = make_source_with_preset(store_id, "prose");
+
+            let ingestor = FakeIngestor::new(vec![
+                ScriptStep::Discovered(1),
+                ScriptStep::Skipped(
+                    "https://example.com/empty".to_string(),
+                    SkipReason::Other("extraction produced no content".to_string()),
+                ),
+            ]);
+
+            let mut doc_index = DocumentIndex::new();
+            let deps = SourceIngestionDeps {
+                doc_index: &mut doc_index,
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+                progress: None,
+            };
+            let result = run_source_ingestion(&source, &ingestor, deps)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                result.docs_skipped, 1,
+                "SkipReason::Other must count as docs_skipped"
+            );
+            assert_eq!(
+                result.unsupported_format_count, 0,
+                "SkipReason::Other must NOT count toward unsupported_format_count — \
+                 that counter is reserved for SkipReason::Unsupported (no parser \
+                 handles the format), a different condition than an \
+                 accepted-but-empty extraction"
+            );
+            assert_eq!(result.error_count, 0);
+        }
+
+        // -----------------------------------------------------------------
         // 1b. C8 — SkipReason::Error is counted as an error (not a skip),
         //     while SkipReason::Unchanged still counts as a skip; both keep
         //     their URIs alive across the delete-sweep.

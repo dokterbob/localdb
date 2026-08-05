@@ -1379,6 +1379,132 @@ async fn empty_content_and_summary_fall_back_to_title_only() {
 }
 
 // ---------------------------------------------------------------------------
+// Fetched-page extracts empty (Codex review finding F1): must fall back to
+// embedded content exactly like Gone/Unsupported, never index a 0-block
+// Resource that would delete previously indexed content.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn entry_link_extracts_empty_falls_back_to_summary() {
+    let items = r#"<item><title>E1</title><link>https://feed.example.com/empty</link><guid>e1</guid><author>jane@example.com</author><pubDate>Mon, 05 Jan 2026 00:00:00 GMT</pubDate><description>Fallback summary text</description></item>"#;
+    let feed_xml = rss2_feed("", items);
+    let mut script = HashMap::new();
+    script.insert(
+        "https://feed.example.com/feed.xml".to_string(),
+        ScriptedOutcome::text(&feed_xml),
+    );
+    script.insert(
+        "https://feed.example.com/empty".to_string(),
+        // A 200 response whose body extracts (via PlainParser) to an empty
+        // string — the fetched-page analog of F1's zero-block Resource.
+        ScriptedOutcome::text(""),
+    );
+    let (ingestor, _fetcher) = ingestor_with(script);
+    let source = source_for("https://feed.example.com/feed.xml", None, true);
+    let mut cb = RecordingCallback::default();
+    let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+    assert_eq!(result.resources_produced, 1);
+    assert_eq!(result.errors, 0);
+    assert_eq!(cb.resources.len(), 1);
+    let res = &cb.resources[0];
+    assert_eq!(
+        res.uri.as_str(),
+        "https://feed.example.com/empty",
+        "the fallback Resource must still carry the entry-link URI, not a synthetic one"
+    );
+    assert!(
+        !res.blocks.is_empty(),
+        "regression guard: an entry whose linked page extracts empty must never \
+         produce a 0-block Resource (that's exactly the data-loss bug this fixes)"
+    );
+    let text = res
+        .blocks
+        .iter()
+        .map(|b| b.text.clone())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        text.contains("Fallback summary text"),
+        "must fall back to the entry's own summary: {text}"
+    );
+
+    // Full feed enrichment must still apply on the fallback Resource.
+    assert_eq!(res.external_id.as_deref(), Some("e1"));
+    assert_eq!(
+        res.metadata.dublin_core().creator,
+        vec!["jane@example.com".to_string()]
+    );
+    assert!(res.metadata.dublin_core().date.is_some());
+    assert_eq!(
+        res.metadata.dublin_core().source.as_deref(),
+        Some("https://feed.example.com/feed.xml")
+    );
+}
+
+#[tokio::test]
+async fn entry_link_extracts_empty_with_no_summary_falls_back_to_title_only() {
+    let items = r#"<item><title>Only A Title</title><link>https://feed.example.com/empty</link><guid>e1</guid><pubDate>Mon, 05 Jan 2026 00:00:00 GMT</pubDate></item>"#;
+    let feed_xml = rss2_feed("", items);
+    let mut script = HashMap::new();
+    script.insert(
+        "https://feed.example.com/feed.xml".to_string(),
+        ScriptedOutcome::text(&feed_xml),
+    );
+    script.insert(
+        "https://feed.example.com/empty".to_string(),
+        ScriptedOutcome::text(""),
+    );
+    let (ingestor, _fetcher) = ingestor_with(script);
+    let source = source_for("https://feed.example.com/feed.xml", None, true);
+    let mut cb = RecordingCallback::default();
+    let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+    assert_eq!(result.resources_produced, 1);
+    assert_eq!(result.errors, 0);
+    assert_eq!(cb.resources.len(), 1);
+    assert!(
+        !cb.resources[0].blocks.is_empty(),
+        "regression guard: title-only fallback must still produce non-empty blocks"
+    );
+    let text = cb.resources[0]
+        .blocks
+        .iter()
+        .map(|b| b.text.clone())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(text.contains("Only A Title"));
+}
+
+#[tokio::test]
+async fn entry_link_extracts_empty_with_nothing_embedded_reports_error() {
+    let items = r#"<item><title></title><link>https://feed.example.com/empty</link><guid>e1</guid><pubDate>Mon, 05 Jan 2026 00:00:00 GMT</pubDate></item>"#;
+    let feed_xml = rss2_feed("", items);
+    let mut script = HashMap::new();
+    script.insert(
+        "https://feed.example.com/feed.xml".to_string(),
+        ScriptedOutcome::text(&feed_xml),
+    );
+    script.insert(
+        "https://feed.example.com/empty".to_string(),
+        ScriptedOutcome::text(""),
+    );
+    let (ingestor, _fetcher) = ingestor_with(script);
+    let source = source_for("https://feed.example.com/feed.xml", None, true);
+    let mut cb = RecordingCallback::default();
+    let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+    assert_eq!(
+        result.resources_produced, 0,
+        "no usable content anywhere in the chain must yield zero resources"
+    );
+    assert_eq!(result.errors, 1);
+    assert!(cb.resources.is_empty());
+    assert_eq!(cb.skipped.len(), 1);
+    assert!(matches!(&cb.skipped[0].1, SkipReason::Error(_)));
+}
+
+// ---------------------------------------------------------------------------
 // modified_at from feed timestamps (added_at stays ingestion-time)
 // ---------------------------------------------------------------------------
 

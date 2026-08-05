@@ -339,8 +339,17 @@ async fn process_discovery_entry(
         // ParseFailed) already reported themselves as errors — no fallback,
         // so the last good index stays put instead of flip-flopping between
         // full-page and summary content on every transient hiccup.
-        // `Gone`/`Unsupported` are stable properties of the linked page, so
-        // those DO fall back to the entry's own embedded content.
+        // `Gone`/`Unsupported`/`Empty` are all stable properties of the
+        // linked page (a 404 stays a 404, an unhandled format stays
+        // unhandled, and a page that renders to nothing renders to nothing
+        // again next run), so those DO fall back to the entry's own
+        // embedded content. `Empty` in particular (Codex review finding F1)
+        // must never be indexed as-is: a 0-block Resource with a changed
+        // content hash would hit `index_resource`'s empty-chunks arm and
+        // delete any previously indexed content for this URI — unlike a
+        // transient fetch/parse failure, there's no flip-flop risk here
+        // because emptiness is stable, so falling back to the entry's own
+        // summary/title is safe and strictly better than reporting nothing.
         let outcome = process_url(
             parser,
             fetcher,
@@ -353,7 +362,10 @@ async fn process_discovery_entry(
             result,
         )
         .await?;
-        matches!(outcome, UrlOutcome::Gone | UrlOutcome::Unsupported)
+        matches!(
+            outcome,
+            UrlOutcome::Gone | UrlOutcome::Unsupported | UrlOutcome::Empty
+        )
     } else {
         // Link-less and non-http(s)-linked entries never fetch — straight
         // to embedded content.

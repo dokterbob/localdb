@@ -20,6 +20,20 @@
 //!   immediately (preserving its existing behavior); `FeedIngestor` instead
 //!   attempts an embedded-content fallback first and only reports if that
 //!   also fails.
+//! - `Empty` (the parser accepted the format and returned `Ok(Some(doc))`,
+//!   but `doc.markdown` trims to nothing) ALSO returns WITHOUT reporting
+//!   anything — the caller decides, exactly like `Unsupported`. Kept as a
+//!   distinct variant rather than folded into `Unsupported` because the two
+//!   mean different things: `Unsupported` is "no parser handles this
+//!   format", `Empty` is "a parser accepted it and produced nothing". A
+//!   fetched page that extracts to zero content must never reach
+//!   `on_resource`: a 0-block `Resource` with a changed content hash hits
+//!   `index_resource`'s empty-chunks arm, which deletes any previously
+//!   indexed content for the URI and reports it as indexed (Codex review
+//!   finding F1) — silent data loss. `UrlIngestor` reports
+//!   `on_skipped(Other("...")) + resources_skipped += 1` immediately (NOT
+//!   `Unsupported` — see `url_ingestor`'s match arm for why); `FeedIngestor`
+//!   folds it into the same fallback chain as `Gone`/`Unsupported`.
 //! - `Indexed` calls `on_resource` and bumps `resources_produced` internally.
 
 use extract::sniff_mime;
@@ -46,6 +60,9 @@ pub(crate) enum UrlOutcome {
     Unchanged,
     Gone,
     Unsupported,
+    /// The parser accepted the format (`Ok(Some(doc))`) but `doc.markdown`
+    /// trims to nothing. Distinct from `Unsupported` — see the module doc.
+    Empty,
     FetchError,
     ParseFailed,
 }
@@ -189,6 +206,17 @@ pub(crate) async fn process_url(
             return Ok(UrlOutcome::ParseFailed);
         }
     };
+
+    if parsed.markdown.trim().is_empty() {
+        // The parser accepted the format and returned content, but that
+        // content is empty (e.g. a 200 with an empty/whitespace-only body).
+        // Deliberately NOT reported here — the caller decides, exactly like
+        // `Unsupported` above (Codex review finding F1: a 0-block Resource
+        // would otherwise reach `index_resource`'s empty-chunks arm and
+        // silently delete any previously indexed content for this URI).
+        tracing::info!(url = %locator, "process_url: extraction produced no content");
+        return Ok(UrlOutcome::Empty);
+    }
 
     let mut resource = build_resource(
         source,
