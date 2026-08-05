@@ -1527,6 +1527,58 @@ async fn redirected_feed_link_less_entry_fragment_uri_stays_pinned_to_configured
     );
 }
 
+#[tokio::test]
+async fn redirected_feed_guidless_linkless_entry_id_stays_pinned_to_configured_url() {
+    // The test above covers the fragment *prefix*; this covers the `{id}`
+    // half, which has its own way of leaking the effective URL. An entry
+    // with neither <guid> nor <link> has no id of its own, so feed-rs's
+    // `assign_missing_ids` synthesizes one — and for a link-less entry
+    // `generate_id` derives it from the parser's base URI plus the title.
+    // Since the base URI is now the *effective* (post-redirect) feed URL,
+    // that would make the whole synthetic Resource URI move the first time
+    // a feed starts redirecting: the old URI gets delete-swept and the same
+    // entry re-indexed under a new identity. Pinning the id generator's URI
+    // argument to the configured `feed_url` keeps identity stable; link
+    // resolution still uses the effective URL, because `generate_id` only
+    // consults that argument on the link-less branch.
+    let items = r#"<item><title>No Link No Guid</title><pubDate>Mon, 05 Jan 2026 00:00:00 GMT</pubDate><description>Body text</description></item>"#;
+    let feed_xml = rss2_feed("", items);
+
+    let mut direct = HashMap::new();
+    direct.insert(
+        "https://old.example.com/feed.xml".to_string(),
+        ScriptedOutcome::text(&feed_xml),
+    );
+    let (direct_ingestor, _direct_fetcher) = ingestor_with(direct);
+    let source = source_for("https://old.example.com/feed.xml", None, true);
+    let mut direct_cb = RecordingCallback::default();
+    direct_ingestor
+        .ingest(&source, &mut direct_cb)
+        .await
+        .unwrap();
+
+    let mut redirected = HashMap::new();
+    redirected.insert(
+        "https://old.example.com/feed.xml".to_string(),
+        ScriptedOutcome::text_redirected_from(&feed_xml, "https://new.example.com/path/feed.xml"),
+    );
+    let (redirected_ingestor, _redirected_fetcher) = ingestor_with(redirected);
+    let mut redirected_cb = RecordingCallback::default();
+    redirected_ingestor
+        .ingest(&source, &mut redirected_cb)
+        .await
+        .unwrap();
+
+    assert_eq!(direct_cb.resources.len(), 1);
+    assert_eq!(redirected_cb.resources.len(), 1);
+    assert_eq!(
+        redirected_cb.resources[0].uri, direct_cb.resources[0].uri,
+        "a guid-less, link-less entry must keep the same synthetic Resource URI \
+         whether or not the feed fetch was redirected — otherwise the first \
+         redirecting run re-keys it and delete-sweeps the previously indexed copy"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Non-http(s) entry links: never fetched, embedded content at the link URI
 // ---------------------------------------------------------------------------

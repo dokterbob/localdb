@@ -143,9 +143,25 @@ impl Ingestor for FeedIngestor {
         // finding F2). This is purely about where a relative link points —
         // identity (`feed_uri`, fragment URIs, provenance) stays pinned to
         // `feed_url` regardless, per the comment above.
+        //
+        // The id generator is the one place the effective URL must NOT leak.
+        // feed-rs synthesizes an id for any entry that declares none, and for
+        // a link-less entry it derives that id from the parser's base URI plus
+        // the title — which would put the effective URL inside
+        // `synthetic_entry_uri`'s `{feed_url}#entry:{id}`, moving the whole
+        // Resource identity the first time a feed starts redirecting (old URI
+        // delete-swept, same entry re-indexed under a new one). Pinning the
+        // generator's URI argument to the configured `feed_url` keeps that
+        // stable without affecting link resolution: `generate_id` only
+        // consults the argument on the link-less branch, and for a linked
+        // entry it hashes the (correctly, effectively-resolved) link instead.
+        let id_generator_url = feed_url.clone();
         let parse_outcome = catch_panic(std::panic::AssertUnwindSafe(|| {
             feed_rs::parser::Builder::new()
                 .base_uri(Some(effective_feed_url.as_str()))
+                .id_generator(move |links, title, _effective_uri| {
+                    feed_rs::parser::generate_id(links, title, Some(id_generator_url.as_str()))
+                })
                 .build()
                 .parse(bytes.as_slice())
         }));
