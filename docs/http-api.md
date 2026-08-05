@@ -363,7 +363,7 @@ HTTP status codes follow the shared error taxonomy in [specs/05-surfaces.md](../
 
 | Code | HTTP status | Meaning |
 |---|---|---|
-| `store_not_found` / `source_not_found` / `document_not_found` / `job_not_found` | 404 | Unknown entity |
+| `store_not_found` / `source_not_found` / `resource_not_found` / `job_not_found` | 404 | Unknown entity |
 | `runtime_state_locked` | 409 | Unified database locked by another process (SQLite `busy_timeout` exceeded) |
 | `daemon_running` | 409 | A second daemon was started against the same data dir |
 | `daemon_unreachable` | 502 | Daemon socket exists but is not responding |
