@@ -58,6 +58,17 @@ A resource stays alive across a run if it is observed via **either** `on_resourc
 `Resource.uri` carries, so both hooks populate the sweep's "seen" set in one consistent key
 space.
 
+An extraction that produces **zero blocks** must never be yielded as a `Resource` to
+`on_resource`: `index_resource`'s zero-chunk arm treats a zero-block Resource as an empty
+replacement, deleting the previously indexed content for that URI and writing nothing in its
+place — it cannot tell "the source is legitimately empty" apart from "extraction produced
+nothing usable." Ingestors must therefore classify "extracted to nothing" as unusable and report
+it via `on_skipped`, not as content via `on_resource`.
+[Issue #156](https://github.com/dokterbob/localdb/issues/156) ("Delete-sweep wipes an entire
+source when its root is unreachable (data loss)") is the source-level statement of the same
+rule — zero-URIs-enumerated there, zero-blocks-extracted here — both are the same conflation of
+"unavailable" with "legitimately empty," one level apart.
+
 ## 2. Extraction (v1 matrix)
 
 The parser chain is an implementation detail of the `file` and `url` ingestors. Parsers

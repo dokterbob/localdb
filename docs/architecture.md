@@ -367,6 +367,23 @@ store for an already-indexed document until its content bytes change. Fixing thi
 skip-contract change (metadata-aware compare, or a metadata-only store update that skips
 re-embedding); see the issue for the design options.
 
+**14. `index_resource`'s zero-chunk arm still deletes on an empty replacement for any ingestor
+that yields a zero-block Resource — `file` sources are not guarded.**
+([#156](https://github.com/dokterbob/localdb/issues/156))
+The fetched-page and embedded-content paths (`url`/`feed` sources, via
+`ingest/src/url_pipeline.rs`) now classify "extracted to nothing" as unusable and report it via
+`on_skipped` rather than yielding a zero-block `Resource` — see
+[specs/02-domain-model.md](../specs/02-domain-model.md) § "Feed connector" and
+[specs/04-search-pipeline.md](../specs/04-search-pipeline.md) §1. `FileIngestor` has no
+equivalent guard: a file that extracts to zero blocks (emptied on disk between the watcher's
+debounce firing and the read, or an extractor regression) still reaches `index_resource`'s
+zero-chunk arm and deletes the previously indexed document for that path, reporting the run as
+successful. Same root conflation as #156 — "unavailable" mistaken for "legitimately empty" — one
+layer down: #156 is zero-URIs-enumerated at the source level, this is zero-blocks-extracted at
+the resource level, and here it is `file` rather than `url`/`feed` that lacks the guard.
+Extending the same classification to `FileIngestor` is tracked separately (follow-up issue to be
+filed).
+
 ---
 
 ## Deferred design decisions {#design-decisions}

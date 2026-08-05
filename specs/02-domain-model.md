@@ -121,8 +121,17 @@ metadata date = the entry's published/updated timestamp, `metadata.source` = the
 (provenance back to the discovering feed), `external_etag` captured from the entry-link fetch. The
 Resource's `uri` (and therefore its content-addressed `id`, §3) keys off the entry's
 **pre-redirect, feed-declared link**, not wherever it 30x's to, so re-fetching the same feed
-resolves to the same Resource identity regardless of redirect-target churn. Entries with no link
-get a fragment URI instead: `{feed_url}#entry:{entry.id}`.
+resolves to the same Resource identity regardless of redirect-target churn. That is a statement
+about *identity*, distinct from *link resolution*: a relative entry link (e.g.
+`<link>article.html</link>`) is resolved by `feed-rs` against the feed's **effective
+(post-redirect) URL**, not the configured `feed_url` — a feed that 301's to a new host must
+still resolve its entries' relative links against that new host, not the stale one it was
+configured with. `xml:base`, where present in the feed XML, still takes precedence over that
+base URI (feed-rs's own resolution rule). Once resolved, the link is the feed-declared link that
+identity keys off, per the paragraph above — resolution decides *where a relative link points*;
+identity decides *what URI names the Resource*, and stays pinned to that resolved link
+regardless of where the linked page itself later redirects. Entries with no link get a fragment
+URI instead: `{feed_url}#entry:{entry.id}`.
 
 **General connector pattern.** Discovery mode plus the fragment-URI fallback is not feed-specific
 — it's the expected shape for any ingestor that discovers sub-resource URIs from a parent
@@ -154,7 +163,14 @@ The byline line omits missing parts outright — no placeholder text, and the en
 appears in it.
 
 **Both modes:** entries are stable-sorted by `published.or(updated)` descending (entries with
-neither date sort last, stable among themselves), then truncated to `max_entries`.
+neither date sort last, stable among themselves), then **deduplicated by resolved resource
+URI** — the same URI that becomes the Resource's identity (the entry's resolved link, or the
+`{feed_url}#entry:{entry.id}` fragment for a link-less entry) — keeping the first (i.e. newest)
+survivor and dropping the rest, then truncated to `max_entries`. `max_entries` therefore counts
+*distinct* resource URIs, not raw entry count: two entries that resolve to the same URI cost one
+slot, not two. First-wins (not last-wins) is deliberate: when a feed lists the same URI more
+than once, the newest listing is the feed's most current claim about that URI, so it is the one
+that should win whichever content ends up indexed for it.
 
 **Timestamps.** Feed-produced Resources map times as follows. `added_at` is always ingestion-time
 `now()` — it records when *our store* first saw the resource, never a feed-claimed date.
@@ -173,6 +189,14 @@ incremental-skip runs before any store write).
   reported as a per-item error and skipped this run. Falling back here would flip the Resource's
   content hash between "full page" and "feed summary" on every transient outage, forcing needless
   re-embedding; the existing good index is left alone instead.
+- A fetched entry page — or, having fallen back that far, the entry's own embedded content — that
+  extracts to empty or whitespace-only Markdown is **unusable, not empty**: it falls through the
+  same `content → summary → title` chain that `Gone`/`Unsupported` use, and never yields a
+  zero-block Resource. A zero-block Resource reaching `index_resource` is indistinguishable from
+  a legitimate empty replacement and deletes the previously indexed document (see
+  [04-search-pipeline.md](04-search-pipeline.md) §1) — exactly the hazard the embedded-content
+  chain's own empty-Markdown guards (`feed_ingestor.rs`'s `entry_routed_content`) exist to avoid,
+  extended here to the fetched-page path that shares the same fallthrough logic.
 - An invalid feed URL in config fails the whole source run fast (`invalid_config`). Everything
   else data-driven — malformed feed XML, malformed entries, entry-link fetch failures — is
   per-item `on_skipped(Error)` + continue. An empty feed (zero entries) is valid, not an error.
