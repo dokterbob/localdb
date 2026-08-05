@@ -369,7 +369,8 @@ re-embedding); see the issue for the design options.
 
 **14. `index_resource`'s zero-chunk arm still deletes on an empty replacement for any ingestor
 that yields a zero-block Resource — `file` sources are not guarded.**
-([#156](https://github.com/dokterbob/localdb/issues/156))
+([#185](https://github.com/dokterbob/localdb/issues/185),
+[#156](https://github.com/dokterbob/localdb/issues/156))
 The fetched-page and embedded-content paths (`url`/`feed` sources, via
 `ingest/src/url_pipeline.rs`) now classify "extracted to nothing" as unusable and report it via
 `on_skipped` rather than yielding a zero-block `Resource` — see
@@ -381,8 +382,14 @@ zero-chunk arm and deletes the previously indexed document for that path, report
 successful. Same root conflation as #156 — "unavailable" mistaken for "legitimately empty" — one
 layer down: #156 is zero-URIs-enumerated at the source level, this is zero-blocks-extracted at
 the resource level, and here it is `file` rather than `url`/`feed` that lacks the guard.
-Extending the same classification to `FileIngestor` is tracked separately (follow-up issue to be
-filed).
+Extending the same classification to `FileIngestor` — and giving `index_resource` itself an
+"empty ≠ deleted" rule, so the guard is an invariant rather than per-ingestor discipline — is
+tracked in #185.
+
+A related feed-specific identity bug lives in the same family:
+[#186](https://github.com/dokterbob/localdb/issues/186) — an entry with no guid, no link and no
+title gets a random UUID identity on every parse, so it is re-indexed and its previous copy
+delete-swept on every run.
 
 ---
 
