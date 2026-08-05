@@ -459,25 +459,53 @@ $ localdb search -s notes --json hybrid search
 {
   "citations": [
     {
+      "block": {
+        "kind": "text",
+        "seq": 1
+      },
       "chunk_id": "f0113639ebf62fa402aa506a80e0f6dba19a970cfbea3c80ffbb4ca082db30e7",
-      "document_id": "ff6ff626d0062eab2d3a5f76dbbe75e6a265a127d99486cacfcde9f42777fe1d",
+      "chunk_position": {
+        "seq_in_block": 0
+      },
       "heading_path": [
         "LanceDB notes"
       ],
+      "location": {
+        "span": {
+          "end": 172,
+          "start": 0
+        }
+      },
+      "metadata": {
+        "contributor": [],
+        "coverage": null,
+        "creator": [],
+        "description": null,
+        "format": null,
+        "identifier": null,
+        "kind": "document",
+        "language": null,
+        "page_count": null,
+        "publisher": null,
+        "relation": [],
+        "rights": null,
+        "source": null,
+        "subject": [],
+        "title": "LanceDB notes",
+        "type": null,
+        "word_count": null
+      },
       "provenance": {
         "content_hash": "360be062b82116aa1a7f707bc9ea9d2f60e0f619e84e4f0f72e8f689d0e18f64",
         "fetched_at": "2026-06-11T14:17:30Z"
       },
+      "resource_id": "ff6ff626d0062eab2d3a5f76dbbe75e6a265a127d99486cacfcde9f42777fe1d",
       "score": {
         "bm25": 1.9203118085861206,
         "dense": 1.0,
         "fused": 0.032266458495966696
       },
       "snippet": "LanceDB notes\nLanceDB is an embedded vector database built on the Lance columnar format. It supports hybrid search combining vector similarity with BM25 full-text scoring.\n",
-      "span": {
-        "end": 172,
-        "start": 0
-      },
       "store": {
         "id": "01KTVGQ62TQN8X6XN9E5FDZN67",
         "name": "notes"
@@ -488,6 +516,11 @@ $ localdb search -s notes --json hybrid search
   ]
 }
 ```
+
+There is no top-level `document_id`, `block_seq`, `block_kind`, or `span` in the
+Citation shape — those are superseded by `resource_id`, the nested `block {seq, kind}`,
+`chunk_position {seq_in_block}`, and `location {span, window_block_seqs}` respectively.
+See [specs/02-domain-model.md](../specs/02-domain-model.md) §6.
 
 (paths shown from a scratch run)
 
