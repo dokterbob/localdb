@@ -192,19 +192,59 @@ impl Ingestor for FeedIngestor {
                 (None, None) => std::cmp::Ordering::Equal,
             }
         });
+        // Deduplicate by resolved resource URI — the same URI that becomes
+        // the eventual Resource's identity (see the "Both modes" paragraph
+        // of specs/02-domain-model.md's Feed connector section) — keeping
+        // the first (i.e. newest, since `entries` is already sorted DESC
+        // above) occurrence of each and dropping the rest, BEFORE
+        // `max_entries` truncation, so `max_entries` counts *distinct*
+        // resource URIs, not raw entry count (Codex review finding F3: two
+        // entries resolving to the same URI used to both be processed,
+        // burning two slots and — on the embedded-content fallback path —
+        // letting the older entry's body win over the newer one since it
+        // was processed last). `Vec::dedup_by` is deliberately NOT used
+        // here: it only collapses *adjacent* duplicates, and this vec is
+        // sorted by date, not by URI, so duplicate entries are not
+        // guaranteed to be neighbours.
+        //
+        // Link-less entries resolve to an `entry.id`-derived synthetic
+        // fragment URI (`synthetic_entry_uri`), which differs per entry in
+        // virtually every real feed, so this pass is a no-op for them in
+        // practice — except in the pathological case of a feed repeating
+        // the same `<guid>` across entries, where collapsing them down to
+        // the newest is also the correct outcome.
+        //
+        // The resolved `(locator, uri, fetchable)` triple is threaded
+        // straight into the discovery loop below so it is computed exactly
+        // once per surviving entry, not recomputed inside
+        // `process_discovery_entry`.
+        let mut seen_uris: std::collections::HashSet<Uri> = std::collections::HashSet::new();
+        let mut targets: Vec<(String, Uri, bool)> = Vec::with_capacity(entries.len());
+        entries.retain(|entry| {
+            let target = resolve_entry_target(entry, &feed_url, &feed_uri);
+            let is_new = seen_uris.insert(target.1.clone());
+            if is_new {
+                targets.push(target);
+            }
+            is_new
+        });
+
         if let Some(max) = max_entries {
             entries.truncate(max);
+            targets.truncate(max);
         }
 
         if fetch_full_content {
             callback.on_discovered(entries.len()).await;
-            for entry in &entries {
+            for (entry, (locator, uri, fetchable)) in entries.iter().zip(targets.iter()) {
                 process_discovery_entry(
                     self.parser.as_ref(),
                     self.fetcher.as_ref(),
                     entry,
+                    locator,
+                    uri,
+                    *fetchable,
                     &feed_url,
-                    &feed_uri,
                     source,
                     callback,
                     &mut result,
@@ -305,17 +345,12 @@ fn synthetic_entry_uri(feed_url: &str, feed_uri: &Uri, entry_id: &str) -> Uri {
     Uri::parse(&candidate).unwrap_or_else(|| feed_uri.clone())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn process_discovery_entry(
-    parser: &dyn Parser,
-    fetcher: &dyn UrlFetcher,
-    entry: &Entry,
-    feed_url: &str,
-    feed_uri: &Uri,
-    source: &IngestSource,
-    callback: &mut dyn IngestCallback,
-    result: &mut IngestResult,
-) -> Result<(), Error> {
+/// Resolve an entry's `(locator, resource URI, fetchable)` triple. Hoisted
+/// out of `process_discovery_entry` (Codex review finding F3) so the
+/// dedup-by-resolved-URI pass in `ingest` can key on the same resolution
+/// before entries are ever handed to per-entry processing — this is a pure
+/// refactor, the resolution logic itself is unchanged.
+fn resolve_entry_target(entry: &Entry, feed_url: &str, feed_uri: &Uri) -> (String, Uri, bool) {
     let link_href = select_entry_link(entry).map(|l| l.href.clone());
     // A parsed link is the resource identity either way (stable, matching
     // the "URI keys off the feed-declared link" contract), but only an
@@ -323,7 +358,7 @@ async fn process_discovery_entry(
     // `ftp:` links, and handing those to the HTTP fetcher would fail as a
     // transient FetchError every run — which never falls back, so the
     // entry's embedded content would never be indexed at all.
-    let (locator, uri, fetchable) = match link_href.as_deref().map(Uri::parse) {
+    match link_href.as_deref().map(Uri::parse) {
         Some(Some(parsed)) => {
             let fetchable = matches!(parsed.scheme(), "http" | "https");
             (link_href.clone().unwrap(), parsed, fetchable)
@@ -335,8 +370,22 @@ async fn process_discovery_entry(
             let u = synthetic_entry_uri(feed_url, feed_uri, &entry.id);
             (frag, u, false)
         }
-    };
+    }
+}
 
+#[allow(clippy::too_many_arguments)]
+async fn process_discovery_entry(
+    parser: &dyn Parser,
+    fetcher: &dyn UrlFetcher,
+    entry: &Entry,
+    locator: &str,
+    uri: &Uri,
+    fetchable: bool,
+    feed_url: &str,
+    source: &IngestSource,
+    callback: &mut dyn IngestCallback,
+    result: &mut IngestResult,
+) -> Result<(), Error> {
     let enrichment = ResourceEnrichment {
         external_id: Some(entry.id.clone()),
         title_fallback: entry.title.as_ref().map(|t| t.content.clone()),
@@ -369,8 +418,8 @@ async fn process_discovery_entry(
         let outcome = process_url(
             parser,
             fetcher,
-            &locator,
-            &uri,
+            locator,
+            uri,
             source,
             IngestorKind::Feed,
             &enrichment,
@@ -394,8 +443,8 @@ async fn process_discovery_entry(
                 let resource = build_resource(
                     source,
                     IngestorKind::Feed,
-                    &uri,
-                    &locator,
+                    uri,
+                    locator,
                     &markdown,
                     extracted_title,
                     DublinCoreMetadata::default(),
@@ -407,7 +456,7 @@ async fn process_discovery_entry(
             }
             None => {
                 callback
-                    .on_skipped(&uri, SkipReason::Error("feed entry: no usable content (no fetchable link, no content, no summary, no title)".to_string()))
+                    .on_skipped(uri, SkipReason::Error("feed entry: no usable content (no fetchable link, no content, no summary, no title)".to_string()))
                     .await;
                 result.errors += 1;
             }

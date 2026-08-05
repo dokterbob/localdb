@@ -736,7 +736,12 @@ async fn discovery_mode_fetches_entry_pages_and_enriches_fully() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn two_entries_sharing_one_link_both_processed() {
+async fn two_entries_sharing_one_link_dedup_keeps_newest() {
+    // "First" is the NEWER entry (05 Jan) and sorts first; "Second" is
+    // older (04 Jan). Both resolve to the same entry-link URI, so the
+    // dedup pass (Codex review finding F3) must keep only "First" — the
+    // sorted-first, i.e. newest, survivor — and the shared link is fetched
+    // exactly once, not once per duplicate.
     let items = r#"<item><title>First</title><link>https://feed.example.com/shared</link><guid>e1</guid><pubDate>Mon, 05 Jan 2026 00:00:00 GMT</pubDate><description>d1</description></item><item><title>Second</title><link>https://feed.example.com/shared</link><guid>e2</guid><pubDate>Sun, 04 Jan 2026 00:00:00 GMT</pubDate><description>d2</description></item>"#;
     let feed_xml = rss2_feed("", items);
     let mut script = HashMap::new();
@@ -748,20 +753,109 @@ async fn two_entries_sharing_one_link_both_processed() {
         "https://feed.example.com/shared".to_string(),
         ScriptedOutcome::text("# Shared Page\n\nBody.\n"),
     );
+    let (ingestor, fetcher) = ingestor_with(script);
+    let source = source_for("https://feed.example.com/feed.xml", None, true);
+    let mut cb = RecordingCallback::default();
+    let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+    // Dedup by resolved URI, first (newest)-wins: exactly one Resource,
+    // carrying the newer entry's identity, and only one fetch of the
+    // shared link.
+    assert_eq!(
+        cb.discovered,
+        vec![1],
+        "on_discovered must reflect the post-dedup count"
+    );
+    assert_eq!(result.resources_produced, 1);
+    assert_eq!(cb.resources.len(), 1);
+    assert_eq!(cb.resources[0].external_id.as_deref(), Some("e1"));
+    assert_eq!(
+        fetcher.call_count("https://feed.example.com/shared"),
+        1,
+        "the shared link must be fetched exactly once, not once per duplicate"
+    );
+}
+
+/// The bug this fixes (Codex review finding F3): on the fallback path (no
+/// fetched page — here the entry link is `Gone`), each duplicate used to
+/// fall back to its OWN embedded content, and because entries are processed
+/// newest-first, the older entry's body landed last and won. With dedup by
+/// resolved URI applied before processing, only the newest entry survives,
+/// so its body is what gets indexed.
+#[tokio::test]
+async fn two_entries_sharing_gone_link_dedup_keeps_newest_body() {
+    let items = r#"<item><title>First</title><link>https://feed.example.com/shared-gone</link><guid>e1</guid><pubDate>Mon, 05 Jan 2026 00:00:00 GMT</pubDate><description>Newer body</description></item><item><title>Second</title><link>https://feed.example.com/shared-gone</link><guid>e2</guid><pubDate>Sun, 04 Jan 2026 00:00:00 GMT</pubDate><description>Older body</description></item>"#;
+    let feed_xml = rss2_feed("", items);
+    let mut script = HashMap::new();
+    script.insert(
+        "https://feed.example.com/feed.xml".to_string(),
+        ScriptedOutcome::text(&feed_xml),
+    );
+    script.insert(
+        "https://feed.example.com/shared-gone".to_string(),
+        ScriptedOutcome::Gone,
+    );
     let (ingestor, _fetcher) = ingestor_with(script);
     let source = source_for("https://feed.example.com/feed.xml", None, true);
     let mut cb = RecordingCallback::default();
     let result = ingestor.ingest(&source, &mut cb).await.unwrap();
 
-    // No pre-dedup: both entries individually run process_url against the
-    // same locator/URI. The pipeline's own content-hash skip (not this
-    // ingestor) is what would absorb the second one in a real store; from
-    // the ingestor's point of view both are reported.
-    assert_eq!(result.resources_produced, 2);
-    assert_eq!(cb.resources.len(), 2);
-    assert_eq!(cb.resources[0].uri, cb.resources[1].uri);
+    assert_eq!(result.resources_produced, 1);
+    assert_eq!(cb.resources.len(), 1);
     assert_eq!(cb.resources[0].external_id.as_deref(), Some("e1"));
-    assert_eq!(cb.resources[1].external_id.as_deref(), Some("e2"));
+    let text = cb.resources[0]
+        .blocks
+        .iter()
+        .map(|b| b.text.clone())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        text.contains("Newer body"),
+        "the newer entry's body must win: {text}"
+    );
+    assert!(
+        !text.contains("Older body"),
+        "the older duplicate's body must not appear: {text}"
+    );
+}
+
+/// `max_entries` counts distinct resource URIs, not raw entry count: a feed
+/// with `[A, dup-of-A, B]` (newest-first) and `max_entries = 2` must yield
+/// Resources for A and B, not A twice — duplicates must not burn slots.
+#[tokio::test]
+async fn max_entries_counts_distinct_uris_not_raw_entries() {
+    let items = r#"<item><title>A</title><link>https://feed.example.com/a</link><guid>a1</guid><pubDate>Wed, 07 Jan 2026 00:00:00 GMT</pubDate><description>d</description></item><item><title>A dup</title><link>https://feed.example.com/a</link><guid>a2</guid><pubDate>Tue, 06 Jan 2026 00:00:00 GMT</pubDate><description>d</description></item><item><title>B</title><link>https://feed.example.com/b</link><guid>b1</guid><pubDate>Mon, 05 Jan 2026 00:00:00 GMT</pubDate><description>d</description></item>"#;
+    let feed_xml = rss2_feed("", items);
+    let mut script = HashMap::new();
+    script.insert(
+        "https://feed.example.com/feed.xml".to_string(),
+        ScriptedOutcome::text(&feed_xml),
+    );
+    script.insert(
+        "https://feed.example.com/a".to_string(),
+        ScriptedOutcome::text("# A\n"),
+    );
+    script.insert(
+        "https://feed.example.com/b".to_string(),
+        ScriptedOutcome::text("# B\n"),
+    );
+    let (ingestor, _fetcher) = ingestor_with(script);
+    let source = source_for("https://feed.example.com/feed.xml", Some(2), true);
+    let mut cb = RecordingCallback::default();
+    let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+    assert_eq!(cb.discovered, vec![2]);
+    assert_eq!(result.resources_produced, 2);
+    let ids: Vec<&str> = cb
+        .resources
+        .iter()
+        .map(|r| r.external_id.as_deref().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["a1", "b1"],
+        "the A-duplicate must not burn a second max_entries slot"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -930,6 +1024,62 @@ async fn oldest_first_archive_feed_max_entries_picks_two_newest() {
         ids,
         vec!["3", "2"],
         "must keep the two NEWEST entries, newest first"
+    );
+}
+
+/// Dedup must happen AFTER the sort, not before: an oldest-first archive
+/// feed with a duplicated URI among its entries must still keep the newest
+/// member of that duplicate group, exactly like
+/// `oldest_first_archive_feed_max_entries_picks_two_newest` but with a
+/// duplicate thrown into the document-order mix.
+#[tokio::test]
+async fn dedup_after_sort_oldest_first_archive_feed_with_duplicate() {
+    // Document (oldest-first) order in the XML on purpose. "1" and "1-dup"
+    // resolve to the same link but "1-dup" is newer than "1".
+    let items = r#"
+        <item><title>Oldest</title><link>https://feed.example.com/1</link><guid>1</guid><pubDate>Mon, 01 Jan 2024 00:00:00 GMT</pubDate><description>d</description></item>
+        <item><title>Middle</title><link>https://feed.example.com/2</link><guid>2</guid><pubDate>Tue, 01 Jan 2025 00:00:00 GMT</pubDate><description>d</description></item>
+        <item><title>Oldest dup, newer pubDate</title><link>https://feed.example.com/1</link><guid>1-dup</guid><pubDate>Wed, 01 Jan 2025 06:00:00 GMT</pubDate><description>d</description></item>
+        <item><title>Newest</title><link>https://feed.example.com/3</link><guid>3</guid><pubDate>Wed, 01 Jan 2026 00:00:00 GMT</pubDate><description>d</description></item>
+    "#;
+    let feed_xml = rss2_feed("", items);
+    let mut script = HashMap::new();
+    script.insert(
+        "https://feed.example.com/feed.xml".to_string(),
+        ScriptedOutcome::text(&feed_xml),
+    );
+    script.insert(
+        "https://feed.example.com/1".to_string(),
+        ScriptedOutcome::text("# One\n"),
+    );
+    script.insert(
+        "https://feed.example.com/2".to_string(),
+        ScriptedOutcome::text("# Two\n"),
+    );
+    script.insert(
+        "https://feed.example.com/3".to_string(),
+        ScriptedOutcome::text("# Three\n"),
+    );
+    let (ingestor, _fetcher) = ingestor_with(script);
+    // No max_entries: assert full dedup + sort behaviour without truncation
+    // interacting.
+    let source = source_for("https://feed.example.com/feed.xml", None, true);
+    let mut cb = RecordingCallback::default();
+    let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+    assert_eq!(cb.discovered, vec![3], "4 entries dedup to 3 distinct URIs");
+    assert_eq!(result.resources_produced, 3);
+    let ids: Vec<&str> = cb
+        .resources
+        .iter()
+        .map(|r| r.external_id.as_deref().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["3", "1-dup", "2"],
+        "newest-first order preserved, and the newer member of the /1 \
+         duplicate group (1-dup, sorting ahead of 2) survives, not the \
+         oldest (1)"
     );
 }
 
@@ -1124,6 +1274,50 @@ async fn single_doc_reordered_entries_and_bumped_feed_updated_same_hash() {
         hash_a, hash_b,
         "reordered entries must sort identically and hash identically"
     );
+}
+
+/// Single-document mode renders from the same `entries` collection that
+/// discovery mode dedups before processing, so a duplicated entry must not
+/// appear twice in the rendered feed document either.
+#[tokio::test]
+async fn single_doc_dedup_entry_listed_once() {
+    let items = r#"<item><title>First</title><link>https://feed.example.com/shared</link><guid>e1</guid><pubDate>Mon, 05 Jan 2026 00:00:00 GMT</pubDate><description>Newer body text</description></item><item><title>Second</title><link>https://feed.example.com/shared</link><guid>e2</guid><pubDate>Sun, 04 Jan 2026 00:00:00 GMT</pubDate><description>Older body text</description></item>"#;
+    let feed_xml = rss2_feed("", items);
+    let mut script = HashMap::new();
+    script.insert(
+        "https://feed.example.com/feed.xml".to_string(),
+        ScriptedOutcome::text(&feed_xml),
+    );
+    let (ingestor, _fetcher) = ingestor_with(script);
+    let source = source_for("https://feed.example.com/feed.xml", None, false);
+    let mut cb = RecordingCallback::default();
+    ingestor.ingest(&source, &mut cb).await.unwrap();
+
+    assert_eq!(
+        cb.resources.len(),
+        1,
+        "single-doc mode always emits one Resource"
+    );
+    let text = cb.resources[0]
+        .blocks
+        .iter()
+        .map(|b| b.text.clone())
+        .collect::<Vec<_>>();
+    let title_count = text
+        .iter()
+        .filter(|t| *t == "First" || *t == "Second")
+        .count();
+    assert_eq!(
+        title_count, 1,
+        "the duplicated entry must be listed once, not twice: {text:?}"
+    );
+    assert!(
+        text.iter().any(|t| t == "First"),
+        "the surviving (newer) entry's title must appear: {text:?}"
+    );
+    let joined = text.join(" ");
+    assert!(joined.contains("Newer body text"));
+    assert!(!joined.contains("Older body text"));
 }
 
 // ---------------------------------------------------------------------------
