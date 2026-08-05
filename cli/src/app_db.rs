@@ -253,12 +253,18 @@ fn reject_store_flag_inner(ctx: &CliContext) -> Result<(), Error> {
 /// consulting the local database.
 ///
 /// Used by the daemon-routing paths (`source add`/`remove` when a daemon is
-/// running). The daemon owns its own store set — it runs an in-memory store,
-/// so CLI-indexed libsql data is invisible to it and vice versa (see
-/// `docs/architecture.md#known-gaps`). Resolving `StoreRow`s out of the local
-/// file before proxying would reject every store that exists only in the
-/// daemon, so these paths validate the names and let the daemon be the
-/// authority on existence (its 404 surfaces as `store_not_found`).
+/// running), where the daemon — not this process — is the authority on which
+/// stores exist.
+///
+/// A running daemon need not share our database at all: `LOCALDB_DAEMON_URL`
+/// (see `CliContext::daemon_url`) can point at a daemon on another host with
+/// its own data directory, in which case a local `StoreRow` lookup would
+/// reject perfectly valid store names. Even against a local daemon sharing
+/// `<data_dir>/localdb.db`, a local pre-check is redundant and can go stale
+/// between our read and the proxied request landing — the HTTP call
+/// re-validates anyway, and its 404 surfaces as `store_not_found`.
+///
+/// So these paths validate the *names* and let the daemon decide existence.
 ///
 /// Names are validated (A9 traversal-safety) and deduped, order preserved;
 /// an empty `--store` set yields the implicit `default` store.

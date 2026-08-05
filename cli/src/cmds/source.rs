@@ -108,10 +108,13 @@ pub(crate) async fn run_source_add_async(
         let src = SourceRow {
             id: new_ulid(),
             store_id: row.id.clone(),
-            kind: match kind {
-                "url" => SourceKind::Url,
-                "path" => SourceKind::Path,
-                _ => SourceKind::Path,
+            // `classify_source` only ever yields "url" or "path", but it
+            // returns a `&str`, so a `match` would need an unreachable
+            // wildcard arm. Two branches keep it honest and coverable.
+            kind: if kind == "url" {
+                SourceKind::Url
+            } else {
+                SourceKind::Path
             },
             root: if kind == "path" {
                 Some(actual_root.clone())
