@@ -215,6 +215,11 @@ mod tests {
                     content_type: content_type.clone(),
                     etag: None,
                     last_modified: None,
+                    // This fake models no redirects; a real fetcher's
+                    // `None` here means "no redirect information
+                    // available", not "definitely no redirect" — see
+                    // `FetchResult::Downloaded`'s doc comment.
+                    final_url: None,
                 }),
                 Some(ScriptedOutcome::NotModified) => Ok(FetchResult::NotModified),
                 Some(ScriptedOutcome::Gone) => Ok(FetchResult::Gone),

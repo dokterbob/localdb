@@ -43,6 +43,7 @@ enum ScriptedOutcome {
         bytes: Vec<u8>,
         content_type: Option<String>,
         etag: Option<String>,
+        final_url: Option<String>,
     },
     NotModified,
     Gone,
@@ -54,6 +55,7 @@ impl ScriptedOutcome {
             bytes: body.as_bytes().to_vec(),
             content_type: None,
             etag: None,
+            final_url: None,
         }
     }
 
@@ -62,6 +64,19 @@ impl ScriptedOutcome {
             bytes: body.as_bytes().to_vec(),
             content_type: None,
             etag: Some(etag.to_string()),
+            final_url: None,
+        }
+    }
+
+    /// Models a fetch that followed a redirect: `final_url` is the
+    /// post-redirect effective URL, distinct from whatever URL the
+    /// `ScriptedFetcher` was keyed on (the pre-redirect, configured URL).
+    fn text_redirected_from(body: &str, final_url: &str) -> Self {
+        ScriptedOutcome::Downloaded {
+            bytes: body.as_bytes().to_vec(),
+            content_type: None,
+            etag: None,
+            final_url: Some(final_url.to_string()),
         }
     }
 }
@@ -102,11 +117,13 @@ impl UrlFetcher for ScriptedFetcher {
                 bytes,
                 content_type,
                 etag,
+                final_url,
             }) => Ok(FetchResult::Downloaded {
                 bytes: bytes.clone(),
                 content_type: content_type.clone(),
                 etag: etag.clone(),
                 last_modified: None,
+                final_url: final_url.clone(),
             }),
             Some(ScriptedOutcome::NotModified) => Ok(FetchResult::NotModified),
             Some(ScriptedOutcome::Gone) => Ok(FetchResult::Gone),
@@ -456,6 +473,7 @@ async fn iso_8859_1_fixture_decodes_correctly() {
             bytes: xml,
             content_type: None,
             etag: None,
+            final_url: None,
         },
     );
     script.insert(
@@ -494,6 +512,7 @@ async fn windows_1251_fixture_decodes_correctly() {
             bytes: xml,
             content_type: None,
             etag: None,
+            final_url: None,
         },
     );
     script.insert(
@@ -1214,6 +1233,103 @@ async fn entry_link_redirect_resource_uri_is_pre_redirect_link() {
     assert_eq!(
         cb.resources[0].uri.as_str(),
         "https://feed.example.com/pre-redirect"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Redirect: relative entry links resolve against the effective (post-
+// redirect) feed URL, not the configured one (Codex review finding F2).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn relative_entry_link_resolves_against_effective_post_redirect_feed_url() {
+    // A relative link: feed-rs resolves it against `base_uri` at parse time,
+    // so `entry.links[0].href` (and therefore the Resource `uri`) is already
+    // the resolved absolute URL by the time `FeedIngestor` sees it.
+    let items = r#"<item><title>E1</title><link>article.html</link><guid>e1</guid><pubDate>Mon, 05 Jan 2026 00:00:00 GMT</pubDate><description>d</description></item>"#;
+    let feed_xml = rss2_feed("", items);
+    let mut script = HashMap::new();
+    script.insert(
+        "https://old.example.com/feed.xml".to_string(),
+        ScriptedOutcome::text_redirected_from(&feed_xml, "https://new.example.com/path/feed.xml"),
+    );
+    script.insert(
+        "https://new.example.com/path/article.html".to_string(),
+        ScriptedOutcome::text("# Post-redirect entry\n\nBody.\n"),
+    );
+    let (ingestor, _fetcher) = ingestor_with(script);
+    let source = source_for("https://old.example.com/feed.xml", None, true);
+    let mut cb = RecordingCallback::default();
+    let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+    assert_eq!(result.resources_produced, 1);
+    assert_eq!(
+        cb.resources[0].uri.as_str(),
+        "https://new.example.com/path/article.html",
+        "a relative entry link must resolve against the effective (post-redirect) feed \
+         URL and host, not the stale configured one"
+    );
+}
+
+#[tokio::test]
+async fn relative_entry_link_with_no_final_url_resolves_against_configured_feed_url() {
+    // No redirect information available (`final_url: None`) -> falls back to
+    // the configured URL as the resolution base, exactly like every other
+    // existing fixture in this file (no behavior change when there's no
+    // redirect).
+    let items = r#"<item><title>E1</title><link>article.html</link><guid>e1</guid><pubDate>Mon, 05 Jan 2026 00:00:00 GMT</pubDate><description>d</description></item>"#;
+    let feed_xml = rss2_feed("", items);
+    let mut script = HashMap::new();
+    script.insert(
+        "https://old.example.com/feed.xml".to_string(),
+        ScriptedOutcome::text(&feed_xml),
+    );
+    script.insert(
+        "https://old.example.com/article.html".to_string(),
+        ScriptedOutcome::text("# No-redirect entry\n\nBody.\n"),
+    );
+    let (ingestor, _fetcher) = ingestor_with(script);
+    let source = source_for("https://old.example.com/feed.xml", None, true);
+    let mut cb = RecordingCallback::default();
+    let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+    assert_eq!(result.resources_produced, 1);
+    assert_eq!(
+        cb.resources[0].uri.as_str(),
+        "https://old.example.com/article.html",
+        "with no final_url reported, resolution must fall back to the configured feed URL"
+    );
+}
+
+#[tokio::test]
+async fn redirected_feed_link_less_entry_fragment_uri_stays_pinned_to_configured_url() {
+    // Identity vs. resolution split: a redirected feed's link-less entry
+    // must still fragment off the CONFIGURED feed URL, never the effective
+    // one — otherwise a transient redirect-target change would re-key every
+    // link-less entry's Resource identity on every run.
+    let items = r#"<item><title>No Link Entry</title><guid>nolink1</guid><pubDate>Mon, 05 Jan 2026 00:00:00 GMT</pubDate><description>Body text</description></item>"#;
+    let feed_xml = rss2_feed("", items);
+    let mut script = HashMap::new();
+    script.insert(
+        "https://old.example.com/feed.xml".to_string(),
+        ScriptedOutcome::text_redirected_from(&feed_xml, "https://new.example.com/path/feed.xml"),
+    );
+    let (ingestor, _fetcher) = ingestor_with(script);
+    let source = source_for("https://old.example.com/feed.xml", None, true);
+    let mut cb = RecordingCallback::default();
+    let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+    assert_eq!(result.resources_produced, 1);
+    let expected = Uri::parse("https://old.example.com/feed.xml#entry:nolink1").unwrap();
+    assert_eq!(
+        cb.resources[0].uri, expected,
+        "a link-less entry's synthetic fragment URI must stay pinned to the CONFIGURED \
+         feed URL, even when the feed fetch itself was redirected"
+    );
+    assert_eq!(
+        cb.resources[0].metadata.dublin_core().source.as_deref(),
+        Some("https://old.example.com/feed.xml"),
+        "provenance_source must stay pinned to the configured feed URL too"
     );
 }
 

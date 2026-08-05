@@ -443,6 +443,11 @@ pub enum FetchResult {
         content_type: Option<String>,
         etag: Option<String>,
         last_modified: Option<String>,
+        /// Effective URL after redirects, when the fetcher can report one.
+        /// `None` means "no redirect information available" — callers must
+        /// fall back to the URL they requested, never treat `None` as "no
+        /// redirect".
+        final_url: Option<String>,
     },
     /// Server returned 304 Not Modified (conditional GET).
     NotModified,

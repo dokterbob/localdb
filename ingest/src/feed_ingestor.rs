@@ -105,8 +105,18 @@ impl Ingestor for FeedIngestor {
             }
         };
 
-        let bytes = match fetch_result {
-            FetchResult::Downloaded { bytes, .. } => bytes,
+        // `effective_feed_url` is ONLY the parser's link-resolution base —
+        // never substitute it for `feed_url` anywhere else. `feed_url`
+        // remains the value used for `feed_uri` (source identity),
+        // `synthetic_entry_uri`'s `{feed_url}#entry:{id}` fragments, every
+        // `enrichment.provenance_source`, and all tracing fields: keeping
+        // those pinned to the *configured* URL is what stops a transient
+        // redirect-target change from re-keying every link-less entry (see
+        // specs/02-domain-model.md's "Feed connector" section).
+        let (bytes, effective_feed_url) = match fetch_result {
+            FetchResult::Downloaded {
+                bytes, final_url, ..
+            } => (bytes, final_url.unwrap_or_else(|| feed_url.clone())),
             FetchResult::NotModified => {
                 // The "feed 304 => zero per-entry callbacks" case the core
                 // sweep exemption for `SourceSpec::Feed` protects: a single
@@ -126,10 +136,16 @@ impl Ingestor for FeedIngestor {
 
         // Panic-tolerant parse of raw bytes. feed-rs resolves relative entry
         // links itself when given `base_uri` (xml:base takes precedence) —
-        // never re-resolve links in this ingestor.
+        // never re-resolve links in this ingestor. The base is the
+        // *effective* (post-redirect) feed URL, not the configured
+        // `feed_url`: a feed that 301's to a new host must resolve its
+        // entries' relative links against that new host (Codex review
+        // finding F2). This is purely about where a relative link points —
+        // identity (`feed_uri`, fragment URIs, provenance) stays pinned to
+        // `feed_url` regardless, per the comment above.
         let parse_outcome = catch_panic(std::panic::AssertUnwindSafe(|| {
             feed_rs::parser::Builder::new()
-                .base_uri(Some(feed_url.as_str()))
+                .base_uri(Some(effective_feed_url.as_str()))
                 .build()
                 .parse(bytes.as_slice())
         }));

@@ -60,6 +60,12 @@ impl UrlFetcher for HttpUrlFetcher {
             });
         }
 
+        // Captured before `response.bytes()` consumes the response below:
+        // `Response::url()` is the effective URL after any redirects reqwest
+        // followed (reqwest 0.12's default `Policy::limited(10)`, which this
+        // client's builder never overrides).
+        let final_url = response.url().to_string();
+
         let etag = response
             .headers()
             .get("etag")
@@ -91,6 +97,7 @@ impl UrlFetcher for HttpUrlFetcher {
             content_type,
             etag,
             last_modified,
+            final_url: Some(final_url),
         })
     }
 }
@@ -128,8 +135,9 @@ mod tests {
             .await;
 
         let fetcher = HttpUrlFetcher::new().expect("HttpUrlFetcher::new should succeed in tests");
+        let requested_url = format!("{}/doc", server.uri());
         let result = fetcher
-            .fetch(&format!("{}/doc", server.uri()), &FetchMetadata::default())
+            .fetch(&requested_url, &FetchMetadata::default())
             .await
             .unwrap();
 
@@ -139,6 +147,7 @@ mod tests {
                 content_type,
                 etag,
                 last_modified,
+                final_url,
             } => {
                 assert_eq!(bytes, b"hello world");
                 assert_eq!(content_type.as_deref(), Some("text/plain"));
@@ -146,6 +155,51 @@ mod tests {
                 assert_eq!(
                     last_modified.as_deref(),
                     Some("Wed, 21 Oct 2025 07:28:00 GMT")
+                );
+                assert_eq!(
+                    final_url.as_deref(),
+                    Some(requested_url.as_str()),
+                    "no redirect happened, so final_url must equal the requested URL"
+                );
+            }
+            other => panic!("expected Downloaded, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_redirect_reports_final_url_as_redirect_target() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/old"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/new", server.uri())),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/new"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"redirected body"))
+            .mount(&server)
+            .await;
+
+        let fetcher = HttpUrlFetcher::new().expect("HttpUrlFetcher::new should succeed in tests");
+        let requested_url = format!("{}/old", server.uri());
+        let expected_final_url = format!("{}/new", server.uri());
+        let result = fetcher
+            .fetch(&requested_url, &FetchMetadata::default())
+            .await
+            .unwrap();
+
+        match result {
+            FetchResult::Downloaded {
+                bytes, final_url, ..
+            } => {
+                assert_eq!(bytes, b"redirected body");
+                assert_eq!(
+                    final_url.as_deref(),
+                    Some(expected_final_url.as_str()),
+                    "final_url must be the redirect TARGET, not the originally requested URL"
                 );
             }
             other => panic!("expected Downloaded, got {other:?}"),
