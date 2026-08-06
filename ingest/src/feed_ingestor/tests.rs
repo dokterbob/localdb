@@ -250,6 +250,17 @@ async fn feed_level_not_modified_is_single_unchanged_skip_no_entry_callbacks() {
     assert_eq!(cb.skipped[0].1, SkipReason::Unchanged);
 }
 
+/// A feed-level 404/410 is a complete no-op: zero errors, zero skips, zero
+/// produced, and not a single callback.
+///
+/// The consequence matters as much as the silence. Because
+/// `run_source_ingestion` exempts `SourceSpec::Feed` sources from the
+/// delete-sweep, this silence does *not* prune anything — whatever the feed
+/// indexed previously stays until `source remove`. That is deliberate:
+/// dropping a whole source on one 404 is irreversible and a feed-root 404 is
+/// often transient (issue #156, "unavailable != empty"). The reclamation
+/// policy is tracked in issue #171; see the `FetchResult::Gone` arm in
+/// `feed_ingestor.rs` and known gap 8 in docs/architecture.md.
 #[tokio::test]
 async fn feed_level_gone_is_silent_zero_errors() {
     let mut script = HashMap::new();
@@ -263,6 +274,11 @@ async fn feed_level_gone_is_silent_zero_errors() {
     let result = ingestor.ingest(&source, &mut cb).await.unwrap();
 
     assert_eq!(result.errors, 0);
+    assert_eq!(result.resources_produced, 0);
+    assert_eq!(
+        result.resources_skipped, 0,
+        "a gone feed is not reported as a skip either"
+    );
     assert!(cb.discovered.is_empty());
     assert!(cb.resources.is_empty());
     assert!(cb.skipped.is_empty(), "Gone must not be reported at all");

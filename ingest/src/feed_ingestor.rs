@@ -127,8 +127,22 @@ impl Ingestor for FeedIngestor {
             }
             FetchResult::Gone => {
                 // Silent, like `process_url`'s Gone handling: no callback at
-                // all, so the delete-sweep removes this feed's previously
-                // indexed content.
+                // all. For a feed source that silence does *not* cause a
+                // deletion, though — `run_source_ingestion` exempts every
+                // `SourceSpec::Feed` source from the delete-sweep (see
+                // core/src/ingestion.rs), so the run reports zero errors, zero
+                // skips and zero produced, and whatever this feed indexed
+                // previously stays until `source remove`.
+                //
+                // That is deliberate. Dropping a whole source's content on a
+                // single 404 is irreversible, and a 404 on a feed root is
+                // frequently transient (misconfiguration, migration, CDN) —
+                // exactly the "unavailable != empty" tension in issue #156.
+                // Retention is spec'd in specs/02-domain-model.md's "Feed
+                // connector" / "Retention" paragraph and tracked as known gap
+                // 8 in docs/architecture.md; the pruning policy that would let a
+                // persistently-gone feed be reclaimed belongs to issue #171
+                // (persist conditional-GET state and prune on 404/410).
                 tracing::info!(url = %feed_url, "FeedIngestor: feed is gone (404/410)");
                 return Ok(result);
             }
