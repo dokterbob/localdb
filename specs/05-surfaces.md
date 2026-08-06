@@ -55,7 +55,7 @@ default below. When `-s` is omitted, the default depends on the command:
 
 | Command | `-s` omitted | Rationale |
 |---|---|---|
-| `search`, `status`, `store list` | **all stores** | already correct — no change |
+| `search`, `status`, `store list` | **all stores** | this is only the *default* when `-s` is omitted — an explicit `--store` is still validated and resolved exactly like every other command; an unknown name is `store_not_found`, exit 3, not a silently-ignored flag |
 | `index` | **all stores** | idempotent and re-runnable; "refresh everything" is the common workflow |
 | `source add`/`list`/`remove`, `add` alias | **store named `default`**; **exit 2** if absent | mutations must never guess; `list` stays consistent with its siblings |
 | `db status`/`migrate`/`downgrade` | n/a — **exit 2 if `-s` is passed** | not store-scoped; silently ignoring a flag the user believed in is the #178 failure mode again |
@@ -83,6 +83,10 @@ Additional rules:
   emits an array of per-store summaries. `--strict` exits 2 if **any** store reported errors, but
   every store still runs to completion first — consistent with the "`--strict` never aborts
   mid-run" rule (see "`localdb index --strict`" under §5).
+- **Known limitation (#188):** daemon-routed `source remove` validates `--store` only
+  *syntactically* (name shape, traversal safety) — it cannot confirm the source actually belongs
+  to the named store, because `DELETE /v1/sources/{id}` is store-agnostic. Embedded (daemonless)
+  mode does enforce this, since it resolves the source through the named store's own row.
 
 ## 3. HTTP API
 

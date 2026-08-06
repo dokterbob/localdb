@@ -61,7 +61,16 @@ pub(crate) async fn run_source_add_async(
 
     if let DaemonState::Running { ref base_url } = daemon_state {
         // Names only — the daemon is the authority on which stores exist.
-        for store_name in resolve_store_scope_names(ctx) {
+        let store_names = resolve_store_scope_names(ctx);
+
+        // Accumulate JSON results across the loop and emit exactly one
+        // top-level document afterward (finding 3): printing per-iteration,
+        // as this used to, made `--store a --store b --json source add`
+        // write multiple back-to-back JSON objects to stdout, which isn't
+        // parseable as a single document.
+        let mut json_results: Vec<serde_json::Value> = Vec::new();
+
+        for store_name in &store_names {
             // The handler's CreateSourceRequest expects {kind, spec, preset}
             // where spec is a nested object (see server/src/handlers.rs
             // CreateSourceRequest).
@@ -80,7 +89,7 @@ pub(crate) async fn run_source_add_async(
             match daemon_request_async(reqwest::Method::POST, &url_str, Some(body)).await {
                 Ok(v) => {
                     if ctx.json {
-                        print_json(&v);
+                        json_results.push(v);
                     } else {
                         println!(
                             "Added source {} to store '{}' (via daemon)",
@@ -90,6 +99,17 @@ pub(crate) async fn run_source_add_async(
                     }
                 }
                 Err(e) => exit_err(&e, ctx.json),
+            }
+        }
+
+        if ctx.json {
+            if json_results.len() == 1 {
+                // Single store: today's exact flat shape — the daemon's raw
+                // response, passed through unchanged (specs/05-surfaces.md
+                // §2.2 promises existing scripts don't break).
+                print_json(&json_results[0]);
+            } else {
+                print_json(&json!({ "status": "ok", "results": json_results }));
             }
         }
         return;
@@ -103,6 +123,11 @@ pub(crate) async fn run_source_add_async(
     // after `db`/`config_loader` are dropped (`run_embedded_index` opens its
     // own `AppDb`).
     let mut to_index: Vec<(StoreRow, String)> = Vec::new();
+
+    // Accumulate JSON results across the loop and emit exactly one top-level
+    // document afterward (finding 3) — see the daemon branch above for the
+    // same restructuring and its rationale.
+    let mut json_results: Vec<serde_json::Value> = Vec::new();
 
     for row in &rows {
         let src = SourceRow {
@@ -134,8 +159,7 @@ pub(crate) async fn run_source_add_async(
         }
 
         if ctx.json {
-            print_json(&json!({
-                "status": "ok",
+            json_results.push(json!({
                 "id": src.id,
                 "store": { "name": row.name },
                 "kind": kind_to_string(&src.kind),
@@ -147,6 +171,22 @@ pub(crate) async fn run_source_add_async(
         // #2: Auto-index after source add.
         if kind == "path" || kind == "url" {
             to_index.push((row.clone(), src.id.clone()));
+        }
+    }
+
+    if ctx.json {
+        if json_results.len() == 1 {
+            // Single store: today's exact flat shape (specs/05-surfaces.md
+            // §2.2 promises existing scripts don't break).
+            let r = &json_results[0];
+            print_json(&json!({
+                "status": "ok",
+                "id": r["id"],
+                "store": r["store"],
+                "kind": r["kind"],
+            }));
+        } else {
+            print_json(&json!({ "status": "ok", "results": json_results }));
         }
     }
 
@@ -300,6 +340,28 @@ pub(crate) async fn run_source_remove_async(ctx: &CliContext, id: &str) {
     if let DaemonState::Running { base_url } =
         probe_daemon(&config_loader.paths.data_dir, ctx.daemon_url.as_deref())
     {
+        // Finding 5: validate --store names for traversal-safety before the
+        // DELETE fires, matching `source add`'s daemon branch above. We
+        // validate directly (not via `resolve_store_scope_names`) because its
+        // empty-input case returns `["default"]`, which is meaningless for
+        // remove-by-ID — there's no per-store scope to inject here, only
+        // syntax-checking of whatever `--store` values were actually passed.
+        for name in &ctx.stores {
+            if let Err(e) = crate::normalize::validate_store_name(name) {
+                exit_err(&e, ctx.json);
+            }
+        }
+
+        // KNOWN LIMITATION (issue #188): `DELETE /v1/sources/{id}` is
+        // store-agnostic, so daemon mode has no way to enforce that the
+        // source actually belongs to a store named by `--store` — embedded
+        // mode does enforce this (see the `matches` resolution below, D2).
+        // Fixing that needs an HTTP API change; tracked in #188, not
+        // attempted here. We deliberately do NOT add a local existence check
+        // for `--store` either: `LOCALDB_DAEMON_URL` may point at a daemon on
+        // another host with its own data directory, so a syntactically-valid
+        // but locally-unknown store name must still reach the daemon (see
+        // `resolve_store_scope_names`'s doc comment in `cli/src/app_db.rs`).
         let url = format!("{}/v1/sources/{}", base_url, id);
         match daemon_request_async(reqwest::Method::DELETE, &url, None).await {
             Ok(v) => {

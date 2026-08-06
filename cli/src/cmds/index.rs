@@ -63,11 +63,19 @@ pub(crate) struct StoreIndexOutcome {
 /// (optionally) an already-built embedder.
 ///
 /// Callers that already hold an open `AppDb` and want to index several
-/// stores in one run (`run_index_async`) should call this directly, building
-/// the embedder once and passing `Some(..)` for every store — reloading a
-/// ~706 MB local embedding model per store would be wasteful. The
-/// `run_embedded_index` wrapper below is for callers with only a `CliContext`
-/// and a single store in hand (e.g. the post-`source add` auto-index).
+/// stores in one run (`run_index_async`) should call this directly and pass
+/// `embedder` through from store to store: `None` until one is built, then
+/// `Some(..)` for the rest — reloading a ~706 MB local embedding model per
+/// store would be wasteful. The `run_embedded_index` wrapper below is for
+/// callers with only a `CliContext` and a single store in hand (e.g. the
+/// post-`source add` auto-index).
+///
+/// Returns the summary alongside the embedder actually used (`Some` once
+/// this store's sources required constructing or reusing one, `None` when
+/// the store had no sources to index and no embedder was touched at all —
+/// this is what lets a multi-store run skip building the embedder entirely
+/// when every store in scope is empty). A caller looping over stores should
+/// carry the returned embedder forward into the next call.
 ///
 /// `progress_label` is rendered as a `[label]` prefix on progress output when
 /// `Some` — set it only when more than one store is in scope for the run, so
@@ -82,7 +90,7 @@ pub(crate) async fn run_embedded_index_with(
     mode: IndexErrorMode,
     embedder: Option<Arc<dyn Embedder>>,
     progress_label: Option<&str>,
-) -> Result<IndexSummary, Error> {
+) -> Result<(IndexSummary, Option<Arc<dyn Embedder>>), Error> {
     use localdb_core::{
         chunker::ChunkerConfig,
         ingestion::{run_source_ingestion, DocumentIndex, IngestionConfig, SourceIngestionDeps},
@@ -98,7 +106,7 @@ pub(crate) async fn run_embedded_index_with(
                     let error = Error::from(e);
                     if mode.warn() {
                         eprintln!($fmt, error);
-                        return Ok(IndexSummary::default());
+                        return Ok((IndexSummary::default(), None));
                     }
                     return Err(error);
                 }
@@ -114,7 +122,7 @@ pub(crate) async fn run_embedded_index_with(
     let sources_to_index: Vec<SourceRow> = if let Some(sid) = source_id {
         match all_sources.into_iter().find(|s| s.id == sid) {
             Some(s) => vec![s],
-            None if mode.warn() => return Ok(IndexSummary::default()),
+            None if mode.warn() => return Ok((IndexSummary::default(), None)),
             None => {
                 return Err(Error::SourceNotFound {
                     id: sid.to_string(),
@@ -126,7 +134,7 @@ pub(crate) async fn run_embedded_index_with(
     };
 
     if sources_to_index.is_empty() {
-        return Ok(IndexSummary::default());
+        return Ok((IndexSummary::default(), None));
     }
 
     let policy = config_loader.config.defaults.indexing.clone();
@@ -255,7 +263,7 @@ pub(crate) async fn run_embedded_index_with(
         }
     }
 
-    Ok(summary)
+    Ok((summary, Some(embedder)))
 }
 
 /// Index one store, opening its own `AppDb` and building its own embedder.
@@ -272,7 +280,7 @@ pub(crate) async fn run_embedded_index(
     mode: IndexErrorMode,
 ) -> Result<IndexSummary, Error> {
     let (config_loader, db) = load_app_db(ctx).await;
-    run_embedded_index_with(
+    let (summary, _embedder) = run_embedded_index_with(
         ctx,
         &db,
         &config_loader,
@@ -282,7 +290,8 @@ pub(crate) async fn run_embedded_index(
         None,
         None,
     )
-    .await
+    .await?;
+    Ok(summary)
 }
 
 /// `localdb index [--source <id>] [--strict]`
@@ -307,47 +316,91 @@ pub(crate) async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, s
     // Per specs/05-surfaces.md §2: when daemon is running, submit a job per
     // resolved store instead of indexing embedded. `/v1/jobs` is a
     // single-store API (server/src/handlers/jobs.rs), so a multi-store scope
-    // becomes one POST per store here rather than a batched request.
+    // becomes one POST per store here rather than a batched request. The
+    // daemon — not this process — validates `--source`, so no local source
+    // resolution (below) applies on this path.
     if let DaemonState::Running { base_url } = probe_daemon(&data_dir, ctx.daemon_url.as_deref()) {
         run_daemon_index(ctx, &base_url, &store_rows, source_id).await;
         return;
     }
 
-    // Build the embedder once, up front, and share it across every store in
-    // scope — rebuilding it per store would reload a ~706 MB local model N
-    // times for an N-store run.
-    let embedder: Arc<dyn Embedder> = match embed::create_embedder(
-        &config_loader.config.defaults.indexing.embedding,
-        &config_loader.config.providers,
-        Some(&config_loader.paths.models_dir),
-    ) {
-        Ok(e) => Arc::from(e),
-        Err(e) => exit_err(&Error::from(e), ctx.json),
+    // `--source` names a single, globally-unique source: resolve its owning
+    // store once and narrow the run to just that store, rather than passing
+    // the same source_id to every store in scope. The latter used to abort
+    // the whole run (exit 3, `SourceNotFound`) the moment it reached the
+    // first store that *didn't* own the source (#180 review finding 1). An
+    // explicit `--store` scope (`ctx.stores` non-empty, reflected in
+    // `store_rows` by `resolve_store_scope` above) is a hard filter here: if
+    // the source's owner isn't among the explicitly-requested stores, that's
+    // still exit 3 — we don't silently redirect to the owner.
+    let store_rows: Vec<StoreRow> = if let Some(sid) = source_id {
+        let owner_store_id = match db.backend().get_source(sid).await {
+            Ok(Some(src)) => src.store_id,
+            Ok(None) => exit_err(
+                &Error::SourceNotFound {
+                    id: sid.to_string(),
+                },
+                ctx.json,
+            ),
+            Err(e) => exit_err(&e, ctx.json),
+        };
+        match store_rows.into_iter().find(|r| r.id == owner_store_id) {
+            Some(row) => vec![row],
+            None => exit_err(
+                &Error::SourceNotFound {
+                    id: sid.to_string(),
+                },
+                ctx.json,
+            ),
+        }
+    } else {
+        store_rows
     };
 
     let multi = store_rows.len() > 1;
     let mut outcomes: Vec<StoreIndexOutcome> = Vec::with_capacity(store_rows.len());
+    // Built lazily, on the first store that actually has sources to index —
+    // and cached here for the rest of the loop. An empty (or all-empty)
+    // scope must not pay for embedder construction, which for the default
+    // `local` provider can trigger a one-time ~706 MB model download, just
+    // to report "no sources to index" (#180 review finding 2). Once built,
+    // it's shared across the remaining stores in scope exactly as before —
+    // an N-store run still constructs the embedder at most once.
+    //
+    // INVARIANT: this loop must stay on `IndexErrorMode::StrictExit`. Under
+    // `WarnAndContinue`, a store that fails *after* building the embedder
+    // (e.g. `retrieval_store` or `list_indexed_documents` erroring) returns
+    // `None` for `used_embedder`, so the next store would rebuild it —
+    // reintroducing the per-store ~706 MB reload this cache exists to avoid.
+    // `StrictExit` makes that unreachable: the same failure returns `Err` and
+    // exits below, so there is no "next store". If you ever want `index` to
+    // continue past a failing store, thread the embedder out of that path too
+    // rather than just switching the mode.
+    let mut embedder: Option<Arc<dyn Embedder>> = None;
     for store_row in &store_rows {
         let label = if multi {
             Some(store_row.name.as_str())
         } else {
             None
         };
-        let summary = match run_embedded_index_with(
+        let (summary, used_embedder) = match run_embedded_index_with(
             ctx,
             &db,
             &config_loader,
             store_row,
             source_id,
             IndexErrorMode::StrictExit,
-            Some(Arc::clone(&embedder)),
+            embedder.clone(),
             label,
         )
         .await
         {
-            Ok(summary) => summary,
+            Ok(result) => result,
             Err(e) => exit_err(&e, ctx.json),
         };
+        if embedder.is_none() {
+            embedder = used_embedder;
+        }
         outcomes.push(StoreIndexOutcome {
             store_name: store_row.name.clone(),
             summary,

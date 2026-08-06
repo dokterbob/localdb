@@ -2,7 +2,9 @@ use localdb_core::Error;
 use serde_json::json;
 
 use crate::{
-    app_db::{default_store_row, load_app_db, load_app_db_lenient},
+    app_db::{
+        default_store_row, load_app_db, load_app_db_lenient, resolve_store_scope, StoreScopePolicy,
+    },
     daemon_client::{daemon_request_async, probe_daemon, CliContext, DaemonState},
     normalize::{
         confirm_destructive, exit_err, print_json, validate_store_name, visibility_to_string,
@@ -81,10 +83,11 @@ pub(crate) async fn run_store_list_async(ctx: &CliContext) {
     // F1-cli: use lenient loader so store list works even with malformed config.
     let (_, db) = load_app_db_lenient(ctx).await;
 
-    let runtime_stores = match db.backend().list_stores().await {
-        Ok(s) => s,
-        Err(e) => exit_err(&e, ctx.json),
-    };
+    // specs/05-surfaces.md §2.2: `--store` is repeatable and always validated
+    // and resolved; the "all stores" behavior only applies when `-s` is
+    // omitted. Route through the shared resolver rather than listing
+    // everything unconditionally.
+    let runtime_stores = resolve_store_scope(ctx, &db, StoreScopePolicy::AllStores).await;
 
     let all: Vec<serde_json::Value> = runtime_stores
         .iter()
