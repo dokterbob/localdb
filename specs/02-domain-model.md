@@ -326,6 +326,11 @@ Every resource and every chunk carries:
 | `content_hash` | blake3 of resource content (ordered block texts concatenated). |
 | `share_path` | Reserved, empty in MVP: list of (node, store) hops for federated content. |
 
+**Write path.** A chunk's `fetched_at` is always taken from its resource's `added_at`, never its
+`modified_at` — it is persisted as `resources.added_at`, and that is the column
+`MetadataFilter::FetchedAfter`/`FetchedBefore` filter on and every citation's
+`provenance.fetched_at` reports.
+
 ## 5. Conversations and non-document resources
 
 The resource model natively supports non-document content shapes:

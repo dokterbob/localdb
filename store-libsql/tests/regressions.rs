@@ -9,8 +9,12 @@ use tempfile::tempdir;
 
 use localdb_core::metadata::Metadata;
 use localdb_core::store::ChunkRecord;
-use localdb_core::types::{SourceKind, Span, StoreVisibility};
-use localdb_core::{SourceRow, StoreBackend, StoreBackendConfig, StoreRow, VectorEncoding};
+use localdb_core::types::{Source, SourceKind, SourceSpec, Span, StoreVisibility};
+use localdb_core::{
+    content_hash, index_resource, resource_id, Block, BlockKind, ChunkerConfig, FakeEmbedder,
+    IndexResourceDeps, IngestionConfig, IngestorKind, Resource, ResourceKind, SourceRow,
+    StoreBackend, StoreBackendConfig, StoreRow, Uri, VectorEncoding,
+};
 use store_libsql::SqliteBackend;
 
 async fn open_db_2d() -> (tempfile::TempDir, SqliteBackend) {
@@ -232,4 +236,112 @@ async fn dense_search_exact_fallback_when_ann_cap_saturated() {
          when ANN is saturated by store-B's 25 chunks. Got: {results:?}"
     );
     assert_eq!(results[0].chunk.id, "a-chunk-0");
+}
+
+/// Regression for Codex round-3 finding R2: a resource's *ingestion* time must
+/// be what lands in `resources.added_at`, not the date its source claims.
+///
+/// **Bug**: `index_resource` built `Provenance { fetched_at: resource.modified_at }`
+/// and `upsert_chunks` binds `fetched_at` to the `added_at` column, whose
+/// `ON CONFLICT` clause never updates it. A feed entry dated 2020 and ingested
+/// today therefore recorded 2020 as its acquisition time — permanently.
+///
+/// **Observable failure**: `find_document` maps `resources.added_at` →
+/// `DocumentInfo.fetched_at`, so every citation reported a 2020 acquisition
+/// time, and `MetadataFilter::FetchedAfter` (which filters on `r.added_at`)
+/// excluded the entry from any "fetched since last week" query.
+///
+/// **Why the fix is correct**: `Provenance.fetched_at` is defined as
+/// acquisition time (specs/02-domain-model.md §4), and `added_at` is spec'd as
+/// "always ingestion-time `now()` … never a feed-claimed date"
+/// (specs/02-domain-model.md, Feed connector "Timestamps"). Reading
+/// `resource.added_at` is the only value consistent with both.
+///
+/// Only feed sources make the two fields differ — `file` and `url` set both to
+/// the same value — which is why no unit test caught it: `FakeStore` has no
+/// separate `added_at`/`modified_at` columns, so the collapse is invisible
+/// without the real backend.
+#[tokio::test]
+async fn indexed_resource_persists_ingestion_time_not_feed_date_in_added_at() {
+    const INGESTED_AT: &str = "2026-08-05T09:30:00Z";
+    const FEED_CLAIMED: &str = "2020-01-01T00:00:00Z";
+
+    let (_dir, db) = open_db_2d().await;
+    let store_id = "feed-store";
+    // Seeds the store + source rows the `resources` insert refers to.
+    seed_store(&db, store_id, vec![]).await;
+
+    let source = Source {
+        id: format!("src-{store_id}"),
+        store_id: store_id.to_string(),
+        kind: SourceKind::Feed,
+        spec: SourceSpec::Feed {
+            url: "https://blog.example.com/feed.xml".to_string(),
+            max_entries: None,
+            fetch_full_content: false,
+            refresh_interval_secs: None,
+        },
+        source_preset: "prose".to_string(),
+    };
+
+    let uri = "https://blog.example.com/2020/old-post";
+    let body = "An old post that the feed is only surfacing to us today.";
+    let hash = content_hash(body);
+    let resource = Resource {
+        id: resource_id(uri, &hash),
+        store_id: store_id.to_string(),
+        source_id: source.id.clone(),
+        ingestor_kind: IngestorKind::Feed,
+        resource_kind: ResourceKind::Document,
+        uri: Uri::parse(uri).unwrap(),
+        external_id: None,
+        external_etag: None,
+        content_hash: hash,
+        title: Some("Old post".to_string()),
+        mime: Some("text/markdown".to_string()),
+        metadata: Metadata::default(),
+        // The feed connector's shape: acquisition is now, the feed claims 2020.
+        added_at: INGESTED_AT.to_string(),
+        modified_at: FEED_CLAIMED.to_string(),
+        thread_id: None,
+        channel: None,
+        participants: vec![],
+        origin_store: store_id.to_string(),
+        policy_version: "v1".to_string(),
+        share_path: None,
+        extractor_version: "1".to_string(),
+        blocks: vec![Block {
+            seq: 0,
+            kind: BlockKind::Text,
+            text: body.to_string(),
+            location: None,
+        }],
+    };
+
+    let handle = db.retrieval_store(store_id).await.unwrap();
+    let embedder = FakeEmbedder::new(2);
+    let config = IngestionConfig {
+        store_id: store_id.to_string(),
+        policy_version: "v1".to_string(),
+        chunker: ChunkerConfig::prose(),
+    };
+    let deps = IndexResourceDeps {
+        store: handle.as_ref(),
+        embedder: &embedder,
+        config: &config,
+    };
+    let written = index_resource(&resource, &source, None, &deps)
+        .await
+        .unwrap();
+    assert!(written > 0, "the resource must produce at least one chunk");
+
+    let info = db
+        .find_document(&resource.id)
+        .await
+        .unwrap()
+        .expect("the indexed resource must be readable back");
+    assert_eq!(
+        info.fetched_at, INGESTED_AT,
+        "resources.added_at must hold the ingestion time, not the feed's date"
+    );
 }

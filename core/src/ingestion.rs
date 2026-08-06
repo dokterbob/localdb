@@ -745,7 +745,13 @@ pub async fn index_resource(
             id: resource.source_id.clone(),
             kind: resource.ingestor_kind.as_str().to_string(),
         },
-        fetched_at: resource.modified_at.clone(),
+        // Acquisition time, i.e. when *our store* got hold of this resource —
+        // `added_at`, never `modified_at` (which for a feed entry is the
+        // feed's own claim about the content's age). The libsql backend binds
+        // this to `resources.added_at`, the column `MetadataFilter::
+        // FetchedAfter`/`FetchedBefore` filter on and every citation reports.
+        // See specs/02-domain-model.md §4.
+        fetched_at: resource.added_at.clone(),
         content_hash: resource.content_hash.clone(),
         share_path: vec![],
     };
@@ -3874,6 +3880,66 @@ mod tests {
                 old_chunks.is_empty(),
                 "replacing with an empty resource must delete the old chunks"
             );
+        }
+
+        // -----------------------------------------------------------------
+        // Codex R2: fetched_at is the resource's `added_at` (ingestion time),
+        //           never its `modified_at` (a feed-claimed date).
+        // -----------------------------------------------------------------
+
+        /// `Provenance.fetched_at` is defined as *acquisition* time, and the
+        /// libsql backend binds it to `resources.added_at` — the column
+        /// `MetadataFilter::FetchedAfter`/`FetchedBefore` filter on and that
+        /// every citation reports. `index_resource` used to read
+        /// `resource.modified_at`, so a 2020 feed entry ingested today claimed
+        /// a 2020 acquisition time and fell outside a "fetched since last
+        /// week" filter. Only the feed connector makes the two fields differ
+        /// (`file`/`url` set both to the same value), which is why this stayed
+        /// latent until the Atom/RSS ingestor landed.
+        ///
+        /// See specs/02-domain-model.md §4 and its "Timestamps" rule in the
+        /// Feed connector section.
+        #[tokio::test]
+        async fn index_resource_fetched_at_is_added_at_not_modified_at() {
+            const INGESTED_AT: &str = "2026-08-05T00:00:00Z";
+            const FEED_CLAIMED: &str = "2020-01-01T00:00:00Z";
+
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let source = make_source_with_preset(store_id, "prose");
+            let config = make_ingestion_config(store_id);
+
+            let mut resource = make_resource(
+                "https://blog.example.com/2020/old-post",
+                "An old post that a feed is only surfacing to us today.",
+                &source.id,
+                store_id,
+            );
+            resource.added_at = INGESTED_AT.to_string();
+            resource.modified_at = FEED_CLAIMED.to_string();
+
+            let deps = IndexResourceDeps {
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+            };
+            index_resource(&resource, &source, None, &deps)
+                .await
+                .unwrap();
+
+            let chunks = store.get_chunks_for_resource(&resource.id).await.unwrap();
+            assert!(!chunks.is_empty(), "the resource must produce chunks");
+            for c in &chunks {
+                assert_eq!(
+                    c.fetched_at, INGESTED_AT,
+                    "fetched_at must be the resource's added_at (ingestion time)"
+                );
+                assert_ne!(
+                    c.fetched_at, FEED_CLAIMED,
+                    "fetched_at must never be the feed-claimed modified_at"
+                );
+            }
         }
     }
 }
