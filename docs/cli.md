@@ -63,10 +63,10 @@ paths it created. The generated config file contains only `version: 1`; add
 `paths` and other keys as needed (see
 [specs/03-config.md](../specs/03-config.md)).
 
-**Note on embedding models:** `init` prints `embedding models will be downloaded
-on first index`. In v0.1.0 this message is inaccurate — no model download
-occurs; the current build uses a hash-based internal embedder. See the note in
-[`index`](#localdb-index) for details.
+**Note on embedding models:** `init` prints a note about model download. It is
+accurate: the default embedder (`pplx-embed-context-v1-0.6b`, local ONNX) is
+downloaded from HuggingFace (~706 MB) the first time `localdb index` or
+`localdb search` runs. See the note in [`index`](#localdb-index) for details.
 
 **Example:**
 
@@ -76,7 +76,8 @@ Initialized localdb at ~/notes
   Config: ~/notes/localdb-config.yaml
   Data:   ~/Library/Application Support/com.localdb.localdb.localdb/data
 
-Note: embedding models will be downloaded on first index.
+Note: when using 'local-onnx' provider, the ONNX model is downloaded on first index.
+      Hosted providers (openai-compatible, perplexity, voyage) require an API key in config.
 Run `localdb store add <name>` to create a store.
 ```
 
@@ -108,7 +109,7 @@ Options:
 $ localdb status
 daemon: not running (embedded mode)
 stores (1):
-  notes [libsql] (runtime)
+  notes [libsql]
 ```
 
 ```
@@ -322,7 +323,10 @@ $ localdb source list --store notes --json
       "kind": "path",
       "preset": "prose",
       "root": "/home/user/notes",
-      "store": "notes",
+      "store": {
+        "name": "notes"
+      },
+      "store_id": "01KTVGQ62TQN8X6XN9E5FDZN67",
       "url": null
     }
   ]
@@ -382,8 +386,8 @@ automatically on first run (~706 MB). See
 
 ```
 $ localdb index --store notes
-Indexing source 01KTVH6AY4DC84HWW7M2PP4F0X (/home/user/notes)
-Index complete: 3 indexed, 0 skipped, 3 chunks written, 0 errors
+Indexing /home/user/notes
+Index complete: 3 indexed, 0 skipped, 3 chunks written, 0 unsupported, 0 errors
 ```
 
 Use `--source <ID>` to re-index a single source without touching others in the
@@ -421,35 +425,29 @@ Runs hybrid BM25 + dense-vector search across the targeted stores and returns
 ranked citations. The Citation JSON shape is documented in
 [specs/02-domain-model.md](../specs/02-domain-model.md) §6.
 
-**Ranking:** hybrid BM25 + dense (RRF fusion). The `dense` score is the cosine
-similarity from the configured ONNX embedder; `fused` is the final RRF score.
+**Ranking:** hybrid BM25 + dense (RRF fusion). With the default binary-quantized
+local model, `dense` is the normalized Hamming similarity (`1.0 - hamming_dist / nbits`);
+a float32 embedder yields cosine similarity instead. `fused` is the final RRF score.
 
 **Examples:**
 
 ```
-$ localdb search how does rust handle errors
-1. file:///home/user/notes/rust-error-handling.md > Error handling in Rust
-   Error handling in Rust
-Rust uses the Result type for recoverable errors and panic! for unrecoverable ones. The question-
+$ localdb search hybrid search
+1. file:///home/user/notes/lancedb-notes.md > LanceDB notes
+   LanceDB is an embedded vector database built on the Lance columnar format. It supports hybrid search combining vector similarity with BM25 full-text scoring.
 
 2. file:///home/user/notes/meeting.txt
-   Meeting 2026-06-02: decided to adopt reciprocal rank fusion for combining dense and sparse retrieval results. Aardvark c
+   Meeting 2026-06-02: decided to adopt reciprocal rank fusion for combining dense and sparse retrieval results. Aardvark connectors are deferred to the next milestone.
 
-3. file:///home/user/notes/lancedb-notes.md > LanceDB notes
-   LanceDB notes
-LanceDB is an embedded vector database built on the Lance columnar format. It supports hybrid search combi
 ```
 
 (paths shown from a scratch run)
 
 ```
-$ localdb search --limit 2 rank fusion
+$ localdb search --limit 1 rank fusion
 1. file:///home/user/notes/meeting.txt
-   Meeting 2026-06-02: decided to adopt reciprocal rank fusion for combining dense and sparse retrieval results. Aardvark c
+   Meeting 2026-06-02: decided to adopt reciprocal rank fusion for combining dense and sparse retrieval results. Aardvark connectors are deferred to the next milestone.
 
-2. file:///home/user/notes/rust-error-handling.md > Error handling in Rust
-   Error handling in Rust
-Rust uses the Result type for recoverable errors and panic! for unrecoverable ones. The question-
 ```
 
 JSON output (full citation shape):
@@ -463,7 +461,7 @@ $ localdb search -s notes --json hybrid search
         "kind": "text",
         "seq": 1
       },
-      "chunk_id": "f0113639ebf62fa402aa506a80e0f6dba19a970cfbea3c80ffbb4ca082db30e7",
+      "chunk_id": "82b4631e898166f7834a786b1e8e56125ce6bfc2193fc210f591179527abbdcb",
       "chunk_position": {
         "seq_in_block": 0
       },
@@ -472,7 +470,7 @@ $ localdb search -s notes --json hybrid search
       ],
       "location": {
         "span": {
-          "end": 172,
+          "end": 157,
           "start": 0
         }
       },
@@ -480,8 +478,9 @@ $ localdb search -s notes --json hybrid search
         "contributor": [],
         "coverage": null,
         "creator": [],
+        "date": null,
         "description": null,
-        "format": null,
+        "format": "text/markdown",
         "identifier": null,
         "kind": "document",
         "language": null,
@@ -496,33 +495,36 @@ $ localdb search -s notes --json hybrid search
         "word_count": null
       },
       "provenance": {
-        "content_hash": "360be062b82116aa1a7f707bc9ea9d2f60e0f619e84e4f0f72e8f689d0e18f64",
+        "content_hash": "55567825f371ea048f61a59fa156068945a7ef0d9276b7813438820002ce72a2",
         "fetched_at": "2026-06-11T14:17:30Z"
       },
-      "resource_id": "ff6ff626d0062eab2d3a5f76dbbe75e6a265a127d99486cacfcde9f42777fe1d",
+      "resource_id": "ee2cfd35725ead3b0fb7ebccdcc4cf9fa0ea6990ac2fa1276dc689e1abed6700",
       "score": {
         "bm25": 1.9203118085861206,
-        "dense": 1.0,
+        "dense": 0.640625,
         "fused": 0.032266458495966696
       },
-      "snippet": "LanceDB notes\nLanceDB is an embedded vector database built on the Lance columnar format. It supports hybrid search combining vector similarity with BM25 full-text scoring.\n",
+      "snippet": "LanceDB is an embedded vector database built on the Lance columnar format. It supports hybrid search combining vector similarity with BM25 full-text scoring.",
       "store": {
         "id": "01KTVGQ62TQN8X6XN9E5FDZN67",
         "name": "notes"
       },
       "title": "LanceDB notes",
-      "uri": "file:///private/tmp/localdb-recon.0z2dTw/notes/lancedb-notes.md"
+      "uri": "file:///home/user/notes/lancedb-notes.md"
     }
   ]
 }
 ```
 
+(The structural fields above — `block`, `chunk_position`, `heading_path`,
+`location.span`, `snippet`, `metadata`, `chunk_id`, `resource_id` and
+`provenance.content_hash` — are captured from a real indexing run. `score`,
+`store` and `provenance.fetched_at` are illustrative.)
+
 There is no top-level `document_id`, `block_seq`, `block_kind`, or `span` in the
 Citation shape — those are superseded by `resource_id`, the nested `block {seq, kind}`,
 `chunk_position {seq_in_block}`, and `location {span, window_block_seqs}` respectively.
 See [specs/02-domain-model.md](../specs/02-domain-model.md) §6.
-
-(paths shown from a scratch run)
 
 ---
 
@@ -772,12 +774,14 @@ For the full HTTP API reference see [docs/http-api.md](http-api.md).
 
 ### Known limitations (v0.1.0)
 
-- **Ingestion via `POST /v1/jobs` is a no-op.** The daemon's job endpoint accepts
-  the request, transitions the job state machine, and reports `chunks_written: 0`.
-  To actually index, run `localdb index` from the CLI — this works while the daemon
-  is running because both share the unified database (`<data_dir>/localdb.db`) and
-  concurrent writers serialise via SQLite WAL + `busy_timeout=5000`. Daemon-side
-  reads (`/v1/search`, `/v1/documents/{id}`, `/v1/status`) DO see CLI-indexed data.
+- **Ingestion via `POST /v1/jobs` is a no-op.** ([#187](https://github.com/dokterbob/localdb/issues/187))
+  The daemon's job endpoint accepts the request, transitions the job state machine,
+  and reports `chunks_written: 0`. `localdb index` does **not** route around this:
+  when a daemon is running it proxies the job to that same no-op endpoint
+  (`cli/src/cmds/index.rs`), so indexing silently writes nothing. **Stop the daemon
+  first, then run `localdb index`.** Daemon-side reads (`/v1/search`,
+  `/v1/documents/{id}`, `/v1/status`) DO see CLI-indexed data, because the daemon
+  opens the same unified database (`<data_dir>/localdb.db`) as the CLI.
 - **Stale socket after kill.** If the daemon process is killed without a clean
   shutdown, `daemon.sock` is not removed. Subsequent CLI commands report
   `daemon: running` but searches fail with `exit 5` (`daemon is unreachable`).
@@ -821,8 +825,8 @@ Options:
 ```
 
 Starts a JSON-RPC 2.0 MCP server on stdin/stdout, using embedded mode (no daemon
-required). The server is fully functional in v0.1.0 and exposes three read-only
-tools: `search`, `get_document`, and `list_stores`.
+required). The server is fully functional in v0.1.0 and exposes four read-only
+tools: `search`, `get_document`, `get_chunks`, and `list_stores`.
 
 `--allow-write` is accepted on the command line for forward compatibility but all
 mutating tool calls are rejected in v1.

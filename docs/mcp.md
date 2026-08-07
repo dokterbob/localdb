@@ -132,31 +132,51 @@ of citations in the canonical localdb Citation JSON shape.
 **Input schema** (as actually returned by `tools/list`):
 
 ```json
+
 {
-  "type": "object",
-  "required": ["query"],
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "properties": {
-    "query": {
-      "type": "string",
-      "description": "Natural language search query"
-    },
-    "stores": {
-      "type": ["array", "null"],
-      "items": { "type": "string" },
-      "description": "Optional list of store names to search. Defaults to all stores."
+    "content_length": {
+      "default": null,
+      "description": "Soft cap on snippet text chars per result in the text rendering; snaps to the nearest paragraph/sentence/word boundary rather than cutting mid-word (default: 400). The JSON citation payload always carries the full snippet.",
+      "format": "int64",
+      "minimum": 1,
+      "type": [
+        "integer",
+        "null"
+      ]
     },
     "limit": {
-      "type": ["integer", "null"],
-      "minimum": 1,
+      "default": null,
+      "description": "Maximum number of results to return (default: 10, max: 100)",
+      "format": "int64",
       "maximum": 100,
-      "description": "Maximum number of results to return (default: 10, max: 100)"
-    },
-    "content_length": {
-      "type": ["integer", "null"],
       "minimum": 1,
-      "description": "Soft cap on snippet text chars per result in the text rendering (default: 400)"
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "query": {
+      "description": "Natural language search query",
+      "type": "string"
+    },
+    "stores": {
+      "default": null,
+      "description": "Optional list of store names to search. Defaults to all stores.",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
     }
-  }
+  },
+  "required": [
+    "query"
+  ],
+  "type": "object"
 }
 ```
 
@@ -174,7 +194,9 @@ of citations in the canonical localdb Citation JSON shape.
 }
 ```
 
-**Example result** (the `text` field carries pretty-printed JSON):
+**Example result.** The single `text` content block carries the pretty-printed JSON,
+then a `\n\n---\n` separator, then a human-readable rendering of the same citations
+(`search` is the only tool that appends this rendering; the others return JSON alone):
 
 ```json
 {
@@ -185,16 +207,34 @@ of citations in the canonical localdb Citation JSON shape.
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"citations\": [\n    {\n      \"block\": { \"kind\": \"text\", \"seq\": 0 },\n      \"chunk_id\": \"eff4065c...\",\n      \"chunk_position\": { \"seq_in_block\": 0 },\n      \"heading_path\": [],\n      \"location\": { \"span\": { \"end\": 138, \"start\": 0 } },\n      \"metadata\": {\n        \"contributor\": [],\n        \"coverage\": null,\n        \"creator\": [],\n        \"description\": null,\n        \"format\": null,\n        \"identifier\": null,\n        \"kind\": \"document\",\n        \"language\": null,\n        \"page_count\": null,\n        \"publisher\": null,\n        \"relation\": [],\n        \"rights\": null,\n        \"source\": null,\n        \"subject\": [],\n        \"title\": null,\n        \"type\": null,\n        \"word_count\": null\n      },\n      \"provenance\": {\n        \"content_hash\": \"929258b8...\",\n        \"fetched_at\": \"2026-06-11T14:17:30Z\"\n      },\n      \"resource_id\": \"a9bb80b7...\",\n      \"score\": {\n        \"bm25\": 3.0748,\n        \"dense\": 1.0,\n        \"fused\": 0.032786\n      },\n      \"snippet\": \"Meeting 2026-06-02: decided to adopt reciprocal rank fusion...\",\n      \"store\": { \"id\": \"01KTVGQ62...\", \"name\": \"notes\" },\n      \"title\": null,\n      \"uri\": \"file:///home/user/notes/meeting.txt\"\n    }\n  ],\n  \"total_candidates\": 3\n}"
+        "text": "{\n  \"citations\": [\n    {\n      \"block\": {\n        \"kind\": \"text\",\n        \"seq\": 0\n      },\n      \"chunk_id\": \"0bbaaa6b64dffd8b232410017b224c7b499bc3fe235382bfaa8ea63b1e435824\",\n      \"chunk_position\": {\n        \"seq_in_block\": 0\n      },\n      \"heading_path\": [],\n      \"location\": {\n        \"span\": {\n          \"end\": 165,\n          \"start\": 0\n        }\n      },\n      \"metadata\": {\n        \"contributor\": [],\n        \"coverage\": null,\n        \"creator\": [],\n        \"date\": null,\n        \"description\": null,\n        \"format\": \"text/plain\",\n        \"identifier\": null,\n        \"kind\": \"document\",\n        \"language\": null,\n        \"page_count\": null,\n        \"publisher\": null,\n        \"relation\": [],\n        \"rights\": null,\n        \"source\": null,\n        \"subject\": [],\n        \"title\": null,\n        \"type\": null,\n        \"word_count\": null\n      },\n      \"provenance\": {\n        \"content_hash\": \"226aa53267d613baa9aaf444cf661ef20a2e9d8e1e9d140819ee2f7044320e4b\",\n        \"fetched_at\": \"2026-06-11T14:17:30Z\"\n      },\n      \"resource_id\": \"5e16a53946004c13b941685cddaed55d9267965abe65462bbe75d8e6184f15e7\",\n      \"score\": {\n        \"bm25\": 3.0748,\n        \"dense\": 0.7099609375,\n        \"fused\": 0.03278688524590164\n      },\n      \"snippet\": \"Meeting 2026-06-02: decided to adopt reciprocal rank fusion for combining dense and sparse retrieval results. Aardvark connectors are deferred to the next milestone.\",\n      \"store\": {\n        \"id\": \"01KTVGQ62TQN8X6XN9E5FDZN67\",\n        \"name\": \"notes\"\n      },\n      \"title\": null,\n      \"uri\": \"file:///home/user/notes/meeting.txt\"\n    }\n  ],\n  \"total_candidates\": 3\n}\n\n---\n1. file:///home/user/notes/meeting.txt\n   Score: 0.0328\n   Meeting 2026-06-02: decided to adopt reciprocal rank fusion for combining dense and sparse retrieval results. Aardvark connectors are deferred to the next milestone."
       }
     ]
   }
 }
 ```
 
-(`metadata` here is all-null/empty because a plain `.txt` file carries no Dublin Core
-metadata; a PDF or a source with front-matter would populate `title`, `creator`, etc.
-The top-level `title` field is a convenience copy of `metadata`'s title.)
+(`metadata` here is mostly null/empty because a plain `.txt` file carries no Dublin Core
+metadata — only `format` is set, from the sniffed MIME type. Every Dublin Core field is
+always present in the JSON; absent values serialize as `null` (or `[]` for the repeated
+fields), never omitted. How much gets populated depends entirely on the parser:
+
+| Parser | Populates |
+|---|---|
+| EPUB | `title`, `creator`, `subject`, `description`, `publisher`, `contributor`, `date`, `format`, `identifier`, `language`, `rights` — read from the OPF package's own Dublin Core block |
+| Markdown / HTML / Office | `title` (first H1) + `format` |
+| PDF | `format` only — the info dictionary is not read |
+| Plain text | `format` only |
+
+EPUB is currently the only parser that populates the rich Dublin Core set. YAML front
+matter is preserved as a `Frontmatter` content block but is **not** parsed into metadata —
+see [#195](https://github.com/dokterbob/localdb/issues/195). The top-level `title` field is
+a convenience copy of `metadata`'s title.)
+
+(The structural fields above — `block`, `chunk_position`, `heading_path`,
+`location.span`, `snippet`, `metadata`, `chunk_id`, `resource_id` and
+`provenance.content_hash` — are captured from a real indexing run. `score`,
+`store` and `provenance.fetched_at` are illustrative.)
 
 The citation shape is identical to `localdb search --json`. There is no top-level
 `document_id`, `block_seq`, `block_kind`, or `span` — those are superseded by
@@ -211,18 +251,25 @@ Fetch the normalized text and metadata for a document by its ID.
 **Input schema:**
 
 ```json
+
 {
-  "type": "object",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "properties": {
     "id": {
-      "type": "string",
-      "description": "Document ID (content-addressed blake3 hash)"
+      "default": "",
+      "description": "Document ID (content-addressed blake3 hash)",
+      "type": "string"
     },
     "uri": {
-      "type": ["string", "null"],
-      "description": "Document URI (e.g. file:///path/to/doc or URL)"
+      "default": null,
+      "description": "Document URI (e.g. file:///path/to/doc or URL)",
+      "type": [
+        "string",
+        "null"
+      ]
     }
-  }
+  },
+  "type": "object"
 }
 ```
 
@@ -240,7 +287,7 @@ Fetch the normalized text and metadata for a document by its ID.
   "method": "tools/call",
   "params": {
     "name": "get_document",
-    "arguments": { "id": "a9bb80b7ae3ab7fa65b2181542690785d79e04c4497b59d401583e2358e77ca4" }
+    "arguments": { "id": "5e16a53946004c13b941685cddaed55d9267965abe65462bbe75d8e6184f15e7" }
   }
 }
 ```
@@ -256,7 +303,7 @@ Fetch the normalized text and metadata for a document by its ID.
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"chunk_count\": 1,\n  \"metadata\": { \"contributor\": [], \"coverage\": null, \"creator\": [], \"description\": null, \"format\": null, \"identifier\": null, \"kind\": \"document\", \"language\": null, \"page_count\": null, \"publisher\": null, \"relation\": [], \"rights\": null, \"source\": null, \"subject\": [], \"title\": null, \"type\": null, \"word_count\": null },\n  \"provenance\": { \"content_hash\": \"929258b8...\", \"fetched_at\": \"2026-06-11T14:17:30Z\" },\n  \"resource_id\": \"a9bb80b7...\",\n  \"store\": { \"id\": \"01KTVGQ62...\", \"name\": \"notes\" },\n  \"text\": \"Meeting 2026-06-02: decided to adopt reciprocal rank fusion...\",\n  \"title\": null,\n  \"uri\": \"file:///home/user/notes/meeting.txt\"\n}"
+        "text": "{\n  \"chunk_count\": 1,\n  \"metadata\": {\n    \"contributor\": [],\n    \"coverage\": null,\n    \"creator\": [],\n    \"date\": null,\n    \"description\": null,\n    \"format\": \"text/plain\",\n    \"identifier\": null,\n    \"kind\": \"document\",\n    \"language\": null,\n    \"page_count\": null,\n    \"publisher\": null,\n    \"relation\": [],\n    \"rights\": null,\n    \"source\": null,\n    \"subject\": [],\n    \"title\": null,\n    \"type\": null,\n    \"word_count\": null\n  },\n  \"provenance\": {\n    \"content_hash\": \"226aa53267d613baa9aaf444cf661ef20a2e9d8e1e9d140819ee2f7044320e4b\",\n    \"fetched_at\": \"2026-06-11T14:17:30Z\"\n  },\n  \"resource_id\": \"5e16a53946004c13b941685cddaed55d9267965abe65462bbe75d8e6184f15e7\",\n  \"store\": {\n    \"id\": \"01KTVGQ62TQN8X6XN9E5FDZN67\",\n    \"name\": \"notes\"\n  },\n  \"text\": \"Meeting 2026-06-02: decided to adopt reciprocal rank fusion for combining dense and sparse retrieval results. Aardvark connectors are deferred to the next milestone.\",\n  \"title\": null,\n  \"uri\": \"file:///home/user/notes/meeting.txt\"\n}"
       }
     ]
   }
@@ -275,35 +322,58 @@ page through a long document after finding it via `search` or `get_document`.
 **Input schema:**
 
 ```json
+
 {
-  "type": "object",
-  "required": ["resource_id"],
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "properties": {
-    "resource_id": {
-      "type": "string",
-      "description": "Resource ID (content-addressed blake3 hash)"
-    },
-    "offset": {
-      "type": ["integer", "null"],
+    "anchor_block_seq": {
+      "default": null,
+      "description": "Resolve via lower-bound to the first chunk with block_seq >= anchor_block_seq (tie-broken by lowest seq_in_block), then return a window of `limit` chunks centered on it. Mutually exclusive with `offset` and `anchor_chunk_id`.",
+      "format": "uint32",
       "minimum": 0,
-      "description": "Number of chunks to skip before the first returned chunk (default: 0)"
-    },
-    "limit": {
-      "type": ["integer", "null"],
-      "minimum": 1,
-      "maximum": 200,
-      "description": "Maximum number of chunks to return (default: 50, max: 200)"
+      "type": [
+        "integer",
+        "null"
+      ]
     },
     "anchor_chunk_id": {
-      "type": ["string", "null"],
-      "description": "Resolve to the chunk with this exact chunk_id, then return a window of `limit` chunks centered on it. Mutually exclusive with `offset` and `anchor_block_seq`."
+      "default": null,
+      "description": "Resolve to the chunk with this exact chunk_id, then return a window of `limit` chunks centered on it. Mutually exclusive with `offset` and `anchor_block_seq`.",
+      "type": [
+        "string",
+        "null"
+      ]
     },
-    "anchor_block_seq": {
-      "type": ["integer", "null"],
+    "limit": {
+      "default": null,
+      "description": "Maximum number of chunks to return (default: 50, max: 200)",
+      "format": "int64",
+      "maximum": 200,
+      "minimum": 1,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "offset": {
+      "default": null,
+      "description": "Number of chunks to skip before the first returned chunk (default: 0)",
+      "format": "int64",
       "minimum": 0,
-      "description": "Resolve via lower-bound to the first chunk with block_seq >= anchor_block_seq (tie-broken by lowest seq_in_block), then return a window of `limit` chunks centered on it. Mutually exclusive with `offset` and `anchor_chunk_id`."
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "resource_id": {
+      "description": "Resource ID (content-addressed blake3 hash)",
+      "type": "string"
     }
-  }
+  },
+  "required": [
+    "resource_id"
+  ],
+  "type": "object"
 }
 ```
 
@@ -321,7 +391,7 @@ page through a long document after finding it via `search` or `get_document`.
   "method": "tools/call",
   "params": {
     "name": "get_chunks",
-    "arguments": { "resource_id": "a9bb80b7...", "offset": 0, "limit": 50 }
+    "arguments": { "resource_id": "5e16a53946004c13b941685cddaed55d9267965abe65462bbe75d8e6184f15e7", "offset": 0, "limit": 50 }
   }
 }
 ```
@@ -337,7 +407,7 @@ page through a long document after finding it via `search` or `get_document`.
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"anchor_index\": null,\n  \"chunks\": [\n    {\n      \"block_kind\": \"text\",\n      \"block_seq\": 0,\n      \"chunk_id\": \"eff4065c...\",\n      \"heading_path\": [],\n      \"seq_in_block\": 0,\n      \"span\": { \"end\": 138, \"start\": 0 },\n      \"text\": \"Meeting 2026-06-02: decided to adopt reciprocal rank fusion...\"\n    }\n  ],\n  \"limit\": 50,\n  \"offset\": 0,\n  \"resource_id\": \"a9bb80b7...\",\n  \"returned\": 1,\n  \"store\": { \"id\": \"01KTVGQ62...\", \"name\": \"notes\" },\n  \"title\": null,\n  \"total_chunks\": 1,\n  \"uri\": \"file:///home/user/notes/meeting.txt\"\n}"
+        "text": "{\n  \"anchor_index\": null,\n  \"chunks\": [\n    {\n      \"block_kind\": \"text\",\n      \"block_seq\": 0,\n      \"chunk_id\": \"0bbaaa6b64dffd8b232410017b224c7b499bc3fe235382bfaa8ea63b1e435824\",\n      \"heading_path\": [],\n      \"seq_in_block\": 0,\n      \"span\": {\n        \"end\": 165,\n        \"start\": 0\n      },\n      \"text\": \"Meeting 2026-06-02: decided to adopt reciprocal rank fusion for combining dense and sparse retrieval results. Aardvark connectors are deferred to the next milestone.\"\n    }\n  ],\n  \"limit\": 50,\n  \"offset\": 0,\n  \"resource_id\": \"5e16a53946004c13b941685cddaed55d9267965abe65462bbe75d8e6184f15e7\",\n  \"returned\": 1,\n  \"store\": {\n    \"id\": \"01KTVGQ62TQN8X6XN9E5FDZN67\",\n    \"name\": \"notes\"\n  },\n  \"title\": null,\n  \"total_chunks\": 1,\n  \"uri\": \"file:///home/user/notes/meeting.txt\"\n}"
       }
     ]
   }
@@ -377,7 +447,8 @@ corresponds to (as if the caller had passed that `offset` directly), and
 `anchor_index` reports the 0-based index of the anchor chunk within the returned
 `chunks` array — `null` when the request used plain `offset` pagination instead.
 
-**Example:** a resource with 20 chunks (`block_seq` 0–19, one chunk per block),
+**Example** (illustrative — placeholder IDs and elided `text`/`span` values, to show the
+windowing arithmetic): a resource with 20 chunks (`block_seq` 0–19, one chunk per block),
 requested with `anchor_chunk_id` set to the `block_seq = 10` chunk and `limit: 5`.
 With an odd `limit`, centering puts 2 chunks before the anchor and 2 after, so the
 returned window covers `block_seq` 8–12, `offset` is 8 (the position of the first
@@ -391,7 +462,7 @@ chunks (`anchor_index: 2`):
   "method": "tools/call",
   "params": {
     "name": "get_chunks",
-    "arguments": { "resource_id": "a9bb80b7...", "anchor_chunk_id": "chunk-at-block-10", "limit": 5 }
+    "arguments": { "resource_id": "<resource_id of a 20-chunk document>", "anchor_chunk_id": "<chunk_id at block 10>", "limit": 5 }
   }
 }
 ```
@@ -405,7 +476,7 @@ chunks (`anchor_index: 2`):
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"anchor_index\": 2,\n  \"chunks\": [\n    { \"block_kind\": \"text\", \"block_seq\": 8, \"chunk_id\": \"...\", \"heading_path\": [], \"seq_in_block\": 0, \"span\": { \"end\": 0, \"start\": 0 }, \"text\": \"...\" },\n    { \"block_kind\": \"text\", \"block_seq\": 9, \"chunk_id\": \"...\", \"heading_path\": [], \"seq_in_block\": 0, \"span\": { \"end\": 0, \"start\": 0 }, \"text\": \"...\" },\n    { \"block_kind\": \"text\", \"block_seq\": 10, \"chunk_id\": \"chunk-at-block-10\", \"heading_path\": [], \"seq_in_block\": 0, \"span\": { \"end\": 0, \"start\": 0 }, \"text\": \"...\" },\n    { \"block_kind\": \"text\", \"block_seq\": 11, \"chunk_id\": \"...\", \"heading_path\": [], \"seq_in_block\": 0, \"span\": { \"end\": 0, \"start\": 0 }, \"text\": \"...\" },\n    { \"block_kind\": \"text\", \"block_seq\": 12, \"chunk_id\": \"...\", \"heading_path\": [], \"seq_in_block\": 0, \"span\": { \"end\": 0, \"start\": 0 }, \"text\": \"...\" }\n  ],\n  \"limit\": 5,\n  \"offset\": 8,\n  \"resource_id\": \"a9bb80b7...\",\n  \"returned\": 5,\n  \"store\": { \"id\": \"01KTVGQ62...\", \"name\": \"notes\" },\n  \"title\": null,\n  \"total_chunks\": 20,\n  \"uri\": \"file:///home/user/notes/meeting.txt\"\n}"
+        "text": "{\n  \"anchor_index\": 2,\n  \"chunks\": [\n    { \"block_kind\": \"text\", \"block_seq\": 8, \"chunk_id\": \"...\", \"heading_path\": [], \"seq_in_block\": 0, \"span\": { \"end\": 0, \"start\": 0 }, \"text\": \"...\" },\n    { \"block_kind\": \"text\", \"block_seq\": 9, \"chunk_id\": \"...\", \"heading_path\": [], \"seq_in_block\": 0, \"span\": { \"end\": 0, \"start\": 0 }, \"text\": \"...\" },\n    { \"block_kind\": \"text\", \"block_seq\": 10, \"chunk_id\": \"<anchor chunk_id>\", \"heading_path\": [], \"seq_in_block\": 0, \"span\": { \"end\": 0, \"start\": 0 }, \"text\": \"...\" },\n    { \"block_kind\": \"text\", \"block_seq\": 11, \"chunk_id\": \"...\", \"heading_path\": [], \"seq_in_block\": 0, \"span\": { \"end\": 0, \"start\": 0 }, \"text\": \"...\" },\n    { \"block_kind\": \"text\", \"block_seq\": 12, \"chunk_id\": \"...\", \"heading_path\": [], \"seq_in_block\": 0, \"span\": { \"end\": 0, \"start\": 0 }, \"text\": \"...\" }\n  ],\n  \"limit\": 5,\n  \"offset\": 8,\n  \"resource_id\": \"<resource_id>\",\n  \"returned\": 5,\n  \"store\": { \"id\": \"<store id>\", \"name\": \"<store>\" },\n  \"title\": null,\n  \"total_chunks\": 20,\n  \"uri\": \"file:///home/user/notes/research-log.md\"\n}"
       }
     ]
   }
@@ -425,7 +496,7 @@ See [specs/05-surfaces.md](../specs/05-surfaces.md) §4.1 for the full spec
 
 List all available stores with their names, visibility, and document/chunk counts.
 
-**Input schema:** `{}` (no arguments)
+**Input schema:** `{"properties": {}, "type": "object"}` (no arguments)
 
 **Example call:**
 
