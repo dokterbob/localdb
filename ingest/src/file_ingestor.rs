@@ -91,7 +91,12 @@ impl Ingestor for FileIngestor {
             let bytes = match std::fs::read(&file.path) {
                 Ok(b) => b,
                 Err(e) => {
-                    tracing::warn!(path = %file.path.display(), "FileIngestor: failed to read file: {}", e);
+                    // Debug, not warn: `core::ingestion` emits the single
+                    // user-facing WARN for every SkipReason::Error (it owns
+                    // ingestion outcome accounting). This line keeps the
+                    // extra framing for troubleshooting without duplicating
+                    // the warning.
+                    tracing::debug!(path = %file.path.display(), "FileIngestor: failed to read file: {}", e);
                     // Report via on_skipped so the delete-sweep keeps this
                     // still-existing file's indexed content: only URIs never
                     // reported at all get swept, and a transient read error
@@ -156,9 +161,19 @@ impl Ingestor for FileIngestor {
                 self.parser.parse(&probe)
             })) {
                 Err(panic_msg) => {
-                    tracing::warn!(uri = %file.uri, "FileIngestor: parser panicked: {}", panic_msg);
+                    // Debug: `core::ingestion` owns the user-facing WARN.
+                    tracing::debug!(uri = %file.uri, "FileIngestor: parser panicked: {}", panic_msg);
+                    // The "parser panicked" framing must live in the payload,
+                    // not only in the debug line above: `core`'s single WARN
+                    // prints the payload verbatim, and without this a crash
+                    // and an ordinary returned Err are indistinguishable at
+                    // the default log level. The read/parse-error arms
+                    // already prefix theirs for the same reason.
                     callback
-                        .on_skipped(&file.uri, SkipReason::Error(panic_msg))
+                        .on_skipped(
+                            &file.uri,
+                            SkipReason::Error(format!("parser panicked: {panic_msg}")),
+                        )
                         .await;
                     result.errors += 1;
                     continue;
@@ -172,7 +187,8 @@ impl Ingestor for FileIngestor {
                     continue;
                 }
                 Ok(Err(e)) => {
-                    tracing::warn!(uri = %file.uri, "FileIngestor: parser error: {}", e);
+                    // Debug: `core::ingestion` owns the user-facing WARN.
+                    tracing::debug!(uri = %file.uri, "FileIngestor: parser error: {}", e);
                     // Same aliveness rule as the read-error path above;
                     // SkipReason::Error so it's counted as an error (C8).
                     callback

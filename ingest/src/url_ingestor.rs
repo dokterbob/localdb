@@ -107,7 +107,12 @@ impl Ingestor for UrlIngestor {
                     // A single fetch failure is counted and the batch
                     // continues rather than aborting the whole run, per the
                     // test plan's "fetch error -> errors counter" requirement.
-                    tracing::warn!(url = %url, "UrlIngestor: fetch error: {}", e);
+                    // Debug, not warn: `core::ingestion` emits the single
+                    // user-facing WARN for every SkipReason::Error (it owns
+                    // ingestion outcome accounting). This line keeps the
+                    // extra framing for troubleshooting without duplicating
+                    // the warning.
+                    tracing::debug!(url = %url, "UrlIngestor: fetch error: {}", e);
                     // Report via on_skipped so the delete-sweep keeps this
                     // URL's previously indexed content: a transient network
                     // failure is not evidence the resource is gone (contrast
@@ -162,8 +167,19 @@ impl Ingestor for UrlIngestor {
             let parsed =
                 match catch_panic(std::panic::AssertUnwindSafe(|| self.parser.parse(&probe))) {
                     Err(panic_msg) => {
-                        tracing::warn!(url = %url, "UrlIngestor: parser panicked: {}", panic_msg);
-                        callback.on_skipped(uri, SkipReason::Error(panic_msg)).await;
+                        // Debug: `core::ingestion` owns the user-facing WARN.
+                        tracing::debug!(url = %url, "UrlIngestor: parser panicked: {}", panic_msg);
+                        // Framing goes in the payload, not just the debug
+                        // line: `core`'s single WARN prints the payload
+                        // verbatim, and without this a crash is
+                        // indistinguishable from an ordinary returned Err at
+                        // the default log level.
+                        callback
+                            .on_skipped(
+                                uri,
+                                SkipReason::Error(format!("parser panicked: {panic_msg}")),
+                            )
+                            .await;
                         result.errors += 1;
                         continue;
                     }
@@ -174,7 +190,8 @@ impl Ingestor for UrlIngestor {
                         continue;
                     }
                     Ok(Err(e)) => {
-                        tracing::warn!(url = %url, "UrlIngestor: parser error: {}", e);
+                        // Debug: `core::ingestion` owns the user-facing WARN.
+                        tracing::debug!(url = %url, "UrlIngestor: parser error: {}", e);
                         // C7: this arm previously never called on_skipped at
                         // all, silently orphaning the URL from the
                         // delete-sweep's "seen" set — a transient parser
