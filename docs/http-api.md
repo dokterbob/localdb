@@ -2,7 +2,7 @@
 
 > **EXPERIMENTAL — do not rely on this surface for production use.**
 >
-> The daemon opens the same unified database (`<data_dir>/localdb.db`) as the CLI, so CLI-indexed data IS visible via `/v1/search`, `/v1/documents/{id}`, and `/v1/status`. The one open limitation in v0.1.0 is that ingestion via `POST /v1/jobs` is a no-op — to actually index, run `localdb index` from the CLI (which works concurrently with the daemon via SQLite WAL).
+> The daemon opens the same unified database (`<data_dir>/localdb.db`) as the CLI, so CLI-indexed data IS visible via `/v1/search`, `/v1/documents/{id}`, and `/v1/status`. The one open limitation in v0.1.0 is that ingestion via `POST /v1/jobs` is a no-op ([#187](https://github.com/dokterbob/localdb/issues/187)) — and `localdb index` proxies to that same endpoint whenever a daemon is running, so it silently indexes nothing. **Stop the daemon first, then run `localdb index`.**
 >
 > For design rationale see [specs/05-surfaces.md](../specs/05-surfaces.md) §3.
 
@@ -107,8 +107,7 @@ curl -s http://127.0.0.1:7700/v1/stores
         {
             "name": "notes",
             "visibility": "private",
-            "backend": "libsql",
-            "ownership": "runtime"
+            "backend": "libsql"
         }
     ],
     "next_cursor": null,
@@ -130,8 +129,7 @@ curl -s http://127.0.0.1:7700/v1/stores/notes
 {
     "name": "notes",
     "visibility": "private",
-    "backend": "libsql",
-    "ownership": "runtime"
+    "backend": "libsql"
 }
 ```
 
@@ -220,8 +218,8 @@ the daemon and the CLI share `<data_dir>/localdb.db`.
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `query` | string | yes | Natural language search query |
-| `stores` | string[] | no | Store names to search; omit to search all stores |
-| `limit` | int | no | Maximum results to return (default: 10, max: 100) |
+| `store_filter` | string[] | no | Store names to search; omit or pass `[]` to search all stores |
+| `limit` | int | no | Maximum results to return (default: 10; not clamped) |
 | `cursor` | string | no | Pagination cursor from a previous response |
 
 ```
@@ -253,13 +251,13 @@ Submit an index job for a store. The daemon processes the job asynchronously; po
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `type` | string | yes | Job type; currently only `"index"` is supported |
 | `store_name` | string | yes | Name of the store to index |
+| `source_id` | string | no | Index only this source; omit to index the whole store |
 
 ```
 curl -s -X POST http://127.0.0.1:7700/v1/jobs \
   -H 'Content-Type: application/json' \
-  -d '{"type":"index","store_name":"notes"}'
+  -d '{"store_name":"notes"}'
 ```
 
 ```json
@@ -267,8 +265,9 @@ curl -s -X POST http://127.0.0.1:7700/v1/jobs \
 ```
 
 > If you pass `"store"` instead of `"store_name"` the server returns a 422-style deserialisation
-> error: `Failed to deserialize the JSON body into the target type: missing field 'store_name' at
-> line 1 column 32`.
+> error: `Failed to deserialize the JSON body into the target type: missing field 'store_name'`
+> (followed by a line/column offset). Unknown keys are ignored rather than rejected —
+> `CreateJobRequest` does not set `deny_unknown_fields`.
 
 ---
 
@@ -310,7 +309,7 @@ curl -s http://127.0.0.1:7700/v1/jobs/01KTVM5XMA59N4WGHNZ80QX9B7
 | `id` | string | ULID job identifier |
 | `store_id` | string | Store name the job runs against |
 | `scope` | object | `{"type":"store"}` for a full-store index |
-| `state` | string | `"pending"`, `"running"`, or `"done"` |
+| `state` | string | `"pending"`, `"running"`, `"done"`, or `"failed"` |
 | `stats` | object | Running counters (see below) |
 | `error` | string\|null | Error message if the job failed |
 | `created_at` | string | ISO 8601 timestamp |
@@ -363,7 +362,7 @@ HTTP status codes follow the shared error taxonomy in [specs/05-surfaces.md](../
 
 | Code | HTTP status | Meaning |
 |---|---|---|
-| `store_not_found` / `source_not_found` / `document_not_found` / `job_not_found` | 404 | Unknown entity |
+| `store_not_found` / `source_not_found` / `resource_not_found` / `job_not_found` | 404 | Unknown entity |
 | `runtime_state_locked` | 409 | Unified database locked by another process (SQLite `busy_timeout` exceeded) |
 | `daemon_running` | 409 | A second daemon was started against the same data dir |
 | `daemon_unreachable` | 502 | Daemon socket exists but is not responding |

@@ -143,8 +143,11 @@ to the appropriate crate. No logic of its own. Subcommands: `init`, `serve`, `mc
 ```
 
 Content-addressed IDs (`blake3`) flow through every step: documents get
-`blake3(uri ‖ content_hash)` and chunks get `blake3(document_id ‖ chunk_text ‖ span)`,
-making re-indexing idempotent. See [specs/02-domain-model.md](../specs/02-domain-model.md) §3.
+`blake3(uri ‖ content_hash)` and chunks get
+`blake3(resource_id ‖ block_seq ‖ chunk_text ‖ seq_in_block)`, making re-indexing idempotent.
+Span (byte offsets) is deliberately excluded — it can shift slightly between runs (e.g. from
+whitespace-normalization tweaks) without the chunk's actual membership changing, which would
+otherwise needlessly churn IDs. See [specs/02-domain-model.md](../specs/02-domain-model.md) §3.
 
 The `Citation` is the canonical output shape used by every surface — CLI, HTTP, and MCP all
 return the same structure. See [specs/02-domain-model.md](../specs/02-domain-model.md) §6.
