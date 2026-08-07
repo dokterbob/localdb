@@ -79,7 +79,8 @@ cargo install --git https://github.com/dokterbob/localdb localdb
 `localdb init` prints:
 
 ```
-Note: embedding models will be downloaded on first index.
+Note: when using 'local-onnx' provider, the ONNX model is downloaded on first index.
+      Hosted providers (openai-compatible, perplexity, voyage) require an API key in config.
 ```
 
 **This message is accurate.** The default embedder (`pplx-embed-context-v1-0.6b`) is

@@ -143,8 +143,11 @@ to the appropriate crate. No logic of its own. Subcommands: `init`, `serve`, `mc
 ```
 
 Content-addressed IDs (`blake3`) flow through every step: documents get
-`blake3(uri ‖ content_hash)` and chunks get `blake3(document_id ‖ chunk_text ‖ span)`,
-making re-indexing idempotent. See [specs/02-domain-model.md](../specs/02-domain-model.md) §3.
+`blake3(uri ‖ content_hash)` and chunks get
+`blake3(resource_id ‖ block_seq ‖ chunk_text ‖ seq_in_block)`, making re-indexing idempotent.
+Span (byte offsets) is deliberately excluded — it can shift slightly between runs (e.g. from
+whitespace-normalization tweaks) without the chunk's actual membership changing, which would
+otherwise needlessly churn IDs. See [specs/02-domain-model.md](../specs/02-domain-model.md) §3.
 
 The `Citation` is the canonical output shape used by every surface — CLI, HTTP, and MCP all
 return the same structure. See [specs/02-domain-model.md](../specs/02-domain-model.md) §6.
@@ -286,8 +289,8 @@ verify both the `localdb` binary and the embedded `.so` stay at or below `GLIBC_
 
 This section documents verified divergences between the specs and the v0.1.0 implementation. They are listed honestly so contributors know where work remains. Each item names the responsible code area.
 
-**1. HTTP daemon `POST /v1/jobs` is a no-op.**
-The daemon's job-submission endpoint accepts the request and reports the job state machine (`pending → done`) but does not run the ingestion pipeline; `chunks_written` stays `0`. Daemon-side reads (`/v1/search`, `/v1/documents/{id}`, `/v1/status`) DO see CLI-indexed data because the daemon now opens the same unified database as the CLI. To actually index, run `localdb index` from the CLI (which still works while the daemon runs — concurrent writers serialise via SQLite WAL).
+**1. HTTP daemon `POST /v1/jobs` is a no-op.** ([#187](https://github.com/dokterbob/localdb/issues/187))
+The daemon's job-submission endpoint accepts the request and reports the job state machine (`pending → done`) but does not run the ingestion pipeline; `chunks_written` stays `0`. Daemon-side reads (`/v1/search`, `/v1/documents/{id}`, `/v1/status`) DO see CLI-indexed data because the daemon now opens the same unified database as the CLI. `localdb index` does not route around this — when a daemon is running it proxies the job to the same no-op endpoint. To actually index, stop the daemon first, then run `localdb index`.
 
 **Gap #2. `source add` does not validate path existence.** ([#14](https://github.com/dokterbob/localdb/issues/14))
 **Resolved as of 2026-06-28:** `cli/src/lib.rs` now validates path existence in `run_source_add_async` via `normalize_path_source`.
