@@ -20,7 +20,8 @@ Initialized localdb at ~/Library/Application Support/com.localdb.localdb.localdb
   Config: ~/Library/Application Support/com.localdb.localdb.localdb/config.yaml
   Data:   ~/Library/Application Support/com.localdb.localdb.localdb/data
 
-Note: embedding models will be downloaded on first index.
+Note: when using 'local-onnx' provider, the ONNX model is downloaded on first index.
+      Hosted providers (openai-compatible, perplexity, voyage) require an API key in config.
 Run `localdb store add <name>` to create a store.
 ```
 
@@ -36,7 +37,7 @@ version: 1
 # Add stores and sources below.
 ```
 
-> **Note on the "embedding models will be downloaded" message:** This is accurate. The default
+> **Note on the model-download message:** It is accurate. The default
 > embedder (`pplx-embed-context-v1-0.6b`) is downloaded from HuggingFace (~706 MB) the first
 > time `localdb index` or `localdb search` runs. No API key or license click-through is required.
 > Subsequent runs use the cached model. See
@@ -91,7 +92,7 @@ localdb store list
 ```
 
 ```
-notes [libsql] (runtime)
+notes [libsql]
 ```
 
 The `[libsql]` label is the storage backend.
@@ -115,7 +116,7 @@ localdb source list --store notes
 ```
 
 ```
-01KTVH6AY4DC84HWW7M2PP4F0X [path] ~/notes
+01KTVH6AY4DC84HWW7M2PP4F0X [path] /home/user/notes
 ```
 
 ## Step 6 — Index
@@ -127,8 +128,8 @@ localdb index --store notes
 ```
 
 ```
-Indexing source 01KTVH6AY4DC84HWW7M2PP4F0X (~/notes)
-Index complete: 3 indexed, 0 skipped, 3 chunks written, 0 errors
+Indexing /home/user/notes
+Index complete: 3 indexed, 0 skipped, 3 chunks written, 0 unsupported, 0 errors
 ```
 
 (Output reflects a corpus of three files; your counts will differ.)
@@ -147,20 +148,16 @@ data/
 Run a plain-text search across the indexed store:
 
 ```bash
-localdb search how does rust handle errors
+localdb search hybrid search
 ```
 
 ```
-1. file:///path/to/notes/rust-error-handling.md > Error handling in Rust
-   Error handling in Rust
-Rust uses the Result type for recoverable errors and panic! for unrecoverable ones. The question-
+1. file:///home/user/notes/lancedb-notes.md > LanceDB notes
+   LanceDB is an embedded vector database built on the Lance columnar format. It supports hybrid search combining vector similarity with BM25 full-text scoring.
 
-2. file:///path/to/notes/meeting.txt
-   Meeting 2026-06-02: decided to adopt reciprocal rank fusion for combining dense and sparse retrieval results. Aardvark c
+2. file:///home/user/notes/meeting.txt
+   Meeting 2026-06-02: decided to adopt reciprocal rank fusion for combining dense and sparse retrieval results. Aardvark connectors are deferred to the next milestone.
 
-3. file:///path/to/notes/lancedb-notes.md > LanceDB notes
-   LanceDB notes
-LanceDB is an embedded vector database built on the Lance columnar format. It supports hybrid search combi
 ```
 
 (Paths shown from a scratch run.)
@@ -168,7 +165,7 @@ LanceDB is an embedded vector database built on the Lance columnar format. It su
 Limit results with `--limit`:
 
 ```bash
-localdb search --limit 2 rank fusion
+localdb search --limit 1 rank fusion
 ```
 
 ### JSON output
@@ -184,35 +181,69 @@ localdb search -s notes --json hybrid search
 {
   "citations": [
     {
-      "chunk_id": "f0113639ebf62fa402aa506a80e0f6dba19a970cfbea3c80ffbb4ca082db30e7",
-      "document_id": "ff6ff626d0062eab2d3a5f76dbbe75e6a265a127d99486cacfcde9f42777fe1d",
+      "block": {
+        "kind": "text",
+        "seq": 1
+      },
+      "chunk_id": "82b4631e898166f7834a786b1e8e56125ce6bfc2193fc210f591179527abbdcb",
+      "chunk_position": {
+        "seq_in_block": 0
+      },
       "heading_path": [
         "LanceDB notes"
       ],
+      "location": {
+        "span": {
+          "end": 157,
+          "start": 0
+        }
+      },
+      "metadata": {
+        "contributor": [],
+        "coverage": null,
+        "creator": [],
+        "date": null,
+        "description": null,
+        "format": "text/markdown",
+        "identifier": null,
+        "kind": "document",
+        "language": null,
+        "page_count": null,
+        "publisher": null,
+        "relation": [],
+        "rights": null,
+        "source": null,
+        "subject": [],
+        "title": "LanceDB notes",
+        "type": null,
+        "word_count": null
+      },
       "provenance": {
-        "content_hash": "360be062b82116aa1a7f707bc9ea9d2f60e0f619e84e4f0f72e8f689d0e18f64",
+        "content_hash": "55567825f371ea048f61a59fa156068945a7ef0d9276b7813438820002ce72a2",
         "fetched_at": "2026-06-11T14:17:30Z"
       },
+      "resource_id": "ee2cfd35725ead3b0fb7ebccdcc4cf9fa0ea6990ac2fa1276dc689e1abed6700",
       "score": {
         "bm25": 1.9203118085861206,
-        "dense": 0.64,
+        "dense": 0.640625,
         "fused": 0.032266458495966696
       },
-      "snippet": "LanceDB notes\nLanceDB is an embedded vector database built on the Lance columnar format. It supports hybrid search combining vector similarity with BM25 full-text scoring.\n",
-      "span": {
-        "end": 172,
-        "start": 0
-      },
+      "snippet": "LanceDB is an embedded vector database built on the Lance columnar format. It supports hybrid search combining vector similarity with BM25 full-text scoring.",
       "store": {
         "id": "01KTVGQ62TQN8X6XN9E5FDZN67",
         "name": "notes"
       },
       "title": "LanceDB notes",
-      "uri": "file:///private/tmp/localdb-recon.0z2dTw/notes/lancedb-notes.md"
+      "uri": "file:///home/user/notes/lancedb-notes.md"
     }
   ]
 }
 ```
+
+(The structural fields above — `block`, `chunk_position`, `heading_path`,
+`location.span`, `snippet`, `metadata`, `chunk_id`, `resource_id` and
+`provenance.content_hash` — are captured from a real indexing run. `score`,
+`store` and `provenance.fetched_at` are illustrative.)
 
 (Output truncated to one result; paths shown from a scratch run.)
 
@@ -230,7 +261,7 @@ localdb status
 ```
 daemon: not running (embedded mode)
 stores (1):
-  notes [libsql] (runtime)
+  notes [libsql]
 ```
 
 ## What's next
