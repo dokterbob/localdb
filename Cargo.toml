@@ -91,6 +91,7 @@ cli = { path = "cli" }
 
 [profile.dev]
 opt-level = 0
+debug = "line-tables-only"
 
 [profile.release]
 opt-level = 3
