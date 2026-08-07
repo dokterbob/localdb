@@ -1,0 +1,73 @@
+{
+  "file": "gutenberg-car-of-destiny-clean.pdf",
+  "expect": "ok",
+  "pages": 12,
+  "forbid_substrings": [
+    "�"
+  ],
+  "title_contains": "Car of Destiny",
+  "notes": "NEGATIVE CONTROL fixture: a clean, well-formed, born-digital PDF -- Project Gutenberg's own generated PDF (https://www.gutenberg.org/files/23500/23500-pdf.pdf, ebook #23500) of C. N. and A. M. Williamson's 1908 novel 'The Car of Destiny', trimmed from the full 424-page file to 12 representative pages (title page, both pages of the table of contents, then the opening of Chapter I 'The King's Car' running into the start of Chapter II 'The Girl'). Vector text throughout, justified paragraphs, real chapter headings ('I' / 'The King's Car' and 'II' / 'The Girl') and abundant quoted first-person dialogue ('\"Motor to Biarritz? You must be mad,\" said Dick Waring.') in ordinary prose paragraphs with no tables, columns, scans, or images -- any of this corpus's defect guards (A/D/E/F) that fires on this fixture is a false positive by construction, since there is nothing here for them to correctly flag. (Note: pdfplumber's own word splitter drops inter-word spaces on several front-matter lines in this file, e.g. rendering 'The Car of Destiny' as 'TheCarofDestiny' -- verified by rendering the pages that this is a pdfplumber word-grouping artifact, not a defect of the underlying PDF: the pypdfium2 image renders show normal, correctly spaced justified text throughout.) Ground truth was transcribed from pypdfium2 page renders at ~144 DPI. All 12 pages carry substantial text, so phrase_recall_applies and the 0.8 recall floor is exercised here as well. Public domain: hosted by Project Gutenberg, which only distributes texts it has confirmed are public domain in the United States; first published 1908, both authors long deceased.",
+  "forbid_code_fences": true,
+  "page_phrases": {
+    "1": [
+      "THE",
+      "CAR OF DESTINY",
+      "C. N. AND A. M. WILLIAMSON"
+    ],
+    "2": [
+      "The King's Car",
+      "The Girl",
+      "The Guest Who Was Not Asked"
+    ],
+    "3": [
+      "The Hand Under the Curtains",
+      "The Seven Men of Ecija",
+      "The Fifth Bull; and After"
+    ],
+    "4": [
+      "Motor to Biarritz? You must be mad",
+      "said Dick Waring",
+      "I wish him happiness"
+    ],
+    "5": [
+      "when I was twenty-one, the longing to see Spain had become an obsession",
+      "I was suspected and clapped into a cell",
+      "Pride kept me from answering that question with the name of"
+    ],
+    "6": [
+      "I've never yet regretted rashness",
+      "So we started from Paris the next day",
+      "We put up at a private hotel out of the way from fashionable"
+    ],
+    "7": [
+      "I give you up",
+      "There were five persons in the King's car",
+      "I wish something would happen to them"
+    ],
+    "8": [
+      "who had hastily whipped off their veils, turned and glanced at me",
+      "the son of a banished rebel, to the King's aid",
+      "I was conscious only of the girl's eyes"
+    ],
+    "9": [
+      "knowing the traditions of our family",
+      "What's the matter?",
+      "whether she was the Princess, or"
+    ],
+    "10": [
+      "It was easy to learn that she was not the Princess",
+      "Lady Monica Vale, daughter of the widowed Countess of Vale-Avon",
+      "the two were staying at Biarritz, in a villa"
+    ],
+    "11": [
+      "It was half-past ten o'clock, and a night flooded with moonlight",
+      "We're meant for each other",
+      "piled up as barriers between us, I'd cross them"
+    ],
+    "12": [
+      "through the remaining hours of the night I tried to plan",
+      "you're in a hopeless position",
+      "you can't meet this young lady"
+    ]
+  }
+}

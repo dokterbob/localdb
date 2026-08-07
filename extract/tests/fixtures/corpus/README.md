@@ -52,5 +52,8 @@ GitHub sources are pinned to the commit SHA they were fetched from.
 | `damaged-content-stream.pdf` | qpdf's damaged/truncated content-stream regression fixture | Apache-2.0 (qpdf) | github.com/qpdf/qpdf @ 8ff6b5c |
 | `broken-xref-qpdf.pdf` | 819-byte qpdf corrupted-xref regression fixture | Apache-2.0 (qpdf) | github.com/qpdf/qpdf @ 8ff6b5c |
 | `simple-multipage-text.pdf` | Clean 4-page text control with distinguishable per-page content | CC0 / public domain (self-authored) | — |
+| `paragonah-archeology-partial-scan.pdf` | Real IA scan with a PARTIAL text layer: dense OCR body text bracketed by near-empty front matter and a full-page image plate with no text | Public domain (1919 Smithsonian publication) | archive.org/details/archeologicalinv00juddrich |
+| `alice-wonderland-quoted-dialogue.pdf` | Real IA scan of a typeset novel with dense quoted dialogue and a real chapter heading + running header/folio | Public domain (first published 1865) | archive.org/details/alicesadventures0000lewi_i4x4 |
+| `gutenberg-car-of-destiny-clean.pdf` | Negative control: clean, well-formed, born-digital Project Gutenberg PDF with dialogue and chapter headings | Public domain (Gutenberg eBook #23500, 1908) | gutenberg.org/ebooks/23500 |
 
 See `manifest.json` for exact URLs, commit SHAs, and sha256 checksums.

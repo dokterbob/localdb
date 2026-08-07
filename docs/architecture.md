@@ -331,6 +331,31 @@ re-extracted. Threading a real per-parser `extractor_version` into the
 skip-check would close that last axis and is a deferred follow-up (cross-ref
 [#47](https://github.com/dokterbob/localdb/issues/47)).
 
+**9. Residual PDF-extraction gaps.**
+`extract/src/pdf.rs` repairs several classes of upstream extraction defect (see
+[specs/04-search-pipeline.md](../specs/04-search-pipeline.md) §"PDF extraction is tuned for
+retrieval"). These remain:
+
+- **No title fallback.** A PDF carrying neither `/Title` nor XMP `dc:title` gets
+  `title: null`. There is deliberately no filename or first-page heuristic — a guessed
+  title presented as metadata is worse than an absent one.
+- **Heading and code-block inference is heuristic, and upstream.** Headings come from the
+  extractor's font clustering and code blocks from its monospace detection. Our guards
+  suppress **false positives only**: a heading the extractor never detected (a Part title
+  in a different face, say) cannot be recovered, so `heading_path` will keep reporting the
+  last heading it did see. Conversely, code that reads as English prose — Inform 7,
+  period-terminated Gherkin, pseudocode paragraphs — is un-fenced and labelled `text`. Both
+  cost a wrong label, never altered text.
+- **Spurious intra-word spaces.** Glyph-run clustering can split a word (`"consid ered"`,
+  `"investi tions"`). There is no hyphen and no positional signal left after reflow, so
+  rejoining needs sentence context rather than a regex: English is full of legitimate pairs
+  whose concatenation is also a word (`a bout`/`about`, `in to`/`into`, `any one`/`anyone`),
+  and misjoining those silently changes meaning. Tracked separately.
+- **Untagged running headers survive.** Artifact-tagged furniture is dropped, but a PDF that
+  does not tag its running heads keeps them. The upstream geometric stripper is unsafe (it
+  deletes body text from multi-column documents) — see
+  [docs/followups-pdf-oxide-swap.md](followups-pdf-oxide-swap.md) §2a.
+
 ---
 
 ## Deferred design decisions {#design-decisions}

@@ -88,5 +88,32 @@
     "redistributable": true,
     "why_difficult": "Not difficult by design -- a clean, uncomplicated 4-page text-only PDF (standard font, single column, no images) with clearly distinguishable per-page content, included as a baseline/control fixture so ground-truth expectations have a 'nothing should go wrong here' reference point.",
     "pages": 4
+  },
+  {
+    "file": "paragonah-archeology-partial-scan.pdf",
+    "source_url": "https://archive.org/download/archeologicalinv00juddrich/archeologicalinv00juddrich.pdf",
+    "sha256": "67df2202bb98be92258af7fa3ae9aaa13758a958af5972b24773d87cfb2d7700",
+    "license": "Public domain -- Neil M. Judd, \"Archeological Investigations at Paragonah, Utah\" (Smithsonian Miscellaneous Collections, Vol. 70, No. 3), published 1919 by the Smithsonian Institution; Internet Archive item metadata records possible-copyright-status NOT_IN_COPYRIGHT and no access restriction. Vendored file is a locally-trimmed subset (pages 2-32 of the original 52-page IA derivative PDF, re-saved with pikepdf to drop unreferenced objects) to stay under the corpus size cap; sha256 above is of the trimmed file actually committed, not IA's original derivative.",
+    "redistributable": true,
+    "why_difficult": "Genuine Internet Archive OCR scan with a PARTIAL text layer: 22 consecutive pages of dense real body text (running headers alternating 'ARCHEOLOGICAL INVESTIGATIONS AT PARAGONAH-JUDD' / 'SMITHSONIAN MISCELLANEOUS COLLECTIONS VOL. 70' with page-number folios) are bracketed by front-matter pages with ~0 extracted characters (bookplate, blank flyleaves, duplicated title-page scans) and end in a full-page rotated line-drawing site plate with 0 extracted text -- the positive real-world case for defect D (an extractor must not choke on or hallucinate text for a genuine image-only page) and defect A (running headers/folios must be recognized, not swallowed into body text).",
+    "pages": 30
+  },
+  {
+    "file": "alice-wonderland-quoted-dialogue.pdf",
+    "source_url": "https://archive.org/download/alicesadventures0000lewi_i4x4/alicesadventures0000lewi_i4x4.pdf",
+    "sha256": "e0b9ba260330720c9e2d04b724a9a32c7a69e87093922a3d0fd203b01bc14392",
+    "license": "Public domain -- Lewis Carroll (1832-1898), \"Alice's Adventures in Wonderland\", first published 1865; this scanned printing is a ca. 1910 Tenniel-illustrated edition. Internet Archive item metadata (identifier alicesadventures0000lewi_i4x4) records no access restriction. Vendored file is a locally-trimmed 12-page subset (original pages 13-24, re-saved with pikepdf/new-document page copy to drop unreferenced objects) to stay well under the corpus size cap; sha256 above is of the trimmed file actually committed, not IA's original derivative.",
+    "redistributable": true,
+    "why_difficult": "Genuine Internet Archive scan of a typeset novel spanning Chapter I's opening ('DOWN THE RABBIT-HOLE.') into the start of Chapter II, chosen for dense quoted first-person dialogue in ordinary book typography (positive case for defect F: prose dialogue must never be misdetected as a code block) and a real chapter heading plus an alternating running header/folio that must survive extraction (defect E).",
+    "pages": 12
+  },
+  {
+    "file": "gutenberg-car-of-destiny-clean.pdf",
+    "source_url": "https://www.gutenberg.org/files/23500/23500-pdf.pdf",
+    "sha256": "d043972cc8a79d9c2d8de4bef4594e0378f63d620dbc2cc81d0e5d7bd9ca24ab",
+    "license": "Public domain -- Project Gutenberg eBook #23500, C. N. and A. M. Williamson, \"The Car of Destiny\", first published 1908. Project Gutenberg only distributes texts confirmed public domain in the United States.",
+    "redistributable": true,
+    "why_difficult": "Not difficult by design -- NEGATIVE CONTROL fixture: a clean, well-formed, born-digital PDF (Project Gutenberg's own generated PDF, vector text, no scan artifacts) trimmed to 12 pages (title page, table of contents, and the Chapter I / Chapter II openings) containing plenty of quoted dialogue and real chapter headings, included so that any defect guard (A/D/E/F) firing here is known to be a false positive.",
+    "pages": 12
   }
 ]

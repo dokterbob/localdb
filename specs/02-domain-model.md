@@ -298,6 +298,23 @@ Dublin Core Metadata Element Set 1.1 (DCMES), all 15 elements. Repeatable elemen
 | `coverage` | `Option<String>` | Spatial or temporal extent. |
 | `rights` | `Option<String>` | Rights statement or license. |
 
+#### Population by source format
+
+EPUB populates the set from the OPF, whose metadata *is* Dublin Core. PDF populates it from the
+Info dictionary first, with XMP as a per-field fallback: `/Title`, `/Author` → `creator`,
+`/Subject` → `description`, `/Keywords` → `subject` (split on `,` and `;`), `/CreationDate` →
+`date` (PDF date syntax `D:YYYYMMDDHHmmSSOHH'mm'` parsed to ISO-8601; on parse failure the field
+is left empty rather than storing the raw string), then XMP's `dc:creator`, `dc:description`,
+`dc:subject`, `dc:language`, `dc:rights` and `xmp:CreateDate`.
+
+Two fields are deliberately left empty for PDFs. `publisher` has no honest source — the Info
+dictionary's nearest key, `/Producer`, is the *generating software* ("Adobe PDF Library 15.0"),
+not the publisher of the work. And `title` has no filename or first-page fallback: a PDF that
+carries neither `/Title` nor XMP has no title, and inventing one would be a guess presented as
+data.
+
+`format` is set by the parser from the sniffed MIME type, not read from the document.
+
 ### Metadata enum
 
 ```rust

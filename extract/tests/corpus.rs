@@ -32,7 +32,17 @@ const PHRASE_RECALL_FLOOR: f64 = 0.8;
 /// reading order legitimately differs from the visual order a human (or the
 /// image-reading agent) follows, so exact-phrase recall understates quality.
 /// Those still get the no-panic, page-count, and anti-mojibake checks.
-fn phrase_recall_applies(expect: &str, pages: u64, total_phrases: usize) -> bool {
+///
+/// An expectation file may also opt out explicitly with
+/// `"recall_exempt_reason": "…"`. That exists for scans whose *embedded OCR
+/// layer* is itself degraded: ground truth is transcribed from the rendered
+/// page images (the corpus contract), so exact-phrase recall there measures
+/// the source scan's OCR quality, not this extractor's fidelity. The reason
+/// string is mandatory so an exemption can never be a silent one.
+fn phrase_recall_applies(exp: &Value, expect: &str, pages: u64, total_phrases: usize) -> bool {
+    if exp.get("recall_exempt_reason").is_some() {
+        return false;
+    }
     expect == "ok" && pages <= 12 && total_phrases >= 3
 }
 
@@ -118,6 +128,81 @@ fn check_one(exp_path: &Path) -> bool {
         "{label}: extracted text contains U+FFFD replacement char"
     );
 
+    // pdf_oxide's skipped-page marker must never reach the index: it is not
+    // content, and because it is printable it also masks scanned pages from
+    // `is_scanned_pdf`. Turned off via `annotate_skipped_pages: false`;
+    // asserted globally so re-enabling it can never regress silently.
+    for marker in ["[OCR REQUIRED", "scanned/rasterised"] {
+        assert!(
+            !extracted.markdown.contains(marker),
+            "{label}: skipped-page marker {marker:?} was indexed as content"
+        );
+    }
+
+    // Ligatures are expanded (`expand_ligatures: true`) so BM25 tokenization
+    // and the embedder see real words: no U+FB00–U+FB06 may survive.
+    if let Some(lig) = extracted
+        .markdown
+        .chars()
+        .find(|c| ('\u{FB00}'..='\u{FB06}').contains(c))
+    {
+        panic!(
+            "{label}: unexpanded ligature {lig:?} (U+{:04X}) in extracted text",
+            lig as u32
+        );
+    }
+
+    // `"forbid_code_fences": true` — the defect-F guard: a real book's
+    // quoted dialogue must not survive as a fenced code block. Set on the
+    // dialogue-dense novel fixtures.
+    if exp
+        .get("forbid_code_fences")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        assert!(
+            !extracted.markdown.contains("```"),
+            "{label}: prose was fenced as code (defect F)"
+        );
+    }
+
+    // `"require_headings": [...]` — the defect-E guard from the other side:
+    // these genuine chapter headings must still be headings, not demoted to
+    // paragraphs. A guard that suppresses false positives must not cost us
+    // true ones.
+    if let Some(required) = exp.get("require_headings").and_then(|v| v.as_array()) {
+        let headings: Vec<String> = extracted
+            .markdown
+            .lines()
+            .filter(|l| l.trim_start().starts_with('#'))
+            .map(normalize_ws)
+            .collect();
+        for want in required.iter().filter_map(|v| v.as_str()) {
+            let want_n = normalize_ws(want);
+            assert!(
+                headings.iter().any(|h| h.contains(&want_n)),
+                "{label}: required heading {want:?} did not survive as a heading; \
+                 got headings: {headings:?}"
+            );
+        }
+    }
+
+    // `"expect_textless_pages": N` — the defect-D guard. A page with no text
+    // layer must contribute *nothing*: no page-start offset, and (asserted
+    // globally above) no `[OCR REQUIRED …]` marker text masquerading as
+    // content. Pinned on the partial-scan fixture, whose blank flyleaves and
+    // full-page image plate are the real-world case.
+    if let Some(want) = exp.get("expect_textless_pages").and_then(|v| v.as_u64()) {
+        let got = pages - extracted.page_starts.len() as u64;
+        assert_eq!(
+            got,
+            want,
+            "{label}: expected {want} pages with no text layer to be dropped, got {got} \
+             ({} of {pages} pages contributed content)",
+            extracted.page_starts.len()
+        );
+    }
+
     // Structural page check for paginated "ok" documents.
     if expect == "ok" && pages > 0 {
         let n = extracted.page_starts.len();
@@ -141,7 +226,7 @@ fn check_one(exp_path: &Path) -> bool {
 
     // Phrase recall for small, clean documents.
     let phrases = all_phrases(&exp);
-    if phrase_recall_applies(expect, pages, phrases.len()) {
+    if phrase_recall_applies(&exp, expect, pages, phrases.len()) {
         let haystack = normalize_ws(&extracted.markdown);
         let found = phrases
             .iter()
