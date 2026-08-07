@@ -32,6 +32,7 @@ which also wipes the dependency cache and costs a full rebuild (~15 min for this
 | `cli` | Thin surface over `core`; `init`, `store`, `source`, `index`, `search` commands |
 | `embed` | Embedder implementations: ONNX (local), OpenAI-compatible, Perplexity, Voyage |
 | `extract` | Format detection and text extraction (Markdown, plain text, HTML, PDF → Markdown) |
+| `fetch` | The `UrlFetcher` impl (reqwest). Two clients: `new()` unrestricted for operator-configured URLs, `new_public_only()` with the SSRF destination guard for URLs discovered in untrusted content (feed entry links) |
 | `ingest` | Concrete `Ingestor` impls (`FileIngestor`, `UrlIngestor`, future connectors — Atom/RSS, Notion, Telegram, …); depends on `core` + `extract`; owns all acquisition I/O |
 | `localdb` | Binary entry point; wires all subcommands |
 | `mcp` | `rmcp`-based MCP server, stdio (embedded or daemon-proxied) and HTTP (`/mcp`); tools: `search`, `get_document`, `get_chunks`, `list_stores` |

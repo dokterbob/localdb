@@ -386,6 +386,18 @@ Extending the same classification to `FileIngestor` — and giving `index_resour
 "empty ≠ deleted" rule, so the guard is an invariant rather than per-ingestor discipline — is
 tracked in #185.
 
+**15. There is no opt-in for private-network feed entry links.**
+Discovery mode fetches entry links through a public-destination-only HTTP client (see
+[specs/02-domain-model.md](../specs/02-domain-model.md) § "Feed connector", *Destination policy*),
+and v0.1 offers no way to relax that. An operator running an internal feed whose entries link to
+LAN hosts gets those entries indexed from their embedded summaries only — the linked pages are
+never fetched, silently from the operator's point of view apart from a `WARN` log line. There is
+also a residual hole the guard deliberately does not close: the **feed URL itself** uses the
+unrestricted client (it is operator-configured, the same trust class as a `url` source), so a
+feed URL that 30x's to a private destination is still followed. A per-source or global
+allow-private-destinations setting would address both at once — the opt-in and the residual
+redirect risk — and is the shape the follow-up issue proposes.
+
 A related feed-specific identity bug lives in the same family:
 [#186](https://github.com/dokterbob/localdb/issues/186) — an entry with no guid, no link and no
 title gets a random UUID identity on every parse, so it is re-indexed and its previous copy

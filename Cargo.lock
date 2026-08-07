@@ -1642,6 +1642,7 @@ dependencies = [
  "localdb-core",
  "reqwest 0.12.28",
  "tokio",
+ "tracing",
  "wiremock",
 ]
 

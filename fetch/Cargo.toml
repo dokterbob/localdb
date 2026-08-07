@@ -10,7 +10,11 @@ description = "HTTP URL fetcher implementation for localdb ingestion"
 localdb-core = { path = "../core" }
 async-trait = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Real dependency, not just dev: `destination::GuardedResolver` resolves names
+# itself via `tokio::net::lookup_host` (`reqwest::dns::Resolve` has no
+# delegate-to-default hook).
+tokio = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
 wiremock = "0.6"

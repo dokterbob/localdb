@@ -59,6 +59,13 @@ pub(crate) enum UrlOutcome {
     Indexed,
     Unchanged,
     Gone,
+    /// The fetcher refused the destination (see `FetchResult::Blocked`).
+    /// Reported like `Gone` from here — log and return, no callback — so the
+    /// caller decides. Unlike `Gone`, though, "no callback" is NOT a
+    /// delete-sweep signal the caller may rely on: `UrlIngestor` must report
+    /// this explicitly (see its match arm), and `FeedIngestor` folds it into
+    /// the embedded-content fallback chain.
+    Blocked,
     Unsupported,
     /// The parser accepted the format (`Ok(Some(doc))`) but `doc.markdown`
     /// trims to nothing. Distinct from `Unsupported` — see the module doc.
@@ -170,6 +177,18 @@ pub(crate) async fn process_url(
             // Staying silent here is what gets this URI's chunks deleted.
             tracing::info!(url = %locator, "process_url: URL is gone (404/410)");
             return Ok(UrlOutcome::Gone);
+        }
+        FetchResult::Blocked => {
+            // Mirrors the `Gone` arm structurally — log and return without a
+            // callback, leaving the decision to the caller — but for a
+            // different reason: the destination was refused before any
+            // connection happened, so we know nothing about whether the
+            // resource exists. Every caller must therefore report *something*
+            // for this URI (see `UrlOutcome::Blocked`), or the delete-sweep
+            // would read the silence as "gone" and delete content that is
+            // very much still there.
+            tracing::warn!(url = %locator, "process_url: destination blocked by fetch policy");
+            return Ok(UrlOutcome::Blocked);
         }
     };
 

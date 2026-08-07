@@ -47,6 +47,8 @@ enum ScriptedOutcome {
     },
     NotModified,
     Gone,
+    /// The destination guard refused this URL — no connection was made.
+    Blocked,
 }
 
 impl ScriptedOutcome {
@@ -127,6 +129,7 @@ impl UrlFetcher for ScriptedFetcher {
             }),
             Some(ScriptedOutcome::NotModified) => Ok(FetchResult::NotModified),
             Some(ScriptedOutcome::Gone) => Ok(FetchResult::Gone),
+            Some(ScriptedOutcome::Blocked) => Ok(FetchResult::Blocked),
             None => Err(Error::Internal {
                 message: "simulated fetch error".to_string(),
                 correlation_id: "test_fetch_error".to_string(),
@@ -165,7 +168,17 @@ fn ingestor_with(
             self.0.fetch(url, meta).await
         }
     }
-    let ingestor = FeedIngestor::new(Box::new(PlainParser), Box::new(ArcFetcher(fetcher.clone())));
+    // Both the feed fetcher and the entry fetcher are the same scripted
+    // double here: the production split is about *destination policy*, which
+    // a scripted fetcher has none of, and sharing one script keeps every
+    // pre-existing test's expectations (including `call_count`) unchanged.
+    // `feed_entry_link_blocked_falls_back_to_embedded_content` below scripts
+    // a `Blocked` outcome to exercise the entry-fetcher path specifically.
+    let ingestor = FeedIngestor::new(
+        Box::new(PlainParser),
+        Box::new(ArcFetcher(fetcher.clone())),
+        Box::new(ArcFetcher(fetcher.clone())),
+    );
     (ingestor, fetcher)
 }
 
@@ -180,8 +193,14 @@ fn rss2_feed(channel_extra: &str, items_xml: &str) -> String {
 }
 
 fn atom_feed(entries_xml: &str) -> String {
+    atom_feed_with("", entries_xml)
+}
+
+/// `atom_feed` plus arbitrary feed-level children (e.g. a feed-level
+/// `<author>`), injected before the entries.
+fn atom_feed_with(feed_extra: &str, entries_xml: &str) -> String {
     format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><feed xmlns="http://www.w3.org/2005/Atom"><title>Test Feed</title><id>urn:test-feed</id><updated>2026-01-01T00:00:00Z</updated><link href="https://feed.example.com/" rel="alternate"/>{entries_xml}</feed>"#
+        r#"<?xml version="1.0" encoding="UTF-8"?><feed xmlns="http://www.w3.org/2005/Atom"><title>Test Feed</title><id>urn:test-feed</id><updated>2026-01-01T00:00:00Z</updated><link href="https://feed.example.com/" rel="alternate"/>{feed_extra}{entries_xml}</feed>"#
     )
 }
 
@@ -1154,7 +1173,11 @@ async fn entry_link_unsupported_falls_back_to_embedded_content() {
         }
     }
     // NoneParser declines everything -> Unsupported on the entry page.
-    let ingestor = FeedIngestor::new(Box::new(NoneParser), Box::new(ArcFetcher(fetcher)));
+    let ingestor = FeedIngestor::new(
+        Box::new(NoneParser),
+        Box::new(ArcFetcher(fetcher.clone())),
+        Box::new(ArcFetcher(fetcher)),
+    );
     let source = source_for("https://feed.example.com/feed.xml", None, true);
     let mut cb = RecordingCallback::default();
     let result = ingestor.ingest(&source, &mut cb).await.unwrap();
@@ -1989,5 +2012,151 @@ async fn large_generated_feed_smoke_test_no_pathological_slowness() {
     assert!(
         elapsed.as_secs() < 10,
         "2000-entry feed took pathologically long: {elapsed:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Destination guard (SSRF): a blocked entry link degrades to embedded content
+// ---------------------------------------------------------------------------
+
+/// The user-visible half of the entry-link SSRF guard. `FetchResult::Blocked`
+/// joins `Gone`/`Unsupported`/`Empty` in the fallback set, so an entry whose
+/// link points at a non-routable destination is still indexed — from its own
+/// embedded summary — rather than erroring or (worse) silently disappearing.
+#[tokio::test]
+async fn entry_link_blocked_falls_back_to_embedded_content() {
+    let items = r#"<item><title>E1</title><link>http://127.0.0.1:8080/internal</link><guid>e1</guid><pubDate>Mon, 05 Jan 2026 00:00:00 GMT</pubDate><description>Embedded body text</description></item>"#;
+    let feed_xml = rss2_feed("", items);
+    let mut script = HashMap::new();
+    script.insert(
+        "https://feed.example.com/feed.xml".to_string(),
+        ScriptedOutcome::text(&feed_xml),
+    );
+    script.insert(
+        "http://127.0.0.1:8080/internal".to_string(),
+        ScriptedOutcome::Blocked,
+    );
+    let (ingestor, _fetcher) = ingestor_with(script);
+    let source = source_for("https://feed.example.com/feed.xml", None, true);
+    let mut cb = RecordingCallback::default();
+    let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+    assert_eq!(result.resources_produced, 1);
+    assert_eq!(
+        result.errors, 0,
+        "a blocked destination is a policy decision, not a failure"
+    );
+    let text = cb.resources[0]
+        .blocks
+        .iter()
+        .map(|b| b.text.clone())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(text.contains("Embedded body text"), "got: {text}");
+}
+
+/// The URI must still be reported even when the blocked entry has nothing to
+/// fall back to — silence would be read by the delete-sweep as "gone".
+#[tokio::test]
+async fn entry_link_blocked_with_no_embedded_content_reports_the_uri() {
+    let items = r#"<item><link>http://169.254.169.254/latest/meta-data/</link><guid>e1</guid><pubDate>Mon, 05 Jan 2026 00:00:00 GMT</pubDate></item>"#;
+    let feed_xml = rss2_feed("", items);
+    let mut script = HashMap::new();
+    script.insert(
+        "https://feed.example.com/feed.xml".to_string(),
+        ScriptedOutcome::text(&feed_xml),
+    );
+    script.insert(
+        "http://169.254.169.254/latest/meta-data/".to_string(),
+        ScriptedOutcome::Blocked,
+    );
+    let (ingestor, _fetcher) = ingestor_with(script);
+    let source = source_for("https://feed.example.com/feed.xml", None, true);
+    let mut cb = RecordingCallback::default();
+    let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+    assert_eq!(result.resources_produced, 0);
+    assert_eq!(result.errors, 1);
+    assert_eq!(
+        cb.skipped.len(),
+        1,
+        "the URI must be reported so the delete-sweep does not read silence as deletion"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Atom feed-level <author> inheritance (RFC 4287 §4.2.1)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn discovery_entry_inherits_feed_level_author() {
+    let entries = r#"<entry><title>E1</title><id>urn:e1</id><updated>2026-01-05T00:00:00Z</updated><summary>Body</summary></entry>"#;
+    let feed_xml = atom_feed_with(r#"<author><name>Feed Author</name></author>"#, entries);
+    let mut script = HashMap::new();
+    script.insert(
+        "https://feed.example.com/feed.xml".to_string(),
+        ScriptedOutcome::text(&feed_xml),
+    );
+    let (ingestor, _fetcher) = ingestor_with(script);
+    let source = source_for("https://feed.example.com/feed.xml", None, true);
+    let mut cb = RecordingCallback::default();
+    ingestor.ingest(&source, &mut cb).await.unwrap();
+
+    assert_eq!(cb.resources.len(), 1);
+    assert_eq!(
+        cb.resources[0].metadata.dublin_core().creator,
+        vec!["Feed Author".to_string()],
+        "an authorless entry must inherit the feed-level <author>"
+    );
+}
+
+#[tokio::test]
+async fn discovery_entry_own_author_wins_over_feed_level() {
+    let entries = r#"<entry><title>E1</title><id>urn:e1</id><updated>2026-01-05T00:00:00Z</updated><author><name>Entry Author</name></author><summary>Body</summary></entry>"#;
+    let feed_xml = atom_feed_with(r#"<author><name>Feed Author</name></author>"#, entries);
+    let mut script = HashMap::new();
+    script.insert(
+        "https://feed.example.com/feed.xml".to_string(),
+        ScriptedOutcome::text(&feed_xml),
+    );
+    let (ingestor, _fetcher) = ingestor_with(script);
+    let source = source_for("https://feed.example.com/feed.xml", None, true);
+    let mut cb = RecordingCallback::default();
+    ingestor.ingest(&source, &mut cb).await.unwrap();
+
+    assert_eq!(
+        cb.resources[0].metadata.dublin_core().creator,
+        vec!["Entry Author".to_string()],
+        "the entry's own author wins outright; the two lists are never merged"
+    );
+}
+
+#[tokio::test]
+async fn single_doc_byline_inherits_feed_level_author() {
+    let entries = r#"<entry><title>E1</title><id>urn:e1</id><updated>2026-01-05T00:00:00Z</updated><summary>Body</summary></entry><entry><title>E2</title><id>urn:e2</id><updated>2026-01-04T00:00:00Z</updated><author><name>Entry Author</name></author><summary>Body2</summary></entry>"#;
+    let feed_xml = atom_feed_with(r#"<author><name>Feed Author</name></author>"#, entries);
+    let mut script = HashMap::new();
+    script.insert(
+        "https://feed.example.com/feed.xml".to_string(),
+        ScriptedOutcome::text(&feed_xml),
+    );
+    let (ingestor, _fetcher) = ingestor_with(script);
+    let source = source_for("https://feed.example.com/feed.xml", None, false);
+    let mut cb = RecordingCallback::default();
+    ingestor.ingest(&source, &mut cb).await.unwrap();
+
+    let text = cb.resources[0]
+        .blocks
+        .iter()
+        .map(|b| b.text.clone())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        text.contains("By Feed Author"),
+        "the authorless entry's byline must inherit the feed-level author: {text}"
+    );
+    assert!(
+        text.contains("By Entry Author"),
+        "the entry that declares its own author keeps it: {text}"
     );
 }

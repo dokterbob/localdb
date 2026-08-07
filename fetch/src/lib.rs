@@ -1,9 +1,27 @@
+mod destination;
+
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use localdb_core::{
     error::Error,
     ingestion::{FetchMetadata, FetchResult, UrlFetcher},
 };
 use reqwest::{Client, StatusCode};
+
+/// Which destinations a fetcher is willing to connect to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DestinationPolicy {
+    /// Anything the operator points us at, including loopback and private
+    /// ranges. Correct for operator-configured locators (`url` sources, a
+    /// feed's own URL): a homelab or LAN address is a legitimate choice
+    /// there, and refusing it would break a real use case to guard against
+    /// nothing — the operator already chose the target.
+    Unrestricted,
+    /// Globally-routable destinations only. For locators chosen by a third
+    /// party — today, the `<link>` of a feed entry. See [`destination`].
+    PublicOnly,
+}
 
 /// HTTP URL fetcher backed by reqwest.
 ///
@@ -13,24 +31,72 @@ use reqwest::{Client, StatusCode};
 #[derive(Clone)]
 pub struct HttpUrlFetcher {
     client: Client,
+    policy: DestinationPolicy,
 }
 
 impl HttpUrlFetcher {
+    /// A fetcher with no destination restrictions — for operator-configured
+    /// URLs. See [`DestinationPolicy::Unrestricted`].
     pub fn new() -> Result<Self, Error> {
-        let client = Client::builder()
-            .user_agent("localdb/0.1")
-            .timeout(std::time::Duration::from_secs(30))
+        let client = Self::builder()
             .build()
             .map_err(|e| Error::ProviderUnavailable {
                 message: format!("failed to build HTTP client: {e}"),
             })?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            policy: DestinationPolicy::Unrestricted,
+        })
+    }
+
+    /// A fetcher that refuses any destination which is not globally routable,
+    /// on the initial request and on every redirect hop.
+    ///
+    /// Use this for locators that came from untrusted content. A refusal is
+    /// reported as `Ok(FetchResult::Blocked)`, never as an error: it is a
+    /// stable, unambiguous outcome (it will be refused again next run), so it
+    /// belongs beside `Gone` rather than in the transient-failure bucket.
+    pub fn new_public_only() -> Result<Self, Error> {
+        let client = Self::builder()
+            .dns_resolver(Arc::new(destination::GuardedResolver))
+            .redirect(destination::guarded_redirect_policy())
+            .build()
+            .map_err(|e| Error::ProviderUnavailable {
+                message: format!("failed to build HTTP client: {e}"),
+            })?;
+        Ok(Self {
+            client,
+            policy: DestinationPolicy::PublicOnly,
+        })
+    }
+
+    /// Settings shared by both constructors.
+    fn builder() -> reqwest::ClientBuilder {
+        Client::builder()
+            .user_agent("localdb/0.1")
+            .timeout(std::time::Duration::from_secs(30))
     }
 }
 
 #[async_trait]
 impl UrlFetcher for HttpUrlFetcher {
     async fn fetch(&self, url: &str, metadata: &FetchMetadata) -> Result<FetchResult, Error> {
+        // Preflight (destination guard layer 2). Mandatory for IP literals:
+        // hyper-util's connector parses the host as a socket address before it
+        // ever consults a custom DNS resolver, so `http://127.0.0.1/` would
+        // otherwise never reach `GuardedResolver`. A URL that does not parse
+        // is left alone — `send()` below reports it with a better message.
+        if self.policy == DestinationPolicy::PublicOnly {
+            if let Ok(parsed) = reqwest::Url::parse(url) {
+                if destination::ip_literal_host(&parsed)
+                    .is_some_and(destination::is_blocked_destination)
+                {
+                    tracing::info!(url = %url, "fetch: destination blocked (non-routable IP literal)");
+                    return Ok(FetchResult::Blocked);
+                }
+            }
+        }
+
         let mut req = self.client.get(url);
 
         if let Some(etag) = &metadata.etag {
@@ -40,9 +106,22 @@ impl UrlFetcher for HttpUrlFetcher {
             req = req.header("If-Modified-Since", last_modified);
         }
 
-        let response = req.send().await.map_err(|e| Error::ProviderUnavailable {
-            message: format!("HTTP request failed: {e}"),
-        })?;
+        let response = match req.send().await {
+            Ok(response) => response,
+            Err(e) => {
+                // A rejection from the guarded resolver (layer 1) or the
+                // guarded redirect policy (layer 3) reaches us only as an
+                // opaque `reqwest::Error`; recover it so the caller sees the
+                // stable `Blocked` outcome rather than a transient failure.
+                if destination::is_blocked_error(&e) {
+                    tracing::info!(url = %url, "fetch: destination blocked ({e})");
+                    return Ok(FetchResult::Blocked);
+                }
+                return Err(Error::ProviderUnavailable {
+                    message: format!("HTTP request failed: {e}"),
+                });
+            }
+        };
 
         let status = response.status();
 
@@ -313,5 +392,129 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(Error::ProviderUnavailable { .. })));
+    }
+
+    // -----------------------------------------------------------------------
+    // Destination guard (`new_public_only`)
+    //
+    // Every test above uses `new()` deliberately: wiremock binds loopback,
+    // which the guard blocks — which is precisely why the guard is opt-in via
+    // a second constructor rather than applied to the existing client.
+    // -----------------------------------------------------------------------
+
+    /// The one test where wiremock's loopback binding is the *asset*: it gives
+    /// us a live server we can prove was never contacted. Asserting zero
+    /// received requests is what distinguishes "refused before connecting"
+    /// from "connected, then classified the response as blocked".
+    #[tokio::test]
+    async fn public_only_refuses_loopback_without_connecting() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"secret"))
+            .mount(&server)
+            .await;
+
+        let fetcher =
+            HttpUrlFetcher::new_public_only().expect("new_public_only should succeed in tests");
+        let result = fetcher
+            .fetch(
+                &format!("{}/internal", server.uri()),
+                &FetchMetadata::default(),
+            )
+            .await
+            .expect("a blocked destination is Ok(Blocked), never Err");
+
+        assert!(
+            matches!(result, FetchResult::Blocked),
+            "expected Blocked, got {result:?}"
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "the guard must refuse before any connection is made"
+        );
+    }
+
+    /// Layer 2 in isolation: an obfuscated decimal IP literal. `Url::parse`
+    /// normalizes it to 127.0.0.1 before the guard ever looks, which is why
+    /// the check goes through `reqwest::Url` rather than the raw string.
+    #[tokio::test]
+    async fn public_only_refuses_obfuscated_ip_literal() {
+        let fetcher =
+            HttpUrlFetcher::new_public_only().expect("new_public_only should succeed in tests");
+        let result = fetcher
+            .fetch("http://2130706433/", &FetchMetadata::default())
+            .await
+            .expect("a blocked destination is Ok(Blocked), never Err");
+        assert!(matches!(result, FetchResult::Blocked));
+    }
+
+    /// Layer 1: a *name* that resolves to loopback never reaches the preflight
+    /// (it is not an IP literal), so this exercises `GuardedResolver` and the
+    /// `reqwest::Error` → `Blocked` recovery walk end to end.
+    #[tokio::test]
+    async fn public_only_refuses_a_name_that_resolves_to_loopback() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"secret"))
+            .mount(&server)
+            .await;
+
+        let port = server.address().port();
+        let fetcher =
+            HttpUrlFetcher::new_public_only().expect("new_public_only should succeed in tests");
+        let result = fetcher
+            .fetch(
+                &format!("http://localhost:{port}/internal"),
+                &FetchMetadata::default(),
+            )
+            .await
+            .expect("a resolver rejection must surface as Ok(Blocked), not Err");
+
+        assert!(
+            matches!(result, FetchResult::Blocked),
+            "expected Blocked, got {result:?} — if this regresses to \
+             Err(ProviderUnavailable), reqwest stopped preserving the error \
+             source chain that `destination::is_blocked_error` walks. Security \
+             is unaffected (the connection still never happens); the feed \
+             ingestor just loses its fall-back-to-summary behavior."
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "the guarded resolver must refuse before any connection is made"
+        );
+    }
+
+    /// The unrestricted client is unchanged — it must still reach loopback,
+    /// because operator-configured `url` sources and feed URLs legitimately
+    /// point at LAN and homelab addresses.
+    #[tokio::test]
+    async fn unrestricted_fetcher_still_reaches_loopback() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"local content"))
+            .mount(&server)
+            .await;
+
+        let fetcher = HttpUrlFetcher::new().expect("HttpUrlFetcher::new should succeed in tests");
+        let result = fetcher
+            .fetch(
+                &format!("{}/internal", server.uri()),
+                &FetchMetadata::default(),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(result, FetchResult::Downloaded { .. }));
     }
 }

@@ -140,6 +140,29 @@ impl Ingestor for UrlIngestor {
                         .await;
                     result.resources_skipped += 1;
                 }
+                UrlOutcome::Blocked => {
+                    // Dead code today — `url` sources are handed the
+                    // unrestricted fetcher, which never returns `Blocked` —
+                    // but `process_url` is shared with `FeedIngestor` and its
+                    // contract must hold for every caller. Falling into the
+                    // `_` arm below would be silent data loss: the URI would
+                    // never be marked seen, and `url` sources (unlike feed
+                    // sources) are NOT exempt from the delete-sweep, so the
+                    // previously indexed content would be deleted on the
+                    // strength of a refusal that says nothing at all about
+                    // whether the resource still exists.
+                    //
+                    // `Other`, not `Unsupported` or `Error`: the format was
+                    // never examined, and nothing failed — we declined to
+                    // look. That belongs in `docs_skipped`.
+                    callback
+                        .on_skipped(
+                            uri,
+                            SkipReason::Other("destination blocked by fetch policy".to_string()),
+                        )
+                        .await;
+                    result.resources_skipped += 1;
+                }
                 _ => {}
             }
         }
@@ -182,6 +205,8 @@ mod tests {
         NotModified,
         Gone,
         FetchError,
+        /// The fetcher's destination policy refused the URL.
+        Blocked,
     }
 
     /// A fake `UrlFetcher` scripted per-URL, and recording which URLs were
@@ -223,6 +248,7 @@ mod tests {
                 }),
                 Some(ScriptedOutcome::NotModified) => Ok(FetchResult::NotModified),
                 Some(ScriptedOutcome::Gone) => Ok(FetchResult::Gone),
+                Some(ScriptedOutcome::Blocked) => Ok(FetchResult::Blocked),
                 Some(ScriptedOutcome::FetchError) | None => Err(Error::Internal {
                     message: "simulated fetch error".to_string(),
                     correlation_id: "test_fetch_error".to_string(),
@@ -673,6 +699,39 @@ mod tests {
         assert_eq!(
             cb.resources[0].added_at, cb.resources[0].modified_at,
             "added_at and modified_at must be the same now_rfc3339() string"
+        );
+    }
+
+    /// `url` sources are NOT exempt from the delete-sweep, so `Blocked` must
+    /// be reported rather than falling into the `_` wildcard: an unreported
+    /// URI is deleted by the sweep, which would turn a "we declined to
+    /// connect" into data loss. Dead code for `url` sources today (they use
+    /// the unrestricted fetcher) — this pins `process_url`'s shared contract.
+    #[tokio::test]
+    async fn blocked_destination_is_reported_not_swallowed() {
+        let mut script = HashMap::new();
+        script.insert(
+            "http://169.254.169.254/latest/meta-data/".to_string(),
+            ScriptedOutcome::Blocked,
+        );
+        let ingestor =
+            UrlIngestor::new(Box::new(AllParser), Box::new(ScriptedFetcher::new(script)));
+        let source = source_with_urls(&["http://169.254.169.254/latest/meta-data/"]);
+        let mut cb = RecordingCallback::default();
+        let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+        assert_eq!(result.resources_skipped, 1);
+        assert_eq!(result.errors, 0, "a policy refusal is not a failure");
+        assert!(cb.resources.is_empty());
+        assert_eq!(
+            cb.skipped.len(),
+            1,
+            "the URI must be reported so the delete-sweep leaves its content alone"
+        );
+        assert!(
+            matches!(cb.skipped[0].1, SkipReason::Other(_)),
+            "expected SkipReason::Other, got {:?}",
+            cb.skipped[0].1
         );
     }
 }

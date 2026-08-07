@@ -453,6 +453,18 @@ pub enum FetchResult {
     NotModified,
     /// Document gone (404/410 after retry). Should trigger deletion.
     Gone,
+    /// The fetcher refused to connect because the destination violates its
+    /// policy — today, a non-globally-routable address behind a locator that
+    /// came from untrusted content (see `fetch`'s destination guard).
+    ///
+    /// A `FetchResult` variant rather than an `Error` on purpose. `Err` is
+    /// the ambiguous-and-possibly-transient bucket; every caller treats it as
+    /// "try again next run, keep what we have". A blocked destination is
+    /// neither ambiguous nor transient — it will be refused identically next
+    /// run — so it belongs beside `Gone` among the stable outcomes the
+    /// pipeline knows how to route. Keeping it out of `Error` also means no
+    /// new stable exit code is minted (see specs/05-surfaces.md §5).
+    Blocked,
 }
 
 /// HTTP client seam for URL fetching.

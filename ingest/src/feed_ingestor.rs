@@ -32,15 +32,33 @@ use crate::url_pipeline::{build_resource, process_url, ResourceEnrichment, UrlOu
 /// JSON Feed — whatever `feed-rs::parser` auto-detects).
 pub struct FeedIngestor {
     parser: Box<dyn Parser>,
-    fetcher: Box<dyn UrlFetcher>,
+    feed_fetcher: Box<dyn UrlFetcher>,
+    entry_fetcher: Box<dyn UrlFetcher>,
 }
 
 impl FeedIngestor {
     /// Create a new `FeedIngestor` with the given parser chain (used for
-    /// entry pages in discovery mode) and fetcher (used for both the feed
-    /// itself and entry pages).
-    pub fn new(parser: Box<dyn Parser>, fetcher: Box<dyn UrlFetcher>) -> Self {
-        Self { parser, fetcher }
+    /// entry pages in discovery mode) and two fetchers.
+    ///
+    /// The split is a trust boundary, not an optimization. `feed_fetcher`
+    /// requests the *operator-configured* feed URL — the same trust class as a
+    /// `url` source, so it gets the same unrestricted client; a homelab or LAN
+    /// feed is a legitimate thing to configure. `entry_fetcher` requests entry
+    /// `<link>`s, which are **attacker-controlled content** inside the feed
+    /// document, so it must be a destination-restricted client (see
+    /// `fetch::HttpUrlFetcher::new_public_only`). Restricting entry links only
+    /// also degrades gracefully: an internal feed's entries fall back to their
+    /// embedded summary rather than the whole source failing at step one.
+    pub fn new(
+        parser: Box<dyn Parser>,
+        feed_fetcher: Box<dyn UrlFetcher>,
+        entry_fetcher: Box<dyn UrlFetcher>,
+    ) -> Self {
+        Self {
+            parser,
+            feed_fetcher,
+            entry_fetcher,
+        }
     }
 }
 
@@ -85,7 +103,7 @@ impl Ingestor for FeedIngestor {
         let mut result = IngestResult::default();
 
         let fetch_result = match self
-            .fetcher
+            .feed_fetcher
             .fetch(&feed_url, &FetchMetadata::default())
             .await
         {
@@ -144,6 +162,23 @@ impl Ingestor for FeedIngestor {
                 // persistently-gone feed be reclaimed belongs to issue #171
                 // (persist conditional-GET state and prune on 404/410).
                 tracing::info!(url = %feed_url, "FeedIngestor: feed is gone (404/410)");
+                return Ok(result);
+            }
+            FetchResult::Blocked => {
+                // Unreachable under the current wiring: `feed_fetcher` is the
+                // unrestricted client by construction (the feed URL is
+                // operator-configured — see `FeedIngestor::new`), so it never
+                // returns `Blocked`. The arm exists because `FetchResult` is
+                // exhaustively matched, and it must not silently vanish if a
+                // future caller ever hands this ingestor a restricted feed
+                // fetcher.
+                //
+                // Treated exactly like `Gone`: silent, no callback. The
+                // sweep-exemption for `SourceSpec::Feed` means that silence
+                // preserves whatever the feed indexed previously, which is
+                // the right outcome for a refusal that says nothing about
+                // whether the feed still exists.
+                tracing::warn!(url = %feed_url, "FeedIngestor: feed destination blocked by fetch policy");
                 return Ok(result);
             }
         };
@@ -208,6 +243,12 @@ impl Ingestor for FeedIngestor {
         // mode needs them).
         let mut entries = std::mem::take(&mut feed.entries);
 
+        // Atom's inheritance rule: a feed-level `<author>` is the effective
+        // author of every entry that declares none (RFC 4287 §4.2.1). Computed
+        // once here rather than per entry — `Feed.authors` and `Entry.authors`
+        // are the same `Vec<Person>`, so `person_display` applies unchanged.
+        let feed_authors: Vec<String> = feed.authors.iter().filter_map(person_display).collect();
+
         // Stable-sort DESC by published.or(updated); `None` dates sort last.
         // Never `sort_unstable_by` — and always sort BEFORE truncating: an
         // oldest-first archive feed would otherwise permanently pin the
@@ -269,12 +310,15 @@ impl Ingestor for FeedIngestor {
             for (entry, (locator, uri, fetchable)) in entries.iter().zip(targets.iter()) {
                 process_discovery_entry(
                     self.parser.as_ref(),
-                    self.fetcher.as_ref(),
+                    // Entry links are third-party content: the restricted
+                    // fetcher, never `feed_fetcher`. See `FeedIngestor::new`.
+                    self.entry_fetcher.as_ref(),
                     entry,
                     locator,
                     uri,
                     *fetchable,
                     &feed_url,
+                    &feed_authors,
                     source,
                     callback,
                     &mut result,
@@ -342,6 +386,24 @@ fn person_display(p: &feed_rs::model::Person) -> Option<String> {
         .map(str::trim)
         .filter(|e| !e.is_empty())
         .map(String::from)
+}
+
+/// The authors that apply to `entry`, honouring Atom's inheritance rule: a
+/// feed-level `<author>` is the effective author of any entry that declares
+/// none (RFC 4287 §4.2.1). An entry's own authors always win outright — the
+/// two lists are never merged.
+///
+/// The emptiness test is on the *displayable* names, not on `entry.authors`
+/// itself, so an entry carrying only unusable `Person` records (feed-rs's
+/// `"author"` placeholder with no email — see [`person_display`]) still
+/// inherits rather than ending up with no byline at all.
+fn effective_authors(entry: &Entry, feed_authors: &[String]) -> Vec<String> {
+    let own: Vec<String> = entry.authors.iter().filter_map(person_display).collect();
+    if own.is_empty() {
+        feed_authors.to_vec()
+    } else {
+        own
+    }
 }
 
 /// First entry link with `rel` `None` or `"alternate"` (RSS `<link>` maps to
@@ -412,6 +474,7 @@ async fn process_discovery_entry(
     uri: &Uri,
     fetchable: bool,
     feed_url: &str,
+    feed_authors: &[String],
     source: &IngestSource,
     callback: &mut dyn IngestCallback,
     result: &mut IngestResult,
@@ -419,7 +482,7 @@ async fn process_discovery_entry(
     let enrichment = ResourceEnrichment {
         external_id: Some(entry.id.clone()),
         title_fallback: entry.title.as_ref().map(|t| t.content.clone()),
-        creator: entry.authors.iter().filter_map(person_display).collect(),
+        creator: effective_authors(entry, feed_authors),
         date: entry.published.or(entry.updated).map(|d| d.to_rfc3339()),
         // The feed's own modification claim, preferring `updated` (that's
         // what it means) over `published`; `dc.date` above keeps the
@@ -445,6 +508,16 @@ async fn process_discovery_entry(
         // transient fetch/parse failure, there's no flip-flop risk here
         // because emptiness is stable, so falling back to the entry's own
         // summary/title is safe and strictly better than reporting nothing.
+        //
+        // `Blocked` joins that stable set for the same reason and is the
+        // whole of the entry-level SSRF fix's user-visible behavior: a
+        // destination refused by the guard will be refused identically next
+        // run, so falling back to the entry's embedded content is both safe
+        // and the graceful-degradation path that lets an internal feed keep
+        // working (entries indexed from their summaries, links never
+        // fetched). It also means the URI IS reported — via `on_resource`
+        // here, or `on_skipped(Error)` if the entry carries no usable content
+        // at all — which is what keeps the delete-sweep contract intact.
         let outcome = process_url(
             parser,
             fetcher,
@@ -459,7 +532,7 @@ async fn process_discovery_entry(
         .await?;
         matches!(
             outcome,
-            UrlOutcome::Gone | UrlOutcome::Unsupported | UrlOutcome::Empty
+            UrlOutcome::Gone | UrlOutcome::Unsupported | UrlOutcome::Empty | UrlOutcome::Blocked
         )
     } else {
         // Link-less and non-http(s)-linked entries never fetch — straight
@@ -605,6 +678,7 @@ fn feed_title_or_default(feed: &Feed) -> String {
 /// such noise without a publisher-specific heuristic.
 fn build_single_doc_markdown(feed: &Feed, feed_title_text: &str, entries: &[Entry]) -> String {
     let mut md = format!("# {feed_title_text}\n\n");
+    let feed_authors: Vec<String> = feed.authors.iter().filter_map(person_display).collect();
 
     if let Some(desc) = &feed.description {
         if let Some((body, _)) = route_text(&desc.content_type, &desc.content) {
@@ -632,7 +706,10 @@ fn build_single_doc_markdown(feed: &Feed, feed_title_text: &str, entries: &[Entr
         // template — and therefore the whole single-doc content hash —
         // churn on every title tweak even when nothing else changed.
         let mut byline_parts: Vec<String> = Vec::new();
-        let author_names: Vec<String> = entry.authors.iter().filter_map(person_display).collect();
+        // Same Atom inheritance rule discovery mode applies (`feed.authors`
+        // is already in scope here — `feed` is a parameter — so no signature
+        // change was needed).
+        let author_names = effective_authors(entry, &feed_authors);
         if !author_names.is_empty() {
             byline_parts.push(format!("By {}", author_names.join(", ")));
         }

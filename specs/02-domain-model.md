@@ -116,7 +116,9 @@ indexed content: parse the feed, then for each entry resolve the entry's link an
 the *same* per-URL pipeline `UrlIngestor` uses for `url` sources (fetch page → parser chain →
 blocks → `Resource`), via a shared `ingest/src/url_pipeline.rs` helper — a feed entry and a
 directly-configured `url` source produce identically-shaped Resources. Entry metadata enriches the
-resulting Resource: `external_id` = the entry's feed-native ID, `creator` = entry authors, the
+resulting Resource: `external_id` = the entry's feed-native ID, `creator` = entry authors — falling
+back to the **feed-level** `<author>` when the entry declares none, per Atom's inheritance rule
+(RFC 4287 §4.2.1); an entry's own authors win outright and the two lists are never merged — the
 metadata date = the entry's published/updated timestamp, `metadata.source` = the feed URL
 (provenance back to the discovering feed), `external_etag` captured from the entry-link fetch. The
 Resource's `uri` (and therefore its content-addressed `id`, §3) keys off the entry's
@@ -160,7 +162,23 @@ discovering per-message permalinks from a thread).
 ```
 
 The byline line omits missing parts outright — no placeholder text, and the entry's guid never
-appears in it.
+appears in it. `{authors}` follows the same feed-level inheritance rule discovery mode uses: an
+entry with no `<author>` of its own bylines the feed's.
+
+**Destination policy (entry links).** Entry links are the only locators in localdb chosen by a
+third party rather than by the operator, so discovery mode fetches them through a
+**public-destination-only** HTTP client. Any request — or any redirect hop — whose host is, or
+resolves to, a non-globally-routable address (loopback, RFC 1918 private, link-local incl.
+`169.254.169.254`, CGNAT, ULA, multicast, reserved, and their IPv4-mapped-IPv6 forms) is refused
+before a connection is opened, and the entry falls back to its embedded content exactly like
+`Gone`/`Unsupported`/`Empty` below. Filtering happens inside a custom DNS resolver, so the address
+reqwest connects to is the address that was checked (no rebinding window). **The feed URL itself
+and `url` sources are unaffected** — both are operator-configured, and a homelab or LAN address is
+a legitimate thing for an operator to point localdb at. Guarding entry links only also means an
+internal feed degrades gracefully rather than failing at step one: its entries are still indexed,
+from their embedded summaries. There is no opt-out in v0.1; the per-source/global allowance for
+private destinations is tracked as a known gap in
+[../docs/architecture.md](../docs/architecture.md#known-gaps).
 
 **Both modes:** entries are stable-sorted by `published.or(updated)` descending (entries with
 neither date sort last, stable among themselves), then **deduplicated by resolved resource
@@ -183,8 +201,11 @@ whose content hash is unchanged does not retroactively pick these up (the pipeli
 incremental-skip runs before any store write).
 
 **Fallback and error handling:**
-- Discovery mode, entry-link fetch returns `Gone`/`Unsupported`: falls back to indexing the
-  entry's own embedded content/summary at the same URI, instead of dropping the entry.
+- Discovery mode, entry-link fetch returns `Gone`/`Unsupported`/`Blocked`: falls back to indexing
+  the entry's own embedded content/summary at the same URI, instead of dropping the entry. All
+  three are *stable* properties of the link (a 404 stays a 404; a refused destination is refused
+  identically next run), which is what makes falling back safe — contrast the transient cases
+  below.
 - Discovery mode, entry-link fetch returns a transient `FetchError`/`ParseFailed`: no fallback —
   reported as a per-item error and skipped this run. Falling back here would flip the Resource's
   content hash between "full page" and "feed summary" on every transient outage, forcing needless
