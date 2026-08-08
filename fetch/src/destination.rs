@@ -201,6 +201,18 @@ impl Resolve for GuardedResolver {
 /// `Limit` arm: `previous` includes the originally requested URL, hence `>`).
 const MAX_REDIRECTS: usize = 10;
 
+/// Mirrors reqwest's own private `TooManyRedirects` marker.
+#[derive(Debug)]
+struct TooManyRedirects;
+
+impl fmt::Display for TooManyRedirects {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("too many redirects")
+    }
+}
+
+impl std::error::Error for TooManyRedirects {}
+
 /// Redirect policy that refuses hops to blocked IP literals and keeps
 /// reqwest's default 10-hop cap.
 ///
@@ -214,8 +226,14 @@ pub(crate) fn guarded_redirect_policy() -> reqwest::redirect::Policy {
         if let Some(host) = blocked_host {
             return attempt.error(BlockedDestinationError { host });
         }
+        // `error`, not `stop`, so this matches `Policy::limited(10)` exactly.
+        // `stop()` would hand the 30x response back as `Ok`, which `fetch`
+        // then reports as a bewildering "HTTP error 302 Found" rather than
+        // "too many redirects". Deliberately NOT a `BlockedDestinationError`:
+        // exhausting the hop budget says nothing about the destination, so it
+        // belongs in the ordinary transient-error path, not `Blocked`.
         if attempt.previous().len() > MAX_REDIRECTS {
-            return attempt.stop();
+            return attempt.error(TooManyRedirects);
         }
         attempt.follow()
     })

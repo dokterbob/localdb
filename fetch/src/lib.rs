@@ -70,12 +70,53 @@ impl HttpUrlFetcher {
         })
     }
 
+    /// Test-only: the guarded **redirect policy** alone — default resolver, no
+    /// preflight.
+    ///
+    /// Layer 3 is otherwise unreachable from a test. Every redirect fixture
+    /// has to be a local server, and against `new_public_only()` the preflight
+    /// (layer 2) or the guarded resolver (layer 1) refuses the *initial*
+    /// request to that server, so the chain never starts and the redirect
+    /// policy is never consulted. Disabling the two layers that guard the
+    /// first hop is what lets the tests drive the third.
+    #[cfg(test)]
+    fn new_redirect_guard_only() -> Result<Self, Error> {
+        let client = Self::builder()
+            .redirect(destination::guarded_redirect_policy())
+            .build()
+            .map_err(|e| Error::ProviderUnavailable {
+                message: format!("failed to build HTTP client: {e}"),
+            })?;
+        Ok(Self {
+            client,
+            policy: DestinationPolicy::Unrestricted,
+        })
+    }
+
     /// Settings shared by both constructors.
     fn builder() -> reqwest::ClientBuilder {
         Client::builder()
             .user_agent("localdb/0.1")
             .timeout(std::time::Duration::from_secs(30))
     }
+}
+
+/// Render a `reqwest::Error` together with its cause chain.
+///
+/// reqwest's own `Display` is deliberately terse and names only the outermost
+/// layer — a redirect budget exhaustion prints as "error following redirect
+/// for url (...)", with the actual reason buried in `source()`. Since this
+/// string is all the operator ever sees (it becomes the `ProviderUnavailable`
+/// message and lands in the run's error output), the chain is worth spelling
+/// out.
+fn describe_error(err: &reqwest::Error) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut source = std::error::Error::source(err);
+    while let Some(e) = source {
+        parts.push(e.to_string());
+        source = e.source();
+    }
+    parts.join(": ")
 }
 
 #[async_trait]
@@ -118,7 +159,7 @@ impl UrlFetcher for HttpUrlFetcher {
                     return Ok(FetchResult::Blocked);
                 }
                 return Err(Error::ProviderUnavailable {
-                    message: format!("HTTP request failed: {e}"),
+                    message: format!("HTTP request failed: {}", describe_error(&e)),
                 });
             }
         };
@@ -493,6 +534,129 @@ mod tests {
             "the guarded resolver must refuse before any connection is made"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Layer 3 — the guarded redirect policy
+    //
+    // Driven through `new_redirect_guard_only()`; see its doc comment for why
+    // the other two layers have to be off for these to be reachable at all.
+    // -----------------------------------------------------------------------
+
+    /// The security-critical branch: a hop whose target is a blocked IP
+    /// literal is refused, and the hop target is never requested.
+    #[tokio::test]
+    async fn guarded_redirect_refuses_a_hop_to_a_blocked_ip_literal() {
+        let server = MockServer::start().await;
+        // `server.uri()` is `http://127.0.0.1:<port>` — an IP literal, which
+        // is exactly what this layer inspects.
+        Mock::given(method("GET"))
+            .and(path("/hop"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/internal", server.uri())),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"secret"))
+            .mount(&server)
+            .await;
+
+        let fetcher = HttpUrlFetcher::new_redirect_guard_only()
+            .expect("new_redirect_guard_only should succeed in tests");
+        let result = fetcher
+            .fetch(&format!("{}/hop", server.uri()), &FetchMetadata::default())
+            .await
+            .expect("a blocked redirect target is Ok(Blocked), never Err");
+
+        assert!(
+            matches!(result, FetchResult::Blocked),
+            "expected Blocked, got {result:?}"
+        );
+        let hits = server.received_requests().await.unwrap_or_default();
+        assert!(
+            hits.iter().all(|r| r.url.path() != "/internal"),
+            "the redirect target must never be requested"
+        );
+    }
+
+    /// The policy must not over-block: a hop to a *hostname* is followed
+    /// normally (name targets are layer 1's job, not this layer's).
+    #[tokio::test]
+    async fn guarded_redirect_follows_a_hostname_hop() {
+        let server = MockServer::start().await;
+        let port = server.address().port();
+        let target = format!("http://localhost:{port}/final");
+        Mock::given(method("GET"))
+            .and(path("/hop"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", target.as_str()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/final"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"followed"))
+            .mount(&server)
+            .await;
+
+        let fetcher = HttpUrlFetcher::new_redirect_guard_only()
+            .expect("new_redirect_guard_only should succeed in tests");
+        let result = fetcher
+            .fetch(
+                &format!("http://localhost:{port}/hop"),
+                &FetchMetadata::default(),
+            )
+            .await
+            .unwrap();
+
+        match result {
+            FetchResult::Downloaded {
+                bytes, final_url, ..
+            } => {
+                assert_eq!(bytes, b"followed");
+                assert_eq!(final_url.as_deref(), Some(target.as_str()));
+            }
+            other => panic!("expected Downloaded, got {other:?}"),
+        }
+    }
+
+    /// `Policy::custom` replaces reqwest's default outright, so the 10-hop cap
+    /// is restated by hand — this pins that it actually terminates, and as an
+    /// error rather than as a bare 30x handed back to the caller.
+    #[tokio::test]
+    async fn guarded_redirect_enforces_the_hop_cap() {
+        let server = MockServer::start().await;
+        let port = server.address().port();
+        let loop_url = format!("http://localhost:{port}/loop");
+        Mock::given(method("GET"))
+            .and(path("/loop"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", loop_url.as_str()))
+            .mount(&server)
+            .await;
+
+        let fetcher = HttpUrlFetcher::new_redirect_guard_only()
+            .expect("new_redirect_guard_only should succeed in tests");
+        let result = fetcher.fetch(&loop_url, &FetchMetadata::default()).await;
+
+        match result {
+            Err(Error::ProviderUnavailable { message }) => assert!(
+                message.contains("too many redirects"),
+                "the cap must report itself as a redirect budget exhaustion, \
+                 not as a bare 30x status: {message}"
+            ),
+            other => panic!("expected ProviderUnavailable, got {other:?}"),
+        }
+        // Exhausting the budget says nothing about the destination, so it must
+        // NOT be laundered into the stable `Blocked` outcome.
+        assert!(
+            server.received_requests().await.unwrap_or_default().len() <= MAX_HOPS_SANITY,
+            "the redirect loop must terminate, not spin"
+        );
+    }
+
+    /// Generous upper bound for the hop-cap test — the point is "terminates",
+    /// not an exact count (reqwest's bookkeeping of `previous` is its own).
+    const MAX_HOPS_SANITY: usize = 20;
 
     /// The unrestricted client is unchanged — it must still reach loopback,
     /// because operator-configured `url` sources and feed URLs legitimately
