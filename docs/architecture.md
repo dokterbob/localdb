@@ -389,7 +389,7 @@ Extending the same classification to `FileIngestor` — and giving `index_resour
 "empty ≠ deleted" rule, so the guard is an invariant rather than per-ingestor discipline — is
 tracked in #185.
 
-**15. There is no opt-in for private-network feed entry links.**
+**15. There is no opt-in for private-network feed entry links.** ([#196](https://github.com/dokterbob/localdb/issues/196))
 Discovery mode fetches entry links through a public-destination-only HTTP client (see
 [specs/02-domain-model.md](../specs/02-domain-model.md) § "Feed connector", *Destination policy*),
 and v0.1 offers no way to relax that. An operator running an internal feed whose entries link to
