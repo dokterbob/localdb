@@ -1,12 +1,14 @@
+use std::sync::Arc;
+
 use localdb_core::{
-    ids::new_ulid, ingestion::now_rfc3339, source::normalize_path_source, types::SourceKind, Error,
-    SourceRow, StoreRow,
+    ids::new_ulid, ingestion::now_rfc3339, source::normalize_path_source, types::SourceKind,
+    Embedder, Error, SourceRow, StoreRow,
 };
 use serde_json::json;
 
 use crate::{
     app_db::{load_app_db, resolve_store_scope, resolve_store_scope_names, StoreScopePolicy},
-    cmds::index::{run_embedded_index, IndexErrorMode},
+    cmds::index::{run_embedded_index_with, IndexErrorMode},
     daemon_client::{daemon_request_async, probe_daemon, CliContext, DaemonState},
     normalize::{classify_source, exit_err, kind_to_string, looks_like_id, print_json},
 };
@@ -219,9 +221,9 @@ pub(crate) async fn run_source_add_async(
     // `-s` (repeatable) always wins and is validated/resolved/deduped here.
     let rows = resolve_store_scope(ctx, &db, StoreScopePolicy::DefaultStore).await;
 
-    // Sources that were added locally and need auto-indexing, deferred until
-    // after `db`/`config_loader` are dropped (`run_embedded_index` opens its
-    // own `AppDb`).
+    // Sources that were added locally and need auto-indexing, run in a
+    // second pass below once every source in this request has been
+    // persisted.
     let mut to_index: Vec<(StoreRow, String)> = Vec::new();
 
     // Accumulate JSON results across the loop and emit exactly one top-level
@@ -321,32 +323,34 @@ pub(crate) async fn run_source_add_async(
         }
     }
 
-    // Drop the db handle before re-entering the index path, which opens its own.
-    drop(db);
-    drop(config_loader);
-
+    // Auto-index every newly added source, reusing the already-open
+    // `db`/`config_loader` and threading the built embedder across stores so
+    // an N-store `source add` builds the (potentially ~706 MB local)
+    // embedder at most once rather than once per store (Codex review round
+    // 2, finding 6) — the same threading `run_index_async` does for
+    // `localdb index`.
+    let mut embedder: Option<Arc<dyn Embedder>> = None;
     for (row, src_id) in &to_index {
         if !ctx.json {
             eprintln!("Auto-indexing source {} ...", src_id);
         }
-        // Build an index context scoped to this store.
-        let index_ctx = CliContext {
-            config: ctx.config.clone(),
-            json: ctx.json,
-            stores: vec![row.name.clone()],
-            yes: false,
-            daemon_url: ctx.daemon_url.clone(),
-            config_env: ctx.config_env.clone(),
-        };
-        if let Err(e) = run_embedded_index(
-            &index_ctx,
+        let (_summary, used_embedder) = match run_embedded_index_with(
+            ctx,
+            &db,
+            &config_loader,
             row,
             Some(src_id),
             IndexErrorMode::WarnAndContinue,
+            embedder.clone(),
+            None,
         )
         .await
         {
-            exit_err(&e, ctx.json);
+            Ok(result) => result,
+            Err(e) => exit_err(&e, ctx.json),
+        };
+        if embedder.is_none() {
+            embedder = used_embedder;
         }
     }
 }
@@ -936,5 +940,85 @@ mod tests {
         let v = source_to_json_value(&row, "notes");
         assert_eq!(v["kind"], "path");
         assert!(v.get("refresh").is_none());
+    }
+
+    // -- auto-index embedder reuse (Codex review round 2, finding 6) --------
+
+    /// `source add` scoped to two stores must build the (potentially ~706 MB
+    /// local) embedder once for the whole request, not once per store.
+    ///
+    /// Drives `run_source_add_async` end to end against a real temp DB/config
+    /// (provider `fake`, so it's fully offline and cheap) and asserts on
+    /// `crate::cmds::index::EMBEDDER_BUILD_COUNT`, a test-only counter
+    /// incremented exactly where `run_embedded_index_with` calls
+    /// `embed::create_embedder`. Before the fix, `source add`'s auto-index
+    /// loop called the single-store `run_embedded_index` wrapper once per
+    /// store, rebuilding the embedder each time; this test fails red against
+    /// that code (count == 2 for two stores) and green once the loop threads
+    /// one `Arc<dyn Embedder>` across stores via `run_embedded_index_with`,
+    /// exactly as `run_index_async` already does for `localdb index`.
+    #[tokio::test]
+    async fn source_add_across_two_stores_builds_embedder_once() {
+        use crate::cmds::index::EMBEDDER_BUILD_COUNT;
+        use crate::cmds::store::run_store_add_async;
+        use std::sync::atomic::Ordering;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let note_path = dir.path().join("note.md");
+        std::fs::write(&note_path, "# Hello\n\nSome content to index.\n").unwrap();
+
+        let config_path = dir.path().join("config.yaml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "version: 1\npaths:\n  data: {}\ndefaults:\n  indexing:\n    embedding:\n      provider: fake\n      model: bge-small-en-v1.5\n",
+                dir.path().display()
+            ),
+        )
+        .unwrap();
+
+        let base_ctx = CliContext {
+            config: Some(config_path.clone()),
+            json: false,
+            stores: vec![],
+            yes: false,
+            daemon_url: None,
+            config_env: None,
+        };
+        // Pre-create both stores: `source add`'s explicit `--store` scope
+        // requires them to already exist (`resolve_store_scope_inner`).
+        run_store_add_async(&base_ctx, "a").await;
+        run_store_add_async(&base_ctx, "b").await;
+
+        // Reset just before the call under test: no other test in this crate
+        // currently drives `run_embedded_index_with`'s embedder-construction
+        // path, so this is safe against `cargo test`'s parallel test threads
+        // (see the counter's doc comment).
+        EMBEDDER_BUILD_COUNT.store(0, Ordering::SeqCst);
+
+        let add_ctx = CliContext {
+            config: Some(config_path),
+            json: false,
+            stores: vec!["a".to_string(), "b".to_string()],
+            yes: false,
+            daemon_url: None,
+            config_env: None,
+        };
+        run_source_add_async(
+            &add_ctx,
+            note_path.to_str().unwrap(),
+            None,
+            None,
+            None,
+            false,
+        )
+        .await;
+
+        assert_eq!(
+            EMBEDDER_BUILD_COUNT.load(Ordering::SeqCst),
+            1,
+            "auto-indexing 2 stores in one `source add` must build the embedder once, not once per store"
+        );
     }
 }

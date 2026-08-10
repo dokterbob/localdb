@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use fetch::HttpUrlFetcher;
@@ -49,6 +51,19 @@ impl IndexErrorMode {
     }
 }
 
+/// Test-only construction counter for the `embed::create_embedder` call made
+/// by `run_embedded_index_with` below. Exists purely so the `source add`
+/// multi-store auto-index test (`cmds::source::tests`) can assert the
+/// embedder is built once across an N-store run, not once per store (Codex
+/// review round 2, finding 6). Compiled out entirely in non-test builds.
+///
+/// Shared per test binary, so it's only safe to assert on because no other
+/// test in this crate currently drives `run_embedded_index_with`'s
+/// embedder-construction path concurrently; a test reading it resets the
+/// counter to 0 immediately before exercising the call it's measuring.
+#[cfg(test)]
+pub(crate) static EMBEDDER_BUILD_COUNT: AtomicUsize = AtomicUsize::new(0);
+
 /// A single store's index outcome, paired with its name — the unit the
 /// summary renderers below combine and format. Kept separate from
 /// `IndexSummary` (which has no notion of *which* store it came from) so the
@@ -62,20 +77,22 @@ pub(crate) struct StoreIndexOutcome {
 /// Index one store, using an already-open `AppDb`/`ConfigLoader` and
 /// (optionally) an already-built embedder.
 ///
-/// Callers that already hold an open `AppDb` and want to index several
-/// stores in one run (`run_index_async`) should call this directly and pass
+/// Every multi-store caller — `run_index_async` and `run_source_add_async`'s
+/// post-`source add` auto-index loop alike — calls this directly and threads
 /// `embedder` through from store to store: `None` until one is built, then
 /// `Some(..)` for the rest — reloading a ~706 MB local embedding model per
-/// store would be wasteful. The `run_embedded_index` wrapper below is for
-/// callers with only a `CliContext` and a single store in hand (e.g. the
-/// post-`source add` auto-index).
+/// store would be wasteful.
 ///
-/// Returns the summary alongside the embedder actually used (`Some` once
-/// this store's sources required constructing or reusing one, `None` when
-/// the store had no sources to index and no embedder was touched at all —
-/// this is what lets a multi-store run skip building the embedder entirely
-/// when every store in scope is empty). A caller looping over stores should
-/// carry the returned embedder forward into the next call.
+/// Returns the summary alongside the embedder actually used. This is `Some`
+/// as soon as this call has built or reused an embedder — including when the
+/// call goes on to fail *after* that point (e.g. `retrieval_store` or
+/// `list_indexed_documents` erroring under `IndexErrorMode::WarnAndContinue`)
+/// — so a caller looping under `WarnAndContinue` keeps the cache even after a
+/// mid-store failure. It's `None` only when no sources needed indexing, or a
+/// failure happened before the embedder was ever touched; this is what lets a
+/// multi-store run skip building the embedder entirely when every store in
+/// scope is empty. A caller looping over stores should carry the returned
+/// embedder forward into the next call.
 ///
 /// `progress_label` is rendered as a `[label]` prefix on progress output when
 /// `Some` — set it only when more than one store is in scope for the run, so
@@ -100,13 +117,21 @@ pub(crate) async fn run_embedded_index_with(
 
     macro_rules! warn_or_default {
         ($expr:expr, $fmt:literal) => {
+            warn_or_default!($expr, $fmt, None)
+        };
+        // Three-arg form: `$embedder_on_warn` is what to report as the used
+        // embedder when this failure is warned-and-swallowed. Callers after
+        // the embedder is built pass `Some(embedder.clone())` so a mid-store
+        // failure under `IndexErrorMode::WarnAndContinue` doesn't discard an
+        // embedder that was actually constructed (see the doc comment above).
+        ($expr:expr, $fmt:literal, $embedder_on_warn:expr) => {
             match $expr {
                 Ok(value) => value,
                 Err(e) => {
                     let error = Error::from(e);
                     if mode.warn() {
                         eprintln!($fmt, error);
-                        return Ok((IndexSummary::default(), None));
+                        return Ok((IndexSummary::default(), $embedder_on_warn));
                     }
                     return Err(error);
                 }
@@ -168,6 +193,8 @@ pub(crate) async fn run_embedded_index_with(
             ),
             "warning: cannot create embedder for auto-index: {}"
         );
+        #[cfg(test)]
+        EMBEDDER_BUILD_COUNT.fetch_add(1, Ordering::SeqCst);
         Arc::from(built)
     };
     // Validate the parser chain once up front — fail-fast parity with the
@@ -175,17 +202,24 @@ pub(crate) async fn run_embedded_index_with(
     // instances are cheap unit structs (not `Clone`), so each source below
     // rebuilds its own owned chain from the same `policy.parsers` ids rather
     // than sharing this one.
+    //
+    // From here on, `embedder` is already built/reused, so every
+    // `warn_or_default!` call below passes `Some(embedder.clone())` as what
+    // to report on a swallowed failure — see the doc comment above.
     warn_or_default!(
         extract::build_chain(&policy.parsers),
-        "warning: cannot build parser chain for auto-index: {}"
+        "warning: cannot build parser chain for auto-index: {}",
+        Some(embedder.clone())
     );
     let handle = warn_or_default!(
         db.backend().retrieval_store(&store_row.id).await,
-        "warning: cannot open store handle for auto-index: {}"
+        "warning: cannot open store handle for auto-index: {}",
+        Some(embedder.clone())
     );
     let existing = warn_or_default!(
         handle.list_indexed_documents().await,
-        "warning: cannot read existing documents for auto-index: {}"
+        "warning: cannot read existing documents for auto-index: {}",
+        Some(embedder.clone())
     );
     let mut doc_index = DocumentIndex::from_records(existing);
     let url_fetcher = HttpUrlFetcher::new()?;
@@ -279,34 +313,6 @@ pub(crate) async fn run_embedded_index_with(
     Ok((summary, Some(embedder)))
 }
 
-/// Index one store, opening its own `AppDb` and building its own embedder.
-///
-/// **Signature is a hard constraint**: `source.rs`'s post-`source add`
-/// auto-index call site depends on this exact shape. Multi-store callers
-/// (`run_index_async`) should call `run_embedded_index_with` directly instead
-/// — it accepts an already-open `AppDb` and a pre-built embedder so an N-store
-/// run doesn't reopen the DB or reload the embedding model N times.
-pub(crate) async fn run_embedded_index(
-    ctx: &CliContext,
-    store_row: &StoreRow,
-    source_id: Option<&str>,
-    mode: IndexErrorMode,
-) -> Result<IndexSummary, Error> {
-    let (config_loader, db) = load_app_db(ctx).await;
-    let (summary, _embedder) = run_embedded_index_with(
-        ctx,
-        &db,
-        &config_loader,
-        store_row,
-        source_id,
-        mode,
-        None,
-        None,
-    )
-    .await?;
-    Ok(summary)
-}
-
 /// `localdb index [--source <id>] [--strict]`
 ///
 /// One-shot scan-and-index (embedded mode) or submits a job to the daemon.
@@ -378,17 +384,18 @@ pub(crate) async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, s
     // `local` provider can trigger a one-time ~706 MB model download, just
     // to report "no sources to index" (#180 review finding 2). Once built,
     // it's shared across the remaining stores in scope exactly as before —
-    // an N-store run still constructs the embedder at most once.
+    // an N-store run still constructs the embedder at most once, even across
+    // a mid-store failure: `run_embedded_index_with` threads the embedder it
+    // built through its own `WarnAndContinue` error paths too, so
+    // `used_embedder` comes back `Some` as soon as the embedder exists,
+    // regardless of whether that call went on to succeed or fail.
     //
-    // INVARIANT: this loop must stay on `IndexErrorMode::StrictExit`. Under
-    // `WarnAndContinue`, a store that fails *after* building the embedder
-    // (e.g. `retrieval_store` or `list_indexed_documents` erroring) returns
-    // `None` for `used_embedder`, so the next store would rebuild it —
-    // reintroducing the per-store ~706 MB reload this cache exists to avoid.
-    // `StrictExit` makes that unreachable: the same failure returns `Err` and
-    // exits below, so there is no "next store". If you ever want `index` to
-    // continue past a failing store, thread the embedder out of that path too
-    // rather than just switching the mode.
+    // This loop uses `IndexErrorMode::StrictExit`, not for embedder caching
+    // (the caching now holds under either mode — see above), but for
+    // `index`'s own semantics: `index` aborts the whole run the moment any
+    // store fails (`exit_err` below), unlike `source add`'s auto-index loop
+    // (`run_source_add_async`), which deliberately keeps going under
+    // `WarnAndContinue` so one bad source doesn't fail the add.
     let mut embedder: Option<Arc<dyn Embedder>> = None;
     for store_row in &store_rows {
         let label = if multi {
