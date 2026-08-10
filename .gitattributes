@@ -1,0 +1,4 @@
+# Hand-built PDF test fixtures have no NUL bytes; without this, Git treats them
+# as text and rewrites LF->CRLF on autocrlf checkouts, shifting xref offsets and
+# stream /Length counts and corrupting the fixtures. Force binary handling.
+*.pdf binary

@@ -23,6 +23,8 @@ impl Parser for PlainParser {
             markdown: text,
             title: None,
             metadata: DublinCoreMetadata::default(),
+            // Non-paginated: only PDFs carry page offsets (#103).
+            page_starts: Vec::new(),
         }))
     }
 }

@@ -51,6 +51,11 @@ pub struct CitationBlock {
     /// `None` for chunks indexed before the Resource/Block architecture.
     #[serde(default)]
     pub kind: Option<String>,
+    /// 1-indexed page number for paginated source formats (#103, today PDF).
+    /// `None` for non-paginated formats and pre-page-plumbing chunks. Omitted
+    /// from JSON when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<u32>,
 }
 
 /// The chunk's position within its parent block.
@@ -147,6 +152,7 @@ mod tests {
             block: CitationBlock {
                 seq: 3,
                 kind: Some("paragraph".to_string()),
+                page: Some(12),
             },
             chunk_position: ChunkPosition { seq_in_block: 0 },
             location: CitationLocation {

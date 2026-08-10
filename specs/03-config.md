@@ -167,7 +167,8 @@ values select between them:
 | `local-onnx` | ONNX (CPU) | Forces ONNX. Existing `local-onnx` configs keep working unchanged. |
 
 The CoreML backend is macOS-only and gated behind the opt-in `local-coreml` cargo feature; default
-builds are ONNX-only and unaffected. Building `--features local-coreml` requires **Rust ≥ 1.85**.
+builds are ONNX-only and unaffected. Building `--features local-coreml` requires **Rust ≥ 1.85**
+— subsumed in practice by the workspace floor of **1.88**, which `pdf_oxide` sets for every build.
 
 **Index interchangeability.** Both backends share `model_id = pplx-embed-context-v1-0.6b`, are
 1024-dim, and emit binary-quantized vectors (`VectorEncoding::Binary`). Only the sign survives

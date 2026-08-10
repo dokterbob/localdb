@@ -1,0 +1,119 @@
+[
+  {
+    "file": "sewtha-sustainable-energy.pdf",
+    "source_url": "https://www.inference.org.uk/sustainable/book/tex/sewtha.pdf",
+    "sha256": "ade22462ddf3f1caa32b2f641b583db7282f95f4b6ef7501d2394a9ddb64745c",
+    "license": "Free to download from the author's site (David MacKay, \"Sustainable Energy -- without the hot air\"); not a redistribution-permissive license (no explicit CC grant found on the download page) -- treat as cache-only, do not vendor in-repo.",
+    "redistributable": false,
+    "why_difficult": "Real 383-page book (issue #87 repro) with mixed text/vector-graphics/photo pages, footnotes, and dense figure-heavy layout that has caused pdf-extract to panic.",
+    "pages": 383
+  },
+  {
+    "file": "plos-compbio-two-column.pdf",
+    "source_url": "https://journals.plos.org/ploscompbiol/article/file?id=10.1371/journal.pcbi.1002386&type=printable",
+    "sha256": "8610909c295ba514113c4f9bb52915f25a3538f0e02801c2e5187af3d3d2544f",
+    "license": "CC BY 4.0 (PLOS applies Creative Commons Attribution 4.0 International to all published articles). Thomas et al., \"On the Use of Gene Ontology Annotations to Assess Functional Similarity among Orthologs and Paralogs: A Short Report\", PLoS Computational Biology 8(2): e1002386, 2012, DOI 10.1371/journal.pcbi.1002386.",
+    "redistributable": true,
+    "why_difficult": "Genuine two-column academic journal layout (pre-2016 PLOS template) with a sidebar callout box, inline citations, and column-interleaved reading order that stresses reading-order reconstruction.",
+    "pages": 7
+  },
+  {
+    "file": "financial-table-layout.pdf",
+    "source_url": "https://raw.githubusercontent.com/yfedoseev/pdf_oxide/10b87f153200cd5c4d4a4defee471757091e6559/tests/fixtures/multi_column_table.pdf",
+    "sha256": "a7863f1ac824b93043dad6ca36fb71969590830426399b7c2bee68031cdc04b8",
+    "license": "MIT OR Apache-2.0 (pdf_oxide project fixture; synthetic, no third-party attribution file present in its directory, unlike the vertical_cjk/ and icc/ fixtures which do carry ATTRIBUTION.md/README.md).",
+    "redistributable": true,
+    "why_difficult": "Synthetic financial table where every cell is written with a separate right-aligned text-show operator -- the classic PDF layout pattern that triggers word concatenation and column-alignment failures in naive text extractors.",
+    "pages": 1
+  },
+  {
+    "file": "cjk-vertical-jo.pdf",
+    "source_url": "https://raw.githubusercontent.com/yfedoseev/pdf_oxide/10b87f153200cd5c4d4a4defee471757091e6559/tests/fixtures/vertical_cjk/jo.pdf",
+    "sha256": "cd5590bf3f86df1addf0bc773b5ffe6734a353b16cb293c9c82bd1c001c2839c",
+    "license": "MIT (originally from pdfminer.six's sample corpus, https://github.com/pdfminer/pdfminer.six/blob/master/samples/jo.pdf; redistributable under pdfminer.six's MIT license per pdf_oxide's tests/fixtures/vertical_cjk/ATTRIBUTION.md).",
+    "redistributable": true,
+    "why_difficult": "Single-page DVIPDFMx-emitted Japanese poem (Miyazawa Kenji) in vertical Identity-V writing mode using the predefined Adobe-Japan1 CIDFont Ryumin-Light with no embedded glyph outlines and no ToUnicode CMap -- the classic 'vertical CJK renders blank/mojibake' repro.",
+    "pages": 1
+  },
+  {
+    "file": "cjk-kampo-multipage.pdf",
+    "source_url": "https://raw.githubusercontent.com/yfedoseev/pdf_oxide/10b87f153200cd5c4d4a4defee471757091e6559/tests/fixtures/vertical_cjk/kampo.pdf",
+    "sha256": "7c2dcadaa18195e631e1eb3d6994f9714c79852168516524b61ee33b7b34d0b3",
+    "license": "MIT (originally from pdfminer.six's sample corpus, https://github.com/pdfminer/pdfminer.six/blob/master/samples/kampo.pdf; redistributable under pdfminer.six's MIT license per pdf_oxide's tests/fixtures/vertical_cjk/ATTRIBUTION.md).",
+    "redistributable": true,
+    "why_difficult": "Japanese pharmaceutical reference text mixing Ryumin-Light and GothicBBB-Medium (both Adobe-Japan1) in both horizontal and vertical writing modes, plus a HeiseiKakuGo-W5 reference, with only a single embedded Type1C subset covering Latin glyphs -- exercises mixed-writing-mode CID font fallback.",
+    "pages": 1
+  },
+  {
+    "file": "encrypted-cid-truetype.pdf",
+    "source_url": "https://raw.githubusercontent.com/yfedoseev/pdf_oxide/10b87f153200cd5c4d4a4defee471757091e6559/tests/fixtures/encrypted_cid_truetype.pdf",
+    "sha256": "8a13ef9cda7e4a63041e0a524c3a660e96178ac2c02e418c2763d8bd102f3c3c",
+    "license": "MIT OR Apache-2.0 (pdf_oxide project fixture; synthetic, no third-party attribution override found; produced by OpenPDF 1.3.26 per pdf_oxide's own regression-test comments).",
+    "redistributable": true,
+    "why_difficult": "RC4-128 (V=4, CFM=V2) encrypted PDF, openable with an empty user password, containing CID TrueType fonts with Identity-H encoding and an encrypted CIDToGIDMap stream -- was pdf_oxide issue #202 (text extraction silently returned empty string).",
+    "pages": 2
+  },
+  {
+    "file": "broken-xref-verapdf.pdf",
+    "source_url": "https://raw.githubusercontent.com/veraPDF/veraPDF-corpus/377728596647e40edf16003d68d620773ce96ec5/PDF_A-1b/6.1%20File%20structure/6.1.4%20Cross%20reference%20table/veraPDF%20test%20suite%206-1-4-t01-fail-a.pdf",
+    "sha256": "f266afada9dc83ae2cb4627520e0bc36c96ab884950c9193a8f6d0d38833d99a",
+    "license": "CC BY 4.0 (veraPDF-corpus repository license, per its README.md).",
+    "redistributable": true,
+    "why_difficult": "veraPDF ISO 32000-1 6.1.4 'Cross reference table' conformance-failure fixture -- deliberately malformed xref table structure; must not panic our parser and should ideally fall back to a linear/reconstruction scan.",
+    "pages": 1
+  },
+  {
+    "file": "damaged-content-stream.pdf",
+    "source_url": "https://raw.githubusercontent.com/qpdf/qpdf/8ff6b5c4fca59e38b147aebddeb54341fc313ed1/qpdf/qtest/qpdf/damaged-stream.pdf",
+    "sha256": "91e119f2db2e9f738f696ddacea90498d460b0afda0fcdf71bb6281fc5085819",
+    "license": "Apache-2.0 (qpdf project test fixture).",
+    "redistributable": true,
+    "why_difficult": "qpdf's own damaged/truncated content-stream regression fixture used to test qpdf's stream-recovery path; exercises malformed-content-stream tolerance rather than xref damage.",
+    "pages": 1
+  },
+  {
+    "file": "broken-xref-qpdf.pdf",
+    "source_url": "https://raw.githubusercontent.com/qpdf/qpdf/8ff6b5c4fca59e38b147aebddeb54341fc313ed1/qpdf/qtest/qpdf/bad-xref.pdf",
+    "sha256": "5895dfedf978f600b12e29643617dbb111869b60526d957878e349571e1467d1",
+    "license": "Apache-2.0 (qpdf project test fixture).",
+    "redistributable": true,
+    "why_difficult": "Tiny (819-byte) qpdf regression fixture with a corrupted xref table, structurally distinct from the veraPDF xref-break style above -- a second, minimal broken-xref repro for parser-robustness testing.",
+    "pages": 1
+  },
+  {
+    "file": "simple-multipage-text.pdf",
+    "source_url": null,
+    "sha256": "6546fe186defd26046416933bac2b502debdfd7e0adf32e86dff8722ec19ff1f",
+    "license": "CC0 / public domain -- authored from scratch for this task (hand-built minimal PDF, no external content), not derived from any third-party source.",
+    "redistributable": true,
+    "why_difficult": "Not difficult by design -- a clean, uncomplicated 4-page text-only PDF (standard font, single column, no images) with clearly distinguishable per-page content, included as a baseline/control fixture so ground-truth expectations have a 'nothing should go wrong here' reference point.",
+    "pages": 4
+  },
+  {
+    "file": "paragonah-archeology-partial-scan.pdf",
+    "source_url": "https://archive.org/download/archeologicalinv00juddrich/archeologicalinv00juddrich.pdf",
+    "sha256": "67df2202bb98be92258af7fa3ae9aaa13758a958af5972b24773d87cfb2d7700",
+    "license": "Public domain -- Neil M. Judd, \"Archeological Investigations at Paragonah, Utah\" (Smithsonian Miscellaneous Collections, Vol. 70, No. 3), published 1919 by the Smithsonian Institution; Internet Archive item metadata records possible-copyright-status NOT_IN_COPYRIGHT and no access restriction. Vendored file is a locally-trimmed subset (pages 2-32 of the original 52-page IA derivative PDF, re-saved with pikepdf to drop unreferenced objects) to stay under the corpus size cap; sha256 above is of the trimmed file actually committed, not IA's original derivative.",
+    "redistributable": true,
+    "why_difficult": "Genuine Internet Archive OCR scan with a PARTIAL text layer: 22 consecutive pages of dense real body text (running headers alternating 'ARCHEOLOGICAL INVESTIGATIONS AT PARAGONAH-JUDD' / 'SMITHSONIAN MISCELLANEOUS COLLECTIONS VOL. 70' with page-number folios) are bracketed by front-matter pages with ~0 extracted characters (bookplate, blank flyleaves, duplicated title-page scans) and end in a full-page rotated line-drawing site plate with 0 extracted text -- the positive real-world case for defect D (an extractor must not choke on or hallucinate text for a genuine image-only page) and defect A (running headers/folios must be recognized, not swallowed into body text).",
+    "pages": 30
+  },
+  {
+    "file": "alice-wonderland-quoted-dialogue.pdf",
+    "source_url": "https://archive.org/download/alicesadventures0000lewi_i4x4/alicesadventures0000lewi_i4x4.pdf",
+    "sha256": "e0b9ba260330720c9e2d04b724a9a32c7a69e87093922a3d0fd203b01bc14392",
+    "license": "Public domain -- Lewis Carroll (1832-1898), \"Alice's Adventures in Wonderland\", first published 1865; this scanned printing is a ca. 1910 Tenniel-illustrated edition. Internet Archive item metadata (identifier alicesadventures0000lewi_i4x4) records no access restriction. Vendored file is a locally-trimmed 12-page subset (original pages 13-24, re-saved with pikepdf/new-document page copy to drop unreferenced objects) to stay well under the corpus size cap; sha256 above is of the trimmed file actually committed, not IA's original derivative.",
+    "redistributable": true,
+    "why_difficult": "Genuine Internet Archive scan of a typeset novel spanning Chapter I's opening ('DOWN THE RABBIT-HOLE.') into the start of Chapter II, chosen for dense quoted first-person dialogue in ordinary book typography (positive case for defect F: prose dialogue must never be misdetected as a code block) and a real chapter heading plus an alternating running header/folio that must survive extraction (defect E).",
+    "pages": 12
+  },
+  {
+    "file": "gutenberg-car-of-destiny-clean.pdf",
+    "source_url": "https://www.gutenberg.org/files/23500/23500-pdf.pdf",
+    "sha256": "d043972cc8a79d9c2d8de4bef4594e0378f63d620dbc2cc81d0e5d7bd9ca24ab",
+    "license": "Public domain -- Project Gutenberg eBook #23500, C. N. and A. M. Williamson, \"The Car of Destiny\", first published 1908. Project Gutenberg only distributes texts confirmed public domain in the United States.",
+    "redistributable": true,
+    "why_difficult": "Not difficult by design -- NEGATIVE CONTROL fixture: a clean, well-formed, born-digital PDF (Project Gutenberg's own generated PDF, vector text, no scan artifacts) trimmed to 12 pages (title page, table of contents, and the Chapter I / Chapter II openings) containing plenty of quoted dialogue and real chapter headings, included so that any defect guard (A/D/E/F) firing here is known to be a false positive.",
+    "pages": 12
+  }
+]

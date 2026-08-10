@@ -12,7 +12,7 @@
 
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
-use crate::block::{Block, BlockKind};
+use crate::block::{Block, BlockKind, BlockLocation};
 use crate::ids::content_hash;
 
 // ---------------------------------------------------------------------------
@@ -31,8 +31,39 @@ use crate::ids::content_hash;
 /// `ENABLE_TABLES` and `ENABLE_STRIKETHROUGH` options. Blocks are assigned
 /// sequential `seq` values starting from 0. `location` is always `None`.
 pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
+    markdown_to_blocks_with_pages(markdown, &[])
+}
+
+/// Like [`markdown_to_blocks`], but stamps each block's `location.page` by
+/// resolving the block's first contributing source byte against `page_starts`
+/// — `(byte_offset, 1-based page number)` pairs, ascending in both fields, as
+/// produced by PDF extraction (`ParsedDocument::page_starts`).
+///
+/// **Page attribution rule** (specs/02-domain-model.md §6): a block's page is
+/// the page containing its *first contributing byte*. Blocks are never split
+/// at page boundaries — a coarse `Text` run crossing a page break carries the
+/// page it starts on.
+///
+/// With an empty `page_starts` this is behavior-identical to
+/// [`markdown_to_blocks`]: every block's `location` stays `None`.
+pub fn markdown_to_blocks_with_pages(markdown: &str, page_starts: &[(usize, u32)]) -> Vec<Block> {
     let mut blocks: Vec<Block> = Vec::new();
     let mut seq: u32 = 0;
+
+    // Resolve a byte offset (into `markdown`) to a location carrying the page
+    // that starts at or before it. Offsets before the first entry (possible
+    // when page 1 contributed no content) attribute to the first listed page.
+    let page_at = |offset: usize| -> Option<BlockLocation> {
+        if page_starts.is_empty() {
+            return None;
+        }
+        let idx = page_starts.partition_point(|&(start, _)| start <= offset);
+        let page = page_starts[idx.saturating_sub(1)].1;
+        Some(BlockLocation {
+            page: Some(page),
+            ..Default::default()
+        })
+    };
 
     // -----------------------------------------------------------------------
     // 1. Pre-scan: YAML front-matter detection
@@ -45,7 +76,7 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                 format: "yaml".to_string(),
             },
             text: fm_text,
-            location: None,
+            location: page_at(0),
         });
         seq += 1;
     }
@@ -58,7 +89,12 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_DEFINITION_LIST;
 
-    let parser = Parser::new_ext(rest, opts);
+    // `rest` is always a suffix of `markdown` (possibly all of it, possibly
+    // empty), so event ranges — relative to `rest` — map into `markdown`
+    // coordinates by adding the suffix's start offset.
+    let rest_base = markdown.len() - rest.len();
+
+    let parser = Parser::new_ext(rest, opts).into_offset_iter();
 
     // We accumulate block state using a simple stack-based approach.  The
     // pulldown-cmark stream is a flat sequence of `Start`/`End` events with
@@ -68,6 +104,9 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
     // Active block being assembled.
     struct ActiveBlock {
         kind: ActiveKind,
+        /// Byte offset (into `markdown`) of the element's `Start` event —
+        /// the block's first contributing byte, for page attribution.
+        start: usize,
         /// Accumulated text pieces.
         text: Vec<String>,
         /// Table-specific state.
@@ -80,9 +119,10 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
     }
 
     impl ActiveBlock {
-        fn new(kind: ActiveKind) -> Self {
+        fn new(kind: ActiveKind, start: usize) -> Self {
             ActiveBlock {
                 kind,
+                start,
                 text: Vec::new(),
                 table_headers: Vec::new(),
                 table_rows: Vec::new(),
@@ -111,19 +151,35 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
     // into a single `BlockKind::Text` block at structural boundaries (heading,
     // code, table, image) and once more after the event loop.
     let mut text_accum: Vec<String> = Vec::new();
+    // Earliest source offset among the accumulator's contributors — the
+    // eventual `Text` block's first contributing byte.
+    let mut accum_start: Option<usize> = None;
 
-    // Helper: push a completed block.
+    // Helper: push a completed block at the given source offset.
     macro_rules! push_block {
-        ($blocks:expr, $seq:expr, $kind:expr, $text:expr) => {{
+        ($blocks:expr, $seq:expr, $kind:expr, $text:expr, $start:expr) => {{
             let text = $text;
             if !text.is_empty() {
                 $blocks.push(Block {
                     seq: $seq,
                     kind: $kind,
                     text,
-                    location: None,
+                    location: page_at($start),
                 });
                 $seq += 1;
+            }
+        }};
+    }
+
+    // Helper: append finished element text to the running-text accumulator,
+    // tracking the earliest contributing offset.
+    macro_rules! accum_push {
+        ($text:expr, $start:expr) => {{
+            let text = $text;
+            if !text.is_empty() {
+                let start: usize = $start;
+                accum_start = Some(accum_start.map_or(start, |s| s.min(start)));
+                text_accum.push(text);
             }
         }};
     }
@@ -133,19 +189,25 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
         ($blocks:expr, $seq:expr, $accum:expr) => {{
             if !$accum.is_empty() {
                 let text = $accum.join("\n\n");
+                let location = accum_start.and_then(page_at);
                 $blocks.push(Block {
                     seq: $seq,
                     kind: BlockKind::Text,
                     text,
-                    location: None,
+                    location,
                 });
                 $seq += 1;
                 $accum.clear();
             }
+            accum_start = None;
         }};
     }
 
-    for event in parser {
+    for (event, range) in parser {
+        // The element's first byte in `markdown` coordinates. For `Start`
+        // events the range covers the whole element, so `range.start` is the
+        // element's first contributing byte.
+        let offset = rest_base + range.start;
         match event {
             // ----------------------------------------------------------------
             // Block start events
@@ -153,11 +215,11 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
             Event::Start(Tag::Heading { level, .. }) => {
                 flush_text!(blocks, seq, text_accum);
                 let lv = level as u8;
-                stack.push(ActiveBlock::new(ActiveKind::Heading { level: lv }));
+                stack.push(ActiveBlock::new(ActiveKind::Heading { level: lv }, offset));
             }
 
             Event::Start(Tag::Paragraph) => {
-                stack.push(ActiveBlock::new(ActiveKind::Paragraph));
+                stack.push(ActiveBlock::new(ActiveKind::Paragraph, offset));
             }
 
             Event::Start(Tag::CodeBlock(fence)) => {
@@ -173,20 +235,23 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                     pulldown_cmark::CodeBlockKind::Indented => None,
                 };
                 flush_text!(blocks, seq, text_accum);
-                stack.push(ActiveBlock::new(ActiveKind::Code { language: lang }));
+                stack.push(ActiveBlock::new(
+                    ActiveKind::Code { language: lang },
+                    offset,
+                ));
             }
 
             Event::Start(Tag::BlockQuote(_)) => {
-                stack.push(ActiveBlock::new(ActiveKind::Quote));
+                stack.push(ActiveBlock::new(ActiveKind::Quote, offset));
             }
 
             Event::Start(Tag::List(_start)) => {
-                stack.push(ActiveBlock::new(ActiveKind::List));
+                stack.push(ActiveBlock::new(ActiveKind::List, offset));
             }
 
             Event::Start(Tag::Table(_alignments)) => {
                 flush_text!(blocks, seq, text_accum);
-                stack.push(ActiveBlock::new(ActiveKind::Table));
+                stack.push(ActiveBlock::new(ActiveKind::Table, offset));
             }
 
             Event::Start(Tag::TableHead) => {
@@ -204,7 +269,7 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                 // The title attribute is stored separately if present.
                 let _ = title; // may use in future
                 flush_text!(blocks, seq, text_accum);
-                stack.push(ActiveBlock::new(ActiveKind::Image { src }));
+                stack.push(ActiveBlock::new(ActiveKind::Image { src }, offset));
             }
 
             // ----------------------------------------------------------------
@@ -217,7 +282,7 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                         ActiveKind::Heading { level } => level,
                         _ => 1,
                     };
-                    push_block!(blocks, seq, BlockKind::Heading { level }, text);
+                    push_block!(blocks, seq, BlockKind::Heading { level }, text, b.start);
                 }
             }
 
@@ -243,9 +308,7 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                             }
                             // Top-level paragraph: feed the running-text accumulator
                             // rather than emitting a standalone block.
-                            if !text.is_empty() {
-                                text_accum.push(text);
-                            }
+                            accum_push!(text, b.start);
                         }
                         _ => {
                             // Restore — shouldn't happen normally.
@@ -262,25 +325,21 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                         ActiveKind::Code { language } => language,
                         _ => None,
                     };
-                    push_block!(blocks, seq, BlockKind::Code { language }, text);
+                    push_block!(blocks, seq, BlockKind::Code { language }, text, b.start);
                 }
             }
 
             Event::End(TagEnd::BlockQuote(_)) => {
                 if let Some(b) = stack.pop() {
                     let text = b.text.join(" ");
-                    if !text.is_empty() {
-                        text_accum.push(text);
-                    }
+                    accum_push!(text, b.start);
                 }
             }
 
             Event::End(TagEnd::List(_)) => {
                 if let Some(b) = stack.pop() {
                     let text = b.text.join("\n");
-                    if !text.is_empty() {
-                        text_accum.push(text);
-                    }
+                    accum_push!(text, b.start);
                 }
             }
 
@@ -312,7 +371,13 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                         lines.extend(b.table_rows.iter().map(|r| render_row(r)));
                         lines.join("\n")
                     };
-                    push_block!(blocks, seq, BlockKind::Table { headers, rows }, text);
+                    push_block!(
+                        blocks,
+                        seq,
+                        BlockKind::Table { headers, rows },
+                        text,
+                        b.start
+                    );
                 }
             }
 
@@ -362,7 +427,7 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                         seq,
                         kind: BlockKind::Image { alt, src },
                         text,
-                        location: None,
+                        location: page_at(b.start),
                     });
                     seq += 1;
                 }
@@ -420,14 +485,10 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
                 // the same `Text` block.
                 while let Some(b) = stack.pop() {
                     let text = b.text.join(" ");
-                    if !text.is_empty() {
-                        text_accum.push(text);
-                    }
+                    accum_push!(text, b.start);
                 }
                 let trimmed = t.trim().to_string();
-                if !trimmed.is_empty() {
-                    text_accum.push(trimmed);
-                }
+                accum_push!(trimmed, offset);
             }
 
             // Ignore everything else: HR, footnotes, soft/hard breaks, and
@@ -440,7 +501,9 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
 
     // Flush any trailing running text after the event loop ends.
     flush_text!(blocks, seq, text_accum);
-    let _ = seq; // final increment inside flush_text! is otherwise never read
+    // Final flush_text! increments seq and resets accum_start; neither is
+    // read again after the loop.
+    let _ = (seq, accum_start);
 
     blocks
 }
@@ -449,16 +512,30 @@ pub fn markdown_to_blocks(markdown: &str) -> Vec<Block> {
 // compute_blocks_hash
 // ---------------------------------------------------------------------------
 
-/// Compute a content hash from block kind and text, joined with separators.
+/// Compute a content hash from block kind, text, and page, joined with separators.
 ///
 /// Each block contributes `"kind:text"` and entries are separated by `\x00`
 /// (NUL byte) to prevent cross-block collisions. Including the block kind
 /// ensures that structural changes (e.g. paragraph→heading with same text)
 /// trigger re-indexing.
+///
+/// When a block carries a page number (paginated formats — PDF, #103) it is
+/// folded in as a `\x01p{page}` suffix, so a **repagination that leaves the
+/// text and kinds unchanged still changes the hash** and re-indexes — otherwise
+/// the skip-check (which keys on this hash) would leave stored citations on
+/// their old, now-wrong pages. Blocks without a page (every non-paginated
+/// format) contribute no suffix, so their hashes are unchanged from before this
+/// addition — no spurious global reindex.
 pub fn compute_blocks_hash(blocks: &[Block]) -> String {
     let combined: String = blocks
         .iter()
-        .map(|b| format!("{}:{}", b.kind.kind_str(), b.text))
+        .map(|b| {
+            let base = format!("{}:{}", b.kind.kind_str(), b.text);
+            match b.location.as_ref().and_then(|loc| loc.page) {
+                Some(page) => format!("{base}\x01p{page}"),
+                None => base,
+            }
+        })
         .collect::<Vec<_>>()
         .join("\x00");
     content_hash(&combined)
@@ -961,6 +1038,158 @@ Para three.
         assert!(matches!(blocks[0].kind, BlockKind::Heading { level: 1 }));
         assert_eq!(blocks[1].kind, BlockKind::Text);
         assert!(blocks[1].text.contains("After paragraph."));
+    }
+
+    // -----------------------------------------------------------------------
+    // Page stamping (#103)
+    // -----------------------------------------------------------------------
+
+    /// With empty `page_starts`, the `_with_pages` variant is byte-identical to
+    /// `markdown_to_blocks` — the zero-page regression guard.
+    #[test]
+    fn with_pages_empty_equals_markdown_to_blocks() {
+        let samples = [
+            "# H1\n\npara1\n\n## H2\n\npara2\n",
+            "---\ntitle: x\n---\n\n# C\n\ntext\n",
+            "| A | B |\n|---|---|\n| 1 | 2 |\n",
+            "para\n\n```rust\nfn f(){}\n```\n\nmore\n",
+            "",
+        ];
+        for md in samples {
+            assert_eq!(
+                markdown_to_blocks_with_pages(md, &[]),
+                markdown_to_blocks(md),
+                "empty page_starts must match plain markdown_to_blocks for {md:?}"
+            );
+        }
+    }
+
+    /// Every block gets stamped with the page containing its first byte.
+    #[test]
+    fn blocks_stamped_with_correct_page() {
+        // "# One\n\nAlpha body.\n\n"  -> offsets 0..20
+        // "# Two\n\nBravo body.\n\n"  starts at 20
+        // "# Three\n\nCharlie body.\n" starts at 40
+        let md = "# One\n\nAlpha body.\n\n# Two\n\nBravo body.\n\n# Three\n\nCharlie body.\n";
+        let p2 = md.find("# Two").unwrap();
+        let p3 = md.find("# Three").unwrap();
+        let page_starts = vec![(0usize, 1u32), (p2, 2u32), (p3, 3u32)];
+
+        let blocks = markdown_to_blocks_with_pages(md, &page_starts);
+        let page_of = |needle: &str| {
+            blocks
+                .iter()
+                .find(|b| b.text.contains(needle))
+                .and_then(|b| b.location.as_ref())
+                .and_then(|l| l.page)
+        };
+        assert_eq!(page_of("One"), Some(1));
+        assert_eq!(page_of("Alpha body."), Some(1));
+        assert_eq!(page_of("Two"), Some(2));
+        assert_eq!(page_of("Bravo body."), Some(2));
+        assert_eq!(page_of("Three"), Some(3));
+        assert_eq!(page_of("Charlie body."), Some(3));
+    }
+
+    /// A block is attributed to the page of its FIRST byte even when its text
+    /// spans a page boundary — the coarse-`Text` packing rule (#158).
+    #[test]
+    fn block_spanning_page_boundary_takes_first_byte_page() {
+        // A single running-text block (two paragraphs, no structural break)
+        // whose second paragraph starts after the page-2 offset. The whole
+        // Text block must still be attributed to page 1.
+        let md = "First paragraph on page one.\n\nSecond paragraph on page two.\n";
+        let boundary = md.find("Second").unwrap();
+        let page_starts = vec![(0usize, 1u32), (boundary, 2u32)];
+
+        let blocks = markdown_to_blocks_with_pages(md, &page_starts);
+        assert_eq!(blocks.len(), 1, "both paragraphs fold into one Text block");
+        assert_eq!(blocks[0].kind, BlockKind::Text);
+        assert!(blocks[0].text.contains("Second paragraph"));
+        assert_eq!(
+            blocks[0].location.as_ref().and_then(|l| l.page),
+            Some(1),
+            "the crossing block takes the page of its first byte"
+        );
+    }
+
+    /// An offset before the first `page_starts` entry attributes to the first
+    /// listed page (page 1 may contribute no content, so its start offset can
+    /// be > 0).
+    #[test]
+    fn offset_before_first_page_start_uses_first_page() {
+        let md = "Intro line.\n\n# Heading\n\nBody.\n";
+        // First recorded page starts at the heading, not at offset 0.
+        let heading = md.find("# Heading").unwrap();
+        let page_starts = vec![(heading, 5u32), (md.find("Body").unwrap(), 6u32)];
+
+        let blocks = markdown_to_blocks_with_pages(md, &page_starts);
+        let intro = blocks.iter().find(|b| b.text.contains("Intro")).unwrap();
+        assert_eq!(
+            intro.location.as_ref().and_then(|l| l.page),
+            Some(5),
+            "content before the first page start attributes to the first page"
+        );
+    }
+
+    /// #103 fingerprint: a repagination (same text/kinds, different page)
+    /// changes `compute_blocks_hash`, so the skip-check re-indexes instead of
+    /// leaving citations on stale pages.
+    #[test]
+    fn blocks_hash_changes_with_page() {
+        let block = |page: Option<u32>| Block {
+            seq: 0,
+            kind: BlockKind::Text,
+            text: "Identical body text.".to_string(),
+            location: page.map(|p| BlockLocation {
+                page: Some(p),
+                ..Default::default()
+            }),
+        };
+        let h1 = compute_blocks_hash(&[block(Some(1))]);
+        let h2 = compute_blocks_hash(&[block(Some(2))]);
+        assert_ne!(h1, h2, "moving a block to a new page must change the hash");
+    }
+
+    /// A block with no page (every non-paginated format) hashes identically to
+    /// before page folding — the suffix is added only when a page is present,
+    /// so there is no spurious global reindex.
+    #[test]
+    fn blocks_hash_unchanged_without_page() {
+        let paged = Block {
+            seq: 0,
+            kind: BlockKind::Text,
+            text: "Body.".to_string(),
+            location: Some(BlockLocation {
+                page: None,
+                ..Default::default()
+            }),
+        };
+        let no_loc = Block {
+            seq: 0,
+            kind: BlockKind::Text,
+            text: "Body.".to_string(),
+            location: None,
+        };
+        // A location with page=None contributes no suffix, matching a block
+        // with no location at all and the pre-#103 `{kind}:{text}` hash.
+        assert_eq!(
+            compute_blocks_hash(&[paged]),
+            compute_blocks_hash(&[no_loc])
+        );
+        assert_eq!(
+            compute_blocks_hash(&[no_loc_block("Body.")]),
+            content_hash("text:Body.")
+        );
+    }
+
+    fn no_loc_block(text: &str) -> Block {
+        Block {
+            seq: 0,
+            kind: BlockKind::Text,
+            text: text.to_string(),
+            location: None,
+        }
     }
 
     /// Frontmatter with CRLF line endings is detected correctly.

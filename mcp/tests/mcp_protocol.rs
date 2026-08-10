@@ -152,6 +152,9 @@ async fn make_handler_with_seeded_store() -> (McpHandler, String, String) {
         block_seq: 0,
         seq_in_block: 0,
         block_kind: None,
+        // Paginated source (#103): the MCP surface must carry this through to
+        // citation.block.page with no surface-crate code change.
+        page: Some(4),
         window_block_seqs: vec![],
     };
 
@@ -211,6 +214,7 @@ async fn make_handler_with_multichunk_doc() -> (McpHandler, String) {
             block_seq,
             seq_in_block,
             block_kind: Some("text".to_string()),
+            page: None,
             window_block_seqs: vec![],
         }
     };
@@ -272,6 +276,7 @@ async fn make_handler_with_tied_chunks(reversed: bool) -> (McpHandler, String) {
             block_seq: 0,
             seq_in_block: 0,
             block_kind: Some("text".to_string()),
+            page: None,
             window_block_seqs: vec![],
         }
     };
@@ -331,6 +336,7 @@ async fn make_handler_with_sequential_chunks(count: u32) -> (McpHandler, String,
             block_seq,
             seq_in_block: 0,
             block_kind: Some("text".to_string()),
+            page: None,
             window_block_seqs: vec![],
         });
     }
@@ -381,6 +387,7 @@ async fn make_handler_with_block_seq_gaps() -> (McpHandler, String) {
             block_seq,
             seq_in_block,
             block_kind: Some("text".to_string()),
+            page: None,
             window_block_seqs: vec![],
         }
     };
@@ -590,6 +597,12 @@ async fn test_search_returns_canonical_citations() {
     let block = &first["block"];
     assert!(block.get("seq").is_some(), "citation.block.seq missing");
     assert!(block.get("kind").is_some(), "citation.block.kind missing");
+    // #103: page from a paginated source is serialized on the MCP surface.
+    assert_eq!(
+        block.get("page").and_then(|p| p.as_u64()),
+        Some(4),
+        "citation.block.page must serialize through the MCP search surface"
+    );
 
     assert!(
         first["chunk_position"].get("seq_in_block").is_some(),
@@ -652,6 +665,7 @@ collector, which keeps runtime performance predictable and fast.";
         block_seq: 0,
         seq_in_block: 0,
         block_kind: None,
+        page: None,
         window_block_seqs: vec![],
     };
     store.upsert_chunks(vec![record]).await.unwrap();
@@ -799,6 +813,7 @@ async fn test_search_limit_respected() {
             block_seq: 0,
             seq_in_block: 0,
             block_kind: None,
+            page: None,
             window_block_seqs: vec![],
         });
     }

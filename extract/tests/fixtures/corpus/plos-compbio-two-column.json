@@ -1,0 +1,22 @@
+{
+  "file": "plos-compbio-two-column.pdf",
+  "expect": "ok",
+  "pages": 7,
+  "page_phrases": {
+    "1": ["based on both theoretical and empirical considerations", "revolutionized the use of structured, controlled vocabularies", "have more closely related functions than paralogous genes"],
+    "2": ["genes contribute to the biology of an organism", "a score based on the normalized intersection", "we suggest that the authors, rather than testing"],
+    "3": ["Experimentally-supported GO annotations for MAP4K2 and MAP4K3 genes"],
+    "4": ["This lack of experimental characterization cannot, however, be", "apparently not been characterized at the molecular level", "are known to be highly dependent upon their"],
+    "5": ["similar in its actual biological function to its", "convergence in function between paralogs would be a", "even for similar experiments, may arise for non-biological"],
+    "6": ["but this claim is essential for their interpretations", "GO annotation congruence as functional similarity is problematic", "the common use of mouse as a genetic system"],
+    "7": ["Users of GO should ensure that they test", "the cumulative hypergeometric probability distribution in Microsoft Excel", "The full membership of the Gene Ontology Consortium"]
+  },
+  "reading_order": [
+    {"page": 1, "phrase": "revolutionized the use of structured, controlled vocabularies"},
+    {"page": 1, "phrase": "have more closely related functions than paralogous genes"},
+    {"page": 2, "phrase": "genes contribute to the biology of an organism"},
+    {"page": 2, "phrase": "we suggest that the authors, rather than testing"}
+  ],
+  "title_contains": "Ontology",
+  "notes": "Standard PLoS Computational Biology two-column layout: title/author/affiliations/abstract/citation block run full-width at the top of page 1, then body text (Introduction onward) starts in two columns. Page 1's two reading_order phrases are the left-column open of the Introduction and the immediately-following right-column continuation of the same sentence pair -- a correct extractor must emit the left-column phrase before the right-column one despite the right column being physically to the right of (and vertically overlapping) the left column's later paragraphs. Page 2 similarly pairs a left-column 'Author Summary' box phrase with a right-column body phrase. Page 3 is a full-page continuation of Table 1 (GO term/ID rows for MAP4K2, Map4k2, MAP4K3) with no prose paragraphs at all; its one phrase is the table's own caption line, not body prose -- noted since the task normally asks for body-text phrases. Pages 4-7 alternate ordinary two-column prose with embedded tables (Table 2 on page 5, Table 3 on page 6) and a two-column References list on page 7; phrases were drawn only from prose paragraphs, never table cells or the numbered reference entries. Every page after page 1 repeats the running header 'GO Annotations for Orthologous Genes' and a footer with the journal name, page number, and DOI -- excluded from all phrases as headers/footers. Several otherwise-tempting sentences were rejected for containing 'fi'/'fl'/'ff' ligature-risk words (e.g. 'different', 'specificity', 'influencing', 'specific', 'finding', 'effects') or citation brackets like '[8]'/'[13]'; phrase boundaries were chosen to stop just before such words while still forming a clean multi-word substring. No blank, rotated, or scanned-looking pages; text renders as clean vector PDF output throughout, and small caps / italic gene names (e.g. MAP4K2, Thra) appear only as ordinary characters in the underlying text layer."
+}

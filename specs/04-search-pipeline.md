@@ -82,9 +82,40 @@ through a Markdown intermediate.
 | Markdown | pulldown-cmark parser (passthrough) | Headings → heading blocks; code fences → code blocks. |
 | Plain text | direct passthrough | Treated as Markdown verbatim. |
 | HTML | readability-style main-content selection → Markdown | Used for both `url` fetches and `.html` files. |
-| PDF (text layer) | Rust PDF text extraction | Scanned/text-less PDFs are rejected (no OCR). |
+| PDF (text layer) | `pdf_oxide` per-page → Markdown, plus retrieval-oriented post-processing (see below) | Scanned/text-less PDFs are rejected (no OCR); Info dict + XMP → `DocumentMetadata`. |
 | Office (DOCX/PPTX/CSV) | `anytomd` (v1.3.0) → Markdown | Production-ready. XLSX/XLS disabled (see below). |
 | EPUB | `rbook` spine walk → per-chapter XHTML → Markdown via the internal HTML converter | Reading order preserved; OPF Dublin Core → `DocumentMetadata`. Extension-gated (`.epub`). DRM'd / image-only books → `ExtractionFailed`. |
+
+#### PDF extraction is tuned for retrieval, not for visual fidelity
+
+A PDF is converted one page at a time and the pages are concatenated, recording the byte offset
+where each page begins so blocks can carry a `page` number (§2 of
+[02-domain-model.md](02-domain-model.md)). Four deliberate deviations from the extractor's
+defaults, plus three local repairs, exist because the goal is the words an author wrote — not a
+faithful reproduction of the printed page:
+
+- **Artifacts are dropped** (`/Artifact`-tagged running headers, footers, page-number folios and
+  watermarks, per ISO 32000-1 §14.8.2.2.1). Without this, a folio becomes its own chunk.
+- **Ligatures are expanded** (U+FB00–U+FB06 → `fi`/`fl`/`ff`/…), so BM25 tokenization and the
+  embedder see real words.
+- **Soft hyphens (U+00AD) are deleted.** They are discretionary line-break hints with no textual
+  meaning (§14.8.2.2.3). Deletion alone reconstructs the word; line-break hyphens are
+  deliberately *not* rejoined, as that is where `well-being` → `wellbeing` corruption comes from.
+- **Pages with no text layer are dropped, not annotated.** A page that yields nothing contributes
+  nothing; the whole set is reported once via a `WARN` naming the count and page ranges. A
+  *mixed* document — real text on some pages, bare scans on others — still indexes its text.
+  This is what keeps the "scanned PDFs are rejected, OCR is out of scope" statement below honest:
+  previously a placeholder marker was emitted per skipped page and indexed as though it were
+  content, which also let mixed documents evade scanned-PDF detection entirely.
+- **Heading and code-block inference is guarded.** The extractor infers headings from font
+  clustering and code blocks from monospace detection; both over-fire on real books. A heading
+  that fails a sanity check is demoted to a paragraph (it stays indexed — it just stops becoming
+  a `heading_path` breadcrumb for every following chunk), and a bare fence whose content reads as
+  prose is un-fenced. Both guards are biased hard against false positives.
+
+Geometric stripping of running headers in *untagged* PDFs is **not** enabled: the upstream
+implementation matches glyph-run spans rather than lines and deletes body text from multi-column
+documents. See `docs/followups-pdf-oxide-swap.md`.
 
 **Out of scope (explicit):** OCR / scanned PDFs and images. EPUB is the only ebook format
 supported; **MOBI/AZW/AZW3** (PalmDOC/KF8 compression, frequent DRM — realistically need a
@@ -122,6 +153,17 @@ glob). Sources added via explicit `include` override this default entirely.
 | Unexpected panic in parser/chunker | `Internal` (via `catch_unwind`) | `error_count` | WARN logged per file; counted as failure. |
 
 In all three cases the ingestion loop continues with the next file; the process does **not** abort.
+
+Exactly one WARN is emitted per failing resource. `core::ingestion` owns that line — it is the
+layer that accounts for ingestion outcomes — so ingestors log their extra framing at `debug!`
+and fold anything the operator needs at default level (e.g. that the failure was a *panic*
+rather than a returned error) into the `SkipReason::Error` payload itself.
+
+**Partial success is a fourth, orthogonal case.** A document can extract successfully and still
+lose content: a PDF whose text layer covers only some pages contributes nothing for the rest.
+That is `Ok` — the document indexes, and counts as a success — but `extract` emits one WARN
+naming how many pages were dropped and which. It is deliberately not an error variant: a mixed
+scanned/text book must still be indexed for the text it does have.
 
 **`--strict` opt-in:** by default `index` is best-effort (exits `0` regardless of per-file
 failures). Pass `--strict` to exit `2` after the run completes when `error_count > 0`. Unsupported
@@ -307,7 +349,8 @@ selected by the `local` / `local-coreml` / `local-onnx` provider values
   token embeddings, then Rust does mean-pooling over each chunk's token span and `tanh` int8
   quantization before binarization.
 - **CoreML (ANE/GPU):** macOS-only, behind the opt-in `local-coreml` cargo feature
-  (requires Rust ≥ 1.85). Executes on Apple Silicon's ANE/GPU via `objc2-core-ml`. Pooling
+  (requires Rust ≥ 1.85, subsumed by the workspace's 1.88 floor). Executes on Apple Silicon's
+  ANE/GPU via `objc2-core-ml`. Pooling
   and `tanh` int8 quantization happen **inside the model** — it consumes a `pool_matrix`
   input and outputs int8 `(32, 1024)` directly, so the in-Rust mean-pool + quant of the
   ONNX path is not needed. The CoreML bundle is the context (late-chunking) variant,

@@ -42,7 +42,7 @@ But the moment a store has one `kind = 'feed'` source, any older binary that pre
 ingestor can no longer open that store for `source list` or `index` at all — even for its
 non-feed sources. There is no `db downgrade` for this: the incompatibility lives in a data row,
 not the schema version, so the migration framework's version-gated refusal never sees it coming.
-See [docs/architecture.md#known-gaps](architecture.md#known-gaps) (item 10) for the tracked
+See [docs/architecture.md#known-gaps](architecture.md#known-gaps) (item 12) for the tracked
 follow-up — graceful degradation so an old binary skips unknown source kinds instead of failing
 the whole store.
 

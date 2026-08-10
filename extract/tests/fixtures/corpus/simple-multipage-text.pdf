@@ -1,0 +1,146 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [10 0 R 11 0 R 12 0 R 13 0 R] /Count 4 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+10 0 obj
+<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 3 0 R >> >> /MediaBox [0 0 612 792] /Contents 20 0 R >>
+endobj
+11 0 obj
+<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 3 0 R >> >> /MediaBox [0 0 612 792] /Contents 21 0 R >>
+endobj
+12 0 obj
+<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 3 0 R >> >> /MediaBox [0 0 612 792] /Contents 22 0 R >>
+endobj
+13 0 obj
+<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 3 0 R >> >> /MediaBox [0 0 612 792] /Contents 23 0 R >>
+endobj
+20 0 obj
+<< /Length 372 >>
+stream
+BT
+/F1 18 Tf
+72 740 Td
+20 TL
+(Better-PDF Sample Document) Tj
+T*
+(Page 1 of 4 -- Introduction) Tj
+T*
+() Tj
+T*
+(This is a small, freely licensed \(CC0 / public domain\) PDF) Tj
+T*
+(created specifically for the better-pdf test corpus.) Tj
+T*
+(Each page below contains clearly distinguishable text so that) Tj
+T*
+(ground-truth expectations can be written unambiguously.) Tj
+ET
+endstream
+endobj
+21 0 obj
+<< /Length 245 >>
+stream
+BT
+/F1 18 Tf
+72 740 Td
+20 TL
+(Page 2 of 4 -- Alpha Section) Tj
+T*
+() Tj
+T*
+(The quick brown fox jumps over the lazy dog.) Tj
+T*
+(Sphinx of black quartz, judge my vow.) Tj
+T*
+(Item A: apples) Tj
+T*
+(Item B: bananas) Tj
+T*
+(Item C: cherries) Tj
+ET
+endstream
+endobj
+22 0 obj
+<< /Length 240 >>
+stream
+BT
+/F1 18 Tf
+72 740 Td
+20 TL
+(Page 3 of 4 -- Beta Section) Tj
+T*
+() Tj
+T*
+(1. First numbered item) Tj
+T*
+(2. Second numbered item) Tj
+T*
+(3. Third numbered item) Tj
+T*
+() Tj
+T*
+(This page intentionally differs from pages 1, 2, and 4.) Tj
+ET
+endstream
+endobj
+23 0 obj
+<< /Length 282 >>
+stream
+BT
+/F1 18 Tf
+72 740 Td
+20 TL
+(Page 4 of 4 -- Conclusion) Tj
+T*
+() Tj
+T*
+(This is the final page of the sample document.) Tj
+T*
+(If you can read this sentence on page four, page-level) Tj
+T*
+(text extraction and page ordering are both working.) Tj
+T*
+() Tj
+T*
+(END OF DOCUMENT) Tj
+ET
+endstream
+endobj
+xref
+0 24
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000143 00000 n 
+0000000000 65535 f 
+0000000000 65535 f 
+0000000000 65535 f 
+0000000000 65535 f 
+0000000000 65535 f 
+0000000000 65535 f 
+0000000213 00000 n 
+0000000341 00000 n 
+0000000469 00000 n 
+0000000597 00000 n 
+0000000000 65535 f 
+0000000000 65535 f 
+0000000000 65535 f 
+0000000000 65535 f 
+0000000000 65535 f 
+0000000000 65535 f 
+0000000725 00000 n 
+0000001149 00000 n 
+0000001446 00000 n 
+0000001738 00000 n 
+trailer
+<< /Size 24 /Root 1 0 R >>
+startxref
+2072
+%%EOF

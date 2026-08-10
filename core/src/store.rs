@@ -99,6 +99,13 @@ pub struct ChunkRecord {
     #[serde(default)]
     pub block_kind: Option<String>,
 
+    /// 1-indexed page number of the originating block, for paginated source
+    /// formats (#103). Copied from the block's `location.page`; `None` for
+    /// non-paginated formats and rows written before page plumbing existed.
+    /// Persisted inside `location_json` as an optional `"page"` key.
+    #[serde(default)]
+    pub page: Option<u32>,
+
     /// For message-window chunks (#129): all block seqs participating in the
     /// window. Empty for ordinary single-block chunks. Persisted inside
     /// `location_json` as `{"start", "end", "window_block_seqs"?}`, present
@@ -136,6 +143,7 @@ impl ChunkRecord {
             block_seq: 0,
             seq_in_block: 0,
             block_kind: None,
+            page: None,
             window_block_seqs: chunk.window_block_seqs.clone(),
         }
     }
@@ -662,6 +670,7 @@ pub mod conformance {
             block_seq: 0,
             seq_in_block: 0,
             block_kind: None,
+            page: None,
             window_block_seqs: vec![],
         }
     }
@@ -1105,6 +1114,44 @@ pub mod conformance {
         );
     }
 
+    /// #103: a chunk's `page` survives the store round trip via the optional
+    /// `"page"` key in `location_json`; a chunk without a page reads back
+    /// `None` (missing-key compatibility — same pattern as window_block_seqs).
+    pub async fn test_page_round_trip(store: &dyn RetrievalStore) {
+        let mut paged = make_record(
+            "chunk-paged",
+            "doc-1",
+            "store-1",
+            "paged chunk text",
+            vec![1.0, 0.0],
+        );
+        paged.page = Some(7);
+
+        let unpaged = make_record(
+            "chunk-unpaged",
+            "doc-1",
+            "store-1",
+            "unpaged chunk text",
+            vec![0.0, 1.0],
+        );
+        assert!(unpaged.page.is_none());
+
+        store.upsert_chunks(vec![paged, unpaged]).await.unwrap();
+
+        let got_paged = store.get_chunk("chunk-paged").await.unwrap().unwrap();
+        assert_eq!(
+            got_paged.page,
+            Some(7),
+            "paged chunk's page must survive round trip"
+        );
+
+        let got_unpaged = store.get_chunk("chunk-unpaged").await.unwrap().unwrap();
+        assert_eq!(
+            got_unpaged.page, None,
+            "a chunk without a page reads back None (missing-key compat)"
+        );
+    }
+
     /// Test: `upsert_blocks` then `get_blocks_for_resource` round-trips
     /// blocks ordered by `seq`, regardless of insertion order — proving
     /// reconstruction can't accidentally depend on physical/insertion order.
@@ -1198,6 +1245,7 @@ mod tests {
             block_seq: 0,
             seq_in_block: 0,
             block_kind: None,
+            page: None,
             window_block_seqs: vec![],
         }
     }
@@ -1296,6 +1344,12 @@ mod tests {
     async fn fake_store_window_block_seqs_round_trip() {
         let store = FakeStore::new();
         test_window_block_seqs_round_trip(&store).await;
+    }
+
+    #[tokio::test]
+    async fn fake_store_page_round_trip() {
+        let store = FakeStore::new();
+        test_page_round_trip(&store).await;
     }
 
     #[tokio::test]

@@ -4,9 +4,9 @@
 
 ## Prerequisites
 
-localdb requires **Rust 1.82 or later** (Linux) or **Rust 1.85 or later** (macOS, because
-CoreML is built automatically and pulls edition-2024 `hf-hub` 1.0). The easiest way to
-install and manage Rust is
+localdb requires **Rust 1.88 or later** on every platform (the `pdf_oxide` PDF parser pulls
+in `image` 0.25, which needs 1.88; the macOS CoreML path's edition-2024 `hf-hub` 1.0 floor of
+1.85 is subsumed). The easiest way to install and manage Rust is
 [rustup](https://rustup.rs/):
 
 ```bash

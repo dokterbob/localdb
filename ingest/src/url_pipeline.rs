@@ -143,7 +143,13 @@ pub(crate) async fn process_url(
     let fetch_result = match fetcher.fetch(locator, &fetch_meta).await {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!(url = %locator, "process_url: fetch error: {}", e);
+            // Debug, not warn: `core::ingestion` emits the single user-facing
+            // WARN for every SkipReason::Error (it owns ingestion outcome
+            // accounting). This line keeps the extra framing for
+            // troubleshooting without duplicating the warning. Note the
+            // `Blocked` arm below stays at warn — it reports
+            // `SkipReason::Other`, for which `core` logs nothing.
+            tracing::debug!(url = %locator, "process_url: fetch error: {}", e);
             // Report via on_skipped so the delete-sweep keeps this locator's
             // previously indexed content: a transient network failure is not
             // evidence the resource is gone (contrast with `Gone` below,
@@ -204,8 +210,19 @@ pub(crate) async fn process_url(
     // SkipReason::Error rather than a benign-skip counter.
     let parsed = match catch_panic(std::panic::AssertUnwindSafe(|| parser.parse(&probe))) {
         Err(panic_msg) => {
-            tracing::warn!(url = %locator, "process_url: parser panicked: {}", panic_msg);
-            callback.on_skipped(uri, SkipReason::Error(panic_msg)).await;
+            // Debug: `core::ingestion` owns the user-facing WARN.
+            tracing::debug!(url = %locator, "process_url: parser panicked: {}", panic_msg);
+            // The "parser panicked" framing must live in the payload, not only
+            // in the debug line above: `core`'s single WARN prints the payload
+            // verbatim, and without this a crash and an ordinary returned Err
+            // are indistinguishable at the default log level. The fetch- and
+            // parser-error arms already prefix theirs for the same reason.
+            callback
+                .on_skipped(
+                    uri,
+                    SkipReason::Error(format!("parser panicked: {panic_msg}")),
+                )
+                .await;
             result.errors += 1;
             return Ok(UrlOutcome::ParseFailed);
         }
@@ -217,7 +234,8 @@ pub(crate) async fn process_url(
             return Ok(UrlOutcome::Unsupported);
         }
         Ok(Err(e)) => {
-            tracing::warn!(url = %locator, "process_url: parser error: {}", e);
+            // Debug: `core::ingestion` owns the user-facing WARN.
+            tracing::debug!(url = %locator, "process_url: parser error: {}", e);
             callback
                 .on_skipped(uri, SkipReason::Error(format!("parser error: {e}")))
                 .await;

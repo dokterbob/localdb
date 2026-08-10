@@ -53,6 +53,7 @@ impl Parser for HtmlParser {
             markdown,
             title,
             metadata: dc,
+            page_starts: Vec::new(),
         }))
     }
 }

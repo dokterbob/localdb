@@ -2,3 +2,8 @@
 .claude/worktrees/
 .omo/
 .claude/tmp/
+
+# Fetch-on-demand PDF corpus file (scripts/fetch_test_pdfs.sh): free to
+# download but not redistributable, so not vendored. The redistributable
+# corpus PDFs and all expectation JSONs in that dir ARE committed.
+/extract/tests/fixtures/corpus/sewtha-sustainable-energy.pdf

@@ -191,6 +191,8 @@ mod tests {
                 markdown: text,
                 title: None,
                 metadata: localdb_core::metadata::DublinCoreMetadata::default(),
+                // Non-paginated: only PDFs carry page offsets (#103).
+                page_starts: Vec::new(),
             }))
         }
     }

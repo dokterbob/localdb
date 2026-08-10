@@ -1,0 +1,11 @@
+{
+  "file": "broken-xref-verapdf.pdf",
+  "expect": "any",
+  "pages": 1,
+  "page_phrases": {
+    "1": []
+  },
+  "forbid_substrings": ["�"],
+  "title_contains": null,
+  "notes": "Damaged/broken xref table (veraPDF corpus fixture). Rendered page 1 shows no visible text at all -- only a small solid green square with a thin black border in the lower-right area of an otherwise blank white page. No page_phrases can be asserted; the test only needs to confirm extraction does not panic and produces no mojibake ('�')."
+}

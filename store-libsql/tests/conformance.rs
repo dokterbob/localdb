@@ -176,6 +176,13 @@ async fn window_block_seqs_round_trip() {
 }
 
 #[tokio::test]
+async fn page_round_trip() {
+    let (_dir, db) = setup().await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+    conformance::test_page_round_trip(handle.as_ref()).await;
+}
+
+#[tokio::test]
 async fn blocks_round_trip_ordered() {
     let (_dir, db) = setup().await;
     let handle = db.retrieval_store("store-1").await.unwrap();
@@ -861,6 +868,7 @@ fn make_record(id: &str, doc_id: &str, store_id: &str, embedding: Vec<f32>) -> C
         block_seq: 0,
         seq_in_block: 0,
         block_kind: None,
+        page: None,
         window_block_seqs: vec![],
     }
 }

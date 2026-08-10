@@ -69,11 +69,13 @@ pub(crate) fn row_to_chunk_record_strict(row: &libsql::Row) -> Result<ChunkRecor
 
     // location_json is written by upsert_chunks_inner; fall back to text length
     // for rows written before this column was populated. Shape:
-    // `{"start": N, "end": N, "window_block_seqs": [..]}`, with
-    // `window_block_seqs` present only for message-window chunks (#129) —
-    // absent (and thus defaulting to empty) for ordinary chunks.
+    // `{"start": N, "end": N, "window_block_seqs": [..], "page": N}`, with
+    // `window_block_seqs` present only for message-window chunks (#129) and
+    // `page` only for paginated formats (#103) — both absent (and thus
+    // defaulting to empty / None) for ordinary chunks.
     let text_len = text.len();
     let mut window_block_seqs: Vec<u32> = Vec::new();
+    let mut page: Option<u32> = None;
     let span = {
         let location_json: Option<String> = row.get(18).map_err(map_libsql_err)?;
         match location_json {
@@ -89,6 +91,7 @@ pub(crate) fn row_to_chunk_record_strict(row: &libsql::Row) -> Result<ChunkRecor
                         .map(|s| s as u32)
                         .collect();
                 }
+                page = v.get("page").and_then(|p| p.as_u64()).map(|p| p as u32);
                 match (start, end) {
                     (Some(s), Some(e)) => Span { start: s, end: e },
                     _ => Span {
@@ -126,6 +129,7 @@ pub(crate) fn row_to_chunk_record_strict(row: &libsql::Row) -> Result<ChunkRecor
         block_seq: block_seq as u32,
         seq_in_block: seq_in_block as u32,
         block_kind,
+        page,
         window_block_seqs,
     })
 }

@@ -231,9 +231,11 @@ model can run on Apple's ANE/GPU via a CoreML backend in `embed`, behind the opt
 `local-coreml` cargo feature (macOS-only; every code path is
 `#[cfg(all(target_os = "macos", feature = "local-coreml"))]`). Build it with
 `cargo build -p localdb --features local-coreml`. Because the feature pulls edition-2024
-dependencies (`hf-hub` 1.0), it requires **Rust ≥ 1.85**; the workspace `rust-version` is `1.85`.
-Default builds (feature off) are unaffected and remain ONNX-only — Linux and CI default builds
-never touch any CoreML code.
+dependencies (`hf-hub` 1.0), it requires **Rust ≥ 1.85** — but that floor is subsumed: since
+the `pdf_oxide` PDF parser landed, the workspace `rust-version` is **1.88** on every platform
+(`pdf_oxide` itself declares `rust-version = "1.88"`, and it pulls `image` 0.25, which needs the
+same). Default builds (feature off) are unaffected and remain ONNX-only — Linux and CI default
+builds never touch any CoreML code.
 
 The default `local` provider auto-selects CoreML on Apple Silicon when the feature is built and
 the bundle loads, otherwise falls back to ONNX (CPU). `local-coreml` forces CoreML (hard error if
@@ -321,7 +323,45 @@ proxied stdio mode always exposes the daemon's full store set regardless of
 re-filtering for this was rejected as not worth the complexity in v1. See
 [docs/mcp.md](mcp.md#daemon-proxied-stdio) and [specs/05-surfaces.md](../specs/05-surfaces.md) §4.2.
 
-**8. Feed sources are exempt from the delete-sweep — there is no entry pruning.**
+**8. `extractor_version` is dead code; PDF reindex relies on the content hash.**
+The `extractor_version` field is hardcoded (`"1"` in both ingestors and in
+`store-libsql`'s resource upsert) and is never read by the skip-check — that
+check keys only on `content_hash`. The `pdf-extract` → `pdf_oxide` swap changes
+the extracted text of every PDF, so the content hash changes and PDFs re-index
+automatically on the next `localdb index` (picking up page citations and better
+text). `compute_blocks_hash` folds in each block's page, so a *repagination*
+that leaves text and kinds unchanged also changes the hash and re-indexes. The
+one residual gap: if a future parser change produces *byte-identical* text **and
+identical pages** for some PDF, the hash is unchanged and that document is not
+re-extracted. Threading a real per-parser `extractor_version` into the
+skip-check would close that last axis and is a deferred follow-up (cross-ref
+[#47](https://github.com/dokterbob/localdb/issues/47)).
+
+**9. Residual PDF-extraction gaps.**
+`extract/src/pdf.rs` repairs several classes of upstream extraction defect (see
+[specs/04-search-pipeline.md](../specs/04-search-pipeline.md) §"PDF extraction is tuned for
+retrieval"). These remain:
+
+- **No title fallback.** A PDF carrying neither `/Title` nor XMP `dc:title` gets
+  `title: null`. There is deliberately no filename or first-page heuristic — a guessed
+  title presented as metadata is worse than an absent one.
+- **Heading and code-block inference is heuristic, and upstream.** Headings come from the
+  extractor's font clustering and code blocks from its monospace detection. Our guards
+  suppress **false positives only**: a heading the extractor never detected (a Part title
+  in a different face, say) cannot be recovered, so `heading_path` will keep reporting the
+  last heading it did see. Conversely, code that reads as English prose — Inform 7,
+  period-terminated Gherkin, pseudocode paragraphs — is un-fenced and labelled `text`. Both
+  cost a wrong label, never altered text.
+- **Spurious intra-word spaces.** Glyph-run clustering can split a word (`"consid ered"`,
+  `"investi tions"`). There is no hyphen and no positional signal left after reflow, so
+  rejoining needs sentence context rather than a regex: English is full of legitimate pairs
+  whose concatenation is also a word (`a bout`/`about`, `in to`/`into`, `any one`/`anyone`),
+  and misjoining those silently changes meaning. Tracked separately.
+- **Untagged running headers survive.** Artifact-tagged furniture is dropped, but a PDF that
+  does not tag its running heads keeps them. The upstream geometric stripper is unsafe (it
+  deletes body text from multi-column documents) — see
+  [docs/followups-pdf-oxide-swap.md](followups-pdf-oxide-swap.md) §2a.
+**10. Feed sources are exempt from the delete-sweep — there is no entry pruning.**
 A feed exposes only its most recent entries, so an entry falling out of the feed does not mean it
 was deleted upstream: treating it as a delete would wipe most of a feed's indexed history on a
 normal fetch, and a feed `304` (or a transient empty parse) would zero out every entry in one
@@ -330,13 +370,13 @@ entirely — entries once indexed stay indexed indefinitely, even after they scr
 until the whole source is removed (`source remove`, which still cascades normally). Pruning
 truly-dead entry URLs (404/410) is a follow-up issue.
 
-**9. Conditional-GET state (`ETag`/`Last-Modified`) is captured but never persisted or reused, for both `url` and `feed` sources.**
+**11. Conditional-GET state (`ETag`/`Last-Modified`) is captured but never persisted or reused, for both `url` and `feed` sources.**
 `external_etag` is captured on the `Resource` at fetch time but nothing writes it back for reuse
 on the next fetch — every `localdb index` re-fetches every URL and every feed entry in full, with
 no `If-None-Match`/`If-Modified-Since` sent. A follow-up issue covers persisting and round-tripping
 conditional-GET state together with delete-on-404/410 pruning (previous item).
 
-**10. A store containing a `kind = 'feed'` source cannot be opened by an older binary that predates the Feed ingestor.**
+**12. A store containing a `kind = 'feed'` source cannot be opened by an older binary that predates the Feed ingestor.**
 `sources.ingestor_kind` decoding is a hard match over the known `IngestorKind` variants
 ([specs/02-domain-model.md](../specs/02-domain-model.md) §2); an unrecognized kind fails the whole
 `list_sources`/`index` call for the store, not just the one source with that kind. Concretely: add
@@ -348,7 +388,7 @@ around it (there is no `db downgrade` for this — the incompatibility lives in 
 schema version). See [docs/migrations.md](migrations.md). Graceful degradation (skip unrecognized
 kinds instead of hard-erroring the whole store) is a follow-up issue.
 
-**11. Cross-source URL ownership: two sources claiming the same URL in one store can race, and the loser's sweep deletes the other's live document.**
+**13. Cross-source URL ownership: two sources claiming the same URL in one store can race, and the loser's sweep deletes the other's live document.**
 Resource upsert keys off `(store_id, uri)` and reassigns `source_id` to whichever source most
 recently ingested that URI; the delete-sweep runs per-source, over the URIs that source saw this
 run. If two sources resolve to the same URL within the same run window — e.g. a feed entry linking
@@ -359,12 +399,12 @@ two `url` sources, or a `path`/`url` collision, sharing a URI) and is not fixed 
 feed connector's discovery mode just makes the collision more likely in practice, since feeds
 routinely link to pages users have also added directly.
 
-**12. Feed `refresh` is accepted, persisted, and validated but does not do anything yet.**
+**14. Feed `refresh` is accepted, persisted, and validated but does not do anything yet.**
 Same story as `url`'s `refresh_interval_secs`: the value round-trips through config and the API
 but no scheduler reads it back to trigger a re-fetch — scheduled refresh is daemon-side work not
 yet built for either source kind.
 
-**13. Enrichment metadata changes don't persist while content is unchanged.** ([#176](https://github.com/dokterbob/localdb/issues/176))
+**15. Enrichment metadata changes don't persist while content is unchanged.** ([#176](https://github.com/dokterbob/localdb/issues/176))
 The pipeline's incremental skip (`core/src/ingestion.rs`, `on_resource`) returns on a
 `content_hash` + `policy_version` match before any store write, and metadata is never compared —
 so corrected feed dates/authors/external ids (and the feed-derived `modified_at`) never reach the
@@ -372,7 +412,15 @@ store for an already-indexed document until its content bytes change. Fixing thi
 skip-contract change (metadata-aware compare, or a metadata-only store update that skips
 re-embedding); see the issue for the design options.
 
-**14. `index_resource`'s zero-chunk arm still deletes on an empty replacement for any ingestor
+This is format-general, not feed-specific. It equally covers a PDF whose Info dictionary or XMP
+is corrected (`/Title`, `/Author`) and a Markdown file whose YAML front-matter changes: in both
+cases the extracted blocks — and therefore `content_hash` — are byte-identical, so the resource
+is skipped and the stored metadata stays stale. PDFs became a visible instance of it when PDF
+Dublin Core extraction landed, but the skip contract, not the extractor, is the cause. Note the
+first index after upgrading is unaffected: the extraction change moves every PDF's content hash
+anyway, so metadata is written then.
+
+**16. `index_resource`'s zero-chunk arm still deletes on an empty replacement for any ingestor
 that yields a zero-block Resource — `file` sources are not guarded.**
 ([#185](https://github.com/dokterbob/localdb/issues/185),
 [#156](https://github.com/dokterbob/localdb/issues/156))
@@ -391,7 +439,7 @@ Extending the same classification to `FileIngestor` — and giving `index_resour
 "empty ≠ deleted" rule, so the guard is an invariant rather than per-ingestor discipline — is
 tracked in #185.
 
-**15. There is no opt-in for private-network feed entry links.** ([#196](https://github.com/dokterbob/localdb/issues/196))
+**17. There is no opt-in for private-network feed entry links.** ([#196](https://github.com/dokterbob/localdb/issues/196))
 Discovery mode fetches entry links through a public-destination-only HTTP client (see
 [specs/02-domain-model.md](../specs/02-domain-model.md) § "Feed connector", *Destination policy*),
 and v0.1 offers no way to relax that. An operator running an internal feed whose entries link to

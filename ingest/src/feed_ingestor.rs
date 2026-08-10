@@ -111,7 +111,11 @@ impl Ingestor for FeedIngestor {
             Err(e) => {
                 // Batch semantics: a multi-source run continues past a
                 // single feed's fetch failure.
-                tracing::warn!(url = %feed_url, "FeedIngestor: feed fetch error: {}", e);
+                // Debug, not warn: `core::ingestion` emits the single
+                // user-facing WARN for every SkipReason::Error. The blocked
+                // arm below stays at warn — it reports `SkipReason::Other`,
+                // for which `core` logs nothing.
+                tracing::debug!(url = %feed_url, "FeedIngestor: feed fetch error: {}", e);
                 callback
                     .on_skipped(
                         &feed_uri,
@@ -216,15 +220,23 @@ impl Ingestor for FeedIngestor {
         }));
         let mut feed: Feed = match parse_outcome {
             Err(panic_msg) => {
-                tracing::warn!(url = %feed_url, "FeedIngestor: feed parser panicked: {}", panic_msg);
+                // Debug: `core::ingestion` owns the user-facing WARN. The
+                // "panicked" framing goes into the payload, which `core`
+                // prints verbatim — otherwise a crash is indistinguishable
+                // from an ordinary returned Err at the default log level.
+                tracing::debug!(url = %feed_url, "FeedIngestor: feed parser panicked: {}", panic_msg);
                 callback
-                    .on_skipped(&feed_uri, SkipReason::Error(panic_msg))
+                    .on_skipped(
+                        &feed_uri,
+                        SkipReason::Error(format!("feed parser panicked: {panic_msg}")),
+                    )
                     .await;
                 result.errors += 1;
                 return Ok(result);
             }
             Ok(Err(e)) => {
-                tracing::warn!(url = %feed_url, "FeedIngestor: feed parse error: {}", e);
+                // Debug: `core::ingestion` owns the user-facing WARN.
+                tracing::debug!(url = %feed_url, "FeedIngestor: feed parse error: {}", e);
                 callback
                     .on_skipped(
                         &feed_uri,
