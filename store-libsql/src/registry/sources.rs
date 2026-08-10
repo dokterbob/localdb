@@ -17,8 +17,8 @@ pub(crate) async fn upsert_source(db: &LibsqlDb, source: &SourceRow) -> Result<(
     })?;
     conn.execute(
         "INSERT INTO sources (id, store_id, kind, root, url, include, exclude,
-                preset, refresh, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                preset, refresh, created_at, config_json)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                  store_id = excluded.store_id,
                  kind = excluded.kind,
@@ -27,7 +27,8 @@ pub(crate) async fn upsert_source(db: &LibsqlDb, source: &SourceRow) -> Result<(
                  include = excluded.include,
                  exclude = excluded.exclude,
                  preset = excluded.preset,
-                 refresh = excluded.refresh",
+                 refresh = excluded.refresh,
+                 config_json = excluded.config_json",
         libsql::params![
             source.id.clone(),
             source.store_id.clone(),
@@ -39,6 +40,7 @@ pub(crate) async fn upsert_source(db: &LibsqlDb, source: &SourceRow) -> Result<(
             source.preset.clone(),
             source.refresh.clone(),
             source.created_at.clone(),
+            source.config_json.clone(),
         ],
     )
     .await
@@ -84,7 +86,7 @@ pub(crate) async fn get_source(db: &LibsqlDb, id: &str) -> Result<Option<SourceR
     let conn = db.conn().await;
     let mut rows = conn
         .query(
-            "SELECT id, store_id, kind, root, url, include, exclude, preset, refresh, created_at
+            "SELECT id, store_id, kind, root, url, include, exclude, preset, refresh, created_at, config_json
                  FROM sources WHERE id = ?",
             libsql::params![id.to_string()],
         )
@@ -100,7 +102,7 @@ pub(crate) async fn list_sources(db: &LibsqlDb, store_id: &str) -> Result<Vec<So
     let conn = db.conn().await;
     let mut rows = conn
         .query(
-            "SELECT id, store_id, kind, root, url, include, exclude, preset, refresh, created_at
+            "SELECT id, store_id, kind, root, url, include, exclude, preset, refresh, created_at, config_json
                  FROM sources WHERE store_id = ? ORDER BY created_at",
             libsql::params![store_id.to_string()],
         )
@@ -121,7 +123,7 @@ pub(crate) async fn find_source_by_root_or_url(
     let conn = db.conn().await;
     let mut rows = conn
         .query(
-            "SELECT id, store_id, kind, root, url, include, exclude, preset, refresh, created_at
+            "SELECT id, store_id, kind, root, url, include, exclude, preset, refresh, created_at, config_json
                  FROM sources WHERE store_id = ? AND (root = ? OR url = ?) LIMIT 1",
             libsql::params![store_id.to_string(), value.to_string(), value.to_string()],
         )

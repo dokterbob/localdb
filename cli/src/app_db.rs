@@ -278,6 +278,7 @@ mod tests {
             preset: "prose".to_string(),
             refresh: None,
             created_at: now_rfc3339(),
+            config_json: None,
         }
     }
 
