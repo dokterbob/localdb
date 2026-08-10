@@ -260,6 +260,14 @@ Fetch the normalized text and metadata for a document by its ID.
       "description": "Document ID (content-addressed blake3 hash)",
       "type": "string"
     },
+    "store": {
+      "default": null,
+      "description": "Store id or name to restrict the lookup to (e.g. the store.id or store.name from a search result's citation). Defaults to scanning all available stores and returning the first match.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "uri": {
       "default": null,
       "description": "Document URI (e.g. file:///path/to/doc or URL)",
@@ -277,6 +285,13 @@ Fetch the normalized text and metadata for a document by its ID.
 > from a `search` citation. Sending a `uri` without `id` returns `isError: true` with the
 > message: `"uri-based get_document is not supported in v1; use the document 'id'
 > from a search result"`.
+
+> **Store disambiguation (#144):** pass `store` — the `store.id` or `store.name`
+> from a search citation — when the document `id` might exist in more than one
+> store; it is resolved the same way as `search`'s `stores` argument, and an
+> unknown `store` returns `store_not_found`. Omitting `store` scans every
+> available store and returns the first match, which is ambiguous (effectively
+> a coin flip) if the id exists in more than one.
 
 **Example call:**
 
@@ -368,6 +383,14 @@ page through a long document after finding it via `search` or `get_document`.
     "resource_id": {
       "description": "Resource ID (content-addressed blake3 hash)",
       "type": "string"
+    },
+    "store": {
+      "default": null,
+      "description": "Store id or name to restrict the lookup to (e.g. the store.id or store.name from a search result's citation). Defaults to scanning all available stores and returning the first match.",
+      "type": [
+        "string",
+        "null"
+      ]
     }
   },
   "required": [
@@ -381,6 +404,11 @@ page through a long document after finding it via `search` or `get_document`.
 > obtained from a prior `search` or `get_document` call. An unknown `resource_id`
 > returns `resource_not_found`. An `offset` past the end of the chunk list returns an
 > empty `chunks` array, not an error.
+
+> **Store disambiguation (#144):** pass `store` — the `store.id` or `store.name`
+> from a search citation — when the resource id might exist in more than one
+> store; resolved the same way as `get_document`'s `store` argument. Omitting
+> it scans every available store and returns the first match.
 
 **Example call:**
 

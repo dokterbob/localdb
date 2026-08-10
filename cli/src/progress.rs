@@ -25,15 +25,31 @@ fn bar_style(template: &str) -> ProgressStyle {
 /// Returns `None` when `--json` is active (stdout must be clean).
 /// Returns `Some(sink)` otherwise; the sink drives an animated bar on a TTY
 /// or periodic plain `eprintln!` lines when stderr is piped.
-pub fn build_progress_sink(json_mode: bool) -> Option<ProgressSink> {
+///
+/// `store_label`, when `Some`, is rendered as a `[label]` prefix on every
+/// emitted line — callers should pass this only when more than one store is
+/// in scope for the run (multi-store `localdb index`), so a two-plus-store
+/// source has a store name to distinguish it by. `None` preserves the
+/// pre-existing unprefixed single-store output exactly.
+pub fn build_progress_sink(json_mode: bool, store_label: Option<&str>) -> Option<ProgressSink> {
     if json_mode {
         return None;
     }
 
+    let label = store_label.map(str::to_string);
     if std::io::stderr().is_terminal() {
-        Some(tty_sink())
+        Some(tty_sink(label))
     } else {
-        Some(plain_sink())
+        Some(plain_sink(label))
+    }
+}
+
+/// Prefix `line` with `[label] ` when `label` is `Some`; pass it through
+/// unchanged otherwise.
+fn prefixed(label: &Option<String>, line: &str) -> String {
+    match label {
+        Some(l) => format!("[{l}] {line}"),
+        None => line.to_string(),
     }
 }
 
@@ -41,8 +57,8 @@ pub fn build_progress_sink(json_mode: bool) -> Option<ProgressSink> {
 // TTY renderer — indicatif bar
 // ---------------------------------------------------------------------------
 
-fn tty_sink() -> ProgressSink {
-    let (sink, _, _) = tty_sink_parts();
+fn tty_sink(label: Option<String>) -> ProgressSink {
+    let (sink, _, _) = tty_sink_parts(label);
     sink
 }
 
@@ -52,7 +68,7 @@ type TtySinkParts = (
     Arc<Mutex<usize>>,
 );
 
-fn tty_sink_parts() -> TtySinkParts {
+fn tty_sink_parts(label: Option<String>) -> TtySinkParts {
     let pb: Arc<Mutex<Option<ProgressBar>>> = Arc::new(Mutex::new(None));
 
     // Chunk count accumulator shown in the message slot.
@@ -60,6 +76,7 @@ fn tty_sink_parts() -> TtySinkParts {
 
     let pb_for_sink = Arc::clone(&pb);
     let chunks_for_sink = Arc::clone(&chunks);
+    let label_for_sink = label;
 
     let sink = Arc::new(move |event: ProgressEvent| match event {
         ProgressEvent::SourceStarted { location, .. } => {
@@ -68,7 +85,7 @@ fn tty_sink_parts() -> TtySinkParts {
                 spinner_style("{spinner} {msg}")
                     .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
             );
-            spinner.set_message(format!("Indexing {location}…"));
+            spinner.set_message(prefixed(&label_for_sink, &format!("Indexing {location}…")));
             spinner.enable_steady_tick(std::time::Duration::from_millis(80));
             *lock_or_poison(&pb_for_sink) = Some(spinner);
             *lock_or_poison(&chunks_for_sink) = 0;
@@ -111,11 +128,17 @@ fn tty_sink_parts() -> TtySinkParts {
                 bar.finish_and_clear();
             }
             eprintln!(
-                "  indexed {} docs, {} skipped, {} deleted, {} chunks",
-                result.docs_indexed,
-                result.docs_skipped,
-                result.docs_deleted,
-                result.chunks_written
+                "{}",
+                prefixed(
+                    &label_for_sink,
+                    &format!(
+                        "  indexed {} docs, {} skipped, {} deleted, {} chunks",
+                        result.docs_indexed,
+                        result.docs_skipped,
+                        result.docs_deleted,
+                        result.chunks_written
+                    )
+                )
             );
         }
     });
@@ -149,13 +172,19 @@ impl PlainState {
 /// How often to emit a mid-progress line in plain mode.
 const PLAIN_REPORT_INTERVAL: usize = 10;
 
-fn plain_sink() -> ProgressSink {
-    plain_sink_with_emitter(Arc::new(|line: String| {
-        eprintln!("{line}");
-    }))
+fn plain_sink(label: Option<String>) -> ProgressSink {
+    plain_sink_with_emitter(
+        Arc::new(|line: String| {
+            eprintln!("{line}");
+        }),
+        label,
+    )
 }
 
-fn plain_sink_with_emitter(writer: Arc<dyn Fn(String) + Send + Sync>) -> ProgressSink {
+fn plain_sink_with_emitter(
+    writer: Arc<dyn Fn(String) + Send + Sync>,
+    label: Option<String>,
+) -> ProgressSink {
     let state: Arc<Mutex<PlainState>> = Arc::new(Mutex::new(PlainState::new()));
 
     Arc::new(move |event: ProgressEvent| {
@@ -163,11 +192,11 @@ fn plain_sink_with_emitter(writer: Arc<dyn Fn(String) + Send + Sync>) -> Progres
         match event {
             ProgressEvent::SourceStarted { location, .. } => {
                 *s = PlainState::new();
-                writer(format!("Indexing {location}"));
+                writer(prefixed(&label, &format!("Indexing {location}")));
             }
             ProgressEvent::Discovered { total } => {
                 s.total = total;
-                writer(format!("  discovered {} files", total));
+                writer(prefixed(&label, &format!("  discovered {} files", total)));
             }
             ProgressEvent::DocumentStarted { .. } => {}
             ProgressEvent::DocumentFinished { outcome, .. } => {
@@ -181,20 +210,23 @@ fn plain_sink_with_emitter(writer: Arc<dyn Fn(String) + Send + Sync>) -> Progres
                     PLAIN_REPORT_INTERVAL
                 };
                 if s.done - s.last_reported_done >= interval {
-                    writer(format!(
-                        "  {}",
-                        format_plain_progress(s.done, s.total, s.chunks)
+                    writer(prefixed(
+                        &label,
+                        &format!("  {}", format_plain_progress(s.done, s.total, s.chunks)),
                     ));
                     s.last_reported_done = s.done;
                 }
             }
             ProgressEvent::SourceFinished { result } => {
-                writer(format!(
-                    "  indexed {} docs, {} skipped, {} deleted, {} chunks",
-                    result.docs_indexed,
-                    result.docs_skipped,
-                    result.docs_deleted,
-                    result.chunks_written
+                writer(prefixed(
+                    &label,
+                    &format!(
+                        "  indexed {} docs, {} skipped, {} deleted, {} chunks",
+                        result.docs_indexed,
+                        result.docs_skipped,
+                        result.docs_deleted,
+                        result.chunks_written
+                    ),
                 ));
             }
         }
@@ -203,9 +235,20 @@ fn plain_sink_with_emitter(writer: Arc<dyn Fn(String) + Send + Sync>) -> Progres
 
 #[cfg(test)]
 fn plain_sink_with_writer(writer: Arc<Mutex<Vec<String>>>) -> ProgressSink {
-    plain_sink_with_emitter(Arc::new(move |line: String| {
-        lock_or_poison(&writer).push(line);
-    }))
+    plain_sink_with_labeled_writer(writer, None)
+}
+
+#[cfg(test)]
+fn plain_sink_with_labeled_writer(
+    writer: Arc<Mutex<Vec<String>>>,
+    label: Option<String>,
+) -> ProgressSink {
+    plain_sink_with_emitter(
+        Arc::new(move |line: String| {
+            lock_or_poison(&writer).push(line);
+        }),
+        label,
+    )
 }
 
 /// Pure function: format a mid-progress status line. Unit-testable.
@@ -368,7 +411,13 @@ mod tests {
 
     #[test]
     fn build_progress_sink_json_returns_none() {
-        let sink = build_progress_sink(true);
+        let sink = build_progress_sink(true, None);
+        assert!(sink.is_none());
+    }
+
+    #[test]
+    fn build_progress_sink_json_returns_none_even_with_store_label() {
+        let sink = build_progress_sink(true, Some("books"));
         assert!(sink.is_none());
     }
 
@@ -423,6 +472,55 @@ mod tests {
         );
     }
 
+    // Multi-store `localdb index` (specs/05-surfaces.md §2.2): with more than
+    // one store in scope, progress events from different stores' sources are
+    // otherwise indistinguishable in the log. A `store_label` prefixes every
+    // line so a scrollback (or piped/plain-mode) reader can tell them apart.
+    #[test]
+    fn plain_sink_prefixes_every_line_with_store_label_when_set() {
+        let writer = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = plain_sink_with_labeled_writer(Arc::clone(&writer), Some("books".to_string()));
+        sink(ProgressEvent::SourceStarted {
+            source_id: "s1".to_string(),
+            location: "/tmp/test".to_string(),
+        });
+        sink(ProgressEvent::Discovered { total: 3 });
+        sink(ProgressEvent::SourceFinished {
+            result: localdb_core::ingestion::IngestionResult {
+                docs_seen: 3,
+                docs_indexed: 3,
+                docs_skipped: 0,
+                docs_deleted: 0,
+                chunks_written: 6,
+                unsupported_format_count: 0,
+                error_count: 0,
+            },
+        });
+
+        let output = lock_or_poison(&writer).clone();
+        assert_eq!(
+            output,
+            vec![
+                "[books] Indexing /tmp/test".to_string(),
+                "[books]   discovered 3 files".to_string(),
+                "[books]   indexed 3 docs, 0 skipped, 0 deleted, 6 chunks".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn plain_sink_omits_prefix_when_label_is_none() {
+        let writer = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = plain_sink_with_writer(Arc::clone(&writer));
+        sink(ProgressEvent::SourceStarted {
+            source_id: "s1".to_string(),
+            location: "/tmp/test".to_string(),
+        });
+
+        let output = lock_or_poison(&writer).clone();
+        assert_eq!(output, vec!["Indexing /tmp/test".to_string()]);
+    }
+
     // Part B.2 (PR #152 comment): the delete-sweep's count was previously
     // invisible in the SourceFinished summary line — a source silently
     // deleting thousands of resources produced no visible signal. Assert the
@@ -459,7 +557,7 @@ mod tests {
         use std::panic::{catch_unwind, AssertUnwindSafe};
         use std::thread;
 
-        let (sink, pb, _) = tty_sink_parts();
+        let (sink, pb, _) = tty_sink_parts(None);
         let poison = Arc::clone(&pb);
 
         let handle = thread::spawn(move || {
@@ -480,13 +578,28 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[test]
+    fn tty_sink_prefixes_spinner_message_with_store_label_when_set() {
+        let (sink, pb, _) = tty_sink_parts(Some("books".to_string()));
+        sink(ProgressEvent::SourceStarted {
+            source_id: "s1".to_string(),
+            location: "/tmp/test".to_string(),
+        });
+
+        let guard = lock_or_poison(&pb);
+        let bar = guard
+            .as_ref()
+            .expect("spinner should exist after SourceStarted");
+        assert_eq!(bar.message(), "[books] Indexing /tmp/test…");
+    }
+
     // Part B: `DocumentStarted` carries the raw `Uri::as_str()` string
     // (percent-encoded), but the progress bar must show a human-readable
     // name — decode before extracting the trailing path segment, don't
     // display "my%20file.md" for a file literally named "my file.md".
     #[test]
     fn tty_sink_decodes_percent_encoded_uri_for_display() {
-        let (sink, pb, _) = tty_sink_parts();
+        let (sink, pb, _) = tty_sink_parts(None);
         sink(ProgressEvent::SourceStarted {
             source_id: "s1".to_string(),
             location: "/tmp/test".to_string(),
@@ -511,7 +624,7 @@ mod tests {
     // the CLI's one decode-then-display path benefits from it.
     #[test]
     fn tty_sink_does_not_emit_raw_control_bytes_from_a_decoded_uri() {
-        let (sink, pb, _) = tty_sink_parts();
+        let (sink, pb, _) = tty_sink_parts(None);
         sink(ProgressEvent::SourceStarted {
             source_id: "s1".to_string(),
             location: "/tmp/test".to_string(),

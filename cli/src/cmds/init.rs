@@ -7,7 +7,7 @@ use localdb_core::{
 use serde_json::json;
 
 use crate::{
-    app_db::{default_store_row, load_app_db_lenient},
+    app_db::{default_store_row, load_app_db_lenient, DEFAULT_STORE_NAME},
     daemon_client::CliContext,
     normalize::{exit_err, print_json},
 };
@@ -117,9 +117,9 @@ pub(crate) async fn run_init_async(ctx: &CliContext) {
 
     let (_config_loader, db) = load_app_db_lenient(ctx).await;
 
-    match db.backend().get_store_by_name("default").await {
+    match db.backend().get_store_by_name(DEFAULT_STORE_NAME).await {
         Ok(None) => {
-            let default_store = match default_store_row("default", &db) {
+            let default_store = match default_store_row(DEFAULT_STORE_NAME, &db) {
                 Ok(store) => store,
                 Err(e) => exit_err(&e, ctx.json),
             };

@@ -69,6 +69,33 @@ pub fn exit_err(err: &Error, json_mode: bool) -> ! {
     std::process::exit(code);
 }
 
+/// Exit with a partial-batch `--json` result document, preserving whatever
+/// per-item results were already buffered.
+///
+/// A multi-`--store` `--json` loop (`source add`/`add`'s local and
+/// daemon-routed branches alike) that fails partway through — after at least
+/// one earlier item already succeeded — must not silently discard the
+/// buffered results (Codex review round 2, finding 5; the fuller
+/// validate-then-persist restructuring across the multi-argument axis is
+/// tracked separately as #174). Mirrors `cmds::index::report_index_outcomes`'s
+/// existing pattern: print a `"status"`-tagged JSON document to stdout, then
+/// exit explicitly, rather than routing through `exit_err`'s stderr-only
+/// shape — `results` is output data a caller may need, not just an error
+/// message, so it belongs on stdout like every other `--json` document
+/// (specs/05-surfaces.md §2.2).
+///
+/// Only meaningful in `--json` mode: non-JSON output already prints each
+/// success as it happens, so callers should keep using `exit_err` directly
+/// when `!ctx.json` — there is nothing buffered to lose.
+pub(crate) fn exit_err_with_partial_results(err: &Error, results: Vec<serde_json::Value>) -> ! {
+    print_json(&json!({
+        "status": "error",
+        "error": { "code": err.code(), "message": err.to_string() },
+        "results": results,
+    }));
+    std::process::exit(err.exit_code());
+}
+
 pub(crate) fn visibility_to_string(visibility: &StoreVisibility) -> &'static str {
     match visibility {
         StoreVisibility::Private => "private",

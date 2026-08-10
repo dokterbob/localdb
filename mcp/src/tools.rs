@@ -171,8 +171,10 @@ fn resolve_content_length(content_length: Option<i64>) -> usize {
 /// Returns a list of citations in the canonical JSON shape
 /// (specs/02-domain-model.md §6).
 ///
-/// If `stores` is non-empty, only those store names are queried.
-/// Unknown store name → returns a tool error with code `store_not_found`.
+/// If `stores` is non-empty, only those stores are queried — each entry may
+/// be a store id or a store name (#144: this lets a caller round-trip the
+/// `store.id`/`store.name` from a prior `search` citation straight back in).
+/// Unknown store id/name → returns a tool error with code `store_not_found`.
 fn select_mcp_stores(
     stores: &[AvailableStore],
     store_names: &[String],
@@ -191,7 +193,16 @@ fn select_mcp_stores(
     } else {
         let mut selected = Vec::new();
         for name in store_names {
-            match stores.iter().find(|s| &s.descriptor.name == name) {
+            // Ids are unique and machine-generated; names are user-chosen and
+            // (per `validate_store_name`) may legitimately collide with
+            // another store's id. Resolve by id first so that exact,
+            // unambiguous signal always wins over a same-named but unrelated
+            // store — only fall back to a name match when no id matches.
+            match stores
+                .iter()
+                .find(|s| &s.descriptor.id == name)
+                .or_else(|| stores.iter().find(|s| &s.descriptor.name == name))
+            {
                 Some(s) => selected.push((
                     s.descriptor.id.clone(),
                     s.descriptor.name.clone(),
@@ -359,7 +370,7 @@ pub async fn tool_get_document(stores: &[AvailableStore], args: GetDocumentArgs)
             "invalid arguments: 'id' must not be empty",
         );
     }
-    match find_document_chunks(stores, &args.id).await {
+    match find_document_chunks(stores, &args.id, args.store.as_deref()).await {
         Ok(Some((store, chunks))) => {
             let resource_id = chunks[0].resource_id.clone();
             let blocks = match store.store.get_blocks_for_resource(&resource_id).await {
@@ -384,11 +395,35 @@ pub async fn tool_get_document(stores: &[AvailableStore], args: GetDocumentArgs)
     }
 }
 
+/// Look up a document's chunks by id, optionally scoped to a single store.
+///
+/// `store_filter`, when present, is a store id or name (#144) — e.g. the
+/// `store.id`/`store.name` from a prior `search` citation. It is resolved via
+/// [`select_mcp_stores`] (the same id-or-name resolver `search`'s `stores`
+/// argument uses) rather than a parallel matcher, so an unknown store id/name
+/// produces the same `store_not_found` error shape as `search`. Once
+/// resolved, the scan below is restricted to that single store; an absent
+/// `store_filter` keeps the pre-#144 behavior of scanning every available
+/// store and returning whichever matches first.
 async fn find_document_chunks<'a>(
     stores: &'a [AvailableStore],
     doc_id: &str,
+    store_filter: Option<&str>,
 ) -> Result<Option<(&'a AvailableStore, Vec<localdb_core::ChunkRecord>)>, CallToolResult> {
-    for store in stores {
+    let scoped: Vec<&'a AvailableStore> = match store_filter {
+        Some(store_id_or_name) => {
+            let handles =
+                select_mcp_stores(stores, std::slice::from_ref(&store_id_or_name.to_string()))?;
+            let handle = &handles[0];
+            stores
+                .iter()
+                .filter(|s| s.descriptor.id == handle.id)
+                .collect()
+        }
+        None => stores.iter().collect(),
+    };
+
+    for store in scoped {
         let chunks = match store.store.get_chunks_for_resource(doc_id).await {
             Ok(chunks) => chunks,
             Err(e) => {
@@ -658,7 +693,7 @@ pub async fn tool_get_chunks(stores: &[AvailableStore], args: GetChunksArgs) -> 
         Ok(v) => v,
         Err(result) => return result,
     };
-    match find_document_chunks(stores, &args.resource_id).await {
+    match find_document_chunks(stores, &args.resource_id, args.store.as_deref()).await {
         Ok(Some((store, mut chunks))) => {
             chunks.sort_by(|a, b| {
                 (a.block_seq, a.seq_in_block, a.span.start, a.span.end, &a.id).cmp(&(
@@ -840,6 +875,7 @@ mod get_document_tests {
         let args = GetDocumentArgs {
             id: doc_id.clone(),
             uri: None,
+            store: None,
         };
 
         let result = tool_get_document(&stores, args).await;
@@ -967,6 +1003,7 @@ mod get_document_tests {
         let args = GetDocumentArgs {
             id: doc_id.clone(),
             uri: None,
+            store: None,
         };
 
         let result = tool_get_document(&stores, args).await;
@@ -1060,6 +1097,7 @@ mod tests {
             limit: None,
             anchor_chunk_id: None,
             anchor_block_seq: None,
+            store: None,
         }
     }
 
@@ -1129,6 +1167,7 @@ mod tests {
         let args = GetDocumentArgs {
             id: "doc-mismatched".to_string(),
             uri: None,
+            store: None,
         };
         let result = tool_get_document(&[av], args).await;
 
@@ -1157,6 +1196,7 @@ mod tests {
         let args = GetDocumentArgs {
             id: "doc-1".to_string(),
             uri: None,
+            store: None,
         };
         let result = tool_get_document(&[av], args).await;
 
@@ -1195,6 +1235,7 @@ mod tests {
         let args = GetDocumentArgs {
             id: "doc-meta".to_string(),
             uri: None,
+            store: None,
         };
         let result = tool_get_document(&[av], args).await;
 
@@ -1256,6 +1297,7 @@ mod tests {
         let args = GetDocumentArgs {
             id: String::new(),
             uri: None,
+            store: None,
         };
         let result = tool_get_document(&[av], args).await;
         assert_eq!(result.is_error, Some(true));
@@ -1272,6 +1314,7 @@ mod tests {
         let args = GetDocumentArgs {
             id: String::new(),
             uri: Some("file:///docs/guide.md".to_string()),
+            store: None,
         };
         let result = tool_get_document(&[av], args).await;
         assert_eq!(result.is_error, Some(true));
@@ -1300,6 +1343,233 @@ mod tests {
         let text = text_of(&result);
         let parsed: serde_json::Value = serde_json::from_str(&text).expect("must be JSON");
         assert_eq!(parsed["error"]["code"].as_str().unwrap(), "store_not_found");
+    }
+
+    // -----------------------------------------------------------------------
+    // #144 — `store` discriminator on get_document / get_chunks
+    // -----------------------------------------------------------------------
+
+    /// Build two `AvailableStore`s that each hold a chunk for the *same*
+    /// `doc_id`, with distinguishable text, so a caller can tell which
+    /// store's copy a lookup returned.
+    async fn duplicate_doc_stores(doc_id: &str) -> (AvailableStore, AvailableStore) {
+        let store_a = FakeStore::new();
+        let chunk_a = make_chunk("chunk-a", doc_id, "store-A-id", "from store A");
+        store_a.upsert_chunks(vec![chunk_a]).await.unwrap();
+        let av_a = AvailableStore::new(make_descriptor("store-A-id", "store-a"), Box::new(store_a));
+
+        let store_b = FakeStore::new();
+        let chunk_b = make_chunk("chunk-b", doc_id, "store-B-id", "from store B");
+        store_b.upsert_chunks(vec![chunk_b]).await.unwrap();
+        let av_b = AvailableStore::new(make_descriptor("store-B-id", "store-b"), Box::new(store_b));
+
+        (av_a, av_b)
+    }
+
+    #[tokio::test]
+    async fn get_document_with_store_name_disambiguates_duplicate_id_across_stores() {
+        let (av_a, av_b) = duplicate_doc_stores("dup-doc").await;
+        let stores = vec![av_a, av_b];
+
+        let mut args_a = GetDocumentArgs {
+            id: "dup-doc".to_string(),
+            uri: None,
+            store: None,
+        };
+        args_a.store = Some("store-a".to_string());
+        let result_a = tool_get_document(&stores, args_a).await;
+        assert_ne!(result_a.is_error, Some(true));
+        let parsed_a: serde_json::Value = serde_json::from_str(&text_of(&result_a)).unwrap();
+        assert_eq!(parsed_a["text"].as_str().unwrap(), "from store A");
+        assert_eq!(parsed_a["store"]["name"].as_str().unwrap(), "store-a");
+
+        let args_b = GetDocumentArgs {
+            id: "dup-doc".to_string(),
+            uri: None,
+            store: Some("store-b".to_string()),
+        };
+        let result_b = tool_get_document(&stores, args_b).await;
+        assert_ne!(result_b.is_error, Some(true));
+        let parsed_b: serde_json::Value = serde_json::from_str(&text_of(&result_b)).unwrap();
+        assert_eq!(parsed_b["text"].as_str().unwrap(), "from store B");
+        assert_eq!(parsed_b["store"]["name"].as_str().unwrap(), "store-b");
+    }
+
+    #[tokio::test]
+    async fn get_document_with_store_id_also_disambiguates() {
+        let (av_a, av_b) = duplicate_doc_stores("dup-doc").await;
+        let stores = vec![av_a, av_b];
+
+        let args = GetDocumentArgs {
+            id: "dup-doc".to_string(),
+            uri: None,
+            store: Some("store-B-id".to_string()),
+        };
+        let result = tool_get_document(&stores, args).await;
+        assert_ne!(result.is_error, Some(true));
+        let parsed: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        assert_eq!(parsed["text"].as_str().unwrap(), "from store B");
+        assert_eq!(parsed["store"]["id"].as_str().unwrap(), "store-B-id");
+    }
+
+    #[tokio::test]
+    async fn get_document_unknown_store_returns_store_not_found() {
+        let (av_a, av_b) = duplicate_doc_stores("dup-doc").await;
+        let stores = vec![av_a, av_b];
+
+        let args = GetDocumentArgs {
+            id: "dup-doc".to_string(),
+            uri: None,
+            store: Some("no-such-store".to_string()),
+        };
+        let result = tool_get_document(&stores, args).await;
+        assert_eq!(result.is_error, Some(true));
+        let parsed: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        assert_eq!(parsed["error"]["code"].as_str().unwrap(), "store_not_found");
+    }
+
+    #[tokio::test]
+    async fn get_document_omitted_store_keeps_first_match_backward_compat() {
+        let (av_a, av_b) = duplicate_doc_stores("dup-doc").await;
+        let stores = vec![av_a, av_b];
+
+        let args = GetDocumentArgs {
+            id: "dup-doc".to_string(),
+            uri: None,
+            store: None,
+        };
+        let result = tool_get_document(&stores, args).await;
+        assert_ne!(result.is_error, Some(true));
+        let parsed: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        assert_eq!(
+            parsed["text"].as_str().unwrap(),
+            "from store A",
+            "omitted store must keep pre-#144 first-match-wins behavior"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_chunks_with_store_name_disambiguates_duplicate_id_across_stores() {
+        let (av_a, av_b) = duplicate_doc_stores("dup-doc").await;
+        let stores = vec![av_a, av_b];
+
+        let mut args_a = get_chunks_args("dup-doc");
+        args_a.store = Some("store-a".to_string());
+        let result_a = tool_get_chunks(&stores, args_a).await;
+        assert_ne!(result_a.is_error, Some(true));
+        let parsed_a: serde_json::Value = serde_json::from_str(&text_of(&result_a)).unwrap();
+        assert_eq!(
+            parsed_a["chunks"][0]["text"].as_str().unwrap(),
+            "from store A"
+        );
+        assert_eq!(parsed_a["store"]["name"].as_str().unwrap(), "store-a");
+
+        let mut args_b = get_chunks_args("dup-doc");
+        args_b.store = Some("store-b".to_string());
+        let result_b = tool_get_chunks(&stores, args_b).await;
+        assert_ne!(result_b.is_error, Some(true));
+        let parsed_b: serde_json::Value = serde_json::from_str(&text_of(&result_b)).unwrap();
+        assert_eq!(
+            parsed_b["chunks"][0]["text"].as_str().unwrap(),
+            "from store B"
+        );
+        assert_eq!(parsed_b["store"]["name"].as_str().unwrap(), "store-b");
+    }
+
+    #[tokio::test]
+    async fn get_chunks_with_store_id_also_disambiguates() {
+        let (av_a, av_b) = duplicate_doc_stores("dup-doc").await;
+        let stores = vec![av_a, av_b];
+
+        let mut args = get_chunks_args("dup-doc");
+        args.store = Some("store-A-id".to_string());
+        let result = tool_get_chunks(&stores, args).await;
+        assert_ne!(result.is_error, Some(true));
+        let parsed: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        assert_eq!(
+            parsed["chunks"][0]["text"].as_str().unwrap(),
+            "from store A"
+        );
+        assert_eq!(parsed["store"]["id"].as_str().unwrap(), "store-A-id");
+    }
+
+    #[tokio::test]
+    async fn get_chunks_unknown_store_returns_store_not_found() {
+        let (av_a, av_b) = duplicate_doc_stores("dup-doc").await;
+        let stores = vec![av_a, av_b];
+
+        let mut args = get_chunks_args("dup-doc");
+        args.store = Some("no-such-store".to_string());
+        let result = tool_get_chunks(&stores, args).await;
+        assert_eq!(result.is_error, Some(true));
+        let parsed: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        assert_eq!(parsed["error"]["code"].as_str().unwrap(), "store_not_found");
+    }
+
+    #[tokio::test]
+    async fn get_chunks_omitted_store_keeps_first_match_backward_compat() {
+        let (av_a, av_b) = duplicate_doc_stores("dup-doc").await;
+        let stores = vec![av_a, av_b];
+
+        let args = get_chunks_args("dup-doc");
+        let result = tool_get_chunks(&stores, args).await;
+        assert_ne!(result.is_error, Some(true));
+        let parsed: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        assert_eq!(
+            parsed["chunks"][0]["text"].as_str().unwrap(),
+            "from store A",
+            "omitted store must keep pre-#144 first-match-wins behavior"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Codex review round 2, finding 3 — select_mcp_stores id-vs-name ambiguity
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn select_mcp_stores_id_match_wins_over_shadowing_name() {
+        // stores[0] is *named* the same string as stores[1]'s *id*. An
+        // order-dependent `name == x || id == x` predicate would return
+        // stores[0] (it comes first and matches on the name arm); the fix
+        // must do an id pass before falling back to a name pass, so the more
+        // specific (unique, machine-generated) id match wins regardless of
+        // slice order.
+        let shared = "shadow-value".to_string();
+        let store_0 = AvailableStore::new(
+            make_descriptor("store-0-id", &shared),
+            Box::new(FakeStore::new()),
+        );
+        let store_1 = AvailableStore::new(
+            make_descriptor(&shared, "store-1-name"),
+            Box::new(FakeStore::new()),
+        );
+        let stores = vec![store_0, store_1];
+
+        let selected = select_mcp_stores(&stores, std::slice::from_ref(&shared))
+            .expect("lookup should resolve");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            selected[0].id, shared,
+            "the id match (stores[1]) must win over the shadowing name match (stores[0])"
+        );
+        assert_eq!(selected[0].name, "store-1-name");
+    }
+
+    #[test]
+    fn select_mcp_stores_falls_back_to_name_when_no_id_matches() {
+        // Ordinary name-lookup path: no store's id equals the lookup string,
+        // so the name pass must find it.
+        let store_0 =
+            AvailableStore::new(make_descriptor("id-0", "alpha"), Box::new(FakeStore::new()));
+        let store_1 =
+            AvailableStore::new(make_descriptor("id-1", "beta"), Box::new(FakeStore::new()));
+        let stores = vec![store_0, store_1];
+
+        let selected = select_mcp_stores(&stores, std::slice::from_ref(&"beta".to_string()))
+            .expect("lookup should resolve by name");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, "id-1");
+        assert_eq!(selected[0].name, "beta");
     }
 
     // -----------------------------------------------------------------------

@@ -70,7 +70,10 @@ and caveats (including the `⚠️` partial marks) are in [docs/comparison.md](d
   `get_document`, `get_chunks`) to any MCP-capable AI assistant, over stdio or (via
   `localdb serve`) HTTP — including from another machine over Tailscale/LAN. Connect
   once, search forever.
-- **Multiple stores** — each store is isolated; query one or all with `--store`.
+- **Multiple stores** — each store is isolated. `--store <name>` (repeatable) narrows most
+  commands to specific stores; omitted, `search`/`status`/`store list`/`index` span every store,
+  while `source add`/`list`/`remove` (and the `add` alias) default to the store named `default`
+  (exit 2 if it doesn't exist) — see [docs/cli.md](docs/cli.md#global-flags).
 - **Context-aware dense search** — the default embedder (`pplx-embed-context-v1-0.6b`) is a
   late-chunking model from Perplexity AI that encodes each chunk in the context of its full
   document, producing strong retrieval quality. Stored as binary-quantized 128-byte
@@ -243,7 +246,7 @@ migration's down-SQL is stored as data in the database itself, not read from com
 | MCP while daemon runs | `localdb mcp` now detects a running daemon and proxies to its `/mcp` route automatically, rather than conflicting with it. `--store` narrowing is not honored in proxied mode (v1 limitation — see [docs/mcp.md](docs/mcp.md#daemon-proxied-stdio)). |
 | MCP over HTTP | `/mcp` on the daemon snapshots the store list once at startup — a store added later via `/v1/stores` isn't visible over MCP until restart. |
 
-Docs sync: the old Known Gaps entries for source path validation and the macOS bundle ID are resolved in code and reflected in `docs/architecture.md`.
+Docs sync: the old Known Gaps entries for source path validation and the macOS bundle ID are resolved in code and reflected in `docs/architecture.md`. `--store` scoping is now consistent across every subcommand rather than only `search`/`mcp` (#178, #118), and `get_document`/`get_chunks` accept an optional `store` argument to disambiguate a document id that exists in more than one store (#144) — see [specs/05-surfaces.md §2.2](specs/05-surfaces.md#22-store-scope).
 
 Design rationale and planned behavior live in the [specs/](specs/) directory.
 
