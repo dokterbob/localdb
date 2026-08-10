@@ -30,7 +30,12 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
-    /// Operate on this store (repeatable; defaults to all stores).
+    /// Operate on this store (repeatable); default depends on the subcommand.
+    ///
+    /// Omitted, this means "all stores" for `search`/`status`/`store list`/
+    /// `index`; the store named `default` for `source`/`add` (exit 2 if
+    /// absent); and is rejected outright for `db` subcommands (exit 2). See
+    /// `--help` on the specific subcommand for its exact rule.
     #[arg(long = "store", short = 's', global = true, value_name = "NAME")]
     pub stores: Vec<String>,
 
@@ -71,15 +76,24 @@ pub enum Command {
     Store(StoreCommand),
 
     /// Manage sources on a store.
+    ///
+    /// `add`/`list`/`remove` default to the store named `default` when
+    /// `--store` is omitted; exit 2 if no store named `default` exists.
     #[command(subcommand)]
     Source(SourceCommand),
 
-    /// Inspect or migrate a store's schema.
+    /// Inspect or migrate the database schema.
+    ///
+    /// Operates on the whole database file, not a single store: `--store` is
+    /// rejected outright (exit 2) on all three subcommands.
     // See specs/05-surfaces.md §2.1.
     #[command(subcommand)]
     Db(DbCommand),
 
     /// Run a one-shot scan-and-index job.
+    ///
+    /// Indexes every store when `--store` is omitted; pass `--store <NAME>`
+    /// (repeatable) to index only the named store(s).
     Index {
         /// Limit to a specific source (by ID).
         #[arg(long, value_name = "SOURCE_ID")]
@@ -107,14 +121,48 @@ pub enum Command {
     },
 
     /// Alias for `source add`: add one or more sources to a store.
+    ///
+    /// Defaults to the store named `default` when `--store` is omitted;
+    /// exit 2 if no store named `default` exists.
     Add {
         /// Source paths or URLs (one or more).
         #[arg(required = true, num_args = 1..)]
         sources: Vec<String>,
-        /// Refresh interval for URL sources (e.g. "1h", "30m", "3600").
+        /// Refresh interval for URL and feed sources (e.g. "1h", "30m", "3600").
         #[arg(long)]
         refresh: Option<String>,
+        /// Override source-kind classification instead of inferring it from
+        /// the argument (path vs. `http(s)://` URL). `feed` treats the
+        /// argument as an Atom/RSS feed URL, which fetches every entry page
+        /// at index time — pass `--max-entries` to bound that.
+        #[arg(long, value_enum)]
+        kind: Option<SourceKindArg>,
+        /// Cap on feed entries considered per indexing run (feed sources only).
+        #[arg(long, value_name = "N")]
+        max_entries: Option<u32>,
+        /// For feed sources, index only the feed-supplied summary instead of
+        /// fetching each entry's full page content (feed sources only).
+        #[arg(long)]
+        no_fetch_full_content: bool,
     },
+}
+
+/// `--kind` override for `source add` / `add` (see [`Command::Add`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SourceKindArg {
+    Path,
+    Url,
+    Feed,
+}
+
+impl SourceKindArg {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            SourceKindArg::Path => "path",
+            SourceKindArg::Url => "url",
+            SourceKindArg::Feed => "feed",
+        }
+    }
 }
 
 /// Store management subcommands.
@@ -140,26 +188,31 @@ pub enum StoreCommand {
 /// they only ever surface the refusal-with-hint that `LibsqlDb::open`
 /// produces on a version mismatch. All three subcommands refuse with
 /// `daemon_running` (exit 4) while the daemon is up, the same way every
-/// other daemon-aware write command does.
+/// other daemon-aware write command does. None of them are store-scoped:
+/// they operate on the whole database file, and `--store` is rejected
+/// outright (exit 2) rather than silently ignored.
 #[derive(Debug, Subcommand)]
 pub enum DbCommand {
     /// Show schema version, pending migrations, and migration history.
     ///
     /// Never refuses, even on a store newer than this binary or one that
-    /// predates the migration framework entirely.
+    /// predates the migration framework entirely. Not store-scoped: passing
+    /// `--store` exits 2.
     Status,
 
-    /// Apply pending migrations to bring the store up to this binary's head version.
+    /// Apply pending migrations to bring the database up to this binary's head version.
     ///
     /// A legacy (pre-migration-framework, v1-v3) store requires confirmation
     /// before its destructive rebuild (all indexed data is lost); an
-    /// ordinary forward migration needs no confirmation.
+    /// ordinary forward migration needs no confirmation. Not store-scoped:
+    /// passing `--store` exits 2.
     Migrate,
 
     /// Reverse migrations using stored down-SQL (default: one step back).
     ///
     /// Always requires confirmation. Refuses cleanly, without changing
-    /// anything, if a migration on the way to `--to` has no down path.
+    /// anything, if a migration on the way to `--to` has no down path. Not
+    /// store-scoped: passing `--store` exits 2.
     Downgrade {
         /// Target schema version to downgrade to (default: one step below the current version).
         #[arg(long, value_name = "VERSION")]
@@ -168,20 +221,45 @@ pub enum DbCommand {
 }
 
 /// Source management subcommands.
+///
+/// All three default to the store named `default` when `--store` is
+/// omitted, and exit 2 if no store named `default` exists.
 #[derive(Debug, Subcommand)]
 pub enum SourceCommand {
     /// Add a new source to a store.
+    ///
+    /// Defaults to the store named `default` when `--store` is omitted;
+    /// exit 2 if no store named `default` exists.
     Add {
         /// Source paths or URLs (one or more).
         #[arg(required = true, num_args = 1..)]
         sources: Vec<String>,
-        /// Refresh interval for URL sources (e.g. "1h", "30m", "3600").
+        /// Refresh interval for URL and feed sources (e.g. "1h", "30m", "3600").
         #[arg(long)]
         refresh: Option<String>,
+        /// Override source-kind classification instead of inferring it from
+        /// the argument (path vs. `http(s)://` URL). `feed` treats the
+        /// argument as an Atom/RSS feed URL, which fetches every entry page
+        /// at index time — pass `--max-entries` to bound that.
+        #[arg(long, value_enum)]
+        kind: Option<SourceKindArg>,
+        /// Cap on feed entries considered per indexing run (feed sources only).
+        #[arg(long, value_name = "N")]
+        max_entries: Option<u32>,
+        /// For feed sources, index only the feed-supplied summary instead of
+        /// fetching each entry's full page content (feed sources only).
+        #[arg(long)]
+        no_fetch_full_content: bool,
     },
     /// List sources on a store.
+    ///
+    /// Defaults to the store named `default` when `--store` is omitted;
+    /// exit 2 if no store named `default` exists.
     List,
     /// Remove a source from a store.
+    ///
+    /// Defaults to the store named `default` when `--store` is omitted;
+    /// exit 2 if no store named `default` exists.
     Remove {
         /// Source IDs, paths, or URLs (one or more).
         #[arg(required = true, num_args = 1..)]
@@ -231,10 +309,23 @@ fn main() {
             StoreCommand::Remove { name } => cli::run_store_remove(&ctx, name),
         },
         Command::Source(cmd) => match cmd {
-            SourceCommand::Add { sources, refresh } => {
+            SourceCommand::Add {
+                sources,
+                refresh,
+                kind,
+                max_entries,
+                no_fetch_full_content,
+            } => {
                 // #5: loop over multiple arguments.
                 for source in sources {
-                    cli::run_source_add(&ctx, source, refresh.as_deref());
+                    cli::run_source_add(
+                        &ctx,
+                        source,
+                        refresh.as_deref(),
+                        (*kind).map(SourceKindArg::as_str),
+                        *max_entries,
+                        *no_fetch_full_content,
+                    );
                 }
             }
             SourceCommand::List => cli::run_source_list(&ctx),
@@ -256,9 +347,22 @@ fn main() {
             limit,
             content_length,
         } => cli::run_search(&ctx, &query.join(" "), *limit, *content_length),
-        Command::Add { sources, refresh } => {
+        Command::Add {
+            sources,
+            refresh,
+            kind,
+            max_entries,
+            no_fetch_full_content,
+        } => {
             for source in sources {
-                cli::run_source_add(&ctx, source, refresh.as_deref());
+                cli::run_source_add(
+                    &ctx,
+                    source,
+                    refresh.as_deref(),
+                    (*kind).map(SourceKindArg::as_str),
+                    *max_entries,
+                    *no_fetch_full_content,
+                );
             }
         }
     }
@@ -426,6 +530,143 @@ mod tests {
             assert_eq!(sources, vec!["/some/path"]);
         } else {
             panic!("expected Add command");
+        }
+    }
+
+    /// `--kind`, `--max-entries`, `--no-fetch-full-content` parse on `add`.
+    #[test]
+    fn add_feed_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "localdb",
+            "add",
+            "https://example.com/feed.xml",
+            "--kind",
+            "feed",
+            "--max-entries",
+            "10",
+            "--no-fetch-full-content",
+        ])
+        .unwrap();
+        if let Command::Add {
+            kind,
+            max_entries,
+            no_fetch_full_content,
+            ..
+        } = cli.command
+        {
+            assert_eq!(kind, Some(SourceKindArg::Feed));
+            assert_eq!(max_entries, Some(10));
+            assert!(no_fetch_full_content);
+        } else {
+            panic!("expected Add command");
+        }
+    }
+
+    /// Same flags parse identically on `source add`.
+    #[test]
+    fn source_add_feed_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "localdb",
+            "source",
+            "add",
+            "https://example.com/feed.xml",
+            "--kind",
+            "feed",
+            "--max-entries",
+            "10",
+            "--no-fetch-full-content",
+        ])
+        .unwrap();
+        if let Command::Source(SourceCommand::Add {
+            kind,
+            max_entries,
+            no_fetch_full_content,
+            ..
+        }) = cli.command
+        {
+            assert_eq!(kind, Some(SourceKindArg::Feed));
+            assert_eq!(max_entries, Some(10));
+            assert!(no_fetch_full_content);
+        } else {
+            panic!("expected Source(Add) command");
+        }
+    }
+
+    /// `--kind path|url` also parses (bypasses classification without a
+    /// feed-only implication).
+    #[test]
+    fn kind_path_and_url_parse() {
+        let cli = Cli::try_parse_from(["localdb", "add", "some-arg", "--kind", "path"]).unwrap();
+        if let Command::Add { kind, .. } = cli.command {
+            assert_eq!(kind, Some(SourceKindArg::Path));
+        } else {
+            panic!("expected Add command");
+        }
+
+        let cli = Cli::try_parse_from(["localdb", "add", "some-arg", "--kind", "url"]).unwrap();
+        if let Command::Add { kind, .. } = cli.command {
+            assert_eq!(kind, Some(SourceKindArg::Url));
+        } else {
+            panic!("expected Add command");
+        }
+    }
+
+    /// `Command::Add` and `SourceCommand::Add` must expose identical arg
+    /// names/requirements for the shared flags — they are hand-synced clap
+    /// structs, and drift between them would silently desync `localdb add`
+    /// from `localdb source add` (issue #116).
+    #[test]
+    fn add_and_source_add_flags_are_in_parity() {
+        use clap::CommandFactory;
+        use std::collections::BTreeMap;
+
+        let cmd = Cli::command();
+        let add_cmd = cmd
+            .get_subcommands()
+            .find(|sc| sc.get_name() == "add")
+            .expect("add subcommand missing");
+        let source_cmd = cmd
+            .get_subcommands()
+            .find(|sc| sc.get_name() == "source")
+            .expect("source subcommand missing");
+        let source_add_cmd = source_cmd
+            .get_subcommands()
+            .find(|sc| sc.get_name() == "add")
+            .expect("source add subcommand missing");
+
+        fn arg_shapes(
+            cmd: &clap::Command,
+        ) -> BTreeMap<String, (bool, Option<clap::builder::ValueRange>)> {
+            cmd.get_arguments()
+                .map(|a| {
+                    (
+                        a.get_id().as_str().to_string(),
+                        (a.is_required_set(), a.get_num_args()),
+                    )
+                })
+                .collect()
+        }
+
+        let add_args = arg_shapes(add_cmd);
+        let source_add_args = arg_shapes(source_add_cmd);
+
+        for flag in &[
+            "sources",
+            "refresh",
+            "kind",
+            "max_entries",
+            "no_fetch_full_content",
+        ] {
+            let add_shape = add_args
+                .get(*flag)
+                .unwrap_or_else(|| panic!("`add` is missing --{flag}"));
+            let source_add_shape = source_add_args
+                .get(*flag)
+                .unwrap_or_else(|| panic!("`source add` is missing --{flag}"));
+            assert_eq!(
+                add_shape, source_add_shape,
+                "`--{flag}` differs between `add` and `source add`: {add_shape:?} vs {source_add_shape:?}"
+            );
         }
     }
 

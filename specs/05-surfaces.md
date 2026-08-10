@@ -23,13 +23,13 @@ Single binary, subcommand tree. Global flags: `--config`, `--json`, `--store <na
 | `mcp` | Run MCP server on stdio | embedded core | thin client |
 | `status` | Stores, resource/chunk counts, policy staleness, daemon state | reads directly | queries daemon |
 | `store add/list/remove` | Manage runtime-owned stores | direct write | routed to daemon |
-| `source add/list/remove` | Manage sources on a store | direct write | routed to daemon |
-| `add <path|url>...` | Alias for `source add` — add one or more sources to a store | direct write | routed to daemon |
-| `index [--store S] [--source ID] [--strict]` | One-shot scan & index; creates IndexJob | runs job synchronously, progress to stderr | submits job, polls, streams progress |
+| `source add/list/remove` | Manage sources on a store; defaults to the store named `default` if `-s` is omitted, exit 2 if absent (§2.2) | direct write | `add`/`remove` routed to daemon; `list` always reads the local database (§2.2 known limitation) |
+| `add <path|url>...` | Alias for `source add` — add one or more sources to a store; same `default`-store rule as `source add` (§2.2) | direct write | routed to daemon |
+| `index [--store S]... [--source ID] [--strict]` | One-shot scan & index; creates IndexJob; all stores if `-s` is omitted (§2.2) | runs job synchronously, progress to stderr | submits job, polls, streams progress |
 | `search <query>... [--limit N] [--content-length N]` | Hybrid search with citations; `--content-length` is a **soft cap** on human-readable snippet chars (default 1000; JSON output always full text) — see §4 for the snapping behavior shared with MCP | embedded read | via API |
-| `db status` | Inspect schema state: current version, head version, pending/unsupported steps. Never refuses, even on a store newer than the binary | reads directly | error `daemon_running` |
-| `db migrate` | Apply pending migrations with per-step progress; legacy v1–v3 rebuild and any other destructive step require confirmation; prints a `localdb index` hint when a weight-class-3 migration ran | direct write | error `daemon_running` |
-| `db downgrade [--to N]` | Reverse migrations down to version `N` (default: one step) using stored down-SQL; requires confirmation; refuses cleanly on a step with `down_unsupported_reason` | direct write | error `daemon_running` |
+| `db status` | Inspect schema state: current version, head version, pending/unsupported steps. Never refuses, even on a store newer than the binary; not store-scoped, `-s` is rejected, exit 2 (§2.2) | reads directly | error `daemon_running` |
+| `db migrate` | Apply pending migrations with per-step progress; legacy v1–v3 rebuild and any other destructive step require confirmation; prints a `localdb index` hint when a weight-class-3 migration ran; not store-scoped, `-s` is rejected, exit 2 (§2.2) | direct write | error `daemon_running` |
+| `db downgrade [--to N]` | Reverse migrations down to version `N` (default: one step) using stored down-SQL; requires confirmation; refuses cleanly on a step with `down_unsupported_reason`; not store-scoped, `-s` is rejected, exit 2 (§2.2) | direct write | error `daemon_running` |
 
 Output: human-readable by default (citations as `uri:heading_path` + snippet), `--json` emits the
 canonical structures for scripting. The CLI is **command-oriented**; interactive browse is a
@@ -46,6 +46,102 @@ error `daemon_running`, exit 4. Destructive paths (the legacy v1–v3 rebuild in
 and `db downgrade`) require explicit confirmation before touching the store. See
 [02-domain-model.md](02-domain-model.md) §9 for the `schema_migrations` table and the
 migration-weight-class design.
+
+### 2.2 Store scope
+
+`--store <name>` is **repeatable**; every name passed is validated and resolved, not just the
+first. An unknown name is `store_not_found`, exit 3. When explicit, `-s` always wins over any
+default below. When `-s` is omitted, the default depends on the command:
+
+| Command | `-s` omitted | Rationale |
+|---|---|---|
+| `search`, `status`, `store list` | **all stores** | this is only the *default* when `-s` is omitted — an explicit `--store` is still validated and resolved exactly like every other command; an unknown name is `store_not_found`, exit 3, not a silently-ignored flag |
+| `index` | **all stores** | idempotent and re-runnable; "refresh everything" is the common workflow |
+| `source add`/`list`/`remove`, `add` alias | **store named `default`**; **exit 2** if absent | mutations must never guess; `list` stays consistent with its siblings |
+| `db status`/`migrate`/`downgrade` | n/a — **exit 2 if `-s` is passed** | not store-scoped; silently ignoring a flag the user believed in is the #178 failure mode again |
+
+Additional rules:
+
+- An empty resolved store set under an all-stores policy (no stores configured at all) is exit 2,
+  not a silent no-op.
+- `source add`/`remove` (and the `add` alias) error text when the `default` store is missing is
+  `no store named 'default'; pass --store <name>`. This fires even when exactly one store exists
+  under a different name — predictability wins over guessing the sole store.
+- Output gains a store-name column only when more than one store is in scope; a single store in
+  scope keeps the pre-existing output format so existing scripts don't break:
+
+  ```
+  $ localdb source list -s books          # 1 store in scope — unchanged
+  01KWEZN72M... [path] /Volumes/Archive/books
+
+  $ localdb source list -s books -s default   # >1 in scope — column appears
+  books    01KWEZN72M... [path] /Volumes/Archive/books
+  default  01KWEXGA9Y... [path] nextcloud
+  ```
+
+- `index` across multiple stores emits one summary per store plus a combined total; `--json`
+  emits an array of per-store summaries. `--strict` exits 2 if **any** store reported errors, but
+  every store still runs to completion first — consistent with the "`--strict` never aborts
+  mid-run" rule (see "`localdb index --strict`" under §5).
+- **Known limitation (#188):** daemon-routed `source remove` validates `--store` only
+  *syntactically* (name shape, traversal safety) — it cannot confirm the source actually belongs
+  to the named store, because `DELETE /v1/sources/{id}` is store-agnostic. Embedded (daemonless)
+  mode does enforce this, since it resolves the source through the named store's own row.
+- **Known limitation: `source list` never consults the daemon.** Unlike `source add`/`remove`,
+  `source list` has no daemon branch at all — it always opens the local database directly and
+  resolves `--store` scope against it, even when a daemon is running. In the common case (daemon
+  and CLI share one data directory) this is invisible: the local database and the daemon's store
+  set agree. It only surfaces when `LOCALDB_DAEMON_URL` points at a daemon with a *different* data
+  directory: `source add`/`remove` and `index` resolve scope against the daemon's store set (see
+  the next bullet), but `source list` still reads whatever store set the local database happens to
+  have, which can disagree with what a preceding `source add` just reported. The table in §2 lists
+  `source add/list/remove` together as "routed to daemon"; that is only true of `add` and `remove`.
+- **Daemon-routed scope resolution asks the daemon, not the local database.** `source add`/`remove`
+  (via their daemon branches) and `index` resolve `--store` scope by paginating `GET /v1/stores`
+  to exhaustion, because a running daemon may point at a different data directory than the one
+  this process would otherwise open (`LOCALDB_DAEMON_URL`) and is the authority on which stores
+  exist either way. `source list` is the exception — see the known limitation above. The same
+  omitted-vs-explicit distinction from the table above still holds for the commands that do ask the
+  daemon: an omitted `-s` resolving against a daemon with no store named `default` is
+  `invalid_request`, exit 2, with the same `no store named 'default'; pass --store <name>` message;
+  an *explicit* `--store default` the daemon does not have is `store_not_found`, exit 3, same as
+  any other explicit unknown name — the implicit default and an explicit request for that same name
+  are not the same failure.
+- **Daemon-routed `index --source ID` always verifies ownership.** `/v1/jobs` does not validate
+  `source_id` (it only checks `store_name`), so submitting the same source id to every store in a
+  multi-store scope would silently create one job per store, only one of which is meaningful — and
+  submitting it to a single resolved store with no check at all would silently accept an id that
+  store doesn't actually own. So regardless of how many stores are in the resolved scope, the CLI
+  always walks `GET /v1/stores/{name}/sources` (paginating each store to exhaustion) over the
+  scoped stores to find the id's owner first, submitting exactly one job. A source found in no
+  scoped store is `source_not_found`, exit 3 — reproducing embedded mode's hard-filter rule that an
+  explicit `--store` scope excluding the owner does not silently redirect to it, and its "unknown
+  source id" rule for a single-store scope too.
+- A multi-item `--json` batch (`source add`/`add` across more than one `--store`, local or
+  daemon-routed) that fails partway through — after at least one earlier item already succeeded —
+  does not discard the buffered results: it prints one JSON document
+  `{"status": "error", "error": {"code": <error code>, "message": <text>}, "results": [<items
+  completed so far>]}` to stdout, then exits with the failing error's normal exit code, instead of
+  routing through the usual stderr-only error shape. The buffered `results` are output data, not
+  merely an error message, so — like every other `--json` document — they belong on stdout.
+
+### 2.3 Feed sources
+
+Both `localdb add <url>...` and `localdb source add <url>...` accept `--kind <path|url|feed>` to
+override auto-classification. `--kind feed` requires an `http(s)://` argument — anything else is
+`invalid_request`, exit 2. Two more flags apply only when the effective kind is `feed`:
+`--max-entries <N>` (`0` is rejected) and `--no-fetch-full-content` (selects single-document mode,
+[02-domain-model.md](02-domain-model.md) §2). Passing either flag when the effective kind is not
+`feed` is `invalid_request`, exit 2 — not silently ignored. `--help` for `add`/`source add` notes
+that feed ingestion in the default (discovery) mode fetches every entry's linked page and
+recommends `--max-entries` to bound that.
+
+`source list` (human) renders feed rows as `{id} [feed] {url} (max_entries=…, full_content=on|off)`
+— `…` is the configured integer or `unbounded`. `--json` adds parsed `max_entries` (`null` or integer)
+and `fetch_full_content` (bool), reconstructed from `config_json` (never the raw column), and now
+also surfaces `refresh` for both `url` and `feed` sources. These shapes compose with §2.2's
+store-scope rule: the store-name column (human) and `store` field (`--json`) are prepended when
+more than one store is in scope, and the feed detail above is what follows it.
 
 ## 3. HTTP API
 
@@ -70,6 +166,13 @@ later if a consumer demands it).
   limit; citations carry full `Metadata`), `GET /resources/{id}` (response includes
   `metadata: Metadata`), `POST /jobs` (index requests), `GET /jobs/{id}`, `GET /status`,
   `GET /config` (resolved config).
+- **Feed sources:** `POST /stores/{id}/sources` accepts `{kind: "feed", spec: {url, max_entries,
+  fetch_full_content}, preset, refresh}` — `spec` mirrors `SourceSpec::Feed`
+  ([02-domain-model.md](02-domain-model.md) §2). Validation failures (`max_entries: 0`, a
+  non-`http(s)` `url`, etc.) are `invalid_request`, 400. `GET .../sources` reconstructs a clean
+  `spec` object per source from `config_json` (never the raw column) and now surfaces `refresh`
+  for both `url` and `feed` sources. Feed's `refresh` is persisted and validated the same as
+  `url`'s but is currently inert — no scheduled refresh runs yet for either kind.
 - **Long-running work:** indexing is a **job resource**: `POST /jobs` → `202` + job; clients poll
   `GET /jobs/{id}`. SSE progress streaming is roadmap ([06-roadmap.md](06-roadmap.md) §5) — the
   job resource is designed so SSE adds a representation, not a new model.
@@ -79,9 +182,9 @@ later if a consumer demands it).
 
 **Decision:** v1 MCP is **read-only**: tools `search` (args: query, optional store names, limit, optional content_length →
 Citation list as structured content; each citation carries full `Metadata`),
-`get_document` (id or uri → block texts + `metadata: Metadata`),
-`get_chunks` (resource_id, optional offset/limit, or optional anchor_chunk_id/anchor_block_seq
-(§4.1) → the resource's chunks in order, paginated),
+`get_document` (id or uri, optional store → block texts + `metadata: Metadata`),
+`get_chunks` (resource_id, optional store, optional offset/limit, or optional
+anchor_chunk_id/anchor_block_seq (§4.1) → the resource's chunks in order, paginated),
 `list_stores` (names, visibility, counts). **Mutating tools** (`add_source`, `reindex`, …) are a
 follow-up behind an explicit opt-in flag (`localdb mcp --allow-write`), never on by default.
 
@@ -93,6 +196,15 @@ Citations cross MCP as structured tool results (the JSON shape from
 [02-domain-model.md](02-domain-model.md) §6), with a short text rendering alongside for
 non-structured clients (text rendering includes `creator · date` where present).
 Resources/prompts: none in v1; resources are reachable via `get_document` / `get_chunks`.
+
+**Store disambiguation (#144).** `get_document` and `get_chunks` both accept an optional
+`store` argument: a store **id or name**, resolved the same way as `search`'s `stores`
+argument. A `search` citation carries the store it came from (`store.id` / `store.name`),
+so a client can round-trip a citation back into either tool without ambiguity. Unknown
+store → `store_not_found`. When `store` is **omitted**, both tools scan every available
+store and return the first match — the pre-#144 behavior, retained for backward
+compatibility. Omitting it when the same document id exists in more than one store is
+therefore a coin flip; pass `store` whenever the id's origin is known.
 
 ### 4.1 `get_chunks`
 

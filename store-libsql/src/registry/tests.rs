@@ -44,6 +44,7 @@ fn make_path_source(id: &str, store_id: &str, root: &str) -> SourceRow {
         preset: "prose".to_string(),
         refresh: None,
         created_at: "2026-06-25T12:00:00Z".to_string(),
+        config_json: None,
     }
 }
 
@@ -59,6 +60,23 @@ fn make_url_source(id: &str, store_id: &str, url: &str) -> SourceRow {
         preset: "prose".to_string(),
         refresh: Some("24h".to_string()),
         created_at: "2026-06-25T12:00:00Z".to_string(),
+        config_json: None,
+    }
+}
+
+fn make_feed_source(id: &str, store_id: &str, url: &str, config_json: Option<&str>) -> SourceRow {
+    SourceRow {
+        id: id.to_string(),
+        store_id: store_id.to_string(),
+        kind: SourceKind::Feed,
+        root: None,
+        url: Some(url.to_string()),
+        include: vec![],
+        exclude: vec![],
+        preset: "prose".to_string(),
+        refresh: Some("24h".to_string()),
+        created_at: "2026-06-25T12:00:00Z".to_string(),
+        config_json: config_json.map(|s| s.to_string()),
     }
 }
 
@@ -528,5 +546,163 @@ async fn find_document_tolerates_invalid_metadata_json() {
         info.metadata,
         Metadata::default(),
         "invalid metadata_json must fall back to default metadata, not error the read"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Feed sources (issue #116)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn feed_source_kind_round_trips() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    let s = make_feed_source(
+        "src-1",
+        "store-1",
+        "https://example.com/feed.xml",
+        Some(r#"{"max_entries":50,"fetch_full_content":true}"#),
+    );
+    api.upsert_source(&s).await.unwrap();
+    let got = api.get_source("src-1").await.unwrap().unwrap();
+    assert_eq!(got.kind, SourceKind::Feed);
+    assert_eq!(got, s);
+}
+
+#[tokio::test]
+async fn upsert_and_get_feed_source_with_populated_config_json_round_trips() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    let s = make_feed_source(
+        "src-1",
+        "store-1",
+        "https://example.com/feed.xml",
+        Some(r#"{"max_entries":10,"fetch_full_content":false}"#),
+    );
+    api.upsert_source(&s).await.unwrap();
+    let got = api.get_source("src-1").await.unwrap().unwrap();
+    assert_eq!(
+        got.config_json.as_deref(),
+        Some(r#"{"max_entries":10,"fetch_full_content":false}"#)
+    );
+}
+
+#[tokio::test]
+async fn upsert_and_get_feed_source_with_null_config_json_round_trips() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    let s = make_feed_source("src-1", "store-1", "https://example.com/feed.xml", None);
+    api.upsert_source(&s).await.unwrap();
+    let got = api.get_source("src-1").await.unwrap().unwrap();
+    assert_eq!(got.config_json, None);
+}
+
+#[tokio::test]
+async fn list_sources_includes_feed_source_config_json() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    api.upsert_source(&make_feed_source(
+        "src-1",
+        "store-1",
+        "https://example.com/feed.xml",
+        Some(r#"{"max_entries":5,"fetch_full_content":true}"#),
+    ))
+    .await
+    .unwrap();
+    let sources = api.list_sources("store-1").await.unwrap();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0].kind, SourceKind::Feed);
+    assert_eq!(
+        sources[0].config_json.as_deref(),
+        Some(r#"{"max_entries":5,"fetch_full_content":true}"#)
+    );
+}
+
+#[tokio::test]
+async fn find_feed_source_by_url_finds_it_with_config_json() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    api.upsert_source(&make_feed_source(
+        "src-1",
+        "store-1",
+        "https://example.com/feed.xml",
+        Some(r#"{"max_entries":null,"fetch_full_content":true}"#),
+    ))
+    .await
+    .unwrap();
+    let found = api
+        .find_source_by_root_or_url("https://example.com/feed.xml", "store-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.id, "src-1");
+    assert_eq!(
+        found.config_json.as_deref(),
+        Some(r#"{"max_entries":null,"fetch_full_content":true}"#)
+    );
+}
+
+#[tokio::test]
+async fn upsert_feed_source_on_conflict_updates_config_json() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    let mut s = make_feed_source(
+        "src-1",
+        "store-1",
+        "https://example.com/feed.xml",
+        Some(r#"{"max_entries":10,"fetch_full_content":true}"#),
+    );
+    api.upsert_source(&s).await.unwrap();
+
+    // ON CONFLICT(id) DO UPDATE path: change config_json and re-upsert with
+    // the same id.
+    s.config_json = Some(r#"{"max_entries":20,"fetch_full_content":false}"#.to_string());
+    api.upsert_source(&s).await.unwrap();
+
+    let got = api.get_source("src-1").await.unwrap().unwrap();
+    assert_eq!(
+        got.config_json.as_deref(),
+        Some(r#"{"max_entries":20,"fetch_full_content":false}"#)
+    );
+}
+
+#[tokio::test]
+async fn check_constraint_allows_feed_kind_with_null_root_and_url() {
+    // C1/C3: the CHECK constraint's third disjunct
+    // `(kind NOT IN ('path', 'url'))` tolerates a 'feed' kind row
+    // regardless of root/url — this test inserts raw SQL (bypassing
+    // `upsert_source`, which always sets `url` for a feed row) to pin that
+    // the CHECK constraint itself, not just the Rust-level API, accepts
+    // kind='feed' with both root and url NULL.
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    let conn = api.conn.conn().await;
+    let result = conn
+        .execute(
+            "INSERT INTO sources (id, store_id, kind, root, url, include, exclude, \
+                 preset, refresh, created_at, config_json) \
+             VALUES ('src-1', 'store-1', 'feed', NULL, NULL, '[]', '[]', 'prose', NULL, \
+                 '2026-06-25T12:00:00Z', NULL)",
+            (),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "CHECK constraint must accept kind='feed' with NULL root and url; got: {:?}",
+        result.err()
     );
 }

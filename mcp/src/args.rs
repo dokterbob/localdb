@@ -79,6 +79,19 @@ pub struct GetDocumentArgs {
     #[serde(default)]
     #[schemars(description = "Document URI (e.g. file:///path/to/doc or URL)")]
     pub uri: Option<String>,
+
+    /// Store id or name to restrict the lookup to — e.g. the `store.id` or
+    /// `store.name` carried by a `search` result's citation (#144). Resolved
+    /// with the same id-or-name matching `search`'s `stores` argument uses
+    /// (`tools::select_mcp_stores`); an unknown store is a `store_not_found`
+    /// tool error. When omitted, `tools::find_document_chunks` keeps the
+    /// pre-#144 behavior: scan every available store and return whichever
+    /// matches first.
+    #[serde(default)]
+    #[schemars(
+        description = "Store id or name to restrict the lookup to (e.g. the store.id or store.name from a search result's citation). Defaults to scanning all available stores and returning the first match."
+    )]
+    pub store: Option<String>,
 }
 
 /// Arguments for the `get_chunks` tool.
@@ -125,4 +138,17 @@ pub struct GetChunksArgs {
         range(min = 0)
     )]
     pub anchor_block_seq: Option<u32>,
+
+    /// Store id or name to restrict the lookup to — e.g. the `store.id` or
+    /// `store.name` carried by a `search` result's citation (#144). Resolved
+    /// with the same id-or-name matching `search`'s `stores` argument uses
+    /// (`tools::select_mcp_stores`); an unknown store is a `store_not_found`
+    /// tool error. When omitted, `tools::find_document_chunks` keeps the
+    /// pre-#144 behavior: scan every available store and return whichever
+    /// matches first.
+    #[serde(default)]
+    #[schemars(
+        description = "Store id or name to restrict the lookup to (e.g. the store.id or store.name from a search result's citation). Defaults to scanning all available stores and returning the first match."
+    )]
+    pub store: Option<String>,
 }

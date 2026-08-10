@@ -199,6 +199,7 @@ pub struct Source {
 pub enum SourceKind {
     Path,
     Url,
+    Feed,
 }
 
 /// Source spec — kind-specific configuration.
@@ -222,6 +223,28 @@ pub enum SourceSpec {
         #[serde(default)]
         refresh_interval_secs: Option<u64>,
     },
+    Feed {
+        /// The Atom/RSS feed URL.
+        url: String,
+        /// Cap on entries considered per run (`None` = unbounded). A feed
+        /// only ever exposes its most recent N entries, so this bounds how
+        /// many of those are processed, not how many exist historically.
+        #[serde(default)]
+        max_entries: Option<u32>,
+        /// Whether to follow each entry's link and fetch the full page
+        /// content, or index only the feed-supplied summary/content.
+        #[serde(default = "default_true")]
+        fetch_full_content: bool,
+        /// Refresh interval in seconds.
+        #[serde(default)]
+        refresh_interval_secs: Option<u64>,
+    },
+}
+
+/// `serde(default = "default_true")` helper: feed sources default to
+/// fetching full entry content when `fetch_full_content` is omitted.
+fn default_true() -> bool {
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -590,6 +613,65 @@ mod tests {
         let json = serde_json::to_string(&source).unwrap();
         let source2: Source = serde_json::from_str(&json).unwrap();
         assert_eq!(source, source2);
+    }
+
+    #[test]
+    fn feed_source_serializes_roundtrip() {
+        let source = Source {
+            id: new_ulid(),
+            store_id: new_ulid(),
+            kind: SourceKind::Feed,
+            spec: SourceSpec::Feed {
+                url: "https://example.com/feed.xml".to_string(),
+                max_entries: Some(50),
+                fetch_full_content: false,
+                refresh_interval_secs: Some(3600),
+            },
+            source_preset: "prose".to_string(),
+        };
+        let json = serde_json::to_string(&source).unwrap();
+        let source2: Source = serde_json::from_str(&json).unwrap();
+        assert_eq!(source, source2);
+    }
+
+    #[test]
+    fn feed_source_spec_serializes_with_tag_feed() {
+        let spec = SourceSpec::Feed {
+            url: "https://example.com/feed.xml".to_string(),
+            max_entries: None,
+            fetch_full_content: true,
+            refresh_interval_secs: None,
+        };
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json.get("type").and_then(|v| v.as_str()), Some("feed"));
+    }
+
+    #[test]
+    fn feed_source_kind_serializes_lowercase() {
+        let json = serde_json::to_value(SourceKind::Feed).unwrap();
+        assert_eq!(json, serde_json::json!("feed"));
+    }
+
+    #[test]
+    fn feed_source_spec_omitted_fetch_full_content_defaults_true() {
+        let json = r#"{"type": "feed", "url": "https://example.com/feed.xml"}"#;
+        let spec: SourceSpec = serde_json::from_str(json).unwrap();
+        match spec {
+            SourceSpec::Feed {
+                fetch_full_content,
+                max_entries,
+                refresh_interval_secs,
+                ..
+            } => {
+                assert!(
+                    fetch_full_content,
+                    "fetch_full_content must default to true"
+                );
+                assert_eq!(max_entries, None);
+                assert_eq!(refresh_interval_secs, None);
+            }
+            _ => panic!("expected feed spec"),
+        }
     }
 
     // --- Document tests ---

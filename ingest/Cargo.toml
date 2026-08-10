@@ -12,6 +12,8 @@ extract = { path = "../extract" }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+feed-rs = { version = "2", features = ["sanitize"] }
+mediatype = "0.21"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }

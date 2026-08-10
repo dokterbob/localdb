@@ -138,6 +138,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_preserves_fragment_untouched() {
+        // Pinning test for the Atom/RSS feed ingestor's discovery mode
+        // (issue #116): link-less entries are addressed by a synthetic
+        // fragment URI `{feed_url}#entry:{id}`. `Uri::parse` must round-trip
+        // the fragment byte-for-byte, since it's the only thing that makes
+        // such an entry's URI unique.
+        let uri = Uri::parse("https://example.com/feed.xml#entry:abc123").unwrap();
+        assert_eq!(uri.as_str(), "https://example.com/feed.xml#entry:abc123");
+        assert_eq!(uri.as_url().fragment(), Some("entry:abc123"));
+
+        // Round trip through Display and re-parse.
+        let redisplayed = uri.to_string();
+        assert_eq!(redisplayed, "https://example.com/feed.xml#entry:abc123");
+        let reparsed = Uri::parse(&redisplayed).unwrap();
+        assert_eq!(uri, reparsed);
+
+        // Round trip through serde too.
+        let json = serde_json::to_string(&uri).unwrap();
+        let from_json: Uri = serde_json::from_str(&json).unwrap();
+        assert_eq!(uri, from_json);
+    }
+
+    #[test]
     fn parse_connector_scheme() {
         let uri = Uri::parse("notion://page/abc123").unwrap();
         assert_eq!(uri.scheme(), "notion");

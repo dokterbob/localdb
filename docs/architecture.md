@@ -143,8 +143,11 @@ to the appropriate crate. No logic of its own. Subcommands: `init`, `serve`, `mc
 ```
 
 Content-addressed IDs (`blake3`) flow through every step: documents get
-`blake3(uri ‖ content_hash)` and chunks get `blake3(document_id ‖ chunk_text ‖ span)`,
-making re-indexing idempotent. See [specs/02-domain-model.md](../specs/02-domain-model.md) §3.
+`blake3(uri ‖ content_hash)` and chunks get
+`blake3(resource_id ‖ block_seq ‖ chunk_text ‖ seq_in_block)`, making re-indexing idempotent.
+Span (byte offsets) is deliberately excluded — it can shift slightly between runs (e.g. from
+whitespace-normalization tweaks) without the chunk's actual membership changing, which would
+otherwise needlessly churn IDs. See [specs/02-domain-model.md](../specs/02-domain-model.md) §3.
 
 The `Citation` is the canonical output shape used by every surface — CLI, HTTP, and MCP all
 return the same structure. See [specs/02-domain-model.md](../specs/02-domain-model.md) §6.
@@ -286,8 +289,10 @@ verify both the `localdb` binary and the embedded `.so` stay at or below `GLIBC_
 
 This section documents verified divergences between the specs and the v0.1.0 implementation. They are listed honestly so contributors know where work remains. Each item names the responsible code area.
 
-**1. HTTP daemon `POST /v1/jobs` is a no-op.**
-The daemon's job-submission endpoint accepts the request and reports the job state machine (`pending → done`) but does not run the ingestion pipeline; `chunks_written` stays `0`. Daemon-side reads (`/v1/search`, `/v1/documents/{id}`, `/v1/status`) DO see CLI-indexed data because the daemon now opens the same unified database as the CLI. To actually index, run `localdb index` from the CLI (which still works while the daemon runs — concurrent writers serialise via SQLite WAL).
+**Recently closed, not (re)listed below:** `--store` used to be honored only by `search`/`mcp` — every other command silently operated on an arbitrary store instead of respecting the flag's absence consistently (#178, #118). `--store` is now resolved and validated the same way everywhere, with a per-command default documented in [specs/05-surfaces.md §2.2](../specs/05-surfaces.md#22-store-scope): all stores for `search`/`status`/`store list`/`index`, the store named `default` for `source`/`add`, and rejected outright for `db status`/`migrate`/`downgrade`. Separately, MCP `get_document`/`get_chunks` now accept an optional `store` argument (id or name) to disambiguate a document id that exists in more than one store (#144; see [docs/mcp.md](mcp.md#get_document)). Gaps #6 and #7 below (the `/mcp` HTTP store-list snapshot and daemon-proxied `localdb mcp --store`) are related but distinct and remain open.
+
+**1. HTTP daemon `POST /v1/jobs` is a no-op.** ([#187](https://github.com/dokterbob/localdb/issues/187))
+The daemon's job-submission endpoint accepts the request and reports the job state machine (`pending → done`) but does not run the ingestion pipeline; `chunks_written` stays `0`. Daemon-side reads (`/v1/search`, `/v1/documents/{id}`, `/v1/status`) DO see CLI-indexed data because the daemon now opens the same unified database as the CLI. `localdb index` does not route around this — when a daemon is running it proxies the job to the same no-op endpoint. To actually index, stop the daemon first, then run `localdb index`.
 
 **Gap #2. `source add` does not validate path existence.** ([#14](https://github.com/dokterbob/localdb/issues/14))
 **Resolved as of 2026-06-28:** `cli/src/lib.rs` now validates path existence in `run_source_add_async` via `normalize_path_source`.
@@ -355,6 +360,92 @@ retrieval"). These remain:
   does not tag its running heads keeps them. The upstream geometric stripper is unsafe (it
   deletes body text from multi-column documents) — see
   [docs/followups-pdf-oxide-swap.md](followups-pdf-oxide-swap.md) §2a.
+**10. Feed sources are exempt from the delete-sweep — there is no entry pruning.**
+A feed exposes only its most recent entries, so an entry falling out of the feed does not mean it
+was deleted upstream: treating it as a delete would wipe most of a feed's indexed history on a
+normal fetch, and a feed `304` (or a transient empty parse) would zero out every entry in one
+sweep. The ingestion pipeline's delete-sweep therefore skips `ingestor_kind = feed` sources
+entirely — entries once indexed stay indexed indefinitely, even after they scroll off the feed,
+until the whole source is removed (`source remove`, which still cascades normally). Pruning
+truly-dead entry URLs (404/410) is a follow-up issue.
+
+**11. Conditional-GET state (`ETag`/`Last-Modified`) is captured but never persisted or reused, for both `url` and `feed` sources.**
+`external_etag` is captured on the `Resource` at fetch time but nothing writes it back for reuse
+on the next fetch — every `localdb index` re-fetches every URL and every feed entry in full, with
+no `If-None-Match`/`If-Modified-Since` sent. A follow-up issue covers persisting and round-tripping
+conditional-GET state together with delete-on-404/410 pruning (previous item).
+
+**12. A store containing a `kind = 'feed'` source cannot be opened by an older binary that predates the Feed ingestor.**
+`sources.ingestor_kind` decoding is a hard match over the known `IngestorKind` variants
+([specs/02-domain-model.md](../specs/02-domain-model.md) §2); an unrecognized kind fails the whole
+`list_sources`/`index` call for the store, not just the one source with that kind. Concretely: add
+even one `kind = 'feed'` source to a store, and every older `localdb` binary whose `IngestorKind`
+enum doesn't yet have `Feed` can no longer list or index *any* source in that store — not just the
+feed one — until it's upgraded. Adding a source kind is therefore a floor-version event for a
+store, the same way a schema migration is, but with none of the migration framework's tooling
+around it (there is no `db downgrade` for this — the incompatibility lives in a data row, not the
+schema version). See [docs/migrations.md](migrations.md). Graceful degradation (skip unrecognized
+kinds instead of hard-erroring the whole store) is a follow-up issue.
+
+**13. Cross-source URL ownership: two sources claiming the same URL in one store can race, and the loser's sweep deletes the other's live document.**
+Resource upsert keys off `(store_id, uri)` and reassigns `source_id` to whichever source most
+recently ingested that URI; the delete-sweep runs per-source, over the URIs that source saw this
+run. If two sources resolve to the same URL within the same run window — e.g. a feed entry linking
+to a page that's also directly registered as a `url` source — the resource can be silently
+reassigned between them, and the loser's next sweep, no longer seeing that URI as "its own,"
+deletes the shared, still-live document. This predates the feed connector (it already applied to
+two `url` sources, or a `path`/`url` collision, sharing a URI) and is not fixed by this work; the
+feed connector's discovery mode just makes the collision more likely in practice, since feeds
+routinely link to pages users have also added directly.
+
+**14. Feed `refresh` is accepted, persisted, and validated but does not do anything yet.**
+Same story as `url`'s `refresh_interval_secs`: the value round-trips through config and the API
+but no scheduler reads it back to trigger a re-fetch — scheduled refresh is daemon-side work not
+yet built for either source kind.
+
+**15. Enrichment metadata changes don't persist while content is unchanged.** ([#176](https://github.com/dokterbob/localdb/issues/176))
+The pipeline's incremental skip (`core/src/ingestion.rs`, `on_resource`) returns on a
+`content_hash` + `policy_version` match before any store write, and metadata is never compared —
+so corrected feed dates/authors/external ids (and the feed-derived `modified_at`) never reach the
+store for an already-indexed document until its content bytes change. Fixing this needs a core
+skip-contract change (metadata-aware compare, or a metadata-only store update that skips
+re-embedding); see the issue for the design options.
+
+**16. `index_resource`'s zero-chunk arm still deletes on an empty replacement for any ingestor
+that yields a zero-block Resource — `file` sources are not guarded.**
+([#185](https://github.com/dokterbob/localdb/issues/185),
+[#156](https://github.com/dokterbob/localdb/issues/156))
+The fetched-page and embedded-content paths (`url`/`feed` sources, via
+`ingest/src/url_pipeline.rs`) now classify "extracted to nothing" as unusable and report it via
+`on_skipped` rather than yielding a zero-block `Resource` — see
+[specs/02-domain-model.md](../specs/02-domain-model.md) § "Feed connector" and
+[specs/04-search-pipeline.md](../specs/04-search-pipeline.md) §1. `FileIngestor` has no
+equivalent guard: a file that extracts to zero blocks (emptied on disk between the watcher's
+debounce firing and the read, or an extractor regression) still reaches `index_resource`'s
+zero-chunk arm and deletes the previously indexed document for that path, reporting the run as
+successful. Same root conflation as #156 — "unavailable" mistaken for "legitimately empty" — one
+layer down: #156 is zero-URIs-enumerated at the source level, this is zero-blocks-extracted at
+the resource level, and here it is `file` rather than `url`/`feed` that lacks the guard.
+Extending the same classification to `FileIngestor` — and giving `index_resource` itself an
+"empty ≠ deleted" rule, so the guard is an invariant rather than per-ingestor discipline — is
+tracked in #185.
+
+**17. There is no opt-in for private-network feed entry links.** ([#196](https://github.com/dokterbob/localdb/issues/196))
+Discovery mode fetches entry links through a public-destination-only HTTP client (see
+[specs/02-domain-model.md](../specs/02-domain-model.md) § "Feed connector", *Destination policy*),
+and v0.1 offers no way to relax that. An operator running an internal feed whose entries link to
+LAN hosts gets those entries indexed from their embedded summaries only — the linked pages are
+never fetched, silently from the operator's point of view apart from a `WARN` log line. There is
+also a residual hole the guard deliberately does not close: the **feed URL itself** uses the
+unrestricted client (it is operator-configured, the same trust class as a `url` source), so a
+feed URL that 30x's to a private destination is still followed. A per-source or global
+allow-private-destinations setting would address both at once — the opt-in and the residual
+redirect risk — and is the shape the follow-up issue proposes.
+
+A related feed-specific identity bug lives in the same family:
+[#186](https://github.com/dokterbob/localdb/issues/186) — an entry with no guid, no link and no
+title gets a random UUID identity on every parse, so it is re-indexed and its previous copy
+delete-swept on every run.
 
 ---
 

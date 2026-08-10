@@ -1,6 +1,8 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use localdb_core::Error;
+use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 
 /// Parsed global CLI flags, forwarded to every command handler.
 #[derive(Debug, Clone)]
@@ -206,6 +208,129 @@ fn decode_daemon_error(code: &str, msg: String, status: reqwest::StatusCode) -> 
     }
 }
 
+/// RFC 3986 "unreserved" characters (`ALPHA / DIGIT / "-" / "." / "_" /
+/// "~"`) are left unencoded; everything else is percent-encoded.
+const PATH_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+/// Percent-encode a single user- or daemon-controlled value for safe
+/// inclusion in a daemon request URL — whether as a path segment (a store
+/// name, a source id) or a query value (a pagination cursor).
+///
+/// Without this, a store name containing a URL-structural character (`#`,
+/// `?`, `/`) interpolated raw via `format!` silently retargets the request:
+/// `"a#b"` in `format!("{base_url}/v1/stores/{name}/sources")` parses as
+/// path `/v1/stores/a` with fragment `b/sources` — the fragment is never
+/// sent to the server at all, so the request hits `GET /v1/stores/a`
+/// instead. The unreserved-only encoding here is safe in both the
+/// path-segment and query-value position: percent-encoding round-trips
+/// through `axum`'s `Path`/`Query` extractors regardless of which delimiter
+/// the raw value happened to contain, so a value can never be split across a
+/// URL structural boundary it didn't ask to cross. Over-encoding a character
+/// that didn't strictly need it is harmless; under-encoding one that did is
+/// this bug.
+pub(crate) fn encode_path_segment(s: &str) -> String {
+    utf8_percent_encode(s, PATH_SEGMENT).to_string()
+}
+
+/// Upper bound on pages walked by [`walk_daemon_pages`] — defense in depth
+/// beyond the cursor-repeat guard below: even a daemon that never repeats a
+/// cursor value cannot make the CLI paginate forever.
+const MAX_DAEMON_PAGES: usize = 10_000;
+
+/// Walk a paginated daemon list endpoint (`GET {base_url}{path}`, optionally
+/// suffixed with `?cursor=<encoded>`) to exhaustion, invoking `on_page` with
+/// each page's raw `items` array. `on_page` returns `true` to stop walking
+/// early (e.g. once a sought item has been found) or `false` to continue to
+/// the next page. `path` must already be fully formed (any dynamic segment,
+/// e.g. a store name, pre-encoded via [`encode_path_segment`]) — this
+/// function only ever appends the `?cursor=` query value itself.
+///
+/// Shared by every daemon-routed command that paginates a list endpoint
+/// (`resolve_daemon_store_scope`'s `GET /v1/stores` walk, `index`'s
+/// `GET /v1/stores/{name}/sources` owner walk) so the two guards below can't
+/// drift out of sync between call sites.
+///
+/// Guards against two failure modes a hostile or broken daemon response can
+/// trigger:
+/// - **Malformed page shape**: a response with a missing or non-array
+///   `items` field is `Error::Internal`, not a silently-empty page. Without
+///   this, a request that lands on the wrong endpoint (e.g. the
+///   fragment-truncation bug `encode_path_segment` fixes) gets back a
+///   differently-shaped body — a single resource object, say — and the old
+///   `.unwrap_or_default()` swallowed that into an empty item list, which
+///   `daemon_store_has_source` then read as a legitimate "not found in this
+///   store" rather than an error.
+/// - **Cursor cycles**: every `next_cursor` value returned is recorded in a
+///   `HashSet`; a repeat of *any* previously-seen value — not just the
+///   immediately-preceding one — is `Error::Internal` rather than an
+///   infinite loop. A single "does this equal the previous cursor" check
+///   only catches an immediate repeat; a daemon alternating between two (or
+///   more) cursors never triggers it and loops forever. `MAX_DAEMON_PAGES`
+///   additionally bounds the walk even against a daemon that never repeats a
+///   cursor value at all.
+pub(crate) async fn walk_daemon_pages(
+    base_url: &str,
+    path: &str,
+    mut on_page: impl FnMut(&[serde_json::Value]) -> bool,
+) -> Result<(), Error> {
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors: HashSet<String> = HashSet::new();
+
+    for _ in 0..MAX_DAEMON_PAGES {
+        let url = match &cursor {
+            Some(c) => format!("{base_url}{path}?cursor={}", encode_path_segment(c)),
+            None => format!("{base_url}{path}"),
+        };
+        let resp = daemon_request_async(reqwest::Method::GET, &url, None).await?;
+        let items = resp
+            .get("items")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| Error::Internal {
+                message: format!(
+                    "unexpected response shape from GET {path} (missing or non-array 'items' \
+                     field)"
+                ),
+                correlation_id: "daemon_pagination_shape".to_string(),
+            })?;
+
+        if on_page(items) {
+            return Ok(());
+        }
+
+        let next_cursor = resp
+            .get("next_cursor")
+            .and_then(|c| c.as_str())
+            .map(str::to_string);
+        match next_cursor {
+            None => return Ok(()),
+            Some(next) => {
+                if !seen_cursors.insert(next.clone()) {
+                    return Err(Error::Internal {
+                        message: format!(
+                            "daemon returned a repeating pagination cursor '{next}' for GET \
+                             {path} — a cursor value was seen twice, which a well-behaved daemon \
+                             never produces"
+                        ),
+                        correlation_id: "daemon_pagination_cycle".to_string(),
+                    });
+                }
+                cursor = Some(next);
+            }
+        }
+    }
+
+    Err(Error::Internal {
+        message: format!(
+            "daemon pagination for GET {path} did not terminate within {MAX_DAEMON_PAGES} pages"
+        ),
+        correlation_id: "daemon_pagination_page_cap".to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,5 +443,25 @@ mod tests {
                 id: "doc-1".to_string()
             }
         );
+    }
+
+    #[test]
+    fn encode_path_segment_leaves_unreserved_characters_alone() {
+        assert_eq!(encode_path_segment("my_store-1.2~x"), "my_store-1.2~x");
+    }
+
+    #[test]
+    fn encode_path_segment_escapes_fragment_char() {
+        // The exact regression this fixes (finding 1): an unescaped '#'
+        // interpolated into `format!("{base}/v1/stores/{name}/sources")`
+        // truncates the path at the '#', turning everything after it into a
+        // URL fragment the server never receives.
+        assert_eq!(encode_path_segment("a#b"), "a%23b");
+    }
+
+    #[test]
+    fn encode_path_segment_escapes_query_and_path_delimiters() {
+        assert_eq!(encode_path_segment("a?b=c"), "a%3Fb%3Dc");
+        assert_eq!(encode_path_segment("a/b"), "a%2Fb");
     }
 }

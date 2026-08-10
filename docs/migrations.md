@@ -27,6 +27,27 @@ A fresh (`version == 0`) or already-at-head store opens normally — no CLI acti
 
 ---
 
+## Adding a source kind is a floor-version event too
+
+Schema migrations aren't the only thing that can make a store unreadable by an older binary.
+`sources.ingestor_kind` is decoded via a hard match over `IngestorKind`'s known variants
+([specs/02-domain-model.md](../specs/02-domain-model.md) §2) — an unrecognized kind is a hard
+error for the whole `list_sources`/`index` call, not just the one source carrying it.
+
+The Atom/RSS feed connector (`kind = 'feed'`, [#116](https://github.com/dokterbob/localdb/issues/116))
+needed **no schema migration at all** — `sources.config_json` already existed at baseline (v4) and
+simply gained a new key shape (`{"max_entries", "fetch_full_content"}`), so `localdb db status` /
+`db migrate` report nothing unusual for a feed-bearing store; its schema version is unaffected.
+But the moment a store has one `kind = 'feed'` source, any older binary that predates the Feed
+ingestor can no longer open that store for `source list` or `index` at all — even for its
+non-feed sources. There is no `db downgrade` for this: the incompatibility lives in a data row,
+not the schema version, so the migration framework's version-gated refusal never sees it coming.
+See [docs/architecture.md#known-gaps](architecture.md#known-gaps) (item 12) for the tracked
+follow-up — graceful degradation so an old binary skips unknown source kinds instead of failing
+the whole store.
+
+---
+
 ## `db status` / `db migrate` / `db downgrade`
 
 Three CLI-only maintenance subcommands (`localdb db …`), specced in

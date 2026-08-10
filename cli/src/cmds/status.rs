@@ -1,9 +1,9 @@
 use serde_json::json;
 
 use crate::{
-    app_db::load_app_db_lenient,
+    app_db::{load_app_db_lenient, resolve_store_scope, StoreScopePolicy},
     daemon_client::{probe_daemon, CliContext, DaemonState},
-    normalize::{exit_err, print_json, visibility_to_string},
+    normalize::{print_json, visibility_to_string},
 };
 
 /// `localdb status`
@@ -22,10 +22,11 @@ pub(crate) async fn run_status_async(ctx: &CliContext) {
         DaemonState::NotRunning => "not running (embedded mode)".to_string(),
     };
 
-    let runtime_stores = match db.backend().list_stores().await {
-        Ok(s) => s,
-        Err(e) => exit_err(&e, ctx.json),
-    };
+    // specs/05-surfaces.md §2.2: `--store` is repeatable and always validated
+    // and resolved; the "all stores" behavior only applies when `-s` is
+    // omitted. Route through the shared resolver rather than listing
+    // everything unconditionally.
+    let runtime_stores = resolve_store_scope(ctx, &db, StoreScopePolicy::AllStores).await;
 
     let all_stores: Vec<serde_json::Value> = runtime_stores
         .iter()

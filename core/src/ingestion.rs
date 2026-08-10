@@ -445,11 +445,28 @@ pub enum FetchResult {
         content_type: Option<String>,
         etag: Option<String>,
         last_modified: Option<String>,
+        /// Effective URL after redirects, when the fetcher can report one.
+        /// `None` means "no redirect information available" — callers must
+        /// fall back to the URL they requested, never treat `None` as "no
+        /// redirect".
+        final_url: Option<String>,
     },
     /// Server returned 304 Not Modified (conditional GET).
     NotModified,
     /// Document gone (404/410 after retry). Should trigger deletion.
     Gone,
+    /// The fetcher refused to connect because the destination violates its
+    /// policy — today, a non-globally-routable address behind a locator that
+    /// came from untrusted content (see `fetch`'s destination guard).
+    ///
+    /// A `FetchResult` variant rather than an `Error` on purpose. `Err` is
+    /// the ambiguous-and-possibly-transient bucket; every caller treats it as
+    /// "try again next run, keep what we have". A blocked destination is
+    /// neither ambiguous nor transient — it will be refused identically next
+    /// run — so it belongs beside `Gone` among the stable outcomes the
+    /// pipeline knows how to route. Keeping it out of `Error` also means no
+    /// new stable exit code is minted (see specs/05-surfaces.md §5).
+    Blocked,
 }
 
 /// HTTP client seam for URL fetching.
@@ -742,7 +759,13 @@ pub async fn index_resource(
             id: resource.source_id.clone(),
             kind: resource.ingestor_kind.as_str().to_string(),
         },
-        fetched_at: resource.modified_at.clone(),
+        // Acquisition time, i.e. when *our store* got hold of this resource —
+        // `added_at`, never `modified_at` (which for a feed entry is the
+        // feed's own claim about the content's age). The libsql backend binds
+        // this to `resources.added_at`, the column `MetadataFilter::
+        // FetchedAfter`/`FetchedBefore` filter on and every citation reports.
+        // See specs/02-domain-model.md §4.
+        fetched_at: resource.added_at.clone(),
         content_hash: resource.content_hash.clone(),
         share_path: vec![],
     };
@@ -831,7 +854,9 @@ pub struct SourceIngestionDeps<'a> {
 /// the run. After `ingestor.ingest()` returns, runs the delete-sweep: any URI
 /// previously indexed for this source that was neither yielded nor reported via
 /// `on_skipped` this run is deleted — this is how a file deletion, source
-/// removal, or (once ingestors report it) a Gone URL is swept.
+/// removal, or (once ingestors report it) a Gone URL is swept. Feed sources
+/// (`SourceSpec::Feed`) are exempt from the sweep — see the comment at the
+/// sweep loop below for why.
 pub async fn run_source_ingestion(
     source: &Source,
     ingestor: &dyn Ingestor,
@@ -926,21 +951,34 @@ pub async fn run_source_ingestion(
     // one source delete another source's live documents. `source_id` is exact:
     // it is persisted per resource (baseline schema), rehydrated by
     // `list_indexed_documents`, and immune to encoding.
-    let existing_uris = doc_index.uris();
-    for uri in existing_uris {
-        let owned_by_this_source = doc_index
-            .get(&uri)
-            .is_some_and(|record| record.source_id == source.id);
-        if !owned_by_this_source {
-            continue;
-        }
-        if seen.contains(&uri) {
-            continue;
-        }
-        if let Some(old_record) = doc_index.remove(&uri) {
-            let deleted = store.delete_by_resource(&old_record.resource_id).await?;
-            if deleted > 0 {
-                result.docs_deleted += 1;
+    // C1: feed sources are exempt from the delete-sweep. A feed only ever
+    // exposes its most-recent N entries (an Atom/RSS document is a bounded
+    // window, not a full archive listing) — an entry's absence from this
+    // run means only "it scrolled off the feed," not "it was deleted at the
+    // origin." Sweeping on that basis would delete everything the feed
+    // previously contributed as soon as it aged out of the window, and a
+    // feed-level 304 Not Modified (zero callbacks at all) would make the
+    // sweep delete the *entire* source on every unchanged poll. Path and
+    // url sources have no such windowing — their ingestor enumerates the
+    // full current state every run — so absence there really does mean
+    // deletion and the sweep must still run for them.
+    if !matches!(source.spec, SourceSpec::Feed { .. }) {
+        let existing_uris = doc_index.uris();
+        for uri in existing_uris {
+            let owned_by_this_source = doc_index
+                .get(&uri)
+                .is_some_and(|record| record.source_id == source.id);
+            if !owned_by_this_source {
+                continue;
+            }
+            if seen.contains(&uri) {
+                continue;
+            }
+            if let Some(old_record) = doc_index.remove(&uri) {
+                let deleted = store.delete_by_resource(&old_record.resource_id).await?;
+                if deleted > 0 {
+                    result.docs_deleted += 1;
+                }
             }
         }
     }
@@ -959,6 +997,7 @@ fn source_location(source: &Source) -> String {
     match &source.spec {
         SourceSpec::Path { root, .. } => root.clone(),
         SourceSpec::Url { url, .. } => url.clone(),
+        SourceSpec::Feed { url, .. } => url.clone(),
     }
 }
 
@@ -2045,6 +2084,57 @@ mod tests {
         }
 
         // -----------------------------------------------------------------
+        // 1a. Codex review finding F1 (ingest/url_pipeline.rs) — an
+        //     accepted-but-empty extraction reports `SkipReason::Other` and
+        //     must land in `docs_skipped`, NOT `unsupported_format_count`:
+        //     the two counters mean different things ("extraction produced
+        //     nothing" vs "no parser handles this format") and the CLI
+        //     reports them as separate fields.
+        // -----------------------------------------------------------------
+
+        #[tokio::test]
+        async fn skip_reason_other_counts_as_docs_skipped_not_unsupported() {
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let config = make_ingestion_config(store_id);
+            let source = make_source_with_preset(store_id, "prose");
+
+            let ingestor = FakeIngestor::new(vec![
+                ScriptStep::Discovered(1),
+                ScriptStep::Skipped(
+                    "https://example.com/empty".to_string(),
+                    SkipReason::Other("extraction produced no content".to_string()),
+                ),
+            ]);
+
+            let mut doc_index = DocumentIndex::new();
+            let deps = SourceIngestionDeps {
+                doc_index: &mut doc_index,
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+                progress: None,
+            };
+            let result = run_source_ingestion(&source, &ingestor, deps)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                result.docs_skipped, 1,
+                "SkipReason::Other must count as docs_skipped"
+            );
+            assert_eq!(
+                result.unsupported_format_count, 0,
+                "SkipReason::Other must NOT count toward unsupported_format_count — \
+                 that counter is reserved for SkipReason::Unsupported (no parser \
+                 handles the format), a different condition than an \
+                 accepted-but-empty extraction"
+            );
+            assert_eq!(result.error_count, 0);
+        }
+
+        // -----------------------------------------------------------------
         // 1b. C8 — SkipReason::Error is counted as an error (not a skip),
         //     while SkipReason::Unchanged still counts as a skip; both keep
         //     their URIs alive across the delete-sweep.
@@ -2998,6 +3088,147 @@ mod tests {
         }
 
         // -----------------------------------------------------------------
+        // 8f. C1: feed sources are exempt from the delete-sweep. A feed only
+        // ever exposes its most-recent N entries, so a zero-callback run
+        // (absent entries scrolled off the window, or a feed-level 304 Not
+        // Modified) must NOT delete previously-indexed entries — unlike the
+        // identically-shaped zero-callback scenario for a url source, which
+        // must still sweep normally (test 8 above covers that alone; this
+        // test additionally proves the two behaviors coexist correctly in
+        // the same store/doc_index).
+        // -----------------------------------------------------------------
+
+        #[tokio::test]
+        async fn feed_source_zero_callback_run_is_not_swept_but_url_source_still_sweeps() {
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let config = make_ingestion_config(store_id);
+
+            let feed_source = Source {
+                id: new_ulid(),
+                store_id: store_id.to_string(),
+                kind: SourceKind::Feed,
+                spec: SourceSpec::Feed {
+                    url: "https://example.com/feed.xml".to_string(),
+                    max_entries: None,
+                    fetch_full_content: true,
+                    refresh_interval_secs: None,
+                },
+                source_preset: "prose".to_string(),
+            };
+            let url_source = Source {
+                id: new_ulid(),
+                store_id: store_id.to_string(),
+                kind: SourceKind::Url,
+                spec: SourceSpec::Url {
+                    url: "https://example.com/page".to_string(),
+                    refresh_interval_secs: None,
+                },
+                source_preset: "prose".to_string(),
+            };
+
+            let feed_entry_uri = "https://example.com/feed.xml#entry:1";
+            let url_uri = "https://example.com/page";
+
+            let feed_record = seed_indexed(
+                &store,
+                &embedder,
+                &config,
+                &feed_source,
+                feed_entry_uri,
+                "Feed entry body.",
+            )
+            .await;
+            let url_record = seed_indexed(
+                &store,
+                &embedder,
+                &config,
+                &url_source,
+                url_uri,
+                "Page body.",
+            )
+            .await;
+
+            let mut doc_index = DocumentIndex::new();
+            doc_index.upsert(feed_record.clone());
+            doc_index.upsert(url_record.clone());
+
+            // Both runs' ingestors yield nothing at all — for the feed this
+            // mirrors a feed-level 304 Not Modified (zero callbacks) or the
+            // entry simply having scrolled off the feed's window; for the
+            // url source it mirrors a 404/410 Gone.
+            let feed_ingestor = FakeIngestor::new(vec![]);
+            let deps = SourceIngestionDeps {
+                doc_index: &mut doc_index,
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+                progress: None,
+            };
+            let feed_result = run_source_ingestion(&feed_source, &feed_ingestor, deps)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                feed_result.docs_deleted, 0,
+                "feed sources are exempt from the delete-sweep — a zero-callback \
+                 run must not delete"
+            );
+            let feed_chunks = store
+                .get_chunks_for_resource(&feed_record.resource_id)
+                .await
+                .unwrap();
+            assert!(
+                !feed_chunks.is_empty(),
+                "feed entry's chunks must survive an unswept run"
+            );
+            assert!(doc_index.get(feed_entry_uri).is_some());
+
+            let url_ingestor = FakeIngestor::new(vec![]);
+            let deps = SourceIngestionDeps {
+                doc_index: &mut doc_index,
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+                progress: None,
+            };
+            let url_result = run_source_ingestion(&url_source, &url_ingestor, deps)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                url_result.docs_deleted, 1,
+                "a url source in the very same store/doc_index still sweeps normally"
+            );
+            let url_chunks = store
+                .get_chunks_for_resource(&url_record.resource_id)
+                .await
+                .unwrap();
+            assert!(
+                url_chunks.is_empty(),
+                "swept url resource's chunks must be gone"
+            );
+        }
+
+        #[tokio::test]
+        async fn source_location_feed_arm_returns_url() {
+            let source = Source {
+                id: new_ulid(),
+                store_id: "store-1".to_string(),
+                kind: SourceKind::Feed,
+                spec: SourceSpec::Feed {
+                    url: "https://example.com/feed.xml".to_string(),
+                    max_entries: None,
+                    fetch_full_content: true,
+                    refresh_interval_secs: None,
+                },
+                source_preset: "prose".to_string(),
+            };
+            assert_eq!(source_location(&source), "https://example.com/feed.xml");
+        }
+
+        // -----------------------------------------------------------------
         // 8b-8e (removed by the `on_skipped(&Uri, ...)` signature change):
         // these four tests fed a RAW locator string through
         // `ScriptStep::Skipped` to prove `PipelineCallback::on_skipped`
@@ -3748,6 +3979,66 @@ mod tests {
                 page_for_seq(2).iter().all(|p| p.is_none()),
                 "block 2 has no location → page None"
             );
+        }
+
+        // -----------------------------------------------------------------
+        // Codex R2: fetched_at is the resource's `added_at` (ingestion time),
+        //           never its `modified_at` (a feed-claimed date).
+        // -----------------------------------------------------------------
+
+        /// `Provenance.fetched_at` is defined as *acquisition* time, and the
+        /// libsql backend binds it to `resources.added_at` — the column
+        /// `MetadataFilter::FetchedAfter`/`FetchedBefore` filter on and that
+        /// every citation reports. `index_resource` used to read
+        /// `resource.modified_at`, so a 2020 feed entry ingested today claimed
+        /// a 2020 acquisition time and fell outside a "fetched since last
+        /// week" filter. Only the feed connector makes the two fields differ
+        /// (`file`/`url` set both to the same value), which is why this stayed
+        /// latent until the Atom/RSS ingestor landed.
+        ///
+        /// See specs/02-domain-model.md §4 and its "Timestamps" rule in the
+        /// Feed connector section.
+        #[tokio::test]
+        async fn index_resource_fetched_at_is_added_at_not_modified_at() {
+            const INGESTED_AT: &str = "2026-08-05T00:00:00Z";
+            const FEED_CLAIMED: &str = "2020-01-01T00:00:00Z";
+
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let source = make_source_with_preset(store_id, "prose");
+            let config = make_ingestion_config(store_id);
+
+            let mut resource = make_resource(
+                "https://blog.example.com/2020/old-post",
+                "An old post that a feed is only surfacing to us today.",
+                &source.id,
+                store_id,
+            );
+            resource.added_at = INGESTED_AT.to_string();
+            resource.modified_at = FEED_CLAIMED.to_string();
+
+            let deps = IndexResourceDeps {
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+            };
+            index_resource(&resource, &source, None, &deps)
+                .await
+                .unwrap();
+
+            let chunks = store.get_chunks_for_resource(&resource.id).await.unwrap();
+            assert!(!chunks.is_empty(), "the resource must produce chunks");
+            for c in &chunks {
+                assert_eq!(
+                    c.fetched_at, INGESTED_AT,
+                    "fetched_at must be the resource's added_at (ingestion time)"
+                );
+                assert_ne!(
+                    c.fetched_at, FEED_CLAIMED,
+                    "fetched_at must never be the feed-claimed modified_at"
+                );
+            }
         }
     }
 }

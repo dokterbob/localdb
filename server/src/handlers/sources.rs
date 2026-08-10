@@ -47,10 +47,10 @@ pub async fn create_source(
     Path(store_name): Path<String>,
     Json(req): Json<CreateSourceRequest>,
 ) -> Result<(StatusCode, Json<SourceRecord>), ApiError> {
-    if req.kind != "path" && req.kind != "url" {
+    if req.kind != "path" && req.kind != "url" && req.kind != "feed" {
         return Err(ApiError(CoreError::InvalidRequest {
             message: format!(
-                "unknown source kind '{}'; expected 'path' or 'url'",
+                "unknown source kind '{}'; expected 'path', 'url', or 'feed'",
                 req.kind
             ),
         }));
