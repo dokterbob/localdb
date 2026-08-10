@@ -349,7 +349,8 @@ selected by the `local` / `local-coreml` / `local-onnx` provider values
   token embeddings, then Rust does mean-pooling over each chunk's token span and `tanh` int8
   quantization before binarization.
 - **CoreML (ANE/GPU):** macOS-only, behind the opt-in `local-coreml` cargo feature
-  (requires Rust ≥ 1.85). Executes on Apple Silicon's ANE/GPU via `objc2-core-ml`. Pooling
+  (requires Rust ≥ 1.85, subsumed by the workspace's 1.88 floor). Executes on Apple Silicon's
+  ANE/GPU via `objc2-core-ml`. Pooling
   and `tanh` int8 quantization happen **inside the model** — it consumes a `pool_matrix`
   input and outputs int8 `(32, 1024)` directly, so the in-Rust mean-pool + quant of the
   ONNX path is not needed. The CoreML bundle is the context (late-chunking) variant,

@@ -95,8 +95,9 @@ and caveats (including the `⚠️` partial marks) are in [docs/comparison.md](d
 
 ### From source (works today)
 
-Requires a Rust toolchain (**Linux: 1.82 or later; macOS: 1.85 or later**, as CoreML is
-built automatically on macOS). Install via [rustup](https://rustup.rs/).
+Requires a Rust toolchain (**1.88 or later, on every platform** — the `pdf_oxide` PDF
+parser declares that floor, and it subsumes the older per-platform split of Linux 1.82 /
+macOS 1.85). Install via [rustup](https://rustup.rs/).
 
 ```bash
 git clone https://github.com/dokterbob/localdb
@@ -239,7 +240,7 @@ migration's down-SQL is stored as data in the database itself, not read from com
 |---|---|
 | Search ranking | Hybrid BM25 + dense (RRF fusion). Default embedder is `pplx-embed-context-v1-0.6b` (local ONNX, ~706 MB download on first use). |
 | Embedding models | Downloaded automatically on first `localdb index` or `localdb search` from the public HuggingFace repo `perplexity-ai/pplx-embed-context-v1-0.6b`. No API key required. |
-| Embedding backend | Default provider `local` runs ONNX on CPU. On Apple Silicon macOS (Rust ≥1.85), the macOS binary includes CoreML by default and auto-selects the ANE/GPU backend at runtime, falling back to ONNX otherwise. CoreML/ONNX indexes are interchangeable. Force a backend with `local-coreml` / `local-onnx`. |
+| Embedding backend | Default provider `local` runs ONNX on CPU. On Apple Silicon macOS, the macOS binary includes CoreML by default and auto-selects the ANE/GPU backend at runtime, falling back to ONNX otherwise. CoreML/ONNX indexes are interchangeable. Force a backend with `local-coreml` / `local-onnx`. |
 | HTTP daemon | Experimental preview. Ingestion via POST /v1/jobs is a no-op; reads and writes the unified database. |
 | YAML-declared stores | Appear in `store list` but **cannot be indexed** (`localdb index` only resolves runtime stores). Use `localdb store add` + `localdb source add` instead. |
 | CLI while daemon runs | CLI and daemon can run concurrently. SQLite WAL and busy_timeout serialise concurrent writes. |

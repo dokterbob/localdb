@@ -231,10 +231,11 @@ model can run on Apple's ANE/GPU via a CoreML backend in `embed`, behind the opt
 `local-coreml` cargo feature (macOS-only; every code path is
 `#[cfg(all(target_os = "macos", feature = "local-coreml"))]`). Build it with
 `cargo build -p localdb --features local-coreml`. Because the feature pulls edition-2024
-dependencies (`hf-hub` 1.0), it requires **Rust ≥ 1.85**; the workspace `rust-version` is `1.85`.
-Default builds (feature off) are unaffected and remain ONNX-only — Linux and CI default builds
-never touch any CoreML code. (Since the `pdf_oxide` PDF parser landed, the workspace
-`rust-version` is `1.88` on all platforms — the CoreML 1.85 floor is subsumed.)
+dependencies (`hf-hub` 1.0), it requires **Rust ≥ 1.85** — but that floor is subsumed: since
+the `pdf_oxide` PDF parser landed, the workspace `rust-version` is **1.88** on every platform
+(`pdf_oxide` itself declares `rust-version = "1.88"`, and it pulls `image` 0.25, which needs the
+same). Default builds (feature off) are unaffected and remain ONNX-only — Linux and CI default
+builds never touch any CoreML code.
 
 The default `local` provider auto-selects CoreML on Apple Silicon when the feature is built and
 the bundle loads, otherwise falls back to ONNX (CPU). `local-coreml` forces CoreML (hard error if
@@ -410,6 +411,14 @@ so corrected feed dates/authors/external ids (and the feed-derived `modified_at`
 store for an already-indexed document until its content bytes change. Fixing this needs a core
 skip-contract change (metadata-aware compare, or a metadata-only store update that skips
 re-embedding); see the issue for the design options.
+
+This is format-general, not feed-specific. It equally covers a PDF whose Info dictionary or XMP
+is corrected (`/Title`, `/Author`) and a Markdown file whose YAML front-matter changes: in both
+cases the extracted blocks — and therefore `content_hash` — are byte-identical, so the resource
+is skipped and the stored metadata stays stale. PDFs became a visible instance of it when PDF
+Dublin Core extraction landed, but the skip contract, not the extractor, is the cause. Note the
+first index after upgrading is unaffected: the extraction change moves every PDF's content hash
+anyway, so metadata is written then.
 
 **16. `index_resource`'s zero-chunk arm still deletes on an empty replacement for any ingestor
 that yields a zero-block Resource — `file` sources are not guarded.**
