@@ -249,40 +249,144 @@ fn reject_store_flag_inner(ctx: &CliContext) -> Result<(), Error> {
     })
 }
 
-/// Resolve a `DefaultStore`-policy scope to store *names* only, without
-/// consulting the local database.
+/// Resolve a store-scope policy against a running daemon's own store set,
+/// genuinely asking it rather than treating it as a rubber stamp.
 ///
-/// Used by the daemon-routing paths (`source add`/`remove` when a daemon is
-/// running), where the daemon — not this process — is the authority on which
-/// stores exist.
+/// Used by every daemon-routing path that needs a store scope (`source add`'s
+/// daemon branch, `index`'s daemon branch): the daemon — not this process —
+/// is the authority on which stores exist.
 ///
 /// A running daemon need not share our database at all: `LOCALDB_DAEMON_URL`
 /// (see `CliContext::daemon_url`) can point at a daemon on another host with
 /// its own data directory, in which case a local `StoreRow` lookup would
-/// reject perfectly valid store names. Even against a local daemon sharing
-/// `<data_dir>/localdb.db`, a local pre-check is redundant and can go stale
-/// between our read and the proxied request landing — the HTTP call
-/// re-validates anyway, and its 404 surfaces as `store_not_found`.
+/// reject perfectly valid store names (or, worse, silently resolve an
+/// all-stores/default-store scope against the *wrong* store set). So this
+/// walks `GET {base_url}/v1/stores`, paginating to exhaustion — `PaginatedList`
+/// truncates each page to `default_limit()` (20), so a single unpaginated
+/// call would quietly drop stores 21+ from an all-stores scope — and resolves
+/// the policy against the daemon's answer.
 ///
-/// So these paths validate the *names* and let the daemon decide existence.
+/// Exits the process (via `exit_err`) on any error; see
+/// `resolve_daemon_store_scope_inner` for the pure decision logic.
+pub(crate) async fn resolve_daemon_store_scope(
+    base_url: &str,
+    ctx: &CliContext,
+    policy: StoreScopePolicy,
+) -> Vec<String> {
+    match resolve_daemon_store_scope_inner(base_url, ctx, policy).await {
+        Ok(names) => names,
+        Err(e) => exit_err(&e, ctx.json),
+    }
+}
+
+/// Fetch every store name the daemon knows about, following `next_cursor` to
+/// exhaustion.
 ///
-/// Names are validated (A9 traversal-safety) and deduped, order preserved;
-/// an empty `--store` set yields the implicit `default` store.
-pub(crate) fn resolve_store_scope_names(ctx: &CliContext) -> Vec<String> {
-    for name in &ctx.stores {
-        if let Err(e) = crate::normalize::validate_store_name(name) {
-            exit_err(&e, ctx.json);
+/// Guards against a non-advancing cursor (a malformed or hostile response)
+/// with `Error::Internal` so a broken daemon response can't spin this loop
+/// forever.
+async fn fetch_all_daemon_store_names(base_url: &str) -> Result<Vec<String>, Error> {
+    let mut names = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let url = match &cursor {
+            Some(c) => format!("{base_url}/v1/stores?cursor={c}"),
+            None => format!("{base_url}/v1/stores"),
+        };
+        let resp =
+            crate::daemon_client::daemon_request_async(reqwest::Method::GET, &url, None).await?;
+        let items = resp
+            .get("items")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for item in &items {
+            if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
+                names.push(name.to_string());
+            }
+        }
+        let next_cursor = resp
+            .get("next_cursor")
+            .and_then(|c| c.as_str())
+            .map(str::to_string);
+        match next_cursor {
+            None => return Ok(names),
+            Some(next) => {
+                if cursor.as_deref() == Some(next.as_str()) {
+                    return Err(Error::Internal {
+                        message: format!(
+                            "daemon returned a non-advancing pagination cursor '{next}' for \
+                             GET /v1/stores"
+                        ),
+                        correlation_id: "daemon_store_scope_cursor".to_string(),
+                    });
+                }
+                cursor = Some(next);
+            }
         }
     }
-    if ctx.stores.is_empty() {
-        return vec![DEFAULT_STORE_NAME.to_string()];
+}
+
+/// Pure-ish decision logic behind `resolve_daemon_store_scope` (the only
+/// non-purity is the daemon HTTP round trip itself), factored out so the
+/// branch logic is unit-testable independent of `exit_err`'s `process::exit`.
+///
+/// Order matters: names are syntax-validated *before* any network call (a
+/// malformed name never hits the wire), then the daemon's full store list is
+/// fetched exactly once, then the policy is applied against it.
+///
+/// The implicit-vs-explicit distinction (Codex review round 2, finding 4):
+/// an *implicit* `default` (no `--store` given, `DefaultStore` policy) that
+/// the daemon doesn't have is `Error::InvalidRequest`, exit 2 — matching
+/// `resolve_store_scope_inner`'s embedded-mode message exactly. An *explicit*
+/// `--store default` (or any other name) absent from the daemon's list is
+/// `Error::StoreNotFound`, exit 3, same as any other unknown explicit name —
+/// collapsing these two into one case was the reviewer's framing error.
+async fn resolve_daemon_store_scope_inner(
+    base_url: &str,
+    ctx: &CliContext,
+    policy: StoreScopePolicy,
+) -> Result<Vec<String>, Error> {
+    for name in &ctx.stores {
+        crate::normalize::validate_store_name(name)?;
     }
-    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    ctx.stores
-        .iter()
-        .filter(|n| seen.insert(n.as_str()))
-        .cloned()
-        .collect()
+
+    let daemon_names = fetch_all_daemon_store_names(base_url).await?;
+
+    if !ctx.stores.is_empty() {
+        let mut names: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for name in &ctx.stores {
+            if !daemon_names.iter().any(|n| n == name) {
+                return Err(Error::StoreNotFound { id: name.clone() });
+            }
+            if seen.insert(name.as_str()) {
+                names.push(name.clone());
+            }
+        }
+        return Ok(names);
+    }
+
+    match policy {
+        StoreScopePolicy::AllStores => {
+            if daemon_names.is_empty() {
+                return Err(Error::InvalidRequest {
+                    message: "no stores; run `localdb store add <name>` or pass --store"
+                        .to_string(),
+                });
+            }
+            Ok(daemon_names)
+        }
+        StoreScopePolicy::DefaultStore => {
+            if daemon_names.iter().any(|n| n == DEFAULT_STORE_NAME) {
+                Ok(vec![DEFAULT_STORE_NAME.to_string()])
+            } else {
+                Err(Error::InvalidRequest {
+                    message: "no store named 'default'; pass --store <name>".to_string(),
+                })
+            }
+        }
+    }
 }
 
 /// Resolve the set of stores a command should operate on, from `--store`

@@ -10,7 +10,9 @@ use localdb_core::{
 use serde_json::json;
 
 use crate::{
-    app_db::{load_app_db, resolve_store_scope, AppDb, StoreScopePolicy},
+    app_db::{
+        load_app_db, resolve_daemon_store_scope, resolve_store_scope, AppDb, StoreScopePolicy,
+    },
     daemon_client::{daemon_request_async, probe_daemon, CliContext, DaemonState},
     normalize::{exit_err, print_json, source_row_to_core_source},
 };
@@ -328,20 +330,34 @@ pub(crate) async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, s
     let (config_loader, db) = load_app_db(ctx).await;
     let data_dir = config_loader.paths.data_dir.clone();
 
-    // specs/05-surfaces.md §2.2: `-s` is repeatable and every store scoped by
-    // it (or, absent `-s`, every store in the database) is indexed.
-    let store_rows = resolve_store_scope(ctx, &db, StoreScopePolicy::AllStores).await;
-
     // Per specs/05-surfaces.md §2: when daemon is running, submit a job per
-    // resolved store instead of indexing embedded. `/v1/jobs` is a
+    // resolved store instead of indexing embedded. Probed *before* store
+    // resolution — like `source add`'s daemon branch
+    // (`cli/src/cmds/source.rs`) — because the two paths resolve scope
+    // differently: the daemon owns its own store set (see
+    // `resolve_daemon_store_scope`), which may differ from whatever this
+    // process's local database happens to contain (`LOCALDB_DAEMON_URL` can
+    // point at a daemon with an entirely different data directory). Getting
+    // this order wrong was Codex review round 2, finding 1: an explicit
+    // daemon-valid `--store` used to be rejected against the local DB before
+    // the daemon was ever asked, and an omitted `-s` submitted jobs for the
+    // *local* store set instead of the daemon's. `/v1/jobs` is a
     // single-store API (server/src/handlers/jobs.rs), so a multi-store scope
-    // becomes one POST per store here rather than a batched request. The
-    // daemon — not this process — validates `--source`, so no local source
-    // resolution (below) applies on this path.
+    // becomes one POST per store here rather than a batched request.
     if let DaemonState::Running { base_url } = probe_daemon(&data_dir, ctx.daemon_url.as_deref()) {
-        run_daemon_index(ctx, &base_url, &store_rows, source_id).await;
+        let store_names =
+            resolve_daemon_store_scope(&base_url, ctx, StoreScopePolicy::AllStores).await;
+        run_daemon_index(ctx, &base_url, &store_names, source_id).await;
         return;
     }
+
+    // specs/05-surfaces.md §2.2: `-s` is repeatable and every store scoped by
+    // it (or, absent `-s`, every store in the database) is indexed. Resolved
+    // here, after the daemon probe above, so the embedded path still opens
+    // the DB exactly once (via `load_app_db` at the top of this function)
+    // and never pays for a local store lookup that the daemon branch would
+    // have thrown away.
+    let store_rows = resolve_store_scope(ctx, &db, StoreScopePolicy::AllStores).await;
 
     // `--source` names a single, globally-unique source: resolve its owning
     // store once and narrow the run to just that store, rather than passing
@@ -430,11 +446,101 @@ pub(crate) async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, s
     report_index_outcomes(ctx, &outcomes, strict);
 }
 
+/// Walk `GET {base_url}/v1/stores/{store_name}/sources`, paginating to
+/// exhaustion, to check whether `store_name` owns `source_id`.
+///
+/// Used by `resolve_daemon_source_owner` below. Must paginate: `PaginatedList`
+/// truncates each page to `default_limit()` (20), so a single unpaginated
+/// fetch would silently miss a source sitting on page 2+ — turning the
+/// finding-2 fix into a worse bug than the one it replaces. Guards against a
+/// non-advancing cursor the same way `fetch_all_daemon_store_names`
+/// (`cli/src/app_db.rs`) does.
+async fn daemon_store_has_source(
+    base_url: &str,
+    store_name: &str,
+    source_id: &str,
+) -> Result<bool, Error> {
+    let mut cursor: Option<String> = None;
+    loop {
+        let url = match &cursor {
+            Some(c) => format!("{base_url}/v1/stores/{store_name}/sources?cursor={c}"),
+            None => format!("{base_url}/v1/stores/{store_name}/sources"),
+        };
+        let resp = daemon_request_async(reqwest::Method::GET, &url, None).await?;
+        let items = resp
+            .get("items")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if items
+            .iter()
+            .any(|it| it.get("id").and_then(|i| i.as_str()) == Some(source_id))
+        {
+            return Ok(true);
+        }
+        let next_cursor = resp
+            .get("next_cursor")
+            .and_then(|c| c.as_str())
+            .map(str::to_string);
+        match next_cursor {
+            None => return Ok(false),
+            Some(next) => {
+                if cursor.as_deref() == Some(next.as_str()) {
+                    return Err(Error::Internal {
+                        message: format!(
+                            "daemon returned a non-advancing pagination cursor '{next}' for \
+                             GET /v1/stores/{store_name}/sources"
+                        ),
+                        correlation_id: "daemon_source_owner_cursor".to_string(),
+                    });
+                }
+                cursor = Some(next);
+            }
+        }
+    }
+}
+
+/// Narrow a multi-store daemon scope down to `source_id`'s owning store
+/// (Codex review round 2, finding 2).
+///
+/// `/v1/jobs` (`server/src/handlers/jobs.rs`'s `create_job`) validates only
+/// `store_name` — `source_id` is checked neither for existence nor for
+/// ownership — so without this, submitting the same `source_id` to every
+/// store in `scoped_names` would silently accept a job for every one of them,
+/// only one of which is meaningful. Walks the scoped stores in order via
+/// `daemon_store_has_source`, returning the first owner found.
+///
+/// Not found in any scoped store is `Error::SourceNotFound`, exit 3 — the
+/// same outcome an explicit `--store` scope that excludes the true owner
+/// produces, reproducing the embedded path's hard-filter rule for free (see
+/// `index_source_owner_not_in_explicit_store_scope_exits_3`).
+async fn resolve_daemon_source_owner(
+    base_url: &str,
+    scoped_names: &[String],
+    source_id: &str,
+) -> Result<String, Error> {
+    for name in scoped_names {
+        if daemon_store_has_source(base_url, name, source_id).await? {
+            return Ok(name.clone());
+        }
+    }
+    Err(Error::SourceNotFound {
+        id: source_id.to_string(),
+    })
+}
+
 /// Submit one `/v1/jobs` request per resolved store to a running daemon and
 /// report the submissions. `/v1/jobs` is single-store only
 /// (`server/src/handlers/jobs.rs`'s `CreateJobRequest`), so there is no
 /// batched request to make here — this is intentionally simple submit-and-
 /// report, matching what the single-store path already did, looped.
+///
+/// When `source_id` is given and `store_names` holds more than one name, this
+/// first narrows to the owning store via `resolve_daemon_source_owner` — the
+/// scope has already been asked to resolve to `store_names`, but a source id
+/// is only ever meaningful for the one store that owns it (finding 2). When
+/// `store_names` is already a single store, no extra request is made: the
+/// common `-s one --source X` case pays zero pagination round trips.
 ///
 /// A submission failure exits immediately (via `exit_err`), the same as the
 /// pre-existing single-store behavior: unlike the embedded-index loop, a
@@ -445,18 +551,27 @@ pub(crate) async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, s
 async fn run_daemon_index(
     ctx: &CliContext,
     base_url: &str,
-    store_rows: &[StoreRow],
+    store_names: &[String],
     source_id: Option<&str>,
 ) {
-    let mut submissions: Vec<(String, serde_json::Value)> = Vec::with_capacity(store_rows.len());
-    for store_row in store_rows {
+    let target_names: Vec<String> = match (source_id, store_names) {
+        (Some(_), [only]) => vec![only.clone()],
+        (Some(sid), many) => match resolve_daemon_source_owner(base_url, many, sid).await {
+            Ok(owner) => vec![owner],
+            Err(e) => exit_err(&e, ctx.json),
+        },
+        (None, names) => names.to_vec(),
+    };
+
+    let mut submissions: Vec<(String, serde_json::Value)> = Vec::with_capacity(target_names.len());
+    for store_name in &target_names {
         let url = format!("{}/v1/jobs", base_url);
-        let mut body = json!({ "store_name": store_row.name });
+        let mut body = json!({ "store_name": store_name });
         if let Some(sid) = source_id {
             body["source_id"] = serde_json::Value::String(sid.to_string());
         }
         match daemon_request_async(reqwest::Method::POST, &url, Some(body)).await {
-            Ok(v) => submissions.push((store_row.name.clone(), v)),
+            Ok(v) => submissions.push((store_name.clone(), v)),
             Err(e) => exit_err(&e, ctx.json),
         }
     }

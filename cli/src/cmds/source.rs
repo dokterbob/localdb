@@ -7,10 +7,13 @@ use localdb_core::{
 use serde_json::json;
 
 use crate::{
-    app_db::{load_app_db, resolve_store_scope, resolve_store_scope_names, StoreScopePolicy},
+    app_db::{load_app_db, resolve_daemon_store_scope, resolve_store_scope, StoreScopePolicy},
     cmds::index::{run_embedded_index_with, IndexErrorMode},
     daemon_client::{daemon_request_async, probe_daemon, CliContext, DaemonState},
-    normalize::{classify_source, exit_err, kind_to_string, looks_like_id, print_json},
+    normalize::{
+        classify_source, exit_err, exit_err_with_partial_results, kind_to_string, looks_like_id,
+        print_json,
+    },
 };
 
 /// Resolve the effective source kind for `source add` / `add` and, for feed
@@ -124,7 +127,7 @@ pub(crate) async fn run_source_add_async(
 
     // Per specs/05-surfaces.md §2: route to daemon when running. Probed before
     // store resolution because the two paths resolve scope differently — the
-    // daemon owns its own store set (see `resolve_store_scope_names`).
+    // daemon owns its own store set (see `resolve_daemon_store_scope`).
     let daemon_state = probe_daemon(&config_loader.paths.data_dir, ctx.daemon_url.as_deref());
 
     // Normalize path sources: validate existence, promote single files, apply
@@ -156,8 +159,12 @@ pub(crate) async fn run_source_add_async(
     }
 
     if let DaemonState::Running { ref base_url } = daemon_state {
-        // Names only — the daemon is the authority on which stores exist.
-        let store_names = resolve_store_scope_names(ctx);
+        // Ask the daemon which stores actually exist rather than treating
+        // `--store` as pre-validated names (Codex review round 2, findings 1
+        // & 4) — a running daemon may point at an entirely different data
+        // directory than this process would otherwise open.
+        let store_names =
+            resolve_daemon_store_scope(base_url, ctx, StoreScopePolicy::DefaultStore).await;
 
         // Accumulate JSON results across the loop and emit exactly one
         // top-level document afterward (finding 3): printing per-iteration,
@@ -200,7 +207,18 @@ pub(crate) async fn run_source_add_async(
                         );
                     }
                 }
-                Err(e) => exit_err(&e, ctx.json),
+                Err(e) => {
+                    // Finding 5: don't discard results already persisted by
+                    // earlier iterations of this loop — see
+                    // `exit_err_with_partial_results`'s doc comment. Non-JSON
+                    // mode already printed each success as it happened, so
+                    // it keeps using plain `exit_err`.
+                    if ctx.json {
+                        exit_err_with_partial_results(&e, json_results);
+                    } else {
+                        exit_err(&e, ctx.json);
+                    }
+                }
             }
         }
 
@@ -288,7 +306,16 @@ pub(crate) async fn run_source_add_async(
         };
 
         if let Err(e) = db.backend().upsert_source(&src).await {
-            exit_err(&e, ctx.json);
+            // Finding 5: don't discard results already persisted by earlier
+            // iterations of this loop — see
+            // `exit_err_with_partial_results`'s doc comment. Non-JSON mode
+            // already printed each success as it happened, so it keeps using
+            // plain `exit_err`.
+            if ctx.json {
+                exit_err_with_partial_results(&e, json_results);
+            } else {
+                exit_err(&e, ctx.json);
+            }
         }
 
         if ctx.json {
@@ -522,10 +549,12 @@ pub(crate) async fn run_source_remove_async(ctx: &CliContext, id: &str) {
     {
         // Finding 5: validate --store names for traversal-safety before the
         // DELETE fires, matching `source add`'s daemon branch above. We
-        // validate directly (not via `resolve_store_scope_names`) because its
-        // empty-input case returns `["default"]`, which is meaningless for
-        // remove-by-ID — there's no per-store scope to inject here, only
-        // syntax-checking of whatever `--store` values were actually passed.
+        // validate directly (not via `resolve_daemon_store_scope`) because
+        // that helper's empty-input case resolves an implicit `default`
+        // scope, which is meaningless for remove-by-ID — there's no
+        // per-store scope to inject here, only syntax-checking of whatever
+        // `--store` values were actually passed. Nor do we ask the daemon to
+        // confirm these names exist (see the KNOWN LIMITATION note below).
         for name in &ctx.stores {
             if let Err(e) = crate::normalize::validate_store_name(name) {
                 exit_err(&e, ctx.json);
@@ -541,7 +570,7 @@ pub(crate) async fn run_source_remove_async(ctx: &CliContext, id: &str) {
         // for `--store` either: `LOCALDB_DAEMON_URL` may point at a daemon on
         // another host with its own data directory, so a syntactically-valid
         // but locally-unknown store name must still reach the daemon (see
-        // `resolve_store_scope_names`'s doc comment in `cli/src/app_db.rs`).
+        // `resolve_daemon_store_scope`'s doc comment in `cli/src/app_db.rs`).
         let url = format!("{}/v1/sources/{}", base_url, id);
         match daemon_request_async(reqwest::Method::DELETE, &url, None).await {
             Ok(v) => {

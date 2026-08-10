@@ -87,6 +87,31 @@ Additional rules:
   *syntactically* (name shape, traversal safety) — it cannot confirm the source actually belongs
   to the named store, because `DELETE /v1/sources/{id}` is store-agnostic. Embedded (daemonless)
   mode does enforce this, since it resolves the source through the named store's own row.
+- **Daemon-routed scope resolution asks the daemon, not the local database.** `source add`/`list`
+  (via their daemon branches) and `index` resolve `--store` scope by paginating `GET /v1/stores`
+  to exhaustion, because a running daemon may point at a different data directory than the one
+  this process would otherwise open (`LOCALDB_DAEMON_URL`) and is the authority on which stores
+  exist either way. The same omitted-vs-explicit distinction from the table above still holds:
+  an omitted `-s` resolving against a daemon with no store named `default` is `invalid_request`,
+  exit 2, with the same `no store named 'default'; pass --store <name>` message; an *explicit*
+  `--store default` the daemon does not have is `store_not_found`, exit 3, same as any other
+  explicit unknown name — the implicit default and an explicit request for that same name are not
+  the same failure.
+- **Daemon-routed `index --source ID` narrows to the owning store.** `/v1/jobs` does not validate
+  `source_id` (it only checks `store_name`), so submitting the same source id to every store in a
+  multi-store scope would silently create one job per store, only one of which is meaningful. When
+  the resolved scope is already a single store, the CLI submits directly (no extra request). When
+  it is more than one, the CLI walks `GET /v1/stores/{name}/sources` (paginating each store to
+  exhaustion) over the scoped stores to find the id's owner, submitting exactly one job. A source
+  found in no scoped store is `source_not_found`, exit 3 — reproducing embedded mode's hard-filter
+  rule that an explicit `--store` scope excluding the owner does not silently redirect to it.
+- A multi-item `--json` batch (`source add`/`add` across more than one `--store`, local or
+  daemon-routed) that fails partway through — after at least one earlier item already succeeded —
+  does not discard the buffered results: it prints one JSON document
+  `{"status": "error", "error": {"code": <error code>, "message": <text>}, "results": [<items
+  completed so far>]}` to stdout, then exits with the failing error's normal exit code, instead of
+  routing through the usual stderr-only error shape. The buffered `results` are output data, not
+  merely an error message, so — like every other `--json` document — they belong on stdout.
 
 ### 2.3 Feed sources
 
