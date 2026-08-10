@@ -56,6 +56,13 @@ pub struct SourceRow {
     pub preset: String,
     pub refresh: Option<String>,
     pub created_at: String,
+    /// Kind-specific JSON config blob. Currently populated only for feed
+    /// sources (`{"max_entries": null|N, "fetch_full_content": bool}`, see
+    /// `core::source::{parse_feed_config_json, build_feed_config_json}`);
+    /// `None` for path/url sources. The `refresh` interval is NOT stored
+    /// here even for feed sources — it stays in the `refresh` column as the
+    /// single source of truth read directly by the scheduler.
+    pub config_json: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

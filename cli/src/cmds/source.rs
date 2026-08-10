@@ -11,25 +11,119 @@ use crate::{
     normalize::{classify_source, exit_err, kind_to_string, looks_like_id, print_json},
 };
 
-/// `localdb source add <path-or-url>`
-pub fn run_source_add(ctx: &CliContext, source_arg: &str, refresh: Option<&str>) {
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    rt.block_on(run_source_add_async(ctx, source_arg, refresh));
+/// Resolve the effective source kind for `source add` / `add` and, for feed
+/// sources, the parsed spec — pure and side-effect free so the exit-code-2
+/// flag-matrix rejections (issue #116) are unit testable without going
+/// through `exit_err`'s `process::exit`.
+///
+/// `--kind` overrides `classify_source` uniformly for all three kinds (an
+/// explicit `--kind path`/`--kind url` also bypasses classification);
+/// `classify_source` itself stays two-way and is only consulted when no
+/// override is given. `--max-entries` / `--no-fetch-full-content` are
+/// feed-only flags, rejected here for any other kind. Feed validation
+/// itself (http(s) requirement, `max_entries != 0`) is centralized in
+/// `parse_source_spec`'s `"feed"` arm — the single validation authority —
+/// rather than duplicated here.
+pub(crate) fn resolve_source_add_kind(
+    source_arg: &str,
+    kind_override: Option<&str>,
+    max_entries: Option<u32>,
+    no_fetch_full_content: bool,
+) -> Result<(String, Option<localdb_core::source::ParsedSourceSpec>), Error> {
+    let kind: String =
+        kind_override.map_or_else(|| classify_source(source_arg).0.to_string(), String::from);
+
+    if max_entries.is_some() && kind != "feed" {
+        return Err(Error::InvalidRequest {
+            message: "--max-entries is only supported for feed sources (--kind feed)".to_string(),
+        });
+    }
+    if no_fetch_full_content && kind != "feed" {
+        return Err(Error::InvalidRequest {
+            message: "--no-fetch-full-content is only supported for feed sources (--kind feed)"
+                .to_string(),
+        });
+    }
+
+    // An explicit `--kind url` bypasses `classify_source`, which is what
+    // normally guarantees a url-kind arg is `http(s)://`-shaped. Without this
+    // check, `source add /tmp/docs --kind url` would persist (exit 0) a url
+    // source whose locator can never parse — auto-index only warns, so the
+    // source would sit permanently unindexable. Full parse, not a prefix
+    // check (`https://[` and bare `https://` pass a prefix check but can
+    // never parse), mirroring the feed arm's validation; `--kind path` stays
+    // unrestricted (any string can be a path).
+    if kind == "url" && kind_override.is_some() {
+        let scheme_ok = localdb_core::uri::Uri::parse(source_arg)
+            .is_some_and(|u| matches!(u.scheme(), "http" | "https"));
+        if !scheme_ok {
+            return Err(Error::InvalidRequest {
+                message: format!("url source must be a valid http(s) URL: '{source_arg}'"),
+            });
+        }
+    }
+
+    if kind == "feed" {
+        let feed_spec = json!({
+            "url": source_arg,
+            "max_entries": max_entries,
+            "fetch_full_content": !no_fetch_full_content,
+        });
+        let parsed = localdb_core::source::parse_source_spec("feed", &feed_spec)?;
+        Ok((kind, Some(parsed)))
+    } else {
+        Ok((kind, None))
+    }
 }
 
+/// `localdb source add <path-or-url>`
+#[allow(clippy::too_many_arguments)]
+pub fn run_source_add(
+    ctx: &CliContext,
+    source_arg: &str,
+    refresh: Option<&str>,
+    kind_override: Option<&str>,
+    max_entries: Option<u32>,
+    no_fetch_full_content: bool,
+) {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(run_source_add_async(
+        ctx,
+        source_arg,
+        refresh,
+        kind_override,
+        max_entries,
+        no_fetch_full_content,
+    ));
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_source_add_async(
     ctx: &CliContext,
     source_arg: &str,
     refresh: Option<&str>,
+    kind_override: Option<&str>,
+    max_entries: Option<u32>,
+    no_fetch_full_content: bool,
 ) {
+    let (kind, parsed_feed_spec) = match resolve_source_add_kind(
+        source_arg,
+        kind_override,
+        max_entries,
+        no_fetch_full_content,
+    ) {
+        Ok(v) => v,
+        Err(e) => exit_err(&e, ctx.json),
+    };
+    let kind = kind.as_str();
+    let fetch_full_content = !no_fetch_full_content;
+
     let (config_loader, db) = load_app_db(ctx).await;
 
     // Per specs/05-surfaces.md §2: route to daemon when running. Probed before
     // store resolution because the two paths resolve scope differently — the
     // daemon owns its own store set (see `resolve_store_scope_names`).
     let daemon_state = probe_daemon(&config_loader.paths.data_dir, ctx.daemon_url.as_deref());
-
-    let (kind, _root, url) = classify_source(source_arg);
 
     // Normalize path sources: validate existence, promote single files, apply
     // excludes. Store-independent, so this runs once regardless of how many
@@ -50,10 +144,10 @@ pub(crate) async fn run_source_add_async(
         }
     }
 
-    if refresh.is_some() && kind != "url" {
+    if refresh.is_some() && kind != "url" && kind != "feed" {
         exit_err(
             &Error::InvalidRequest {
-                message: "refresh is only supported for URL sources".to_string(),
+                message: "refresh is only supported for URL and feed sources".to_string(),
             },
             ctx.json,
         );
@@ -76,8 +170,14 @@ pub(crate) async fn run_source_add_async(
             // CreateSourceRequest).
             let spec = if kind == "path" {
                 json!({ "root": actual_root, "include": include_globs, "exclude": exclude_globs })
+            } else if kind == "feed" {
+                json!({
+                    "url": source_arg,
+                    "max_entries": max_entries,
+                    "fetch_full_content": fetch_full_content,
+                })
             } else {
-                json!({ "url": url })
+                json!({ "url": source_arg })
             };
             let url_str = format!("{}/v1/stores/{}/sources", base_url, store_name);
             let body = json!({
@@ -130,28 +230,59 @@ pub(crate) async fn run_source_add_async(
     let mut json_results: Vec<serde_json::Value> = Vec::new();
 
     for row in &rows {
-        let src = SourceRow {
-            id: new_ulid(),
-            store_id: row.id.clone(),
-            // `classify_source` only ever yields "url" or "path", but it
-            // returns a `&str`, so a `match` would need an unreachable
-            // wildcard arm. Two branches keep it honest and coverable.
-            kind: if kind == "url" {
-                SourceKind::Url
-            } else {
-                SourceKind::Path
-            },
-            root: if kind == "path" {
-                Some(actual_root.clone())
-            } else {
-                None
-            },
-            url: url.map(|s| s.to_string()),
-            include: include_globs.clone(),
-            exclude: exclude_globs.clone(),
-            preset: "prose".to_string(),
-            refresh: refresh.map(|s| s.to_string()),
-            created_at: now_rfc3339(),
+        let src = if kind == "feed" {
+            // #116: already validated + parsed by `resolve_source_add_kind`
+            // above (routed through `parse_source_spec`, the single
+            // validation authority) — reuse it rather than re-parsing.
+            // Fields are cloned per store since the same parsed spec is
+            // reused across every store in scope.
+            let parsed = parsed_feed_spec
+                .as_ref()
+                .expect("feed kind always yields a parsed spec");
+            SourceRow {
+                id: new_ulid(),
+                store_id: row.id.clone(),
+                kind: parsed.kind.clone(),
+                root: parsed.root.clone(),
+                url: parsed.url.clone(),
+                include: parsed.include.clone(),
+                exclude: parsed.exclude.clone(),
+                preset: "prose".to_string(),
+                refresh: refresh.map(|s| s.to_string()),
+                created_at: now_rfc3339(),
+                config_json: parsed.config_json.clone(),
+            }
+        } else {
+            SourceRow {
+                id: new_ulid(),
+                store_id: row.id.clone(),
+                // `classify_source`/`resolve_source_add_kind` only ever
+                // yield "url" or "path" here (feed is handled above), but
+                // `kind` is a `&str`, so a `match` would need an
+                // unreachable wildcard arm. Two branches keep it honest and
+                // coverable.
+                kind: if kind == "url" {
+                    SourceKind::Url
+                } else {
+                    SourceKind::Path
+                },
+                root: if kind == "path" {
+                    Some(actual_root.clone())
+                } else {
+                    None
+                },
+                url: if kind == "path" {
+                    None
+                } else {
+                    Some(source_arg.to_string())
+                },
+                include: include_globs.clone(),
+                exclude: exclude_globs.clone(),
+                preset: "prose".to_string(),
+                refresh: refresh.map(|s| s.to_string()),
+                created_at: now_rfc3339(),
+                config_json: None,
+            }
         };
 
         if let Err(e) = db.backend().upsert_source(&src).await {
@@ -169,7 +300,7 @@ pub(crate) async fn run_source_add_async(
         }
 
         // #2: Auto-index after source add.
-        if kind == "path" || kind == "url" {
+        if kind == "path" || kind == "url" || kind == "feed" {
             to_index.push((row.clone(), src.id.clone()));
         }
     }
@@ -247,17 +378,7 @@ pub(crate) async fn run_source_list_async(ctx: &CliContext) {
         // D4: include store as an object matching the citation shape.
         let json_sources: Vec<serde_json::Value> = all
             .iter()
-            .map(|(store_name, s)| {
-                json!({
-                    "id": s.id,
-                    "store": { "name": store_name },
-                    "store_id": s.store_id,
-                    "kind": kind_to_string(&s.kind),
-                    "root": s.root,
-                    "url": s.url,
-                    "preset": s.preset,
-                })
-            })
+            .map(|(store_name, s)| source_to_json_value(s, store_name))
             .collect();
         print_json(&json!({ "sources": json_sources }));
         return;
@@ -294,19 +415,74 @@ fn store_column_width<'a>(names: impl Iterator<Item = &'a str>) -> usize {
 }
 
 /// Format a single `source list` line, with or without a leading store-name
-/// column. `col_width` is only consulted when `store_name` is `Some`.
+/// column. `col_width` is only consulted when `store_name` is `Some`. A thin
+/// wrapper over `source_to_human_line`, which owns the actual per-kind
+/// rendering (including feed detail, #116) — this function only adds the
+/// store-name column.
 fn format_source_line(store_name: Option<&str>, col_width: usize, src: &SourceRow) -> String {
-    let loc = src.root.as_deref().or(src.url.as_deref()).unwrap_or("?");
     match store_name {
         Some(name) => format!(
-            "{:<width$}{} [{}] {}",
+            "{:<width$}{}",
             name,
-            src.id,
-            kind_to_string(&src.kind),
-            loc,
+            source_to_human_line(src),
             width = col_width
         ),
-        None => format!("{} [{}] {}", src.id, kind_to_string(&src.kind), loc),
+        None => source_to_human_line(src),
+    }
+}
+
+/// Build one `source list --json` row. Feed sources get their parsed (never
+/// raw `config_json`) `max_entries` / `fetch_full_content` fields; `refresh`
+/// is surfaced for both url and feed sources (#116).
+pub(crate) fn source_to_json_value(s: &SourceRow, store_name: &str) -> serde_json::Value {
+    let mut obj = json!({
+        "id": s.id,
+        "store": { "name": store_name },
+        "store_id": s.store_id,
+        "kind": kind_to_string(&s.kind),
+        "root": s.root,
+        "url": s.url,
+        "preset": s.preset,
+    });
+    if matches!(s.kind, SourceKind::Url | SourceKind::Feed) {
+        obj["refresh"] = json!(s.refresh);
+    }
+    if s.kind == SourceKind::Feed {
+        let feed_config = localdb_core::source::parse_feed_config_json(s.config_json.as_deref());
+        obj["max_entries"] = json!(feed_config.max_entries);
+        obj["fetch_full_content"] = json!(feed_config.fetch_full_content);
+    }
+    obj
+}
+
+/// Build one `source list` human-readable line.
+///
+/// Feed rows get an extra `(max_entries=…, full_content=on|off)` suffix
+/// (`max_entries=unbounded` when uncapped) — path/url rows are unchanged
+/// (#116).
+pub(crate) fn source_to_human_line(s: &SourceRow) -> String {
+    let loc = s.root.as_deref().or(s.url.as_deref()).unwrap_or("?");
+    if s.kind == SourceKind::Feed {
+        let feed_config = localdb_core::source::parse_feed_config_json(s.config_json.as_deref());
+        let max_entries_str = feed_config
+            .max_entries
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "unbounded".to_string());
+        let full_content_str = if feed_config.fetch_full_content {
+            "on"
+        } else {
+            "off"
+        };
+        format!(
+            "{} [{}] {} (max_entries={}, full_content={})",
+            s.id,
+            kind_to_string(&s.kind),
+            loc,
+            max_entries_str,
+            full_content_str
+        )
+    } else {
+        format!("{} [{}] {}", s.id, kind_to_string(&s.kind), loc)
     }
 }
 
@@ -445,7 +621,6 @@ pub(crate) async fn run_source_remove_async(ctx: &CliContext, id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use localdb_core::ingestion::now_rfc3339;
 
     fn test_source_row(root: Option<&str>, url: Option<&str>) -> SourceRow {
         SourceRow {
@@ -463,6 +638,7 @@ mod tests {
             preset: "prose".to_string(),
             refresh: None,
             created_at: now_rfc3339(),
+            config_json: None,
         }
     }
 
@@ -499,5 +675,266 @@ mod tests {
     fn store_column_width_uses_longest_name_plus_two() {
         assert_eq!(store_column_width(["a", "bb", "ccc"].into_iter()), 5);
         assert_eq!(store_column_width(std::iter::empty()), 2);
+    }
+
+    fn feed_row(
+        id: &str,
+        url: &str,
+        config_json: Option<&str>,
+        refresh: Option<&str>,
+    ) -> SourceRow {
+        SourceRow {
+            id: id.to_string(),
+            store_id: "store-1".to_string(),
+            kind: SourceKind::Feed,
+            root: None,
+            url: Some(url.to_string()),
+            include: vec![],
+            exclude: vec![],
+            preset: "prose".to_string(),
+            refresh: refresh.map(str::to_string),
+            created_at: now_rfc3339(),
+            config_json: config_json.map(str::to_string),
+        }
+    }
+
+    fn url_row(id: &str, url: &str, refresh: Option<&str>) -> SourceRow {
+        SourceRow {
+            id: id.to_string(),
+            store_id: "store-1".to_string(),
+            kind: SourceKind::Url,
+            root: None,
+            url: Some(url.to_string()),
+            include: vec![],
+            exclude: vec![],
+            preset: "prose".to_string(),
+            refresh: refresh.map(str::to_string),
+            created_at: now_rfc3339(),
+            config_json: None,
+        }
+    }
+
+    fn path_row(id: &str, root: &str) -> SourceRow {
+        SourceRow {
+            id: id.to_string(),
+            store_id: "store-1".to_string(),
+            kind: SourceKind::Path,
+            root: Some(root.to_string()),
+            url: None,
+            include: vec!["**/*.md".to_string()],
+            exclude: vec![],
+            preset: "prose".to_string(),
+            refresh: None,
+            created_at: now_rfc3339(),
+            config_json: None,
+        }
+    }
+
+    // --- resolve_source_add_kind: flag-matrix rejections (exit 2) ---
+
+    #[test]
+    fn resolve_source_add_kind_rejects_max_entries_with_path_kind() {
+        let err = resolve_source_add_kind("/tmp/docs", Some("path"), Some(10), false).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(matches!(err, Error::InvalidRequest { .. }));
+    }
+
+    #[test]
+    fn resolve_source_add_kind_rejects_max_entries_with_url_kind() {
+        let err = resolve_source_add_kind("https://example.com/page", Some("url"), Some(10), false)
+            .unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn resolve_source_add_kind_rejects_max_entries_without_override_on_inferred_path() {
+        // No --kind at all: classify_source infers "path" from a non-URL arg.
+        let err = resolve_source_add_kind("/tmp/docs", None, Some(5), false).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn resolve_source_add_kind_rejects_no_fetch_full_content_with_non_feed() {
+        let err = resolve_source_add_kind("/tmp/docs", Some("path"), None, true).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+
+        let err = resolve_source_add_kind("https://example.com/page", Some("url"), None, true)
+            .unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn resolve_source_add_kind_rejects_kind_feed_non_http_url() {
+        let err = resolve_source_add_kind("ftp://example.com/feed.xml", Some("feed"), None, false)
+            .unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(matches!(err, Error::InvalidRequest { .. }));
+    }
+
+    #[test]
+    fn resolve_source_add_kind_rejects_max_entries_zero() {
+        let err =
+            resolve_source_add_kind("https://example.com/feed.xml", Some("feed"), Some(0), false)
+                .unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    // --- resolve_source_add_kind: acceptance paths ---
+
+    #[test]
+    fn resolve_source_add_kind_accepts_feed_defaults() {
+        let (kind, parsed) =
+            resolve_source_add_kind("https://example.com/feed.xml", Some("feed"), None, false)
+                .unwrap();
+        assert_eq!(kind, "feed");
+        let parsed = parsed.expect("feed kind yields a parsed spec");
+        assert_eq!(parsed.kind, SourceKind::Feed);
+        assert_eq!(parsed.url, Some("https://example.com/feed.xml".to_string()));
+        let config = localdb_core::source::parse_feed_config_json(parsed.config_json.as_deref());
+        assert_eq!(config.max_entries, None);
+        assert!(config.fetch_full_content);
+    }
+
+    #[test]
+    fn resolve_source_add_kind_accepts_feed_with_explicit_fields() {
+        let (kind, parsed) =
+            resolve_source_add_kind("https://example.com/feed.xml", Some("feed"), Some(25), true)
+                .unwrap();
+        assert_eq!(kind, "feed");
+        let parsed = parsed.unwrap();
+        let config = localdb_core::source::parse_feed_config_json(parsed.config_json.as_deref());
+        assert_eq!(config.max_entries, Some(25));
+        assert!(
+            !config.fetch_full_content,
+            "--no-fetch-full-content flips the default"
+        );
+    }
+
+    #[test]
+    fn resolve_source_add_kind_infers_path_and_url_without_override() {
+        let (kind, parsed) = resolve_source_add_kind("/tmp/docs", None, None, false).unwrap();
+        assert_eq!(kind, "path");
+        assert!(parsed.is_none());
+
+        let (kind, parsed) =
+            resolve_source_add_kind("https://example.com/page", None, None, false).unwrap();
+        assert_eq!(kind, "url");
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn resolve_source_add_kind_override_bypasses_classification() {
+        // A URL-shaped string can be forced to "path": #116 says `--kind`
+        // overrides classification uniformly. (The reverse — forcing a
+        // non-URL string to "url" — is rejected; see the scheme-check tests
+        // below.)
+        let (kind, _) =
+            resolve_source_add_kind("https://example.com/page", Some("path"), None, false).unwrap();
+        assert_eq!(kind, "path");
+    }
+
+    #[test]
+    fn resolve_source_add_kind_rejects_kind_url_non_http_arg() {
+        // Explicit `--kind url` bypasses classify_source's http(s) shape
+        // guarantee; without a scheme check it would persist a url source
+        // that can never be indexed (auto-index only warns, exit 0).
+        let err = resolve_source_add_kind("/tmp/docs", Some("url"), None, false).unwrap_err();
+        assert!(matches!(err, Error::InvalidRequest { .. }));
+        assert!(err.to_string().contains("must be a valid http(s) URL"));
+    }
+
+    #[test]
+    fn resolve_source_add_kind_rejects_kind_url_unparseable_http_prefixed_arg() {
+        // Right prefix, but not a parseable URL (unclosed IPv6 bracket /
+        // empty host) — a prefix-only check would persist these.
+        for bad in ["https://[", "https://", "http://"] {
+            let err = resolve_source_add_kind(bad, Some("url"), None, false).unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidRequest { .. }),
+                "expected InvalidRequest for arg={bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_source_add_kind_accepts_kind_url_http_arg() {
+        let (kind, parsed) =
+            resolve_source_add_kind("https://example.com/page", Some("url"), None, false).unwrap();
+        assert_eq!(kind, "url");
+        assert!(parsed.is_none());
+    }
+
+    // --- source list formatting ---
+
+    #[test]
+    fn source_to_human_line_feed_with_max_entries() {
+        let row = feed_row(
+            "src-1",
+            "https://example.com/feed.xml",
+            Some(r#"{"max_entries":25,"fetch_full_content":false}"#),
+            None,
+        );
+        let line = source_to_human_line(&row);
+        assert_eq!(
+            line,
+            "src-1 [feed] https://example.com/feed.xml (max_entries=25, full_content=off)"
+        );
+    }
+
+    #[test]
+    fn source_to_human_line_feed_unbounded_defaults() {
+        let row = feed_row("src-2", "https://example.com/feed.xml", None, None);
+        let line = source_to_human_line(&row);
+        assert_eq!(
+            line,
+            "src-2 [feed] https://example.com/feed.xml (max_entries=unbounded, full_content=on)"
+        );
+    }
+
+    #[test]
+    fn source_to_human_line_path_and_url_unchanged() {
+        let row = path_row("src-3", "/tmp/docs");
+        assert_eq!(source_to_human_line(&row), "src-3 [path] /tmp/docs");
+
+        let row = url_row("src-4", "https://example.com/page", None);
+        assert_eq!(
+            source_to_human_line(&row),
+            "src-4 [url] https://example.com/page"
+        );
+    }
+
+    #[test]
+    fn source_to_json_value_feed_includes_parsed_fields_and_refresh_not_raw_config_json() {
+        let row = feed_row(
+            "src-5",
+            "https://example.com/feed.xml",
+            Some(r#"{"max_entries":10,"fetch_full_content":false}"#),
+            Some("1h"),
+        );
+        let v = source_to_json_value(&row, "notes");
+        assert_eq!(v["kind"], "feed");
+        assert_eq!(v["max_entries"], 10);
+        assert_eq!(v["fetch_full_content"], false);
+        assert_eq!(v["refresh"], "1h");
+        // Never expose the raw config_json blob.
+        assert!(v.get("config_json").is_none());
+    }
+
+    #[test]
+    fn source_to_json_value_url_surfaces_refresh_but_no_feed_fields() {
+        let row = url_row("src-6", "https://example.com/page", Some("30m"));
+        let v = source_to_json_value(&row, "notes");
+        assert_eq!(v["kind"], "url");
+        assert_eq!(v["refresh"], "30m");
+        assert!(v.get("max_entries").is_none());
+        assert!(v.get("fetch_full_content").is_none());
+    }
+
+    #[test]
+    fn source_to_json_value_path_has_no_refresh_field() {
+        let row = path_row("src-7", "/tmp/docs");
+        let v = source_to_json_value(&row, "notes");
+        assert_eq!(v["kind"], "path");
+        assert!(v.get("refresh").is_none());
     }
 }

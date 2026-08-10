@@ -189,6 +189,14 @@ pub(crate) async fn run_embedded_index_with(
     );
     let mut doc_index = DocumentIndex::from_records(existing);
     let url_fetcher = HttpUrlFetcher::new()?;
+    // Second client, for locators that come from *content* rather than from
+    // the operator: today only a feed entry's `<link>`. It refuses any
+    // destination that is not globally routable, so a hostile feed cannot
+    // steer localdb at `169.254.169.254` or a LAN admin panel and have the
+    // response indexed into a searchable store. The feed's own URL keeps the
+    // unrestricted client above — it is operator-typed, the same trust class
+    // as a `url` source. See `ingest::FeedIngestor::new`.
+    let entry_fetcher = HttpUrlFetcher::new_public_only()?;
     let mut summary = IndexSummary {
         has_sources: true,
         ..IndexSummary::default()
@@ -230,6 +238,11 @@ pub(crate) async fn run_embedded_index_with(
             SourceSpec::Url { .. } => Box::new(ingest::UrlIngestor::new(
                 Box::new(parser_chain),
                 Box::new(url_fetcher.clone()),
+            )),
+            SourceSpec::Feed { .. } => Box::new(ingest::FeedIngestor::new(
+                Box::new(parser_chain),
+                Box::new(url_fetcher.clone()),
+                Box::new(entry_fetcher.clone()),
             )),
         };
 

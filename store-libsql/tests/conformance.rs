@@ -54,6 +54,7 @@ async fn setup() -> (tempfile::TempDir, SqliteBackend) {
                 preset: "prose".to_string(),
                 refresh: None,
                 created_at: "2026-06-25T12:00:00Z".to_string(),
+                config_json: None,
             })
             .await
             .unwrap();
@@ -290,6 +291,7 @@ async fn dense_search_with_filter_returns_matching_chunks() {
             preset: "prose".to_string(),
             refresh: None,
             created_at: "2026-06-25T12:00:00Z".to_string(),
+            config_json: None,
         })
         .await
         .unwrap();
@@ -362,6 +364,7 @@ async fn reopen_with_same_encoding_succeeds() {
         preset: "prose".to_string(),
         refresh: None,
         created_at: "2026-06-25T12:00:00Z".to_string(),
+        config_json: None,
     })
     .await
     .unwrap();
@@ -747,6 +750,7 @@ async fn upsert_chunks_with_binary_encoding_round_trips_through_search_and_get_c
         preset: "prose".to_string(),
         refresh: None,
         created_at: "2026-06-25T12:00:00Z".to_string(),
+        config_json: None,
     })
     .await
     .unwrap();
