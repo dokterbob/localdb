@@ -282,49 +282,24 @@ pub(crate) async fn resolve_daemon_store_scope(
 /// Fetch every store name the daemon knows about, following `next_cursor` to
 /// exhaustion.
 ///
-/// Guards against a non-advancing cursor (a malformed or hostile response)
-/// with `Error::Internal` so a broken daemon response can't spin this loop
-/// forever.
+/// Delegates the actual HTTP walk to `daemon_client::walk_daemon_pages`,
+/// shared with `cmds::index::daemon_store_has_source`'s owner walk: it bails
+/// with `Error::Internal` on a malformed page shape, on *any* repeated
+/// pagination cursor (not just an immediate repeat — a daemon alternating
+/// between two or more cursors is caught too), and on an absolute page-count
+/// cap, so a broken or hostile daemon response can't spin this loop forever.
 async fn fetch_all_daemon_store_names(base_url: &str) -> Result<Vec<String>, Error> {
     let mut names = Vec::new();
-    let mut cursor: Option<String> = None;
-    loop {
-        let url = match &cursor {
-            Some(c) => format!("{base_url}/v1/stores?cursor={c}"),
-            None => format!("{base_url}/v1/stores"),
-        };
-        let resp =
-            crate::daemon_client::daemon_request_async(reqwest::Method::GET, &url, None).await?;
-        let items = resp
-            .get("items")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        for item in &items {
+    crate::daemon_client::walk_daemon_pages(base_url, "/v1/stores", |items| {
+        for item in items {
             if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
                 names.push(name.to_string());
             }
         }
-        let next_cursor = resp
-            .get("next_cursor")
-            .and_then(|c| c.as_str())
-            .map(str::to_string);
-        match next_cursor {
-            None => return Ok(names),
-            Some(next) => {
-                if cursor.as_deref() == Some(next.as_str()) {
-                    return Err(Error::Internal {
-                        message: format!(
-                            "daemon returned a non-advancing pagination cursor '{next}' for \
-                             GET /v1/stores"
-                        ),
-                        correlation_id: "daemon_store_scope_cursor".to_string(),
-                    });
-                }
-                cursor = Some(next);
-            }
-        }
-    }
+        false
+    })
+    .await?;
+    Ok(names)
 }
 
 /// Pure-ish decision logic behind `resolve_daemon_store_scope` (the only

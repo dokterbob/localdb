@@ -19,6 +19,7 @@ tokio = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 indicatif = { workspace = true }
+percent-encoding = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # On macOS, auto-enable CoreML so any localdb build (release tarball or cargo install)

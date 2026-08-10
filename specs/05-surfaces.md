@@ -23,7 +23,7 @@ Single binary, subcommand tree. Global flags: `--config`, `--json`, `--store <na
 | `mcp` | Run MCP server on stdio | embedded core | thin client |
 | `status` | Stores, resource/chunk counts, policy staleness, daemon state | reads directly | queries daemon |
 | `store add/list/remove` | Manage runtime-owned stores | direct write | routed to daemon |
-| `source add/list/remove` | Manage sources on a store; defaults to the store named `default` if `-s` is omitted, exit 2 if absent (§2.2) | direct write | routed to daemon |
+| `source add/list/remove` | Manage sources on a store; defaults to the store named `default` if `-s` is omitted, exit 2 if absent (§2.2) | direct write | `add`/`remove` routed to daemon; `list` always reads the local database (§2.2 known limitation) |
 | `add <path|url>...` | Alias for `source add` — add one or more sources to a store; same `default`-store rule as `source add` (§2.2) | direct write | routed to daemon |
 | `index [--store S]... [--source ID] [--strict]` | One-shot scan & index; creates IndexJob; all stores if `-s` is omitted (§2.2) | runs job synchronously, progress to stderr | submits job, polls, streams progress |
 | `search <query>... [--limit N] [--content-length N]` | Hybrid search with citations; `--content-length` is a **soft cap** on human-readable snippet chars (default 1000; JSON output always full text) — see §4 for the snapping behavior shared with MCP | embedded read | via API |
@@ -87,24 +87,36 @@ Additional rules:
   *syntactically* (name shape, traversal safety) — it cannot confirm the source actually belongs
   to the named store, because `DELETE /v1/sources/{id}` is store-agnostic. Embedded (daemonless)
   mode does enforce this, since it resolves the source through the named store's own row.
-- **Daemon-routed scope resolution asks the daemon, not the local database.** `source add`/`list`
+- **Known limitation: `source list` never consults the daemon.** Unlike `source add`/`remove`,
+  `source list` has no daemon branch at all — it always opens the local database directly and
+  resolves `--store` scope against it, even when a daemon is running. In the common case (daemon
+  and CLI share one data directory) this is invisible: the local database and the daemon's store
+  set agree. It only surfaces when `LOCALDB_DAEMON_URL` points at a daemon with a *different* data
+  directory: `source add`/`remove` and `index` resolve scope against the daemon's store set (see
+  the next bullet), but `source list` still reads whatever store set the local database happens to
+  have, which can disagree with what a preceding `source add` just reported. The table in §2 lists
+  `source add/list/remove` together as "routed to daemon"; that is only true of `add` and `remove`.
+- **Daemon-routed scope resolution asks the daemon, not the local database.** `source add`/`remove`
   (via their daemon branches) and `index` resolve `--store` scope by paginating `GET /v1/stores`
   to exhaustion, because a running daemon may point at a different data directory than the one
   this process would otherwise open (`LOCALDB_DAEMON_URL`) and is the authority on which stores
-  exist either way. The same omitted-vs-explicit distinction from the table above still holds:
-  an omitted `-s` resolving against a daemon with no store named `default` is `invalid_request`,
-  exit 2, with the same `no store named 'default'; pass --store <name>` message; an *explicit*
-  `--store default` the daemon does not have is `store_not_found`, exit 3, same as any other
-  explicit unknown name — the implicit default and an explicit request for that same name are not
-  the same failure.
-- **Daemon-routed `index --source ID` narrows to the owning store.** `/v1/jobs` does not validate
+  exist either way. `source list` is the exception — see the known limitation above. The same
+  omitted-vs-explicit distinction from the table above still holds for the commands that do ask the
+  daemon: an omitted `-s` resolving against a daemon with no store named `default` is
+  `invalid_request`, exit 2, with the same `no store named 'default'; pass --store <name>` message;
+  an *explicit* `--store default` the daemon does not have is `store_not_found`, exit 3, same as
+  any other explicit unknown name — the implicit default and an explicit request for that same name
+  are not the same failure.
+- **Daemon-routed `index --source ID` always verifies ownership.** `/v1/jobs` does not validate
   `source_id` (it only checks `store_name`), so submitting the same source id to every store in a
-  multi-store scope would silently create one job per store, only one of which is meaningful. When
-  the resolved scope is already a single store, the CLI submits directly (no extra request). When
-  it is more than one, the CLI walks `GET /v1/stores/{name}/sources` (paginating each store to
-  exhaustion) over the scoped stores to find the id's owner, submitting exactly one job. A source
-  found in no scoped store is `source_not_found`, exit 3 — reproducing embedded mode's hard-filter
-  rule that an explicit `--store` scope excluding the owner does not silently redirect to it.
+  multi-store scope would silently create one job per store, only one of which is meaningful — and
+  submitting it to a single resolved store with no check at all would silently accept an id that
+  store doesn't actually own. So regardless of how many stores are in the resolved scope, the CLI
+  always walks `GET /v1/stores/{name}/sources` (paginating each store to exhaustion) over the
+  scoped stores to find the id's owner first, submitting exactly one job. A source found in no
+  scoped store is `source_not_found`, exit 3 — reproducing embedded mode's hard-filter rule that an
+  explicit `--store` scope excluding the owner does not silently redirect to it, and its "unknown
+  source id" rule for a single-store scope too.
 - A multi-item `--json` batch (`source add`/`add` across more than one `--store`, local or
   daemon-routed) that fails partway through — after at least one earlier item already succeeded —
   does not discard the buffered results: it prints one JSON document

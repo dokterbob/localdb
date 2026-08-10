@@ -224,7 +224,11 @@ pub(crate) async fn run_embedded_index_with(
         Some(embedder.clone())
     );
     let mut doc_index = DocumentIndex::from_records(existing);
-    let url_fetcher = HttpUrlFetcher::new()?;
+    let url_fetcher = warn_or_default!(
+        HttpUrlFetcher::new(),
+        "warning: cannot build HTTP client for auto-index: {}",
+        Some(embedder.clone())
+    );
     // Second client, for locators that come from *content* rather than from
     // the operator: today only a feed entry's `<link>`. It refuses any
     // destination that is not globally routable, so a hostile feed cannot
@@ -232,7 +236,11 @@ pub(crate) async fn run_embedded_index_with(
     // response indexed into a searchable store. The feed's own URL keeps the
     // unrestricted client above — it is operator-typed, the same trust class
     // as a `url` source. See `ingest::FeedIngestor::new`.
-    let entry_fetcher = HttpUrlFetcher::new_public_only()?;
+    let entry_fetcher = warn_or_default!(
+        HttpUrlFetcher::new_public_only(),
+        "warning: cannot build public-only HTTP client for auto-index: {}",
+        Some(embedder.clone())
+    );
     let mut summary = IndexSummary {
         has_sources: true,
         ..IndexSummary::default()
@@ -452,62 +460,53 @@ pub(crate) async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, s
 /// Used by `resolve_daemon_source_owner` below. Must paginate: `PaginatedList`
 /// truncates each page to `default_limit()` (20), so a single unpaginated
 /// fetch would silently miss a source sitting on page 2+ — turning the
-/// finding-2 fix into a worse bug than the one it replaces. Guards against a
-/// non-advancing cursor the same way `fetch_all_daemon_store_names`
-/// (`cli/src/app_db.rs`) does.
+/// finding-2 fix into a worse bug than the one it replaces.
+///
+/// `store_name` is percent-encoded via `encode_path_segment` before it's
+/// interpolated into the URL path — an unescaped `#`/`?`/`/` would otherwise
+/// retarget the request at a different endpoint entirely (finding 1). Page
+/// walking, the malformed-shape check, and the pagination-cycle guard are
+/// shared with `fetch_all_daemon_store_names` (`cli/src/app_db.rs`) via
+/// `daemon_client::walk_daemon_pages` — see its doc comment. In particular, a
+/// response with no (or non-array) `items` field is an error here, not a
+/// silent "source not found": that swallow was exactly how a request that
+/// silently landed on the wrong endpoint (finding 1's bug) used to be
+/// misreported as a clean "not found" instead of failing loudly.
 async fn daemon_store_has_source(
     base_url: &str,
     store_name: &str,
     source_id: &str,
 ) -> Result<bool, Error> {
-    let mut cursor: Option<String> = None;
-    loop {
-        let url = match &cursor {
-            Some(c) => format!("{base_url}/v1/stores/{store_name}/sources?cursor={c}"),
-            None => format!("{base_url}/v1/stores/{store_name}/sources"),
-        };
-        let resp = daemon_request_async(reqwest::Method::GET, &url, None).await?;
-        let items = resp
-            .get("items")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
+    let path = format!(
+        "/v1/stores/{}/sources",
+        crate::daemon_client::encode_path_segment(store_name)
+    );
+    let mut found = false;
+    crate::daemon_client::walk_daemon_pages(base_url, &path, |items| {
         if items
             .iter()
             .any(|it| it.get("id").and_then(|i| i.as_str()) == Some(source_id))
         {
-            return Ok(true);
+            found = true;
+            true
+        } else {
+            false
         }
-        let next_cursor = resp
-            .get("next_cursor")
-            .and_then(|c| c.as_str())
-            .map(str::to_string);
-        match next_cursor {
-            None => return Ok(false),
-            Some(next) => {
-                if cursor.as_deref() == Some(next.as_str()) {
-                    return Err(Error::Internal {
-                        message: format!(
-                            "daemon returned a non-advancing pagination cursor '{next}' for \
-                             GET /v1/stores/{store_name}/sources"
-                        ),
-                        correlation_id: "daemon_source_owner_cursor".to_string(),
-                    });
-                }
-                cursor = Some(next);
-            }
-        }
-    }
+    })
+    .await?;
+    Ok(found)
 }
 
-/// Narrow a multi-store daemon scope down to `source_id`'s owning store
-/// (Codex review round 2, finding 2).
+/// Narrow a daemon scope (of any size, including a single store — see
+/// `run_daemon_index`'s doc comment, finding 4) down to `source_id`'s owning
+/// store (Codex review round 2, finding 2).
 ///
 /// `/v1/jobs` (`server/src/handlers/jobs.rs`'s `create_job`) validates only
 /// `store_name` — `source_id` is checked neither for existence nor for
 /// ownership — so without this, submitting the same `source_id` to every
 /// store in `scoped_names` would silently accept a job for every one of them,
-/// only one of which is meaningful. Walks the scoped stores in order via
+/// only one of which is meaningful, and a single-store scope would submit
+/// with zero verification at all. Walks the scoped stores in order via
 /// `daemon_store_has_source`, returning the first owner found.
 ///
 /// Not found in any scoped store is `Error::SourceNotFound`, exit 3 — the
@@ -535,12 +534,17 @@ async fn resolve_daemon_source_owner(
 /// batched request to make here — this is intentionally simple submit-and-
 /// report, matching what the single-store path already did, looped.
 ///
-/// When `source_id` is given and `store_names` holds more than one name, this
-/// first narrows to the owning store via `resolve_daemon_source_owner` — the
-/// scope has already been asked to resolve to `store_names`, but a source id
-/// is only ever meaningful for the one store that owns it (finding 2). When
-/// `store_names` is already a single store, no extra request is made: the
-/// common `-s one --source X` case pays zero pagination round trips.
+/// When `source_id` is given, this always narrows to the owning store via
+/// `resolve_daemon_source_owner` first — regardless of whether `store_names`
+/// is already a single store. A single-store scope used to short-circuit
+/// straight to submission with zero ownership verification, which meant
+/// `index --store foo --source bogus-id` submitted a job (0 docs attached)
+/// instead of exiting 3 like embedded mode's equivalent
+/// (`run_embedded_index_with`, which always resolves the source's true owner
+/// and checks it against scope) — precisely the daemon/embedded divergence
+/// this whole command exists to eliminate (finding 4). The extra request
+/// this costs in the common `-s one --source X` case is an accepted
+/// trade-off for exact parity.
 ///
 /// A submission failure exits immediately (via `exit_err`), the same as the
 /// pre-existing single-store behavior: unlike the embedded-index loop, a
@@ -554,13 +558,12 @@ async fn run_daemon_index(
     store_names: &[String],
     source_id: Option<&str>,
 ) {
-    let target_names: Vec<String> = match (source_id, store_names) {
-        (Some(_), [only]) => vec![only.clone()],
-        (Some(sid), many) => match resolve_daemon_source_owner(base_url, many, sid).await {
+    let target_names: Vec<String> = match source_id {
+        Some(sid) => match resolve_daemon_source_owner(base_url, store_names, sid).await {
             Ok(owner) => vec![owner],
             Err(e) => exit_err(&e, ctx.json),
         },
-        (None, names) => names.to_vec(),
+        None => store_names.to_vec(),
     };
 
     let mut submissions: Vec<(String, serde_json::Value)> = Vec::with_capacity(target_names.len());
