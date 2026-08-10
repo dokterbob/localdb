@@ -236,13 +236,12 @@ Every search hit, on every surface, resolves to the same citation structure:
   "resource_id": "...",
   "uri": "...",
   "title": "...",
-  "block": { "seq": 3, "kind": "paragraph" },
+  "block": { "seq": 3, "kind": "text" },
   "chunk_position": { "seq_in_block": 0 },
   "location": {
     "span": { "start": 120, "end": 512 },
     "window_block_seqs": [3, 4, 5]
-  },
-  "score": 0.87
+  }
 }
 ```
 
