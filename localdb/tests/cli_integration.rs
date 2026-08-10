@@ -2293,20 +2293,44 @@ fn index_traversal_store_name_exits_2() {
 // defaults rework (#178/#118/#144).
 // ---------------------------------------------------------------------------
 
-/// Requests recorded by [`start_recording_mock_server`]: one `(start_line,
-/// json_body)` pair per request received, in arrival order.
+/// Requests recorded by [`start_recording_mock_server`] /
+/// [`start_routing_mock_server`]: one `(start_line, json_body)` pair per
+/// request received, in arrival order.
 type RecordedRequests = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
 
-/// Spin up a minimal mock HTTP server that answers every request with the
-/// same fixed status line + JSON body, recording each request's start-line
-/// and raw JSON body (if any) for assertions. Unlike `start_mock_daemon`'s
-/// inline callers above, this variant also captures the request body so
-/// tests can assert on what the CLI actually sent (e.g. the `spec` object
-/// for url-kind sources).
-fn start_recording_mock_server(
-    status_line: &'static str,
-    body: &'static str,
-) -> (u16, RecordedRequests) {
+/// A single `(method, path_prefix, status_line, body)` route for
+/// [`start_routing_mock_server`].
+///
+/// `method` matches the request's HTTP method exactly (e.g. `"GET"`,
+/// `"POST"`), or matches *any* method when left `""`; `path_prefix` matches
+/// the request's path (before the `?` query string, if any) via
+/// [`str::starts_with`] — `""` matches any path.
+type MockRoute = (&'static str, &'static str, &'static str, &'static str);
+
+/// Fallback response served when no route matches: a 404 with a JSON error
+/// body shaped like the daemon's real error envelope (`{"code": ...,
+/// "message": ...}`, see `cli/src/daemon_client.rs::decode_daemon_error`),
+/// so a test that forgets a route fails with a clear CLI-level error
+/// instead of the mock server hanging or panicking.
+const UNMATCHED_ROUTE_STATUS: &str = "HTTP/1.1 404 Not Found";
+const UNMATCHED_ROUTE_BODY: &str =
+    r#"{"code":"resource_not_found","message":"no mock route matched this request"}"#;
+
+/// Spin up a minimal mock HTTP server that dispatches each request to the
+/// first route in `routes` whose method matches (exactly, or any method if
+/// `""`) and whose path starts with `path_prefix` — **first-match-wins**,
+/// so callers should list more specific routes (e.g. an exact path) before
+/// more general ones (e.g. a shared prefix or a catch-all `("", "", ..,
+/// ..)`). Requests matching no route get [`UNMATCHED_ROUTE_STATUS`] /
+/// [`UNMATCHED_ROUTE_BODY`] rather than hanging.
+///
+/// Every request's start-line and raw JSON body (if any) is recorded for
+/// assertions, mirroring `start_recording_mock_server`. `routes` is taken
+/// by value (rather than `&'static [MockRoute]`) so callers can build it
+/// from ordinary runtime `&'static str` arguments (as
+/// `start_recording_mock_server` does) without needing const-promotion or
+/// leaking memory.
+fn start_routing_mock_server(routes: Vec<MockRoute>) -> (u16, RecordedRequests) {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -2343,7 +2367,26 @@ fn start_recording_mock_server(
                 String::new()
             };
 
-            received_clone.lock().unwrap().push((path, req_body));
+            received_clone
+                .lock()
+                .unwrap()
+                .push((path.clone(), req_body));
+
+            // The recorded `path` is the whole trimmed request line, e.g.
+            // `"GET /v1/stores?limit=50 HTTP/1.1"`; pull out method + path
+            // (sans query string) for route matching.
+            let mut parts = path.split_whitespace();
+            let req_method = parts.next().unwrap_or("");
+            let req_path = parts.next().unwrap_or("");
+            let req_path = req_path.split('?').next().unwrap_or(req_path);
+
+            let (status_line, body) = routes
+                .iter()
+                .find(|(method, prefix, _, _)| {
+                    (method.is_empty() || *method == req_method) && req_path.starts_with(prefix)
+                })
+                .map(|(_, _, status_line, body)| (*status_line, *body))
+                .unwrap_or((UNMATCHED_ROUTE_STATUS, UNMATCHED_ROUTE_BODY));
 
             let response = format!(
                 "{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
@@ -2356,6 +2399,38 @@ fn start_recording_mock_server(
     });
 
     (port, received)
+}
+
+/// Spin up a minimal mock HTTP server that answers every request with the
+/// same fixed status line + JSON body, recording each request's start-line
+/// and raw JSON body (if any) for assertions. Unlike `start_mock_daemon`'s
+/// inline callers above, this variant also captures the request body so
+/// tests can assert on what the CLI actually sent (e.g. the `spec` object
+/// for url-kind sources).
+///
+/// A thin wrapper over [`start_routing_mock_server`] with a single
+/// catch-all route (`""`/`""`) matching any method and any path.
+fn start_recording_mock_server(
+    status_line: &'static str,
+    body: &'static str,
+) -> (u16, RecordedRequests) {
+    start_routing_mock_server(vec![("", "", status_line, body)])
+}
+
+/// Build a `PaginatedList` JSON body (`server/src/handlers/mod.rs`) with no
+/// further pages, for stubbing routes like `GET /v1/stores` in
+/// [`start_routing_mock_server`] tests.
+///
+/// Not yet called: the daemon-routed pre-flight `GET /v1/stores` tests that
+/// will use this land in the next commit. `#[allow(dead_code)]` keeps
+/// `-D warnings` clean in the meantime.
+#[allow(dead_code)]
+fn paginated_list_body(items_json: &[&str]) -> String {
+    format!(
+        r#"{{"items":[{}],"next_cursor":null,"total":{}}}"#,
+        items_json.join(","),
+        items_json.len()
+    )
 }
 
 // -- source add: local (non-daemon) error/success branches -----------------
