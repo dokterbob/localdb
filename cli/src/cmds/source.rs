@@ -188,7 +188,17 @@ pub(crate) async fn run_source_add_async(
             } else {
                 json!({ "url": source_arg })
             };
-            let url_str = format!("{}/v1/stores/{}/sources", base_url, store_name);
+            // `store_name` is percent-encoded before it's interpolated into
+            // the URL path segment — an unescaped '#'/'?'/'/' would otherwise
+            // retarget the request at a different daemon endpoint entirely
+            // (finding 1: e.g. a store named "a#b" would silently POST to
+            // `/v1/stores/a`, since '#' starts a URL fragment that's never
+            // sent to the server).
+            let url_str = format!(
+                "{}/v1/stores/{}/sources",
+                base_url,
+                crate::daemon_client::encode_path_segment(store_name)
+            );
             let body = json!({
                 "kind": kind,
                 "spec": spec,
@@ -571,7 +581,14 @@ pub(crate) async fn run_source_remove_async(ctx: &CliContext, id: &str) {
         // another host with its own data directory, so a syntactically-valid
         // but locally-unknown store name must still reach the daemon (see
         // `resolve_daemon_store_scope`'s doc comment in `cli/src/app_db.rs`).
-        let url = format!("{}/v1/sources/{}", base_url, id);
+        // `id` is percent-encoded before it's interpolated into the URL path
+        // segment — see the `encode_path_segment` doc comment (finding 1);
+        // same class of bug as the store-name case above.
+        let url = format!(
+            "{}/v1/sources/{}",
+            base_url,
+            crate::daemon_client::encode_path_segment(id)
+        );
         match daemon_request_async(reqwest::Method::DELETE, &url, None).await {
             Ok(v) => {
                 if ctx.json {

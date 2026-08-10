@@ -135,7 +135,15 @@ pub(crate) async fn run_store_remove_async(ctx: &CliContext, name: &str) {
 
     // Per specs/05-surfaces.md §2: route to daemon when running.
     if let DaemonState::Running { base_url } = probe_daemon(data_dir, ctx.daemon_url.as_deref()) {
-        let url = format!("{}/v1/stores/{}", base_url, name);
+        // `name` is percent-encoded before it's interpolated into the URL
+        // path segment — see `daemon_client::encode_path_segment`'s doc
+        // comment (finding 1): an unescaped '#'/'?'/'/' would otherwise
+        // retarget the DELETE at a different daemon endpoint entirely.
+        let url = format!(
+            "{}/v1/stores/{}",
+            base_url,
+            crate::daemon_client::encode_path_segment(name)
+        );
         match daemon_request_async(reqwest::Method::DELETE, &url, None).await {
             Ok(v) => {
                 if ctx.json {
