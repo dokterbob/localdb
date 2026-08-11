@@ -430,24 +430,17 @@ Dublin Core extraction landed, but the skip contract, not the extractor, is the 
 first index after upgrading is unaffected: the extraction change moves every PDF's content hash
 anyway, so metadata is written then.
 
-**16. `index_resource`'s zero-chunk arm still deletes on an empty replacement for any ingestor
-that yields a zero-block Resource — `file` sources are not guarded.**
+**16. ~~`index_resource`'s zero-chunk arm still deletes on an empty replacement~~ — RESOLVED.**
 ([#185](https://github.com/dokterbob/localdb/issues/185),
 [#156](https://github.com/dokterbob/localdb/issues/156))
-The fetched-page and embedded-content paths (`url`/`feed` sources, via
-`ingest/src/url_pipeline.rs`) now classify "extracted to nothing" as unusable and report it via
-`on_skipped` rather than yielding a zero-block `Resource` — see
-[specs/02-domain-model.md](../specs/02-domain-model.md) § "Feed connector" and
-[specs/04-search-pipeline.md](../specs/04-search-pipeline.md) §1. `FileIngestor` has no
-equivalent guard: a file that extracts to zero blocks (emptied on disk between the watcher's
-debounce firing and the read, or an extractor regression) still reaches `index_resource`'s
-zero-chunk arm and deletes the previously indexed document for that path, reporting the run as
-successful. Same root conflation as #156 — "unavailable" mistaken for "legitimately empty" — one
-layer down: #156 is zero-URIs-enumerated at the source level, this is zero-blocks-extracted at
-the resource level, and here it is `file` rather than `url`/`feed` that lacks the guard.
-Extending the same classification to `FileIngestor` — and giving `index_resource` itself an
-"empty ≠ deleted" rule, so the guard is an invariant rather than per-ingestor discipline — is
-tracked in #185.
+`index_resource` now returns `IndexOutcome::Empty` for a resource that chunks to nothing and
+deletes nothing — an invariant at the sink rather than per-ingestor discipline. `FileIngestor`
+additionally classifies zero-block extraction as `on_skipped(Other)`, matching `UrlIngestor`.
+At the source level, `enumerate_path_source` distinguishes `PathEnumeration::RootUnavailable`
+from `Complete(vec![])`, and the delete-sweep is suppressed both for an incomplete enumeration
+and for a run that observed none of the source's own URIs. Deletion is also now opt-in
+(`--delete`). See [specs/04-search-pipeline.md](../specs/04-search-pipeline.md) §1 for the full
+contract, and gaps 18 and 19 below for the retention trade-offs this deliberately accepts.
 
 **17. There is no opt-in for private-network feed entry links.** ([#196](https://github.com/dokterbob/localdb/issues/196))
 Discovery mode fetches entry links through a public-destination-only HTTP client (see
@@ -465,6 +458,25 @@ A related feed-specific identity bug lives in the same family:
 [#186](https://github.com/dokterbob/localdb/issues/186) — an entry with no guid, no link and no
 title gets a random UUID identity on every parse, so it is re-indexed and its previous copy
 delete-swept on every run.
+
+**18. A source that loses everything at once keeps its documents until it is re-created.**
+(accepted trade-off of [#156](https://github.com/dokterbob/localdb/issues/156)'s guard 2)
+The zero-seen backstop cannot distinguish "the connector is broken" from "every document really
+was removed" — both look like a run that observed none of the source's own URIs — and it resolves
+that ambiguity in favor of retention. So a `path` source whose directory is legitimately emptied,
+or whose files are all renamed in one run, keeps its now-stale documents even under `--delete`.
+The run warns loudly, naming the source and the count, and the remedy is `localdb source remove`
+followed by `source add` and a reindex. Chosen deliberately: the alternative is the failure mode
+that motivated the guard. A future `--delete --force`, or a confirmation prompt showing the
+affected URIs, would give the escape hatch without weakening the default.
+
+**19. A file legitimately emptied keeps its previous content indexed.**
+(accepted trade-off of [#185](https://github.com/dokterbob/localdb/issues/185)'s sink invariant)
+`index_resource` refuses to delete on an empty replacement, because it cannot tell a file that is
+now genuinely blank from one whose extraction failed to produce anything this run. Truncating a
+file to zero bytes therefore leaves its old content searchable, and the run reports it as skipped.
+The escape hatch is clean and needs no new surface: delete the file, and the sweep removes it
+normally under `--delete`.
 
 ---
 

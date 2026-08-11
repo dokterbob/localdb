@@ -12,8 +12,8 @@ use localdb_core::store::ChunkRecord;
 use localdb_core::types::{Source, SourceKind, SourceSpec, Span, StoreVisibility};
 use localdb_core::{
     content_hash, index_resource, resource_id, Block, BlockKind, ChunkerConfig, FakeEmbedder,
-    IndexResourceDeps, IngestionConfig, IngestorKind, Resource, ResourceKind, SourceRow,
-    StoreBackend, StoreBackendConfig, StoreRow, Uri, VectorEncoding,
+    IndexOutcome, IndexResourceDeps, IngestionConfig, IngestorKind, Resource, ResourceKind,
+    SourceRow, StoreBackend, StoreBackendConfig, StoreRow, Uri, VectorEncoding,
 };
 use store_libsql::SqliteBackend;
 
@@ -331,10 +331,13 @@ async fn indexed_resource_persists_ingestion_time_not_feed_date_in_added_at() {
         embedder: &embedder,
         config: &config,
     };
-    let written = index_resource(&resource, &source, None, &deps)
+    let outcome = index_resource(&resource, &source, None, &deps)
         .await
         .unwrap();
-    assert!(written > 0, "the resource must produce at least one chunk");
+    assert!(
+        matches!(outcome, IndexOutcome::Written(n) if n > 0),
+        "the resource must produce at least one chunk, got {outcome:?}"
+    );
 
     let info = db
         .find_document(&resource.id)

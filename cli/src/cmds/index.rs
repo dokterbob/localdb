@@ -31,6 +31,12 @@ pub(crate) struct IndexSummary {
     chunks: u64,
     errors: u64,
     unsupported: u64,
+    /// Documents no longer present at their source that were kept anyway,
+    /// because `--delete` was not passed. Always 0 on a `--delete` run (they
+    /// were removed instead).
+    prunable: u64,
+    /// Documents actually removed (only ever non-zero with `--delete`).
+    deleted: u64,
 }
 
 impl IndexSummary {
@@ -44,6 +50,8 @@ impl IndexSummary {
         self.chunks += other.chunks;
         self.errors += other.errors;
         self.unsupported += other.unsupported;
+        self.prunable += other.prunable;
+        self.deleted += other.deleted;
     }
 }
 
@@ -109,6 +117,7 @@ pub(crate) async fn run_embedded_index_with(
     mode: IndexErrorMode,
     embedder: Option<Arc<dyn Embedder>>,
     progress_label: Option<&str>,
+    deletion: localdb_core::ingestion::DeletionPolicy,
 ) -> Result<(IndexSummary, Option<Arc<dyn Embedder>>), Error> {
     use localdb_core::{
         chunker::ChunkerConfig,
@@ -296,6 +305,7 @@ pub(crate) async fn run_embedded_index_with(
             embedder: embedder.as_ref(),
             config: &cfg,
             progress: sink,
+            deletion,
         };
 
         match run_source_ingestion(&source, ingestor.as_ref(), deps).await {
@@ -305,6 +315,8 @@ pub(crate) async fn run_embedded_index_with(
                 summary.chunks += r.chunks_written;
                 summary.errors += r.error_count;
                 summary.unsupported += r.unsupported_format_count;
+                summary.prunable += r.docs_prunable;
+                summary.deleted += r.docs_deleted;
             }
             Err(e) => {
                 summary.errors += 1;
@@ -329,12 +341,19 @@ pub(crate) async fn run_embedded_index_with(
 ///
 /// Per specs/05-surfaces.md §2: when daemon is running, submits job and polls.
 /// With `--strict`, exits 2 if any document failed extraction (run always completes).
-pub fn run_index(ctx: &CliContext, source_id: Option<&str>, strict: bool) {
+/// With `--delete`, removes documents that no longer exist at their source;
+/// without it nothing is ever removed (see `DeletionPolicy`).
+pub fn run_index(ctx: &CliContext, source_id: Option<&str>, strict: bool, delete: bool) {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    rt.block_on(run_index_async(ctx, source_id, strict));
+    rt.block_on(run_index_async(ctx, source_id, strict, delete));
 }
 
-pub(crate) async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, strict: bool) {
+pub(crate) async fn run_index_async(
+    ctx: &CliContext,
+    source_id: Option<&str>,
+    strict: bool,
+    delete: bool,
+) {
     let (config_loader, db) = load_app_db(ctx).await;
     let data_dir = config_loader.paths.data_dir.clone();
 
@@ -436,6 +455,11 @@ pub(crate) async fn run_index_async(ctx: &CliContext, source_id: Option<&str>, s
             IndexErrorMode::StrictExit,
             embedder.clone(),
             label,
+            if delete {
+                localdb_core::ingestion::DeletionPolicy::Prune
+            } else {
+                localdb_core::ingestion::DeletionPolicy::Retain
+            },
         )
         .await
         {
@@ -641,10 +665,22 @@ fn summary_status(summary: &IndexSummary, strict: bool) -> &'static str {
 /// Render the "N indexed, N skipped, ..." body shared by the single-store
 /// line, each multi-store line, and the combined total line.
 fn format_summary_body(summary: &IndexSummary) -> String {
-    format!(
+    let mut body = format!(
         "{} indexed, {} skipped, {} chunks written, {} unsupported, {} errors",
         summary.indexed, summary.skipped, summary.chunks, summary.unsupported, summary.errors
-    )
+    );
+    // Only ever one of these is non-zero: `prunable` counts what a retaining
+    // run kept, `deleted` what a `--delete` run removed.
+    if summary.deleted > 0 {
+        body.push_str(&format!(", {} deleted", summary.deleted));
+    }
+    if summary.prunable > 0 {
+        body.push_str(&format!(
+            ", {} no longer at source (kept; use --delete to remove)",
+            summary.prunable
+        ));
+    }
+    body
 }
 
 /// Render the full text report for a set of store outcomes.
@@ -692,6 +728,8 @@ fn summary_fields_json(summary: &IndexSummary, strict: bool) -> serde_json::Valu
         "chunks_written": summary.chunks,
         "unsupported": summary.unsupported,
         "errors": summary.errors,
+        "docs_deleted": summary.deleted,
+        "docs_prunable": summary.prunable,
     })
 }
 
@@ -758,6 +796,8 @@ mod tests {
             chunks,
             errors,
             unsupported,
+            prunable: 0,
+            deleted: 0,
         }
     }
 
@@ -874,6 +914,10 @@ mod tests {
                 "chunks_written": 6,
                 "unsupported": 0,
                 "errors": 0,
+                // Added alongside the opt-in `--delete` flag: a retaining run
+                // has to be able to tell consumers what pruning would remove.
+                "docs_deleted": 0,
+                "docs_prunable": 0,
             })
         );
         assert!(
@@ -911,6 +955,8 @@ mod tests {
                         "chunks_written": 6,
                         "unsupported": 0,
                         "errors": 0,
+                        "docs_deleted": 0,
+                        "docs_prunable": 0,
                     },
                     {
                         "store": "notes",
@@ -920,6 +966,8 @@ mod tests {
                         "chunks_written": 2,
                         "unsupported": 0,
                         "errors": 1,
+                        "docs_deleted": 0,
+                        "docs_prunable": 0,
                     },
                 ],
                 "total": {
@@ -929,6 +977,8 @@ mod tests {
                     "chunks_written": 8,
                     "unsupported": 0,
                     "errors": 1,
+                    "docs_deleted": 0,
+                    "docs_prunable": 0,
                 },
             })
         );

@@ -14,7 +14,14 @@
 //! - `NotModified` -> `on_skipped(Unchanged)` + `resources_skipped += 1`.
 //! - `FetchError` / `ParseFailed` (incl. parser panic and parser `Err`) ->
 //!   `on_skipped(Error)` + `errors += 1`.
-//! - `Gone` stays silent — no callback at all (delete-sweep contract).
+//! - `Gone` returns WITHOUT reporting anything — the caller decides, like
+//!   `Unsupported`/`Empty` below. `UrlIngestor` reports it via
+//!   `on_gone(uri)`, the positive "confirmed absent at the origin" signal
+//!   that deletes unconditionally (see `IngestCallback::on_gone`);
+//!   `FeedIngestor` folds it into its embedded-content fallback chain
+//!   instead. It used to stay silent and let the delete-sweep infer the
+//!   deletion from absence — no longer viable since #156, where absence
+//!   alone stopped being evidence.
 //! - `Unsupported` returns WITHOUT reporting anything — the caller decides:
 //!   `UrlIngestor` reports `on_skipped(Unsupported) + resources_skipped += 1`
 //!   immediately (preserving its existing behavior); `FeedIngestor` instead
