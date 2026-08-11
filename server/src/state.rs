@@ -330,14 +330,10 @@ impl AppState {
             }
         }
 
-        Ok(SourceRecord {
-            id,
-            store_id,
-            kind: kind.to_string(),
-            spec,
-            preset: preset.to_string(),
-            refresh: refresh.map(|s| s.to_string()),
-        })
+        // Return the row as persisted, not the raw request — defaults filled
+        // in during persistence (or future normalization) must be reflected
+        // in the 201 body so it matches a subsequent GET (#197).
+        source_row_to_record(source_row)
     }
 
     /// List sources for a store.
