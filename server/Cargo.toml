@@ -10,6 +10,9 @@ description = "HTTP API daemon: axum REST API, file watching, job queue, unix so
 localdb-core = { path = "../core" }
 store-libsql = { path = "../store-libsql" }
 embed = { path = "../embed" }
+extract = { path = "../extract" }
+fetch = { path = "../fetch" }
+ingest = { path = "../ingest" }
 mcp = { path = "../mcp" }
 async-trait = { workspace = true }
 axum = { workspace = true }

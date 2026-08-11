@@ -123,7 +123,6 @@ pub(crate) async fn run_embedded_index_with(
         chunker::ChunkerConfig,
         ingestion::{run_source_ingestion, DocumentIndex, IngestionConfig, SourceIngestionDeps},
         ingestor::Ingestor,
-        types::SourceSpec,
     };
 
     macro_rules! warn_or_default {
@@ -284,20 +283,17 @@ pub(crate) async fn run_embedded_index_with(
         // Build the concrete `Ingestor` for this source's kind — the CLI is
         // the composition root that wires I/O-owning `ingest` crate types
         // into the I/O-free `core` pipeline (specs/01-architecture.md §1).
+        // `ingest::build_ingestor_for_spec` is shared with the daemon's job
+        // execution engine (`server::job_exec`, issue #187) so both surfaces
+        // build identical ingestors from the same source spec.
         let parser_chain =
             extract::build_chain(&policy.parsers).expect("parser chain already validated above");
-        let ingestor: Box<dyn Ingestor> = match &source.spec {
-            SourceSpec::Path { .. } => Box::new(ingest::FileIngestor::new(Box::new(parser_chain))),
-            SourceSpec::Url { .. } => Box::new(ingest::UrlIngestor::new(
-                Box::new(parser_chain),
-                Box::new(url_fetcher.clone()),
-            )),
-            SourceSpec::Feed { .. } => Box::new(ingest::FeedIngestor::new(
-                Box::new(parser_chain),
-                Box::new(url_fetcher.clone()),
-                Box::new(entry_fetcher.clone()),
-            )),
-        };
+        let ingestor: Box<dyn Ingestor> = ingest::build_ingestor_for_spec(
+            &source.spec,
+            parser_chain,
+            &url_fetcher,
+            &entry_fetcher,
+        );
 
         let deps = SourceIngestionDeps {
             doc_index: &mut doc_index,

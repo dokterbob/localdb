@@ -112,6 +112,12 @@ async fn build_daemon_state(
         url_scheduler.clone(),
     )
     .await?;
+    // `AppState::new` above requires an already-built `UrlRefreshScheduler`
+    // (so sources can register with it), which is why this can't happen at
+    // `UrlRefreshScheduler::new` time — see that field's doc comment.
+    // Without this, `tick()`'s submitted jobs would fail every time with
+    // "no state attached" instead of running real ingestion (issue #187).
+    url_scheduler.attach_state(state.clone()).await;
 
     Ok((state, url_scheduler))
 }
@@ -821,26 +827,28 @@ mod tests {
 
         // Submit a job that upserts the chunk (simulating real ingestion).
         let job = queue
-            .submit("store-A", localdb_core::IndexJobScope::Store, move || {
-                // This closure runs on a blocking thread and produces the chunk data.
-                // In real ingestion, this would call run_source_ingestion.
-                tokio::runtime::Handle::current()
-                    .block_on(async {
-                        job_state_clone
-                            .backend()
-                            .retrieval_store(&job_store_id)
-                            .await?
-                            .upsert_chunks(chunks)
-                            .await
+            .submit(
+                "store-A",
+                localdb_core::IndexJobScope::Store,
+                move || async move {
+                    // In real ingestion, this would call run_source_ingestion.
+                    job_state_clone
+                        .backend()
+                        .retrieval_store(&job_store_id)
+                        .await
+                        .map_err(|e| format!("upsert failed: {}", e))?
+                        .upsert_chunks(chunks)
+                        .await
+                        .map_err(|e| format!("upsert failed: {}", e))?;
+                    Ok(localdb_core::IndexJobStats {
+                        docs_indexed: 1,
+                        chunks_written: 1,
+                        ..Default::default()
                     })
-                    .map_err(|e| format!("upsert failed: {}", e))?;
-                Ok(localdb_core::IndexJobStats {
-                    docs_indexed: 1,
-                    chunks_written: 1,
-                    ..Default::default()
-                })
-            })
-            .await;
+                },
+            )
+            .await
+            .unwrap();
 
         // Poll until the job completes.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);

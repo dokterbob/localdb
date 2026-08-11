@@ -12,6 +12,7 @@
 pub mod daemon;
 pub mod error;
 pub mod handlers;
+pub mod job_exec;
 pub mod job_queue;
 pub mod mcp_bridge;
 pub mod scheduler;

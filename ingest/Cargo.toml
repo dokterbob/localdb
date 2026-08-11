@@ -9,6 +9,7 @@ description = "Content-acquisition ingestors implementing core::ingestor::Ingest
 [dependencies]
 localdb-core = { path = "../core" }
 extract = { path = "../extract" }
+fetch = { path = "../fetch" }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
