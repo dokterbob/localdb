@@ -338,9 +338,11 @@ chunker so the content is still indexed in bounded chunks:
   paragraphs, even the single-line ones EPUB/HTML extraction emits, stay far below this cap.
 
 Both probes compare a *char* count against the target, which in production is a *token* count
-from the embedder's tokenizer — a deliberate heuristic, not an exact unit match (a run's char
-count is at least its token count, so the probes trip no later than a true token measure
-would, erring toward the bounded `code` chunker). Known limitation: scripts without
+from the embedder's tokenizer — a deliberate heuristic, not an exact unit match. The
+chars-per-token ratio is tokenizer-dependent: for whitespace-delimited text it is ≥ 1, so the
+probes trip no later than a true token measure would; BPE tokenizers can emit multiple tokens
+per char on CJK and rare scripts, inverting the direction — an accepted imprecision for
+content already covered by the CJK limitation above. Known limitation: scripts without
 inter-word whitespace (CJK, Thai, …) make a whole paragraph one "run", so long CJK prose trips
 the quality probe and gets char-aligned cuts in the `code` chunker; proper word segmentation is
 out of scope.

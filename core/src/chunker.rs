@@ -966,8 +966,13 @@ fn chunk_table(
                 &mut seq_in_block,
                 block_seq,
             );
+            // `chunk_code` computes spans relative to its input (`row`); rebase them onto
+            // the block so they keep the exact-slice contract (`row` borrows from
+            // `markdown`, so pointer arithmetic gives its byte offset).
+            let row_off = row.as_ptr() as usize - markdown.as_ptr() as usize;
             let row_chunks = chunk_code(resource_id, row, config, block_seq)?;
             for mut rc in row_chunks {
+                rc.span = Span::new(rc.span.start + row_off, rc.span.end + row_off);
                 rc.block_seq = block_seq;
                 rc.seq_in_block = seq_in_block;
                 seq_in_block += 1;
@@ -1781,8 +1786,17 @@ mod tests {
         assert!(!long_line.contains('\n'));
         let cfg = ChunkerConfig::prose();
         let target = cfg.resolved_target_tokens();
+        // The line is far longer than 8×target chars, i.e. it would have tripped the
+        // pre-#191 line-length probe; sanity-check that NEITHER current probe trips
+        // (these mirror the actual backstop branch conditions in `chunk_prose`):
         assert!(long_line.chars().count() > STRUCTURELESS_RUN_MULTIPLIER * target);
-        assert!(long_line.chars().count() < OVERLONG_LINE_MULTIPLIER * target);
+        let max_run = long_line
+            .split_whitespace()
+            .map(|w| w.chars().count())
+            .max()
+            .unwrap();
+        assert!(max_run <= STRUCTURELESS_RUN_MULTIPLIER * target);
+        assert!(long_line.chars().count() <= OVERLONG_LINE_MULTIPLIER * target);
         let chunks = chunk_prose("doc-below-guard", &long_line, &cfg, &WordSizer, 0).unwrap();
         assert!(chunks.len() >= 2, "expected multiple chunks");
         assert!(
@@ -2578,6 +2592,14 @@ mod tests {
                 c.text.chars().count() <= 2 * cfg.resolved_target_tokens(),
                 "fallback chunk must stay bounded: {} chars",
                 c.text.chars().count()
+            );
+            // The fallback's spans are rebased from row-relative to block-relative
+            // coordinates, so they must keep the exact-slice contract — a plausible
+            // span pointing at the wrong text would be worse than a placeholder.
+            assert_eq!(
+                &md[c.span.start..c.span.end],
+                c.text,
+                "oversized-row fallback span must slice the block to exactly the chunk text"
             );
         }
     }

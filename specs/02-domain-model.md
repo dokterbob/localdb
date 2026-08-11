@@ -314,9 +314,13 @@ MUST NOT reconstruct block text by concatenating chunk spans or chunk texts in s
 Two chunk shapes are exempt from the exact-slice equality; consumers MUST NOT slice
 `block.text` by span expecting it to equal `chunk.text` for them:
 
-- **Table chunks:** table chunk text is *reconstructed* Markdown — the header row is re-emitted
-  in every chunk — so no substring of the block corresponds to it. Table chunks carry the
-  placeholder span `(0, 0)`; their span is not meaningful.
+- **Reconstructed table chunks:** a table chunk's text is normally *reconstructed* Markdown —
+  the header row is re-emitted in every chunk — so no substring of the block corresponds to it.
+  These chunks carry the placeholder span `(0, 0)`; their span is not meaningful. Table blocks
+  that fall back to the code chunker (a malformed table with no recognizable header/separator
+  row, or a single row too large to fit a chunk) emit chunks with real spans that DO satisfy
+  the exact-slice contract. Rule of thumb for `block_kind == "table"`: a `(0, 0)` span is a
+  placeholder; a non-degenerate span slices exactly.
 - **Message chunks:** all `messages`-preset chunk text is prefixed with sender/timestamp
   metadata that is not part of any block's `text`. Sliding-window chunks additionally span
   multiple `Message`/`Segment` blocks — an explicit multi-block chunking mode — and carry the
