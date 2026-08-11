@@ -2,6 +2,9 @@
 .claude/worktrees/
 .omo/
 .claude/tmp/
+# Local CodeGraph index — a rebuildable cache of this checkout, per-machine
+# and large. Whether to index at all is each contributor's own choice.
+.codegraph/
 
 # Fetch-on-demand PDF corpus file (scripts/fetch_test_pdfs.sh): free to
 # download but not redistributable, so not vendored. The redistributable

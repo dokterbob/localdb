@@ -280,6 +280,30 @@ run synchronously inside `db migrate`:
 2. **In-DB rebuilds.** FTS5 rebuild, DiskANN index drop+recreate — single-statement runner steps
    that may take minutes. Acceptable because `db migrate` is explicit, not run silently on open,
    and reports per-step progress as it goes.
+
+   The shipped example is **v6 `shrink_vector_index`** (issues #179, #177), and it's worth
+   reading before writing another class-2 step because it illustrates the two things that make
+   this class safe:
+
+   - *It is class 2, not class 3.* `CREATE INDEX` on a vector index returns `CREATE_OK` rather
+     than `CREATE_OK_SKIP_REFILL`, so SQLite runs its normal refill and re-inserts every row
+     straight from `chunks.embedding`. No embedder is involved, so `needs_reindex` stays
+     `false`. Don't assume "the index is derived data, therefore re-embedding" — check whether
+     the source column is still there. (`store-libsql/tests/vector_index_cost.rs` asserts the
+     refill actually happens; an index that silently rebuilt *empty* would leave a store
+     unsearchable after a "successful" migration, which no schema-shape test would catch.)
+   - *Its rendered SQL depends on `MigrationContext`.* v6 emits different statements for
+     `Binary` than for `Float32` (and none at all for the latter, whose tuning was already
+     correct). That is supported — the runner renders per-context and the checksum is computed
+     from the rendered result — but it has a consequence: opening a store with the *wrong*
+     encoding now produces a checksum mismatch as well as a column mismatch. `LibsqlDb::open`
+     therefore validates the embedding column *before* verifying checksums, so the user gets
+     "embedding schema mismatch" rather than a misleading "migration drift" error. If you write
+     another context-dependent migration, keep that ordering in mind.
+
+   Class-2 steps free pages onto SQLite's free list without shrinking the file, so a migration
+   that reclaims significant space should leave the user pointed at `localdb db vacuum` —
+   `db migrate` does this automatically when `shrink_vector_index` applies to a binary store.
 3. **Re-embedding / re-extraction.** Not runnable by the store itself — the embedder and
    extractors live above `store-libsql`, and a migration step must not reach up into them (see
    the `RustStep` rules above). Instead, the migration only *marks* the work: bump

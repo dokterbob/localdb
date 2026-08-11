@@ -9,10 +9,13 @@
 //! download just to answer "what version is this store at". See
 //! `app_db::load_config_for_maintenance`'s doc comment.
 
-use localdb_core::{config::loader::ConfigLoader, Error};
+use std::path::Path;
+
+use localdb_core::{config::loader::ConfigLoader, Error, VectorEncoding};
 use serde_json::json;
 use store_libsql::{
-    downgrade_store, inspect_schema, migrate_store_with_progress, MigrationContext, SchemaStatus,
+    downgrade_store, inspect_schema, migrate_store_with_progress, vacuum_store, MigrateReport,
+    MigrationContext, SchemaStatus,
 };
 
 use crate::{
@@ -50,6 +53,77 @@ fn migration_context_from_config(config_loader: &ConfigLoader) -> Result<Migrati
         embedding_dim,
         encoding,
     })
+}
+
+/// Whether `db migrate`'s completion summary should point the user at
+/// `localdb db vacuum`.
+///
+/// Today that's exactly the case where the `shrink_vector_index` migration
+/// (v6, `store-libsql/src/migrations/chain.rs`) actually applied *and*
+/// rebuilt the index — its `up` step is a real `DROP INDEX`/`CREATE INDEX`
+/// (freeing pages onto SQLite's free list) only on `VectorEncoding::Binary`
+/// stores; on `Float32` stores it's bookkeeping-only and frees nothing, so
+/// the hint would be actively misleading there. Named by migration, not by a
+/// generic "this migration frees pages" flag on `Migration` — introduce that
+/// generalization if/when a second page-freeing migration lands, rather than
+/// speculatively building it for a chain of exactly one.
+///
+/// Pulled out as a pure function of `MigrateReport` so it's unit-testable
+/// without a real database.
+/// The schema version whose up-step rebuilds the DiskANN index.
+const SHRINK_VECTOR_INDEX_VERSION: i64 = 6;
+
+/// Whether `db migrate` is about to run the v6 index rebuild on this store.
+///
+/// Pure predicate over the pre-inspection, so it's unit-testable without a
+/// database. `pre.legacy` stores are excluded: a legacy rebuild recreates the
+/// schema from scratch at head rather than stepping the chain, so it never
+/// runs v6's up-step and never leaves a bloated old index behind.
+fn index_shrink_pending(pre: &SchemaStatus, encoding: VectorEncoding) -> bool {
+    encoding == VectorEncoding::Binary
+        && !pre.legacy
+        && pre.current_version < SHRINK_VECTOR_INDEX_VERSION
+        && pre.head_version >= SHRINK_VECTOR_INDEX_VERSION
+}
+
+/// Warn, before any work starts, that this migration will not shrink the file
+/// — it will briefly *grow* it.
+///
+/// The v6 rebuild writes a new, ~9x smaller index while the old one's pages go
+/// to the free list rather than back to the filesystem, so peak on-disk size
+/// during and after the migration exceeds the starting size until `db vacuum`
+/// runs. That ordering surprises people (issue #177 is someone running
+/// `VACUUM` *before* anything had been freed and concluding it did nothing),
+/// and the users most likely to hit it are disk-constrained by definition —
+/// they're here because a store grew to tens of GB. Reporting the current size
+/// up front lets them judge headroom before committing to a long operation,
+/// rather than discovering it partway through.
+///
+/// stderr in both human and `--json` modes, so `--json` stdout stays clean.
+fn warn_if_index_shrink_pending(pre: &SchemaStatus, mctx: &MigrationContext, path: &Path) {
+    if !index_shrink_pending(pre, mctx.encoding) {
+        return;
+    }
+    let current = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    eprintln!(
+        "note: this migration rebuilds the vector index (~9x smaller) by re-reading the \
+         stored embeddings — no re-embedding, but it does one index insert per chunk and \
+         can take a long time on a large store."
+    );
+    eprintln!(
+        "      it does NOT shrink the file: the space it frees goes to SQLite's free list, \
+         so '{}' ({}) will briefly grow before `localdb db vacuum` reclaims it.",
+        path.display(),
+        format_bytes(current),
+    );
+}
+
+fn vacuum_recommended(report: &MigrateReport, encoding: VectorEncoding) -> bool {
+    encoding == VectorEncoding::Binary
+        && report
+            .applied
+            .iter()
+            .any(|step| step.name == "shrink_vector_index")
 }
 
 /// Pending-migration count for `db status`: the number of chain entries
@@ -249,6 +323,8 @@ pub(crate) async fn run_db_migrate_async(ctx: &CliContext) {
         false
     };
 
+    warn_if_index_shrink_pending(&pre, &mctx, &path);
+
     // `None` in `--json` mode (stdout must stay clean JSON) or when stderr
     // isn't a terminal, `build_migration_progress_sink` still returns
     // `Some` for the piped case (bounded plain lines) — see its doc comment.
@@ -291,6 +367,8 @@ pub(crate) async fn run_db_migrate_async(ctx: &CliContext) {
         return;
     }
 
+    let vacuum_hint = vacuum_recommended(&report, mctx.encoding);
+
     if ctx.json {
         print_json(&json!({
             "status": "ok",
@@ -299,6 +377,7 @@ pub(crate) async fn run_db_migrate_async(ctx: &CliContext) {
             "steps": report.applied.len(),
             "legacy_rebuilt": report.legacy_rebuilt,
             "staleness_marked": report.staleness_marked,
+            "vacuum_recommended": vacuum_hint,
         }));
         return;
     }
@@ -319,6 +398,12 @@ pub(crate) async fn run_db_migrate_async(ctx: &CliContext) {
     }
     if report.staleness_marked {
         println!("hint: run `localdb index` to re-index stale content");
+    }
+    if vacuum_hint {
+        println!(
+            "hint: this migration shrank the vector index but freed pages stay in the file \
+             until reclaimed — run `localdb db vacuum` to shrink it on disk"
+        );
     }
 }
 
@@ -456,6 +541,77 @@ pub(crate) async fn run_db_downgrade_async(ctx: &CliContext, to: Option<i64>) {
             if report.steps.len() == 1 { "" } else { "s" }
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// db vacuum
+// ---------------------------------------------------------------------------
+
+/// Render a byte count as a human-readable size (binary units). Small enough
+/// not to warrant a dependency for it.
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// `localdb db vacuum`
+pub fn run_db_vacuum(ctx: &CliContext) {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(run_db_vacuum_async(ctx));
+}
+
+pub(crate) async fn run_db_vacuum_async(ctx: &CliContext) {
+    reject_store_flag(ctx);
+    let config_loader = load_config_for_maintenance(ctx);
+    refuse_if_daemon_running(ctx, &config_loader);
+
+    let path = config_loader.paths.db_path();
+
+    // VACUUM is data-safe — SQLite builds a full replacement file and swaps
+    // it in atomically, so an interrupted run leaves the original untouched
+    // — unlike the legacy-rebuild/downgrade paths above, which lose data and
+    // gate behind `confirm_destructive`. It's resource-heavy instead: warn
+    // rather than prompt. Printed to stderr in both human and `--json` modes
+    // so `--json` stdout stays clean.
+    eprintln!(
+        "vacuuming '{}': this rewrites the entire database file and needs roughly its current \
+         size again in free disk space; large stores can take minutes",
+        path.display()
+    );
+
+    let report = match vacuum_store(&path).await {
+        Ok(r) => r,
+        Err(e) => exit_err(&e, ctx.json),
+    };
+
+    if ctx.json {
+        print_json(&json!({
+            "status": "ok",
+            "size_before_bytes": report.size_before,
+            "size_after_bytes": report.size_after,
+            "bytes_reclaimed": report.bytes_reclaimed,
+            "duration_ms": report.duration.as_millis() as u64,
+        }));
+        return;
+    }
+
+    println!(
+        "vacuumed: {} -> {} ({} reclaimed, {:.1}s)",
+        format_bytes(report.size_before),
+        format_bytes(report.size_after),
+        format_bytes(report.bytes_reclaimed),
+        report.duration.as_secs_f64(),
+    );
 }
 
 #[cfg(test)]
@@ -615,5 +771,122 @@ mod tests {
         s.rows = vec![unsupported_row(5, "kept_migration", "n/a")];
 
         assert!(validate_downgrade_target(&s, 5).is_ok());
+    }
+
+    // -- vacuum_recommended / format_bytes --------------------------------
+
+    fn applied_step(name: &str) -> store_libsql::migrations::runner::AppliedStep {
+        store_libsql::migrations::runner::AppliedStep {
+            version: 6,
+            name: name.to_string(),
+            duration: std::time::Duration::from_millis(1),
+        }
+    }
+
+    fn migrate_report(
+        applied: Vec<store_libsql::migrations::runner::AppliedStep>,
+    ) -> MigrateReport {
+        MigrateReport {
+            from_version: 5,
+            to_version: 6,
+            applied,
+            legacy_rebuilt: false,
+            staleness_marked: false,
+        }
+    }
+
+    #[test]
+    fn index_shrink_pending_true_for_binary_store_below_v6() {
+        assert!(index_shrink_pending(
+            &status(5, 6, 4, false, true),
+            VectorEncoding::Binary
+        ));
+    }
+
+    #[test]
+    fn index_shrink_pending_false_for_float32_store() {
+        // v6's up-step renders zero statements for Float32 — nothing is
+        // rebuilt, nothing is freed, so the warning would be a lie.
+        assert!(!index_shrink_pending(
+            &status(5, 6, 4, false, true),
+            VectorEncoding::Float32
+        ));
+    }
+
+    #[test]
+    fn index_shrink_pending_false_when_already_at_or_past_v6() {
+        assert!(!index_shrink_pending(
+            &status(6, 6, 4, false, true),
+            VectorEncoding::Binary
+        ));
+    }
+
+    #[test]
+    fn index_shrink_pending_false_for_legacy_rebuild() {
+        // A legacy store is rebuilt from scratch at head rather than stepped
+        // through the chain, so v6's up-step never runs and no bloated index
+        // is left behind to reclaim.
+        assert!(!index_shrink_pending(
+            &status(2, 6, 4, true, true),
+            VectorEncoding::Binary
+        ));
+    }
+
+    #[test]
+    fn index_shrink_pending_false_when_binary_head_predates_v6() {
+        // An older binary whose compiled chain stops before v6 must not
+        // promise a rebuild it cannot perform.
+        assert!(!index_shrink_pending(
+            &status(5, 5, 4, false, true),
+            VectorEncoding::Binary
+        ));
+    }
+
+    #[test]
+    fn vacuum_recommended_true_when_shrink_vector_index_applied_on_binary_store() {
+        let report = migrate_report(vec![applied_step("shrink_vector_index")]);
+        assert!(vacuum_recommended(&report, VectorEncoding::Binary));
+    }
+
+    #[test]
+    fn vacuum_recommended_false_on_float32_store_even_if_migration_applied() {
+        // v6's up-step is a no-op on Float32 stores (already correctly
+        // tuned) — nothing was freed, so no hint should fire.
+        let report = migrate_report(vec![applied_step("shrink_vector_index")]);
+        assert!(!vacuum_recommended(&report, VectorEncoding::Float32));
+    }
+
+    #[test]
+    fn vacuum_recommended_false_when_migration_did_not_apply() {
+        let report = migrate_report(vec![applied_step("some_other_migration")]);
+        assert!(!vacuum_recommended(&report, VectorEncoding::Binary));
+    }
+
+    #[test]
+    fn vacuum_recommended_false_when_nothing_applied() {
+        let report = migrate_report(vec![]);
+        assert!(!vacuum_recommended(&report, VectorEncoding::Binary));
+    }
+
+    #[test]
+    fn vacuum_recommended_false_for_legacy_rebuild() {
+        // legacy_rebuilt never populates `applied` (it recreates the schema
+        // from scratch rather than stepping the chain), so this is covered
+        // by the "nothing applied" case above, but assert the shape
+        // explicitly since it's the one real-world path where a full rebuild
+        // (which *does* free plenty of pages) still shouldn't get this hint
+        // — `staleness_marked`'s reindex hint already covers that case.
+        let mut report = migrate_report(vec![]);
+        report.legacy_rebuilt = true;
+        assert!(!vacuum_recommended(&report, VectorEncoding::Binary));
+    }
+
+    #[test]
+    fn format_bytes_formats_across_units() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1536), "1.5 KiB");
+        assert_eq!(format_bytes(3 * 1024 * 1024), "3.0 MiB");
+        assert_eq!(format_bytes(2 * 1024 * 1024 * 1024), "2.0 GiB");
     }
 }

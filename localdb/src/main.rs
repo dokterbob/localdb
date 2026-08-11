@@ -218,6 +218,18 @@ pub enum DbCommand {
         #[arg(long, value_name = "VERSION")]
         to: Option<i64>,
     },
+
+    /// Reclaim disk space freed by prior migrations/deletes by rewriting the
+    /// whole database file (SQLite `VACUUM`).
+    ///
+    /// A schema migration (e.g. v6 `shrink_vector_index`) or an ordinary
+    /// bulk delete frees pages onto SQLite's own free list, but the file
+    /// itself does not shrink until something rewrites it — this does that.
+    /// Data-preserving (an interrupted VACUUM leaves the original file
+    /// untouched), but needs roughly the current file size again in free
+    /// disk space and can take minutes on a large store. Not store-scoped:
+    /// passing `--store` exits 2.
+    Vacuum,
 }
 
 /// Source management subcommands.
@@ -340,6 +352,7 @@ fn main() {
             DbCommand::Status => cli::run_db_status(&ctx),
             DbCommand::Migrate => cli::run_db_migrate(&ctx),
             DbCommand::Downgrade { to } => cli::run_db_downgrade(&ctx, *to),
+            DbCommand::Vacuum => cli::run_db_vacuum(&ctx),
         },
         Command::Index { source, strict } => cli::run_index(&ctx, source.as_deref(), *strict),
         Command::Search {
@@ -456,12 +469,23 @@ mod tests {
 
         let sub_names: Vec<&str> = db_cmd.get_subcommands().map(|sc| sc.get_name()).collect();
 
-        for expected in &["status", "migrate", "downgrade"] {
+        for expected in &["status", "migrate", "downgrade", "vacuum"] {
             assert!(
                 sub_names.contains(expected),
                 "db {expected} subcommand missing; found: {sub_names:?}",
             );
         }
+    }
+
+    /// `localdb db vacuum` parses with no arguments.
+    #[test]
+    fn db_vacuum_parses() {
+        assert!(matches!(
+            Cli::try_parse_from(["localdb", "db", "vacuum"])
+                .unwrap()
+                .command,
+            Command::Db(DbCommand::Vacuum)
+        ));
     }
 
     /// `localdb db downgrade --to N` parses `N` as an `i64`.

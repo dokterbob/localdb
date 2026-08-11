@@ -503,3 +503,77 @@ types, with DiskANN indexing via `libsql_vector_idx`.
   keeps `Float32`.
 - **Expected recall drop (binary):** ~2–4 pts on MTEB-ML vs float32 at 1024 dim; cushioned
   by the BM25+RRF hybrid. Future rerank via an int8 copy can recover the gap.
+
+#### Index tuning and the per-chunk cost model
+
+libsql stores every DiskANN node as a **fixed-size** blob, allocated with
+`sqlite3_bind_zeroblob(..., nBlockSize)` regardless of the node's actual degree. So the
+index has an exact, unavoidable per-chunk cost:
+
+```
+block_size = (node_vec_size + 16) + max_neighbors × (edge_vec_size + 16)
+```
+
+`max_neighbors` multiplies the edge width, which makes `compress_neighbors` the single
+largest lever on total database size. Hence the invariant:
+
+> **`compress_neighbors` must never be wider than the embedding column's own encoding.**
+> It is a *compression* only relative to a wider node vector. Against a narrower one it is
+> an inflation that buys no recall.
+
+Violating that invariant is what produced issue #179 (45 GB for ~600k chunks whose raw
+vectors are under 1 GB) and issue #177. `compress_neighbors=float8` was chosen in PR #92
+while a float32 column was in play, and was not revisited when the binary column landed. On
+an `F1BIT_BLOB` column libsql converts each source bit to `±1` and quantizes *that* to a
+byte, so every one of those 1032 edge bytes held only 0 or 255 — 8× the space for exactly
+the information the 128-byte node vector already carried, and therefore zero recall benefit.
+Pinning `max_neighbors=64` compounded it by overriding libsql's own guard rail, which caps
+edge overhead at 50× node overhead.
+
+Measured per-chunk cost at 1024 dimensions (read back from `libsql_vector_meta_shadow`, not
+derived — see `store-libsql/tests/vector_index_cost.rs`):
+
+| Column | `compress_neighbors` | `max_neighbors` | Bytes/chunk | 600k chunks |
+|---|---|---|---|---|
+| `F1BIT_BLOB` | *(none — schema v6)* | *(libsql default: 51)* | **7,488** | **4.5 GB** |
+| `F1BIT_BLOB` | `float8` (schema v5) | 64 | 67,216 | 40.3 GB |
+| `F32_BLOB` | `float8` | 64 | 71,184 | 42.7 GB |
+| `F32_BLOB` | *(none)* | *(libsql default: 51)* | 213,824 | 128 GB |
+
+The tuning is therefore **encoding-dependent**, and derived in exactly one place
+(`store-libsql`'s `vectors::vector_index_params`): binary columns pass `metric=cosine`
+alone, while float32 columns keep both parameters, because for a 4 KiB node vector `float8`
+edges are a genuine 4× compression and the bare default would be 3× *worse*.
+
+**Recall.** Dropping `compress_neighbors` is lossless by construction: libsql converts a 1-bit
+source to float8 by mapping each bit to `±1` and quantizing, giving exactly byte 0 or 255, so
+the float8 cosine distance is an exact zero-intercept linear rescaling of Hamming distance
+(`F8_distance = (2/dims) × Hamming`). RobustPrune's keep/drop decision is a *ratio* between two
+distances computed the same way, so it is invariant to the substitution. Dropping
+`max_neighbors` is a real change — degree 64 → 51, with no compensating change to the search
+beam (`insert_l`/`search_l` are fixed constants, unrelated to `max_neighbors`) — so it was
+measured, not argued: 6,000 clustered 1024-bit vectors, 200 held-out queries, recall@10 against
+exact brute-force ground truth, **6 independent index builds per configuration**:
+
+| Configuration | mean recall@10 | sd | min | max |
+|---|---|---|---|---|
+| v5 (`float8`, 64) | 0.5714 | 0.1164 | 0.3190 | 0.6625 |
+| v6 (1-bit, 51) | 0.5792 | 0.0609 | 0.5085 | 0.6695 |
+
+The difference in means is 0.15 standard errors — no detectable regression, and v6 is nominally
+better with half the variance.
+
+> **Benchmarking DiskANN here requires repeated builds.** `diskAnnSelectRandomShadowRow` picks
+> the graph traversal's entry point with SQL `RANDOM()`, and it is called *per inserted row* and
+> *per query*. Index construction is therefore nondeterministic, and its quality is bimodal:
+> across the 12 builds above, most landed near 0.6 but one v5 build landed at 0.32. A single
+> before/after comparison samples that distribution once and can show a 2× swing in either
+> direction — an earlier single-run pass of exactly this benchmark appeared to show a 32%
+> regression that repeated trials showed did not exist. Never gate a tuning change on one build.
+
+Schema v6 (`shrink_vector_index`) rebuilds an existing binary index into the new shape. The
+rebuild reads `chunks.embedding` directly — **no re-embedding and no model download** — but
+it is a DiskANN insert per chunk, so it is a long operation on a large store. The freed
+pages land on SQLite's freelist, so the file does not shrink until `localdb db vacuum` runs;
+this is why the `VACUUM` attempted in #177, *before* any rebuild had freed anything,
+correctly reclaimed nothing.
