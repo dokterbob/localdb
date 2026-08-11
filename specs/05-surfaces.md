@@ -513,3 +513,7 @@ contents could not be observed, and warn when they do. Documents a guard is prot
 counted as prunable — `--delete` would not remove them either.
 
 Both counters appear in `--json` output as `docs_deleted` and `docs_prunable`.
+
+`--delete` is **rejected with exit 2 when a daemon is running**: `POST /v1/jobs` carries no
+deletion policy, so a daemon-submitted job cannot prune. Silently downgrading to a non-pruning
+run would report success for a deletion that never happened. Stop the daemon and re-run.

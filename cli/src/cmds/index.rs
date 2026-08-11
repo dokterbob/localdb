@@ -372,6 +372,26 @@ pub(crate) async fn run_index_async(
     // single-store API (server/src/handlers/jobs.rs), so a multi-store scope
     // becomes one POST per store here rather than a batched request.
     if let DaemonState::Running { base_url } = probe_daemon(&data_dir, ctx.daemon_url.as_deref()) {
+        // `--delete` is refused rather than silently dropped here. `/v1/jobs`
+        // carries no deletion policy, and daemon-side ingestion is a no-op
+        // today anyway (docs/architecture.md#known-gaps, #187) — so honoring
+        // the flag is impossible and accepting it would report success for a
+        // prune that never ran. Threading a policy through a pipeline that
+        // does not execute would be worse: it would look supported.
+        //
+        // Refusing is also the rule this whole change exists to enforce, one
+        // level up: never let silence stand in for a fact you don't have.
+        if delete {
+            exit_err(
+                &Error::InvalidRequest {
+                    message: "`--delete` is not supported while the daemon is running: \
+                              daemon-submitted index jobs cannot prune. Stop the daemon \
+                              and re-run `localdb index --delete`."
+                        .to_string(),
+                },
+                ctx.json,
+            );
+        }
         let store_names =
             resolve_daemon_store_scope(&base_url, ctx, StoreScopePolicy::AllStores).await;
         run_daemon_index(ctx, &base_url, &store_names, source_id).await;
