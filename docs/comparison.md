@@ -233,12 +233,14 @@ table:
   [specs/06-roadmap.md](../specs/06-roadmap.md) ("tracked but unscheduled: entities/graph layer,
   metadata-only entities first, graph extraction only after baseline retrieval quality is
   proven") but is not designed or built. Basic Memory already has one.
-- **Ingestion via the HTTP daemon is a documented no-op.** True real-time (file-watch-triggered)
-  re-indexing is the intended shape of the daemon, but isn't live yet: `server/src/watcher.rs`
-  currently only watches for config-file changes in the running daemon, and `POST /v1/jobs` is a
-  no-op (see the README's What works today table and `core/src/ingestion.rs`, which notes the
-  daemon "adds file watching" as a T11 follow-up). Today, keeping an index current means running
-  `localdb index` again — incremental, but not automatic.
+- **File-watch-triggered re-indexing isn't live yet.** `POST /v1/jobs` itself runs real ingestion
+  through the daemon's async job queue ([#187](https://github.com/dokterbob/localdb/issues/187)),
+  and `localdb index` (embedded or daemon-attached) drives it with live progress — but nothing
+  yet *triggers* a job automatically when a watched file changes: `server/src/watcher.rs`
+  currently only watches for config-file changes in the running daemon, not path-source roots
+  (see `core/src/ingestion.rs`, which notes the daemon "adds file watching" as a T11 follow-up).
+  Today, keeping an index current still means running `localdb index` again — incremental, but
+  not automatic.
 
 ## Where localdb is headed that nobody else is
 

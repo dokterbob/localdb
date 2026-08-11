@@ -1,6 +1,6 @@
 # Spec 02 — Canonical Domain Model
 
-> Status: accepted draft, revised 2026-06-30. All entities live in the `core` crate and are
+> Status: accepted draft, revised 2026-08-11. All entities live in the `core` crate and are
 > shared by every surface. Field lists are normative for meaning, not for exact Rust types.
 >
 > **Supersedes:** the Markdown-native IR model (commit `3da56d0`). The block model is
@@ -336,10 +336,19 @@ Not a stored entity: the **canonical result shape** every surface uses (§6).
 
 ### IndexJob
 A unit of indexing work with observable state. Fields: `id` (ULID), `store_id`, `scope` (full
-store / one source / one resource), `state` (`pending` → `running` → `done` | `failed`),
-`stats` (resources seen/indexed/deleted, chunks written), `error`, timestamps. Embedded mode
-runs jobs synchronously but still records them; the daemon queues them
-([05-surfaces.md](05-surfaces.md) §3).
+store / one source / one resource — the one-resource variant, `IndexJobScope::Document`, is
+accepted by the type but currently unreachable: nothing constructs it, since `POST /v1/jobs` has
+no `resource_id` field), `state` (`pending` → `running` → `done` | `failed`), `stats`, `error`,
+timestamps. `stats` (`IndexJobStats`) carries `docs_seen`, `docs_indexed`, `docs_skipped`
+(unchanged content hash), `docs_deleted`, `docs_prunable` (would-have-been-deleted count under
+`DeletionPolicy::Retain`), `chunks_written`, `unsupported_format_count`, `error_count`, and
+`sources_count` (size of the job's resolved scope before processing, distinguishing "nothing to
+index" from "sources existed but nothing needed indexing"). Both embedded and daemon-submitted
+jobs run through the same async engine (`server::job_exec::run_job`, driven by a `JobQueue`) — the
+CLI's embedded mode spins up its own in-process, single-job `JobQueue` per invocation rather than
+running synchronously outside the job model; the daemon's `JobQueue` is long-lived and serves every
+job for the process's lifetime, one at a time per store (a per-store in-flight guard rejects a
+second concurrent submission with `index_in_progress`) ([05-surfaces.md](05-surfaces.md) §3).
 
 ## 3. ID scheme
 

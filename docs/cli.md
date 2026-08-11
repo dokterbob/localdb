@@ -884,14 +884,17 @@ For the full HTTP API reference see [docs/http-api.md](http-api.md).
 
 ### Known limitations (v0.1.0)
 
-- **Ingestion via `POST /v1/jobs` is a no-op.** ([#187](https://github.com/dokterbob/localdb/issues/187))
-  The daemon's job endpoint accepts the request, transitions the job state machine,
-  and reports `chunks_written: 0`. `localdb index` does **not** route around this:
-  when a daemon is running it proxies the job to that same no-op endpoint
-  (`cli/src/cmds/index.rs`), so indexing silently writes nothing. **Stop the daemon
-  first, then run `localdb index`.** Daemon-side reads (`/v1/search`,
-  `/v1/documents/{id}`, `/v1/status`) DO see CLI-indexed data, because the daemon
-  opens the same unified database (`<data_dir>/localdb.db`) as the CLI.
+- **`POST /v1/jobs` runs real ingestion.** ([#187](https://github.com/dokterbob/localdb/issues/187))
+  The daemon's job endpoint runs the actual ingestion pipeline through an async,
+  single-worker job queue with a per-store in-flight guard — a second submission
+  for a store already running gets `index_in_progress` (409). When a daemon is
+  running, `localdb index` (`cli/src/job_attach.rs`) submits a job and attaches to
+  its live progress over SSE (`GET /v1/jobs/{id}/events`, falling back to polling),
+  rendering an identical summary/`--json`/`--strict` to embedded mode; `--delete`
+  works daemon-attached too. Stopping the daemon before `localdb index` is no
+  longer necessary. Daemon-side reads (`/v1/search`, `/v1/documents/{id}`,
+  `/v1/status`) see the same data, because the daemon opens the same unified
+  database (`<data_dir>/localdb.db`) as the CLI.
 - **Stale socket after kill.** If the daemon process is killed without a clean
   shutdown, `daemon.sock` is not removed. Subsequent CLI commands report
   `daemon: running` but searches fail with `exit 5` (`daemon is unreachable`).

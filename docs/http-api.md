@@ -2,7 +2,7 @@
 
 > **EXPERIMENTAL — do not rely on this surface for production use.**
 >
-> The daemon opens the same unified database (`<data_dir>/localdb.db`) as the CLI, so CLI-indexed data IS visible via `/v1/search`, `/v1/documents/{id}`, and `/v1/status`. The one open limitation in v0.1.0 is that ingestion via `POST /v1/jobs` is a no-op ([#187](https://github.com/dokterbob/localdb/issues/187)) — and `localdb index` proxies to that same endpoint whenever a daemon is running, so it silently indexes nothing. **Stop the daemon first, then run `localdb index`.**
+> The daemon opens the same unified database (`<data_dir>/localdb.db`) as the CLI, so CLI-indexed data IS visible via `/v1/search`, `/v1/documents/{id}`, and `/v1/status`. Ingestion via `POST /v1/jobs` runs the real pipeline through an async job queue ([#187](https://github.com/dokterbob/localdb/issues/187)) — `localdb index` submits a job and attaches to its live progress (`GET /v1/jobs/{id}/events`, SSE) whenever a daemon is running, with identical output to embedded mode; you no longer need to stop the daemon first. It remains experimental as a surface: write concurrency across processes is SQLite WAL + `busy_timeout=5000`, not a dedicated lock.
 >
 > For design rationale see [specs/05-surfaces.md](../specs/05-surfaces.md) §3.
 
@@ -81,7 +81,32 @@ curl -s http://127.0.0.1:7700/v1/status
 ```
 
 ```json
-{"daemon":true,"store_count":1,"source_count":0,"job_count":0}
+{
+    "daemon": true,
+    "store_count": 1,
+    "source_count": 0,
+    "job_count": 0,
+    "stores": [
+        {
+            "name": "notes",
+            "visibility": "private",
+            "backend": "libsql",
+            "document_count": 3,
+            "chunk_count": 30
+        }
+    ],
+    "database": {
+        "path": "/path/to/data/localdb.db",
+        "exists": true,
+        "size_bytes": 90112,
+        "wal_size_bytes": 0,
+        "total_size_bytes": 90112,
+        "bytes_per_chunk": 3003,
+        "largest_tables": [
+            {"name": "chunks", "bytes": 65536}
+        ]
+    }
+}
 ```
 
 | Field | Type | Description |
@@ -90,6 +115,17 @@ curl -s http://127.0.0.1:7700/v1/status
 | `store_count` | int | Number of stores known to this daemon instance |
 | `source_count` | int | Total sources across all stores |
 | `job_count` | int | Number of jobs ever created in this daemon session |
+| `stores[].document_count` / `stores[].chunk_count` | int\|null | Per-store `RetrievalStore::stats()` figures; `null` if that store's stats call itself failed (a corrupt or mid-migration store must not blank out the report on the others) |
+| `database.path` | string | Path to the shared `localdb.db` file — one physical file backs every store, so this is reported once, not per-store |
+| `database.exists` | bool | Whether the file exists yet (`false` before the first `store add`/`index`) |
+| `database.size_bytes` / `database.wal_size_bytes` | int\|null | Bytes in the main file / `-wal` sidecar; `null` if a stat fails |
+| `database.total_size_bytes` | int | `size_bytes + wal_size_bytes` (missing components treated as 0) — what the disk actually has allocated right now |
+| `database.bytes_per_chunk` | int\|null | `total_size_bytes` divided by the sum of every store's `chunk_count`; `null` with no chunks |
+| `database.largest_tables` | array | Up to 5 `{name, bytes}` rows, the largest on-disk tables via SQLite's `dbstat`, descending; best-effort — empty if `dbstat` querying fails |
+
+This is the same shape the embedded CLI's `localdb status --json` reports (see
+[specs/05-surfaces.md](../specs/05-surfaces.md) §2.4) — daemon-routed and embedded `status`
+render identically.
 
 ---
 
@@ -106,6 +142,7 @@ curl -s http://127.0.0.1:7700/v1/stores
     "items": [
         {
             "name": "notes",
+            "id": "01KTVGQ62TQN8X6XN9E5FDZN67",
             "visibility": "private",
             "backend": "libsql"
         }
@@ -128,6 +165,7 @@ curl -s http://127.0.0.1:7700/v1/stores/notes
 ```json
 {
     "name": "notes",
+    "id": "01KTVGQ62TQN8X6XN9E5FDZN67",
     "visibility": "private",
     "backend": "libsql"
 }
@@ -244,8 +282,10 @@ Each citation in `citations` follows the canonical Citation shape defined in
 
 ### `POST /v1/jobs`
 
-Submit an index job for a store. The daemon processes the job asynchronously; poll
-`GET /v1/jobs/{id}` for progress.
+Submit an index job for a store. This runs the real ingestion pipeline
+(`server::job_exec::run_job`) through an async, single-worker job queue (issue #187) — the
+daemon processes the job asynchronously, in the background; poll `GET /v1/jobs/{id}` or stream
+`GET /v1/jobs/{id}/events` for progress.
 
 **Request body:**
 
@@ -253,6 +293,7 @@ Submit an index job for a store. The daemon processes the job asynchronously; po
 |---|---|---|---|
 | `store_name` | string | yes | Name of the store to index |
 | `source_id` | string | no | Index only this source; omit to index the whole store |
+| `deletion_policy` | string | no | `"retain"` (default) — never removes documents; `"delete"` — prunes documents no longer present at their source (mirrors CLI `index --delete`). Any other value is `invalid_request`, 400 |
 
 ```
 curl -s -X POST http://127.0.0.1:7700/v1/jobs \
@@ -261,13 +302,20 @@ curl -s -X POST http://127.0.0.1:7700/v1/jobs \
 ```
 
 ```json
-{"id":"01KTVM5XMA59N4WGHNZ80QX9B7","store_id":"notes","scope":{"type":"store"},"state":"pending","stats":{"docs_seen":0,"docs_indexed":0,"docs_deleted":0,"chunks_written":0,"unsupported_format_count":0,"error_count":0},"error":null,"created_at":"2026-06-11T15:17:59Z","started_at":null,"completed_at":null}
+{"id":"01KTVM5XMA59N4WGHNZ80QX9B7","store_id":"notes","scope":{"type":"store"},"state":"pending","stats":{"docs_seen":0,"docs_indexed":0,"docs_skipped":0,"docs_deleted":0,"docs_prunable":0,"chunks_written":0,"unsupported_format_count":0,"error_count":0,"sources_count":0},"error":null,"created_at":"2026-06-11T15:17:59Z","started_at":null,"completed_at":null}
 ```
 
 > If you pass `"store"` instead of `"store_name"` the server returns a 422-style deserialisation
 > error: `Failed to deserialize the JSON body into the target type: missing field 'store_name'`
 > (followed by a line/column offset). Unknown keys are ignored rather than rejected —
 > `CreateJobRequest` does not set `deny_unknown_fields`.
+
+A second `POST /v1/jobs` for a store that already has a job queued or running is rejected with
+`index_in_progress`, 409 (see [Error responses](#error-responses)) — the in-flight guard is
+per-store, reserved atomically before the job is created, so two concurrent submissions for the
+same store can never both proceed. Jobs against different stores run concurrently; a single
+sequential worker processes the queue (a worker-pool size >1 is a follow-up, not a correctness
+issue, since the per-store guard already prevents same-store overlap).
 
 ---
 
@@ -288,12 +336,15 @@ curl -s http://127.0.0.1:7700/v1/jobs/01KTVM5XMA59N4WGHNZ80QX9B7
     },
     "state": "done",
     "stats": {
-        "docs_seen": 0,
-        "docs_indexed": 0,
+        "docs_seen": 3,
+        "docs_indexed": 3,
+        "docs_skipped": 0,
         "docs_deleted": 0,
-        "chunks_written": 0,
+        "docs_prunable": 0,
+        "chunks_written": 12,
         "unsupported_format_count": 0,
-        "error_count": 0
+        "error_count": 0,
+        "sources_count": 1
     },
     "error": null,
     "created_at": "2026-06-11T15:17:59Z",
@@ -308,7 +359,7 @@ curl -s http://127.0.0.1:7700/v1/jobs/01KTVM5XMA59N4WGHNZ80QX9B7
 |---|---|---|
 | `id` | string | ULID job identifier |
 | `store_id` | string | Store name the job runs against |
-| `scope` | object | `{"type":"store"}` for a full-store index |
+| `scope` | object | `{"type":"store"}` for a full-store index, `{"type":"source","source_id":"..."}` for one source. `{"type":"document","resource_id":"..."}` also exists in the type but is currently unreachable — `POST /v1/jobs` has no `resource_id` field to construct it |
 | `state` | string | `"pending"`, `"running"`, `"done"`, or `"failed"` |
 | `stats` | object | Running counters (see below) |
 | `error` | string\|null | Error message if the job failed |
@@ -322,13 +373,57 @@ curl -s http://127.0.0.1:7700/v1/jobs/01KTVM5XMA59N4WGHNZ80QX9B7
 |---|---|
 | `docs_seen` | Files/URLs examined |
 | `docs_indexed` | New or changed documents ingested |
-| `docs_deleted` | Documents removed because the source file is gone |
+| `docs_skipped` | Documents skipped (unchanged content hash) |
+| `docs_deleted` | Documents removed because the source is gone (only ever non-zero with `deletion_policy: "delete"`) |
+| `docs_prunable` | Documents that would have been deleted had `deletion_policy: "delete"` been requested — always 0 on a run that actually deleted (they were removed and counted in `docs_deleted` instead) |
 | `chunks_written` | Chunks written to the vector store |
 | `unsupported_format_count` | Files skipped due to unrecognised format |
 | `error_count` | Per-document errors |
+| `sources_count` | Number of sources the job's scope resolved to, before any were processed — distinguishes "nothing to index" (0) from "sources existed but nothing needed indexing" (>0, other counters possibly still 0) |
 
-SSE progress streaming is on the roadmap (see [specs/06-roadmap.md](../specs/06-roadmap.md) §5);
-the job resource shape is designed so SSE adds a new representation without changing the model.
+---
+
+### `GET /v1/jobs/{id}/events`
+
+Stream a job's live progress as [Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events) (issue #83).
+
+```
+curl -N -H 'Accept: text/event-stream' http://127.0.0.1:7700/v1/jobs/01KTVM5XMA59N4WGHNZ80QX9B7/events
+```
+
+Each in-flight update is an `event: progress` frame, `data:` a JSON-serialized
+`core::ProgressEvent` (internally tagged on `type`):
+
+```
+event: progress
+data: {"type":"source_started","source_id":"01K...","location":"/path/to/docs"}
+
+event: progress
+data: {"type":"discovered","total":3}
+
+event: progress
+data: {"type":"document_started","uri":"file:///path/to/docs/a.md","index":0,"total":3}
+
+event: progress
+data: {"type":"document_finished","uri":"file:///path/to/docs/a.md","outcome":{"outcome":"indexed","chunks":4}}
+```
+
+The stream always ends with exactly one `event: job` frame carrying the terminal `IndexJob` (the
+same shape `GET /v1/jobs/{id}` returns, `state` either `"done"` or `"failed"`), after which the
+connection closes:
+
+```
+event: job
+data: {"id":"01KTVM5XMA59N4WGHNZ80QX9B7","store_id":"notes","scope":{"type":"store"},"state":"done","stats":{...},"error":null,"created_at":"...","started_at":"...","completed_at":"..."}
+```
+
+A client that connects after the job has already reached a terminal state — or after its live
+progress channel has already been torn down — receives *only* that terminal `job` event,
+immediately; it never sees the `progress` events it missed. Progress delivery is
+lossy/best-effort by design (a lagging subscriber skips ahead rather than stalling the stream or
+buffering unboundedly), but the terminal `job` event is always guaranteed exactly once. Unknown
+`job_id` → `job_not_found`, 404, as an ordinary JSON error response (not an SSE frame — the 404
+happens before the stream opens).
 
 ---
 

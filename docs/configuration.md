@@ -82,8 +82,8 @@ server:
 | `port` | `7700` | Set to `0` to let the OS assign an ephemeral port |
 
 > **Experimental:** the HTTP daemon is an early preview. It opens the same unified database
-> (`<data_dir>/localdb.db`) as the CLI, so CLI-indexed data IS visible. The one open limitation
-> is that ingestion via `POST /v1/jobs` is a no-op. See [Daemon limitations](#daemon-limitations).
+> (`<data_dir>/localdb.db`) as the CLI, so CLI-indexed data IS visible, and `POST /v1/jobs` runs
+> real ingestion through an async job queue. See [Daemon limitations](#daemon-limitations).
 
 ---
 
@@ -205,12 +205,13 @@ No such file or directory (os error 2)
 
 The HTTP daemon (`localdb serve`) is an **experimental preview** in v1. Key limitations:
 
-- **Ingestion via `POST /v1/jobs` is a no-op.** The endpoint accepts the request, transitions
-  the job state machine (`pending → done`), and reports `chunks_written: 0`. To actually index,
-  run `localdb index` from the CLI — this works while the daemon is running because both
-  processes share the same unified database and concurrent writers serialise via SQLite WAL
-  + `busy_timeout=5000`. Daemon-side reads (`/v1/search`, `/v1/documents/{id}`, `/v1/status`)
-  see CLI-indexed data correctly.
+- **`POST /v1/jobs` runs real ingestion**, through an async, single-worker job queue with a
+  per-store in-flight guard (a second submission for a store already running gets
+  `index_in_progress`, 409). `localdb index` submits a job and attaches to its live progress
+  (`GET /v1/jobs/{id}/events`, SSE, falling back to polling) whenever a daemon is running, with
+  output identical to embedded mode; concurrent writers (CLI and daemon alike) serialise via
+  SQLite WAL + `busy_timeout=5000`. Daemon-side reads (`/v1/search`, `/v1/documents/{id}`,
+  `/v1/status`) see the same data.
 - **Stale socket after a crash.** If the daemon process is killed (not stopped cleanly), the
   unix socket `<data_dir>/daemon.sock` is not cleaned up. Subsequent CLI commands report
   `daemon: running` and searches exit with `error: daemon is unreachable` (exit 5).
