@@ -148,6 +148,10 @@ Additional rules:
   completed so far>]}` to stdout, then exits with the failing error's normal exit code, instead of
   routing through the usual stderr-only error shape. The buffered `results` are output data, not
   merely an error message, so — like every other `--json` document — they belong on stdout.
+- `source add`'s per-item output — `{"id": ..., "store": {"name": ...}, "kind": ...}` per source,
+  wrapped as described above — is identical whether the source was persisted locally or via a
+  daemon; the daemon transport never echoes its own raw persisted-record response. Text mode is
+  likewise identical either way (`Added source <id> to store '<name>'`, no daemon-specific suffix).
 
 ### 2.3 Feed sources
 
@@ -223,19 +227,26 @@ later if a consumer demands it).
   exposed this makes them. The daemon also records its client-reachable base URL (loopback
   substituted for a wildcard bind) in a discovery file so CLI/MCP clients can find it regardless
   of bind address or port ([01-architecture.md](01-architecture.md) §3).
-- **Resources** (`/v1`): `GET/POST /stores`, `GET/PATCH/DELETE /stores/{id}`,
-  `GET/POST /stores/{id}/sources`, `POST /search` (body: query, store filter, metadata filters,
-  limit; citations carry full `Metadata`), `GET /resources/{id}` (response includes
+- **Resources** (`/v1`): `GET/POST /stores`, `GET/PATCH/DELETE /stores/{name}`,
+  `GET/POST /stores/{name}/sources`, `POST /search` (body: query, store filter, metadata filters,
+  limit; citations carry full `Metadata`), `GET /documents/{id}` (response includes
   `metadata: Metadata`), `POST /jobs` (index requests), `GET /jobs/{id}`, `GET /jobs/{id}/events`
   (SSE, below), `GET /status`, `GET /config` (resolved config). Store records (`GET/POST /stores`,
-  `GET /stores/{id}`) include `id` alongside `name`/`visibility`/`backend`.
-- **Feed sources:** `POST /stores/{id}/sources` accepts `{kind: "feed", spec: {url, max_entries,
+  `GET /stores/{name}`) include `id` alongside `name`/`visibility`/`backend`. Despite the
+  `{name}` path param, stores are still looked up and returned with their `id` intact — `{name}`
+  is only how the route addresses *which* store, not a claim that `id` is dropped from the shape.
+- **Feed sources:** `POST /stores/{name}/sources` accepts `{kind: "feed", spec: {url, max_entries,
   fetch_full_content}, preset, refresh}` — `spec` mirrors `SourceSpec::Feed`
   ([02-domain-model.md](02-domain-model.md) §2). Validation failures (`max_entries: 0`, a
   non-`http(s)` `url`, etc.) are `invalid_request`, 400. `GET .../sources` reconstructs a clean
   `spec` object per source from `config_json` (never the raw column) and now surfaces `refresh`
   for both `url` and `feed` sources. Feed's `refresh` is persisted and validated the same as
-  `url`'s but is currently inert — no scheduled refresh runs yet for either kind.
+  `url`'s, but only `url`-source scheduled refresh is actually live: the daemon's URL-refresh
+  scheduler (`server::scheduler`) polls every 60s and submits a real job through the same job
+  engine `POST /jobs` uses for any `url` source past its `refresh` interval. Feed-source scheduled
+  refresh is not yet wired — the scheduler only ever registers `SourceKind::Url` sources, so a
+  feed source's `refresh` is persisted and round-tripped but has no effect until a manual
+  `POST /jobs` (or CLI `index`) runs.
 - **Long-running work:** indexing is a **job resource**, and `POST /jobs` runs the real ingestion
   pipeline (`server::job_exec::run_job`) through an async, single-worker queue (issue #187) — not
   a stub. Body: `{store_name, source_id?, deletion_policy?}`; `store_name` is required, `source_id`

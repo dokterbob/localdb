@@ -6,6 +6,7 @@
 
 pub mod backend;
 pub mod block;
+pub mod blocking;
 pub mod chunker;
 pub mod citation;
 pub mod config;
@@ -36,6 +37,7 @@ pub use block::{
     Block, BlockKind, BlockLocation, BoundingBox, ChunkLocation, IngestorKind, Resource,
     ResourceKind,
 };
+pub use blocking::run_blocking;
 pub use chunker::{chunk_blocks, CharSizer, ChunkOutput, ChunkSizer, ChunkerConfig, TokenSizer};
 /// Re-export key types at the crate root for convenience.
 pub use citation::Citation;

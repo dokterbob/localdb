@@ -510,6 +510,111 @@ async fn sse_events_late_subscribe_yields_only_terminal_job_event() {
     assert_eq!(body["id"], job_id);
 }
 
+/// Issue #187 review, finding 4d: forces `broadcast::error::RecvError::Lagged`
+/// on a real, already-subscribed `GET /v1/jobs/{id}/events` receiver and
+/// proves `next_job_event`'s `Err(Lagged(_)) => continue` (`handlers/jobs.rs`)
+/// still lets the stream reach its terminal `job` event afterward — progress
+/// is documented as lossy-tolerant, but the terminal event is not.
+///
+/// Built around a `JobQueue::new_with_event_capacity(2)` (instead of the
+/// production 1024) and a job whose task blocks on a `oneshot` until the
+/// test releases it, so this can deterministically:
+/// 1. Subscribe (via the real HTTP route, before the task sends anything).
+/// 2. Inject 5 synthetic events directly on the channel's `Sender` (via the
+///    test-only `test_progress_sender` accessor) — well over the capacity of
+///    2, guaranteed to lag the subscriber before it ever polls, with no
+///    task-scheduling race to win.
+/// 3. Release the task, letting the job complete and its channel close.
+/// 4. Drain the SSE body and assert on what actually arrived.
+#[tokio::test]
+async fn sse_events_lagged_subscriber_still_receives_terminal_job_event() {
+    use localdb_core::{IndexJobScope, IndexJobStats, ProgressEvent};
+
+    // Capacity 2, so 5 injected events guarantee at least one `Lagged`.
+    let queue = crate::job_queue::JobQueue::new_with_event_capacity(2);
+    let (_dir, app) = super::common::make_app_with_queue(queue.clone()).await;
+
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+    let job = queue
+        .submit(
+            "lag-store",
+            IndexJobScope::Store,
+            move |_progress| async move {
+                // Blocks until the test has finished manipulating the channel
+                // directly, so the job stays non-terminal (and its channel open)
+                // for exactly as long as the test needs.
+                let _ = done_rx.await;
+                Ok(IndexJobStats::default())
+            },
+        )
+        .await
+        .expect("submit should succeed against an empty in-flight set");
+    let job_id = job.id.clone();
+
+    // Real HTTP request: `job_events` subscribes to the channel as part of
+    // building the response (the job is not yet terminal — its task is
+    // still blocked on `done_rx`), before the stream body is ever polled.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/jobs/{}/events", job_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Inject synthetic events directly on the channel, bypassing the task
+    // entirely — deterministic, no scheduling race with the subscriber
+    // above (which hasn't polled the stream yet: `resp`'s body has not been
+    // read at all at this point).
+    let raw_tx = queue
+        .test_progress_sender(&job_id)
+        .await
+        .expect("job channel should still be open (task hasn't completed)");
+    for i in 0..5usize {
+        raw_tx
+            .send(ProgressEvent::Discovered { total: i })
+            .expect("subscriber above should still be attached to receive this");
+    }
+    // Drop this Sender clone before completing the job, so the queue's own
+    // internal Sender (removed from the registry once the job goes
+    // terminal) is the one whose drop actually closes the channel.
+    drop(raw_tx);
+
+    // Let the task finish now that the channel has been manipulated.
+    let _ = done_tx.send(());
+
+    let bytes = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        axum::body::to_bytes(resp.into_body(), usize::MAX),
+    )
+    .await
+    .expect("SSE stream did not terminate in time — a Lagged receiver must still see Closed")
+    .unwrap();
+    let body = String::from_utf8(bytes.to_vec()).unwrap();
+    let frames = parse_sse_frames(&body);
+
+    // Exactly one terminal `job` frame must survive, regardless of how many
+    // `progress` frames a lagging receiver did or didn't see.
+    let job_frames: Vec<&SseFrame> = frames.iter().filter(|f| f.event == "job").collect();
+    assert_eq!(
+        job_frames.len(),
+        1,
+        "expected exactly one terminal job frame despite the forced lag, got frames: {:?}",
+        frames.iter().map(|f| &f.event).collect::<Vec<_>>()
+    );
+    let final_job: serde_json::Value = serde_json::from_str(&job_frames[0].data).unwrap();
+    assert_eq!(final_job["id"], job_id, "{:?}", final_job);
+    assert_eq!(
+        final_job["state"], "done",
+        "the terminal event must still report the job's real final state: {:?}",
+        final_job
+    );
+}
+
 #[tokio::test]
 async fn sse_events_unknown_job_returns_404() {
     let (_dir, app) = make_app().await;

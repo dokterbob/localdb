@@ -12,6 +12,15 @@ use crate::handlers::{
 use crate::state::AppState;
 
 pub(crate) async fn make_app() -> (TempDir, Router) {
+    make_app_with_queue(crate::job_queue::JobQueue::new()).await
+}
+
+/// Like [`make_app`], but with a caller-supplied `JobQueue` instead of a
+/// fresh `JobQueue::new()` — lets a test build the app around a queue
+/// constructed via `JobQueue::new_with_event_capacity` (issue #187 review,
+/// finding 4d), so it can force `RecvError::Lagged` on the real `GET
+/// /v1/jobs/{id}/events` route without needing 1024+ real progress events.
+pub(crate) async fn make_app_with_queue(queue: crate::job_queue::JobQueue) -> (TempDir, Router) {
     let dir = tempfile::tempdir().unwrap();
     let yaml_config = localdb_core::config::schema::RawConfig {
         version: 1,
@@ -29,7 +38,6 @@ pub(crate) async fn make_app() -> (TempDir, Router) {
         },
         providers: vec![],
     };
-    let queue = crate::job_queue::JobQueue::new();
     let state = AppState::new(
         yaml_config,
         dir.path().to_path_buf(),

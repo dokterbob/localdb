@@ -91,6 +91,12 @@ pub struct JobQueue {
     registry: JobRegistry,
     inflight: InFlightSet,
     events: EventRegistry,
+    /// Capacity of each job's progress-event broadcast channel — normally
+    /// `EVENT_CHANNEL_CAPACITY`, shrinkable in tests via
+    /// `new_with_event_capacity` (issue #187 review, finding 4d) so a test
+    /// can force `broadcast::error::RecvError::Lagged` deterministically
+    /// with only a handful of events instead of needing 1024+.
+    event_capacity: usize,
 }
 
 impl JobQueue {
@@ -98,6 +104,22 @@ impl JobQueue {
     ///
     /// Returns the queue handle. The worker runs until the sender is dropped.
     pub fn new() -> Self {
+        Self::with_event_capacity(EVENT_CHANNEL_CAPACITY)
+    }
+
+    /// Test-only: identical to [`JobQueue::new`], but with a caller-chosen
+    /// progress-event broadcast channel capacity instead of the production
+    /// `EVENT_CHANNEL_CAPACITY` (1024). Exists so a test exercising `GET
+    /// /v1/jobs/{id}/events`'s `RecvError::Lagged` handling (see
+    /// `next_job_event` in `handlers/jobs.rs`) can overflow the channel with
+    /// a handful of events rather than needing to actually produce 1024+
+    /// real progress events. Production behavior (`new()`) is unaffected.
+    #[cfg(test)]
+    pub(crate) fn new_with_event_capacity(capacity: usize) -> Self {
+        Self::with_event_capacity(capacity)
+    }
+
+    fn with_event_capacity(event_capacity: usize) -> Self {
         let (sender, receiver) = mpsc::channel::<QueuedJob>(QUEUE_CAPACITY);
         let registry: JobRegistry = Arc::new(RwLock::new(HashMap::new()));
         let inflight: InFlightSet = Arc::new(RwLock::new(HashSet::new()));
@@ -115,6 +137,7 @@ impl JobQueue {
             registry,
             inflight,
             events,
+            event_capacity,
         }
     }
 
@@ -165,7 +188,7 @@ impl JobQueue {
         // Create this job's progress-event channel and the sink that feeds
         // it, before enqueuing — so `subscribe(job_id)` works the instant
         // `submit` returns, even before the worker has picked the job up.
-        let (tx, _rx) = broadcast::channel::<ProgressEvent>(EVENT_CHANNEL_CAPACITY);
+        let (tx, _rx) = broadcast::channel::<ProgressEvent>(self.event_capacity);
         {
             let mut events = self.events.write().await;
             events.insert(job_id.clone(), tx.clone());
@@ -227,6 +250,24 @@ impl JobQueue {
     pub async fn subscribe(&self, job_id: &str) -> Option<broadcast::Receiver<ProgressEvent>> {
         let events = self.events.read().await;
         events.get(job_id).map(|tx| tx.subscribe())
+    }
+
+    /// Test-only: a clone of a live job's progress-event `Sender`, for
+    /// injecting synthetic events directly (bypassing the job's own task and
+    /// its `ProgressSink`) — lets a test force
+    /// `broadcast::error::RecvError::Lagged` on an already-subscribed
+    /// receiver deterministically (send more than the channel's capacity,
+    /// with no task-scheduling race), rather than trying to win a timing
+    /// race against a real task's own progress reporting. `None` once the
+    /// job is terminal and its channel entry has been removed, same as
+    /// `subscribe`.
+    #[cfg(test)]
+    pub(crate) async fn test_progress_sender(
+        &self,
+        job_id: &str,
+    ) -> Option<broadcast::Sender<ProgressEvent>> {
+        let events = self.events.read().await;
+        events.get(job_id).cloned()
     }
 }
 
@@ -682,6 +723,7 @@ mod tests {
             registry: Arc::new(RwLock::new(HashMap::new())),
             inflight: Arc::new(RwLock::new(HashSet::new())),
             events: Arc::new(RwLock::new(HashMap::new())),
+            event_capacity: EVENT_CHANNEL_CAPACITY,
         };
 
         let job = queue

@@ -181,9 +181,16 @@ impl Ingestor for FileIngestor {
             // surfaced via `on_skipped` + `SkipReason::Error` (a panic IS an
             // error, matching the old pipeline's behavior of folding panics
             // into the error count, C8) rather than the benign-skip counter.
-            let parsed = match catch_panic(std::panic::AssertUnwindSafe(|| {
-                self.parser.parse(&probe)
-            })) {
+            //
+            // `Parser::parse` is documented sync/CPU-bound (`core::parser`);
+            // this may run under the daemon's shared HTTP/SSE-serving tokio
+            // runtime (issue #187 real ingestion), so it's guarded with
+            // `run_blocking` rather than called inline — see
+            // `core::blocking::run_blocking`'s doc comment for why that's
+            // `block_in_place`-on-multi-thread rather than a bare call.
+            let parsed = match localdb_core::run_blocking(|| {
+                catch_panic(std::panic::AssertUnwindSafe(|| self.parser.parse(&probe)))
+            }) {
                 Err(panic_msg) => {
                     // Debug: `core::ingestion` owns the user-facing WARN.
                     tracing::debug!(uri = %file.uri, "FileIngestor: parser panicked: {}", panic_msg);
@@ -465,6 +472,32 @@ mod tests {
             // Parity fix: policy_version comes from the source, not "v1".
             assert_eq!(res.policy_version, "policy-xyz");
         }
+    }
+
+    /// Issue #187 review finding 2: `self.parser.parse(&probe)` is guarded
+    /// with `localdb_core::run_blocking` (`core::blocking`) because it may
+    /// now run under the daemon's shared multi-thread tokio runtime.
+    /// `run_blocking` takes its `block_in_place` branch only on a
+    /// multi-thread runtime — the default `#[tokio::test]` used by every
+    /// other test in this module is current-thread, so it never exercises
+    /// that branch. This test forces `flavor = "multi_thread"` so a real
+    /// end-to-end file ingestion actually drives the `block_in_place` path
+    /// (not just `core::blocking`'s own unit tests in isolation), proving
+    /// the call site doesn't panic there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn discovery_on_multi_thread_runtime_exercises_block_in_place_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), "# A\n\nContent A.").unwrap();
+        std::fs::write(dir.path().join("b.md"), "# B\n\nContent B.").unwrap();
+
+        let ingestor = FileIngestor::new(Box::new(AllParser));
+        let source = source_with_root(dir.path().to_str().unwrap());
+        let mut cb = RecordingCallback::default();
+        let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+        assert_eq!(cb.discovered, vec![2]);
+        assert_eq!(result.resources_produced, 2);
+        assert_eq!(cb.resources.len(), 2);
     }
 
     /// #103 end-to-end: a parser emitting `page_starts` produces a resource

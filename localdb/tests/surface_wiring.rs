@@ -537,10 +537,20 @@ fn daemon_source_add_auto_indexes_and_is_searchable() {
         );
     }
 
+    // Issue #187 review, finding 1: the daemon-only "(via daemon)" text
+    // suffix is gone — daemon-routed `source add` now prints byte-identical
+    // output to embedded mode (mode is not part of the result; the request
+    // actually reaching the daemon is instead confirmed below by the
+    // auto-index progress lines, which only the daemon branch produces via
+    // `job_attach::run_daemon_store_job`'s SSE attach).
     let add_stdout = String::from_utf8_lossy(&add_output.stdout).to_string();
     assert!(
-        add_stdout.contains("(via daemon)"),
-        "source add must confirm it went through the daemon: {add_stdout}"
+        add_stdout.contains("Added source ") && add_stdout.contains("to store 'default'"),
+        "expected the same success line embedded mode prints: {add_stdout}"
+    );
+    assert!(
+        !add_stdout.contains("(via daemon)"),
+        "the daemon-only '(via daemon)' suffix must be gone: {add_stdout}"
     );
 
     // D3: the daemon branch now auto-indexes too — the plain-mode progress

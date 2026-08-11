@@ -1782,9 +1782,10 @@ fn db_downgrade_explicit_target_below_baseline_without_confirmation_reports_real
     );
 }
 
-/// All three `db` subcommands refuse with exit 4 (`daemon_running`) while a
-/// daemon is running — per specs/05-surfaces.md §2.1 they are CLI-only and
-/// never route to the daemon's HTTP API, unlike `store`/`source`/`search`.
+/// All four `db` subcommands (`status`, `migrate`, `downgrade`, `vacuum`)
+/// refuse with exit 4 (`daemon_running`) while a daemon is running — per
+/// specs/05-surfaces.md §2.1 they are CLI-only and never route to the
+/// daemon's HTTP API, unlike `store`/`source`/`search`.
 #[test]
 fn db_commands_refuse_while_daemon_running() {
     let dir = TempDir::new().unwrap();
@@ -1800,6 +1801,10 @@ fn db_commands_refuse_while_daemon_running() {
         vec!["db", "migrate"],
         vec!["--yes", "db", "migrate"],
         vec!["--yes", "db", "downgrade"],
+        // issue #187 review, finding 4b: `db vacuum` is the fourth `db`
+        // subcommand (specs/05-surfaces.md §2, §2.1) and must refuse the
+        // same way as its siblings — it was missing from this trio.
+        vec!["db", "vacuum"],
     ] {
         let output = cmd_with_dir(&dir)
             .env("LOCALDB_DAEMON_URL", "http://127.0.0.1:19999")
@@ -3024,10 +3029,12 @@ fn source_add_auto_index_permission_denied_warns_but_succeeds() {
 // -- source add: daemon-routing branches ------------------------------------
 
 /// `source add <url>` with a daemon running, non-`--json`: exercises the
-/// url-kind `spec` shape (`{"url": ...}`) and the plain-text success print
-/// (`Added source ... (via daemon)`), both cold in the pre-existing
-/// `source_add_routes_to_daemon_without_panic` test (which only used
-/// `--json` and a path source).
+/// url-kind `spec` shape (`{"url": ...}`) and the plain-text success print,
+/// both cold in the pre-existing `source_add_routes_to_daemon_without_panic`
+/// test (which only used `--json` and a path source). Issue #187 review
+/// finding 1: the daemon-only `(via daemon)` suffix is gone — this is now
+/// byte-identical to embedded mode's line (see
+/// `source_add_shape_parity_between_embedded_and_daemon_mock` below).
 #[test]
 fn source_add_daemon_url_kind_non_json_prints_and_sends_url_spec() {
     let dir = TempDir::new().unwrap();
@@ -3066,8 +3073,9 @@ fn source_add_daemon_url_kind_non_json_prints_and_sends_url_spec() {
         "daemon-routed source add should succeed; stdout={stdout} stderr={stderr}"
     );
     assert!(
-        stdout.contains("Added source 01ABCDEFGHIJKLMNOPQRSTUVWX to store 'mystore' (via daemon)"),
-        "expected non-json daemon success line; got: {stdout}"
+        stdout.contains("Added source 01ABCDEFGHIJKLMNOPQRSTUVWX to store 'mystore'")
+            && !stdout.contains("via daemon"),
+        "expected the same success line embedded mode prints, with no daemon-mode suffix; got: {stdout}"
     );
 
     let reqs = received.lock().unwrap();
@@ -3081,6 +3089,171 @@ fn source_add_daemon_url_kind_non_json_prints_and_sends_url_spec() {
     assert_eq!(
         body_json["spec"]["url"].as_str().unwrap(),
         "https://example.com/page"
+    );
+}
+
+/// Shape parity (issue #187 review, finding 1): `source add`'s daemon and
+/// embedded branches used to diverge in what they printed — the daemon
+/// branch echoed the raw persisted `SourceRecord` (`--json`) plus a `(via
+/// daemon)` text suffix, while embedded mode printed a reduced
+/// `{id, kind, status, store}` object and a plain text line. Both now funnel
+/// through the same `render_source_add_item`/`render_source_add_summary`
+/// (`cli/src/cmds/source.rs`), so this asserts byte-identical text *and*
+/// `--json` output, one comparison each (each needs its own real generated
+/// ULID, so the two can't share one embedded run) — mirroring
+/// `index_shape_parity_between_embedded_and_daemon_mock`'s approach of
+/// deriving the daemon-mock's response from a real embedded run's output
+/// instead of hand-picking values that might happen to already agree.
+#[test]
+fn source_add_shape_parity_between_embedded_and_daemon_mock() {
+    // -- text mode ----------------------------------------------------------
+    let embedded_dir = TempDir::new().unwrap();
+    write_default_config(&embedded_dir);
+    cmd_with_dir(&embedded_dir)
+        .args(["store", "add", "parity"])
+        .assert()
+        .success();
+    let fixture = embedded_dir.path().join("parity-docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    let embedded_text = cmd_with_dir(&embedded_dir)
+        .args([
+            "--store",
+            "parity",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        embedded_text.status.success(),
+        "embedded source add should succeed; stderr: {}",
+        String::from_utf8_lossy(&embedded_text.stderr)
+    );
+    let embedded_stdout = String::from_utf8_lossy(&embedded_text.stdout).to_string();
+
+    // Pull the real generated ULID out of the embedded run's output so the
+    // daemon-mock can be made to "persist" a source under the identical id
+    // — text/json output would trivially differ on id otherwise.
+    let real_id = embedded_stdout
+        .strip_prefix("Added source ")
+        .and_then(|s| s.split(' ').next())
+        .expect("embedded text output must start with 'Added source <id>'")
+        .to_string();
+
+    let daemon_dir = TempDir::new().unwrap();
+    write_default_config(&daemon_dir);
+    let daemon_fixture = daemon_dir.path().join("parity-docs");
+    std::fs::create_dir_all(&daemon_fixture).unwrap();
+    let stores_body = paginated_list_body(&[&store_record_json("parity")]);
+    let add_body = format!(r#"{{"id":"{real_id}","store":"parity","kind":"path"}}"#);
+    let (port, _received) = start_routing_mock_server(vec![
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+        (
+            "POST",
+            "/v1/stores/parity/sources",
+            "HTTP/1.1 200 OK",
+            add_body,
+        ),
+    ]);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let daemon_text = cmd_with_dir(&daemon_dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args([
+            "--store",
+            "parity",
+            "source",
+            "add",
+            daemon_fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        daemon_text.status.success(),
+        "daemon-routed source add should succeed; stderr: {}",
+        String::from_utf8_lossy(&daemon_text.stderr)
+    );
+    let daemon_stdout = String::from_utf8_lossy(&daemon_text.stdout).to_string();
+
+    assert_eq!(
+        embedded_stdout, daemon_stdout,
+        "text output must be byte-identical between embedded and daemon-mock"
+    );
+
+    // -- --json mode ----------------------------------------------------------
+    // A fresh store/fixture pair — re-adding the same root to "parity" would
+    // hit the UNIQUE(store_id, root) constraint — so this comparison gets its
+    // own real generated id, independent of the text-mode one above.
+    cmd_with_dir(&embedded_dir)
+        .args(["store", "add", "parity-json"])
+        .assert()
+        .success();
+    let fixture_json = embedded_dir.path().join("parity-json-docs");
+    std::fs::create_dir_all(&fixture_json).unwrap();
+
+    let embedded_json = cmd_with_dir(&embedded_dir)
+        .args([
+            "--json",
+            "--store",
+            "parity-json",
+            "source",
+            "add",
+            fixture_json.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        embedded_json.status.success(),
+        "embedded source add --json should succeed; stderr: {}",
+        String::from_utf8_lossy(&embedded_json.stderr)
+    );
+    let embedded_json_stdout = String::from_utf8_lossy(&embedded_json.stdout).to_string();
+    let embedded_v: serde_json::Value = serde_json::from_str(&embedded_json_stdout).unwrap();
+    let real_id_json = embedded_v["id"]
+        .as_str()
+        .expect("embedded --json output must have an 'id' field")
+        .to_string();
+
+    let daemon_json_fixture = daemon_dir.path().join("parity-json-docs");
+    std::fs::create_dir_all(&daemon_json_fixture).unwrap();
+    let stores_body2 = paginated_list_body(&[&store_record_json("parity-json")]);
+    let add_body2 = format!(r#"{{"id":"{real_id_json}","store":"parity-json","kind":"path"}}"#);
+    let (port2, _received2) = start_routing_mock_server(vec![
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body2),
+        (
+            "POST",
+            "/v1/stores/parity-json/sources",
+            "HTTP/1.1 200 OK",
+            add_body2,
+        ),
+    ]);
+    let daemon_url2 = format!("http://127.0.0.1:{}", port2);
+
+    let daemon_json = cmd_with_dir(&daemon_dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url2)
+        .args([
+            "--json",
+            "--store",
+            "parity-json",
+            "source",
+            "add",
+            daemon_json_fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        daemon_json.status.success(),
+        "daemon-routed source add --json should succeed; stderr: {}",
+        String::from_utf8_lossy(&daemon_json.stderr)
+    );
+    let daemon_json_stdout = String::from_utf8_lossy(&daemon_json.stdout).to_string();
+    let daemon_v: serde_json::Value = serde_json::from_str(&daemon_json_stdout).unwrap();
+
+    assert_eq!(
+        embedded_v, daemon_v,
+        "--json output must be identical between embedded and daemon-mock"
     );
 }
 
@@ -4909,6 +5082,99 @@ fn index_daemon_job_with_errors_and_strict_exits_2_like_embedded() {
         "--strict on a completed daemon job with errors must exit 2, like embedded; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// Issue #187 review, finding 4c: `index_daemon_job_with_errors_and_strict_exits_2_like_embedded`
+/// only covers a *single* daemon-mock store; this extends the same scenario
+/// to two stores in scope, asserting two things neither the single-store
+/// test nor `index_daemon_multi_store_json_wraps_with_store_field` (which
+/// has no errors at all) covers:
+///
+/// 1. Exit code parity with embedded's `strict_should_fail` (`cli/src/cmds/index.rs`):
+///    "`--strict` exits 2 if *any* store reported errors" — proven here with
+///    a genuinely multi-store scope, not just summed into a single store's
+///    counters.
+/// 2. `report_index_outcomes` prints the full `--json` document to stdout
+///    *before* the `--strict` exit (`std::process::exit(2)` only happens
+///    after `print_json`) — the "no `--json`-at-strict-exit e2e" gap: a
+///    nonzero exit code alone doesn't prove the results were ever emitted
+///    rather than silently dropped, so this parses stdout and asserts on
+///    the actual per-store and total content.
+#[test]
+fn index_daemon_multi_store_strict_exits_2_and_prints_full_json_to_stdout() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let stores_body =
+        paginated_list_body(&[&store_record_json("alpha"), &store_record_json("beta")]);
+    let job_body = r#"{"id":"job-strict","status":"queued"}"#;
+    // Both stores attach to the same mocked job id (the routing mock server
+    // matches by path only, so a single `POST /v1/jobs` route necessarily
+    // answers both stores' submissions identically — see
+    // `index_daemon_multi_store_json_wraps_with_store_field` above for the
+    // same simplification) — each store therefore reports the identical
+    // per-store stats below, and the assertions check the CLI's own
+    // aggregation/rendering of that fan-out, not per-store mock fidelity.
+    let events_body = sse_done_body(&index_job_done_json(
+        "job-strict",
+        "alpha",
+        r#"{"docs_indexed":1,"chunks_written":2,"error_count":1,"sources_count":1}"#,
+    ));
+    let (port, _received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-strict/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+        ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
+    ]);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["--json", "index", "--strict"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "--strict must exit 2 when any store in a multi-store daemon-mock scope reported \
+         errors, matching embedded's strict_should_fail; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!(
+            "a --strict exit must still print the full --json document to stdout \
+             (report_index_outcomes prints before exiting), not just the bare exit code: {e}\n\
+             stdout:\n{stdout}"
+        )
+    });
+
+    let stores = v["stores"].as_array().expect("stores must be an array");
+    assert_eq!(stores.len(), 2, "{v}");
+    let by_name: std::collections::HashMap<&str, &serde_json::Value> = stores
+        .iter()
+        .map(|s| (s["store"].as_str().unwrap(), s))
+        .collect();
+    for name in ["alpha", "beta"] {
+        let entry = by_name
+            .get(name)
+            .unwrap_or_else(|| panic!("missing store entry for '{name}': {v}"));
+        assert_eq!((*entry)["status"], "error", "{v}");
+        assert_eq!((*entry)["docs_indexed"], 1, "{v}");
+        assert_eq!((*entry)["chunks_written"], 2, "{v}");
+        assert_eq!((*entry)["errors"], 1, "{v}");
+    }
+    assert_eq!(v["total"]["status"], "error", "{v}");
+    assert_eq!(v["total"]["docs_indexed"], 2, "{v}");
+    assert_eq!(v["total"]["chunks_written"], 4, "{v}");
+    assert_eq!(v["total"]["errors"], 2, "{v}");
 }
 
 /// SSE-attach fallback: when `GET /v1/jobs/{id}/events` is unavailable (a

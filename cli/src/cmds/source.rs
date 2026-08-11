@@ -95,19 +95,32 @@ pub(crate) fn resolve_source_add_kind(
 // `source add`'s daemon/embedded branches were already unified onto the
 // shared async job model in issue #187 stage 3 (auto-index runs through
 // `job_attach::run_daemon_store_job` / `run_embedded_store_job` either way,
-// with identical `IndexErrorMode::WarnAndContinue` semantics). Stage 5 only
-// moves the *mode selection* itself onto `command_table::dispatch` so a
-// future edit can't reintroduce a second, competing `probe_daemon` call —
-// the two branches' bodies (including their pre-existing text/JSON output
-// shapes) are otherwise unchanged.
+// with identical `IndexErrorMode::WarnAndContinue` semantics). Stage 5 moved
+// the *mode selection* itself onto `command_table::dispatch` so a future edit
+// can't reintroduce a second, competing `probe_daemon` call.
+//
+// Adversarial review (issue #187, finding 1): the two branches' *rendering*
+// had NOT actually converged — `run_daemon` printed the raw daemon-persisted
+// `SourceRecord` echo (`--json`) and a `(via daemon)` text suffix, while
+// `run_embedded` printed a hand-built `{id, kind, status, store}` object and
+// plain text. Fixed by reducing both branches to the same `AddedSource`
+// triple and routing every print through `render_source_add_item` /
+// `render_source_add_summary` — the only functions in this command that call
+// `println!`/`print_json`. Canonical shape = embedded mode's pre-existing
+// output, byte-for-byte; the daemon branch converges to it, and the `(via
+// daemon)` suffix / raw `SourceRecord` echo are both gone.
 //
 // `Outcome = ()`: unlike `search`/`store list`/`status`, this command's
 // output is inherently streaming — non-JSON mode prints each store's result
 // as soon as it's persisted, and a mid-loop `--json` failure must flush
 // whatever succeeded so far via `exit_err_with_partial_results` *before*
 // aborting, not after a final value is assembled. Both of those need to
-// happen from inside the loop, which rules out collecting into one
-// value rendered afterward.
+// happen from inside the loop, which rules out collecting into one value
+// rendered afterward — so unlike `render_source_remove` (which renders once,
+// after `dispatch` returns), `render_source_add_item` is called from inside
+// BOTH transports' loops. The requirement finding 1 fixes is that the
+// printing code carry no mode branch, not that output be buffered to the
+// end.
 
 /// The subset of `source add`'s arguments needed by both transports,
 /// resolved once by `run_source_add_async` (kind classification, feed spec
@@ -123,6 +136,64 @@ struct SourceAddCmd<'a> {
     refresh: Option<&'a str>,
     max_entries: Option<u32>,
     fetch_full_content: bool,
+}
+
+/// One added source's outcome, as `source add` renders it — the fields
+/// `render_source_add_item`/`render_source_add_summary` need, whichever
+/// transport produced them. `kind` is always one of `self.kind`'s three
+/// values ("path"/"url"/"feed"), the same strings `kind_to_string` yields, so
+/// both transports can populate it directly without a `SourceKind` round
+/// trip.
+struct AddedSource {
+    id: String,
+    store_name: String,
+    kind: String,
+}
+
+/// The one per-item renderer for `source add`'s `Ok` path — called from
+/// inside BOTH transports' loops (issue #187 review, finding 1), immediately
+/// after each source is persisted. Text mode prints the line right away;
+/// `--json` mode instead accumulates into `json_results` for
+/// `render_source_add_summary` (or `exit_err_with_partial_results`) to emit
+/// later — see the module doc comment above `SourceAddCmd` for why this
+/// can't be deferred to a single end-of-loop call the way `source remove`'s
+/// `render_source_remove` is.
+fn render_source_add_item(
+    added: &AddedSource,
+    ctx: &CliContext,
+    json_results: &mut Vec<serde_json::Value>,
+) {
+    if ctx.json {
+        json_results.push(json!({
+            "id": added.id,
+            "store": { "name": added.store_name },
+            "kind": added.kind,
+        }));
+    } else {
+        println!("Added source {} to store '{}'", added.id, added.store_name);
+    }
+}
+
+/// The one `--json`-summary renderer for `source add`, called once after
+/// both transports' loops complete without error. No-op in text mode — text
+/// mode already printed every line via `render_source_add_item`.
+fn render_source_add_summary(json_results: &[serde_json::Value], json_mode: bool) {
+    if !json_mode {
+        return;
+    }
+    if json_results.len() == 1 {
+        // Single store: today's exact flat shape — specs/05-surfaces.md
+        // §2.2 promises existing scripts don't break.
+        let r = &json_results[0];
+        print_json(&json!({
+            "status": "ok",
+            "id": r["id"],
+            "store": r["store"],
+            "kind": r["kind"],
+        }));
+    } else {
+        print_json(&json!({ "status": "ok", "results": json_results }));
+    }
 }
 
 impl DaemonAwareCommand for SourceAddCmd<'_> {
@@ -187,21 +258,31 @@ impl DaemonAwareCommand for SourceAddCmd<'_> {
             });
             match daemon_request_async(reqwest::Method::POST, &url_str, Some(body)).await {
                 Ok(v) => {
-                    let new_id = v.get("id").and_then(|i| i.as_str()).map(str::to_string);
-                    if self.kind == "path" || self.kind == "url" || self.kind == "feed" {
-                        if let Some(id) = &new_id {
-                            to_index.push((store_name.clone(), id.clone()));
-                        }
+                    // Only `id` is pulled from the daemon's response — the
+                    // rest of its raw persisted `SourceRecord` echo (spec,
+                    // include/exclude globs, preset, ...) never reaches the
+                    // renderer (finding 1): the daemon converges on
+                    // embedded mode's reduced `AddedSource` shape instead of
+                    // leaking its own storage representation.
+                    let new_id = v
+                        .get("id")
+                        .and_then(|i| i.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    if !new_id.is_empty()
+                        && (self.kind == "path" || self.kind == "url" || self.kind == "feed")
+                    {
+                        to_index.push((store_name.clone(), new_id.clone()));
                     }
-                    if ctx.json {
-                        json_results.push(v);
-                    } else {
-                        println!(
-                            "Added source {} to store '{}' (via daemon)",
-                            new_id.as_deref().unwrap_or("?"),
-                            store_name
-                        );
-                    }
+                    render_source_add_item(
+                        &AddedSource {
+                            id: new_id,
+                            store_name: store_name.clone(),
+                            kind: self.kind.to_string(),
+                        },
+                        ctx,
+                        &mut json_results,
+                    );
                 }
                 Err(e) => {
                     // Finding 5: don't discard results already persisted by
@@ -218,16 +299,7 @@ impl DaemonAwareCommand for SourceAddCmd<'_> {
             }
         }
 
-        if ctx.json {
-            if json_results.len() == 1 {
-                // Single store: today's exact flat shape — the daemon's raw
-                // response, passed through unchanged (specs/05-surfaces.md
-                // §2.2 promises existing scripts don't break).
-                print_json(&json_results[0]);
-            } else {
-                print_json(&json!({ "status": "ok", "results": json_results }));
-            }
-        }
+        render_source_add_summary(&json_results, ctx.json);
 
         // D3 (issue #187 stage 3): the daemon branch used to skip
         // auto-indexing entirely — a source added while a daemon was
@@ -351,15 +423,15 @@ impl DaemonAwareCommand for SourceAddCmd<'_> {
                 }
             }
 
-            if ctx.json {
-                json_results.push(json!({
-                    "id": src.id,
-                    "store": { "name": row.name },
-                    "kind": kind_to_string(&src.kind),
-                }));
-            } else {
-                println!("Added source {} to store '{}'", src.id, row.name);
-            }
+            render_source_add_item(
+                &AddedSource {
+                    id: src.id.clone(),
+                    store_name: row.name.clone(),
+                    kind: kind_to_string(&src.kind).to_string(),
+                },
+                ctx,
+                &mut json_results,
+            );
 
             // #2: Auto-index after source add.
             if self.kind == "path" || self.kind == "url" || self.kind == "feed" {
@@ -367,21 +439,7 @@ impl DaemonAwareCommand for SourceAddCmd<'_> {
             }
         }
 
-        if ctx.json {
-            if json_results.len() == 1 {
-                // Single store: today's exact flat shape (specs/05-surfaces.md
-                // §2.2 promises existing scripts don't break).
-                let r = &json_results[0];
-                print_json(&json!({
-                    "status": "ok",
-                    "id": r["id"],
-                    "store": r["store"],
-                    "kind": r["kind"],
-                }));
-            } else {
-                print_json(&json!({ "status": "ok", "results": json_results }));
-            }
-        }
+        render_source_add_summary(&json_results, ctx.json);
 
         // Auto-index every newly added source, reusing the already-open
         // `db`/`config_loader` and threading the built embedder across stores so

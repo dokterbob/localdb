@@ -1112,6 +1112,77 @@ mod tests {
         );
     }
 
+    /// The 404 case above only proves the `log_rejected_responses` layer
+    /// sees rejections from the top-level `/v1` routes — it never reaches
+    /// the nested `/mcp` mount at all (no route matches
+    /// `/v1/does-not-exist`). `log_rejected_responses` is deliberately
+    /// applied *after* `nest_service` specifically so it also wraps
+    /// rejections rmcp's own `StreamableHttpService` produces internally
+    /// (see `build_router`'s doc comment) — this test drives an actual
+    /// request through the mount and proves that half of the claim.
+    ///
+    /// The deterministic rejection: rmcp's Streamable HTTP transport
+    /// validates the `MCP-Protocol-Version` header on every request/method
+    /// before any session/handshake state is needed (rmcp
+    /// `validate_protocol_version_header`) — an unsupported version always
+    /// 400s, with no need to first complete an `initialize` round trip or
+    /// open a session, unlike almost every other way `/mcp` can reject a
+    /// request.
+    #[tokio::test]
+    async fn rejected_response_through_mcp_mount_is_logged_at_warn() {
+        let (_dir, state) = make_state().await;
+        let app = build_router(
+            state,
+            vec![],
+            std::sync::Arc::new(localdb_core::FakeEmbedder::new(1)),
+            vec![],
+        );
+
+        let buf = BufWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/mcp")
+                    .header("MCP-Protocol-Version", "not-a-real-version")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "an unsupported MCP-Protocol-Version should 400 before any session is needed"
+        );
+
+        drop(_guard);
+
+        let captured = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            captured.contains("WARN"),
+            "expected a WARN line for a rejection inside the /mcp mount, captured: {captured}"
+        );
+        assert!(
+            captured.contains("/mcp"),
+            "expected the /mcp path in the log line, captured: {captured}"
+        );
+        assert!(
+            captured.contains("400"),
+            "expected the status in the log line, captured: {captured}"
+        );
+    }
+
     // --- parse_refresh_interval ---
 
     #[test]

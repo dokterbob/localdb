@@ -374,6 +374,36 @@ mod tests {
         assert_eq!(cb.discovered, vec![1]);
     }
 
+    /// Issue #187 review finding 2: `url_pipeline::process_url` guards its
+    /// `parser.parse(&probe)` call with `localdb_core::run_blocking`, which
+    /// only takes the `block_in_place` branch on a multi-thread tokio
+    /// runtime — every other test in this module runs on the default
+    /// current-thread `#[tokio::test]` runtime and never exercises it. This
+    /// forces `flavor = "multi_thread"` so a real end-to-end URL ingestion
+    /// actually drives `block_in_place`, proving the call site doesn't
+    /// panic there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn downloaded_on_multi_thread_runtime_exercises_block_in_place_guard() {
+        let content = b"# Test Page\n\nHello from the web.\n".to_vec();
+        let mut script = HashMap::new();
+        script.insert(
+            "https://example.com/ok".to_string(),
+            ScriptedOutcome::Downloaded {
+                bytes: content,
+                content_type: Some("text/markdown".to_string()),
+            },
+        );
+
+        let ingestor =
+            UrlIngestor::new(Box::new(AllParser), Box::new(ScriptedFetcher::new(script)));
+        let source = source_with_urls(&["https://example.com/ok"]);
+        let mut cb = RecordingCallback::default();
+        let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+        assert_eq!(result.resources_produced, 1);
+        assert_eq!(cb.resources.len(), 1);
+    }
+
     #[tokio::test]
     async fn not_modified_is_skipped_as_unchanged() {
         let mut script = HashMap::new();
