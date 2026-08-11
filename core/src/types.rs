@@ -481,20 +481,42 @@ pub enum IndexJobState {
 }
 
 /// Statistics accumulated during indexing.
+///
+/// `#[serde(default)]` at the struct level (issue #187 stage 3): a job
+/// producer (or a test fixture) may omit any subset of these fields and
+/// still deserialize cleanly, with the omitted fields defaulting to 0 —
+/// important now that `IndexJob`s cross the wire (`GET
+/// /v1/jobs/{id}/events`'s terminal `job` frame) to a CLI that only cares
+/// about a few of them in most cases.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct IndexJobStats {
     /// Documents seen in the scan.
     pub docs_seen: u64,
     /// Documents actually indexed (new or changed).
     pub docs_indexed: u64,
+    /// Documents skipped (unchanged content hash).
+    pub docs_skipped: u64,
     /// Documents deleted (source removed them).
     pub docs_deleted: u64,
+    /// Documents that would have been deleted had deletion been enabled
+    /// (`DeletionPolicy::Retain` ran instead of `Prune`) — mirrors
+    /// `IngestionResult::docs_prunable`, surfaced here so a daemon-submitted
+    /// job can report the same "N no longer at source (kept; use --delete to
+    /// remove)" information the embedded CLI path already does.
+    pub docs_prunable: u64,
     /// Chunks written to the retrieval backend.
     pub chunks_written: u64,
     /// Files that could not be indexed due to unsupported format.
     pub unsupported_format_count: u64,
     /// Files that errored during indexing.
     pub error_count: u64,
+    /// Number of sources the job's scope resolved to, before any were
+    /// processed. Distinguishes "this store/source had nothing to index" (0)
+    /// from "sources existed but nothing needed indexing" (>0, all other
+    /// counters 0) — the same distinction `IndexSummary::has_sources` makes
+    /// on the CLI side (issue #187 stage 3).
+    pub sources_count: u64,
 }
 
 #[cfg(test)]

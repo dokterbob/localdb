@@ -2818,6 +2818,41 @@ fn source_record_json(id: &str, store_name: &str) -> String {
     )
 }
 
+// -- issue #187 stage 3: unified job model — SSE/poll job-attach fixtures --
+
+/// A minimal terminal `IndexJob` JSON body (`core::types::IndexJob`) in the
+/// `done` state, for stubbing `GET /v1/jobs/{id}/events` (as the `data:` of
+/// its sole `event: job` SSE frame — see [`sse_done_body`]) or `GET
+/// /v1/jobs/{id}` (poll fallback) in daemon-routed `index`/`source add`
+/// auto-index tests (issue #187 stage 3: both now attach to the submitted
+/// job to completion instead of just printing "submitted").
+///
+/// `IndexJobStats` has struct-level `#[serde(default)]`, so `stats_json` only
+/// needs to set the fields a given test actually cares about — `"{}"` is a
+/// valid (all-zero) `IndexJobStats`.
+fn index_job_done_json(job_id: &str, store_id: &str, stats_json: &str) -> String {
+    format!(
+        r#"{{"id":"{job_id}","store_id":"{store_id}","scope":{{"type":"store"}},"state":"done","stats":{stats_json},"created_at":"2026-01-01T00:00:00Z"}}"#
+    )
+}
+
+/// A terminal `IndexJob` JSON body in the `failed` state, for tests covering
+/// a daemon job that fails after being accepted.
+fn index_job_failed_json(job_id: &str, store_id: &str, error: &str) -> String {
+    format!(
+        r#"{{"id":"{job_id}","store_id":"{store_id}","scope":{{"type":"store"}},"state":"failed","stats":{{}},"error":"{error}","created_at":"2026-01-01T00:00:00Z"}}"#
+    )
+}
+
+/// Wrap a terminal `IndexJob` JSON body (from [`index_job_done_json`] /
+/// [`index_job_failed_json`]) as the single-frame SSE body `GET
+/// /v1/jobs/{id}/events` returns once a job is already finished — a bare
+/// `event: job` frame, matching `server/src/handlers/jobs.rs`'s
+/// `terminal_job_event`.
+fn sse_done_body(job_json: &str) -> String {
+    format!("event: job\ndata: {job_json}\n\n")
+}
+
 // -- source add: local (non-daemon) error/success branches -----------------
 
 /// `source add <nonexistent path>` exits 2 (`normalize_path_source` fails).
@@ -3875,7 +3910,18 @@ fn index_daemon_single_store_json_includes_source_id() {
     let stores_body = paginated_list_body(&[&store_record_json("onlystore")]);
     let sources_body = paginated_list_body(&[&source_record_json("src-123", "onlystore")]);
     let job_body = r#"{"id":"job-1","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json(
+        "job-1",
+        "onlystore",
+        r#"{"docs_indexed":2,"chunks_written":4,"sources_count":1}"#,
+    ));
     let (port, received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-1/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
         (
             "GET",
             "/v1/stores/onlystore/sources",
@@ -3898,7 +3944,11 @@ fn index_daemon_single_store_json_includes_source_id() {
     );
     let v: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
-    assert_eq!(v["id"].as_str().unwrap(), "job-1");
+    // issue #187 stage 3: `index --json` now attaches and renders the same
+    // unified `render_index_json` single-store shape embedded mode does —
+    // the flat submission-echo body (`{"id": "job-1", ...}`) is gone.
+    assert_eq!(v["status"], "ok", "{v}");
+    assert_eq!(v["docs_indexed"], 2, "{v}");
     assert!(
         v.get("jobs").is_none(),
         "single-store index --json must not wrap in a jobs array"
@@ -3907,8 +3957,9 @@ fn index_daemon_single_store_json_includes_source_id() {
     let reqs = received.lock().unwrap();
     // finding 4: a single-store scope no longer short-circuits the owner
     // walk — GET /v1/stores (scope resolution), GET
-    // /v1/stores/onlystore/sources (ownership check), then POST /v1/jobs.
-    assert_eq!(reqs.len(), 3, "unexpected requests: {:?}", reqs);
+    // /v1/stores/onlystore/sources (ownership check), POST /v1/jobs, then
+    // GET /v1/jobs/job-1/events (issue #187 stage 3 attach).
+    assert_eq!(reqs.len(), 4, "unexpected requests: {:?}", reqs);
     let (path, req_body) = reqs
         .iter()
         .find(|(line, _)| line.starts_with("POST"))
@@ -3964,25 +4015,30 @@ fn index_daemon_single_store_unknown_source_exits_3() {
     );
 }
 
-/// `index --delete` with a daemon running must be refused (exit 2), not
-/// silently downgraded to a non-pruning run.
-///
-/// `/v1/jobs` carries no deletion policy and daemon-side ingestion is a no-op
-/// (#187), so the flag cannot be honored. Accepting it anyway would report
-/// success for a prune that never happened — the same "silence standing in for
-/// a fact" failure that #156/#185 were about, one level up. No job may be
-/// submitted either: a job that silently ignores the user's explicit request
-/// is worse than no job.
+/// `index --delete` with a daemon running now sends `deletion_policy:
+/// "delete"` on the submitted job (D6, issue #187 stage 3) — the daemon runs
+/// real ingestion (issue #187) and can honor it, so the old refusal (exit 2)
+/// is gone. Replaces `index_delete_with_daemon_running_exits_2_and_submits_nothing`.
 #[test]
-fn index_delete_with_daemon_running_exits_2_and_submits_nothing() {
+fn index_daemon_delete_sends_deletion_policy_delete() {
     let dir = TempDir::new().unwrap();
     write_default_config(&dir);
     let data_dir = dir.path().join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
 
     let stores_body = paginated_list_body(&[&store_record_json("onlystore")]);
-    let (port, received) =
-        start_routing_mock_server(vec![("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body)]);
+    let job_body = r#"{"id":"job-del","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json("job-del", "onlystore", "{}"));
+    let (port, received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-del/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+        ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
+    ]);
 
     let output = cmd_with_dir(&dir)
         .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
@@ -3992,26 +4048,26 @@ fn index_delete_with_daemon_running_exits_2_and_submits_nothing() {
 
     assert_eq!(
         output.status.code().unwrap(),
-        2,
-        "`--delete` must be refused while the daemon is running; stderr: {}",
+        0,
+        "`--delete` against a daemon must now succeed (D6); stderr: {}",
         String::from_utf8_lossy(&output.stderr)
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("--delete") && stderr.contains("daemon"),
-        "the error must name the flag and the reason so the remedy is obvious; got: {stderr}"
     );
 
     let reqs = received.lock().unwrap();
-    assert!(
-        !reqs.iter().any(|(l, _)| l.starts_with("POST")),
-        "no index job may be submitted when the requested deletion cannot be honored; got: {:?}",
-        reqs
+    let (_, post_body) = reqs
+        .iter()
+        .find(|(l, _)| l.starts_with("POST /v1/jobs"))
+        .expect("a job should have been submitted");
+    let body_json: serde_json::Value = serde_json::from_str(post_body).unwrap();
+    assert_eq!(
+        body_json["deletion_policy"].as_str().unwrap(),
+        "delete",
+        "--delete must be carried through as deletion_policy: {body_json}"
     );
 }
 
-/// The same command *without* `--delete` still submits normally — the refusal
-/// above must be scoped to the flag, not break daemon-routed indexing.
+/// The same command *without* `--delete` sends `deletion_policy: "retain"`
+/// and still submits/completes normally.
 #[test]
 fn index_without_delete_still_submits_when_daemon_running() {
     let dir = TempDir::new().unwrap();
@@ -4020,13 +4076,16 @@ fn index_without_delete_still_submits_when_daemon_running() {
     std::fs::create_dir_all(&data_dir).unwrap();
 
     let stores_body = paginated_list_body(&[&store_record_json("onlystore")]);
+    let job_body = r#"{"id":"job-1","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json("job-1", "onlystore", "{}"));
     let (port, received) = start_routing_mock_server(vec![
         (
-            "POST",
-            "/v1/jobs",
+            "GET",
+            "/v1/jobs/job-1/events",
             "HTTP/1.1 200 OK",
-            r#"{"job_id":"job-1","status":"queued"}"#.to_string(),
+            events_body,
         ),
+        ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
         ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
     ]);
 
@@ -4043,16 +4102,19 @@ fn index_without_delete_still_submits_when_daemon_running() {
         String::from_utf8_lossy(&output.stderr)
     );
     let reqs = received.lock().unwrap();
-    assert!(
-        reqs.iter().any(|(l, _)| l.starts_with("POST /v1/jobs")),
-        "a job should be submitted in the ordinary (non-deleting) case; got: {:?}",
-        reqs
-    );
+    let (_, post_body) = reqs
+        .iter()
+        .find(|(l, _)| l.starts_with("POST /v1/jobs"))
+        .expect("a job should be submitted in the ordinary (non-deleting) case");
+    let body_json: serde_json::Value = serde_json::from_str(post_body).unwrap();
+    assert_eq!(body_json["deletion_policy"].as_str().unwrap(), "retain");
 }
 
 /// `index --json` with a daemon running and more than one store in scope:
-/// wraps submissions into `{"jobs": [...], }`, each entry tagged with its
-/// store name.
+/// issue #187 stage 3 unifies daemon-mode rendering with embedded mode's
+/// `render_index_json` — the old `{"jobs": [...]}` submission-echo shape is
+/// gone in favor of the same `{"stores": [...], "total": {...}}` shape a
+/// multi-store embedded run produces.
 #[test]
 fn index_daemon_multi_store_json_wraps_with_store_field() {
     let dir = TempDir::new().unwrap();
@@ -4063,7 +4125,18 @@ fn index_daemon_multi_store_json_wraps_with_store_field() {
     let stores_body =
         paginated_list_body(&[&store_record_json("alpha"), &store_record_json("beta")]);
     let job_body = r#"{"id":"job-x","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json(
+        "job-x",
+        "alpha",
+        r#"{"docs_indexed":1,"sources_count":1}"#,
+    ));
     let (port, received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-x/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
         ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
         ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
     ]);
@@ -4080,19 +4153,27 @@ fn index_daemon_multi_store_json_wraps_with_store_field() {
     );
     let v: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
-    let jobs = v["jobs"].as_array().expect("jobs must be an array");
-    assert_eq!(jobs.len(), 2);
-    let store_names: std::collections::HashSet<&str> =
-        jobs.iter().map(|j| j["store"].as_str().unwrap()).collect();
+    let stores = v["stores"].as_array().expect("stores must be an array");
+    assert_eq!(stores.len(), 2, "{v}");
+    let store_names: std::collections::HashSet<&str> = stores
+        .iter()
+        .map(|j| j["store"].as_str().unwrap())
+        .collect();
     assert_eq!(store_names, ["alpha", "beta"].into_iter().collect());
+    assert_eq!(v["total"]["docs_indexed"], 2, "{v}");
 
     let reqs = received.lock().unwrap();
-    let post_reqs = reqs.iter().filter(|(l, _)| l.starts_with("POST")).count();
+    let post_reqs = reqs
+        .iter()
+        .filter(|(l, _)| l.starts_with("POST /v1/jobs"))
+        .count();
     assert_eq!(post_reqs, 2, "expected one POST per store; got: {:?}", reqs);
 }
 
-/// `index` (non-json) with a daemon running and a single store in scope
-/// prints the plain "submitted to daemon" line without a store prefix.
+/// `index` (non-json) with a daemon running and a single store in scope now
+/// waits for the job and prints the same "Index complete: ..." summary
+/// embedded mode does — the old "submitted to daemon ... (poll with status)"
+/// hint is gone (issue #187 stage 3, D1: both modes attach to completion).
 #[test]
 fn index_daemon_single_store_text_output() {
     let dir = TempDir::new().unwrap();
@@ -4102,7 +4183,18 @@ fn index_daemon_single_store_text_output() {
 
     let stores_body = paginated_list_body(&[&store_record_json("onlystore2")]);
     let job_body = r#"{"id":"job-2","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json(
+        "job-2",
+        "onlystore2",
+        r#"{"docs_indexed":3,"chunks_written":6,"sources_count":1}"#,
+    ));
     let (port, _received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-2/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
         ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
         ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
     ]);
@@ -4113,12 +4205,13 @@ fn index_daemon_single_store_text_output() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Index job submitted to daemon: job-2 (poll with status)",
+            "Index complete: 3 indexed, 0 skipped, 6 chunks written, 0 unsupported, 0 errors",
         ));
 }
 
 /// `index` (non-json) with a daemon running and more than one store in
-/// scope prefixes each submission line with its store name.
+/// scope prefixes each store's completed-job summary line with its store
+/// name — the multi-store embedded rendering, now shared by daemon mode too.
 #[test]
 fn index_daemon_multi_store_text_output_prefixes_store_name() {
     let dir = TempDir::new().unwrap();
@@ -4129,7 +4222,14 @@ fn index_daemon_multi_store_text_output_prefixes_store_name() {
     let stores_body =
         paginated_list_body(&[&store_record_json("gamma"), &store_record_json("delta")]);
     let job_body = r#"{"id":"job-3","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json("job-3", "gamma", "{}"));
     let (port, _received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-3/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
         ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
         ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
     ]);
@@ -4142,12 +4242,9 @@ fn index_daemon_multi_store_text_output_prefixes_store_name() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout
-            .contains("Index job submitted to daemon for store 'gamma': job-3 (poll with status)")
-            && stdout.contains(
-                "Index job submitted to daemon for store 'delta': job-3 (poll with status)"
-            ),
-        "expected a per-store submission line for each store; got: {stdout}"
+        stdout.contains("[gamma] No sources to index.")
+            && stdout.contains("[delta] No sources to index."),
+        "expected a per-store completion line for each store; got: {stdout}"
     );
 }
 
@@ -4198,7 +4295,14 @@ fn index_daemon_explicit_store_known_to_daemon_not_local_succeeds() {
 
     let stores_body = paginated_list_body(&[&store_record_json("remote-only")]);
     let job_body = r#"{"id":"job-9","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json("job-9", "remote-only", "{}"));
     let (port, received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-9/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
         ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
         ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
     ]);
@@ -4241,7 +4345,14 @@ fn index_daemon_omitted_store_uses_daemon_stores_not_local() {
     // ...and the daemon reports a completely different one.
     let stores_body = paginated_list_body(&[&store_record_json("daemon-only")]);
     let job_body = r#"{"id":"job-10","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json("job-10", "daemon-only", "{}"));
     let (port, received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-10/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
         ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
         ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
     ]);
@@ -4360,7 +4471,14 @@ fn index_daemon_store_scope_paginates_over_20_stores() {
     let page2 = paginated_list_page(&[store_record_json("store-20")], None, 21);
 
     let job_body = r#"{"id":"job-page2","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json("job-page2", "store-00", "{}"));
     let (port, received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-page2/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
         ("GET", "/v1/stores?cursor=20", "HTTP/1.1 200 OK", page2),
         ("GET", "/v1/stores", "HTTP/1.1 200 OK", page1),
         ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
@@ -4378,14 +4496,16 @@ fn index_daemon_store_scope_paginates_over_20_stores() {
     );
     let v: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
-    let jobs = v["jobs"].as_array().expect("jobs must be an array");
+    let stores = v["stores"].as_array().expect("stores must be an array");
     assert_eq!(
-        jobs.len(),
+        stores.len(),
         21,
         "every store across both pages must be in the all-stores scope: {v}"
     );
-    let submitted_names: std::collections::HashSet<&str> =
-        jobs.iter().map(|j| j["store"].as_str().unwrap()).collect();
+    let submitted_names: std::collections::HashSet<&str> = stores
+        .iter()
+        .map(|j| j["store"].as_str().unwrap())
+        .collect();
     assert!(
         submitted_names.contains("store-20"),
         "the store sitting on page 2 must not be dropped: {:?}",
@@ -4420,8 +4540,19 @@ fn index_daemon_source_owner_walk_narrows_to_single_job() {
     let alpha_sources = paginated_list_body(&[]);
     let beta_sources = paginated_list_body(&[&source_record_json("src-owned", "beta")]);
     let job_body = r#"{"id":"job-11","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json(
+        "job-11",
+        "beta",
+        r#"{"docs_indexed":1,"sources_count":1}"#,
+    ));
 
     let (port, received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-11/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
         (
             "GET",
             "/v1/stores/alpha/sources",
@@ -4450,7 +4581,7 @@ fn index_daemon_source_owner_walk_narrows_to_single_job() {
     );
     let v: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
-    assert_eq!(v["id"], "job-11");
+    assert_eq!(v["docs_indexed"], 1, "{v}");
     assert!(
         v.get("jobs").is_none(),
         "narrowed to one store, this must render the flat single-job shape: {v}"
@@ -4603,8 +4734,15 @@ fn index_daemon_source_owner_walk_paginates_to_page_2() {
     let beta_page1 = paginated_list_page(&beta_page1_items, Some("20"), 21);
     let beta_page2 = paginated_list_page(&[source_record_json("src-on-page-2", "beta")], None, 21);
     let job_body = r#"{"id":"job-page2-src","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json("job-page2-src", "beta", "{}"));
 
     let (port, received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-page2-src/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
         (
             "GET",
             "/v1/stores/beta/sources?cursor=20",
@@ -4643,6 +4781,317 @@ fn index_daemon_source_owner_walk_paginates_to_page_2() {
     assert_eq!(post_reqs.len(), 1, "{:?}", reqs);
     let body_json: serde_json::Value = serde_json::from_str(&post_reqs[0].1).unwrap();
     assert_eq!(body_json["store_name"].as_str().unwrap(), "beta");
+}
+
+// ---------------------------------------------------------------------------
+// index.rs: unified job model (issue #187 stage 3) — a daemon job that
+// fails, --strict parity with embedded, and the SSE-attach poll fallback.
+// ---------------------------------------------------------------------------
+
+/// A daemon job that ends in the `failed` state must hard-fail `index`
+/// exactly like an embedded pre-flight failure does — exit 1
+/// (`Error::Internal`), with the job's own error text in stderr. This holds
+/// whether or not `--strict` was passed: `--strict` governs the *summary
+/// error-count* path (`report_index_outcomes`/`strict_should_fail`), which a
+/// `Failed` job never reaches — `job_attach::finish_job` hard-errors before
+/// that renderer ever runs, for both daemon and embedded jobs alike.
+#[test]
+fn index_daemon_failed_job_exits_1_regardless_of_strict() {
+    for strict in [false, true] {
+        let dir = TempDir::new().unwrap();
+        write_default_config(&dir);
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let stores_body = paginated_list_body(&[&store_record_json("failstore")]);
+        let job_body = r#"{"id":"job-fail","status":"queued"}"#;
+        let events_body = sse_done_body(&index_job_failed_json(
+            "job-fail",
+            "failstore",
+            "ingestion blew up",
+        ));
+        let (port, _received) = start_routing_mock_server(vec![
+            (
+                "GET",
+                "/v1/jobs/job-fail/events",
+                "HTTP/1.1 200 OK",
+                events_body,
+            ),
+            ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+            ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
+        ]);
+
+        let mut args = vec!["index"];
+        if strict {
+            args.push("--strict");
+        }
+        let output = cmd_with_dir(&dir)
+            .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+            .args(&args)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "a failed daemon job must exit 1 like an embedded hard failure (strict={strict}); \
+             stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("ingestion blew up"),
+            "the job's own error text must reach stderr (strict={strict}); got: {stderr}"
+        );
+    }
+}
+
+/// A daemon job that completes (`done`) but reports per-source/per-document
+/// errors in its stats must drive `--strict` exactly like embedded's
+/// `strict_should_fail` does: exit 2 with `--strict`, exit 0 without it —
+/// both render the completed summary first (unlike the hard-failure case
+/// above).
+#[test]
+fn index_daemon_job_with_errors_and_strict_exits_2_like_embedded() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let stores_body = paginated_list_body(&[&store_record_json("errstore")]);
+    let job_body = r#"{"id":"job-err","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json(
+        "job-err",
+        "errstore",
+        r#"{"docs_indexed":2,"chunks_written":3,"error_count":1,"sources_count":1}"#,
+    ));
+    let (port, _received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-err/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+        ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
+    ]);
+
+    // Without --strict: the run completed, so it's exit 0 even with errors.
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .arg("index")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "without --strict, a completed job with errors must still exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // With --strict: the same completed-with-errors job must exit 2, the
+    // same code `strict_should_fail` gives an embedded run with errors.
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["index", "--strict"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "--strict on a completed daemon job with errors must exit 2, like embedded; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// SSE-attach fallback: when `GET /v1/jobs/{id}/events` is unavailable (a
+/// 404, e.g. an older daemon predating issue #83), `index` must fall back to
+/// polling `GET /v1/jobs/{id}` and still complete correctly, rather than
+/// failing the command.
+#[test]
+fn index_daemon_sse_404_falls_back_to_polling() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let stores_body = paginated_list_body(&[&store_record_json("pollstore")]);
+    let job_body = r#"{"id":"job-poll","status":"queued"}"#;
+    let poll_body = index_job_done_json(
+        "job-poll",
+        "pollstore",
+        r#"{"docs_indexed":5,"chunks_written":9,"sources_count":1}"#,
+    );
+    let (port, received) = start_routing_mock_server(vec![
+        // Listed before the bare "/v1/jobs/job-poll" route below so it wins
+        // for the longer, more specific `/events` path (first-match-wins) —
+        // simulating a daemon that doesn't implement the SSE route at all.
+        (
+            "GET",
+            "/v1/jobs/job-poll/events",
+            "HTTP/1.1 404 Not Found",
+            r#"{"code":"resource_not_found","message":"no such route"}"#.to_string(),
+        ),
+        ("GET", "/v1/jobs/job-poll", "HTTP/1.1 200 OK", poll_body),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+        ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
+    ]);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["--json", "index"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "an SSE 404 must fall back to polling, not fail the command; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert_eq!(v["docs_indexed"], 5, "{v}");
+    assert_eq!(v["chunks_written"], 9, "{v}");
+
+    let reqs = received.lock().unwrap();
+    assert!(
+        reqs.iter()
+            .any(|(l, _)| l.starts_with("GET /v1/jobs/job-poll/events")),
+        "the SSE route must have been tried first; got: {:?}",
+        reqs
+    );
+    assert!(
+        reqs.iter()
+            .any(|(l, _)| l.starts_with("GET /v1/jobs/job-poll HTTP")),
+        "the poll fallback must have been used after the SSE 404; got: {:?}",
+        reqs
+    );
+}
+
+/// Shape parity (D1): the same command produces byte-identical text *and*
+/// `--json` summaries whether it ran embedded or was submitted to (and
+/// completed by) a daemon-mock — because both transports funnel their
+/// result through the exact same `render_index_text`/`render_index_json`.
+///
+/// Rather than hand-picking numbers, this drives a real embedded `index
+/// --json` run first to learn the real stats a trivial one-file store
+/// produces, then builds a daemon-mock job whose `IndexJobStats` mirror
+/// those exact numbers, and asserts *both* the plain-text and `--json`
+/// daemon-routed output are identical to the embedded run's.
+#[test]
+fn index_shape_parity_between_embedded_and_daemon_mock() {
+    let embedded_dir = TempDir::new().unwrap();
+    write_default_config(&embedded_dir);
+    cmd_with_dir(&embedded_dir)
+        .args(["store", "add", "parity"])
+        .assert()
+        .success();
+    let fixture = embedded_dir.path().join("parity-docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+    std::fs::write(fixture.join("doc.md"), "# Doc\n\nhello world\n").unwrap();
+    cmd_with_dir(&embedded_dir)
+        .args([
+            "--store",
+            "parity",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // A second source, so the `index` re-run below has two source records
+    // in scope (both already auto-indexed by `source add`, so it reports
+    // them seen-but-skipped rather than "no sources to index").
+    let fixture2 = embedded_dir.path().join("parity-docs-2");
+    std::fs::create_dir_all(&fixture2).unwrap();
+    std::fs::write(fixture2.join("doc2.md"), "# Doc 2\n\nsecond file\n").unwrap();
+    cmd_with_dir(&embedded_dir)
+        .args([
+            "--store",
+            "parity",
+            "source",
+            "add",
+            fixture2.to_str().unwrap(),
+            "--kind",
+            "path",
+        ])
+        .assert()
+        .success();
+
+    // Both sources are now auto-indexed; a plain `index` re-run reports
+    // real, deterministic "seen but unchanged" numbers (docs_skipped > 0,
+    // everything else 0) without depending on exact chunking output.
+    let embedded_text = cmd_with_dir(&embedded_dir)
+        .args(["--store", "parity", "index"])
+        .output()
+        .unwrap();
+    assert!(embedded_text.status.success());
+    let embedded_stdout = String::from_utf8_lossy(&embedded_text.stdout).to_string();
+
+    let embedded_json = cmd_with_dir(&embedded_dir)
+        .args(["--json", "--store", "parity", "index"])
+        .output()
+        .unwrap();
+    assert!(embedded_json.status.success());
+    let embedded_json_stdout = String::from_utf8_lossy(&embedded_json.stdout).to_string();
+
+    // Daemon-mock run: a job whose `IndexJobStats` mirror the real embedded
+    // run's numbers exactly (both sources already indexed by the earlier
+    // `source add` auto-index runs, so `index` here reports them seen-but-
+    // skipped, not "no sources to index" — that shape only applies when a
+    // store has zero source *records*, not zero pending work).
+    let embedded_v: serde_json::Value = serde_json::from_str(&embedded_json_stdout).unwrap();
+    let stats_json = format!(
+        r#"{{"docs_indexed":{},"docs_skipped":{},"chunks_written":{},"unsupported_format_count":{},"error_count":{},"docs_deleted":{},"docs_prunable":{},"sources_count":2}}"#,
+        embedded_v["docs_indexed"],
+        embedded_v["docs_skipped"],
+        embedded_v["chunks_written"],
+        embedded_v["unsupported"],
+        embedded_v["errors"],
+        embedded_v["docs_deleted"],
+        embedded_v["docs_prunable"],
+    );
+
+    let daemon_dir = TempDir::new().unwrap();
+    write_default_config(&daemon_dir);
+    let stores_body = paginated_list_body(&[&store_record_json("parity")]);
+    let job_body = r#"{"id":"job-parity","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json("job-parity", "parity", &stats_json));
+    let (port, _received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-parity/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+        ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
+    ]);
+
+    let daemon_text = cmd_with_dir(&daemon_dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .arg("index")
+        .output()
+        .unwrap();
+    assert!(daemon_text.status.success());
+    let daemon_stdout = String::from_utf8_lossy(&daemon_text.stdout).to_string();
+
+    let daemon_json = cmd_with_dir(&daemon_dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["--json", "index"])
+        .output()
+        .unwrap();
+    assert!(daemon_json.status.success());
+    let daemon_json_stdout = String::from_utf8_lossy(&daemon_json.stdout).to_string();
+
+    assert_eq!(
+        embedded_stdout, daemon_stdout,
+        "text summary must be byte-identical between embedded and daemon-mock"
+    );
+    let daemon_v: serde_json::Value = serde_json::from_str(&daemon_json_stdout).unwrap();
+    assert_eq!(
+        embedded_v, daemon_v,
+        "--json summary must be identical between embedded and daemon-mock"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -4958,7 +5407,15 @@ fn source_add_json_multi_store_is_single_document_daemon() {
     assert_eq!(results.len(), 2, "{v}");
 
     let reqs = received.lock().unwrap();
-    let post_reqs = reqs.iter().filter(|(l, _)| l.starts_with("POST")).count();
+    // D3 (issue #187 stage 3): `source add`'s daemon branch now also
+    // submits a best-effort auto-index job per added source
+    // (`POST /v1/jobs`), so only the `POST /v1/stores/.../sources` add
+    // requests are counted here — the auto-index submissions aren't stubbed
+    // by this fixture and 404 harmlessly (WarnAndContinue).
+    let post_reqs = reqs
+        .iter()
+        .filter(|(l, _)| l.starts_with("POST /v1/stores"))
+        .count();
     assert_eq!(post_reqs, 2, "expected one POST per store; got: {:?}", reqs);
 }
 

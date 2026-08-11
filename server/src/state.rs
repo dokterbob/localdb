@@ -65,7 +65,11 @@ struct Inner {
 }
 
 impl AppState {
-    /// Create a new `AppState`.
+    /// Create a new `AppState`, opening its own connection to `localdb.db`.
+    ///
+    /// This is the daemon's own constructor — used by `start_daemon`, where
+    /// no connection to the store exists yet. Delegates the actual field
+    /// assembly to [`Self::from_backend`] once the connection is open.
     pub async fn new(
         yaml_config: RawConfig,
         data_dir: PathBuf,
@@ -84,10 +88,53 @@ impl AppState {
         let db_path = data_dir.join("localdb.db");
         let config = StoreBackendConfig::local_path(db_path, dim, encoding);
         let backend = Arc::new(SqliteBackend::open(config).await?) as Arc<dyn StoreBackend>;
+
+        Ok(Self::from_backend(
+            yaml_config,
+            data_dir,
+            models_dir,
+            backend,
+            job_queue,
+            url_scheduler,
+        ))
+    }
+
+    /// Create a new `AppState` around an already-open backend (issue #187
+    /// stage 3).
+    ///
+    /// For embedded/in-process use: the CLI's `index` and `source add`
+    /// commands already hold an open `StoreBackend` connection to
+    /// `localdb.db` (via `AppDb::open`/`load_app_db`) by the time they need
+    /// to run a job through `job_exec::run_job` — opening a second
+    /// connection here would be wasteful, and more importantly,
+    /// `SqliteBackend::open` (what `Self::new` calls) enforces a
+    /// schema-version migration guard on every open; embedded mode must pay
+    /// that cost at most once per process, not once for the CLI's own
+    /// `AppDb::open` *and again* for a second `AppState`-owned connection to
+    /// the same file.
+    ///
+    /// No I/O happens here — everything this constructor does is derived
+    /// from `yaml_config` alone (mirroring `Self::new`'s
+    /// `default_indexing_policy`/`default_policy_version` derivation
+    /// exactly, so the two constructors can never drift apart on what an
+    /// `AppState`'s default indexing policy is) or is simply stored as
+    /// given. In particular, nothing here assumes the backend was *just*
+    /// opened: `default_indexing_policy`/`default_policy_version` come from
+    /// the YAML config, not from a query against the backend, and every
+    /// other `Inner` field is either caller-supplied already or has no
+    /// dependency on connection freshness.
+    pub fn from_backend(
+        yaml_config: RawConfig,
+        data_dir: PathBuf,
+        models_dir: PathBuf,
+        backend: Arc<dyn StoreBackend>,
+        job_queue: JobQueue,
+        url_scheduler: UrlRefreshScheduler,
+    ) -> Self {
         let default_indexing_policy = yaml_config.defaults.indexing.clone();
         let default_policy_version = compute_policy_version(&default_indexing_policy);
 
-        Ok(Self {
+        Self {
             inner: Arc::new(Inner {
                 yaml_config: RwLock::new(yaml_config),
                 data_dir,
@@ -98,7 +145,7 @@ impl AppState {
                 job_queue,
                 url_scheduler,
             }),
-        })
+        }
     }
 
     /// Access the job queue.
@@ -520,6 +567,106 @@ mod tests {
     async fn models_dir_returns_the_value_it_was_given() {
         let (dir, state) = make_state().await;
         assert_eq!(state.models_dir(), dir.path().join("models"));
+    }
+
+    // --- from_backend (issue #187 stage 3) ---------------------------------
+
+    fn fake_yaml_config() -> RawConfig {
+        let mut yaml_config = RawConfig {
+            version: 1,
+            server: Default::default(),
+            paths: Default::default(),
+            defaults: Default::default(),
+            providers: vec![],
+        };
+        yaml_config.defaults.indexing.embedding = localdb_core::config::schema::EmbeddingPolicy {
+            provider: "fake".to_string(),
+            model: "default".to_string(),
+        };
+        yaml_config
+    }
+
+    /// `from_backend` must derive the exact same `default_indexing_policy` /
+    /// `default_policy_version` as `new` — both are pure functions of
+    /// `yaml_config`, so a store added via either constructor must land on
+    /// the same policy version.
+    #[tokio::test]
+    async fn from_backend_derives_same_default_policy_version_as_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml_config = fake_yaml_config();
+
+        let (dim, encoding) = embed::infer_dim_encoding(
+            &yaml_config.defaults.indexing.embedding,
+            &yaml_config.providers,
+        )
+        .unwrap();
+        let db_path = dir.path().join("localdb.db");
+        let config = StoreBackendConfig::local_path(db_path, dim, encoding);
+        let backend = Arc::new(SqliteBackend::open(config).await.unwrap()) as Arc<dyn StoreBackend>;
+
+        let queue = JobQueue::new();
+        let state = AppState::from_backend(
+            yaml_config.clone(),
+            dir.path().to_path_buf(),
+            dir.path().join("models"),
+            backend,
+            queue.clone(),
+            UrlRefreshScheduler::new(queue),
+        );
+
+        state.add_store("notes", "private").await.unwrap();
+        let row = state
+            .backend()
+            .get_store_by_name("notes")
+            .await
+            .unwrap()
+            .unwrap();
+        let expected_version = compute_policy_version(&yaml_config.defaults.indexing);
+        assert_eq!(row.policy_version, expected_version);
+    }
+
+    /// `from_backend` must operate on the exact backend handle it was given
+    /// — not open a fresh connection of its own — so a store added through
+    /// the caller's own already-open handle is immediately visible through
+    /// the resulting `AppState`, and vice versa.
+    #[tokio::test]
+    async fn from_backend_shares_the_given_backend_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml_config = fake_yaml_config();
+
+        let (dim, encoding) = embed::infer_dim_encoding(
+            &yaml_config.defaults.indexing.embedding,
+            &yaml_config.providers,
+        )
+        .unwrap();
+        let db_path = dir.path().join("localdb.db");
+        let config = StoreBackendConfig::local_path(db_path, dim, encoding);
+        let backend = Arc::new(SqliteBackend::open(config).await.unwrap()) as Arc<dyn StoreBackend>;
+
+        // Add a store directly via the caller's own handle, before the
+        // `AppState` even exists.
+        let row = store_factory::default_store_row(
+            "pre-existing",
+            StoreVisibility::Private,
+            &yaml_config.defaults.indexing,
+            &compute_policy_version(&yaml_config.defaults.indexing),
+        )
+        .unwrap();
+        backend.upsert_store(&row).await.unwrap();
+
+        let queue = JobQueue::new();
+        let state = AppState::from_backend(
+            yaml_config,
+            dir.path().to_path_buf(),
+            dir.path().join("models"),
+            backend,
+            queue.clone(),
+            UrlRefreshScheduler::new(queue),
+        );
+
+        let effective = state.effective_config().await.unwrap();
+        assert_eq!(effective.stores.len(), 1);
+        assert_eq!(effective.stores[0].name, "pre-existing");
     }
 
     #[tokio::test]

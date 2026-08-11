@@ -834,6 +834,7 @@ dependencies = [
  "embed",
  "extract",
  "fetch",
+ "futures",
  "indicatif 0.17.11",
  "ingest",
  "localdb-core",

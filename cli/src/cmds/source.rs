@@ -1,15 +1,18 @@
 use std::sync::Arc;
 
 use localdb_core::{
-    ids::new_ulid, ingestion::now_rfc3339, source::normalize_path_source, types::SourceKind,
-    Embedder, Error, SourceRow, StoreRow,
+    ids::new_ulid, ingestion::now_rfc3339, ingestion::DeletionPolicy,
+    source::normalize_path_source, types::SourceKind, Embedder, Error, IndexJobScope, SourceRow,
+    StoreRow,
 };
 use serde_json::json;
+use server::JobQueue;
 
 use crate::{
     app_db::{load_app_db, resolve_daemon_store_scope, resolve_store_scope, StoreScopePolicy},
-    cmds::index::{run_embedded_index_with, IndexErrorMode},
+    cmds::index::IndexErrorMode,
     daemon_client::{daemon_request_async, probe_daemon, CliContext, DaemonState},
+    job_attach,
     normalize::{
         classify_source, exit_err, exit_err_with_partial_results, kind_to_string, looks_like_id,
         print_json,
@@ -173,6 +176,12 @@ pub(crate) async fn run_source_add_async(
         // parseable as a single document.
         let mut json_results: Vec<serde_json::Value> = Vec::new();
 
+        // Sources successfully added, queued for a second-pass auto-index
+        // (D3, issue #187 stage 3) once every source in this request has
+        // been persisted — mirrors the embedded branch's own `to_index`
+        // deferral below.
+        let mut to_index: Vec<(String, String)> = Vec::new();
+
         for store_name in &store_names {
             // The handler's CreateSourceRequest expects {kind, spec, preset}
             // where spec is a nested object (see server/src/handlers.rs
@@ -207,12 +216,18 @@ pub(crate) async fn run_source_add_async(
             });
             match daemon_request_async(reqwest::Method::POST, &url_str, Some(body)).await {
                 Ok(v) => {
+                    let new_id = v.get("id").and_then(|i| i.as_str()).map(str::to_string);
+                    if kind == "path" || kind == "url" || kind == "feed" {
+                        if let Some(id) = &new_id {
+                            to_index.push((store_name.clone(), id.clone()));
+                        }
+                    }
                     if ctx.json {
                         json_results.push(v);
                     } else {
                         println!(
                             "Added source {} to store '{}' (via daemon)",
-                            v.get("id").and_then(|i| i.as_str()).unwrap_or("?"),
+                            new_id.as_deref().unwrap_or("?"),
                             store_name
                         );
                     }
@@ -241,6 +256,32 @@ pub(crate) async fn run_source_add_async(
             } else {
                 print_json(&json!({ "status": "ok", "results": json_results }));
             }
+        }
+
+        // D3 (issue #187 stage 3): the daemon branch used to skip
+        // auto-indexing entirely — a source added while a daemon was
+        // running sat unindexed until a later `localdb index`. Now it
+        // submits a best-effort auto-index job per newly-added source, the
+        // same `IndexErrorMode::WarnAndContinue` semantics the embedded
+        // branch below has always had: a failure (submission, attach, or
+        // the job itself) only ever warns to stderr, never fails `source
+        // add` (`job_attach::run_daemon_store_job` never returns `Err`
+        // under `WarnAndContinue`, short of the defensive
+        // non-terminal-state case, which is likewise swallowed here).
+        for (store_name, src_id) in &to_index {
+            if !ctx.json {
+                eprintln!("Auto-indexing source {} ...", src_id);
+            }
+            let _ = job_attach::run_daemon_store_job(
+                ctx,
+                base_url,
+                store_name,
+                Some(src_id.as_str()),
+                DeletionPolicy::Retain,
+                IndexErrorMode::WarnAndContinue,
+                None,
+            )
+            .await;
         }
         return;
     }
@@ -370,33 +411,34 @@ pub(crate) async fn run_source_add_async(
     // an N-store `source add` builds the (potentially ~706 MB local)
     // embedder at most once rather than once per store (Codex review round
     // 2, finding 6) — the same threading `run_index_async` does for
-    // `localdb index`.
+    // `localdb index`. Runs through the same unified job model
+    // (`job_attach::run_embedded_store_job`, issue #187 stage 3) `localdb
+    // index` uses, via a local `JobQueue` scoped to this command; under
+    // `IndexErrorMode::WarnAndContinue` it never returns `Err`, so a failure
+    // only ever warns to stderr and `source add` itself always succeeds.
     let mut embedder: Option<Arc<dyn Embedder>> = None;
+    let queue = JobQueue::new();
     for (row, src_id) in &to_index {
         if !ctx.json {
             eprintln!("Auto-indexing source {} ...", src_id);
         }
-        let (_summary, used_embedder) = match run_embedded_index_with(
+        let _ = job_attach::run_embedded_store_job(
             ctx,
-            &db,
+            &queue,
             &config_loader,
+            &db,
             row,
-            Some(src_id),
-            IndexErrorMode::WarnAndContinue,
-            embedder.clone(),
-            None,
+            IndexJobScope::Source {
+                source_id: src_id.clone(),
+            },
             // A source being added for the first time has no indexed history
             // to prune, and auto-index is not the place to remove anything.
-            localdb_core::ingestion::DeletionPolicy::Retain,
+            DeletionPolicy::Retain,
+            IndexErrorMode::WarnAndContinue,
+            &mut embedder,
+            None,
         )
-        .await
-        {
-            Ok(result) => result,
-            Err(e) => exit_err(&e, ctx.json),
-        };
-        if embedder.is_none() {
-            embedder = used_embedder;
-        }
+        .await;
     }
 }
 

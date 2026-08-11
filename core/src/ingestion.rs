@@ -1531,6 +1531,7 @@ mod tests {
             chunks_written: 12,
             unsupported_format_count: 1,
             error_count: 0,
+            ..Default::default()
         };
         complete_index_job(&mut job, stats.clone());
         assert_eq!(job.state, IndexJobState::Done);

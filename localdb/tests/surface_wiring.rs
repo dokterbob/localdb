@@ -452,3 +452,156 @@ fn serve_starts_listens_and_serves_status() {
         "/v1/status body must report daemon status and store_count: {response}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Unified async job model, daemon-routed (issue #187 stage 3)
+// ---------------------------------------------------------------------------
+
+/// Real two-process end-to-end: `localdb serve` (a genuine daemon, no mock)
+/// → `localdb store add` + `localdb source add` (routed to it over HTTP,
+/// D3: auto-index now runs for a daemon-routed `source add` too) → `localdb
+/// search` (also daemon-routed) finds the indexed content.
+///
+/// Embedder: `provider: fake` (`write_config`'s default, the same one every
+/// other `surface_wiring`/`cli_integration` test uses) — a real local-model
+/// download is unacceptable in a test, and `fake` is already the
+/// established offline stand-in throughout this crate, so no new stub HTTP
+/// embedding server is needed.
+///
+/// Asserts the parts D3 and the unified job model actually promise:
+/// - `source add`'s stdout confirms the add went through the daemon.
+/// - stderr shows live auto-index progress (the plain-mode progress sink,
+///   since stderr is piped rather than a TTY here) — proving the daemon
+///   branch actually attached to the job instead of just printing
+///   "submitted".
+/// - the auto-index summary reports a nonzero indexed/chunk count.
+/// - a subsequent `localdb search` (also daemon-routed, since the daemon is
+///   still up) finds the content by a distinctive word from the fixture.
+#[test]
+fn daemon_source_add_auto_indexes_and_is_searchable() {
+    let dir = TempDir::new().unwrap();
+    write_config(&dir, "server:\n  port: 0\n");
+
+    let bin = assert_cmd::cargo::cargo_bin("localdb");
+    let mut daemon = std::process::Command::new(&bin)
+        .arg("serve")
+        .env("LOCALDB_CONFIG", dir.path().join("config.yaml"))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn localdb serve");
+
+    let daemon_stdout = daemon.stdout.take().unwrap();
+    let mut reader = BufReader::new(daemon_stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read announce line");
+    let addr = line
+        .split("http://")
+        .nth(1)
+        .unwrap_or_else(|| panic!("announce line must contain http:// URL, got: {line}"))
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    let base_url = format!("http://{addr}");
+
+    // `source add`'s daemon branch defaults to the store named "default"
+    // (specs/05-surfaces.md §2.2) — it must already exist, same as the
+    // embedded path.
+    cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &base_url)
+        .args(["store", "add", "default"])
+        .assert()
+        .success();
+
+    let fixture = dir.path().join("e2e-docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+    std::fs::write(
+        fixture.join("quokka.md"),
+        "# Quokka facts\n\nQuokkas are small marsupials known for their friendly smiles.\n",
+    )
+    .unwrap();
+
+    let add_output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &base_url)
+        .args(["source", "add", fixture.to_str().unwrap()])
+        .output()
+        .expect("run source add");
+
+    if !add_output.status.success() {
+        daemon.kill().ok();
+        daemon.wait().ok();
+        panic!(
+            "daemon-routed source add failed: stdout={}\nstderr={}",
+            String::from_utf8_lossy(&add_output.stdout),
+            String::from_utf8_lossy(&add_output.stderr)
+        );
+    }
+
+    let add_stdout = String::from_utf8_lossy(&add_output.stdout).to_string();
+    assert!(
+        add_stdout.contains("(via daemon)"),
+        "source add must confirm it went through the daemon: {add_stdout}"
+    );
+
+    // D3: the daemon branch now auto-indexes too — the plain-mode progress
+    // sink (stderr is piped, not a TTY, under `assert_cmd`) must show real
+    // live progress, not just a submission acknowledgement.
+    let add_stderr = String::from_utf8_lossy(&add_output.stderr).to_string();
+    assert!(
+        add_stderr.contains("Auto-indexing source"),
+        "expected the auto-indexing announcement on stderr: {add_stderr}"
+    );
+    assert!(
+        add_stderr.contains("Indexing") && add_stderr.contains("indexed"),
+        "expected live progress-sink output (Indexing.../indexed... lines) on stderr, proving \
+         the daemon branch attached to the job rather than just printing 'submitted': {add_stderr}"
+    );
+
+    // Now confirm via an explicit `index --json` that the auto-indexed
+    // content actually landed: a plain re-run should report the source as
+    // already up to date (docs_skipped > 0), never "no sources to index".
+    let index_output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &base_url)
+        .args(["--json", "index"])
+        .output()
+        .expect("run index --json");
+    assert!(
+        index_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&index_output.stderr)
+    );
+    let index_v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&index_output.stdout)).unwrap();
+    assert!(
+        index_v["docs_skipped"].as_u64().unwrap_or(0) > 0,
+        "the auto-indexed document must already be up to date on a follow-up index: {index_v}"
+    );
+
+    // `localdb search` (daemon-routed, per `search_routes_to_daemon_when_running`
+    // — the daemon is still up) must find the content by a word unique to
+    // the fixture.
+    let search_output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &base_url)
+        .args(["--json", "search", "quokka marsupial"])
+        .output()
+        .expect("run search");
+
+    daemon.kill().ok();
+    daemon.wait().ok();
+
+    assert!(
+        search_output.status.success(),
+        "search failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&search_output.stdout),
+        String::from_utf8_lossy(&search_output.stderr)
+    );
+    let search_v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&search_output.stdout)).unwrap();
+    let citations = search_v["citations"]
+        .as_array()
+        .expect("search --json returns a citations array");
+    assert!(
+        !citations.is_empty(),
+        "search must find the auto-indexed quokka content: {search_v}"
+    );
+}

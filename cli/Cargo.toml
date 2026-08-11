@@ -18,9 +18,15 @@ server = { path = "../server" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 indicatif = { workspace = true }
 percent-encoding = { workspace = true }
+# `bytes_stream()` on a `reqwest::Response` yields a `futures_util::Stream`
+# (re-exported by `futures`, already a pinned workspace dependency used by
+# `server` for its own SSE stream) — hand-rolling the `GET
+# /v1/jobs/{id}/events` SSE line parser in `job_attach.rs` needs `StreamExt`
+# to poll it.
+futures = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # On macOS, auto-enable CoreML so any localdb build (release tarball or cargo install)

@@ -80,6 +80,7 @@ pub async fn create_job(
                 models_dir: state.models_dir(),
                 embedder: None,
                 progress: Some(progress),
+                on_source_error: None,
             };
             job_exec::run_job(&store_row, job_scope_for_closure, deletion, deps)
                 .await
