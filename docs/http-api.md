@@ -378,6 +378,15 @@ HTTP status codes follow the shared error taxonomy in [specs/05-surfaces.md](../
 
 ## Troubleshooting
 
+### Diagnosing a rejected (4xx/5xx) request
+
+`localdb serve` logs every response with status >= 400 at `warn` level, with the
+request's method, path, status, and `Host` header — including responses from the nested
+`/mcp` mount (e.g. rmcp's own DNS-rebinding Host-header check), not just `/v1` routes.
+This surfaces on stderr by default: `localdb`'s default log filter (`warn,pdf_oxide=off`,
+set in `localdb/src/main.rs`) already passes `warn`-level events through, so no `RUST_LOG`
+is needed to see a rejected request logged. Set `RUST_LOG=debug` for more detail.
+
 ### `daemon_running` (exit 4) when starting `localdb serve`
 
 Only one daemon may run against a given data directory at a time. If `localdb serve` exits

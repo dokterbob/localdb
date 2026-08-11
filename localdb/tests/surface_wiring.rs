@@ -309,6 +309,53 @@ fn mcp_stdio_daemon_unreachable_maps_to_daemon_unreachable_exit_code() {
     );
 }
 
+/// Issue #147: a failed proxy connect must not fail *silently* — before this
+/// fix, the only signal was `exit_err`'s generic "error: daemon is
+/// unreachable" line, with the actual transport-level reason (e.g.
+/// connection refused) discarded. `run_mcp_async`'s
+/// `Err(ProxyConnectError::Unreachable(e))` arm now emits a `tracing::warn!`
+/// carrying `e` before exiting; `localdb/src/main.rs`'s default log filter
+/// (`warn,pdf_oxide=off`) means this shows up on stderr with no `RUST_LOG`
+/// needed, exactly like every other daemon-connection diagnostic this ticket
+/// adds. Reuses the same closed-port setup as
+/// `mcp_stdio_daemon_unreachable_maps_to_daemon_unreachable_exit_code` (a
+/// single client process is sufficient to drive the connect failure — no
+/// second `localdb serve` process is needed to prove the warning fires, so a
+/// full two-process test would be disproportionate here).
+#[test]
+fn mcp_stdio_daemon_unreachable_logs_a_warning() {
+    let dir = TempDir::new().unwrap();
+    write_config(&dir, "");
+
+    let closed_port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+        // listener drops here, closing the port.
+    };
+    let stale_url = format!("http://127.0.0.1:{closed_port}");
+
+    let assert = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &stale_url)
+        .arg("mcp")
+        .write_stdin("")
+        .assert()
+        .code(5);
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("WARN"),
+        "expected a WARN-level log line, got stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("mcp proxy: failed to connect to daemon"),
+        "expected the proxy-connect warning, got stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(&stale_url),
+        "expected the warning to name the unreachable daemon URL, got stderr: {stderr}"
+    );
+}
+
 /// Codex review (P2): a malformed `--store` name must be rejected as
 /// `invalid_request`/exit 2 in proxied mode too, matching embedded mode and
 /// every other store-scoped command — not surface as `store_not_found`/exit 3
