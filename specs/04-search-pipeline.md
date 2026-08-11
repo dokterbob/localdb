@@ -324,12 +324,19 @@ citation granularity — while the model handles cross-chunk context, with no ov
 These are defaults to beat with evaluation, not dogma.
 
 **`chunk_prose` structureless fallback:** When `MarkdownSplitter` produces a single chunk
-covering the whole block (a sign that the content lacks structure), `chunk_prose` falls back
-to the `code` chunker so that the content is still indexed in bounded chunks.
+covering the whole block, `chunk_prose` probes the block's longest whitespace-free run rather
+than its longest line — an ordinary paragraph or long-lined prose block has plenty of internal
+whitespace and stays on the prose path. Only when that run exceeds `STRUCTURELESS_RUN_MULTIPLIER`
+(8×) the char target — genuinely structureless content such as minified JSON or a lockfile —
+does `chunk_prose` fall back to the `code` chunker so the content is still indexed in bounded
+chunks (#191, #192).
 
-**`chunk_code` long-line split:** `chunk_code` enforces a per-line byte limit. Lines
-exceeding the limit are split into fixed-width sub-segments before chunking, preventing
-single-line binary or minified content from producing unbounded chunk sizes.
+**`chunk_code` long-line split:** `chunk_code` enforces a per-line char limit. Lines exceeding
+the limit are hard-split into target-sized pieces, preventing single-line binary or minified
+content from producing unbounded chunk sizes. Each cut prefers the last whitespace inside the
+window over the raw char boundary — as long as backing off to it still leaves a piece more than
+half the window — so ordinary long-lined prose splits between words instead of mid-word;
+content with no whitespace in the window (base64, URLs) still gets the hard char cut (#191).
 
 ### Spreadsheet routing
 
@@ -426,7 +433,12 @@ reordering parsers alone marks the store stale and schedules a reindex.
 
 The `chunking` sub-policy embeds a chunking algorithm identifier as part of what gets hashed;
 bumping it forces a reindex even when no user-visible config field changed. Current value:
-**`textsplitter-md-v5`** (bumped from `v4`). The `v5` bump covers the coarse `Text` block
+**`textsplitter-md-v6`** (bumped from `v5`). The `v6` bump covers the mid-word-split fix
+(#191, #192): `chunk_prose`'s structureless backstop now probes the longest whitespace-free
+run instead of the longest line, and `chunk_code`'s overlong-line hard-split now backs off to
+the last whitespace in the window (falling back to the char cut only when the window has no
+whitespace) — chunk boundaries change for long single-line prose, so existing stores reindex
+on the next `localdb index`. The `v5` bump covers the coarse `Text` block
 ontology — `markdown_to_blocks` now emits one `Text` block per run of consecutive running-text
 content, so prose chunks pack toward the ~256-token target instead of one-tiny-chunk-per-
 paragraph (§3 above, "Coarse `Text` blocks"; the #158 fix), silently altering chunk boundaries.

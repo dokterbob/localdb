@@ -303,6 +303,14 @@ offsets** — they index into the parent block's `text`, not the full document M
 with `block_seq`, they provide a complete location: `(resource_id, block_seq, span)`.
 Document-relative offsets are not stored or computed.
 
+For single-block chunks, a span locates its chunk's exact text: `block.text[span.start..span.end]
+== chunk.text`. **Adjacent spans within a block are not guaranteed contiguous** — the underlying
+splitter trims whitespace from chunk boundaries, so a small gap between one chunk's `end` and the
+next chunk's `start` is normal, not a bug. Any such gap contains only whitespace. Spans are
+therefore **not a partition of the block**: consumers MUST NOT reconstruct block text by
+concatenating chunk spans or chunk texts in sequence — use `block.text` directly if the full
+block is needed.
+
 **Exception — message-window chunks:** the `messages` chunking preset creates chunks that span
 multiple `Message`/`Segment` blocks via a sliding window. This is an explicit multi-block
 chunking mode. The `ChunkLocation` carries `window_block_seqs`: the set of participating block
