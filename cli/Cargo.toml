@@ -36,3 +36,11 @@ embed = { path = "../embed", features = ["local-coreml"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Real-server test harnesses for `job_attach.rs`'s daemon-routed paths
+# (submit/attach/SSE/poll-fallback error branches): both a real
+# `server::daemon::build_router` instance and a small hand-rolled mock router
+# for wire-shape edge cases the real daemon can't be coaxed into producing
+# (a malformed `/v1/jobs` response, a dropped SSE stream). `axum` is already
+# resolved in the dependency graph via `server`'s own (non-dev) dependency on
+# it — this only newly depends on it directly for test code.
+axum = { workspace = true }

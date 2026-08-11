@@ -10,7 +10,7 @@
 | **1 — MVP** | Files + URLs → hybrid search (BM25+dense, RRF) with citations, via **CLI + MCP**; multiple stores; embedded-first with optional daemon + HTTP API | Complete. |
 | **1.5 — Ingestor framework** | Resource/Block/Ingestor architecture: typed blocks replace Markdown IR, `Ingestor` trait, `messages` chunker, schema replacement, context expansion queries | Current work. See [07-adr-blocks-canonical-ir.md](07-adr-blocks-canonical-ir.md). |
 | 2 — Connectors | Individual ingestors: Notion, Telegram, Signal, email (mbox/EML), transcription (SRT/VTT/Whisper), HackMD, Obsidian enhancements. **Atom/RSS: shipped** (#116) — `feed-rs`-based `Feed` ingestor, discovery + single-document modes ([02-domain-model.md](02-domain-model.md) §2). Each remaining connector tracked as its own GitHub issue. | Builds on the Ingestor trait from Phase 1.5. |
-| 3 — Web UI | Search/browse + admin on the existing HTTP API; SSE job progress | First management GUI. |
+| 3 — Web UI | Search/browse + admin on the existing HTTP API. SSE job progress: **shipped** (#83) — `GET /v1/jobs/{id}/events`, consumed by the CLI's daemon-routed job attach (`cli/src/job_attach.rs`); ahead of this phase's own UI work. | First management GUI. |
 | 4 — Remote store / home-server | Qdrant **server** adapter behind `RetrievalStore`; headless Linux mode; reverse-proxy guidance | "Laptop → home server without rethinking the stack." |
 | 5 — Shared stores | `visibility: shared` becomes functional; **mature auth only** — OIDC/OAuth2 for client-server sharing; per-store ACLs | No homegrown crypto. |
 | 6 — Federation | Propagating shares through the social graph | §3 below. |
@@ -59,7 +59,7 @@ Linux; web UI assets embedded in the binary at Phase 3. Model files are never bu
 
 ## 5. Consolidated "later" list
 
-Deferred items referenced by other specs, in one place: reranking stage; SSE job streaming;
+Deferred items referenced by other specs, in one place: reranking stage;
 original-file line mapping for citations; OCR / scanned PDFs; additional ebook formats (see
 below); OS keychain secret storage; interactive CLI browse; gRPC (if demanded); entities/graph;
 backup/export/import strategy (with Phase 4); metrics/tracing endpoints (structured logs ship in

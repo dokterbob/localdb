@@ -313,13 +313,42 @@ mod tests {
     use super::*;
     use localdb_core::IndexJobState;
 
+    /// Shared trivial task body used by every test below that only cares
+    /// "the job completes successfully with no stats to speak of" — a plain
+    /// function item (not a closure literal) so its body is one piece of
+    /// code shared by every call site, rather than a separate,
+    /// separately-instrumented closure per call site (several of which,
+    /// written inline, would never actually run to completion within their
+    /// own test — e.g. a submission that's expected to be rejected before
+    /// the worker ever invokes its task).
+    async fn ok_job(_progress: ProgressSink) -> Result<IndexJobStats, String> {
+        Ok(IndexJobStats::default())
+    }
+
+    /// Poll `queue.get_job(job_id)` until it reports `Done`, panicking if
+    /// `deadline` elapses first — the shared wait-for-completion pattern
+    /// used throughout this module's tests so a task's body is guaranteed
+    /// to have actually run (not just been scheduled) before the test
+    /// inspects it.
+    async fn wait_for_done(queue: &JobQueue, job_id: &str) -> IndexJob {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let job = queue.get_job(job_id).await.unwrap();
+            if job.state == IndexJobState::Done || job.state == IndexJobState::Failed {
+                return job;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("job did not reach a terminal state in time: {job:?}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     #[tokio::test]
     async fn submit_creates_job_in_known_state() {
         let queue = JobQueue::new();
         let job = queue
-            .submit("store-1", IndexJobScope::Store, |_progress| async {
-                Ok(IndexJobStats::default())
-            })
+            .submit("store-1", IndexJobScope::Store, ok_job)
             .await
             .unwrap();
         assert_eq!(job.store_id, "store-1");
@@ -331,6 +360,10 @@ mod tests {
             "unexpected state: {:?}",
             job.state
         );
+        // Drive it to completion too, so `ok_job`'s body is guaranteed to
+        // have actually run at least once under coverage.
+        let done = wait_for_done(&queue, &job.id).await;
+        assert_eq!(done.state, IndexJobState::Done);
     }
 
     #[tokio::test]
@@ -401,15 +434,11 @@ mod tests {
     async fn list_jobs_returns_all() {
         let queue = JobQueue::new();
         queue
-            .submit("store-1", IndexJobScope::Store, |_progress| async {
-                Ok(IndexJobStats::default())
-            })
+            .submit("store-1", IndexJobScope::Store, ok_job)
             .await
             .unwrap();
         queue
-            .submit("store-2", IndexJobScope::Store, |_progress| async {
-                Ok(IndexJobStats::default())
-            })
+            .submit("store-2", IndexJobScope::Store, ok_job)
             .await
             .unwrap();
 
@@ -445,33 +474,34 @@ mod tests {
             .await
             .unwrap();
 
-        let second = queue
-            .submit("store-1", IndexJobScope::Store, |_progress| async {
-                Ok(IndexJobStats::default())
-            })
-            .await;
+        let second = queue.submit("store-1", IndexJobScope::Store, ok_job).await;
         assert!(
             matches!(second, Err(Error::IndexInProgress)),
             "expected IndexInProgress, got: {:?}",
             second
         );
 
+        // Release the blocked first job and drive it to completion, so its
+        // task body (the `move |_progress| async move { ... }` closure
+        // above) is guaranteed to actually run under coverage rather than
+        // merely being scheduled.
         let _ = release_tx.send(());
+        let job_id = queue
+            .list_jobs()
+            .await
+            .into_iter()
+            .find(|j| j.store_id == "store-1")
+            .expect("the first submission's job must be registered")
+            .id;
+        let done = wait_for_done(&queue, &job_id).await;
+        assert_eq!(done.state, IndexJobState::Done);
     }
 
     #[tokio::test]
     async fn two_distinct_stores_both_queue_fine() {
         let queue = JobQueue::new();
-        let a = queue
-            .submit("store-a", IndexJobScope::Store, |_progress| async {
-                Ok(IndexJobStats::default())
-            })
-            .await;
-        let b = queue
-            .submit("store-b", IndexJobScope::Store, |_progress| async {
-                Ok(IndexJobStats::default())
-            })
-            .await;
+        let a = queue.submit("store-a", IndexJobScope::Store, ok_job).await;
+        let b = queue.submit("store-b", IndexJobScope::Store, ok_job).await;
         assert!(a.is_ok());
         assert!(b.is_ok());
     }
@@ -480,32 +510,16 @@ mod tests {
     async fn guard_is_released_after_job_completes_allowing_resubmission() {
         let queue = JobQueue::new();
         let job = queue
-            .submit("store-1", IndexJobScope::Store, |_progress| async {
-                Ok(IndexJobStats::default())
-            })
+            .submit("store-1", IndexJobScope::Store, ok_job)
             .await
             .unwrap();
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            if std::time::Instant::now() > deadline {
-                panic!("job did not complete in time");
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            if queue.get_job(&job.id).await.unwrap().state == IndexJobState::Done {
-                break;
-            }
-        }
+        wait_for_done(&queue, &job.id).await;
 
         // Poll for the guard release too — it happens just after the
         // registry update, so a resubmission may race it by a tick.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            let resubmit = queue
-                .submit("store-1", IndexJobScope::Store, |_progress| async {
-                    Ok(IndexJobStats::default())
-                })
-                .await;
+            let resubmit = queue.submit("store-1", IndexJobScope::Store, ok_job).await;
             if resubmit.is_ok() {
                 break;
             }
@@ -539,11 +553,7 @@ mod tests {
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            let resubmit = queue
-                .submit("store-1", IndexJobScope::Store, |_progress| async {
-                    Ok(IndexJobStats::default())
-                })
-                .await;
+            let resubmit = queue.submit("store-1", IndexJobScope::Store, ok_job).await;
             if resubmit.is_ok() {
                 break;
             }
@@ -564,9 +574,7 @@ mod tests {
     async fn subscribe_finds_channel_before_terminal_and_none_after() {
         let queue = JobQueue::new();
         let job = queue
-            .submit("store-1", IndexJobScope::Store, |_progress| async {
-                Ok(IndexJobStats::default())
-            })
+            .submit("store-1", IndexJobScope::Store, ok_job)
             .await
             .unwrap();
 
@@ -575,16 +583,7 @@ mod tests {
             "expected a channel for a freshly-submitted job"
         );
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            if std::time::Instant::now() > deadline {
-                panic!("job did not complete in time");
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            if queue.get_job(&job.id).await.unwrap().state == IndexJobState::Done {
-                break;
-            }
-        }
+        wait_for_done(&queue, &job.id).await;
 
         assert!(
             queue.subscribe(&job.id).await.is_none(),
@@ -626,5 +625,102 @@ mod tests {
             localdb_core::ProgressEvent::Discovered { total } => assert_eq!(total, 3),
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    // --- Worker resilience -----------------------------------------------
+
+    /// A task future that panics must be recorded as a normal job failure
+    /// (via `tokio::spawn`'s `JoinError`), not crash the worker loop or the
+    /// process — the whole point of running each job's future through
+    /// `tokio::spawn` rather than awaiting it inline.
+    #[tokio::test]
+    async fn job_whose_task_panics_is_recorded_as_failed_not_worker_crashing() {
+        let queue = JobQueue::new();
+        let job = queue
+            .submit("store-1", IndexJobScope::Store, |_progress| async {
+                panic!("simulated task panic");
+                #[allow(unreachable_code)]
+                Ok(IndexJobStats::default())
+            })
+            .await
+            .unwrap();
+
+        let done = wait_for_done(&queue, &job.id).await;
+        assert_eq!(done.state, IndexJobState::Failed);
+        assert!(
+            done.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("panicked"),
+            "expected the panic to surface in the job's error text, got: {:?}",
+            done.error
+        );
+
+        // The worker loop itself must have survived: a second, unrelated
+        // submission still gets processed normally afterwards.
+        let job2 = queue
+            .submit("store-2", IndexJobScope::Store, ok_job)
+            .await
+            .unwrap();
+        let done2 = wait_for_done(&queue, &job2.id).await;
+        assert_eq!(done2.state, IndexJobState::Done);
+    }
+
+    /// `submit` must report the job as `Failed` (not panic or hang) when the
+    /// worker side of the channel is already gone — the "queue full or
+    /// closed" branch. Constructed directly (this test lives in the same
+    /// module as `JobQueue`'s private fields) with a receiver dropped
+    /// up front and no `run_worker` task spawned, so the very first `send`
+    /// in `submit` is guaranteed to hit a closed channel rather than one
+    /// that's merely unpolled.
+    #[tokio::test]
+    async fn submit_fails_the_job_when_the_worker_channel_is_already_closed() {
+        let (sender, receiver) = mpsc::channel::<QueuedJob>(1);
+        drop(receiver);
+        let queue = JobQueue {
+            sender,
+            registry: Arc::new(RwLock::new(HashMap::new())),
+            inflight: Arc::new(RwLock::new(HashSet::new())),
+            events: Arc::new(RwLock::new(HashMap::new())),
+        };
+
+        let job = queue
+            .submit("store-1", IndexJobScope::Store, ok_job)
+            .await
+            .expect("submit itself still returns Ok — the failure is recorded on the job");
+
+        assert_eq!(job.state, IndexJobState::Failed);
+        assert_eq!(
+            job.error.as_deref(),
+            Some("job queue is full or closed"),
+            "unexpected error: {:?}",
+            job.error
+        );
+        // The in-flight guard for this store must have been released too —
+        // a fresh submission (against a real, working queue) must not see
+        // a stale reservation.
+        assert!(
+            !queue.inflight.read().await.contains("store-1"),
+            "the in-flight guard must be released on a send failure"
+        );
+        // And the just-created progress-event channel must have been torn
+        // down, matching a normally-terminal job.
+        assert!(
+            queue.subscribe(&job.id).await.is_none(),
+            "no progress channel should remain for a job that never ran"
+        );
+    }
+
+    // --- Default -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn default_constructs_a_working_queue() {
+        let queue = JobQueue::default();
+        let job = queue
+            .submit("store-1", IndexJobScope::Store, ok_job)
+            .await
+            .unwrap();
+        let done = wait_for_done(&queue, &job.id).await;
+        assert_eq!(done.state, IndexJobState::Done);
     }
 }
