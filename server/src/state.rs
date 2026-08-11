@@ -295,6 +295,7 @@ impl AppState {
             .find(|s| s.name == name)
             .map(|s| StoreRecord {
                 name: s.name.clone(),
+                id: s.id.clone(),
                 visibility: s.visibility.clone(),
                 backend: s.backend.clone(),
             })
@@ -518,9 +519,18 @@ fn source_row_to_record(row: SourceRow) -> Result<SourceRecord, Error> {
 }
 
 /// A store record as returned by the API.
+///
+/// `id` (issue #187 stage 5): needed so `POST /v1/stores`'s response can
+/// carry the same `{status, name, id}` shape the embedded `store add` path
+/// has always returned in `--json` mode — without it, the CLI's daemon-aware
+/// dispatch table would have no way to render an identical `Outcome` for both
+/// transports. Populated on every handler (`list_stores`, `create_store`,
+/// `get_store`, `patch_store`) rather than only `create_store`, so the type
+/// never has a "sometimes has an id" ambiguity.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoreRecord {
     pub name: String,
+    pub id: String,
     pub visibility: String,
     pub backend: String,
 }

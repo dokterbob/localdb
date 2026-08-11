@@ -9,8 +9,11 @@ use serde_json::json;
 use server::JobQueue;
 
 use crate::{
-    app_db::{load_app_db, resolve_daemon_store_scope, resolve_store_scope, StoreScopePolicy},
-    daemon_client::{probe_daemon, CliContext, DaemonState},
+    app_db::{
+        load_app_db, resolve_daemon_store_scope, resolve_store_scope, AppDb, StoreScopePolicy,
+    },
+    command_table::{dispatch, DaemonAwareCommand},
+    daemon_client::CliContext,
     job_attach,
     normalize::{exit_err, print_json},
 };
@@ -118,57 +121,33 @@ pub fn run_index(ctx: &CliContext, source_id: Option<&str>, strict: bool, delete
     rt.block_on(run_index_async(ctx, source_id, strict, delete));
 }
 
-pub(crate) async fn run_index_async(
-    ctx: &CliContext,
-    source_id: Option<&str>,
-    strict: bool,
-    delete: bool,
-) {
-    let (config_loader, db) = load_app_db(ctx).await;
-    let data_dir = config_loader.paths.data_dir.clone();
-    let deletion = if delete {
-        DeletionPolicy::Prune
-    } else {
-        DeletionPolicy::Retain
-    };
+/// `index`'s table entry (issue #187 stage 5). Both transports were already
+/// unified onto the shared async job model in stage 3 — `run_daemon`/
+/// `run_embedded` below submit through `job_attach::run_daemon_store_job` /
+/// `run_embedded_store_job` respectively and fold the result into the same
+/// `Vec<StoreIndexOutcome>` `Outcome`, rendered by the one shared
+/// `report_index_outcomes` call in `run_index_async`. Stage 5 only moves the
+/// *mode selection* itself onto `command_table::dispatch`, replacing the
+/// hand-written `if let DaemonState::Running {...} {...} else {...}` so a
+/// future edit can't reintroduce a second, competing `probe_daemon` call.
+struct IndexCmd<'a> {
+    source_id: Option<&'a str>,
+    deletion: DeletionPolicy,
+}
 
-    // Per specs/05-surfaces.md §2: when daemon is running, submit a job per
-    // resolved store instead of indexing embedded. Probed *before* store
-    // resolution — like `source add`'s daemon branch
-    // (`cli/src/cmds/source.rs`) — because the two paths resolve scope
-    // differently: the daemon owns its own store set (see
-    // `resolve_daemon_store_scope`), which may differ from whatever this
-    // process's local database happens to contain (`LOCALDB_DAEMON_URL` can
-    // point at a daemon with an entirely different data directory). Getting
-    // this order wrong was Codex review round 2, finding 1: an explicit
-    // daemon-valid `--store` used to be rejected against the local DB before
-    // the daemon was ever asked, and an omitted `-s` submitted jobs for the
-    // *local* store set instead of the daemon's. `/v1/jobs` is a
-    // single-store API (server/src/handlers/jobs.rs), so a multi-store scope
-    // becomes one POST per store here rather than a batched request.
-    //
-    // D1/D6 (issue #187 stage 3): both branches below submit a job — through
-    // `job_attach::run_embedded_store_job` (a local `JobQueue` running
-    // `job_exec::run_job` in-process) or `job_attach::run_daemon_store_job`
-    // (`POST /v1/jobs` + SSE/poll attach) — and fold the result into the
-    // *same* `Vec<StoreIndexOutcome>`, rendered by the one shared
-    // `report_index_outcomes` call at the end. `--delete` is no longer
-    // refused against a daemon (D6): it is sent as `deletion_policy: "delete"`
-    // and the daemon now runs real ingestion (issue #187), so it can honor it.
-    let outcomes: Vec<StoreIndexOutcome> = if let DaemonState::Running { base_url } =
-        probe_daemon(&data_dir, ctx.daemon_url.as_deref())
-    {
-        let store_names =
-            resolve_daemon_store_scope(&base_url, ctx, StoreScopePolicy::AllStores).await;
+impl DaemonAwareCommand for IndexCmd<'_> {
+    type Outcome = Vec<StoreIndexOutcome>;
+
+    const SCOPE_POLICY: StoreScopePolicy = StoreScopePolicy::AllStores;
+
+    async fn run_daemon(&self, ctx: &CliContext, base_url: &str) -> Result<Self::Outcome, Error> {
+        let store_names = resolve_daemon_store_scope(base_url, ctx, Self::SCOPE_POLICY).await;
 
         // `--source` narrows the daemon scope to the source's owning
-        // store, exactly as the embedded branch below narrows its own
-        // `store_rows` — see `resolve_daemon_source_owner`'s doc comment.
-        let target_names: Vec<String> = match source_id {
-            Some(sid) => match resolve_daemon_source_owner(&base_url, &store_names, sid).await {
-                Ok(owner) => vec![owner],
-                Err(e) => exit_err(&e, ctx.json),
-            },
+        // store, exactly as `run_embedded` narrows its own `store_rows` —
+        // see `resolve_daemon_source_owner`'s doc comment.
+        let target_names: Vec<String> = match self.source_id {
+            Some(sid) => vec![resolve_daemon_source_owner(base_url, &store_names, sid).await?],
             None => store_names,
         };
 
@@ -178,10 +157,10 @@ pub(crate) async fn run_index_async(
             let label = if multi { Some(name.as_str()) } else { None };
             let summary = match job_attach::run_daemon_store_job(
                 ctx,
-                &base_url,
+                base_url,
                 name,
-                source_id,
-                deletion,
+                self.source_id,
+                self.deletion,
                 IndexErrorMode::StrictExit,
                 label,
             )
@@ -195,16 +174,19 @@ pub(crate) async fn run_index_async(
                 summary,
             });
         }
-        outcomes
-    } else {
+        Ok(outcomes)
+    }
+
+    async fn run_embedded(
+        &self,
+        ctx: &CliContext,
+        config_loader: &localdb_core::config::loader::ConfigLoader,
+        db: &AppDb,
+    ) -> Result<Self::Outcome, Error> {
         // specs/05-surfaces.md §2.2: `-s` is repeatable and every store
         // scoped by it (or, absent `-s`, every store in the database) is
-        // indexed. Resolved here, after the daemon probe above, so the
-        // embedded path still opens the DB exactly once (via
-        // `load_app_db` at the top of this function) and never pays for
-        // a local store lookup that the daemon branch would have thrown
-        // away.
-        let store_rows = resolve_store_scope(ctx, &db, StoreScopePolicy::AllStores).await;
+        // indexed.
+        let store_rows = resolve_store_scope(ctx, db, Self::SCOPE_POLICY).await;
 
         // `--source` names a single, globally-unique source: resolve its
         // owning store once and narrow the run to just that store,
@@ -217,25 +199,22 @@ pub(crate) async fn run_index_async(
         // here: if the source's owner isn't among the
         // explicitly-requested stores, that's still exit 3 — we don't
         // silently redirect to the owner.
-        let store_rows: Vec<StoreRow> = if let Some(sid) = source_id {
-            let owner_store_id = match db.backend().get_source(sid).await {
-                Ok(Some(src)) => src.store_id,
-                Ok(None) => exit_err(
-                    &Error::SourceNotFound {
+        let store_rows: Vec<StoreRow> = if let Some(sid) = self.source_id {
+            let owner_store_id = match db.backend().get_source(sid).await? {
+                Some(src) => src.store_id,
+                None => {
+                    return Err(Error::SourceNotFound {
                         id: sid.to_string(),
-                    },
-                    ctx.json,
-                ),
-                Err(e) => exit_err(&e, ctx.json),
+                    })
+                }
             };
             match store_rows.into_iter().find(|r| r.id == owner_store_id) {
                 Some(row) => vec![row],
-                None => exit_err(
-                    &Error::SourceNotFound {
+                None => {
+                    return Err(Error::SourceNotFound {
                         id: sid.to_string(),
-                    },
-                    ctx.json,
-                ),
+                    })
+                }
             }
         } else {
             store_rows
@@ -269,7 +248,7 @@ pub(crate) async fn run_index_async(
             } else {
                 None
             };
-            let scope = match source_id {
+            let scope = match self.source_id {
                 Some(sid) => IndexJobScope::Source {
                     source_id: sid.to_string(),
                 },
@@ -278,11 +257,11 @@ pub(crate) async fn run_index_async(
             let summary = match job_attach::run_embedded_store_job(
                 ctx,
                 &queue,
-                &config_loader,
-                &db,
+                config_loader,
+                db,
                 store_row,
                 scope,
-                deletion,
+                self.deletion,
                 IndexErrorMode::StrictExit,
                 &mut embedder,
                 label,
@@ -297,8 +276,31 @@ pub(crate) async fn run_index_async(
                 summary,
             });
         }
-        outcomes
+        Ok(outcomes)
+    }
+}
+
+pub(crate) async fn run_index_async(
+    ctx: &CliContext,
+    source_id: Option<&str>,
+    strict: bool,
+    delete: bool,
+) {
+    let (config_loader, db) = load_app_db(ctx).await;
+    let deletion = if delete {
+        DeletionPolicy::Prune
+    } else {
+        DeletionPolicy::Retain
     };
+
+    // D1/D6 (issue #187 stage 3): `--delete` is no longer refused against a
+    // daemon (D6) — it is sent as `deletion_policy: "delete"` and the daemon
+    // now runs real ingestion (issue #187), so it can honor it.
+    let cmd = IndexCmd {
+        source_id,
+        deletion,
+    };
+    let outcomes = dispatch(&cmd, ctx, &config_loader, &db).await;
 
     report_index_outcomes(ctx, &outcomes, strict);
 }

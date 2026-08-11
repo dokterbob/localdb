@@ -1,23 +1,36 @@
 use std::path::{Path, PathBuf};
 
+use localdb_core::config::loader::ConfigLoader;
+use localdb_core::{bytes_per_chunk, compute_db_file_size, format_bytes, DbFileSize, Error};
 use serde_json::json;
 
 use crate::{
-    app_db::{load_app_db_lenient, resolve_store_scope, AppDb, StoreScopePolicy},
-    daemon_client::{probe_daemon, CliContext, DaemonState},
+    app_db::{
+        apply_daemon_store_scope, load_app_db_lenient, resolve_store_scope_inner, AppDb,
+        StoreScopePolicy,
+    },
+    command_table::{dispatch, DaemonAwareCommand},
+    daemon_client::{daemon_request_async, CliContext},
     normalize::{print_json, visibility_to_string},
 };
 
 /// How many rows `StoreBackend::largest_tables` is asked for; matches the
-/// number surfaced in both `--json` and human output.
+/// number surfaced in both `--json` and human output, and the daemon's own
+/// `LARGEST_TABLES_LIMIT` (`server/src/handlers/status.rs`) — kept equal by
+/// convention, not by a shared constant, since the two crates don't share a
+/// dependency edge for it.
 const LARGEST_TABLES_LIMIT: usize = 5;
 
-/// Per-store figures gathered for `status`'s output.
+/// Per-store figures gathered for `status`'s output — identical whether they
+/// came from the embedded `RetrievalStore::stats()` call or from a daemon's
+/// `GET /v1/status` response (issue #187 stage 5); `run_daemon`/`run_embedded`
+/// below are the only two places that distinction still exists.
 ///
-/// `stats` is `None` when `RetrievalStore::stats()` itself failed for this
-/// store (e.g. a corrupt or mid-migration store) — `status` must keep
-/// reporting on the daemon state and the other stores rather than aborting
-/// outright; see `gather_store_status`.
+/// `stats` is `None` when per-store stats weren't available (e.g. a corrupt
+/// or mid-migration store, embedded mode; or a store the daemon couldn't
+/// stat) — `status` must keep reporting on the daemon state and the other
+/// stores rather than aborting outright.
+#[derive(Debug, Clone)]
 pub(crate) struct StoreStatusEntry {
     pub name: String,
     pub visibility: &'static str,
@@ -25,53 +38,15 @@ pub(crate) struct StoreStatusEntry {
     pub stats: Option<localdb_core::StoreStats>,
 }
 
-/// On-disk size of the single unified `localdb.db` file shared by every
-/// store, plus its `-wal` sidecar.
-///
-/// specs/03-config.md: there is exactly one physical file for the whole
-/// database — file size is never a per-store figure, so `status` reports it
-/// once, in a top-level `database` section, not attached to any one store.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct DbFileSize {
-    /// Bytes in `localdb.db` itself. `None` if the file doesn't exist yet,
-    /// or a stat error of any kind — `status` degrades to "unknown" rather
-    /// than failing (specs/05-surfaces.md).
-    pub main_bytes: Option<u64>,
-    /// Bytes in the `-wal` sidecar, if one exists.
-    ///
-    /// Deliberately included in `total_bytes`, not just `main_bytes`: WAL
-    /// mode (set by `LibsqlDb::open`) defers committed pages there until the
-    /// next checkpoint, so on a store with recent writes a large share of
-    /// genuine on-disk usage can live in the WAL rather than the main file.
-    /// Reporting `main_bytes` alone would understate current disk usage —
-    /// exactly the blind spot issues #179/#177 are about.
-    pub wal_bytes: Option<u64>,
-}
-
-impl DbFileSize {
-    /// `main_bytes + wal_bytes`, treating a missing file/sidecar as 0 bytes.
-    pub(crate) fn total_bytes(&self) -> u64 {
-        self.main_bytes.unwrap_or(0) + self.wal_bytes.unwrap_or(0)
-    }
-}
-
-/// Stat `db_path` and its `-wal` sidecar.
-///
-/// Never fails: any stat error (missing file, permissions, ...) degrades the
-/// corresponding field to `None` rather than propagating — `status` must
-/// keep working even before the database file exists.
-pub(crate) fn compute_db_file_size(db_path: &Path) -> DbFileSize {
-    let main_bytes = std::fs::metadata(db_path).ok().map(|m| m.len());
-
-    let mut wal_name = db_path.as_os_str().to_owned();
-    wal_name.push("-wal");
-    let wal_path = PathBuf::from(wal_name);
-    let wal_bytes = std::fs::metadata(&wal_path).ok().map(|m| m.len());
-
-    DbFileSize {
-        main_bytes,
-        wal_bytes,
-    }
+/// The mode-agnostic result of `localdb status` — one shared renderer
+/// (`build_status_json`/`print_status_human`) consumes this regardless of
+/// which transport produced it.
+pub(crate) struct StatusOutcome {
+    pub(crate) daemon_status: String,
+    pub(crate) stores: Vec<StoreStatusEntry>,
+    pub(crate) db_path: PathBuf,
+    pub(crate) db_size: DbFileSize,
+    pub(crate) largest_tables: Vec<localdb_core::TableSize>,
 }
 
 /// Sum of `chunk_count` across every store whose stats were available.
@@ -83,28 +58,15 @@ fn total_chunk_count(stores: &[StoreStatusEntry]) -> u64 {
         .sum()
 }
 
-/// `total on-disk bytes / total chunks` — the single number that makes an
-/// over-sized index obvious at a glance, which is the whole point of this
-/// diagnostic (issues #179, #177). `None` when there are no chunks to divide
-/// by (avoids a division by zero and a meaningless "0 bytes/chunk").
-fn bytes_per_chunk(total_bytes: u64, total_chunks: u64) -> Option<u64> {
-    total_bytes.checked_div(total_chunks)
-}
-
-/// Human-readable byte size, e.g. `128.4 MB`. Binary (1024) units, matching
-/// the `du -h` convention.
-pub(crate) fn format_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    let mut value = bytes as f64;
-    let mut unit = 0usize;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} {}", UNITS[unit])
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
+/// Coerce an arbitrary visibility string (from a daemon's JSON response) to
+/// the `&'static str` `StoreStatusEntry::visibility` expects. Anything other
+/// than "shared" defaults to "private" — the same default embedded mode's
+/// own `visibility_to_string` never needs to fall back from, since it's
+/// driven off a typed `StoreVisibility` enum rather than a wire string.
+fn static_visibility(s: &str) -> &'static str {
+    match s {
+        "shared" => "shared",
+        _ => "private",
     }
 }
 
@@ -236,6 +198,126 @@ pub(crate) fn print_status_human(
     }
 }
 
+/// `localdb status`, table-driven (issue #187 stage 5): `status` used to
+/// query only a display string from the daemon and pull every count from the
+/// local DB regardless of which mode was active (specs/05-surfaces.md's
+/// "queries daemon" claim was false — see issue #187 §2). `run_daemon` below
+/// is the daemon's first real contribution to `status`'s numbers.
+pub(crate) struct StatusCmd;
+
+impl DaemonAwareCommand for StatusCmd {
+    type Outcome = StatusOutcome;
+
+    // specs/05-surfaces.md §2.2: `--store` is repeatable and always validated
+    // and resolved; the "all stores" behavior only applies when `-s` is
+    // omitted, and a store-less database is exit 2 like every other
+    // all-stores command.
+    const SCOPE_POLICY: StoreScopePolicy = StoreScopePolicy::AllStores;
+
+    async fn run_daemon(&self, ctx: &CliContext, base_url: &str) -> Result<StatusOutcome, Error> {
+        let url = format!("{base_url}/v1/status");
+        let v = daemon_request_async(reqwest::Method::GET, &url, None).await?;
+
+        let daemon_stores: Vec<StoreStatusEntry> = v
+            .get("stores")
+            .and_then(|s| s.as_array())
+            .ok_or_else(|| Error::Internal {
+                message: "daemon status response missing 'stores' array".to_string(),
+                correlation_id: "daemon_status_shape".to_string(),
+            })?
+            .iter()
+            .map(|s| StoreStatusEntry {
+                name: s
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("?")
+                    .to_string(),
+                visibility: static_visibility(
+                    s.get("visibility").and_then(|n| n.as_str()).unwrap_or(""),
+                ),
+                backend: s
+                    .get("backend")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("?")
+                    .to_string(),
+                stats: match (
+                    s.get("document_count").and_then(|n| n.as_u64()),
+                    s.get("chunk_count").and_then(|n| n.as_u64()),
+                ) {
+                    (Some(document_count), Some(chunk_count)) => Some(localdb_core::StoreStats {
+                        document_count,
+                        chunk_count,
+                    }),
+                    _ => None,
+                },
+            })
+            .collect();
+
+        // The daemon reports every store it knows about; `--store` filters
+        // that list client-side through the exact same policy-application
+        // logic `resolve_daemon_store_scope` uses (`apply_daemon_store_scope`)
+        // rather than a second, potentially-drifting implementation.
+        let stores =
+            apply_daemon_store_scope(&daemon_stores, |s| s.name.as_str(), ctx, Self::SCOPE_POLICY)?;
+
+        let db = v.get("database").ok_or_else(|| Error::Internal {
+            message: "daemon status response missing 'database' object".to_string(),
+            correlation_id: "daemon_status_shape".to_string(),
+        })?;
+        let db_path = PathBuf::from(db.get("path").and_then(|p| p.as_str()).unwrap_or(""));
+        let db_size = DbFileSize {
+            main_bytes: db.get("size_bytes").and_then(|n| n.as_u64()),
+            wal_bytes: db.get("wal_size_bytes").and_then(|n| n.as_u64()),
+        };
+        let largest_tables: Vec<localdb_core::TableSize> = db
+            .get("largest_tables")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| Error::Internal {
+                message: format!("cannot parse daemon status 'largest_tables': {e}"),
+                correlation_id: "daemon_status_shape".to_string(),
+            })?
+            .unwrap_or_default();
+
+        Ok(StatusOutcome {
+            daemon_status: format!("running ({base_url})"),
+            stores,
+            db_path,
+            db_size,
+            largest_tables,
+        })
+    }
+
+    async fn run_embedded(
+        &self,
+        ctx: &CliContext,
+        config_loader: &ConfigLoader,
+        db: &AppDb,
+    ) -> Result<StatusOutcome, Error> {
+        let db_path = config_loader.paths.db_path();
+        let runtime_stores = resolve_store_scope_inner(ctx, db, Self::SCOPE_POLICY).await?;
+        let stores = gather_store_status(db, &runtime_stores).await;
+
+        let db_size = compute_db_file_size(&db_path);
+        // Best-effort diagnostic (see `StoreBackend::largest_tables`'s doc
+        // comment) — an error here must not take `status` down with it.
+        let largest_tables = db
+            .backend()
+            .largest_tables(LARGEST_TABLES_LIMIT)
+            .await
+            .unwrap_or_default();
+
+        Ok(StatusOutcome {
+            daemon_status: "not running (embedded mode)".to_string(),
+            stores,
+            db_path,
+            db_size,
+            largest_tables,
+        })
+    }
+}
+
 /// `localdb status`
 pub fn run_status(ctx: &CliContext) {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -245,40 +327,25 @@ pub fn run_status(ctx: &CliContext) {
 pub(crate) async fn run_status_async(ctx: &CliContext) {
     // F1-cli: use lenient loader so status works even with malformed config.
     let (config_loader, db) = load_app_db_lenient(ctx).await;
-    let data_dir = &config_loader.paths.data_dir;
-    let db_path = config_loader.paths.db_path();
 
-    let daemon_status = match probe_daemon(data_dir, ctx.daemon_url.as_deref()) {
-        DaemonState::Running { base_url } => format!("running ({})", base_url),
-        DaemonState::NotRunning => "not running (embedded mode)".to_string(),
-    };
-
-    // specs/05-surfaces.md §2.2: `--store` is repeatable and always validated
-    // and resolved; the "all stores" behavior only applies when `-s` is
-    // omitted. Route through the shared resolver rather than listing
-    // everything unconditionally.
-    let runtime_stores = resolve_store_scope(ctx, &db, StoreScopePolicy::AllStores).await;
-    let stores = gather_store_status(&db, &runtime_stores).await;
-
-    let db_size = compute_db_file_size(&db_path);
-    // Best-effort diagnostic (see `StoreBackend::largest_tables`'s doc
-    // comment) — an error here must not take `status` down with it.
-    let largest_tables = db
-        .backend()
-        .largest_tables(LARGEST_TABLES_LIMIT)
-        .await
-        .unwrap_or_default();
+    let outcome = dispatch(&StatusCmd, ctx, &config_loader, &db).await;
 
     if ctx.json {
         print_json(&build_status_json(
-            &daemon_status,
-            &stores,
-            &db_path,
-            db_size,
-            &largest_tables,
+            &outcome.daemon_status,
+            &outcome.stores,
+            &outcome.db_path,
+            outcome.db_size,
+            &outcome.largest_tables,
         ));
     } else {
-        print_status_human(&daemon_status, &stores, &db_path, db_size, &largest_tables);
+        print_status_human(
+            &outcome.daemon_status,
+            &outcome.stores,
+            &outcome.db_path,
+            outcome.db_size,
+            &outcome.largest_tables,
+        );
     }
 }
 

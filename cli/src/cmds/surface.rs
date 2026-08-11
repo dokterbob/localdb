@@ -95,13 +95,13 @@ pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
     }
 
     // `load_app_db` is unconditional here — same sequencing as
-    // `search.rs`'s `run_search_async` — since `probe_daemon` needs
-    // `config_loader.paths.data_dir` regardless of which mode we end up in.
-    // SQLite WAL mode makes opening it harmless even when a daemon is
-    // already running (see `app_db::load_app_db`'s doc comment); in the
-    // `Proxied` branch below, `db`/`config_loader` simply go unused beyond
-    // this point, exactly as `search.rs`'s `SearchMode::Daemon` branch
-    // leaves its own `db` unused.
+    // `search.rs`'s `run_search_async` (via `command_table::dispatch`) —
+    // since `probe_daemon` needs `config_loader.paths.data_dir` regardless of
+    // which mode we end up in. SQLite WAL mode makes opening it harmless even
+    // when a daemon is already running (see `app_db::load_app_db`'s doc
+    // comment); in the `Proxied` branch below, `db`/`config_loader` simply go
+    // unused beyond this point, exactly as `SearchCmd::run_daemon` leaves its
+    // own `db` unused.
     let (config_loader, db) = load_app_db(ctx).await;
 
     if let DaemonState::Running { base_url } =

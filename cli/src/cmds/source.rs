@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use localdb_core::{
-    ids::new_ulid, ingestion::now_rfc3339, ingestion::DeletionPolicy,
+    config::loader::ConfigLoader, ids::new_ulid, ingestion::now_rfc3339, ingestion::DeletionPolicy,
     source::normalize_path_source, types::SourceKind, Embedder, Error, IndexJobScope, SourceRow,
     StoreRow,
 };
@@ -9,9 +9,13 @@ use serde_json::json;
 use server::JobQueue;
 
 use crate::{
-    app_db::{load_app_db, resolve_daemon_store_scope, resolve_store_scope, StoreScopePolicy},
+    app_db::{
+        load_app_db, resolve_daemon_store_scope, resolve_store_scope, resolve_store_scope_inner,
+        AppDb, StoreScopePolicy,
+    },
     cmds::index::IndexErrorMode,
-    daemon_client::{daemon_request_async, probe_daemon, CliContext, DaemonState},
+    command_table::{dispatch, DaemonAwareCommand},
+    daemon_client::{daemon_request_async, encode_path_segment, walk_daemon_pages, CliContext},
     job_attach,
     normalize::{
         classify_source, exit_err, exit_err_with_partial_results, kind_to_string, looks_like_id,
@@ -84,90 +88,57 @@ pub(crate) fn resolve_source_add_kind(
     }
 }
 
-/// `localdb source add <path-or-url>`
-#[allow(clippy::too_many_arguments)]
-pub fn run_source_add(
-    ctx: &CliContext,
-    source_arg: &str,
-    refresh: Option<&str>,
-    kind_override: Option<&str>,
+// ---------------------------------------------------------------------------
+// source add
+// ---------------------------------------------------------------------------
+//
+// `source add`'s daemon/embedded branches were already unified onto the
+// shared async job model in issue #187 stage 3 (auto-index runs through
+// `job_attach::run_daemon_store_job` / `run_embedded_store_job` either way,
+// with identical `IndexErrorMode::WarnAndContinue` semantics). Stage 5 only
+// moves the *mode selection* itself onto `command_table::dispatch` so a
+// future edit can't reintroduce a second, competing `probe_daemon` call —
+// the two branches' bodies (including their pre-existing text/JSON output
+// shapes) are otherwise unchanged.
+//
+// `Outcome = ()`: unlike `search`/`store list`/`status`, this command's
+// output is inherently streaming — non-JSON mode prints each store's result
+// as soon as it's persisted, and a mid-loop `--json` failure must flush
+// whatever succeeded so far via `exit_err_with_partial_results` *before*
+// aborting, not after a final value is assembled. Both of those need to
+// happen from inside the loop, which rules out collecting into one
+// value rendered afterward.
+
+/// The subset of `source add`'s arguments needed by both transports,
+/// resolved once by `run_source_add_async` (kind classification, feed spec
+/// parsing, path normalization, refresh validation) before `dispatch` ever
+/// runs — so `run_daemon`/`run_embedded` can't each re-derive it and drift.
+struct SourceAddCmd<'a> {
+    source_arg: &'a str,
+    kind: &'a str,
+    parsed_feed_spec: Option<&'a localdb_core::source::ParsedSourceSpec>,
+    actual_root: &'a str,
+    include_globs: &'a [String],
+    exclude_globs: &'a [String],
+    refresh: Option<&'a str>,
     max_entries: Option<u32>,
-    no_fetch_full_content: bool,
-) {
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    rt.block_on(run_source_add_async(
-        ctx,
-        source_arg,
-        refresh,
-        kind_override,
-        max_entries,
-        no_fetch_full_content,
-    ));
+    fetch_full_content: bool,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_source_add_async(
-    ctx: &CliContext,
-    source_arg: &str,
-    refresh: Option<&str>,
-    kind_override: Option<&str>,
-    max_entries: Option<u32>,
-    no_fetch_full_content: bool,
-) {
-    let (kind, parsed_feed_spec) = match resolve_source_add_kind(
-        source_arg,
-        kind_override,
-        max_entries,
-        no_fetch_full_content,
-    ) {
-        Ok(v) => v,
-        Err(e) => exit_err(&e, ctx.json),
-    };
-    let kind = kind.as_str();
-    let fetch_full_content = !no_fetch_full_content;
+impl DaemonAwareCommand for SourceAddCmd<'_> {
+    type Outcome = ();
 
-    let (config_loader, db) = load_app_db(ctx).await;
+    // `source add` is the one write command whose omitted-`--store` scope is
+    // a single implicit `default` store, not "every store" — see
+    // `StoreScopePolicy::DefaultStore`'s doc comment.
+    const SCOPE_POLICY: StoreScopePolicy = StoreScopePolicy::DefaultStore;
 
-    // Per specs/05-surfaces.md §2: route to daemon when running. Probed before
-    // store resolution because the two paths resolve scope differently — the
-    // daemon owns its own store set (see `resolve_daemon_store_scope`).
-    let daemon_state = probe_daemon(&config_loader.paths.data_dir, ctx.daemon_url.as_deref());
-
-    // Normalize path sources: validate existence, promote single files, apply
-    // excludes. Store-independent, so this runs once regardless of how many
-    // stores are in scope.
-    let (actual_root, include_globs, exclude_globs) = if kind == "path" {
-        match normalize_path_source(source_arg) {
-            Ok(v) => v,
-            Err(e) => exit_err(&e, ctx.json),
-        }
-    } else {
-        (source_arg.to_string(), vec![], vec![])
-    };
-
-    // Validate refresh interval before persisting.
-    if let Some(r) = refresh {
-        if let Err(e) = localdb_core::config::validate_refresh_interval(r) {
-            exit_err(&e, ctx.json);
-        }
-    }
-
-    if refresh.is_some() && kind != "url" && kind != "feed" {
-        exit_err(
-            &Error::InvalidRequest {
-                message: "refresh is only supported for URL and feed sources".to_string(),
-            },
-            ctx.json,
-        );
-    }
-
-    if let DaemonState::Running { ref base_url } = daemon_state {
+    async fn run_daemon(&self, ctx: &CliContext, base_url: &str) -> Result<(), Error> {
         // Ask the daemon which stores actually exist rather than treating
         // `--store` as pre-validated names (Codex review round 2, findings 1
         // & 4) — a running daemon may point at an entirely different data
         // directory than this process would otherwise open.
-        let store_names =
-            resolve_daemon_store_scope(base_url, ctx, StoreScopePolicy::DefaultStore).await;
+        let store_names = resolve_daemon_store_scope(base_url, ctx, Self::SCOPE_POLICY).await;
 
         // Accumulate JSON results across the loop and emit exactly one
         // top-level document afterward (finding 3): printing per-iteration,
@@ -186,16 +157,16 @@ pub(crate) async fn run_source_add_async(
             // The handler's CreateSourceRequest expects {kind, spec, preset}
             // where spec is a nested object (see server/src/handlers.rs
             // CreateSourceRequest).
-            let spec = if kind == "path" {
-                json!({ "root": actual_root, "include": include_globs, "exclude": exclude_globs })
-            } else if kind == "feed" {
+            let spec = if self.kind == "path" {
+                json!({ "root": self.actual_root, "include": self.include_globs, "exclude": self.exclude_globs })
+            } else if self.kind == "feed" {
                 json!({
-                    "url": source_arg,
-                    "max_entries": max_entries,
-                    "fetch_full_content": fetch_full_content,
+                    "url": self.source_arg,
+                    "max_entries": self.max_entries,
+                    "fetch_full_content": self.fetch_full_content,
                 })
             } else {
-                json!({ "url": source_arg })
+                json!({ "url": self.source_arg })
             };
             // `store_name` is percent-encoded before it's interpolated into
             // the URL path segment — an unescaped '#'/'?'/'/' would otherwise
@@ -206,18 +177,18 @@ pub(crate) async fn run_source_add_async(
             let url_str = format!(
                 "{}/v1/stores/{}/sources",
                 base_url,
-                crate::daemon_client::encode_path_segment(store_name)
+                encode_path_segment(store_name)
             );
             let body = json!({
-                "kind": kind,
+                "kind": self.kind,
                 "spec": spec,
                 "preset": "prose",
-                "refresh": refresh,
+                "refresh": self.refresh,
             });
             match daemon_request_async(reqwest::Method::POST, &url_str, Some(body)).await {
                 Ok(v) => {
                     let new_id = v.get("id").and_then(|i| i.as_str()).map(str::to_string);
-                    if kind == "path" || kind == "url" || kind == "feed" {
+                    if self.kind == "path" || self.kind == "url" || self.kind == "feed" {
                         if let Some(id) = &new_id {
                             to_index.push((store_name.clone(), id.clone()));
                         }
@@ -283,221 +254,401 @@ pub(crate) async fn run_source_add_async(
             )
             .await;
         }
-        return;
+        Ok(())
     }
 
-    // specs/05-surfaces.md §2.2: bare invocation -> store named "default";
-    // `-s` (repeatable) always wins and is validated/resolved/deduped here.
-    // `source add` is the *one* command that still defaults this way — every
-    // other `-s`-accepting command treats the flag as a filter over all
-    // stores. A write has to pick a single target, and "every store" would
-    // fan one `source add` out across the whole database; picking `default`
-    // by name is the only choice here that isn't a guess.
-    let rows = resolve_store_scope(ctx, &db, StoreScopePolicy::DefaultStore).await;
+    async fn run_embedded(
+        &self,
+        ctx: &CliContext,
+        config_loader: &ConfigLoader,
+        db: &AppDb,
+    ) -> Result<(), Error> {
+        // specs/05-surfaces.md §2.2: bare invocation -> store named "default";
+        // `-s` (repeatable) always wins and is validated/resolved/deduped here.
+        // `source add` is the *one* command that still defaults this way — every
+        // other `-s`-accepting command treats the flag as a filter over all
+        // stores. A write has to pick a single target, and "every store" would
+        // fan one `source add` out across the whole database; picking `default`
+        // by name is the only choice here that isn't a guess.
+        let rows = resolve_store_scope(ctx, db, Self::SCOPE_POLICY).await;
 
-    // Sources that were added locally and need auto-indexing, run in a
-    // second pass below once every source in this request has been
-    // persisted.
-    let mut to_index: Vec<(StoreRow, String)> = Vec::new();
+        // Sources that were added locally and need auto-indexing, run in a
+        // second pass below once every source in this request has been
+        // persisted.
+        let mut to_index: Vec<(StoreRow, String)> = Vec::new();
 
-    // Accumulate JSON results across the loop and emit exactly one top-level
-    // document afterward (finding 3) — see the daemon branch above for the
-    // same restructuring and its rationale.
-    let mut json_results: Vec<serde_json::Value> = Vec::new();
+        // Accumulate JSON results across the loop and emit exactly one top-level
+        // document afterward (finding 3) — see the daemon branch above for the
+        // same restructuring and its rationale.
+        let mut json_results: Vec<serde_json::Value> = Vec::new();
 
-    for row in &rows {
-        let src = if kind == "feed" {
-            // #116: already validated + parsed by `resolve_source_add_kind`
-            // above (routed through `parse_source_spec`, the single
-            // validation authority) — reuse it rather than re-parsing.
-            // Fields are cloned per store since the same parsed spec is
-            // reused across every store in scope.
-            let parsed = parsed_feed_spec
-                .as_ref()
-                .expect("feed kind always yields a parsed spec");
-            SourceRow {
-                id: new_ulid(),
-                store_id: row.id.clone(),
-                kind: parsed.kind.clone(),
-                root: parsed.root.clone(),
-                url: parsed.url.clone(),
-                include: parsed.include.clone(),
-                exclude: parsed.exclude.clone(),
-                preset: "prose".to_string(),
-                refresh: refresh.map(|s| s.to_string()),
-                created_at: now_rfc3339(),
-                config_json: parsed.config_json.clone(),
-            }
-        } else {
-            SourceRow {
-                id: new_ulid(),
-                store_id: row.id.clone(),
-                // `classify_source`/`resolve_source_add_kind` only ever
-                // yield "url" or "path" here (feed is handled above), but
-                // `kind` is a `&str`, so a `match` would need an
-                // unreachable wildcard arm. Two branches keep it honest and
-                // coverable.
-                kind: if kind == "url" {
-                    SourceKind::Url
-                } else {
-                    SourceKind::Path
-                },
-                root: if kind == "path" {
-                    Some(actual_root.clone())
-                } else {
-                    None
-                },
-                url: if kind == "path" {
-                    None
-                } else {
-                    Some(source_arg.to_string())
-                },
-                include: include_globs.clone(),
-                exclude: exclude_globs.clone(),
-                preset: "prose".to_string(),
-                refresh: refresh.map(|s| s.to_string()),
-                created_at: now_rfc3339(),
-                config_json: None,
-            }
-        };
-
-        if let Err(e) = db.backend().upsert_source(&src).await {
-            // Finding 5: don't discard results already persisted by earlier
-            // iterations of this loop — see
-            // `exit_err_with_partial_results`'s doc comment. Non-JSON mode
-            // already printed each success as it happened, so it keeps using
-            // plain `exit_err`.
-            if ctx.json {
-                exit_err_with_partial_results(&e, json_results);
+        for row in &rows {
+            let src = if self.kind == "feed" {
+                // #116: already validated + parsed by `resolve_source_add_kind`
+                // above (routed through `parse_source_spec`, the single
+                // validation authority) — reuse it rather than re-parsing.
+                // Fields are cloned per store since the same parsed spec is
+                // reused across every store in scope.
+                let parsed = self
+                    .parsed_feed_spec
+                    .expect("feed kind always yields a parsed spec");
+                SourceRow {
+                    id: new_ulid(),
+                    store_id: row.id.clone(),
+                    kind: parsed.kind.clone(),
+                    root: parsed.root.clone(),
+                    url: parsed.url.clone(),
+                    include: parsed.include.clone(),
+                    exclude: parsed.exclude.clone(),
+                    preset: "prose".to_string(),
+                    refresh: self.refresh.map(|s| s.to_string()),
+                    created_at: now_rfc3339(),
+                    config_json: parsed.config_json.clone(),
+                }
             } else {
-                exit_err(&e, ctx.json);
+                SourceRow {
+                    id: new_ulid(),
+                    store_id: row.id.clone(),
+                    // `classify_source`/`resolve_source_add_kind` only ever
+                    // yield "url" or "path" here (feed is handled above), but
+                    // `kind` is a `&str`, so a `match` would need an
+                    // unreachable wildcard arm. Two branches keep it honest and
+                    // coverable.
+                    kind: if self.kind == "url" {
+                        SourceKind::Url
+                    } else {
+                        SourceKind::Path
+                    },
+                    root: if self.kind == "path" {
+                        Some(self.actual_root.to_string())
+                    } else {
+                        None
+                    },
+                    url: if self.kind == "path" {
+                        None
+                    } else {
+                        Some(self.source_arg.to_string())
+                    },
+                    include: self.include_globs.to_vec(),
+                    exclude: self.exclude_globs.to_vec(),
+                    preset: "prose".to_string(),
+                    refresh: self.refresh.map(|s| s.to_string()),
+                    created_at: now_rfc3339(),
+                    config_json: None,
+                }
+            };
+
+            if let Err(e) = db.backend().upsert_source(&src).await {
+                // Finding 5: don't discard results already persisted by earlier
+                // iterations of this loop — see
+                // `exit_err_with_partial_results`'s doc comment. Non-JSON mode
+                // already printed each success as it happened, so it keeps using
+                // plain `exit_err`.
+                if ctx.json {
+                    exit_err_with_partial_results(&e, json_results);
+                } else {
+                    exit_err(&e, ctx.json);
+                }
+            }
+
+            if ctx.json {
+                json_results.push(json!({
+                    "id": src.id,
+                    "store": { "name": row.name },
+                    "kind": kind_to_string(&src.kind),
+                }));
+            } else {
+                println!("Added source {} to store '{}'", src.id, row.name);
+            }
+
+            // #2: Auto-index after source add.
+            if self.kind == "path" || self.kind == "url" || self.kind == "feed" {
+                to_index.push((row.clone(), src.id.clone()));
             }
         }
 
         if ctx.json {
-            json_results.push(json!({
-                "id": src.id,
-                "store": { "name": row.name },
-                "kind": kind_to_string(&src.kind),
-            }));
-        } else {
-            println!("Added source {} to store '{}'", src.id, row.name);
+            if json_results.len() == 1 {
+                // Single store: today's exact flat shape (specs/05-surfaces.md
+                // §2.2 promises existing scripts don't break).
+                let r = &json_results[0];
+                print_json(&json!({
+                    "status": "ok",
+                    "id": r["id"],
+                    "store": r["store"],
+                    "kind": r["kind"],
+                }));
+            } else {
+                print_json(&json!({ "status": "ok", "results": json_results }));
+            }
         }
 
-        // #2: Auto-index after source add.
-        if kind == "path" || kind == "url" || kind == "feed" {
-            to_index.push((row.clone(), src.id.clone()));
+        // Auto-index every newly added source, reusing the already-open
+        // `db`/`config_loader` and threading the built embedder across stores so
+        // an N-store `source add` builds the (potentially ~706 MB local)
+        // embedder at most once rather than once per store (Codex review round
+        // 2, finding 6) — the same threading `run_index_async` does for
+        // `localdb index`. Runs through the same unified job model
+        // (`job_attach::run_embedded_store_job`, issue #187 stage 3) `localdb
+        // index` uses, via a local `JobQueue` scoped to this command; under
+        // `IndexErrorMode::WarnAndContinue` it never returns `Err`, so a failure
+        // only ever warns to stderr and `source add` itself always succeeds.
+        let mut embedder: Option<Arc<dyn Embedder>> = None;
+        let queue = JobQueue::new();
+        for (row, src_id) in &to_index {
+            if !ctx.json {
+                eprintln!("Auto-indexing source {} ...", src_id);
+            }
+            let _ = job_attach::run_embedded_store_job(
+                ctx,
+                &queue,
+                config_loader,
+                db,
+                row,
+                IndexJobScope::Source {
+                    source_id: src_id.clone(),
+                },
+                // A source being added for the first time has no indexed history
+                // to prune, and auto-index is not the place to remove anything.
+                DeletionPolicy::Retain,
+                IndexErrorMode::WarnAndContinue,
+                &mut embedder,
+                None,
+            )
+            .await;
         }
-    }
-
-    if ctx.json {
-        if json_results.len() == 1 {
-            // Single store: today's exact flat shape (specs/05-surfaces.md
-            // §2.2 promises existing scripts don't break).
-            let r = &json_results[0];
-            print_json(&json!({
-                "status": "ok",
-                "id": r["id"],
-                "store": r["store"],
-                "kind": r["kind"],
-            }));
-        } else {
-            print_json(&json!({ "status": "ok", "results": json_results }));
-        }
-    }
-
-    // Auto-index every newly added source, reusing the already-open
-    // `db`/`config_loader` and threading the built embedder across stores so
-    // an N-store `source add` builds the (potentially ~706 MB local)
-    // embedder at most once rather than once per store (Codex review round
-    // 2, finding 6) — the same threading `run_index_async` does for
-    // `localdb index`. Runs through the same unified job model
-    // (`job_attach::run_embedded_store_job`, issue #187 stage 3) `localdb
-    // index` uses, via a local `JobQueue` scoped to this command; under
-    // `IndexErrorMode::WarnAndContinue` it never returns `Err`, so a failure
-    // only ever warns to stderr and `source add` itself always succeeds.
-    let mut embedder: Option<Arc<dyn Embedder>> = None;
-    let queue = JobQueue::new();
-    for (row, src_id) in &to_index {
-        if !ctx.json {
-            eprintln!("Auto-indexing source {} ...", src_id);
-        }
-        let _ = job_attach::run_embedded_store_job(
-            ctx,
-            &queue,
-            &config_loader,
-            &db,
-            row,
-            IndexJobScope::Source {
-                source_id: src_id.clone(),
-            },
-            // A source being added for the first time has no indexed history
-            // to prune, and auto-index is not the place to remove anything.
-            DeletionPolicy::Retain,
-            IndexErrorMode::WarnAndContinue,
-            &mut embedder,
-            None,
-        )
-        .await;
+        Ok(())
     }
 }
 
-/// `localdb source list`
-pub fn run_source_list(ctx: &CliContext) {
+/// `localdb source add <path-or-url>`
+#[allow(clippy::too_many_arguments)]
+pub fn run_source_add(
+    ctx: &CliContext,
+    source_arg: &str,
+    refresh: Option<&str>,
+    kind_override: Option<&str>,
+    max_entries: Option<u32>,
+    no_fetch_full_content: bool,
+) {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    rt.block_on(run_source_list_async(ctx));
+    rt.block_on(run_source_add_async(
+        ctx,
+        source_arg,
+        refresh,
+        kind_override,
+        max_entries,
+        no_fetch_full_content,
+    ));
 }
 
-pub(crate) async fn run_source_list_async(ctx: &CliContext) {
-    let (_, db) = load_app_db(ctx).await;
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_source_add_async(
+    ctx: &CliContext,
+    source_arg: &str,
+    refresh: Option<&str>,
+    kind_override: Option<&str>,
+    max_entries: Option<u32>,
+    no_fetch_full_content: bool,
+) {
+    let (kind, parsed_feed_spec) = match resolve_source_add_kind(
+        source_arg,
+        kind_override,
+        max_entries,
+        no_fetch_full_content,
+    ) {
+        Ok(v) => v,
+        Err(e) => exit_err(&e, ctx.json),
+    };
+    let kind = kind.as_str();
+    let fetch_full_content = !no_fetch_full_content;
+
+    let (config_loader, db) = load_app_db(ctx).await;
+
+    // Normalize path sources: validate existence, promote single files, apply
+    // excludes. Store-independent, so this runs once regardless of how many
+    // stores are in scope, and once regardless of which transport ends up
+    // handling the request.
+    let (actual_root, include_globs, exclude_globs) = if kind == "path" {
+        match normalize_path_source(source_arg) {
+            Ok(v) => v,
+            Err(e) => exit_err(&e, ctx.json),
+        }
+    } else {
+        (source_arg.to_string(), vec![], vec![])
+    };
+
+    // Validate refresh interval before persisting.
+    if let Some(r) = refresh {
+        if let Err(e) = localdb_core::config::validate_refresh_interval(r) {
+            exit_err(&e, ctx.json);
+        }
+    }
+
+    if refresh.is_some() && kind != "url" && kind != "feed" {
+        exit_err(
+            &Error::InvalidRequest {
+                message: "refresh is only supported for URL and feed sources".to_string(),
+            },
+            ctx.json,
+        );
+    }
+
+    let cmd = SourceAddCmd {
+        source_arg,
+        kind,
+        parsed_feed_spec: parsed_feed_spec.as_ref(),
+        actual_root: &actual_root,
+        include_globs: &include_globs,
+        exclude_globs: &exclude_globs,
+        refresh,
+        max_entries,
+        fetch_full_content,
+    };
+    dispatch(&cmd, ctx, &config_loader, &db).await;
+}
+
+// ---------------------------------------------------------------------------
+// source list
+// ---------------------------------------------------------------------------
+
+/// One source, as `source list` reports it — identical fields whether
+/// sourced from an embedded `SourceRow` or a daemon's `GET
+/// /v1/stores/{name}/sources` (issue #187 stage 5, decision D2: reads route
+/// to the daemon when one is detected).
+struct SourceListItem {
+    id: String,
+    store_name: String,
+    kind: String,
+    root: Option<String>,
+    url: Option<String>,
+    preset: String,
+    refresh: Option<String>,
+    max_entries: Option<u32>,
+    fetch_full_content: Option<bool>,
+}
+
+fn source_row_to_list_item(s: &SourceRow, store_name: &str) -> SourceListItem {
+    let (max_entries, fetch_full_content) = if s.kind == SourceKind::Feed {
+        let feed_config = localdb_core::source::parse_feed_config_json(s.config_json.as_deref());
+        (
+            feed_config.max_entries,
+            Some(feed_config.fetch_full_content),
+        )
+    } else {
+        (None, None)
+    };
+    SourceListItem {
+        id: s.id.clone(),
+        store_name: store_name.to_string(),
+        kind: kind_to_string(&s.kind).to_string(),
+        root: s.root.clone(),
+        url: s.url.clone(),
+        preset: s.preset.clone(),
+        refresh: s.refresh.clone(),
+        max_entries,
+        fetch_full_content,
+    }
+}
+
+/// Convert one raw `GET /v1/stores/{name}/sources` item (a `SourceRecord`,
+/// `server/src/state.rs`) into a `SourceListItem`. `spec` shapes vary by kind
+/// (`{"root",...}` for path, `{"url"}` for url, `{"url","max_entries",
+/// "fetch_full_content"}` for feed — see `server::state::source_row_to_record`),
+/// so fields are read defensively rather than assumed present.
+fn daemon_item_to_list_item(item: &serde_json::Value, store_name: &str) -> SourceListItem {
+    let kind = item
+        .get("kind")
+        .and_then(|k| k.as_str())
+        .unwrap_or("path")
+        .to_string();
+    let spec = item.get("spec").cloned().unwrap_or(json!({}));
+    let max_entries = if kind == "feed" {
+        spec.get("max_entries")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+    } else {
+        None
+    };
+    let fetch_full_content = if kind == "feed" {
+        Some(
+            spec.get("fetch_full_content")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+        )
+    } else {
+        None
+    };
+    SourceListItem {
+        id: item
+            .get("id")
+            .and_then(|i| i.as_str())
+            .unwrap_or("?")
+            .to_string(),
+        store_name: store_name.to_string(),
+        kind,
+        root: spec
+            .get("root")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        url: spec.get("url").and_then(|v| v.as_str()).map(str::to_string),
+        preset: item
+            .get("preset")
+            .and_then(|p| p.as_str())
+            .unwrap_or("prose")
+            .to_string(),
+        refresh: item
+            .get("refresh")
+            .and_then(|r| r.as_str())
+            .map(str::to_string),
+        max_entries,
+        fetch_full_content,
+    }
+}
+
+struct SourceListCmd;
+
+impl DaemonAwareCommand for SourceListCmd {
+    type Outcome = Vec<SourceListItem>;
 
     // specs/05-surfaces.md §2.2: `-s` is a *filter* — a bare `source list`
-    // spans every store. Narrowing a read to one arbitrarily-privileged store
-    // is what made `source list` report "No sources on store 'default'" on a
-    // database that plainly had sources (#201).
-    let rows = resolve_store_scope(ctx, &db, StoreScopePolicy::AllStores).await;
+    // spans every store.
+    const SCOPE_POLICY: StoreScopePolicy = StoreScopePolicy::AllStores;
 
-    let mut all: Vec<(String, SourceRow)> = Vec::new();
-    for row in &rows {
-        let sources = match db.backend().list_sources(&row.id).await {
-            Ok(s) => s,
-            Err(e) => exit_err(&e, ctx.json),
-        };
-        for s in sources {
-            all.push((row.name.clone(), s));
+    async fn run_daemon(&self, ctx: &CliContext, base_url: &str) -> Result<Self::Outcome, Error> {
+        let store_names =
+            crate::app_db::resolve_daemon_store_scope_inner(base_url, ctx, Self::SCOPE_POLICY)
+                .await?;
+
+        let mut all = Vec::new();
+        for store_name in &store_names {
+            let path = format!("/v1/stores/{}/sources", encode_path_segment(store_name));
+            walk_daemon_pages(base_url, &path, |items| {
+                for item in items {
+                    all.push(daemon_item_to_list_item(item, store_name));
+                }
+                false
+            })
+            .await?;
         }
+        Ok(all)
     }
 
-    if ctx.json {
-        // D4: include store as an object matching the citation shape.
-        let json_sources: Vec<serde_json::Value> = all
-            .iter()
-            .map(|(store_name, s)| source_to_json_value(s, store_name))
-            .collect();
-        print_json(&json!({ "sources": json_sources }));
-        return;
-    }
-
-    if all.is_empty() {
-        if rows.len() == 1 {
-            println!("No sources on store '{}'.", rows[0].name);
-        } else {
-            println!("No sources in scope.");
+    async fn run_embedded(
+        &self,
+        ctx: &CliContext,
+        _config_loader: &ConfigLoader,
+        db: &AppDb,
+    ) -> Result<Self::Outcome, Error> {
+        let rows = resolve_store_scope_inner(ctx, db, Self::SCOPE_POLICY).await?;
+        let mut all = Vec::new();
+        for row in &rows {
+            let sources = db.backend().list_sources(&row.id).await?;
+            for s in &sources {
+                all.push(source_row_to_list_item(s, &row.name));
+            }
         }
-        return;
-    }
-
-    // Output gains a store-name column only when more than one store is in
-    // scope; a single store in scope keeps the pre-existing output format
-    // (specs/05-surfaces.md §2.2).
-    let col_width = store_column_width(rows.iter().map(|r| r.name.as_str()));
-    for (store_name, s) in &all {
-        let store_col = if rows.len() > 1 {
-            Some(store_name.as_str())
-        } else {
-            None
-        };
-        println!("{}", format_source_line(store_col, col_width, s));
+        Ok(all)
     }
 }
 
@@ -508,75 +659,332 @@ fn store_column_width<'a>(names: impl Iterator<Item = &'a str>) -> usize {
     names.map(str::len).max().unwrap_or(0) + 2
 }
 
-/// Format a single `source list` line, with or without a leading store-name
-/// column. `col_width` is only consulted when `store_name` is `Some`. A thin
-/// wrapper over `source_to_human_line`, which owns the actual per-kind
-/// rendering (including feed detail, #116) — this function only adds the
-/// store-name column.
-fn format_source_line(store_name: Option<&str>, col_width: usize, src: &SourceRow) -> String {
-    match store_name {
-        Some(name) => format!(
-            "{:<width$}{}",
-            name,
-            source_to_human_line(src),
-            width = col_width
-        ),
-        None => source_to_human_line(src),
-    }
-}
-
-/// Build one `source list --json` row. Feed sources get their parsed (never
-/// raw `config_json`) `max_entries` / `fetch_full_content` fields; `refresh`
-/// is surfaced for both url and feed sources (#116).
-pub(crate) fn source_to_json_value(s: &SourceRow, store_name: &str) -> serde_json::Value {
+/// Build one `source list --json` row. Feed sources get their parsed
+/// `max_entries` / `fetch_full_content` fields; `refresh` is surfaced for
+/// both url and feed sources (#116).
+///
+/// D4/D2 (issue #187 stages 3/5): the `store` field is emitted
+/// unconditionally, matching the pre-existing embedded behavior — the spec's
+/// "only when more than one store is in scope" claim (§2.3) is itself wrong
+/// and gets corrected in the docs stage, not here (no behavior churn).
+fn source_list_item_json(s: &SourceListItem) -> serde_json::Value {
     let mut obj = json!({
         "id": s.id,
-        "store": { "name": store_name },
-        "store_id": s.store_id,
-        "kind": kind_to_string(&s.kind),
+        "store": { "name": s.store_name },
+        "kind": s.kind,
         "root": s.root,
         "url": s.url,
         "preset": s.preset,
     });
-    if matches!(s.kind, SourceKind::Url | SourceKind::Feed) {
+    if s.kind == "url" || s.kind == "feed" {
         obj["refresh"] = json!(s.refresh);
     }
-    if s.kind == SourceKind::Feed {
-        let feed_config = localdb_core::source::parse_feed_config_json(s.config_json.as_deref());
-        obj["max_entries"] = json!(feed_config.max_entries);
-        obj["fetch_full_content"] = json!(feed_config.fetch_full_content);
+    if s.kind == "feed" {
+        obj["max_entries"] = json!(s.max_entries);
+        obj["fetch_full_content"] = json!(s.fetch_full_content);
     }
     obj
 }
 
-/// Build one `source list` human-readable line.
-///
-/// Feed rows get an extra `(max_entries=…, full_content=on|off)` suffix
-/// (`max_entries=unbounded` when uncapped) — path/url rows are unchanged
-/// (#116).
-pub(crate) fn source_to_human_line(s: &SourceRow) -> String {
+/// Format a single `source list` line, with or without a leading store-name
+/// column. `col_width` is only consulted when `with_store_column` is true.
+fn source_list_item_human_line(
+    s: &SourceListItem,
+    with_store_column: bool,
+    col_width: usize,
+) -> String {
     let loc = s.root.as_deref().or(s.url.as_deref()).unwrap_or("?");
-    if s.kind == SourceKind::Feed {
-        let feed_config = localdb_core::source::parse_feed_config_json(s.config_json.as_deref());
-        let max_entries_str = feed_config
+    let body = if s.kind == "feed" {
+        let max_entries_str = s
             .max_entries
             .map(|n| n.to_string())
             .unwrap_or_else(|| "unbounded".to_string());
-        let full_content_str = if feed_config.fetch_full_content {
+        let full_content_str = if s.fetch_full_content.unwrap_or(true) {
             "on"
         } else {
             "off"
         };
         format!(
             "{} [{}] {} (max_entries={}, full_content={})",
-            s.id,
-            kind_to_string(&s.kind),
-            loc,
-            max_entries_str,
-            full_content_str
+            s.id, s.kind, loc, max_entries_str, full_content_str
         )
     } else {
-        format!("{} [{}] {}", s.id, kind_to_string(&s.kind), loc)
+        format!("{} [{}] {}", s.id, s.kind, loc)
+    };
+    if with_store_column {
+        format!("{:<width$}{}", s.store_name, body, width = col_width)
+    } else {
+        body
+    }
+}
+
+fn render_source_list(items: &[SourceListItem], scope_store_names: &[String], json_mode: bool) {
+    if json_mode {
+        let json_sources: Vec<serde_json::Value> =
+            items.iter().map(source_list_item_json).collect();
+        print_json(&json!({ "sources": json_sources }));
+        return;
+    }
+
+    if items.is_empty() {
+        if scope_store_names.len() == 1 {
+            println!("No sources on store '{}'.", scope_store_names[0]);
+        } else {
+            println!("No sources in scope.");
+        }
+        return;
+    }
+
+    // Output gains a store-name column only when more than one store is in
+    // scope; a single store in scope keeps the pre-existing output format
+    // (specs/05-surfaces.md §2.2).
+    let multi = scope_store_names.len() > 1;
+    let col_width = if multi {
+        store_column_width(scope_store_names.iter().map(String::as_str))
+    } else {
+        0
+    };
+    for s in items {
+        println!("{}", source_list_item_human_line(s, multi, col_width));
+    }
+}
+
+/// `localdb source list`
+pub fn run_source_list(ctx: &CliContext) {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(run_source_list_async(ctx));
+}
+
+pub(crate) async fn run_source_list_async(ctx: &CliContext) {
+    let (config_loader, db) = load_app_db(ctx).await;
+    let items = dispatch(&SourceListCmd, ctx, &config_loader, &db).await;
+
+    // The store-name column / "no sources on store X" message need the
+    // resolved scope's store *names*, independent of whether any of them
+    // actually had sources — recomputed the same way `dispatch` just did,
+    // through whichever transport is active, so this never has to guess.
+    let scope_store_names: Vec<String> = if items.is_empty() {
+        // Cheap path: an empty scope or an empty result set either way needs
+        // the store names only for the human-mode message; re-resolve once
+        // more via the same dispatch machinery used above would double the
+        // network cost for daemon mode, so this falls back to the resolved
+        // set already implied by `items` when non-empty, and to the
+        // embedded/daemon resolver directly when it's empty.
+        resolve_scope_store_names(ctx, &config_loader, &db).await
+    } else {
+        let mut names: Vec<String> = Vec::new();
+        for item in &items {
+            if !names.iter().any(|n| n == &item.store_name) {
+                names.push(item.store_name.clone());
+            }
+        }
+        names
+    };
+
+    render_source_list(&items, &scope_store_names, ctx.json);
+}
+
+/// Resolve just the store *names* in `source list`'s scope, through whichever
+/// transport is active — used only for the empty-scope human-mode message
+/// ("No sources on store 'x'." vs "No sources in scope."), since an empty
+/// `items` list can't itself reveal how many stores were in scope.
+async fn resolve_scope_store_names(
+    ctx: &CliContext,
+    config_loader: &ConfigLoader,
+    db: &AppDb,
+) -> Vec<String> {
+    struct ScopeNamesCmd;
+    impl DaemonAwareCommand for ScopeNamesCmd {
+        type Outcome = Vec<String>;
+        const SCOPE_POLICY: StoreScopePolicy = StoreScopePolicy::AllStores;
+
+        async fn run_daemon(
+            &self,
+            ctx: &CliContext,
+            base_url: &str,
+        ) -> Result<Self::Outcome, Error> {
+            crate::app_db::resolve_daemon_store_scope_inner(base_url, ctx, Self::SCOPE_POLICY).await
+        }
+
+        async fn run_embedded(
+            &self,
+            ctx: &CliContext,
+            _config_loader: &ConfigLoader,
+            db: &AppDb,
+        ) -> Result<Self::Outcome, Error> {
+            let rows = resolve_store_scope_inner(ctx, db, Self::SCOPE_POLICY).await?;
+            Ok(rows.into_iter().map(|r| r.name).collect())
+        }
+    }
+    dispatch(&ScopeNamesCmd, ctx, config_loader, db).await
+}
+
+// ---------------------------------------------------------------------------
+// source remove
+// ---------------------------------------------------------------------------
+
+/// One deleted source, as `source remove` reports it. `store_name` is
+/// `None` for the daemon transport: `DELETE /v1/sources/{id}` is
+/// store-agnostic (see the `KNOWN LIMITATION` note in `SourceRemoveCmd::run_daemon`)
+/// and never tells the CLI which store the source belonged to. This is never
+/// user-visible: the daemon path always deletes exactly one source (a single
+/// DELETE per invocation), which is exactly the case embedded mode's own
+/// single-item rendering already omits the store name for.
+struct DeletedSource {
+    id: String,
+    store_name: Option<String>,
+}
+
+struct SourceRemoveCmd<'a> {
+    id: &'a str,
+}
+
+impl DaemonAwareCommand for SourceRemoveCmd<'_> {
+    type Outcome = Vec<DeletedSource>;
+
+    // `source remove`'s embedded scope defaults to "every store" (a bare
+    // invocation with a globally-unique ULID spans all of them) — see
+    // `run_source_remove_async`'s doc comment on the ULID/path distinction.
+    const SCOPE_POLICY: StoreScopePolicy = StoreScopePolicy::AllStores;
+
+    async fn run_daemon(&self, ctx: &CliContext, base_url: &str) -> Result<Self::Outcome, Error> {
+        // Finding 5: validate --store names for traversal-safety before the
+        // DELETE fires, matching `source add`'s daemon branch. We validate
+        // directly (not via `resolve_daemon_store_scope`) because that
+        // helper's empty-input case resolves an implicit `default` scope,
+        // which is meaningless for remove-by-ID — there's no per-store scope
+        // to inject here, only syntax-checking of whatever `--store` values
+        // were actually passed. Nor do we ask the daemon to confirm these
+        // names exist (see the KNOWN LIMITATION note below).
+        for name in &ctx.stores {
+            crate::normalize::validate_store_name(name)?;
+        }
+
+        // KNOWN LIMITATION (issue #188): `DELETE /v1/sources/{id}` is
+        // store-agnostic, so daemon mode has no way to enforce that the
+        // source actually belongs to a store named by `--store` — embedded
+        // mode does enforce this (see `run_embedded`'s `matches` resolution,
+        // D2). Fixing that needs an HTTP API change; tracked in #188, not
+        // attempted here. We deliberately do NOT add a local existence check
+        // for `--store` either: `LOCALDB_DAEMON_URL` may point at a daemon on
+        // another host with its own data directory, so a syntactically-valid
+        // but locally-unknown store name must still reach the daemon (see
+        // `resolve_daemon_store_scope`'s doc comment in `cli/src/app_db.rs`).
+        // `id` is percent-encoded before it's interpolated into the URL path
+        // segment — see the `encode_path_segment` doc comment (finding 1);
+        // same class of bug as the store-name case above.
+        let url = format!("{base_url}/v1/sources/{}", encode_path_segment(self.id));
+        daemon_request_async(reqwest::Method::DELETE, &url, None).await?;
+        Ok(vec![DeletedSource {
+            id: self.id.to_string(),
+            store_name: None,
+        }])
+    }
+
+    async fn run_embedded(
+        &self,
+        ctx: &CliContext,
+        _config_loader: &ConfigLoader,
+        db: &AppDb,
+    ) -> Result<Self::Outcome, Error> {
+        // specs/05-surfaces.md §2.2: a bare invocation spans every store.
+        // Safe for both argument shapes by this point — the path/url case
+        // already exited 2 above (in `run_source_remove_async`) demanding
+        // `-s`, so only a globally-unique ULID reaches an implicit scope, and
+        // scoping *that* to `default` only made valid ids fail when their
+        // store happened not to be `default` (#201).
+        let rows = resolve_store_scope_inner(ctx, db, Self::SCOPE_POLICY).await?;
+
+        // Resolve (store, source_id) matches within the scoped stores.
+        let matches: Vec<(StoreRow, String)> =
+            if looks_like_id(self.id) {
+                // A global ID is inherently single-store: fetch it once, then
+                // check that the store it actually belongs to is in scope (D2).
+                let src = db.backend().get_source(self.id).await?.ok_or_else(|| {
+                    Error::SourceNotFound {
+                        id: self.id.to_string(),
+                    }
+                })?;
+                match rows.iter().find(|r| r.id == src.store_id) {
+                    Some(row) => vec![(row.clone(), src.id)],
+                    None => {
+                        return Err(Error::SourceNotFound {
+                            id: self.id.to_string(),
+                        })
+                    }
+                }
+            } else {
+                // Path/url: look it up per resolved store; a matching root/url
+                // can in principle exist in more than one store in scope.
+                let mut found = Vec::new();
+                for row in &rows {
+                    if let Some(src) = db
+                        .backend()
+                        .find_source_by_root_or_url(self.id, &row.id)
+                        .await?
+                    {
+                        found.push((row.clone(), src.id));
+                    }
+                }
+                if found.is_empty() {
+                    return Err(Error::SourceNotFound {
+                        id: self.id.to_string(),
+                    });
+                }
+                found
+            };
+
+        let mut deleted = Vec::with_capacity(matches.len());
+        for (row, source_id) in &matches {
+            if db.backend().delete_source(source_id).await? {
+                deleted.push(DeletedSource {
+                    id: source_id.clone(),
+                    store_name: Some(row.name.clone()),
+                });
+            } else {
+                return Err(Error::SourceNotFound {
+                    id: source_id.clone(),
+                });
+            }
+        }
+        Ok(deleted)
+    }
+}
+
+/// The one renderer for `source remove`'s `Outcome`. Both transports collapse
+/// to the same single-item shape in the common case: the daemon always
+/// returns exactly one `DeletedSource`, and embedded mode's own single-match
+/// rendering already omits the store name — so this doesn't need a
+/// mode-specific branch to reach parity, it just always was structurally
+/// compatible with a single generic renderer (issue #187 stage 5). The
+/// `(via daemon)` suffix the old daemon branch printed is gone: mode is not
+/// part of the result.
+fn render_source_remove(deleted: &[DeletedSource], json_mode: bool) {
+    if json_mode {
+        if deleted.len() == 1 {
+            print_json(&json!({ "status": "ok", "id": deleted[0].id }));
+        } else {
+            let results: Vec<serde_json::Value> = deleted
+                .iter()
+                .map(|d| {
+                    json!({
+                        "id": d.id,
+                        "store": { "name": d.store_name.clone().unwrap_or_default() },
+                    })
+                })
+                .collect();
+            print_json(&json!({ "status": "ok", "results": results }));
+        }
+    } else if deleted.len() == 1 {
+        println!("Removed source: {}", deleted[0].id);
+    } else {
+        for d in deleted {
+            println!(
+                "Removed source: {} from store '{}'",
+                d.id,
+                d.store_name.as_deref().unwrap_or("?")
+            );
+        }
     }
 }
 
@@ -606,126 +1014,21 @@ pub(crate) async fn run_source_remove_async(ctx: &CliContext, id: &str) {
         );
     }
 
-    // Per specs/05-surfaces.md §2: route to daemon when running. The DELETE
-    // route is store-agnostic (`/v1/sources/{id}`), so this fires once
-    // regardless of how many stores are in scope — and, since the daemon owns
-    // its own store set, it must run before any local store resolution.
-    if let DaemonState::Running { base_url } =
-        probe_daemon(&config_loader.paths.data_dir, ctx.daemon_url.as_deref())
-    {
-        // Finding 5: validate --store names for traversal-safety before the
-        // DELETE fires, matching `source add`'s daemon branch above. We
-        // validate directly (not via `resolve_daemon_store_scope`) because
-        // that helper's empty-input case resolves an implicit `default`
-        // scope, which is meaningless for remove-by-ID — there's no
-        // per-store scope to inject here, only syntax-checking of whatever
-        // `--store` values were actually passed. Nor do we ask the daemon to
-        // confirm these names exist (see the KNOWN LIMITATION note below).
-        for name in &ctx.stores {
-            if let Err(e) = crate::normalize::validate_store_name(name) {
-                exit_err(&e, ctx.json);
-            }
-        }
+    let deleted = dispatch(&SourceRemoveCmd { id }, ctx, &config_loader, &db).await;
+    render_source_remove(&deleted, ctx.json);
+}
 
-        // KNOWN LIMITATION (issue #188): `DELETE /v1/sources/{id}` is
-        // store-agnostic, so daemon mode has no way to enforce that the
-        // source actually belongs to a store named by `--store` — embedded
-        // mode does enforce this (see the `matches` resolution below, D2).
-        // Fixing that needs an HTTP API change; tracked in #188, not
-        // attempted here. We deliberately do NOT add a local existence check
-        // for `--store` either: `LOCALDB_DAEMON_URL` may point at a daemon on
-        // another host with its own data directory, so a syntactically-valid
-        // but locally-unknown store name must still reach the daemon (see
-        // `resolve_daemon_store_scope`'s doc comment in `cli/src/app_db.rs`).
-        // `id` is percent-encoded before it's interpolated into the URL path
-        // segment — see the `encode_path_segment` doc comment (finding 1);
-        // same class of bug as the store-name case above.
-        let url = format!(
-            "{}/v1/sources/{}",
-            base_url,
-            crate::daemon_client::encode_path_segment(id)
-        );
-        match daemon_request_async(reqwest::Method::DELETE, &url, None).await {
-            Ok(v) => {
-                if ctx.json {
-                    print_json(&v);
-                } else {
-                    println!("Removed source: {} (via daemon)", id);
-                }
-                return;
-            }
-            Err(e) => exit_err(&e, ctx.json),
-        }
-    }
+/// Build one `source list` human-readable line — kept for direct unit
+/// testing below, delegating to the `SourceListItem`-based renderer that
+/// `run_source_list_async` actually uses.
+#[cfg(test)]
+fn source_to_human_line(s: &SourceRow) -> String {
+    source_list_item_human_line(&source_row_to_list_item(s, "?"), false, 0)
+}
 
-    // specs/05-surfaces.md §2.2: a bare invocation spans every store. Safe
-    // for both argument shapes by this point — the path/url case already
-    // exited 2 above demanding `-s`, so only a globally-unique ULID reaches
-    // an implicit scope, and scoping *that* to `default` only made valid ids
-    // fail when their store happened not to be `default` (#201).
-    let rows = resolve_store_scope(ctx, &db, StoreScopePolicy::AllStores).await;
-
-    // Resolve (store, source_id) matches within the scoped stores.
-    let matches: Vec<(StoreRow, String)> = if looks_like_id(id) {
-        // A global ID is inherently single-store: fetch it once, then check
-        // that the store it actually belongs to is in scope (D2).
-        let src = match db.backend().get_source(id).await {
-            Ok(Some(s)) => s,
-            Ok(None) => exit_err(&Error::SourceNotFound { id: id.to_string() }, ctx.json),
-            Err(e) => exit_err(&e, ctx.json),
-        };
-        match rows.iter().find(|r| r.id == src.store_id) {
-            Some(row) => vec![(row.clone(), src.id)],
-            None => exit_err(&Error::SourceNotFound { id: id.to_string() }, ctx.json),
-        }
-    } else {
-        // Path/url: look it up per resolved store; a matching root/url can
-        // in principle exist in more than one store in scope.
-        let mut found = Vec::new();
-        for row in &rows {
-            match db.backend().find_source_by_root_or_url(id, &row.id).await {
-                Ok(Some(src)) => found.push((row.clone(), src.id)),
-                Ok(None) => {}
-                Err(e) => exit_err(&e, ctx.json),
-            }
-        }
-        if found.is_empty() {
-            exit_err(&Error::SourceNotFound { id: id.to_string() }, ctx.json);
-        }
-        found
-    };
-
-    let mut deleted: Vec<(String, String)> = Vec::new();
-    for (row, source_id) in &matches {
-        match db.backend().delete_source(source_id).await {
-            Ok(true) => deleted.push((row.name.clone(), source_id.clone())),
-            Ok(false) => exit_err(
-                &Error::SourceNotFound {
-                    id: source_id.clone(),
-                },
-                ctx.json,
-            ),
-            Err(e) => exit_err(&e, ctx.json),
-        }
-    }
-
-    if ctx.json {
-        if deleted.len() == 1 {
-            print_json(&json!({ "status": "ok", "id": deleted[0].1 }));
-        } else {
-            let results: Vec<serde_json::Value> = deleted
-                .iter()
-                .map(|(name, sid)| json!({ "id": sid, "store": { "name": name } }))
-                .collect();
-            print_json(&json!({ "status": "ok", "results": results }));
-        }
-    } else if deleted.len() == 1 {
-        println!("Removed source: {}", deleted[0].1);
-    } else {
-        for (name, sid) in &deleted {
-            println!("Removed source: {} from store '{}'", sid, name);
-        }
-    }
+#[cfg(test)]
+fn source_to_json_value(s: &SourceRow, store_name: &str) -> serde_json::Value {
+    source_list_item_json(&source_row_to_list_item(s, store_name))
 }
 
 #[cfg(test)]
@@ -755,7 +1058,7 @@ mod tests {
     #[test]
     fn format_source_line_single_store_matches_legacy_format() {
         let src = test_source_row(Some("/Volumes/Archive/books"), None);
-        let line = format_source_line(None, 0, &src);
+        let line = source_to_human_line(&src);
         assert_eq!(
             line,
             "01HRQHB7FN3WMX4AZDV3S9VCTZ [path] /Volumes/Archive/books"
@@ -767,7 +1070,8 @@ mod tests {
         let src = test_source_row(Some("/Volumes/Archive/books"), None);
         let width = store_column_width(["books", "default"].into_iter());
         assert_eq!(width, 9); // "default" (7) + 2
-        let line = format_source_line(Some("books"), width, &src);
+        let item = source_row_to_list_item(&src, "books");
+        let line = source_list_item_human_line(&item, true, width);
         assert_eq!(
             line,
             "books    01HRQHB7FN3WMX4AZDV3S9VCTZ [path] /Volumes/Archive/books"
@@ -777,7 +1081,7 @@ mod tests {
     #[test]
     fn format_source_line_falls_back_to_url_when_no_root() {
         let src = test_source_row(None, Some("https://example.com"));
-        let line = format_source_line(None, 0, &src);
+        let line = source_to_human_line(&src);
         assert_eq!(line, "01HRQHB7FN3WMX4AZDV3S9VCTZ [url] https://example.com");
     }
 

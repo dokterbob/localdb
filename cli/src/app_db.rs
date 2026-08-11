@@ -352,58 +352,89 @@ async fn fetch_all_daemon_store_names(base_url: &str) -> Result<Vec<String>, Err
 ///
 /// Order matters: names are syntax-validated *before* any network call (a
 /// malformed name never hits the wire), then the daemon's full store list is
-/// fetched exactly once, then the policy is applied against it.
+/// fetched exactly once, then [`apply_daemon_store_scope`] applies the policy
+/// against it.
+///
+/// `pub(crate)` (rather than private) so `DaemonAwareCommand::run_daemon`
+/// implementations that need a `Result`-returning store-name scope (e.g.
+/// `cmds::source::SourceListCmd`) can use it directly instead of going
+/// through `resolve_daemon_store_scope`'s `exit_err`-on-error wrapper —
+/// `dispatch` is what owns the exit point for those.
+pub(crate) async fn resolve_daemon_store_scope_inner(
+    base_url: &str,
+    ctx: &CliContext,
+    policy: StoreScopePolicy,
+) -> Result<Vec<String>, Error> {
+    let daemon_names = fetch_all_daemon_store_names(base_url).await?;
+    apply_daemon_store_scope(&daemon_names, |n| n.as_str(), ctx, policy)
+}
+
+/// Apply a store-scope policy to an already-fetched list of daemon store
+/// names/records — no additional network round trip.
+///
+/// Shared by every daemon-routed command that needs to filter a full store
+/// list by `--store` (`resolve_daemon_store_scope_inner` above; `store
+/// list`'s and `status`'s daemon branches, issue #187 stage 5): the single
+/// point where "how do we interpret `ctx.stores` against what the daemon
+/// has" is decided, so the interpretation can never drift between commands
+/// the way the nine hand-rolled branches in issue #187 §2 did. `name_of`
+/// projects whatever record type `T` a caller has (a bare `String` for the
+/// store-scope resolvers, a richer `StoreRecord`-shaped DTO for `store
+/// list`/`status`) down to the name this function matches `--store` against.
+///
+/// Order matters: names are syntax-validated *before* being matched against
+/// `items` (a malformed name is `Error::InvalidRequest`, exit 2, regardless
+/// of what the daemon actually has).
 ///
 /// The implicit-vs-explicit distinction (Codex review round 2, finding 4):
 /// an *implicit* `default` (no `--store` given, `DefaultStore` policy) that
 /// the daemon doesn't have is `Error::InvalidRequest`, exit 2 — matching
 /// `resolve_store_scope_inner`'s embedded-mode message exactly. An *explicit*
-/// `--store default` (or any other name) absent from the daemon's list is
+/// `--store default` (or any other name) absent from `items` is
 /// `Error::StoreNotFound`, exit 3, same as any other unknown explicit name —
 /// collapsing these two into one case was the reviewer's framing error.
-async fn resolve_daemon_store_scope_inner(
-    base_url: &str,
+pub(crate) fn apply_daemon_store_scope<T: Clone>(
+    items: &[T],
+    name_of: impl Fn(&T) -> &str,
     ctx: &CliContext,
     policy: StoreScopePolicy,
-) -> Result<Vec<String>, Error> {
+) -> Result<Vec<T>, Error> {
     for name in &ctx.stores {
         crate::normalize::validate_store_name(name)?;
     }
 
-    let daemon_names = fetch_all_daemon_store_names(base_url).await?;
-
     if !ctx.stores.is_empty() {
-        let mut names: Vec<String> = Vec::new();
+        let mut result: Vec<T> = Vec::new();
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for name in &ctx.stores {
-            if !daemon_names.iter().any(|n| n == name) {
-                return Err(Error::StoreNotFound { id: name.clone() });
-            }
+            let item = items
+                .iter()
+                .find(|it| name_of(it) == name.as_str())
+                .ok_or_else(|| Error::StoreNotFound { id: name.clone() })?;
             if seen.insert(name.as_str()) {
-                names.push(name.clone());
+                result.push(item.clone());
             }
         }
-        return Ok(names);
+        return Ok(result);
     }
 
     match policy {
         StoreScopePolicy::AllStores => {
-            if daemon_names.is_empty() {
+            if items.is_empty() {
                 return Err(Error::InvalidRequest {
                     message: "no stores; run `localdb store add <name>` or pass --store"
                         .to_string(),
                 });
             }
-            Ok(daemon_names)
+            Ok(items.to_vec())
         }
-        StoreScopePolicy::AllStoresAllowEmpty => Ok(daemon_names),
+        StoreScopePolicy::AllStoresAllowEmpty => Ok(items.to_vec()),
         StoreScopePolicy::DefaultStore => {
-            if daemon_names.iter().any(|n| n == DEFAULT_STORE_NAME) {
-                Ok(vec![DEFAULT_STORE_NAME.to_string()])
-            } else {
-                Err(Error::InvalidRequest {
+            match items.iter().find(|it| name_of(it) == DEFAULT_STORE_NAME) {
+                Some(item) => Ok(vec![item.clone()]),
+                None => Err(Error::InvalidRequest {
                     message: "no store named 'default'; pass --store <name>".to_string(),
-                })
+                }),
             }
         }
     }
@@ -427,10 +458,11 @@ pub(crate) async fn resolve_store_scope(
 /// branch can be unit-tested without going through `exit_err`'s
 /// `process::exit`.
 ///
-/// `pub(crate)` rather than private because `cmds::search` needs the
-/// `Result`-returning form: `resolve_search_targets` is itself fallible and
-/// its caller owns the `exit_err` call, so going through the exiting wrapper
-/// would move the exit point out of `run_search_async` where it belongs.
+/// `pub(crate)` rather than private because `cmds::search`'s
+/// `SearchCmd::run_embedded` needs the `Result`-returning form: it is itself
+/// fallible and returns to `command_table::dispatch`, which owns the
+/// `exit_err` call — going through the exiting wrapper here would move the
+/// exit point out of `dispatch` where it belongs.
 pub(crate) async fn resolve_store_scope_inner(
     ctx: &CliContext,
     db: &AppDb,
