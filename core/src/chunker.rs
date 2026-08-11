@@ -1058,6 +1058,42 @@ mod tests {
         }
     }
 
+    /// Returns the char immediately preceding byte offset `pos` in `s`, if any.
+    fn char_before(s: &str, pos: usize) -> Option<char> {
+        s[..pos].chars().next_back()
+    }
+
+    /// Returns the char starting at byte offset `pos` in `s`, if any.
+    fn char_at(s: &str, pos: usize) -> Option<char> {
+        s[pos..].chars().next()
+    }
+
+    /// Asserts that no chunk boundary in `chunks` splits a run of alphanumeric
+    /// characters in `source` (a "mid-word split", #191). A boundary is a
+    /// mid-word split when the char immediately on one side of it and the
+    /// char immediately on the other side are both alphanumeric.
+    fn assert_no_mid_word_splits(source: &str, chunks: &[ChunkOutput]) {
+        for c in chunks {
+            let start = c.span.start;
+            let end = c.span.end;
+            if let (Some(prev), Some(first)) = (char_before(source, start), char_at(source, start))
+            {
+                assert!(
+                    !(prev.is_alphanumeric() && first.is_alphanumeric()),
+                    "mid-word split at chunk start (byte {start}): preceding char {prev:?}, \
+                     chunk's first char {first:?}"
+                );
+            }
+            if let (Some(last), Some(next)) = (char_before(source, end), char_at(source, end)) {
+                assert!(
+                    !(last.is_alphanumeric() && next.is_alphanumeric()),
+                    "mid-word split at chunk end (byte {end}): chunk's last char {last:?}, \
+                     following char {next:?}"
+                );
+            }
+        }
+    }
+
     // ---------------------------------------------------------------------------
     // ChunkerConfig tests
     // ---------------------------------------------------------------------------
@@ -1162,6 +1198,60 @@ mod tests {
             assert!(
                 c.span.start <= c.span.end,
                 "span start must be <= span end (sanity check)"
+            );
+        }
+    }
+
+    #[test]
+    fn prose_span_slices_exactly_equal_chunk_text() {
+        let full_text =
+            "# Heading One\n\nParagraph one with some words.\n\n## Heading Two\n\nParagraph two here.";
+        let doc_id = resource_id("file:///exact.md", "abc");
+        let cfg = ChunkerConfig::prose();
+        let chunks = chunk_prose(&doc_id, full_text, &cfg, &WordSizer, 0).unwrap();
+        assert!(!chunks.is_empty());
+        for c in &chunks {
+            assert_eq!(
+                &full_text[c.span.start..c.span.end],
+                c.text,
+                "span slice must exactly equal chunk text"
+            );
+        }
+    }
+
+    #[test]
+    fn prose_adjacent_span_gaps_are_whitespace_only() {
+        let para = "word ".repeat(40);
+        let mut full_text = String::new();
+        for i in 0..6 {
+            full_text.push_str(&format!("## Section {i}\n\n{para}\n\n"));
+        }
+        let doc_id = resource_id("file:///gaps.md", "abc");
+        let cfg = ChunkerConfig {
+            preset: "prose".to_string(),
+            target_tokens: Some(60),
+            overlap_tokens: Some(0),
+            window_turns: None,
+            stride_turns: None,
+        };
+        let chunks = chunk_prose(&doc_id, &full_text, &cfg, &WordSizer, 0).unwrap();
+        assert!(
+            chunks.len() >= 2,
+            "should produce multiple chunks to exercise gaps, got {}",
+            chunks.len()
+        );
+        for pair in chunks.windows(2) {
+            let (a, b) = (&pair[0], &pair[1]);
+            assert!(
+                a.span.end <= b.span.start,
+                "chunks must be non-overlapping and in span order: {} > {}",
+                a.span.end,
+                b.span.start
+            );
+            let gap = &full_text[a.span.end..b.span.start];
+            assert!(
+                gap.chars().all(|c| c.is_whitespace()),
+                "gap between adjacent chunks must be whitespace-only, got: {gap:?}"
             );
         }
     }
@@ -1425,6 +1515,11 @@ mod tests {
                 c.span.start <= c.span.end,
                 "span start must be <= span end (sanity check)"
             );
+            assert_eq!(
+                &full_text[c.span.start..c.span.end],
+                c.text,
+                "span slice must exactly equal chunk text"
+            );
         }
     }
 
@@ -1487,6 +1582,52 @@ mod tests {
                 c.text.chars().count()
             );
         }
+    }
+
+    #[test]
+    fn code_hard_split_prefers_whitespace_boundary() {
+        // A single overlong line of space-separated ordinary words. The hard-split
+        // path should never cut through a word (bug #191) — it should prefer to
+        // split on whitespace.
+        let word = "alphabet";
+        let mut long_line = String::new();
+        while long_line.len() < 10_000 {
+            long_line.push_str(word);
+            long_line.push(' ');
+        }
+        let doc_id = "doc-overlong-words";
+        let cfg = ChunkerConfig::code(); // target = 3000 chars
+        let chunks = chunk_code(doc_id, &long_line, &cfg, 0).unwrap();
+        assert!(
+            chunks.len() >= 2,
+            "overlong line should produce multiple chunks, got {}",
+            chunks.len()
+        );
+        assert_no_mid_word_splits(&long_line, &chunks);
+    }
+
+    #[test]
+    fn prose_long_single_line_paragraph_does_not_split_mid_word() {
+        // A single-line paragraph (no newlines) of ordinary English sentences,
+        // long enough to trip the Layer D backstop (> 8 * target chars) and be
+        // delegated to chunk_code, whose hard-split path must not cut mid-word
+        // (bug #191).
+        let sentence =
+            "The quick brown fox jumps over the lazy dog and runs swiftly through the forest. ";
+        let mut full_text = String::new();
+        while full_text.len() < 2200 {
+            full_text.push_str(sentence);
+        }
+        assert!(!full_text.contains('\n'), "paragraph must be a single line");
+        let doc_id = "doc-prose-long-line";
+        let cfg = ChunkerConfig::prose(); // target = 256 chars; backstop threshold = 2048
+        let chunks = chunk_prose(doc_id, &full_text, &cfg, &WordSizer, 0).unwrap();
+        assert!(
+            chunks.len() >= 2,
+            "long single-line paragraph should produce multiple chunks, got {}",
+            chunks.len()
+        );
+        assert_no_mid_word_splits(&full_text, &chunks);
     }
 
     #[test]
