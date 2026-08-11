@@ -323,13 +323,36 @@ context itself. Aligning the chunker to that regime gives smaller, precise chunk
 citation granularity — while the model handles cross-chunk context, with no overlap needed.
 These are defaults to beat with evaluation, not dogma.
 
-**`chunk_prose` structureless fallback:** When `MarkdownSplitter` produces a single chunk
-covering the whole block (a sign that the content lacks structure), `chunk_prose` falls back
-to the `code` chunker so that the content is still indexed in bounded chunks.
+**`chunk_prose` structureless fallback:** Before invoking `MarkdownSplitter`, `chunk_prose`
+runs two O(n) probes over the block; tripping either delegates the whole block to the `code`
+chunker so the content is still indexed in bounded chunks:
 
-**`chunk_code` long-line split:** `chunk_code` enforces a per-line byte limit. Lines
-exceeding the limit are split into fixed-width sub-segments before chunking, preventing
-single-line binary or minified content from producing unbounded chunk sizes.
+- **Quality probe:** longest whitespace-free run > `STRUCTURELESS_RUN_MULTIPLIER` (8) × the
+  target. An ordinary paragraph or long-lined prose block in a whitespace-delimited script has
+  plenty of internal whitespace and stays on the prose path; genuinely structureless content
+  (minified JSON, a lockfile) does not (#191, #192).
+- **Performance guard:** longest *line* > `OVERLONG_LINE_MULTIPLIER` (64) × the target,
+  whitespace or not. `MarkdownSplitter`'s split-point search is super-linear on a single flat
+  line, so a pathologically long line (hundreds of KB with no newlines) must not reach it —
+  the multi-minute-hang class the fallback was originally introduced for (#61). Real prose
+  paragraphs, even the single-line ones EPUB/HTML extraction emits, stay far below this cap.
+
+Both probes compare a *char* count against the target, which in production is a *token* count
+from the embedder's tokenizer — a deliberate heuristic, not an exact unit match. The
+chars-per-token ratio is tokenizer-dependent: for whitespace-delimited text it is ≥ 1, so the
+probes trip no later than a true token measure would; BPE tokenizers can emit multiple tokens
+per char on CJK and rare scripts, inverting the direction — an accepted imprecision for
+content already covered by the CJK limitation above. Known limitation: scripts without
+inter-word whitespace (CJK, Thai, …) make a whole paragraph one "run", so long CJK prose trips
+the quality probe and gets char-aligned cuts in the `code` chunker; proper word segmentation is
+out of scope.
+
+**`chunk_code` long-line split:** `chunk_code` enforces a per-line char limit. Lines exceeding
+the limit are hard-split into target-sized pieces, preventing single-line binary or minified
+content from producing unbounded chunk sizes. Each cut prefers the last whitespace inside the
+window over the raw char boundary — as long as backing off to it still leaves a piece more than
+half the window — so ordinary long-lined prose splits between words instead of mid-word;
+content with no whitespace in the window (base64, URLs) still gets the hard char cut (#191).
 
 ### Spreadsheet routing
 
@@ -426,7 +449,13 @@ reordering parsers alone marks the store stale and schedules a reindex.
 
 The `chunking` sub-policy embeds a chunking algorithm identifier as part of what gets hashed;
 bumping it forces a reindex even when no user-visible config field changed. Current value:
-**`textsplitter-md-v5`** (bumped from `v4`). The `v5` bump covers the coarse `Text` block
+**`textsplitter-md-v6`** (bumped from `v5`). The `v6` bump covers the mid-word-split fix
+(#191, #192): `chunk_prose`'s structureless backstop is now dual-condition — longest
+whitespace-free run > 8× target (quality) or longest line > 64× target (performance guard,
+replacing the old 8× line probe) — and `chunk_code`'s overlong-line hard-split now backs off
+to the last whitespace in the window (falling back to the char cut only when the window has no
+whitespace) — chunk boundaries change for long single-line prose, so existing stores reindex
+on the next `localdb index`. The `v5` bump covers the coarse `Text` block
 ontology — `markdown_to_blocks` now emits one `Text` block per run of consecutive running-text
 content, so prose chunks pack toward the ~256-token target instead of one-tiny-chunk-per-
 paragraph (§3 above, "Coarse `Text` blocks"; the #158 fix), silently altering chunk boundaries.

@@ -340,6 +340,9 @@ Response shape (plain `offset` pagination):
 }
 ```
 
+`span` is block-relative, not a partition of the block: adjacent chunks' spans are not
+guaranteed contiguous — see [02-domain-model.md](02-domain-model.md) §"Span semantics".
+
 **Anchor example:** a resource with 20 chunks (`block_seq` 0–19, one chunk per block),
 requested with `anchor_chunk_id` set to the `block_seq = 10` chunk and `limit: 5`. With an
 odd `limit`, centering puts 2 chunks before the anchor and 2 after, so the returned window
