@@ -144,7 +144,19 @@ pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
             Err(ProxyConnectError::StoreNotFound(name)) => {
                 exit_err(&Error::StoreNotFound { id: name }, ctx.json);
             }
-            Err(ProxyConnectError::Unreachable(_)) => {
+            Err(ProxyConnectError::Unreachable(e)) => {
+                // The underlying transport/handshake error (`e`) is otherwise
+                // discarded — `exit_err` below only ever prints the generic
+                // "daemon is unreachable" message, giving no clue *why* the
+                // proxy hop failed (issue #147: the daemon/MCP connection
+                // path gives no diagnostic signal on rejection). `warn!` so
+                // it surfaces under the default `warn,pdf_oxide=off` filter
+                // (`localdb/src/main.rs`) without needing `RUST_LOG=debug`.
+                tracing::warn!(
+                    daemon_url = %base_url,
+                    error = %e,
+                    "mcp proxy: failed to connect to daemon"
+                );
                 exit_err(&Error::DaemonUnreachable, ctx.json);
             }
         };

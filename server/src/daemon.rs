@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::{
+    extract::Request,
+    middleware::{self, Next},
+    response::Response,
     routing::{delete, get, post},
     Router,
 };
@@ -237,6 +240,53 @@ pub fn build_router(
             "/mcp",
             mcp::build_streamable_http_service(mcp_stores, mcp_embedder, mcp_allowed_hosts),
         )
+        // Applied *after* `nest_service` so this layer wraps the whole
+        // composed router — including the nested rmcp `/mcp` mount, whose
+        // own rejections (e.g. the Host-header DNS-rebinding check; see
+        // `mcp_allowed_hosts`) would otherwise never reach a log at all
+        // (issue #147). A layer added before `nest_service` would only wrap
+        // the routes already present at that point.
+        .layer(middleware::from_fn(log_rejected_responses))
+}
+
+/// Log any response with status >= 400 at `warn`, so a rejected request —
+/// whether from `/v1` or the nested `/mcp` mount — leaves a trace instead of
+/// silently returning a bare 4xx/5xx with nothing in `localdb serve`'s
+/// output to diagnose it (issue #147). Deliberately hand-rolled rather than
+/// pulling in `tower-http`'s trace layer: this is the one thing we need
+/// (method, path, status, `Host`) and the project avoids adding a dependency
+/// for it.
+///
+/// The `Host` header is logged (rather than peer address) because it's what
+/// actually drives rejection in the one case this was hardest to diagnose
+/// without it — rmcp's DNS-rebinding check on `/mcp` (see
+/// `mcp_allowed_hosts`'s doc comment) — and it's already present on every
+/// HTTP request at no extra cost, unlike the TCP peer address, which axum
+/// does not expose to middleware without opting into `into_make_service_with_connect_info`.
+async fn log_rejected_responses(request: Request, next: Next) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let host = request
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
+        .to_string();
+
+    let response = next.run(request).await;
+
+    let status = response.status();
+    if status.as_u16() >= 400 {
+        warn!(
+            method = %method,
+            path = %path,
+            status = status.as_u16(),
+            host = %host,
+            "rejected request"
+        );
+    }
+
+    response
 }
 
 /// Warn when the actually-bound address is unspecified (all interfaces).
@@ -959,6 +1009,94 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    // --- rejected-request logging (issue #147) ---
+    //
+    // A minimal `MakeWriter` capturing formatted log lines into a shared
+    // buffer, installed via `tracing::subscriber::set_default` — scoped to
+    // the current thread/task rather than global `tracing::subscriber::set_global_default`,
+    // so it can't clash with other tests' subscribers running in parallel
+    // (`cargo test` runs each test in its own thread by default, and each
+    // `#[tokio::test]` here uses a single-threaded current-thread runtime,
+    // so the thread-local default set before `.await`ing stays in effect for
+    // the whole request).
+
+    #[derive(Clone, Default)]
+    struct BufWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for BufWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufWriter {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// A request that 4xxs (an unknown path -> axum's default 404) must
+    /// produce a WARN-level log line carrying method, path, and status —
+    /// proving the middleware installed in `build_router` actually observes
+    /// rejected responses instead of leaving them undiagnosable (issue #147).
+    #[tokio::test]
+    async fn rejected_response_is_logged_at_warn() {
+        let (_dir, state) = make_state().await;
+        let app = build_router(
+            state,
+            vec![],
+            std::sync::Arc::new(localdb_core::FakeEmbedder::new(1)),
+            vec![],
+        );
+
+        let buf = BufWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/does-not-exist")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+
+        drop(_guard);
+
+        let captured = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            captured.contains("WARN"),
+            "expected a WARN line, captured: {captured}"
+        );
+        assert!(
+            captured.contains("GET"),
+            "expected the method in the log line, captured: {captured}"
+        );
+        assert!(
+            captured.contains("/v1/does-not-exist"),
+            "expected the path in the log line, captured: {captured}"
+        );
+        assert!(
+            captured.contains("404"),
+            "expected the status in the log line, captured: {captured}"
+        );
     }
 
     // --- parse_refresh_interval ---

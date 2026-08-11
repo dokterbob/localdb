@@ -29,6 +29,7 @@ serde_yaml = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
+tracing-subscriber = { workspace = true }
 
 # Client-side transport for the `/mcp` route's round-trip integration test
 # (server/tests/mcp_route.rs) — not used by any non-test code, which only
