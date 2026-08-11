@@ -213,11 +213,14 @@ incremental-skip runs before any store write).
 - A fetched entry page — or, having fallen back that far, the entry's own embedded content — that
   extracts to empty or whitespace-only Markdown is **unusable, not empty**: it falls through the
   same `content → summary → title` chain that `Gone`/`Unsupported` use, and never yields a
-  zero-block Resource. A zero-block Resource reaching `index_resource` is indistinguishable from
-  a legitimate empty replacement and deletes the previously indexed document (see
-  [04-search-pipeline.md](04-search-pipeline.md) §1) — exactly the hazard the embedded-content
-  chain's own empty-Markdown guards (`feed_ingestor.rs`'s `entry_routed_content`) exist to avoid,
-  extended here to the fetched-page path that shares the same fallthrough logic.
+  zero-block Resource. A zero-block Resource reaching `index_resource` is refused by the sink and
+  reported as a skip — it can no longer delete the previously indexed document (see
+  [04-search-pipeline.md](04-search-pipeline.md) §1) — but the fallback chain's rationale is
+  unchanged: an entry whose page yields nothing should still be indexed from its summary or title
+  rather than left to the sink's refusal, which preserves the *old* content rather than producing
+  the best content available now. The embedded-content chain's own empty-Markdown guards
+  (`feed_ingestor.rs`'s `entry_routed_content`) exist for that reason, extended here to the
+  fetched-page path that shares the same fallthrough logic.
 - An invalid feed URL in config fails the whole source run fast (`invalid_config`). Everything
   else data-driven — malformed feed XML, malformed entries, entry-link fetch failures — is
   per-item `on_skipped(Error)` + continue. An empty feed (zero entries) is valid, not an error.

@@ -451,6 +451,7 @@ mod tests {
                 docs_deleted: 0,
                 chunks_written: 6,
                 unsupported_format_count: 0,
+                docs_prunable: 0,
                 error_count: 0,
             },
         });
@@ -493,6 +494,7 @@ mod tests {
                 docs_deleted: 0,
                 chunks_written: 6,
                 unsupported_format_count: 0,
+                docs_prunable: 0,
                 error_count: 0,
             },
         });
@@ -541,6 +543,7 @@ mod tests {
                 docs_deleted: 4394,
                 chunks_written: 12,
                 unsupported_format_count: 0,
+                docs_prunable: 0,
                 error_count: 0,
             },
         });

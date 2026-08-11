@@ -121,6 +121,15 @@ pub enum Command {
         /// Exit with code 2 if any document failed extraction (never aborts mid-run).
         #[arg(long)]
         strict: bool,
+
+        /// Remove indexed documents that no longer exist at their source.
+        ///
+        /// Off by default, like `rsync --delete`: indexing never removes
+        /// anything unless you ask. Without it, documents whose files were
+        /// deleted (or whose URLs now 404) stay searchable, and the run
+        /// reports how many could be pruned.
+        #[arg(long)]
+        delete: bool,
     },
 
     /// Hybrid search with citations.
@@ -388,7 +397,11 @@ fn main() {
             DbCommand::Downgrade { to } => cli::run_db_downgrade(&ctx, *to),
             DbCommand::Vacuum => cli::run_db_vacuum(&ctx),
         },
-        Command::Index { source, strict } => cli::run_index(&ctx, source.as_deref(), *strict),
+        Command::Index {
+            source,
+            strict,
+            delete,
+        } => cli::run_index(&ctx, source.as_deref(), *strict, *delete),
         Command::Search {
             query,
             limit,

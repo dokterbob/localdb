@@ -24,7 +24,7 @@ use crate::chunker::{chunk_blocks, CharSizer, ChunkSizer, ChunkerConfig, TokenSi
 use crate::embedder::{DocumentChunks, Embedder};
 use crate::error::Error;
 use crate::ids::new_ulid;
-use crate::ingestor::{IngestCallback, IngestSource, Ingestor, SkipReason};
+use crate::ingestor::{Enumeration, IngestCallback, IngestSource, Ingestor, SkipReason};
 use crate::store::{ChunkRecord, RetrievalStore};
 use crate::types::{
     Chunk, IndexJob, IndexJobScope, IndexJobState, IndexJobStats, Provenance, Source, SourceRef,
@@ -159,6 +159,33 @@ pub struct IngestionResult {
     pub unsupported_format_count: u64,
     /// Files that errored during processing.
     pub error_count: u64,
+    /// Documents this run would have deleted had deletion been enabled
+    /// ([`DeletionPolicy::Prune`]) — either confirmed gone at the origin or
+    /// absent from a trustworthy enumeration. Always 0 when pruning ran, since
+    /// then they were actually deleted and counted in `docs_deleted`.
+    ///
+    /// Surfaced so a default (retaining) run can tell the user what `--delete`
+    /// would remove, instead of silently accumulating stale documents.
+    pub docs_prunable: u64,
+}
+
+/// Whether an ingestion run may remove documents from the store.
+///
+/// Deletion is opt-in, following `rsync --delete` (issues #156/#185): removing
+/// indexed content is destructive and asymmetric — a wrong delete cost this
+/// project's `books` store ~4.4M chunks and a full re-index, while a missed
+/// delete costs only a stale search hit. Retaining is also frequently what a
+/// user actually wants from a local index: a copy of a newspaper article that
+/// has since 404'd is *more* valuable for having outlived its origin, not less.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeletionPolicy {
+    /// Never remove anything; report what would have been removed via
+    /// [`IngestionResult::docs_prunable`]. The default.
+    #[default]
+    Retain,
+    /// Remove documents confirmed gone at the origin, and — subject to the
+    /// enumeration guards — documents absent from this run.
+    Prune,
 }
 
 // ---------------------------------------------------------------------------
@@ -217,22 +244,58 @@ pub struct FoundFile {
     pub uri: Uri,
 }
 
+/// The outcome of enumerating a `path`-kind source.
+///
+/// This is an enum rather than a plain `Vec<FoundFile>` on purpose (#156):
+/// a missing root used to be flattened into `Ok(vec![])`, indistinguishable
+/// from an empty-but-present directory, and the delete-sweep read that empty
+/// vector as "every file in this source was deleted." Making the caller
+/// destructure the two cases is the fix — every future caller has to confront
+/// the distinction that caused the data loss.
+#[derive(Debug, Clone)]
+pub enum PathEnumeration {
+    /// The root was present and walked in full: these are all its files.
+    Complete(Vec<FoundFile>),
+    /// The root does not exist — an unmounted volume, a detached external
+    /// disk, a moved directory. Says nothing about whether the files it used
+    /// to hold still exist, so it must never license a delete.
+    RootUnavailable,
+}
+
+impl PathEnumeration {
+    /// The enumerated files, or an empty slice if the root was unavailable.
+    ///
+    /// Convenience for callers that only care about what was found (tests,
+    /// display). Anything that *deletes* on the strength of absence must
+    /// match on the variant instead.
+    pub fn files(&self) -> &[FoundFile] {
+        match self {
+            PathEnumeration::Complete(files) => files,
+            PathEnumeration::RootUnavailable => &[],
+        }
+    }
+}
+
 /// Enumerate files in a `path`-kind source, applying include/exclude globs.
 ///
-/// Returns a list of found files sorted by path for determinism.
+/// Returns [`PathEnumeration::Complete`] with the found files sorted by path
+/// for determinism, or [`PathEnumeration::RootUnavailable`] if the configured
+/// root does not exist.
 ///
 /// # Errors
-/// Returns `Error::Internal` if the root path cannot be read.
+/// Returns `Error::Internal` if the root path exists but cannot be read.
 pub fn enumerate_path_source(
     root: &str,
     include: &[String],
     exclude: &[String],
-) -> Result<Vec<FoundFile>, Error> {
+) -> Result<PathEnumeration, Error> {
     let root_path = Path::new(root);
 
     if !root_path.exists() {
-        // Non-existent root is OK: treat as empty source (0 files, no error)
-        return Ok(vec![]);
+        // #156: a root that isn't there is *unavailable*, not empty. Reporting
+        // it as zero files is what let an unmounted volume delete a whole
+        // source's worth of indexed documents.
+        return Ok(PathEnumeration::RootUnavailable);
     }
 
     let include_set = build_glob_set(include)?;
@@ -249,7 +312,7 @@ pub fn enumerate_path_source(
         &mut found,
     )?;
     found.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(found)
+    Ok(PathEnumeration::Complete(found))
 }
 
 /// Recursively enumerate a directory.
@@ -669,13 +732,14 @@ fn filename_hint_from_uri(uri: &crate::uri::Uri) -> Option<String> {
 /// `PipelineCallback` below) — this function always (re)indexes; `resource`'s
 /// blocks, metadata, and `content_hash` must already be final.
 ///
-/// Returns the number of chunks written.
+/// Returns [`IndexOutcome::Written`] with the number of chunks written, or
+/// [`IndexOutcome::Empty`] if the resource produced no chunks at all.
 pub async fn index_resource(
     resource: &Resource,
     source: &Source,
     replaces_resource_id: Option<&str>,
     deps: &IndexResourceDeps<'_>,
-) -> Result<usize, Error> {
+) -> Result<IndexOutcome, Error> {
     let token_counter = deps.embedder.token_counter();
     let sizer: Box<dyn ChunkSizer> = match &token_counter {
         Some(f) => Box::new(TokenSizer::new(f.clone())),
@@ -705,12 +769,28 @@ pub async fn index_resource(
     )?;
 
     if chunk_outputs.is_empty() {
-        // No chunks produced (empty resource): delete any old chunks if this
-        // is a replace, write nothing new.
-        if let Some(old_id) = replaces_resource_id {
-            deps.store.delete_by_resource(old_id).await?;
-        }
-        return Ok(0);
+        // #185 — the sink's invariant: an empty replacement writes nothing AND
+        // deletes nothing.
+        //
+        // This arm used to `delete_by_resource(replaces_resource_id)`, on the
+        // reading that a resource which now chunks to nothing is a document
+        // that has become empty. But `index_resource` cannot distinguish
+        // "this file is legitimately empty now" from "extraction produced
+        // nothing this run" (a scanned PDF with no text layer, a parser
+        // regression, an HTML page whose body failed to render) — and only the
+        // first is evidence the content is gone. Guarding this at each
+        // ingestor (as PR #170 did for url/feed) leaves every future connector
+        // one oversight away from silently erasing a URI's content, so the
+        // rule lives here, where nothing can bypass it.
+        //
+        // The escape hatch for a genuinely empty file is clean and already
+        // exists: delete the file, and the delete-sweep removes it normally.
+        tracing::warn!(
+            uri = %resource.uri,
+            "resource produced no chunks — keeping any previously indexed \
+             content for this URI (delete the source item if it is really gone)"
+        );
+        return Ok(IndexOutcome::Empty);
     }
 
     // Embed BEFORE any delete (A6) — see module doc comment above.
@@ -831,7 +911,24 @@ pub async fn index_resource(
         )
         .await?;
 
-    Ok(written)
+    Ok(IndexOutcome::Written(written))
+}
+
+/// What [`index_resource`] did with a resource.
+///
+/// `Empty` is a distinct outcome rather than `Written(0)` because the caller
+/// must treat it differently (#185): a resource that chunked to nothing is
+/// *not* an indexed document, and recording it as one — bumping
+/// `docs_indexed`, upserting its hash into the `DocumentIndex` — is what
+/// turned "this file extracted to nothing" into "this file's indexed content
+/// is gone."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexOutcome {
+    /// The resource was chunked, embedded, and written: this many chunks.
+    Written(usize),
+    /// The resource produced no chunks. Nothing was written, and — the
+    /// invariant this type exists to carry — nothing was deleted either.
+    Empty,
 }
 
 /// Dependencies for [`run_source_ingestion`]: the mutable incremental-skip
@@ -842,6 +939,9 @@ pub struct SourceIngestionDeps<'a> {
     pub embedder: &'a dyn Embedder,
     pub config: &'a IngestionConfig,
     pub progress: Option<crate::progress::ProgressSink>,
+    /// Whether this run may remove documents. Defaults to
+    /// [`DeletionPolicy::Retain`] — deletion is opt-in.
+    pub deletion: DeletionPolicy,
 }
 
 /// Run the unified ingestion pipeline for one source, driven by a caller-supplied
@@ -851,12 +951,27 @@ pub struct SourceIngestionDeps<'a> {
 /// an entire source's resources in memory. Per resource: skip-check (unchanged
 /// `content_hash` + `policy_version`) → [`index_resource`] → counters/progress.
 /// Per-resource errors become stats counters and progress events, never abort
-/// the run. After `ingestor.ingest()` returns, runs the delete-sweep: any URI
-/// previously indexed for this source that was neither yielded nor reported via
-/// `on_skipped` this run is deleted — this is how a file deletion, source
-/// removal, or (once ingestors report it) a Gone URL is swept. Feed sources
-/// (`SourceSpec::Feed`) are exempt from the sweep — see the comment at the
-/// sweep loop below for why.
+/// the run.
+///
+/// # Removal
+///
+/// Nothing is ever removed unless `deps.deletion` is [`DeletionPolicy::Prune`]
+/// — deletion is opt-in, like `rsync --delete`. A retaining run counts what it
+/// would have removed into [`IngestionResult::docs_prunable`] instead.
+///
+/// Under `Prune`, two separate paths remove documents, and the difference
+/// between them is the subject of issues #156/#185:
+///
+/// - **Confirmed gone.** A URI reported via `IngestCallback::on_gone` (an HTTP
+///   404/410 after retry) is deleted unconditionally. The origin was reached
+///   and answered — that is knowledge, so no guard applies.
+/// - **Presumed gone (the delete-sweep).** A URI previously indexed for this
+///   source that was neither yielded nor reported via `on_skipped` is
+///   *inferred* to be gone. Because that is an inference from absence, it is
+///   swept only when the absence is informative: feed sources are exempt
+///   entirely (a feed is a bounded window), an incomplete enumeration
+///   suppresses it (guard 1), and so does a run that observed none of the
+///   source's own URIs (guard 2). See the comments at the sweep below.
 pub async fn run_source_ingestion(
     source: &Source,
     ingestor: &dyn Ingestor,
@@ -868,6 +983,7 @@ pub async fn run_source_ingestion(
         embedder,
         config,
         progress,
+        deletion,
     } = deps;
 
     let ingest_config = serde_json::to_value(&source.spec).map_err(|e| Error::Internal {
@@ -899,6 +1015,7 @@ pub async fn run_source_ingestion(
         progress: progress.clone(),
         result: IngestionResult::default(),
         seen: std::collections::HashSet::new(),
+        gone: std::collections::HashSet::new(),
         discovered_total: 0,
         next_index: 0,
         skip_error_count: 0,
@@ -909,6 +1026,7 @@ pub async fn run_source_ingestion(
     let PipelineCallback {
         mut result,
         seen,
+        gone,
         doc_index,
         skip_error_count,
         ..
@@ -937,10 +1055,44 @@ pub async fn run_source_ingestion(
         source.id, ingest_result.errors, skip_error_count
     );
 
+    // Confirmed deletions first, and unconditionally: a URI reported via
+    // `on_gone` was positively established as absent at the origin (an HTTP
+    // 404/410 after retry). That is *knowledge*, not inference — the origin
+    // was reached and answered — so none of the sweep's guards below apply to
+    // it, and neither does the feed exemption: a feed entry whose linked page
+    // is confirmed 410 is gone whether or not the feed window still lists it.
+    //
+    // This is the distinction the rest of this function is organized around.
+    // Knowing a resource is gone is not the same as failing to find it; only
+    // the latter needs guarding, because only the latter is inferred.
+    //
+    // Both still answer to `deletion`, though: "the origin no longer has this"
+    // is not the same as "you no longer want this." A local copy of a page
+    // that has since 404'd is often the most valuable thing in the index.
+    for uri in &gone {
+        let owned_by_this_source = doc_index
+            .get(uri)
+            .is_some_and(|record| record.source_id == source.id);
+        if !owned_by_this_source {
+            continue;
+        }
+        if deletion == DeletionPolicy::Retain {
+            result.docs_prunable += 1;
+            continue;
+        }
+        if let Some(old_record) = doc_index.remove(uri) {
+            let deleted = store.delete_by_resource(&old_record.resource_id).await?;
+            if deleted > 0 {
+                result.docs_deleted += 1;
+            }
+        }
+    }
+
     // Delete-sweep: any URI known to this source's doc_index that was neither
     // yielded (on_resource) nor reported skipped (on_skipped) this run is
-    // gone — delete it. A deleted file simply isn't enumerated again; a Gone
-    // URL is simply never yielded.
+    // *presumed* gone — delete it. A deleted file simply isn't enumerated
+    // again. Unlike the `on_gone` path above, this is an inference from
+    // absence, which is why it is guarded.
     //
     // Ownership is decided by `source_id`, never by comparing URI strings
     // against the source's configured root/URL. The doc_index is store-wide,
@@ -963,21 +1115,75 @@ pub async fn run_source_ingestion(
     // full current state every run — so absence there really does mean
     // deletion and the sweep must still run for them.
     if !matches!(source.spec, SourceSpec::Feed { .. }) {
-        let existing_uris = doc_index.uris();
-        for uri in existing_uris {
-            let owned_by_this_source = doc_index
-                .get(&uri)
-                .is_some_and(|record| record.source_id == source.id);
-            if !owned_by_this_source {
-                continue;
+        // Two further suppressions, both from issue #156, both stating for
+        // path/url sources the rule the feed exemption above states for feeds:
+        // the sweep infers deletion from absence, so it may only run when the
+        // absence is *informative*.
+        let owned_uris: Vec<String> = doc_index
+            .uris()
+            .into_iter()
+            .filter(|uri| {
+                doc_index
+                    .get(uri)
+                    .is_some_and(|record| record.source_id == source.id)
+            })
+            .collect();
+        let any_owned_uri_seen = owned_uris.iter().any(|uri| seen.contains(uri));
+
+        let suppressed_because = match &ingest_result.enumeration {
+            // Guard 1 — enumeration completeness. The ingestor itself reported
+            // that it could not observe the source (an unmounted volume, an
+            // unreachable root, an API that failed part-way). Its silence
+            // about a URI says nothing about whether that URI still exists.
+            // This is the guard that fires for the reported incident:
+            // `/Volumes/Archive` unmounted, `FileIngestor` enumerated zero
+            // files, and the sweep deleted every document the source owned.
+            Enumeration::Incomplete { reason } => Some(reason.clone()),
+            // Guard 2 — zero-seen backstop, source-shape-agnostic. Even with a
+            // *complete* enumeration claimed, a source that previously owned
+            // documents and observed none of them this run is far more likely
+            // to be a broken connector than a source whose entire contents
+            // vanished at once. This does not subsume guard 1: a connector
+            // that enumerates 3 of 500 items before failing has a non-empty
+            // `seen` set, so only guard 1 protects the other 497.
+            //
+            // Deliberate trade-off: a source whose files really were all
+            // deleted or renamed in one run keeps its stale documents until
+            // the source is re-created. The warning below says so.
+            Enumeration::Complete if !owned_uris.is_empty() && !any_owned_uri_seen => {
+                Some("this run observed none of the documents this source owns".to_string())
             }
-            if seen.contains(&uri) {
-                continue;
-            }
-            if let Some(old_record) = doc_index.remove(&uri) {
-                let deleted = store.delete_by_resource(&old_record.resource_id).await?;
-                if deleted > 0 {
-                    result.docs_deleted += 1;
+            Enumeration::Complete => None,
+        };
+
+        if let Some(reason) = suppressed_because {
+            tracing::warn!(
+                source_id = %source.id,
+                location = %source_location(source),
+                documents_preserved = owned_uris.len(),
+                "skipping delete-sweep for source at '{}': {}. {} previously \
+                 indexed document(s) were left in place rather than deleted, \
+                 because this run produced no evidence that they are gone. If \
+                 the source really is empty now, remove and re-add it \
+                 (`localdb source remove` / `localdb source add`) and reindex.",
+                source_location(source),
+                reason,
+                owned_uris.len(),
+            );
+        } else {
+            for uri in owned_uris {
+                if seen.contains(&uri) || gone.contains(&uri) {
+                    continue;
+                }
+                if deletion == DeletionPolicy::Retain {
+                    result.docs_prunable += 1;
+                    continue;
+                }
+                if let Some(old_record) = doc_index.remove(&uri) {
+                    let deleted = store.delete_by_resource(&old_record.resource_id).await?;
+                    if deleted > 0 {
+                        result.docs_deleted += 1;
+                    }
                 }
             }
         }
@@ -1035,6 +1241,9 @@ struct PipelineCallback<'a> {
     result: IngestionResult,
     /// URIs yielded or reported skipped this run — survive the delete-sweep.
     seen: std::collections::HashSet<String>,
+    /// URIs the ingestor positively confirmed gone at the origin (404/410
+    /// after retry). Deleted unconditionally — see `IngestCallback::on_gone`.
+    gone: std::collections::HashSet<String>,
     /// Last total reported via `on_discovered`, if any (0 until then).
     discovered_total: usize,
     /// Running index for `ProgressEvent::DocumentStarted`.
@@ -1097,7 +1306,25 @@ impl IngestCallback for PipelineCallback<'_> {
         };
 
         match index_resource(&resource, self.source, replaces.as_deref(), &deps).await {
-            Ok(chunks_written) => {
+            Ok(IndexOutcome::Empty) => {
+                // #185: the resource chunked to nothing, so `index_resource`
+                // wrote nothing and deleted nothing. Count it as a skip, not
+                // as an indexed document.
+                //
+                // `doc_index` is deliberately left UNTOUCHED. Upserting the
+                // empty resource's id/hash here would point the index at a
+                // resource_id the store has no rows for (the store still holds
+                // the *old* resource), which would make the next run's
+                // skip-check compare against a phantom and leave the real rows
+                // unreachable. The URI is already in `seen` (inserted at the
+                // top of this method), so it survives the delete-sweep.
+                self.result.docs_skipped += 1;
+                self.emit(crate::progress::ProgressEvent::DocumentFinished {
+                    uri,
+                    outcome: crate::progress::DocOutcome::Skipped,
+                });
+            }
+            Ok(IndexOutcome::Written(chunks_written)) => {
                 self.result.docs_indexed += 1;
                 self.result.chunks_written += chunks_written as u64;
                 self.doc_index.upsert(DocumentRecord {
@@ -1133,6 +1360,18 @@ impl IngestCallback for PipelineCallback<'_> {
     async fn on_discovered(&mut self, total: usize) {
         self.discovered_total = total;
         self.emit(crate::progress::ProgressEvent::Discovered { total });
+    }
+
+    async fn on_gone(&mut self, uri: &Uri) {
+        // Positively confirmed absent at the origin. Recorded rather than
+        // deleted here so that all deletion happens in one place in
+        // `run_source_ingestion` — but unlike the sweep's inferred deletions,
+        // this one is exempt from every guard: the ingestor didn't fail to see
+        // it, the origin told us it's gone.
+        //
+        // Deliberately NOT added to `seen`: `seen` means "still alive, don't
+        // sweep", which is the opposite of what this signal says.
+        self.gone.insert(uri.as_str().to_string());
     }
 
     async fn on_skipped(&mut self, uri: &Uri, reason: SkipReason) {
@@ -1359,10 +1598,29 @@ mod tests {
     // Path source enumeration tests
     // ---------------------------------------------------------------------------
 
+    /// #156: a root that does not exist is `RootUnavailable`, not an empty
+    /// `Complete`. Collapsing the two is what let an unmounted volume look
+    /// like a source whose every file had been deleted.
     #[test]
-    fn enumerate_nonexistent_root_returns_empty() {
-        let result = enumerate_path_source("/this/path/does/not/exist", &[], &[]).unwrap();
-        assert!(result.is_empty());
+    fn enumerate_path_source_missing_root_is_unavailable() {
+        let enumeration = enumerate_path_source("/this/path/does/not/exist", &[], &[]).unwrap();
+        assert!(
+            matches!(enumeration, PathEnumeration::RootUnavailable),
+            "a missing root must be reported as unavailable, not as zero files"
+        );
+    }
+
+    /// The other half of the distinction: a root that exists and genuinely
+    /// holds nothing is `Complete(vec![])` — an observation, not an absence
+    /// of one — and the sweep is right to act on it.
+    #[test]
+    fn enumerate_path_source_empty_dir_is_complete_and_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let enumeration = enumerate_path_source(dir.path().to_str().unwrap(), &[], &[]).unwrap();
+        assert!(
+            matches!(&enumeration, PathEnumeration::Complete(files) if files.is_empty()),
+            "an existing but empty root is a complete enumeration of zero files"
+        );
     }
 
     #[test]
@@ -1372,7 +1630,10 @@ mod tests {
         std::fs::write(dir.path().join("b.txt"), b"hello").unwrap();
 
         let root = dir.path().to_str().unwrap();
-        let files = enumerate_path_source(root, &[], &[]).unwrap();
+        let files = enumerate_path_source(root, &[], &[])
+            .unwrap()
+            .files()
+            .to_vec();
         assert_eq!(files.len(), 2, "should find both files");
     }
 
@@ -1383,7 +1644,10 @@ mod tests {
         std::fs::write(dir.path().join("data.bin"), b"\x00\x01\x02").unwrap();
 
         let root = dir.path().to_str().unwrap();
-        let files = enumerate_path_source(root, &["*.md".to_string()], &[]).unwrap();
+        let files = enumerate_path_source(root, &["*.md".to_string()], &[])
+            .unwrap()
+            .files()
+            .to_vec();
         assert_eq!(files.len(), 1, "should find only .md files");
         assert!(files[0].path.to_str().unwrap().ends_with(".md"));
     }
@@ -1396,7 +1660,10 @@ mod tests {
         std::fs::write(dir.path().join("app.js"), b"app").unwrap();
 
         let root = dir.path().to_str().unwrap();
-        let files = enumerate_path_source(root, &[], &["**/node_modules/**".to_string()]).unwrap();
+        let files = enumerate_path_source(root, &[], &["**/node_modules/**".to_string()])
+            .unwrap()
+            .files()
+            .to_vec();
         // Should exclude node_modules files
         assert!(
             files
@@ -1415,7 +1682,10 @@ mod tests {
         std::fs::write(dir.path().join(".DS_Store"), b"\x00root").unwrap();
 
         let root = dir.path().to_str().unwrap();
-        let files = enumerate_path_source(root, &[], &[".DS_Store".to_string()]).unwrap();
+        let files = enumerate_path_source(root, &[], &[".DS_Store".to_string()])
+            .unwrap()
+            .files()
+            .to_vec();
         assert!(
             files
                 .iter()
@@ -1447,7 +1717,9 @@ mod tests {
         let root = dir.path().to_str().unwrap();
         let files =
             enumerate_path_source(root, &[], &[".git".to_string(), "node_modules".to_string()])
-                .unwrap();
+                .unwrap()
+                .files()
+                .to_vec();
         assert!(
             files.iter().all(|f| {
                 let p = f.path.to_string_lossy();
@@ -1466,7 +1738,10 @@ mod tests {
         std::fs::write(dir.path().join("sub").join("a.md"), b"# A").unwrap();
 
         let root = dir.path().to_str().unwrap();
-        let files = enumerate_path_source(root, &[], &["**/.DS_Store".to_string()]).unwrap();
+        let files = enumerate_path_source(root, &[], &["**/.DS_Store".to_string()])
+            .unwrap()
+            .files()
+            .to_vec();
         assert!(files
             .iter()
             .all(|f| !f.path.to_string_lossy().ends_with(".DS_Store")));
@@ -1481,13 +1756,19 @@ mod tests {
 
         let root = dir.path().to_str().unwrap();
         // Bare `*.md` include must NOT match nested docs/notes.md (path-anchored).
-        let files = enumerate_path_source(root, &["*.md".to_string()], &[]).unwrap();
+        let files = enumerate_path_source(root, &["*.md".to_string()], &[])
+            .unwrap()
+            .files()
+            .to_vec();
         assert!(
             files.is_empty(),
             "bare *.md include must not match at depth"
         );
         // `**/*.md` does match.
-        let files = enumerate_path_source(root, &["**/*.md".to_string()], &[]).unwrap();
+        let files = enumerate_path_source(root, &["**/*.md".to_string()], &[])
+            .unwrap()
+            .files()
+            .to_vec();
         assert_eq!(files.len(), 1);
         assert!(files[0].path.to_string_lossy().ends_with("notes.md"));
     }
@@ -1511,7 +1792,10 @@ mod tests {
         std::fs::write(dir.path().join("a").join("keep.rs"), b"fn main() {}").unwrap();
 
         let root = dir.path().to_str().unwrap();
-        let files = enumerate_path_source(root, &[], &["**/node_modules".to_string()]).unwrap();
+        let files = enumerate_path_source(root, &[], &["**/node_modules".to_string()])
+            .unwrap()
+            .files()
+            .to_vec();
         assert!(
             files
                 .iter()
@@ -1527,7 +1811,10 @@ mod tests {
         std::fs::write(dir.path().join("test.md"), b"content").unwrap();
 
         let root = dir.path().to_str().unwrap();
-        let files = enumerate_path_source(root, &[], &[]).unwrap();
+        let files = enumerate_path_source(root, &[], &[])
+            .unwrap()
+            .files()
+            .to_vec();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].uri.scheme(), "file");
         assert!(files[0].uri.as_str().starts_with("file://"));
@@ -1539,7 +1826,10 @@ mod tests {
         std::fs::write(dir.path().join("Notes \u{2013} draft.md"), b"# hi").unwrap();
         std::fs::write(dir.path().join("r\u{e9}sum\u{e9}.txt"), b"x").unwrap();
         let root = dir.path().to_str().unwrap();
-        let files = enumerate_path_source(root, &["*.md".to_string()], &[]).unwrap();
+        let files = enumerate_path_source(root, &["*.md".to_string()], &[])
+            .unwrap()
+            .files()
+            .to_vec();
         assert_eq!(files.len(), 1); // only the .md, no panic
     }
 
@@ -1899,16 +2189,34 @@ mod tests {
             Discovered(usize),
             Resource(Resource),
             Skipped(String, SkipReason),
+            /// Positively confirmed absent at the origin (404/410).
+            Gone(String),
         }
 
         struct FakeIngestor {
             script: std::sync::Mutex<Vec<ScriptStep>>,
+            /// What this ingestor claims about enumeration completeness —
+            /// `Complete` unless a test is exercising the #156 guard.
+            enumeration: Enumeration,
         }
 
         impl FakeIngestor {
             fn new(script: Vec<ScriptStep>) -> Self {
                 Self {
                     script: std::sync::Mutex::new(script),
+                    enumeration: Enumeration::Complete,
+                }
+            }
+
+            /// An ingestor that ran without error but could not observe the
+            /// source — the shape a `FileIngestor` over an unmounted volume
+            /// reports.
+            fn incomplete(reason: &str) -> Self {
+                Self {
+                    script: std::sync::Mutex::new(vec![]),
+                    enumeration: Enumeration::Incomplete {
+                        reason: reason.to_string(),
+                    },
                 }
             }
         }
@@ -1959,12 +2267,18 @@ mod tests {
                                 .unwrap_or_else(|| panic!("invalid test skip uri: {uri}"));
                             callback.on_skipped(&uri, reason).await;
                         }
+                        ScriptStep::Gone(uri) => {
+                            let uri = Uri::parse(&uri)
+                                .unwrap_or_else(|| panic!("invalid test gone uri: {uri}"));
+                            callback.on_gone(&uri).await;
+                        }
                     }
                 }
                 Ok(IngestResult {
                     resources_produced: produced,
                     resources_skipped: skipped,
                     errors,
+                    enumeration: self.enumeration.clone(),
                 })
             }
         }
@@ -2064,6 +2378,7 @@ mod tests {
                 embedder: &embedder,
                 config: &config,
                 progress: None,
+                deletion: DeletionPolicy::Prune,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -2115,6 +2430,7 @@ mod tests {
                 embedder: &embedder,
                 config: &config,
                 progress: None,
+                deletion: DeletionPolicy::Prune,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -2201,6 +2517,7 @@ mod tests {
                 embedder: &embedder,
                 config: &config,
                 progress: Some(sink),
+                deletion: DeletionPolicy::Prune,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -2293,6 +2610,7 @@ mod tests {
                 embedder: &embedder,
                 config: &config,
                 progress: Some(sink),
+                deletion: DeletionPolicy::Prune,
             };
             run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -2372,6 +2690,7 @@ mod tests {
                 embedder: &embedder,
                 config: &config,
                 progress: None,
+                deletion: DeletionPolicy::Prune,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -2422,6 +2741,7 @@ mod tests {
                 embedder: &embedder,
                 config: &config_v2,
                 progress: None,
+                deletion: DeletionPolicy::Prune,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -2485,6 +2805,7 @@ mod tests {
                 embedder: &embedder,
                 config: &config,
                 progress: None,
+                deletion: DeletionPolicy::Prune,
             };
             let result1 = run_source_ingestion(&source, &ingestor1, deps1)
                 .await
@@ -2518,6 +2839,7 @@ mod tests {
                 embedder: &embedder,
                 config: &config,
                 progress: None,
+                deletion: DeletionPolicy::Prune,
             };
             let result2 = run_source_ingestion(&source, &ingestor2, deps2)
                 .await
@@ -2578,6 +2900,7 @@ mod tests {
                 embedder: &embedder,
                 config: &config,
                 progress: None,
+                deletion: DeletionPolicy::Prune,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -2605,6 +2928,471 @@ mod tests {
         }
 
         // -----------------------------------------------------------------
+        // #185 / #156: "I observed nothing" is not "it was deleted".
+        //
+        // Three levels of the same conflation, guarded independently:
+        //   - the sink   — a zero-chunk resource neither writes nor deletes;
+        //   - guard 1    — an incomplete enumeration suppresses the sweep;
+        //   - guard 2    — a run that saw none of the source's own URIs
+        //                  suppresses the sweep whatever the ingestor claims.
+        // -----------------------------------------------------------------
+
+        /// #185 end-to-end: a zero-block `Resource` reaching `on_resource`
+        /// must be reported as a skip, must not delete the URI's indexed
+        /// content, and — the subtle part — must leave `doc_index` pointing
+        /// at the OLD resource. Upserting the empty resource's id/hash while
+        /// the store still holds the old resource's rows would leave the
+        /// index referencing a resource_id with no rows behind it.
+        #[tokio::test]
+        async fn zero_block_resource_leaves_doc_index_pointing_at_old_resource() {
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let config = make_ingestion_config(store_id);
+            let source = make_source_with_preset(store_id, "prose");
+
+            let uri = "file:///docs/emptied.md";
+            let old_record =
+                seed_indexed(&store, &embedder, &config, &source, uri, "Original body.").await;
+
+            let mut doc_index = DocumentIndex::new();
+            doc_index.upsert(old_record.clone());
+
+            // The file is still there and still enumerated — it just extracted
+            // to nothing this run.
+            let empty_resource = make_resource_with_blocks(uri, &source.id, store_id, vec![]);
+            assert_ne!(
+                empty_resource.id, old_record.resource_id,
+                "sanity: the empty resource must have its own id, or this test \
+                 could not distinguish 'index updated' from 'index left alone'"
+            );
+            let ingestor = FakeIngestor::new(vec![ScriptStep::Resource(empty_resource)]);
+
+            let deps = SourceIngestionDeps {
+                doc_index: &mut doc_index,
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+                progress: None,
+                deletion: DeletionPolicy::Prune,
+            };
+            let result = run_source_ingestion(&source, &ingestor, deps)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                result.docs_deleted, 0,
+                "an empty extraction deletes nothing"
+            );
+            assert_eq!(
+                result.docs_indexed, 0,
+                "nothing was written, so nothing was indexed"
+            );
+            assert_eq!(result.docs_skipped, 1, "the empty resource is a skip");
+            assert_eq!(result.error_count, 0, "an empty extraction is not an error");
+
+            let old_chunks = store
+                .get_chunks_for_resource(&old_record.resource_id)
+                .await
+                .unwrap();
+            assert!(
+                !old_chunks.is_empty(),
+                "the previously indexed content must still be searchable"
+            );
+
+            let record = doc_index.get(uri).expect("the URI must survive the sweep");
+            assert_eq!(
+                record.resource_id, old_record.resource_id,
+                "doc_index must still point at the resource whose rows the \
+                 store actually holds"
+            );
+            assert_eq!(record.content_hash, old_record.content_hash);
+        }
+
+        /// Guard 1 (#156): an ingestor that reports `Enumeration::Incomplete`
+        /// has told us it could not see the source. Its zero observations are
+        /// no evidence of deletion, so the sweep must not run.
+        #[tokio::test]
+        async fn unavailable_enumeration_skips_sweep() {
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let config = make_ingestion_config(store_id);
+            let source = make_source_with_preset(store_id, "prose");
+
+            let uri = "file:///volumes/archive/book.md";
+            let record = seed_indexed(&store, &embedder, &config, &source, uri, "Book text.").await;
+
+            let mut doc_index = DocumentIndex::new();
+            doc_index.upsert(record.clone());
+
+            // Zero callbacks of any kind — exactly what `FileIngestor` does
+            // when its root is an unmounted volume.
+            let ingestor =
+                FakeIngestor::incomplete("source root is not reachable: /volumes/archive");
+
+            let deps = SourceIngestionDeps {
+                doc_index: &mut doc_index,
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+                progress: None,
+                deletion: DeletionPolicy::Prune,
+            };
+            let result = run_source_ingestion(&source, &ingestor, deps)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                result.docs_deleted, 0,
+                "an unreachable source must not delete its documents — this is \
+                 the #156 incident in miniature"
+            );
+            let chunks = store
+                .get_chunks_for_resource(&record.resource_id)
+                .await
+                .unwrap();
+            assert!(
+                !chunks.is_empty(),
+                "chunks must survive an unreachable root"
+            );
+            assert!(
+                doc_index.get(uri).is_some(),
+                "the doc_index record must survive too, or the next successful \
+                 run would re-index everything from scratch"
+            );
+        }
+
+        /// Guard 2 (#156): source-shape-agnostic backstop. Even when the
+        /// ingestor claims a *complete* enumeration, a run that observed none
+        /// of the URIs this source owns is far more likely to be a broken
+        /// connector than a source whose entire contents vanished at once.
+        #[tokio::test]
+        async fn zero_seen_run_does_not_sweep_source_with_history() {
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let config = make_ingestion_config(store_id);
+            let source = make_source_with_preset(store_id, "prose");
+
+            let a = seed_indexed(
+                &store,
+                &embedder,
+                &config,
+                &source,
+                "file:///docs/a.md",
+                "Alpha.",
+            )
+            .await;
+            let b = seed_indexed(
+                &store,
+                &embedder,
+                &config,
+                &source,
+                "file:///docs/b.md",
+                "Bravo.",
+            )
+            .await;
+
+            let mut doc_index = DocumentIndex::new();
+            doc_index.upsert(a.clone());
+            doc_index.upsert(b.clone());
+
+            // A well-behaved-looking run that nevertheless yielded nothing.
+            let ingestor = FakeIngestor::new(vec![ScriptStep::Discovered(0)]);
+
+            let deps = SourceIngestionDeps {
+                doc_index: &mut doc_index,
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+                progress: None,
+                deletion: DeletionPolicy::Prune,
+            };
+            let result = run_source_ingestion(&source, &ingestor, deps)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                result.docs_deleted,
+                0,
+                "a run that saw none of the source's {} known URIs must not \
+                 sweep them",
+                doc_index.len()
+            );
+            for record in [&a, &b] {
+                let chunks = store
+                    .get_chunks_for_resource(&record.resource_id)
+                    .await
+                    .unwrap();
+                assert!(!chunks.is_empty(), "chunks for {} must survive", record.uri);
+            }
+        }
+
+        /// Guard 2 must not over-suppress: seeing *any* owned URI licenses the
+        /// sweep for the rest. (`delete_sweep_removes_uri_not_yielded_keeps_yielded`
+        /// covers the same shape; this states the guard's boundary directly,
+        /// with a source that owns several URIs and reports only one.)
+        #[tokio::test]
+        async fn sweep_still_runs_when_any_owned_uri_is_seen() {
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let config = make_ingestion_config(store_id);
+            let source = make_source_with_preset(store_id, "prose");
+
+            let kept_uri = "file:///docs/kept.md";
+            let gone_a = "file:///docs/gone-a.md";
+            let gone_b = "file:///docs/gone-b.md";
+
+            let kept = seed_indexed(&store, &embedder, &config, &source, kept_uri, "Kept.").await;
+            let a = seed_indexed(&store, &embedder, &config, &source, gone_a, "Gone A.").await;
+            let b = seed_indexed(&store, &embedder, &config, &source, gone_b, "Gone B.").await;
+
+            let mut doc_index = DocumentIndex::new();
+            for record in [&kept, &a, &b] {
+                doc_index.upsert(record.clone());
+            }
+
+            // One of three URIs observed — the other two really were deleted.
+            let kept_resource = make_resource(kept_uri, "Kept.", &source.id, store_id);
+            let ingestor = FakeIngestor::new(vec![ScriptStep::Resource(kept_resource)]);
+
+            let deps = SourceIngestionDeps {
+                doc_index: &mut doc_index,
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+                progress: None,
+                deletion: DeletionPolicy::Prune,
+            };
+            let result = run_source_ingestion(&source, &ingestor, deps)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                result.docs_deleted, 2,
+                "legitimate deletion must still work — the guards suppress the \
+                 sweep only when the run observed nothing at all"
+            );
+            assert!(doc_index.get(gone_a).is_none());
+            assert!(doc_index.get(gone_b).is_none());
+            assert!(doc_index.get(kept_uri).is_some());
+        }
+
+        // -----------------------------------------------------------------
+        // DeletionPolicy::Retain — the default. Nothing is ever removed
+        // unless the operator passes `--delete` (rsync semantics).
+        // -----------------------------------------------------------------
+
+        /// The default policy removes nothing and reports what `--delete`
+        /// would have removed. This is the same fixture as
+        /// `delete_sweep_removes_uri_not_yielded_keeps_yielded`, differing
+        /// only in the policy — so the two together isolate the flag's effect.
+        #[tokio::test]
+        async fn retain_policy_keeps_absent_documents_and_counts_them_prunable() {
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let config = make_ingestion_config(store_id);
+            let source = make_source_with_preset(store_id, "prose");
+
+            let kept_uri = "file:///docs/kept.md";
+            let gone_uri = "file:///docs/gone.md";
+            let kept = seed_indexed(&store, &embedder, &config, &source, kept_uri, "Kept.").await;
+            let gone = seed_indexed(&store, &embedder, &config, &source, gone_uri, "Gone.").await;
+
+            let mut doc_index = DocumentIndex::new();
+            doc_index.upsert(kept.clone());
+            doc_index.upsert(gone.clone());
+
+            let ingestor = FakeIngestor::new(vec![ScriptStep::Resource(make_resource(
+                kept_uri, "Kept.", &source.id, store_id,
+            ))]);
+
+            let deps = SourceIngestionDeps {
+                doc_index: &mut doc_index,
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+                progress: None,
+                deletion: DeletionPolicy::Retain,
+            };
+            let result = run_source_ingestion(&source, &ingestor, deps)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                result.docs_deleted, 0,
+                "the default policy must never delete"
+            );
+            assert_eq!(
+                result.docs_prunable, 1,
+                "the absent document must be reported as prunable so the CLI \
+                 can tell the user what --delete would remove"
+            );
+            let chunks = store
+                .get_chunks_for_resource(&gone.resource_id)
+                .await
+                .unwrap();
+            assert!(!chunks.is_empty(), "retained document's chunks stay");
+            assert!(
+                doc_index.get(gone_uri).is_some(),
+                "a retained document must stay in the index too, or the next \
+                 run would re-index it as new"
+            );
+        }
+
+        /// Retention covers positively-confirmed deletions as well. An
+        /// archived copy of a page that has since 404'd is often the most
+        /// valuable thing in the index — "the origin dropped it" is not "you
+        /// wanted it dropped."
+        #[tokio::test]
+        async fn retain_policy_keeps_confirmed_gone_documents() {
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let config = make_ingestion_config(store_id);
+            let source = Source {
+                id: new_ulid(),
+                store_id: store_id.to_string(),
+                kind: SourceKind::Url,
+                spec: SourceSpec::Url {
+                    url: "https://example.com/article".to_string(),
+                    refresh_interval_secs: None,
+                },
+                source_preset: "prose".to_string(),
+            };
+
+            let url = "https://example.com/article";
+            let record =
+                seed_indexed(&store, &embedder, &config, &source, url, "Article body.").await;
+            let mut doc_index = DocumentIndex::new();
+            doc_index.upsert(record.clone());
+
+            let ingestor = FakeIngestor::new(vec![ScriptStep::Gone(url.to_string())]);
+            let deps = SourceIngestionDeps {
+                doc_index: &mut doc_index,
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+                progress: None,
+                deletion: DeletionPolicy::Retain,
+            };
+            let result = run_source_ingestion(&source, &ingestor, deps)
+                .await
+                .unwrap();
+
+            assert_eq!(result.docs_deleted, 0);
+            assert_eq!(result.docs_prunable, 1);
+            let chunks = store
+                .get_chunks_for_resource(&record.resource_id)
+                .await
+                .unwrap();
+            assert!(
+                !chunks.is_empty(),
+                "a 404'd article stays searchable by default"
+            );
+        }
+
+        /// A guard-suppressed sweep must NOT inflate `docs_prunable`: those
+        /// documents would not be removed even under `--delete`, so telling
+        /// the user "N could be pruned" would be a lie that invites them to
+        /// pass the flag expecting a cleanup that cannot happen.
+        #[tokio::test]
+        async fn suppressed_sweep_reports_nothing_prunable() {
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let config = make_ingestion_config(store_id);
+            let source = make_source_with_preset(store_id, "prose");
+
+            let record = seed_indexed(
+                &store,
+                &embedder,
+                &config,
+                &source,
+                "file:///volumes/archive/a.md",
+                "Body.",
+            )
+            .await;
+            let mut doc_index = DocumentIndex::new();
+            doc_index.upsert(record.clone());
+
+            let ingestor =
+                FakeIngestor::incomplete("source root is not reachable: /volumes/archive");
+            let deps = SourceIngestionDeps {
+                doc_index: &mut doc_index,
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+                progress: None,
+                deletion: DeletionPolicy::Retain,
+            };
+            let result = run_source_ingestion(&source, &ingestor, deps)
+                .await
+                .unwrap();
+
+            assert_eq!(result.docs_deleted, 0);
+            assert_eq!(
+                result.docs_prunable, 0,
+                "an unreachable root makes nothing prunable — --delete would \
+                 not remove these either"
+            );
+        }
+
+        /// Guard 2 must not fire for a source with no history: a brand-new
+        /// source that legitimately enumerates zero documents has nothing to
+        /// preserve, and suppressing its (no-op) sweep would be meaningless.
+        /// Stated as a test so the "N > 0" half of the condition can't be
+        /// dropped silently.
+        #[tokio::test]
+        async fn zero_seen_run_on_source_without_history_is_harmless() {
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let config = make_ingestion_config(store_id);
+            let source = make_source_with_preset(store_id, "prose");
+            let other = make_source_with_preset(store_id, "prose");
+
+            // A sibling source's document — this source owns nothing.
+            let foreign = seed_indexed(
+                &store,
+                &embedder,
+                &config,
+                &other,
+                "file:///other/x.md",
+                "Foreign.",
+            )
+            .await;
+            let mut doc_index = DocumentIndex::new();
+            doc_index.upsert(foreign.clone());
+
+            let ingestor = FakeIngestor::new(vec![ScriptStep::Discovered(0)]);
+            let deps = SourceIngestionDeps {
+                doc_index: &mut doc_index,
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+                progress: None,
+                deletion: DeletionPolicy::Prune,
+            };
+            let result = run_source_ingestion(&source, &ingestor, deps)
+                .await
+                .unwrap();
+
+            assert_eq!(result.docs_deleted, 0);
+            let chunks = store
+                .get_chunks_for_resource(&foreign.resource_id)
+                .await
+                .unwrap();
+            assert!(
+                !chunks.is_empty(),
+                "another source's document is never this source's to sweep"
+            );
+        }
+
+        // -----------------------------------------------------------------
         // 5b. Regression: delete-sweep must fire for a file under a
         // space-containing root. Before the sweep filtered by `source_id`,
         // it matched URIs against a prefix built from the raw
@@ -2628,6 +3416,15 @@ mod tests {
                 b"Space root content.",
             )
             .unwrap();
+            // A second file that survives this run. Without it the source
+            // would own exactly one URI and observe none of them, tripping
+            // the #156 zero-seen guard — which would mask what this test is
+            // actually about (URI encoding in the sweep's ownership check).
+            std::fs::write(
+                dir.path().join("My Docs").join("keep.md"),
+                b"Still here content.",
+            )
+            .unwrap();
             let root = dir.path().join("My Docs").canonicalize().unwrap();
 
             let source = Source {
@@ -2645,9 +3442,21 @@ mod tests {
             // Enumerate for real — this is exactly how the URI the doc_index
             // stores is shaped in production (`FoundFile.uri` is already a
             // normalized `Uri`, built via `Uri::from_file_path`).
-            let found = enumerate_path_source(root.to_str().unwrap(), &[], &[]).unwrap();
-            assert_eq!(found.len(), 1);
-            let normalized_uri = &found[0].uri;
+            let found = enumerate_path_source(root.to_str().unwrap(), &[], &[])
+                .unwrap()
+                .files()
+                .to_vec();
+            assert_eq!(found.len(), 2);
+            let uri_of = |name: &str| {
+                found
+                    .iter()
+                    .find(|f| f.path.ends_with(name))
+                    .unwrap_or_else(|| panic!("{name} must be enumerated"))
+                    .uri
+                    .clone()
+            };
+            let normalized_uri = uri_of("note.md");
+            let kept_uri = uri_of("keep.md");
             assert!(
                 normalized_uri.as_str().contains("My%20Docs"),
                 "sanity: the space must be percent-encoded in the indexed URI"
@@ -2662,19 +3471,35 @@ mod tests {
                 "Space root content.",
             )
             .await;
+            let kept_record = seed_indexed(
+                &store,
+                &embedder,
+                &config,
+                &source,
+                kept_uri.as_str(),
+                "Still here content.",
+            )
+            .await;
 
             let mut doc_index = DocumentIndex::new();
             doc_index.upsert(record.clone());
+            doc_index.upsert(kept_record.clone());
 
-            // Simulate the file having been deleted from disk: this run's
-            // ingestor yields nothing at all.
-            let ingestor = FakeIngestor::new(vec![]);
+            // Simulate `note.md` having been deleted from disk: this run
+            // yields only `keep.md`.
+            let ingestor = FakeIngestor::new(vec![ScriptStep::Resource(make_resource(
+                kept_uri.as_str(),
+                "Still here content.",
+                &source.id,
+                store_id,
+            ))]);
             let deps = SourceIngestionDeps {
                 doc_index: &mut doc_index,
                 store: &store,
                 embedder: &embedder,
                 config: &config,
                 progress: None,
+                deletion: DeletionPolicy::Prune,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -2690,6 +3515,10 @@ mod tests {
                 .unwrap();
             assert!(chunks.is_empty(), "swept resource's chunks must be gone");
             assert!(doc_index.get(normalized_uri.as_str()).is_none());
+            assert!(
+                doc_index.get(kept_uri.as_str()).is_some(),
+                "the still-present file under the same root must survive"
+            );
         }
 
         /// Same shape as the space-root sweep above, but with a reserved URI
@@ -2714,6 +3543,14 @@ mod tests {
                 b"Hash root content.",
             )
             .unwrap();
+            // Second file survives this run — see the space-root test above
+            // for why a lone owned URI would trip the #156 zero-seen guard
+            // and mask what this test is pinning.
+            std::fs::write(
+                dir.path().join("my#notes").join("keep.md"),
+                b"Still here content.",
+            )
+            .unwrap();
             let root = dir.path().join("my#notes").canonicalize().unwrap();
 
             let source = Source {
@@ -2728,9 +3565,21 @@ mod tests {
                 source_preset: "prose".to_string(),
             };
 
-            let found = enumerate_path_source(root.to_str().unwrap(), &[], &[]).unwrap();
-            assert_eq!(found.len(), 1);
-            let normalized_uri = &found[0].uri;
+            let found = enumerate_path_source(root.to_str().unwrap(), &[], &[])
+                .unwrap()
+                .files()
+                .to_vec();
+            assert_eq!(found.len(), 2);
+            let uri_of = |name: &str| {
+                found
+                    .iter()
+                    .find(|f| f.path.ends_with(name))
+                    .unwrap_or_else(|| panic!("{name} must be enumerated"))
+                    .uri
+                    .clone()
+            };
+            let normalized_uri = uri_of("note.md");
+            let kept_uri = uri_of("keep.md");
             assert!(
                 normalized_uri.as_str().contains("my%23notes"),
                 "sanity: the `#` must be percent-encoded in the indexed URI"
@@ -2745,18 +3594,34 @@ mod tests {
                 "Hash root content.",
             )
             .await;
+            let kept_record = seed_indexed(
+                &store,
+                &embedder,
+                &config,
+                &source,
+                kept_uri.as_str(),
+                "Still here content.",
+            )
+            .await;
 
             let mut doc_index = DocumentIndex::new();
             doc_index.upsert(record.clone());
+            doc_index.upsert(kept_record.clone());
 
-            // The file is gone from disk: this run's ingestor yields nothing.
-            let ingestor = FakeIngestor::new(vec![]);
+            // `note.md` is gone from disk: this run yields only `keep.md`.
+            let ingestor = FakeIngestor::new(vec![ScriptStep::Resource(make_resource(
+                kept_uri.as_str(),
+                "Still here content.",
+                &source.id,
+                store_id,
+            ))]);
             let deps = SourceIngestionDeps {
                 doc_index: &mut doc_index,
                 store: &store,
                 embedder: &embedder,
                 config: &config,
                 progress: None,
+                deletion: DeletionPolicy::Prune,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -2819,12 +3684,26 @@ mod tests {
             };
 
             let uri_a = format!("file://{}/post.md", blog_root.display());
+            let uri_a_kept = format!("file://{}/kept.md", blog_root.display());
             let uri_b = format!("file://{}/draft.md", blog_drafts_root.display());
 
             // Both sources' documents share the same store-level doc_index —
             // exactly the shared-store scenario the finding describes.
             let record_a =
                 seed_indexed(&store, &embedder, &config, &source_a, &uri_a, "Blog post.").await;
+            // A second document under source A that survives this run. Source
+            // A must observe at least one of its own URIs or the #156
+            // zero-seen guard suppresses its sweep entirely, which would make
+            // this test vacuous rather than failing loudly.
+            let record_a_kept = seed_indexed(
+                &store,
+                &embedder,
+                &config,
+                &source_a,
+                &uri_a_kept,
+                "Kept post.",
+            )
+            .await;
             let record_b = seed_indexed(
                 &store,
                 &embedder,
@@ -2837,18 +3716,24 @@ mod tests {
 
             let mut doc_index = DocumentIndex::new();
             doc_index.upsert(record_a.clone());
+            doc_index.upsert(record_a_kept.clone());
             doc_index.upsert(record_b.clone());
 
-            // Sweep source A only: its ingestor finds nothing at all this
-            // run (simulating, e.g., every file under blog/ having been
-            // deleted). Source B's ingestor does NOT run this cycle.
-            let ingestor = FakeIngestor::new(vec![]);
+            // Sweep source A only: `post.md` is gone from disk, `kept.md`
+            // still there. Source B's ingestor does NOT run this cycle.
+            let ingestor = FakeIngestor::new(vec![ScriptStep::Resource(make_resource(
+                &uri_a_kept,
+                "Kept post.",
+                &source_a.id,
+                store_id,
+            ))]);
             let deps = SourceIngestionDeps {
                 doc_index: &mut doc_index,
                 store: &store,
                 embedder: &embedder,
                 config: &config,
                 progress: None,
+                deletion: DeletionPolicy::Prune,
             };
             let result = run_source_ingestion(&source_a, &ingestor, deps)
                 .await
@@ -2932,7 +3817,10 @@ mod tests {
 
             // Enumerate B's root for real, so the stored URI is shaped exactly
             // as production shapes it.
-            let found = enumerate_path_source(root_b.to_str().unwrap(), &[], &[]).unwrap();
+            let found = enumerate_path_source(root_b.to_str().unwrap(), &[], &[])
+                .unwrap()
+                .files()
+                .to_vec();
             assert_eq!(found.len(), 1);
             let uri_b = found[0].uri.as_str().to_string();
             assert!(
@@ -2963,6 +3851,7 @@ mod tests {
                 embedder: &embedder,
                 config: &config,
                 progress: None,
+                deletion: DeletionPolicy::Prune,
             };
             let result = run_source_ingestion(&source_a, &ingestor, deps)
                 .await
@@ -3019,6 +3908,7 @@ mod tests {
                 embedder: &embedder,
                 config: &config,
                 progress: None,
+                deletion: DeletionPolicy::Prune,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -3038,11 +3928,16 @@ mod tests {
         }
 
         // -----------------------------------------------------------------
-        // 8. URL-Gone-style absence is swept (Url-kind source)
+        // 8. A confirmed-Gone URL is deleted (Url-kind source).
+        //
+        // Renamed from `gone_url_style_absence_is_swept`: since #156 the
+        // deletion no longer rides on *absence* — the ingestor reports the
+        // 404/410 positively via `on_gone`, and that path is exempt from the
+        // sweep guards precisely because nothing about it is inferred.
         // -----------------------------------------------------------------
 
         #[tokio::test]
-        async fn gone_url_style_absence_is_swept() {
+        async fn confirmed_gone_url_is_deleted() {
             let store = FakeStore::new();
             let embedder = FakeEmbedder::new(4);
             let store_id = "store-1";
@@ -3064,9 +3959,12 @@ mod tests {
             let mut doc_index = DocumentIndex::new();
             doc_index.upsert(record.clone());
 
-            // The URL now 404s/410s — the ingestor simply never yields it
-            // (and never reports it via on_skipped either).
-            let ingestor = FakeIngestor::new(vec![]);
+            // The URL now 404s/410s. `UrlIngestor` reports that positively via
+            // `on_gone` rather than by staying silent: since #156 an absence
+            // alone no longer licenses a delete, but a confirmed 410 is
+            // knowledge — the origin answered — so it deletes regardless of
+            // the sweep guards.
+            let ingestor = FakeIngestor::new(vec![ScriptStep::Gone(url.to_string())]);
 
             let deps = SourceIngestionDeps {
                 doc_index: &mut doc_index,
@@ -3074,6 +3972,7 @@ mod tests {
                 embedder: &embedder,
                 config: &config,
                 progress: None,
+                deletion: DeletionPolicy::Prune,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -3091,15 +3990,22 @@ mod tests {
         // 8f. C1: feed sources are exempt from the delete-sweep. A feed only
         // ever exposes its most-recent N entries, so a zero-callback run
         // (absent entries scrolled off the window, or a feed-level 304 Not
-        // Modified) must NOT delete previously-indexed entries — unlike the
-        // identically-shaped zero-callback scenario for a url source, which
-        // must still sweep normally (test 8 above covers that alone; this
-        // test additionally proves the two behaviors coexist correctly in
-        // the same store/doc_index).
+        // Modified) must NOT delete previously-indexed entries — while a url
+        // source that positively confirms its URL is Gone must still delete
+        // it. Test 8 above covers the url half alone; this test additionally
+        // proves the two behaviors coexist correctly in the same
+        // store/doc_index.
+        //
+        // Note what changed with #156: the two scenarios are no longer
+        // "identically-shaped zero-callback runs" distinguished only by
+        // source kind. The url source now *says* the URL is gone. Silence
+        // means the same thing for both kinds now — no evidence — which is
+        // why the feed exemption and the sweep guards can coexist without
+        // one having to special-case the other.
         // -----------------------------------------------------------------
 
         #[tokio::test]
-        async fn feed_source_zero_callback_run_is_not_swept_but_url_source_still_sweeps() {
+        async fn feed_zero_callback_run_is_not_swept_but_confirmed_gone_url_is_deleted() {
             let store = FakeStore::new();
             let embedder = FakeEmbedder::new(4);
             let store_id = "store-1";
@@ -3154,10 +4060,9 @@ mod tests {
             doc_index.upsert(feed_record.clone());
             doc_index.upsert(url_record.clone());
 
-            // Both runs' ingestors yield nothing at all — for the feed this
-            // mirrors a feed-level 304 Not Modified (zero callbacks) or the
-            // entry simply having scrolled off the feed's window; for the
-            // url source it mirrors a 404/410 Gone.
+            // The feed's ingestor yields nothing at all — a feed-level 304 Not
+            // Modified, or the entry simply having scrolled off the feed's
+            // window. Silence, carrying no information.
             let feed_ingestor = FakeIngestor::new(vec![]);
             let deps = SourceIngestionDeps {
                 doc_index: &mut doc_index,
@@ -3165,6 +4070,7 @@ mod tests {
                 embedder: &embedder,
                 config: &config,
                 progress: None,
+                deletion: DeletionPolicy::Prune,
             };
             let feed_result = run_source_ingestion(&feed_source, &feed_ingestor, deps)
                 .await
@@ -3185,13 +4091,16 @@ mod tests {
             );
             assert!(doc_index.get(feed_entry_uri).is_some());
 
-            let url_ingestor = FakeIngestor::new(vec![]);
+            // The url source's fetch came back 404/410 — knowledge, reported
+            // positively.
+            let url_ingestor = FakeIngestor::new(vec![ScriptStep::Gone(url_uri.to_string())]);
             let deps = SourceIngestionDeps {
                 doc_index: &mut doc_index,
                 store: &store,
                 embedder: &embedder,
                 config: &config,
                 progress: None,
+                deletion: DeletionPolicy::Prune,
             };
             let url_result = run_source_ingestion(&url_source, &url_ingestor, deps)
                 .await
@@ -3199,7 +4108,9 @@ mod tests {
 
             assert_eq!(
                 url_result.docs_deleted, 1,
-                "a url source in the very same store/doc_index still sweeps normally"
+                "a confirmed-Gone URL in the very same store/doc_index is still \
+                 deleted — the feed exemption is about absence, not about \
+                 refusing to act on knowledge"
             );
             let url_chunks = store
                 .get_chunks_for_resource(&url_record.resource_id)
@@ -3306,6 +4217,7 @@ mod tests {
                 embedder: &embedder,
                 config: &config,
                 progress: None,
+                deletion: DeletionPolicy::Prune,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -3368,6 +4280,7 @@ mod tests {
                 embedder: &failing_embedder,
                 config: &config,
                 progress: None,
+                deletion: DeletionPolicy::Prune,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -3862,11 +4775,15 @@ mod tests {
         }
 
         // -----------------------------------------------------------------
-        // Extra: empty-resource replace deletes old chunks and writes nothing
+        // #185: an empty replacement is refused by the sink — it neither
+        // writes nor deletes. This test asserted the opposite until #185:
+        // "replacing with an empty resource must delete the old chunks" was
+        // the documented behavior, and it is exactly how a file that
+        // transiently extracts to nothing erased its own indexed content.
         // -----------------------------------------------------------------
 
         #[tokio::test]
-        async fn index_resource_empty_blocks_deletes_old_and_writes_nothing() {
+        async fn index_resource_empty_blocks_keeps_old_content() {
             let store = FakeStore::new();
             let embedder = FakeEmbedder::new(4);
             let store_id = "store-1";
@@ -3891,7 +4808,7 @@ mod tests {
                 embedder: &embedder,
                 config: &config,
             };
-            let written = index_resource(
+            let outcome = index_resource(
                 &empty_resource,
                 &source,
                 Some(&old_record.resource_id),
@@ -3900,14 +4817,17 @@ mod tests {
             .await
             .unwrap();
 
-            assert_eq!(written, 0);
+            assert_eq!(outcome, IndexOutcome::Empty);
             let old_chunks = store
                 .get_chunks_for_resource(&old_record.resource_id)
                 .await
                 .unwrap();
             assert!(
-                old_chunks.is_empty(),
-                "replacing with an empty resource must delete the old chunks"
+                !old_chunks.is_empty(),
+                "an empty replacement must not delete the old chunks: the sink \
+                 cannot tell 'this file is legitimately empty now' apart from \
+                 'extraction produced nothing this run', and only one of those \
+                 is evidence the content is gone (#185)"
             );
         }
 
@@ -3955,7 +4875,10 @@ mod tests {
             let written = index_resource(&resource, &source, None, &deps)
                 .await
                 .unwrap();
-            assert!(written >= 3, "expected at least one chunk per block");
+            assert!(
+                matches!(written, IndexOutcome::Written(n) if n >= 3),
+                "expected at least one chunk per block, got {written:?}"
+            );
 
             let chunks = store.get_chunks_for_resource(&resource.id).await.unwrap();
 

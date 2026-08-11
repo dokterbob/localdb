@@ -3964,6 +3964,92 @@ fn index_daemon_single_store_unknown_source_exits_3() {
     );
 }
 
+/// `index --delete` with a daemon running must be refused (exit 2), not
+/// silently downgraded to a non-pruning run.
+///
+/// `/v1/jobs` carries no deletion policy and daemon-side ingestion is a no-op
+/// (#187), so the flag cannot be honored. Accepting it anyway would report
+/// success for a prune that never happened — the same "silence standing in for
+/// a fact" failure that #156/#185 were about, one level up. No job may be
+/// submitted either: a job that silently ignores the user's explicit request
+/// is worse than no job.
+#[test]
+fn index_delete_with_daemon_running_exits_2_and_submits_nothing() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let stores_body = paginated_list_body(&[&store_record_json("onlystore")]);
+    let (port, received) =
+        start_routing_mock_server(vec![("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body)]);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["index", "--delete"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "`--delete` must be refused while the daemon is running; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--delete") && stderr.contains("daemon"),
+        "the error must name the flag and the reason so the remedy is obvious; got: {stderr}"
+    );
+
+    let reqs = received.lock().unwrap();
+    assert!(
+        !reqs.iter().any(|(l, _)| l.starts_with("POST")),
+        "no index job may be submitted when the requested deletion cannot be honored; got: {:?}",
+        reqs
+    );
+}
+
+/// The same command *without* `--delete` still submits normally — the refusal
+/// above must be scoped to the flag, not break daemon-routed indexing.
+#[test]
+fn index_without_delete_still_submits_when_daemon_running() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let stores_body = paginated_list_body(&[&store_record_json("onlystore")]);
+    let (port, received) = start_routing_mock_server(vec![
+        (
+            "POST",
+            "/v1/jobs",
+            "HTTP/1.1 200 OK",
+            r#"{"job_id":"job-1","status":"queued"}"#.to_string(),
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+    ]);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["index"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        0,
+        "daemon-routed index without --delete must still succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reqs = received.lock().unwrap();
+    assert!(
+        reqs.iter().any(|(l, _)| l.starts_with("POST /v1/jobs")),
+        "a job should be submitted in the ordinary (non-deleting) case; got: {:?}",
+        reqs
+    );
+}
+
 /// `index --json` with a daemon running and more than one store in scope:
 /// wraps submissions into `{"jobs": [...], }`, each entry tagged with its
 /// store name.

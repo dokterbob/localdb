@@ -25,7 +25,7 @@ Single binary, subcommand tree. Global flags: `--config`, `--json`, `--store <na
 | `store add/list/remove` | Manage runtime-owned stores; `list` spans all stores if `-s` is omitted, `add`/`remove` name their store as an argument so `-s` is rejected, exit 2 (§2.2) | direct write | routed to daemon |
 | `source add/list/remove` | Manage sources on a store; `list` and `remove <ULID>` span all stores if `-s` is omitted, `add` defaults to the store named `default` (exit 2 if absent), `remove <path\|url>` requires `-s` (§2.2) | direct write | `add`/`remove` routed to daemon; `list` always reads the local database (§2.2 known limitation) |
 | `add <path|url>...` | Alias for `source add` — add one or more sources to a store; same `default`-store rule as `source add` (§2.2) | direct write | routed to daemon |
-| `index [--store S]... [--source ID] [--strict]` | One-shot scan & index; creates IndexJob; all stores if `-s` is omitted (§2.2) | runs job synchronously, progress to stderr | submits job, polls, streams progress |
+| `index [--store S]... [--source ID] [--strict] [--delete]` | One-shot scan & index; creates IndexJob; all stores if `-s` is omitted (§2.2) | runs job synchronously, progress to stderr | submits job, polls, streams progress |
 | `search <query>... [--limit N] [--content-length N]` | Hybrid search with citations; `--content-length` is a **soft cap** on human-readable snippet chars (default 1000; JSON output always full text) — see §4 for the snapping behavior shared with MCP | embedded read | via API |
 | `db status` | Inspect schema state: current version, head version, pending/unsupported steps. Never refuses, even on a store newer than the binary; not store-scoped, `-s` is rejected, exit 2 (§2.2) | reads directly | error `daemon_running` |
 | `db migrate` | Apply pending migrations with per-step progress; legacy v1–v3 rebuild and any other destructive step require confirmation; prints a `localdb index` hint when a weight-class-3 migration ran; not store-scoped, `-s` is rejected, exit 2 (§2.2) | direct write | error `daemon_running` |
@@ -498,3 +498,22 @@ By default `index` is **best-effort**: unsupported files are silently counted; e
 produce a per-file WARN but the run continues and exits `0`. Pass `--strict` to exit `2` when any
 resource failed (`error_count > 0`). The run always completes — `--strict` never aborts mid-run;
 it only affects the final exit code and JSON `"status"` field.
+
+### `localdb index --delete`
+
+`index` **never removes anything** unless `--delete` is passed, following `rsync --delete`. A
+document whose file was deleted, or whose URL now returns 404/410, stays indexed and searchable;
+the run reports the count as `docs_prunable` (text: `N no longer at source (kept; use --delete
+to remove)`) so nothing goes stale silently. With `--delete`, those documents are removed and
+counted in `docs_deleted`.
+
+`--delete` is a request, not an override: the enumeration guards in
+[04-search-pipeline.md](04-search-pipeline.md) §1 still suppress the sweep for a source whose
+contents could not be observed, and warn when they do. Documents a guard is protecting are *not*
+counted as prunable — `--delete` would not remove them either.
+
+Both counters appear in `--json` output as `docs_deleted` and `docs_prunable`.
+
+`--delete` is **rejected with exit 2 when a daemon is running**: `POST /v1/jobs` carries no
+deletion policy, so a daemon-submitted job cannot prune. Silently downgrading to a non-pruning
+run would report success for a deletion that never happened. Stop the daemon and re-run.

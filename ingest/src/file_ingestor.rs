@@ -9,8 +9,10 @@ use extract::sniff_mime;
 use localdb_core::block::{IngestorKind, Resource, ResourceKind};
 use localdb_core::error::Error;
 use localdb_core::ids::resource_id;
-use localdb_core::ingestion::{enumerate_path_source, now_rfc3339};
-use localdb_core::ingestor::{IngestCallback, IngestResult, IngestSource, Ingestor, SkipReason};
+use localdb_core::ingestion::{enumerate_path_source, now_rfc3339, PathEnumeration};
+use localdb_core::ingestor::{
+    Enumeration, IngestCallback, IngestResult, IngestSource, Ingestor, SkipReason,
+};
 use localdb_core::markdown_blocks::{compute_blocks_hash, markdown_to_blocks_with_pages};
 use localdb_core::metadata::{DocumentMetadata, Metadata};
 use localdb_core::parser::{Parser, Probe};
@@ -79,7 +81,29 @@ impl Ingestor for FileIngestor {
 
         // `enumerate_path_source` owns directory-walk, hidden-file, extension
         // and glob filtering behavior (shared with any other path-source caller).
-        let files = enumerate_path_source(root, &include, &exclude)?;
+        let files = match enumerate_path_source(root, &include, &exclude)? {
+            PathEnumeration::Complete(files) => files,
+            PathEnumeration::RootUnavailable => {
+                // #156: the root isn't there — an unmounted volume, a detached
+                // external disk, a directory that moved. We have observed
+                // nothing about this source's contents, which is *not* the
+                // same as observing that it is empty. Reporting
+                // `Enumeration::Incomplete` is what stops
+                // `run_source_ingestion`'s delete-sweep from reading our zero
+                // resources as "every document in this source was deleted."
+                tracing::warn!(
+                    root = %root,
+                    "source root is not reachable — enumerating nothing this run"
+                );
+                callback.on_discovered(0).await;
+                return Ok(IngestResult {
+                    enumeration: Enumeration::Incomplete {
+                        reason: format!("source root is not reachable: {root}"),
+                    },
+                    ..Default::default()
+                });
+            }
+        };
 
         // Signal `Discovered { total }` right after enumeration and before
         // processing the first file.
@@ -202,6 +226,33 @@ impl Ingestor for FileIngestor {
             // Page stamping (#103): `page_starts` is empty for non-paginated
             // formats, in which case this is plain `markdown_to_blocks`.
             let blocks = markdown_to_blocks_with_pages(&parsed.markdown, &parsed.page_starts);
+
+            // #185, defense in depth: never yield a contentless `Resource`.
+            // The parser accepted this file and returned something, but it
+            // extracted to nothing usable — a whitespace-only file, a scanned
+            // PDF with no text layer, an HTML page whose body is all script.
+            // Yielding that as a `Resource` would be claiming "here is this
+            // document's content" on no evidence. The sink refuses empty
+            // replacements too (`core::ingestion::index_resource`), but an
+            // ingestor should not make the claim in the first place.
+            //
+            // `SkipReason::Other`, and this exact wording, match
+            // `UrlIngestor`'s `UrlOutcome::Empty` arm so both paths land in
+            // `docs_skipped` rather than `unsupported_format_count` — the
+            // format WAS supported. `resources_skipped` (not `errors`) keeps
+            // `run_source_ingestion`'s `errors == skip_error_count`
+            // cross-check satisfied: nothing failed here.
+            if blocks.is_empty() {
+                callback
+                    .on_skipped(
+                        &file.uri,
+                        SkipReason::Other("extraction produced no content".to_string()),
+                    )
+                    .await;
+                result.resources_skipped += 1;
+                continue;
+            }
+
             let hash = compute_blocks_hash(&blocks);
             let res_id = resource_id(file.uri.as_str(), &hash);
 
@@ -602,6 +653,99 @@ mod tests {
             "expected SkipReason::Error with the panic message, got: {:?}",
             cb.skipped[0].1
         );
+    }
+
+    /// #185 (defense in depth): a file whose extraction yields zero blocks
+    /// must be reported via `on_skipped`, never handed to `on_resource` as an
+    /// empty `Resource`. The sink refuses empty replacements too, but that is
+    /// a backstop — an ingestor that yields a contentless resource is making a
+    /// claim ("here is this document's content") it cannot support.
+    ///
+    /// It must land in `resources_skipped`, not `errors`: nothing failed, so
+    /// bumping `errors` without a matching `SkipReason::Error` would trip
+    /// `run_source_ingestion`'s `debug_assert_eq!` cross-check.
+    #[tokio::test]
+    async fn zero_block_extraction_is_skipped_not_yielded_as_empty_resource() {
+        /// Parses successfully but returns empty Markdown — a whitespace-only
+        /// file, a PDF of scanned images with no text layer, an HTML page
+        /// whose body is all script tags.
+        struct EmptyOutputParser;
+        impl Parser for EmptyOutputParser {
+            fn id(&self) -> &'static str {
+                "empty-output"
+            }
+            fn parse(&self, _probe: &Probe) -> Result<Option<ParsedDocument>, Error> {
+                Ok(Some(ParsedDocument {
+                    markdown: String::new(),
+                    title: None,
+                    metadata: localdb_core::metadata::DublinCoreMetadata::default(),
+                    page_starts: Vec::new(),
+                }))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("blank.md"), "   \n\n  \n").unwrap();
+
+        let ingestor = FileIngestor::new(Box::new(EmptyOutputParser));
+        let source = source_with_root(dir.path().to_str().unwrap());
+        let mut cb = RecordingCallback::default();
+        let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+        assert!(
+            cb.resources.is_empty(),
+            "a zero-block extraction must never reach on_resource"
+        );
+        assert_eq!(result.resources_produced, 0);
+        assert_eq!(result.resources_skipped, 1);
+        assert_eq!(
+            result.errors, 0,
+            "an empty extraction is a skip, not an error"
+        );
+        assert_eq!(cb.skipped.len(), 1);
+        assert!(cb.skipped[0].0.ends_with("blank.md"));
+        // Same reason and wording as `UrlIngestor`'s `UrlOutcome::Empty` arm,
+        // so both paths land in `docs_skipped` rather than
+        // `unsupported_format_count`.
+        assert_eq!(
+            cb.skipped[0].1,
+            SkipReason::Other("extraction produced no content".to_string())
+        );
+    }
+
+    /// The complement to the test above: enumeration over a root that does not
+    /// exist reports `Enumeration::Incomplete`, which is what suppresses the
+    /// delete-sweep (#156). Zero resources alone can't carry that signal —
+    /// an empty-but-present directory produces the same zero.
+    #[tokio::test]
+    async fn unreachable_root_reports_incomplete_enumeration() {
+        let ingestor = FileIngestor::new(Box::new(AllParser));
+        let source = source_with_root("/nonexistent_path_12345");
+        let mut cb = RecordingCallback::default();
+        let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+        assert!(
+            matches!(&result.enumeration, Enumeration::Incomplete { reason }
+                     if reason.contains("/nonexistent_path_12345")),
+            "an unreachable root must be reported as an incomplete enumeration \
+             naming the root, got: {:?}",
+            result.enumeration
+        );
+        assert_eq!(result.resources_produced, 0);
+    }
+
+    /// ...and an empty-but-present root is `Complete`: the sweep must still
+    /// run for a source whose files were genuinely all deleted.
+    #[tokio::test]
+    async fn empty_but_present_root_reports_complete_enumeration() {
+        let dir = tempfile::tempdir().unwrap();
+        let ingestor = FileIngestor::new(Box::new(AllParser));
+        let source = source_with_root(dir.path().to_str().unwrap());
+        let mut cb = RecordingCallback::default();
+        let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+        assert_eq!(result.enumeration, Enumeration::Complete);
+        assert_eq!(cb.discovered, vec![0]);
     }
 
     #[tokio::test]

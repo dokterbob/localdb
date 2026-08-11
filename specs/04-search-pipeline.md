@@ -48,26 +48,60 @@ Resources also carry:
 
 ### Deletes
 
-File deleted / URL gone (404 or 410 after retry) / source removed → delete that resource's
-chunks and the resource itself from the backend. Deletes are data-modifying: ≥ 90% coverage
-gate ([01-architecture.md](01-architecture.md) §7).
+Deletes are data-modifying: ≥ 90% coverage gate ([01-architecture.md](01-architecture.md) §7).
 
-A resource stays alive across a run if it is observed via **either** `on_resource` or
-`on_skipped` — the delete-sweep removes only a URI that neither hook reported this run.
-`on_skipped` takes an already-canonical `Uri`, the same representation `on_resource`'s
-`Resource.uri` carries, so both hooks populate the sweep's "seen" set in one consistent key
-space.
+**Deletion is opt-in.** `localdb index` removes nothing; `localdb index --delete` does, following
+`rsync --delete`. A retaining run reports what pruning would have removed
+(`IngestionResult.docs_prunable`) so nothing goes silently stale. Two reasons for the default:
+removal is asymmetric (a wrong delete costs a full re-index, a missed one costs a stale hit —
+[#156](https://github.com/dokterbob/localdb/issues/156) cost ~4.4M chunks), and retention is
+often what's actually wanted — a local copy of a newspaper article that has since 404'd is *more*
+valuable for having outlived its origin.
 
-An extraction that produces **zero blocks** must never be yielded as a `Resource` to
-`on_resource`: `index_resource`'s zero-chunk arm treats a zero-block Resource as an empty
-replacement, deleting the previously indexed content for that URI and writing nothing in its
-place — it cannot tell "the source is legitimately empty" apart from "extraction produced
-nothing usable." Ingestors must therefore classify "extracted to nothing" as unusable and report
-it via `on_skipped`, not as content via `on_resource`.
-[Issue #156](https://github.com/dokterbob/localdb/issues/156) ("Delete-sweep wipes an entire
-source when its root is unreachable (data loss)") is the source-level statement of the same
-rule — zero-URIs-enumerated there, zero-blocks-extracted here — both are the same conflation of
-"unavailable" with "legitimately empty," one level apart.
+Under `--delete`, two paths remove documents, and the distinction between them governs
+everything below: **knowing a resource is gone is not the same as failing to find it.**
+
+**Confirmed gone → deleted unconditionally.** An ingestor that positively establishes a locator
+no longer exists at the origin (HTTP 404/410 after retry) reports it via `IngestCallback::on_gone`.
+The origin was reached and answered; nothing is inferred, so no guard applies and the feed
+exemption below does not either. An ingestor that merely *fails to observe* a locator must not
+use this hook.
+
+**Presumed gone → the guarded delete-sweep.** A resource stays alive across a run if it is
+observed via **either** `on_resource` or `on_skipped`; the sweep removes a URI that neither hook
+reported. `on_skipped` takes an already-canonical `Uri`, the same representation `on_resource`'s
+`Resource.uri` carries, so both hooks populate the "seen" set in one consistent key space. Because
+this infers deletion from absence, it runs only where the absence is informative:
+
+- **Feed sources are exempt entirely.** A feed exposes a bounded window of recent entries, so an
+  entry's absence means "it scrolled off," not "it was deleted."
+- **Guard 1 — incomplete enumeration.** An ingestor that could not observe its source reports
+  `IngestResult.enumeration = Enumeration::Incomplete { reason }`; `enumerate_path_source`
+  returns `PathEnumeration::RootUnavailable` for a root that does not exist (an unmounted volume),
+  distinct from `Complete(vec![])` for a root that exists and is empty. Incomplete ⇒ no sweep.
+- **Guard 2 — zero-seen backstop.** A source that owns previously indexed URIs and observed none
+  of them this run does not sweep, whatever the ingestor claims. Source-shape-agnostic, so it also
+  covers connectors that cannot detect their own incompleteness. It does not subsume guard 1: a
+  connector that enumerates 3 of 500 items before failing has a non-empty seen set, so only
+  guard 1 protects the other 497.
+
+Both suppressions log a warning naming the source, the reason, and the number of documents
+preserved. **Retention trade-off:** a source whose contents really were all removed at once keeps
+its documents until the source is removed and re-added — accepted deliberately, and stated in the
+warning.
+
+At the resource level the same rule is a **sink invariant**: `index_resource` never deletes on an
+empty replacement. A resource that chunks to nothing returns `IndexOutcome::Empty` — nothing
+written, nothing deleted — and the pipeline records it as a skip without touching `DocumentIndex`.
+Ingestors should still classify "extracted to nothing" as unusable and report it via `on_skipped`
+(`FileIngestor` and `UrlIngestor` both do), but that is defense in depth; the guarantee lives at
+the sink, where no ingestor can bypass it.
+**Retention trade-off:** a file legitimately emptied keeps its previous content indexed. The
+escape hatch already exists — delete the file, and the sweep removes it normally under `--delete`.
+
+[#156](https://github.com/dokterbob/localdb/issues/156) (source level, zero URIs enumerated) and
+[#185](https://github.com/dokterbob/localdb/issues/185) (resource level, zero blocks extracted)
+are one conflation — "unavailable" mistaken for "legitimately empty" — one layer apart.
 
 ## 2. Extraction (v1 matrix)
 

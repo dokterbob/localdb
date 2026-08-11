@@ -163,6 +163,15 @@ impl Ingestor for UrlIngestor {
                         .await;
                     result.resources_skipped += 1;
                 }
+                UrlOutcome::Gone => {
+                    // Confirmed 404/410 after retry: the origin was reached
+                    // and told us the resource is gone. Report it positively
+                    // rather than relying on silence — since #156, an absent
+                    // URI is only swept when the run's absences are
+                    // trustworthy, and "I know this is deleted" must not be
+                    // expressed the same way as "I couldn't look."
+                    callback.on_gone(uri).await;
+                }
                 _ => {}
             }
         }

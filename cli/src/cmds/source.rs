@@ -385,6 +385,9 @@ pub(crate) async fn run_source_add_async(
             IndexErrorMode::WarnAndContinue,
             embedder.clone(),
             None,
+            // A source being added for the first time has no indexed history
+            // to prune, and auto-index is not the place to remove anything.
+            localdb_core::ingestion::DeletionPolicy::Retain,
         )
         .await
         {
