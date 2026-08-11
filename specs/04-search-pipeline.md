@@ -323,13 +323,27 @@ context itself. Aligning the chunker to that regime gives smaller, precise chunk
 citation granularity — while the model handles cross-chunk context, with no overlap needed.
 These are defaults to beat with evaluation, not dogma.
 
-**`chunk_prose` structureless fallback:** When `MarkdownSplitter` produces a single chunk
-covering the whole block, `chunk_prose` probes the block's longest whitespace-free run rather
-than its longest line — an ordinary paragraph or long-lined prose block has plenty of internal
-whitespace and stays on the prose path. Only when that run exceeds `STRUCTURELESS_RUN_MULTIPLIER`
-(8×) the char target — genuinely structureless content such as minified JSON or a lockfile —
-does `chunk_prose` fall back to the `code` chunker so the content is still indexed in bounded
-chunks (#191, #192).
+**`chunk_prose` structureless fallback:** Before invoking `MarkdownSplitter`, `chunk_prose`
+runs two O(n) probes over the block; tripping either delegates the whole block to the `code`
+chunker so the content is still indexed in bounded chunks:
+
+- **Quality probe:** longest whitespace-free run > `STRUCTURELESS_RUN_MULTIPLIER` (8) × the
+  target. An ordinary paragraph or long-lined prose block in a whitespace-delimited script has
+  plenty of internal whitespace and stays on the prose path; genuinely structureless content
+  (minified JSON, a lockfile) does not (#191, #192).
+- **Performance guard:** longest *line* > `OVERLONG_LINE_MULTIPLIER` (64) × the target,
+  whitespace or not. `MarkdownSplitter`'s split-point search is super-linear on a single flat
+  line, so a pathologically long line (hundreds of KB with no newlines) must not reach it —
+  the multi-minute-hang class the fallback was originally introduced for (#61). Real prose
+  paragraphs, even the single-line ones EPUB/HTML extraction emits, stay far below this cap.
+
+Both probes compare a *char* count against the target, which in production is a *token* count
+from the embedder's tokenizer — a deliberate heuristic, not an exact unit match (a run's char
+count is at least its token count, so the probes trip no later than a true token measure
+would, erring toward the bounded `code` chunker). Known limitation: scripts without
+inter-word whitespace (CJK, Thai, …) make a whole paragraph one "run", so long CJK prose trips
+the quality probe and gets char-aligned cuts in the `code` chunker; proper word segmentation is
+out of scope.
 
 **`chunk_code` long-line split:** `chunk_code` enforces a per-line char limit. Lines exceeding
 the limit are hard-split into target-sized pieces, preventing single-line binary or minified
@@ -434,9 +448,10 @@ reordering parsers alone marks the store stale and schedules a reindex.
 The `chunking` sub-policy embeds a chunking algorithm identifier as part of what gets hashed;
 bumping it forces a reindex even when no user-visible config field changed. Current value:
 **`textsplitter-md-v6`** (bumped from `v5`). The `v6` bump covers the mid-word-split fix
-(#191, #192): `chunk_prose`'s structureless backstop now probes the longest whitespace-free
-run instead of the longest line, and `chunk_code`'s overlong-line hard-split now backs off to
-the last whitespace in the window (falling back to the char cut only when the window has no
+(#191, #192): `chunk_prose`'s structureless backstop is now dual-condition — longest
+whitespace-free run > 8× target (quality) or longest line > 64× target (performance guard,
+replacing the old 8× line probe) — and `chunk_code`'s overlong-line hard-split now backs off
+to the last whitespace in the window (falling back to the char cut only when the window has no
 whitespace) — chunk boundaries change for long single-line prose, so existing stores reindex
 on the next `localdb index`. The `v5` bump covers the coarse `Text` block
 ontology — `markdown_to_blocks` now emits one `Text` block per run of consecutive running-text

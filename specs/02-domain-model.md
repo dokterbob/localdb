@@ -303,19 +303,29 @@ offsets** — they index into the parent block's `text`, not the full document M
 with `block_seq`, they provide a complete location: `(resource_id, block_seq, span)`.
 Document-relative offsets are not stored or computed.
 
-For single-block chunks, a span locates its chunk's exact text: `block.text[span.start..span.end]
-== chunk.text`. **Adjacent spans within a block are not guaranteed contiguous** — the underlying
-splitter trims whitespace from chunk boundaries, so a small gap between one chunk's `end` and the
-next chunk's `start` is normal, not a bug. Any such gap contains only whitespace. Spans are
-therefore **not a partition of the block**: consumers MUST NOT reconstruct block text by
-concatenating chunk spans or chunk texts in sequence — use `block.text` directly if the full
-block is needed.
+For prose and code chunks (`Text`/`Code`-block content), a span locates its chunk's exact text:
+`block.text[span.start..span.end] == chunk.text`. **Adjacent spans within a block are not
+guaranteed contiguous** — the underlying splitter trims whitespace from chunk boundaries, so a
+small gap between one chunk's `end` and the next chunk's `start` is normal, not a bug. Any such
+gap contains only whitespace. Spans are therefore **not a partition of the block**: consumers
+MUST NOT reconstruct block text by concatenating chunk spans or chunk texts in sequence — use
+`block.text` directly if the full block is needed.
 
-**Exception — message-window chunks:** the `messages` chunking preset creates chunks that span
-multiple `Message`/`Segment` blocks via a sliding window. This is an explicit multi-block
-chunking mode. The `ChunkLocation` carries `window_block_seqs`: the set of participating block
-sequence numbers. `window_block_seqs` is present only for this chunk shape — absent for
-single-block chunks.
+Two chunk shapes are exempt from the exact-slice equality; consumers MUST NOT slice
+`block.text` by span expecting it to equal `chunk.text` for them:
+
+- **Table chunks:** table chunk text is *reconstructed* Markdown — the header row is re-emitted
+  in every chunk — so no substring of the block corresponds to it. Table chunks carry the
+  placeholder span `(0, 0)`; their span is not meaningful.
+- **Message chunks:** all `messages`-preset chunk text is prefixed with sender/timestamp
+  metadata that is not part of any block's `text`. Sliding-window chunks additionally span
+  multiple `Message`/`Segment` blocks — an explicit multi-block chunking mode — and carry the
+  placeholder span `(0, 0)`. The `ChunkLocation` carries `window_block_seqs`, the set of
+  participating block sequence numbers (`window_block_seqs` is non-empty for every
+  `messages`-preset chunk, including the single-oversized-turn split case where it has exactly
+  one element; it is empty for prose, code, and table chunks). For an oversized-turn split
+  chunk, the span *is* meaningful but locates the chunk's text within the raw turn text, minus
+  the prepended prefix: `block.text[span]` equals `chunk.text` with the sender prefix stripped.
 
 ### Citation
 Not a stored entity: the **canonical result shape** every surface uses (§6).
