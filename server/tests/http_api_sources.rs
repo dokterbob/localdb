@@ -51,6 +51,45 @@ async fn source_routes_roundtrip_path_and_url_specs() {
 }
 
 #[tokio::test]
+async fn create_source_response_matches_persisted_row() {
+    // Given: a runtime store, and a request that omits every optional field
+    // (no include/exclude, no explicit preset, no refresh) — the persisted
+    // row fills in defaults (e.g. `preset`) that the raw request never had.
+    let (_dir, app) = make_app().await;
+    create_store(app.clone(), "docs").await;
+
+    // When: a minimal path source is created, then the store's sources are listed.
+    let created = request(
+        app.clone(),
+        Method::POST,
+        "/v1/stores/docs/sources",
+        Some(json!({
+            "kind": "path",
+            "spec": {"root": "/tmp/minimal"}
+        })),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created_body = json_body(created.into_body()).await;
+
+    let listed = request(app, Method::GET, "/v1/stores/docs/sources", None).await;
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed_body = json_body(listed.into_body()).await;
+    let items = listed_body["items"].as_array().expect("source items array");
+    let persisted = items
+        .iter()
+        .find(|item| item["id"] == created_body["id"])
+        .expect("created source should be present in the list");
+
+    // Then: the 201 body is exactly the persisted row, not an echo of the request.
+    assert_eq!(
+        &created_body, persisted,
+        "POST response must equal the persisted row returned by GET/list, \
+         not the raw request spec"
+    );
+}
+
+#[tokio::test]
 async fn source_routes_reject_invalid_kind_and_refresh_on_path() {
     // Given: a runtime store exists.
     let (_dir, app) = make_app().await;
