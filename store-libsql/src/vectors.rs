@@ -74,6 +74,67 @@ pub fn embedding_column_type(dim: usize, encoding: VectorEncoding) -> String {
     }
 }
 
+/// Return the `libsql_vector_idx` tuning parameters for the DiskANN index
+/// over an embedding column of the given encoding.
+///
+/// # The cost model
+///
+/// libsql stores every DiskANN node as a **fixed-size** blob — allocated with
+/// `sqlite3_bind_zeroblob(..., nBlockSize)` regardless of the node's actual
+/// degree — so this is a per-row cost paid by every chunk:
+///
+/// ```text
+/// block_size = (node_vec_size + 16) + max_neighbors × (edge_vec_size + 16)
+/// ```
+///
+/// `max_neighbors` multiplies the edge width, which makes the choice of
+/// `compress_neighbors` the single biggest lever on index size. Hence the
+/// invariant this function exists to enforce:
+///
+/// > **`compress_neighbors` must never be wider than the column's own
+/// > encoding.** It is a *compression* only relative to a wider node vector;
+/// > against a narrower one it is an inflation that buys no recall.
+///
+/// - [`VectorEncoding::Binary`] (`F1BIT_BLOB`) — node vectors are already
+///   1 bit/dim (128 B at 1024 dims), so nothing can compress them further.
+///   `compress_neighbors=float8` converted each bit to `±1` and then
+///   quantized *that* to a whole byte, so every one of those 1032 edge bytes
+///   held only 0 or 255: 8× the space for exactly the information the node
+///   vector already carried. Omitting `max_neighbors` as well lets libsql
+///   apply its own "cap edge overhead at 50× node overhead" rule, which
+///   picks 51 here. Measured: 7,488 B/row, down from 67,216 B/row (9.0×).
+/// - [`VectorEncoding::Float32`] (`F32_BLOB`) — node vectors are 4 KiB, so
+///   `float8` edges *are* a genuine 4× compression. `max_neighbors` stays
+///   pinned here: with both params omitted libsql picks 51 float32 edges =
+///   213,824 B/row, three times **worse** than the 71,184 B/row this tuning
+///   gives.
+///
+/// Every figure above is read back from `libsql_vector_meta_shadow` rather
+/// than derived — see `store-libsql/tests/vector_index_cost.rs`. Background:
+/// issues #179 (45 GB for ~600k chunks) and #177.
+pub fn vector_index_params(encoding: VectorEncoding) -> &'static str {
+    match encoding {
+        VectorEncoding::Binary => "'metric=cosine'",
+        VectorEncoding::Float32 => {
+            "'metric=cosine', 'max_neighbors=64', 'compress_neighbors=float8'"
+        }
+    }
+}
+
+/// The full `CREATE INDEX` statement for the `chunks_vec_idx` DiskANN index.
+///
+/// Single source of truth shared by [`crate::schema::create_schema`] and the
+/// v6 chain migration. The write-twice rule (CLAUDE.md) requires those two to
+/// emit **byte-identical** DDL — `drift_guard_create_schema_equals_baseline_plus_chain`
+/// compares `sqlite_master.sql` verbatim — so they must not each spell it out.
+pub fn vector_index_ddl(encoding: VectorEncoding) -> String {
+    format!(
+        "CREATE INDEX IF NOT EXISTS chunks_vec_idx ON chunks(\
+         libsql_vector_idx(embedding, {params}))",
+        params = vector_index_params(encoding)
+    )
+}
+
 /// Convert a cosine distance (from `vector_distance_cos`) to a similarity score [0, 1].
 ///
 /// Cosine distance = 1 - cosine_similarity, range [0, 2].

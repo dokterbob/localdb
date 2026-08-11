@@ -29,6 +29,7 @@ pub mod uri;
 
 pub use backend::{
     DocumentInfo, SourceRow, StoreBackend, StoreBackendConfig, StoreBackendConnection, StoreRow,
+    TableSize,
 };
 pub use block::{
     Block, BlockKind, BlockLocation, BoundingBox, ChunkLocation, IngestorKind, Resource,

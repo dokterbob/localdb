@@ -65,6 +65,19 @@ pub struct SourceRow {
     pub config_json: Option<String>,
 }
 
+/// One row of `StoreBackend::largest_tables`: an on-disk table's name and its
+/// aggregate byte size (its own pages plus every index built on it), as
+/// reported by SQLite's `dbstat` virtual table.
+///
+/// A whole-database-file diagnostic, not scoped to any one store — every
+/// store shares the same unified `localdb.db` file (specs/03-config.md), so
+/// "which table is biggest" is a property of the file, not of a store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableSize {
+    pub name: String,
+    pub bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DocumentInfo {
     pub store_id: String,
@@ -106,4 +119,14 @@ pub trait StoreBackend: Send + Sync + 'static {
     async fn find_document(&self, doc_id: &str) -> Result<Option<DocumentInfo>, Error>;
 
     async fn retrieval_store(&self, store_id: &str) -> Result<Arc<dyn RetrievalStore>, Error>;
+
+    /// The largest on-disk tables (own pages + every index on them) by byte
+    /// size, descending, capped at `limit`.
+    ///
+    /// A best-effort diagnostic for `localdb status` (issues #179, #177):
+    /// implementations that can't compute it (e.g. the backend's `dbstat`
+    /// equivalent is unavailable) return an empty vector rather than
+    /// erroring — callers must treat an empty result as "unavailable", not
+    /// as "the database has no tables".
+    async fn largest_tables(&self, limit: usize) -> Result<Vec<TableSize>, Error>;
 }

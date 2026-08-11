@@ -1,7 +1,7 @@
 use libsql::Connection;
 use localdb_core::VectorEncoding;
 
-use crate::vectors::embedding_column_type;
+use crate::vectors::{embedding_column_type, vector_index_ddl};
 
 /// Run the full DDL for the unified database.
 ///
@@ -210,14 +210,12 @@ async fn create_chunks(
     )
     .await?;
 
-    // DiskANN index. Tuning (max_neighbors=64, compress_neighbors=float8)
-    // matches PR #92 review feedback that landed on main.
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS chunks_vec_idx ON chunks(\
-         libsql_vector_idx(embedding, 'metric=cosine', 'max_neighbors=64', 'compress_neighbors=float8'))",
-        (),
-    )
-    .await?;
+    // DiskANN index. Tuning is encoding-dependent and derived in one place —
+    // see `vectors::vector_index_params` for the block-size cost model and
+    // why a binary column must not carry float8 neighbors (issue #179).
+    // Schema v6 must keep emitting this byte-for-byte identically to the
+    // chain migration; both call the same helper for exactly that reason.
+    conn.execute(&vector_index_ddl(encoding), ()).await?;
 
     Ok(())
 }

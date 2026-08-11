@@ -213,6 +213,21 @@ impl LibsqlDb {
                         .await
                         .map_err(map_libsql_err)?;
                 }
+                // BEFORE `verify_checksums`, not after. `ctx` is built from
+                // the caller-supplied `(embedding_dim, encoding)`, and since
+                // schema v6 a migration's rendered SQL — and therefore its
+                // checksum — depends on `ctx.encoding` (see
+                // `chain::shrink_vector_index_up`). So opening a store with
+                // the wrong encoding makes every checksum computed from that
+                // context meaningless, and `verify_checksums` would report it
+                // as `Internal` "migration drift" — pointing the user at a
+                // corrupt-bookkeeping problem they don't have, and masking the
+                // actionable `InvalidConfig` "embedding schema mismatch:
+                // expected …, found …" they do. Establishing that the context
+                // actually describes this store is a precondition for the
+                // checksum check meaning anything.
+                validate_embedding_column(&conn, embedding_dim, encoding).await?;
+
                 checksum::verify_checksums(&conn, &chain::migrations(), &ctx, head).await?;
 
                 schema::create_schema(&conn, embedding_dim, encoding)
@@ -454,6 +469,43 @@ mod tests {
                 );
             }
             Err(other) => panic!("expected InvalidConfig, got: {other:?}"),
+            Ok(_) => panic!("expected InvalidConfig, but reopen succeeded"),
+        }
+    }
+
+    /// The encoding-mismatch refusal must not be masked by migration-checksum
+    /// verification.
+    ///
+    /// Since schema v6 (`chain::shrink_vector_index_up`) a migration's
+    /// rendered SQL depends on `ctx.encoding`, so its stored checksum does
+    /// too. Reopening a Float32 store as Binary therefore *also* trips a
+    /// checksum mismatch — and if `verify_checksums` runs first, the user gets
+    /// an `Internal` "migration drift" error blaming corrupt bookkeeping
+    /// instead of the `InvalidConfig` that names the actual problem. This pins
+    /// the ordering in `LibsqlDb::open`'s `AtHead` branch.
+    #[tokio::test]
+    async fn encoding_mismatch_beats_migration_checksum_mismatch() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("localdb.db");
+
+        // 1024 dims: the production default, and the shape whose v6 up-SQL
+        // actually differs between the two encodings.
+        let db = LibsqlDb::open(&path, 1024, VectorEncoding::Binary)
+            .await
+            .unwrap();
+        drop(db);
+
+        match LibsqlDb::open(&path, 1024, VectorEncoding::Float32).await {
+            Err(Error::InvalidConfig { message }) => {
+                assert!(
+                    message.contains("embedding schema mismatch"),
+                    "must name the embedding mismatch, not migration drift: {message}"
+                );
+            }
+            Err(other) => panic!(
+                "expected InvalidConfig naming the embedding mismatch; \
+                 got {other:?} — checksum verification is running first again"
+            ),
             Ok(_) => panic!("expected InvalidConfig, but reopen succeeded"),
         }
     }

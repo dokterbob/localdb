@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use localdb_core::{
     DocumentInfo, Error, RetrievalStore, SourceRow, StoreBackend, StoreBackendConfig,
-    StoreBackendConnection, StoreRow, VectorEncoding,
+    StoreBackendConnection, StoreRow, TableSize, VectorEncoding,
 };
 
 use crate::connection::LibsqlDb;
@@ -90,5 +90,9 @@ impl StoreBackend for SqliteBackend {
             self.embedding_dim,
             self.encoding,
         )))
+    }
+
+    async fn largest_tables(&self, limit: usize) -> Result<Vec<TableSize>, Error> {
+        registry::diagnostics::largest_tables(&self.conn, limit).await
     }
 }

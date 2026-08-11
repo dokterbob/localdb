@@ -22,6 +22,7 @@ pub mod migrate;
 pub mod progress;
 pub mod runner;
 pub mod table;
+pub mod vacuum;
 
 #[cfg(test)]
 pub(crate) mod test_fixtures;

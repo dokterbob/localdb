@@ -701,19 +701,21 @@ async fn migrate_store_on_real_chain_drops_block_id_and_retags_metadata() {
         .unwrap();
 
     assert_eq!(report.from_version, BASELINE_VERSION);
-    assert_eq!(report.to_version, BASELINE_VERSION + 1);
+    assert_eq!(report.to_version, BASELINE_VERSION + 2);
     assert_eq!(
         report.applied.iter().map(|s| s.version).collect::<Vec<_>>(),
-        vec![BASELINE_VERSION + 1]
+        vec![BASELINE_VERSION + 1, BASELINE_VERSION + 2],
+        "a v4 store steps through the whole compiled chain, not just v5"
     );
     assert!(!report.legacy_rebuilt);
     assert!(
         report.staleness_marked,
-        "the block_id-drop migration is needs_reindex: true"
+        "the block_id-drop migration is needs_reindex: true (v6, the index \
+         shrink, is not — it rebuilds from chunks.embedding)"
     );
 
     let (_db, conn) = open_conn(&path).await;
-    assert_eq!(user_version(&conn).await, BASELINE_VERSION + 1);
+    assert_eq!(user_version(&conn).await, BASELINE_VERSION + 2);
     assert!(!column_exists(&conn, "chunks", "block_id").await);
     assert!(!index_exists(&conn, "idx_chunks_store_resource").await);
     assert!(index_exists(&conn, "idx_chunks_store_resource_pos").await);
