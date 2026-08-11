@@ -124,6 +124,21 @@ pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
         // gives — instead of the old behavior of warning and then serving
         // the daemon's *full* store set, which silently widened access
         // exactly when the caller had asked to narrow it (#201).
+        //
+        // Syntax-validate first, though (Codex review, P2). `connect` can
+        // only ever answer "the daemon doesn't have that name", so a
+        // malformed one like `../evil` would surface as
+        // `store_not_found`/exit 3 — while embedded mode and every other
+        // store-scoped command reject it as `invalid_request`/exit 2 before
+        // resolving anything. Same ordering, and the same reason, as
+        // `resolve_daemon_store_scope_inner` and `source remove`'s daemon
+        // branch: a malformed name never reaches the wire.
+        for name in &ctx.stores {
+            if let Err(e) = crate::normalize::validate_store_name(name) {
+                exit_err(&e, ctx.json);
+            }
+        }
+
         let handler = match ProxyHandler::connect(&base_url, &ctx.stores).await {
             Ok(handler) => handler,
             Err(ProxyConnectError::StoreNotFound(name)) => {

@@ -309,6 +309,42 @@ fn mcp_stdio_daemon_unreachable_maps_to_daemon_unreachable_exit_code() {
     );
 }
 
+/// Codex review (P2): a malformed `--store` name must be rejected as
+/// `invalid_request`/exit 2 in proxied mode too, matching embedded mode and
+/// every other store-scoped command — not surface as `store_not_found`/exit 3
+/// merely because the daemon's store set happens not to contain `../evil`.
+///
+/// `LOCALDB_DAEMON_URL` pointing at a *closed* port is what makes this sharp:
+/// `probe_daemon` trusts the override without a health check, so the proxied
+/// branch is definitely taken, and the connect that follows would definitely
+/// fail with exit 5. Getting exit 2 therefore proves the name was rejected
+/// before anything touched the network.
+#[test]
+fn mcp_proxied_traversal_store_name_exits_2_before_connecting() {
+    let dir = TempDir::new().unwrap();
+    write_config(&dir, "");
+
+    let closed_port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+        // listener drops here, closing the port.
+    };
+    let stale_url = format!("http://127.0.0.1:{closed_port}");
+
+    let assert = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &stale_url)
+        .args(["--store", "../evil", "mcp"])
+        .write_stdin("")
+        .assert()
+        .code(2);
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        !stderr.contains("store not found"),
+        "a malformed name is invalid usage, not a missing store: {stderr}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // HTTP daemon
 // ---------------------------------------------------------------------------
