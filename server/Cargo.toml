@@ -16,6 +16,14 @@ ingest = { path = "../ingest" }
 mcp = { path = "../mcp" }
 async-trait = { workspace = true }
 axum = { workspace = true }
+# `futures::stream::unfold` builds the `GET /v1/jobs/{id}/events` SSE stream
+# (issue #83) — `axum::response::sse::Sse` requires its payload to implement
+# `futures_util::stream::Stream`, which `futures` re-exports. Already a
+# pinned workspace dependency (`futures = "0.3"` in the root `Cargo.toml`,
+# already resolved in `Cargo.lock` as a transitive dependency of `axum`
+# itself) — this only newly *directly* depends on it for `server`, it does
+# not add a new crate to the dependency graph.
+futures = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true }
 serde = { workspace = true }

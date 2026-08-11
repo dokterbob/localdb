@@ -5399,6 +5399,7 @@ dependencies = [
  "embed",
  "extract",
  "fetch",
+ "futures",
  "ingest",
  "localdb-core",
  "mcp",

@@ -172,7 +172,7 @@ impl UrlRefreshScheduler {
                     IndexJobScope::Source {
                         source_id: source_id.clone(),
                     },
-                    move || async move {
+                    move |progress| async move {
                         debug!(
                             "URL refresh job running for source '{}' ({})",
                             source_id_for_closure, store_name_for_closure
@@ -192,7 +192,7 @@ impl UrlRefreshScheduler {
                             yaml: &yaml,
                             models_dir: state.models_dir(),
                             embedder: None,
-                            progress: None,
+                            progress: Some(progress),
                         };
                         job_exec::run_job(
                             &store_row,

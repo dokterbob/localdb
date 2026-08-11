@@ -334,6 +334,199 @@ async fn deletion_policy_default_retain_keeps_gone_document_in_search() {
     );
 }
 
+// --- GET /v1/jobs/{id}/events (SSE live progress, issue #83) ----------
+
+/// One parsed SSE frame: its `event:` name and the raw text of its
+/// `data:` field (still JSON-encoded — callers parse it themselves).
+struct SseFrame {
+    event: String,
+    data: String,
+}
+
+/// Parse a raw `text/event-stream` body into its frames.
+///
+/// Frames are separated by a blank line; within a frame, a `event: <name>`
+/// line sets the name and a `data: <value>` line sets the data. Good enough
+/// for the single-field-per-line frames this handler emits — not a
+/// general-purpose SSE parser.
+fn parse_sse_frames(body: &str) -> Vec<SseFrame> {
+    body.split("\n\n")
+        .filter(|block| !block.trim().is_empty())
+        .map(|block| {
+            let mut event = String::new();
+            let mut data = String::new();
+            for line in block.lines() {
+                if let Some(rest) = line.strip_prefix("event: ") {
+                    event = rest.to_string();
+                } else if let Some(rest) = line.strip_prefix("data: ") {
+                    data = rest.to_string();
+                }
+            }
+            SseFrame { event, data }
+        })
+        .collect()
+}
+
+/// GET `/v1/jobs/{id}/events` and return its parsed SSE frames. Bounded by a
+/// timeout — a stream that never terminates is itself a bug worth failing
+/// loudly on, per this file's existing `poll_job_to_terminal` convention.
+async fn get_job_events(app: &axum::Router, job_id: &str) -> Vec<SseFrame> {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/jobs/{}/events", job_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        axum::body::to_bytes(resp.into_body(), usize::MAX),
+    )
+    .await
+    .expect("SSE stream did not terminate in time")
+    .unwrap();
+    let body = String::from_utf8(bytes.to_vec()).unwrap();
+    parse_sse_frames(&body)
+}
+
+/// THE regression test for issue #83: subscribing to a running job's
+/// `/events` must observe at least one `progress` frame from real ingestion
+/// (not a stub), followed by exactly one terminal `job` frame reporting
+/// `done` with nonzero `chunks_written` — mirroring
+/// `post_and_poll_job_runs_real_ingestion_and_content_is_searchable`'s setup
+/// but asserting on the live stream instead of polling `GET /jobs/{id}`.
+#[tokio::test]
+async fn sse_events_stream_progress_then_terminal_job_event() {
+    let (_dir, app) = make_app().await;
+
+    let content_dir = tempfile::tempdir().unwrap();
+    std::fs::write(content_dir.path().join("alpha.md"), "alpha bravo charlie").unwrap();
+    std::fs::write(content_dir.path().join("delta.md"), "delta echo foxtrot").unwrap();
+
+    post_json(&app, "/v1/stores", json!({"name": "test"})).await;
+    post_json(
+        &app,
+        "/v1/stores/test/sources",
+        json!({
+            "kind": "path",
+            "spec": {"root": content_dir.path().to_string_lossy()},
+        }),
+    )
+    .await;
+
+    let job = post_json(&app, "/v1/jobs", json!({"store_name": "test"})).await;
+    let job_id = job["id"].as_str().unwrap().to_string();
+
+    // Subscribe immediately — the job may still be Pending/Running at this
+    // point, which is exactly the "running job" path this test exercises.
+    let frames = get_job_events(&app, &job_id).await;
+
+    assert!(
+        !frames.is_empty(),
+        "expected at least the terminal job frame"
+    );
+
+    let (job_frames, progress_frames): (Vec<_>, Vec<_>) =
+        frames.iter().partition(|f| f.event == "job");
+    assert_eq!(
+        job_frames.len(),
+        1,
+        "expected exactly one terminal job frame, got frames: {:?}",
+        frames.iter().map(|f| &f.event).collect::<Vec<_>>()
+    );
+
+    assert!(
+        !progress_frames.is_empty(),
+        "expected at least one progress frame from real ingestion"
+    );
+    // At least one recognizable ingestion-level event — source-started or a
+    // per-document event — proves this is real pipeline progress, not an
+    // empty placeholder stream.
+    assert!(
+        progress_frames.iter().any(|f| {
+            let v: serde_json::Value = serde_json::from_str(&f.data).unwrap();
+            matches!(
+                v["type"].as_str(),
+                Some("source_started") | Some("document_started") | Some("document_finished")
+            )
+        }),
+        "expected a source/document-level progress event, got: {:?}",
+        progress_frames.iter().map(|f| &f.data).collect::<Vec<_>>()
+    );
+
+    let final_job: serde_json::Value = serde_json::from_str(&job_frames[0].data).unwrap();
+    assert_eq!(final_job["state"], "done", "job: {:?}", final_job);
+    assert!(
+        final_job["stats"]["chunks_written"].as_u64().unwrap() > 0,
+        "expected nonzero chunks_written, got: {:?}",
+        final_job["stats"]
+    );
+}
+
+/// Late subscribe: a job that has already finished must yield exactly the
+/// terminal `job` frame, immediately, with no `progress` frames — the
+/// "already terminal at subscribe time" path.
+#[tokio::test]
+async fn sse_events_late_subscribe_yields_only_terminal_job_event() {
+    let (_dir, app) = make_app().await;
+
+    let content_dir = tempfile::tempdir().unwrap();
+    std::fs::write(content_dir.path().join("doc.md"), "quokka wallaby island").unwrap();
+
+    post_json(&app, "/v1/stores", json!({"name": "test"})).await;
+    post_json(
+        &app,
+        "/v1/stores/test/sources",
+        json!({
+            "kind": "path",
+            "spec": {"root": content_dir.path().to_string_lossy()},
+        }),
+    )
+    .await;
+
+    let job = post_json(&app, "/v1/jobs", json!({"store_name": "test"})).await;
+    let job_id = job["id"].as_str().unwrap().to_string();
+
+    // Run the job to completion first via the existing polling helper.
+    let final_job = poll_job_to_terminal(&app, &job_id).await;
+    assert_eq!(final_job["state"], "done", "job: {:?}", final_job);
+
+    let frames = get_job_events(&app, &job_id).await;
+
+    assert_eq!(
+        frames.len(),
+        1,
+        "expected exactly one frame (the terminal job event), got: {:?}",
+        frames.iter().map(|f| &f.event).collect::<Vec<_>>()
+    );
+    assert_eq!(frames[0].event, "job");
+    let body: serde_json::Value = serde_json::from_str(&frames[0].data).unwrap();
+    assert_eq!(body["state"], "done");
+    assert_eq!(body["id"], job_id);
+}
+
+#[tokio::test]
+async fn sse_events_unknown_job_returns_404() {
+    let (_dir, app) = make_app().await;
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/jobs/nonexistent-job-id/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = json_body(resp.into_body()).await;
+    assert_eq!(body["code"], "job_not_found");
+}
+
 #[tokio::test]
 async fn deletion_policy_explicit_retain_behaves_like_default() {
     let (_dir, app) = make_app().await;

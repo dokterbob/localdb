@@ -143,7 +143,11 @@ pub struct IngestionConfig {
 // ---------------------------------------------------------------------------
 
 /// Result of a completed ingestion pipeline run.
-#[derive(Debug, Default, Clone)]
+///
+/// `Serialize`/`Deserialize` are derived because this type is embedded in
+/// [`crate::progress::ProgressEvent::SourceFinished`], which crosses the
+/// SSE wire boundary (issue #83).
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct IngestionResult {
     /// Total documents seen in the scan.
     pub docs_seen: u64,
