@@ -21,7 +21,7 @@ Single binary, subcommand tree. Global flags: `--config`, `--json`, `--store <na
 | `init` | Create config + data dir, first-run model download prompt; not store-scoped, `-s` is rejected, exit 2 (§2.2) | full | n/a (refuses if daemon running with different data dir) |
 | `serve` | Run the daemon (HTTP API, watching, refresh, socket); serves every store regardless, so `-s` is rejected, exit 2 (§2.2) | becomes the daemon | error `daemon_running` |
 | `mcp` | Run MCP server on stdio; exposes all stores if `-s` is omitted, and `-s` genuinely narrows the exposed set in **both** modes (§4.2) | embedded core | thin client |
-| `status` | Stores, resource/chunk counts, policy staleness, daemon state; all stores if `-s` is omitted (§2.2) | reads directly | queries daemon |
+| `status` | Stores, resource/chunk counts, policy staleness, daemon state, unified database file size and largest tables (§2.4); all stores if `-s` is omitted (§2.2) | reads directly | queries daemon |
 | `store add/list/remove` | Manage runtime-owned stores; `list` spans all stores if `-s` is omitted, `add`/`remove` name their store as an argument so `-s` is rejected, exit 2 (§2.2) | direct write | routed to daemon |
 | `source add/list/remove` | Manage sources on a store; `list` and `remove <ULID>` span all stores if `-s` is omitted, `add` defaults to the store named `default` (exit 2 if absent), `remove <path\|url>` requires `-s` (§2.2) | direct write | `add`/`remove` routed to daemon; `list` always reads the local database (§2.2 known limitation) |
 | `add <path|url>...` | Alias for `source add` — add one or more sources to a store; same `default`-store rule as `source add` (§2.2) | direct write | routed to daemon |
@@ -30,6 +30,7 @@ Single binary, subcommand tree. Global flags: `--config`, `--json`, `--store <na
 | `db status` | Inspect schema state: current version, head version, pending/unsupported steps. Never refuses, even on a store newer than the binary; not store-scoped, `-s` is rejected, exit 2 (§2.2) | reads directly | error `daemon_running` |
 | `db migrate` | Apply pending migrations with per-step progress; legacy v1–v3 rebuild and any other destructive step require confirmation; prints a `localdb index` hint when a weight-class-3 migration ran; not store-scoped, `-s` is rejected, exit 2 (§2.2) | direct write | error `daemon_running` |
 | `db downgrade [--to N]` | Reverse migrations down to version `N` (default: one step) using stored down-SQL; requires confirmation; refuses cleanly on a step with `down_unsupported_reason`; not store-scoped, `-s` is rejected, exit 2 (§2.2) | direct write | error `daemon_running` |
+| `db vacuum` | Reclaim disk space a prior migration or bulk delete freed onto SQLite's free list but never returned to the file (e.g. after `db migrate` runs the v6 `shrink_vector_index` step) by running `VACUUM`; data-preserving, no confirmation prompt, but warns that it needs roughly the store's current size again in free disk space and can take minutes on a large store; not store-scoped, `-s` is rejected, exit 2 (§2.2) | direct write | error `daemon_running` |
 
 Output: human-readable by default (citations as `uri:heading_path` + snippet), `--json` emits the
 canonical structures for scripting. The CLI is **command-oriented**; interactive browse is a
@@ -47,6 +48,15 @@ and `db downgrade`) require explicit confirmation before touching the store. See
 [02-domain-model.md](02-domain-model.md) §9 for the `schema_migrations` table and the
 migration-weight-class design.
 
+A schema migration that rebuilds a large on-disk structure (e.g. v6 `shrink_vector_index`, issue
+#177) frees pages onto SQLite's own free list without shrinking the database file — only `VACUUM`
+(`db vacuum`) returns that space to the filesystem, and it's a separate, explicit step rather than
+something `db migrate` runs automatically (it needs roughly the store's current size again in free
+disk space and can take minutes). When `db migrate` applies a migration that actually freed pages,
+its completion summary points the user at `db vacuum`; `db vacuum` itself is data-preserving (an
+interrupted run leaves the original file untouched), so unlike the destructive paths above it warns
+rather than requiring `--yes` confirmation.
+
 ### 2.2 Store scope
 
 `--store <name>` is **repeatable**; every name passed is validated and resolved, not just the
@@ -60,7 +70,7 @@ default below. When `-s` is omitted, the default depends on the command:
 | `source remove <path\|url>` | n/a — **exit 2** | a path/url can exist in several stores; this one really is a guess |
 | `source add`, `add` alias | **store named `default`**; **exit 2** if absent | the one write that must pick a single target, and must not pick it by guessing |
 | `store add`, `store remove`, `init`, `serve` | n/a — **exit 2 if `-s` is passed** | the store is named by the command's own argument, or there is no store concept yet, or the daemon serves every store regardless |
-| `db status`/`migrate`/`downgrade` | n/a — **exit 2 if `-s` is passed** | not store-scoped |
+| `db status`/`migrate`/`downgrade`/`vacuum` | n/a — **exit 2 if `-s` is passed** | not store-scoped |
 
 Every "exit 2 if `-s` is passed" row above exists for one reason: silently ignoring a flag the
 user believed in is the #178 failure mode again.
@@ -162,6 +172,41 @@ and `fetch_full_content` (bool), reconstructed from `config_json` (never the raw
 also surfaces `refresh` for both `url` and `feed` sources. These shapes compose with §2.2's
 store-scope rule: the store-name column (human) and `store` field (`--json`) are prepended when
 more than one store is in scope, and the feed detail above is what follows it.
+
+### 2.4 `status` output
+
+`status` exists to catch runaway disk usage before it becomes a surprise 45 GB (issue #179) or
+350 GB (issue #177) database — nothing else in the CLI reports a store's size or chunk count.
+Per-store scope follows §2.2 (`-s` omitted means all stores); each store's entry gets its
+`RetrievalStore::stats()` figures (`document_count`, `chunk_count` — `core/src/store.rs`), already
+the same struct the HTTP daemon and MCP `list_stores` surface. A store whose `stats()` call itself
+fails reports `document_count`/`chunk_count` as `null` (human: "stats unavailable") rather than
+aborting the whole command — one broken store must not blank out the report on the others.
+
+All stores share one physical `localdb.db` file (specs/03-config.md) — file size is a property of
+that file, not of any one store, so it is reported once, in a top-level `database` section, never
+attached to a store entry:
+
+- `size_bytes` — bytes in `localdb.db` itself; `null` if the file doesn't exist yet (e.g. before the
+  first `store add`/`index`) or a stat of any kind fails. `status` never fails just because this is
+  unknown.
+- `wal_size_bytes` — bytes in the `-wal` sidecar, if one exists. WAL-mode SQLite (the mode `open`
+  always sets) defers committed pages there until the next checkpoint, so on a store with recent
+  writes a large share of genuine on-disk usage can live in the WAL rather than the main file.
+- `total_size_bytes` — `size_bytes + wal_size_bytes` (missing components treated as 0). This, not
+  `size_bytes` alone, is what the disk actually has allocated to the database right now — omitting
+  the WAL would understate exactly the kind of silent growth this diagnostic exists to catch.
+- `bytes_per_chunk` — `total_size_bytes` divided by the sum of every in-scope store's `chunk_count`;
+  `null` when there are no chunks to divide by. This is the single number that makes an over-sized
+  index obvious at a glance — a `chunk_count` in the thousands next to a `bytes_per_chunk` in the
+  hundreds of KB is the signature both #179 and #177 would have shown from the start.
+- `largest_tables` — up to 5 `{name, bytes}` rows, the largest on-disk tables (own pages plus every
+  index built on them) via SQLite's `dbstat` virtual table, descending. Best-effort: if `dbstat`
+  querying fails for any reason, this is an empty array rather than a command failure.
+
+`--json` extends the pre-existing shape — `daemon` and `stores[].{name,visibility,backend}` are
+unchanged — by adding `stores[].{document_count,chunk_count}` and the top-level `database` object
+above; no existing field is renamed or removed.
 
 ## 3. HTTP API
 

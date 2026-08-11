@@ -22,7 +22,7 @@ mod cmds {
 }
 
 pub use app_db::AppDb;
-pub use cmds::db::{run_db_downgrade, run_db_migrate, run_db_status};
+pub use cmds::db::{run_db_downgrade, run_db_migrate, run_db_status, run_db_vacuum};
 pub use cmds::index::run_index;
 pub use cmds::init::run_init;
 pub use cmds::search::run_search;

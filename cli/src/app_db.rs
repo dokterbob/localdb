@@ -238,7 +238,7 @@ pub(crate) enum StoreScopePolicy {
 }
 
 /// Reject `--store` on commands that are not store-scoped at all, per
-/// specs/05-surfaces.md §2.2: `db status`/`migrate`/`downgrade` (they operate
+/// specs/05-surfaces.md §2.2: `db status`/`migrate`/`downgrade`/`vacuum` (they operate
 /// on the whole database file), `store add`/`store remove` (the store is
 /// named by the command's own argument), `init` (there is no store concept
 /// yet) and `serve` (the daemon serves every store regardless).

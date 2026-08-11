@@ -18,4 +18,5 @@ pub use migrations::downgrade::{
 };
 pub use migrations::migrate::{migrate_store, migrate_store_with_progress, MigrateReport};
 pub use migrations::progress::{MigrationProgressEvent, MigrationProgressSink};
+pub use migrations::vacuum::{vacuum_store, VacuumReport};
 pub use migrations::MigrationContext;

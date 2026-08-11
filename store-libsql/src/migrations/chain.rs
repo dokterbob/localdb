@@ -1,7 +1,9 @@
 //! The migration chain: a frozen baseline version plus the list of
 //! migrations that have shipped on top of it.
 
-use localdb_core::Error;
+use localdb_core::{Error, VectorEncoding};
+
+use crate::vectors::vector_index_ddl;
 
 use super::{Down, Migration, MigrationContext, Up};
 
@@ -47,6 +49,70 @@ fn drop_chunks_block_id_and_retag_resource_metadata_up(_ctx: &MigrationContext) 
     ]
 }
 
+/// The exact `chunks_vec_idx` DDL every store carried at schema v5, frozen
+/// here as the v6 down-step's target.
+///
+/// Deliberately a literal rather than `vectors::vector_index_ddl(Float32)` —
+/// the two strings coincide today, but this one is a historical constant that
+/// must never move if the live tuning changes again.
+const V5_VECTOR_INDEX_DDL: &str = "CREATE INDEX IF NOT EXISTS chunks_vec_idx ON chunks(\
+     libsql_vector_idx(embedding, 'metric=cosine', 'max_neighbors=64', 'compress_neighbors=float8'))";
+
+/// `v6`: rebuild `chunks_vec_idx` without `compress_neighbors=float8` /
+/// `max_neighbors=64` on binary-encoded stores (issues #179, #177).
+///
+/// v5 pinned both params for every encoding. On an `F1BIT_BLOB` column that
+/// made each DiskANN node blob 67,216 bytes — 9× larger than necessary — for
+/// no recall benefit, because float8 edge vectors of a 1-bit source hold only
+/// 0 or 255 per byte and so carry exactly the information the 128-byte node
+/// vector already has. See `vectors::vector_index_params` for the full cost
+/// model. Dropping the params takes the per-row cost to 7,488 bytes; a 600k
+/// chunk store goes from ~40 GB of index to ~4.5 GB.
+///
+/// **Weight class 2** (in-DB rebuild), *not* class 3: `CREATE INDEX` on a
+/// vector index returns `CREATE_OK` rather than `CREATE_OK_SKIP_REFILL`, so
+/// SQLite runs its normal refill and re-inserts every existing row straight
+/// from `chunks.embedding`. No re-embedding, no model download, hence
+/// `needs_reindex: false`. It is still a long operation on a large store —
+/// one DiskANN insert per chunk — which is why `db migrate` reports per-step
+/// progress.
+///
+/// Freed pages land on the freelist, so the file does not shrink on its own.
+/// `db migrate` points the user at `localdb db vacuum` to reclaim them (issue
+/// #177, where a `VACUUM` run *before* any rebuild correctly reclaimed
+/// nothing).
+fn shrink_vector_index_up(ctx: &MigrationContext) -> Vec<String> {
+    match ctx.encoding {
+        // Drop-first is deliberate, per `runner::apply_pending`'s note:
+        // whether libsql unwinds partial ANN construction on rollback is
+        // unverified, so a retried migration must not meet a half-built index.
+        VectorEncoding::Binary => vec![
+            "DROP INDEX IF EXISTS chunks_vec_idx".to_string(),
+            vector_index_ddl(VectorEncoding::Binary),
+        ],
+        // F32_BLOB stores already have the right tuning — for a 4 KiB node
+        // vector, float8 edges are a real 4× compression and libsql's default
+        // max_neighbors would be 3× worse. Rebuilding would burn minutes to
+        // land on a byte-identical index, so this is a bookkeeping-only step
+        // for them.
+        VectorEncoding::Float32 => vec![],
+    }
+}
+
+/// The v6 down-step: restore the v5 float8/64 index on binary stores.
+///
+/// Reversible (unlike v5) because nothing is discarded — the index is derived
+/// data rebuilt from `chunks.embedding` in either direction.
+fn shrink_vector_index_down(ctx: &MigrationContext) -> Vec<String> {
+    match ctx.encoding {
+        VectorEncoding::Binary => vec![
+            "DROP INDEX IF EXISTS chunks_vec_idx".to_string(),
+            V5_VECTOR_INDEX_DDL.to_string(),
+        ],
+        VectorEncoding::Float32 => vec![],
+    }
+}
+
 /// The real migration registry.
 ///
 /// Consumer branches append entries starting at version `BASELINE_VERSION +
@@ -54,18 +120,31 @@ fn drop_chunks_block_id_and_retag_resource_metadata_up(_ctx: &MigrationContext) 
 /// whoever lands second is responsible for renumbering their entries to
 /// stay contiguous with whatever landed first.
 pub fn migrations() -> Vec<Migration> {
-    vec![Migration {
-        version: BASELINE_VERSION + 1,
-        name: "drop_chunks_block_id_and_retag_resource_metadata",
-        summary: "drops chunks.block_id, replaces idx_chunks_store_resource with \
+    vec![
+        Migration {
+            version: BASELINE_VERSION + 1,
+            name: "drop_chunks_block_id_and_retag_resource_metadata",
+            summary: "drops chunks.block_id, replaces idx_chunks_store_resource with \
                   idx_chunks_store_resource_pos, retags resources.metadata_json from the \
                   retired flat Dublin-Core shape to the tagged Metadata::Document encoding",
-        up: Up::Sql(drop_chunks_block_id_and_retag_resource_metadata_up),
-        down: Down::Unsupported(
-            "chunks.block_id cannot be reconstructed; re-index required after downgrade",
-        ),
-        needs_reindex: true,
-    }]
+            up: Up::Sql(drop_chunks_block_id_and_retag_resource_metadata_up),
+            down: Down::Unsupported(
+                "chunks.block_id cannot be reconstructed; re-index required after downgrade",
+            ),
+            needs_reindex: true,
+        },
+        Migration {
+            version: BASELINE_VERSION + 2,
+            name: "shrink_vector_index",
+            summary: "rebuilds chunks_vec_idx without compress_neighbors=float8/max_neighbors=64 \
+                      on binary-encoded stores, cutting the per-chunk DiskANN block from 67,216 \
+                      to 7,488 bytes (9.0x); run `localdb db vacuum` afterwards to return the \
+                      freed pages to the filesystem",
+            up: Up::Sql(shrink_vector_index_up),
+            down: Down::Sql(shrink_vector_index_down),
+            needs_reindex: false,
+        },
+    ]
 }
 
 /// The schema version a database is at once every migration in `chain` has
