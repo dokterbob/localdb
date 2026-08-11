@@ -162,3 +162,76 @@ pub(crate) async fn seed_store_a_chunk(state: &AppState, input: SeedChunkInput) 
         .await
         .unwrap();
 }
+
+/// Seed `count` distinct chunks into a single fresh store/source, all sharing
+/// enough vocabulary that a single query matches every one of them (needed to
+/// exercise pagination, which requires a candidate pool larger than one page).
+///
+/// Returns the seeded chunk ids in insertion order (not search rank order).
+pub(crate) async fn seed_many_chunks(state: &AppState, count: usize) -> Vec<String> {
+    use localdb_core::Embedder;
+
+    state.add_store("store-A", "private").await.unwrap();
+    let source = state
+        .add_source("store-A", "path", json!({"root": "/tmp"}), "prose", None)
+        .await
+        .unwrap();
+    let store_id = source.store_id.clone();
+    let embedder = localdb_core::FakeEmbedder::new(128);
+
+    let mut ids = Vec::with_capacity(count);
+    let mut chunks = Vec::with_capacity(count);
+    for i in 0..count {
+        let chunk_id = format!("chunk-{i:04}");
+        let text = format!("pagination test document number {i} rust programming content");
+        let docs = vec![localdb_core::embedder::DocumentChunks {
+            document_context: text.clone(),
+            chunks: vec![text.clone()],
+        }];
+        let embedding = embedder
+            .embed_documents(docs)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        chunks.push(localdb_core::ChunkRecord {
+            id: chunk_id.clone(),
+            resource_id: format!("doc-{i:04}"),
+            store_id: store_id.clone(),
+            text: text.clone(),
+            span: localdb_core::types::Span::new(0, text.len()),
+            heading_path: vec![],
+            embedding,
+            policy_version: "v1".to_string(),
+            fetched_at: "2026-06-10T12:00:00Z".to_string(),
+            content_hash: format!("hash-{i:04}"),
+            origin_store: store_id.clone(),
+            source_id: source.id.clone(),
+            ingestor_kind: "path".to_string(),
+            mime: Some("text/plain".to_string()),
+            uri: format!("file:///doc{i:04}.md"),
+            metadata: localdb_core::metadata::Metadata::default(),
+            block_seq: 0,
+            seq_in_block: 0,
+            block_kind: None,
+            page: None,
+            window_block_seqs: vec![],
+        });
+        ids.push(chunk_id);
+    }
+
+    state
+        .backend()
+        .retrieval_store(&store_id)
+        .await
+        .unwrap()
+        .upsert_chunks(chunks)
+        .await
+        .unwrap();
+
+    ids
+}
