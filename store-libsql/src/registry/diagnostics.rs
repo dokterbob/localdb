@@ -27,10 +27,21 @@ pub(crate) async fn largest_tables(db: &LibsqlDb, limit: usize) -> Result<Vec<Ta
     let conn = db.conn().await;
     let mut rows = match conn
         .query(
+            // The `sqlite_%` filter is applied to the RESOLVED name, not to
+            // `d.name`. UNIQUE/PRIMARY KEY constraints are backed by implicit
+            // `sqlite_autoindex_<table>_<n>` b-trees — `chunks`'s `UNIQUE
+            // (store_id, id)` is one — which are real pages belonging to a
+            // real table. Filtering on `d.name` would discard them before the
+            // join could attribute them, understating every constrained
+            // table and hiding uniqueness-index storage from the one
+            // diagnostic meant to explain file size. Resolved first, an
+            // autoindex becomes its parent table and survives; only genuine
+            // catalog objects (`sqlite_schema`, `sqlite_stat1`, …), which
+            // aren't indexes and so resolve to themselves, are dropped.
             "SELECT COALESCE(m.tbl_name, d.name) AS table_name, SUM(d.pgsize) AS bytes
              FROM dbstat d
              LEFT JOIN sqlite_master m ON m.name = d.name AND m.type = 'index'
-             WHERE d.name NOT LIKE 'sqlite_%'
+             WHERE COALESCE(m.tbl_name, d.name) NOT LIKE 'sqlite_%'
              GROUP BY table_name
              ORDER BY bytes DESC
              LIMIT ?",
@@ -172,6 +183,89 @@ mod tests {
         assert!(
             tables.iter().any(|t| t.name == "chunks"),
             "expected a 'chunks' row among {tables:?}"
+        );
+    }
+
+    /// An implicit `sqlite_autoindex_*` b-tree's pages must be attributed to
+    /// the table it constrains, not dropped.
+    ///
+    /// `chunks` declares `UNIQUE (store_id, id)`, which SQLite backs with a
+    /// real `sqlite_autoindex_chunks_*` index. Filtering `dbstat` on
+    /// `d.name NOT LIKE 'sqlite_%'` — i.e. before the join resolves an index
+    /// to its table — silently discards those pages, understating `chunks`
+    /// and hiding uniqueness-index storage from a diagnostic whose entire
+    /// purpose is explaining why the file is big (issues #179, #177).
+    ///
+    /// Asserts against the raw `dbstat` total for everything owned by
+    /// `chunks`, so it measures the actual accounting rather than restating
+    /// the query under test. Guarded by an assertion that the autoindex is
+    /// really there, so the test can't pass vacuously if the schema stops
+    /// declaring that constraint.
+    #[tokio::test]
+    async fn largest_tables_attributes_autoindex_pages_to_their_table() {
+        let (dir, api) = make_api().await;
+        api.upsert_store(&make_store("store-1", "notes"))
+            .await
+            .unwrap();
+        api.upsert_source(&make_source("src-1", "store-1"))
+            .await
+            .unwrap();
+        let handle = api.retrieval_store("store-1").await.unwrap();
+        // Enough rows that the autoindex spans more than the single page an
+        // empty b-tree would occupy.
+        let chunks: Vec<ChunkRecord> = (0..400)
+            .map(|i| make_chunk(&format!("c{i}"), "store-1"))
+            .collect();
+        handle.upsert_chunks(chunks).await.unwrap();
+
+        let reported = api
+            .largest_tables(50)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.name == "chunks")
+            .expect("chunks must be reported")
+            .bytes;
+
+        // Ground truth, computed independently of the query under test: every
+        // dbstat row that is either the `chunks` table itself or an index on
+        // it — autoindexes included.
+        let db = libsql::Builder::new_local(dir.path().join("localdb.db"))
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+
+        let mut idx = conn
+            .query(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'index' AND tbl_name = 'chunks' AND name LIKE 'sqlite_autoindex_%'",
+                (),
+            )
+            .await
+            .unwrap();
+        let autoindexes: i64 = idx.next().await.unwrap().unwrap().get(0).unwrap();
+        assert!(
+            autoindexes > 0,
+            "precondition: chunks must have an implicit autoindex (it declares \
+             UNIQUE (store_id, id)); without one this test proves nothing"
+        );
+
+        let mut rows = conn
+            .query(
+                "SELECT SUM(d.pgsize) FROM dbstat d \
+                 LEFT JOIN sqlite_master m ON m.name = d.name AND m.type = 'index' \
+                 WHERE COALESCE(m.tbl_name, d.name) = 'chunks'",
+                (),
+            )
+            .await
+            .unwrap();
+        let expected: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+
+        assert_eq!(
+            reported, expected as u64,
+            "chunks must account for its own pages plus every index on it, \
+             including the {autoindexes} implicit autoindex(es)"
         );
     }
 
