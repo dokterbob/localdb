@@ -554,17 +554,32 @@ fn daemon_source_add_auto_indexes_and_is_searchable() {
     );
 
     // D3: the daemon branch now auto-indexes too — the plain-mode progress
-    // sink (stderr is piped, not a TTY, under `assert_cmd`) must show real
-    // live progress, not just a submission acknowledgement.
+    // sink (stderr is piped, not a TTY, under `assert_cmd`) must show the
+    // job's real outcome, not just a submission acknowledgement.
+    //
+    // Deliberately NOT asserted: live per-document `Indexing ...` frames.
+    // With a near-instant fake-embedder job the SSE subscribe can land
+    // after the job already finished, in which case the attach path
+    // correctly receives only the terminal event (late-subscribe contract,
+    // issue #83) and prints only the summary — a timing race, observed on
+    // CI. The summary line below is the deterministic proof of attachment:
+    // it is rendered from the terminal job event's stats, which the old
+    // fire-and-forget daemon branch (it printed "submitted", polled
+    // nothing) could never produce.
     let add_stderr = String::from_utf8_lossy(&add_output.stderr).to_string();
     assert!(
         add_stderr.contains("Auto-indexing source"),
         "expected the auto-indexing announcement on stderr: {add_stderr}"
     );
     assert!(
-        add_stderr.contains("Indexing") && add_stderr.contains("indexed"),
-        "expected live progress-sink output (Indexing.../indexed... lines) on stderr, proving \
-         the daemon branch attached to the job rather than just printing 'submitted': {add_stderr}"
+        add_stderr.contains("indexed 1 docs") && add_stderr.contains("2 chunks"),
+        "expected the attached job's terminal summary with real nonzero stats on stderr, \
+         proving the daemon branch attached to the job rather than just printing \
+         'submitted': {add_stderr}"
+    );
+    assert!(
+        !add_stderr.contains("submitted"),
+        "the old fire-and-forget submission hint must be gone: {add_stderr}"
     );
 
     // Now confirm via an explicit `index --json` that the auto-indexed
