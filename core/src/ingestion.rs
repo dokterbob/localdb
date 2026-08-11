@@ -2173,8 +2173,13 @@ mod tests {
             index_resource(&resource, source, None, &deps)
                 .await
                 .expect("seed index must succeed");
+            // The doc_index key must be the NORMALIZED uri, exactly as
+            // `list_indexed_documents` rehydrates it — a raw spelling here
+            // diverges from the pipeline's seen-set whenever the path needs
+            // percent-encoding (e.g. a directory with a space), and the
+            // sweep would delete a live document it just observed.
             DocumentRecord {
-                uri: uri.to_string(),
+                uri: resource.uri.as_str().to_string(),
                 resource_id: resource.id.clone(),
                 source_id: source.id.clone(),
                 content_hash: resource.content_hash.clone(),
@@ -3763,7 +3768,7 @@ mod tests {
                  B's root string starts with A's root string"
             );
             assert!(
-                doc_index.get(&uri_b).is_some(),
+                doc_index.get(&record_b.uri).is_some(),
                 "source B's doc_index record must remain"
             );
         }
@@ -3876,7 +3881,7 @@ mod tests {
                 "source B's chunks must survive sweeping source A"
             );
             assert!(
-                doc_index.get(&uri_b).is_some(),
+                doc_index.get(&record_b.uri).is_some(),
                 "source B's doc_index record must remain"
             );
         }
