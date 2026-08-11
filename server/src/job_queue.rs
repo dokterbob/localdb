@@ -27,8 +27,8 @@ use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{error, info, warn};
 
 use localdb_core::{
-    complete_index_job, create_index_job, fail_index_job, start_index_job, Error, IndexJob,
-    IndexJobScope, IndexJobStats, ProgressEvent, ProgressSink,
+    complete_index_job, create_index_job, fail_index_job, fail_index_job_with_error,
+    start_index_job, Error, IndexJob, IndexJobScope, IndexJobStats, ProgressEvent, ProgressSink,
 };
 
 /// Maximum number of pending jobs in the channel.
@@ -43,9 +43,18 @@ const QUEUE_CAPACITY: usize = 64;
 /// derived from the registry, never from this channel alone).
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
-/// A pinned, boxed future producing a job's final stats (or an error
-/// message) — the async equivalent of the old synchronous `JobTask` closure.
-type JobFuture = Pin<Box<dyn Future<Output = Result<IndexJobStats, String>> + Send>>;
+/// A pinned, boxed future producing a job's final stats (or a typed error) —
+/// the async equivalent of the old synchronous `JobTask` closure.
+///
+/// The error type is `core::Error`, not `String` (issue #187 review, finding
+/// 3): stringifying a task's error here — as this used to — discarded the
+/// error's stable `code()` before it ever reached `fail_index_job_with_error`,
+/// so a daemon-attached job failure always surfaced as an undifferentiated
+/// `Error::Internal` (exit 1) even when the underlying failure was e.g.
+/// `Error::InvalidConfig` (exit 2 embedded). Carrying the typed `Error`
+/// through end to end is what lets `run_worker` classify the failure
+/// correctly when it calls `fail_index_job_with_error` below.
+type JobFuture = Pin<Box<dyn Future<Output = Result<IndexJobStats, Error>> + Send>>;
 
 /// A submitted job's work, as a `FnOnce` that produces the future when the
 /// worker is ready to run it (not before — building the future may itself
@@ -167,7 +176,7 @@ impl JobQueue {
     ) -> Result<IndexJob, Error>
     where
         F: FnOnce(ProgressSink) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<IndexJobStats, String>> + Send + 'static,
+        Fut: Future<Output = Result<IndexJobStats, Error>> + Send + 'static,
     {
         {
             let mut inflight = self.inflight.write().await;
@@ -309,7 +318,7 @@ async fn run_worker(
                     }
                     Ok(Err(e)) => {
                         warn!("job {} failed: {}", job_id, e);
-                        fail_index_job(job, e);
+                        fail_index_job_with_error(job, &e);
                     }
                     Err(join_err) => {
                         error!("job {} panicked: {}", job_id, join_err);
@@ -362,7 +371,7 @@ mod tests {
     /// written inline, would never actually run to completion within their
     /// own test — e.g. a submission that's expected to be rejected before
     /// the worker ever invokes its task).
-    async fn ok_job(_progress: ProgressSink) -> Result<IndexJobStats, String> {
+    async fn ok_job(_progress: ProgressSink) -> Result<IndexJobStats, Error> {
         Ok(IndexJobStats::default())
     }
 
@@ -444,7 +453,10 @@ mod tests {
         let queue = JobQueue::new();
         let job = queue
             .submit("store-1", IndexJobScope::Store, |_progress| async {
-                Err("something went wrong".to_string())
+                Err(Error::Internal {
+                    message: "something went wrong".to_string(),
+                    correlation_id: "test".to_string(),
+                })
             })
             .await
             .unwrap();
@@ -459,9 +471,48 @@ mod tests {
             let current = queue.get_job(&job_id).await.unwrap();
             if current.state == IndexJobState::Failed {
                 assert!(current.error.is_some());
+                assert_eq!(current.error_code.as_deref(), Some("internal"));
                 break;
             }
         }
+    }
+
+    /// Issue #187 review, finding 3: a task failing with a typed
+    /// `core::Error` must have that error's stable `code()` land in the
+    /// terminal job's `error_code` — not just its stringified `error`
+    /// message — so a daemon-attached CLI (`cli::job_attach::finish_job`)
+    /// can reconstruct the original variant via `Error::from_code` and exit
+    /// with the same code an embedded pre-flight failure of the same kind
+    /// would. `GET /v1/jobs/{id}` and the SSE terminal `job` event both
+    /// serialize this `IndexJob` directly, so this also pins the wire shape.
+    #[tokio::test]
+    async fn job_failure_with_a_typed_error_carries_its_stable_code_in_error_code() {
+        let queue = JobQueue::new();
+        let job = queue
+            .submit("store-1", IndexJobScope::Store, |_progress| async {
+                Err(Error::InvalidConfig {
+                    message: "unconfigured embedder provider".to_string(),
+                })
+            })
+            .await
+            .unwrap();
+
+        let done = wait_for_done(&queue, &job.id).await;
+        assert_eq!(done.state, IndexJobState::Failed);
+        assert_eq!(done.error_code.as_deref(), Some("invalid_config"));
+        assert!(
+            done.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("unconfigured embedder provider"),
+            "the human-readable message must still be present too: {:?}",
+            done.error
+        );
+
+        // The JSON wire shape (what `GET /v1/jobs/{id}` and the SSE terminal
+        // `job` event actually send) must carry the same field.
+        let json = serde_json::to_value(&done).unwrap();
+        assert_eq!(json["error_code"], "invalid_config");
     }
 
     #[tokio::test]
@@ -576,7 +627,10 @@ mod tests {
         let queue = JobQueue::new();
         let job = queue
             .submit("store-1", IndexJobScope::Store, |_progress| async {
-                Err("boom".to_string())
+                Err(Error::Internal {
+                    message: "boom".to_string(),
+                    correlation_id: "test".to_string(),
+                })
             })
             .await
             .unwrap();

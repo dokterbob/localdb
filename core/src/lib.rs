@@ -48,10 +48,11 @@ pub use embedder::{
 pub use error::Error;
 pub use ids::{chunk_id, content_hash, new_ulid, resource_id};
 pub use ingestion::{
-    complete_index_job, create_index_job, enumerate_path_source, fail_index_job, index_resource,
-    is_store_stale, run_source_ingestion, start_index_job, DeletionPolicy, DocumentIndex,
-    DocumentRecord, FetchMetadata, FetchResult, FoundFile, IndexOutcome, IndexResourceDeps,
-    IngestionConfig, IngestionResult, PathEnumeration, SourceIngestionDeps, UrlFetcher,
+    complete_index_job, create_index_job, enumerate_path_source, fail_index_job,
+    fail_index_job_with_error, index_resource, is_store_stale, run_source_ingestion,
+    start_index_job, DeletionPolicy, DocumentIndex, DocumentRecord, FetchMetadata, FetchResult,
+    FoundFile, IndexOutcome, IndexResourceDeps, IngestionConfig, IngestionResult, PathEnumeration,
+    SourceIngestionDeps, UrlFetcher,
 };
 pub use ingestor::{
     ConfigField, ConfigFieldType, Enumeration, IngestCallback, IngestResult, IngestSource,

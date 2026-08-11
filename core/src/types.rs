@@ -446,6 +446,18 @@ pub struct IndexJob {
     #[serde(default)]
     pub error: Option<String>,
 
+    /// Stable machine-readable error code (`Error::code()`) if state is
+    /// `Failed` and the failure came from a typed `core::Error` — `None` for
+    /// a synthetic queue-level failure (e.g. "job queue is full or closed",
+    /// a task panic) that never had one. `#[serde(default)]` so an older
+    /// daemon's job JSON (predating this field) still deserializes.
+    /// `cli::job_attach::finish_job` reconstructs the original typed error
+    /// via `Error::from_code(error_code, error)` so a daemon-attached job
+    /// failure exits with the same code an embedded pre-flight failure of
+    /// the same kind would (issue #187 review).
+    #[serde(default)]
+    pub error_code: Option<String>,
+
     /// When the job was created (RFC 3339).
     pub created_at: String,
 
@@ -880,6 +892,7 @@ mod tests {
             state: IndexJobState::Pending,
             stats: IndexJobStats::default(),
             error: None,
+            error_code: None,
             created_at: "2026-06-10T12:00:00Z".to_string(),
             started_at: None,
             completed_at: None,
@@ -887,6 +900,25 @@ mod tests {
         let json = serde_json::to_string(&job).unwrap();
         let job2: IndexJob = serde_json::from_str(&json).unwrap();
         assert_eq!(job, job2);
+    }
+
+    #[test]
+    fn index_job_error_code_defaults_to_none_when_absent_from_json() {
+        // A daemon predating this field (issue #187 review) emits `IndexJob`
+        // JSON with no `error_code` key at all — `#[serde(default)]` must
+        // still deserialize it, not fail the whole response.
+        let json = r#"{
+            "id": "job-1",
+            "store_id": "store-1",
+            "scope": {"type": "store"},
+            "state": "failed",
+            "stats": {},
+            "error": "boom",
+            "created_at": "2026-06-10T12:00:00Z"
+        }"#;
+        let job: IndexJob = serde_json::from_str(json).unwrap();
+        assert_eq!(job.error_code, None);
+        assert_eq!(job.error, Some("boom".to_string()));
     }
 
     #[test]

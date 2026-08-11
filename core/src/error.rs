@@ -123,6 +123,47 @@ impl Error {
         }
     }
 
+    /// Reconstruct a typed `Error` from a stable `code()` string plus a
+    /// message, the inverse of [`Error::code`].
+    ///
+    /// Every surface that receives an error as a `{code, message}` pair
+    /// across a boundary — a daemon HTTP error body
+    /// (`cli::daemon_client::decode_daemon_error`) or a failed `IndexJob`'s
+    /// `error_code`/`error` fields (`cli::job_attach::finish_job`) —
+    /// reconstructs the original variant through this one mapping, so the
+    /// code taxonomy only has to be kept in sync in one place. `message` is
+    /// reused verbatim for every variant's message-shaped field (`id`,
+    /// `message`, ...) — the original field *name* isn't recoverable, but
+    /// every consumer only ever displays the string, never inspects it
+    /// structurally.
+    ///
+    /// Returns `None` for a code this binary doesn't recognize (e.g. a newer
+    /// code string from a daemon build ahead of this CLI, or a variant like
+    /// `Error::Internal`/`Error::UnsupportedFormat`/`Error::ExtractionFailed`
+    /// whose fields don't fit a single `message` string) — callers supply
+    /// their own fallback (typically `Error::Internal`) with whatever extra
+    /// context (HTTP status, a wrapping label, ...) is available to them.
+    pub fn from_code(code: &str, message: String) -> Option<Error> {
+        Some(match code {
+            "store_not_found" => Error::StoreNotFound { id: message },
+            "source_not_found" => Error::SourceNotFound { id: message },
+            "resource_not_found" => Error::ResourceNotFound { id: message },
+            // Legacy code string from a stale daemon predating the
+            // resource_not_found rename (specs/05-surfaces.md §5).
+            "document_not_found" => Error::ResourceNotFound { id: message },
+            "job_not_found" => Error::JobNotFound { id: message },
+            "runtime_state_locked" => Error::RuntimeStateLocked,
+            "daemon_running" => Error::DaemonRunning,
+            "daemon_unreachable" => Error::DaemonUnreachable,
+            "invalid_config" => Error::InvalidConfig { message },
+            "invalid_request" => Error::InvalidRequest { message },
+            "index_in_progress" => Error::IndexInProgress,
+            "provider_unavailable" => Error::ProviderUnavailable { message },
+            "model_missing" => Error::ModelMissing { message },
+            _ => return None,
+        })
+    }
+
     /// Returns the suggested CLI exit code for this error.
     pub fn exit_code(&self) -> i32 {
         match self {
@@ -254,6 +295,68 @@ mod tests {
         assert_eq!(Error::SourceNotFound { id: "s".into() }.exit_code(), 3);
         assert_eq!(Error::ResourceNotFound { id: "s".into() }.exit_code(), 3);
         assert_eq!(Error::JobNotFound { id: "s".into() }.exit_code(), 3);
+    }
+
+    // -- from_code: round trip with code(), and the two documented gaps -----
+
+    #[test]
+    fn from_code_round_trips_every_code_with_a_message_field() {
+        // Every variant whose `code()` output `from_code` claims to
+        // recognize must decode back to an equal value when fed its own
+        // `code()` + a representative message — this is what makes it safe
+        // for `finish_job`/`decode_daemon_error` to reconstruct the typed
+        // error a job or an HTTP error body only carries as a string pair.
+        let cases: &[Error] = &[
+            Error::StoreNotFound { id: "x".into() },
+            Error::SourceNotFound { id: "x".into() },
+            Error::ResourceNotFound { id: "x".into() },
+            Error::JobNotFound { id: "x".into() },
+            Error::RuntimeStateLocked,
+            Error::DaemonRunning,
+            Error::DaemonUnreachable,
+            Error::InvalidConfig {
+                message: "x".into(),
+            },
+            Error::InvalidRequest {
+                message: "x".into(),
+            },
+            Error::IndexInProgress,
+            Error::ProviderUnavailable {
+                message: "x".into(),
+            },
+            Error::ModelMissing {
+                message: "x".into(),
+            },
+        ];
+        for err in cases {
+            let decoded = Error::from_code(err.code(), "x".to_string());
+            assert_eq!(decoded.as_ref(), Some(err), "round trip failed for {err:?}");
+        }
+    }
+
+    #[test]
+    fn from_code_accepts_the_legacy_document_not_found_alias() {
+        assert_eq!(
+            Error::from_code("document_not_found", "doc-1".to_string()),
+            Some(Error::ResourceNotFound {
+                id: "doc-1".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn from_code_returns_none_for_an_unrecognized_or_unmappable_code() {
+        // An unknown code (e.g. a newer daemon build) and every code whose
+        // variant doesn't fit a single `message` field (internal,
+        // unsupported_format, extraction_failed) all return `None` so the
+        // caller applies its own fallback.
+        assert_eq!(Error::from_code("something_new", "x".to_string()), None);
+        assert_eq!(Error::from_code("internal", "x".to_string()), None);
+        assert_eq!(
+            Error::from_code("unsupported_format", "x".to_string()),
+            None
+        );
+        assert_eq!(Error::from_code("extraction_failed", "x".to_string()), None);
     }
 
     #[test]

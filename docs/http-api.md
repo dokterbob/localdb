@@ -302,7 +302,7 @@ curl -s -X POST http://127.0.0.1:7700/v1/jobs \
 ```
 
 ```json
-{"id":"01KTVM5XMA59N4WGHNZ80QX9B7","store_id":"notes","scope":{"type":"store"},"state":"pending","stats":{"docs_seen":0,"docs_indexed":0,"docs_skipped":0,"docs_deleted":0,"docs_prunable":0,"chunks_written":0,"unsupported_format_count":0,"error_count":0,"sources_count":0},"error":null,"created_at":"2026-06-11T15:17:59Z","started_at":null,"completed_at":null}
+{"id":"01KTVM5XMA59N4WGHNZ80QX9B7","store_id":"notes","scope":{"type":"store"},"state":"pending","stats":{"docs_seen":0,"docs_indexed":0,"docs_skipped":0,"docs_deleted":0,"docs_prunable":0,"chunks_written":0,"unsupported_format_count":0,"error_count":0,"sources_count":0},"error":null,"error_code":null,"created_at":"2026-06-11T15:17:59Z","started_at":null,"completed_at":null}
 ```
 
 > If you pass `"store"` instead of `"store_name"` the server returns a 422-style deserialisation
@@ -347,6 +347,7 @@ curl -s http://127.0.0.1:7700/v1/jobs/01KTVM5XMA59N4WGHNZ80QX9B7
         "sources_count": 1
     },
     "error": null,
+    "error_code": null,
     "created_at": "2026-06-11T15:17:59Z",
     "started_at": "2026-06-11T15:17:59Z",
     "completed_at": "2026-06-11T15:17:59Z"
@@ -363,6 +364,7 @@ curl -s http://127.0.0.1:7700/v1/jobs/01KTVM5XMA59N4WGHNZ80QX9B7
 | `state` | string | `"pending"`, `"running"`, `"done"`, or `"failed"` |
 | `stats` | object | Running counters (see below) |
 | `error` | string\|null | Error message if the job failed |
+| `error_code` | string\|null | Stable error code (see [Error responses](#error-responses)) if the job failed with a typed error — e.g. `"invalid_config"` for an embedder-construction failure. `null` for a synthetic queue-level failure (the queue itself full/closed, or the job's task panicking) that never had one, and always `null` on `"done"`. Issue #187 review, finding 3: lets a daemon-attached CLI client reconstruct the original error and exit with the same code an equivalent embedded failure would, instead of every job failure collapsing to a generic internal error. `#[serde(default)]` on the Rust side, so a daemon predating this field omits the key entirely rather than sending `null` — treat a missing key the same as `null` |
 | `created_at` | string | ISO 8601 timestamp |
 | `started_at` | string\|null | ISO 8601 timestamp; null while pending |
 | `completed_at` | string\|null | ISO 8601 timestamp; null while running |
@@ -414,7 +416,7 @@ connection closes:
 
 ```
 event: job
-data: {"id":"01KTVM5XMA59N4WGHNZ80QX9B7","store_id":"notes","scope":{"type":"store"},"state":"done","stats":{...},"error":null,"created_at":"...","started_at":"...","completed_at":"..."}
+data: {"id":"01KTVM5XMA59N4WGHNZ80QX9B7","store_id":"notes","scope":{"type":"store"},"state":"done","stats":{...},"error":null,"error_code":null,"created_at":"...","started_at":"...","completed_at":"..."}
 ```
 
 A client that connects after the job has already reached a terminal state — or after its live

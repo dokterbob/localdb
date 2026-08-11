@@ -886,11 +886,9 @@ mod tests {
                     job_state_clone
                         .backend()
                         .retrieval_store(&job_store_id)
-                        .await
-                        .map_err(|e| format!("upsert failed: {}", e))?
+                        .await?
                         .upsert_chunks(chunks)
-                        .await
-                        .map_err(|e| format!("upsert failed: {}", e))?;
+                        .await?;
                     Ok(localdb_core::IndexJobStats {
                         docs_indexed: 1,
                         chunks_written: 1,

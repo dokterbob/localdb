@@ -559,6 +559,7 @@ pub fn create_index_job(store_id: &str, scope: IndexJobScope) -> IndexJob {
         state: IndexJobState::Pending,
         stats: IndexJobStats::default(),
         error: None,
+        error_code: None,
         created_at: now_rfc3339(),
         started_at: None,
         completed_at: None,
@@ -578,10 +579,30 @@ pub fn complete_index_job(job: &mut IndexJob, stats: IndexJobStats) {
     job.completed_at = Some(now_rfc3339());
 }
 
-/// Mark an IndexJob as failed with an error message.
+/// Mark an IndexJob as failed with an unclassified error message — a
+/// synthetic queue-level failure (the queue itself is full/closed, or the
+/// job's task panicked) that never had a typed `core::Error` to carry a
+/// stable code from. `job.error_code` is left `None`; a caller reconstructing
+/// the job's error (`cli::job_attach::finish_job`) falls back to
+/// `Error::Internal` for these, same as it always has.
 pub fn fail_index_job(job: &mut IndexJob, error: String) {
     job.state = IndexJobState::Failed;
     job.error = Some(error);
+    job.error_code = None;
+    job.completed_at = Some(now_rfc3339());
+}
+
+/// Mark an IndexJob as failed from a typed `core::Error`, carrying both its
+/// display message (`job.error`) and its stable `code()` string
+/// (`job.error_code`) — the pairing `Error::from_code` can invert. This is
+/// what lets a daemon-attached job failure surface with the same exit code
+/// an embedded pre-flight failure of the same kind would (issue #187
+/// review): without it, every job-level failure collapsed to a bare string,
+/// indistinguishable from `Error::Internal` once read back by the CLI.
+pub fn fail_index_job_with_error(job: &mut IndexJob, error: &Error) {
+    job.state = IndexJobState::Failed;
+    job.error = Some(error.to_string());
+    job.error_code = Some(error.code().to_string());
     job.completed_at = Some(now_rfc3339());
 }
 
@@ -1548,6 +1569,24 @@ mod tests {
         fail_index_job(&mut job, "something went wrong".to_string());
         assert_eq!(job.state, IndexJobState::Failed);
         assert_eq!(job.error.as_deref(), Some("something went wrong"));
+        assert_eq!(
+            job.error_code, None,
+            "a synthetic queue-level failure never had a typed error to carry a code from"
+        );
+        assert!(job.completed_at.is_some());
+    }
+
+    #[test]
+    fn fail_index_job_with_error_carries_the_typed_errors_code_and_message() {
+        let mut job = create_index_job("store-1", IndexJobScope::Store);
+        start_index_job(&mut job);
+        let err = Error::InvalidConfig {
+            message: "unconfigured embedder provider".to_string(),
+        };
+        fail_index_job_with_error(&mut job, &err);
+        assert_eq!(job.state, IndexJobState::Failed);
+        assert_eq!(job.error.as_deref(), Some(err.to_string().as_str()));
+        assert_eq!(job.error_code.as_deref(), Some("invalid_config"));
         assert!(job.completed_at.is_some());
     }
 

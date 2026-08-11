@@ -139,7 +139,6 @@ pub(crate) async fn run_embedded_store_job(
                 job_exec::run_job(&store_row_owned, scope_for_job, deletion, deps)
                     .await
                     .map(|(stats, _)| stats)
-                    .map_err(|e| e.to_string())
             }
         })
         .await?;
@@ -151,6 +150,7 @@ pub(crate) async fn run_embedded_store_job(
         final_job.state,
         final_job.stats,
         final_job.error,
+        final_job.error_code,
     )
 }
 
@@ -310,6 +310,7 @@ pub(crate) async fn run_daemon_store_job(
         final_job.state,
         final_job.stats,
         final_job.error,
+        final_job.error_code,
     )
 }
 
@@ -464,12 +465,27 @@ async fn poll_job_until_terminal(base_url: &str, job_id: &str) -> Result<IndexJo
 /// strict-vs-warn semantics to a `Failed` (or, defensively, any other
 /// non-terminal) state. `context` is a short human-readable label used only
 /// in the resulting diagnostic/error text.
+///
+/// `error_code`, when present, is the failed job's `Error::code()` string
+/// (`IndexJob::error_code` — set by `fail_index_job_with_error` on the
+/// engine side of either transport). Under `StrictExit` this is threaded
+/// through `Error::from_code` to reconstruct the *original* typed error
+/// (e.g. `Error::InvalidConfig`, exit 2) instead of always collapsing to
+/// `Error::Internal` (exit 1) — the transport-parity fix for issue #187
+/// review finding 3: an embedded pre-flight failure (e.g. embedder
+/// construction in `run_embedded_store_job`, caught before the job is even
+/// submitted) already surfaced its typed error directly; a daemon-attached
+/// job reached this function with only a stringified message and lost that
+/// classification. `error_code: None` (a synthetic queue-level failure, or
+/// an older daemon predating this field) falls back to the historical
+/// `Error::Internal` behavior unchanged.
 fn finish_job(
     mode: IndexErrorMode,
     context: &str,
     state: IndexJobState,
     stats: IndexJobStats,
     error: Option<String>,
+    error_code: Option<String>,
 ) -> Result<IndexSummary, Error> {
     match state {
         IndexJobState::Done => Ok(IndexSummary::from_job_stats(stats)),
@@ -479,10 +495,13 @@ fn finish_job(
                 eprintln!("warning: {context}: {msg}");
                 Ok(IndexSummary::default())
             } else {
-                Err(Error::Internal {
+                let typed = error_code
+                    .as_deref()
+                    .and_then(|code| Error::from_code(code, msg.clone()));
+                Err(typed.unwrap_or_else(|| Error::Internal {
                     message: format!("{context}: {msg}"),
                     correlation_id: "index_job_failed".to_string(),
-                })
+                }))
             }
         }
         _ => Err(Error::Internal {
@@ -530,6 +549,7 @@ mod tests {
             state,
             stats: IndexJobStats::default(),
             error: None,
+            error_code: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             started_at: None,
             completed_at: None,
@@ -1151,6 +1171,7 @@ mod tests {
                 ..Default::default()
             },
             Some("boom".to_string()),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1168,6 +1189,7 @@ mod tests {
             IndexJobState::Failed,
             IndexJobStats::default(),
             Some("boom".to_string()),
+            None,
         )
         .unwrap_err();
         assert!(
@@ -1185,11 +1207,64 @@ mod tests {
             IndexJobState::Failed,
             IndexJobStats::default(),
             None,
+            None,
         )
         .unwrap_err();
         assert!(
             matches!(err, Error::Internal { ref message, .. } if message.contains("index job failed")),
             "expected the generic fallback message, got: {err:?}"
+        );
+    }
+
+    /// Issue #187 review, finding 3: a failed job carrying a recognized
+    /// `error_code` (e.g. `invalid_config`, the code an embedder-construction
+    /// failure classifies as) must reconstruct the *original* typed error
+    /// under `StrictExit` — not collapse to `Error::Internal` — so a
+    /// daemon-attached failure exits with the same code (2) an embedded
+    /// pre-flight failure of the same kind already does (see
+    /// `run_embedded_store_job`'s doc comment and
+    /// `index_embedder_creation_failure_exits_2` in
+    /// `localdb/tests/cli_integration.rs`).
+    #[test]
+    fn finish_job_failed_with_a_recognized_error_code_reconstructs_the_typed_error() {
+        let err = finish_job(
+            IndexErrorMode::StrictExit,
+            "auto-index job for store 'docs'",
+            IndexJobState::Failed,
+            IndexJobStats::default(),
+            Some("unconfigured embedder provider".to_string()),
+            Some("invalid_config".to_string()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            Error::InvalidConfig {
+                message: "unconfigured embedder provider".to_string()
+            },
+            "expected the original typed error reconstructed via Error::from_code, got: {err:?}"
+        );
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    /// An `error_code` this binary doesn't recognize (e.g. a newer daemon)
+    /// must fall back to the historical contextualized `Error::Internal`,
+    /// exactly like `error_code: None` — never panic or silently drop the
+    /// message.
+    #[test]
+    fn finish_job_failed_with_an_unrecognized_error_code_falls_back_to_internal() {
+        let err = finish_job(
+            IndexErrorMode::StrictExit,
+            "auto-index job for store 'docs'",
+            IndexJobState::Failed,
+            IndexJobStats::default(),
+            Some("boom".to_string()),
+            Some("some_future_code".to_string()),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::Internal { ref message, .. }
+                if message.contains("auto-index job for store 'docs'") && message.contains("boom")),
+            "expected the Internal fallback, got: {err:?}"
         );
     }
 
@@ -1207,6 +1282,7 @@ mod tests {
             "auto-index",
             IndexJobState::Running,
             IndexJobStats::default(),
+            None,
             None,
         )
         .unwrap_err();

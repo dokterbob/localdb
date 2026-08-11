@@ -168,11 +168,16 @@ recommends `--max-entries` to bound that.
 — `…` is the configured integer or `unbounded`. `--json` adds parsed `max_entries` (`null` or integer)
 and `fetch_full_content` (bool), reconstructed from `config_json` (never the raw column), and now
 also surfaces `refresh` for both `url` and `feed` sources. The **human** rendering's store-name
-column still follows §2.2's scope rule — prepended only when more than one store is in scope. The
-**`--json`** `store` field (`{"name": ...}`) is different: it is emitted **unconditionally**, on
-every row regardless of how many stores are in scope, matching the pre-existing embedded behavior
-— there never was a single-store special case on the `--json` path, and the feed detail above
-composes with it either way.
+column still follows §2.2's scope rule — prepended only when more than one store is in *the
+resolved scope*, independent of which of those stores actually contributed a row to the output (a
+scope of two stores where only one has any sources still gets the column on that one row — issue
+#187 review, finding 1). The **`--json`** `store` field (`{"name": ...}`) is different: it is
+emitted **unconditionally**, on every row regardless of how many stores are in scope, matching the
+pre-existing embedded behavior — there never was a single-store special case on the `--json` path,
+and the feed detail above composes with it either way. A top-level, sibling `store_id` field (the
+owning store's ULID, not its name) is emitted unconditionally alongside `store` on every row too
+(issue #187 review, finding 2) — pre-existing embedded behavior, also documented in `docs/cli.md`'s
+`source list --json` example.
 
 ### 2.4 `status` output
 
@@ -260,8 +265,16 @@ later if a consumer demands it).
   concurrently against a single sequential worker (job worker pool size N>1 is a follow-up, not
   v1 scope). The URL-refresh scheduler submits jobs through this same engine, not a separate code
   path. Clients poll `GET /jobs/{id}` for the current `IndexJob` (state
-  `pending`/`running`/`done`/`failed`, `stats`, `error`, timestamps) or stream `GET
-  /jobs/{id}/events` for live progress (below).
+  `pending`/`running`/`done`/`failed`, `stats`, `error`, `error_code`, timestamps) or stream `GET
+  /jobs/{id}/events` for live progress (below). `error_code` (issue #187 review, finding 3) is the
+  failing `core::Error`'s stable `code()` string (§5) when the job's `Failed` state came from a
+  typed error — `null`/absent for a synthetic queue-level failure (the queue itself full/closed, or
+  the job's task panicking) that never had one, and always absent on `done`. `error_code` +
+  `error` round-trip through the same `code -> Error` mapping a daemon HTTP error body's `code`
+  field does (§5), so a daemon-attached CLI client reconstructs the original typed error and exits
+  with the same code an equivalent embedded failure would, instead of collapsing every job failure
+  to a generic internal error. `#[serde(default)]`, so a daemon predating this field omits the key
+  entirely rather than sending `null`.
 - **`GET /jobs/{id}/events`** (SSE, issue #83): streams the job's live progress as
   `text/event-stream`. Each in-flight update is an `event: progress` frame whose `data:` is one
   JSON-serialized `core::ProgressEvent` (internally tagged `type`: `source_started`,
@@ -536,6 +549,15 @@ MCP tool error). Codes are stable API:
 
 CLI exit codes: `0` ok, `1` internal, `2` invalid usage/config, `3` not found, `4` conflict/locked,
 `5` unavailable (daemon/provider/model).
+
+`core::Error::from_code(code, message)` is the one mapping back from a `{code, message}` pair to a
+typed `Error` (the inverse of `code()` above), shared by every surface that receives an error this
+way rather than as the enum itself: a daemon HTTP error body's `code` field
+(`cli::daemon_client::decode_daemon_error`) and a failed `IndexJob`'s `error_code`/`error` fields
+(`cli::job_attach::finish_job`, §3's `POST /v1/jobs` entry — issue #187 review, finding 3). Both
+call sites fall back to `internal` for a code `from_code` doesn't recognize (an unknown/newer code,
+or one of the three variants — `internal`, `unsupported_format`, `extraction_failed` — whose fields
+don't fit a single `message` string).
 
 ### `localdb index --strict`
 

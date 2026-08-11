@@ -576,6 +576,7 @@ pub(crate) async fn run_source_add_async(
 /// to the daemon when one is detected).
 struct SourceListItem {
     id: String,
+    store_id: String,
     store_name: String,
     kind: String,
     root: Option<String>,
@@ -598,6 +599,7 @@ fn source_row_to_list_item(s: &SourceRow, store_name: &str) -> SourceListItem {
     };
     SourceListItem {
         id: s.id.clone(),
+        store_id: s.store_id.clone(),
         store_name: store_name.to_string(),
         kind: kind_to_string(&s.kind).to_string(),
         root: s.root.clone(),
@@ -643,6 +645,11 @@ fn daemon_item_to_list_item(item: &serde_json::Value, store_name: &str) -> Sourc
             .and_then(|i| i.as_str())
             .unwrap_or("?")
             .to_string(),
+        store_id: item
+            .get("store_id")
+            .and_then(|i| i.as_str())
+            .unwrap_or("?")
+            .to_string(),
         store_name: store_name.to_string(),
         kind,
         root: spec
@@ -667,7 +674,18 @@ fn daemon_item_to_list_item(item: &serde_json::Value, store_name: &str) -> Sourc
 struct SourceListCmd;
 
 impl DaemonAwareCommand for SourceListCmd {
-    type Outcome = Vec<SourceListItem>;
+    // The resolved scope's store *names* alongside the items themselves
+    // (issue #187 review, finding 1) — the store-name column / "no sources
+    // on store X" message need every store *resolved* into scope, not just
+    // the subset that happened to return at least one item. Folding items
+    // from `--store populated --store empty` down to `Vec<SourceListItem>`
+    // alone loses `empty` entirely, so a caller reconstructing scope size
+    // from `items` would wrongly see one store in scope and drop the column.
+    // Returning both from the one dispatch call (rather than a second
+    // dispatch just to re-resolve names) also avoids doubling the daemon
+    // round-trip cost for every `source list` invocation, not just the
+    // previously-special-cased empty one.
+    type Outcome = (Vec<String>, Vec<SourceListItem>);
 
     // specs/05-surfaces.md §2.2: `-s` is a *filter* — a bare `source list`
     // spans every store.
@@ -689,7 +707,7 @@ impl DaemonAwareCommand for SourceListCmd {
             })
             .await?;
         }
-        Ok(all)
+        Ok((store_names, all))
     }
 
     async fn run_embedded(
@@ -706,7 +724,8 @@ impl DaemonAwareCommand for SourceListCmd {
                 all.push(source_row_to_list_item(s, &row.name));
             }
         }
-        Ok(all)
+        let store_names = rows.into_iter().map(|r| r.name).collect();
+        Ok((store_names, all))
     }
 }
 
@@ -725,10 +744,16 @@ fn store_column_width<'a>(names: impl Iterator<Item = &'a str>) -> usize {
 /// unconditionally, matching the pre-existing embedded behavior — the spec's
 /// "only when more than one store is in scope" claim (§2.3) is itself wrong
 /// and gets corrected in the docs stage, not here (no behavior churn).
+///
+/// `store_id` (issue #187 review, finding 2) sits alongside `store.name` —
+/// pre-existing embedded behavior (and documented in `docs/cli.md`'s worked
+/// example) that the shared renderer dropped when both transports were
+/// unified onto it; restored here so it's populated by both.
 fn source_list_item_json(s: &SourceListItem) -> serde_json::Value {
     let mut obj = json!({
         "id": s.id,
         "store": { "name": s.store_name },
+        "store_id": s.store_id,
         "kind": s.kind,
         "root": s.root,
         "url": s.url,
@@ -815,66 +840,14 @@ pub fn run_source_list(ctx: &CliContext) {
 
 pub(crate) async fn run_source_list_async(ctx: &CliContext) {
     let (config_loader, db) = load_app_db(ctx).await;
-    let items = dispatch(&SourceListCmd, ctx, &config_loader, &db).await;
-
-    // The store-name column / "no sources on store X" message need the
-    // resolved scope's store *names*, independent of whether any of them
-    // actually had sources — recomputed the same way `dispatch` just did,
-    // through whichever transport is active, so this never has to guess.
-    let scope_store_names: Vec<String> = if items.is_empty() {
-        // Cheap path: an empty scope or an empty result set either way needs
-        // the store names only for the human-mode message; re-resolve once
-        // more via the same dispatch machinery used above would double the
-        // network cost for daemon mode, so this falls back to the resolved
-        // set already implied by `items` when non-empty, and to the
-        // embedded/daemon resolver directly when it's empty.
-        resolve_scope_store_names(ctx, &config_loader, &db).await
-    } else {
-        let mut names: Vec<String> = Vec::new();
-        for item in &items {
-            if !names.iter().any(|n| n == &item.store_name) {
-                names.push(item.store_name.clone());
-            }
-        }
-        names
-    };
-
+    // The store-name column / "no sources on store X" message key off the
+    // *resolved scope's* store names (`scope_store_names`), never off which
+    // of them happened to return an item (issue #187 review, finding 1) — a
+    // scope of `--store populated --store empty` must still show the column
+    // on `populated`'s line, not silently collapse to a single-store-looking
+    // scope just because `empty` contributed nothing to `items`.
+    let (scope_store_names, items) = dispatch(&SourceListCmd, ctx, &config_loader, &db).await;
     render_source_list(&items, &scope_store_names, ctx.json);
-}
-
-/// Resolve just the store *names* in `source list`'s scope, through whichever
-/// transport is active — used only for the empty-scope human-mode message
-/// ("No sources on store 'x'." vs "No sources in scope."), since an empty
-/// `items` list can't itself reveal how many stores were in scope.
-async fn resolve_scope_store_names(
-    ctx: &CliContext,
-    config_loader: &ConfigLoader,
-    db: &AppDb,
-) -> Vec<String> {
-    struct ScopeNamesCmd;
-    impl DaemonAwareCommand for ScopeNamesCmd {
-        type Outcome = Vec<String>;
-        const SCOPE_POLICY: StoreScopePolicy = StoreScopePolicy::AllStores;
-
-        async fn run_daemon(
-            &self,
-            ctx: &CliContext,
-            base_url: &str,
-        ) -> Result<Self::Outcome, Error> {
-            crate::app_db::resolve_daemon_store_scope_inner(base_url, ctx, Self::SCOPE_POLICY).await
-        }
-
-        async fn run_embedded(
-            &self,
-            ctx: &CliContext,
-            _config_loader: &ConfigLoader,
-            db: &AppDb,
-        ) -> Result<Self::Outcome, Error> {
-            let rows = resolve_store_scope_inner(ctx, db, Self::SCOPE_POLICY).await?;
-            Ok(rows.into_iter().map(|r| r.name).collect())
-        }
-    }
-    dispatch(&ScopeNamesCmd, ctx, config_loader, db).await
 }
 
 // ---------------------------------------------------------------------------

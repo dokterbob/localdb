@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use localdb_core::IndexJobScope;
+use localdb_core::{Error, IndexJobScope};
 
 use crate::job_exec::{self, JobExecDeps};
 use crate::job_queue::JobQueue;
@@ -177,15 +177,17 @@ impl UrlRefreshScheduler {
                             "URL refresh job running for source '{}' ({})",
                             source_id_for_closure, store_name_for_closure
                         );
-                        let state = state_for_closure.ok_or_else(|| {
-                            "URL refresh scheduler has no state attached".to_string()
+                        let state = state_for_closure.ok_or_else(|| Error::Internal {
+                            message: "URL refresh scheduler has no state attached".to_string(),
+                            correlation_id: "url_refresh_no_state".to_string(),
                         })?;
                         let store_row = state
                             .backend()
                             .get_store_by_name(&store_name_for_closure)
-                            .await
-                            .map_err(|e| e.to_string())?
-                            .ok_or_else(|| format!("store not found: {store_name_for_closure}"))?;
+                            .await?
+                            .ok_or_else(|| Error::StoreNotFound {
+                                id: store_name_for_closure.clone(),
+                            })?;
                         let yaml = state.yaml_config().await;
                         let deps = JobExecDeps {
                             backend: state.backend(),
@@ -205,7 +207,6 @@ impl UrlRefreshScheduler {
                         )
                         .await
                         .map(|(stats, _embedder)| stats)
-                        .map_err(|e| e.to_string())
                     },
                 )
                 .await;

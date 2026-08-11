@@ -85,7 +85,6 @@ pub async fn create_job(
             job_exec::run_job(&store_row, job_scope_for_closure, deletion, deps)
                 .await
                 .map(|(stats, _embedder)| stats)
-                .map_err(|e| e.to_string())
         })
         .await?;
 

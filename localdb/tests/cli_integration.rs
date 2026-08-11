@@ -2094,6 +2094,60 @@ fn source_list_shows_store_column_only_when_multi_store_in_scope() {
     );
 }
 
+/// Issue #187 review, finding 1: a scope of two stores where only *one* has
+/// any sources must still show the store-name column — the column keys off
+/// the size of the *resolved scope* (2 stores), never off how many of those
+/// stores happened to contribute an item to the result set. Regression test
+/// for a bug where the renderer instead rebuilt "how many stores are in
+/// scope" from the *returned items'* own `store_name`s, so a scope of
+/// `--store populated --store empty` silently looked single-store (only
+/// `populated` ever appears in `items`) and dropped the column.
+#[test]
+fn source_list_shows_store_column_even_when_one_scoped_store_is_empty() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    for name in ["populated", "empty"] {
+        cmd_with_dir(&dir)
+            .args(["store", "add", name])
+            .assert()
+            .success();
+    }
+
+    let fixture = dir.path().join("populated-docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+    std::fs::write(fixture.join("doc.md"), "# Doc\n\nhello\n").unwrap();
+    cmd_with_dir(&dir)
+        .args([
+            "--store",
+            "populated",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let output = cmd_with_dir(&dir)
+        .args(["--store", "populated", "--store", "empty", "source", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 1, "only 'populated' has a source: {stdout}");
+    // Column width = longest name in scope ("populated", 9) + 2 = 11.
+    assert!(
+        lines[0].starts_with("populated  "),
+        "expected the store-name column even though 'empty' contributed no \
+         items to the result set: {lines:?}"
+    );
+}
+
 /// `index` with no `--store` touches every store, not just the first —
 /// verified via the multi-store `--json` shape (`{"stores": [...], "total":
 /// {...}}`, specs/05-surfaces.md §2.2).
@@ -2222,6 +2276,47 @@ fn source_list_no_store_flag_json_includes_every_store() {
     assert_eq!(
         names,
         ["books", "default", "research"].into_iter().collect()
+    );
+}
+
+/// Issue #187 review, finding 2: `source list --json` must include
+/// `store_id` alongside `store.name` — pre-wave behavior (see
+/// `docs/cli.md`'s worked example) that the shared `SourceListItem`
+/// renderer introduced when both transports were unified onto it silently
+/// dropped. Each source's `store_id` must be a real, non-empty store ULID,
+/// distinct across stores (never the store's *name*, and never blank).
+#[test]
+fn source_list_json_includes_store_id() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir); // books, default, research — one source each
+
+    let output = cmd_with_dir(&dir)
+        .args(["--json", "source", "list"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    let sources = v["sources"].as_array().expect("sources array");
+    assert_eq!(sources.len(), 3, "{v}");
+
+    let mut store_ids = std::collections::HashSet::new();
+    for s in sources {
+        let store_id = s["store_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a string store_id on {s}"));
+        assert!(!store_id.is_empty(), "store_id must not be blank: {s}");
+        let store_name = s["store"]["name"].as_str().unwrap();
+        assert_ne!(
+            store_id, store_name,
+            "store_id must be the store's ULID, not its name: {s}"
+        );
+        store_ids.insert(store_id.to_string());
+    }
+    assert_eq!(
+        store_ids.len(),
+        3,
+        "each of the three stores must have its own distinct store_id: {v}"
     );
 }
 
@@ -2850,6 +2945,22 @@ fn index_job_done_json(job_id: &str, store_id: &str, stats_json: &str) -> String
 fn index_job_failed_json(job_id: &str, store_id: &str, error: &str) -> String {
     format!(
         r#"{{"id":"{job_id}","store_id":"{store_id}","scope":{{"type":"store"}},"state":"failed","stats":{{}},"error":"{error}","created_at":"2026-01-01T00:00:00Z"}}"#
+    )
+}
+
+/// Like [`index_job_failed_json`], but with an explicit `error_code` (issue
+/// #187 review, finding 3) — for stubbing a daemon job whose failure came
+/// from a typed `core::Error` (e.g. `"invalid_config"`), so
+/// `cli::job_attach::finish_job` can reconstruct the original variant and
+/// exit with its code instead of collapsing to `Error::Internal` (exit 1).
+fn index_job_failed_json_with_code(
+    job_id: &str,
+    store_id: &str,
+    error: &str,
+    error_code: &str,
+) -> String {
+    format!(
+        r#"{{"id":"{job_id}","store_id":"{store_id}","scope":{{"type":"store"}},"state":"failed","stats":{{}},"error":"{error}","error_code":"{error_code}","created_at":"2026-01-01T00:00:00Z"}}"#
     )
 }
 
@@ -5026,6 +5137,61 @@ fn index_daemon_failed_job_exits_1_regardless_of_strict() {
     }
 }
 
+/// Issue #187 review, finding 3: a daemon job classified with a recognized
+/// `error_code` (here `invalid_config`, the code an embedder-construction
+/// failure carries) must exit with *that* code — 2 — daemon-attached, not
+/// the undifferentiated exit 1 `index_daemon_failed_job_exits_1_regardless_of_strict`
+/// pins for an unclassified failure. This is transport parity with embedded
+/// mode's own pre-flight embedder-construction failure, which has always
+/// exited 2 (`index_embedder_creation_failure_exits_2` above): before this
+/// fix, the daemon stringified every job-level error before it ever reached
+/// the terminal `IndexJob`, so this exact scenario exited 1 daemon-attached
+/// despite being the identical underlying failure as the embedded case.
+#[test]
+fn index_daemon_failed_job_with_invalid_config_code_exits_2_like_embedded() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let stores_body = paginated_list_body(&[&store_record_json("failstore")]);
+    let job_body = r#"{"id":"job-fail","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_failed_json_with_code(
+        "job-fail",
+        "failstore",
+        "unconfigured embedder provider",
+        "invalid_config",
+    ));
+    let (port, _received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-fail/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+        ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
+    ]);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["index"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a daemon job failure classified as invalid_config must exit 2, matching \
+         embedded's own embedder-construction pre-flight failure; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unconfigured embedder provider"),
+        "the job's own error text must still reach stderr; got: {stderr}"
+    );
+}
+
 /// A daemon job that completes (`done`) but reports per-source/per-document
 /// errors in its stats must drive `--strict` exactly like embedded's
 /// `strict_should_fail` does: exit 2 with `--strict`, exit 0 without it —
@@ -6305,16 +6471,24 @@ fn source_list_daemon_routes_and_matches_embedded_shape() {
         .unwrap();
     let embedded_text_stdout = String::from_utf8_lossy(&embedded_text.stdout).to_string();
 
-    // Mirror the embedded run's own persisted source exactly (same id/root),
-    // so the daemon-mock fixture describes the same logical source.
+    // Mirror the embedded run's own persisted source exactly (same
+    // id/root/store_id), so the daemon-mock fixture describes the same
+    // logical source and `embedded_v == daemon_v` is a meaningful check —
+    // `store_id` (issue #187 review, finding 2) is a real internal store
+    // ULID minted by `store add`, not the store's name, so it has to be
+    // pulled from the embedded run's own output rather than guessed.
     let src_id = embedded_v["sources"][0]["id"].as_str().unwrap().to_string();
+    let store_id = embedded_v["sources"][0]["store_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let root = embedded_v["sources"][0]["root"]
         .as_str()
         .unwrap()
         .to_string();
     let src_json = serde_json::json!({
         "id": src_id,
-        "store_id": "mystore",
+        "store_id": store_id,
         "kind": "path",
         "spec": { "root": root },
         "preset": "prose",
@@ -6356,6 +6530,13 @@ fn source_list_daemon_routes_and_matches_embedded_shape() {
         embedded_v, daemon_v,
         "--json source list must be identical between embedded and daemon-mock"
     );
+    // Issue #187 review, finding 2: `store_id` must be present (not just
+    // `store.name`) on both transports — the shared renderer this test
+    // otherwise exercises had dropped it entirely.
+    assert_eq!(
+        daemon_v["sources"][0]["store_id"], store_id,
+        "daemon-routed source list --json must include store_id: {daemon_v}"
+    );
 
     let daemon_text = cmd_with_dir(&daemon_dir)
         .env("LOCALDB_DAEMON_URL", &daemon_url)
@@ -6374,6 +6555,141 @@ fn source_list_daemon_routes_and_matches_embedded_shape() {
             .any(|(l, _)| l.starts_with("GET /v1/stores/mystore/sources")),
         "expected a GET /v1/stores/mystore/sources request; got {:?}",
         reqs
+    );
+}
+
+/// Daemon-transport counterpart of
+/// `source_list_shows_store_column_even_when_one_scoped_store_is_empty`
+/// (issue #187 review, finding 1) — shape-parity style with
+/// `source_list_daemon_routes_and_matches_embedded_shape` above: builds the
+/// same "two stores in scope, only one has sources" fixture through an
+/// embedded run first, then reproduces it against a daemon-mock and asserts
+/// both text and `--json` output are byte-identical between the two
+/// transports. Before the fix, the daemon branch had the identical bug as
+/// embedded (the shared renderer, not either transport's own resolver, was
+/// at fault): the store-name column disappeared because `empty` never
+/// contributed an item.
+#[test]
+fn source_list_daemon_shows_store_column_even_when_one_scoped_store_is_empty() {
+    let embedded_dir = TempDir::new().unwrap();
+    write_default_config(&embedded_dir);
+    for name in ["populated", "empty"] {
+        cmd_with_dir(&embedded_dir)
+            .args(["store", "add", name])
+            .assert()
+            .success();
+    }
+    let fixture = embedded_dir.path().join("docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+    cmd_with_dir(&embedded_dir)
+        .args([
+            "--store",
+            "populated",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let embedded_args = ["--store", "populated", "--store", "empty", "source", "list"];
+    let embedded_json = cmd_with_dir(&embedded_dir)
+        .args(["--json"])
+        .args(embedded_args)
+        .output()
+        .unwrap();
+    assert!(embedded_json.status.success());
+    let embedded_v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&embedded_json.stdout)).unwrap();
+    let embedded_text = cmd_with_dir(&embedded_dir)
+        .args(embedded_args)
+        .output()
+        .unwrap();
+    assert!(embedded_text.status.success());
+    let embedded_text_stdout = String::from_utf8_lossy(&embedded_text.stdout).to_string();
+    // Sanity check on the embedded fixture itself, matching the equivalent
+    // assertion in `source_list_shows_store_column_even_when_one_scoped_store_is_empty`:
+    // only 'populated' produced a source, but the column must still appear.
+    assert!(
+        embedded_text_stdout
+            .lines()
+            .next()
+            .unwrap()
+            .starts_with("populated  "),
+        "embedded fixture sanity check failed: {embedded_text_stdout}"
+    );
+
+    let src_id = embedded_v["sources"][0]["id"].as_str().unwrap().to_string();
+    let store_id = embedded_v["sources"][0]["store_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let root = embedded_v["sources"][0]["root"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let src_json = serde_json::json!({
+        "id": src_id,
+        "store_id": store_id,
+        "kind": "path",
+        "spec": { "root": root },
+        "preset": "prose",
+    })
+    .to_string();
+
+    let daemon_dir = TempDir::new().unwrap();
+    write_default_config(&daemon_dir);
+    let stores_body =
+        paginated_list_body(&[&store_record_json("populated"), &store_record_json("empty")]);
+    let populated_sources = paginated_list_body(&[&src_json]);
+    let empty_sources = paginated_list_body(&[]);
+    let (port, _received) = start_routing_mock_server(vec![
+        // The specific `/sources` routes must be listed before the bare
+        // `/v1/stores` fallback — first-match-wins on a path *prefix*.
+        (
+            "GET",
+            "/v1/stores/populated/sources",
+            "HTTP/1.1 200 OK",
+            populated_sources,
+        ),
+        (
+            "GET",
+            "/v1/stores/empty/sources",
+            "HTTP/1.1 200 OK",
+            empty_sources,
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+    ]);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let daemon_json = cmd_with_dir(&daemon_dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["--json"])
+        .args(embedded_args)
+        .output()
+        .unwrap();
+    assert!(
+        daemon_json.status.success(),
+        "daemon-routed source list --json should succeed; stderr: {}",
+        String::from_utf8_lossy(&daemon_json.stderr)
+    );
+    let daemon_v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&daemon_json.stdout)).unwrap();
+    assert_eq!(
+        embedded_v, daemon_v,
+        "--json source list must be identical between embedded and daemon-mock"
+    );
+
+    let daemon_text = cmd_with_dir(&daemon_dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(embedded_args)
+        .output()
+        .unwrap();
+    let daemon_text_stdout = String::from_utf8_lossy(&daemon_text.stdout).to_string();
+    assert_eq!(
+        embedded_text_stdout, daemon_text_stdout,
+        "text source list must be identical between embedded and daemon-mock, \
+         including the store-name column surviving an empty scoped store"
     );
 }
 
