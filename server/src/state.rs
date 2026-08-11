@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
@@ -56,6 +56,7 @@ pub struct AppState {
 struct Inner {
     yaml_config: RwLock<RawConfig>,
     data_dir: PathBuf,
+    models_dir: PathBuf,
     backend: Arc<dyn StoreBackend>,
     default_indexing_policy: IndexingPolicyConfig,
     default_policy_version: String,
@@ -68,6 +69,7 @@ impl AppState {
     pub async fn new(
         yaml_config: RawConfig,
         data_dir: PathBuf,
+        models_dir: PathBuf,
         job_queue: JobQueue,
         url_scheduler: UrlRefreshScheduler,
     ) -> Result<Self, Error> {
@@ -89,6 +91,7 @@ impl AppState {
             inner: Arc::new(Inner {
                 yaml_config: RwLock::new(yaml_config),
                 data_dir,
+                models_dir,
                 backend,
                 default_indexing_policy,
                 default_policy_version,
@@ -105,6 +108,12 @@ impl AppState {
 
     pub fn data_dir(&self) -> &PathBuf {
         &self.inner.data_dir
+    }
+
+    /// The directory `embed::create_embedder` should cache/load local model
+    /// weights from (mirrors the CLI's `ResolvedPaths::models_dir`).
+    pub fn models_dir(&self) -> &Path {
+        &self.inner.models_dir
     }
 
     pub fn backend(&self) -> &dyn StoreBackend {
@@ -502,12 +511,19 @@ mod tests {
         let state = AppState::new(
             yaml_config,
             dir.path().to_path_buf(),
+            dir.path().join("models"),
             queue.clone(),
             UrlRefreshScheduler::new(queue),
         )
         .await
         .unwrap();
         (dir, state)
+    }
+
+    #[tokio::test]
+    async fn models_dir_returns_the_value_it_was_given() {
+        let (dir, state) = make_state().await;
+        assert_eq!(state.models_dir(), dir.path().join("models"));
     }
 
     #[tokio::test]

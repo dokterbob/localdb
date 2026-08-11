@@ -62,6 +62,7 @@ pub use search::{
     QueryResponse, SearchOrchestrator, StoreHandle,
 };
 pub use snippet::truncate_snippet;
+pub use source::source_row_to_source;
 #[cfg(any(test, feature = "test-support"))]
 pub use store::FakeStore;
 pub use store::{ChunkRecord, MetadataFilter, RetrievalStore, SearchResult, StoreStats};

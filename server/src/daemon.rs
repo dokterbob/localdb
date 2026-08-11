@@ -107,6 +107,7 @@ async fn build_daemon_state(
     let state = AppState::new(
         options.config.clone(),
         options.paths.data_dir.clone(),
+        options.paths.models_dir.clone(),
         queue.clone(),
         url_scheduler.clone(),
     )
@@ -408,6 +409,7 @@ mod tests {
         let state = AppState::new(
             yaml_config,
             dir.path().to_path_buf(),
+            dir.path().join("models"),
             queue.clone(),
             crate::scheduler::UrlRefreshScheduler::new(queue),
         )
@@ -729,6 +731,7 @@ mod tests {
         let state = AppState::new(
             yaml_config,
             dir_real.to_path_buf(),
+            dir_real.join("models"),
             queue.clone(),
             UrlRefreshScheduler::new(queue.clone()),
         )
@@ -931,6 +934,7 @@ mod tests {
         let state = AppState::new(
             yaml_config,
             dir.path().to_path_buf(),
+            dir.path().join("models"),
             queue.clone(),
             UrlRefreshScheduler::new(queue),
         )

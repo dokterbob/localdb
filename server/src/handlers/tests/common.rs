@@ -33,6 +33,7 @@ pub(crate) async fn make_app() -> (TempDir, Router) {
     let state = AppState::new(
         yaml_config,
         dir.path().to_path_buf(),
+        dir.path().join("models"),
         queue.clone(),
         crate::scheduler::UrlRefreshScheduler::new(queue),
     )
@@ -88,6 +89,7 @@ pub(crate) async fn make_state_with_fake_config() -> (TempDir, AppState) {
     let state = AppState::new(
         yaml_config,
         dir.path().to_path_buf(),
+        dir.path().join("models"),
         queue.clone(),
         crate::scheduler::UrlRefreshScheduler::new(queue),
     )

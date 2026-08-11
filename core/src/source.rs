@@ -335,6 +335,66 @@ pub fn build_feed_config_json(max_entries: Option<u32>, fetch_full_content: bool
     .to_string()
 }
 
+// ---------------------------------------------------------------------------
+// SourceRow -> Source (read path)
+// ---------------------------------------------------------------------------
+
+/// Reconstruct a domain [`crate::types::Source`] from its persisted
+/// [`crate::backend::SourceRow`] form.
+///
+/// Pure, zero I/O — the mirror image of [`parse_source_spec`], which goes the
+/// other way (request JSON -> `ParsedSourceSpec` -> `SourceRow`). Shared by
+/// every surface that reads sources back out of a `StoreBackend` (currently
+/// `cli::normalize::source_row_to_core_source`, which re-exports this
+/// unchanged; `server` builds its own JSON shape via `source_row_to_record`
+/// instead, since the HTTP wire format differs from the domain `Source`
+/// type).
+pub fn source_row_to_source(row: &crate::backend::SourceRow) -> crate::types::Source {
+    use crate::types::{Source, SourceSpec};
+
+    // C5: `refresh` is stored as the raw human-readable string the user gave
+    // `localdb source add --refresh` (e.g. "24h"), validated at write time
+    // but never converted to seconds for storage — the seconds value must be
+    // recomputed here on every read. Tolerant: a row that somehow holds an
+    // invalid string (should never happen post-validation, but this is a
+    // read path and must not panic/error on stale data) falls back to `None`
+    // rather than failing the whole reconstruction.
+    let refresh_interval_secs = row
+        .refresh
+        .as_deref()
+        .and_then(|s| crate::config::validate_refresh_interval(s).ok())
+        .flatten();
+
+    let spec = match row.kind {
+        SourceKind::Url => SourceSpec::Url {
+            url: row.url.clone().unwrap_or_default(),
+            refresh_interval_secs,
+        },
+        SourceKind::Path => SourceSpec::Path {
+            root: row.root.clone().unwrap_or_default(),
+            include: row.include.clone(),
+            exclude: row.exclude.clone(),
+        },
+        SourceKind::Feed => {
+            let feed_config = parse_feed_config_json(row.config_json.as_deref());
+            SourceSpec::Feed {
+                url: row.url.clone().unwrap_or_default(),
+                max_entries: feed_config.max_entries,
+                fetch_full_content: feed_config.fetch_full_content,
+                refresh_interval_secs,
+            }
+        }
+    };
+
+    Source {
+        id: row.id.clone(),
+        store_id: row.store_id.clone(),
+        kind: row.kind.clone(),
+        spec,
+        source_preset: row.preset.clone(),
+    }
+}
+
 pub(crate) fn string_array_field(
     spec: &serde_json::Value,
     field: &str,

@@ -150,51 +150,12 @@ pub(crate) fn looks_like_id(s: &str) -> bool {
     false
 }
 
+/// Thin delegation to `core::source::source_row_to_source` — kept under its
+/// original name so no CLI call site needs to change. The conversion itself
+/// is pure (zero I/O) and needs nothing CLI-specific, so it now lives in
+/// `core` where `server` can share it too (issue #187).
 pub fn source_row_to_core_source(src: &SourceRow) -> localdb_core::types::Source {
-    use localdb_core::types::{Source, SourceSpec};
-
-    // C5: `refresh` is stored as the raw human-readable string the user
-    // gave `localdb source add --refresh` (e.g. "24h"), validated at write
-    // time but never converted to seconds for storage — the seconds value
-    // must be recomputed here on every read. Tolerant: a row that somehow
-    // holds an invalid string (should never happen post-validation, but
-    // this is a read path and must not panic/error on stale data) falls
-    // back to `None` rather than failing the whole reconstruction.
-    let refresh_interval_secs = src
-        .refresh
-        .as_deref()
-        .and_then(|s| localdb_core::config::validate_refresh_interval(s).ok())
-        .flatten();
-
-    let spec = match src.kind {
-        SourceKind::Url => SourceSpec::Url {
-            url: src.url.clone().unwrap_or_default(),
-            refresh_interval_secs,
-        },
-        SourceKind::Path => SourceSpec::Path {
-            root: src.root.clone().unwrap_or_default(),
-            include: src.include.clone(),
-            exclude: src.exclude.clone(),
-        },
-        SourceKind::Feed => {
-            let feed_config =
-                localdb_core::source::parse_feed_config_json(src.config_json.as_deref());
-            SourceSpec::Feed {
-                url: src.url.clone().unwrap_or_default(),
-                max_entries: feed_config.max_entries,
-                fetch_full_content: feed_config.fetch_full_content,
-                refresh_interval_secs,
-            }
-        }
-    };
-
-    Source {
-        id: src.id.clone(),
-        store_id: src.store_id.clone(),
-        kind: src.kind.clone(),
-        spec,
-        source_preset: src.preset.clone(),
-    }
+    localdb_core::source::source_row_to_source(src)
 }
 
 /// Prompt the user for confirmation of a destructive action.
