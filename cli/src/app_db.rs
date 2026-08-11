@@ -210,42 +210,86 @@ pub(crate) fn load_config_for_maintenance(ctx: &CliContext) -> ConfigLoader {
 }
 
 /// Name of the implicit default store used by `DefaultStore`-scoped commands
-/// (`source add`/`list`/`remove`) when no `--store` flag is given.
+/// (`source add` and its `add` alias) when no `--store` flag is given.
 pub(crate) const DEFAULT_STORE_NAME: &str = "default";
 
 /// How a command resolves its target store(s) when no explicit `--store`
-/// flags narrow the scope.
+/// flags narrow the scope (specs/05-surfaces.md §2.2).
+///
+/// This only ever governs the *omitted*-`--store` case: an explicit `-s` is
+/// validated and resolved identically under every variant.
 pub(crate) enum StoreScopePolicy {
-    /// No `--store` -> every store in the database (search, index, status).
+    /// No `--store` -> every store in the database; a database with no stores
+    /// at all is exit 2 (`status`, `store list`, `source list`,
+    /// `source remove`, `index`).
     AllStores,
-    /// No `--store` -> exactly the store named "default" (source add/list/remove).
+    /// No `--store` -> every store in the database; a database with no stores
+    /// resolves to an *empty* scope rather than an error (`search`, `mcp`).
+    ///
+    /// The two commands that need this are the two whose empty answer is a
+    /// correct answer: `search` on a fresh install has no results, and an MCP
+    /// server that exits non-zero at startup reads as a *broken* server to
+    /// its client rather than as an empty one. Every other all-stores command
+    /// would be doing silently nothing, which §2.2 makes exit 2.
+    AllStoresAllowEmpty,
+    /// No `--store` -> exactly the store named "default" (`source add` and
+    /// its `add` alias — the one write that must pick a single target).
     DefaultStore,
 }
 
-/// Reject `--store` on commands that operate on the whole database file
-/// (`db status`/`db migrate`/`db downgrade`), per specs/05-surfaces.md §2.2.
+/// Reject `--store` on commands that are not store-scoped at all, per
+/// specs/05-surfaces.md §2.2: `db status`/`migrate`/`downgrade`/`vacuum` (they operate
+/// on the whole database file), `store add`/`store remove` (the store is
+/// named by the command's own argument), `init` (there is no store concept
+/// yet) and `serve` (the daemon serves every store regardless).
+///
+/// `message` is the caller's own explanation of why the flag doesn't apply —
+/// it is the entire user-visible error text, so it must read as a complete
+/// sentence on its own.
 ///
 /// This is a standalone, `AppDb`-free counterpart to `resolve_store_scope`
-/// rather than a third `StoreScopePolicy` variant: those commands never open
-/// an `AppDb` (see `load_config_for_maintenance`'s doc comment above), so
-/// they have no handle to pass the async resolver. Exits the process (via
-/// `exit_err`) on error; see `reject_store_flag_inner` for the pure check.
-pub(crate) fn reject_store_flag(ctx: &CliContext) {
-    if let Err(e) = reject_store_flag_inner(ctx) {
+/// rather than a fourth `StoreScopePolicy` variant: several of these commands
+/// never open an `AppDb` at all (see `load_config_for_maintenance`'s doc
+/// comment above), so they have no handle to pass the async resolver, and the
+/// rest must reject *before* opening one so misuse never has a side effect.
+/// Exits the process (via `exit_err`) on error; see `reject_store_flag_inner`
+/// for the pure check.
+pub(crate) fn reject_store_flag(ctx: &CliContext, message: &str) {
+    if let Err(e) = reject_store_flag_inner(ctx, message) {
         exit_err(&e, ctx.json);
     }
 }
 
+/// The `--store`-rejection message for each command that isn't store-scoped.
+///
+/// Kept together rather than inline at the call sites so the whole family is
+/// auditable in one place against specs/05-surfaces.md §2.2's table — these
+/// five are the complete set, and each says *why* the flag doesn't apply
+/// rather than only that it doesn't.
+///
+/// `DB_REJECT_MESSAGE` is load-bearing beyond its wording: it is asserted on
+/// verbatim by `db_migrate_with_store_flag_exits_2`
+/// (`localdb/tests/cli_integration.rs`), so it must not drift.
+pub(crate) const DB_REJECT_MESSAGE: &str =
+    "`db` commands operate on the whole database file; --store is not applicable";
+pub(crate) const STORE_ADD_REJECT_MESSAGE: &str =
+    "`store add` names its store as an argument; --store is not applicable";
+pub(crate) const STORE_REMOVE_REJECT_MESSAGE: &str =
+    "`store remove` names its store as an argument; --store is not applicable";
+pub(crate) const INIT_REJECT_MESSAGE: &str =
+    "`init` creates the config and data directory before any store exists; --store is not applicable";
+pub(crate) const SERVE_REJECT_MESSAGE: &str =
+    "`serve` serves every store in the database; --store is not applicable";
+
 /// Pure decision logic behind `reject_store_flag`, factored out so the
 /// rejection can be unit-tested without going through `exit_err`'s
 /// `process::exit`.
-fn reject_store_flag_inner(ctx: &CliContext) -> Result<(), Error> {
+fn reject_store_flag_inner(ctx: &CliContext, message: &str) -> Result<(), Error> {
     if ctx.stores.is_empty() {
         return Ok(());
     }
     Err(Error::InvalidRequest {
-        message: "`db` commands operate on the whole database file; --store is not applicable"
-            .to_string(),
+        message: message.to_string(),
     })
 }
 
@@ -352,6 +396,7 @@ async fn resolve_daemon_store_scope_inner(
             }
             Ok(daemon_names)
         }
+        StoreScopePolicy::AllStoresAllowEmpty => Ok(daemon_names),
         StoreScopePolicy::DefaultStore => {
             if daemon_names.iter().any(|n| n == DEFAULT_STORE_NAME) {
                 Ok(vec![DEFAULT_STORE_NAME.to_string()])
@@ -381,7 +426,12 @@ pub(crate) async fn resolve_store_scope(
 /// Pure decision logic behind `resolve_store_scope`, factored out so each
 /// branch can be unit-tested without going through `exit_err`'s
 /// `process::exit`.
-async fn resolve_store_scope_inner(
+///
+/// `pub(crate)` rather than private because `cmds::search` needs the
+/// `Result`-returning form: `resolve_search_targets` is itself fallible and
+/// its caller owns the `exit_err` call, so going through the exiting wrapper
+/// would move the exit point out of `run_search_async` where it belongs.
+pub(crate) async fn resolve_store_scope_inner(
     ctx: &CliContext,
     db: &AppDb,
     policy: StoreScopePolicy,
@@ -417,6 +467,7 @@ async fn resolve_store_scope_inner(
             }
             Ok(stores)
         }
+        StoreScopePolicy::AllStoresAllowEmpty => Ok(db.backend().list_stores().await?),
         StoreScopePolicy::DefaultStore => {
             match db.backend().get_store_by_name(DEFAULT_STORE_NAME).await? {
                 Some(row) => Ok(vec![row]),
@@ -512,7 +563,7 @@ mod tests {
     #[test]
     fn reject_store_flag_inner_with_store_errors() {
         let ctx = test_ctx(vec!["a"]);
-        let err = reject_store_flag_inner(&ctx).unwrap_err();
+        let err = reject_store_flag_inner(&ctx, DB_REJECT_MESSAGE).unwrap_err();
         assert_eq!(
             err,
             Error::InvalidRequest {
@@ -523,10 +574,78 @@ mod tests {
         );
     }
 
+    /// The caller's `message` is the entire user-visible error text — the
+    /// helper never prefixes or rewrites it, which is what lets one function
+    /// serve `db`, `store add`/`remove`, `init` and `serve` with four
+    /// different explanations.
+    #[test]
+    fn reject_store_flag_inner_uses_the_callers_message_verbatim() {
+        let ctx = test_ctx(vec!["a"]);
+        let err = reject_store_flag_inner(&ctx, "totally bespoke explanation").unwrap_err();
+        assert_eq!(
+            err,
+            Error::InvalidRequest {
+                message: "totally bespoke explanation".to_string(),
+            }
+        );
+        assert_eq!(err.exit_code(), 2);
+    }
+
     #[test]
     fn reject_store_flag_inner_without_store_is_ok() {
         let ctx = test_ctx(vec![]);
-        assert!(reject_store_flag_inner(&ctx).is_ok());
+        assert!(reject_store_flag_inner(&ctx, DB_REJECT_MESSAGE).is_ok());
+    }
+
+    /// `AllStoresAllowEmpty` is the one all-stores policy that resolves a
+    /// zero-store database to an empty scope instead of exit 2 — the
+    /// difference `search`/`mcp` depend on (specs/05-surfaces.md §2.2).
+    #[tokio::test]
+    async fn scope_all_stores_allow_empty_resolves_empty_scope() {
+        let dir = TempDir::new().unwrap();
+        let db = tmp_app_db(&dir).await;
+        let ctx = test_ctx(vec![]);
+        let rows = resolve_store_scope_inner(&ctx, &db, StoreScopePolicy::AllStoresAllowEmpty)
+            .await
+            .expect("an empty database must resolve, not error, under AllStoresAllowEmpty");
+        assert!(rows.is_empty());
+    }
+
+    /// `AllStoresAllowEmpty` differs from `AllStores` *only* in the
+    /// empty-database case: with stores present it still spans all of them.
+    #[tokio::test]
+    async fn scope_all_stores_allow_empty_still_spans_every_store() {
+        let dir = TempDir::new().unwrap();
+        let db = tmp_app_db(&dir).await;
+        for name in ["a", "b"] {
+            let row = test_store_row(name, &db);
+            db.backend().upsert_store(&row).await.unwrap();
+        }
+        let ctx = test_ctx(vec![]);
+        let rows = resolve_store_scope_inner(&ctx, &db, StoreScopePolicy::AllStoresAllowEmpty)
+            .await
+            .unwrap();
+        let names: std::collections::HashSet<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["a", "b"].into_iter().collect());
+    }
+
+    /// An explicit unknown `-s` is still exit 3 under `AllStoresAllowEmpty` —
+    /// "allow empty" relaxes only the *omitted*-`-s` case, never validation.
+    #[tokio::test]
+    async fn scope_all_stores_allow_empty_still_rejects_unknown_explicit_name() {
+        let dir = TempDir::new().unwrap();
+        let db = tmp_app_db(&dir).await;
+        let ctx = test_ctx(vec!["nope"]);
+        let err = resolve_store_scope_inner(&ctx, &db, StoreScopePolicy::AllStoresAllowEmpty)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            Error::StoreNotFound {
+                id: "nope".to_string()
+            }
+        );
+        assert_eq!(err.exit_code(), 3);
     }
 
     #[tokio::test]

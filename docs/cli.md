@@ -18,7 +18,7 @@ These flags are accepted by every subcommand.
 |---|---|
 | `--config <PATH>` | Path to the config file. Default: the platform config dir — `~/Library/Application Support/com.localdb.localdb.localdb/config.yaml` on macOS, `~/.config/localdb/config.yaml` on Linux. Can also be set via the `LOCALDB_CONFIG` environment variable. |
 | `--json` | Emit machine-readable JSON instead of human-readable text. All JSON shapes are stable API. |
-| `-s, --store <NAME>` | Operate on this store; repeatable. Default when omitted depends on the command: **all stores** for `search`/`status`/`store list`/`index`; the store named `default` for `source add`/`list`/`remove` and the `add` alias (exit 2 if absent); **rejected outright** (exit 2) for `db status`/`migrate`/`downgrade`. See [specs/05-surfaces.md §2.2](../specs/05-surfaces.md#22-store-scope). |
+| `-s, --store <NAME>` | Narrow to these stores; repeatable. It is a **filter**, so omitting it means **all stores** for `search`, `status`, `store list`, `source list`, `source remove <ULID>`, `index` and `mcp`. Three exceptions: `source add` (and the `add` alias) defaults to the store named `default`, exit 2 if absent; `source remove <path\|url>` requires it, exit 2 without it; and `init`, `serve`, `store add`, `store remove`, `db status`/`migrate`/`downgrade`/`vacuum` **reject it outright** (exit 2) because they aren't store-scoped. An explicit name is always validated — unknown is exit 3, never silently ignored. See [specs/05-surfaces.md §2.2](../specs/05-surfaces.md#22-store-scope). |
 | `-y, --yes` | Skip confirmation prompts for destructive operations (`db migrate` legacy rebuild, `db downgrade`). |
 | `-h, --help` | Print help. |
 | `-V, --version` | Print version. |
@@ -54,7 +54,7 @@ Usage: localdb init [OPTIONS]
 Options:
       --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
       --json           Emit JSON output instead of human-readable text
-  -s, --store <NAME>   Operate on this store (repeatable); default depends on the subcommand
+  -s, --store <NAME>   Operate on these stores (repeatable); a filter, not a selector
   -y, --yes            Skip confirmation prompts for destructive operations
   -h, --help           Print help (see more with '--help')
   -V, --version        Print version
@@ -64,6 +64,11 @@ Creates the config file and data directory if they do not exist. Prints the
 paths it created. The generated config file contains only `version: 1`; add
 `paths` and other keys as needed (see
 [specs/03-config.md](../specs/03-config.md)).
+
+**Not store-scoped:** `init` runs before any store exists — the only store it
+creates is `default`, which `--store` cannot rename or redirect — so passing
+`--store` exits `2` rather than being silently ignored. The check runs first,
+so a misused flag creates no directories and writes no config.
 
 **Note on embedding models:** `init` prints a note about model download. It is
 accurate: the default embedder (`pplx-embed-context-v1-0.6b`, local ONNX) is
@@ -100,7 +105,7 @@ Usage: localdb status [OPTIONS]
 Options:
       --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
       --json           Emit JSON output instead of human-readable text
-  -s, --store <NAME>   Operate on this store (repeatable); default depends on the subcommand
+  -s, --store <NAME>   Operate on these stores (repeatable); a filter, not a selector
   -y, --yes            Skip confirmation prompts for destructive operations
   -h, --help           Print help (see more with '--help')
   -V, --version        Print version
@@ -149,7 +154,7 @@ Commands:
 Options:
       --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
       --json           Emit JSON output instead of human-readable text
-  -s, --store <NAME>   Operate on this store (repeatable); default depends on the subcommand
+  -s, --store <NAME>   Operate on these stores (repeatable); a filter, not a selector
   -y, --yes            Skip confirmation prompts for destructive operations
   -h, --help           Print help (see more with '--help')
   -V, --version        Print version
@@ -168,7 +173,7 @@ Arguments:
 Options:
       --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
       --json           Emit JSON output instead of human-readable text
-  -s, --store <NAME>   Operate on this store (repeatable); default depends on the subcommand
+  -s, --store <NAME>   Operate on these stores (repeatable); a filter, not a selector
   -y, --yes            Skip confirmation prompts for destructive operations
   -h, --help           Print help (see more with '--help')
   -V, --version        Print version
@@ -176,6 +181,9 @@ Options:
 
 Creates a store backed by libsql. Stores are persisted in
 the unified database (`<data_dir>/localdb.db`) and survive restarts.
+
+**Not store-scoped:** the store is named by the `<NAME>` argument, so passing
+`--store` exits `2` rather than being silently ignored.
 
 Exits `2` (`invalid_request`) if a store with that name already exists:
 
@@ -198,7 +206,7 @@ Usage: localdb store list [OPTIONS]
 Options:
       --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
       --json           Emit JSON output instead of human-readable text
-  -s, --store <NAME>   Operate on this store (repeatable); default depends on the subcommand
+  -s, --store <NAME>   Operate on these stores (repeatable); a filter, not a selector
   -y, --yes            Skip confirmation prompts for destructive operations
   -h, --help           Print help (see more with '--help')
   -V, --version        Print version
@@ -235,7 +243,7 @@ Arguments:
 Options:
       --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
       --json           Emit JSON output instead of human-readable text
-  -s, --store <NAME>   Operate on this store (repeatable); default depends on the subcommand
+  -s, --store <NAME>   Operate on these stores (repeatable); a filter, not a selector
   -y, --yes            Skip confirmation prompts for destructive operations
   -h, --help           Print help (see more with '--help')
   -V, --version        Print version
@@ -249,13 +257,21 @@ error: store not found: nope
 exit: 3
 ```
 
+**Not store-scoped:** the store is named by the `<NAME>` argument, so passing
+`--store` exits `2` rather than being silently ignored. This is checked before
+the confirmation prompt, so a misused flag never gets as far as asking you to
+confirm a deletion.
+
 ---
 
 ## `localdb source`
 
-Manage sources on a store. `add`/`list`/`remove` default to the store named
-`default` when `--store` is omitted, and exit `2` if no store named `default`
-exists (specs/05-surfaces.md §2.2).
+Manage sources on a store. With `--store` omitted, `list` and `remove <ULID>`
+span **every** store — `-s` is a filter. `add` is the exception: a write has to
+land in one named place, so it targets the store named `default` and exits `2`
+if there isn't one. `remove <path|url>` is the other: the same path can be a
+source in several stores, so it requires an explicit `--store`
+(specs/05-surfaces.md §2.2).
 
 ```
 Manage sources on a store
@@ -264,14 +280,14 @@ Usage: localdb source [OPTIONS] <COMMAND>
 
 Commands:
   add     Add a new source to a store
-  list    List sources on a store
+  list    List sources across stores
   remove  Remove a source from a store
   help    Print this message or the help of the given subcommand(s)
 
 Options:
       --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
       --json           Emit JSON output instead of human-readable text
-  -s, --store <NAME>   Operate on this store (repeatable); default depends on the subcommand
+  -s, --store <NAME>   Operate on these stores (repeatable); a filter, not a selector
   -y, --yes            Skip confirmation prompts for destructive operations
   -h, --help           Print help (see more with '--help')
   -V, --version        Print version
@@ -291,7 +307,7 @@ Options:
       --config <PATH>      Path to config file (default: platform data dir / localdb / config.yaml)
       --refresh <REFRESH>  Refresh interval for URL sources (e.g. "1h", "30m", "3600")
       --json               Emit JSON output instead of human-readable text
-  -s, --store <NAME>       Operate on this store (repeatable); default depends on the subcommand
+  -s, --store <NAME>       Operate on these stores (repeatable); a filter, not a selector
   -y, --yes                Skip confirmation prompts for destructive operations
   -h, --help               Print help (see more with '--help')
   -V, --version            Print version
@@ -301,6 +317,10 @@ Registers one or more filesystem paths (or URLs) as sources for a store.
 `--store` is repeatable; omit it and the source is added to the store named
 `default` (exit `2` if no such store exists) — it is never guessed from
 whatever stores happen to exist (specs/05-surfaces.md §2.2).
+
+This is the **one** command where omitting `--store` narrows rather than
+spans. Everything else treats `-s` as a filter over all stores; a write can't,
+because "add this source to every store" is not what anyone means.
 
 **Note:** path existence is not validated at registration time — `source add
 /does/not/exist` succeeds (exit 0). The error surfaces at `index` time.
@@ -313,25 +333,31 @@ Added source 01KTVH6AY4DC84HWW7M2PP4F0X to store 'notes'
 ### `localdb source list`
 
 ```
-List sources on a store
+List sources across stores
 
 Usage: localdb source list [OPTIONS]
 
 Options:
       --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
       --json           Emit JSON output instead of human-readable text
-  -s, --store <NAME>   Operate on this store (repeatable); default depends on the subcommand
+  -s, --store <NAME>   Operate on these stores (repeatable); a filter, not a selector
   -y, --yes            Skip confirmation prompts for destructive operations
   -h, --help           Print help (see more with '--help')
   -V, --version        Print version
 ```
 
-Omit `--store` and this lists the store named `default` (exit `2` if no such
-store exists); pass `--store` (repeatable) to list one or more specific
-stores. A store-name column appears in the output only when more than one
-store is in scope (specs/05-surfaces.md §2.2).
+Omit `--store` and this lists **every** store's sources; pass `--store`
+(repeatable) to narrow to one or more specific stores. A store-name column
+appears in the output only when more than one store is in scope
+(specs/05-surfaces.md §2.2), so a single-store database and an explicit
+`-s <one-store>` both keep the original column-free format.
 
 ```
+$ localdb source list                     # no --store: every store
+books    01KWEZN72MJ4T8Q1V3XA9BCDEF [path] /Volumes/Archive/books
+default  01KTVH6AY4DC84HWW7M2PP4F0X [path] /home/user/notes
+hydra    01KWEXGA9YR5S2P7N4MB6GHIJK [path] /home/user/hydra-docs
+
 $ localdb source list --store notes
 01KTVH6AY4DC84HWW7M2PP4F0X [path] /home/user/notes
 
@@ -368,17 +394,33 @@ Arguments:
 Options:
       --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
       --json           Emit JSON output instead of human-readable text
-  -s, --store <NAME>   Operate on this store (repeatable); default depends on the subcommand
+  -s, --store <NAME>   Operate on these stores (repeatable); a filter, not a selector
   -y, --yes            Skip confirmation prompts for destructive operations
   -h, --help           Print help (see more with '--help')
   -V, --version        Print version
 ```
 
-A `<ID>` may be the ULID shown by `source list`, or a source's path/URL —
-removing by path/url requires an explicit `--store` (it is never resolved
-against the implicit `default` store). Omitting `--store` when removing by
-ULID defaults to the store named `default`, same as `source add`/`list`
-(specs/05-surfaces.md §2.2).
+A `<ID>` may be the ULID shown by `source list`, or a source's path/URL. The
+two shapes have different `--store` rules, because they differ in whether they
+identify a store on their own (specs/05-surfaces.md §2.2):
+
+| Argument | `--store` omitted |
+|---|---|
+| ULID | Searches **every** store — a ULID is globally unique, so its owning store is not in question |
+| path or URL | Exit `2`, asking for `--store` — the same path can be registered in several stores at once |
+
+```
+$ localdb source remove 01KWEZN72MJ4T8Q1V3XA9BCDEF   # found wherever it lives
+Removed source: 01KWEZN72MJ4T8Q1V3XA9BCDEF
+
+$ localdb source remove ~/notes
+error: source remove by path/url requires --store; pass --store <name> or use the source ULID
+exit: 2
+```
+
+An explicit `--store` still hard-filters a ULID removal: if the source exists
+but lives outside the named scope, this is `source_not_found` (exit `3`)
+rather than a silent redirect to its real store.
 
 ---
 
@@ -396,7 +438,7 @@ Options:
       --source <SOURCE_ID>  Limit to a specific source (by ID)
       --json                Emit JSON output instead of human-readable text
       --strict              Exit with code 2 if any document failed extraction (never aborts mid-run)
-  -s, --store <NAME>        Operate on this store (repeatable); default depends on the subcommand
+  -s, --store <NAME>        Operate on these stores (repeatable); a filter, not a selector
   -y, --yes                 Skip confirmation prompts for destructive operations
   -h, --help                Print help (see more with '--help')
   -V, --version             Print version
@@ -452,7 +494,7 @@ Options:
       --json
           Emit JSON output instead of human-readable text
   -s, --store <NAME>
-          Operate on this store (repeatable); default depends on the subcommand
+          Operate on these stores (repeatable); a filter, not a selector
   -y, --yes
           Skip confirmation prompts for destructive operations
   -h, --help
@@ -599,7 +641,7 @@ Commands:
 Options:
       --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
       --json           Emit JSON output instead of human-readable text
-  -s, --store <NAME>   Operate on this store (repeatable); default depends on the subcommand
+  -s, --store <NAME>   Operate on these stores (repeatable); a filter, not a selector
   -y, --yes            Skip confirmation prompts for destructive operations
   -h, --help           Print help (see more with '--help')
   -V, --version        Print version
@@ -640,7 +682,7 @@ Usage: localdb db status [OPTIONS]
 Options:
       --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
       --json           Emit JSON output instead of human-readable text
-  -s, --store <NAME>   Operate on this store (repeatable); default depends on the subcommand
+  -s, --store <NAME>   Operate on these stores (repeatable); a filter, not a selector
   -y, --yes            Skip confirmation prompts for destructive operations
   -h, --help           Print help (see more with '--help')
   -V, --version        Print version
@@ -692,7 +734,7 @@ Usage: localdb db migrate [OPTIONS]
 Options:
       --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
       --json           Emit JSON output instead of human-readable text
-  -s, --store <NAME>   Operate on this store (repeatable); default depends on the subcommand
+  -s, --store <NAME>   Operate on these stores (repeatable); a filter, not a selector
   -y, --yes            Skip confirmation prompts for destructive operations
   -h, --help           Print help (see more with '--help')
   -V, --version        Print version
@@ -742,7 +784,7 @@ Options:
       --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
       --to <VERSION>   Target schema version to downgrade to (default: one step below the current version)
       --json           Emit JSON output instead of human-readable text
-  -s, --store <NAME>   Operate on this store (repeatable); default depends on the subcommand
+  -s, --store <NAME>   Operate on these stores (repeatable); a filter, not a selector
   -y, --yes            Skip confirmation prompts for destructive operations
   -h, --help           Print help (see more with '--help')
   -V, --version        Print version
@@ -807,7 +849,7 @@ Usage: localdb serve [OPTIONS]
 Options:
       --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
       --json           Emit JSON output instead of human-readable text
-  -s, --store <NAME>   Operate on this store (repeatable); default depends on the subcommand
+  -s, --store <NAME>   Operate on these stores (repeatable); a filter, not a selector
   -y, --yes            Skip confirmation prompts for destructive operations
   -h, --help           Print help (see more with '--help')
   -V, --version        Print version
@@ -823,6 +865,12 @@ daemon listening on http://127.0.0.1:7700
 
 Also creates a Unix socket at `<data_dir>/daemon.sock` that CLI commands use to
 detect the daemon.
+
+**Not store-scoped:** the daemon serves every store in the database, on `/v1`
+and `/mcp` alike, so there is nothing for `--store` to narrow — passing it
+exits `2` rather than being silently ignored. The check runs before the daemon
+binds a port. To limit an *MCP client* to a subset of stores, scope the client
+instead: `localdb mcp --store <name>` (see [docs/mcp.md](mcp.md#store-scoping)).
 
 Exits `4` (`daemon_running`) if a daemon is already running on the same data dir:
 
@@ -860,15 +908,17 @@ For the full HTTP API reference see [docs/http-api.md](http-api.md).
 Run the MCP server on stdio for use with AI agents.
 
 ```
-Run the MCP server on stdio for use with AI agents
+Run the MCP server on stdio for use with AI agents.
+
+Exposes every store when `--store` is omitted; pass `--store <NAME>` (repeatable) to limit the session to those stores. The limit is enforced whether the server runs embedded or proxies to a running daemon, and an unknown name exits 3. Note this is a guardrail, not a security boundary: the daemon's MCP endpoint is unauthenticated, so a client that bypasses `localdb mcp` can still reach every store.
 
 Usage: localdb mcp [OPTIONS]
 
 Options:
       --allow-write
-          Enable write tools (reserved for future use; always rejected in v1).
+          Enable write tools (reserved for future use; no effect in v1).
           
-          Parsing this flag now makes the CLI stable for callers even though the server rejects all mutating operations in v1.
+          v1 registers no mutating tool, so the tool set is identical with and without this flag; passing it prints a warning. Parsing it now makes the CLI stable for callers.
 
       --config <PATH>
           Path to config file (default: platform data dir / localdb / config.yaml)
@@ -877,9 +927,9 @@ Options:
           Emit JSON output instead of human-readable text
 
   -s, --store <NAME>
-          Operate on this store (repeatable); default depends on the subcommand.
+          Operate on these stores (repeatable); a filter, not a selector.
           
-          Omitted, this means "all stores" for `search`/`status`/`store list`/ `index`; the store named `default` for `source`/`add` (exit 2 if absent); and is rejected outright for `db` subcommands (exit 2). See `--help` on the specific subcommand for its exact rule.
+          Omitted, this means "all stores" for `search`, `status`, `store list`, `source list`, `source remove <ULID>`, `index` and `mcp`; the store named `default` for `source add` and the `add` alias (exit 2 if absent). `source remove <path|url>` requires it (exit 2 without it). It is rejected outright (exit 2) by `init`, `serve`, `store add`, `store remove` and the `db` subcommands, which are not store-scoped. An explicit name is always validated: unknown is exit 3. See `--help` on the specific subcommand for its exact rule.
 
   -y, --yes
           Skip confirmation prompts for destructive operations
@@ -891,15 +941,35 @@ Options:
           Print version
 ```
 
-Starts a JSON-RPC 2.0 MCP server on stdin/stdout, using embedded mode (no daemon
-required). The server is fully functional in v0.1.0 and exposes four read-only
-tools: `search`, `get_document`, `get_chunks`, and `list_stores`. Omitting
-`--store` exposes every store; pass `--store` (repeatable) to narrow the set
-(not honored when proxying to a running daemon — see
-[docs/mcp.md](mcp.md#daemon-proxied-stdio)).
+Starts a JSON-RPC 2.0 MCP server on stdin/stdout. If no daemon is running it
+uses embedded mode; if one is, it proxies to that daemon's `/mcp` route. The
+server is fully functional in v0.1.0 and exposes four read-only tools:
+`search`, `get_document`, `get_chunks`, and `list_stores`.
 
-`--allow-write` is accepted on the command line for forward compatibility but all
-mutating tool calls are rejected in v1.
+Omitting `--store` exposes every store; pass `--store` (repeatable) to limit
+the session to those stores. The limit is enforced in **both** modes, and an
+unknown name exits `3`:
+
+```
+$ localdb mcp --store books --store research   # only these two are reachable
+$ localdb mcp --store typo
+error: store not found: typo
+exit: 3
+```
+
+A database with no stores at all is not an error here — the server starts and
+exposes zero stores, because an MCP server that exits non-zero at startup reads
+to its client as broken rather than as empty.
+
+> **Scoping, not a security boundary.** The daemon's `/mcp` route is loopback
+> and unauthenticated, so anything that can open a socket can bypass
+> `localdb mcp` and talk to it unscoped. `--store` stops an agent from
+> *accidentally* reading another project's docs; it does not contain a hostile
+> one. See [docs/mcp.md](mcp.md#store-scoping).
+
+`--allow-write` is accepted on the command line for forward compatibility, but
+v1 registers no mutating tool at all — the tool set is identical with and
+without it, and passing it prints a warning to stderr saying so.
 
 See [docs/mcp.md](mcp.md) for the full tool reference, input schemas, and
 example JSON-RPC exchanges.

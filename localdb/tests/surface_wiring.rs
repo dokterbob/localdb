@@ -158,9 +158,14 @@ fn mcp_allow_write_flag_still_serves_tools() {
 
 /// Phase 3: `localdb mcp` delegates to a running daemon's `/mcp` HTTP route
 /// (Phase 2's mount) instead of opening the store embedded, when a daemon is
-/// already up — proven by a real two-subprocess round trip, not a mock. Also
-/// verifies the documented v1 gap: `--store` is warned-about, not honored,
-/// in proxied mode (specs/05-surfaces.md §4).
+/// already up — proven by a real two-subprocess round trip, not a mock.
+///
+/// Also verifies that `--store` is *honored* in proxied mode
+/// (specs/05-surfaces.md §4.2.1). This assertion used to be its exact
+/// inverse — it pinned a warning saying the flag was ignored, which was the
+/// documented v1 gap until issue #201 showed that "ignored" meant silently
+/// serving the daemon's **full** store set precisely when the caller had
+/// asked to narrow it.
 #[test]
 fn mcp_stdio_proxies_to_running_daemon() {
     let dir = TempDir::new().unwrap();
@@ -196,10 +201,13 @@ fn mcp_stdio_proxies_to_running_daemon() {
         "\n",
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
         "\n",
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_stores","arguments":{}}}"#,
+        "\n",
     );
 
-    // `--store notes` is passed on purpose: proxied mode must ignore it
-    // (with a warning) rather than filtering client-side (see run_mcp_async).
+    // `--store notes` is passed on purpose: proxied mode must *honor* it.
+    // `notes` is the store `seed_indexed_store` creates, so this is a valid
+    // name — an invalid one would now exit 3 before serving anything.
     let assert = cmd_with_dir(&dir)
         .env("LOCALDB_DAEMON_URL", &base_url)
         .args(["mcp", "--store", "notes"])
@@ -216,9 +224,18 @@ fn mcp_stdio_proxies_to_running_daemon() {
         .filter(|l| !l.trim().is_empty())
         .map(|l| serde_json::from_str(l).expect("each stdout line is JSON"))
         .collect();
-    assert_eq!(responses.len(), 2, "stdout was: {stdout}");
+    assert_eq!(responses.len(), 3, "stdout was: {stdout}");
 
-    let tools = &responses[1];
+    // Index by JSON-RPC id rather than arrival position: the proxy issues its
+    // own upstream calls, so responses are correlated by id, not ordered.
+    let by_id = |id: u64| -> &serde_json::Value {
+        responses
+            .iter()
+            .find(|r| r["id"].as_u64() == Some(id))
+            .unwrap_or_else(|| panic!("no response with id {id}; stdout was: {stdout}"))
+    };
+
+    let tools = by_id(2);
     let names: Vec<&str> = tools["result"]["tools"]
         .as_array()
         .expect("tools/list result.tools is an array")
@@ -232,10 +249,28 @@ fn mcp_stdio_proxies_to_running_daemon() {
         );
     }
 
+    // The scope reached the daemon: `list_stores` came back filtered to the
+    // one store named by `--store`, over a real HTTP hop to a real daemon.
+    let call = by_id(3);
+    let text = call["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("list_stores result should carry text content: {call}"));
+    let listed: serde_json::Value =
+        serde_json::from_str(text).expect("list_stores returns JSON text content");
+    let stores = listed["stores"].as_array().expect("stores array");
+    assert_eq!(
+        stores.len(),
+        1,
+        "a --store-scoped proxy must expose exactly the scoped store: {listed}"
+    );
+    assert_eq!(stores[0]["name"], "notes");
+
+    // And the old "not honored" warning is gone — its presence would mean
+    // the #201 regression is back.
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
     assert!(
-        stderr.contains("--store") && stderr.contains("daemon"),
-        "proxied mode must warn that --store is ignored: {stderr}"
+        !stderr.contains("--store is not honored"),
+        "proxied mode now enforces --store rather than warning it away: {stderr}"
     );
 }
 
@@ -271,6 +306,42 @@ fn mcp_stdio_daemon_unreachable_maps_to_daemon_unreachable_exit_code() {
     assert!(
         stderr.contains("daemon_unreachable") || stderr.contains("daemon"),
         "expected a daemon-unreachable error, got stderr: {stderr}"
+    );
+}
+
+/// Codex review (P2): a malformed `--store` name must be rejected as
+/// `invalid_request`/exit 2 in proxied mode too, matching embedded mode and
+/// every other store-scoped command — not surface as `store_not_found`/exit 3
+/// merely because the daemon's store set happens not to contain `../evil`.
+///
+/// `LOCALDB_DAEMON_URL` pointing at a *closed* port is what makes this sharp:
+/// `probe_daemon` trusts the override without a health check, so the proxied
+/// branch is definitely taken, and the connect that follows would definitely
+/// fail with exit 5. Getting exit 2 therefore proves the name was rejected
+/// before anything touched the network.
+#[test]
+fn mcp_proxied_traversal_store_name_exits_2_before_connecting() {
+    let dir = TempDir::new().unwrap();
+    write_config(&dir, "");
+
+    let closed_port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+        // listener drops here, closing the port.
+    };
+    let stale_url = format!("http://127.0.0.1:{closed_port}");
+
+    let assert = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &stale_url)
+        .args(["--store", "../evil", "mcp"])
+        .write_stdin("")
+        .assert()
+        .code(2);
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        !stderr.contains("store not found"),
+        "a malformed name is invalid usage, not a missing store: {stderr}"
     );
 }
 

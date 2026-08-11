@@ -18,12 +18,12 @@ Single binary, subcommand tree. Global flags: `--config`, `--json`, `--store <na
 
 | Command | Purpose | Daemonless (embedded) | Daemon-attached |
 |---|---|---|---|
-| `init` | Create config + data dir, first-run model download prompt | full | n/a (refuses if daemon running with different data dir) |
-| `serve` | Run the daemon (HTTP API, watching, refresh, socket) | becomes the daemon | error `daemon_running` |
-| `mcp` | Run MCP server on stdio | embedded core | thin client |
-| `status` | Stores, resource/chunk counts, policy staleness, daemon state, unified database file size and largest tables (§2.4) | reads directly | queries daemon |
-| `store add/list/remove` | Manage runtime-owned stores | direct write | routed to daemon |
-| `source add/list/remove` | Manage sources on a store; defaults to the store named `default` if `-s` is omitted, exit 2 if absent (§2.2) | direct write | `add`/`remove` routed to daemon; `list` always reads the local database (§2.2 known limitation) |
+| `init` | Create config + data dir, first-run model download prompt; not store-scoped, `-s` is rejected, exit 2 (§2.2) | full | n/a (refuses if daemon running with different data dir) |
+| `serve` | Run the daemon (HTTP API, watching, refresh, socket); serves every store regardless, so `-s` is rejected, exit 2 (§2.2) | becomes the daemon | error `daemon_running` |
+| `mcp` | Run MCP server on stdio; exposes all stores if `-s` is omitted, and `-s` genuinely narrows the exposed set in **both** modes (§4.2) | embedded core | thin client |
+| `status` | Stores, resource/chunk counts, policy staleness, daemon state, unified database file size and largest tables (§2.4); all stores if `-s` is omitted (§2.2) | reads directly | queries daemon |
+| `store add/list/remove` | Manage runtime-owned stores; `list` spans all stores if `-s` is omitted, `add`/`remove` name their store as an argument so `-s` is rejected, exit 2 (§2.2) | direct write | routed to daemon |
+| `source add/list/remove` | Manage sources on a store; `list` and `remove <ULID>` span all stores if `-s` is omitted, `add` defaults to the store named `default` (exit 2 if absent), `remove <path\|url>` requires `-s` (§2.2) | direct write | `add`/`remove` routed to daemon; `list` always reads the local database (§2.2 known limitation) |
 | `add <path|url>...` | Alias for `source add` — add one or more sources to a store; same `default`-store rule as `source add` (§2.2) | direct write | routed to daemon |
 | `index [--store S]... [--source ID] [--strict]` | One-shot scan & index; creates IndexJob; all stores if `-s` is omitted (§2.2) | runs job synchronously, progress to stderr | submits job, polls, streams progress |
 | `search <query>... [--limit N] [--content-length N]` | Hybrid search with citations; `--content-length` is a **soft cap** on human-readable snippet chars (default 1000; JSON output always full text) — see §4 for the snapping behavior shared with MCP | embedded read | via API |
@@ -65,24 +65,44 @@ default below. When `-s` is omitted, the default depends on the command:
 
 | Command | `-s` omitted | Rationale |
 |---|---|---|
-| `search`, `status`, `store list` | **all stores** | this is only the *default* when `-s` is omitted — an explicit `--store` is still validated and resolved exactly like every other command; an unknown name is `store_not_found`, exit 3, not a silently-ignored flag |
-| `index` | **all stores** | idempotent and re-runnable; "refresh everything" is the common workflow |
-| `source add`/`list`/`remove`, `add` alias | **store named `default`**; **exit 2** if absent | mutations must never guess; `list` stays consistent with its siblings |
-| `db status`/`migrate`/`downgrade`/`vacuum` | n/a — **exit 2 if `-s` is passed** | not store-scoped; silently ignoring a flag the user believed in is the #178 failure mode again |
+| `search`, `status`, `store list`, `source list`, `index`, `mcp` | **all stores** | `-s` is a *filter*; only the *default* changes — an explicit name is still validated and resolved (unknown → `store_not_found`, exit 3), never silently ignored |
+| `source remove <ULID>` | **all stores** | a ULID identifies its owning store on its own; scoping it to `default` makes a valid id fail |
+| `source remove <path\|url>` | n/a — **exit 2** | a path/url can exist in several stores; this one really is a guess |
+| `source add`, `add` alias | **store named `default`**; **exit 2** if absent | the one write that must pick a single target, and must not pick it by guessing |
+| `store add`, `store remove`, `init`, `serve` | n/a — **exit 2 if `-s` is passed** | the store is named by the command's own argument, or there is no store concept yet, or the daemon serves every store regardless |
+| `db status`/`migrate`/`downgrade`/`vacuum` | n/a — **exit 2 if `-s` is passed** | not store-scoped |
+
+Every "exit 2 if `-s` is passed" row above exists for one reason: silently ignoring a flag the
+user believed in is the #178 failure mode again.
 
 Additional rules:
 
 - An empty resolved store set under an all-stores policy (no stores configured at all) is exit 2,
-  not a silent no-op.
-- `source add`/`remove` (and the `add` alias) error text when the `default` store is missing is
+  not a silent no-op — for `status`, `store list`, `source list`, `source remove` and `index`.
+  `search` and `mcp` are the two exceptions: they resolve an empty scope and still succeed
+  (`search` prints no results, exit 0; `mcp` starts and serves zero stores). A retrieval query
+  against a fresh install has a correct answer — "nothing" — and an MCP server that exits
+  non-zero at startup reads as a broken server to its client rather than as an empty one.
+- **`source remove` has two implicit-scope rules, keyed on the shape of its argument.** A ULID
+  spans all stores when `-s` is omitted (it is globally unique, so there is nothing to guess); a
+  path/url exits 2 demanding `-s` (the same path can be a source in several stores at once). The
+  argument shape is decided before scope resolution, so the two never interact.
+- `source add`'s (and the `add` alias's) error text when the `default` store is missing is
   `no store named 'default'; pass --store <name>`. This fires even when exactly one store exists
-  under a different name — predictability wins over guessing the sole store.
+  under a different name — predictability wins over guessing the sole store. `source list` and
+  `source remove` no longer produce this error at all: they span every store instead.
 - Output gains a store-name column only when more than one store is in scope; a single store in
-  scope keeps the pre-existing output format so existing scripts don't break:
+  scope keeps the pre-existing output format so existing scripts don't break. This keys off the
+  *size of the resolved scope*, not off which policy resolved it, so a bare `source list` picks
+  up the column exactly when the database holds more than one store:
 
   ```
   $ localdb source list -s books          # 1 store in scope — unchanged
   01KWEZN72M... [path] /Volumes/Archive/books
+
+  $ localdb source list                   # no -s — every store, so the column appears
+  books    01KWEZN72M... [path] /Volumes/Archive/books
+  default  01KWEXGA9Y... [path] nextcloud
 
   $ localdb source list -s books -s default   # >1 in scope — column appears
   books    01KWEZN72M... [path] /Volumes/Archive/books
@@ -233,6 +253,13 @@ anchor_chunk_id/anchor_block_seq (§4.1) → the resource's chunks in order, pag
 `list_stores` (names, visibility, counts). **Mutating tools** (`add_source`, `reindex`, …) are a
 follow-up behind an explicit opt-in flag (`localdb mcp --allow-write`), never on by default.
 
+Because v1 registers no mutating tool at all, `--allow-write` currently has **no effect**: the
+tool set is byte-identical with and without it. Passing it prints a non-fatal stderr warning
+saying so, rather than exiting 2 the way a misapplied `-s` does. The asymmetry is deliberate —
+`-s` failing open would silently *widen* access, whereas `--allow-write` failing closed can only
+withhold a capability the caller notices immediately as a missing tool, so refusing to start an
+MCP server over it would be disproportionate.
+
 **Rationale:** the dominant agent use case is retrieval; a read-only surface has a trivially
 auditable blast radius, and write semantics through agents deserve their own design pass.
 **Rejected:** full CRUD via MCP in v1.
@@ -373,15 +400,11 @@ MCP is served over two transports, built on the official `rmcp` SDK:
 
 - **Stdio** (`localdb mcp`): if no daemon is running, the CLI opens the store(s) embedded
   in-process and serves them directly. If a daemon is already running (detected the same way
-  every other daemon-aware CLI command detects it, §1), `localdb mcp` instead **proxies**
-  every request verbatim to that daemon's own `/mcp` HTTP route below, rather than opening the
-  store a second time. The stdio caller cannot tell which mode is in effect except by behavior:
-  proxied mode exposes whatever store set the daemon had at its own startup, unfiltered.
-  **Known v1 gap:** `--store` is not honored in proxied mode — the daemon's `/mcp` route has no
-  concept of a per-stdio-session store filter, and building client-side re-filtering for this
-  narrow case was rejected as not worth the complexity in v1. `localdb mcp --store <name>`
-  against a running daemon prints a non-fatal warning to stderr and serves the daemon's full
-  store set regardless of the flag; this is a documented limitation, not a bug.
+  every other daemon-aware CLI command detects it, §1), `localdb mcp` instead **proxies** every
+  request to that daemon's own `/mcp` HTTP route below, rather than opening the store a second
+  time. Absent `--store`, the proxy is a verbatim relay and the stdio caller cannot tell which
+  mode is in effect except by behavior: it exposes whatever store set the daemon had at its own
+  startup.
 - **HTTP** (`/mcp`, mounted on the daemon alongside its own `/v1` routes): a startup-time
   snapshot of stores, not rebuilt per session — a store added later via `/v1/stores` is
   invisible over MCP until the daemon restarts (see `mcp::http::build_streamable_http_service`'s
@@ -389,6 +412,34 @@ MCP is served over two transports, built on the official `rmcp` SDK:
 
 Tool registration (the four read-only tools) and business logic are identical on both
 transports and in both stdio modes — only the code path serving the request differs.
+
+### 4.2.1 `--store` scoping over stdio
+
+`localdb mcp -s <name>` (repeatable) narrows the store set the MCP session can reach, in **both**
+stdio modes. Omitted, it means all stores (§2.2); an unknown name is `store_not_found`, exit 3,
+before the server ever starts serving. A database with no stores at all is *not* an error here —
+the server starts and exposes zero stores (§2.2's empty-scope exception).
+
+- **Embedded mode** resolves the scope against the local database and builds the handler over
+  exactly those stores. Nothing else is reachable, because nothing else is open.
+- **Proxied mode** enforces the scope per request, at the *tool-argument* level, because that is
+  the only channel that exists. rmcp's `StreamableHttpService` takes a synchronous
+  `Fn() -> Result<S, io::Error>` service factory with no access to the HTTP request, so neither
+  `/mcp?store=x` nor a custom header can select a scoped handler on the daemon side. The tool
+  arguments already carry store scope, though — `search.stores`, `get_document.store`,
+  `get_chunks.store` — so `ProxyHandler` validates and injects them on each relayed
+  `tools/call`: an absent store argument is filled in from the scope, an explicit one outside
+  the scope is a tool-level `invalid_request` naming the allowed set, and `list_stores`'
+  response is filtered so an agent cannot even enumerate stores it may not read. While the tool
+  set is fixed at four read-only tools, a scoped proxy relays *only* those four and rejects any
+  other name with `invalid_request` — a future mutating tool must be given an explicit scoping
+  rule before it can pass through.
+
+**This is scoping, not a security boundary.** The daemon's `/mcp` is loopback and
+unauthenticated, so anything that can open a socket can bypass `localdb mcp` and talk to the
+unscoped endpoint directly. It stops an agent from *accidentally* reading another project's
+docs; it does not contain a hostile one. Real containment needs daemon-side auth, which is out
+of scope for v1.
 
 ### 4.3 Error model
 
@@ -415,6 +466,9 @@ Proxied stdio mode forwards whichever tier the daemon's own `/mcp` route returns
 the proxy never re-tiers an error it received an answer for. A failure of the proxy hop itself
 (the daemon unreachable, the connection dropped mid-request) is a distinct case: there is no
 upstream answer to relay a tier from, so it surfaces as a fresh protocol-level error instead.
+A scope rejection (§4.2.1) is a third case, and the only one the proxy authors itself: the
+request never reaches the upstream, and it is tool-level `invalid_request`, matching the tier
+the upstream's own store validation would have used.
 
 ## 5. Shared error taxonomy
 

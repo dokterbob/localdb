@@ -1861,16 +1861,20 @@ fn setup_multi_store(dir: &TempDir) -> std::collections::HashMap<&'static str, s
     fixtures
 }
 
-/// Headline regression test for issue #178: `source list` with no `--store`
-/// must NOT silently resolve to an arbitrary store (the pre-fix behavior
-/// picked `list_stores()[0]`, which in practice was often not `default`).
-/// It must deterministically resolve to the store named `default`
-/// (specs/05-surfaces.md §2.2) — proven here by showing the bare invocation
-/// differs from `-s books` and is identical to the explicit `-s default`.
+/// Headline regression test for issues #178 and #201: `source list` with no
+/// `--store` must not silently narrow to *any* single store.
+///
+/// #178's original fix replaced "an arbitrary store (`list_stores()[0]`)"
+/// with "the store named `default`" — which cured the arbitrariness but kept
+/// the narrowing, and that is #201: `source list` reporting
+/// `No sources on store 'default'.` on a database that plainly had sources in
+/// `books` and `hydra`. `-s` is a *filter*, so omitting it spans everything
+/// (specs/05-surfaces.md §2.2). This asserts the sharper form of #178's
+/// intent: the bare listing covers every store, not one privileged one.
 #[test]
-fn source_list_no_store_flag_is_default_store_not_arbitrary_178() {
+fn source_list_no_store_flag_spans_all_stores_178_201() {
     let dir = TempDir::new().unwrap();
-    setup_multi_store(&dir);
+    setup_multi_store(&dir); // books, default, research — one source each
 
     let bare = cmd_with_dir(&dir)
         .args(["--json", "source", "list"])
@@ -1879,36 +1883,39 @@ fn source_list_no_store_flag_is_default_store_not_arbitrary_178() {
     assert!(bare.status.success());
     let bare_v: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&bare.stdout)).unwrap();
+    let sources = bare_v["sources"].as_array().expect("sources array");
 
-    let explicit_books = cmd_with_dir(&dir)
-        .args(["--json", "--store", "books", "source", "list"])
-        .output()
-        .unwrap();
-    assert!(explicit_books.status.success());
-    let books_v: serde_json::Value =
-        serde_json::from_str(&String::from_utf8_lossy(&explicit_books.stdout)).unwrap();
-
-    // The headline #178 assertion: omitting --store must not be equivalent
-    // to picking an arbitrary other store (here, `books`).
-    assert_ne!(
-        bare_v, books_v,
-        "issue #178 regression: `source list` with no --store must not silently \
-         resolve to an arbitrary store (e.g. `books`); got identical output: {bare_v}"
-    );
-
-    // And it must positively be the `default` store's view, not just "some
-    // other store".
-    let explicit_default = cmd_with_dir(&dir)
-        .args(["--json", "--store", "default", "source", "list"])
-        .output()
-        .unwrap();
-    assert!(explicit_default.status.success());
-    let default_v: serde_json::Value =
-        serde_json::from_str(&String::from_utf8_lossy(&explicit_default.stdout)).unwrap();
     assert_eq!(
-        bare_v, default_v,
-        "no --store should resolve deterministically to the store named 'default'"
+        sources.len(),
+        3,
+        "a bare `source list` must cover every store's sources: {bare_v}"
     );
+    let store_names: std::collections::HashSet<&str> = sources
+        .iter()
+        .map(|s| s["store"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        store_names,
+        ["books", "default", "research"].into_iter().collect(),
+        "every store must appear in a bare `source list`: {bare_v}"
+    );
+
+    // The #201 half, stated negatively: the bare listing must not be
+    // equivalent to any single-store view — neither the arbitrary store #178
+    // used to pick, nor the `default` store #178's fix picked instead.
+    for narrowed in ["books", "default"] {
+        let explicit = cmd_with_dir(&dir)
+            .args(["--json", "--store", narrowed, "source", "list"])
+            .output()
+            .unwrap();
+        assert!(explicit.status.success());
+        let explicit_v: serde_json::Value =
+            serde_json::from_str(&String::from_utf8_lossy(&explicit.stdout)).unwrap();
+        assert_ne!(
+            bare_v, explicit_v,
+            "a bare `source list` must not collapse to the single store '{narrowed}'"
+        );
+    }
 }
 
 /// `source add` with no `--store` lands in the store named `default`
@@ -2145,6 +2152,343 @@ fn db_migrate_with_store_flag_exits_2() {
         stderr.contains("--store is not applicable"),
         "stderr: {stderr}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #201: `-s` is a filter, and every command that accepts it either
+// honors it or refuses it — none silently ignore it.
+// ---------------------------------------------------------------------------
+
+/// The reporter's exact human-mode symptom (#201): three stores with sources,
+/// and a bare `source list` showed one store's worth. It must now print one
+/// line per source across all stores, each carrying the store-name column
+/// (which appears because >1 store is in scope, specs/05-surfaces.md §2.2).
+#[test]
+fn source_list_no_store_flag_spans_all_stores_with_column() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir); // books, default, research — one source each
+
+    let output = cmd_with_dir(&dir)
+        .args(["source", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines.len(),
+        3,
+        "one line per source across all three stores; stdout: {stdout}"
+    );
+
+    // Column width is the longest name in scope ("research", 8) + 2 = 10.
+    for name in ["books", "default", "research"] {
+        assert!(
+            lines.iter().any(|l| l.starts_with(&format!("{name:<10}"))),
+            "expected a '{name}' line with the store-name column: {lines:?}"
+        );
+    }
+}
+
+/// The same, in `--json`: every store's sources appear, each tagged with its
+/// own `store.name`.
+#[test]
+fn source_list_no_store_flag_json_includes_every_store() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["--json", "source", "list"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    let sources = v["sources"].as_array().expect("sources array");
+    assert_eq!(sources.len(), 3, "{v}");
+    let names: std::collections::HashSet<&str> = sources
+        .iter()
+        .map(|s| s["store"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        ["books", "default", "research"].into_iter().collect()
+    );
+}
+
+/// The direct #201 regression: a source living in a *non*-`default` store,
+/// removed by ULID with no `--store`. Under the old `DefaultStore` policy the
+/// ULID resolved fine but its owning store was outside the implicit scope, so
+/// a perfectly valid id exited 3.
+#[test]
+fn source_remove_by_ulid_no_store_flag_succeeds_for_non_default_store() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    for name in ["books", "default"] {
+        cmd_with_dir(&dir)
+            .args(["store", "add", name])
+            .assert()
+            .success();
+    }
+
+    let fixture = dir.path().join("books-docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+    let add_out = cmd_with_dir(&dir)
+        .args([
+            "--json",
+            "--store",
+            "books",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(add_out.status.success());
+    let add_v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&add_out.stdout)).unwrap();
+    let id = add_v["id"].as_str().unwrap().to_string();
+
+    // No `--store`: the ULID identifies its owning store on its own.
+    let output = cmd_with_dir(&dir)
+        .args(["source", "remove", &id])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code().unwrap(),
+        0,
+        "a bare `source remove <ulid>` must find the source wherever it lives (#201); stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // And it is genuinely gone from `books`.
+    cmd_with_dir(&dir)
+        .args(["--store", "books", "source", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No sources on store 'books'."));
+}
+
+/// `source remove` now runs under the `AllStores` policy, so a database with
+/// no stores at all is exit 2 with that policy's message — not a silent
+/// no-op, and no longer the `no store named 'default'` message.
+#[test]
+fn source_remove_by_ulid_no_store_flag_zero_stores_exits_2() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["source", "remove", "01ABCDEFGHIJKLMNOPQRSTUVWX"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no stores; run `localdb store add <name>` or pass --store"),
+        "stderr: {stderr}"
+    );
+}
+
+/// `store add` names its store as an argument — `--store` has nothing to
+/// select, so it must exit 2 rather than be silently ignored (the #178
+/// failure mode, still present in `store add` until #201).
+#[test]
+fn store_add_rejects_store_flag_exits_2() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["--store", "books", "store", "add", "newstore"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--store is not applicable"));
+
+    // The rejection must also be a no-op: `newstore` must not exist.
+    let stores = cmd_with_dir(&dir)
+        .args(["--json", "store", "list"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&stores.stdout)).unwrap();
+    assert!(
+        !v["stores"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["name"] == "newstore"),
+        "a rejected `store add` must not have created the store: {v}"
+    );
+}
+
+/// Same for `store remove` — and deliberately run *without* `--yes`, so it
+/// would block on a confirmation prompt if the rejection didn't come first.
+/// The rejection is the first statement in the command for exactly this
+/// reason: misuse must never get as far as asking the user to confirm a
+/// deletion.
+#[test]
+fn store_remove_rejects_store_flag_exits_2() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["--store", "books", "store", "remove", "research"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--store is not applicable"));
+
+    // Nothing was deleted, and nothing was prompted for.
+    cmd_with_dir(&dir)
+        .args(["store", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("research"));
+}
+
+/// `init` runs before any store exists, so `--store` is meaningless — exit 2,
+/// and (since the check is the first statement) without writing a config.
+#[test]
+fn init_rejects_store_flag_exits_2() {
+    let dir = TempDir::new().unwrap();
+    let config_path = dir.path().join("config.yaml");
+
+    let output = cmd()
+        .env("LOCALDB_CONFIG", &config_path)
+        .args(["--store", "books", "init"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--store is not applicable"));
+    assert!(
+        !config_path.exists(),
+        "a rejected `init` must not have written a config file"
+    );
+}
+
+/// `serve` serves every store regardless, so `--store` is rejected — and the
+/// check must precede binding a port, which is what makes this test able to
+/// complete at all (a daemon that started would run until killed).
+#[test]
+fn serve_rejects_store_flag_exits_2() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["--store", "books", "serve"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--store is not applicable"));
+    assert!(
+        !dir.path().join("data").join("daemon.sock").exists(),
+        "a rejected `serve` must not have created a daemon socket"
+    );
+}
+
+/// `mcp -s <unknown>` exits 3 instead of starting a server that silently
+/// exposes zero stores (#201). Embedded mode, no daemon running: validation
+/// happens before `serve_embedded_stdio`, so the process exits without ever
+/// reading stdin — which is why this can use `.output()` at all.
+#[test]
+fn mcp_unknown_store_flag_exits_3() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["--store", "nosuchstore", "mcp"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        3,
+        "an unknown --store must be store_not_found, not a silently empty server; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `mcp` on a database with no stores must still start cleanly (exit 0 on
+/// stdin EOF) rather than exit 2. This pins the `AllStoresAllowEmpty` policy:
+/// an MCP server that exits non-zero at startup reads to its client as
+/// broken, not as empty, so a later "simplification" back to `AllStores`
+/// would turn a fresh install into a broken-looking one.
+#[test]
+fn mcp_zero_stores_still_starts() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    // Empty stdin => immediate EOF => clean shutdown (see
+    // `mcp_exits_cleanly_on_stdin_eof`).
+    let output = cmd_with_dir(&dir)
+        .arg("mcp")
+        .write_stdin("")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        0,
+        "a storeless database must start an MCP server exposing zero stores, not exit 2; \
+         stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The `search` half of the same policy: a query against a storeless database
+/// is "no results", exit 0 — not exit 2.
+#[test]
+fn search_zero_stores_exits_0() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["search", "anything"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        0,
+        "search on a storeless database must exit 0 with no results; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("No results"));
 }
 
 /// `-s`/`--store` is repeatable and every name is resolved, not truncated to

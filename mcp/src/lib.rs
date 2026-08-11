@@ -69,16 +69,22 @@
 //! its caller, but when `cli` detects a daemon is already running, it calls
 //! `proxy::ProxyHandler::connect` and hands the result to
 //! `entrypoint::serve_proxied_stdio` instead of building an embedded
-//! `McpHandler`. In that mode, every stdio request is forwarded verbatim to
-//! the daemon's own `/mcp` HTTP route by `proxy::ProxyHandler` — a
-//! hand-written `ServerHandler` (the one non-macro-native one in this
-//! crate; see its doc comment for why) — rather than opening the store a
-//! second time in the CLI process. Store resolution then happens entirely
-//! on the daemon side: a stdio caller's `--store` flags are not honored in
-//! proxied mode (specs/05-surfaces.md §4 documents this as a known v1
-//! gap), since the daemon's own `/mcp` route has no notion of a per-session
-//! store filter to apply. `cli` alone decides which mode to run in — this
-//! crate has no dependency on `cli` and never probes for a daemon itself.
+//! `McpHandler`. In that mode, every stdio request is forwarded to the
+//! daemon's own `/mcp` HTTP route by `proxy::ProxyHandler` — a hand-written
+//! `ServerHandler` (the one non-macro-native one in this crate; see its doc
+//! comment for why) — rather than opening the store a second time in the CLI
+//! process.
+//!
+//! A stdio caller's `--store` scope *is* honored in proxied mode: `cli`
+//! passes the names to `ProxyHandler::connect`, which validates them against
+//! the upstream's own `list_stores` and then enforces the scope per request
+//! by injecting/validating the `stores`/`store` tool arguments that already
+//! exist for exactly this purpose (specs/05-surfaces.md §4.2.1 — and see
+//! `proxy.rs`'s doc comment for why the enforcement lives on arguments
+//! rather than on the transport, and for the caveat that this is scoping,
+//! not a security boundary). Unscoped, the proxy remains a verbatim relay.
+//! `cli` alone decides which mode to run in — this crate has no dependency
+//! on `cli` and never probes for a daemon itself.
 
 pub mod args;
 pub mod entrypoint;
@@ -91,4 +97,5 @@ pub mod tools;
 pub use entrypoint::{serve_embedded_stdio, serve_proxied_stdio};
 pub use handler::McpHandler;
 pub use http::build_streamable_http_service;
+pub use proxy::{ProxyConnectError, ProxyHandler};
 pub use tools::{AvailableStore, StoreDescriptor};
