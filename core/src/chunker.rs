@@ -82,6 +82,14 @@ impl text_splitter::ChunkSizer for TsSizer<'_> {
 /// char target. See the doc comment at the backstop's call site in `chunk_prose`.
 const STRUCTURELESS_RUN_MULTIPLIER: usize = 8;
 
+/// `chunk_prose`'s Layer D performance guard multiplier: a block is also delegated to
+/// `chunk_code` when its longest *line* exceeds this many multiples of the target,
+/// regardless of internal whitespace. `MarkdownSplitter`'s split-point search is
+/// super-linear on a single flat line (the multi-minute-hang class the backstop was
+/// introduced for in #61); real prose paragraphs — even the single-line ones EPUB/HTML
+/// extraction emits — stay far below this cap, so they keep the semantic prose path.
+const OVERLONG_LINE_MULTIPLIER: usize = 64;
+
 /// Returns the largest byte index ≤ `index` that is a valid UTF-8 char boundary.
 /// MSRV-safe replacement for `str::floor_char_boundary` (stable since 1.91).
 #[inline]
@@ -602,31 +610,52 @@ fn chunk_prose(
 
     let target = config.resolved_target_tokens();
 
-    // Layer D: backstop for structureless files misclassified as prose.
+    // Layer D: backstop for structureless files misclassified as prose. Two independent
+    // probes, each a single O(n) pass; tripping either delegates the block to `chunk_code`:
     //
-    // Probe: longest whitespace-free run in the block, not longest line. An ordinary
-    // long paragraph (e.g. from EPUB/HTML extraction, which emits paragraphs as single
-    // long lines) has plenty of internal whitespace and should NOT be diverted to the
-    // char-level `chunk_code` splitter — only genuinely structureless content (minified
-    // JSON, lockfiles) has no whitespace to break on. If the longest whitespace-free run
-    // exceeds `STRUCTURELESS_RUN_MULTIPLIER` × the char target, delegate to `chunk_code`.
+    // 1. Quality probe — longest whitespace-free run > STRUCTURELESS_RUN_MULTIPLIER ×
+    //    target. An ordinary long paragraph (e.g. from EPUB/HTML extraction, which emits
+    //    paragraphs as single long lines) has plenty of internal whitespace and should
+    //    NOT be diverted to the char-level `chunk_code` splitter — only genuinely
+    //    structureless content (minified JSON, lockfiles) has no whitespace to break on.
     //
-    // Accepted limitation: a paragraph containing one giant space-free token (a URL, a
-    // base64 blob) still trips this probe and sends the WHOLE block to `chunk_code`, even
-    // though the rest of the paragraph is ordinary prose. This is deliberate — the probe
-    // is a single O(n) pass with no per-token special-casing, and that one token is
-    // itself unsplittable-without-mid-token-cuts regardless of which chunker handles it.
+    // 2. Performance guard — longest line > OVERLONG_LINE_MULTIPLIER × target, whitespace
+    //    or not. `MarkdownSplitter` is super-linear on one flat line (the #61 hang class),
+    //    so a pathologically long single line (hundreds of KB of space-separated tokens)
+    //    must not reach it. Routing it to `chunk_code` is acceptable since the hard-split
+    //    there backs off to whitespace: even the degraded path cuts between words.
+    //
+    // Accepted limitations, both deliberate (no per-token special-casing):
+    // - A paragraph containing one giant space-free token (a URL, a base64 blob) trips
+    //   probe 1 and sends the WHOLE block to `chunk_code`, even though the rest is
+    //   ordinary prose — that token is unsplittable-without-mid-token-cuts anyway.
+    // - Scripts without inter-word whitespace (CJK, Thai, …) make the whole paragraph one
+    //   "run", so long CJK prose trips probe 1 and gets char-aligned cuts in `chunk_code`
+    //   (same as before this probe existed); proper word segmentation is out of scope.
     {
         let max_run_len = markdown
             .split_whitespace()
             .map(|w| w.chars().count())
             .max()
             .unwrap_or(0);
-        let threshold = STRUCTURELESS_RUN_MULTIPLIER * target;
-        tracing::debug!(max_run_len, threshold, "chunk_prose backstop probe");
-        if max_run_len > threshold {
+        let max_line_len = markdown
+            .lines()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(0);
+        let run_threshold = STRUCTURELESS_RUN_MULTIPLIER * target;
+        let line_threshold = OVERLONG_LINE_MULTIPLIER * target;
+        tracing::debug!(
+            max_run_len,
+            run_threshold,
+            max_line_len,
+            line_threshold,
+            "chunk_prose backstop probe"
+        );
+        if max_run_len > run_threshold || max_line_len > line_threshold {
             tracing::debug!(
                 max_run_len,
+                max_line_len,
                 "chunk_prose backstop: delegating to chunk_code"
             );
             return chunk_code(resource_id, markdown, config, block_seq);
@@ -1111,6 +1140,10 @@ mod tests {
     /// characters in `source` (a "mid-word split", #191). A boundary is a
     /// mid-word split when the char immediately on one side of it and the
     /// char immediately on the other side are both alphanumeric.
+    ///
+    /// Deliberate scope: only alphanumeric-to-alphanumeric boundaries are flagged.
+    /// A split at a hyphen or apostrophe ("well-|known", "don|'t") passes silently,
+    /// since the flanking punctuation is not alphanumeric.
     fn assert_no_mid_word_splits(source: &str, chunks: &[ChunkOutput]) {
         for c in chunks {
             let start = c.span.start;
@@ -1705,27 +1738,89 @@ mod tests {
     }
 
     #[test]
-    fn prose_long_whitespace_separated_text_completes_without_hanging() {
-        // Renamed from `prose_structureless_long_line_falls_back_to_line_packer` (#191
-        // fix): that name is no longer accurate. Under the OLD probe (longest LINE),
-        // this single ~50k-char line tripped the Layer D backstop and fell back to the
-        // code packer. Under the NEW probe (longest whitespace-free RUN, part (a) of the
-        // #191 fix), this text's longest run is just 4 chars ("word") — nowhere near the
-        // threshold — so it no longer trips the backstop at all and is handled directly
-        // by MarkdownSplitter. The key assertions that remain meaningful: it completes
-        // promptly (no hang — MarkdownSplitter must not choke on one enormous
-        // whitespace-separated block) and produces multiple bounded chunks.
-        let long_line = "word ".repeat(10_000); // ~50k chars, no newlines
-        let doc_id = "doc-structureless";
-        let cfg = ChunkerConfig::prose(); // target = 256 chars (prose default)
+    fn prose_overlong_single_line_hits_perf_guard_no_hang_no_mid_word_splits() {
+        // Layer D performance guard (`OVERLONG_LINE_MULTIPLIER`): a pathologically long
+        // single LINE — even one full of ordinary whitespace-separated words — must not
+        // reach MarkdownSplitter, whose split-point search is super-linear on one flat
+        // line (measured ~O(n²): 4.2s at 800k chars; the #61 hang class). At 200k chars
+        // this line is far above the 64×target (16 384-char) guard, so it routes to
+        // `chunk_code` — which, post-#191, backs its hard splits off to whitespace, so
+        // even this degraded path must produce no mid-word splits. Completing promptly
+        // (chunk_code is O(n)) is itself a key assertion.
+        let long_line = "word ".repeat(40_000); // ~200k chars, no newlines
+        let doc_id = "doc-overlong-line";
+        let cfg = ChunkerConfig::prose(); // target = 256; line guard = 16_384 chars
+        let target = cfg.resolved_target_tokens();
         let chunks = chunk_prose(doc_id, &long_line, &cfg, &CharSizer, 0).unwrap();
         assert!(
             chunks.len() >= 2,
-            "long whitespace-separated text should split into multiple chunks, got {}",
+            "overlong single line should split into multiple chunks, got {}",
             chunks.len()
         );
-        // Should not take forever — MarkdownSplitter must handle this directly.
-        // (The test completing at all is the key assertion.)
+        // chunk_code bounds every chunk to ≤ target chars — the observable pinning that
+        // the perf guard routed this block to chunk_code, not MarkdownSplitter.
+        for c in &chunks {
+            assert!(
+                c.text.chars().count() <= target,
+                "chunk_code path should bound every chunk to the char target: {} chars",
+                c.text.chars().count()
+            );
+        }
+        assert_no_mid_word_splits(&long_line, &chunks);
+    }
+
+    #[test]
+    fn prose_long_single_line_below_perf_guard_stays_on_prose_path() {
+        // Boundary of the Layer D dual probe: a single-line paragraph well above the old
+        // 8×target line threshold but below the new 64×target perf guard must stay on
+        // the semantic MarkdownSplitter path — this is the #191 quality win. Observable:
+        // with WordSizer (256-word cap) the prose path emits chunks far longer than 256
+        // CHARS, whereas the chunk_code path bounds every chunk to ≤ 256 chars.
+        let sentence = "The quick brown fox jumps over the lazy dog near the riverbank today. ";
+        let long_line = sentence.repeat(75).trim_end().to_string(); // ~5.3k chars, one line
+        assert!(!long_line.contains('\n'));
+        let cfg = ChunkerConfig::prose();
+        let target = cfg.resolved_target_tokens();
+        assert!(long_line.chars().count() > STRUCTURELESS_RUN_MULTIPLIER * target);
+        assert!(long_line.chars().count() < OVERLONG_LINE_MULTIPLIER * target);
+        let chunks = chunk_prose("doc-below-guard", &long_line, &cfg, &WordSizer, 0).unwrap();
+        assert!(chunks.len() >= 2, "expected multiple chunks");
+        assert!(
+            chunks.iter().any(|c| c.text.chars().count() > target),
+            "prose path should pack chunks beyond the char target (word-capped, not char-capped)"
+        );
+        assert_no_mid_word_splits(&long_line, &chunks);
+    }
+
+    #[test]
+    fn prose_cjk_long_paragraph_pins_char_cut_limitation() {
+        // Pins a DOCUMENTED limitation, not desired behavior: scripts without inter-word
+        // whitespace (CJK, Thai, …) make an entire paragraph one whitespace-free "run",
+        // so long CJK prose trips the structureless probe and is routed to `chunk_code`,
+        // where the whitespace backoff never fires and the raw char cut applies — i.e.
+        // CJK text still gets mid-"word" cuts (#191 fixes whitespace-delimited scripts
+        // only; word segmentation is out of scope). What this pins: the routing, that
+        // chunking completes promptly, char-boundary safety on multibyte text, the
+        // exact-slice span invariant, and lossless reassembly. Deliberately does NOT use
+        // `assert_no_mid_word_splits` — mid-word cuts are expected here.
+        let sentence = "深度学习模型通过大量标注数据进行训练以逐步提高预测准确性。";
+        let cfg = ChunkerConfig::prose();
+        let target = cfg.resolved_target_tokens();
+        let para = sentence.repeat(2048 / sentence.chars().count() + 2); // > 8×target chars
+        assert!(para.chars().count() > STRUCTURELESS_RUN_MULTIPLIER * target);
+        assert!(!para.contains(char::is_whitespace));
+        let chunks = chunk_prose("doc-cjk", &para, &cfg, &CharSizer, 0).unwrap();
+        assert!(chunks.len() >= 2, "expected multiple chunks");
+        let mut reassembled = String::new();
+        for c in &chunks {
+            // chunk_code path: every chunk bounded to ≤ target chars.
+            assert!(c.text.chars().count() <= target);
+            // Exact-slice span invariant holds even on the char-cut path.
+            assert_eq!(&para[c.span.start..c.span.end], c.text);
+            reassembled.push_str(&c.text);
+        }
+        // No whitespace to trim and no gaps possible: reassembly is lossless.
+        assert_eq!(reassembled, para);
     }
 
     #[test]
@@ -1748,10 +1843,10 @@ mod tests {
             "backstop should route to chunk_code and hard-split the oversized token, got {} chunks",
             chunks.len()
         );
-        // chunk_code bounds every chunk to at most `target` chars (its hard-cut budget).
-        // MarkdownSplitter would not guarantee this for an atomic unit it can't split
-        // (see `prose_oversized_single_atomic_unit_no_panic`) — this is the observable
-        // that pins "routed to chunk_code" vs. "handled directly by MarkdownSplitter".
+        // chunk_code bounds every chunk to at most `target` chars (its hard-cut budget) —
+        // that bound is the observable pinning "routed to chunk_code" vs. "handled
+        // directly by MarkdownSplitter" (which sizes chunks by the sizer's own metric,
+        // not a hard char budget).
         for c in &chunks {
             assert!(
                 c.text.chars().count() <= target,
