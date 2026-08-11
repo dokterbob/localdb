@@ -7,7 +7,10 @@ use localdb_core::{
 use serde_json::json;
 
 use crate::{
-    app_db::{default_store_row, load_app_db_lenient, DEFAULT_STORE_NAME},
+    app_db::{
+        default_store_row, load_app_db_lenient, reject_store_flag, DEFAULT_STORE_NAME,
+        INIT_REJECT_MESSAGE,
+    },
     daemon_client::CliContext,
     normalize::{exit_err, print_json},
 };
@@ -29,6 +32,12 @@ pub fn run_init(ctx: &CliContext) {
 }
 
 pub(crate) async fn run_init_async(ctx: &CliContext) {
+    // specs/05-surfaces.md §2.2: `init` runs before any store exists — the
+    // only store it creates is `default`, and `-s` cannot rename or redirect
+    // that. First statement in the function so a misused flag never creates
+    // directories or writes a config first.
+    reject_store_flag(ctx, INIT_REJECT_MESSAGE);
+
     let platform = localdb_core::config::PlatformPaths::resolve().unwrap_or_else(|| {
         eprintln!("error: cannot determine platform paths");
         std::process::exit(1);

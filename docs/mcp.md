@@ -103,22 +103,79 @@ own `/mcp` route instead of opening the store a second time. This means:
 - You no longer need to stop `localdb serve` before using `localdb mcp` — the two now
   coexist by design (this replaces earlier v1 guidance that told you to stop the
   daemon first).
-- Proxied mode always exposes whatever store set the daemon had at its own startup —
-  **`--store` narrowing is not honored** when a daemon is running. `localdb mcp
-  --store <name>` against a running daemon prints a non-fatal warning to stderr and
-  serves the daemon's full store set regardless. This is a documented v1 limitation,
-  not a bug — see [specs/05-surfaces.md](../specs/05-surfaces.md) §4.2.
+- Absent `--store`, proxied mode exposes whatever store set the daemon had at its own
+  startup, and every request relays verbatim.
+- With `--store`, the scope is enforced per request — see
+  [Store scoping](#store-scoping) below.
 
 If no daemon is running, `localdb mcp` opens the store(s) embedded in-process exactly
 as before — no behavior change for the common case.
 
 ---
 
+## Store scoping
+
+`localdb mcp --store <name>` (repeatable) limits the session to those stores. Use it
+when an agent should only see part of your index — a project-bound store, say, rather
+than everything you have ever indexed.
+
+```
+$ localdb mcp --store books --store research
+```
+
+Omit `--store` and every store is exposed. An unknown name exits `3` before the server
+starts serving, in both modes — it is never silently dropped. A database with **no**
+stores is not an error: the server starts and exposes zero stores, since an MCP server
+that exits non-zero at startup reads to its client as broken rather than as empty.
+
+The scope is enforced in both process modes, by different mechanisms:
+
+| Mode | How |
+|---|---|
+| Embedded (no daemon) | Only the scoped stores are opened. Nothing else is reachable because nothing else exists in the process. |
+| Daemon-proxied | The scope is applied to every relayed `tools/call`: `search`'s `stores` and `get_document`/`get_chunks`'s `store` arguments are filled in when absent and rejected when they name a store outside the scope, and `list_stores` is filtered so out-of-scope stores cannot even be enumerated. |
+
+Proxied mode has to work through tool arguments because there is no transport-level
+channel: rmcp's HTTP service factory is a synchronous `Fn()` with no access to the
+request, so neither `/mcp?store=x` nor a custom header can select a scoped handler on
+the daemon side. The tool arguments already exist to name stores, so the scope travels
+per request instead of per connection.
+
+An out-of-scope store name comes back as an ordinary tool-level error:
+
+```json
+{
+  "error": {
+    "code": "invalid_request",
+    "message": "store 'hydra' is outside this session's --store scope; allowed: [books]"
+  }
+}
+```
+
+While the tool set is fixed at four read-only tools, a scoped session relays only those
+four; any other tool name is rejected, so a future mutating tool cannot slip through
+unscoped on the day it lands.
+
+> **This is scoping, not a security boundary.** The daemon's `/mcp` route is loopback
+> and **unauthenticated**: anything that can open a socket can bypass `localdb mcp`
+> entirely and talk to the unscoped endpoint directly. `--store` stops an agent from
+> *accidentally* reading another project's docs; it does not contain a hostile one.
+> Real containment needs daemon-side authentication, which does not exist in v1. In
+> embedded mode there is no such endpoint, so the scope is as strong as the process
+> boundary.
+
+---
+
 ## Tools
 
 The server exposes four read-only tools. Write tools are reserved for a future
-`--allow-write` release; `--allow-write` is accepted by the CLI today for
-forward-compatibility but all mutating operations are rejected in v1.
+`--allow-write` release.
+
+**`--allow-write` currently has no effect.** v1 registers no mutating tool on any
+transport, so the tool set is byte-identical with and without the flag; passing it
+prints a warning to stderr saying so. It is accepted today only so the CLI surface is
+stable for callers. (Unlike a misapplied `--store`, which exits 2, this one only warns:
+`--allow-write` fails *safe* — it can withhold a capability, never widen access.)
 
 ### `search`
 

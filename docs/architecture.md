@@ -316,12 +316,22 @@ MCP until the daemon restarts. Root cause: `rmcp`'s Streamable HTTP service fact
 synchronous, so there's no hook to redo the async `AppState` lookup per session
 without an ugly blocking bridge. See [docs/mcp.md](mcp.md#remote-http-connecting-from-another-machine).
 
-**7. `--store` is not honored when `localdb mcp` proxies to a running daemon.**
-The daemon's `/mcp` route has no concept of a per-stdio-session store filter, so
-proxied stdio mode always exposes the daemon's full store set regardless of
-`--store`; a non-fatal warning is printed to stderr. Building client-side
-re-filtering for this was rejected as not worth the complexity in v1. See
-[docs/mcp.md](mcp.md#daemon-proxied-stdio) and [specs/05-surfaces.md](../specs/05-surfaces.md) §4.2.
+**7. MCP `--store` scoping is a guardrail, not a security boundary.**
+`localdb mcp --store <name>` does now narrow the store set in both stdio modes
+(issue #201 — proxied mode used to warn and serve the daemon's *full* store set,
+which silently widened access exactly when the caller asked to narrow it). In
+proxied mode the scope is enforced per request, on the `stores`/`store` tool
+arguments, because `rmcp`'s Streamable HTTP service factory is synchronous and
+has no access to the request — so there is no transport-level channel for a
+per-connection scope (same root cause as gap 6 above).
+
+The residual gap is containment, not enforcement: the daemon's `/mcp` route is
+loopback and **unauthenticated**, so any process that can open a socket can
+bypass `localdb mcp` and talk to it unscoped. This stops an agent reading
+another project's docs by accident; it does not contain a hostile one. Closing
+it needs daemon-side auth, which v1 does not have. Embedded mode has no such
+endpoint, so there the scope is as strong as the process boundary. See
+[docs/mcp.md](mcp.md#store-scoping) and [specs/05-surfaces.md](../specs/05-surfaces.md) §4.2.1.
 
 **8. `extractor_version` is dead code; PDF reindex relies on the content hash.**
 The `extractor_version` field is hardcoded (`"1"` in both ingestors and in

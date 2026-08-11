@@ -3,7 +3,9 @@ use serde_json::json;
 
 use crate::{
     app_db::{
-        default_store_row, load_app_db, load_app_db_lenient, resolve_store_scope, StoreScopePolicy,
+        default_store_row, load_app_db, load_app_db_lenient, reject_store_flag,
+        resolve_store_scope, StoreScopePolicy, STORE_ADD_REJECT_MESSAGE,
+        STORE_REMOVE_REJECT_MESSAGE,
     },
     daemon_client::{daemon_request_async, probe_daemon, CliContext, DaemonState},
     normalize::{
@@ -18,6 +20,12 @@ pub fn run_store_add(ctx: &CliContext, name: &str) {
 }
 
 pub(crate) async fn run_store_add_async(ctx: &CliContext, name: &str) {
+    // specs/05-surfaces.md §2.2: the store this command acts on is its
+    // positional argument, so `-s` has nothing to select. It used to be
+    // silently ignored — `localdb -s books store add x` created `x`, not
+    // anything to do with `books` — which is the #178 failure mode (#201).
+    reject_store_flag(ctx, STORE_ADD_REJECT_MESSAGE);
+
     // A9-safety: validate store name before anything else.
     if let Err(e) = validate_store_name(name) {
         exit_err(&e, ctx.json);
@@ -122,6 +130,12 @@ pub fn run_store_remove(ctx: &CliContext, name: &str) {
 }
 
 pub(crate) async fn run_store_remove_async(ctx: &CliContext, name: &str) {
+    // specs/05-surfaces.md §2.2, as for `store add` above. First statement in
+    // the function on purpose: it must precede `confirm_destructive` below,
+    // so a misused flag never gets as far as asking the user to confirm a
+    // deletion this invocation was never going to perform correctly.
+    reject_store_flag(ctx, STORE_REMOVE_REJECT_MESSAGE);
+
     let (config_loader, db) = load_app_db(ctx).await;
     let data_dir = &config_loader.paths.data_dir;
 

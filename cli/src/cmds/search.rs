@@ -4,7 +4,7 @@ use localdb_core::{config::loader::ConfigLoader, Error};
 use serde_json::json;
 
 use crate::{
-    app_db::load_app_db_lenient,
+    app_db::{load_app_db_lenient, resolve_store_scope_inner, StoreScopePolicy},
     daemon_client::{daemon_request_async, probe_daemon, CliContext, DaemonState},
     normalize::{exit_err, format_snippet, print_json, validate_store_name},
 };
@@ -56,38 +56,29 @@ pub(crate) async fn resolve_search_targets(
         SearchMode::Daemon { .. } => Ok(Vec::new()),
         SearchMode::Embedded => {
             let (_config_loader, db) = load_app_db_lenient(ctx).await;
-            let runtime_stores = db.backend().list_stores().await?;
 
-            if !ctx.stores.is_empty() {
-                let runtime_names: std::collections::HashSet<&str> =
-                    runtime_stores.iter().map(|s| s.name.as_str()).collect();
-                for name in &ctx.stores {
-                    if !runtime_names.contains(name.as_str()) {
-                        return Err(Error::StoreNotFound { id: name.clone() });
-                    }
-                }
-            }
-
-            let store_names: Vec<String> = if ctx.stores.is_empty() {
-                runtime_stores.iter().map(|s| s.name.clone()).collect()
-            } else {
-                ctx.stores.clone()
-            };
+            // specs/05-surfaces.md §2.2, via the one shared resolver every
+            // other `-s`-accepting command uses. `AllStoresAllowEmpty` is
+            // what makes a fresh, storeless database return no results and
+            // exit 0 rather than exit 2; the explicit-`-s` path (validate,
+            // resolve, dedupe, unknown name -> exit 3) is identical under
+            // every policy, which is why replacing the hand-rolled block that
+            // used to live here changes no observable behavior.
+            let rows =
+                resolve_store_scope_inner(ctx, &db, StoreScopePolicy::AllStoresAllowEmpty).await?;
 
             let mut store_handles = Vec::new();
-            for name in &store_names {
-                if let Some(store_row) = runtime_stores.iter().find(|s| s.name == *name) {
-                    let handle = db.backend().retrieval_store(&store_row.id).await?;
-                    let store_name = store_row.name.clone();
-                    store_handles.push((
-                        localdb_core::search::StoreHandle {
-                            id: store_row.id.clone(),
-                            name: store_name.clone(),
-                            store: handle,
-                        },
-                        store_name,
-                    ));
-                }
+            for store_row in &rows {
+                let handle = db.backend().retrieval_store(&store_row.id).await?;
+                let store_name = store_row.name.clone();
+                store_handles.push((
+                    localdb_core::search::StoreHandle {
+                        id: store_row.id.clone(),
+                        name: store_name.clone(),
+                        store: handle,
+                    },
+                    store_name,
+                ));
             }
 
             Ok(store_handles)

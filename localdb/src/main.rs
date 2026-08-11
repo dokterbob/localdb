@@ -30,12 +30,16 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
-    /// Operate on this store (repeatable); default depends on the subcommand.
+    /// Operate on these stores (repeatable); a filter, not a selector.
     ///
-    /// Omitted, this means "all stores" for `search`/`status`/`store list`/
-    /// `index`; the store named `default` for `source`/`add` (exit 2 if
-    /// absent); and is rejected outright for `db` subcommands (exit 2). See
-    /// `--help` on the specific subcommand for its exact rule.
+    /// Omitted, this means "all stores" for `search`, `status`, `store list`,
+    /// `source list`, `source remove <ULID>`, `index` and `mcp`; the store
+    /// named `default` for `source add` and the `add` alias (exit 2 if
+    /// absent). `source remove <path|url>` requires it (exit 2 without it).
+    /// It is rejected outright (exit 2) by `init`, `serve`, `store add`,
+    /// `store remove` and the `db` subcommands, which are not store-scoped.
+    /// An explicit name is always validated: unknown is exit 3. See `--help`
+    /// on the specific subcommand for its exact rule.
     #[arg(long = "store", short = 's', global = true, value_name = "NAME")]
     pub stores: Vec<String>,
 
@@ -53,17 +57,31 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Initialize config and data directory; prompt for first-run model download.
+    ///
+    /// Runs before any store exists. Not store-scoped: passing `--store`
+    /// exits 2.
     Init,
 
     /// Start the HTTP API daemon (file watching, scheduled refresh, REST API).
+    ///
+    /// The daemon serves every store in the database. Not store-scoped:
+    /// passing `--store` exits 2.
     Serve,
 
     /// Run the MCP server on stdio for use with AI agents.
+    ///
+    /// Exposes every store when `--store` is omitted; pass `--store <NAME>`
+    /// (repeatable) to limit the session to those stores. The limit is
+    /// enforced whether the server runs embedded or proxies to a running
+    /// daemon, and an unknown name exits 3. Note this is a guardrail, not a
+    /// security boundary: the daemon's MCP endpoint is unauthenticated, so a
+    /// client that bypasses `localdb mcp` can still reach every store.
     Mcp {
-        /// Enable write tools (reserved for future use; always rejected in v1).
+        /// Enable write tools (reserved for future use; no effect in v1).
         ///
-        /// Parsing this flag now makes the CLI stable for callers even though
-        /// the server rejects all mutating operations in v1.
+        /// v1 registers no mutating tool, so the tool set is identical with
+        /// and without this flag; passing it prints a warning. Parsing it now
+        /// makes the CLI stable for callers.
         #[arg(long)]
         allow_write: bool,
     },
@@ -77,8 +95,9 @@ pub enum Command {
 
     /// Manage sources on a store.
     ///
-    /// `add`/`list`/`remove` default to the store named `default` when
-    /// `--store` is omitted; exit 2 if no store named `default` exists.
+    /// With `--store` omitted, `list` and `remove <ULID>` span every store,
+    /// while `add` targets the store named `default` (exit 2 if absent) and
+    /// `remove <path|url>` exits 2 asking for `--store`.
     #[command(subcommand)]
     Source(SourceCommand),
 
@@ -169,13 +188,22 @@ impl SourceKindArg {
 #[derive(Debug, Subcommand)]
 pub enum StoreCommand {
     /// Add a new store.
+    ///
+    /// The store is named by the positional argument below. Not store-scoped:
+    /// passing `--store` exits 2.
     Add {
         /// Store name.
         name: String,
     },
     /// List all stores.
+    ///
+    /// Lists every store when `--store` is omitted; pass `--store`
+    /// (repeatable) to narrow.
     List,
     /// Remove a store.
+    ///
+    /// The store is named by the positional argument below. Not store-scoped:
+    /// passing `--store` exits 2.
     Remove {
         /// Store name or ID.
         name: String,
@@ -222,14 +250,17 @@ pub enum DbCommand {
 
 /// Source management subcommands.
 ///
-/// All three default to the store named `default` when `--store` is
-/// omitted, and exit 2 if no store named `default` exists.
+/// `--store` is a filter: omitted, `list` and `remove <ULID>` span every
+/// store. `add` is the exception — a write has to pick one target, so it
+/// defaults to the store named `default` (exit 2 if absent).
 #[derive(Debug, Subcommand)]
 pub enum SourceCommand {
     /// Add a new source to a store.
     ///
     /// Defaults to the store named `default` when `--store` is omitted;
-    /// exit 2 if no store named `default` exists.
+    /// exit 2 if no store named `default` exists. This is the one `source`
+    /// subcommand that narrows to a single store by default, because a write
+    /// must land in one named place rather than fan out across every store.
     Add {
         /// Source paths or URLs (one or more).
         #[arg(required = true, num_args = 1..)]
@@ -251,15 +282,18 @@ pub enum SourceCommand {
         #[arg(long)]
         no_fetch_full_content: bool,
     },
-    /// List sources on a store.
+    /// List sources across stores.
     ///
-    /// Defaults to the store named `default` when `--store` is omitted;
-    /// exit 2 if no store named `default` exists.
+    /// Lists every store's sources when `--store` is omitted; pass `--store`
+    /// (repeatable) to narrow. A store-name column appears whenever more than
+    /// one store is in scope.
     List,
     /// Remove a source from a store.
     ///
-    /// Defaults to the store named `default` when `--store` is omitted;
-    /// exit 2 if no store named `default` exists.
+    /// A source ULID is globally unique, so removing by ULID searches every
+    /// store when `--store` is omitted. Removing by path or URL is ambiguous
+    /// — the same path can be a source in several stores — so it requires an
+    /// explicit `--store` and exits 2 without one.
     Remove {
         /// Source IDs, paths, or URLs (one or more).
         #[arg(required = true, num_args = 1..)]

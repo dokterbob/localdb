@@ -16,7 +16,7 @@ use store_libsql::{
 };
 
 use crate::{
-    app_db::{load_config_for_maintenance, reject_store_flag},
+    app_db::{load_config_for_maintenance, reject_store_flag, DB_REJECT_MESSAGE},
     daemon_client::{probe_daemon, CliContext, DaemonState},
     normalize::{confirm_destructive, exit_err, print_json},
 };
@@ -88,7 +88,7 @@ pub fn run_db_status(ctx: &CliContext) {
 }
 
 pub(crate) async fn run_db_status_async(ctx: &CliContext) {
-    reject_store_flag(ctx);
+    reject_store_flag(ctx, DB_REJECT_MESSAGE);
     let config_loader = load_config_for_maintenance(ctx);
     refuse_if_daemon_running(ctx, &config_loader);
 
@@ -206,7 +206,7 @@ pub fn run_db_migrate(ctx: &CliContext) {
 }
 
 pub(crate) async fn run_db_migrate_async(ctx: &CliContext) {
-    reject_store_flag(ctx);
+    reject_store_flag(ctx, DB_REJECT_MESSAGE);
     let config_loader = load_config_for_maintenance(ctx);
     refuse_if_daemon_running(ctx, &config_loader);
 
@@ -408,7 +408,7 @@ pub fn run_db_downgrade(ctx: &CliContext, to: Option<i64>) {
 }
 
 pub(crate) async fn run_db_downgrade_async(ctx: &CliContext, to: Option<i64>) {
-    reject_store_flag(ctx);
+    reject_store_flag(ctx, DB_REJECT_MESSAGE);
     let config_loader = load_config_for_maintenance(ctx);
     refuse_if_daemon_running(ctx, &config_loader);
 

@@ -5,7 +5,9 @@ use localdb_core::{
 use serde_json::json;
 
 use crate::{
-    app_db::load_app_db,
+    app_db::{
+        load_app_db, reject_store_flag, resolve_store_scope, StoreScopePolicy, SERVE_REJECT_MESSAGE,
+    },
     daemon_client::{probe_daemon, CliContext, DaemonState},
     normalize::{exit_err, print_json, visibility_to_string},
 };
@@ -17,6 +19,12 @@ pub fn run_serve(ctx: &CliContext) {
 }
 
 pub(crate) async fn run_serve_async(ctx: &CliContext) {
+    // specs/05-surfaces.md §2.2: the daemon serves every store in the
+    // database — `/v1` and `/mcp` alike — so there is nothing for `-s` to
+    // narrow. First statement in the function so a misused flag exits before
+    // `create_dir_all`/`start_daemon` bind a port or take the write lock.
+    reject_store_flag(ctx, SERVE_REJECT_MESSAGE);
+
     let options = LoadOptions {
         config_path: ctx.config.clone(),
         ..Default::default()
@@ -68,7 +76,23 @@ pub fn run_mcp(ctx: &CliContext, allow_write: bool) {
 }
 
 pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
-    use mcp::{proxy::ProxyHandler, AvailableStore, McpHandler, StoreDescriptor};
+    use mcp::{
+        proxy::{ProxyConnectError, ProxyHandler},
+        AvailableStore, McpHandler, StoreDescriptor,
+    };
+
+    // specs/05-surfaces.md §4: v1 registers no mutating tool on any
+    // transport, so `--allow-write` currently changes nothing — the tool set
+    // is identical with and without it. Warn rather than exit 2 (which is
+    // what a misapplied `-s` gets): this flag fails *safe*. It can only
+    // withhold a capability the caller would notice immediately as a missing
+    // tool, whereas `-s` failing open would silently widen access. Refusing
+    // to start an MCP server over it would be disproportionate.
+    if allow_write {
+        eprintln!(
+            "warning: no mutating MCP tools exist in v1; `--allow-write` currently has no effect"
+        );
+    }
 
     // `load_app_db` is unconditional here — same sequencing as
     // `search.rs`'s `run_search_async` — since `probe_daemon` needs
@@ -83,17 +107,6 @@ pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
     if let DaemonState::Running { base_url } =
         probe_daemon(&config_loader.paths.data_dir, ctx.daemon_url.as_deref())
     {
-        // The daemon's `/mcp` route has no notion of a stdio caller's
-        // `--store` scope (specs/05-surfaces.md §4) — re-filtering
-        // client-side would mean re-deriving store visibility rules the
-        // daemon already applied, for a flag combination narrow enough not
-        // to be worth it in v1. Warn instead of silently ignoring it.
-        if !ctx.stores.is_empty() {
-            eprintln!(
-                "warning: --store is not honored when a daemon is running; \
-                 the daemon's full store set will be used instead"
-            );
-        }
         // Connect and serve are separate calls (`ProxyHandler::connect` then
         // `mcp::serve_proxied_stdio`, rather than one moded entrypoint) so a
         // failure to reach the daemon at all — it went away between
@@ -102,9 +115,21 @@ pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
         // every other daemon-backed CLI path, instead of `internal`/exit-1.
         // Only a failure in the stdio loop *after* a successful proxy
         // connection (a much rarer case) still falls back to `internal`.
-        let handler = match ProxyHandler::connect(&base_url).await {
+        //
+        // `ctx.stores` is passed through rather than warned about: proxied
+        // mode now genuinely enforces `--store` (specs/05-surfaces.md
+        // §4.2.1). `connect` validates each name against the store set the
+        // daemon actually exposes over MCP, so an unknown name is
+        // `store_not_found`/exit 3 here — the same answer embedded mode
+        // gives — instead of the old behavior of warning and then serving
+        // the daemon's *full* store set, which silently widened access
+        // exactly when the caller had asked to narrow it (#201).
+        let handler = match ProxyHandler::connect(&base_url, &ctx.stores).await {
             Ok(handler) => handler,
-            Err(_) => {
+            Err(ProxyConnectError::StoreNotFound(name)) => {
+                exit_err(&Error::StoreNotFound { id: name }, ctx.json);
+            }
+            Err(ProxyConnectError::Unreachable(_)) => {
                 exit_err(&Error::DaemonUnreachable, ctx.json);
             }
         };
@@ -120,18 +145,17 @@ pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
         return;
     }
 
-    let runtime_stores = match db.backend().list_stores().await {
-        Ok(s) => s,
-        Err(e) => exit_err(&e, ctx.json),
-    };
-
-    // Same store resolution as `localdb search`: runtime stores only,
-    // narrowed by --store flags when given.
-    let store_names: Vec<String> = if ctx.stores.is_empty() {
-        runtime_stores.iter().map(|s| s.name.clone()).collect()
-    } else {
-        ctx.stores.clone()
-    };
+    // Same store resolution as `localdb search`, through the one shared
+    // resolver (specs/05-surfaces.md §2.2/§4.2.1). This replaced a
+    // hand-rolled `runtime_stores.iter().find(...)` loop that *skipped*
+    // unmatched `--store` names: `localdb -s typo mcp` used to start a server
+    // exposing zero stores, which reads to an agent as "this index is empty"
+    // rather than "you typo'd" (#201). It is now `store_not_found`, exit 3.
+    //
+    // `AllStoresAllowEmpty`, not `AllStores`: a genuinely storeless database
+    // must still *start* — an MCP server that exits non-zero at startup reads
+    // to its client as broken, not as empty.
+    let scoped_stores = resolve_store_scope(ctx, &db, StoreScopePolicy::AllStoresAllowEmpty).await;
 
     let embed_policy = &config_loader.config.defaults.indexing.embedding;
     let models_dir = config_loader.paths.models_dir.clone();
@@ -145,19 +169,17 @@ pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
     };
 
     let mut available: Vec<AvailableStore> = Vec::new();
-    for name in &store_names {
-        if let Some(store_row) = runtime_stores.iter().find(|s| s.name == *name) {
-            let descriptor = StoreDescriptor {
-                id: store_row.id.clone(),
-                name: store_row.name.clone(),
-                visibility: visibility_to_string(&store_row.visibility).to_string(),
-            };
-            let handle = match db.backend().retrieval_store(&store_row.id).await {
-                Ok(handle) => handle,
-                Err(e) => exit_err(&e, ctx.json),
-            };
-            available.push(AvailableStore::from_arc(descriptor, handle));
-        }
+    for store_row in &scoped_stores {
+        let descriptor = StoreDescriptor {
+            id: store_row.id.clone(),
+            name: store_row.name.clone(),
+            visibility: visibility_to_string(&store_row.visibility).to_string(),
+        };
+        let handle = match db.backend().retrieval_store(&store_row.id).await {
+            Ok(handle) => handle,
+            Err(e) => exit_err(&e, ctx.json),
+        };
+        available.push(AvailableStore::from_arc(descriptor, handle));
     }
 
     let handler = McpHandler::new(available, std::sync::Arc::from(embedder), allow_write);

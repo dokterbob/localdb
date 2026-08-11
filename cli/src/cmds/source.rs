@@ -247,6 +247,11 @@ pub(crate) async fn run_source_add_async(
 
     // specs/05-surfaces.md §2.2: bare invocation -> store named "default";
     // `-s` (repeatable) always wins and is validated/resolved/deduped here.
+    // `source add` is the *one* command that still defaults this way — every
+    // other `-s`-accepting command treats the flag as a filter over all
+    // stores. A write has to pick a single target, and "every store" would
+    // fan one `source add` out across the whole database; picking `default`
+    // by name is the only choice here that isn't a guess.
     let rows = resolve_store_scope(ctx, &db, StoreScopePolicy::DefaultStore).await;
 
     // Sources that were added locally and need auto-indexing, run in a
@@ -401,8 +406,11 @@ pub fn run_source_list(ctx: &CliContext) {
 pub(crate) async fn run_source_list_async(ctx: &CliContext) {
     let (_, db) = load_app_db(ctx).await;
 
-    // specs/05-surfaces.md §2.2: bare invocation -> store named "default".
-    let rows = resolve_store_scope(ctx, &db, StoreScopePolicy::DefaultStore).await;
+    // specs/05-surfaces.md §2.2: `-s` is a *filter* — a bare `source list`
+    // spans every store. Narrowing a read to one arbitrarily-privileged store
+    // is what made `source list` report "No sources on store 'default'" on a
+    // database that plainly had sources (#201).
+    let rows = resolve_store_scope(ctx, &db, StoreScopePolicy::AllStores).await;
 
     let mut all: Vec<(String, SourceRow)> = Vec::new();
     for row in &rows {
@@ -538,9 +546,12 @@ pub(crate) async fn run_source_remove_async(ctx: &CliContext, id: &str) {
 
     // #3: If the argument looks like a path or URL (not a ULID/UUID), it must
     // be resolved against a specific store's sources, so an explicit --store
-    // is required; a bare invocation must not silently fall back to the
-    // implicit "default" store scope for this case (specs/05-surfaces.md
-    // §2.2 still requires callers to say which store's path/url they mean).
+    // is required. This is the one place `source remove`'s two implicit-scope
+    // rules diverge (specs/05-surfaces.md §2.2): a ULID is globally unique, so
+    // a bare invocation can safely span every store, but the *same* path can
+    // be a source in several stores at once — deleting from all of them on a
+    // bare `source remove ~/notes` would be a guess with teeth. Checked here,
+    // before any scope resolution, so the two rules never interact.
     if !looks_like_id(id) && ctx.stores.is_empty() {
         exit_err(
             &Error::InvalidRequest {
@@ -602,8 +613,12 @@ pub(crate) async fn run_source_remove_async(ctx: &CliContext, id: &str) {
         }
     }
 
-    // specs/05-surfaces.md §2.2: bare invocation -> store named "default".
-    let rows = resolve_store_scope(ctx, &db, StoreScopePolicy::DefaultStore).await;
+    // specs/05-surfaces.md §2.2: a bare invocation spans every store. Safe
+    // for both argument shapes by this point — the path/url case already
+    // exited 2 above demanding `-s`, so only a globally-unique ULID reaches
+    // an implicit scope, and scoping *that* to `default` only made valid ids
+    // fail when their store happened not to be `default` (#201).
+    let rows = resolve_store_scope(ctx, &db, StoreScopePolicy::AllStores).await;
 
     // Resolve (store, source_id) matches within the scoped stores.
     let matches: Vec<(StoreRow, String)> = if looks_like_id(id) {
