@@ -102,7 +102,7 @@ impl SearchService {
         let query_request = QueryRequest {
             query: req.query.clone(),
             leg_k: None,
-            top_n: Some(req.limit),
+            top_n: Some(offset + req.limit),
             filters: vec![],
         };
 
@@ -117,8 +117,10 @@ impl SearchService {
             None
         };
 
+        let citations = response.citations.into_iter().skip(offset).collect();
+
         Ok(SearchResponse {
-            citations: response.citations,
+            citations,
             total_candidates: total,
             next_cursor,
         })
