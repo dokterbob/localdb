@@ -468,6 +468,29 @@ fn store_remove_not_found_exits_3() {
     assert_eq!(output.status.code().unwrap(), 3);
 }
 
+/// `store remove ../bad --yes` (embedded mode) must exit 2 (InvalidRequest)
+/// like every other command's traversal-name rejection, not exit 3 — H2
+/// (Codex review, PR #212): `store remove` used to skip syntactic
+/// validation in both modes and fall through to a plain "not found" lookup.
+/// This is a deliberate behavior change (3 -> 2) for names of this shape.
+#[test]
+fn store_remove_embedded_traversal_store_name_exits_2() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["store", "remove", "--yes", "../bad"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "a traversal store name must exit 2 in embedded mode; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // source add / list / remove
 // ---------------------------------------------------------------------------
@@ -6315,6 +6338,203 @@ fn source_remove_daemon_unknown_but_valid_store_name_reaches_daemon() {
     assert!(reqs[0].0.starts_with("DELETE "), "{:?}", reqs[0]);
     assert!(
         reqs[0].0.contains("/v1/sources/01ABCDEFGHIJKLMNOPQRSTUVWX"),
+        "{:?}",
+        reqs[0]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// H2 (Codex review, PR #212) — `status`, `store list`, and `store remove`
+// must validate `--store`/positional store names for traversal-safety
+// *before* contacting the daemon, exactly like `source remove` above.
+// ---------------------------------------------------------------------------
+
+/// Daemon-routed `status --store ../evil` must exit 2 before the `GET
+/// /v1/status` request ever fires.
+#[test]
+fn status_daemon_invalid_store_name_exits_2_and_sends_no_request() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let body = r#"{"stores":[],"database":{"path":"/tmp/x.db","size_bytes":0,"wal_size_bytes":0,"largest_tables":[]}}"#;
+    let (port, received) = start_recording_mock_server("HTTP/1.1 200 OK", body);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["--store", "../evil", "status"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "an unsafe --store name must exit 2 before the daemon status request fires; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let reqs = received.lock().unwrap();
+    assert!(
+        reqs.is_empty(),
+        "mock daemon must receive no request when --store fails validation; got: {:?}",
+        reqs
+    );
+}
+
+/// Flip side of the test above: a syntactically valid but locally-unknown
+/// `--store` name must still reach the daemon for `status`.
+#[test]
+fn status_daemon_unknown_but_valid_store_name_reaches_daemon() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let body = r#"{"stores":[],"database":{"path":"/tmp/x.db","size_bytes":0,"wal_size_bytes":0,"largest_tables":[]}}"#;
+    let (port, received) = start_recording_mock_server("HTTP/1.1 200 OK", body);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let _output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["--store", "totally-unknown-store", "status"])
+        .output()
+        .unwrap();
+
+    let reqs = received.lock().unwrap();
+    assert_eq!(
+        reqs.len(),
+        1,
+        "a syntactically valid --store name must reach the daemon even if locally unknown; got: {:?}",
+        reqs
+    );
+    assert!(reqs[0].0.starts_with("GET "), "{:?}", reqs[0]);
+    assert!(reqs[0].0.contains("/v1/status"), "{:?}", reqs[0]);
+}
+
+/// Daemon-routed `store list --store ../evil` must exit 2 before the `GET
+/// /v1/stores` request ever fires.
+#[test]
+fn store_list_daemon_invalid_store_name_exits_2_and_sends_no_request() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let body = paginated_list_body(&[]);
+    let (port, received) = start_routing_mock_server(vec![("", "", "HTTP/1.1 200 OK", body)]);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["--store", "../evil", "store", "list"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "an unsafe --store name must exit 2 before the daemon store-list request fires; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let reqs = received.lock().unwrap();
+    assert!(
+        reqs.is_empty(),
+        "mock daemon must receive no request when --store fails validation; got: {:?}",
+        reqs
+    );
+}
+
+/// Flip side of the test above: a syntactically valid but locally-unknown
+/// `--store` name must still reach the daemon for `store list`.
+#[test]
+fn store_list_daemon_unknown_but_valid_store_name_reaches_daemon() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let body = paginated_list_body(&[&store_record_json("other-store")]);
+    let (port, received) = start_routing_mock_server(vec![("", "", "HTTP/1.1 200 OK", body)]);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let _output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["--store", "totally-unknown-store", "store", "list"])
+        .output()
+        .unwrap();
+
+    let reqs = received.lock().unwrap();
+    assert_eq!(
+        reqs.len(),
+        1,
+        "a syntactically valid --store name must reach the daemon even if locally unknown; got: {:?}",
+        reqs
+    );
+    assert!(reqs[0].0.starts_with("GET "), "{:?}", reqs[0]);
+    assert!(reqs[0].0.contains("/v1/stores"), "{:?}", reqs[0]);
+}
+
+/// Daemon-routed `store remove ../bad --yes` must exit 2 before the `DELETE
+/// /v1/stores/{name}` request ever fires. Also pins that embedded and daemon
+/// mode now agree (exit 2, not the old daemon-only exit 3).
+#[test]
+fn store_remove_daemon_invalid_store_name_exits_2_and_sends_no_request() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let body = r#"{"status":"ok","name":"../bad"}"#;
+    let (port, received) = start_recording_mock_server("HTTP/1.1 200 OK", body);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["store", "remove", "--yes", "../bad"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "an unsafe store name must exit 2 before the daemon DELETE fires; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let reqs = received.lock().unwrap();
+    assert!(
+        reqs.is_empty(),
+        "mock daemon must receive no request when the store name fails validation; got: {:?}",
+        reqs
+    );
+}
+
+/// Flip side of the test above: a syntactically valid but locally-unknown
+/// store name must still reach the daemon for `store remove`.
+#[test]
+fn store_remove_daemon_unknown_but_valid_store_name_reaches_daemon() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let body = r#"{"status":"ok","name":"totally-unknown-store"}"#;
+    let (port, received) = start_recording_mock_server("HTTP/1.1 200 OK", body);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["store", "remove", "--yes", "totally-unknown-store"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "a syntactically valid store name must reach the daemon even if locally unknown; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let reqs = received.lock().unwrap();
+    assert_eq!(
+        reqs.len(),
+        1,
+        "expected exactly one DELETE request to reach the daemon; got: {:?}",
+        reqs
+    );
+    assert!(reqs[0].0.starts_with("DELETE "), "{:?}", reqs[0]);
+    assert!(
+        reqs[0].0.contains("/v1/stores/totally-unknown-store"),
         "{:?}",
         reqs[0]
     );

@@ -224,6 +224,20 @@ impl DaemonAwareCommand for StatusCmd {
         // `encode_path_segment` is safe in a query-value position too (see
         // its own doc comment; it's already used this way for `?cursor=` in
         // `walk_daemon_pages`).
+        //
+        // H2 (Codex review, PR #212): validate every requested name for
+        // traversal-safety *before* the request is built at all — mirrors
+        // the in-`run_daemon` loop idiom `source remove` uses
+        // (`cli/src/cmds/source.rs`'s `SourceRemoveCmd::run_daemon`).
+        // Previously this validation only happened after the response came
+        // back, via `apply_daemon_store_scope` below — so `../bad` reached
+        // the daemon first and its exit code depended on daemon
+        // reachability (404/exit 3 if reachable, DaemonUnreachable/exit 5
+        // otherwise) instead of the stable exit 2 every other command gives
+        // an unsafe name.
+        for name in &ctx.stores {
+            crate::normalize::validate_store_name(name)?;
+        }
         let url = if ctx.stores.is_empty() {
             format!("{base_url}/v1/status")
         } else {

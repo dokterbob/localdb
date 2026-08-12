@@ -138,6 +138,16 @@ impl DaemonAwareCommand for StoreListCmd {
     const SCOPE_POLICY: StoreScopePolicy = StoreScopePolicy::AllStores;
 
     async fn run_daemon(&self, ctx: &CliContext, base_url: &str) -> Result<Self::Outcome, Error> {
+        // H2 (Codex review, PR #212): validate every requested name for
+        // traversal-safety *before* `walk_daemon_pages` fires the first `GET
+        // /v1/stores` request — mirrors the in-`run_daemon` loop idiom
+        // `source remove` uses (`SourceRemoveCmd::run_daemon` above).
+        // Previously `apply_daemon_store_scope` below was the only
+        // validation, running only after the daemon had already been
+        // queried.
+        for name in &ctx.stores {
+            validate_store_name(name)?;
+        }
         let mut all: Vec<StoreListEntry> = Vec::new();
         walk_daemon_pages(base_url, "/v1/stores", |items| {
             for item in items {
@@ -288,6 +298,17 @@ pub(crate) async fn run_store_remove_async(ctx: &CliContext, name: &str) {
     // so a misused flag never gets as far as asking the user to confirm a
     // deletion this invocation was never going to perform correctly.
     reject_store_flag(ctx, STORE_REMOVE_REJECT_MESSAGE);
+
+    // H2 (Codex review, PR #212): validate the store name before anything
+    // else — like `store add` does in `run_store_add_async` above — so both
+    // embedded and daemon mode reject a syntactically invalid name
+    // (`InvalidRequest`/exit 2) instead of only embedded mode doing so via a
+    // later "not found" lookup, and so the user is never prompted about a
+    // name that can never exist. This intentionally changes embedded mode's
+    // exit code for names like `../bad` from 3 (StoreNotFound) to 2.
+    if let Err(e) = validate_store_name(name) {
+        exit_err(&e, ctx.json);
+    }
 
     let config_loader = load_config_for_maintenance(ctx);
 
