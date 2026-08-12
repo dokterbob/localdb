@@ -60,7 +60,18 @@ pub(crate) async fn make_app_with_queue_and_state(
     .await
     .unwrap();
 
-    let router = Router::new()
+    let router = build_router(state.clone());
+
+    (dir, router, state)
+}
+
+/// Build the router around an arbitrary `AppState` — factored out of
+/// [`make_app_with_queue_and_state`] so a test that needs a non-standard
+/// backend (e.g. one that fails or tracks calls for a specific store) can
+/// assemble its own `AppState` via `AppState::from_backend` and still get
+/// the real route table rather than a route subset.
+pub(crate) fn build_router(state: AppState) -> Router {
+    Router::new()
         .route("/v1/stores", get(list_stores).post(create_store))
         .route(
             "/v1/stores/{name}",
@@ -78,9 +89,7 @@ pub(crate) async fn make_app_with_queue_and_state(
         .route("/v1/jobs/{id}/events", get(job_events))
         .route("/v1/status", get(get_status))
         .route("/v1/config", get(get_config))
-        .with_state(state.clone());
-
-    (dir, router, state)
+        .with_state(state)
 }
 
 pub(crate) async fn json_body(body: axum::body::Body) -> serde_json::Value {

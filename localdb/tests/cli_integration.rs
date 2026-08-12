@@ -242,6 +242,123 @@ fn status_json_has_daemon_field() {
     assert!(v.get("stores").is_some());
 }
 
+/// `status --store <name>...` must scope the daemon request itself, not just
+/// filter the response client-side (issue #187 review, finding F7): each
+/// requested name is sent as a repeated, percent-encoded `?store=` query
+/// param, mirroring `encode_path_segment`'s use on URL path segments
+/// elsewhere in `daemon_client`. Uses a store name containing a space to
+/// prove the value is actually percent-encoded (`store=sp%20ace`), not just
+/// concatenated raw — an unescaped space would still parse as one query
+/// param in this case, but an unescaped '&' or '#' would corrupt the query
+/// string entirely, which is what percent-encoding here guards against.
+#[test]
+fn status_daemon_scopes_request_with_percent_encoded_store_params() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let (listener, port) = start_mock_daemon();
+    let received_request_lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let received_clone = received_request_lines.clone();
+
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).is_ok() {
+                received_clone
+                    .lock()
+                    .unwrap()
+                    .push(request_line.trim().to_string());
+            }
+
+            // Drain headers.
+            loop {
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+
+            // Respond with a `GET /v1/status` body naming the two scoped
+            // stores, so the CLI's client-side `apply_daemon_store_scope`
+            // (kept as defense-in-depth) also succeeds and the process exits
+            // 0 rather than `store_not_found`.
+            let body = r#"{
+                "daemon": true,
+                "store_count": 2,
+                "source_count": 0,
+                "job_count": 0,
+                "stores": [
+                    {"name": "sp ace", "visibility": "private", "backend": "libsql", "document_count": 0, "chunk_count": 0},
+                    {"name": "c", "visibility": "private", "backend": "libsql", "document_count": 0, "chunk_count": 0}
+                ],
+                "database": {
+                    "path": "/tmp/localdb.db",
+                    "exists": false,
+                    "size_bytes": null,
+                    "wal_size_bytes": null,
+                    "total_size_bytes": 0,
+                    "bytes_per_chunk": null,
+                    "largest_tables": []
+                }
+            }"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    std::fs::write(
+        data_dir.join("daemon.sock"),
+        format!("http://127.0.0.1:{}", port),
+    )
+    .unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["--json", "status", "--store", "sp ace", "--store", "c"])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "status --store should succeed against the mock daemon; \
+         exit={:?} stdout={} stderr={}",
+        output.status.code(),
+        stdout,
+        stderr
+    );
+
+    let lines = received_request_lines.lock().unwrap();
+    let status_request = lines
+        .iter()
+        .find(|l| l.contains("/v1/status"))
+        .unwrap_or_else(|| panic!("mock daemon never received a /v1/status request: {lines:?}"));
+    assert!(
+        status_request.contains("store=sp%20ace"),
+        "expected a percent-encoded 'sp ace' store param; got: {status_request}"
+    );
+    assert!(
+        status_request.contains("store=c"),
+        "expected a repeated 'store=c' query param; got: {status_request}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // store add / list / remove
 // ---------------------------------------------------------------------------

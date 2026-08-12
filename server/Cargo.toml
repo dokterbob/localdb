@@ -16,6 +16,12 @@ ingest = { path = "../ingest" }
 mcp = { path = "../mcp" }
 async-trait = { workspace = true }
 axum = { workspace = true }
+# `axum_extra::extract::Query` (issue #187 review, finding F7): unlike
+# `axum::extract::Query`, it deserializes repeated query keys into a
+# `Vec<T>` field via `serde_html_form` — needed for `GET /status`'s
+# repeatable `?store=` scoping param (`server/src/handlers/status.rs`),
+# mirroring the CLI's repeatable `--store` flag.
+axum-extra = { version = "0.12", default-features = false, features = ["query"] }
 # `futures::stream::unfold` builds the `GET /v1/jobs/{id}/events` SSE stream
 # (issue #83) — `axum::response::sse::Sse` requires its payload to implement
 # `futures_util::stream::Stream`, which `futures` re-exports. Already a

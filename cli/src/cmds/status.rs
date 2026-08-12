@@ -10,7 +10,7 @@ use crate::{
         StoreScopePolicy,
     },
     command_table::{dispatch, DaemonAwareCommand},
-    daemon_client::{daemon_request_async, CliContext},
+    daemon_client::{daemon_request_async, encode_path_segment, CliContext},
     normalize::{print_json, visibility_to_string},
 };
 
@@ -215,7 +215,26 @@ impl DaemonAwareCommand for StatusCmd {
     const SCOPE_POLICY: StoreScopePolicy = StoreScopePolicy::AllStores;
 
     async fn run_daemon(&self, ctx: &CliContext, base_url: &str) -> Result<StatusOutcome, Error> {
-        let url = format!("{base_url}/v1/status");
+        // Scope the request itself with a repeatable, percent-encoded
+        // `?store=` per requested name (issue #187 review, finding F7) —
+        // previously this always fetched every store and relied entirely on
+        // `apply_daemon_store_scope` below to filter client-side, which both
+        // wasted work gathering stores the caller didn't ask about and gave
+        // an unscoped daemon-side view of `store_count`/`source_count`.
+        // `encode_path_segment` is safe in a query-value position too (see
+        // its own doc comment; it's already used this way for `?cursor=` in
+        // `walk_daemon_pages`).
+        let url = if ctx.stores.is_empty() {
+            format!("{base_url}/v1/status")
+        } else {
+            let query: String = ctx
+                .stores
+                .iter()
+                .map(|name| format!("store={}", encode_path_segment(name)))
+                .collect::<Vec<_>>()
+                .join("&");
+            format!("{base_url}/v1/status?{query}")
+        };
         let v = daemon_request_async(reqwest::Method::GET, &url, None).await?;
 
         let daemon_stores: Vec<StoreStatusEntry> = v

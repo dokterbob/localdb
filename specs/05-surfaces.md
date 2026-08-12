@@ -296,6 +296,24 @@ later if a consumer demands it).
   `bytes_per_chunk`, `largest_tables`) describing the one shared `localdb.db` file — same shape and
   same fields as the embedded CLI's `status --json` (§2.4), so daemon-routed and embedded `status`
   render identically.
+  - **Per-store source listing is best-effort, exactly like the adjacent per-store stats call**
+    (issue #187 review, finding F7): a store whose source listing fails (e.g. a corrupt or
+    mid-migration store) still gets an entry in `stores[]` with `document_count`/`chunk_count`
+    reflecting whatever `RetrievalStore::stats()` managed, but contributes nothing to
+    `source_count` rather than failing the whole response — one broken store must not blank out
+    the report on every other store, the same rule the stats call already followed.
+  - **`?store=` (repeatable) scopes the response to specific stores**, mirroring CLI `--store`
+    (§2.2): `GET /status?store=a&store=b` gathers and reports only stores `a` and `b`; stores
+    outside the requested set are never queried (neither their sources nor their
+    `RetrievalStore::stats()`) — the same "gather only what's in scope" behavior the embedded
+    CLI's `resolve_store_scope_inner` already gives `status --store`. `store_count`, `source_count`,
+    and the `database` object's `bytes_per_chunk` (derived from the scoped stores' chunk counts)
+    are computed over the subset; `job_count` and the rest of `database` (the shared file's own
+    size/table figures) are unaffected by scope — jobs and the on-disk file aren't per-store
+    resources. An unknown store name is `store_not_found`, HTTP 404 — parity with the embedded
+    CLI's exit code 3 for an unresolvable explicit `--store` name. A name that resolves to a real
+    but broken store degrades best-effort like the unscoped case, it does not 404. Omitting
+    `?store=` entirely is the pre-existing all-stores behavior.
 - **Pagination:** cursor-based (`?cursor=`, `?limit=`) on list endpoints from day one.
 
 ## 4. MCP
