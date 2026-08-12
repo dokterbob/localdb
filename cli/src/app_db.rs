@@ -365,6 +365,18 @@ pub(crate) async fn resolve_daemon_store_scope_inner(
     ctx: &CliContext,
     policy: StoreScopePolicy,
 ) -> Result<Vec<String>, Error> {
+    // Finding 5 (Codex review): validate before the network round trip, not
+    // just before the match against its result. `apply_daemon_store_scope`
+    // below validates too (defense in depth for its other direct callers),
+    // but that check runs *after* `fetch_all_daemon_store_names` — too late
+    // to keep a malformed name from tripping `DaemonUnreachable` (exit 5)
+    // against an unreachable daemon instead of `InvalidRequest` (exit 2), as
+    // this function's own doc comment above promises. Mirrors
+    // `SourceRemoveCmd::run_daemon`'s validate-before-I/O loop in
+    // `cmds/source.rs`.
+    for name in &ctx.stores {
+        crate::normalize::validate_store_name(name)?;
+    }
     let daemon_names = fetch_all_daemon_store_names(base_url).await?;
     apply_daemon_store_scope(&daemon_names, |n| n.as_str(), ctx, policy)
 }
@@ -773,6 +785,48 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, DEFAULT_STORE_NAME);
+    }
+
+    /// Finding 5 (Codex review): an invalid `--store` name must be rejected
+    /// as `Error::InvalidRequest` (exit 2) *before* the daemon store list is
+    /// fetched — the daemon base URL here (`127.0.0.1:0`) is guaranteed
+    /// connection-refused (see `daemon_client::tests::probe_stale_removes_both_socket_and_url_file`
+    /// for the same idiom), so if validation ran after the fetch this would
+    /// surface `Error::DaemonUnreachable` (exit 5) instead — exactly the
+    /// ordering bug the function's doc comment already promised was fixed.
+    #[tokio::test]
+    async fn resolve_daemon_store_scope_inner_validates_before_fetching() {
+        let ctx = test_ctx(vec!["../bad"]);
+        let err = resolve_daemon_store_scope_inner(
+            "http://127.0.0.1:0",
+            &ctx,
+            StoreScopePolicy::AllStores,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(
+            matches!(err, Error::InvalidRequest { .. }),
+            "expected InvalidRequest, got {err:?}"
+        );
+    }
+
+    /// Pin the empty-`--store` (no flags passed) daemon-scope behavior: with
+    /// nothing to validate, the call proceeds straight to the daemon fetch,
+    /// so an unreachable daemon still surfaces as `DaemonUnreachable` (exit
+    /// 5) rather than being reinterpreted as a validation error.
+    #[tokio::test]
+    async fn resolve_daemon_store_scope_inner_empty_stores_still_reaches_daemon() {
+        let ctx = test_ctx(vec![]);
+        let err = resolve_daemon_store_scope_inner(
+            "http://127.0.0.1:0",
+            &ctx,
+            StoreScopePolicy::AllStores,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, Error::DaemonUnreachable);
+        assert_eq!(err.exit_code(), 5);
     }
 
     #[tokio::test]
