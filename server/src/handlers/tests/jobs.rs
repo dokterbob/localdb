@@ -222,6 +222,35 @@ async fn create_job_across_multiple_jobs_builds_embedder_once() {
     );
 }
 
+/// Codex review finding G1 (issue #187): `create_job`'s closure used to call
+/// `state.get_or_build_embedder` unconditionally before `run_job` ran,
+/// defeating `run_job`'s zero-source short-circuit — a store with zero
+/// sources still triggered a (potentially huge) embedder build. Submits a
+/// job for a store that has no sources at all and asserts it reaches `done`
+/// without the daemon's embedder cache ever being built.
+#[tokio::test]
+async fn create_job_for_store_with_no_sources_never_builds_embedder() {
+    let (_dir, app, state) =
+        super::common::make_app_with_queue_and_state(crate::job_queue::JobQueue::new()).await;
+
+    post_json(&app, "/v1/stores", json!({"name": "empty"})).await;
+
+    let job = post_json(&app, "/v1/jobs", json!({"store_name": "empty"})).await;
+    let job_id = job["id"].as_str().unwrap().to_string();
+    let final_job = poll_job_to_terminal(&app, &job_id).await;
+    assert_eq!(
+        final_job["state"], "done",
+        "job should complete successfully: {:?}",
+        final_job
+    );
+
+    assert_eq!(
+        state.embedder_build_count(),
+        0,
+        "a store with zero sources must never trigger an embedder build"
+    );
+}
+
 #[tokio::test]
 async fn create_job_nonexistent_store_returns_404() {
     let (_dir, app) = make_app().await;

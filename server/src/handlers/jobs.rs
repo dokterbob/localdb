@@ -74,16 +74,34 @@ pub async fn create_job(
     let job = queue
         .submit(&req.store_name, scope, move |progress| async move {
             let yaml = state.yaml_config().await;
+            // Codex review finding G1 (#187): resolve this job's sources
+            // before deciding whether to build/reuse an embedder — a store
+            // (or source scope) with zero sources must never pay for
+            // building a (potentially huge) embedding model, mirroring the
+            // embedded CLI path's `run_embedded_store_job` check
+            // (cli/src/job_attach.rs). `run_job` below resolves the same
+            // scope again internally; that duplicate `list_sources` call is
+            // negligible.
+            let sources = job_exec::resolve_job_sources(
+                state.backend(),
+                &store_row.id,
+                &job_scope_for_closure,
+            )
+            .await?;
             // Codex review finding F2 (#187): reuse the daemon's cached
             // embedder instead of building one from scratch for every job —
             // for the default local ONNX/CoreML provider that's a
             // ~model-load per job avoided.
-            let embedder = state.get_or_build_embedder(&yaml).await?;
+            let embedder = if sources.is_empty() {
+                None
+            } else {
+                Some(state.get_or_build_embedder(&yaml).await?)
+            };
             let deps = JobExecDeps {
                 backend: state.backend(),
                 yaml: &yaml,
                 models_dir: state.models_dir(),
-                embedder: Some(embedder),
+                embedder,
                 progress: Some(progress),
                 on_source_error: None,
             };

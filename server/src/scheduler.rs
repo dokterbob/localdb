@@ -204,24 +204,47 @@ impl UrlRefreshScheduler {
                                     id: store_name_for_closure.clone(),
                                 })?;
                             let yaml = state.yaml_config().await;
+                            let refresh_scope = IndexJobScope::Source {
+                                source_id: source_id_for_closure.clone(),
+                            };
+                            // Codex review finding G1 (#187): resolve the
+                            // scoped source before deciding whether to
+                            // build/reuse an embedder — a scope that fails to
+                            // resolve (e.g. the source was deleted) must
+                            // surface that error before paying for a
+                            // (potentially huge) embedding model build, and a
+                            // resolved-but-empty scope must never build one
+                            // at all. Mirrors the embedded CLI path's
+                            // `run_embedded_store_job` check
+                            // (cli/src/job_attach.rs). `run_job` below
+                            // resolves the same scope again internally; that
+                            // duplicate `list_sources` call is negligible.
+                            let sources = job_exec::resolve_job_sources(
+                                state.backend(),
+                                &store_row.id,
+                                &refresh_scope,
+                            )
+                            .await?;
                             // Codex review finding F2 (#187): reuse the
                             // daemon's cached embedder instead of building
                             // one from scratch for every scheduled refresh
                             // job.
-                            let embedder = state.get_or_build_embedder(&yaml).await?;
+                            let embedder = if sources.is_empty() {
+                                None
+                            } else {
+                                Some(state.get_or_build_embedder(&yaml).await?)
+                            };
                             let deps = JobExecDeps {
                                 backend: state.backend(),
                                 yaml: &yaml,
                                 models_dir: state.models_dir(),
-                                embedder: Some(embedder),
+                                embedder,
                                 progress: Some(progress),
                                 on_source_error: None,
                             };
                             job_exec::run_job(
                                 &store_row,
-                                IndexJobScope::Source {
-                                    source_id: source_id_for_closure.clone(),
-                                },
+                                refresh_scope,
                                 localdb_core::DeletionPolicy::Retain,
                                 deps,
                             )
@@ -681,5 +704,87 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Codex review finding G1 (issue #187): the scheduler's refresh closure
+    /// used to call `state.get_or_build_embedder` unconditionally before
+    /// `run_job` ran. For `IndexJobScope::Source`, an unresolvable source
+    /// (e.g. deleted since it was registered for refresh) makes
+    /// `resolve_job_sources` return `Err(SourceNotFound)` rather than an
+    /// empty list — but under the old ordering that error surfaced only
+    /// *after* an embedder had already been built and thrown away. Registers
+    /// a refresh record for a source id that was never actually added to the
+    /// store, ticks, and asserts the job fails with that source unresolved
+    /// while the daemon's embedder cache is never built.
+    #[tokio::test]
+    async fn tick_with_unresolvable_source_never_builds_embedder() {
+        let queue = JobQueue::new();
+        let scheduler = UrlRefreshScheduler::new(queue.clone());
+
+        let mut yaml_config = localdb_core::config::schema::RawConfig {
+            version: 1,
+            server: Default::default(),
+            paths: Default::default(),
+            defaults: Default::default(),
+            providers: vec![],
+        };
+        yaml_config.defaults.indexing.embedding = localdb_core::config::schema::EmbeddingPolicy {
+            provider: "fake".to_string(),
+            model: "default".to_string(),
+        };
+        let state_dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            yaml_config,
+            state_dir.path().to_path_buf(),
+            state_dir.path().join("models"),
+            queue.clone(),
+            scheduler.clone(),
+        )
+        .await
+        .unwrap();
+
+        state.add_store("notes", "private").await.unwrap();
+        scheduler.attach_state(state.clone()).await;
+        // No source was ever added to "notes" — this id resolves to nothing.
+        scheduler
+            .register(
+                "missing-source".to_string(),
+                "notes".to_string(),
+                "https://example.com".to_string(),
+                Some(0),
+            )
+            .await;
+
+        scheduler.tick().await;
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if std::time::Instant::now() > deadline {
+                panic!("refresh job did not reach a terminal state in time");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let jobs = queue.list_jobs().await;
+            if let Some(job) = jobs.first() {
+                if job.state == IndexJobState::Done {
+                    panic!("job with an unresolvable source must not report Done: {job:?}");
+                }
+                if job.state == IndexJobState::Failed {
+                    assert!(
+                        job.error
+                            .as_deref()
+                            .is_some_and(|e| e.contains("missing-source")),
+                        "expected a source-not-found error naming the missing source, got: {:?}",
+                        job.error
+                    );
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(
+            state.embedder_build_count(),
+            0,
+            "an unresolvable source scope must never trigger an embedder build"
+        );
     }
 }
