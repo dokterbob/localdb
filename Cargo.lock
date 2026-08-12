@@ -3425,6 +3425,7 @@ dependencies = [
  "clap",
  "cli",
  "libsql",
+ "localdb-core",
  "predicates",
  "serde_json",
  "tempfile",

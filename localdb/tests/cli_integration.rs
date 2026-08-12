@@ -131,6 +131,59 @@ fn search_requires_query() {
 }
 
 // ---------------------------------------------------------------------------
+// internal print-schema (hidden)
+// ---------------------------------------------------------------------------
+
+/// `localdb internal print-schema` is hidden from `--help` (build/release
+/// tooling only, not part of the public surface).
+#[test]
+fn internal_print_schema_is_hidden_from_help() {
+    let output = cmd()
+        .arg("--help")
+        .output()
+        .expect("localdb --help should succeed");
+    let help_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        !help_text.contains("internal"),
+        "`internal` must not appear in --help output;\nfull output:\n{help_text}",
+    );
+}
+
+/// `localdb internal print-schema` prints the generated router JSON Schema
+/// and must work without any config file present — it must not load config,
+/// probe the daemon, or otherwise touch `LOCALDB_CONFIG`'s target.
+#[test]
+fn internal_print_schema_prints_router_schema() {
+    // Point LOCALDB_CONFIG at a path inside an empty temp dir; no config.yaml
+    // is ever written here.
+    let dir = TempDir::new().unwrap();
+    let output = cmd_with_dir(&dir)
+        .arg("internal")
+        .arg("print-schema")
+        .output()
+        .expect("localdb internal print-schema should run");
+
+    assert!(
+        output.status.success(),
+        "expected exit 0, got {:?}; stderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout must parse as JSON");
+    assert_eq!(
+        value["$id"],
+        serde_json::Value::String(localdb_core::config::SCHEMA_URL.to_string())
+    );
+}
+
+// ---------------------------------------------------------------------------
 // serve / mcp wiring
 // ---------------------------------------------------------------------------
 // Full behavioral coverage lives in tests/surface_wiring.rs; here we only

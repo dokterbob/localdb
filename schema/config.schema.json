@@ -1,0 +1,287 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/dokterbob/localdb/main/schema/config.schema.json",
+  "title": "localdb configuration",
+  "description": "config.yaml for localdb. Dispatches on the top-level `version` field to a per-version sub-schema; see specs/03-config.md.",
+  "type": "object",
+  "required": [
+    "version"
+  ],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "description": "Config schema version. Currently only 1 is supported."
+    }
+  },
+  "if": {
+    "properties": {
+      "version": {
+        "const": 1
+      }
+    },
+    "required": [
+      "version"
+    ]
+  },
+  "then": {
+    "$ref": "#/$defs/v1"
+  },
+  "else": false,
+  "$defs": {
+    "v1": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "description": "Schema version; must be 1 in MVP. Required."
+        },
+        "$schema": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Editor schema reference (`$schema:` key), written by the auto-generated\nconfig template; accepted and semantically ignored on load."
+        },
+        "server": {
+          "$ref": "#/$defs/v1_ServerConfig",
+          "description": "HTTP server settings.",
+          "default": {
+            "bind": "127.0.0.1",
+            "port": 7700
+          }
+        },
+        "paths": {
+          "$ref": "#/$defs/v1_PathsConfig",
+          "description": "Platform path overrides.",
+          "default": {
+            "data": null,
+            "models": null,
+            "logs": null
+          }
+        },
+        "defaults": {
+          "$ref": "#/$defs/v1_DefaultsConfig",
+          "description": "Global indexing defaults inherited by all stores.",
+          "default": {
+            "indexing": {
+              "chunking": {
+                "preset_overrides": {}
+              },
+              "embedding": {
+                "model": "pplx-embed-context-v1-0.6b",
+                "provider": "local"
+              },
+              "parsers": [
+                "pdf",
+                "epub",
+                "office",
+                "html",
+                "markdown",
+                "plaintext"
+              ]
+            }
+          }
+        },
+        "providers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/v1_ProviderConfig"
+          },
+          "description": "External embedding / LLM providers.",
+          "default": []
+        }
+      },
+      "required": [
+        "version"
+      ],
+      "description": "Raw YAML config shape — the user's config file.\n\n`#[serde(deny_unknown_fields)]` enforces strict key rejection.",
+      "title": "RawConfig"
+    },
+    "v1_ServerConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "bind": {
+          "type": "string",
+          "description": "Bind address; loopback-only by default.",
+          "default": "127.0.0.1"
+        },
+        "port": {
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "Port to listen on.",
+          "default": 7700
+        }
+      },
+      "description": "HTTP server configuration."
+    },
+    "v1_PathsConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Override for data directory (indexes, runtime-state DB, lock, socket).",
+          "default": null
+        },
+        "models": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Override for model cache directory.",
+          "default": null
+        },
+        "logs": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Override for log directory.",
+          "default": null
+        }
+      },
+      "description": "Optional platform path overrides.\n\n`None` means use the platform default from `PlatformPaths`."
+    },
+    "v1_DefaultsConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "indexing": {
+          "$ref": "#/$defs/v1_IndexingPolicyConfig",
+          "description": "Default indexing policy for all stores.",
+          "default": {
+            "chunking": {
+              "preset_overrides": {}
+            },
+            "embedding": {
+              "model": "pplx-embed-context-v1-0.6b",
+              "provider": "local"
+            },
+            "parsers": [
+              "pdf",
+              "epub",
+              "office",
+              "html",
+              "markdown",
+              "plaintext"
+            ]
+          }
+        }
+      },
+      "description": "Global defaults; stores inherit from here unless they override."
+    },
+    "v1_IndexingPolicyConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "chunking": {
+          "$ref": "#/$defs/v1_ChunkingPolicy",
+          "description": "Chunking settings.",
+          "default": {
+            "preset_overrides": {}
+          }
+        },
+        "embedding": {
+          "$ref": "#/$defs/v1_EmbeddingPolicy",
+          "description": "Embedding settings.",
+          "default": {
+            "model": "pplx-embed-context-v1-0.6b",
+            "provider": "local"
+          }
+        },
+        "parsers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Ordered list of parser IDs to try (first match wins).\n\nEmpty or absent defaults to `[\"pdf\", \"epub\", \"office\", \"html\", \"markdown\", \"plaintext\"]`.\nUnknown IDs are rejected at config validation time.\nOrder is load-bearing: placing `plaintext` before `html` would cause\nHTML files with a `.html` extension to be parsed as plain text.",
+          "default": [
+            "pdf",
+            "epub",
+            "office",
+            "html",
+            "markdown",
+            "plaintext"
+          ]
+        }
+      },
+      "description": "Indexing policy config — chunking + embedding + parsers as one unit.\n\nA change to any field triggers a reindex (policy_version changes).\nSee specs/03-config.md §2 and specs/04-search-pipeline.md §4."
+    },
+    "v1_ChunkingPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "preset_overrides": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Per-source-kind preset overrides (e.g. `prose`, `code`, `messages`).",
+          "default": {}
+        }
+      },
+      "description": "Chunking policy configuration."
+    },
+    "v1_EmbeddingPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "model": {
+          "type": "string",
+          "description": "Model name / path.",
+          "default": "pplx-embed-context-v1-0.6b"
+        },
+        "provider": {
+          "type": "string",
+          "description": "Provider kind. Local options:\n- `\"local\"` — auto: on macOS with CoreML support use CoreML, else ONNX.\n- `\"local-coreml\"` — force in-process CoreML (macOS/Apple Silicon only).\n- `\"local-onnx\"` — force in-process ONNX inference.\n\nHosted options: `\"openai-compatible\"`, `\"perplexity\"`, `\"voyage\"`.",
+          "default": "local"
+        }
+      },
+      "description": "Embedding policy configuration."
+    },
+    "v1_ProviderConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Provider name (user-assigned label)."
+        },
+        "kind": {
+          "type": "string",
+          "description": "Provider kind: \"openai-compatible\", \"perplexity\", \"voyage\"."
+        },
+        "base_url": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Base URL for API calls.",
+          "default": null
+        },
+        "api_key_env": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Environment variable name that holds the API key. Never inline.",
+          "default": null
+        }
+      },
+      "required": [
+        "name",
+        "kind"
+      ],
+      "description": "External provider configuration."
+    }
+  }
+}
