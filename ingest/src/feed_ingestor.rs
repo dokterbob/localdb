@@ -208,16 +208,24 @@ impl Ingestor for FeedIngestor {
         // stable without affecting link resolution: `generate_id` only
         // consults the argument on the link-less branch, and for a linked
         // entry it hashes the (correctly, effectively-resolved) link instead.
+        // `feed_rs::parser::Parser::parse` is CPU-bound (XML/JSON parsing of
+        // the whole feed body); this may run under the daemon's shared
+        // HTTP/SSE-serving tokio runtime (issue #187 real ingestion), so it's
+        // guarded with `run_blocking` rather than called inline — see
+        // `core::blocking::run_blocking`'s doc comment for why that's
+        // `block_in_place`-on-multi-thread rather than a bare call.
         let id_generator_url = feed_url.clone();
-        let parse_outcome = catch_panic(std::panic::AssertUnwindSafe(|| {
-            feed_rs::parser::Builder::new()
-                .base_uri(Some(effective_feed_url.as_str()))
-                .id_generator(move |links, title, _effective_uri| {
-                    feed_rs::parser::generate_id(links, title, Some(id_generator_url.as_str()))
-                })
-                .build()
-                .parse(bytes.as_slice())
-        }));
+        let parse_outcome = localdb_core::run_blocking(|| {
+            catch_panic(std::panic::AssertUnwindSafe(|| {
+                feed_rs::parser::Builder::new()
+                    .base_uri(Some(effective_feed_url.as_str()))
+                    .id_generator(move |links, title, _effective_uri| {
+                        feed_rs::parser::generate_id(links, title, Some(id_generator_url.as_str()))
+                    })
+                    .build()
+                    .parse(bytes.as_slice())
+            }))
+        });
         let mut feed: Feed = match parse_outcome {
             Err(panic_msg) => {
                 // Debug: `core::ingestion` owns the user-facing WARN. The
