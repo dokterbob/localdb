@@ -21,6 +21,18 @@ pub(crate) async fn make_app() -> (TempDir, Router) {
 /// finding 4d), so it can force `RecvError::Lagged` on the real `GET
 /// /v1/jobs/{id}/events` route without needing 1024+ real progress events.
 pub(crate) async fn make_app_with_queue(queue: crate::job_queue::JobQueue) -> (TempDir, Router) {
+    let (dir, router, _state) = make_app_with_queue_and_state(queue).await;
+    (dir, router)
+}
+
+/// Like [`make_app_with_queue`], but also returns the `AppState` the router
+/// was built around (cloned before `with_state` consumes it — `AppState` is
+/// `Arc`-backed, so the clone shares the same `Inner`). Lets a test observe
+/// state that isn't reachable through any HTTP route, e.g.
+/// `AppState::embedder_build_count` (Codex review finding F2, issue #187).
+pub(crate) async fn make_app_with_queue_and_state(
+    queue: crate::job_queue::JobQueue,
+) -> (TempDir, Router, AppState) {
     let dir = tempfile::tempdir().unwrap();
     let yaml_config = localdb_core::config::schema::RawConfig {
         version: 1,
@@ -66,9 +78,9 @@ pub(crate) async fn make_app_with_queue(queue: crate::job_queue::JobQueue) -> (T
         .route("/v1/jobs/{id}/events", get(job_events))
         .route("/v1/status", get(get_status))
         .route("/v1/config", get(get_config))
-        .with_state(state);
+        .with_state(state.clone());
 
-    (dir, router)
+    (dir, router, state)
 }
 
 pub(crate) async fn json_body(body: axum::body::Body) -> serde_json::Value {

@@ -6,10 +6,10 @@ use tokio::sync::RwLock;
 use localdb_core::{
     config::{
         policy::compute_policy_version,
-        schema::{IndexingPolicyConfig, RawConfig},
+        schema::{EmbeddingPolicy, IndexingPolicyConfig, RawConfig},
     },
     ingestion::now_rfc3339,
-    store_factory, Error, SourceRow, Store, StoreBackend, StoreBackendConfig, StoreRow,
+    store_factory, Embedder, Error, SourceRow, Store, StoreBackend, StoreBackendConfig, StoreRow,
     StoreVisibility,
 };
 use store_libsql::SqliteBackend;
@@ -62,6 +62,24 @@ struct Inner {
     default_policy_version: String,
     job_queue: JobQueue,
     url_scheduler: UrlRefreshScheduler,
+    /// Single-slot embedder cache, keyed by the `EmbeddingPolicy` that
+    /// determined the cached embedder's identity (Codex review finding F2,
+    /// issue #187). See `AppState::get_or_build_embedder`.
+    embedder_cache: RwLock<Option<(EmbeddingPolicy, Arc<dyn Embedder>)>>,
+    /// Test-only construction counter for the `embed::create_embedder` call
+    /// made by `get_or_build_embedder`, so tests can assert the embedder is
+    /// built once per distinct `EmbeddingPolicy` rather than once per job.
+    /// Scoped to this `AppState`'s own `Inner` rather than a shared
+    /// process-wide static (contrast `cli::cmds::index::EMBEDDER_BUILD_COUNT`,
+    /// which is safe as a static only because it is exercised by exactly one
+    /// test in that crate) — nearly every job-executing test in this crate
+    /// exercises `get_or_build_embedder` indirectly, so a shared static would
+    /// have every one of them stomp on the same counter under `cargo test`'s
+    /// default parallel test threads. Per-instance sidesteps that: each
+    /// test's own `AppState` counts only its own builds. Compiled out
+    /// entirely in non-test builds.
+    #[cfg(test)]
+    embedder_build_count: std::sync::atomic::AtomicUsize,
 }
 
 impl AppState {
@@ -144,6 +162,9 @@ impl AppState {
                 default_policy_version,
                 job_queue,
                 url_scheduler,
+                embedder_cache: RwLock::new(None),
+                #[cfg(test)]
+                embedder_build_count: std::sync::atomic::AtomicUsize::new(0),
             }),
         }
     }
@@ -204,6 +225,69 @@ impl AppState {
     pub async fn reload_yaml_config(&self, new_config: RawConfig) {
         let mut yaml = self.inner.yaml_config.write().await;
         *yaml = new_config;
+    }
+
+    /// Get the embedder for `yaml`'s embedding policy, building it only when
+    /// the policy has changed since the last build (Codex review finding
+    /// F2, issue #187).
+    ///
+    /// Before this cache existed, every job execution called
+    /// `embed::create_embedder` from scratch — for the default local
+    /// ONNX/CoreML provider that reloads the model weights on every single
+    /// job. The single-slot cache below is keyed by `EmbeddingPolicy`
+    /// (`yaml.defaults.indexing.embedding`, the model+provider pair that
+    /// determines embedder identity): the same policy hits the cache, a
+    /// changed policy misses and rebuilds. A config reload
+    /// (`reload_yaml_config`) needs no explicit cache flush — the caller
+    /// always passes the freshly reloaded `yaml`, so a changed embedding
+    /// policy simply fails the equality check below on the next call and
+    /// rebuilds naturally.
+    pub async fn get_or_build_embedder(
+        &self,
+        yaml: &RawConfig,
+    ) -> Result<Arc<dyn Embedder>, Error> {
+        let policy = &yaml.defaults.indexing.embedding;
+
+        // Fast path: an unchanged policy only ever needs a read lock.
+        {
+            let cache = self.inner.embedder_cache.read().await;
+            if let Some((cached_policy, embedder)) = cache.as_ref() {
+                if cached_policy == policy {
+                    return Ok(embedder.clone());
+                }
+            }
+        }
+
+        let mut cache = self.inner.embedder_cache.write().await;
+        // Re-check under the write lock: another caller may have already
+        // rebuilt for this exact policy while we were waiting on it.
+        if let Some((cached_policy, embedder)) = cache.as_ref() {
+            if cached_policy == policy {
+                return Ok(embedder.clone());
+            }
+        }
+
+        // Build while still holding the write lock. This is deliberate: it
+        // guarantees at most one embedder is ever built per policy change,
+        // at the cost of serializing concurrent builders behind a cold/
+        // changed cache. Acceptable today because the job engine runs a
+        // single worker (issue #187) — there is never more than one job in
+        // flight to contend for this lock.
+        let policy_owned = policy.clone();
+        let providers = yaml.providers.clone();
+        let models_dir = self.inner.models_dir.clone();
+        let built = localdb_core::run_blocking(move || {
+            embed::create_embedder(&policy_owned, &providers, Some(&models_dir))
+        })?;
+        let embedder: Arc<dyn Embedder> = Arc::from(built);
+
+        #[cfg(test)]
+        self.inner
+            .embedder_build_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        *cache = Some((policy.clone(), embedder.clone()));
+        Ok(embedder)
     }
 
     /// Add a runtime-owned store.
@@ -539,6 +623,16 @@ pub struct StoreRecord {
 impl AppState {
     async fn scheduler_source_count(&self) -> usize {
         self.inner.url_scheduler.source_count().await
+    }
+
+    /// Number of times this `AppState`'s embedder cache has actually called
+    /// `embed::create_embedder` (Codex review finding F2, issue #187). See
+    /// `Inner::embedder_build_count`'s doc comment for why this is
+    /// per-instance rather than a shared static.
+    pub(crate) fn embedder_build_count(&self) -> usize {
+        self.inner
+            .embedder_build_count
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -1216,6 +1310,92 @@ mod tests {
             state.scheduler_source_count().await,
             0,
             "url_scheduler should have 0 sources after remove_store"
+        );
+    }
+
+    // --- get_or_build_embedder (Codex review finding F2, issue #187) -------
+
+    /// Three sequential calls with the same policy must build the embedder
+    /// exactly once — the read-lock fast path must hit on calls 2 and 3, and
+    /// every call must return the same `Arc`.
+    #[tokio::test]
+    async fn get_or_build_embedder_builds_once_across_repeated_calls() {
+        let (_dir, state) = make_state().await;
+        let yaml = state.yaml_config().await;
+
+        let a = state.get_or_build_embedder(&yaml).await.unwrap();
+        let b = state.get_or_build_embedder(&yaml).await.unwrap();
+        let c = state.get_or_build_embedder(&yaml).await.unwrap();
+
+        assert_eq!(
+            state.embedder_build_count(),
+            1,
+            "embedder should be built exactly once across 3 calls with an unchanged policy"
+        );
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "second call should return the cached Arc"
+        );
+        assert!(
+            Arc::ptr_eq(&a, &c),
+            "third call should return the cached Arc"
+        );
+    }
+
+    /// A changed `EmbeddingPolicy` (different model) must miss the cache and
+    /// rebuild, returning a distinct `Arc`.
+    #[tokio::test]
+    async fn get_or_build_embedder_rebuilds_on_policy_change() {
+        let (_dir, state) = make_state().await;
+        let mut yaml = state.yaml_config().await;
+
+        let first = state.get_or_build_embedder(&yaml).await.unwrap();
+
+        yaml.defaults.indexing.embedding.model = "different-model".to_string();
+        let second = state.get_or_build_embedder(&yaml).await.unwrap();
+
+        assert_eq!(
+            state.embedder_build_count(),
+            2,
+            "a changed embedding policy should trigger a rebuild"
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "a rebuilt embedder must not be the same Arc as the stale cached one"
+        );
+    }
+
+    /// After `reload_yaml_config` swaps in a config with a different
+    /// embedding policy, the next `get_or_build_embedder` call (using the
+    /// freshly reloaded snapshot, as every real call site does via
+    /// `state.yaml_config()`) must rebuild exactly once — no explicit cache
+    /// flush needed, since the policy comparison itself misses.
+    #[tokio::test]
+    async fn get_or_build_embedder_rebuilds_once_after_config_reload() {
+        let (_dir, state) = make_state().await;
+        let old_yaml = state.yaml_config().await;
+        let old = state.get_or_build_embedder(&old_yaml).await.unwrap();
+
+        let mut new_yaml = old_yaml.clone();
+        new_yaml.defaults.indexing.embedding.model = "reloaded-model".to_string();
+        state.reload_yaml_config(new_yaml).await;
+
+        let reloaded_yaml = state.yaml_config().await;
+        let rebuilt = state.get_or_build_embedder(&reloaded_yaml).await.unwrap();
+        let rebuilt_again = state.get_or_build_embedder(&reloaded_yaml).await.unwrap();
+
+        assert_eq!(
+            state.embedder_build_count(),
+            2,
+            "should build once for the original policy, once more for the reloaded policy"
+        );
+        assert!(
+            !Arc::ptr_eq(&old, &rebuilt),
+            "post-reload embedder must not be the stale pre-reload Arc"
+        );
+        assert!(
+            Arc::ptr_eq(&rebuilt, &rebuilt_again),
+            "a second call against the same reloaded policy should hit the cache"
         );
     }
 }

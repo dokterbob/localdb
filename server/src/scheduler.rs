@@ -204,11 +204,16 @@ impl UrlRefreshScheduler {
                                     id: store_name_for_closure.clone(),
                                 })?;
                             let yaml = state.yaml_config().await;
+                            // Codex review finding F2 (#187): reuse the
+                            // daemon's cached embedder instead of building
+                            // one from scratch for every scheduled refresh
+                            // job.
+                            let embedder = state.get_or_build_embedder(&yaml).await?;
                             let deps = JobExecDeps {
                                 backend: state.backend(),
                                 yaml: &yaml,
                                 models_dir: state.models_dir(),
-                                embedder: None,
+                                embedder: Some(embedder),
                                 progress: Some(progress),
                                 on_source_error: None,
                             };
