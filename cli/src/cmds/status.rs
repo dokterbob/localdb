@@ -6,8 +6,8 @@ use serde_json::json;
 
 use crate::{
     app_db::{
-        apply_daemon_store_scope, load_app_db_lenient, resolve_store_scope_inner, AppDb,
-        StoreScopePolicy,
+        apply_daemon_store_scope, load_config_lenient, open_app_db_lenient_or_exit,
+        resolve_store_scope_inner, AppDb, StoreScopePolicy,
     },
     command_table::{dispatch, DaemonAwareCommand},
     daemon_client::{daemon_request_async, encode_path_segment, CliContext},
@@ -345,9 +345,12 @@ pub fn run_status(ctx: &CliContext) {
 
 pub(crate) async fn run_status_async(ctx: &CliContext) {
     // F1-cli: use lenient loader so status works even with malformed config.
-    let (config_loader, db) = load_app_db_lenient(ctx).await;
+    let config_loader = load_config_lenient(ctx);
 
-    let outcome = dispatch(&StatusCmd, ctx, &config_loader, &db).await;
+    let outcome = dispatch(&StatusCmd, ctx, &config_loader, || {
+        open_app_db_lenient_or_exit(ctx, &config_loader)
+    })
+    .await;
 
     if ctx.json {
         print_json(&build_status_json(

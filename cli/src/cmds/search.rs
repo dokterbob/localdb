@@ -3,7 +3,7 @@ use localdb_core::{config::loader::ConfigLoader, Error};
 use serde_json::json;
 
 use crate::{
-    app_db::load_app_db_lenient,
+    app_db::{load_config_lenient, open_app_db_lenient_or_exit},
     app_db::{resolve_store_scope_inner, AppDb, StoreScopePolicy},
     command_table::{dispatch, DaemonAwareCommand},
     daemon_client::{daemon_request_async, CliContext},
@@ -173,8 +173,11 @@ pub(crate) async fn run_search_async(
     content_length: usize,
 ) {
     // F1-cli: use lenient loader so search works even with malformed config.
-    let (config_loader, db) = load_app_db_lenient(ctx).await;
-    let citations = dispatch(&SearchCmd { query, limit }, ctx, &config_loader, &db).await;
+    let config_loader = load_config_lenient(ctx);
+    let citations = dispatch(&SearchCmd { query, limit }, ctx, &config_loader, || {
+        open_app_db_lenient_or_exit(ctx, &config_loader)
+    })
+    .await;
     render_search_output(&citations, query, content_length, ctx.json);
 }
 

@@ -3,9 +3,10 @@ use serde_json::json;
 
 use crate::{
     app_db::{
-        apply_daemon_store_scope, default_store_row, load_app_db, load_app_db_lenient,
-        reject_store_flag, resolve_store_scope_inner, AppDb, StoreScopePolicy,
-        STORE_ADD_REJECT_MESSAGE, STORE_REMOVE_REJECT_MESSAGE,
+        apply_daemon_store_scope, default_store_row, load_config_for_maintenance,
+        load_config_lenient, open_app_db_lenient_or_exit, open_app_db_or_exit, reject_store_flag,
+        resolve_store_scope_inner, AppDb, StoreScopePolicy, STORE_ADD_REJECT_MESSAGE,
+        STORE_REMOVE_REJECT_MESSAGE,
     },
     command_table::{dispatch, DaemonAwareCommand},
     daemon_client::{daemon_request_async, encode_path_segment, walk_daemon_pages, CliContext},
@@ -107,8 +108,11 @@ pub(crate) async fn run_store_add_async(ctx: &CliContext, name: &str) {
         exit_err(&e, ctx.json);
     }
 
-    let (config_loader, db) = load_app_db(ctx).await;
-    let outcome = dispatch(&StoreAddCmd { name }, ctx, &config_loader, &db).await;
+    let config_loader = load_config_for_maintenance(ctx);
+    let outcome = dispatch(&StoreAddCmd { name }, ctx, &config_loader, || {
+        open_app_db_or_exit(ctx, &config_loader)
+    })
+    .await;
     render_store_add(outcome, ctx.json);
 }
 
@@ -203,8 +207,11 @@ pub fn run_store_list(ctx: &CliContext) {
 
 pub(crate) async fn run_store_list_async(ctx: &CliContext) {
     // F1-cli: use lenient loader so store list works even with malformed config.
-    let (config_loader, db) = load_app_db_lenient(ctx).await;
-    let outcome = dispatch(&StoreListCmd, ctx, &config_loader, &db).await;
+    let config_loader = load_config_lenient(ctx);
+    let outcome = dispatch(&StoreListCmd, ctx, &config_loader, || {
+        open_app_db_lenient_or_exit(ctx, &config_loader)
+    })
+    .await;
     render_store_list(outcome, ctx.json);
 }
 
@@ -282,7 +289,7 @@ pub(crate) async fn run_store_remove_async(ctx: &CliContext, name: &str) {
     // deletion this invocation was never going to perform correctly.
     reject_store_flag(ctx, STORE_REMOVE_REJECT_MESSAGE);
 
-    let (config_loader, db) = load_app_db(ctx).await;
+    let config_loader = load_config_for_maintenance(ctx);
 
     let prompt = format!(
         "This permanently deletes store '{}', its sources, and its index data. Continue?",
@@ -292,6 +299,9 @@ pub(crate) async fn run_store_remove_async(ctx: &CliContext, name: &str) {
         return;
     }
 
-    let outcome = dispatch(&StoreRemoveCmd { name }, ctx, &config_loader, &db).await;
+    let outcome = dispatch(&StoreRemoveCmd { name }, ctx, &config_loader, || {
+        open_app_db_or_exit(ctx, &config_loader)
+    })
+    .await;
     render_store_remove(outcome, ctx.json);
 }

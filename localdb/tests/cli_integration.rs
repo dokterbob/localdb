@@ -6689,6 +6689,99 @@ fn source_list_daemon_routes_and_matches_embedded_shape() {
     );
 }
 
+/// Regression test for issue #187 review, finding G4: `command_table::dispatch`
+/// used to require every call site to open the local `AppDb` *before*
+/// probing for a daemon, even though the daemon branch never used it — so a
+/// broken local store (unwritable, locked, schema-too-new — all real cases
+/// that `exit_err` on open) would preempt a healthy daemon that never needed
+/// the local DB at all. This test breaks the local DB deterministically
+/// (stamps a schema version this build's migration chain will never reach,
+/// via `stamp_user_version`, so `LibsqlDb::open` returns
+/// `Error::InvalidConfig` — see `store-libsql/src/connection.rs`'s
+/// `VersionDisposition::TooNew` arm) and checks both transports: embedded
+/// `source list` must still fail exactly as it always did (same exit code /
+/// message, just reached after the daemon probe instead of before), and
+/// daemon-routed `source list` against the identical broken local DB must
+/// succeed.
+#[test]
+fn source_list_routes_to_daemon_when_local_db_schema_is_incompatible() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    let db_path = data_dir.join("localdb.db");
+
+    // `store add` creates a fresh store at head, seeding a real schema this
+    // binary understands and can open normally.
+    cmd_with_dir(&dir)
+        .args(["store", "add", "s1"])
+        .assert()
+        .success();
+
+    // Stamp a schema version far beyond anything this binary's migration
+    // chain will ever reach, so every subsequent `AppDb::open` on this file
+    // hits `VersionDisposition::TooNew` -> `Error::InvalidConfig`.
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(stamp_user_version(&db_path, 999_999));
+
+    // No daemon detected: embedded `source list` must fail exactly as it did
+    // before this fix -- exit 2 (invalid_config), mentioning the mismatch.
+    let no_daemon = cmd_with_dir(&dir)
+        .args(["source", "list"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        no_daemon.status.code().unwrap(),
+        2,
+        "embedded source list against a too-new local schema must exit 2 (invalid_config); stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&no_daemon.stdout),
+        String::from_utf8_lossy(&no_daemon.stderr)
+    );
+    let no_daemon_stderr = String::from_utf8_lossy(&no_daemon.stderr);
+    assert!(
+        no_daemon_stderr.contains("newer than this build"),
+        "expected the schema-too-new error message; stderr: {no_daemon_stderr}"
+    );
+
+    // Same directory, same broken `localdb.db` on disk -- but now a daemon is
+    // detected via `LOCALDB_DAEMON_URL`. Before the G4 fix, `dispatch`'s
+    // caller had already opened (and failed to open) the local `AppDb`
+    // before this point; after the fix, `open_db` is only ever invoked from
+    // `dispatch`'s `NotRunning` arm, so the daemon branch must succeed
+    // without ever touching the broken local DB.
+    let stores_body = paginated_list_body(&[&store_record_json("s1")]);
+    let sources_body = paginated_list_body(&[]);
+    let (port, received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/stores/s1/sources",
+            "HTTP/1.1 200 OK",
+            sources_body,
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+    ]);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let with_daemon = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["source", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        with_daemon.status.success(),
+        "daemon-routed source list must succeed even though the local DB schema is too new; stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&with_daemon.stdout),
+        String::from_utf8_lossy(&with_daemon.stderr)
+    );
+
+    let reqs = received.lock().unwrap();
+    assert!(
+        reqs.iter().any(|(l, _)| l.starts_with("GET /v1/stores")),
+        "expected at least a GET /v1/stores request; got {:?}",
+        reqs
+    );
+}
+
 /// Daemon-transport counterpart of
 /// `source_list_shows_store_column_even_when_one_scoped_store_is_empty`
 /// (issue #187 review, finding 1) — shape-parity style with

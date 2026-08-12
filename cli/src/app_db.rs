@@ -101,21 +101,32 @@ pub(crate) async fn open_app_db_from_loader(config_loader: &ConfigLoader) -> Res
 /// opened directly regardless of whether the daemon is also running. Commands
 /// that detect a running daemon will route mutations through the HTTP API;
 /// they still open the real DB for read operations (store list, etc.).
+///
+/// A thin wrapper over [`load_config_for_maintenance`] (the config half) and
+/// [`open_app_db_or_exit`] (the DB-open half), kept for the callers that
+/// still want both steps back-to-back: `job_attach.rs`, `cmds/surface.rs`,
+/// `cmds/init.rs`. `command_table::dispatch`'s call sites use the two halves
+/// separately instead, so the DB open can be deferred until the daemon probe
+/// says `NotRunning` (issue #187 review, finding G4) — see `dispatch`'s doc
+/// comment.
 pub(crate) async fn load_app_db(ctx: &CliContext) -> (ConfigLoader, AppDb) {
-    let options = LoadOptions {
-        config_path: ctx.config.clone(),
-        ..Default::default()
-    };
-    let config_loader = match load_config(&options, ctx.config_env.as_deref()) {
-        Ok(c) => c,
-        Err(e) => exit_err(&e, ctx.json),
-    };
+    let config_loader = load_config_for_maintenance(ctx);
+    let db = open_app_db_or_exit(ctx, &config_loader).await;
+    (config_loader, db)
+}
 
-    let db = match open_app_db_from_loader(&config_loader).await {
+/// Open the `AppDb` half of [`load_app_db`]'s strict behavior. Exits on
+/// failure via `exit_err`, exactly as `load_app_db` always did — factored
+/// out so `command_table::dispatch` call sites can pass it as a lazily-called
+/// `open_db` closure instead of opening the DB before the daemon probe (issue
+/// #187 review, finding G4): a broken local store (unwritable, locked,
+/// schema-too-new) used to `exit_err` here before a healthy daemon ever got a
+/// chance to handle the command.
+pub(crate) async fn open_app_db_or_exit(ctx: &CliContext, config_loader: &ConfigLoader) -> AppDb {
+    match open_app_db_from_loader(config_loader).await {
         Ok(d) => d,
         Err(e) => exit_err(&e, ctx.json),
-    };
-    (config_loader, db)
+    }
 }
 
 /// F1-cli: Load config with fallback to platform defaults for read-only commands.
@@ -123,12 +134,27 @@ pub(crate) async fn load_app_db(ctx: &CliContext) -> (ConfigLoader, AppDb) {
 /// When the config file is malformed or unreadable, read-only commands (search,
 /// store list, status) should still work using platform default config and an
 /// empty temp DB, rather than hard failing.
+///
+/// A thin wrapper over [`load_config_lenient`] (the config half) and
+/// [`open_app_db_lenient_or_exit`] (the DB-open half) — see `load_app_db`'s
+/// doc comment for why `command_table::dispatch` call sites use the two
+/// halves separately instead.
 pub(crate) async fn load_app_db_lenient(ctx: &CliContext) -> (ConfigLoader, AppDb) {
+    let config_loader = load_config_lenient(ctx);
+    let db = open_app_db_lenient_or_exit(ctx, &config_loader).await;
+    (config_loader, db)
+}
+
+/// The config-only half of [`load_app_db_lenient`]'s fallback-to-platform-defaults
+/// behavior — see that function's doc comment. Factored out so
+/// `command_table::dispatch` call sites can select their DB-open moment
+/// independently (issue #187 review, finding G4).
+pub(crate) fn load_config_lenient(ctx: &CliContext) -> ConfigLoader {
     let options = LoadOptions {
         config_path: ctx.config.clone(),
         ..Default::default()
     };
-    let config_loader = match load_config(&options, ctx.config_env.as_deref()) {
+    match load_config(&options, ctx.config_env.as_deref()) {
         Ok(c) => c,
         Err(e) => {
             // If the intended config file exists, it's malformed — fail hard (exit 2).
@@ -169,35 +195,51 @@ pub(crate) async fn load_app_db_lenient(ctx: &CliContext) -> (ConfigLoader, AppD
                 }
             }
         }
-    };
+    }
+}
 
-    let db = match open_app_db_from_loader(&config_loader).await {
+/// The DB-open half of [`load_app_db_lenient`], including its
+/// `RuntimeStateLocked` 100ms-retry. Exits on failure via `exit_err`, exactly
+/// as `load_app_db_lenient` always did — factored out for the same reason as
+/// `open_app_db_or_exit` (issue #187 review, finding G4): so
+/// `command_table::dispatch` call sites can defer the open until the daemon
+/// probe comes back `NotRunning`.
+pub(crate) async fn open_app_db_lenient_or_exit(
+    ctx: &CliContext,
+    config_loader: &ConfigLoader,
+) -> AppDb {
+    match open_app_db_from_loader(config_loader).await {
         Ok(d) => d,
         Err(Error::RuntimeStateLocked) => {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            match open_app_db_from_loader(&config_loader).await {
+            match open_app_db_from_loader(config_loader).await {
                 Ok(d) => d,
                 Err(Error::RuntimeStateLocked) => exit_err(&Error::RuntimeStateLocked, ctx.json),
                 Err(e) => exit_err(&e, ctx.json),
             }
         }
         Err(e) => exit_err(&e, ctx.json),
-    };
-    (config_loader, db)
+    }
 }
 
 /// Load config only — no store open, no embedder construction.
 ///
-/// Used exclusively by the `db status`/`db migrate`/`db downgrade`
-/// maintenance commands (specs/05-surfaces.md §2.1). Those commands must
-/// never go through `AppDb::open`/`SqliteBackend::open`: `LibsqlDb::open`
-/// refuses on a schema-version mismatch, which is exactly the state these
-/// commands exist to repair. They must also never construct an embedder —
-/// the default `local` provider would trigger a one-time ~706 MB model
-/// download just to inspect or migrate a store's schema. `embed::infer_dim_encoding`
-/// gives the `(embedding_dim, encoding)` pair a `MigrationContext` needs from
-/// config alone, the same cheap static lookup `AppDb::open` itself uses
-/// before ever touching the embedder.
+/// Used by the `db status`/`db migrate`/`db downgrade` maintenance commands
+/// (specs/05-surfaces.md §2.1) — those commands must never go through
+/// `AppDb::open`/`SqliteBackend::open`: `LibsqlDb::open` refuses on a
+/// schema-version mismatch, which is exactly the state these commands exist
+/// to repair. They must also never construct an embedder — the default
+/// `local` provider would trigger a one-time ~706 MB model download just to
+/// inspect or migrate a store's schema. `embed::infer_dim_encoding` gives the
+/// `(embedding_dim, encoding)` pair a `MigrationContext` needs from config
+/// alone, the same cheap static lookup `AppDb::open` itself uses before ever
+/// touching the embedder.
+///
+/// Also used as the config-loading half of every strict `command_table::dispatch`
+/// call site (issue #187 review, finding G4): those call sites pair this with
+/// `open_app_db_or_exit`, called lazily from inside `dispatch`'s `open_db`
+/// closure, so a broken local store never preempts a healthy daemon — the
+/// same config-only/DB-open split this function was already built for.
 pub(crate) fn load_config_for_maintenance(ctx: &CliContext) -> ConfigLoader {
     let options = LoadOptions {
         config_path: ctx.config.clone(),
