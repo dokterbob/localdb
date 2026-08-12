@@ -218,6 +218,46 @@ async fn search_pagination_page_two_is_disjoint_from_page_one() {
 }
 
 #[tokio::test]
+async fn search_limit_is_silently_clamped_to_the_max_instead_of_erroring() {
+    // Given: a corpus of candidates for the query to match.
+    let (_dir, state) = make_state_with_fake_config().await;
+    seed_many_chunks(&state, 210).await;
+
+    let app = crate::daemon::build_router(
+        state,
+        vec![],
+        Arc::new(localdb_core::FakeEmbedder::new(1)),
+        vec![],
+    );
+
+    // When: the request asks for a limit far above the clamp (issue #187
+    // review, finding G3 — mirrors the MCP `search` tool's silent-clamp
+    // idiom, `mcp/src/tools.rs::resolve_search_limit`: too-large is capped,
+    // not rejected). Previously this fed straight into an unchecked
+    // `offset + limit` used as `top_n`.
+    let page = search_page(&app, "pagination test rust programming", 100_000, None).await;
+
+    // Then: the request succeeds (no `invalid_request`, no panic) and the
+    // page never exceeds the clamp. This corpus's candidate pool is in
+    // practice bounded well below `SEARCH_MAX_LIMIT` by
+    // `core::search::DEFAULT_LEG_K` (each leg — dense, BM25 — returns at
+    // most `leg_k` = 50 candidates, and `/v1/search` does not expose
+    // `leg_k` to the caller), so this asserts the clamp never lets the
+    // response exceed the max rather than asserting it is hit exactly —
+    // the exact-max case is covered at the unit level by
+    // `search_service::tests::clamp_search_limit_*`.
+    let ids = citation_ids(&page);
+    assert!(
+        ids.len() <= crate::search_service::SEARCH_MAX_LIMIT,
+        "citations must never exceed the {}-item clamp, got {}: {:?}",
+        crate::search_service::SEARCH_MAX_LIMIT,
+        ids.len(),
+        page
+    );
+    assert!(!ids.is_empty(), "expected at least one match: {:?}", page);
+}
+
+#[tokio::test]
 async fn search_pagination_walk_to_exhaustion_covers_all_results_without_duplicates() {
     let (_dir, state) = make_state_with_fake_config().await;
     let seeded_ids = seed_many_chunks(&state, 33).await;

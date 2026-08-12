@@ -323,6 +323,16 @@ later if a consumer demands it).
     never fail the request; it degrades best-effort exactly like a store whose source listing or
     `RetrievalStore::stats()` call fails.
 - **Pagination:** cursor-based (`?cursor=`, `?limit=`) on list endpoints from day one.
+- **`POST /search` limit clamp and cursor overflow (issue #187 review, finding G3):** `limit` is
+  silently clamped to a maximum of 100, matching the MCP `search` tool's own cap — the same
+  `SEARCH_MAX_LIMIT` idiom (§4, `mcp/src/tools.rs::resolve_search_limit`): a request for more than
+  100 gets 100 back, not an error. A `cursor`/`limit`
+  combination whose page end (`cursor + limit`) overflows `usize` is rejected as `invalid_request`,
+  HTTP 400, rather than panicking or silently wrapping — a client cannot use an out-of-range
+  cursor to crash or confuse pagination. `GET /stores` and `GET /stores/{name}/sources` compute the
+  same `offset + limit` internally but treat an overflow there as end-of-list (`next_cursor: null`)
+  instead of an error, since an offset/limit pair that large can never address a real page of
+  either list.
 
 ## 4. MCP
 
