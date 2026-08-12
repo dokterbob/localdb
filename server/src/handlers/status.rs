@@ -2,10 +2,10 @@ use axum::{extract::State, Json};
 use axum_extra::extract::Query;
 use serde::{Deserialize, Serialize};
 
-use localdb_core::{Error, TableSize};
+use localdb_core::{Error, StoreRow, TableSize};
 
 use crate::error::ApiError;
-use crate::state::{AppState, EffectiveStore};
+use crate::state::{store_visibility_to_str, AppState};
 
 /// One store's status figures, mirroring the embedded CLI's
 /// `cmds::status::StoreStatusEntry` (issue #187 stage 5) — the two must stay
@@ -64,17 +64,21 @@ pub struct StatusQuery {
     pub store: Vec<String>,
 }
 
-/// Resolve `?store=` names against the DB-backed store list. Non-empty
-/// `names` scopes to exactly those stores (request order, duplicates
-/// collapsed); an unknown name is `Error::StoreNotFound` (→ 404), matching
+/// Resolve `?store=` names against the DB-backed store list, reading raw
+/// `StoreRow`s (name/id/visibility/backend) rather than the parsed
+/// `EffectiveConfig` — `get_status` never reads a store's parsed
+/// `.indexing` policy, so it must not require every store's
+/// `indexing_policy` JSON to parse just to answer a scoped (or unscoped)
+/// status request (Codex review finding G2, issue #187 PR #212). Mirrors
+/// the embedded CLI's `resolve_store_scope_inner`
+/// (`cli/src/app_db.rs:478`): non-empty `names` resolves each name via a
+/// direct `get_store_by_name` lookup, in request order, with duplicates
+/// collapsed; an unknown name is `Error::StoreNotFound` (→ 404), matching
 /// the embedded CLI's exit code 3 for an unresolvable explicit `--store`
-/// name. Empty `names` is the pre-existing "every store" behavior.
-fn resolve_status_scope(
-    all_stores: Vec<EffectiveStore>,
-    names: &[String],
-) -> Result<Vec<EffectiveStore>, Error> {
+/// name. Empty `names` lists every store.
+async fn resolve_status_scope(state: &AppState, names: &[String]) -> Result<Vec<StoreRow>, Error> {
     if names.is_empty() {
-        return Ok(all_stores);
+        return state.backend().list_stores().await;
     }
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::with_capacity(names.len());
@@ -82,10 +86,10 @@ fn resolve_status_scope(
         if !seen.insert(name.as_str()) {
             continue;
         }
-        let store = all_stores
-            .iter()
-            .find(|s| &s.name == name)
-            .cloned()
+        let store = state
+            .backend()
+            .get_store_by_name(name)
+            .await?
             .ok_or_else(|| Error::StoreNotFound { id: name.clone() })?;
         out.push(store);
     }
@@ -96,8 +100,7 @@ pub async fn get_status(
     State(state): State<AppState>,
     Query(query): Query<StatusQuery>,
 ) -> Result<Json<StatusResponse>, ApiError> {
-    let effective = state.effective_config().await?;
-    let scoped_stores = resolve_status_scope(effective.stores, &query.store)?;
+    let scoped_stores = resolve_status_scope(&state, &query.store).await?;
     let store_count = scoped_stores.len();
 
     let mut source_count = 0;
@@ -120,7 +123,7 @@ pub async fn get_status(
         };
         stores.push(StoreStatusRecord {
             name: store.name.clone(),
-            visibility: store.visibility.clone(),
+            visibility: store_visibility_to_str(&store.visibility).to_string(),
             backend: store.backend.clone(),
             document_count: stats.as_ref().map(|s| s.document_count),
             chunk_count: stats.as_ref().map(|s| s.chunk_count),

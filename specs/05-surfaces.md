@@ -314,6 +314,14 @@ later if a consumer demands it).
     CLI's exit code 3 for an unresolvable explicit `--store` name. A name that resolves to a real
     but broken store degrades best-effort like the unscoped case, it does not 404. Omitting
     `?store=` entirely is the pre-existing all-stores behavior.
+  - **Scope resolution reads raw store rows and does not require every store's indexing policy to
+    parse** (Codex review, issue #187 PR #212 finding G2): resolving `?store=` (or listing every
+    store when it's omitted) reads `name`/`id`/`visibility`/`backend` straight off the DB-backed
+    store row — `status` never reads a store's parsed indexing policy, so it must not fail just
+    because one is malformed. A malformed `indexing_policy` — on the requested store itself, on a
+    store outside the requested scope, or on any store in the unscoped, all-stores case — must
+    never fail the request; it degrades best-effort exactly like a store whose source listing or
+    `RetrievalStore::stats()` call fails.
 - **Pagination:** cursor-based (`?cursor=`, `?limit=`) on list endpoints from day one.
 
 ## 4. MCP

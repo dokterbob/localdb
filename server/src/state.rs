@@ -545,7 +545,7 @@ impl AppState {
     }
 }
 
-fn store_visibility_to_str(visibility: &StoreVisibility) -> &'static str {
+pub(crate) fn store_visibility_to_str(visibility: &StoreVisibility) -> &'static str {
     match visibility {
         StoreVisibility::Private => "private",
         StoreVisibility::Shared => "shared",

@@ -293,3 +293,84 @@ async fn get_status_unknown_store_returns_404_store_not_found() {
     let body = json_body(resp.into_body()).await;
     assert_eq!(body["code"], "store_not_found");
 }
+
+// ---------------------------------------------------------------------------
+// G2 (issue #187 review round on PR #212): `get_status` must not require
+// every store's `indexing_policy` to parse — it only needs raw
+// name/id/visibility/backend off `StoreRow`. Seeds a store with a malformed
+// `indexing_policy` directly through the real backend's `upsert_store` (no
+// production test-only helper needed: `StoreRow.indexing_policy` is a plain
+// unvalidated `String` column, so writing garbage into it and re-upserting
+// is exactly what a corrupt/mid-migration row looks like on disk).
+// ---------------------------------------------------------------------------
+async fn corrupt_indexing_policy(state: &AppState, name: &str) {
+    let mut row = state
+        .backend()
+        .get_store_by_name(name)
+        .await
+        .unwrap()
+        .unwrap();
+    row.indexing_policy = "not valid json".to_string();
+    state.backend().upsert_store(&row).await.unwrap();
+}
+
+#[tokio::test]
+async fn get_status_scoped_by_healthy_ignores_malformed_policy_on_other_store() {
+    let (_dir, state) = super::common::make_state_with_fake_config().await;
+    state.add_store("healthy", "private").await.unwrap();
+    state.add_store("broken", "private").await.unwrap();
+    corrupt_indexing_policy(&state, "broken").await;
+
+    let app = build_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/status?store=healthy")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a malformed policy on an unrelated, out-of-scope store must not fail a scoped status request"
+    );
+    let body = json_body(resp.into_body()).await;
+    let stores = body["stores"].as_array().unwrap();
+    assert_eq!(
+        stores.len(),
+        1,
+        "only the scoped store must be reported: {body}"
+    );
+    assert_eq!(stores[0]["name"], "healthy");
+}
+
+#[tokio::test]
+async fn get_status_unscoped_degrades_best_effort_with_one_malformed_policy_store() {
+    let (_dir, state) = super::common::make_state_with_fake_config().await;
+    state.add_store("healthy", "private").await.unwrap();
+    state.add_store("broken", "private").await.unwrap();
+    corrupt_indexing_policy(&state, "broken").await;
+
+    let app = build_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "an unscoped status request must degrade best-effort rather than 500 when one store's policy is malformed"
+    );
+    let body = json_body(resp.into_body()).await;
+    let stores = body["stores"].as_array().unwrap();
+    assert_eq!(stores.len(), 2, "both stores must be reported: {body}");
+    let names: Vec<&str> = stores.iter().map(|s| s["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"healthy") && names.contains(&"broken"));
+}
