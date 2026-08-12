@@ -18,7 +18,7 @@ use localdb_core::{
     citation::Citation,
     search::{QueryRequest, QueryResponse, SearchOrchestrator, StoreHandle},
     store::{RetrievalStore, StoreStats},
-    Embedder,
+    Embedder, SEARCH_MAX_LIMIT,
 };
 
 use crate::args::{GetChunksArgs, GetDocumentArgs, SearchArgs};
@@ -136,16 +136,23 @@ pub async fn tool_list_stores(stores: &[AvailableStore]) -> CallToolResult {
 // ---------------------------------------------------------------------------
 
 const SEARCH_DEFAULT_LIMIT: usize = 10;
-const SEARCH_MAX_LIMIT: usize = 100;
 const SEARCH_DEFAULT_CONTENT_LENGTH: usize = 400;
 
 /// Resolve `SearchArgs::limit` to a `usize`, preserving the pre-rmcp
 /// behavior: absent -> default; a valid non-negative integer -> clamped to
-/// `SEARCH_MAX_LIMIT`; a negative integer -> silently falls back to the
-/// default (mirroring the old raw-JSON `Value::as_u64()` parse, which
-/// simply failed to match on negative numbers and fell through to
+/// `SEARCH_MAX_LIMIT` (`localdb_core::SEARCH_MAX_LIMIT` — shared with the
+/// HTTP `/v1/search` clamp and the CLI's embedded search, issue #187
+/// review); a negative integer -> silently falls back to the default
+/// (mirroring the old raw-JSON `Value::as_u64()` parse, which simply failed
+/// to match on negative numbers and fell through to
 /// `unwrap_or(DEFAULT_LIMIT)`). An explicit `0` passes through unchanged so
 /// the tool-level guard in `tool_search` can reject it.
+///
+/// This does not call `localdb_core::clamp_search_limit` directly: that
+/// helper's signature is `usize -> usize`, but this function's input is an
+/// `Option<i64>` with its own absent/negative-handling semantics — the
+/// `usize::try_from` conversion has to happen first, so the shared piece is
+/// just the `SEARCH_MAX_LIMIT` constant.
 fn resolve_search_limit(limit: Option<i64>) -> usize {
     match limit {
         None => SEARCH_DEFAULT_LIMIT,

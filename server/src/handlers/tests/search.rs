@@ -245,12 +245,12 @@ async fn search_limit_is_silently_clamped_to_the_max_instead_of_erroring() {
     // `leg_k` to the caller), so this asserts the clamp never lets the
     // response exceed the max rather than asserting it is hit exactly —
     // the exact-max case is covered at the unit level by
-    // `search_service::tests::clamp_search_limit_*`.
+    // `localdb_core::search::tests::clamp_search_limit_*`.
     let ids = citation_ids(&page);
     assert!(
-        ids.len() <= crate::search_service::SEARCH_MAX_LIMIT,
+        ids.len() <= localdb_core::SEARCH_MAX_LIMIT,
         "citations must never exceed the {}-item clamp, got {}: {:?}",
-        crate::search_service::SEARCH_MAX_LIMIT,
+        localdb_core::SEARCH_MAX_LIMIT,
         ids.len(),
         page
     );

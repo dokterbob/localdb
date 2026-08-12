@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use localdb_core::{
-    Citation, Error as CoreError, QueryRequest, SearchOrchestrator, StoreHandle as CoreStoreHandle,
+    clamp_search_limit, Citation, Error as CoreError, QueryRequest, SearchOrchestrator,
+    StoreHandle as CoreStoreHandle,
 };
 
 use crate::error::ApiError;
@@ -20,21 +21,6 @@ pub struct SearchRequest {
 
 fn default_search_limit() -> usize {
     10
-}
-
-/// Maximum `limit` a `/v1/search` request may request — requests above this
-/// are silently clamped, not rejected, mirroring the MCP `search` tool's
-/// `SEARCH_MAX_LIMIT` idiom (`mcp/src/tools.rs::resolve_search_limit`).
-/// `pub(crate)` so tests can assert against it instead of a bare literal.
-pub(crate) const SEARCH_MAX_LIMIT: usize = 100;
-
-/// Clamp a client-supplied `limit` to `SEARCH_MAX_LIMIT`, silently — no
-/// error, same as the MCP `search` tool's `resolve_search_limit`. Must run
-/// before any `offset + limit` arithmetic, so an absurd requested limit
-/// (e.g. `100_000`) can never inflate the page-end computation or the
-/// downstream retrieval request.
-fn clamp_search_limit(limit: usize) -> usize {
-    limit.min(SEARCH_MAX_LIMIT)
 }
 
 #[derive(Debug, Serialize)]
@@ -182,18 +168,10 @@ fn resolve_page_end(offset: usize, limit: usize) -> Result<usize, ApiError> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn clamp_search_limit_passes_through_values_at_or_below_the_max() {
-        assert_eq!(clamp_search_limit(1), 1);
-        assert_eq!(clamp_search_limit(SEARCH_MAX_LIMIT), SEARCH_MAX_LIMIT);
-    }
-
-    #[test]
-    fn clamp_search_limit_caps_values_above_the_max() {
-        assert_eq!(clamp_search_limit(SEARCH_MAX_LIMIT + 1), SEARCH_MAX_LIMIT);
-        assert_eq!(clamp_search_limit(100_000), SEARCH_MAX_LIMIT);
-        assert_eq!(clamp_search_limit(usize::MAX), SEARCH_MAX_LIMIT);
-    }
+    // `clamp_search_limit`/`SEARCH_MAX_LIMIT` are re-exported from
+    // `localdb_core::search` (issue #187 review) — their own coverage lives
+    // in `localdb_core::search::tests::clamp_search_limit_*` rather than
+    // being duplicated here.
 
     #[test]
     fn resolve_page_end_adds_offset_and_limit() {

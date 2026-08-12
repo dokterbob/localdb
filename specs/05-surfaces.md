@@ -333,6 +333,18 @@ later if a consumer demands it).
   same `offset + limit` internally but treat an overflow there as end-of-list (`next_cursor: null`)
   instead of an error, since an offset/limit pair that large can never address a real page of
   either list.
+- **`localdb search` clamps identically in embedded and daemon mode (issue #187 review, finding
+  1):** the 100-item cap above is not a `/v1/search`-only concern — `localdb search --limit
+  <huge>` must return the same number of results whether or not a daemon happens to be running,
+  since that is this PR's whole point. The cap lives in exactly one place,
+  `localdb_core::search::SEARCH_MAX_LIMIT` (plus its `clamp_search_limit` helper), and every
+  surface that accepts a client-supplied result count clamps to it: `POST /v1/search`
+  (`server::search_service::clamp_search_limit`, now a thin re-export), the MCP `search` tool (§4,
+  `mcp::tools::resolve_search_limit`, which clamps its own `Option<i64>` against the same
+  constant), and the CLI's embedded `search` command (`cli::cmds::search::SearchCmd::run_embedded`,
+  which clamps `self.limit` before it becomes `QueryRequest::top_n`). The CLI's daemon-attached
+  branch sends its raw, unclamped `limit` in the request body — `/v1/search` clamps it there, so no
+  second clamp is needed on the way out.
 
 ## 4. MCP
 

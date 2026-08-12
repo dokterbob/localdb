@@ -63,8 +63,8 @@ pub use metadata::{ConversationMetadata, DublinCoreMetadata, Metadata, Transcrip
 pub use parser::{ChainParser, ParsedDocument, Parser, Probe, PROBE_HEADER_LEN};
 pub use progress::{DocOutcome, ProgressEvent, ProgressSink};
 pub use search::{
-    rerank_noop, rrf_fuse_global, rrf_score, shape_citation, FusedChunkEntry, QueryRequest,
-    QueryResponse, SearchOrchestrator, StoreHandle,
+    clamp_search_limit, rerank_noop, rrf_fuse_global, rrf_score, shape_citation, FusedChunkEntry,
+    QueryRequest, QueryResponse, SearchOrchestrator, StoreHandle, SEARCH_MAX_LIMIT,
 };
 pub use snippet::truncate_snippet;
 pub use source::source_row_to_source;

@@ -709,6 +709,93 @@ fn end_to_end_init_store_source_index_search() {
     );
 }
 
+/// Embedded parity (issue #187 review, finding 1): `localdb search --limit
+/// <huge>` must return no more than `SEARCH_MAX_LIMIT` (100) citations in
+/// embedded mode, exactly like `POST /v1/search` already clamps (see
+/// `search_limit_is_silently_clamped_to_the_max_instead_of_erroring` in
+/// `server/src/handlers/tests/search.rs`). Before this fix,
+/// `SearchCmd::run_embedded` passed `self.limit` straight through as
+/// `top_n` with no cap, so the embedded and daemon paths could return a
+/// different number of results for the identical request.
+///
+/// To make the clamp observable, this fans the query out across three
+/// stores, each seeded with more documents than a single search leg's
+/// `DEFAULT_LEG_K` (50) would return alone — with only one store, the
+/// per-store leg cap already limits the *unclamped* embedded result count
+/// to <= 100 by coincidence, which would make this test pass even without
+/// the fix.
+#[test]
+fn search_embedded_limit_is_clamped_across_multiple_stores() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir).arg("init").assert().success();
+
+    let store_names = ["clamp-store-a", "clamp-store-b", "clamp-store-c"];
+    for store_name in store_names {
+        cmd_with_dir(&dir)
+            .args(["store", "add", store_name])
+            .assert()
+            .success();
+
+        let docs_dir = dir.path().join(format!("{store_name}-docs"));
+        std::fs::create_dir_all(&docs_dir).unwrap();
+        for i in 0..40 {
+            std::fs::write(
+                docs_dir.join(format!("doc-{i}.md")),
+                format!("# Doc {i}\n\nzzzclamptestterm content for document {i}.\n"),
+            )
+            .unwrap();
+        }
+
+        cmd_with_dir(&dir)
+            .args(["--store", store_name, "source", "add"])
+            .arg(docs_dir.to_str().unwrap())
+            .assert()
+            .success();
+
+        cmd_with_dir(&dir)
+            .args(["--store", store_name, "index"])
+            .assert()
+            .success();
+    }
+
+    // No daemon running -> embedded path. Ask for far more than
+    // SEARCH_MAX_LIMIT; the corpus has 3 * 40 = 120 matching chunks spread
+    // across three stores, comfortably above the 100-item clamp.
+    let output = cmd_with_dir(&dir)
+        .arg("--json")
+        .args(["search", "--limit", "5000", "zzzclamptestterm"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "search should exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|_| panic!("search --json must emit valid JSON; got: {stdout}"));
+    let citations = v["citations"].as_array().expect("citations must be array");
+
+    assert!(
+        citations.len() <= 100,
+        "embedded search must clamp to SEARCH_MAX_LIMIT (100) citations \
+         regardless of the requested --limit, got {}: {stdout}",
+        citations.len()
+    );
+    assert!(
+        citations.len() >= 90,
+        "corpus has 120 matching chunks across 3 stores; expected the clamp \
+         to be genuinely exercised (near 100 results) so this test can \
+         actually distinguish clamped from unclamped behavior, got only {}: \
+         {stdout}",
+        citations.len()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // --json output canonical shapes
 // ---------------------------------------------------------------------------

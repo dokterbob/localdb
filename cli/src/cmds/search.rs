@@ -82,6 +82,7 @@ impl DaemonAwareCommand for SearchCmd<'_> {
         config_loader: &ConfigLoader,
         db: &AppDb,
     ) -> Result<Self::Outcome, Error> {
+        use localdb_core::clamp_search_limit;
         use localdb_core::search::{QueryRequest, SearchOrchestrator, StoreHandle};
 
         // specs/05-surfaces.md §2.2, via the one shared resolver every other
@@ -111,10 +112,18 @@ impl DaemonAwareCommand for SearchCmd<'_> {
             Some(&models_dir),
         )
         .map_err(Error::from)?;
+        // Parity with the daemon path (issue #187 review, finding 1):
+        // `POST /v1/search` clamps `limit` to `SEARCH_MAX_LIMIT` before it
+        // ever reaches `SearchOrchestrator::query`
+        // (`server::search_service::clamp_search_limit`), and so does the
+        // MCP `search` tool (`mcp::tools::resolve_search_limit`). Without an
+        // equivalent clamp here, `localdb search foo --limit 5000` returned
+        // a different result count depending on whether a daemon happened
+        // to be running — the exact asymmetry this issue is about fixing.
         let request = QueryRequest {
             query: self.query.to_string(),
             leg_k: None,
-            top_n: Some(self.limit),
+            top_n: Some(clamp_search_limit(self.limit)),
             filters: vec![],
         };
 
