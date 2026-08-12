@@ -164,6 +164,7 @@ impl UrlRefreshScheduler {
             let source_id_for_closure = source_id.clone();
             let store_name_for_closure = record.store_name.clone();
             let state_for_closure = self.state.read().await.clone();
+            let records_for_closure = self.records.clone();
 
             let submit_result = self
                 .queue
@@ -177,36 +178,69 @@ impl UrlRefreshScheduler {
                             "URL refresh job running for source '{}' ({})",
                             source_id_for_closure, store_name_for_closure
                         );
-                        let state = state_for_closure.ok_or_else(|| Error::Internal {
-                            message: "URL refresh scheduler has no state attached".to_string(),
-                            correlation_id: "url_refresh_no_state".to_string(),
-                        })?;
-                        let store_row = state
-                            .backend()
-                            .get_store_by_name(&store_name_for_closure)
-                            .await?
-                            .ok_or_else(|| Error::StoreNotFound {
-                                id: store_name_for_closure.clone(),
+
+                        // Kept as a separate binding (not read back out of
+                        // `source_id_for_closure`, which the inner future
+                        // below moves) so the stamping step after it can
+                        // still name the source.
+                        let source_id_for_stamp = source_id_for_closure.clone();
+
+                        // Run the refresh, capturing its outcome as a value
+                        // instead of short-circuiting via `?` — `last_refreshed`
+                        // must be stamped once the job reaches *any* terminal
+                        // state (below), including the "no state attached" /
+                        // "store not found" early-exit paths, not only a
+                        // failure surfaced by `job_exec::run_job` itself.
+                        let result: Result<localdb_core::IndexJobStats, Error> = async move {
+                            let state = state_for_closure.ok_or_else(|| Error::Internal {
+                                message: "URL refresh scheduler has no state attached".to_string(),
+                                correlation_id: "url_refresh_no_state".to_string(),
                             })?;
-                        let yaml = state.yaml_config().await;
-                        let deps = JobExecDeps {
-                            backend: state.backend(),
-                            yaml: &yaml,
-                            models_dir: state.models_dir(),
-                            embedder: None,
-                            progress: Some(progress),
-                            on_source_error: None,
-                        };
-                        job_exec::run_job(
-                            &store_row,
-                            IndexJobScope::Source {
-                                source_id: source_id_for_closure.clone(),
-                            },
-                            localdb_core::DeletionPolicy::Retain,
-                            deps,
-                        )
-                        .await
-                        .map(|(stats, _embedder)| stats)
+                            let store_row = state
+                                .backend()
+                                .get_store_by_name(&store_name_for_closure)
+                                .await?
+                                .ok_or_else(|| Error::StoreNotFound {
+                                    id: store_name_for_closure.clone(),
+                                })?;
+                            let yaml = state.yaml_config().await;
+                            let deps = JobExecDeps {
+                                backend: state.backend(),
+                                yaml: &yaml,
+                                models_dir: state.models_dir(),
+                                embedder: None,
+                                progress: Some(progress),
+                                on_source_error: None,
+                            };
+                            job_exec::run_job(
+                                &store_row,
+                                IndexJobScope::Source {
+                                    source_id: source_id_for_closure.clone(),
+                                },
+                                localdb_core::DeletionPolicy::Retain,
+                                deps,
+                            )
+                            .await
+                            .map(|(stats, _embedder)| stats)
+                        }
+                        .await;
+
+                        // Record completion time now, not at submit time
+                        // (#187 review F1): stamping at submit made a slow
+                        // job look "refreshed" while it was still running,
+                        // drifting scheduling away from actual completion.
+                        // A failed job is stamped too — it must never
+                        // tight-loop retrying; it waits out a full interval
+                        // just like a successful refresh does. Only touch
+                        // the record if it's still registered: the source
+                        // may have been unregistered mid-flight, and
+                        // completion must never re-insert a removed record.
+                        let mut records = records_for_closure.write().await;
+                        if let Some(r) = records.get_mut(&source_id_for_stamp) {
+                            r.last_refreshed = Some(Instant::now());
+                        }
+
+                        result
                     },
                 )
                 .await;
@@ -216,13 +250,6 @@ impl UrlRefreshScheduler {
                     "URL refresh scheduler: failed to submit job for source '{}': {}",
                     record.source_id, e
                 );
-                continue;
-            }
-
-            // Update last_refreshed timestamp.
-            let mut records = self.records.write().await;
-            if let Some(r) = records.get_mut(&record.source_id) {
-                r.last_refreshed = Some(Instant::now());
             }
         }
     }
@@ -438,6 +465,118 @@ mod tests {
         }
     }
 
+    /// #187 review F1: `tick()` submits the job, but must not stamp
+    /// `last_refreshed` until the job actually reaches a terminal state.
+    /// Uses the same deterministic fast-failure path as
+    /// `submitted_job_without_attached_state_fails_honestly` above — no
+    /// state attached, so the job fails immediately without needing a real
+    /// store/embedder — rather than a real, slow ingestion, so the
+    /// "submitted but not yet complete" window is reliably observable on a
+    /// single-threaded test runtime (the worker task doesn't get to run
+    /// until this test task itself yields, e.g. via `sleep`).
+    #[tokio::test]
+    async fn last_refreshed_is_recorded_on_completion_not_on_submission() {
+        let queue = JobQueue::new();
+        let scheduler = UrlRefreshScheduler::new(queue.clone());
+
+        scheduler
+            .register(
+                "src-timing".to_string(),
+                "store-T".to_string(),
+                "https://example.com/".to_string(),
+                Some(0),
+            )
+            .await;
+
+        scheduler.tick().await;
+
+        // Immediately after `tick()` returns: the job has been submitted
+        // (it exists in the queue) but the worker — a separate task on this
+        // current-thread runtime — has not yet had a chance to run it.
+        assert_eq!(
+            queue.list_jobs().await.len(),
+            1,
+            "tick() should have submitted the job"
+        );
+        {
+            let records = scheduler.records.read().await;
+            assert_eq!(
+                records.get("src-timing").unwrap().last_refreshed,
+                None,
+                "last_refreshed must not be set merely because the job was submitted"
+            );
+        }
+
+        // Drive the job to its terminal (failed, no state attached) state.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if std::time::Instant::now() > deadline {
+                panic!("refresh job did not reach a terminal state in time");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let jobs = queue.list_jobs().await;
+            if let Some(job) = jobs.first() {
+                if job.state == IndexJobState::Failed {
+                    break;
+                }
+            }
+        }
+
+        let records = scheduler.records.read().await;
+        assert!(
+            records.get("src-timing").unwrap().last_refreshed.is_some(),
+            "last_refreshed must be set once the job reaches a terminal state"
+        );
+    }
+
+    /// #187 review F1: a failed job must still be stamped with
+    /// `last_refreshed`, so it waits out a full interval before being
+    /// retried rather than tight-looping.
+    #[tokio::test]
+    async fn failed_job_is_not_resubmitted_before_a_full_interval_elapses() {
+        let queue = JobQueue::new();
+        let scheduler = UrlRefreshScheduler::new(queue.clone());
+
+        scheduler
+            .register(
+                "src-retry".to_string(),
+                "store-R".to_string(),
+                "https://example.com/".to_string(),
+                Some(3600), // 1 hour — long enough to never elapse in-test.
+            )
+            .await;
+
+        scheduler.tick().await;
+
+        // Drive the job to Failed (no state attached).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if std::time::Instant::now() > deadline {
+                panic!("refresh job did not fail in time");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let jobs = queue.list_jobs().await;
+            if let Some(job) = jobs.first() {
+                if job.state == IndexJobState::Failed {
+                    break;
+                }
+            }
+        }
+
+        // A second tick immediately after the failure must not resubmit:
+        // the interval (1 hour) has not elapsed since `last_refreshed` was
+        // stamped at completion.
+        scheduler.tick().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let jobs = queue.list_jobs().await;
+        assert_eq!(
+            jobs.len(),
+            1,
+            "a failed job must not be resubmitted before a full interval has elapsed"
+        );
+    }
+
     /// The real regression test for #187 §1 on the scheduler path: with a
     /// real `AppState` attached (real store, real path source with content,
     /// fake embedder), `tick()` on a due source must produce genuine,
@@ -524,6 +663,14 @@ mod tests {
                         job.stats.chunks_written > 0,
                         "expected nonzero chunks_written, got {:?}",
                         job.stats
+                    );
+                    // #187 review F1: `last_refreshed` must be recorded
+                    // once the job actually completes, not back when it was
+                    // merely submitted.
+                    let records = scheduler.records.read().await;
+                    assert!(
+                        records.get(&source.id).unwrap().last_refreshed.is_some(),
+                        "last_refreshed must be set once the refresh job completes"
                     );
                     break;
                 }
