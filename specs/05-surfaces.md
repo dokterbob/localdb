@@ -607,6 +607,14 @@ call sites fall back to `internal` for a code `from_code` doesn't recognize (an 
 or one of the three variants — `internal`, `unsupported_format`, `extraction_failed` — whose fields
 don't fit a single `message` string).
 
+Producers pair `message` with `from_code`'s expectations: for the 8 codes `from_code` rebuilds from
+a single field (the four `*_not_found` codes, plus `invalid_config` / `invalid_request` /
+`provider_unavailable` / `model_missing`), `message` is that bare field with no `Display` prefix —
+a daemon HTTP error body (`server::error::ApiError`) and a failed `IndexJob`'s `error` field both
+store `Error::raw_message()`, not `Error::to_string()`, so `from_code` can re-add the prefix once
+on reconstruction instead of doubling it. Every other code's `message` is the full `Display`
+string, since `from_code` decodes those either to a fixed no-message variant or not at all.
+
 ### `localdb index --strict`
 
 By default `index` is **best-effort**: unsupported files are silently counted; extraction failures

@@ -447,13 +447,22 @@ A `next_cursor` of `null` means the last page has been reached.
 All errors use the same JSON envelope:
 
 ```json
-{"code":"store_not_found","message":"store not found: nope"}
+{"code":"store_not_found","message":"nope"}
 ```
 
 | Field | Type | Description |
 |---|---|---|
 | `code` | string | Machine-readable error code (stable API) |
-| `message` | string | Human-readable detail |
+| `message` | string | Error detail — see below for its exact shape |
+
+For `store_not_found`, `source_not_found`, `resource_not_found`, `job_not_found`, `invalid_config`,
+`invalid_request`, `provider_unavailable`, and `model_missing`, `message` is the *bare* field the
+error was built from (the id, or the validation/provider detail) — it does **not** carry the
+human-readable prefix a CLI-rendered version of the same error would (e.g. `"store not found:
+"`). This lets a daemon-attached client reconstruct the original typed error from `code` +
+`message` (`core::Error::from_code`) and render its own prefix without doubling it; a client that
+just wants display text should combine `code` and `message` itself (e.g. `"store not
+found: nope"`). Every other code's `message` carries the full human-readable string as-is.
 
 HTTP status codes follow the shared error taxonomy in [specs/05-surfaces.md](../specs/05-surfaces.md) §5:
 
