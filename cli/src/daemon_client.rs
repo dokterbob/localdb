@@ -432,6 +432,42 @@ mod tests {
         );
     }
 
+    /// Round-trip through the *real* producer, not a hand-typed bare
+    /// message: `server::error::ApiError::into_response` serializes the
+    /// JSON `{code, message}` body exactly as the daemon's axum handlers do,
+    /// and this feeds that body straight into `decode_daemon_error`. Guards
+    /// against the producer/consumer prefix-doubling regression (issue #187
+    /// review, finding F4): before the fix, the JSON body's `message`
+    /// already carried the "invalid config: " `Display` prefix, and
+    /// `Error::from_code` re-added the same prefix on reconstruction,
+    /// doubling it in the final `Display`ed error.
+    #[tokio::test]
+    async fn decode_daemon_error_round_trips_api_error_response_without_doubling_the_prefix() {
+        use axum::response::IntoResponse;
+        use server::error::ApiError;
+
+        let source_err = Error::InvalidConfig {
+            message: "unconfigured embedder provider".to_string(),
+        };
+        let response = ApiError::from(source_err.clone()).into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let code = body["code"].as_str().unwrap().to_string();
+        let msg = body["message"].as_str().unwrap().to_string();
+
+        let err = decode_daemon_error(&code, msg, status);
+        assert_eq!(err, source_err);
+        let rendered = err.to_string();
+        assert_eq!(
+            rendered.matches("invalid config:").count(),
+            1,
+            "the \"invalid config: \" prefix must appear exactly once, got: {rendered:?}"
+        );
+    }
+
     #[test]
     fn encode_path_segment_leaves_unreserved_characters_alone() {
         assert_eq!(encode_path_segment("my_store-1.2~x"), "my_store-1.2~x");

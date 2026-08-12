@@ -601,7 +601,19 @@ pub fn fail_index_job(job: &mut IndexJob, error: String) {
 /// indistinguishable from `Error::Internal` once read back by the CLI.
 pub fn fail_index_job_with_error(job: &mut IndexJob, error: &Error) {
     job.state = IndexJobState::Failed;
-    job.error = Some(error.to_string());
+    // Store the bare message (`raw_message()`), not `error.to_string()`:
+    // `cli::job_attach::finish_job` reconstructs the typed error via
+    // `Error::from_code(error_code, error)`, which re-adds the `Display`
+    // prefix (e.g. "invalid config: "). Storing the already-prefixed string
+    // would double it (issue #187 review, finding F4). Variants
+    // `raw_message()` can't reconstruct fall back to the full `Display`
+    // string, since there's no bare field to store instead.
+    job.error = Some(
+        error
+            .raw_message()
+            .map(str::to_string)
+            .unwrap_or_else(|| error.to_string()),
+    );
     job.error_code = Some(error.code().to_string());
     job.completed_at = Some(now_rfc3339());
 }
@@ -1585,9 +1597,33 @@ mod tests {
         };
         fail_index_job_with_error(&mut job, &err);
         assert_eq!(job.state, IndexJobState::Failed);
-        assert_eq!(job.error.as_deref(), Some(err.to_string().as_str()));
+        // `job.error` must be the *bare* message ("unconfigured embedder
+        // provider"), not `err.to_string()` ("invalid config: unconfigured
+        // embedder provider"): `cli::job_attach::finish_job` reconstructs the
+        // typed error via `Error::from_code(error_code, error)`, which
+        // re-adds the "invalid config: " prefix through `Display`. Storing
+        // the already-prefixed string here would double it (issue #187
+        // review, finding F4).
+        assert_eq!(job.error.as_deref(), Some("unconfigured embedder provider"));
         assert_eq!(job.error_code.as_deref(), Some("invalid_config"));
         assert!(job.completed_at.is_some());
+    }
+
+    #[test]
+    fn fail_index_job_with_error_falls_back_to_display_for_non_reconstructible_variants() {
+        // A variant `raw_message()` returns `None` for (e.g. `Internal`,
+        // whose fields don't fit a single `message` string) must still
+        // populate `job.error` with something readable — the full `Display`
+        // string, since there's no bare field to store instead.
+        let mut job = create_index_job("store-1", IndexJobScope::Store);
+        start_index_job(&mut job);
+        let err = Error::Internal {
+            message: "bug".to_string(),
+            correlation_id: "corr-1".to_string(),
+        };
+        fail_index_job_with_error(&mut job, &err);
+        assert_eq!(job.error.as_deref(), Some(err.to_string().as_str()));
+        assert_eq!(job.error_code.as_deref(), Some("internal"));
     }
 
     // ---------------------------------------------------------------------------

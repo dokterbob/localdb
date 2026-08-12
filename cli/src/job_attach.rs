@@ -1246,6 +1246,55 @@ mod tests {
         assert_eq!(err.exit_code(), 2);
     }
 
+    /// Round-trip through the *real* producer, not a hand-typed bare
+    /// message: `localdb_core::fail_index_job_with_error` populates
+    /// `job.error`/`job.error_code` exactly as the daemon worker does
+    /// (`server::job_queue::run_worker`), and this feeds that output
+    /// straight into `finish_job`'s reconstruction. Guards against the
+    /// producer/consumer prefix-doubling regression (issue #187 review,
+    /// finding F4): before the fix, the producer stored `error.to_string()`
+    /// ("invalid config: unconfigured embedder provider"), and
+    /// `Error::from_code` re-added the same prefix on reconstruction,
+    /// doubling it in the final `Display`ed error.
+    #[test]
+    fn finish_job_round_trips_fail_index_job_with_error_output_without_doubling_the_prefix() {
+        use localdb_core::fail_index_job_with_error;
+
+        let mut job = IndexJob {
+            id: "job-1".to_string(),
+            store_id: "store-1".to_string(),
+            scope: IndexJobScope::Store,
+            state: IndexJobState::Running,
+            stats: IndexJobStats::default(),
+            error: None,
+            error_code: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            started_at: None,
+            completed_at: None,
+        };
+        let source_err = Error::InvalidConfig {
+            message: "unconfigured embedder provider".to_string(),
+        };
+        fail_index_job_with_error(&mut job, &source_err);
+
+        let err = finish_job(
+            IndexErrorMode::StrictExit,
+            "auto-index job for store 'docs'",
+            job.state,
+            job.stats,
+            job.error,
+            job.error_code,
+        )
+        .unwrap_err();
+        assert_eq!(err, source_err);
+        let rendered = err.to_string();
+        assert_eq!(
+            rendered.matches("invalid config:").count(),
+            1,
+            "the \"invalid config: \" prefix must appear exactly once, got: {rendered:?}"
+        );
+    }
+
     /// An `error_code` this binary doesn't recognize (e.g. a newer daemon)
     /// must fall back to the historical contextualized `Error::Internal`,
     /// exactly like `error_code: None` — never panic or silently drop the

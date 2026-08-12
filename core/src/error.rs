@@ -164,6 +164,47 @@ impl Error {
         })
     }
 
+    /// Returns the bare message field `from_code` would reconstruct this
+    /// variant from, without the `Display` prefix (e.g. `"invalid config: "`)
+    /// that `{self}` / `to_string()` adds.
+    ///
+    /// `Some` exactly for the 8 variants `from_code` maps back into via a
+    /// single `message` string: the four not-found variants' `id`, and
+    /// `InvalidConfig`/`InvalidRequest`/`ProviderUnavailable`/`ModelMissing`'s
+    /// `message`. `None` for every other variant, including ones `from_code`
+    /// *decodes* to (`RuntimeStateLocked`, `DaemonRunning`,
+    /// `DaemonUnreachable`, `IndexInProgress` carry no message at all) and
+    /// ones it can't round-trip at all (`Internal`, `UnsupportedFormat`,
+    /// `ExtractionFailed`).
+    ///
+    /// A producer that will later hand this error to a `{code, message}`
+    /// boundary — a failed `IndexJob`'s `error` field
+    /// (`ingestion::fail_index_job_with_error`), or an HTTP error body's
+    /// `message` field (`server::error::ApiError::into_response`) — must
+    /// store `raw_message().unwrap_or_else(|| self.to_string())` instead of
+    /// `to_string()`: the consumer's `Error::from_code(code, message)`
+    /// reconstructs the variant and re-adds the prefix through `Display`, so
+    /// storing the already-prefixed string doubles it.
+    pub fn raw_message(&self) -> Option<&str> {
+        match self {
+            Error::StoreNotFound { id }
+            | Error::SourceNotFound { id }
+            | Error::ResourceNotFound { id }
+            | Error::JobNotFound { id } => Some(id),
+            Error::InvalidConfig { message }
+            | Error::InvalidRequest { message }
+            | Error::ProviderUnavailable { message }
+            | Error::ModelMissing { message } => Some(message),
+            Error::RuntimeStateLocked
+            | Error::DaemonRunning
+            | Error::DaemonUnreachable
+            | Error::UnsupportedFormat { .. }
+            | Error::ExtractionFailed { .. }
+            | Error::IndexInProgress
+            | Error::Internal { .. } => None,
+        }
+    }
+
     /// Returns the suggested CLI exit code for this error.
     pub fn exit_code(&self) -> i32 {
         match self {
@@ -357,6 +398,95 @@ mod tests {
             None
         );
         assert_eq!(Error::from_code("extraction_failed", "x".to_string()), None);
+    }
+
+    // -- raw_message: the 8 reconstructible variants, and a few that aren't -
+
+    #[test]
+    fn raw_message_returns_the_bare_field_for_reconstructible_variants() {
+        // Every variant `from_code` can rebuild from a single `message`
+        // string must hand back exactly that field, unprefixed — this is
+        // what lets a producer avoid double-prefixing when a consumer later
+        // runs the string back through `from_code` + `Display`.
+        assert_eq!(
+            Error::StoreNotFound { id: "x".into() }.raw_message(),
+            Some("x")
+        );
+        assert_eq!(
+            Error::SourceNotFound { id: "x".into() }.raw_message(),
+            Some("x")
+        );
+        assert_eq!(
+            Error::ResourceNotFound { id: "x".into() }.raw_message(),
+            Some("x")
+        );
+        assert_eq!(
+            Error::JobNotFound { id: "x".into() }.raw_message(),
+            Some("x")
+        );
+        assert_eq!(
+            Error::InvalidConfig {
+                message: "unconfigured embedder provider".into(),
+            }
+            .raw_message(),
+            Some("unconfigured embedder provider")
+        );
+        assert_eq!(
+            Error::InvalidRequest {
+                message: "x".into()
+            }
+            .raw_message(),
+            Some("x")
+        );
+        assert_eq!(
+            Error::ProviderUnavailable {
+                message: "x".into()
+            }
+            .raw_message(),
+            Some("x")
+        );
+        assert_eq!(
+            Error::ModelMissing {
+                message: "x".into()
+            }
+            .raw_message(),
+            Some("x")
+        );
+    }
+
+    #[test]
+    fn raw_message_is_none_for_non_reconstructible_variants() {
+        // Variants `from_code` never decodes (a fixed-message variant like
+        // `RuntimeStateLocked`, or one whose fields don't fit a single
+        // `message` string) have no bare message to hand back — callers must
+        // fall back to `to_string()`.
+        assert_eq!(Error::RuntimeStateLocked.raw_message(), None);
+        assert_eq!(Error::DaemonRunning.raw_message(), None);
+        assert_eq!(Error::DaemonUnreachable.raw_message(), None);
+        assert_eq!(Error::IndexInProgress.raw_message(), None);
+        assert_eq!(
+            Error::UnsupportedFormat {
+                format: "pdf".into()
+            }
+            .raw_message(),
+            None
+        );
+        assert_eq!(
+            Error::ExtractionFailed {
+                format: "office/docx".into(),
+                reason: "zip error".into(),
+            }
+            .raw_message(),
+            None
+        );
+        assert_eq!(
+            Error::Internal {
+                message: "bug".into(),
+                correlation_id: "abc".into(),
+            }
+            .raw_message(),
+            None
+        );
     }
 
     #[test]

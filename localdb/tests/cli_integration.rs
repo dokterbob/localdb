@@ -5190,6 +5190,20 @@ fn index_daemon_failed_job_with_invalid_config_code_exits_2_like_embedded() {
         stderr.contains("unconfigured embedder provider"),
         "the job's own error text must still reach stderr; got: {stderr}"
     );
+    // Issue #187 review, finding F4: the daemon's producers must store the
+    // *bare* message, not `Error::to_string()` — `finish_job` reconstructs
+    // the typed error via `Error::from_code`, which re-adds the "invalid
+    // config: " `Display` prefix itself. A doubled prefix here would mean a
+    // producer regressed back to storing the already-prefixed string.
+    assert_eq!(
+        stderr.matches("invalid config:").count(),
+        1,
+        "the \"invalid config: \" prefix must appear exactly once; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("invalid config: invalid config"),
+        "stderr must not show the doubled prefix; got: {stderr}"
+    );
 }
 
 /// A daemon job that completes (`done`) but reports per-source/per-document

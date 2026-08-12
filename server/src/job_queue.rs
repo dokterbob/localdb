@@ -500,13 +500,15 @@ mod tests {
         let done = wait_for_done(&queue, &job.id).await;
         assert_eq!(done.state, IndexJobState::Failed);
         assert_eq!(done.error_code.as_deref(), Some("invalid_config"));
-        assert!(
-            done.error
-                .as_deref()
-                .unwrap_or_default()
-                .contains("unconfigured embedder provider"),
-            "the human-readable message must still be present too: {:?}",
-            done.error
+        // Exact match, not `.contains`: `done.error` must be the *bare*
+        // message, with no "invalid config: " `Display` prefix — the
+        // consumer (`cli::job_attach::finish_job`) reconstructs the typed
+        // error via `Error::from_code(error_code, error)`, which adds that
+        // prefix itself. A prefixed `done.error` here would double it (issue
+        // #187 review, finding F4).
+        assert_eq!(
+            done.error.as_deref(),
+            Some("unconfigured embedder provider")
         );
 
         // The JSON wire shape (what `GET /v1/jobs/{id}` and the SSE terminal
