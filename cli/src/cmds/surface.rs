@@ -1,7 +1,4 @@
-use localdb_core::{
-    config::loader::{load_config, LoadOptions},
-    Error,
-};
+use localdb_core::Error;
 use serde_json::json;
 
 use crate::{
@@ -26,14 +23,23 @@ pub(crate) async fn run_serve_async(ctx: &CliContext) {
     // `create_dir_all`/`start_daemon` bind a port or take the write lock.
     reject_store_flag(ctx, SERVE_REJECT_MESSAGE);
 
-    let options = LoadOptions {
-        config_path: ctx.config.clone(),
-        ..Default::default()
-    };
-    let config_loader = match load_config(&options, ctx.config_env.as_deref()) {
-        Ok(c) => c,
-        Err(e) => exit_err(&e, ctx.json),
-    };
+    // Issue #119/#120: `serve` is itself a legitimate first-run entry point
+    // (nothing requires `localdb init` before `localdb serve`), so it now
+    // scaffolds config + a `default` store on a genuine first run, the same
+    // way the strict `command_table::dispatch` call sites do — see
+    // `app_db::load_config_scaffolded`'s doc comment. Its scaffolding errors
+    // (e.g. the F11 guard on an explicit `--config` with a missing parent)
+    // map to the same exit codes the old bare `load_config` hard-fail below
+    // did: `Error::InvalidConfig` -> exit 2, via the same `exit_err`.
+    let config_loader = load_config_scaffolded(ctx).await;
+
+    // Still required even after scaffolding: `ensure_config_scaffolded` only
+    // creates `paths.data`/`models`/`logs` on a genuine first run (no config
+    // file at the resolved path at all) — when a config file already exists
+    // but names a data dir that hasn't been created yet (e.g. a hand-edited
+    // `paths.data`), scaffolding is a no-op and this is still the only thing
+    // that creates it. Right after a fresh scaffold, `data_dir` already
+    // exists, so this is a no-op `create_dir_all` in that case.
     if let Err(e) = std::fs::create_dir_all(&config_loader.paths.data_dir) {
         exit_err(
             &Error::Internal {

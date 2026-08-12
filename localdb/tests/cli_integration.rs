@@ -231,6 +231,40 @@ fn mcp_exits_cleanly_on_stdin_eof() {
         .success();
 }
 
+/// `serve` goes through the same `load_config_scaffolded` helper `store
+/// add`/`index`/`source *` do (issue #119/#120), so a fresh install
+/// scaffolds `config.yaml` before `serve` ever binds a port or takes the
+/// daemon's socket lock. Unlike `serve_rejects_store_flag_exits_2` (which
+/// can assert `success()`/exit-2 outright because that rejection happens
+/// *before* any bind attempt), a fresh, unrejected `serve` goes on to bind
+/// and then block forever serving requests — so, like
+/// `search_on_fresh_install_scaffolds_config_and_default_store`, this uses a
+/// short `.timeout()` to let the process run just far enough to scaffold
+/// (which happens before the bind attempt either way) without waiting for —
+/// or depending on the outcome of — an actual daemon start.
+#[test]
+fn serve_on_fresh_install_scaffolds_config() {
+    let dir = TempDir::new().unwrap();
+
+    let _ = cmd_with_fresh_dir(&dir)
+        .arg("serve")
+        .timeout(std::time::Duration::from_secs(5))
+        .output()
+        .unwrap();
+
+    let config_path = dir.path().join("config.yaml");
+    let content = std::fs::read_to_string(&config_path)
+        .expect("`serve` on a fresh install must scaffold config.yaml");
+    let first_line = content
+        .lines()
+        .next()
+        .expect("scaffolded config must be non-empty");
+    assert!(
+        first_line.starts_with("# yaml-language-server: $schema="),
+        "first line must be the yaml-language-server modeline; got: {first_line}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // init
 // ---------------------------------------------------------------------------
