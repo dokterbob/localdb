@@ -95,33 +95,19 @@ pub(crate) async fn open_app_db_from_loader(config_loader: &ConfigLoader) -> Res
 // Common setup helpers
 // ---------------------------------------------------------------------------
 
-/// Load config and open the AppDb. Exits on failure.
-///
 /// SQLite WAL mode allows concurrent readers and writers, so the DB can be
 /// opened directly regardless of whether the daemon is also running. Commands
 /// that detect a running daemon will route mutations through the HTTP API;
 /// they still open the real DB for read operations (store list, etc.).
 ///
-/// A thin wrapper over [`load_config_for_maintenance`] (the config half) and
-/// [`open_app_db_or_exit`] (the DB-open half), kept for the callers that
-/// still want both steps back-to-back: `job_attach.rs`, `cmds/surface.rs`,
-/// `cmds/init.rs`. `command_table::dispatch`'s call sites use the two halves
-/// separately instead, so the DB open can be deferred until the daemon probe
-/// says `NotRunning` (issue #187 review, finding G4) — see `dispatch`'s doc
-/// comment.
-pub(crate) async fn load_app_db(ctx: &CliContext) -> (ConfigLoader, AppDb) {
-    let config_loader = load_config_for_maintenance(ctx);
-    let db = open_app_db_or_exit(ctx, &config_loader).await;
-    (config_loader, db)
-}
-
-/// Open the `AppDb` half of [`load_app_db`]'s strict behavior. Exits on
-/// failure via `exit_err`, exactly as `load_app_db` always did — factored
-/// out so `command_table::dispatch` call sites can pass it as a lazily-called
-/// `open_db` closure instead of opening the DB before the daemon probe (issue
-/// #187 review, finding G4): a broken local store (unwritable, locked,
-/// schema-too-new) used to `exit_err` here before a healthy daemon ever got a
-/// chance to handle the command.
+/// Pairs with [`load_config_for_maintenance`] (the config half) as the
+/// DB-open half. Every caller — `command_table::dispatch` call sites,
+/// `job_attach.rs`, `cmds/surface.rs`'s `run_mcp_async` — calls this lazily,
+/// only once it actually needs the DB (after a daemon probe has already come
+/// back `NotRunning`/not applicable), rather than opening it unconditionally
+/// up front (issue #187 review, finding G4): a broken local store
+/// (unwritable, locked, schema-too-new) used to `exit_err` here before a
+/// healthy daemon ever got a chance to handle the command.
 pub(crate) async fn open_app_db_or_exit(ctx: &CliContext, config_loader: &ConfigLoader) -> AppDb {
     match open_app_db_from_loader(config_loader).await {
         Ok(d) => d,
@@ -136,9 +122,10 @@ pub(crate) async fn open_app_db_or_exit(ctx: &CliContext, config_loader: &Config
 /// empty temp DB, rather than hard failing.
 ///
 /// A thin wrapper over [`load_config_lenient`] (the config half) and
-/// [`open_app_db_lenient_or_exit`] (the DB-open half) — see `load_app_db`'s
-/// doc comment for why `command_table::dispatch` call sites use the two
-/// halves separately instead.
+/// [`open_app_db_lenient_or_exit`] (the DB-open half) — see
+/// [`open_app_db_or_exit`]'s doc comment for why `command_table::dispatch`
+/// call sites, and every other caller in this crate, use the two halves
+/// separately instead.
 pub(crate) async fn load_app_db_lenient(ctx: &CliContext) -> (ConfigLoader, AppDb) {
     let config_loader = load_config_lenient(ctx);
     let db = open_app_db_lenient_or_exit(ctx, &config_loader).await;

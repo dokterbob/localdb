@@ -6,7 +6,8 @@ use serde_json::json;
 
 use crate::{
     app_db::{
-        load_app_db, reject_store_flag, resolve_store_scope, StoreScopePolicy, SERVE_REJECT_MESSAGE,
+        load_config_for_maintenance, open_app_db_or_exit, reject_store_flag, resolve_store_scope,
+        StoreScopePolicy, SERVE_REJECT_MESSAGE,
     },
     daemon_client::{probe_daemon, CliContext, DaemonState},
     normalize::{exit_err, print_json, visibility_to_string},
@@ -94,15 +95,17 @@ pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
         );
     }
 
-    // `load_app_db` is unconditional here — same sequencing as
-    // `search.rs`'s `run_search_async` (via `command_table::dispatch`) —
-    // since `probe_daemon` needs `config_loader.paths.data_dir` regardless of
-    // which mode we end up in. SQLite WAL mode makes opening it harmless even
-    // when a daemon is already running (see `app_db::load_app_db`'s doc
-    // comment); in the `Proxied` branch below, `db`/`config_loader` simply go
-    // unused beyond this point, exactly as `SearchCmd::run_daemon` leaves its
-    // own `db` unused.
-    let (config_loader, db) = load_app_db(ctx).await;
+    // Config only, up front: `probe_daemon` only needs
+    // `config_loader.paths.data_dir`, and `mcp` is hand-rolled rather than a
+    // `command_table::dispatch` call site, so it adopts the same lazy-open
+    // helpers dispatch's call sites use (issue #187 review, finding G4) by
+    // hand. The local `AppDb` is opened below, via `open_app_db_or_exit`,
+    // only in the embedded branch — never in the `Proxied` branch, which
+    // never touches it. Before this, `load_app_db` opened the local db
+    // unconditionally, so a broken local store (unwritable, locked,
+    // schema-too-new) would `exit_err` before `probe_daemon` ever ran,
+    // preempting a healthy daemon that never needed the local db at all.
+    let config_loader = load_config_for_maintenance(ctx);
 
     if let DaemonState::Running { base_url } =
         probe_daemon(&config_loader.paths.data_dir, ctx.daemon_url.as_deref())
@@ -182,6 +185,7 @@ pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
     // `AllStoresAllowEmpty`, not `AllStores`: a genuinely storeless database
     // must still *start* — an MCP server that exits non-zero at startup reads
     // to its client as broken, not as empty.
+    let db = open_app_db_or_exit(ctx, &config_loader).await;
     let scoped_stores = resolve_store_scope(ctx, &db, StoreScopePolicy::AllStoresAllowEmpty).await;
 
     let embed_policy = &config_loader.config.defaults.indexing.embedding;

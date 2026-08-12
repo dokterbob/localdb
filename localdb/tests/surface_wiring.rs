@@ -392,6 +392,139 @@ fn mcp_proxied_traversal_store_name_exits_2_before_connecting() {
     );
 }
 
+/// Stamp `PRAGMA user_version = version` on a raw db file at `path`, bypassing
+/// any of the CLI's normal open paths — simulates a schema-too-new local
+/// store. Copied from `cli_integration.rs`'s helper of the same name: each
+/// file under `tests/` is its own compilation unit, so it can't be shared
+/// directly.
+async fn stamp_user_version(path: &std::path::Path, version: i64) {
+    let db = libsql::Builder::new_local(path).build().await.unwrap();
+    let conn = db.connect().unwrap();
+    conn.query(&format!("PRAGMA user_version = {version}"), ())
+        .await
+        .unwrap();
+}
+
+/// Regression test for issue #187 review, PR #212 finding: `run_mcp_async`
+/// called `load_app_db` — opening the local `AppDb` — *before* `probe_daemon`,
+/// even though the proxied (`DaemonState::Running`) branch below never uses
+/// `db`. So a broken local store (unwritable, locked, schema-too-new) would
+/// `exit_err` on the open and never reach the daemon probe at all — the same
+/// bug class `command_table::dispatch`'s lazy `open_db` closure (issue #187
+/// review, finding G4) fixed for every table-driven command. `mcp` is
+/// hand-rolled (it never went through `dispatch`), so it needed its own fix.
+///
+/// This breaks `dir`'s local db deterministically (stamps a schema version
+/// this build's migration chain will never reach, the same technique
+/// `cli_integration.rs`'s
+/// `source_list_routes_to_daemon_when_local_db_schema_is_incompatible` uses)
+/// and points `LOCALDB_DAEMON_URL` at a real, healthy `localdb serve` daemon
+/// running against a *separate* data directory — proving the fix with a real
+/// two-subprocess MCP round trip, the same idiom
+/// `mcp_stdio_proxies_to_running_daemon` uses, rather than a mock (a mock
+/// HTTP server can't speak the real `/mcp` streamable-HTTP protocol
+/// `ProxyHandler::connect` needs).
+///
+/// Before the fix: `cmd_with_dir(&dir)` opens `dir`'s broken local db before
+/// ever consulting `LOCALDB_DAEMON_URL`, so this exits 2 (invalid_config)
+/// without ever reaching the proxy branch — red. After the fix: the local db
+/// is opened lazily, only from the embedded branch, so the daemon probe (which
+/// trusts `LOCALDB_DAEMON_URL` unconditionally) routes to the healthy daemon
+/// and the broken local db is never touched — green.
+#[test]
+fn mcp_routes_to_daemon_when_local_db_schema_is_incompatible() {
+    let dir = TempDir::new().unwrap();
+    write_config(&dir, "");
+    let data_dir = dir.path().join("data");
+    let db_path = data_dir.join("localdb.db");
+
+    // `store add` creates a fresh store at head, seeding a real schema this
+    // binary understands and can open normally.
+    cmd_with_dir(&dir)
+        .args(["store", "add", "s1"])
+        .assert()
+        .success();
+
+    // Stamp a schema version far beyond anything this binary's migration
+    // chain will ever reach, so any subsequent `AppDb::open` on this file
+    // hits `VersionDisposition::TooNew` -> `Error::InvalidConfig`.
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(stamp_user_version(&db_path, 999_999));
+
+    // A separate, healthy daemon: its own config and data directory,
+    // unrelated to the broken db above, so it starts and opens its own store
+    // normally.
+    let daemon_dir = TempDir::new().unwrap();
+    write_config(&daemon_dir, "server:\n  port: 0\n");
+    seed_indexed_store(&daemon_dir);
+
+    let bin = assert_cmd::cargo::cargo_bin("localdb");
+    let mut daemon = std::process::Command::new(&bin)
+        .arg("serve")
+        .env("LOCALDB_CONFIG", daemon_dir.path().join("config.yaml"))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn localdb serve");
+
+    let daemon_stdout = daemon.stdout.take().unwrap();
+    let mut reader = BufReader::new(daemon_stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read announce line");
+    let addr = line
+        .split("http://")
+        .nth(1)
+        .unwrap_or_else(|| panic!("announce line must contain http:// URL, got: {line}"))
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    let base_url = format!("http://{addr}");
+
+    let input = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test-client","version":"0.0.1"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+        "\n",
+    );
+
+    // `dir`'s local db is broken; `LOCALDB_DAEMON_URL` points at the separate,
+    // healthy daemon above.
+    let assert = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &base_url)
+        .arg("mcp")
+        .write_stdin(input)
+        .assert()
+        .success();
+
+    daemon.kill().ok();
+    daemon.wait().ok();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let responses: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("each stdout line is JSON"))
+        .collect();
+    assert_eq!(responses.len(), 2, "stdout was: {stdout}");
+
+    let tools = &responses[1];
+    let names: Vec<&str> = tools["result"]["tools"]
+        .as_array()
+        .expect("tools/list result.tools is an array")
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    for expected in ["search", "get_document", "get_chunks", "list_stores"] {
+        assert!(
+            names.contains(&expected),
+            "missing tool {expected} via daemon-proxied mcp: {names:?}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // HTTP daemon
 // ---------------------------------------------------------------------------
