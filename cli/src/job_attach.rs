@@ -384,18 +384,15 @@ async fn try_attach_via_sse(
     }
 
     let mut stream = resp.bytes_stream();
-    let mut buf = String::new();
+    let mut buf: Vec<u8> = Vec::new();
     let mut current_event: Option<String> = None;
     let mut current_data = String::new();
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|_| SseAttachError::Fallback)?;
-        buf.push_str(&String::from_utf8_lossy(&chunk));
+        buf.extend_from_slice(&chunk);
 
-        while let Some(nl) = buf.find('\n') {
-            let line = buf[..nl].trim_end_matches('\r').to_string();
-            buf.drain(..=nl);
-
+        while let Some(line) = split_next_line(&mut buf) {
             if line.is_empty() {
                 if let Some(ev) = current_event.take() {
                     match ev.as_str() {
@@ -433,6 +430,27 @@ async fn try_attach_via_sse(
 
     // Stream ended without ever delivering a terminal `job` frame.
     Err(SseAttachError::Fallback)
+}
+
+/// Pop and decode the next completed line (up to but not including the
+/// `\n`) out of `buf`, if one is present; a trailing `\r` (CRLF) is
+/// stripped, matching the wire format's line endings either way.
+///
+/// Returns `None` — leaving `buf` untouched — when no `\n` has arrived yet;
+/// the caller should wait for the next chunk and try again. Decoding via
+/// `String::from_utf8_lossy` runs only once a full line's bytes are in
+/// hand, so a multi-byte UTF-8 character split across two network chunks
+/// (e.g. `é`'s `0xC3` arriving in one `bytes_stream()` item and `0xA9` in
+/// the next) reassembles correctly instead of each half being lossily
+/// decoded — and replaced with `U+FFFD` — on its own chunk.
+fn split_next_line(buf: &mut Vec<u8>) -> Option<String> {
+    let nl = buf.iter().position(|&b| b == b'\n')?;
+    let mut line_bytes: Vec<u8> = buf.drain(..=nl).collect();
+    line_bytes.pop(); // the '\n' itself
+    if line_bytes.last() == Some(&b'\r') {
+        line_bytes.pop();
+    }
+    Some(String::from_utf8_lossy(&line_bytes).into_owned())
 }
 
 /// How often [`poll_job_until_terminal`] re-checks `GET /v1/jobs/{id}`.
@@ -1025,6 +1043,91 @@ mod tests {
         let base_url = spawn_mock_daemon(responses).await;
 
         let job = attach_daemon_job(&base_url, "job-1", false, None)
+            .await
+            .unwrap();
+        assert_eq!(job.state, IndexJobState::Done);
+    }
+
+    // -----------------------------------------------------------------
+    // split_next_line: pure helper, unit-tested directly (Codex review
+    // finding F3 — the SSE byte stream must be buffered as `Vec<u8>` and
+    // decoded only on completed lines, so a multi-byte UTF-8 character
+    // split across two network chunks doesn't get corrupted into
+    // replacement characters).
+    // -----------------------------------------------------------------
+
+    /// `é` (U+00E9) encodes as the two UTF-8 bytes `0xC3 0xA9`. Pushing them
+    /// via two separate `extend_from_slice` calls (mirroring two arriving
+    /// network chunks) before the terminating `\n` must still decode to an
+    /// intact `é` once the line completes — decoding only happens after the
+    /// full line is buffered, never per-partial-chunk.
+    #[test]
+    fn split_next_line_reassembles_a_multibyte_char_split_across_chunks() {
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&[0xC3]); // first byte of 'é', arriving alone
+        buf.extend_from_slice(&[0xA9]); // second byte, arriving in the next chunk
+        buf.extend_from_slice(b"\n");
+
+        let line = split_next_line(&mut buf).expect("a completed line");
+        assert_eq!(
+            line, "é",
+            "the split multi-byte character must decode intact"
+        );
+        assert!(
+            buf.is_empty(),
+            "the consumed line (including its newline) must be drained from buf"
+        );
+    }
+
+    /// A buffer with no `\n` yet — the tail of a line still arriving —
+    /// yields no line and is left untouched, so a later chunk can complete
+    /// it.
+    #[test]
+    fn split_next_line_returns_none_for_a_trailing_partial_line_with_no_newline() {
+        let mut buf: Vec<u8> = b"event: job".to_vec();
+        assert!(
+            split_next_line(&mut buf).is_none(),
+            "a line with no terminating newline yet must not be considered complete"
+        );
+        assert_eq!(
+            buf, b"event: job",
+            "buf must be left untouched when no complete line is available"
+        );
+    }
+
+    /// CRLF line endings strip the trailing `\r`, matching the parser's
+    /// pre-existing `trim_end_matches('\r')` behavior.
+    #[test]
+    fn split_next_line_strips_a_trailing_carriage_return() {
+        let mut buf: Vec<u8> = b"data: hello\r\n".to_vec();
+        let line = split_next_line(&mut buf).expect("a completed line");
+        assert_eq!(line, "data: hello");
+    }
+
+    /// Pins the trailing-partial-line-at-EOF behavior at the full
+    /// `attach_daemon_job` flow level: an SSE stream that ends mid-line,
+    /// with no trailing newline at all, must not panic and must degrade to
+    /// the polling fallback exactly like any other stream that ends without
+    /// a terminal `job` frame.
+    #[tokio::test]
+    async fn attach_daemon_job_falls_back_to_polling_when_the_sse_stream_ends_mid_line_without_a_trailing_newline(
+    ) {
+        let running_job = sample_job("job-7", IndexJobState::Running);
+        let done_job = sample_job("job-7", IndexJobState::Done);
+        let mut responses = MockResponses::default();
+        // The connection ends mid-line, with no trailing "\n" at all.
+        responses
+            .events
+            .push_back((200, "event: progress\ndata: {\"type\":\"disc".to_string()));
+        responses
+            .poll
+            .push_back((200, serde_json::to_string(&running_job).unwrap()));
+        responses
+            .poll
+            .push_back((200, serde_json::to_string(&done_job).unwrap()));
+        let base_url = spawn_mock_daemon(responses).await;
+
+        let job = attach_daemon_job(&base_url, "job-7", false, None)
             .await
             .unwrap();
         assert_eq!(job.state, IndexJobState::Done);
