@@ -6,6 +6,7 @@ use localdb_core::{
 };
 
 use crate::error::ApiError;
+use crate::handlers::parse_cursor;
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -128,19 +129,6 @@ impl SearchService {
             total_candidates: total,
             next_cursor,
         })
-    }
-}
-
-fn parse_cursor(cursor: Option<&str>) -> Result<usize, ApiError> {
-    match cursor {
-        None => Ok(0),
-        Some(s) => s.parse::<usize>().map_err(|_| {
-            ApiError(CoreError::InvalidRequest {
-                message: format!(
-                    "invalid pagination cursor '{s}'; expected a non-negative integer"
-                ),
-            })
-        }),
     }
 }
 
