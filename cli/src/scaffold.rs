@@ -9,9 +9,9 @@
 //! Wired into the CLI's strict and lenient config-load paths via
 //! `app_db::load_config_scaffolded` and `app_db::load_config_lenient` — every
 //! command that goes through either of those (`search`, `status`, `store
-//! add`/`remove`/`list`, `source add`/`list`/`remove`, `index`, `mcp`)
-//! implicitly scaffolds config + a `default` store on a genuine first run,
-//! same as `localdb init` does explicitly.
+//! add`/`remove`/`list`, `source add`/`list`/`remove`, `index`, `mcp`,
+//! `serve`) implicitly scaffolds config + a `default` store on a genuine
+//! first run, same as `localdb init` does explicitly.
 
 use std::path::{Path, PathBuf};
 

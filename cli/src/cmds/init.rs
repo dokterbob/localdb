@@ -66,7 +66,7 @@ pub(crate) async fn run_init_async(ctx: &CliContext) {
         println!("  Data:   {}", scaffold.data_dir.display());
         println!();
         println!(
-            "Note: when using 'local-onnx' provider, the ONNX model is downloaded on first index."
+            "Note: the default 'local' provider downloads its embedding model on first index."
         );
         println!("      Hosted providers (openai-compatible, perplexity, voyage) require an API key in config.");
         println!("Run `localdb store add <name>` to create a store.");

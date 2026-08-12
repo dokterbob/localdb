@@ -1,6 +1,6 @@
 # Spec 05 — Surfaces: CLI, HTTP API, MCP
 
-> Status: accepted draft, revised 2026-08-11. All three surfaces sit on the same `core`
+> Status: accepted draft, revised 2026-08-12. All three surfaces sit on the same `core`
 > ([01-architecture.md](01-architecture.md) §1) and return the same Citation shape
 > ([02-domain-model.md](02-domain-model.md) §6) and error taxonomy (§5).
 
@@ -18,7 +18,7 @@ Single binary, subcommand tree. Global flags: `--config`, `--json`, `--store <na
 
 | Command | Purpose | Daemonless (embedded) | Daemon-attached |
 |---|---|---|---|
-| `init` | Create config + data dir, first-run model download prompt; not store-scoped, `-s` is rejected, exit 2 (§2.2) | full | n/a (refuses if daemon running with different data dir) |
+| `init` | Explicit, idempotent alias of the implicit scaffolding every other command already does on first use (§2.5): ensures config + data/models/logs dirs + a `default` store exist, with repair semantics — it re-checks and creates whichever piece is missing even against a config another command already scaffolded. A fresh run writes the full commented default template (`core/src/config/config.template.yaml`, specs/03-config.md §8); not store-scoped, `-s` is rejected, exit 2 (§2.2) | full | n/a (refuses if daemon running with different data dir) |
 | `serve` | Run the daemon (HTTP API, watching, refresh, socket); serves every store regardless, so `-s` is rejected, exit 2 (§2.2) | becomes the daemon | error `daemon_running` |
 | `mcp` | Run MCP server on stdio; exposes all stores if `-s` is omitted, and `-s` genuinely narrows the exposed set in **both** modes (§4.2) | embedded core | thin client |
 | `status` | Stores, resource/chunk counts, policy staleness, daemon state, unified database file size and largest tables (§2.4); all stores if `-s` is omitted (§2.2) | reads directly | queries daemon |
@@ -213,6 +213,28 @@ attached to a store entry:
 `--json` extends the pre-existing shape — `daemon` and `stores[].{name,visibility,backend}` are
 unchanged — by adding `stores[].{document_count,chunk_count}` and the top-level `database` object
 above; no existing field is renamed or removed.
+
+### 2.5 Implicit initialization
+
+`localdb init` is no longer a prerequisite. Every command whose config-load path is
+`load_config_scaffolded` (strict) or `load_config_lenient` (lenient) — `store add`/`remove`,
+`source add`/`list`/`remove`, `index`, `mcp`, `serve` (strict); `search`, `status`, `store list`
+(lenient) — creates the config file, `paths.data`/`models`/`logs`, and a `default` store on a
+genuine first run, exactly as `localdb init` does explicitly (specs/03-config.md §8). `init`
+itself is now that same scaffolding step run explicitly, with repair semantics on top: it
+unconditionally ensures the `default` store exists, even against a config file another command
+already scaffolded or a user hand-wrote.
+
+`db status`/`migrate`/`downgrade`/`vacuum` are the deliberate exception: they exist to inspect or
+repair an *existing* store's schema, so they keep failing (exit 2) on a fresh install rather than
+scaffolding one into existence underneath themselves — their config-load path
+(`load_config_for_maintenance`) never scaffolds.
+
+Scaffolding fires only when the resolved config path does not exist at all; a present-but-malformed
+file is left untouched, and the command's normal strict/lenient load surfaces the same parse error
+it always did (§5, `invalid_config`). Exit codes are unchanged: a scaffolding failure (e.g. an
+explicit `--config` whose parent directory doesn't exist) maps through the same
+`Error::InvalidConfig` -> exit 2 path every other config error already used.
 
 ## 3. HTTP API
 

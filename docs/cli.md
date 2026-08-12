@@ -83,7 +83,7 @@ Initialized localdb at ~/notes
   Config: ~/notes/localdb-config.yaml
   Data:   ~/Library/Application Support/com.localdb.localdb.localdb/data
 
-Note: when using 'local-onnx' provider, the ONNX model is downloaded on first index.
+Note: the default 'local' provider downloads its embedding model on first index.
       Hosted providers (openai-compatible, perplexity, voyage) require an API key in config.
 Run `localdb store add <name>` to create a store.
 ```

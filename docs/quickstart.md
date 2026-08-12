@@ -1,46 +1,58 @@
 # Quick Start
 
-This guide walks through the complete workflow: initialize, create a store, add a source, index
-files, and search — using only the CLI in embedded mode (no daemon required).
+This guide walks through the complete workflow: create a store, add a source, index files, and
+search — using only the CLI in embedded mode (no daemon required). Config is created for you
+automatically along the way; an explicit init step is optional.
 
 For installation instructions, see [install.md](install.md).
 
-## Step 1 — Initialize
+## Step 1 — (Optional) Initialize
 
-Run `init` once to write the config file and prepare the data directory:
+An explicit init step is no longer required: the config file, data/models/logs directories, and a
+store named `default` are created automatically the first time you run any command below — the
+`store add` in Step 4 would create them just as well if you skipped straight to it. `localdb init`
+still exists as an explicit, idempotent way to set things up first:
 
 ```bash
 localdb init
 ```
 
-Output:
-
 ```
 Initialized localdb at ~/Library/Application Support/com.localdb.localdb.localdb
   Config: ~/Library/Application Support/com.localdb.localdb.localdb/config.yaml
   Data:   ~/Library/Application Support/com.localdb.localdb.localdb/data
-
-Note: when using 'local-onnx' provider, the ONNX model is downloaded on first index.
-      Hosted providers (openai-compatible, perplexity, voyage) require an API key in config.
-Run `localdb store add <name>` to create a store.
 ```
 
 (Paths shown are the macOS defaults — see [configuration.md](configuration.md) for Linux
 paths and the `--config` flag. Yes, the `com.localdb.localdb.localdb` segment is verbose;
 see [architecture.md known gaps](architecture.md#known-gaps).)
 
-The generated `config.yaml` contains only the version key by default:
+The generated `config.yaml` is a commented template with every key at its default value, spelled
+out for discoverability — not a bare stub. It starts:
 
 ```yaml
+# yaml-language-server: $schema=https://raw.githubusercontent.com/dokterbob/localdb/main/schema/config.schema.json
+#
+# localdb configuration — generated automatically on first run.
+# Full reference: docs/configuration.md
+#
+# Every key below is optional except `version`. Unknown keys are a hard
+# error (typos are caught, not silently ignored).
+# `$schema` (above and below) enables autocomplete/inline validation in any
+# editor speaking the yaml-language-server protocol (VS Code + "YAML"
+# extension, Zed, most LSP-aware editors).
+
 version: 1
-# localdb configuration
-# Add stores and sources below.
+$schema: https://raw.githubusercontent.com/dokterbob/localdb/main/schema/config.schema.json
 ```
 
-> **Note on the model-download message:** It is accurate. The default
-> embedder (`pplx-embed-context-v1-0.6b`) is downloaded from HuggingFace (~706 MB) the first
-> time `localdb index` or `localdb search` runs. No API key or license click-through is required.
-> Subsequent runs use the cached model. See
+See [configuration.md](configuration.md#config-is-created-for-you) for the full generated file and
+the `$schema` editor-integration section.
+
+> **Note on the model download:** the default embedder (`provider: local`,
+> `pplx-embed-context-v1-0.6b`) is downloaded from HuggingFace (~706 MB) the first time `localdb
+> index` or `localdb search` runs — not at init/first-run time. No API key or license
+> click-through is required. Subsequent runs use the cached model. See
 > [install.md#a-note-on-embedding-models](install.md#a-note-on-embedding-models).
 
 ## Step 2 — (Optional) Override data paths

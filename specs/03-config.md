@@ -1,6 +1,6 @@
 # Spec 03 — Configuration
 
-> Status: accepted draft, revised 2026-06-30.
+> Status: accepted draft, revised 2026-08-12.
 
 ## 1. Shape
 
@@ -143,6 +143,11 @@ path; `paths.*` in config override the rest.
 - **Versioning:** top-level `version: 1` required. Breaking schema changes bump the version;
   the loader migrates old versions **in memory** and logs a deprecation note — it never rewrites
   the user's file (§3). Unversioned files are rejected with a hint.
+- **Scaffolding is orthogonal to validation:** first-run config generation (§8) only ever writes a
+  config file where the resolved path had none — it is never triggered by, and never softens the
+  outcome of, loading a config file that already exists. A present-but-malformed file always goes
+  through the same strict/lenient validation path and the same `invalid_config` / exit 2 outcome
+  it always did; scaffolding cannot mask a real validation failure.
 
 ## 6. Secrets
 
@@ -176,3 +181,112 @@ binarization; measured cosine parity is ~0.995–0.9995 and per-dimension sign a
 (the ~1–2% of flips are near-zero dimensions that round to a different int8 sign under fp16). An
 index built by one backend is queryable by the other — switching providers requires **no reindex**
 and does not change the `policy_version` ([04-search-pipeline.md](04-search-pipeline.md) §4).
+
+## 8. Config file generation and schema
+
+### First-run scaffolding
+
+A genuinely absent config file is no longer a hard stop. Every CLI command that loads config —
+`search`, `status`, `store add`/`remove`/`list`, `source add`/`list`/`remove`, `index`, `mcp`, and
+`serve` — creates one on first use, transparently, before doing its own work, whether it goes
+through the strict load path (`store add`/`remove`, `source add`/`list`/`remove`, `index`, `mcp`,
+`serve`) or the lenient, fallback-to-platform-defaults read path (`search`, `status`, `store
+list`). `localdb init` ([05-surfaces.md](05-surfaces.md) §2) remains available as an explicit,
+idempotent alias — useful for setting things up before running anything else, but no longer
+required.
+
+On a genuine first run (the resolved config path does not exist at all), scaffolding:
+
+1. creates the config file's parent directory, plus `paths.data`/`paths.models`/`paths.logs`
+   (platform defaults, per §4);
+2. writes the handwritten, commented default template (`core/src/config/config.template.yaml`) to
+   the config path, atomically (below);
+3. creates a store named `default`, idempotently — a name lookup first, so a concurrent racer
+   never produces two.
+
+**Existence, not validity, gates scaffolding.** The check is a plain existence test, never "try to
+parse, scaffold on failure": a config file that is present but malformed is left completely
+untouched, and the caller's own strict/lenient load reports the same parse error it always did
+(exit 2, `invalid_config`, §5). Scaffolding only ever fires into a true void.
+
+**`db status`/`migrate`/`downgrade`/`vacuum` deliberately do not scaffold**
+([05-surfaces.md](05-surfaces.md) §2.5). They exist to inspect or repair an *existing* store's
+schema; scaffolding underneath them would let a schema-repair command silently paper over "there
+is no store here yet" instead of surfacing it.
+
+**Atomic write.** The template is written to a uniquely-named temp file
+(`config.yaml.tmp-<pid>-<ulid>`) in the same directory as the target, then hard-linked into place;
+a concurrent racer that loses the link race (`AlreadyExists`) is treated as success rather than an
+error, since every racer is writing byte-identical content. The temp file is removed in every case
+(success, lost race, or hard failure). This guarantees a concurrent reader — in particular the
+daemon's config file watcher — never observes partial content.
+
+**An explicit `--config` with a missing parent directory is still a hard failure, exit 2, on every
+surface that scaffolds** — not only `init`. Previously the CLI's lenient path silently fell back
+to an unrelated platform-default config when an explicit `--config` pointed into a missing
+directory; it now fails the same way `init` always did.
+
+### Editor schema reference (`$schema`)
+
+`RawConfig` accepts an optional `$schema` key (serde-renamed from `schema`); it is validated as a
+string if present but is otherwise semantically inert — nothing in the loader reads it. The
+generated template writes two forms of the same URL:
+
+- a `# yaml-language-server: $schema=<url>` modeline as the file's first line;
+- a literal `$schema: <url>` key alongside `version: 1`.
+
+Both point at the same stable URL:
+`https://raw.githubusercontent.com/dokterbob/localdb/main/schema/config.schema.json`
+(`localdb_core::config::jsonschema::SCHEMA_URL`) — a live main-branch reference, not a per-release
+pin, so an editor always validates against the schema matching the newest released loader
+behavior. The `$schema` key form works for any tooling that reads a YAML document's own `$schema`
+property; the modeline form is read by the `yaml-language-server`-based ecosystem (VS Code's
+"YAML" extension, Zed, and most other LSP-backed editors), including before the document body
+itself is parsed.
+
+### The router schema and versioning
+
+`generate_router_schema()` (`core/src/config/jsonschema.rs`) emits one draft 2020-12 JSON Schema
+document, published at `$id: <SCHEMA_URL>`, that dispatches on the config's top-level `version`
+field:
+
+```
+version: integer, required
+if version == 1: $ref #/$defs/v1
+else: false
+```
+
+`$defs.v1` is the full `schemars`-derived schema of `RawConfig` — `additionalProperties: false`
+(mirroring `#[serde(deny_unknown_fields)]`), field descriptions taken verbatim from Rust doc
+comments, nested struct schemas flattened into the same `$defs` map with an inserted `v1_` prefix
+(so `ServerConfig`'s def becomes `$defs.v1_ServerConfig`) to keep a future version's defs from
+colliding with `v1`'s.
+
+**Deprecation policy:** a future `version: 2` gets its own `$defs.v2` and an added `if`/`then`/
+`else` branch nested inside the existing `else`. Dropping support for an old version *is* removing
+its branch — the router schema then rejects that version's configs outright (`else: false`), in
+the same place, and for the same reason, the loader itself hard-errors on an unsupported
+`version`. Schema and loader are meant to fail in lockstep: an editor should never accept a config
+version the binary refuses to load, or vice versa.
+
+### Regenerating the committed artifact
+
+The router schema is committed at `schema/config.schema.json` (repo root) and regenerated with:
+
+```sh
+cargo run -p localdb -- internal print-schema > schema/config.schema.json
+```
+
+`internal print-schema` is a hidden subcommand (never shown in `--help`) — pure, offline codegen
+with no config load and no daemon probe. `core/tests/config_schema_drift.rs` byte-compares the
+committed file against a fresh `generate_router_schema()` call and fails if anyone edits the
+schema generator, or a `RawConfig`-reachable doc comment that feeds it, without regenerating the
+artifact.
+
+### Keeping the template honest
+
+`core/src/config/config.template.yaml` is handwritten prose, not generated, so
+`core/src/config/template.rs`'s test suite pins it against the same sources of truth it documents:
+the rendered template must parse to the identical `RawConfig` a minimal `version: 1` config
+produces (the `$schema` field aside), must mention every `$defs.v1*` schema property by name
+(live or commented-out), and must itself validate against `generate_router_schema()`'s output.
