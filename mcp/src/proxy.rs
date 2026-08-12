@@ -109,6 +109,12 @@ impl ProxyScope {
     /// is what closes the shadowing hole: whatever the caller wrote, the
     /// upstream now receives an exact id, and its id-first rule guarantees
     /// that resolves to the store this function actually approved.
+    // `CallToolResult` crossed clippy's result_large_err threshold once the
+    // workspace `schemars` dep gained `preserve_order` (serde_json's Map
+    // switches from BTreeMap to IndexMap, growing `serde_json::Value`).
+    // Boxing every `Err(CallToolResult)` call site in this crate is out of
+    // scope for that change; allow the lint here instead.
+    #[allow(clippy::result_large_err)]
     fn canonicalize(&self, value: &str) -> Result<String, CallToolResult> {
         match self.resolve(value) {
             Some(store) if self.allows(&store.id) => Ok(store.id.clone()),

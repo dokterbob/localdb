@@ -27,8 +27,10 @@ percent-encoding = { workspace = true }
 text-splitter = { version = "0.31", features = ["markdown"] }
 pulldown-cmark = "0.13"
 globset = "0.4"
+schemars = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
 tempfile = "3"
 extract = { path = "../extract" }
+jsonschema = "0.49"

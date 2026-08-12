@@ -3,6 +3,7 @@
 //! See specs/03-config.md for full specification.
 
 pub mod feed;
+pub mod jsonschema;
 pub mod loader;
 pub mod platform;
 pub mod policy;
@@ -10,6 +11,7 @@ pub mod refresh;
 pub mod schema;
 
 pub use feed::validate_max_entries;
+pub use jsonschema::{generate_router_schema, SCHEMA_URL};
 pub use loader::{
     load_config, load_config_from_str, refuse_legacy_layout, resolve_config_path, ConfigLoader,
     LoadOptions,

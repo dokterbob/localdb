@@ -6,6 +6,7 @@
 //!
 //! See specs/03-config.md §1, §5.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -16,7 +17,7 @@ use std::collections::HashMap;
 /// Raw YAML config shape — the user's config file.
 ///
 /// `#[serde(deny_unknown_fields)]` enforces strict key rejection.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RawConfig {
     /// Schema version; must be 1 in MVP. Required.
@@ -49,7 +50,7 @@ pub struct RawConfig {
 // ---------------------------------------------------------------------------
 
 /// HTTP server configuration.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// Bind address; loopback-only by default.
@@ -85,7 +86,7 @@ fn default_port() -> u16 {
 /// Optional platform path overrides.
 ///
 /// `None` means use the platform default from `PlatformPaths`.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PathsConfig {
     /// Override for data directory (indexes, runtime-state DB, lock, socket).
@@ -106,7 +107,7 @@ pub struct PathsConfig {
 // ---------------------------------------------------------------------------
 
 /// Global defaults; stores inherit from here unless they override.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DefaultsConfig {
     /// Default indexing policy for all stores.
@@ -118,7 +119,7 @@ pub struct DefaultsConfig {
 ///
 /// A change to any field triggers a reindex (policy_version changes).
 /// See specs/03-config.md §2 and specs/04-search-pipeline.md §4.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct IndexingPolicyConfig {
     /// Chunking settings.
@@ -161,7 +162,7 @@ fn default_parser_ids() -> Vec<String> {
 }
 
 /// Chunking policy configuration.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ChunkingPolicy {
     /// Per-source-kind preset overrides (e.g. `prose`, `code`, `messages`).
@@ -170,7 +171,7 @@ pub struct ChunkingPolicy {
 }
 
 /// Embedding policy configuration.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EmbeddingPolicy {
     /// Model name / path.
@@ -209,7 +210,7 @@ fn default_embedding_provider() -> String {
 // ---------------------------------------------------------------------------
 
 /// External provider configuration.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
     /// Provider name (user-assigned label).
