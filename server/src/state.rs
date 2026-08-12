@@ -704,6 +704,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut yaml_config = RawConfig {
             version: 1,
+            schema: None,
             server: Default::default(),
             paths: Default::default(),
             defaults: Default::default(),
@@ -737,6 +738,7 @@ mod tests {
     fn fake_yaml_config() -> RawConfig {
         let mut yaml_config = RawConfig {
             version: 1,
+            schema: None,
             server: Default::default(),
             paths: Default::default(),
             defaults: Default::default(),

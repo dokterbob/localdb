@@ -599,6 +599,7 @@ mod tests {
 
         let mut yaml_config = localdb_core::config::schema::RawConfig {
             version: 1,
+            schema: None,
             server: Default::default(),
             paths: Default::default(),
             defaults: Default::default(),
@@ -699,6 +700,7 @@ mod tests {
 
         let mut yaml_config = localdb_core::config::schema::RawConfig {
             version: 1,
+            schema: None,
             server: Default::default(),
             paths: Default::default(),
             defaults: Default::default(),

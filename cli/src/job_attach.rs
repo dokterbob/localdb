@@ -764,6 +764,7 @@ mod tests {
     fn fake_daemon_yaml() -> RawConfig {
         RawConfig {
             version: 1,
+            schema: None,
             server: Default::default(),
             paths: Default::default(),
             defaults: localdb_core::config::schema::DefaultsConfig {

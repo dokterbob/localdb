@@ -22,6 +22,11 @@ pub struct RawConfig {
     /// Schema version; must be 1 in MVP. Required.
     pub version: u32,
 
+    /// Editor schema reference (`$schema:` key), written by the auto-generated
+    /// config template; accepted and semantically ignored on load.
+    #[serde(rename = "$schema", default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+
     /// HTTP server settings.
     #[serde(default)]
     pub server: ServerConfig,
@@ -233,6 +238,15 @@ mod tests {
         assert_eq!(cfg.server.bind, "127.0.0.1");
         assert_eq!(cfg.server.port, 7700);
         assert!(cfg.providers.is_empty());
+        assert_eq!(cfg.schema, None);
+    }
+
+    #[test]
+    fn raw_config_accepts_dollar_schema_key() {
+        let yaml = "version: 1\n$schema: https://example.com/x.json\n";
+        let cfg: RawConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.version, 1);
+        assert_eq!(cfg.schema, Some("https://example.com/x.json".to_string()));
     }
 
     #[test]

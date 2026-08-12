@@ -555,6 +555,7 @@ mod tests {
         };
         let config = RawConfig {
             version: 1,
+            schema: None,
             server: ServerConfig::default(),
             paths: PathsConfig::default(),
             defaults,
