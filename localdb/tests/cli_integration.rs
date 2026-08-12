@@ -42,6 +42,37 @@ fn write_default_config(dir: &TempDir) {
     std::fs::write(dir.path().join("config.yaml"), &config).unwrap();
 }
 
+/// Build a Command pointed at a config path inside `dir` that does **not**
+/// exist yet — for exercising implicit first-run scaffolding
+/// (`cli::scaffold::ensure_config_scaffolded`, issue #119/#120). Unlike
+/// `cmd_with_dir`/`write_default_config`, nothing is pre-seeded: the whole
+/// point is to observe what a genuinely fresh install does.
+///
+/// `ensure_config_scaffolded` falls back to `PlatformPaths::resolve()` for
+/// `paths.data`/`models`/`logs` whenever the config file itself is absent —
+/// even when `LOCALDB_CONFIG` explicitly names where the *file* should live
+/// (see `cli::scaffold::ensure_config_scaffolded_inner`'s doc comment) — so
+/// this also redirects every env var `directories::ProjectDirs` consults
+/// when resolving those platform defaults, or a "fresh install" test would
+/// actually create directories under the real machine's home directory.
+/// `directories`' macOS backend (`directories::mac::project_dirs_from`)
+/// resolves everything from `dirs_sys::home_dir()`, which reads `$HOME`
+/// directly; its Linux/XDG backend reads `$XDG_CONFIG_HOME`/
+/// `$XDG_DATA_HOME`/`$XDG_CACHE_HOME`/`$XDG_STATE_HOME`, falling back to
+/// `$HOME`-derived defaults when any of those are unset. Setting all five
+/// env vars covers both platforms CI runs on (`.github/workflows/ci.yml`:
+/// `ubuntu-latest`/`ubuntu-22.04` and `macos-14`/`macos-latest`).
+fn cmd_with_fresh_dir(dir: &TempDir) -> Command {
+    let mut c = cmd();
+    c.env("LOCALDB_CONFIG", dir.path().join("config.yaml"));
+    c.env("HOME", dir.path());
+    c.env("XDG_CONFIG_HOME", dir.path().join("xdg-config"));
+    c.env("XDG_DATA_HOME", dir.path().join("xdg-data"));
+    c.env("XDG_CACHE_HOME", dir.path().join("xdg-cache"));
+    c.env("XDG_STATE_HOME", dir.path().join("xdg-state"));
+    c
+}
+
 /// Write a YAML config with a specific data dir and extra content.
 fn write_config_with_data_dir(dir: &TempDir, extra: &str) {
     let data_dir = dir.path().join("data");
@@ -244,6 +275,188 @@ fn init_is_idempotent() {
     cmd_with_dir(&dir).arg("init").assert().success();
     // Second init — should still succeed.
     cmd_with_dir(&dir).arg("init").assert().success();
+}
+
+// ---------------------------------------------------------------------------
+// implicit config scaffolding (issue #119/#120)
+// ---------------------------------------------------------------------------
+// Every strict (`cli::app_db::load_config_scaffolded`) and lenient
+// (`cli::app_db::load_config_lenient`) CLI load path now scaffolds the
+// default commented config template — and, on that same first run, a
+// `default` store — instead of requiring an explicit `localdb init` first.
+// `db status`/`migrate`/`downgrade` are the deliberate exception: they must
+// keep hard-failing on a fresh install rather than silently scaffolding
+// underneath a schema-repair command (see
+// `db_status_on_fresh_install_does_not_scaffold_and_exits_2` below).
+
+/// `search` goes through the *lenient* load path. Scaffolding (writing
+/// `config.yaml` and inserting the `default` store) happens synchronously,
+/// before `search` ever touches the configured `provider: local` embedder —
+/// which, on a genuine first run with no cached model, would otherwise
+/// attempt the one-time ~706 MB download documented in CLAUDE.md. A short
+/// `.timeout()` lets this test observe scaffolding's on-disk side effects
+/// without waiting on — or requiring network access for — that download; a
+/// second, separate `store list` invocation (no embedder involved) confirms
+/// the `default` store landed in the database, not just returned in memory.
+#[test]
+fn search_on_fresh_install_scaffolds_config_and_default_store() {
+    let dir = TempDir::new().unwrap();
+
+    let _ = cmd_with_fresh_dir(&dir)
+        .args(["search", "hello"])
+        .timeout(std::time::Duration::from_secs(5))
+        .output()
+        .unwrap();
+
+    let config_path = dir.path().join("config.yaml");
+    let content = std::fs::read_to_string(&config_path)
+        .expect("`search` on a fresh install must scaffold config.yaml");
+    let first_line = content
+        .lines()
+        .next()
+        .expect("scaffolded config must be non-empty");
+    assert!(
+        first_line.starts_with("# yaml-language-server: $schema="),
+        "first line must be the yaml-language-server modeline; got: {first_line}"
+    );
+    assert!(
+        content.lines().any(|l| l.starts_with("$schema: ")),
+        "scaffolded config must contain a `$schema:` key line; got:\n{content}"
+    );
+
+    cmd_with_fresh_dir(&dir)
+        .args(["store", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("default"));
+}
+
+/// `store add` goes through the *strict* load path
+/// (`load_config_scaffolded`) — covers the strict-path half of implicit
+/// scaffolding, distinct from `search`'s lenient path above.
+#[test]
+fn store_add_on_fresh_install_scaffolds() {
+    let dir = TempDir::new().unwrap();
+
+    cmd_with_fresh_dir(&dir)
+        .args(["store", "add", "mystore"])
+        .assert()
+        .success();
+
+    assert!(
+        dir.path().join("config.yaml").exists(),
+        "`store add` on a fresh install must scaffold config.yaml"
+    );
+
+    // Both the store this command created and the implicit `default` store
+    // scaffolding creates on the same first run must be present.
+    cmd_with_fresh_dir(&dir)
+        .args(["store", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("mystore"))
+        .stdout(predicate::str::contains("default"));
+}
+
+/// `status` goes through the lenient load path, like `search`, but never
+/// touches an embedder — so unlike the `search` test above, this can assert
+/// a normal `success()` outcome without a timeout escape hatch.
+#[test]
+fn status_on_fresh_install_scaffolds() {
+    let dir = TempDir::new().unwrap();
+
+    cmd_with_fresh_dir(&dir).arg("status").assert().success();
+
+    assert!(
+        dir.path().join("config.yaml").exists(),
+        "`status` on a fresh install must scaffold config.yaml"
+    );
+    cmd_with_fresh_dir(&dir)
+        .args(["store", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("default"));
+}
+
+/// `db status`/`migrate`/`downgrade` intentionally never scaffold (see
+/// `app_db::load_config_for_maintenance`'s doc comment and CLAUDE.md's
+/// "Schema changes" note): they exist to repair a store's schema, so they
+/// must keep hard-failing on a fresh install rather than quietly creating
+/// one underneath themselves.
+#[test]
+fn db_status_on_fresh_install_does_not_scaffold_and_exits_2() {
+    let dir = TempDir::new().unwrap();
+
+    let output = cmd_with_fresh_dir(&dir)
+        .args(["db", "status"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "`db status` on a fresh install must hard-fail, not scaffold; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !dir.path().join("config.yaml").exists(),
+        "`db status` must never scaffold config.yaml"
+    );
+}
+
+/// Locks the latent-bug fix described in `load_config_lenient`'s doc
+/// comment: an explicit `--config` whose parent directory is missing used
+/// to silently fall through to an unrelated platform-default config on the
+/// lenient path; the F11 guard in `ensure_config_scaffolded` now makes this
+/// exit 2 uniformly, before anything is ever created on disk.
+#[test]
+fn search_with_explicit_config_missing_parent_exits_2() {
+    let dir = TempDir::new().unwrap();
+    let missing_parent_config = dir.path().join("nonexistent-dir").join("config.yaml");
+
+    let output = cmd()
+        .args([
+            "--config",
+            missing_parent_config.to_str().unwrap(),
+            "search",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "explicit --config with a missing parent directory must exit 2; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !missing_parent_config.parent().unwrap().exists(),
+        "nothing should be created when --config's parent directory is missing"
+    );
+}
+
+/// `localdb init` after a command has already implicitly scaffolded config
+/// must remain a byte-for-byte no-op (specs/05-surfaces.md's idempotency
+/// contract for `init`), not just "still exits 0".
+#[test]
+fn init_after_implicit_scaffold_is_still_idempotent() {
+    let dir = TempDir::new().unwrap();
+
+    // `status` needs no store or embedder, so it exercises the lenient
+    // scaffold path cheaply.
+    cmd_with_fresh_dir(&dir).arg("status").assert().success();
+
+    let config_path = dir.path().join("config.yaml");
+    let before = std::fs::read(&config_path).expect("status must have scaffolded config.yaml");
+
+    cmd_with_fresh_dir(&dir).arg("init").assert().success();
+
+    let after = std::fs::read(&config_path).unwrap();
+    assert_eq!(
+        before, after,
+        "`init` after an implicit scaffold must not rewrite config.yaml"
+    );
 }
 
 // ---------------------------------------------------------------------------

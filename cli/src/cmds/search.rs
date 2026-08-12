@@ -182,7 +182,7 @@ pub(crate) async fn run_search_async(
     content_length: usize,
 ) {
     // F1-cli: use lenient loader so search works even with malformed config.
-    let config_loader = load_config_lenient(ctx);
+    let config_loader = load_config_lenient(ctx).await;
     let citations = dispatch(&SearchCmd { query, limit }, ctx, &config_loader, || {
         open_app_db_lenient_or_exit(ctx, &config_loader)
     })

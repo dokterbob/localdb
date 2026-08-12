@@ -2,10 +2,7 @@ use std::sync::Arc;
 
 use localdb_core::{
     config::{
-        loader::{
-            load_config, load_config_from_str, resolve_config_path, ConfigLoader, LoadOptions,
-            ResolvedPaths,
-        },
+        loader::{load_config, load_config_from_str, ConfigLoader, LoadOptions, ResolvedPaths},
         policy::compute_policy_version,
         schema::{EmbeddingPolicy, IndexingPolicyConfig, ProviderConfig},
     },
@@ -127,7 +124,7 @@ pub(crate) async fn open_app_db_or_exit(ctx: &CliContext, config_loader: &Config
 /// call sites, and every other caller in this crate, use the two halves
 /// separately instead.
 pub(crate) async fn load_app_db_lenient(ctx: &CliContext) -> (ConfigLoader, AppDb) {
-    let config_loader = load_config_lenient(ctx);
+    let config_loader = load_config_lenient(ctx).await;
     let db = open_app_db_lenient_or_exit(ctx, &config_loader).await;
     (config_loader, db)
 }
@@ -136,20 +133,54 @@ pub(crate) async fn load_app_db_lenient(ctx: &CliContext) -> (ConfigLoader, AppD
 /// behavior — see that function's doc comment. Factored out so
 /// `command_table::dispatch` call sites can select their DB-open moment
 /// independently (issue #187 review, finding G4).
-pub(crate) fn load_config_lenient(ctx: &CliContext) -> ConfigLoader {
+///
+/// Issue #119/#120: implicit scaffolding runs first, via
+/// [`crate::scaffold::ensure_config_scaffolded`] — a genuinely first-run
+/// machine (no config anywhere) now gets a real config file and directories
+/// written at the resolved path instead of the old in-memory-only synth
+/// below, and (when scaffolding actually happened) a `default` store, via
+/// [`crate::scaffold::ensure_default_store`], so read-only lenient-path
+/// commands (`status`, `search`, `store list`) have something to show on a
+/// fresh install without requiring a prior `init`.
+///
+/// This also fixes a latent bug: the pre-scaffolding fallback below (kept
+/// for the no-home-directory edge — see the second `Err` arm) retried with
+/// `LoadOptions::default()`, silently discarding `--config`/`LOCALDB_CONFIG`
+/// on a genuinely-absent file. `ensure_config_scaffolded`'s F11 guard runs
+/// first now: an *explicit* `--config` whose parent directory is missing is
+/// `Error::InvalidConfig` (exit 2), uniformly, rather than silently falling
+/// through to an unrelated platform-default config.
+pub(crate) async fn load_config_lenient(ctx: &CliContext) -> ConfigLoader {
     let options = LoadOptions {
         config_path: ctx.config.clone(),
         ..Default::default()
     };
-    match load_config(&options, ctx.config_env.as_deref()) {
-        Ok(c) => c,
-        Err(e) => {
-            // If the intended config file exists, it's malformed — fail hard (exit 2).
-            let config_path = resolve_config_path(&options, ctx.config_env.as_deref());
-            if matches!(&config_path, Ok(p) if p.exists()) {
-                exit_err(&e, ctx.json);
+    match crate::scaffold::ensure_config_scaffolded(ctx).await {
+        Ok(scaffold) => match load_config(&options, ctx.config_env.as_deref()) {
+            Ok(config_loader) => {
+                if scaffold.was_scaffolded {
+                    crate::scaffold::log_scaffold_result(&scaffold);
+                    let db = open_app_db_lenient_or_exit(ctx, &config_loader).await;
+                    if let Err(e) = crate::scaffold::ensure_default_store(&db).await {
+                        exit_err(&e, ctx.json);
+                    }
+                }
+                config_loader
             }
-            // File genuinely absent — try platform default config.
+            // The path exists (scaffolding is a no-op on an existing file,
+            // even a malformed one) but failed to parse — unchanged
+            // pre-scaffolding "malformed config -> hard fail" behavior.
+            Err(e) => exit_err(&e, ctx.json),
+        },
+        // An explicit `--config` tripped the F11 guard: fail hard and
+        // uniformly (the latent-bug fix described above) rather than
+        // falling through to platform defaults.
+        Err(e) if ctx.config.is_some() => exit_err(&e, ctx.json),
+        // No explicit `--config`: `ensure_config_scaffolded`'s own
+        // `PlatformPaths::resolve()` call failed outright (no home
+        // directory), before it could even decide whether to scaffold.
+        // Preserve the old genuinely-absent fallback chain for this edge.
+        Err(_) => {
             let options_default = LoadOptions::default();
             match load_config(&options_default, None) {
                 Ok(c) => c,
@@ -236,6 +267,46 @@ pub(crate) fn load_config_for_maintenance(ctx: &CliContext) -> ConfigLoader {
         Ok(c) => c,
         Err(e) => exit_err(&e, ctx.json),
     }
+}
+
+/// [`load_config_for_maintenance`], with implicit first-run scaffolding
+/// (issue #119/#120) in front of it.
+///
+/// First calls [`crate::scaffold::ensure_config_scaffolded`] — a genuine
+/// first run (no config file at the resolved path) writes the commented
+/// default template and creates the data/models/logs directories; an
+/// existing file (even malformed) is a no-op, and the strict load right
+/// after this reports the same parse error it always did. When scaffolding
+/// *did* just happen, also ensures a `default` store exists — via one extra
+/// `AppDb::open` through the existing `open_app_db_or_exit` helper and
+/// [`crate::scaffold::ensure_default_store`] — so the strict-path commands
+/// that switch to this helper (`store add`/`remove`, `index`, `source
+/// add`/`list`/`remove`, `mcp`) have a store to act on immediately after a
+/// fresh install, without a separate `init` step. This costs one extra DB
+/// open only on the rare first-run path; every subsequent call is a single
+/// no-op scaffold check plus the same strict load `load_config_for_maintenance`
+/// already did.
+///
+/// Scaffolding errors (e.g. an explicit `--config` whose parent directory
+/// doesn't exist) map to the same exit codes `init` uses today —
+/// `Error::InvalidConfig` -> exit 2 — via `exit_err`, same as every other
+/// error this function's callers already handle through `load_config_for_maintenance`.
+pub(crate) async fn load_config_scaffolded(ctx: &CliContext) -> ConfigLoader {
+    let scaffold = match crate::scaffold::ensure_config_scaffolded(ctx).await {
+        Ok(s) => s,
+        Err(e) => exit_err(&e, ctx.json),
+    };
+
+    if scaffold.was_scaffolded {
+        crate::scaffold::log_scaffold_result(&scaffold);
+        let config_loader = load_config_for_maintenance(ctx);
+        let db = open_app_db_or_exit(ctx, &config_loader).await;
+        if let Err(e) = crate::scaffold::ensure_default_store(&db).await {
+            exit_err(&e, ctx.json);
+        }
+    }
+
+    load_config_for_maintenance(ctx)
 }
 
 /// Name of the implicit default store used by `DefaultStore`-scoped commands

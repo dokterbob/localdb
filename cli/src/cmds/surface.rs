@@ -6,7 +6,7 @@ use serde_json::json;
 
 use crate::{
     app_db::{
-        load_config_for_maintenance, open_app_db_or_exit, reject_store_flag, resolve_store_scope,
+        load_config_scaffolded, open_app_db_or_exit, reject_store_flag, resolve_store_scope,
         StoreScopePolicy, SERVE_REJECT_MESSAGE,
     },
     daemon_client::{probe_daemon, CliContext, DaemonState},
@@ -105,7 +105,7 @@ pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
     // unconditionally, so a broken local store (unwritable, locked,
     // schema-too-new) would `exit_err` before `probe_daemon` ever ran,
     // preempting a healthy daemon that never needed the local db at all.
-    let config_loader = load_config_for_maintenance(ctx);
+    let config_loader = load_config_scaffolded(ctx).await;
 
     if let DaemonState::Running { base_url } =
         probe_daemon(&config_loader.paths.data_dir, ctx.daemon_url.as_deref())

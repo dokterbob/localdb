@@ -1,16 +1,17 @@
 //! Pure, `Result`-returning scaffolding helpers for first-run setup.
 //!
 //! Factored out of `cmds/init.rs` (issue #119/#120) so the config-write and
-//! default-store-creation steps can be reused by other first-run paths (e.g.
-//! a future "lazy init on first `search`/`index`") without dragging along
-//! `init`'s `exit_err`/process-exit surface. Nothing in this module calls
-//! `exit_err` or `std::process::exit` — every failure is a plain `Result`,
-//! same discipline as `app_db::resolve_store_scope_inner` and friends.
+//! default-store-creation steps can be reused by other first-run paths.
+//! Nothing in this module calls `exit_err` or `std::process::exit` — every
+//! failure is a plain `Result`, same discipline as
+//! `app_db::resolve_store_scope_inner` and friends.
 //!
-//! Not wired into any command yet — see the doc comments below for the
-//! `#[allow(dead_code)]` note. That's the next commit.
-
-#![allow(dead_code)] // wired in the next commit
+//! Wired into the CLI's strict and lenient config-load paths via
+//! `app_db::load_config_scaffolded` and `app_db::load_config_lenient` — every
+//! command that goes through either of those (`search`, `status`, `store
+//! add`/`remove`/`list`, `source add`/`list`/`remove`, `index`, `mcp`)
+//! implicitly scaffolds config + a `default` store on a genuine first run,
+//! same as `localdb init` does explicitly.
 
 use std::path::{Path, PathBuf};
 
@@ -154,6 +155,23 @@ fn ensure_config_scaffolded_inner(
         logs_dir,
         was_scaffolded: true,
     })
+}
+
+/// Emit a single observability line for a genuine first-run scaffold.
+///
+/// Called by both `app_db::load_config_scaffolded` and
+/// `app_db::load_config_lenient` right after a `was_scaffolded: true`
+/// result — the only place either needs `ScaffoldResult`'s path fields for
+/// anything beyond the tests below (which construct and inspect them
+/// directly).
+pub(crate) fn log_scaffold_result(result: &ScaffoldResult) {
+    tracing::info!(
+        config_path = %result.config_path.display(),
+        data_dir = %result.data_dir.display(),
+        models_dir = %result.models_dir.display(),
+        logs_dir = %result.logs_dir.display(),
+        "scaffolded default localdb config on first run"
+    );
 }
 
 /// Write `content` to `config_path` such that any concurrent reader (in

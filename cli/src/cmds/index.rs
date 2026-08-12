@@ -10,7 +10,7 @@ use server::JobQueue;
 
 use crate::{
     app_db::{
-        load_config_for_maintenance, open_app_db_or_exit, resolve_daemon_store_scope,
+        load_config_scaffolded, open_app_db_or_exit, resolve_daemon_store_scope,
         resolve_store_scope, AppDb, StoreScopePolicy,
     },
     command_table::{dispatch, DaemonAwareCommand},
@@ -287,7 +287,7 @@ pub(crate) async fn run_index_async(
     strict: bool,
     delete: bool,
 ) {
-    let config_loader = load_config_for_maintenance(ctx);
+    let config_loader = load_config_scaffolded(ctx).await;
     let deletion = if delete {
         DeletionPolicy::Prune
     } else {

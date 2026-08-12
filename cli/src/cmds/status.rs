@@ -359,7 +359,7 @@ pub fn run_status(ctx: &CliContext) {
 
 pub(crate) async fn run_status_async(ctx: &CliContext) {
     // F1-cli: use lenient loader so status works even with malformed config.
-    let config_loader = load_config_lenient(ctx);
+    let config_loader = load_config_lenient(ctx).await;
 
     let outcome = dispatch(&StatusCmd, ctx, &config_loader, || {
         open_app_db_lenient_or_exit(ctx, &config_loader)
