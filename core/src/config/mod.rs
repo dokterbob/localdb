@@ -9,6 +9,7 @@ pub mod platform;
 pub mod policy;
 pub mod refresh;
 pub mod schema;
+pub mod template;
 
 pub use feed::validate_max_entries;
 pub use jsonschema::{generate_router_schema, SCHEMA_URL};
@@ -23,3 +24,4 @@ pub use schema::{
     ChunkingPolicy, DefaultsConfig, EmbeddingPolicy, IndexingPolicyConfig, PathsConfig,
     ProviderConfig, RawConfig, ServerConfig,
 };
+pub use template::render_default_config_template;
