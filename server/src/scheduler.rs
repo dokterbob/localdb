@@ -18,7 +18,6 @@ use tracing::{debug, info, warn};
 
 use localdb_core::{Error, IndexJobScope};
 
-use crate::job_exec::{self, JobExecDeps};
 use crate::job_queue::JobQueue;
 use crate::state::AppState;
 
@@ -203,53 +202,30 @@ impl UrlRefreshScheduler {
                                 .ok_or_else(|| Error::StoreNotFound {
                                     id: store_name_for_closure.clone(),
                                 })?;
-                            let yaml = state.yaml_config().await;
                             let refresh_scope = IndexJobScope::Source {
                                 source_id: source_id_for_closure.clone(),
                             };
-                            // Codex review finding G1 (#187): resolve the
-                            // scoped source before deciding whether to
-                            // build/reuse an embedder — a scope that fails to
-                            // resolve (e.g. the source was deleted) must
-                            // surface that error before paying for a
-                            // (potentially huge) embedding model build, and a
-                            // resolved-but-empty scope must never build one
-                            // at all. Mirrors the embedded CLI path's
-                            // `run_embedded_store_job` check
-                            // (cli/src/job_attach.rs). `run_job` below
-                            // resolves the same scope again internally; that
-                            // duplicate `list_sources` call is negligible.
-                            let sources = job_exec::resolve_job_sources(
-                                state.backend(),
-                                &store_row.id,
-                                &refresh_scope,
-                            )
-                            .await?;
-                            // Codex review finding F2 (#187): reuse the
-                            // daemon's cached embedder instead of building
-                            // one from scratch for every scheduled refresh
-                            // job.
-                            let embedder = if sources.is_empty() {
-                                None
-                            } else {
-                                Some(state.get_or_build_embedder(&yaml).await?)
-                            };
-                            let deps = JobExecDeps {
-                                backend: state.backend(),
-                                yaml: &yaml,
-                                models_dir: state.models_dir(),
-                                embedder,
-                                progress: Some(progress),
-                                on_source_error: None,
-                            };
-                            job_exec::run_job(
-                                &store_row,
-                                refresh_scope,
-                                localdb_core::DeletionPolicy::Retain,
-                                deps,
-                            )
-                            .await
-                            .map(|(stats, _embedder)| stats)
+                            // Shared with `handlers::jobs::create_job` via
+                            // `AppState::run_scoped_job` (#187 review, DRY
+                            // finding): resolves the scoped source before
+                            // deciding whether to build/reuse an embedder —
+                            // a scope that fails to resolve (e.g. the source
+                            // was deleted) surfaces that error before paying
+                            // for a (potentially huge) embedding model
+                            // build, and a resolved-but-empty scope never
+                            // builds one at all (Codex review finding G1,
+                            // issue #187). Only the deletion policy differs
+                            // between the two callers: a scheduled refresh
+                            // always uses `Retain`, never pruning documents
+                            // on its own (issues #156/#185).
+                            state
+                                .run_scoped_job(
+                                    &store_row,
+                                    refresh_scope,
+                                    localdb_core::DeletionPolicy::Retain,
+                                    progress,
+                                )
+                                .await
                         }
                         .await;
 

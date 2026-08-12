@@ -9,12 +9,12 @@ use localdb_core::{
         schema::{EmbeddingPolicy, IndexingPolicyConfig, RawConfig},
     },
     ingestion::now_rfc3339,
-    store_factory, Embedder, Error, SourceRow, Store, StoreBackend, StoreBackendConfig, StoreRow,
-    StoreVisibility,
+    store_factory, DeletionPolicy, Embedder, Error, IndexJobScope, IndexJobStats, ProgressSink,
+    SourceRow, Store, StoreBackend, StoreBackendConfig, StoreRow, StoreVisibility,
 };
 use store_libsql::SqliteBackend;
 
-use crate::{job_queue::JobQueue, scheduler::UrlRefreshScheduler};
+use crate::{job_exec, job_queue::JobQueue, scheduler::UrlRefreshScheduler};
 
 /// Effective config built from the DB.
 #[derive(Debug, Clone)]
@@ -288,6 +288,47 @@ impl AppState {
 
         *cache = Some((policy.clone(), embedder.clone()));
         Ok(embedder)
+    }
+
+    /// Run one scoped index job end to end: resolve `scope`'s sources,
+    /// build/reuse the cached embedder only if there's actually something to
+    /// index, assemble `JobExecDeps`, and hand off to `job_exec::run_job`.
+    ///
+    /// Factored out of `handlers::jobs::create_job` and
+    /// `UrlRefreshScheduler::tick` (#187 review, DRY finding): both ran this
+    /// exact sequence — differing only in `deletion` (an HTTP caller's
+    /// explicit policy vs. the scheduler's hardcoded `Retain`, issues
+    /// #156/#185) and in what happens to the result afterward (the HTTP path
+    /// returns it as the job's stats; the scheduler also stamps
+    /// `last_refreshed` once it settles). Both call sites still resolve
+    /// `sources` before deciding whether to build an embedder — never pay
+    /// for a (potentially huge) embedding model just to discover the scope
+    /// is empty or unresolvable (Codex review finding G1, issue #187).
+    pub(crate) async fn run_scoped_job(
+        &self,
+        store_row: &StoreRow,
+        scope: IndexJobScope,
+        deletion: DeletionPolicy,
+        progress: ProgressSink,
+    ) -> Result<IndexJobStats, Error> {
+        let yaml = self.yaml_config().await;
+        let sources = job_exec::resolve_job_sources(self.backend(), &store_row.id, &scope).await?;
+        let embedder = if sources.is_empty() {
+            None
+        } else {
+            Some(self.get_or_build_embedder(&yaml).await?)
+        };
+        let deps = job_exec::JobExecDeps {
+            backend: self.backend(),
+            yaml: &yaml,
+            models_dir: self.models_dir(),
+            embedder,
+            progress: Some(progress),
+            on_source_error: None,
+        };
+        job_exec::run_job(store_row, scope, deletion, deps)
+            .await
+            .map(|(stats, _embedder)| stats)
     }
 
     /// Add a runtime-owned store.
