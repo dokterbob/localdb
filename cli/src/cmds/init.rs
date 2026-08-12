@@ -21,10 +21,11 @@ use crate::{
 ///
 /// Unlike the implicit paths (`app_db::load_config_scaffolded`/
 /// `load_config_lenient`, which only call `ensure_default_store` when
-/// scaffolding *just* happened), `init`'s store check is unconditional —
-/// repair semantics: an operator who runs `init` again after hand-editing or
-/// partially repairing their setup should still end up with a `default`
-/// store, not just a re-verified config file.
+/// scaffolding *just* happened), `init`'s store check and directory
+/// re-creation are unconditional — repair semantics: an operator who runs
+/// `init` again after hand-editing their setup or deleting a directory the
+/// config references (e.g. `paths.models` after a disk cleanup) should end
+/// up with every piece recreated, not just a re-verified config file.
 pub fn run_init(ctx: &CliContext) {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(run_init_async(ctx));
@@ -41,6 +42,25 @@ pub(crate) async fn run_init_async(ctx: &CliContext) {
         Ok(s) => s,
         Err(e) => exit_err(&e, ctx.json),
     };
+
+    // Repair semantics: scaffolding only creates directories when it writes a
+    // fresh config, but `init` recreates them even against an existing config
+    // (whose `paths.*` overrides `scaffold` already resolved).
+    for dir in [
+        scaffold.config_path.parent().unwrap_or(Path::new(".")),
+        &scaffold.data_dir,
+        &scaffold.models_dir,
+        &scaffold.logs_dir,
+    ] {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            exit_err(
+                &localdb_core::Error::InvalidConfig {
+                    message: format!("cannot create directory '{}': {e}", dir.display()),
+                },
+                ctx.json,
+            );
+        }
+    }
 
     let (_config_loader, db) = load_app_db_lenient(ctx).await;
     if let Err(e) = ensure_default_store(&db).await {

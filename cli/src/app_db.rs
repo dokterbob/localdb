@@ -176,6 +176,14 @@ pub(crate) async fn load_config_lenient(ctx: &CliContext) -> ConfigLoader {
         // uniformly (the latent-bug fix described above) rather than
         // falling through to platform defaults.
         Err(e) if ctx.config.is_some() => exit_err(&e, ctx.json),
+        // No explicit `--config`, but scaffolding failed for a real reason
+        // (e.g. permission denied creating the data/models/logs dirs, or the
+        // config write itself failed): surface it rather than masking it
+        // behind an unrelated platform-default fallback that would only fail
+        // later with a more confusing error.
+        Err(e) if localdb_core::config::PlatformPaths::resolve().is_some() => {
+            exit_err(&e, ctx.json)
+        }
         // No explicit `--config`: `ensure_config_scaffolded`'s own
         // `PlatformPaths::resolve()` call failed outright (no home
         // directory), before it could even decide whether to scaffold.
@@ -297,16 +305,15 @@ pub(crate) async fn load_config_scaffolded(ctx: &CliContext) -> ConfigLoader {
         Err(e) => exit_err(&e, ctx.json),
     };
 
+    let config_loader = load_config_for_maintenance(ctx);
     if scaffold.was_scaffolded {
         crate::scaffold::log_scaffold_result(&scaffold);
-        let config_loader = load_config_for_maintenance(ctx);
         let db = open_app_db_or_exit(ctx, &config_loader).await;
         if let Err(e) = crate::scaffold::ensure_default_store(&db).await {
             exit_err(&e, ctx.json);
         }
     }
-
-    load_config_for_maintenance(ctx)
+    config_loader
 }
 
 /// Name of the implicit default store used by `DefaultStore`-scoped commands

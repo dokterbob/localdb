@@ -283,6 +283,36 @@ fn init_creates_config_and_data_dir() {
     assert!(dir.path().join("data").exists());
 }
 
+/// `init` has repair semantics against an *existing* config (specs/05
+/// §2.5): directories the config references are recreated even though
+/// implicit scaffolding (a no-op when the file exists) would not touch them.
+#[test]
+fn init_recreates_missing_dirs_from_existing_config() {
+    let dir = TempDir::new().unwrap();
+    let models_dir = dir.path().join("models");
+    let logs_dir = dir.path().join("logs");
+    write_config_with_data_dir(
+        &dir,
+        &format!(
+            "  models: {}\n  logs: {}",
+            models_dir.to_string_lossy(),
+            logs_dir.to_string_lossy()
+        ),
+    );
+    // Neither dir exists yet (write_config_with_data_dir only creates data/).
+    assert!(!models_dir.exists() && !logs_dir.exists());
+
+    cmd_with_dir(&dir).arg("init").assert().success();
+    assert!(models_dir.exists(), "init must recreate paths.models");
+    assert!(logs_dir.exists(), "init must recreate paths.logs");
+
+    // And again after deleting them — repair on every run, not just the first.
+    std::fs::remove_dir_all(&models_dir).unwrap();
+    std::fs::remove_dir_all(&logs_dir).unwrap();
+    cmd_with_dir(&dir).arg("init").assert().success();
+    assert!(models_dir.exists() && logs_dir.exists());
+}
+
 #[test]
 fn init_json_output_has_status_ok() {
     let dir = TempDir::new().unwrap();
