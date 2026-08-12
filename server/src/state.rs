@@ -6,7 +6,7 @@ use tokio::sync::RwLock;
 use localdb_core::{
     config::{
         policy::compute_policy_version,
-        schema::{EmbeddingPolicy, IndexingPolicyConfig, RawConfig},
+        schema::{EmbeddingPolicy, IndexingPolicyConfig, ProviderConfig, RawConfig},
     },
     ingestion::now_rfc3339,
     store_factory, DeletionPolicy, Embedder, Error, IndexJobScope, IndexJobStats, ProgressSink,
@@ -53,6 +53,10 @@ pub struct AppState {
     inner: Arc<Inner>,
 }
 
+/// Cached embedder plus the `(EmbeddingPolicy, providers snapshot)` key that
+/// produced it. See `Inner::embedder_cache` / `AppState::get_or_build_embedder`.
+type EmbedderCacheEntry = (EmbeddingPolicy, Vec<ProviderConfig>, Arc<dyn Embedder>);
+
 struct Inner {
     yaml_config: RwLock<RawConfig>,
     data_dir: PathBuf,
@@ -62,10 +66,13 @@ struct Inner {
     default_policy_version: String,
     job_queue: JobQueue,
     url_scheduler: UrlRefreshScheduler,
-    /// Single-slot embedder cache, keyed by the `EmbeddingPolicy` that
-    /// determined the cached embedder's identity (Codex review finding F2,
-    /// issue #187). See `AppState::get_or_build_embedder`.
-    embedder_cache: RwLock<Option<(EmbeddingPolicy, Arc<dyn Embedder>)>>,
+    /// Single-slot embedder cache, keyed by the `EmbeddingPolicy` plus the
+    /// full `providers` snapshot that together determined the cached
+    /// embedder's identity (Codex review finding F2, issue #187; provider
+    /// settings added for finding H1, issue #212 — a hosted provider's
+    /// `base_url`/`api_key_env` can change under an unchanged policy). See
+    /// `AppState::get_or_build_embedder`.
+    embedder_cache: RwLock<Option<EmbedderCacheEntry>>,
     /// Test-only construction counter for the `embed::create_embedder` call
     /// made by `get_or_build_embedder`, so tests can assert the embedder is
     /// built once per distinct `EmbeddingPolicy` rather than once per job.
@@ -228,31 +235,40 @@ impl AppState {
     }
 
     /// Get the embedder for `yaml`'s embedding policy, building it only when
-    /// the policy has changed since the last build (Codex review finding
-    /// F2, issue #187).
+    /// the policy or the provider settings it resolves against have changed
+    /// since the last build (Codex review finding F2, issue #187; extended
+    /// for finding H1, issue #212).
     ///
     /// Before this cache existed, every job execution called
     /// `embed::create_embedder` from scratch — for the default local
     /// ONNX/CoreML provider that reloads the model weights on every single
     /// job. The single-slot cache below is keyed by `EmbeddingPolicy`
     /// (`yaml.defaults.indexing.embedding`, the model+provider pair that
-    /// determines embedder identity): the same policy hits the cache, a
-    /// changed policy misses and rebuilds. A config reload
+    /// determines embedder identity) *and* the full `yaml.providers`
+    /// snapshot: the same policy over an unchanged providers list hits the
+    /// cache; a changed policy, or a changed `providers` entry (e.g. a
+    /// hosted provider's `base_url`/`api_key_env` edited under an otherwise
+    /// unchanged policy), misses and rebuilds. Comparing the whole `Vec`
+    /// rather than isolating "the provider this policy resolves to" is
+    /// deliberate — simpler, and an unrelated provider edit costing one
+    /// extra rebuild is an acceptable trade. A config reload
     /// (`reload_yaml_config`) needs no explicit cache flush — the caller
-    /// always passes the freshly reloaded `yaml`, so a changed embedding
-    /// policy simply fails the equality check below on the next call and
-    /// rebuilds naturally.
+    /// always passes the freshly reloaded `yaml`, so a changed policy or
+    /// providers list simply fails the equality check below on the next
+    /// call and rebuilds naturally.
     pub async fn get_or_build_embedder(
         &self,
         yaml: &RawConfig,
     ) -> Result<Arc<dyn Embedder>, Error> {
         let policy = &yaml.defaults.indexing.embedding;
+        let providers = &yaml.providers;
 
-        // Fast path: an unchanged policy only ever needs a read lock.
+        // Fast path: an unchanged policy + providers snapshot only ever
+        // needs a read lock.
         {
             let cache = self.inner.embedder_cache.read().await;
-            if let Some((cached_policy, embedder)) = cache.as_ref() {
-                if cached_policy == policy {
+            if let Some((cached_policy, cached_providers, embedder)) = cache.as_ref() {
+                if cached_policy == policy && cached_providers == providers {
                     return Ok(embedder.clone());
                 }
             }
@@ -260,9 +276,10 @@ impl AppState {
 
         let mut cache = self.inner.embedder_cache.write().await;
         // Re-check under the write lock: another caller may have already
-        // rebuilt for this exact policy while we were waiting on it.
-        if let Some((cached_policy, embedder)) = cache.as_ref() {
-            if cached_policy == policy {
+        // rebuilt for this exact policy + providers snapshot while we were
+        // waiting on it.
+        if let Some((cached_policy, cached_providers, embedder)) = cache.as_ref() {
+            if cached_policy == policy && cached_providers == providers {
                 return Ok(embedder.clone());
             }
         }
@@ -274,10 +291,11 @@ impl AppState {
         // single worker (issue #187) — there is never more than one job in
         // flight to contend for this lock.
         let policy_owned = policy.clone();
-        let providers = yaml.providers.clone();
+        let providers_owned = providers.clone();
+        let providers_for_build = providers_owned.clone();
         let models_dir = self.inner.models_dir.clone();
         let built = localdb_core::run_blocking(move || {
-            embed::create_embedder(&policy_owned, &providers, Some(&models_dir))
+            embed::create_embedder(&policy_owned, &providers_for_build, Some(&models_dir))
         })?;
         let embedder: Arc<dyn Embedder> = Arc::from(built);
 
@@ -286,7 +304,7 @@ impl AppState {
             .embedder_build_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-        *cache = Some((policy.clone(), embedder.clone()));
+        *cache = Some((policy.clone(), providers_owned, embedder.clone()));
         Ok(embedder)
     }
 
@@ -1437,6 +1455,40 @@ mod tests {
         assert!(
             Arc::ptr_eq(&rebuilt, &rebuilt_again),
             "a second call against the same reloaded policy should hit the cache"
+        );
+    }
+
+    /// An unchanged `EmbeddingPolicy` but a changed `providers` entry (e.g.
+    /// editing a hosted provider's `base_url` under `providers:` in the
+    /// YAML) must still miss the cache and rebuild — the cache key is
+    /// policy *and* the providers snapshot, not policy alone (Codex review
+    /// finding H1, issue #212).
+    #[tokio::test]
+    async fn get_or_build_embedder_rebuilds_on_provider_settings_change() {
+        let (_dir, state) = make_state().await;
+        let mut old_yaml = state.yaml_config().await;
+        old_yaml.providers = vec![localdb_core::config::schema::ProviderConfig {
+            name: "hosted".to_string(),
+            kind: "openai-compatible".to_string(),
+            base_url: Some("https://old.example.com".to_string()),
+            api_key_env: Some("OLD_API_KEY".to_string()),
+        }];
+        state.reload_yaml_config(old_yaml.clone()).await;
+        let first = state.get_or_build_embedder(&old_yaml).await.unwrap();
+
+        let mut new_yaml = old_yaml.clone();
+        new_yaml.providers[0].base_url = Some("https://new.example.com".to_string());
+        state.reload_yaml_config(new_yaml.clone()).await;
+        let second = state.get_or_build_embedder(&new_yaml).await.unwrap();
+
+        assert_eq!(
+            state.embedder_build_count(),
+            2,
+            "a changed provider base_url under an unchanged policy should trigger a rebuild"
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "a rebuilt embedder must not be the same Arc as the stale cached one"
         );
     }
 }
