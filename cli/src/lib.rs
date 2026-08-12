@@ -11,6 +11,7 @@ mod command_table;
 mod daemon_client;
 mod job_attach;
 mod normalize;
+mod scaffold;
 
 mod cmds {
     pub(crate) mod db;
