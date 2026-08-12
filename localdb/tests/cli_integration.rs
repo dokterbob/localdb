@@ -242,6 +242,123 @@ fn status_json_has_daemon_field() {
     assert!(v.get("stores").is_some());
 }
 
+/// `status --store <name>...` must scope the daemon request itself, not just
+/// filter the response client-side (issue #187 review, finding F7): each
+/// requested name is sent as a repeated, percent-encoded `?store=` query
+/// param, mirroring `encode_path_segment`'s use on URL path segments
+/// elsewhere in `daemon_client`. Uses a store name containing a space to
+/// prove the value is actually percent-encoded (`store=sp%20ace`), not just
+/// concatenated raw — an unescaped space would still parse as one query
+/// param in this case, but an unescaped '&' or '#' would corrupt the query
+/// string entirely, which is what percent-encoding here guards against.
+#[test]
+fn status_daemon_scopes_request_with_percent_encoded_store_params() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let (listener, port) = start_mock_daemon();
+    let received_request_lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let received_clone = received_request_lines.clone();
+
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).is_ok() {
+                received_clone
+                    .lock()
+                    .unwrap()
+                    .push(request_line.trim().to_string());
+            }
+
+            // Drain headers.
+            loop {
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+
+            // Respond with a `GET /v1/status` body naming the two scoped
+            // stores, so the CLI's client-side `apply_daemon_store_scope`
+            // (kept as defense-in-depth) also succeeds and the process exits
+            // 0 rather than `store_not_found`.
+            let body = r#"{
+                "daemon": true,
+                "store_count": 2,
+                "source_count": 0,
+                "job_count": 0,
+                "stores": [
+                    {"name": "sp ace", "visibility": "private", "backend": "libsql", "document_count": 0, "chunk_count": 0},
+                    {"name": "c", "visibility": "private", "backend": "libsql", "document_count": 0, "chunk_count": 0}
+                ],
+                "database": {
+                    "path": "/tmp/localdb.db",
+                    "exists": false,
+                    "size_bytes": null,
+                    "wal_size_bytes": null,
+                    "total_size_bytes": 0,
+                    "bytes_per_chunk": null,
+                    "largest_tables": []
+                }
+            }"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    std::fs::write(
+        data_dir.join("daemon.sock"),
+        format!("http://127.0.0.1:{}", port),
+    )
+    .unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["--json", "status", "--store", "sp ace", "--store", "c"])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "status --store should succeed against the mock daemon; \
+         exit={:?} stdout={} stderr={}",
+        output.status.code(),
+        stdout,
+        stderr
+    );
+
+    let lines = received_request_lines.lock().unwrap();
+    let status_request = lines
+        .iter()
+        .find(|l| l.contains("/v1/status"))
+        .unwrap_or_else(|| panic!("mock daemon never received a /v1/status request: {lines:?}"));
+    assert!(
+        status_request.contains("store=sp%20ace"),
+        "expected a percent-encoded 'sp ace' store param; got: {status_request}"
+    );
+    assert!(
+        status_request.contains("store=c"),
+        "expected a repeated 'store=c' query param; got: {status_request}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // store add / list / remove
 // ---------------------------------------------------------------------------
@@ -349,6 +466,29 @@ fn store_remove_not_found_exits_3() {
 
     // Exit code 3 = not found.
     assert_eq!(output.status.code().unwrap(), 3);
+}
+
+/// `store remove ../bad --yes` (embedded mode) must exit 2 (InvalidRequest)
+/// like every other command's traversal-name rejection, not exit 3 — H2
+/// (Codex review, PR #212): `store remove` used to skip syntactic
+/// validation in both modes and fall through to a plain "not found" lookup.
+/// This is a deliberate behavior change (3 -> 2) for names of this shape.
+#[test]
+fn store_remove_embedded_traversal_store_name_exits_2() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["store", "remove", "--yes", "../bad"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "a traversal store name must exit 2 in embedded mode; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -589,6 +729,93 @@ fn end_to_end_init_store_source_index_search() {
         uri.contains("hello.md"),
         "citation URI should point to hello.md; got: {}",
         uri
+    );
+}
+
+/// Embedded parity (issue #187 review, finding 1): `localdb search --limit
+/// <huge>` must return no more than `SEARCH_MAX_LIMIT` (100) citations in
+/// embedded mode, exactly like `POST /v1/search` already clamps (see
+/// `search_limit_is_silently_clamped_to_the_max_instead_of_erroring` in
+/// `server/src/handlers/tests/search.rs`). Before this fix,
+/// `SearchCmd::run_embedded` passed `self.limit` straight through as
+/// `top_n` with no cap, so the embedded and daemon paths could return a
+/// different number of results for the identical request.
+///
+/// To make the clamp observable, this fans the query out across three
+/// stores, each seeded with more documents than a single search leg's
+/// `DEFAULT_LEG_K` (50) would return alone — with only one store, the
+/// per-store leg cap already limits the *unclamped* embedded result count
+/// to <= 100 by coincidence, which would make this test pass even without
+/// the fix.
+#[test]
+fn search_embedded_limit_is_clamped_across_multiple_stores() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    cmd_with_dir(&dir).arg("init").assert().success();
+
+    let store_names = ["clamp-store-a", "clamp-store-b", "clamp-store-c"];
+    for store_name in store_names {
+        cmd_with_dir(&dir)
+            .args(["store", "add", store_name])
+            .assert()
+            .success();
+
+        let docs_dir = dir.path().join(format!("{store_name}-docs"));
+        std::fs::create_dir_all(&docs_dir).unwrap();
+        for i in 0..40 {
+            std::fs::write(
+                docs_dir.join(format!("doc-{i}.md")),
+                format!("# Doc {i}\n\nzzzclamptestterm content for document {i}.\n"),
+            )
+            .unwrap();
+        }
+
+        cmd_with_dir(&dir)
+            .args(["--store", store_name, "source", "add"])
+            .arg(docs_dir.to_str().unwrap())
+            .assert()
+            .success();
+
+        cmd_with_dir(&dir)
+            .args(["--store", store_name, "index"])
+            .assert()
+            .success();
+    }
+
+    // No daemon running -> embedded path. Ask for far more than
+    // SEARCH_MAX_LIMIT; the corpus has 3 * 40 = 120 matching chunks spread
+    // across three stores, comfortably above the 100-item clamp.
+    let output = cmd_with_dir(&dir)
+        .arg("--json")
+        .args(["search", "--limit", "5000", "zzzclamptestterm"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "search should exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|_| panic!("search --json must emit valid JSON; got: {stdout}"));
+    let citations = v["citations"].as_array().expect("citations must be array");
+
+    assert!(
+        citations.len() <= 100,
+        "embedded search must clamp to SEARCH_MAX_LIMIT (100) citations \
+         regardless of the requested --limit, got {}: {stdout}",
+        citations.len()
+    );
+    assert!(
+        citations.len() >= 90,
+        "corpus has 120 matching chunks across 3 stores; expected the clamp \
+         to be genuinely exercised (near 100 results) so this test can \
+         actually distinguish clamped from unclamped behavior, got only {}: \
+         {stdout}",
+        citations.len()
     );
 }
 
@@ -1782,9 +2009,10 @@ fn db_downgrade_explicit_target_below_baseline_without_confirmation_reports_real
     );
 }
 
-/// All three `db` subcommands refuse with exit 4 (`daemon_running`) while a
-/// daemon is running — per specs/05-surfaces.md §2.1 they are CLI-only and
-/// never route to the daemon's HTTP API, unlike `store`/`source`/`search`.
+/// All four `db` subcommands (`status`, `migrate`, `downgrade`, `vacuum`)
+/// refuse with exit 4 (`daemon_running`) while a daemon is running — per
+/// specs/05-surfaces.md §2.1 they are CLI-only and never route to the
+/// daemon's HTTP API, unlike `store`/`source`/`search`.
 #[test]
 fn db_commands_refuse_while_daemon_running() {
     let dir = TempDir::new().unwrap();
@@ -1800,6 +2028,10 @@ fn db_commands_refuse_while_daemon_running() {
         vec!["db", "migrate"],
         vec!["--yes", "db", "migrate"],
         vec!["--yes", "db", "downgrade"],
+        // issue #187 review, finding 4b: `db vacuum` is the fourth `db`
+        // subcommand (specs/05-surfaces.md §2, §2.1) and must refuse the
+        // same way as its siblings — it was missing from this trio.
+        vec!["db", "vacuum"],
     ] {
         let output = cmd_with_dir(&dir)
             .env("LOCALDB_DAEMON_URL", "http://127.0.0.1:19999")
@@ -2089,6 +2321,60 @@ fn source_list_shows_store_column_only_when_multi_store_in_scope() {
     );
 }
 
+/// Issue #187 review, finding 1: a scope of two stores where only *one* has
+/// any sources must still show the store-name column — the column keys off
+/// the size of the *resolved scope* (2 stores), never off how many of those
+/// stores happened to contribute an item to the result set. Regression test
+/// for a bug where the renderer instead rebuilt "how many stores are in
+/// scope" from the *returned items'* own `store_name`s, so a scope of
+/// `--store populated --store empty` silently looked single-store (only
+/// `populated` ever appears in `items`) and dropped the column.
+#[test]
+fn source_list_shows_store_column_even_when_one_scoped_store_is_empty() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    for name in ["populated", "empty"] {
+        cmd_with_dir(&dir)
+            .args(["store", "add", name])
+            .assert()
+            .success();
+    }
+
+    let fixture = dir.path().join("populated-docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+    std::fs::write(fixture.join("doc.md"), "# Doc\n\nhello\n").unwrap();
+    cmd_with_dir(&dir)
+        .args([
+            "--store",
+            "populated",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let output = cmd_with_dir(&dir)
+        .args(["--store", "populated", "--store", "empty", "source", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 1, "only 'populated' has a source: {stdout}");
+    // Column width = longest name in scope ("populated", 9) + 2 = 11.
+    assert!(
+        lines[0].starts_with("populated  "),
+        "expected the store-name column even though 'empty' contributed no \
+         items to the result set: {lines:?}"
+    );
+}
+
 /// `index` with no `--store` touches every store, not just the first —
 /// verified via the multi-store `--json` shape (`{"stores": [...], "total":
 /// {...}}`, specs/05-surfaces.md §2.2).
@@ -2217,6 +2503,47 @@ fn source_list_no_store_flag_json_includes_every_store() {
     assert_eq!(
         names,
         ["books", "default", "research"].into_iter().collect()
+    );
+}
+
+/// Issue #187 review, finding 2: `source list --json` must include
+/// `store_id` alongside `store.name` — pre-wave behavior (see
+/// `docs/cli.md`'s worked example) that the shared `SourceListItem`
+/// renderer introduced when both transports were unified onto it silently
+/// dropped. Each source's `store_id` must be a real, non-empty store ULID,
+/// distinct across stores (never the store's *name*, and never blank).
+#[test]
+fn source_list_json_includes_store_id() {
+    let dir = TempDir::new().unwrap();
+    setup_multi_store(&dir); // books, default, research — one source each
+
+    let output = cmd_with_dir(&dir)
+        .args(["--json", "source", "list"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    let sources = v["sources"].as_array().expect("sources array");
+    assert_eq!(sources.len(), 3, "{v}");
+
+    let mut store_ids = std::collections::HashSet::new();
+    for s in sources {
+        let store_id = s["store_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a string store_id on {s}"));
+        assert!(!store_id.is_empty(), "store_id must not be blank: {s}");
+        let store_name = s["store"]["name"].as_str().unwrap();
+        assert_ne!(
+            store_id, store_name,
+            "store_id must be the store's ULID, not its name: {s}"
+        );
+        store_ids.insert(store_id.to_string());
+    }
+    assert_eq!(
+        store_ids.len(),
+        3,
+        "each of the three stores must have its own distinct store_id: {v}"
     );
 }
 
@@ -2802,9 +3129,13 @@ fn paginated_list_page(items_json: &[String], next_cursor: Option<&str>, total: 
 
 /// One `StoreRecord` (`server/src/state.rs`) JSON object, for
 /// [`paginated_list_body`]/[`paginated_list_page`] fixtures stubbing
-/// `GET /v1/stores`.
+/// `GET /v1/stores`. `id` (issue #187 stage 5) mirrors the real handler's
+/// shape now that `store add`'s daemon-routed `--json` output needs it for
+/// parity with embedded mode.
 fn store_record_json(name: &str) -> String {
-    format!(r#"{{"name":"{name}","visibility":"private","backend":"libsql"}}"#)
+    format!(
+        r#"{{"name":"{name}","id":"01STOREID000000000000000A","visibility":"private","backend":"libsql"}}"#
+    )
 }
 
 /// One `SourceRecord` (`server/src/state.rs`) JSON object, for
@@ -2816,6 +3147,57 @@ fn source_record_json(id: &str, store_name: &str) -> String {
     format!(
         r#"{{"id":"{id}","store_id":"{store_name}","kind":"path","spec":{{"root":"/tmp/x"}},"preset":"prose","refresh":null}}"#
     )
+}
+
+// -- issue #187 stage 3: unified job model — SSE/poll job-attach fixtures --
+
+/// A minimal terminal `IndexJob` JSON body (`core::types::IndexJob`) in the
+/// `done` state, for stubbing `GET /v1/jobs/{id}/events` (as the `data:` of
+/// its sole `event: job` SSE frame — see [`sse_done_body`]) or `GET
+/// /v1/jobs/{id}` (poll fallback) in daemon-routed `index`/`source add`
+/// auto-index tests (issue #187 stage 3: both now attach to the submitted
+/// job to completion instead of just printing "submitted").
+///
+/// `IndexJobStats` has struct-level `#[serde(default)]`, so `stats_json` only
+/// needs to set the fields a given test actually cares about — `"{}"` is a
+/// valid (all-zero) `IndexJobStats`.
+fn index_job_done_json(job_id: &str, store_id: &str, stats_json: &str) -> String {
+    format!(
+        r#"{{"id":"{job_id}","store_id":"{store_id}","scope":{{"type":"store"}},"state":"done","stats":{stats_json},"created_at":"2026-01-01T00:00:00Z"}}"#
+    )
+}
+
+/// A terminal `IndexJob` JSON body in the `failed` state, for tests covering
+/// a daemon job that fails after being accepted.
+fn index_job_failed_json(job_id: &str, store_id: &str, error: &str) -> String {
+    format!(
+        r#"{{"id":"{job_id}","store_id":"{store_id}","scope":{{"type":"store"}},"state":"failed","stats":{{}},"error":"{error}","created_at":"2026-01-01T00:00:00Z"}}"#
+    )
+}
+
+/// Like [`index_job_failed_json`], but with an explicit `error_code` (issue
+/// #187 review, finding 3) — for stubbing a daemon job whose failure came
+/// from a typed `core::Error` (e.g. `"invalid_config"`), so
+/// `cli::job_attach::finish_job` can reconstruct the original variant and
+/// exit with its code instead of collapsing to `Error::Internal` (exit 1).
+fn index_job_failed_json_with_code(
+    job_id: &str,
+    store_id: &str,
+    error: &str,
+    error_code: &str,
+) -> String {
+    format!(
+        r#"{{"id":"{job_id}","store_id":"{store_id}","scope":{{"type":"store"}},"state":"failed","stats":{{}},"error":"{error}","error_code":"{error_code}","created_at":"2026-01-01T00:00:00Z"}}"#
+    )
+}
+
+/// Wrap a terminal `IndexJob` JSON body (from [`index_job_done_json`] /
+/// [`index_job_failed_json`]) as the single-frame SSE body `GET
+/// /v1/jobs/{id}/events` returns once a job is already finished — a bare
+/// `event: job` frame, matching `server/src/handlers/jobs.rs`'s
+/// `terminal_job_event`.
+fn sse_done_body(job_json: &str) -> String {
+    format!("event: job\ndata: {job_json}\n\n")
 }
 
 // -- source add: local (non-daemon) error/success branches -----------------
@@ -2985,10 +3367,12 @@ fn source_add_auto_index_permission_denied_warns_but_succeeds() {
 // -- source add: daemon-routing branches ------------------------------------
 
 /// `source add <url>` with a daemon running, non-`--json`: exercises the
-/// url-kind `spec` shape (`{"url": ...}`) and the plain-text success print
-/// (`Added source ... (via daemon)`), both cold in the pre-existing
-/// `source_add_routes_to_daemon_without_panic` test (which only used
-/// `--json` and a path source).
+/// url-kind `spec` shape (`{"url": ...}`) and the plain-text success print,
+/// both cold in the pre-existing `source_add_routes_to_daemon_without_panic`
+/// test (which only used `--json` and a path source). Issue #187 review
+/// finding 1: the daemon-only `(via daemon)` suffix is gone — this is now
+/// byte-identical to embedded mode's line (see
+/// `source_add_shape_parity_between_embedded_and_daemon_mock` below).
 #[test]
 fn source_add_daemon_url_kind_non_json_prints_and_sends_url_spec() {
     let dir = TempDir::new().unwrap();
@@ -3027,8 +3411,9 @@ fn source_add_daemon_url_kind_non_json_prints_and_sends_url_spec() {
         "daemon-routed source add should succeed; stdout={stdout} stderr={stderr}"
     );
     assert!(
-        stdout.contains("Added source 01ABCDEFGHIJKLMNOPQRSTUVWX to store 'mystore' (via daemon)"),
-        "expected non-json daemon success line; got: {stdout}"
+        stdout.contains("Added source 01ABCDEFGHIJKLMNOPQRSTUVWX to store 'mystore'")
+            && !stdout.contains("via daemon"),
+        "expected the same success line embedded mode prints, with no daemon-mode suffix; got: {stdout}"
     );
 
     let reqs = received.lock().unwrap();
@@ -3042,6 +3427,171 @@ fn source_add_daemon_url_kind_non_json_prints_and_sends_url_spec() {
     assert_eq!(
         body_json["spec"]["url"].as_str().unwrap(),
         "https://example.com/page"
+    );
+}
+
+/// Shape parity (issue #187 review, finding 1): `source add`'s daemon and
+/// embedded branches used to diverge in what they printed — the daemon
+/// branch echoed the raw persisted `SourceRecord` (`--json`) plus a `(via
+/// daemon)` text suffix, while embedded mode printed a reduced
+/// `{id, kind, status, store}` object and a plain text line. Both now funnel
+/// through the same `render_source_add_item`/`render_source_add_summary`
+/// (`cli/src/cmds/source.rs`), so this asserts byte-identical text *and*
+/// `--json` output, one comparison each (each needs its own real generated
+/// ULID, so the two can't share one embedded run) — mirroring
+/// `index_shape_parity_between_embedded_and_daemon_mock`'s approach of
+/// deriving the daemon-mock's response from a real embedded run's output
+/// instead of hand-picking values that might happen to already agree.
+#[test]
+fn source_add_shape_parity_between_embedded_and_daemon_mock() {
+    // -- text mode ----------------------------------------------------------
+    let embedded_dir = TempDir::new().unwrap();
+    write_default_config(&embedded_dir);
+    cmd_with_dir(&embedded_dir)
+        .args(["store", "add", "parity"])
+        .assert()
+        .success();
+    let fixture = embedded_dir.path().join("parity-docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+
+    let embedded_text = cmd_with_dir(&embedded_dir)
+        .args([
+            "--store",
+            "parity",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        embedded_text.status.success(),
+        "embedded source add should succeed; stderr: {}",
+        String::from_utf8_lossy(&embedded_text.stderr)
+    );
+    let embedded_stdout = String::from_utf8_lossy(&embedded_text.stdout).to_string();
+
+    // Pull the real generated ULID out of the embedded run's output so the
+    // daemon-mock can be made to "persist" a source under the identical id
+    // — text/json output would trivially differ on id otherwise.
+    let real_id = embedded_stdout
+        .strip_prefix("Added source ")
+        .and_then(|s| s.split(' ').next())
+        .expect("embedded text output must start with 'Added source <id>'")
+        .to_string();
+
+    let daemon_dir = TempDir::new().unwrap();
+    write_default_config(&daemon_dir);
+    let daemon_fixture = daemon_dir.path().join("parity-docs");
+    std::fs::create_dir_all(&daemon_fixture).unwrap();
+    let stores_body = paginated_list_body(&[&store_record_json("parity")]);
+    let add_body = format!(r#"{{"id":"{real_id}","store":"parity","kind":"path"}}"#);
+    let (port, _received) = start_routing_mock_server(vec![
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+        (
+            "POST",
+            "/v1/stores/parity/sources",
+            "HTTP/1.1 200 OK",
+            add_body,
+        ),
+    ]);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let daemon_text = cmd_with_dir(&daemon_dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args([
+            "--store",
+            "parity",
+            "source",
+            "add",
+            daemon_fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        daemon_text.status.success(),
+        "daemon-routed source add should succeed; stderr: {}",
+        String::from_utf8_lossy(&daemon_text.stderr)
+    );
+    let daemon_stdout = String::from_utf8_lossy(&daemon_text.stdout).to_string();
+
+    assert_eq!(
+        embedded_stdout, daemon_stdout,
+        "text output must be byte-identical between embedded and daemon-mock"
+    );
+
+    // -- --json mode ----------------------------------------------------------
+    // A fresh store/fixture pair — re-adding the same root to "parity" would
+    // hit the UNIQUE(store_id, root) constraint — so this comparison gets its
+    // own real generated id, independent of the text-mode one above.
+    cmd_with_dir(&embedded_dir)
+        .args(["store", "add", "parity-json"])
+        .assert()
+        .success();
+    let fixture_json = embedded_dir.path().join("parity-json-docs");
+    std::fs::create_dir_all(&fixture_json).unwrap();
+
+    let embedded_json = cmd_with_dir(&embedded_dir)
+        .args([
+            "--json",
+            "--store",
+            "parity-json",
+            "source",
+            "add",
+            fixture_json.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        embedded_json.status.success(),
+        "embedded source add --json should succeed; stderr: {}",
+        String::from_utf8_lossy(&embedded_json.stderr)
+    );
+    let embedded_json_stdout = String::from_utf8_lossy(&embedded_json.stdout).to_string();
+    let embedded_v: serde_json::Value = serde_json::from_str(&embedded_json_stdout).unwrap();
+    let real_id_json = embedded_v["id"]
+        .as_str()
+        .expect("embedded --json output must have an 'id' field")
+        .to_string();
+
+    let daemon_json_fixture = daemon_dir.path().join("parity-json-docs");
+    std::fs::create_dir_all(&daemon_json_fixture).unwrap();
+    let stores_body2 = paginated_list_body(&[&store_record_json("parity-json")]);
+    let add_body2 = format!(r#"{{"id":"{real_id_json}","store":"parity-json","kind":"path"}}"#);
+    let (port2, _received2) = start_routing_mock_server(vec![
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body2),
+        (
+            "POST",
+            "/v1/stores/parity-json/sources",
+            "HTTP/1.1 200 OK",
+            add_body2,
+        ),
+    ]);
+    let daemon_url2 = format!("http://127.0.0.1:{}", port2);
+
+    let daemon_json = cmd_with_dir(&daemon_dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url2)
+        .args([
+            "--json",
+            "--store",
+            "parity-json",
+            "source",
+            "add",
+            daemon_json_fixture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        daemon_json.status.success(),
+        "daemon-routed source add --json should succeed; stderr: {}",
+        String::from_utf8_lossy(&daemon_json.stderr)
+    );
+    let daemon_json_stdout = String::from_utf8_lossy(&daemon_json.stdout).to_string();
+    let daemon_v: serde_json::Value = serde_json::from_str(&daemon_json_stdout).unwrap();
+
+    assert_eq!(
+        embedded_v, daemon_v,
+        "--json output must be identical between embedded and daemon-mock"
     );
 }
 
@@ -3601,9 +4151,13 @@ fn source_remove_daemon_success_json_and_text() {
         .unwrap();
     assert!(text_out.status.success());
     let stdout = String::from_utf8_lossy(&text_out.stdout);
+    // issue #187 stage 5: the daemon-only "(via daemon)" suffix is gone —
+    // mode is not part of the result, so this line is now byte-identical to
+    // embedded mode's single-item removal line.
     assert!(
-        stdout.contains("Removed source: 01ABCDEFGHIJKLMNOPQRSTUVWX (via daemon)"),
-        "expected non-json daemon removal line; got: {stdout}"
+        stdout.contains("Removed source: 01ABCDEFGHIJKLMNOPQRSTUVWX")
+            && !stdout.contains("via daemon"),
+        "expected the same removal line embedded mode prints, with no daemon-mode suffix; got: {stdout}"
     );
 
     let reqs = received.lock().unwrap();
@@ -3875,7 +4429,18 @@ fn index_daemon_single_store_json_includes_source_id() {
     let stores_body = paginated_list_body(&[&store_record_json("onlystore")]);
     let sources_body = paginated_list_body(&[&source_record_json("src-123", "onlystore")]);
     let job_body = r#"{"id":"job-1","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json(
+        "job-1",
+        "onlystore",
+        r#"{"docs_indexed":2,"chunks_written":4,"sources_count":1}"#,
+    ));
     let (port, received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-1/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
         (
             "GET",
             "/v1/stores/onlystore/sources",
@@ -3898,7 +4463,11 @@ fn index_daemon_single_store_json_includes_source_id() {
     );
     let v: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
-    assert_eq!(v["id"].as_str().unwrap(), "job-1");
+    // issue #187 stage 3: `index --json` now attaches and renders the same
+    // unified `render_index_json` single-store shape embedded mode does —
+    // the flat submission-echo body (`{"id": "job-1", ...}`) is gone.
+    assert_eq!(v["status"], "ok", "{v}");
+    assert_eq!(v["docs_indexed"], 2, "{v}");
     assert!(
         v.get("jobs").is_none(),
         "single-store index --json must not wrap in a jobs array"
@@ -3907,8 +4476,9 @@ fn index_daemon_single_store_json_includes_source_id() {
     let reqs = received.lock().unwrap();
     // finding 4: a single-store scope no longer short-circuits the owner
     // walk — GET /v1/stores (scope resolution), GET
-    // /v1/stores/onlystore/sources (ownership check), then POST /v1/jobs.
-    assert_eq!(reqs.len(), 3, "unexpected requests: {:?}", reqs);
+    // /v1/stores/onlystore/sources (ownership check), POST /v1/jobs, then
+    // GET /v1/jobs/job-1/events (issue #187 stage 3 attach).
+    assert_eq!(reqs.len(), 4, "unexpected requests: {:?}", reqs);
     let (path, req_body) = reqs
         .iter()
         .find(|(line, _)| line.starts_with("POST"))
@@ -3964,25 +4534,30 @@ fn index_daemon_single_store_unknown_source_exits_3() {
     );
 }
 
-/// `index --delete` with a daemon running must be refused (exit 2), not
-/// silently downgraded to a non-pruning run.
-///
-/// `/v1/jobs` carries no deletion policy and daemon-side ingestion is a no-op
-/// (#187), so the flag cannot be honored. Accepting it anyway would report
-/// success for a prune that never happened — the same "silence standing in for
-/// a fact" failure that #156/#185 were about, one level up. No job may be
-/// submitted either: a job that silently ignores the user's explicit request
-/// is worse than no job.
+/// `index --delete` with a daemon running now sends `deletion_policy:
+/// "delete"` on the submitted job (D6, issue #187 stage 3) — the daemon runs
+/// real ingestion (issue #187) and can honor it, so the old refusal (exit 2)
+/// is gone. Replaces `index_delete_with_daemon_running_exits_2_and_submits_nothing`.
 #[test]
-fn index_delete_with_daemon_running_exits_2_and_submits_nothing() {
+fn index_daemon_delete_sends_deletion_policy_delete() {
     let dir = TempDir::new().unwrap();
     write_default_config(&dir);
     let data_dir = dir.path().join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
 
     let stores_body = paginated_list_body(&[&store_record_json("onlystore")]);
-    let (port, received) =
-        start_routing_mock_server(vec![("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body)]);
+    let job_body = r#"{"id":"job-del","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json("job-del", "onlystore", "{}"));
+    let (port, received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-del/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+        ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
+    ]);
 
     let output = cmd_with_dir(&dir)
         .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
@@ -3992,26 +4567,26 @@ fn index_delete_with_daemon_running_exits_2_and_submits_nothing() {
 
     assert_eq!(
         output.status.code().unwrap(),
-        2,
-        "`--delete` must be refused while the daemon is running; stderr: {}",
+        0,
+        "`--delete` against a daemon must now succeed (D6); stderr: {}",
         String::from_utf8_lossy(&output.stderr)
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("--delete") && stderr.contains("daemon"),
-        "the error must name the flag and the reason so the remedy is obvious; got: {stderr}"
     );
 
     let reqs = received.lock().unwrap();
-    assert!(
-        !reqs.iter().any(|(l, _)| l.starts_with("POST")),
-        "no index job may be submitted when the requested deletion cannot be honored; got: {:?}",
-        reqs
+    let (_, post_body) = reqs
+        .iter()
+        .find(|(l, _)| l.starts_with("POST /v1/jobs"))
+        .expect("a job should have been submitted");
+    let body_json: serde_json::Value = serde_json::from_str(post_body).unwrap();
+    assert_eq!(
+        body_json["deletion_policy"].as_str().unwrap(),
+        "delete",
+        "--delete must be carried through as deletion_policy: {body_json}"
     );
 }
 
-/// The same command *without* `--delete` still submits normally — the refusal
-/// above must be scoped to the flag, not break daemon-routed indexing.
+/// The same command *without* `--delete` sends `deletion_policy: "retain"`
+/// and still submits/completes normally.
 #[test]
 fn index_without_delete_still_submits_when_daemon_running() {
     let dir = TempDir::new().unwrap();
@@ -4020,13 +4595,16 @@ fn index_without_delete_still_submits_when_daemon_running() {
     std::fs::create_dir_all(&data_dir).unwrap();
 
     let stores_body = paginated_list_body(&[&store_record_json("onlystore")]);
+    let job_body = r#"{"id":"job-1","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json("job-1", "onlystore", "{}"));
     let (port, received) = start_routing_mock_server(vec![
         (
-            "POST",
-            "/v1/jobs",
+            "GET",
+            "/v1/jobs/job-1/events",
             "HTTP/1.1 200 OK",
-            r#"{"job_id":"job-1","status":"queued"}"#.to_string(),
+            events_body,
         ),
+        ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
         ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
     ]);
 
@@ -4043,16 +4621,19 @@ fn index_without_delete_still_submits_when_daemon_running() {
         String::from_utf8_lossy(&output.stderr)
     );
     let reqs = received.lock().unwrap();
-    assert!(
-        reqs.iter().any(|(l, _)| l.starts_with("POST /v1/jobs")),
-        "a job should be submitted in the ordinary (non-deleting) case; got: {:?}",
-        reqs
-    );
+    let (_, post_body) = reqs
+        .iter()
+        .find(|(l, _)| l.starts_with("POST /v1/jobs"))
+        .expect("a job should be submitted in the ordinary (non-deleting) case");
+    let body_json: serde_json::Value = serde_json::from_str(post_body).unwrap();
+    assert_eq!(body_json["deletion_policy"].as_str().unwrap(), "retain");
 }
 
 /// `index --json` with a daemon running and more than one store in scope:
-/// wraps submissions into `{"jobs": [...], }`, each entry tagged with its
-/// store name.
+/// issue #187 stage 3 unifies daemon-mode rendering with embedded mode's
+/// `render_index_json` — the old `{"jobs": [...]}` submission-echo shape is
+/// gone in favor of the same `{"stores": [...], "total": {...}}` shape a
+/// multi-store embedded run produces.
 #[test]
 fn index_daemon_multi_store_json_wraps_with_store_field() {
     let dir = TempDir::new().unwrap();
@@ -4063,7 +4644,18 @@ fn index_daemon_multi_store_json_wraps_with_store_field() {
     let stores_body =
         paginated_list_body(&[&store_record_json("alpha"), &store_record_json("beta")]);
     let job_body = r#"{"id":"job-x","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json(
+        "job-x",
+        "alpha",
+        r#"{"docs_indexed":1,"sources_count":1}"#,
+    ));
     let (port, received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-x/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
         ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
         ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
     ]);
@@ -4080,19 +4672,27 @@ fn index_daemon_multi_store_json_wraps_with_store_field() {
     );
     let v: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
-    let jobs = v["jobs"].as_array().expect("jobs must be an array");
-    assert_eq!(jobs.len(), 2);
-    let store_names: std::collections::HashSet<&str> =
-        jobs.iter().map(|j| j["store"].as_str().unwrap()).collect();
+    let stores = v["stores"].as_array().expect("stores must be an array");
+    assert_eq!(stores.len(), 2, "{v}");
+    let store_names: std::collections::HashSet<&str> = stores
+        .iter()
+        .map(|j| j["store"].as_str().unwrap())
+        .collect();
     assert_eq!(store_names, ["alpha", "beta"].into_iter().collect());
+    assert_eq!(v["total"]["docs_indexed"], 2, "{v}");
 
     let reqs = received.lock().unwrap();
-    let post_reqs = reqs.iter().filter(|(l, _)| l.starts_with("POST")).count();
+    let post_reqs = reqs
+        .iter()
+        .filter(|(l, _)| l.starts_with("POST /v1/jobs"))
+        .count();
     assert_eq!(post_reqs, 2, "expected one POST per store; got: {:?}", reqs);
 }
 
-/// `index` (non-json) with a daemon running and a single store in scope
-/// prints the plain "submitted to daemon" line without a store prefix.
+/// `index` (non-json) with a daemon running and a single store in scope now
+/// waits for the job and prints the same "Index complete: ..." summary
+/// embedded mode does — the old "submitted to daemon ... (poll with status)"
+/// hint is gone (issue #187 stage 3, D1: both modes attach to completion).
 #[test]
 fn index_daemon_single_store_text_output() {
     let dir = TempDir::new().unwrap();
@@ -4102,7 +4702,18 @@ fn index_daemon_single_store_text_output() {
 
     let stores_body = paginated_list_body(&[&store_record_json("onlystore2")]);
     let job_body = r#"{"id":"job-2","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json(
+        "job-2",
+        "onlystore2",
+        r#"{"docs_indexed":3,"chunks_written":6,"sources_count":1}"#,
+    ));
     let (port, _received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-2/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
         ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
         ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
     ]);
@@ -4113,12 +4724,13 @@ fn index_daemon_single_store_text_output() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Index job submitted to daemon: job-2 (poll with status)",
+            "Index complete: 3 indexed, 0 skipped, 6 chunks written, 0 unsupported, 0 errors",
         ));
 }
 
 /// `index` (non-json) with a daemon running and more than one store in
-/// scope prefixes each submission line with its store name.
+/// scope prefixes each store's completed-job summary line with its store
+/// name — the multi-store embedded rendering, now shared by daemon mode too.
 #[test]
 fn index_daemon_multi_store_text_output_prefixes_store_name() {
     let dir = TempDir::new().unwrap();
@@ -4129,7 +4741,14 @@ fn index_daemon_multi_store_text_output_prefixes_store_name() {
     let stores_body =
         paginated_list_body(&[&store_record_json("gamma"), &store_record_json("delta")]);
     let job_body = r#"{"id":"job-3","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json("job-3", "gamma", "{}"));
     let (port, _received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-3/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
         ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
         ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
     ]);
@@ -4142,12 +4761,9 @@ fn index_daemon_multi_store_text_output_prefixes_store_name() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout
-            .contains("Index job submitted to daemon for store 'gamma': job-3 (poll with status)")
-            && stdout.contains(
-                "Index job submitted to daemon for store 'delta': job-3 (poll with status)"
-            ),
-        "expected a per-store submission line for each store; got: {stdout}"
+        stdout.contains("[gamma] No sources to index.")
+            && stdout.contains("[delta] No sources to index."),
+        "expected a per-store completion line for each store; got: {stdout}"
     );
 }
 
@@ -4198,7 +4814,14 @@ fn index_daemon_explicit_store_known_to_daemon_not_local_succeeds() {
 
     let stores_body = paginated_list_body(&[&store_record_json("remote-only")]);
     let job_body = r#"{"id":"job-9","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json("job-9", "remote-only", "{}"));
     let (port, received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-9/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
         ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
         ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
     ]);
@@ -4241,7 +4864,14 @@ fn index_daemon_omitted_store_uses_daemon_stores_not_local() {
     // ...and the daemon reports a completely different one.
     let stores_body = paginated_list_body(&[&store_record_json("daemon-only")]);
     let job_body = r#"{"id":"job-10","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json("job-10", "daemon-only", "{}"));
     let (port, received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-10/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
         ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
         ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
     ]);
@@ -4360,7 +4990,14 @@ fn index_daemon_store_scope_paginates_over_20_stores() {
     let page2 = paginated_list_page(&[store_record_json("store-20")], None, 21);
 
     let job_body = r#"{"id":"job-page2","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json("job-page2", "store-00", "{}"));
     let (port, received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-page2/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
         ("GET", "/v1/stores?cursor=20", "HTTP/1.1 200 OK", page2),
         ("GET", "/v1/stores", "HTTP/1.1 200 OK", page1),
         ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
@@ -4378,14 +5015,16 @@ fn index_daemon_store_scope_paginates_over_20_stores() {
     );
     let v: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
-    let jobs = v["jobs"].as_array().expect("jobs must be an array");
+    let stores = v["stores"].as_array().expect("stores must be an array");
     assert_eq!(
-        jobs.len(),
+        stores.len(),
         21,
         "every store across both pages must be in the all-stores scope: {v}"
     );
-    let submitted_names: std::collections::HashSet<&str> =
-        jobs.iter().map(|j| j["store"].as_str().unwrap()).collect();
+    let submitted_names: std::collections::HashSet<&str> = stores
+        .iter()
+        .map(|j| j["store"].as_str().unwrap())
+        .collect();
     assert!(
         submitted_names.contains("store-20"),
         "the store sitting on page 2 must not be dropped: {:?}",
@@ -4420,8 +5059,19 @@ fn index_daemon_source_owner_walk_narrows_to_single_job() {
     let alpha_sources = paginated_list_body(&[]);
     let beta_sources = paginated_list_body(&[&source_record_json("src-owned", "beta")]);
     let job_body = r#"{"id":"job-11","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json(
+        "job-11",
+        "beta",
+        r#"{"docs_indexed":1,"sources_count":1}"#,
+    ));
 
     let (port, received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-11/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
         (
             "GET",
             "/v1/stores/alpha/sources",
@@ -4450,7 +5100,7 @@ fn index_daemon_source_owner_walk_narrows_to_single_job() {
     );
     let v: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
-    assert_eq!(v["id"], "job-11");
+    assert_eq!(v["docs_indexed"], 1, "{v}");
     assert!(
         v.get("jobs").is_none(),
         "narrowed to one store, this must render the flat single-job shape: {v}"
@@ -4603,8 +5253,15 @@ fn index_daemon_source_owner_walk_paginates_to_page_2() {
     let beta_page1 = paginated_list_page(&beta_page1_items, Some("20"), 21);
     let beta_page2 = paginated_list_page(&[source_record_json("src-on-page-2", "beta")], None, 21);
     let job_body = r#"{"id":"job-page2-src","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json("job-page2-src", "beta", "{}"));
 
     let (port, received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-page2-src/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
         (
             "GET",
             "/v1/stores/beta/sources?cursor=20",
@@ -4643,6 +5300,479 @@ fn index_daemon_source_owner_walk_paginates_to_page_2() {
     assert_eq!(post_reqs.len(), 1, "{:?}", reqs);
     let body_json: serde_json::Value = serde_json::from_str(&post_reqs[0].1).unwrap();
     assert_eq!(body_json["store_name"].as_str().unwrap(), "beta");
+}
+
+// ---------------------------------------------------------------------------
+// index.rs: unified job model (issue #187 stage 3) — a daemon job that
+// fails, --strict parity with embedded, and the SSE-attach poll fallback.
+// ---------------------------------------------------------------------------
+
+/// A daemon job that ends in the `failed` state must hard-fail `index`
+/// exactly like an embedded pre-flight failure does — exit 1
+/// (`Error::Internal`), with the job's own error text in stderr. This holds
+/// whether or not `--strict` was passed: `--strict` governs the *summary
+/// error-count* path (`report_index_outcomes`/`strict_should_fail`), which a
+/// `Failed` job never reaches — `job_attach::finish_job` hard-errors before
+/// that renderer ever runs, for both daemon and embedded jobs alike.
+#[test]
+fn index_daemon_failed_job_exits_1_regardless_of_strict() {
+    for strict in [false, true] {
+        let dir = TempDir::new().unwrap();
+        write_default_config(&dir);
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let stores_body = paginated_list_body(&[&store_record_json("failstore")]);
+        let job_body = r#"{"id":"job-fail","status":"queued"}"#;
+        let events_body = sse_done_body(&index_job_failed_json(
+            "job-fail",
+            "failstore",
+            "ingestion blew up",
+        ));
+        let (port, _received) = start_routing_mock_server(vec![
+            (
+                "GET",
+                "/v1/jobs/job-fail/events",
+                "HTTP/1.1 200 OK",
+                events_body,
+            ),
+            ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+            ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
+        ]);
+
+        let mut args = vec!["index"];
+        if strict {
+            args.push("--strict");
+        }
+        let output = cmd_with_dir(&dir)
+            .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+            .args(&args)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "a failed daemon job must exit 1 like an embedded hard failure (strict={strict}); \
+             stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("ingestion blew up"),
+            "the job's own error text must reach stderr (strict={strict}); got: {stderr}"
+        );
+    }
+}
+
+/// Issue #187 review, finding 3: a daemon job classified with a recognized
+/// `error_code` (here `invalid_config`, the code an embedder-construction
+/// failure carries) must exit with *that* code — 2 — daemon-attached, not
+/// the undifferentiated exit 1 `index_daemon_failed_job_exits_1_regardless_of_strict`
+/// pins for an unclassified failure. This is transport parity with embedded
+/// mode's own pre-flight embedder-construction failure, which has always
+/// exited 2 (`index_embedder_creation_failure_exits_2` above): before this
+/// fix, the daemon stringified every job-level error before it ever reached
+/// the terminal `IndexJob`, so this exact scenario exited 1 daemon-attached
+/// despite being the identical underlying failure as the embedded case.
+#[test]
+fn index_daemon_failed_job_with_invalid_config_code_exits_2_like_embedded() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let stores_body = paginated_list_body(&[&store_record_json("failstore")]);
+    let job_body = r#"{"id":"job-fail","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_failed_json_with_code(
+        "job-fail",
+        "failstore",
+        "unconfigured embedder provider",
+        "invalid_config",
+    ));
+    let (port, _received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-fail/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+        ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
+    ]);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["index"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a daemon job failure classified as invalid_config must exit 2, matching \
+         embedded's own embedder-construction pre-flight failure; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unconfigured embedder provider"),
+        "the job's own error text must still reach stderr; got: {stderr}"
+    );
+    // Issue #187 review, finding F4: the daemon's producers must store the
+    // *bare* message, not `Error::to_string()` — `finish_job` reconstructs
+    // the typed error via `Error::from_code`, which re-adds the "invalid
+    // config: " `Display` prefix itself. A doubled prefix here would mean a
+    // producer regressed back to storing the already-prefixed string.
+    assert_eq!(
+        stderr.matches("invalid config:").count(),
+        1,
+        "the \"invalid config: \" prefix must appear exactly once; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("invalid config: invalid config"),
+        "stderr must not show the doubled prefix; got: {stderr}"
+    );
+}
+
+/// A daemon job that completes (`done`) but reports per-source/per-document
+/// errors in its stats must drive `--strict` exactly like embedded's
+/// `strict_should_fail` does: exit 2 with `--strict`, exit 0 without it —
+/// both render the completed summary first (unlike the hard-failure case
+/// above).
+#[test]
+fn index_daemon_job_with_errors_and_strict_exits_2_like_embedded() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let stores_body = paginated_list_body(&[&store_record_json("errstore")]);
+    let job_body = r#"{"id":"job-err","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json(
+        "job-err",
+        "errstore",
+        r#"{"docs_indexed":2,"chunks_written":3,"error_count":1,"sources_count":1}"#,
+    ));
+    let (port, _received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-err/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+        ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
+    ]);
+
+    // Without --strict: the run completed, so it's exit 0 even with errors.
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .arg("index")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "without --strict, a completed job with errors must still exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // With --strict: the same completed-with-errors job must exit 2, the
+    // same code `strict_should_fail` gives an embedded run with errors.
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["index", "--strict"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "--strict on a completed daemon job with errors must exit 2, like embedded; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Issue #187 review, finding 4c: `index_daemon_job_with_errors_and_strict_exits_2_like_embedded`
+/// only covers a *single* daemon-mock store; this extends the same scenario
+/// to two stores in scope, asserting two things neither the single-store
+/// test nor `index_daemon_multi_store_json_wraps_with_store_field` (which
+/// has no errors at all) covers:
+///
+/// 1. Exit code parity with embedded's `strict_should_fail` (`cli/src/cmds/index.rs`):
+///    "`--strict` exits 2 if *any* store reported errors" — proven here with
+///    a genuinely multi-store scope, not just summed into a single store's
+///    counters.
+/// 2. `report_index_outcomes` prints the full `--json` document to stdout
+///    *before* the `--strict` exit (`std::process::exit(2)` only happens
+///    after `print_json`) — the "no `--json`-at-strict-exit e2e" gap: a
+///    nonzero exit code alone doesn't prove the results were ever emitted
+///    rather than silently dropped, so this parses stdout and asserts on
+///    the actual per-store and total content.
+#[test]
+fn index_daemon_multi_store_strict_exits_2_and_prints_full_json_to_stdout() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let stores_body =
+        paginated_list_body(&[&store_record_json("alpha"), &store_record_json("beta")]);
+    let job_body = r#"{"id":"job-strict","status":"queued"}"#;
+    // Both stores attach to the same mocked job id (the routing mock server
+    // matches by path only, so a single `POST /v1/jobs` route necessarily
+    // answers both stores' submissions identically — see
+    // `index_daemon_multi_store_json_wraps_with_store_field` above for the
+    // same simplification) — each store therefore reports the identical
+    // per-store stats below, and the assertions check the CLI's own
+    // aggregation/rendering of that fan-out, not per-store mock fidelity.
+    let events_body = sse_done_body(&index_job_done_json(
+        "job-strict",
+        "alpha",
+        r#"{"docs_indexed":1,"chunks_written":2,"error_count":1,"sources_count":1}"#,
+    ));
+    let (port, _received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-strict/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+        ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
+    ]);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["--json", "index", "--strict"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "--strict must exit 2 when any store in a multi-store daemon-mock scope reported \
+         errors, matching embedded's strict_should_fail; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!(
+            "a --strict exit must still print the full --json document to stdout \
+             (report_index_outcomes prints before exiting), not just the bare exit code: {e}\n\
+             stdout:\n{stdout}"
+        )
+    });
+
+    let stores = v["stores"].as_array().expect("stores must be an array");
+    assert_eq!(stores.len(), 2, "{v}");
+    let by_name: std::collections::HashMap<&str, &serde_json::Value> = stores
+        .iter()
+        .map(|s| (s["store"].as_str().unwrap(), s))
+        .collect();
+    for name in ["alpha", "beta"] {
+        let entry = by_name
+            .get(name)
+            .unwrap_or_else(|| panic!("missing store entry for '{name}': {v}"));
+        assert_eq!((*entry)["status"], "error", "{v}");
+        assert_eq!((*entry)["docs_indexed"], 1, "{v}");
+        assert_eq!((*entry)["chunks_written"], 2, "{v}");
+        assert_eq!((*entry)["errors"], 1, "{v}");
+    }
+    assert_eq!(v["total"]["status"], "error", "{v}");
+    assert_eq!(v["total"]["docs_indexed"], 2, "{v}");
+    assert_eq!(v["total"]["chunks_written"], 4, "{v}");
+    assert_eq!(v["total"]["errors"], 2, "{v}");
+}
+
+/// SSE-attach fallback: when `GET /v1/jobs/{id}/events` is unavailable (a
+/// 404, e.g. an older daemon predating issue #83), `index` must fall back to
+/// polling `GET /v1/jobs/{id}` and still complete correctly, rather than
+/// failing the command.
+#[test]
+fn index_daemon_sse_404_falls_back_to_polling() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let stores_body = paginated_list_body(&[&store_record_json("pollstore")]);
+    let job_body = r#"{"id":"job-poll","status":"queued"}"#;
+    let poll_body = index_job_done_json(
+        "job-poll",
+        "pollstore",
+        r#"{"docs_indexed":5,"chunks_written":9,"sources_count":1}"#,
+    );
+    let (port, received) = start_routing_mock_server(vec![
+        // Listed before the bare "/v1/jobs/job-poll" route below so it wins
+        // for the longer, more specific `/events` path (first-match-wins) —
+        // simulating a daemon that doesn't implement the SSE route at all.
+        (
+            "GET",
+            "/v1/jobs/job-poll/events",
+            "HTTP/1.1 404 Not Found",
+            r#"{"code":"resource_not_found","message":"no such route"}"#.to_string(),
+        ),
+        ("GET", "/v1/jobs/job-poll", "HTTP/1.1 200 OK", poll_body),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+        ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
+    ]);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["--json", "index"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "an SSE 404 must fall back to polling, not fail the command; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert_eq!(v["docs_indexed"], 5, "{v}");
+    assert_eq!(v["chunks_written"], 9, "{v}");
+
+    let reqs = received.lock().unwrap();
+    assert!(
+        reqs.iter()
+            .any(|(l, _)| l.starts_with("GET /v1/jobs/job-poll/events")),
+        "the SSE route must have been tried first; got: {:?}",
+        reqs
+    );
+    assert!(
+        reqs.iter()
+            .any(|(l, _)| l.starts_with("GET /v1/jobs/job-poll HTTP")),
+        "the poll fallback must have been used after the SSE 404; got: {:?}",
+        reqs
+    );
+}
+
+/// Shape parity (D1): the same command produces byte-identical text *and*
+/// `--json` summaries whether it ran embedded or was submitted to (and
+/// completed by) a daemon-mock — because both transports funnel their
+/// result through the exact same `render_index_text`/`render_index_json`.
+///
+/// Rather than hand-picking numbers, this drives a real embedded `index
+/// --json` run first to learn the real stats a trivial one-file store
+/// produces, then builds a daemon-mock job whose `IndexJobStats` mirror
+/// those exact numbers, and asserts *both* the plain-text and `--json`
+/// daemon-routed output are identical to the embedded run's.
+#[test]
+fn index_shape_parity_between_embedded_and_daemon_mock() {
+    let embedded_dir = TempDir::new().unwrap();
+    write_default_config(&embedded_dir);
+    cmd_with_dir(&embedded_dir)
+        .args(["store", "add", "parity"])
+        .assert()
+        .success();
+    let fixture = embedded_dir.path().join("parity-docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+    std::fs::write(fixture.join("doc.md"), "# Doc\n\nhello world\n").unwrap();
+    cmd_with_dir(&embedded_dir)
+        .args([
+            "--store",
+            "parity",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // A second source, so the `index` re-run below has two source records
+    // in scope (both already auto-indexed by `source add`, so it reports
+    // them seen-but-skipped rather than "no sources to index").
+    let fixture2 = embedded_dir.path().join("parity-docs-2");
+    std::fs::create_dir_all(&fixture2).unwrap();
+    std::fs::write(fixture2.join("doc2.md"), "# Doc 2\n\nsecond file\n").unwrap();
+    cmd_with_dir(&embedded_dir)
+        .args([
+            "--store",
+            "parity",
+            "source",
+            "add",
+            fixture2.to_str().unwrap(),
+            "--kind",
+            "path",
+        ])
+        .assert()
+        .success();
+
+    // Both sources are now auto-indexed; a plain `index` re-run reports
+    // real, deterministic "seen but unchanged" numbers (docs_skipped > 0,
+    // everything else 0) without depending on exact chunking output.
+    let embedded_text = cmd_with_dir(&embedded_dir)
+        .args(["--store", "parity", "index"])
+        .output()
+        .unwrap();
+    assert!(embedded_text.status.success());
+    let embedded_stdout = String::from_utf8_lossy(&embedded_text.stdout).to_string();
+
+    let embedded_json = cmd_with_dir(&embedded_dir)
+        .args(["--json", "--store", "parity", "index"])
+        .output()
+        .unwrap();
+    assert!(embedded_json.status.success());
+    let embedded_json_stdout = String::from_utf8_lossy(&embedded_json.stdout).to_string();
+
+    // Daemon-mock run: a job whose `IndexJobStats` mirror the real embedded
+    // run's numbers exactly (both sources already indexed by the earlier
+    // `source add` auto-index runs, so `index` here reports them seen-but-
+    // skipped, not "no sources to index" — that shape only applies when a
+    // store has zero source *records*, not zero pending work).
+    let embedded_v: serde_json::Value = serde_json::from_str(&embedded_json_stdout).unwrap();
+    let stats_json = format!(
+        r#"{{"docs_indexed":{},"docs_skipped":{},"chunks_written":{},"unsupported_format_count":{},"error_count":{},"docs_deleted":{},"docs_prunable":{},"sources_count":2}}"#,
+        embedded_v["docs_indexed"],
+        embedded_v["docs_skipped"],
+        embedded_v["chunks_written"],
+        embedded_v["unsupported"],
+        embedded_v["errors"],
+        embedded_v["docs_deleted"],
+        embedded_v["docs_prunable"],
+    );
+
+    let daemon_dir = TempDir::new().unwrap();
+    write_default_config(&daemon_dir);
+    let stores_body = paginated_list_body(&[&store_record_json("parity")]);
+    let job_body = r#"{"id":"job-parity","status":"queued"}"#;
+    let events_body = sse_done_body(&index_job_done_json("job-parity", "parity", &stats_json));
+    let (port, _received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/jobs/job-parity/events",
+            "HTTP/1.1 200 OK",
+            events_body,
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+        ("POST", "/v1/jobs", "HTTP/1.1 200 OK", job_body.to_string()),
+    ]);
+
+    let daemon_text = cmd_with_dir(&daemon_dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .arg("index")
+        .output()
+        .unwrap();
+    assert!(daemon_text.status.success());
+    let daemon_stdout = String::from_utf8_lossy(&daemon_text.stdout).to_string();
+
+    let daemon_json = cmd_with_dir(&daemon_dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["--json", "index"])
+        .output()
+        .unwrap();
+    assert!(daemon_json.status.success());
+    let daemon_json_stdout = String::from_utf8_lossy(&daemon_json.stdout).to_string();
+
+    assert_eq!(
+        embedded_stdout, daemon_stdout,
+        "text summary must be byte-identical between embedded and daemon-mock"
+    );
+    let daemon_v: serde_json::Value = serde_json::from_str(&daemon_json_stdout).unwrap();
+    assert_eq!(
+        embedded_v, daemon_v,
+        "--json summary must be identical between embedded and daemon-mock"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -4958,7 +6088,15 @@ fn source_add_json_multi_store_is_single_document_daemon() {
     assert_eq!(results.len(), 2, "{v}");
 
     let reqs = received.lock().unwrap();
-    let post_reqs = reqs.iter().filter(|(l, _)| l.starts_with("POST")).count();
+    // D3 (issue #187 stage 3): `source add`'s daemon branch now also
+    // submits a best-effort auto-index job per added source
+    // (`POST /v1/jobs`), so only the `POST /v1/stores/.../sources` add
+    // requests are counted here — the auto-index submissions aren't stubbed
+    // by this fixture and 404 harmlessly (WarnAndContinue).
+    let post_reqs = reqs
+        .iter()
+        .filter(|(l, _)| l.starts_with("POST /v1/stores"))
+        .count();
     assert_eq!(post_reqs, 2, "expected one POST per store; got: {:?}", reqs);
 }
 
@@ -5206,6 +6344,203 @@ fn source_remove_daemon_unknown_but_valid_store_name_reaches_daemon() {
 }
 
 // ---------------------------------------------------------------------------
+// H2 (Codex review, PR #212) — `status`, `store list`, and `store remove`
+// must validate `--store`/positional store names for traversal-safety
+// *before* contacting the daemon, exactly like `source remove` above.
+// ---------------------------------------------------------------------------
+
+/// Daemon-routed `status --store ../evil` must exit 2 before the `GET
+/// /v1/status` request ever fires.
+#[test]
+fn status_daemon_invalid_store_name_exits_2_and_sends_no_request() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let body = r#"{"stores":[],"database":{"path":"/tmp/x.db","size_bytes":0,"wal_size_bytes":0,"largest_tables":[]}}"#;
+    let (port, received) = start_recording_mock_server("HTTP/1.1 200 OK", body);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["--store", "../evil", "status"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "an unsafe --store name must exit 2 before the daemon status request fires; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let reqs = received.lock().unwrap();
+    assert!(
+        reqs.is_empty(),
+        "mock daemon must receive no request when --store fails validation; got: {:?}",
+        reqs
+    );
+}
+
+/// Flip side of the test above: a syntactically valid but locally-unknown
+/// `--store` name must still reach the daemon for `status`.
+#[test]
+fn status_daemon_unknown_but_valid_store_name_reaches_daemon() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let body = r#"{"stores":[],"database":{"path":"/tmp/x.db","size_bytes":0,"wal_size_bytes":0,"largest_tables":[]}}"#;
+    let (port, received) = start_recording_mock_server("HTTP/1.1 200 OK", body);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let _output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["--store", "totally-unknown-store", "status"])
+        .output()
+        .unwrap();
+
+    let reqs = received.lock().unwrap();
+    assert_eq!(
+        reqs.len(),
+        1,
+        "a syntactically valid --store name must reach the daemon even if locally unknown; got: {:?}",
+        reqs
+    );
+    assert!(reqs[0].0.starts_with("GET "), "{:?}", reqs[0]);
+    assert!(reqs[0].0.contains("/v1/status"), "{:?}", reqs[0]);
+}
+
+/// Daemon-routed `store list --store ../evil` must exit 2 before the `GET
+/// /v1/stores` request ever fires.
+#[test]
+fn store_list_daemon_invalid_store_name_exits_2_and_sends_no_request() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let body = paginated_list_body(&[]);
+    let (port, received) = start_routing_mock_server(vec![("", "", "HTTP/1.1 200 OK", body)]);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["--store", "../evil", "store", "list"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "an unsafe --store name must exit 2 before the daemon store-list request fires; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let reqs = received.lock().unwrap();
+    assert!(
+        reqs.is_empty(),
+        "mock daemon must receive no request when --store fails validation; got: {:?}",
+        reqs
+    );
+}
+
+/// Flip side of the test above: a syntactically valid but locally-unknown
+/// `--store` name must still reach the daemon for `store list`.
+#[test]
+fn store_list_daemon_unknown_but_valid_store_name_reaches_daemon() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let body = paginated_list_body(&[&store_record_json("other-store")]);
+    let (port, received) = start_routing_mock_server(vec![("", "", "HTTP/1.1 200 OK", body)]);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let _output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["--store", "totally-unknown-store", "store", "list"])
+        .output()
+        .unwrap();
+
+    let reqs = received.lock().unwrap();
+    assert_eq!(
+        reqs.len(),
+        1,
+        "a syntactically valid --store name must reach the daemon even if locally unknown; got: {:?}",
+        reqs
+    );
+    assert!(reqs[0].0.starts_with("GET "), "{:?}", reqs[0]);
+    assert!(reqs[0].0.contains("/v1/stores"), "{:?}", reqs[0]);
+}
+
+/// Daemon-routed `store remove ../bad --yes` must exit 2 before the `DELETE
+/// /v1/stores/{name}` request ever fires. Also pins that embedded and daemon
+/// mode now agree (exit 2, not the old daemon-only exit 3).
+#[test]
+fn store_remove_daemon_invalid_store_name_exits_2_and_sends_no_request() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let body = r#"{"status":"ok","name":"../bad"}"#;
+    let (port, received) = start_recording_mock_server("HTTP/1.1 200 OK", body);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["store", "remove", "--yes", "../bad"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "an unsafe store name must exit 2 before the daemon DELETE fires; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let reqs = received.lock().unwrap();
+    assert!(
+        reqs.is_empty(),
+        "mock daemon must receive no request when the store name fails validation; got: {:?}",
+        reqs
+    );
+}
+
+/// Flip side of the test above: a syntactically valid but locally-unknown
+/// store name must still reach the daemon for `store remove`.
+#[test]
+fn store_remove_daemon_unknown_but_valid_store_name_reaches_daemon() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let body = r#"{"status":"ok","name":"totally-unknown-store"}"#;
+    let (port, received) = start_recording_mock_server("HTTP/1.1 200 OK", body);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["store", "remove", "--yes", "totally-unknown-store"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "a syntactically valid store name must reach the daemon even if locally unknown; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let reqs = received.lock().unwrap();
+    assert_eq!(
+        reqs.len(),
+        1,
+        "expected exactly one DELETE request to reach the daemon; got: {:?}",
+        reqs
+    );
+    assert!(reqs[0].0.starts_with("DELETE "), "{:?}", reqs[0]);
+    assert!(
+        reqs[0].0.contains("/v1/stores/totally-unknown-store"),
+        "{:?}",
+        reqs[0]
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Finding 4 — `status` and `store list` now validate/resolve explicit
 // `--store` instead of silently ignoring it — see
 // cli/src/cmds/status.rs's `run_status_async` and cli/src/cmds/store.rs's
@@ -5444,4 +6779,725 @@ fn status_zero_stores_exits_2_with_no_stores_message() {
         !stderr.contains("invalid config"),
         "the minimal config must not be rejected as invalid; stderr: {stderr}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// issue #187 stage 5: declarative command table / renderer unification.
+//
+// Every command below is now driven through `command_table::dispatch`
+// (`cli/src/command_table.rs`): daemon-detected routes to `run_daemon`,
+// no-daemon routes to `run_embedded`, and -- for `store list`/`source
+// list`/`status`/`search` -- both branches feed the *same* renderer. These
+// tests exercise the daemon side of that (some, like `store list`/`source
+// list`/`status`, for the first time ever -- decision D2) and, where
+// meaningful, assert embedded and daemon-mock output are byte-identical.
+// ---------------------------------------------------------------------------
+
+/// `store list` daemon-routing (D2): before this stage, `store list` never
+/// probed for a daemon at all (issue #187 §2 -- "routed to daemon" was a
+/// false spec claim). Builds the daemon-mock's `GET /v1/stores` fixture to
+/// mirror an embedded run's own two stores, and asserts both `--json` and
+/// text output are byte-identical between the two transports.
+#[test]
+fn store_list_daemon_routes_and_matches_embedded_shape() {
+    let embedded_dir = TempDir::new().unwrap();
+    write_default_config(&embedded_dir);
+    cmd_with_dir(&embedded_dir)
+        .args(["store", "add", "alpha"])
+        .assert()
+        .success();
+    cmd_with_dir(&embedded_dir)
+        .args(["store", "add", "beta"])
+        .assert()
+        .success();
+
+    let embedded_json = cmd_with_dir(&embedded_dir)
+        .args(["--json", "store", "list"])
+        .output()
+        .unwrap();
+    assert!(embedded_json.status.success());
+    let embedded_v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&embedded_json.stdout)).unwrap();
+
+    let embedded_text = cmd_with_dir(&embedded_dir)
+        .args(["store", "list"])
+        .output()
+        .unwrap();
+    let embedded_text_stdout = String::from_utf8_lossy(&embedded_text.stdout).to_string();
+
+    let daemon_dir = TempDir::new().unwrap();
+    write_default_config(&daemon_dir);
+    let stores_body =
+        paginated_list_body(&[&store_record_json("alpha"), &store_record_json("beta")]);
+    let (port, received) =
+        start_routing_mock_server(vec![("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body)]);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let daemon_json = cmd_with_dir(&daemon_dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["--json", "store", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        daemon_json.status.success(),
+        "daemon-routed store list --json should succeed; stderr: {}",
+        String::from_utf8_lossy(&daemon_json.stderr)
+    );
+    let daemon_v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&daemon_json.stdout)).unwrap();
+    assert_eq!(
+        embedded_v, daemon_v,
+        "--json store list must be identical between embedded and daemon-mock"
+    );
+
+    let daemon_text = cmd_with_dir(&daemon_dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["store", "list"])
+        .output()
+        .unwrap();
+    let daemon_text_stdout = String::from_utf8_lossy(&daemon_text.stdout).to_string();
+    assert_eq!(
+        embedded_text_stdout, daemon_text_stdout,
+        "text store list must be identical between embedded and daemon-mock"
+    );
+
+    let reqs = received.lock().unwrap();
+    assert!(
+        reqs.iter().any(|(l, _)| l.starts_with("GET /v1/stores")),
+        "expected a GET /v1/stores request; got {:?}",
+        reqs
+    );
+}
+
+/// `source list` daemon-routing (D2), the first daemon test for this
+/// command -- issue #187 §2 documented the missing daemon branch as a
+/// "known limitation" rather than fixing it. Builds the daemon-mock's
+/// fixture from an embedded run's own persisted source (same id/root), and
+/// asserts `--json` and text output are byte-identical between the two
+/// transports.
+#[test]
+fn source_list_daemon_routes_and_matches_embedded_shape() {
+    let embedded_dir = TempDir::new().unwrap();
+    write_default_config(&embedded_dir);
+    cmd_with_dir(&embedded_dir)
+        .args(["store", "add", "mystore"])
+        .assert()
+        .success();
+    let fixture = embedded_dir.path().join("docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+    cmd_with_dir(&embedded_dir)
+        .args([
+            "--store",
+            "mystore",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let embedded_json = cmd_with_dir(&embedded_dir)
+        .args(["--json", "source", "list"])
+        .output()
+        .unwrap();
+    assert!(embedded_json.status.success());
+    let embedded_v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&embedded_json.stdout)).unwrap();
+    let embedded_text = cmd_with_dir(&embedded_dir)
+        .args(["source", "list"])
+        .output()
+        .unwrap();
+    let embedded_text_stdout = String::from_utf8_lossy(&embedded_text.stdout).to_string();
+
+    // Mirror the embedded run's own persisted source exactly (same
+    // id/root/store_id), so the daemon-mock fixture describes the same
+    // logical source and `embedded_v == daemon_v` is a meaningful check —
+    // `store_id` (issue #187 review, finding 2) is a real internal store
+    // ULID minted by `store add`, not the store's name, so it has to be
+    // pulled from the embedded run's own output rather than guessed.
+    let src_id = embedded_v["sources"][0]["id"].as_str().unwrap().to_string();
+    let store_id = embedded_v["sources"][0]["store_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let root = embedded_v["sources"][0]["root"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let src_json = serde_json::json!({
+        "id": src_id,
+        "store_id": store_id,
+        "kind": "path",
+        "spec": { "root": root },
+        "preset": "prose",
+    })
+    .to_string();
+
+    let daemon_dir = TempDir::new().unwrap();
+    write_default_config(&daemon_dir);
+    let stores_body = paginated_list_body(&[&store_record_json("mystore")]);
+    let sources_body = paginated_list_body(&[&src_json]);
+    let (port, received) = start_routing_mock_server(vec![
+        // The more specific `/v1/stores/mystore/sources` route must be
+        // listed before the bare `/v1/stores` one — `start_routing_mock_server`
+        // is first-match-wins on a path *prefix*, and every sources path
+        // also starts with `/v1/stores`.
+        (
+            "GET",
+            "/v1/stores/mystore/sources",
+            "HTTP/1.1 200 OK",
+            sources_body,
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+    ]);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let daemon_json = cmd_with_dir(&daemon_dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["--json", "source", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        daemon_json.status.success(),
+        "daemon-routed source list --json should succeed; stderr: {}",
+        String::from_utf8_lossy(&daemon_json.stderr)
+    );
+    let daemon_v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&daemon_json.stdout)).unwrap();
+    assert_eq!(
+        embedded_v, daemon_v,
+        "--json source list must be identical between embedded and daemon-mock"
+    );
+    // Issue #187 review, finding 2: `store_id` must be present (not just
+    // `store.name`) on both transports — the shared renderer this test
+    // otherwise exercises had dropped it entirely.
+    assert_eq!(
+        daemon_v["sources"][0]["store_id"], store_id,
+        "daemon-routed source list --json must include store_id: {daemon_v}"
+    );
+
+    let daemon_text = cmd_with_dir(&daemon_dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["source", "list"])
+        .output()
+        .unwrap();
+    let daemon_text_stdout = String::from_utf8_lossy(&daemon_text.stdout).to_string();
+    assert_eq!(
+        embedded_text_stdout, daemon_text_stdout,
+        "text source list must be identical between embedded and daemon-mock"
+    );
+
+    let reqs = received.lock().unwrap();
+    assert!(
+        reqs.iter()
+            .any(|(l, _)| l.starts_with("GET /v1/stores/mystore/sources")),
+        "expected a GET /v1/stores/mystore/sources request; got {:?}",
+        reqs
+    );
+}
+
+/// Regression test for issue #187 review, finding G4: `command_table::dispatch`
+/// used to require every call site to open the local `AppDb` *before*
+/// probing for a daemon, even though the daemon branch never used it — so a
+/// broken local store (unwritable, locked, schema-too-new — all real cases
+/// that `exit_err` on open) would preempt a healthy daemon that never needed
+/// the local DB at all. This test breaks the local DB deterministically
+/// (stamps a schema version this build's migration chain will never reach,
+/// via `stamp_user_version`, so `LibsqlDb::open` returns
+/// `Error::InvalidConfig` — see `store-libsql/src/connection.rs`'s
+/// `VersionDisposition::TooNew` arm) and checks both transports: embedded
+/// `source list` must still fail exactly as it always did (same exit code /
+/// message, just reached after the daemon probe instead of before), and
+/// daemon-routed `source list` against the identical broken local DB must
+/// succeed.
+#[test]
+fn source_list_routes_to_daemon_when_local_db_schema_is_incompatible() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    let db_path = data_dir.join("localdb.db");
+
+    // `store add` creates a fresh store at head, seeding a real schema this
+    // binary understands and can open normally.
+    cmd_with_dir(&dir)
+        .args(["store", "add", "s1"])
+        .assert()
+        .success();
+
+    // Stamp a schema version far beyond anything this binary's migration
+    // chain will ever reach, so every subsequent `AppDb::open` on this file
+    // hits `VersionDisposition::TooNew` -> `Error::InvalidConfig`.
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(stamp_user_version(&db_path, 999_999));
+
+    // No daemon detected: embedded `source list` must fail exactly as it did
+    // before this fix -- exit 2 (invalid_config), mentioning the mismatch.
+    let no_daemon = cmd_with_dir(&dir)
+        .args(["source", "list"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        no_daemon.status.code().unwrap(),
+        2,
+        "embedded source list against a too-new local schema must exit 2 (invalid_config); stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&no_daemon.stdout),
+        String::from_utf8_lossy(&no_daemon.stderr)
+    );
+    let no_daemon_stderr = String::from_utf8_lossy(&no_daemon.stderr);
+    assert!(
+        no_daemon_stderr.contains("newer than this build"),
+        "expected the schema-too-new error message; stderr: {no_daemon_stderr}"
+    );
+
+    // Same directory, same broken `localdb.db` on disk -- but now a daemon is
+    // detected via `LOCALDB_DAEMON_URL`. Before the G4 fix, `dispatch`'s
+    // caller had already opened (and failed to open) the local `AppDb`
+    // before this point; after the fix, `open_db` is only ever invoked from
+    // `dispatch`'s `NotRunning` arm, so the daemon branch must succeed
+    // without ever touching the broken local DB.
+    let stores_body = paginated_list_body(&[&store_record_json("s1")]);
+    let sources_body = paginated_list_body(&[]);
+    let (port, received) = start_routing_mock_server(vec![
+        (
+            "GET",
+            "/v1/stores/s1/sources",
+            "HTTP/1.1 200 OK",
+            sources_body,
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+    ]);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let with_daemon = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["source", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        with_daemon.status.success(),
+        "daemon-routed source list must succeed even though the local DB schema is too new; stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&with_daemon.stdout),
+        String::from_utf8_lossy(&with_daemon.stderr)
+    );
+
+    let reqs = received.lock().unwrap();
+    assert!(
+        reqs.iter().any(|(l, _)| l.starts_with("GET /v1/stores")),
+        "expected at least a GET /v1/stores request; got {:?}",
+        reqs
+    );
+}
+
+/// Daemon-transport counterpart of
+/// `source_list_shows_store_column_even_when_one_scoped_store_is_empty`
+/// (issue #187 review, finding 1) — shape-parity style with
+/// `source_list_daemon_routes_and_matches_embedded_shape` above: builds the
+/// same "two stores in scope, only one has sources" fixture through an
+/// embedded run first, then reproduces it against a daemon-mock and asserts
+/// both text and `--json` output are byte-identical between the two
+/// transports. Before the fix, the daemon branch had the identical bug as
+/// embedded (the shared renderer, not either transport's own resolver, was
+/// at fault): the store-name column disappeared because `empty` never
+/// contributed an item.
+#[test]
+fn source_list_daemon_shows_store_column_even_when_one_scoped_store_is_empty() {
+    let embedded_dir = TempDir::new().unwrap();
+    write_default_config(&embedded_dir);
+    for name in ["populated", "empty"] {
+        cmd_with_dir(&embedded_dir)
+            .args(["store", "add", name])
+            .assert()
+            .success();
+    }
+    let fixture = embedded_dir.path().join("docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+    cmd_with_dir(&embedded_dir)
+        .args([
+            "--store",
+            "populated",
+            "source",
+            "add",
+            fixture.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let embedded_args = ["--store", "populated", "--store", "empty", "source", "list"];
+    let embedded_json = cmd_with_dir(&embedded_dir)
+        .args(["--json"])
+        .args(embedded_args)
+        .output()
+        .unwrap();
+    assert!(embedded_json.status.success());
+    let embedded_v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&embedded_json.stdout)).unwrap();
+    let embedded_text = cmd_with_dir(&embedded_dir)
+        .args(embedded_args)
+        .output()
+        .unwrap();
+    assert!(embedded_text.status.success());
+    let embedded_text_stdout = String::from_utf8_lossy(&embedded_text.stdout).to_string();
+    // Sanity check on the embedded fixture itself, matching the equivalent
+    // assertion in `source_list_shows_store_column_even_when_one_scoped_store_is_empty`:
+    // only 'populated' produced a source, but the column must still appear.
+    assert!(
+        embedded_text_stdout
+            .lines()
+            .next()
+            .unwrap()
+            .starts_with("populated  "),
+        "embedded fixture sanity check failed: {embedded_text_stdout}"
+    );
+
+    let src_id = embedded_v["sources"][0]["id"].as_str().unwrap().to_string();
+    let store_id = embedded_v["sources"][0]["store_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let root = embedded_v["sources"][0]["root"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let src_json = serde_json::json!({
+        "id": src_id,
+        "store_id": store_id,
+        "kind": "path",
+        "spec": { "root": root },
+        "preset": "prose",
+    })
+    .to_string();
+
+    let daemon_dir = TempDir::new().unwrap();
+    write_default_config(&daemon_dir);
+    let stores_body =
+        paginated_list_body(&[&store_record_json("populated"), &store_record_json("empty")]);
+    let populated_sources = paginated_list_body(&[&src_json]);
+    let empty_sources = paginated_list_body(&[]);
+    let (port, _received) = start_routing_mock_server(vec![
+        // The specific `/sources` routes must be listed before the bare
+        // `/v1/stores` fallback — first-match-wins on a path *prefix*.
+        (
+            "GET",
+            "/v1/stores/populated/sources",
+            "HTTP/1.1 200 OK",
+            populated_sources,
+        ),
+        (
+            "GET",
+            "/v1/stores/empty/sources",
+            "HTTP/1.1 200 OK",
+            empty_sources,
+        ),
+        ("GET", "/v1/stores", "HTTP/1.1 200 OK", stores_body),
+    ]);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let daemon_json = cmd_with_dir(&daemon_dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["--json"])
+        .args(embedded_args)
+        .output()
+        .unwrap();
+    assert!(
+        daemon_json.status.success(),
+        "daemon-routed source list --json should succeed; stderr: {}",
+        String::from_utf8_lossy(&daemon_json.stderr)
+    );
+    let daemon_v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&daemon_json.stdout)).unwrap();
+    assert_eq!(
+        embedded_v, daemon_v,
+        "--json source list must be identical between embedded and daemon-mock"
+    );
+
+    let daemon_text = cmd_with_dir(&daemon_dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(embedded_args)
+        .output()
+        .unwrap();
+    let daemon_text_stdout = String::from_utf8_lossy(&daemon_text.stdout).to_string();
+    assert_eq!(
+        embedded_text_stdout, daemon_text_stdout,
+        "text source list must be identical between embedded and daemon-mock, \
+         including the store-name column surviving an empty scoped store"
+    );
+}
+
+/// `status` daemon-routing (D2), the first daemon test for this command --
+/// before this stage the daemon probe only produced a display string and
+/// every count still came from the local DB regardless of mode (issue #187
+/// §2). Asserts the daemon's `GET /v1/status` per-store stats and database
+/// section (`server/src/handlers/status.rs`, extended in this stage) flow
+/// through to both `--json` and text output.
+#[test]
+fn status_daemon_reports_daemon_provided_per_store_stats() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let status_body = serde_json::json!({
+        "daemon": true,
+        "store_count": 1,
+        "source_count": 2,
+        "job_count": 0,
+        "stores": [
+            {
+                "name": "mystore",
+                "visibility": "private",
+                "backend": "libsql",
+                "document_count": 3,
+                "chunk_count": 30,
+            }
+        ],
+        "database": {
+            "path": "/fake/localdb.db",
+            "exists": true,
+            "size_bytes": 900,
+            "wal_size_bytes": 100,
+            "total_size_bytes": 1000,
+            "bytes_per_chunk": 33,
+            "largest_tables": [{"name": "chunks", "bytes": 900}],
+        },
+    })
+    .to_string();
+    let (port, received) =
+        start_routing_mock_server(vec![("GET", "/v1/status", "HTTP/1.1 200 OK", status_body)]);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let json_out = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["--json", "status"])
+        .output()
+        .unwrap();
+    assert!(
+        json_out.status.success(),
+        "daemon-routed status --json should succeed; stderr: {}",
+        String::from_utf8_lossy(&json_out.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&json_out.stdout)).unwrap();
+    assert!(v["daemon"].as_str().unwrap().starts_with("running"), "{v}");
+    assert_eq!(v["stores"][0]["name"], "mystore", "{v}");
+    assert_eq!(v["stores"][0]["document_count"], 3, "{v}");
+    assert_eq!(v["stores"][0]["chunk_count"], 30, "{v}");
+    assert_eq!(v["database"]["total_size_bytes"], 1000, "{v}");
+    assert_eq!(v["database"]["bytes_per_chunk"], 33, "{v}");
+    assert_eq!(v["database"]["largest_tables"][0]["name"], "chunks", "{v}");
+
+    let text_out = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .arg("status")
+        .output()
+        .unwrap();
+    assert!(text_out.status.success());
+    let stdout = String::from_utf8_lossy(&text_out.stdout);
+    assert!(stdout.contains("mystore"), "{stdout}");
+    assert!(stdout.contains("3 documents, 30 chunks"), "{stdout}");
+    assert!(stdout.contains("largest tables"), "{stdout}");
+
+    let reqs = received.lock().unwrap();
+    assert!(
+        reqs.iter().any(|(l, _)| l.starts_with("GET /v1/status")),
+        "expected a GET /v1/status request; got {:?}",
+        reqs
+    );
+}
+
+/// Regression for issue #187 §2's `search` divergence: the daemon branch
+/// used to hand-walk the raw JSON response and silently drop `heading_path`
+/// (`cli/src/cmds/search.rs`, pre-stage-5 ~100-121) because it rendered
+/// straight from `serde_json::Value` instead of deserializing into
+/// `Citation` like the embedded branch did. Asserts the heading-path
+/// breadcrumb IS rendered from a daemon response.
+#[test]
+fn search_daemon_renders_heading_path_breadcrumb() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let citation = serde_json::json!({
+        "chunk_id": "chunk1",
+        "resource_id": "doc1",
+        "store": {"id": "01HN1Y28MYWN6X5DSKZMNE1T5W", "name": "mystore"},
+        "uri": "file:///docs/api.md",
+        "heading_path": ["API", "Auth"],
+        "block": {"seq": 0},
+        "chunk_position": {"seq_in_block": 0},
+        "location": {"span": {"start": 0, "end": 10}},
+        "snippet": "some snippet text about tokens",
+        "score": {"fused": 1.0},
+        "provenance": {"fetched_at": "2026-01-01T00:00:00Z", "content_hash": "abc"},
+    });
+    let body = serde_json::json!({ "citations": [citation] }).to_string();
+    let (port, _received) =
+        start_routing_mock_server(vec![("POST", "/v1/search", "HTTP/1.1 200 OK", body)]);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["search", "auth"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "daemon-routed search should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("file:///docs/api.md > API > Auth"),
+        "expected the heading-path breadcrumb rendered from the daemon response; got: {stdout}"
+    );
+}
+
+/// `search --json` shape parity: the daemon branch's `citations` must be
+/// exactly the JSON `Citation` shape (via `serde_json::from_value` into
+/// `core::Citation`, issue #187 stage 5) -- asserted here by round-tripping
+/// a fixed citation through the daemon mock and confirming the fields the
+/// old hand-walking code used to drop survive intact.
+#[test]
+fn search_daemon_json_citations_round_trip_exactly() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let citation = serde_json::json!({
+        "chunk_id": "chunk1",
+        "resource_id": "doc1",
+        "store": {"id": "01HN1Y28MYWN6X5DSKZMNE1T5W", "name": "mystore"},
+        "uri": "file:///docs/api.md",
+        "heading_path": ["API", "Auth"],
+        "block": {"seq": 0, "kind": "text"},
+        "chunk_position": {"seq_in_block": 0},
+        "location": {"span": {"start": 0, "end": 10}},
+        "snippet": "some snippet text about tokens",
+        "score": {"fused": 1.0, "dense": 0.5, "bm25": 0.2},
+        "provenance": {"fetched_at": "2026-01-01T00:00:00Z", "content_hash": "abc"},
+        "title": null,
+        "metadata": {"kind": "document"},
+    });
+    let body = serde_json::json!({ "citations": [citation.clone()] }).to_string();
+    let (port, _received) =
+        start_routing_mock_server(vec![("POST", "/v1/search", "HTTP/1.1 200 OK", body)]);
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["--json", "search", "auth"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert_eq!(v["citations"][0]["heading_path"], citation["heading_path"]);
+    assert_eq!(v["citations"][0]["uri"], citation["uri"]);
+    assert_eq!(v["citations"][0]["snippet"], citation["snippet"]);
+}
+
+/// `store add` shape parity: embedded and daemon-mock must produce
+/// byte-identical `--json` and text output (issue #187 stage 5) -- the
+/// daemon-only `(via daemon)` suffix the old hand-written branch printed is
+/// gone.
+#[test]
+fn store_add_shape_parity_between_embedded_and_daemon_mock() {
+    let embedded_dir = TempDir::new().unwrap();
+    write_default_config(&embedded_dir);
+    let embedded_text = cmd_with_dir(&embedded_dir)
+        .args(["store", "add", "parity-store"])
+        .output()
+        .unwrap();
+    assert!(embedded_text.status.success());
+    let embedded_text_stdout = String::from_utf8_lossy(&embedded_text.stdout).to_string();
+    assert!(
+        !embedded_text_stdout.contains("via daemon"),
+        "sanity: embedded output must never mention daemon mode"
+    );
+
+    let daemon_dir = TempDir::new().unwrap();
+    write_default_config(&daemon_dir);
+    let add_body = r#"{"name":"parity-store","id":"01STOREID000000000000000A","visibility":"private","backend":"libsql"}"#;
+    let (port, received) = start_routing_mock_server(vec![(
+        "POST",
+        "/v1/stores",
+        "HTTP/1.1 201 Created",
+        add_body.to_string(),
+    )]);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let daemon_text = cmd_with_dir(&daemon_dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["store", "add", "parity-store"])
+        .output()
+        .unwrap();
+    assert!(daemon_text.status.success());
+    let daemon_text_stdout = String::from_utf8_lossy(&daemon_text.stdout).to_string();
+    assert_eq!(
+        embedded_text_stdout, daemon_text_stdout,
+        "text `store add` output must be identical between embedded and daemon-mock, with no \
+         '(via daemon)' suffix"
+    );
+
+    let daemon_json = cmd_with_dir(&daemon_dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["--json", "store", "add", "parity-store-2"])
+        .output()
+        .unwrap();
+    assert!(daemon_json.status.success());
+    let daemon_v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&daemon_json.stdout)).unwrap();
+    assert_eq!(daemon_v["status"], "ok", "{daemon_v}");
+    assert_eq!(daemon_v["name"], "parity-store", "{daemon_v}");
+    assert!(daemon_v.get("id").is_some(), "{daemon_v}");
+
+    let reqs = received.lock().unwrap();
+    assert!(reqs.iter().any(|(l, _)| l.starts_with("POST /v1/stores")));
+}
+
+/// `store remove` shape parity, mirroring `store_add_shape_parity_...`
+/// above: embedded and daemon-mock text output must be byte-identical, with
+/// no `(via daemon)` suffix.
+#[test]
+fn store_remove_shape_parity_between_embedded_and_daemon_mock() {
+    let embedded_dir = TempDir::new().unwrap();
+    write_default_config(&embedded_dir);
+    cmd_with_dir(&embedded_dir)
+        .args(["store", "add", "removeme"])
+        .assert()
+        .success();
+    let embedded_text = cmd_with_dir(&embedded_dir)
+        .args(["store", "remove", "--yes", "removeme"])
+        .output()
+        .unwrap();
+    assert!(embedded_text.status.success());
+    let embedded_text_stdout = String::from_utf8_lossy(&embedded_text.stdout).to_string();
+
+    let daemon_dir = TempDir::new().unwrap();
+    write_default_config(&daemon_dir);
+    let remove_body = r#"{"status":"ok"}"#;
+    let (port, received) = start_routing_mock_server(vec![(
+        "DELETE",
+        "/v1/stores/removeme",
+        "HTTP/1.1 204 No Content",
+        remove_body.to_string(),
+    )]);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    let daemon_text = cmd_with_dir(&daemon_dir)
+        .env("LOCALDB_DAEMON_URL", &daemon_url)
+        .args(["store", "remove", "--yes", "removeme"])
+        .output()
+        .unwrap();
+    assert!(
+        daemon_text.status.success(),
+        "daemon-routed store remove should succeed; stderr: {}",
+        String::from_utf8_lossy(&daemon_text.stderr)
+    );
+    let daemon_text_stdout = String::from_utf8_lossy(&daemon_text.stdout).to_string();
+    assert_eq!(
+        embedded_text_stdout, daemon_text_stdout,
+        "text `store remove` output must be identical between embedded and daemon-mock, with no \
+         '(via daemon)' suffix"
+    );
+    assert!(!daemon_text_stdout.contains("via daemon"));
+
+    let reqs = received.lock().unwrap();
+    assert!(reqs
+        .iter()
+        .any(|(l, _)| l.starts_with("DELETE /v1/stores/removeme")));
 }

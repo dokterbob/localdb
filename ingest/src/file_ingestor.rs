@@ -81,29 +81,37 @@ impl Ingestor for FileIngestor {
 
         // `enumerate_path_source` owns directory-walk, hidden-file, extension
         // and glob filtering behavior (shared with any other path-source caller).
-        let files = match enumerate_path_source(root, &include, &exclude)? {
-            PathEnumeration::Complete(files) => files,
-            PathEnumeration::RootUnavailable => {
-                // #156: the root isn't there — an unmounted volume, a detached
-                // external disk, a directory that moved. We have observed
-                // nothing about this source's contents, which is *not* the
-                // same as observing that it is empty. Reporting
-                // `Enumeration::Incomplete` is what stops
-                // `run_source_ingestion`'s delete-sweep from reading our zero
-                // resources as "every document in this source was deleted."
-                tracing::warn!(
-                    root = %root,
-                    "source root is not reachable — enumerating nothing this run"
-                );
-                callback.on_discovered(0).await;
-                return Ok(IngestResult {
-                    enumeration: Enumeration::Incomplete {
-                        reason: format!("source root is not reachable: {root}"),
-                    },
-                    ..Default::default()
-                });
-            }
-        };
+        //
+        // The walk is blocking filesystem I/O (`std::fs::read_dir` recursion);
+        // this may run under the daemon's shared HTTP/SSE-serving tokio
+        // runtime (issue #187 real ingestion), so it's guarded with
+        // `run_blocking` rather than called inline — see
+        // `core::blocking::run_blocking`'s doc comment for why that's
+        // `block_in_place`-on-multi-thread rather than a bare call.
+        let files =
+            match localdb_core::run_blocking(|| enumerate_path_source(root, &include, &exclude))? {
+                PathEnumeration::Complete(files) => files,
+                PathEnumeration::RootUnavailable => {
+                    // #156: the root isn't there — an unmounted volume, a detached
+                    // external disk, a directory that moved. We have observed
+                    // nothing about this source's contents, which is *not* the
+                    // same as observing that it is empty. Reporting
+                    // `Enumeration::Incomplete` is what stops
+                    // `run_source_ingestion`'s delete-sweep from reading our zero
+                    // resources as "every document in this source was deleted."
+                    tracing::warn!(
+                        root = %root,
+                        "source root is not reachable — enumerating nothing this run"
+                    );
+                    callback.on_discovered(0).await;
+                    return Ok(IngestResult {
+                        enumeration: Enumeration::Incomplete {
+                            reason: format!("source root is not reachable: {root}"),
+                        },
+                        ..Default::default()
+                    });
+                }
+            };
 
         // Signal `Discovered { total }` right after enumeration and before
         // processing the first file.
@@ -112,8 +120,36 @@ impl Ingestor for FileIngestor {
         let mut result = IngestResult::default();
 
         for file in &files {
-            let bytes = match std::fs::read(&file.path) {
-                Ok(b) => b,
+            // Read + mtime in one `run_blocking` hop per file: both are
+            // blocking filesystem I/O (`std::fs::read`, `Path::metadata`),
+            // and this may run under the daemon's shared HTTP/SSE-serving
+            // tokio runtime (issue #187 real ingestion) — see
+            // `core::blocking::run_blocking`'s doc comment for why that's
+            // `block_in_place`-on-multi-thread rather than a bare call.
+            // mtime -> fetched_at/added_at/modified_at, formatted as RFC 3339
+            // (falls back to "now" if the filesystem doesn't report a
+            // modified time); only computed once the read succeeds, matching
+            // the original sequencing.
+            let (bytes, fetched_at) = match localdb_core::run_blocking(
+                || -> Result<(Vec<u8>, String), std::io::Error> {
+                    let bytes = std::fs::read(&file.path)?;
+                    let fetched_at = file
+                        .path
+                        .metadata()
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .map(|t| {
+                            let secs = t
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            format_unix_secs(secs)
+                        })
+                        .unwrap_or_else(now_rfc3339);
+                    Ok((bytes, fetched_at))
+                },
+            ) {
+                Ok(v) => v,
                 Err(e) => {
                     // Debug, not warn: `core::ingestion` emits the single
                     // user-facing WARN for every SkipReason::Error (it owns
@@ -134,23 +170,6 @@ impl Ingestor for FileIngestor {
                     continue;
                 }
             };
-
-            // mtime -> fetched_at/added_at/modified_at, formatted as RFC 3339
-            // (falls back to "now" if the filesystem doesn't report a
-            // modified time).
-            let fetched_at = file
-                .path
-                .metadata()
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .map(|t| {
-                    let secs = t
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    format_unix_secs(secs)
-                })
-                .unwrap_or_else(now_rfc3339);
 
             let filename = file
                 .path
@@ -181,9 +200,16 @@ impl Ingestor for FileIngestor {
             // surfaced via `on_skipped` + `SkipReason::Error` (a panic IS an
             // error, matching the old pipeline's behavior of folding panics
             // into the error count, C8) rather than the benign-skip counter.
-            let parsed = match catch_panic(std::panic::AssertUnwindSafe(|| {
-                self.parser.parse(&probe)
-            })) {
+            //
+            // `Parser::parse` is documented sync/CPU-bound (`core::parser`);
+            // this may run under the daemon's shared HTTP/SSE-serving tokio
+            // runtime (issue #187 real ingestion), so it's guarded with
+            // `run_blocking` rather than called inline — see
+            // `core::blocking::run_blocking`'s doc comment for why that's
+            // `block_in_place`-on-multi-thread rather than a bare call.
+            let parsed = match localdb_core::run_blocking(|| {
+                catch_panic(std::panic::AssertUnwindSafe(|| self.parser.parse(&probe)))
+            }) {
                 Err(panic_msg) => {
                     // Debug: `core::ingestion` owns the user-facing WARN.
                     tracing::debug!(uri = %file.uri, "FileIngestor: parser panicked: {}", panic_msg);
@@ -465,6 +491,78 @@ mod tests {
             // Parity fix: policy_version comes from the source, not "v1".
             assert_eq!(res.policy_version, "policy-xyz");
         }
+    }
+
+    /// Issue #187 review finding 2: `self.parser.parse(&probe)` is guarded
+    /// with `localdb_core::run_blocking` (`core::blocking`) because it may
+    /// now run under the daemon's shared multi-thread tokio runtime.
+    /// `run_blocking` takes its `block_in_place` branch only on a
+    /// multi-thread runtime — the default `#[tokio::test]` used by every
+    /// other test in this module is current-thread, so it never exercises
+    /// that branch. This test forces `flavor = "multi_thread"` so a real
+    /// end-to-end file ingestion actually drives the `block_in_place` path
+    /// (not just `core::blocking`'s own unit tests in isolation), proving
+    /// the call site doesn't panic there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn discovery_on_multi_thread_runtime_exercises_block_in_place_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), "# A\n\nContent A.").unwrap();
+        std::fs::write(dir.path().join("b.md"), "# B\n\nContent B.").unwrap();
+
+        let ingestor = FileIngestor::new(Box::new(AllParser));
+        let source = source_with_root(dir.path().to_str().unwrap());
+        let mut cb = RecordingCallback::default();
+        let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+        assert_eq!(cb.discovered, vec![2]);
+        assert_eq!(result.resources_produced, 2);
+        assert_eq!(cb.resources.len(), 2);
+    }
+
+    /// Codex review finding F6: `enumerate_path_source` (the directory walk)
+    /// and the per-file `std::fs::read` + `metadata()` hop are now guarded
+    /// with `localdb_core::run_blocking`, for the same reason as the
+    /// `parser.parse` call covered by
+    /// `discovery_on_multi_thread_runtime_exercises_block_in_place_guard`
+    /// above: this ingestor may run under the daemon's shared multi-thread
+    /// tokio runtime, and `run_blocking` only takes its `block_in_place`
+    /// branch there — the default `#[tokio::test]` current-thread runtime
+    /// never exercises it. This test forces `flavor = "multi_thread"` and
+    /// includes an unreadable file so the walk, the successful-read hop, and
+    /// the failed-read hop (which reports `SkipReason::Error`, not a panic)
+    /// all execute inside `block_in_place` at least once. It does not (and
+    /// cannot, per the task's stated limitation) prove worker-starvation is
+    /// avoided — only that the wrapped paths still behave correctly on a
+    /// multi-thread runtime.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn file_walk_and_read_on_multi_thread_runtime_exercise_block_in_place_guard() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), "# A\n\nContent A.").unwrap();
+        std::fs::write(dir.path().join("b.md"), "# B\n\nContent B.").unwrap();
+        let unreadable = dir.path().join("unreadable.md");
+        std::fs::write(&unreadable, "# C\n\nContent C.").unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let ingestor = FileIngestor::new(Box::new(AllParser));
+        let source = source_with_root(dir.path().to_str().unwrap());
+        let mut cb = RecordingCallback::default();
+        let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+        // Restore permissions so tempdir cleanup can remove the file.
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(cb.discovered, vec![3], "the walk found all three files");
+        assert_eq!(
+            result.resources_produced, 2,
+            "the two readable files are still indexed"
+        );
+        assert_eq!(
+            result.errors, 1,
+            "the unreadable file is still reported as a read error"
+        );
     }
 
     /// #103 end-to-end: a parser emitting `page_starts` produces a resource

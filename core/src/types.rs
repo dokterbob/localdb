@@ -446,6 +446,18 @@ pub struct IndexJob {
     #[serde(default)]
     pub error: Option<String>,
 
+    /// Stable machine-readable error code (`Error::code()`) if state is
+    /// `Failed` and the failure came from a typed `core::Error` — `None` for
+    /// a synthetic queue-level failure (e.g. "job queue is full or closed",
+    /// a task panic) that never had one. `#[serde(default)]` so an older
+    /// daemon's job JSON (predating this field) still deserializes.
+    /// `cli::job_attach::finish_job` reconstructs the original typed error
+    /// via `Error::from_code(error_code, error)` so a daemon-attached job
+    /// failure exits with the same code an embedded pre-flight failure of
+    /// the same kind would (issue #187 review).
+    #[serde(default)]
+    pub error_code: Option<String>,
+
     /// When the job was created (RFC 3339).
     pub created_at: String,
 
@@ -481,20 +493,42 @@ pub enum IndexJobState {
 }
 
 /// Statistics accumulated during indexing.
+///
+/// `#[serde(default)]` at the struct level (issue #187 stage 3): a job
+/// producer (or a test fixture) may omit any subset of these fields and
+/// still deserialize cleanly, with the omitted fields defaulting to 0 —
+/// important now that `IndexJob`s cross the wire (`GET
+/// /v1/jobs/{id}/events`'s terminal `job` frame) to a CLI that only cares
+/// about a few of them in most cases.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct IndexJobStats {
     /// Documents seen in the scan.
     pub docs_seen: u64,
     /// Documents actually indexed (new or changed).
     pub docs_indexed: u64,
+    /// Documents skipped (unchanged content hash).
+    pub docs_skipped: u64,
     /// Documents deleted (source removed them).
     pub docs_deleted: u64,
+    /// Documents that would have been deleted had deletion been enabled
+    /// (`DeletionPolicy::Retain` ran instead of `Prune`) — mirrors
+    /// `IngestionResult::docs_prunable`, surfaced here so a daemon-submitted
+    /// job can report the same "N no longer at source (kept; use --delete to
+    /// remove)" information the embedded CLI path already does.
+    pub docs_prunable: u64,
     /// Chunks written to the retrieval backend.
     pub chunks_written: u64,
     /// Files that could not be indexed due to unsupported format.
     pub unsupported_format_count: u64,
     /// Files that errored during indexing.
     pub error_count: u64,
+    /// Number of sources the job's scope resolved to, before any were
+    /// processed. Distinguishes "this store/source had nothing to index" (0)
+    /// from "sources existed but nothing needed indexing" (>0, all other
+    /// counters 0) — the same distinction `IndexSummary::has_sources` makes
+    /// on the CLI side (issue #187 stage 3).
+    pub sources_count: u64,
 }
 
 #[cfg(test)]
@@ -858,6 +892,7 @@ mod tests {
             state: IndexJobState::Pending,
             stats: IndexJobStats::default(),
             error: None,
+            error_code: None,
             created_at: "2026-06-10T12:00:00Z".to_string(),
             started_at: None,
             completed_at: None,
@@ -865,6 +900,25 @@ mod tests {
         let json = serde_json::to_string(&job).unwrap();
         let job2: IndexJob = serde_json::from_str(&json).unwrap();
         assert_eq!(job, job2);
+    }
+
+    #[test]
+    fn index_job_error_code_defaults_to_none_when_absent_from_json() {
+        // A daemon predating this field (issue #187 review) emits `IndexJob`
+        // JSON with no `error_code` key at all — `#[serde(default)]` must
+        // still deserialize it, not fail the whole response.
+        let json = r#"{
+            "id": "job-1",
+            "store_id": "store-1",
+            "scope": {"type": "store"},
+            "state": "failed",
+            "stats": {},
+            "error": "boom",
+            "created_at": "2026-06-10T12:00:00Z"
+        }"#;
+        let job: IndexJob = serde_json::from_str(json).unwrap();
+        assert_eq!(job.error_code, None);
+        assert_eq!(job.error, Some("boom".to_string()));
     }
 
     #[test]

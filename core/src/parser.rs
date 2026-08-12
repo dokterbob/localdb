@@ -99,7 +99,15 @@ pub struct ParsedDocument {
 ///
 /// Implementors inspect the `Probe` and either decline (`Ok(None)`), handle
 /// (`Ok(Some(doc))`), or fail a recognized format (`Err(e)`). The trait is
-/// **sync** (CPU-bound); callers run it under `spawn_blocking`.
+/// **sync** (CPU-bound); callers on a shared async runtime must not call
+/// `parse` inline. In practice callers use [`crate::blocking::run_blocking`]
+/// (`tokio::task::block_in_place` on a multi-thread runtime, inline
+/// otherwise — see its doc comment) rather than `spawn_blocking`: `parse`
+/// borrows caller-local state (parser chain, probe bytes) that would need to
+/// be `'static` and moved to satisfy `spawn_blocking`'s bound, which
+/// `run_blocking`'s same-thread `block_in_place` doesn't require. See
+/// `ingest/src/file_ingestor.rs` and `ingest/src/url_pipeline.rs` for the
+/// call sites this backs.
 pub trait Parser: Send + Sync {
     /// Stable id used in the config `parsers:` list and in diagnostics.
     fn id(&self) -> &'static str;

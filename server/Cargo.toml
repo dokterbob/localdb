@@ -10,9 +10,26 @@ description = "HTTP API daemon: axum REST API, file watching, job queue, unix so
 localdb-core = { path = "../core" }
 store-libsql = { path = "../store-libsql" }
 embed = { path = "../embed" }
+extract = { path = "../extract" }
+fetch = { path = "../fetch" }
+ingest = { path = "../ingest" }
 mcp = { path = "../mcp" }
 async-trait = { workspace = true }
 axum = { workspace = true }
+# `axum_extra::extract::Query` (issue #187 review, finding F7): unlike
+# `axum::extract::Query`, it deserializes repeated query keys into a
+# `Vec<T>` field via `serde_html_form` — needed for `GET /status`'s
+# repeatable `?store=` scoping param (`server/src/handlers/status.rs`),
+# mirroring the CLI's repeatable `--store` flag.
+axum-extra = { version = "0.12", default-features = false, features = ["query"] }
+# `futures::stream::unfold` builds the `GET /v1/jobs/{id}/events` SSE stream
+# (issue #83) — `axum::response::sse::Sse` requires its payload to implement
+# `futures_util::stream::Stream`, which `futures` re-exports. Already a
+# pinned workspace dependency (`futures = "0.3"` in the root `Cargo.toml`,
+# already resolved in `Cargo.lock` as a transitive dependency of `axum`
+# itself) — this only newly *directly* depends on it for `server`, it does
+# not add a new crate to the dependency graph.
+futures = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true }
 serde = { workspace = true }
@@ -29,6 +46,7 @@ serde_yaml = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
+tracing-subscriber = { workspace = true }
 
 # Client-side transport for the `/mcp` route's round-trip integration test
 # (server/tests/mcp_route.rs) — not used by any non-test code, which only

@@ -43,6 +43,32 @@ pub const DEFAULT_LEG_K: usize = 50;
 pub const DEFAULT_TOP_N: usize = 10;
 
 // ---------------------------------------------------------------------------
+// Search limit clamp
+// ---------------------------------------------------------------------------
+
+/// Maximum `limit`/`top_n` a client may request from any search-serving
+/// surface. Requests above this are silently clamped, not rejected. All
+/// three surfaces that accept a client-supplied result count clamp to this
+/// single constant, so `localdb search --limit <huge>` behaves identically
+/// whether it runs embedded or against the daemon:
+/// - HTTP `POST /v1/search` (`server::search_service::clamp_search_limit`)
+/// - the MCP `search` tool (`mcp::tools::resolve_search_limit`)
+/// - the CLI's embedded `search` command
+///   (`cli::cmds::search::SearchCmd::run_embedded`)
+pub const SEARCH_MAX_LIMIT: usize = 100;
+
+/// Clamp a client-supplied `limit` to [`SEARCH_MAX_LIMIT`], silently — no
+/// error. Shared by the HTTP and CLI-embedded search surfaces, whose `limit`
+/// is a plain `usize`. The MCP tool clamps separately
+/// (`mcp::tools::resolve_search_limit`) because its `limit` is an
+/// `Option<i64>` with its own absent/negative-handling semantics that don't
+/// fit this signature.
+#[inline]
+pub fn clamp_search_limit(limit: usize) -> usize {
+    limit.min(SEARCH_MAX_LIMIT)
+}
+
+// ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
@@ -532,6 +558,23 @@ mod tests {
             .next()
             .and_then(|d| d.into_iter().next())
             .unwrap_or_default()
+    }
+
+    // -----------------------------------------------------------------------
+    // Search limit clamp tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn clamp_search_limit_passes_through_values_at_or_below_the_max() {
+        assert_eq!(clamp_search_limit(1), 1);
+        assert_eq!(clamp_search_limit(SEARCH_MAX_LIMIT), SEARCH_MAX_LIMIT);
+    }
+
+    #[test]
+    fn clamp_search_limit_caps_values_above_the_max() {
+        assert_eq!(clamp_search_limit(SEARCH_MAX_LIMIT + 1), SEARCH_MAX_LIMIT);
+        assert_eq!(clamp_search_limit(100_000), SEARCH_MAX_LIMIT);
+        assert_eq!(clamp_search_limit(usize::MAX), SEARCH_MAX_LIMIT);
     }
 
     // -----------------------------------------------------------------------

@@ -3,7 +3,14 @@
 /// Shaped for parallel readiness: per-doc events are keyed by URI so
 /// out-of-order completion renders correctly, and `Discovered` is separate
 /// from per-doc events so a streaming walk can emit incremental discovery.
-#[derive(Debug, Clone)]
+///
+/// `Serialize`/`Deserialize` are derived so this type can cross a wire
+/// boundary (issue #83: SSE live job progress over `GET
+/// /v1/jobs/{id}/events`). Internally tagged (`tag = "type"`) to match this
+/// codebase's other wire enums (e.g. `IndexJobScope`) and to keep the JSON
+/// shape flat and easy for a JS `EventSource` consumer to switch on.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProgressEvent {
     SourceStarted {
         source_id: String,
@@ -28,7 +35,8 @@ pub enum ProgressEvent {
 }
 
 /// Outcome of processing a single document.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum DocOutcome {
     Indexed { chunks: usize },
     Skipped,

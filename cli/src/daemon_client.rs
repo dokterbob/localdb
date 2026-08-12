@@ -179,33 +179,20 @@ pub(crate) async fn daemon_request_async(
 /// Map a daemon HTTP error body's stable `code` string (see
 /// `server/src/error.rs` and specs/05-surfaces.md §5) to a `core::Error`.
 ///
-/// Extracted as a pure function so the code -> variant mapping (including
-/// the legacy-code fallback below) can be unit-tested without an HTTP round
-/// trip.
+/// Delegates the code -> variant mapping to [`Error::from_code`] — the same
+/// mapping `cli::job_attach::finish_job` uses to reconstruct a failed daemon
+/// job's typed error from its `error_code`/`error` fields, so the two
+/// boundaries (HTTP error bodies, job terminal state) never drift apart. Only
+/// the fallback for a code `from_code` doesn't recognize (an unknown/newer
+/// code, or `internal`/`unsupported_format`/`extraction_failed`, none of
+/// which round-trip through a single message string) is specific to this
+/// call site: it folds the HTTP status into the message, which `from_code`
+/// has no access to.
 fn decode_daemon_error(code: &str, msg: String, status: reqwest::StatusCode) -> Error {
-    match code {
-        "store_not_found" => Error::StoreNotFound { id: msg },
-        "source_not_found" => Error::SourceNotFound { id: msg },
-        "resource_not_found" => Error::ResourceNotFound { id: msg },
-        // Legacy code string from a stale daemon predating the
-        // resource_not_found rename (specs/05-surfaces.md §5); a v5+
-        // CLI may still talk to an older daemon binary, so keep
-        // decoding it to the same variant.
-        "document_not_found" => Error::ResourceNotFound { id: msg },
-        "job_not_found" => Error::JobNotFound { id: msg },
-        "runtime_state_locked" => Error::RuntimeStateLocked,
-        "daemon_running" => Error::DaemonRunning,
-        "daemon_unreachable" => Error::DaemonUnreachable,
-        "invalid_config" => Error::InvalidConfig { message: msg },
-        "invalid_request" => Error::InvalidRequest { message: msg },
-        "index_in_progress" => Error::IndexInProgress,
-        "provider_unavailable" => Error::ProviderUnavailable { message: msg },
-        "model_missing" => Error::ModelMissing { message: msg },
-        _ => Error::Internal {
-            message: format!("daemon returned {}: {}", status.as_u16(), msg),
-            correlation_id: "daemon_http".to_string(),
-        },
-    }
+    Error::from_code(code, msg.clone()).unwrap_or_else(|| Error::Internal {
+        message: format!("daemon returned {}: {}", status.as_u16(), msg),
+        correlation_id: "daemon_http".to_string(),
+    })
 }
 
 /// RFC 3986 "unreserved" characters (`ALPHA / DIGIT / "-" / "." / "_" /
@@ -442,6 +429,42 @@ mod tests {
             Error::ResourceNotFound {
                 id: "doc-1".to_string()
             }
+        );
+    }
+
+    /// Round-trip through the *real* producer, not a hand-typed bare
+    /// message: `server::error::ApiError::into_response` serializes the
+    /// JSON `{code, message}` body exactly as the daemon's axum handlers do,
+    /// and this feeds that body straight into `decode_daemon_error`. Guards
+    /// against the producer/consumer prefix-doubling regression (issue #187
+    /// review, finding F4): before the fix, the JSON body's `message`
+    /// already carried the "invalid config: " `Display` prefix, and
+    /// `Error::from_code` re-added the same prefix on reconstruction,
+    /// doubling it in the final `Display`ed error.
+    #[tokio::test]
+    async fn decode_daemon_error_round_trips_api_error_response_without_doubling_the_prefix() {
+        use axum::response::IntoResponse;
+        use server::error::ApiError;
+
+        let source_err = Error::InvalidConfig {
+            message: "unconfigured embedder provider".to_string(),
+        };
+        let response = ApiError::from(source_err.clone()).into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let code = body["code"].as_str().unwrap().to_string();
+        let msg = body["message"].as_str().unwrap().to_string();
+
+        let err = decode_daemon_error(&code, msg, status);
+        assert_eq!(err, source_err);
+        let rendered = err.to_string();
+        assert_eq!(
+            rendered.matches("invalid config:").count(),
+            1,
+            "the \"invalid config: \" prefix must appear exactly once, got: {rendered:?}"
         );
     }
 

@@ -79,8 +79,12 @@ socket for discovery, runs the file-watcher (`notify`), the URL refresh schedule
 background job queue. Opens the same unified database (`<data_dir>/localdb.db`) as the CLI;
 CLI-indexed data is visible. Multi-process is the first-class concurrency model — the daemon
 is one writer among peers (CLI sessions, multiple stdio MCP servers); concurrent writers
-serialise via SQLite WAL + `busy_timeout=5000`. Ingestion via `POST /v1/jobs` is currently a
-no-op — see [Known gaps §1](#known-gaps). See [specs/05-surfaces.md](../specs/05-surfaces.md) §3.
+serialise via SQLite WAL + `busy_timeout=5000`. Ingestion via `POST /v1/jobs` runs the real
+pipeline (`server::job_exec::run_job`) through an async, single-worker job queue with a
+per-store in-flight guard (issue #187) — not a stub; a second submission for a store already
+running rejects with `index_in_progress`, 409. `GET /jobs/{id}/events` streams the job's live
+progress over SSE (issue #83). The URL-refresh scheduler submits through the same job engine.
+See [specs/05-surfaces.md](../specs/05-surfaces.md) §3.
 
 ### `mcp`
 
@@ -292,8 +296,19 @@ This section documents verified divergences between the specs and the v0.1.0 imp
 
 **Recently closed, not (re)listed below:** `--store` used to be honored only by `search`/`mcp` — every other command silently operated on an arbitrary store instead of respecting the flag's absence consistently (#178, #118). `--store` is now resolved and validated the same way everywhere, with a per-command default documented in [specs/05-surfaces.md §2.2](../specs/05-surfaces.md#22-store-scope): all stores for `search`/`status`/`store list`/`index`, the store named `default` for `source`/`add`, and rejected outright for `db status`/`migrate`/`downgrade`. Separately, MCP `get_document`/`get_chunks` now accept an optional `store` argument (id or name) to disambiguate a document id that exists in more than one store (#144; see [docs/mcp.md](mcp.md#get_document)). Gaps #6 and #7 below (the `/mcp` HTTP store-list snapshot and daemon-proxied `localdb mcp --store`) are related but distinct and remain open.
 
-**1. HTTP daemon `POST /v1/jobs` is a no-op.** ([#187](https://github.com/dokterbob/localdb/issues/187))
-The daemon's job-submission endpoint accepts the request and reports the job state machine (`pending → done`) but does not run the ingestion pipeline; `chunks_written` stays `0`. Daemon-side reads (`/v1/search`, `/v1/documents/{id}`, `/v1/status`) DO see CLI-indexed data because the daemon now opens the same unified database as the CLI. `localdb index` does not route around this — when a daemon is running it proxies the job to the same no-op endpoint. To actually index, stop the daemon first, then run `localdb index`.
+**1. ~~HTTP daemon `POST /v1/jobs` is a no-op~~ — RESOLVED.** ([#187](https://github.com/dokterbob/localdb/issues/187))
+`POST /v1/jobs` now runs the real ingestion pipeline (`server::job_exec::run_job`) through an
+async, single-worker job queue with a per-store in-flight guard — a duplicate submission for a
+store already running rejects with `index_in_progress` (409), rather than silently no-opping.
+`localdb index` submits a job to the daemon and attaches to `GET /v1/jobs/{id}/events` (SSE,
+issue #83) for live progress, falling back to polling `GET /v1/jobs/{id}` if the stream can't be
+established; the summary, `--json`, and `--strict` output are identical to embedded mode. `index
+--delete` also works daemon-attached now (`deletion_policy` on the job request). Stopping the
+daemon before `localdb index` is no longer necessary. See
+[specs/05-surfaces.md](../specs/05-surfaces.md) §2/§3 for the full contract. Still a deliberate
+v1 scope cut: the job queue runs one job at a time (per process, not per store) — a worker-pool
+size is a follow-up, not blocking correctness since the per-store guard already prevents two
+concurrent jobs on the same store from racing.
 
 **Gap #2. `source add` does not validate path existence.** ([#14](https://github.com/dokterbob/localdb/issues/14))
 **Resolved as of 2026-06-28:** `cli/src/lib.rs` now validates path existence in `run_source_add_async` via `normalize_path_source`.

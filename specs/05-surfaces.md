@@ -1,6 +1,6 @@
 # Spec 05 — Surfaces: CLI, HTTP API, MCP
 
-> Status: accepted draft, revised 2026-06-30. All three surfaces sit on the same `core`
+> Status: accepted draft, revised 2026-08-11. All three surfaces sit on the same `core`
 > ([01-architecture.md](01-architecture.md) §1) and return the same Citation shape
 > ([02-domain-model.md](02-domain-model.md) §6) and error taxonomy (§5).
 
@@ -23,9 +23,9 @@ Single binary, subcommand tree. Global flags: `--config`, `--json`, `--store <na
 | `mcp` | Run MCP server on stdio; exposes all stores if `-s` is omitted, and `-s` genuinely narrows the exposed set in **both** modes (§4.2) | embedded core | thin client |
 | `status` | Stores, resource/chunk counts, policy staleness, daemon state, unified database file size and largest tables (§2.4); all stores if `-s` is omitted (§2.2) | reads directly | queries daemon |
 | `store add/list/remove` | Manage runtime-owned stores; `list` spans all stores if `-s` is omitted, `add`/`remove` name their store as an argument so `-s` is rejected, exit 2 (§2.2) | direct write | routed to daemon |
-| `source add/list/remove` | Manage sources on a store; `list` and `remove <ULID>` span all stores if `-s` is omitted, `add` defaults to the store named `default` (exit 2 if absent), `remove <path\|url>` requires `-s` (§2.2) | direct write | `add`/`remove` routed to daemon; `list` always reads the local database (§2.2 known limitation) |
+| `source add/list/remove` | Manage sources on a store; `list` and `remove <ULID>` span all stores if `-s` is omitted, `add` defaults to the store named `default` (exit 2 if absent), `remove <path\|url>` requires `-s` (§2.2) | direct write | `add`/`list`/`remove` all routed to daemon |
 | `add <path|url>...` | Alias for `source add` — add one or more sources to a store; same `default`-store rule as `source add` (§2.2) | direct write | routed to daemon |
-| `index [--store S]... [--source ID] [--strict] [--delete]` | One-shot scan & index; creates IndexJob; all stores if `-s` is omitted (§2.2) | runs job synchronously, progress to stderr | submits job, polls, streams progress |
+| `index [--store S]... [--source ID] [--strict] [--delete]` | One-shot scan & index; submits an `IndexJob` per resolved store through the shared async job engine (`server::job_exec::run_job`); all stores if `-s` is omitted (§2.2); `--delete` works in both modes | submits to a local, in-process job queue; live progress to stderr as the job's own progress events arrive | submits `POST /v1/jobs` (with `deletion_policy`), then attaches via `GET /v1/jobs/{id}/events` (SSE) for live progress, falling back to polling `GET /v1/jobs/{id}` every 500ms if the stream can't be established or drops; identical summary/`--json`/`--strict` output to embedded mode either way |
 | `search <query>... [--limit N] [--content-length N]` | Hybrid search with citations; `--content-length` is a **soft cap** on human-readable snippet chars (default 1000; JSON output always full text) — see §4 for the snapping behavior shared with MCP | embedded read | via API |
 | `db status` | Inspect schema state: current version, head version, pending/unsupported steps. Never refuses, even on a store newer than the binary; not store-scoped, `-s` is rejected, exit 2 (§2.2) | reads directly | error `daemon_running` |
 | `db migrate` | Apply pending migrations with per-step progress; legacy v1–v3 rebuild and any other destructive step require confirmation; prints a `localdb index` hint when a weight-class-3 migration ran; not store-scoped, `-s` is rejected, exit 2 (§2.2) | direct write | error `daemon_running` |
@@ -109,31 +109,25 @@ Additional rules:
   default  01KWEXGA9Y... [path] nextcloud
   ```
 
-- `index` across multiple stores emits one summary per store plus a combined total; `--json`
-  emits an array of per-store summaries. `--strict` exits 2 if **any** store reported errors, but
-  every store still runs to completion first — consistent with the "`--strict` never aborts
-  mid-run" rule (see "`localdb index --strict`" under §5).
+- `index` across multiple stores emits one summary per store plus a combined total. `--json` for a
+  **single** resolved store stays the pre-existing flat object (unchanged, no wrapping, no `store`
+  field); for **more than one** resolved store it wraps into `{"stores": [<per-store object, each
+  with a "store" name field>, ...], "total": <same-shaped object>}` — not a bare array. `--strict`
+  exits 2 if **any** store reported errors, but every store still runs to completion first —
+  consistent with the "`--strict` never aborts mid-run" rule (see "`localdb index --strict`" under
+  §5).
 - **Known limitation (#188):** daemon-routed `source remove` validates `--store` only
   *syntactically* (name shape, traversal safety) — it cannot confirm the source actually belongs
   to the named store, because `DELETE /v1/sources/{id}` is store-agnostic. Embedded (daemonless)
   mode does enforce this, since it resolves the source through the named store's own row.
-- **Known limitation: `source list` never consults the daemon.** Unlike `source add`/`remove`,
-  `source list` has no daemon branch at all — it always opens the local database directly and
-  resolves `--store` scope against it, even when a daemon is running. In the common case (daemon
-  and CLI share one data directory) this is invisible: the local database and the daemon's store
-  set agree. It only surfaces when `LOCALDB_DAEMON_URL` points at a daemon with a *different* data
-  directory: `source add`/`remove` and `index` resolve scope against the daemon's store set (see
-  the next bullet), but `source list` still reads whatever store set the local database happens to
-  have, which can disagree with what a preceding `source add` just reported. The table in §2 lists
-  `source add/list/remove` together as "routed to daemon"; that is only true of `add` and `remove`.
-- **Daemon-routed scope resolution asks the daemon, not the local database.** `source add`/`remove`
-  (via their daemon branches) and `index` resolve `--store` scope by paginating `GET /v1/stores`
-  to exhaustion, because a running daemon may point at a different data directory than the one
-  this process would otherwise open (`LOCALDB_DAEMON_URL`) and is the authority on which stores
-  exist either way. `source list` is the exception — see the known limitation above. The same
-  omitted-vs-explicit distinction from the table above still holds for the commands that do ask the
-  daemon: an omitted `-s` resolving against a daemon with no store named `default` is
-  `invalid_request`, exit 2, with the same `no store named 'default'; pass --store <name>` message;
+- **Daemon-routed scope resolution asks the daemon, not the local database.** `source
+  add`/`list`/`remove` (via their daemon branches) and `index` resolve `--store` scope by
+  paginating `GET /v1/stores` to exhaustion, because a running daemon may point at a different
+  data directory than the one this process would otherwise open (`LOCALDB_DAEMON_URL`) and is the
+  authority on which stores exist either way. The same omitted-vs-explicit distinction from the
+  table above still holds for every command that asks the daemon: an omitted `-s` resolving
+  against a daemon with no store named `default` is `invalid_request`, exit 2, with the same
+  `no store named 'default'; pass --store <name>` message;
   an *explicit* `--store default` the daemon does not have is `store_not_found`, exit 3, same as
   any other explicit unknown name — the implicit default and an explicit request for that same name
   are not the same failure.
@@ -154,6 +148,10 @@ Additional rules:
   completed so far>]}` to stdout, then exits with the failing error's normal exit code, instead of
   routing through the usual stderr-only error shape. The buffered `results` are output data, not
   merely an error message, so — like every other `--json` document — they belong on stdout.
+- `source add`'s per-item output — `{"id": ..., "store": {"name": ...}, "kind": ...}` per source,
+  wrapped as described above — is identical whether the source was persisted locally or via a
+  daemon; the daemon transport never echoes its own raw persisted-record response. Text mode is
+  likewise identical either way (`Added source <id> to store '<name>'`, no daemon-specific suffix).
 
 ### 2.3 Feed sources
 
@@ -169,9 +167,17 @@ recommends `--max-entries` to bound that.
 `source list` (human) renders feed rows as `{id} [feed] {url} (max_entries=…, full_content=on|off)`
 — `…` is the configured integer or `unbounded`. `--json` adds parsed `max_entries` (`null` or integer)
 and `fetch_full_content` (bool), reconstructed from `config_json` (never the raw column), and now
-also surfaces `refresh` for both `url` and `feed` sources. These shapes compose with §2.2's
-store-scope rule: the store-name column (human) and `store` field (`--json`) are prepended when
-more than one store is in scope, and the feed detail above is what follows it.
+also surfaces `refresh` for both `url` and `feed` sources. The **human** rendering's store-name
+column still follows §2.2's scope rule — prepended only when more than one store is in *the
+resolved scope*, independent of which of those stores actually contributed a row to the output (a
+scope of two stores where only one has any sources still gets the column on that one row — issue
+#187 review, finding 1). The **`--json`** `store` field (`{"name": ...}`) is different: it is
+emitted **unconditionally**, on every row regardless of how many stores are in scope, matching the
+pre-existing embedded behavior — there never was a single-store special case on the `--json` path,
+and the feed detail above composes with it either way. A top-level, sibling `store_id` field (the
+owning store's ULID, not its name) is emitted unconditionally alongside `store` on every row too
+(issue #187 review, finding 2) — pre-existing embedded behavior, also documented in `docs/cli.md`'s
+`source list --json` example.
 
 ### 2.4 `status` output
 
@@ -226,22 +232,119 @@ later if a consumer demands it).
   exposed this makes them. The daemon also records its client-reachable base URL (loopback
   substituted for a wildcard bind) in a discovery file so CLI/MCP clients can find it regardless
   of bind address or port ([01-architecture.md](01-architecture.md) §3).
-- **Resources** (`/v1`): `GET/POST /stores`, `GET/PATCH/DELETE /stores/{id}`,
-  `GET/POST /stores/{id}/sources`, `POST /search` (body: query, store filter, metadata filters,
-  limit; citations carry full `Metadata`), `GET /resources/{id}` (response includes
-  `metadata: Metadata`), `POST /jobs` (index requests), `GET /jobs/{id}`, `GET /status`,
-  `GET /config` (resolved config).
-- **Feed sources:** `POST /stores/{id}/sources` accepts `{kind: "feed", spec: {url, max_entries,
+- **Resources** (`/v1`): `GET/POST /stores`, `GET/PATCH/DELETE /stores/{name}`,
+  `GET/POST /stores/{name}/sources`, `POST /search` (body: query, store filter, metadata filters,
+  limit; citations carry full `Metadata`), `GET /documents/{id}` (response includes
+  `metadata: Metadata`), `POST /jobs` (index requests), `GET /jobs/{id}`, `GET /jobs/{id}/events`
+  (SSE, below), `GET /status`, `GET /config` (resolved config). Store records (`GET/POST /stores`,
+  `GET /stores/{name}`) include `id` alongside `name`/`visibility`/`backend`. Despite the
+  `{name}` path param, stores are still looked up and returned with their `id` intact — `{name}`
+  is only how the route addresses *which* store, not a claim that `id` is dropped from the shape.
+- **Feed sources:** `POST /stores/{name}/sources` accepts `{kind: "feed", spec: {url, max_entries,
   fetch_full_content}, preset, refresh}` — `spec` mirrors `SourceSpec::Feed`
   ([02-domain-model.md](02-domain-model.md) §2). Validation failures (`max_entries: 0`, a
   non-`http(s)` `url`, etc.) are `invalid_request`, 400. `GET .../sources` reconstructs a clean
   `spec` object per source from `config_json` (never the raw column) and now surfaces `refresh`
   for both `url` and `feed` sources. Feed's `refresh` is persisted and validated the same as
-  `url`'s but is currently inert — no scheduled refresh runs yet for either kind.
-- **Long-running work:** indexing is a **job resource**: `POST /jobs` → `202` + job; clients poll
-  `GET /jobs/{id}`. SSE progress streaming is roadmap ([06-roadmap.md](06-roadmap.md) §5) — the
-  job resource is designed so SSE adds a representation, not a new model.
+  `url`'s, but only `url`-source scheduled refresh is actually live: the daemon's URL-refresh
+  scheduler (`server::scheduler`) polls every 60s and submits a real job through the same job
+  engine `POST /jobs` uses for any `url` source past its `refresh` interval. Feed-source scheduled
+  refresh is not yet wired — the scheduler only ever registers `SourceKind::Url` sources, so a
+  feed source's `refresh` is persisted and round-tripped but has no effect until a manual
+  `POST /jobs` (or CLI `index`) runs.
+- **Long-running work:** indexing is a **job resource**, and `POST /jobs` runs the real ingestion
+  pipeline (`server::job_exec::run_job`) through an async, single-worker queue (issue #187) — not
+  a stub. Body: `{store_name, source_id?, deletion_policy?}`; `store_name` is required, `source_id`
+  narrows the job to one source (omit to index the whole store), `deletion_policy` is `"retain"`
+  (default — nothing is ever removed) or `"delete"` (prunes documents no longer present at their
+  source, mirroring CLI `index --delete`) — any other value is `invalid_request`, 400. `POST
+  /jobs` → `202` + the created `IndexJob`. A second `POST /jobs` for a store that already has a
+  job queued or running is rejected with `index_in_progress`, 409 (§5) — one job per store at a
+  time; a per-store in-flight guard is reserved atomically at submit time, before the job is
+  created, so two concurrent submissions can never both proceed. Jobs for *different* stores run
+  concurrently against a single sequential worker (job worker pool size N>1 is a follow-up, not
+  v1 scope). The URL-refresh scheduler submits jobs through this same engine, not a separate code
+  path. Clients poll `GET /jobs/{id}` for the current `IndexJob` (state
+  `pending`/`running`/`done`/`failed`, `stats`, `error`, `error_code`, timestamps) or stream `GET
+  /jobs/{id}/events` for live progress (below). `error_code` (issue #187 review, finding 3) is the
+  failing `core::Error`'s stable `code()` string (§5) when the job's `Failed` state came from a
+  typed error — `null`/absent for a synthetic queue-level failure (the queue itself full/closed, or
+  the job's task panicking) that never had one, and always absent on `done`. `error_code` +
+  `error` round-trip through the same `code -> Error` mapping a daemon HTTP error body's `code`
+  field does (§5), so a daemon-attached CLI client reconstructs the original typed error and exits
+  with the same code an equivalent embedded failure would, instead of collapsing every job failure
+  to a generic internal error. `#[serde(default)]`, so a daemon predating this field omits the key
+  entirely rather than sending `null`.
+- **`GET /jobs/{id}/events`** (SSE, issue #83): streams the job's live progress as
+  `text/event-stream`. Each in-flight update is an `event: progress` frame whose `data:` is one
+  JSON-serialized `core::ProgressEvent` (internally tagged `type`: `source_started`,
+  `discovered`, `document_started`, `document_finished`, `source_finished`). The stream always
+  ends with exactly one `event: job` frame carrying the terminal `IndexJob` (state `done` or
+  `failed`) as `data:`, after which the connection closes — there is no further `progress` frame
+  after the `job` frame. A subscriber that connects after the job has already reached a terminal
+  state (or after its live channel has already been torn down) gets *only* that terminal `job`
+  event, immediately — it never sees the `progress` events it missed; progress delivery is
+  lossy/best-effort by design (a lagging subscriber skips buffered events rather than stalling
+  the stream or growing memory unboundedly), but the terminal event is always guaranteed exactly
+  once. Unknown `job_id` → `job_not_found`, 404. `GET /jobs/{id}` and `GET /jobs/{id}/events`
+  report the identical terminal `IndexJob` shape.
+- **`GET /status`** returns, beyond the pre-existing `daemon`/`store_count`/`source_count`/
+  `job_count`: a `stores[]` array with one entry per store (`name`, `visibility`, `backend`,
+  `document_count`, `chunk_count` — the latter two `null` if that store's `RetrievalStore::stats()`
+  call itself failed, mirroring the embedded CLI's `status`, specs §2.4) and a top-level
+  `database` object (`path`, `exists`, `size_bytes`, `wal_size_bytes`, `total_size_bytes`,
+  `bytes_per_chunk`, `largest_tables`) describing the one shared `localdb.db` file — same shape and
+  same fields as the embedded CLI's `status --json` (§2.4), so daemon-routed and embedded `status`
+  render identically.
+  - **Per-store source listing is best-effort, exactly like the adjacent per-store stats call**
+    (issue #187 review, finding F7): a store whose source listing fails (e.g. a corrupt or
+    mid-migration store) still gets an entry in `stores[]` with `document_count`/`chunk_count`
+    reflecting whatever `RetrievalStore::stats()` managed, but contributes nothing to
+    `source_count` rather than failing the whole response — one broken store must not blank out
+    the report on every other store, the same rule the stats call already followed.
+  - **`?store=` (repeatable) scopes the response to specific stores**, mirroring CLI `--store`
+    (§2.2): `GET /status?store=a&store=b` gathers and reports only stores `a` and `b`; stores
+    outside the requested set are never queried (neither their sources nor their
+    `RetrievalStore::stats()`) — the same "gather only what's in scope" behavior the embedded
+    CLI's `resolve_store_scope_inner` already gives `status --store`. `store_count`, `source_count`,
+    and the `database` object's `bytes_per_chunk` (derived from the scoped stores' chunk counts)
+    are computed over the subset; `job_count` and the rest of `database` (the shared file's own
+    size/table figures) are unaffected by scope — jobs and the on-disk file aren't per-store
+    resources. An unknown store name is `store_not_found`, HTTP 404 — parity with the embedded
+    CLI's exit code 3 for an unresolvable explicit `--store` name. A name that resolves to a real
+    but broken store degrades best-effort like the unscoped case, it does not 404. Omitting
+    `?store=` entirely is the pre-existing all-stores behavior.
+  - **Scope resolution reads raw store rows and does not require every store's indexing policy to
+    parse** (Codex review, issue #187 PR #212 finding G2): resolving `?store=` (or listing every
+    store when it's omitted) reads `name`/`id`/`visibility`/`backend` straight off the DB-backed
+    store row — `status` never reads a store's parsed indexing policy, so it must not fail just
+    because one is malformed. A malformed `indexing_policy` — on the requested store itself, on a
+    store outside the requested scope, or on any store in the unscoped, all-stores case — must
+    never fail the request; it degrades best-effort exactly like a store whose source listing or
+    `RetrievalStore::stats()` call fails.
 - **Pagination:** cursor-based (`?cursor=`, `?limit=`) on list endpoints from day one.
+- **`POST /search` limit clamp and cursor overflow (issue #187 review, finding G3):** `limit` is
+  silently clamped to a maximum of 100, matching the MCP `search` tool's own cap — the same
+  `SEARCH_MAX_LIMIT` idiom (§4, `mcp/src/tools.rs::resolve_search_limit`): a request for more than
+  100 gets 100 back, not an error. A `cursor`/`limit`
+  combination whose page end (`cursor + limit`) overflows `usize` is rejected as `invalid_request`,
+  HTTP 400, rather than panicking or silently wrapping — a client cannot use an out-of-range
+  cursor to crash or confuse pagination. `GET /stores` and `GET /stores/{name}/sources` compute the
+  same `offset + limit` internally but treat an overflow there as end-of-list (`next_cursor: null`)
+  instead of an error, since an offset/limit pair that large can never address a real page of
+  either list.
+- **`localdb search` clamps identically in embedded and daemon mode (issue #187 review, finding
+  1):** the 100-item cap above is not a `/v1/search`-only concern — `localdb search --limit
+  <huge>` must return the same number of results whether or not a daemon happens to be running,
+  since that is this PR's whole point. The cap lives in exactly one place,
+  `localdb_core::search::SEARCH_MAX_LIMIT` (plus its `clamp_search_limit` helper), and every
+  surface that accepts a client-supplied result count clamps to it: `POST /v1/search`
+  (`server::search_service::clamp_search_limit`, now a thin re-export), the MCP `search` tool (§4,
+  `mcp::tools::resolve_search_limit`, which clamps its own `Option<i64>` against the same
+  constant), and the CLI's embedded `search` command (`cli::cmds::search::SearchCmd::run_embedded`,
+  which clamps `self.limit` before it becomes `QueryRequest::top_n`). The CLI's daemon-attached
+  branch sends its raw, unclamped `limit` in the request body — `/v1/search` clamps it there, so no
+  second clamp is needed on the way out.
 
 ## 4. MCP
 
@@ -495,6 +598,23 @@ MCP tool error). Codes are stable API:
 CLI exit codes: `0` ok, `1` internal, `2` invalid usage/config, `3` not found, `4` conflict/locked,
 `5` unavailable (daemon/provider/model).
 
+`core::Error::from_code(code, message)` is the one mapping back from a `{code, message}` pair to a
+typed `Error` (the inverse of `code()` above), shared by every surface that receives an error this
+way rather than as the enum itself: a daemon HTTP error body's `code` field
+(`cli::daemon_client::decode_daemon_error`) and a failed `IndexJob`'s `error_code`/`error` fields
+(`cli::job_attach::finish_job`, §3's `POST /v1/jobs` entry — issue #187 review, finding 3). Both
+call sites fall back to `internal` for a code `from_code` doesn't recognize (an unknown/newer code,
+or one of the three variants — `internal`, `unsupported_format`, `extraction_failed` — whose fields
+don't fit a single `message` string).
+
+Producers pair `message` with `from_code`'s expectations: for the 8 codes `from_code` rebuilds from
+a single field (the four `*_not_found` codes, plus `invalid_config` / `invalid_request` /
+`provider_unavailable` / `model_missing`), `message` is that bare field with no `Display` prefix —
+a daemon HTTP error body (`server::error::ApiError`) and a failed `IndexJob`'s `error` field both
+store `Error::raw_message()`, not `Error::to_string()`, so `from_code` can re-add the prefix once
+on reconstruction instead of doubling it. Every other code's `message` is the full `Display`
+string, since `from_code` decodes those either to a fixed no-message variant or not at all.
+
 ### `localdb index --strict`
 
 By default `index` is **best-effort**: unsupported files are silently counted; extraction failures
@@ -517,6 +637,8 @@ counted as prunable — `--delete` would not remove them either.
 
 Both counters appear in `--json` output as `docs_deleted` and `docs_prunable`.
 
-`--delete` is **rejected with exit 2 when a daemon is running**: `POST /v1/jobs` carries no
-deletion policy, so a daemon-submitted job cannot prune. Silently downgrading to a non-pruning
-run would report success for a deletion that never happened. Stop the daemon and re-run.
+`--delete` works identically against a running daemon (maintainer decision D6, issue #187):
+`POST /v1/jobs` carries a `deletion_policy` field (`"retain"` default, `"delete"` for `--delete`;
+§3), so the CLI sends the real policy and the daemon's job engine honors it exactly as the
+embedded path does. Stopping the daemon before indexing is no longer required for `--delete` or
+for `index` in general.

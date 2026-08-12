@@ -1,11 +1,12 @@
-use std::path::Path;
-
+use localdb_core::citation::Citation;
 use localdb_core::{config::loader::ConfigLoader, Error};
 use serde_json::json;
 
 use crate::{
-    app_db::{load_app_db_lenient, resolve_store_scope_inner, StoreScopePolicy},
-    daemon_client::{daemon_request_async, probe_daemon, CliContext, DaemonState},
+    app_db::{load_config_lenient, open_app_db_lenient_or_exit},
+    app_db::{resolve_store_scope_inner, AppDb, StoreScopePolicy},
+    command_table::{dispatch, DaemonAwareCommand},
+    daemon_client::{daemon_request_async, CliContext},
     normalize::{exit_err, format_snippet, print_json, validate_store_name},
 };
 
@@ -32,114 +33,109 @@ pub fn run_search(ctx: &CliContext, query: &str, limit: usize, content_length: u
     rt.block_on(run_search_async(ctx, query, limit, content_length));
 }
 
-pub(crate) enum SearchMode {
-    Daemon { base_url: String },
-    Embedded,
+/// `search`'s table entry (issue #187 stage 5). `Outcome` is `Vec<Citation>`
+/// in both modes: the daemon branch used to hand-walk the raw JSON response
+/// and silently drop `heading_path` (issue #187 §2) because it rendered
+/// straight from `serde_json::Value` instead of deserializing into the same
+/// `Citation` type embedded mode already produced. Deserializing
+/// `value["citations"]` here, once, means there is exactly one citation
+/// renderer (`citation_headline`) and it is structurally impossible for the
+/// daemon path to drop a field the embedded path prints.
+pub(crate) struct SearchCmd<'a> {
+    pub(crate) query: &'a str,
+    pub(crate) limit: usize,
 }
 
-pub(crate) enum SearchOutput {
-    Daemon {
-        value: serde_json::Value,
-        query: String,
-    },
-    Embedded {
-        citations: Vec<localdb_core::citation::Citation>,
-        query: String,
-    },
-}
+impl DaemonAwareCommand for SearchCmd<'_> {
+    type Outcome = Vec<Citation>;
 
-pub(crate) async fn resolve_search_targets(
-    ctx: &CliContext,
-    mode: &SearchMode,
-) -> Result<Vec<(localdb_core::search::StoreHandle, String)>, Error> {
-    match mode {
-        SearchMode::Daemon { .. } => Ok(Vec::new()),
-        SearchMode::Embedded => {
-            let (_config_loader, db) = load_app_db_lenient(ctx).await;
+    // specs/05-surfaces.md §2.2: the one deliberate zero-store exit-0
+    // exception (`AllStoresAllowEmpty`) — a fresh, storeless database has no
+    // results, not an error (test `cli_integration.rs` ~2476).
+    const SCOPE_POLICY: StoreScopePolicy = StoreScopePolicy::AllStoresAllowEmpty;
 
-            // specs/05-surfaces.md §2.2, via the one shared resolver every
-            // other `-s`-accepting command uses. `AllStoresAllowEmpty` is
-            // what makes a fresh, storeless database return no results and
-            // exit 0 rather than exit 2; the explicit-`-s` path (validate,
-            // resolve, dedupe, unknown name -> exit 3) is identical under
-            // every policy, which is why replacing the hand-rolled block that
-            // used to live here changes no observable behavior.
-            let rows =
-                resolve_store_scope_inner(ctx, &db, StoreScopePolicy::AllStoresAllowEmpty).await?;
-
-            let mut store_handles = Vec::new();
-            for store_row in &rows {
-                let handle = db.backend().retrieval_store(&store_row.id).await?;
-                let store_name = store_row.name.clone();
-                store_handles.push((
-                    localdb_core::search::StoreHandle {
-                        id: store_row.id.clone(),
-                        name: store_name.clone(),
-                        store: handle,
-                    },
-                    store_name,
-                ));
-            }
-
-            Ok(store_handles)
+    async fn run_daemon(&self, ctx: &CliContext, base_url: &str) -> Result<Self::Outcome, Error> {
+        let url = format!("{base_url}/v1/search");
+        let mut body = json!({
+            "query": self.query,
+            "limit": self.limit,
+        });
+        if !ctx.stores.is_empty() {
+            body["store_filter"] = serde_json::Value::Array(
+                ctx.stores
+                    .iter()
+                    .map(|s| serde_json::Value::String(s.clone()))
+                    .collect(),
+            );
         }
+        let value = daemon_request_async(reqwest::Method::POST, &url, Some(body)).await?;
+        let citations_json = value.get("citations").cloned().unwrap_or(json!([]));
+        serde_json::from_value(citations_json).map_err(|e| Error::Internal {
+            message: format!("cannot parse daemon search response citations: {e}"),
+            correlation_id: "daemon_search_citations_shape".to_string(),
+        })
     }
-}
 
-pub(crate) fn print_search_output(out: SearchOutput, content_length: usize, json_mode: bool) {
-    match out {
-        SearchOutput::Daemon { value, query } => {
-            if json_mode {
-                print_json(&value);
-            } else {
-                let empty = vec![];
-                let citations = value
-                    .get("citations")
-                    .and_then(|c| c.as_array())
-                    .unwrap_or(&empty);
-                if citations.is_empty() {
-                    println!("No results for '{}'.", query);
-                } else {
-                    for (i, cit) in citations.iter().enumerate() {
-                        let uri = cit.get("uri").and_then(|u| u.as_str()).unwrap_or("?");
-                        let snippet = cit.get("snippet").and_then(|s| s.as_str()).unwrap_or("");
-                        let page = cit
-                            .get("block")
-                            .and_then(|b| b.get("page"))
-                            .and_then(|p| p.as_u64())
-                            .map(|p| format!(" (p.{p})"))
-                            .unwrap_or_default();
-                        println!("{}. {}{}", i + 1, uri, page);
-                        println!("   {}", format_snippet(snippet, content_length));
-                        println!();
-                    }
-                }
-            }
-        }
-        SearchOutput::Embedded { citations, query } => {
-            let json_citations: Vec<serde_json::Value> = citations
-                .iter()
-                .map(|c| serde_json::to_value(c).unwrap_or(json!({})))
-                .collect();
+    async fn run_embedded(
+        &self,
+        ctx: &CliContext,
+        config_loader: &ConfigLoader,
+        db: &AppDb,
+    ) -> Result<Self::Outcome, Error> {
+        use localdb_core::clamp_search_limit;
+        use localdb_core::search::{QueryRequest, SearchOrchestrator, StoreHandle};
 
-            if json_mode {
-                print_json(&json!({ "citations": json_citations }));
-            } else if citations.is_empty() {
-                println!("No results for '{}'.", query);
-            } else {
-                for (i, citation) in citations.iter().enumerate() {
-                    println!("{}. {}", i + 1, citation_headline(citation));
-                    println!("   {}", format_snippet(&citation.snippet, content_length));
-                    println!();
-                }
-            }
+        // specs/05-surfaces.md §2.2, via the one shared resolver every other
+        // `-s`-accepting command uses. `AllStoresAllowEmpty` is what makes a
+        // fresh, storeless database return no results and exit 0 rather than
+        // exit 2.
+        let rows = resolve_store_scope_inner(ctx, db, Self::SCOPE_POLICY).await?;
+        if rows.is_empty() {
+            return Ok(Vec::new());
         }
+
+        let mut store_handles = Vec::with_capacity(rows.len());
+        for store_row in &rows {
+            let handle = db.backend().retrieval_store(&store_row.id).await?;
+            store_handles.push(StoreHandle {
+                id: store_row.id.clone(),
+                name: store_row.name.clone(),
+                store: handle,
+            });
+        }
+
+        let embed_policy = &config_loader.config.defaults.indexing.embedding;
+        let models_dir = config_loader.paths.models_dir.clone();
+        let embedder = embed::create_embedder(
+            embed_policy,
+            &config_loader.config.providers,
+            Some(&models_dir),
+        )
+        .map_err(Error::from)?;
+        // Parity with the daemon path (issue #187 review, finding 1):
+        // `POST /v1/search` clamps `limit` to `SEARCH_MAX_LIMIT` before it
+        // ever reaches `SearchOrchestrator::query`
+        // (`server::search_service::clamp_search_limit`), and so does the
+        // MCP `search` tool (`mcp::tools::resolve_search_limit`). Without an
+        // equivalent clamp here, `localdb search foo --limit 5000` returned
+        // a different result count depending on whether a daemon happened
+        // to be running — the exact asymmetry this issue is about fixing.
+        let request = QueryRequest {
+            query: self.query.to_string(),
+            leg_k: None,
+            top_n: Some(clamp_search_limit(self.limit)),
+            filters: vec![],
+        };
+
+        SearchOrchestrator::query(&store_handles, embedder.as_ref(), &request)
+            .await
+            .map(|response| response.citations)
     }
 }
 
 /// The one-line citation headline for human output: `uri`, then the heading
 /// path (if any), then the page number `(p.N)` for paginated sources (#103).
-fn citation_headline(citation: &localdb_core::citation::Citation) -> String {
+fn citation_headline(citation: &Citation) -> String {
     let heading = if citation.heading_path.is_empty() {
         String::new()
     } else {
@@ -153,90 +149,28 @@ fn citation_headline(citation: &localdb_core::citation::Citation) -> String {
     format!("{}{}{}", citation.uri, heading, page)
 }
 
-fn detect_search_mode(data_dir: &Path, daemon_url: Option<&str>) -> SearchMode {
-    match probe_daemon(data_dir, daemon_url) {
-        DaemonState::Running { base_url } => SearchMode::Daemon { base_url },
-        DaemonState::NotRunning => SearchMode::Embedded,
-    }
-}
-
-async fn request_daemon_search(
-    ctx: &CliContext,
-    base_url: &str,
+/// The one renderer for `search`'s `Outcome`, consumed identically whether
+/// `citations` came from the embedded query path or a deserialized daemon
+/// response.
+fn render_search_output(
+    citations: &[Citation],
     query: &str,
-    limit: usize,
-) -> Result<serde_json::Value, Error> {
-    let url = format!("{base_url}/v1/search");
-    let mut body = json!({
-        "query": query,
-        "limit": limit,
-    });
-    if !ctx.stores.is_empty() {
-        body["store_filter"] = serde_json::Value::Array(
-            ctx.stores
-                .iter()
-                .map(|s| serde_json::Value::String(s.clone()))
-                .collect(),
-        );
-    }
-    daemon_request_async(reqwest::Method::POST, &url, Some(body)).await
-}
-
-async fn query_embedded_search(
-    config_loader: &ConfigLoader,
-    targets: Vec<(localdb_core::search::StoreHandle, String)>,
-    query: &str,
-    limit: usize,
-) -> Result<Vec<localdb_core::citation::Citation>, Error> {
-    use localdb_core::search::{QueryRequest, SearchOrchestrator};
-
-    let embed_policy = &config_loader.config.defaults.indexing.embedding;
-    let models_dir = config_loader.paths.models_dir.clone();
-    let embedder = embed::create_embedder(
-        embed_policy,
-        &config_loader.config.providers,
-        Some(&models_dir),
-    )
-    .map_err(Error::from)?;
-    let store_handles: Vec<_> = targets.into_iter().map(|(handle, _name)| handle).collect();
-    let request = QueryRequest {
-        query: query.to_string(),
-        leg_k: None,
-        top_n: Some(limit),
-        filters: vec![],
-    };
-
-    SearchOrchestrator::query(&store_handles, embedder.as_ref(), &request)
-        .await
-        .map(|response| response.citations)
-}
-
-async fn execute_search_mode(
-    ctx: &CliContext,
-    config_loader: &ConfigLoader,
-    mode: SearchMode,
-    targets: Vec<(localdb_core::search::StoreHandle, String)>,
-    query: &str,
-    limit: usize,
-) -> Result<SearchOutput, Error> {
-    match mode {
-        SearchMode::Daemon { base_url } => {
-            let value = request_daemon_search(ctx, &base_url, query, limit).await?;
-            Ok(SearchOutput::Daemon {
-                value,
-                query: query.to_string(),
-            })
-        }
-        SearchMode::Embedded if targets.is_empty() => Ok(SearchOutput::Embedded {
-            citations: Vec::new(),
-            query: query.to_string(),
-        }),
-        SearchMode::Embedded => {
-            let citations = query_embedded_search(config_loader, targets, query, limit).await?;
-            Ok(SearchOutput::Embedded {
-                citations,
-                query: query.to_string(),
-            })
+    content_length: usize,
+    json_mode: bool,
+) {
+    if json_mode {
+        let json_citations: Vec<serde_json::Value> = citations
+            .iter()
+            .map(|c| serde_json::to_value(c).unwrap_or(json!({})))
+            .collect();
+        print_json(&json!({ "citations": json_citations }));
+    } else if citations.is_empty() {
+        println!("No results for '{}'.", query);
+    } else {
+        for (i, citation) in citations.iter().enumerate() {
+            println!("{}. {}", i + 1, citation_headline(citation));
+            println!("   {}", format_snippet(&citation.snippet, content_length));
+            println!();
         }
     }
 }
@@ -248,17 +182,12 @@ pub(crate) async fn run_search_async(
     content_length: usize,
 ) {
     // F1-cli: use lenient loader so search works even with malformed config.
-    let (config_loader, _db) = load_app_db_lenient(ctx).await;
-    let mode = detect_search_mode(&config_loader.paths.data_dir, ctx.daemon_url.as_deref());
-    let targets = match resolve_search_targets(ctx, &mode).await {
-        Ok(targets) => targets,
-        Err(e) => exit_err(&e, ctx.json),
-    };
-
-    match execute_search_mode(ctx, &config_loader, mode, targets, query, limit).await {
-        Ok(output) => print_search_output(output, content_length, ctx.json),
-        Err(e) => exit_err(&e, ctx.json),
-    }
+    let config_loader = load_config_lenient(ctx);
+    let citations = dispatch(&SearchCmd { query, limit }, ctx, &config_loader, || {
+        open_app_db_lenient_or_exit(ctx, &config_loader)
+    })
+    .await;
+    render_search_output(&citations, query, content_length, ctx.json);
 }
 
 #[cfg(test)]

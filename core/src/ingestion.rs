@@ -143,7 +143,11 @@ pub struct IngestionConfig {
 // ---------------------------------------------------------------------------
 
 /// Result of a completed ingestion pipeline run.
-#[derive(Debug, Default, Clone)]
+///
+/// `Serialize`/`Deserialize` are derived because this type is embedded in
+/// [`crate::progress::ProgressEvent::SourceFinished`], which crosses the
+/// SSE wire boundary (issue #83).
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct IngestionResult {
     /// Total documents seen in the scan.
     pub docs_seen: u64,
@@ -555,6 +559,7 @@ pub fn create_index_job(store_id: &str, scope: IndexJobScope) -> IndexJob {
         state: IndexJobState::Pending,
         stats: IndexJobStats::default(),
         error: None,
+        error_code: None,
         created_at: now_rfc3339(),
         started_at: None,
         completed_at: None,
@@ -574,10 +579,42 @@ pub fn complete_index_job(job: &mut IndexJob, stats: IndexJobStats) {
     job.completed_at = Some(now_rfc3339());
 }
 
-/// Mark an IndexJob as failed with an error message.
+/// Mark an IndexJob as failed with an unclassified error message — a
+/// synthetic queue-level failure (the queue itself is full/closed, or the
+/// job's task panicked) that never had a typed `core::Error` to carry a
+/// stable code from. `job.error_code` is left `None`; a caller reconstructing
+/// the job's error (`cli::job_attach::finish_job`) falls back to
+/// `Error::Internal` for these, same as it always has.
 pub fn fail_index_job(job: &mut IndexJob, error: String) {
     job.state = IndexJobState::Failed;
     job.error = Some(error);
+    job.error_code = None;
+    job.completed_at = Some(now_rfc3339());
+}
+
+/// Mark an IndexJob as failed from a typed `core::Error`, carrying both its
+/// display message (`job.error`) and its stable `code()` string
+/// (`job.error_code`) — the pairing `Error::from_code` can invert. This is
+/// what lets a daemon-attached job failure surface with the same exit code
+/// an embedded pre-flight failure of the same kind would (issue #187
+/// review): without it, every job-level failure collapsed to a bare string,
+/// indistinguishable from `Error::Internal` once read back by the CLI.
+pub fn fail_index_job_with_error(job: &mut IndexJob, error: &Error) {
+    job.state = IndexJobState::Failed;
+    // Store the bare message (`raw_message()`), not `error.to_string()`:
+    // `cli::job_attach::finish_job` reconstructs the typed error via
+    // `Error::from_code(error_code, error)`, which re-adds the `Display`
+    // prefix (e.g. "invalid config: "). Storing the already-prefixed string
+    // would double it (issue #187 review, finding F4). Variants
+    // `raw_message()` can't reconstruct fall back to the full `Display`
+    // string, since there's no bare field to store instead.
+    job.error = Some(
+        error
+            .raw_message()
+            .map(str::to_string)
+            .unwrap_or_else(|| error.to_string()),
+    );
+    job.error_code = Some(error.code().to_string());
     job.completed_at = Some(now_rfc3339());
 }
 
@@ -1527,6 +1564,7 @@ mod tests {
             chunks_written: 12,
             unsupported_format_count: 1,
             error_count: 0,
+            ..Default::default()
         };
         complete_index_job(&mut job, stats.clone());
         assert_eq!(job.state, IndexJobState::Done);
@@ -1543,7 +1581,49 @@ mod tests {
         fail_index_job(&mut job, "something went wrong".to_string());
         assert_eq!(job.state, IndexJobState::Failed);
         assert_eq!(job.error.as_deref(), Some("something went wrong"));
+        assert_eq!(
+            job.error_code, None,
+            "a synthetic queue-level failure never had a typed error to carry a code from"
+        );
         assert!(job.completed_at.is_some());
+    }
+
+    #[test]
+    fn fail_index_job_with_error_carries_the_typed_errors_code_and_message() {
+        let mut job = create_index_job("store-1", IndexJobScope::Store);
+        start_index_job(&mut job);
+        let err = Error::InvalidConfig {
+            message: "unconfigured embedder provider".to_string(),
+        };
+        fail_index_job_with_error(&mut job, &err);
+        assert_eq!(job.state, IndexJobState::Failed);
+        // `job.error` must be the *bare* message ("unconfigured embedder
+        // provider"), not `err.to_string()` ("invalid config: unconfigured
+        // embedder provider"): `cli::job_attach::finish_job` reconstructs the
+        // typed error via `Error::from_code(error_code, error)`, which
+        // re-adds the "invalid config: " prefix through `Display`. Storing
+        // the already-prefixed string here would double it (issue #187
+        // review, finding F4).
+        assert_eq!(job.error.as_deref(), Some("unconfigured embedder provider"));
+        assert_eq!(job.error_code.as_deref(), Some("invalid_config"));
+        assert!(job.completed_at.is_some());
+    }
+
+    #[test]
+    fn fail_index_job_with_error_falls_back_to_display_for_non_reconstructible_variants() {
+        // A variant `raw_message()` returns `None` for (e.g. `Internal`,
+        // whose fields don't fit a single `message` string) must still
+        // populate `job.error` with something readable — the full `Display`
+        // string, since there's no bare field to store instead.
+        let mut job = create_index_job("store-1", IndexJobScope::Store);
+        start_index_job(&mut job);
+        let err = Error::Internal {
+            message: "bug".to_string(),
+            correlation_id: "corr-1".to_string(),
+        };
+        fail_index_job_with_error(&mut job, &err);
+        assert_eq!(job.error.as_deref(), Some(err.to_string().as_str()));
+        assert_eq!(job.error_code.as_deref(), Some("internal"));
     }
 
     // ---------------------------------------------------------------------------
@@ -2169,8 +2249,13 @@ mod tests {
             index_resource(&resource, source, None, &deps)
                 .await
                 .expect("seed index must succeed");
+            // The doc_index key must be the NORMALIZED uri, exactly as
+            // `list_indexed_documents` rehydrates it — a raw spelling here
+            // diverges from the pipeline's seen-set whenever the path needs
+            // percent-encoding (e.g. a directory with a space), and the
+            // sweep would delete a live document it just observed.
             DocumentRecord {
-                uri: uri.to_string(),
+                uri: resource.uri.as_str().to_string(),
                 resource_id: resource.id.clone(),
                 source_id: source.id.clone(),
                 content_hash: resource.content_hash.clone(),
@@ -3759,7 +3844,7 @@ mod tests {
                  B's root string starts with A's root string"
             );
             assert!(
-                doc_index.get(&uri_b).is_some(),
+                doc_index.get(&record_b.uri).is_some(),
                 "source B's doc_index record must remain"
             );
         }
@@ -3872,7 +3957,7 @@ mod tests {
                 "source B's chunks must survive sweeping source A"
             );
             assert!(
-                doc_index.get(&uri_b).is_some(),
+                doc_index.get(&record_b.uri).is_some(),
                 "source B's doc_index record must remain"
             );
         }

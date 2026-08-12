@@ -1,7 +1,7 @@
 use std::io::IsTerminal as _;
 use std::sync::{Arc, Mutex};
 
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{HumanDuration, ProgressBar, ProgressState, ProgressStyle};
 use localdb_core::progress::{DocOutcome, ProgressEvent, ProgressSink};
 use localdb_core::uri::display_decoded_uri;
 use store_libsql::{MigrationProgressEvent, MigrationProgressSink};
@@ -18,6 +18,50 @@ fn spinner_style(template: &str) -> ProgressStyle {
 
 fn bar_style(template: &str) -> ProgressStyle {
     ProgressStyle::with_template(template).unwrap_or_else(|_| ProgressStyle::default_bar())
+}
+
+/// Placeholder rendered by the custom `eta` template key (see
+/// [`render_eta`]) before the bar has any real progress to estimate from.
+const ETA_PLACEHOLDER: &str = "-";
+
+/// Custom `eta` template key for the determinate index bar.
+///
+/// Indicatif's built-in `{eta}` key feeds its rate estimator every tick,
+/// including ticks with zero position change. A steady-tick heartbeat
+/// enabled before the first `.inc()` (or simply the delay before the first
+/// document finishes) produces a run of zero-progress samples, so the
+/// built-in estimate can render a wildly wrong duration even well into a
+/// run. Defensively render a placeholder until the bar has at least one
+/// unit of real progress, and fall back to indicatif's own formatting once
+/// it does.
+fn render_eta(state: &ProgressState, w: &mut dyn std::fmt::Write) {
+    if state.pos() == 0 {
+        let _ = write!(w, "{ETA_PLACEHOLDER}");
+    } else {
+        let _ = write!(w, "{:#}", HumanDuration(state.eta()));
+    }
+}
+
+/// The template + style for the determinate `localdb index` progress bar,
+/// shared by production code and tests so a test exercises the exact
+/// configuration shipped to users.
+fn index_bar_style() -> ProgressStyle {
+    bar_style("{spinner} [{wide_bar}] {pos}/{len} (eta {eta}) {msg}")
+        .progress_chars("=>-")
+        .with_key("eta", render_eta)
+}
+
+/// Construct the determinate index progress bar as production code does.
+///
+/// Deliberately does **not** call `enable_steady_tick`: unlike the
+/// indeterminate spinner (which needs a heartbeat to animate between
+/// sparse events), this bar redraws on every `.inc()` already — a steady
+/// tick only pollutes indicatif's rate estimator with zero-progress
+/// samples and produces a nonsensical ETA (#149).
+fn new_index_bar(total: u64) -> ProgressBar {
+    let bar = ProgressBar::new(total);
+    bar.set_style(index_bar_style());
+    bar
 }
 
 /// Build a progress sink for CLI use.
@@ -95,12 +139,7 @@ fn tty_sink_parts(label: Option<String>) -> TtySinkParts {
             if let Some(old) = guard.take() {
                 old.finish_and_clear();
             }
-            let bar = ProgressBar::new(total as u64);
-            bar.set_style(
-                bar_style("{spinner} [{wide_bar}] {pos}/{len} (eta {eta}) {msg}")
-                    .progress_chars("=>-"),
-            );
-            bar.enable_steady_tick(std::time::Duration::from_millis(80));
+            let bar = new_index_bar(total as u64);
             *guard = Some(bar);
         }
         ProgressEvent::DocumentStarted { uri, .. } => {
@@ -390,6 +429,158 @@ fn migration_plain_sink_with_writer(writer: Arc<Mutex<Vec<String>>>) -> Migratio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indicatif::{ProgressDrawTarget, TermLike};
+    use std::time::Duration;
+
+    /// A [`TermLike`] draw target that records every rendered frame instead
+    /// of writing to a real terminal, so tests can inspect exactly what
+    /// indicatif would have drawn.
+    #[derive(Debug, Default, Clone)]
+    struct CapturingTerm {
+        frames: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl CapturingTerm {
+        fn frames(&self) -> Vec<String> {
+            lock_or_poison(&self.frames).clone()
+        }
+    }
+
+    impl TermLike for CapturingTerm {
+        fn width(&self) -> u16 {
+            200
+        }
+
+        fn move_cursor_up(&self, _n: usize) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn move_cursor_down(&self, _n: usize) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn move_cursor_right(&self, _n: usize) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn move_cursor_left(&self, _n: usize) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn write_line(&self, s: &str) -> std::io::Result<()> {
+            lock_or_poison(&self.frames).push(s.to_string());
+            Ok(())
+        }
+
+        fn write_str(&self, s: &str) -> std::io::Result<()> {
+            lock_or_poison(&self.frames).push(s.to_string());
+            Ok(())
+        }
+
+        fn clear_line(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn flush(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// #149 regression, part 1: the determinate index bar redraws on every
+    /// `.inc()` already, so a steady-tick heartbeat is unnecessary and (per
+    /// the bug) actively harmful to the ETA estimate. Assert the production
+    /// bar constructor never starts a steady-tick background thread: with no
+    /// steady tick and no manual `.tick()`/`.inc()` call, nothing should be
+    /// drawn while we wait — a ticker thread would draw at least once inside
+    /// a window several multiples of its 80ms interval.
+    #[test]
+    fn index_bar_has_no_steady_tick() {
+        let term = CapturingTerm::default();
+        let bar = new_index_bar(175);
+        bar.set_draw_target(ProgressDrawTarget::term_like(Box::new(term.clone())));
+
+        std::thread::sleep(Duration::from_millis(250));
+
+        assert!(
+            term.frames().is_empty(),
+            "no frame should be drawn without an explicit tick/inc when the \
+             steady tick is disabled, got: {:?}",
+            term.frames()
+        );
+    }
+
+    /// #149 regression, part 2: at zero progress the custom `eta` key must
+    /// render the `-` placeholder rather than trusting (or even computing) a
+    /// duration estimate — this is the defensive half of the fix, independent
+    /// of whether the steady tick is present.
+    #[test]
+    fn index_bar_eta_is_placeholder_at_zero_progress() {
+        let term = CapturingTerm::default();
+        let bar = new_index_bar(175);
+        bar.set_draw_target(ProgressDrawTarget::term_like(Box::new(term.clone())));
+
+        // Force a render at pos == 0, the way `Discovered` leaves the bar
+        // until the first document finishes.
+        bar.tick();
+
+        let frames = term.frames();
+        let last = frames
+            .iter()
+            .rev()
+            .find(|f| f.contains("(eta "))
+            .unwrap_or_else(|| panic!("no rendered frame contained an eta segment: {frames:?}"));
+        assert!(
+            last.contains(&format!("eta {ETA_PLACEHOLDER}")),
+            "zero-progress bar must show the eta placeholder, got: {last:?}"
+        );
+    }
+
+    /// #149 regression, part 3 (full scenario from the bug report): Discovered
+    /// leaves the bar sitting at zero progress; a slow first document means
+    /// real time passes before the first `.inc()`. Once that first `.inc()`
+    /// lands, the rendered ETA must be an ordinary small duration — not the
+    /// placeholder (progress is no longer zero) and not an absurd value from
+    /// a polluted rate estimate.
+    #[test]
+    fn index_bar_eta_is_sane_after_first_inc_following_a_delay() {
+        let term = CapturingTerm::default();
+        let bar = new_index_bar(175);
+        bar.set_draw_target(ProgressDrawTarget::term_like(Box::new(term.clone())));
+
+        // Discovered: bar exists, nothing has completed yet.
+        bar.tick();
+        // The first document takes a while — longer than the old steady-tick
+        // interval (80ms) — before finishing.
+        std::thread::sleep(Duration::from_millis(150));
+        // DocumentFinished for the first document.
+        bar.inc(1);
+
+        let frames = term.frames();
+        let last = frames
+            .iter()
+            .rev()
+            .find(|f| f.contains("(eta "))
+            .unwrap_or_else(|| panic!("no rendered frame contained an eta segment: {frames:?}"));
+        let eta = last
+            .split("(eta ")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .unwrap_or_else(|| panic!("frame missing an eta segment: {last:?}"));
+
+        assert_ne!(
+            eta, ETA_PLACEHOLDER,
+            "eta must no longer be the placeholder once real progress exists: {last:?}"
+        );
+        // indicatif's alternate `HumanDuration` renders a single-letter unit
+        // suffix (s/m/h/d/w/y). A sane estimate for 174 remaining steps at a
+        // ~150ms-per-step rate is on the order of half a minute; reject
+        // anything that escalated to hours/days/weeks/years, which is the
+        // "nonsensical ETA" this bug produced.
+        assert!(
+            eta.ends_with('s') || eta.ends_with('m'),
+            "eta escalated to an absurd unit, got {eta:?} in frame {last:?}"
+        );
+    }
 
     #[test]
     fn format_plain_progress_with_total() {

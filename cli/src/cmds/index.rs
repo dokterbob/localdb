@@ -1,20 +1,22 @@
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-use fetch::HttpUrlFetcher;
 use localdb_core::{
-    config::{loader::ConfigLoader, policy::compute_policy_version},
-    Embedder, Error, SourceRow, StoreRow,
+    ingestion::DeletionPolicy, Embedder, Error, IndexJobScope, IndexJobStats, StoreRow,
 };
 use serde_json::json;
+use server::JobQueue;
 
 use crate::{
     app_db::{
-        load_app_db, resolve_daemon_store_scope, resolve_store_scope, AppDb, StoreScopePolicy,
+        load_config_for_maintenance, open_app_db_or_exit, resolve_daemon_store_scope,
+        resolve_store_scope, AppDb, StoreScopePolicy,
     },
-    daemon_client::{daemon_request_async, probe_daemon, CliContext, DaemonState},
-    normalize::{exit_err, print_json, source_row_to_core_source},
+    command_table::{dispatch, DaemonAwareCommand},
+    daemon_client::CliContext,
+    job_attach,
+    normalize::{exit_err, print_json},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,22 +55,45 @@ impl IndexSummary {
         self.prunable += other.prunable;
         self.deleted += other.deleted;
     }
+
+    /// Build an `IndexSummary` from a completed job's `IndexJobStats`
+    /// (issue #187 stage 3) — the unified job model's stats shape, produced
+    /// identically by the embedded engine (`job_exec::run_job` via a local
+    /// `JobQueue`) and a daemon-submitted job alike.
+    ///
+    /// `has_sources` is derived from `stats.sources_count`, which
+    /// `job_exec::run_job` sets to the size of the job's resolved scope
+    /// *before* processing anything — 0 only when the scope had nothing to
+    /// index at all, distinct from "sources existed but nothing needed
+    /// indexing" (`sources_count > 0`, every other counter possibly still 0).
+    pub(crate) fn from_job_stats(stats: IndexJobStats) -> Self {
+        IndexSummary {
+            has_sources: stats.sources_count > 0,
+            indexed: stats.docs_indexed,
+            skipped: stats.docs_skipped,
+            chunks: stats.chunks_written,
+            errors: stats.error_count,
+            unsupported: stats.unsupported_format_count,
+            prunable: stats.docs_prunable,
+            deleted: stats.docs_deleted,
+        }
+    }
 }
 
 impl IndexErrorMode {
-    fn warn(self) -> bool {
+    pub(crate) fn warn(self) -> bool {
         self == Self::WarnAndContinue
     }
 }
 
 /// Test-only construction counter for the `embed::create_embedder` call made
-/// by `run_embedded_index_with` below. Exists purely so the `source add`
+/// by `job_attach::run_embedded_store_job`. Exists purely so the `source add`
 /// multi-store auto-index test (`cmds::source::tests`) can assert the
 /// embedder is built once across an N-store run, not once per store (Codex
 /// review round 2, finding 6). Compiled out entirely in non-test builds.
 ///
 /// Shared per test binary, so it's only safe to assert on because no other
-/// test in this crate currently drives `run_embedded_index_with`'s
+/// test in this crate currently drives `run_embedded_store_job`'s
 /// embedder-construction path concurrently; a test reading it resets the
 /// counter to 0 immediately before exercising the call it's measuring.
 #[cfg(test)]
@@ -84,257 +109,6 @@ pub(crate) struct StoreIndexOutcome {
     pub(crate) summary: IndexSummary,
 }
 
-/// Index one store, using an already-open `AppDb`/`ConfigLoader` and
-/// (optionally) an already-built embedder.
-///
-/// Every multi-store caller — `run_index_async` and `run_source_add_async`'s
-/// post-`source add` auto-index loop alike — calls this directly and threads
-/// `embedder` through from store to store: `None` until one is built, then
-/// `Some(..)` for the rest — reloading a ~706 MB local embedding model per
-/// store would be wasteful.
-///
-/// Returns the summary alongside the embedder actually used. This is `Some`
-/// as soon as this call has built or reused an embedder — including when the
-/// call goes on to fail *after* that point (e.g. `retrieval_store` or
-/// `list_indexed_documents` erroring under `IndexErrorMode::WarnAndContinue`)
-/// — so a caller looping under `WarnAndContinue` keeps the cache even after a
-/// mid-store failure. It's `None` only when no sources needed indexing, or a
-/// failure happened before the embedder was ever touched; this is what lets a
-/// multi-store run skip building the embedder entirely when every store in
-/// scope is empty. A caller looping over stores should carry the returned
-/// embedder forward into the next call.
-///
-/// `progress_label` is rendered as a `[label]` prefix on progress output when
-/// `Some` — set it only when more than one store is in scope for the run, so
-/// single-store output is unchanged.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_embedded_index_with(
-    ctx: &CliContext,
-    db: &AppDb,
-    config_loader: &ConfigLoader,
-    store_row: &StoreRow,
-    source_id: Option<&str>,
-    mode: IndexErrorMode,
-    embedder: Option<Arc<dyn Embedder>>,
-    progress_label: Option<&str>,
-    deletion: localdb_core::ingestion::DeletionPolicy,
-) -> Result<(IndexSummary, Option<Arc<dyn Embedder>>), Error> {
-    use localdb_core::{
-        chunker::ChunkerConfig,
-        ingestion::{run_source_ingestion, DocumentIndex, IngestionConfig, SourceIngestionDeps},
-        ingestor::Ingestor,
-        types::SourceSpec,
-    };
-
-    macro_rules! warn_or_default {
-        ($expr:expr, $fmt:literal) => {
-            warn_or_default!($expr, $fmt, None)
-        };
-        // Three-arg form: `$embedder_on_warn` is what to report as the used
-        // embedder when this failure is warned-and-swallowed. Callers after
-        // the embedder is built pass `Some(embedder.clone())` so a mid-store
-        // failure under `IndexErrorMode::WarnAndContinue` doesn't discard an
-        // embedder that was actually constructed (see the doc comment above).
-        ($expr:expr, $fmt:literal, $embedder_on_warn:expr) => {
-            match $expr {
-                Ok(value) => value,
-                Err(e) => {
-                    let error = Error::from(e);
-                    if mode.warn() {
-                        eprintln!($fmt, error);
-                        return Ok((IndexSummary::default(), $embedder_on_warn));
-                    }
-                    return Err(error);
-                }
-            }
-        };
-    }
-
-    let all_sources = warn_or_default!(
-        db.backend().list_sources(&store_row.id).await,
-        "warning: cannot list sources for auto-index: {}"
-    );
-
-    let sources_to_index: Vec<SourceRow> = if let Some(sid) = source_id {
-        match all_sources.into_iter().find(|s| s.id == sid) {
-            Some(s) => vec![s],
-            None if mode.warn() => return Ok((IndexSummary::default(), None)),
-            None => {
-                return Err(Error::SourceNotFound {
-                    id: sid.to_string(),
-                })
-            }
-        }
-    } else {
-        all_sources
-    };
-
-    if sources_to_index.is_empty() {
-        return Ok((IndexSummary::default(), None));
-    }
-
-    let policy = config_loader.config.defaults.indexing.clone();
-    let current_policy_version = compute_policy_version(&config_loader.config.defaults.indexing);
-    if store_row.policy_version != current_policy_version {
-        let new_indexing_policy =
-            serde_json::to_string(&policy).unwrap_or_else(|_| store_row.indexing_policy.clone());
-        let updated_store = StoreRow {
-            policy_version: current_policy_version.clone(),
-            indexing_policy: new_indexing_policy,
-            ..store_row.clone()
-        };
-        if let Err(e) = db.backend().upsert_store(&updated_store).await {
-            eprintln!("warning: failed to update policy_version: {}", e);
-        }
-    }
-    let ingestion_cfg = IngestionConfig {
-        store_id: store_row.id.clone(),
-        policy_version: current_policy_version,
-        chunker: ChunkerConfig::prose(),
-    };
-
-    let embedder: Arc<dyn Embedder> = if let Some(embedder) = embedder {
-        embedder
-    } else {
-        let built = warn_or_default!(
-            embed::create_embedder(
-                &config_loader.config.defaults.indexing.embedding,
-                &config_loader.config.providers,
-                Some(&config_loader.paths.models_dir),
-            ),
-            "warning: cannot create embedder for auto-index: {}"
-        );
-        #[cfg(test)]
-        EMBEDDER_BUILD_COUNT.fetch_add(1, Ordering::SeqCst);
-        Arc::from(built)
-    };
-    // Validate the parser chain once up front — fail-fast parity with the
-    // legacy path, which built its single extractor before the loop. Parser
-    // instances are cheap unit structs (not `Clone`), so each source below
-    // rebuilds its own owned chain from the same `policy.parsers` ids rather
-    // than sharing this one.
-    //
-    // From here on, `embedder` is already built/reused, so every
-    // `warn_or_default!` call below passes `Some(embedder.clone())` as what
-    // to report on a swallowed failure — see the doc comment above.
-    warn_or_default!(
-        extract::build_chain(&policy.parsers),
-        "warning: cannot build parser chain for auto-index: {}",
-        Some(embedder.clone())
-    );
-    let handle = warn_or_default!(
-        db.backend().retrieval_store(&store_row.id).await,
-        "warning: cannot open store handle for auto-index: {}",
-        Some(embedder.clone())
-    );
-    let existing = warn_or_default!(
-        handle.list_indexed_documents().await,
-        "warning: cannot read existing documents for auto-index: {}",
-        Some(embedder.clone())
-    );
-    let mut doc_index = DocumentIndex::from_records(existing);
-    let url_fetcher = warn_or_default!(
-        HttpUrlFetcher::new(),
-        "warning: cannot build HTTP client for auto-index: {}",
-        Some(embedder.clone())
-    );
-    // Second client, for locators that come from *content* rather than from
-    // the operator: today only a feed entry's `<link>`. It refuses any
-    // destination that is not globally routable, so a hostile feed cannot
-    // steer localdb at `169.254.169.254` or a LAN admin panel and have the
-    // response indexed into a searchable store. The feed's own URL keeps the
-    // unrestricted client above — it is operator-typed, the same trust class
-    // as a `url` source. See `ingest::FeedIngestor::new`.
-    let entry_fetcher = warn_or_default!(
-        HttpUrlFetcher::new_public_only(),
-        "warning: cannot build public-only HTTP client for auto-index: {}",
-        Some(embedder.clone())
-    );
-    let mut summary = IndexSummary {
-        has_sources: true,
-        ..IndexSummary::default()
-    };
-
-    for rt_source in &sources_to_index {
-        let source = source_row_to_core_source(rt_source);
-        let chunker = match ChunkerConfig::from_preset(&source.source_preset) {
-            Ok(chunker) => chunker,
-            Err(e) => {
-                summary.errors += 1;
-                if mode.warn() {
-                    eprintln!(
-                        "warning: invalid chunker preset '{}' for source {}: {}",
-                        source.source_preset, rt_source.id, e
-                    );
-                } else {
-                    eprintln!(
-                        "error indexing source {}: invalid chunker preset '{}': {}",
-                        rt_source.id, source.source_preset, e
-                    );
-                }
-                continue;
-            }
-        };
-        let cfg = IngestionConfig {
-            chunker,
-            ..ingestion_cfg.clone()
-        };
-        let sink = crate::progress::build_progress_sink(ctx.json, progress_label);
-
-        // Build the concrete `Ingestor` for this source's kind — the CLI is
-        // the composition root that wires I/O-owning `ingest` crate types
-        // into the I/O-free `core` pipeline (specs/01-architecture.md §1).
-        let parser_chain =
-            extract::build_chain(&policy.parsers).expect("parser chain already validated above");
-        let ingestor: Box<dyn Ingestor> = match &source.spec {
-            SourceSpec::Path { .. } => Box::new(ingest::FileIngestor::new(Box::new(parser_chain))),
-            SourceSpec::Url { .. } => Box::new(ingest::UrlIngestor::new(
-                Box::new(parser_chain),
-                Box::new(url_fetcher.clone()),
-            )),
-            SourceSpec::Feed { .. } => Box::new(ingest::FeedIngestor::new(
-                Box::new(parser_chain),
-                Box::new(url_fetcher.clone()),
-                Box::new(entry_fetcher.clone()),
-            )),
-        };
-
-        let deps = SourceIngestionDeps {
-            doc_index: &mut doc_index,
-            store: handle.as_ref(),
-            embedder: embedder.as_ref(),
-            config: &cfg,
-            progress: sink,
-            deletion,
-        };
-
-        match run_source_ingestion(&source, ingestor.as_ref(), deps).await {
-            Ok(r) => {
-                summary.indexed += r.docs_indexed;
-                summary.skipped += r.docs_skipped;
-                summary.chunks += r.chunks_written;
-                summary.errors += r.error_count;
-                summary.unsupported += r.unsupported_format_count;
-                summary.prunable += r.docs_prunable;
-                summary.deleted += r.docs_deleted;
-            }
-            Err(e) => {
-                summary.errors += 1;
-                if mode.warn() {
-                    eprintln!(
-                        "warning: auto-index error for source {}: {}",
-                        rt_source.id, e
-                    );
-                } else {
-                    eprintln!("error indexing source {}: {}", rt_source.id, e);
-                }
-            }
-        }
-    }
-
-    Ok((summary, Some(embedder)))
-}
-
 /// `localdb index [--source <id>] [--strict]`
 ///
 /// One-shot scan-and-index (embedded mode) or submits a job to the daemon.
@@ -348,152 +122,189 @@ pub fn run_index(ctx: &CliContext, source_id: Option<&str>, strict: bool, delete
     rt.block_on(run_index_async(ctx, source_id, strict, delete));
 }
 
+/// `index`'s table entry (issue #187 stage 5). Both transports were already
+/// unified onto the shared async job model in stage 3 — `run_daemon`/
+/// `run_embedded` below submit through `job_attach::run_daemon_store_job` /
+/// `run_embedded_store_job` respectively and fold the result into the same
+/// `Vec<StoreIndexOutcome>` `Outcome`, rendered by the one shared
+/// `report_index_outcomes` call in `run_index_async`. Stage 5 only moves the
+/// *mode selection* itself onto `command_table::dispatch`, replacing the
+/// hand-written `if let DaemonState::Running {...} {...} else {...}` so a
+/// future edit can't reintroduce a second, competing `probe_daemon` call.
+struct IndexCmd<'a> {
+    source_id: Option<&'a str>,
+    deletion: DeletionPolicy,
+}
+
+impl DaemonAwareCommand for IndexCmd<'_> {
+    type Outcome = Vec<StoreIndexOutcome>;
+
+    const SCOPE_POLICY: StoreScopePolicy = StoreScopePolicy::AllStores;
+
+    async fn run_daemon(&self, ctx: &CliContext, base_url: &str) -> Result<Self::Outcome, Error> {
+        let store_names = resolve_daemon_store_scope(base_url, ctx, Self::SCOPE_POLICY).await;
+
+        // `--source` narrows the daemon scope to the source's owning
+        // store, exactly as `run_embedded` narrows its own `store_rows` —
+        // see `resolve_daemon_source_owner`'s doc comment.
+        let target_names: Vec<String> = match self.source_id {
+            Some(sid) => vec![resolve_daemon_source_owner(base_url, &store_names, sid).await?],
+            None => store_names,
+        };
+
+        let multi = target_names.len() > 1;
+        let mut outcomes = Vec::with_capacity(target_names.len());
+        for name in &target_names {
+            let label = if multi { Some(name.as_str()) } else { None };
+            let summary = match job_attach::run_daemon_store_job(
+                ctx,
+                base_url,
+                name,
+                self.source_id,
+                self.deletion,
+                IndexErrorMode::StrictExit,
+                label,
+            )
+            .await
+            {
+                Ok(summary) => summary,
+                Err(e) => exit_err(&e, ctx.json),
+            };
+            outcomes.push(StoreIndexOutcome {
+                store_name: name.clone(),
+                summary,
+            });
+        }
+        Ok(outcomes)
+    }
+
+    async fn run_embedded(
+        &self,
+        ctx: &CliContext,
+        config_loader: &localdb_core::config::loader::ConfigLoader,
+        db: &AppDb,
+    ) -> Result<Self::Outcome, Error> {
+        // specs/05-surfaces.md §2.2: `-s` is repeatable and every store
+        // scoped by it (or, absent `-s`, every store in the database) is
+        // indexed.
+        let store_rows = resolve_store_scope(ctx, db, Self::SCOPE_POLICY).await;
+
+        // `--source` names a single, globally-unique source: resolve its
+        // owning store once and narrow the run to just that store,
+        // rather than passing the same source_id to every store in
+        // scope. The latter used to abort the whole run (exit 3,
+        // `SourceNotFound`) the moment it reached the first store that
+        // *didn't* own the source (#180 review finding 1). An explicit
+        // `--store` scope (`ctx.stores` non-empty, reflected in
+        // `store_rows` by `resolve_store_scope` above) is a hard filter
+        // here: if the source's owner isn't among the
+        // explicitly-requested stores, that's still exit 3 — we don't
+        // silently redirect to the owner.
+        let store_rows: Vec<StoreRow> = if let Some(sid) = self.source_id {
+            let owner_store_id = match db.backend().get_source(sid).await? {
+                Some(src) => src.store_id,
+                None => {
+                    return Err(Error::SourceNotFound {
+                        id: sid.to_string(),
+                    })
+                }
+            };
+            match store_rows.into_iter().find(|r| r.id == owner_store_id) {
+                Some(row) => vec![row],
+                None => {
+                    return Err(Error::SourceNotFound {
+                        id: sid.to_string(),
+                    })
+                }
+            }
+        } else {
+            store_rows
+        };
+
+        let multi = store_rows.len() > 1;
+        let mut outcomes: Vec<StoreIndexOutcome> = Vec::with_capacity(store_rows.len());
+        // Built lazily, on the first store that actually has sources to
+        // index — and cached here for the rest of the loop. An empty (or
+        // all-empty) scope must not pay for embedder construction, which
+        // for the default `local` provider can trigger a one-time
+        // ~706 MB model download, just to report "no sources to index"
+        // (#180 review finding 2). Once built, it's shared across the
+        // remaining stores in scope exactly as before —
+        // `job_attach::run_embedded_store_job` threads it in/out of every
+        // call, `Some` as soon as it exists regardless of whether that
+        // call went on to succeed or fail.
+        //
+        // This loop uses `IndexErrorMode::StrictExit`, not for embedder
+        // caching (the caching holds under either mode — see above), but
+        // for `index`'s own semantics: `index` aborts the whole run the
+        // moment any store fails (`exit_err` below), unlike `source
+        // add`'s auto-index loop (`run_source_add_async`), which
+        // deliberately keeps going under `WarnAndContinue` so one bad
+        // source doesn't fail the add.
+        let mut embedder: Option<Arc<dyn Embedder>> = None;
+        let queue = JobQueue::new();
+        for store_row in &store_rows {
+            let label = if multi {
+                Some(store_row.name.as_str())
+            } else {
+                None
+            };
+            let scope = match self.source_id {
+                Some(sid) => IndexJobScope::Source {
+                    source_id: sid.to_string(),
+                },
+                None => IndexJobScope::Store,
+            };
+            let summary = match job_attach::run_embedded_store_job(
+                ctx,
+                &queue,
+                config_loader,
+                db,
+                store_row,
+                scope,
+                self.deletion,
+                IndexErrorMode::StrictExit,
+                &mut embedder,
+                label,
+            )
+            .await
+            {
+                Ok(summary) => summary,
+                Err(e) => exit_err(&e, ctx.json),
+            };
+            outcomes.push(StoreIndexOutcome {
+                store_name: store_row.name.clone(),
+                summary,
+            });
+        }
+        Ok(outcomes)
+    }
+}
+
 pub(crate) async fn run_index_async(
     ctx: &CliContext,
     source_id: Option<&str>,
     strict: bool,
     delete: bool,
 ) {
-    let (config_loader, db) = load_app_db(ctx).await;
-    let data_dir = config_loader.paths.data_dir.clone();
-
-    // Per specs/05-surfaces.md §2: when daemon is running, submit a job per
-    // resolved store instead of indexing embedded. Probed *before* store
-    // resolution — like `source add`'s daemon branch
-    // (`cli/src/cmds/source.rs`) — because the two paths resolve scope
-    // differently: the daemon owns its own store set (see
-    // `resolve_daemon_store_scope`), which may differ from whatever this
-    // process's local database happens to contain (`LOCALDB_DAEMON_URL` can
-    // point at a daemon with an entirely different data directory). Getting
-    // this order wrong was Codex review round 2, finding 1: an explicit
-    // daemon-valid `--store` used to be rejected against the local DB before
-    // the daemon was ever asked, and an omitted `-s` submitted jobs for the
-    // *local* store set instead of the daemon's. `/v1/jobs` is a
-    // single-store API (server/src/handlers/jobs.rs), so a multi-store scope
-    // becomes one POST per store here rather than a batched request.
-    if let DaemonState::Running { base_url } = probe_daemon(&data_dir, ctx.daemon_url.as_deref()) {
-        // `--delete` is refused rather than silently dropped here. `/v1/jobs`
-        // carries no deletion policy, and daemon-side ingestion is a no-op
-        // today anyway (docs/architecture.md#known-gaps, #187) — so honoring
-        // the flag is impossible and accepting it would report success for a
-        // prune that never ran. Threading a policy through a pipeline that
-        // does not execute would be worse: it would look supported.
-        //
-        // Refusing is also the rule this whole change exists to enforce, one
-        // level up: never let silence stand in for a fact you don't have.
-        if delete {
-            exit_err(
-                &Error::InvalidRequest {
-                    message: "`--delete` is not supported while the daemon is running: \
-                              daemon-submitted index jobs cannot prune. Stop the daemon \
-                              and re-run `localdb index --delete`."
-                        .to_string(),
-                },
-                ctx.json,
-            );
-        }
-        let store_names =
-            resolve_daemon_store_scope(&base_url, ctx, StoreScopePolicy::AllStores).await;
-        run_daemon_index(ctx, &base_url, &store_names, source_id).await;
-        return;
-    }
-
-    // specs/05-surfaces.md §2.2: `-s` is repeatable and every store scoped by
-    // it (or, absent `-s`, every store in the database) is indexed. Resolved
-    // here, after the daemon probe above, so the embedded path still opens
-    // the DB exactly once (via `load_app_db` at the top of this function)
-    // and never pays for a local store lookup that the daemon branch would
-    // have thrown away.
-    let store_rows = resolve_store_scope(ctx, &db, StoreScopePolicy::AllStores).await;
-
-    // `--source` names a single, globally-unique source: resolve its owning
-    // store once and narrow the run to just that store, rather than passing
-    // the same source_id to every store in scope. The latter used to abort
-    // the whole run (exit 3, `SourceNotFound`) the moment it reached the
-    // first store that *didn't* own the source (#180 review finding 1). An
-    // explicit `--store` scope (`ctx.stores` non-empty, reflected in
-    // `store_rows` by `resolve_store_scope` above) is a hard filter here: if
-    // the source's owner isn't among the explicitly-requested stores, that's
-    // still exit 3 — we don't silently redirect to the owner.
-    let store_rows: Vec<StoreRow> = if let Some(sid) = source_id {
-        let owner_store_id = match db.backend().get_source(sid).await {
-            Ok(Some(src)) => src.store_id,
-            Ok(None) => exit_err(
-                &Error::SourceNotFound {
-                    id: sid.to_string(),
-                },
-                ctx.json,
-            ),
-            Err(e) => exit_err(&e, ctx.json),
-        };
-        match store_rows.into_iter().find(|r| r.id == owner_store_id) {
-            Some(row) => vec![row],
-            None => exit_err(
-                &Error::SourceNotFound {
-                    id: sid.to_string(),
-                },
-                ctx.json,
-            ),
-        }
+    let config_loader = load_config_for_maintenance(ctx);
+    let deletion = if delete {
+        DeletionPolicy::Prune
     } else {
-        store_rows
+        DeletionPolicy::Retain
     };
 
-    let multi = store_rows.len() > 1;
-    let mut outcomes: Vec<StoreIndexOutcome> = Vec::with_capacity(store_rows.len());
-    // Built lazily, on the first store that actually has sources to index —
-    // and cached here for the rest of the loop. An empty (or all-empty)
-    // scope must not pay for embedder construction, which for the default
-    // `local` provider can trigger a one-time ~706 MB model download, just
-    // to report "no sources to index" (#180 review finding 2). Once built,
-    // it's shared across the remaining stores in scope exactly as before —
-    // an N-store run still constructs the embedder at most once, even across
-    // a mid-store failure: `run_embedded_index_with` threads the embedder it
-    // built through its own `WarnAndContinue` error paths too, so
-    // `used_embedder` comes back `Some` as soon as the embedder exists,
-    // regardless of whether that call went on to succeed or fail.
-    //
-    // This loop uses `IndexErrorMode::StrictExit`, not for embedder caching
-    // (the caching now holds under either mode — see above), but for
-    // `index`'s own semantics: `index` aborts the whole run the moment any
-    // store fails (`exit_err` below), unlike `source add`'s auto-index loop
-    // (`run_source_add_async`), which deliberately keeps going under
-    // `WarnAndContinue` so one bad source doesn't fail the add.
-    let mut embedder: Option<Arc<dyn Embedder>> = None;
-    for store_row in &store_rows {
-        let label = if multi {
-            Some(store_row.name.as_str())
-        } else {
-            None
-        };
-        let (summary, used_embedder) = match run_embedded_index_with(
-            ctx,
-            &db,
-            &config_loader,
-            store_row,
-            source_id,
-            IndexErrorMode::StrictExit,
-            embedder.clone(),
-            label,
-            if delete {
-                localdb_core::ingestion::DeletionPolicy::Prune
-            } else {
-                localdb_core::ingestion::DeletionPolicy::Retain
-            },
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(e) => exit_err(&e, ctx.json),
-        };
-        if embedder.is_none() {
-            embedder = used_embedder;
-        }
-        outcomes.push(StoreIndexOutcome {
-            store_name: store_row.name.clone(),
-            summary,
-        });
-    }
+    // D1/D6 (issue #187 stage 3): `--delete` is no longer refused against a
+    // daemon (D6) — it is sent as `deletion_policy: "delete"` and the daemon
+    // now runs real ingestion (issue #187), so it can honor it.
+    let cmd = IndexCmd {
+        source_id,
+        deletion,
+    };
+    let outcomes = dispatch(&cmd, ctx, &config_loader, || {
+        open_app_db_or_exit(ctx, &config_loader)
+    })
+    .await;
 
     report_index_outcomes(ctx, &outcomes, strict);
 }
@@ -542,8 +353,8 @@ async fn daemon_store_has_source(
 }
 
 /// Narrow a daemon scope (of any size, including a single store — see
-/// `run_daemon_index`'s doc comment, finding 4) down to `source_id`'s owning
-/// store (Codex review round 2, finding 2).
+/// `run_index_async`'s daemon branch, finding 4) down to `source_id`'s
+/// owning store (Codex review round 2, finding 2).
 ///
 /// `/v1/jobs` (`server/src/handlers/jobs.rs`'s `create_job`) validates only
 /// `store_name` — `source_id` is checked neither for existence nor for
@@ -570,91 +381,6 @@ async fn resolve_daemon_source_owner(
     Err(Error::SourceNotFound {
         id: source_id.to_string(),
     })
-}
-
-/// Submit one `/v1/jobs` request per resolved store to a running daemon and
-/// report the submissions. `/v1/jobs` is single-store only
-/// (`server/src/handlers/jobs.rs`'s `CreateJobRequest`), so there is no
-/// batched request to make here — this is intentionally simple submit-and-
-/// report, matching what the single-store path already did, looped.
-///
-/// When `source_id` is given, this always narrows to the owning store via
-/// `resolve_daemon_source_owner` first — regardless of whether `store_names`
-/// is already a single store. A single-store scope used to short-circuit
-/// straight to submission with zero ownership verification, which meant
-/// `index --store foo --source bogus-id` submitted a job (0 docs attached)
-/// instead of exiting 3 like embedded mode's equivalent
-/// (`run_embedded_index_with`, which always resolves the source's true owner
-/// and checks it against scope) — precisely the daemon/embedded divergence
-/// this whole command exists to eliminate (finding 4). The extra request
-/// this costs in the common `-s one --source X` case is an accepted
-/// trade-off for exact parity.
-///
-/// A submission failure exits immediately (via `exit_err`), the same as the
-/// pre-existing single-store behavior: unlike the embedded-index loop, a
-/// failed *submission* hasn't done any indexing work yet, so there's nothing
-/// gained by continuing to submit further stores' jobs after one enqueue call
-/// fails — that's a distinct concern from `--strict`'s "never abort mid-run",
-/// which is about not discarding embedded-mode work already done.
-async fn run_daemon_index(
-    ctx: &CliContext,
-    base_url: &str,
-    store_names: &[String],
-    source_id: Option<&str>,
-) {
-    let target_names: Vec<String> = match source_id {
-        Some(sid) => match resolve_daemon_source_owner(base_url, store_names, sid).await {
-            Ok(owner) => vec![owner],
-            Err(e) => exit_err(&e, ctx.json),
-        },
-        None => store_names.to_vec(),
-    };
-
-    let mut submissions: Vec<(String, serde_json::Value)> = Vec::with_capacity(target_names.len());
-    for store_name in &target_names {
-        let url = format!("{}/v1/jobs", base_url);
-        let mut body = json!({ "store_name": store_name });
-        if let Some(sid) = source_id {
-            body["source_id"] = serde_json::Value::String(sid.to_string());
-        }
-        match daemon_request_async(reqwest::Method::POST, &url, Some(body)).await {
-            Ok(v) => submissions.push((store_name.clone(), v)),
-            Err(e) => exit_err(&e, ctx.json),
-        }
-    }
-
-    if ctx.json {
-        if let [(_, only)] = submissions.as_slice() {
-            print_json(only);
-        } else {
-            let jobs: Vec<serde_json::Value> = submissions
-                .into_iter()
-                .map(|(name, mut v)| {
-                    if let Some(obj) = v.as_object_mut() {
-                        obj.insert("store".to_string(), json!(name));
-                    }
-                    v
-                })
-                .collect();
-            print_json(&json!({ "jobs": jobs }));
-        }
-    } else {
-        let multi = submissions.len() > 1;
-        for (name, v) in &submissions {
-            let job_id = v.get("id").and_then(|i| i.as_str()).unwrap_or("?");
-            if multi {
-                println!(
-                    "Index job submitted to daemon for store '{}': {} (poll with status)",
-                    name, job_id
-                );
-            } else {
-                println!(
-                    "Index job submitted to daemon: {} (poll with status)",
-                    job_id
-                );
-            }
-        }
-    }
 }
 
 /// Sum every store's summary into a single combined total. `has_sources` is

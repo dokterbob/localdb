@@ -7,7 +7,9 @@
 pub mod progress;
 
 mod app_db;
+mod command_table;
 mod daemon_client;
+mod job_attach;
 mod normalize;
 
 mod cmds {

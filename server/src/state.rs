@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
@@ -6,15 +6,15 @@ use tokio::sync::RwLock;
 use localdb_core::{
     config::{
         policy::compute_policy_version,
-        schema::{IndexingPolicyConfig, RawConfig},
+        schema::{EmbeddingPolicy, IndexingPolicyConfig, ProviderConfig, RawConfig},
     },
     ingestion::now_rfc3339,
-    store_factory, Error, SourceRow, Store, StoreBackend, StoreBackendConfig, StoreRow,
-    StoreVisibility,
+    store_factory, DeletionPolicy, Embedder, Error, IndexJobScope, IndexJobStats, ProgressSink,
+    SourceRow, Store, StoreBackend, StoreBackendConfig, StoreRow, StoreVisibility,
 };
 use store_libsql::SqliteBackend;
 
-use crate::{job_queue::JobQueue, scheduler::UrlRefreshScheduler};
+use crate::{job_exec, job_queue::JobQueue, scheduler::UrlRefreshScheduler};
 
 /// Effective config built from the DB.
 #[derive(Debug, Clone)]
@@ -53,21 +53,52 @@ pub struct AppState {
     inner: Arc<Inner>,
 }
 
+/// Cached embedder plus the `(EmbeddingPolicy, providers snapshot)` key that
+/// produced it. See `Inner::embedder_cache` / `AppState::get_or_build_embedder`.
+type EmbedderCacheEntry = (EmbeddingPolicy, Vec<ProviderConfig>, Arc<dyn Embedder>);
+
 struct Inner {
     yaml_config: RwLock<RawConfig>,
     data_dir: PathBuf,
+    models_dir: PathBuf,
     backend: Arc<dyn StoreBackend>,
     default_indexing_policy: IndexingPolicyConfig,
     default_policy_version: String,
     job_queue: JobQueue,
     url_scheduler: UrlRefreshScheduler,
+    /// Single-slot embedder cache, keyed by the `EmbeddingPolicy` plus the
+    /// full `providers` snapshot that together determined the cached
+    /// embedder's identity (Codex review finding F2, issue #187; provider
+    /// settings added for finding H1, issue #212 — a hosted provider's
+    /// `base_url`/`api_key_env` can change under an unchanged policy). See
+    /// `AppState::get_or_build_embedder`.
+    embedder_cache: RwLock<Option<EmbedderCacheEntry>>,
+    /// Test-only construction counter for the `embed::create_embedder` call
+    /// made by `get_or_build_embedder`, so tests can assert the embedder is
+    /// built once per distinct `EmbeddingPolicy` rather than once per job.
+    /// Scoped to this `AppState`'s own `Inner` rather than a shared
+    /// process-wide static (contrast `cli::cmds::index::EMBEDDER_BUILD_COUNT`,
+    /// which is safe as a static only because it is exercised by exactly one
+    /// test in that crate) — nearly every job-executing test in this crate
+    /// exercises `get_or_build_embedder` indirectly, so a shared static would
+    /// have every one of them stomp on the same counter under `cargo test`'s
+    /// default parallel test threads. Per-instance sidesteps that: each
+    /// test's own `AppState` counts only its own builds. Compiled out
+    /// entirely in non-test builds.
+    #[cfg(test)]
+    embedder_build_count: std::sync::atomic::AtomicUsize,
 }
 
 impl AppState {
-    /// Create a new `AppState`.
+    /// Create a new `AppState`, opening its own connection to `localdb.db`.
+    ///
+    /// This is the daemon's own constructor — used by `start_daemon`, where
+    /// no connection to the store exists yet. Delegates the actual field
+    /// assembly to [`Self::from_backend`] once the connection is open.
     pub async fn new(
         yaml_config: RawConfig,
         data_dir: PathBuf,
+        models_dir: PathBuf,
         job_queue: JobQueue,
         url_scheduler: UrlRefreshScheduler,
     ) -> Result<Self, Error> {
@@ -82,20 +113,67 @@ impl AppState {
         let db_path = data_dir.join("localdb.db");
         let config = StoreBackendConfig::local_path(db_path, dim, encoding);
         let backend = Arc::new(SqliteBackend::open(config).await?) as Arc<dyn StoreBackend>;
+
+        Ok(Self::from_backend(
+            yaml_config,
+            data_dir,
+            models_dir,
+            backend,
+            job_queue,
+            url_scheduler,
+        ))
+    }
+
+    /// Create a new `AppState` around an already-open backend (issue #187
+    /// stage 3).
+    ///
+    /// For embedded/in-process use: the CLI's `index` and `source add`
+    /// commands already hold an open `StoreBackend` connection to
+    /// `localdb.db` (via `AppDb::open`/`load_app_db`) by the time they need
+    /// to run a job through `job_exec::run_job` — opening a second
+    /// connection here would be wasteful, and more importantly,
+    /// `SqliteBackend::open` (what `Self::new` calls) enforces a
+    /// schema-version migration guard on every open; embedded mode must pay
+    /// that cost at most once per process, not once for the CLI's own
+    /// `AppDb::open` *and again* for a second `AppState`-owned connection to
+    /// the same file.
+    ///
+    /// No I/O happens here — everything this constructor does is derived
+    /// from `yaml_config` alone (mirroring `Self::new`'s
+    /// `default_indexing_policy`/`default_policy_version` derivation
+    /// exactly, so the two constructors can never drift apart on what an
+    /// `AppState`'s default indexing policy is) or is simply stored as
+    /// given. In particular, nothing here assumes the backend was *just*
+    /// opened: `default_indexing_policy`/`default_policy_version` come from
+    /// the YAML config, not from a query against the backend, and every
+    /// other `Inner` field is either caller-supplied already or has no
+    /// dependency on connection freshness.
+    pub fn from_backend(
+        yaml_config: RawConfig,
+        data_dir: PathBuf,
+        models_dir: PathBuf,
+        backend: Arc<dyn StoreBackend>,
+        job_queue: JobQueue,
+        url_scheduler: UrlRefreshScheduler,
+    ) -> Self {
         let default_indexing_policy = yaml_config.defaults.indexing.clone();
         let default_policy_version = compute_policy_version(&default_indexing_policy);
 
-        Ok(Self {
+        Self {
             inner: Arc::new(Inner {
                 yaml_config: RwLock::new(yaml_config),
                 data_dir,
+                models_dir,
                 backend,
                 default_indexing_policy,
                 default_policy_version,
                 job_queue,
                 url_scheduler,
+                embedder_cache: RwLock::new(None),
+                #[cfg(test)]
+                embedder_build_count: std::sync::atomic::AtomicUsize::new(0),
             }),
-        })
+        }
     }
 
     /// Access the job queue.
@@ -105,6 +183,12 @@ impl AppState {
 
     pub fn data_dir(&self) -> &PathBuf {
         &self.inner.data_dir
+    }
+
+    /// The directory `embed::create_embedder` should cache/load local model
+    /// weights from (mirrors the CLI's `ResolvedPaths::models_dir`).
+    pub fn models_dir(&self) -> &Path {
+        &self.inner.models_dir
     }
 
     pub fn backend(&self) -> &dyn StoreBackend {
@@ -148,6 +232,121 @@ impl AppState {
     pub async fn reload_yaml_config(&self, new_config: RawConfig) {
         let mut yaml = self.inner.yaml_config.write().await;
         *yaml = new_config;
+    }
+
+    /// Get the embedder for `yaml`'s embedding policy, building it only when
+    /// the policy or the provider settings it resolves against have changed
+    /// since the last build (Codex review finding F2, issue #187; extended
+    /// for finding H1, issue #212).
+    ///
+    /// Before this cache existed, every job execution called
+    /// `embed::create_embedder` from scratch — for the default local
+    /// ONNX/CoreML provider that reloads the model weights on every single
+    /// job. The single-slot cache below is keyed by `EmbeddingPolicy`
+    /// (`yaml.defaults.indexing.embedding`, the model+provider pair that
+    /// determines embedder identity) *and* the full `yaml.providers`
+    /// snapshot: the same policy over an unchanged providers list hits the
+    /// cache; a changed policy, or a changed `providers` entry (e.g. a
+    /// hosted provider's `base_url`/`api_key_env` edited under an otherwise
+    /// unchanged policy), misses and rebuilds. Comparing the whole `Vec`
+    /// rather than isolating "the provider this policy resolves to" is
+    /// deliberate — simpler, and an unrelated provider edit costing one
+    /// extra rebuild is an acceptable trade. A config reload
+    /// (`reload_yaml_config`) needs no explicit cache flush — the caller
+    /// always passes the freshly reloaded `yaml`, so a changed policy or
+    /// providers list simply fails the equality check below on the next
+    /// call and rebuilds naturally.
+    pub async fn get_or_build_embedder(
+        &self,
+        yaml: &RawConfig,
+    ) -> Result<Arc<dyn Embedder>, Error> {
+        let policy = &yaml.defaults.indexing.embedding;
+        let providers = &yaml.providers;
+
+        // Fast path: an unchanged policy + providers snapshot only ever
+        // needs a read lock.
+        {
+            let cache = self.inner.embedder_cache.read().await;
+            if let Some((cached_policy, cached_providers, embedder)) = cache.as_ref() {
+                if cached_policy == policy && cached_providers == providers {
+                    return Ok(embedder.clone());
+                }
+            }
+        }
+
+        let mut cache = self.inner.embedder_cache.write().await;
+        // Re-check under the write lock: another caller may have already
+        // rebuilt for this exact policy + providers snapshot while we were
+        // waiting on it.
+        if let Some((cached_policy, cached_providers, embedder)) = cache.as_ref() {
+            if cached_policy == policy && cached_providers == providers {
+                return Ok(embedder.clone());
+            }
+        }
+
+        // Build while still holding the write lock. This is deliberate: it
+        // guarantees at most one embedder is ever built per policy change,
+        // at the cost of serializing concurrent builders behind a cold/
+        // changed cache. Acceptable today because the job engine runs a
+        // single worker (issue #187) — there is never more than one job in
+        // flight to contend for this lock.
+        let policy_owned = policy.clone();
+        let providers_owned = providers.clone();
+        let providers_for_build = providers_owned.clone();
+        let models_dir = self.inner.models_dir.clone();
+        let built = localdb_core::run_blocking(move || {
+            embed::create_embedder(&policy_owned, &providers_for_build, Some(&models_dir))
+        })?;
+        let embedder: Arc<dyn Embedder> = Arc::from(built);
+
+        #[cfg(test)]
+        self.inner
+            .embedder_build_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        *cache = Some((policy.clone(), providers_owned, embedder.clone()));
+        Ok(embedder)
+    }
+
+    /// Run one scoped index job end to end: resolve `scope`'s sources,
+    /// build/reuse the cached embedder only if there's actually something to
+    /// index, assemble `JobExecDeps`, and hand off to `job_exec::run_job`.
+    ///
+    /// Factored out of `handlers::jobs::create_job` and
+    /// `UrlRefreshScheduler::tick` (#187 review, DRY finding): both ran this
+    /// exact sequence — differing only in `deletion` (an HTTP caller's
+    /// explicit policy vs. the scheduler's hardcoded `Retain`, issues
+    /// #156/#185) and in what happens to the result afterward (the HTTP path
+    /// returns it as the job's stats; the scheduler also stamps
+    /// `last_refreshed` once it settles). Both call sites still resolve
+    /// `sources` before deciding whether to build an embedder — never pay
+    /// for a (potentially huge) embedding model just to discover the scope
+    /// is empty or unresolvable (Codex review finding G1, issue #187).
+    pub(crate) async fn run_scoped_job(
+        &self,
+        store_row: &StoreRow,
+        scope: IndexJobScope,
+        deletion: DeletionPolicy,
+        progress: ProgressSink,
+    ) -> Result<IndexJobStats, Error> {
+        let yaml = self.yaml_config().await;
+        let sources = job_exec::resolve_job_sources(self.backend(), &store_row.id, &scope).await?;
+        let embedder = if sources.is_empty() {
+            None
+        } else {
+            Some(self.get_or_build_embedder(&yaml).await?)
+        };
+        let deps = job_exec::JobExecDeps {
+            backend: self.backend(),
+            yaml: &yaml,
+            models_dir: self.models_dir(),
+            embedder,
+            progress: Some(progress),
+            on_source_error: None,
+        };
+        job_exec::run_job(store_row, scope, deletion, deps)
+            .await
+            .map(|(stats, _embedder)| stats)
     }
 
     /// Add a runtime-owned store.
@@ -239,6 +438,7 @@ impl AppState {
             .find(|s| s.name == name)
             .map(|s| StoreRecord {
                 name: s.name.clone(),
+                id: s.id.clone(),
                 visibility: s.visibility.clone(),
                 backend: s.backend.clone(),
             })
@@ -321,14 +521,10 @@ impl AppState {
             }
         }
 
-        Ok(SourceRecord {
-            id,
-            store_id,
-            kind: kind.to_string(),
-            spec,
-            preset: preset.to_string(),
-            refresh: refresh.map(|s| s.to_string()),
-        })
+        // Return the row as persisted, not the raw request — defaults filled
+        // in during persistence (or future normalization) must be reflected
+        // in the 201 body so it matches a subsequent GET (#197).
+        source_row_to_record(source_row)
     }
 
     /// List sources for a store.
@@ -408,7 +604,7 @@ impl AppState {
     }
 }
 
-fn store_visibility_to_str(visibility: &StoreVisibility) -> &'static str {
+pub(crate) fn store_visibility_to_str(visibility: &StoreVisibility) -> &'static str {
     match visibility {
         StoreVisibility::Private => "private",
         StoreVisibility::Shared => "shared",
@@ -466,9 +662,18 @@ fn source_row_to_record(row: SourceRow) -> Result<SourceRecord, Error> {
 }
 
 /// A store record as returned by the API.
+///
+/// `id` (issue #187 stage 5): needed so `POST /v1/stores`'s response can
+/// carry the same `{status, name, id}` shape the embedded `store add` path
+/// has always returned in `--json` mode — without it, the CLI's daemon-aware
+/// dispatch table would have no way to render an identical `Outcome` for both
+/// transports. Populated on every handler (`list_stores`, `create_store`,
+/// `get_store`, `patch_store`) rather than only `create_store`, so the type
+/// never has a "sometimes has an id" ambiguity.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoreRecord {
     pub name: String,
+    pub id: String,
     pub visibility: String,
     pub backend: String,
 }
@@ -477,6 +682,16 @@ pub struct StoreRecord {
 impl AppState {
     async fn scheduler_source_count(&self) -> usize {
         self.inner.url_scheduler.source_count().await
+    }
+
+    /// Number of times this `AppState`'s embedder cache has actually called
+    /// `embed::create_embedder` (Codex review finding F2, issue #187). See
+    /// `Inner::embedder_build_count`'s doc comment for why this is
+    /// per-instance rather than a shared static.
+    pub(crate) fn embedder_build_count(&self) -> usize {
+        self.inner
+            .embedder_build_count
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -502,12 +717,119 @@ mod tests {
         let state = AppState::new(
             yaml_config,
             dir.path().to_path_buf(),
+            dir.path().join("models"),
             queue.clone(),
             UrlRefreshScheduler::new(queue),
         )
         .await
         .unwrap();
         (dir, state)
+    }
+
+    #[tokio::test]
+    async fn models_dir_returns_the_value_it_was_given() {
+        let (dir, state) = make_state().await;
+        assert_eq!(state.models_dir(), dir.path().join("models"));
+    }
+
+    // --- from_backend (issue #187 stage 3) ---------------------------------
+
+    fn fake_yaml_config() -> RawConfig {
+        let mut yaml_config = RawConfig {
+            version: 1,
+            server: Default::default(),
+            paths: Default::default(),
+            defaults: Default::default(),
+            providers: vec![],
+        };
+        yaml_config.defaults.indexing.embedding = localdb_core::config::schema::EmbeddingPolicy {
+            provider: "fake".to_string(),
+            model: "default".to_string(),
+        };
+        yaml_config
+    }
+
+    /// `from_backend` must derive the exact same `default_indexing_policy` /
+    /// `default_policy_version` as `new` — both are pure functions of
+    /// `yaml_config`, so a store added via either constructor must land on
+    /// the same policy version.
+    #[tokio::test]
+    async fn from_backend_derives_same_default_policy_version_as_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml_config = fake_yaml_config();
+
+        let (dim, encoding) = embed::infer_dim_encoding(
+            &yaml_config.defaults.indexing.embedding,
+            &yaml_config.providers,
+        )
+        .unwrap();
+        let db_path = dir.path().join("localdb.db");
+        let config = StoreBackendConfig::local_path(db_path, dim, encoding);
+        let backend = Arc::new(SqliteBackend::open(config).await.unwrap()) as Arc<dyn StoreBackend>;
+
+        let queue = JobQueue::new();
+        let state = AppState::from_backend(
+            yaml_config.clone(),
+            dir.path().to_path_buf(),
+            dir.path().join("models"),
+            backend,
+            queue.clone(),
+            UrlRefreshScheduler::new(queue),
+        );
+
+        state.add_store("notes", "private").await.unwrap();
+        let row = state
+            .backend()
+            .get_store_by_name("notes")
+            .await
+            .unwrap()
+            .unwrap();
+        let expected_version = compute_policy_version(&yaml_config.defaults.indexing);
+        assert_eq!(row.policy_version, expected_version);
+    }
+
+    /// `from_backend` must operate on the exact backend handle it was given
+    /// — not open a fresh connection of its own — so a store added through
+    /// the caller's own already-open handle is immediately visible through
+    /// the resulting `AppState`, and vice versa.
+    #[tokio::test]
+    async fn from_backend_shares_the_given_backend_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml_config = fake_yaml_config();
+
+        let (dim, encoding) = embed::infer_dim_encoding(
+            &yaml_config.defaults.indexing.embedding,
+            &yaml_config.providers,
+        )
+        .unwrap();
+        let db_path = dir.path().join("localdb.db");
+        let config = StoreBackendConfig::local_path(db_path, dim, encoding);
+        let backend = Arc::new(SqliteBackend::open(config).await.unwrap()) as Arc<dyn StoreBackend>;
+
+        // Add a store directly via the caller's own handle, before the
+        // `AppState` even exists.
+        let row = store_factory::default_store_row(
+            "pre-existing",
+            StoreVisibility::Private,
+            &yaml_config.defaults.indexing,
+            &compute_policy_version(&yaml_config.defaults.indexing),
+        )
+        .unwrap();
+        backend.upsert_store(&row).await.unwrap();
+
+        let queue = JobQueue::new();
+        let state = AppState::from_backend(
+            yaml_config,
+            dir.path().to_path_buf(),
+            dir.path().join("models"),
+            backend,
+            queue.clone(),
+            UrlRefreshScheduler::new(queue),
+        );
+
+        let effective = state.effective_config().await.unwrap();
+        assert_eq!(effective.stores.len(), 1);
+        assert_eq!(effective.stores[0].name, "pre-existing");
     }
 
     #[tokio::test]
@@ -1047,6 +1369,126 @@ mod tests {
             state.scheduler_source_count().await,
             0,
             "url_scheduler should have 0 sources after remove_store"
+        );
+    }
+
+    // --- get_or_build_embedder (Codex review finding F2, issue #187) -------
+
+    /// Three sequential calls with the same policy must build the embedder
+    /// exactly once — the read-lock fast path must hit on calls 2 and 3, and
+    /// every call must return the same `Arc`.
+    #[tokio::test]
+    async fn get_or_build_embedder_builds_once_across_repeated_calls() {
+        let (_dir, state) = make_state().await;
+        let yaml = state.yaml_config().await;
+
+        let a = state.get_or_build_embedder(&yaml).await.unwrap();
+        let b = state.get_or_build_embedder(&yaml).await.unwrap();
+        let c = state.get_or_build_embedder(&yaml).await.unwrap();
+
+        assert_eq!(
+            state.embedder_build_count(),
+            1,
+            "embedder should be built exactly once across 3 calls with an unchanged policy"
+        );
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "second call should return the cached Arc"
+        );
+        assert!(
+            Arc::ptr_eq(&a, &c),
+            "third call should return the cached Arc"
+        );
+    }
+
+    /// A changed `EmbeddingPolicy` (different model) must miss the cache and
+    /// rebuild, returning a distinct `Arc`.
+    #[tokio::test]
+    async fn get_or_build_embedder_rebuilds_on_policy_change() {
+        let (_dir, state) = make_state().await;
+        let mut yaml = state.yaml_config().await;
+
+        let first = state.get_or_build_embedder(&yaml).await.unwrap();
+
+        yaml.defaults.indexing.embedding.model = "different-model".to_string();
+        let second = state.get_or_build_embedder(&yaml).await.unwrap();
+
+        assert_eq!(
+            state.embedder_build_count(),
+            2,
+            "a changed embedding policy should trigger a rebuild"
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "a rebuilt embedder must not be the same Arc as the stale cached one"
+        );
+    }
+
+    /// After `reload_yaml_config` swaps in a config with a different
+    /// embedding policy, the next `get_or_build_embedder` call (using the
+    /// freshly reloaded snapshot, as every real call site does via
+    /// `state.yaml_config()`) must rebuild exactly once — no explicit cache
+    /// flush needed, since the policy comparison itself misses.
+    #[tokio::test]
+    async fn get_or_build_embedder_rebuilds_once_after_config_reload() {
+        let (_dir, state) = make_state().await;
+        let old_yaml = state.yaml_config().await;
+        let old = state.get_or_build_embedder(&old_yaml).await.unwrap();
+
+        let mut new_yaml = old_yaml.clone();
+        new_yaml.defaults.indexing.embedding.model = "reloaded-model".to_string();
+        state.reload_yaml_config(new_yaml).await;
+
+        let reloaded_yaml = state.yaml_config().await;
+        let rebuilt = state.get_or_build_embedder(&reloaded_yaml).await.unwrap();
+        let rebuilt_again = state.get_or_build_embedder(&reloaded_yaml).await.unwrap();
+
+        assert_eq!(
+            state.embedder_build_count(),
+            2,
+            "should build once for the original policy, once more for the reloaded policy"
+        );
+        assert!(
+            !Arc::ptr_eq(&old, &rebuilt),
+            "post-reload embedder must not be the stale pre-reload Arc"
+        );
+        assert!(
+            Arc::ptr_eq(&rebuilt, &rebuilt_again),
+            "a second call against the same reloaded policy should hit the cache"
+        );
+    }
+
+    /// An unchanged `EmbeddingPolicy` but a changed `providers` entry (e.g.
+    /// editing a hosted provider's `base_url` under `providers:` in the
+    /// YAML) must still miss the cache and rebuild — the cache key is
+    /// policy *and* the providers snapshot, not policy alone (Codex review
+    /// finding H1, issue #212).
+    #[tokio::test]
+    async fn get_or_build_embedder_rebuilds_on_provider_settings_change() {
+        let (_dir, state) = make_state().await;
+        let mut old_yaml = state.yaml_config().await;
+        old_yaml.providers = vec![localdb_core::config::schema::ProviderConfig {
+            name: "hosted".to_string(),
+            kind: "openai-compatible".to_string(),
+            base_url: Some("https://old.example.com".to_string()),
+            api_key_env: Some("OLD_API_KEY".to_string()),
+        }];
+        state.reload_yaml_config(old_yaml.clone()).await;
+        let first = state.get_or_build_embedder(&old_yaml).await.unwrap();
+
+        let mut new_yaml = old_yaml.clone();
+        new_yaml.providers[0].base_url = Some("https://new.example.com".to_string());
+        state.reload_yaml_config(new_yaml.clone()).await;
+        let second = state.get_or_build_embedder(&new_yaml).await.unwrap();
+
+        assert_eq!(
+            state.embedder_build_count(),
+            2,
+            "a changed provider base_url under an unchanged policy should trigger a rebuild"
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "a rebuilt embedder must not be the same Arc as the stale cached one"
         );
     }
 }

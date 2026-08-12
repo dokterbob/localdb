@@ -309,6 +309,53 @@ fn mcp_stdio_daemon_unreachable_maps_to_daemon_unreachable_exit_code() {
     );
 }
 
+/// Issue #147: a failed proxy connect must not fail *silently* — before this
+/// fix, the only signal was `exit_err`'s generic "error: daemon is
+/// unreachable" line, with the actual transport-level reason (e.g.
+/// connection refused) discarded. `run_mcp_async`'s
+/// `Err(ProxyConnectError::Unreachable(e))` arm now emits a `tracing::warn!`
+/// carrying `e` before exiting; `localdb/src/main.rs`'s default log filter
+/// (`warn,pdf_oxide=off`) means this shows up on stderr with no `RUST_LOG`
+/// needed, exactly like every other daemon-connection diagnostic this ticket
+/// adds. Reuses the same closed-port setup as
+/// `mcp_stdio_daemon_unreachable_maps_to_daemon_unreachable_exit_code` (a
+/// single client process is sufficient to drive the connect failure — no
+/// second `localdb serve` process is needed to prove the warning fires, so a
+/// full two-process test would be disproportionate here).
+#[test]
+fn mcp_stdio_daemon_unreachable_logs_a_warning() {
+    let dir = TempDir::new().unwrap();
+    write_config(&dir, "");
+
+    let closed_port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+        // listener drops here, closing the port.
+    };
+    let stale_url = format!("http://127.0.0.1:{closed_port}");
+
+    let assert = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &stale_url)
+        .arg("mcp")
+        .write_stdin("")
+        .assert()
+        .code(5);
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("WARN"),
+        "expected a WARN-level log line, got stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("mcp proxy: failed to connect to daemon"),
+        "expected the proxy-connect warning, got stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(&stale_url),
+        "expected the warning to name the unreachable daemon URL, got stderr: {stderr}"
+    );
+}
+
 /// Codex review (P2): a malformed `--store` name must be rejected as
 /// `invalid_request`/exit 2 in proxied mode too, matching embedded mode and
 /// every other store-scoped command — not surface as `store_not_found`/exit 3
@@ -343,6 +390,139 @@ fn mcp_proxied_traversal_store_name_exits_2_before_connecting() {
         !stderr.contains("store not found"),
         "a malformed name is invalid usage, not a missing store: {stderr}"
     );
+}
+
+/// Stamp `PRAGMA user_version = version` on a raw db file at `path`, bypassing
+/// any of the CLI's normal open paths — simulates a schema-too-new local
+/// store. Copied from `cli_integration.rs`'s helper of the same name: each
+/// file under `tests/` is its own compilation unit, so it can't be shared
+/// directly.
+async fn stamp_user_version(path: &std::path::Path, version: i64) {
+    let db = libsql::Builder::new_local(path).build().await.unwrap();
+    let conn = db.connect().unwrap();
+    conn.query(&format!("PRAGMA user_version = {version}"), ())
+        .await
+        .unwrap();
+}
+
+/// Regression test for issue #187 review, PR #212 finding: `run_mcp_async`
+/// called `load_app_db` — opening the local `AppDb` — *before* `probe_daemon`,
+/// even though the proxied (`DaemonState::Running`) branch below never uses
+/// `db`. So a broken local store (unwritable, locked, schema-too-new) would
+/// `exit_err` on the open and never reach the daemon probe at all — the same
+/// bug class `command_table::dispatch`'s lazy `open_db` closure (issue #187
+/// review, finding G4) fixed for every table-driven command. `mcp` is
+/// hand-rolled (it never went through `dispatch`), so it needed its own fix.
+///
+/// This breaks `dir`'s local db deterministically (stamps a schema version
+/// this build's migration chain will never reach, the same technique
+/// `cli_integration.rs`'s
+/// `source_list_routes_to_daemon_when_local_db_schema_is_incompatible` uses)
+/// and points `LOCALDB_DAEMON_URL` at a real, healthy `localdb serve` daemon
+/// running against a *separate* data directory — proving the fix with a real
+/// two-subprocess MCP round trip, the same idiom
+/// `mcp_stdio_proxies_to_running_daemon` uses, rather than a mock (a mock
+/// HTTP server can't speak the real `/mcp` streamable-HTTP protocol
+/// `ProxyHandler::connect` needs).
+///
+/// Before the fix: `cmd_with_dir(&dir)` opens `dir`'s broken local db before
+/// ever consulting `LOCALDB_DAEMON_URL`, so this exits 2 (invalid_config)
+/// without ever reaching the proxy branch — red. After the fix: the local db
+/// is opened lazily, only from the embedded branch, so the daemon probe (which
+/// trusts `LOCALDB_DAEMON_URL` unconditionally) routes to the healthy daemon
+/// and the broken local db is never touched — green.
+#[test]
+fn mcp_routes_to_daemon_when_local_db_schema_is_incompatible() {
+    let dir = TempDir::new().unwrap();
+    write_config(&dir, "");
+    let data_dir = dir.path().join("data");
+    let db_path = data_dir.join("localdb.db");
+
+    // `store add` creates a fresh store at head, seeding a real schema this
+    // binary understands and can open normally.
+    cmd_with_dir(&dir)
+        .args(["store", "add", "s1"])
+        .assert()
+        .success();
+
+    // Stamp a schema version far beyond anything this binary's migration
+    // chain will ever reach, so any subsequent `AppDb::open` on this file
+    // hits `VersionDisposition::TooNew` -> `Error::InvalidConfig`.
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(stamp_user_version(&db_path, 999_999));
+
+    // A separate, healthy daemon: its own config and data directory,
+    // unrelated to the broken db above, so it starts and opens its own store
+    // normally.
+    let daemon_dir = TempDir::new().unwrap();
+    write_config(&daemon_dir, "server:\n  port: 0\n");
+    seed_indexed_store(&daemon_dir);
+
+    let bin = assert_cmd::cargo::cargo_bin("localdb");
+    let mut daemon = std::process::Command::new(&bin)
+        .arg("serve")
+        .env("LOCALDB_CONFIG", daemon_dir.path().join("config.yaml"))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn localdb serve");
+
+    let daemon_stdout = daemon.stdout.take().unwrap();
+    let mut reader = BufReader::new(daemon_stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read announce line");
+    let addr = line
+        .split("http://")
+        .nth(1)
+        .unwrap_or_else(|| panic!("announce line must contain http:// URL, got: {line}"))
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    let base_url = format!("http://{addr}");
+
+    let input = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test-client","version":"0.0.1"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+        "\n",
+    );
+
+    // `dir`'s local db is broken; `LOCALDB_DAEMON_URL` points at the separate,
+    // healthy daemon above.
+    let assert = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &base_url)
+        .arg("mcp")
+        .write_stdin(input)
+        .assert()
+        .success();
+
+    daemon.kill().ok();
+    daemon.wait().ok();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let responses: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("each stdout line is JSON"))
+        .collect();
+    assert_eq!(responses.len(), 2, "stdout was: {stdout}");
+
+    let tools = &responses[1];
+    let names: Vec<&str> = tools["result"]["tools"]
+        .as_array()
+        .expect("tools/list result.tools is an array")
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    for expected in ["search", "get_document", "get_chunks", "list_stores"] {
+        assert!(
+            names.contains(&expected),
+            "missing tool {expected} via daemon-proxied mcp: {names:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -403,5 +583,183 @@ fn serve_starts_listens_and_serves_status() {
     assert!(
         response.contains("\"daemon\":true") && response.contains("store_count"),
         "/v1/status body must report daemon status and store_count: {response}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Unified async job model, daemon-routed (issue #187 stage 3)
+// ---------------------------------------------------------------------------
+
+/// Real two-process end-to-end: `localdb serve` (a genuine daemon, no mock)
+/// → `localdb store add` + `localdb source add` (routed to it over HTTP,
+/// D3: auto-index now runs for a daemon-routed `source add` too) → `localdb
+/// search` (also daemon-routed) finds the indexed content.
+///
+/// Embedder: `provider: fake` (`write_config`'s default, the same one every
+/// other `surface_wiring`/`cli_integration` test uses) — a real local-model
+/// download is unacceptable in a test, and `fake` is already the
+/// established offline stand-in throughout this crate, so no new stub HTTP
+/// embedding server is needed.
+///
+/// Asserts the parts D3 and the unified job model actually promise:
+/// - `source add`'s stdout confirms the add went through the daemon.
+/// - stderr shows live auto-index progress (the plain-mode progress sink,
+///   since stderr is piped rather than a TTY here) — proving the daemon
+///   branch actually attached to the job instead of just printing
+///   "submitted".
+/// - the auto-index summary reports a nonzero indexed/chunk count.
+/// - a subsequent `localdb search` (also daemon-routed, since the daemon is
+///   still up) finds the content by a distinctive word from the fixture.
+#[test]
+fn daemon_source_add_auto_indexes_and_is_searchable() {
+    let dir = TempDir::new().unwrap();
+    write_config(&dir, "server:\n  port: 0\n");
+
+    let bin = assert_cmd::cargo::cargo_bin("localdb");
+    let mut daemon = std::process::Command::new(&bin)
+        .arg("serve")
+        .env("LOCALDB_CONFIG", dir.path().join("config.yaml"))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn localdb serve");
+
+    let daemon_stdout = daemon.stdout.take().unwrap();
+    let mut reader = BufReader::new(daemon_stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read announce line");
+    let addr = line
+        .split("http://")
+        .nth(1)
+        .unwrap_or_else(|| panic!("announce line must contain http:// URL, got: {line}"))
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    let base_url = format!("http://{addr}");
+
+    // `source add`'s daemon branch defaults to the store named "default"
+    // (specs/05-surfaces.md §2.2) — it must already exist, same as the
+    // embedded path.
+    cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &base_url)
+        .args(["store", "add", "default"])
+        .assert()
+        .success();
+
+    let fixture = dir.path().join("e2e-docs");
+    std::fs::create_dir_all(&fixture).unwrap();
+    std::fs::write(
+        fixture.join("quokka.md"),
+        "# Quokka facts\n\nQuokkas are small marsupials known for their friendly smiles.\n",
+    )
+    .unwrap();
+
+    let add_output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &base_url)
+        .args(["source", "add", fixture.to_str().unwrap()])
+        .output()
+        .expect("run source add");
+
+    if !add_output.status.success() {
+        daemon.kill().ok();
+        daemon.wait().ok();
+        panic!(
+            "daemon-routed source add failed: stdout={}\nstderr={}",
+            String::from_utf8_lossy(&add_output.stdout),
+            String::from_utf8_lossy(&add_output.stderr)
+        );
+    }
+
+    // Issue #187 review, finding 1: the daemon-only "(via daemon)" text
+    // suffix is gone — daemon-routed `source add` now prints byte-identical
+    // output to embedded mode (mode is not part of the result; the request
+    // actually reaching the daemon is instead confirmed below by the
+    // auto-index progress lines, which only the daemon branch produces via
+    // `job_attach::run_daemon_store_job`'s SSE attach).
+    let add_stdout = String::from_utf8_lossy(&add_output.stdout).to_string();
+    assert!(
+        add_stdout.contains("Added source ") && add_stdout.contains("to store 'default'"),
+        "expected the same success line embedded mode prints: {add_stdout}"
+    );
+    assert!(
+        !add_stdout.contains("(via daemon)"),
+        "the daemon-only '(via daemon)' suffix must be gone: {add_stdout}"
+    );
+
+    // D3: the daemon branch now auto-indexes too — the plain-mode progress
+    // sink (stderr is piped, not a TTY, under `assert_cmd`) must show the
+    // job's real outcome, not just a submission acknowledgement.
+    //
+    // Deliberately NOT asserted: live per-document `Indexing ...` frames.
+    // With a near-instant fake-embedder job the SSE subscribe can land
+    // after the job already finished, in which case the attach path
+    // correctly receives only the terminal event (late-subscribe contract,
+    // issue #83) and prints only the summary — a timing race, observed on
+    // CI. The summary line below is the deterministic proof of attachment:
+    // it is rendered from the terminal job event's stats, which the old
+    // fire-and-forget daemon branch (it printed "submitted", polled
+    // nothing) could never produce.
+    let add_stderr = String::from_utf8_lossy(&add_output.stderr).to_string();
+    assert!(
+        add_stderr.contains("Auto-indexing source"),
+        "expected the auto-indexing announcement on stderr: {add_stderr}"
+    );
+    assert!(
+        add_stderr.contains("indexed 1 docs") && add_stderr.contains("2 chunks"),
+        "expected the attached job's terminal summary with real nonzero stats on stderr, \
+         proving the daemon branch attached to the job rather than just printing \
+         'submitted': {add_stderr}"
+    );
+    assert!(
+        !add_stderr.contains("submitted"),
+        "the old fire-and-forget submission hint must be gone: {add_stderr}"
+    );
+
+    // Now confirm via an explicit `index --json` that the auto-indexed
+    // content actually landed: a plain re-run should report the source as
+    // already up to date (docs_skipped > 0), never "no sources to index".
+    let index_output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &base_url)
+        .args(["--json", "index"])
+        .output()
+        .expect("run index --json");
+    assert!(
+        index_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&index_output.stderr)
+    );
+    let index_v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&index_output.stdout)).unwrap();
+    assert!(
+        index_v["docs_skipped"].as_u64().unwrap_or(0) > 0,
+        "the auto-indexed document must already be up to date on a follow-up index: {index_v}"
+    );
+
+    // `localdb search` (daemon-routed, per `search_routes_to_daemon_when_running`
+    // — the daemon is still up) must find the content by a word unique to
+    // the fixture.
+    let search_output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", &base_url)
+        .args(["--json", "search", "quokka marsupial"])
+        .output()
+        .expect("run search");
+
+    daemon.kill().ok();
+    daemon.wait().ok();
+
+    assert!(
+        search_output.status.success(),
+        "search failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&search_output.stdout),
+        String::from_utf8_lossy(&search_output.stderr)
+    );
+    let search_v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&search_output.stdout)).unwrap();
+    let citations = search_v["citations"]
+        .as_array()
+        .expect("search --json returns a citations array");
+    assert!(
+        !citations.is_empty(),
+        "search must find the auto-indexed quokka content: {search_v}"
     );
 }

@@ -130,3 +130,38 @@ pub trait StoreBackend: Send + Sync + 'static {
     /// as "the database has no tables".
     async fn largest_tables(&self, limit: usize) -> Result<Vec<TableSize>, Error>;
 }
+
+/// Resolve an explicit list of store names against `backend`, in request
+/// order, with duplicate names collapsed to their first occurrence.
+///
+/// Shared by the CLI's `resolve_store_scope_inner`
+/// (`cli/src/app_db.rs`) and the daemon's `resolve_status_scope`
+/// (`server/src/handlers/status.rs`, issue #187 PR #212) — both need the
+/// same "explicit `--store`/`?store=` names, in request order, deduplicated,
+/// `Error::StoreNotFound` on a miss" resolution against `dyn StoreBackend`.
+/// The CLI layers its own `StoreScopePolicy` (all-stores / default-store
+/// fallbacks for when no names were given) on top; that policy logic is not
+/// part of this helper, which only resolves a name list into rows.
+///
+/// `names` is expected to be non-empty (both callers branch on
+/// `names.is_empty()` before reaching here, since an empty list means
+/// something different at each call site); an empty slice simply returns an
+/// empty vector without touching `backend`.
+pub async fn resolve_named_stores(
+    backend: &dyn StoreBackend,
+    names: &[String],
+) -> Result<Vec<StoreRow>, Error> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(names.len());
+    for name in names {
+        if !seen.insert(name.as_str()) {
+            continue;
+        }
+        let store = backend
+            .get_store_by_name(name)
+            .await?
+            .ok_or_else(|| Error::StoreNotFound { id: name.clone() })?;
+        out.push(store);
+    }
+    Ok(out)
+}

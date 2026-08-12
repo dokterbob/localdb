@@ -51,11 +51,10 @@ pub async fn build_available_stores(
     }
 
     let yaml = state.yaml_config().await;
-    // Server has no `models_dir` override the way the CLI does (see
-    // `run_mcp_async`) — mirrors `search_service.rs`'s `create_embedder` call.
     let embedder: Arc<dyn Embedder> = Arc::new(LazyEmbedder::new(
         yaml.defaults.indexing.embedding.clone(),
         yaml.providers.clone(),
+        state.models_dir().to_path_buf(),
     ));
 
     Ok((stores, embedder))
@@ -71,14 +70,20 @@ pub async fn build_available_stores(
 struct LazyEmbedder {
     embed_policy: EmbeddingPolicy,
     providers: Vec<ProviderConfig>,
+    models_dir: std::path::PathBuf,
     inner: OnceCell<Result<Box<dyn Embedder>, Error>>,
 }
 
 impl LazyEmbedder {
-    fn new(embed_policy: EmbeddingPolicy, providers: Vec<ProviderConfig>) -> Self {
+    fn new(
+        embed_policy: EmbeddingPolicy,
+        providers: Vec<ProviderConfig>,
+        models_dir: std::path::PathBuf,
+    ) -> Self {
         Self {
             embed_policy,
             providers,
+            models_dir,
             inner: OnceCell::new(),
         }
     }
@@ -86,7 +91,7 @@ impl LazyEmbedder {
     async fn get_or_init(&self) -> &Result<Box<dyn Embedder>, Error> {
         self.inner
             .get_or_init(|| async {
-                embed::create_embedder(&self.embed_policy, &self.providers, None)
+                embed::create_embedder(&self.embed_policy, &self.providers, Some(&self.models_dir))
                     .map_err(Error::from)
             })
             .await
@@ -142,6 +147,7 @@ mod tests {
         let state = AppState::new(
             yaml_config,
             dir.path().to_path_buf(),
+            dir.path().join("models"),
             queue.clone(),
             UrlRefreshScheduler::new(queue),
         )

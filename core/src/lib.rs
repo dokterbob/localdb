@@ -6,9 +6,11 @@
 
 pub mod backend;
 pub mod block;
+pub mod blocking;
 pub mod chunker;
 pub mod citation;
 pub mod config;
+pub mod diagnostics;
 pub mod embedder;
 pub mod error;
 pub mod heading_index;
@@ -28,26 +30,29 @@ pub mod types;
 pub mod uri;
 
 pub use backend::{
-    DocumentInfo, SourceRow, StoreBackend, StoreBackendConfig, StoreBackendConnection, StoreRow,
-    TableSize,
+    resolve_named_stores, DocumentInfo, SourceRow, StoreBackend, StoreBackendConfig,
+    StoreBackendConnection, StoreRow, TableSize,
 };
 pub use block::{
     Block, BlockKind, BlockLocation, BoundingBox, ChunkLocation, IngestorKind, Resource,
     ResourceKind,
 };
+pub use blocking::run_blocking;
 pub use chunker::{chunk_blocks, CharSizer, ChunkOutput, ChunkSizer, ChunkerConfig, TokenSizer};
 /// Re-export key types at the crate root for convenience.
 pub use citation::Citation;
+pub use diagnostics::{bytes_per_chunk, compute_db_file_size, format_bytes, DbFileSize};
 pub use embedder::{
     DocumentChunks, EmbeddedDocument, Embedder, FakeEmbedder, TokenCounter, VectorEncoding,
 };
 pub use error::Error;
 pub use ids::{chunk_id, content_hash, new_ulid, resource_id};
 pub use ingestion::{
-    complete_index_job, create_index_job, enumerate_path_source, fail_index_job, index_resource,
-    is_store_stale, run_source_ingestion, start_index_job, DeletionPolicy, DocumentIndex,
-    DocumentRecord, FetchMetadata, FetchResult, FoundFile, IndexOutcome, IndexResourceDeps,
-    IngestionConfig, IngestionResult, PathEnumeration, SourceIngestionDeps, UrlFetcher,
+    complete_index_job, create_index_job, enumerate_path_source, fail_index_job,
+    fail_index_job_with_error, index_resource, is_store_stale, run_source_ingestion,
+    start_index_job, DeletionPolicy, DocumentIndex, DocumentRecord, FetchMetadata, FetchResult,
+    FoundFile, IndexOutcome, IndexResourceDeps, IngestionConfig, IngestionResult, PathEnumeration,
+    SourceIngestionDeps, UrlFetcher,
 };
 pub use ingestor::{
     ConfigField, ConfigFieldType, Enumeration, IngestCallback, IngestResult, IngestSource,
@@ -58,10 +63,11 @@ pub use metadata::{ConversationMetadata, DublinCoreMetadata, Metadata, Transcrip
 pub use parser::{ChainParser, ParsedDocument, Parser, Probe, PROBE_HEADER_LEN};
 pub use progress::{DocOutcome, ProgressEvent, ProgressSink};
 pub use search::{
-    rerank_noop, rrf_fuse_global, rrf_score, shape_citation, FusedChunkEntry, QueryRequest,
-    QueryResponse, SearchOrchestrator, StoreHandle,
+    clamp_search_limit, rerank_noop, rrf_fuse_global, rrf_score, shape_citation, FusedChunkEntry,
+    QueryRequest, QueryResponse, SearchOrchestrator, StoreHandle, SEARCH_MAX_LIMIT,
 };
 pub use snippet::truncate_snippet;
+pub use source::source_row_to_source;
 #[cfg(any(test, feature = "test-support"))]
 pub use store::FakeStore;
 pub use store::{ChunkRecord, MetadataFilter, RetrievalStore, SearchResult, StoreStats};

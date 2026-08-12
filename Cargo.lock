@@ -414,6 +414,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "axum-extra"
+version = "0.12.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be44683b41ccb9ab2d23a5230015c9c3c55be97a25e4428366de8873103f7970"
+dependencies = [
+ "axum-core 0.5.6",
+ "bytes",
+ "form_urlencoded",
+ "futures-core",
+ "futures-util",
+ "http 1.4.2",
+ "http-body 1.0.1",
+ "http-body-util",
+ "mime",
+ "pin-project-lite",
+ "serde_core",
+ "serde_html_form",
+ "serde_path_to_error",
+ "tower-layer",
+ "tower-service",
+]
+
+[[package]]
 name = "base64"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -831,9 +854,11 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 name = "cli"
 version = "0.1.0"
 dependencies = [
+ "axum 0.8.9",
  "embed",
  "extract",
  "fetch",
+ "futures",
  "indicatif 0.17.11",
  "ingest",
  "localdb-core",
@@ -845,6 +870,7 @@ dependencies = [
  "store-libsql",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2796,6 +2822,7 @@ dependencies = [
  "async-trait",
  "extract",
  "feed-rs",
+ "fetch",
  "localdb-core",
  "mediatype",
  "serde_json",
@@ -5329,6 +5356,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_html_form"
+version = "0.2.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2f2d7ff8a2140333718bb329f5c40fc5f0865b84c426183ce14c97d2ab8154f"
+dependencies = [
+ "form_urlencoded",
+ "indexmap 2.14.0",
+ "itoa",
+ "ryu",
+ "serde_core",
+]
+
+[[package]]
 name = "serde_json"
 version = "1.0.150"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5394,7 +5434,12 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
+ "axum-extra",
  "embed",
+ "extract",
+ "fetch",
+ "futures",
+ "ingest",
  "localdb-core",
  "mcp",
  "notify-debouncer-mini",
@@ -5407,6 +5452,7 @@ dependencies = [
  "tokio",
  "tower 0.5.3",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

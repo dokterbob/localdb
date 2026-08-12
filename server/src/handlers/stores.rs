@@ -24,6 +24,7 @@ pub async fn list_stores(
         .iter()
         .map(|s| StoreRecord {
             name: s.name.clone(),
+            id: s.id.clone(),
             visibility: s.visibility.clone(),
             backend: s.backend.clone(),
         })
@@ -67,6 +68,7 @@ pub async fn create_store(
     };
     let record = StoreRecord {
         name: store.name.clone(),
+        id: store.id.clone(),
         visibility,
         backend: store.backend.kind.clone(),
     };

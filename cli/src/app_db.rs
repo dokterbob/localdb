@@ -9,7 +9,7 @@ use localdb_core::{
         policy::compute_policy_version,
         schema::{EmbeddingPolicy, IndexingPolicyConfig, ProviderConfig},
     },
-    store_factory,
+    resolve_named_stores, store_factory,
     types::StoreVisibility,
     Error, StoreBackend, StoreBackendConfig, StoreRow,
 };
@@ -95,27 +95,24 @@ pub(crate) async fn open_app_db_from_loader(config_loader: &ConfigLoader) -> Res
 // Common setup helpers
 // ---------------------------------------------------------------------------
 
-/// Load config and open the AppDb. Exits on failure.
-///
 /// SQLite WAL mode allows concurrent readers and writers, so the DB can be
 /// opened directly regardless of whether the daemon is also running. Commands
 /// that detect a running daemon will route mutations through the HTTP API;
 /// they still open the real DB for read operations (store list, etc.).
-pub(crate) async fn load_app_db(ctx: &CliContext) -> (ConfigLoader, AppDb) {
-    let options = LoadOptions {
-        config_path: ctx.config.clone(),
-        ..Default::default()
-    };
-    let config_loader = match load_config(&options, ctx.config_env.as_deref()) {
-        Ok(c) => c,
-        Err(e) => exit_err(&e, ctx.json),
-    };
-
-    let db = match open_app_db_from_loader(&config_loader).await {
+///
+/// Pairs with [`load_config_for_maintenance`] (the config half) as the
+/// DB-open half. Every caller — `command_table::dispatch` call sites,
+/// `job_attach.rs`, `cmds/surface.rs`'s `run_mcp_async` — calls this lazily,
+/// only once it actually needs the DB (after a daemon probe has already come
+/// back `NotRunning`/not applicable), rather than opening it unconditionally
+/// up front (issue #187 review, finding G4): a broken local store
+/// (unwritable, locked, schema-too-new) used to `exit_err` here before a
+/// healthy daemon ever got a chance to handle the command.
+pub(crate) async fn open_app_db_or_exit(ctx: &CliContext, config_loader: &ConfigLoader) -> AppDb {
+    match open_app_db_from_loader(config_loader).await {
         Ok(d) => d,
         Err(e) => exit_err(&e, ctx.json),
-    };
-    (config_loader, db)
+    }
 }
 
 /// F1-cli: Load config with fallback to platform defaults for read-only commands.
@@ -123,12 +120,28 @@ pub(crate) async fn load_app_db(ctx: &CliContext) -> (ConfigLoader, AppDb) {
 /// When the config file is malformed or unreadable, read-only commands (search,
 /// store list, status) should still work using platform default config and an
 /// empty temp DB, rather than hard failing.
+///
+/// A thin wrapper over [`load_config_lenient`] (the config half) and
+/// [`open_app_db_lenient_or_exit`] (the DB-open half) — see
+/// [`open_app_db_or_exit`]'s doc comment for why `command_table::dispatch`
+/// call sites, and every other caller in this crate, use the two halves
+/// separately instead.
 pub(crate) async fn load_app_db_lenient(ctx: &CliContext) -> (ConfigLoader, AppDb) {
+    let config_loader = load_config_lenient(ctx);
+    let db = open_app_db_lenient_or_exit(ctx, &config_loader).await;
+    (config_loader, db)
+}
+
+/// The config-only half of [`load_app_db_lenient`]'s fallback-to-platform-defaults
+/// behavior — see that function's doc comment. Factored out so
+/// `command_table::dispatch` call sites can select their DB-open moment
+/// independently (issue #187 review, finding G4).
+pub(crate) fn load_config_lenient(ctx: &CliContext) -> ConfigLoader {
     let options = LoadOptions {
         config_path: ctx.config.clone(),
         ..Default::default()
     };
-    let config_loader = match load_config(&options, ctx.config_env.as_deref()) {
+    match load_config(&options, ctx.config_env.as_deref()) {
         Ok(c) => c,
         Err(e) => {
             // If the intended config file exists, it's malformed — fail hard (exit 2).
@@ -169,35 +182,51 @@ pub(crate) async fn load_app_db_lenient(ctx: &CliContext) -> (ConfigLoader, AppD
                 }
             }
         }
-    };
+    }
+}
 
-    let db = match open_app_db_from_loader(&config_loader).await {
+/// The DB-open half of [`load_app_db_lenient`], including its
+/// `RuntimeStateLocked` 100ms-retry. Exits on failure via `exit_err`, exactly
+/// as `load_app_db_lenient` always did — factored out for the same reason as
+/// `open_app_db_or_exit` (issue #187 review, finding G4): so
+/// `command_table::dispatch` call sites can defer the open until the daemon
+/// probe comes back `NotRunning`.
+pub(crate) async fn open_app_db_lenient_or_exit(
+    ctx: &CliContext,
+    config_loader: &ConfigLoader,
+) -> AppDb {
+    match open_app_db_from_loader(config_loader).await {
         Ok(d) => d,
         Err(Error::RuntimeStateLocked) => {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            match open_app_db_from_loader(&config_loader).await {
+            match open_app_db_from_loader(config_loader).await {
                 Ok(d) => d,
                 Err(Error::RuntimeStateLocked) => exit_err(&Error::RuntimeStateLocked, ctx.json),
                 Err(e) => exit_err(&e, ctx.json),
             }
         }
         Err(e) => exit_err(&e, ctx.json),
-    };
-    (config_loader, db)
+    }
 }
 
 /// Load config only — no store open, no embedder construction.
 ///
-/// Used exclusively by the `db status`/`db migrate`/`db downgrade`
-/// maintenance commands (specs/05-surfaces.md §2.1). Those commands must
-/// never go through `AppDb::open`/`SqliteBackend::open`: `LibsqlDb::open`
-/// refuses on a schema-version mismatch, which is exactly the state these
-/// commands exist to repair. They must also never construct an embedder —
-/// the default `local` provider would trigger a one-time ~706 MB model
-/// download just to inspect or migrate a store's schema. `embed::infer_dim_encoding`
-/// gives the `(embedding_dim, encoding)` pair a `MigrationContext` needs from
-/// config alone, the same cheap static lookup `AppDb::open` itself uses
-/// before ever touching the embedder.
+/// Used by the `db status`/`db migrate`/`db downgrade` maintenance commands
+/// (specs/05-surfaces.md §2.1) — those commands must never go through
+/// `AppDb::open`/`SqliteBackend::open`: `LibsqlDb::open` refuses on a
+/// schema-version mismatch, which is exactly the state these commands exist
+/// to repair. They must also never construct an embedder — the default
+/// `local` provider would trigger a one-time ~706 MB model download just to
+/// inspect or migrate a store's schema. `embed::infer_dim_encoding` gives the
+/// `(embedding_dim, encoding)` pair a `MigrationContext` needs from config
+/// alone, the same cheap static lookup `AppDb::open` itself uses before ever
+/// touching the embedder.
+///
+/// Also used as the config-loading half of every strict `command_table::dispatch`
+/// call site (issue #187 review, finding G4): those call sites pair this with
+/// `open_app_db_or_exit`, called lazily from inside `dispatch`'s `open_db`
+/// closure, so a broken local store never preempts a healthy daemon — the
+/// same config-only/DB-open split this function was already built for.
 pub(crate) fn load_config_for_maintenance(ctx: &CliContext) -> ConfigLoader {
     let options = LoadOptions {
         config_path: ctx.config.clone(),
@@ -352,58 +381,101 @@ async fn fetch_all_daemon_store_names(base_url: &str) -> Result<Vec<String>, Err
 ///
 /// Order matters: names are syntax-validated *before* any network call (a
 /// malformed name never hits the wire), then the daemon's full store list is
-/// fetched exactly once, then the policy is applied against it.
+/// fetched exactly once, then [`apply_daemon_store_scope`] applies the policy
+/// against it.
+///
+/// `pub(crate)` (rather than private) so `DaemonAwareCommand::run_daemon`
+/// implementations that need a `Result`-returning store-name scope (e.g.
+/// `cmds::source::SourceListCmd`) can use it directly instead of going
+/// through `resolve_daemon_store_scope`'s `exit_err`-on-error wrapper —
+/// `dispatch` is what owns the exit point for those.
+pub(crate) async fn resolve_daemon_store_scope_inner(
+    base_url: &str,
+    ctx: &CliContext,
+    policy: StoreScopePolicy,
+) -> Result<Vec<String>, Error> {
+    // Finding 5 (Codex review): validate before the network round trip, not
+    // just before the match against its result. `apply_daemon_store_scope`
+    // below validates too (defense in depth for its other direct callers),
+    // but that check runs *after* `fetch_all_daemon_store_names` — too late
+    // to keep a malformed name from tripping `DaemonUnreachable` (exit 5)
+    // against an unreachable daemon instead of `InvalidRequest` (exit 2), as
+    // this function's own doc comment above promises. Mirrors
+    // `SourceRemoveCmd::run_daemon`'s validate-before-I/O loop in
+    // `cmds/source.rs`.
+    for name in &ctx.stores {
+        crate::normalize::validate_store_name(name)?;
+    }
+    let daemon_names = fetch_all_daemon_store_names(base_url).await?;
+    apply_daemon_store_scope(&daemon_names, |n| n.as_str(), ctx, policy)
+}
+
+/// Apply a store-scope policy to an already-fetched list of daemon store
+/// names/records — no additional network round trip.
+///
+/// Shared by every daemon-routed command that needs to filter a full store
+/// list by `--store` (`resolve_daemon_store_scope_inner` above; `store
+/// list`'s and `status`'s daemon branches, issue #187 stage 5): the single
+/// point where "how do we interpret `ctx.stores` against what the daemon
+/// has" is decided, so the interpretation can never drift between commands
+/// the way the nine hand-rolled branches in issue #187 §2 did. `name_of`
+/// projects whatever record type `T` a caller has (a bare `String` for the
+/// store-scope resolvers, a richer `StoreRecord`-shaped DTO for `store
+/// list`/`status`) down to the name this function matches `--store` against.
+///
+/// Order matters: names are syntax-validated *before* being matched against
+/// `items` (a malformed name is `Error::InvalidRequest`, exit 2, regardless
+/// of what the daemon actually has).
 ///
 /// The implicit-vs-explicit distinction (Codex review round 2, finding 4):
 /// an *implicit* `default` (no `--store` given, `DefaultStore` policy) that
 /// the daemon doesn't have is `Error::InvalidRequest`, exit 2 — matching
 /// `resolve_store_scope_inner`'s embedded-mode message exactly. An *explicit*
-/// `--store default` (or any other name) absent from the daemon's list is
+/// `--store default` (or any other name) absent from `items` is
 /// `Error::StoreNotFound`, exit 3, same as any other unknown explicit name —
 /// collapsing these two into one case was the reviewer's framing error.
-async fn resolve_daemon_store_scope_inner(
-    base_url: &str,
+pub(crate) fn apply_daemon_store_scope<T: Clone>(
+    items: &[T],
+    name_of: impl Fn(&T) -> &str,
     ctx: &CliContext,
     policy: StoreScopePolicy,
-) -> Result<Vec<String>, Error> {
+) -> Result<Vec<T>, Error> {
     for name in &ctx.stores {
         crate::normalize::validate_store_name(name)?;
     }
 
-    let daemon_names = fetch_all_daemon_store_names(base_url).await?;
-
     if !ctx.stores.is_empty() {
-        let mut names: Vec<String> = Vec::new();
+        let mut result: Vec<T> = Vec::new();
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for name in &ctx.stores {
-            if !daemon_names.iter().any(|n| n == name) {
-                return Err(Error::StoreNotFound { id: name.clone() });
-            }
+            let item = items
+                .iter()
+                .find(|it| name_of(it) == name.as_str())
+                .ok_or_else(|| Error::StoreNotFound { id: name.clone() })?;
             if seen.insert(name.as_str()) {
-                names.push(name.clone());
+                result.push(item.clone());
             }
         }
-        return Ok(names);
+        return Ok(result);
     }
 
     match policy {
         StoreScopePolicy::AllStores => {
-            if daemon_names.is_empty() {
+            if items.is_empty() {
                 return Err(Error::InvalidRequest {
                     message: "no stores; run `localdb store add <name>` or pass --store"
                         .to_string(),
                 });
             }
-            Ok(daemon_names)
+            Ok(items.to_vec())
         }
-        StoreScopePolicy::AllStoresAllowEmpty => Ok(daemon_names),
+        StoreScopePolicy::AllStoresAllowEmpty => Ok(items.to_vec()),
         StoreScopePolicy::DefaultStore => {
-            if daemon_names.iter().any(|n| n == DEFAULT_STORE_NAME) {
-                Ok(vec![DEFAULT_STORE_NAME.to_string()])
-            } else {
-                Err(Error::InvalidRequest {
+            match items.iter().find(|it| name_of(it) == DEFAULT_STORE_NAME) {
+                Some(item) => Ok(vec![item.clone()]),
+                None => Err(Error::InvalidRequest {
                     message: "no store named 'default'; pass --store <name>".to_string(),
-                })
+                }),
             }
         }
     }
@@ -427,10 +499,11 @@ pub(crate) async fn resolve_store_scope(
 /// branch can be unit-tested without going through `exit_err`'s
 /// `process::exit`.
 ///
-/// `pub(crate)` rather than private because `cmds::search` needs the
-/// `Result`-returning form: `resolve_search_targets` is itself fallible and
-/// its caller owns the `exit_err` call, so going through the exiting wrapper
-/// would move the exit point out of `run_search_async` where it belongs.
+/// `pub(crate)` rather than private because `cmds::search`'s
+/// `SearchCmd::run_embedded` needs the `Result`-returning form: it is itself
+/// fallible and returns to `command_table::dispatch`, which owns the
+/// `exit_err` call — going through the exiting wrapper here would move the
+/// exit point out of `dispatch` where it belongs.
 pub(crate) async fn resolve_store_scope_inner(
     ctx: &CliContext,
     db: &AppDb,
@@ -441,19 +514,7 @@ pub(crate) async fn resolve_store_scope_inner(
     }
 
     if !ctx.stores.is_empty() {
-        let mut rows: Vec<StoreRow> = Vec::new();
-        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for name in &ctx.stores {
-            let row = db
-                .backend()
-                .get_store_by_name(name)
-                .await?
-                .ok_or_else(|| Error::StoreNotFound { id: name.clone() })?;
-            if seen_ids.insert(row.id.clone()) {
-                rows.push(row);
-            }
-        }
-        return Ok(rows);
+        return resolve_named_stores(db.backend(), &ctx.stores).await;
     }
 
     match policy {
@@ -741,6 +802,48 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, DEFAULT_STORE_NAME);
+    }
+
+    /// Finding 5 (Codex review): an invalid `--store` name must be rejected
+    /// as `Error::InvalidRequest` (exit 2) *before* the daemon store list is
+    /// fetched — the daemon base URL here (`127.0.0.1:0`) is guaranteed
+    /// connection-refused (see `daemon_client::tests::probe_stale_removes_both_socket_and_url_file`
+    /// for the same idiom), so if validation ran after the fetch this would
+    /// surface `Error::DaemonUnreachable` (exit 5) instead — exactly the
+    /// ordering bug the function's doc comment already promised was fixed.
+    #[tokio::test]
+    async fn resolve_daemon_store_scope_inner_validates_before_fetching() {
+        let ctx = test_ctx(vec!["../bad"]);
+        let err = resolve_daemon_store_scope_inner(
+            "http://127.0.0.1:0",
+            &ctx,
+            StoreScopePolicy::AllStores,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(
+            matches!(err, Error::InvalidRequest { .. }),
+            "expected InvalidRequest, got {err:?}"
+        );
+    }
+
+    /// Pin the empty-`--store` (no flags passed) daemon-scope behavior: with
+    /// nothing to validate, the call proceeds straight to the daemon fetch,
+    /// so an unreachable daemon still surfaces as `DaemonUnreachable` (exit
+    /// 5) rather than being reinterpreted as a validation error.
+    #[tokio::test]
+    async fn resolve_daemon_store_scope_inner_empty_stores_still_reaches_daemon() {
+        let ctx = test_ctx(vec![]);
+        let err = resolve_daemon_store_scope_inner(
+            "http://127.0.0.1:0",
+            &ctx,
+            StoreScopePolicy::AllStores,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, Error::DaemonUnreachable);
+        assert_eq!(err.exit_code(), 5);
     }
 
     #[tokio::test]

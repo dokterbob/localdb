@@ -215,7 +215,15 @@ pub(crate) async fn process_url(
     // Panic-tolerant parsing. A panic IS an error (matching the pipeline's
     // behavior of folding panics into the error count), so it's reported via
     // SkipReason::Error rather than a benign-skip counter.
-    let parsed = match catch_panic(std::panic::AssertUnwindSafe(|| parser.parse(&probe))) {
+    //
+    // `Parser::parse` is documented sync/CPU-bound (`core::parser`); this may
+    // run under the daemon's shared HTTP/SSE-serving tokio runtime (issue
+    // #187 real ingestion), so it's guarded with `run_blocking` rather than
+    // called inline — see `core::blocking::run_blocking`'s doc comment for
+    // why that's `block_in_place`-on-multi-thread rather than a bare call.
+    let parsed = match localdb_core::run_blocking(|| {
+        catch_panic(std::panic::AssertUnwindSafe(|| parser.parse(&probe)))
+    }) {
         Err(panic_msg) => {
             // Debug: `core::ingestion` owns the user-facing WARN.
             tracing::debug!(url = %locator, "process_url: parser panicked: {}", panic_msg);

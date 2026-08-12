@@ -376,6 +376,37 @@ async fn empty_feed_single_doc_mode_emits_one_title_only_resource() {
     assert_eq!(cb.resources[0].title.as_deref(), Some("Test Feed"));
 }
 
+/// Codex review finding F6: the `feed_rs` parse (`catch_panic(...)` around
+/// `feed_rs::parser::Builder::new()....parse(...)`) is CPU-bound and is now
+/// guarded with `localdb_core::run_blocking`, mirroring the existing
+/// `parser.parse` guard in `file_ingestor.rs` /
+/// `discovery_on_multi_thread_runtime_exercises_block_in_place_guard`: this
+/// ingestor may run under the daemon's shared multi-thread tokio runtime, and
+/// `run_blocking` only takes its `block_in_place` branch there — the default
+/// `#[tokio::test]` current-thread runtime never exercises it. This is the
+/// first such test in this crate for feed parsing specifically. It does not
+/// (and cannot, per the task's stated limitation) prove worker-starvation is
+/// avoided — only that the wrapped feed-parse path still behaves correctly on
+/// a multi-thread runtime.
+#[tokio::test(flavor = "multi_thread")]
+async fn feed_parse_on_multi_thread_runtime_exercises_block_in_place_guard() {
+    let feed_xml = rss2_feed("", "");
+    let mut script = HashMap::new();
+    script.insert(
+        "https://feed.example.com/feed.xml".to_string(),
+        ScriptedOutcome::text(&feed_xml),
+    );
+    let (ingestor, _fetcher) = ingestor_with(script);
+    let source = source_for("https://feed.example.com/feed.xml", None, false);
+    let mut cb = RecordingCallback::default();
+    let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+    assert_eq!(cb.discovered, vec![1]);
+    assert_eq!(result.resources_produced, 1);
+    assert_eq!(result.errors, 0);
+    assert_eq!(cb.resources[0].title.as_deref(), Some("Test Feed"));
+}
+
 // ---------------------------------------------------------------------------
 // RSS 2.0: entity-encoded description, rel-less link, discovery mode
 // ---------------------------------------------------------------------------

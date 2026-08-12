@@ -661,6 +661,19 @@ If a daemon *is* running, see [Daemon-proxied stdio](#daemon-proxied-stdio) abov
 
 ## Troubleshooting
 
+### Diagnosing a rejected connection
+
+`localdb serve` and `localdb mcp` log rejected/failed connections at `warn` level:
+a 4xx/5xx response from any daemon route (`/v1/*` or the nested `/mcp` mount — including
+rmcp's own Host-header check, see below) is logged with method, path, status, and the
+request's `Host` header; a failed proxy connect from `localdb mcp` to the daemon (stale
+`LOCALDB_DAEMON_URL`, or the daemon going away between the initial probe and the actual
+connect) is logged with the daemon URL and the underlying transport error.
+
+Both surface on stderr **by default**, no `RUST_LOG` needed — `localdb`'s default log
+filter is `warn,pdf_oxide=off` (set in `localdb/src/main.rs`), which passes `warn`-level
+events through. Set `RUST_LOG=debug` (or `RUST_LOG=localdb=debug`) for more detail.
+
 ### `daemon is unreachable` (exit 5) / stale socket
 
 If the daemon was killed with `SIGKILL` (or crashed), it may leave a stale

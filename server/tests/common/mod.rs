@@ -17,6 +17,7 @@ pub(crate) async fn make_app() -> (TempDir, Router) {
     let state = AppState::new(
         fake_yaml_config(),
         dir.path().to_path_buf(),
+        dir.path().join("models"),
         queue.clone(),
         UrlRefreshScheduler::new(queue),
     )
