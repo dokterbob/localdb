@@ -2,7 +2,7 @@ use axum::{extract::State, Json};
 use axum_extra::extract::Query;
 use serde::{Deserialize, Serialize};
 
-use localdb_core::{Error, StoreRow, TableSize};
+use localdb_core::{resolve_named_stores, Error, StoreRow, TableSize};
 
 use crate::error::ApiError;
 use crate::state::{store_visibility_to_str, AppState};
@@ -69,31 +69,16 @@ pub struct StatusQuery {
 /// `EffectiveConfig` — `get_status` never reads a store's parsed
 /// `.indexing` policy, so it must not require every store's
 /// `indexing_policy` JSON to parse just to answer a scoped (or unscoped)
-/// status request (Codex review finding G2, issue #187 PR #212). Mirrors
-/// the embedded CLI's `resolve_store_scope_inner`
-/// (`cli/src/app_db.rs:478`): non-empty `names` resolves each name via a
-/// direct `get_store_by_name` lookup, in request order, with duplicates
-/// collapsed; an unknown name is `Error::StoreNotFound` (→ 404), matching
-/// the embedded CLI's exit code 3 for an unresolvable explicit `--store`
-/// name. Empty `names` lists every store.
+/// status request (Codex review finding G2, issue #187 PR #212). Empty
+/// `names` lists every store; a non-empty list resolves through the same
+/// `resolve_named_stores` helper the embedded CLI's `resolve_store_scope_inner`
+/// (`cli/src/app_db.rs`) uses, so an unknown name is `Error::StoreNotFound`
+/// (→ 404) in both surfaces alike.
 async fn resolve_status_scope(state: &AppState, names: &[String]) -> Result<Vec<StoreRow>, Error> {
     if names.is_empty() {
         return state.backend().list_stores().await;
     }
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::with_capacity(names.len());
-    for name in names {
-        if !seen.insert(name.as_str()) {
-            continue;
-        }
-        let store = state
-            .backend()
-            .get_store_by_name(name)
-            .await?
-            .ok_or_else(|| Error::StoreNotFound { id: name.clone() })?;
-        out.push(store);
-    }
-    Ok(out)
+    resolve_named_stores(state.backend(), names).await
 }
 
 pub async fn get_status(

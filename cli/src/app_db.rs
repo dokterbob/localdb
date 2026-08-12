@@ -9,7 +9,7 @@ use localdb_core::{
         policy::compute_policy_version,
         schema::{EmbeddingPolicy, IndexingPolicyConfig, ProviderConfig},
     },
-    store_factory,
+    resolve_named_stores, store_factory,
     types::StoreVisibility,
     Error, StoreBackend, StoreBackendConfig, StoreRow,
 };
@@ -514,19 +514,7 @@ pub(crate) async fn resolve_store_scope_inner(
     }
 
     if !ctx.stores.is_empty() {
-        let mut rows: Vec<StoreRow> = Vec::new();
-        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for name in &ctx.stores {
-            let row = db
-                .backend()
-                .get_store_by_name(name)
-                .await?
-                .ok_or_else(|| Error::StoreNotFound { id: name.clone() })?;
-            if seen_ids.insert(row.id.clone()) {
-                rows.push(row);
-            }
-        }
-        return Ok(rows);
+        return resolve_named_stores(db.backend(), &ctx.stores).await;
     }
 
     match policy {
