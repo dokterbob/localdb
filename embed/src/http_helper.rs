@@ -10,9 +10,8 @@
 //! it already does for document fetches — this module's remaining job is
 //! adapting that generic retry machinery to embed's request/response shape
 //! (headers + body in, raw bytes out) and to [`EmbedError`]. It also holds
-//! the hosted providers' shared constructor plumbing (client construction,
-//! and — for the two document-context providers — default resolution): see
-//! [`build_hosted_client`] and [`resolve_contextual_defaults`].
+//! the one piece of constructor plumbing every hosted provider shares — see
+//! [`build_hosted_client`].
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
@@ -23,7 +22,6 @@ use fetch::http::{self, HttpSettings, RetryError};
 use tracing::warn;
 
 use crate::error::EmbedError;
-use crate::retry::RetryPolicy;
 
 const PROVIDER: &str = "hosted-http";
 
@@ -44,31 +42,6 @@ pub(crate) fn build_hosted_client(
         .timeout(request_timeout)
         .build()
         .map_err(|e| EmbedError::Internal(format!("failed to build HTTP client: {e}")))
-}
-
-/// Resolve a document-context hosted provider's constructor inputs
-/// (`PerplexityEmbedder::new`, `VoyageEmbedder::new`): apply the `model`/
-/// `embedding_dim` defaults and build the shared HTTP client in one call.
-///
-/// Perplexity and Voyage differ only in their default base URL/model/
-/// dimension and their request/response JSON shape — their `new()` bodies
-/// were otherwise byte-for-byte identical, which is what this helper
-/// collapses. `OpenAiEmbedder` doesn't use this: its flat-provider `new()`
-/// takes a non-optional `model` (no default to apply) and retains extra
-/// fields (`dimensions`, `retry`) neither contextual provider has, so it
-/// only shares [`build_hosted_client`] with these two, not this wrapper.
-pub(crate) fn resolve_contextual_defaults(
-    http_settings: &HttpSettings,
-    retry: &RetryPolicy,
-    model: Option<String>,
-    default_model: &str,
-    embedding_dim: Option<usize>,
-    default_dim: usize,
-) -> Result<(reqwest::Client, String, usize), EmbedError> {
-    let model = model.unwrap_or_else(|| default_model.to_string());
-    let embedding_dim = embedding_dim.unwrap_or(default_dim);
-    let client = build_hosted_client(http_settings, retry.request_timeout)?;
-    Ok((client, model, embedding_dim))
 }
 
 /// Send an HTTP POST request, retrying transient failures per `settings`.

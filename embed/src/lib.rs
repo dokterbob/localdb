@@ -35,6 +35,7 @@
 //!
 //! See specs/04-search-pipeline.md §4.
 
+pub mod contextual;
 pub mod error;
 pub mod factory;
 pub mod http_helper;
@@ -63,13 +64,14 @@ mod coreml;
 #[cfg(all(target_os = "macos", feature = "local-coreml"))]
 pub mod pplx_context_coreml;
 
+pub use contextual::{ContextualEmbedder, ContextualProviderSpec};
 pub use error::EmbedError;
 pub use factory::{create_embedder, infer_dim_encoding};
 pub use model_cache::{ModelCache, ModelSpec};
 pub use openai::OpenAiEmbedder;
-pub use perplexity::PerplexityEmbedder;
+pub use perplexity::{Perplexity, PerplexityEmbedder};
 pub use retry::RetryPolicy;
-pub use voyage::VoyageEmbedder;
+pub use voyage::{Voyage, VoyageEmbedder};
 
 #[cfg(feature = "local-onnx")]
 pub use onnx::OnnxEmbedder;

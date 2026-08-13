@@ -26,22 +26,14 @@
 //! }
 //! ```
 //!
+//! Everything but the constants and the request body below is shared with the
+//! other contextualized provider — see [`crate::contextual`].
+//!
 //! See specs/04-search-pipeline.md §4, specs/03-config.md §6.
 
-use async_trait::async_trait;
-use fetch::http::HttpSettings;
-use localdb_core::{DocumentChunks, EmbeddedDocument, Embedder, Error as CoreError};
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
-use crate::error::EmbedError;
-use crate::http_helper::send_with_retry;
-use crate::retry::RetryPolicy;
-
-const DEFAULT_BASE_URL: &str = "https://api.perplexity.ai";
-const DEFAULT_MODEL: &str = "pplx-embed-context-v1";
-const DEFAULT_DIM: usize = 768;
+use crate::contextual::{ContextualEmbedder, ContextualProviderSpec};
 
 /// Request body for Perplexity `/v1/contextualizedembeddings`.
 #[derive(Debug, Serialize)]
@@ -51,17 +43,27 @@ struct PerplexityEmbedRequest<'a> {
     chunks: &'a [String],
 }
 
-/// One embedding object in the response.
-#[derive(Debug, Deserialize)]
-struct PerplexityEmbeddingObject {
-    embedding: Vec<f32>,
-    index: usize,
-}
+/// Marker type carrying Perplexity's half of [`ContextualProviderSpec`].
+pub struct Perplexity;
 
-/// Response from Perplexity `/v1/contextualizedembeddings`.
-#[derive(Debug, Deserialize)]
-struct PerplexityEmbedResponse {
-    data: Vec<PerplexityEmbeddingObject>,
+impl ContextualProviderSpec for Perplexity {
+    const DEFAULT_BASE_URL: &'static str = "https://api.perplexity.ai";
+    const DEFAULT_MODEL: &'static str = "pplx-embed-context-v1";
+    const DEFAULT_DIM: usize = 768;
+    const PATH: &'static str = "/v1/contextualizedembeddings";
+    const NAME: &'static str = "perplexity";
+
+    fn request<'a>(
+        model: &'a str,
+        document: &'a str,
+        chunks: &'a [String],
+    ) -> impl Serialize + Send + 'a {
+        PerplexityEmbedRequest {
+            model,
+            document,
+            chunks,
+        }
+    }
 }
 
 /// Perplexity contextualized embedding provider.
@@ -69,421 +71,10 @@ struct PerplexityEmbedResponse {
 /// Uses document context for each document's chunks. The document context
 /// (full text or summary) is passed alongside the chunk list, giving the model
 /// the broader context needed for late/contextualized chunking.
-pub struct PerplexityEmbedder {
-    client: Client,
-    base_url: String,
-    api_key: String,
-    model: String,
-    embedding_dim: usize,
-    http_settings: HttpSettings,
-}
+pub type PerplexityEmbedder = ContextualEmbedder<Perplexity>;
 
-impl PerplexityEmbedder {
-    /// Create a new Perplexity embedder.
-    ///
-    /// `retry` covers batching/timeout policy — only `request_timeout` is
-    /// relevant here (Perplexity embeds one document's chunks per request,
-    /// so `batch_size` does not apply); it is consumed at construction and
-    /// not retained. `http_settings` is the shared outgoing-HTTP policy
-    /// (user agent, retry/backoff/jitter — see `fetch::http`) and is
-    /// retained for use on every request.
-    pub fn new(
-        api_key: impl Into<String>,
-        model: Option<String>,
-        embedding_dim: Option<usize>,
-        retry: RetryPolicy,
-        http_settings: HttpSettings,
-    ) -> Result<Self, EmbedError> {
-        let (client, model, embedding_dim) = crate::http_helper::resolve_contextual_defaults(
-            &http_settings,
-            &retry,
-            model,
-            DEFAULT_MODEL,
-            embedding_dim,
-            DEFAULT_DIM,
-        )?;
-        Ok(Self {
-            client,
-            base_url: DEFAULT_BASE_URL.to_string(),
-            api_key: api_key.into(),
-            model,
-            embedding_dim,
-            http_settings,
-        })
-    }
-
-    /// Create from environment variable for the API key.
-    ///
-    /// Returns `None` if the environment variable is not set.
-    pub fn from_env(api_key_env: &str) -> Option<Result<Self, EmbedError>> {
-        std::env::var(api_key_env).ok().map(|key| {
-            Self::new(
-                key,
-                None,
-                None,
-                RetryPolicy::default(),
-                HttpSettings::default(),
-            )
-        })
-    }
-
-    /// Override the base URL (useful for testing).
-    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        self.base_url = base_url.into();
-        self
-    }
-
-    /// Embed chunks for one document with document context.
-    async fn embed_document_chunks(
-        &self,
-        document_context: &str,
-        chunks: &[String],
-    ) -> Result<Vec<Vec<f32>>, EmbedError> {
-        if chunks.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let url = format!(
-            "{}/v1/contextualizedembeddings",
-            self.base_url.trim_end_matches('/')
-        );
-        let body = PerplexityEmbedRequest {
-            model: &self.model,
-            document: document_context,
-            chunks,
-        };
-
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", self.api_key)).map_err(|e| {
-                EmbedError::Internal(format!("invalid authorization header value: {e}"))
-            })?,
-        );
-
-        let body = serde_json::to_vec(&body).map_err(|e| EmbedError::ProviderError {
-            provider: "perplexity".to_string(),
-            message: format!("failed to serialize request: {e}"),
-        })?;
-
-        let response =
-            send_with_retry(&self.client, &url, headers, body, &self.http_settings).await?;
-
-        let resp: PerplexityEmbedResponse =
-            serde_json::from_slice(&response).map_err(|e| EmbedError::ProviderError {
-                provider: "perplexity".to_string(),
-                message: format!("failed to parse response: {e}"),
-            })?;
-
-        let mut vecs: Vec<Option<Vec<f32>>> = vec![None; chunks.len()];
-        for obj in resp.data {
-            if obj.index < vecs.len() {
-                vecs[obj.index] = Some(obj.embedding);
-            }
-        }
-        let result: Option<Vec<Vec<f32>>> = vecs.into_iter().collect();
-        result.ok_or_else(|| EmbedError::ProviderError {
-            provider: "perplexity".to_string(),
-            message: "response missing some embedding indices".to_string(),
-        })
-    }
-}
-
-#[async_trait]
-impl Embedder for PerplexityEmbedder {
-    async fn embed_documents(
-        &self,
-        docs: Vec<DocumentChunks>,
-    ) -> Result<Vec<EmbeddedDocument>, CoreError> {
-        if docs.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let mut results = Vec::with_capacity(docs.len());
-        for doc in &docs {
-            let embeddings = self
-                .embed_document_chunks(&doc.document_context, &doc.chunks)
-                .await
-                .map_err(CoreError::from)?;
-            results.push(embeddings);
-        }
-        Ok(results)
-    }
-
-    fn embedding_dim(&self) -> usize {
-        self.embedding_dim
-    }
-
-    fn model_id(&self) -> &str {
-        &self.model
-    }
-}
-
+// `"chunks"` is Perplexity's chunk-list field, and the only wire-level
+// difference from Voyage — swapping the two request structs above would leave
+// every other case in the suite green, so it is asserted here explicitly.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use localdb_core::{DocumentChunks, Embedder};
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    /// `HttpSettings` for tests that force a retry: `min_retry_delay` is
-    /// dialed down to millisecond scale so the jittered exponential backoff
-    /// `fetch::http::retry_policy` builds never adds more than a few
-    /// milliseconds of real sleep — see `HttpSettings::min_retry_delay`'s
-    /// doc comment, this is exactly the test seam it exists for.
-    fn fast_http_settings(max_retries: u32) -> HttpSettings {
-        HttpSettings {
-            max_retries,
-            min_retry_delay: std::time::Duration::from_millis(1),
-            ..HttpSettings::default()
-        }
-    }
-
-    fn make_response(n: usize, dim: usize) -> serde_json::Value {
-        let data: Vec<serde_json::Value> = (0..n)
-            .map(|i| {
-                serde_json::json!({
-                    "embedding": vec![0.2f32; dim],
-                    "index": i
-                })
-            })
-            .collect();
-        serde_json::json!({ "data": data })
-    }
-
-    fn make_embedder(server_uri: &str) -> PerplexityEmbedder {
-        PerplexityEmbedder::new(
-            "test-api-key",
-            None,
-            Some(768),
-            RetryPolicy {
-                request_timeout: std::time::Duration::from_secs(5),
-                batch_size: 32,
-            },
-            fast_http_settings(3),
-        )
-        .expect("failed to construct embedder")
-        .with_base_url(server_uri)
-    }
-
-    #[tokio::test]
-    async fn perplexity_embedder_correct_shape() {
-        let server = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(path("/v1/contextualizedembeddings"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(make_response(2, 768)))
-            .mount(&server)
-            .await;
-
-        let embedder = make_embedder(&server.uri());
-        let docs = vec![DocumentChunks {
-            document_context: "Full document about Rust".to_string(),
-            chunks: vec!["chunk one".to_string(), "chunk two".to_string()],
-        }];
-
-        let result = embedder.embed_documents(docs).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].len(), 2);
-        assert_eq!(result[0][0].len(), 768);
-    }
-
-    #[tokio::test]
-    async fn perplexity_embedder_passes_document_context() {
-        let server = MockServer::start().await;
-
-        // Verify the request includes document field by using body_partial_json matcher
-        Mock::given(method("POST"))
-            .and(path("/v1/contextualizedembeddings"))
-            .and(wiremock::matchers::body_partial_json(serde_json::json!({
-                "document": "important document context"
-            })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(make_response(1, 768)))
-            .mount(&server)
-            .await;
-
-        let embedder = make_embedder(&server.uri());
-        let docs = vec![DocumentChunks {
-            document_context: "important document context".to_string(),
-            chunks: vec!["relevant chunk".to_string()],
-        }];
-
-        let result = embedder.embed_documents(docs).await;
-        assert!(
-            result.is_ok(),
-            "contextualized request should succeed: {result:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn perplexity_embedder_retries_on_429() {
-        let server = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(path("/v1/contextualizedembeddings"))
-            .respond_with(ResponseTemplate::new(429))
-            .up_to_n_times(1)
-            .mount(&server)
-            .await;
-
-        Mock::given(method("POST"))
-            .and(path("/v1/contextualizedembeddings"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(make_response(1, 768)))
-            .mount(&server)
-            .await;
-
-        let embedder = make_embedder(&server.uri());
-        let docs = vec![DocumentChunks {
-            document_context: "ctx".to_string(),
-            chunks: vec!["text".to_string()],
-        }];
-        let result = embedder.embed_documents(docs).await;
-        assert!(result.is_ok(), "should succeed after retry: {result:?}");
-    }
-
-    #[tokio::test]
-    async fn perplexity_embedder_fails_after_max_retries() {
-        let server = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(path("/v1/contextualizedembeddings"))
-            .respond_with(ResponseTemplate::new(503))
-            .mount(&server)
-            .await;
-
-        let embedder = PerplexityEmbedder::new(
-            "test-key",
-            None,
-            Some(768),
-            RetryPolicy {
-                request_timeout: std::time::Duration::from_secs(5),
-                batch_size: 32,
-            },
-            fast_http_settings(1),
-        )
-        .expect("failed to construct embedder")
-        .with_base_url(server.uri());
-
-        let docs = vec![DocumentChunks {
-            document_context: "ctx".to_string(),
-            chunks: vec!["text".to_string()],
-        }];
-        let result = embedder.embed_documents(docs).await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code(), "provider_unavailable");
-    }
-
-    #[tokio::test]
-    async fn perplexity_embedder_multiple_docs_sequential() {
-        let server = MockServer::start().await;
-
-        // Two separate calls (one per doc)
-        Mock::given(method("POST"))
-            .and(path("/v1/contextualizedembeddings"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(make_response(2, 768)))
-            .up_to_n_times(1)
-            .mount(&server)
-            .await;
-
-        Mock::given(method("POST"))
-            .and(path("/v1/contextualizedembeddings"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(make_response(1, 768)))
-            .mount(&server)
-            .await;
-
-        let embedder = make_embedder(&server.uri());
-        let docs = vec![
-            DocumentChunks {
-                document_context: "doc1 context".to_string(),
-                chunks: vec!["a".to_string(), "b".to_string()],
-            },
-            DocumentChunks {
-                document_context: "doc2 context".to_string(),
-                chunks: vec!["c".to_string()],
-            },
-        ];
-
-        let result = embedder.embed_documents(docs).await.unwrap();
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].len(), 2);
-        assert_eq!(result[1].len(), 1);
-    }
-
-    #[tokio::test]
-    async fn perplexity_embedder_timeout_returns_provider_unavailable() {
-        let server = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(path("/v1/contextualizedembeddings"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(make_response(1, 768))
-                    .set_delay(std::time::Duration::from_secs(5)),
-            )
-            .mount(&server)
-            .await;
-
-        let embedder = PerplexityEmbedder::new(
-            "test-key",
-            None,
-            Some(768),
-            RetryPolicy {
-                request_timeout: std::time::Duration::from_millis(50),
-                batch_size: 32,
-            },
-            // 0 retries: this test asserts *classification* (a timeout
-            // becomes provider_unavailable), not retry behavior.
-            fast_http_settings(0),
-        )
-        .expect("failed to construct embedder")
-        .with_base_url(server.uri());
-
-        let docs = vec![DocumentChunks {
-            document_context: "ctx".to_string(),
-            chunks: vec!["text".to_string()],
-        }];
-        let result = embedder.embed_documents(docs).await;
-        assert!(result.is_err(), "timed-out request should fail");
-        assert_eq!(
-            result.unwrap_err().code(),
-            "provider_unavailable",
-            "timeout should surface as provider_unavailable"
-        );
-    }
-
-    #[tokio::test]
-    async fn perplexity_embedder_empty_docs() {
-        let server = MockServer::start().await;
-        let embedder = make_embedder(&server.uri());
-        let result = embedder.embed_documents(vec![]).await;
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_empty());
-    }
-
-    #[test]
-    fn perplexity_embedder_model_id() {
-        let embedder = PerplexityEmbedder::new(
-            "key",
-            None,
-            None,
-            RetryPolicy::default(),
-            HttpSettings::default(),
-        )
-        .expect("failed to construct embedder");
-        assert_eq!(embedder.model_id(), DEFAULT_MODEL);
-        assert_eq!(embedder.embedding_dim(), DEFAULT_DIM);
-    }
-
-    #[test]
-    fn perplexity_embedder_construction_does_not_panic() {
-        let retry = RetryPolicy::default();
-        let result =
-            PerplexityEmbedder::new("test-api-key", None, None, retry, HttpSettings::default());
-        assert!(
-            result.is_ok(),
-            "should be able to construct embedder: {:?}",
-            result.err()
-        );
-    }
-}
+crate::contextual::contextual_provider_tests!(Perplexity, "chunks");
