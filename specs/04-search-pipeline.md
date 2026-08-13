@@ -433,7 +433,6 @@ The `chunking` sub-policy embeds a chunking algorithm identifier as part of what
 bumping it forces a reindex even when no user-visible config field changed. Current value:
 **`textsplitter-md-v6`** (bumped from `v5`). The `v6` bump covers the mid-word-split fix (#191,
 #192): `chunk_prose`'s structureless backstop is now dual-condition — longest whitespace-free run >
-
 8× target (quality) or longest line > 64× target (performance guard, replacing the old 8× line
 probe) — and `chunk_code`'s overlong-line hard-split now backs off to the last whitespace in the
 window (falling back to the char cut only when the window has no whitespace) — chunk boundaries

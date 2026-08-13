@@ -117,7 +117,7 @@ The generated config carries a schema reference in two forms, both pointing at t
 
 ```yaml
 # yaml-language-server: $schema=https://raw.githubusercontent.com/dokterbob/localdb/main/schema/config.schema.json
----
+# ... (header comments and `version: 1` omitted) ...
 $schema: https://raw.githubusercontent.com/dokterbob/localdb/main/schema/config.schema.json
 ```
 

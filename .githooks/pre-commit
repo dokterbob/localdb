@@ -13,10 +13,13 @@
 
 command -v qlty >/dev/null 2>&1 || exit 0
 
-md_files=$(git diff --cached --name-only --diff-filter=ACMR -- '*.md')
-[ -n "$md_files" ] || exit 0
+# NUL-delimited throughout: `git diff --name-only` without -z quotes/escapes
+# non-ASCII filenames, which would hand qlty and git a nonexistent path.
+git diff --cached --quiet --diff-filter=ACMR -- '*.md' && exit 0
 
-printf '%s\n' "$md_files" | tr '\n' '\0' | xargs -0 qlty fmt --no-error --no-progress >/dev/null 2>&1
-printf '%s\n' "$md_files" | tr '\n' '\0' | xargs -0 git add
+git diff --cached --name-only -z --diff-filter=ACMR -- '*.md' |
+  xargs -0 qlty fmt --no-error --no-progress >/dev/null 2>&1
+git diff --cached --name-only -z --diff-filter=ACMR -- '*.md' |
+  xargs -0 git add
 
 exit 0
