@@ -160,9 +160,18 @@ pub(crate) async fn load_config_lenient(ctx: &CliContext) -> ConfigLoader {
             Ok(config_loader) => {
                 if scaffold.was_scaffolded {
                     crate::scaffold::log_scaffold_result(&scaffold);
-                    let db = open_app_db_lenient_or_exit(ctx, &config_loader).await;
-                    if let Err(e) = crate::scaffold::ensure_default_store(&db).await {
-                        exit_err(&e, ctx.json);
+                    // `LOCALDB_DAEMON_URL` forces daemon routing: the command
+                    // acts on that daemon's store registry, not the local DB,
+                    // so creating `default` locally would be wasted at best
+                    // and misleading at worst (it never shows up on the
+                    // daemon). Skip it; a later daemonless run of `init` (or
+                    // any scaffolding command against a still-absent config)
+                    // creates it.
+                    if ctx.daemon_url.is_none() {
+                        let db = open_app_db_lenient_or_exit(ctx, &config_loader).await;
+                        if let Err(e) = crate::scaffold::ensure_default_store(&db).await {
+                            exit_err(&e, ctx.json);
+                        }
                     }
                 }
                 config_loader
@@ -308,9 +317,18 @@ pub(crate) async fn load_config_scaffolded(ctx: &CliContext) -> ConfigLoader {
     let config_loader = load_config_for_maintenance(ctx);
     if scaffold.was_scaffolded {
         crate::scaffold::log_scaffold_result(&scaffold);
-        let db = open_app_db_or_exit(ctx, &config_loader).await;
-        if let Err(e) = crate::scaffold::ensure_default_store(&db).await {
-            exit_err(&e, ctx.json);
+        // Skip the local `default`-store insert when `LOCALDB_DAEMON_URL`
+        // forces daemon routing — the command acts on that daemon's store
+        // registry, and touching the local embedded DB here could fail the
+        // command on an unrelated local problem or create a store the daemon
+        // never sees. (Without the explicit URL override there is nothing to
+        // skip for: a discovery-socket daemon on this machine shares the same
+        // unified localdb.db, so the insert is visible to it.)
+        if ctx.daemon_url.is_none() {
+            let db = open_app_db_or_exit(ctx, &config_loader).await;
+            if let Err(e) = crate::scaffold::ensure_default_store(&db).await {
+                exit_err(&e, ctx.json);
+            }
         }
     }
     config_loader

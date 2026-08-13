@@ -395,6 +395,50 @@ fn search_on_fresh_install_scaffolds_config_and_default_store() {
         .stdout(predicate::str::contains("default"));
 }
 
+/// When `LOCALDB_DAEMON_URL` forces daemon routing, first-run scaffolding
+/// still writes the config file but must NOT touch the local embedded DB —
+/// the command acts on that daemon's store registry, and a local `default`
+/// store would either be invisible to the daemon or fail the command on an
+/// unrelated local problem (codex review on PR #215).
+#[test]
+fn fresh_install_with_daemon_url_scaffolds_config_but_not_local_db() {
+    let dir = TempDir::new().unwrap();
+
+    // Unreachable daemon: explicit URL routing fails, exit 5 (specs/05 §5).
+    cmd_with_fresh_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", "http://127.0.0.1:9")
+        .args(["store", "add", "mystore"])
+        .assert()
+        .failure()
+        .code(5);
+
+    assert!(
+        dir.path().join("config.yaml").exists(),
+        "config must still be scaffolded"
+    );
+    // No localdb.db anywhere under the redirected home: the local embedded
+    // DB was never opened, so no `default` store was created behind the
+    // daemon's back.
+    fn find_db(dir: &std::path::Path) -> bool {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|e| {
+                let p = e.path();
+                if p.is_dir() {
+                    find_db(&p)
+                } else {
+                    p.file_name().is_some_and(|n| n == "localdb.db")
+                }
+            })
+    }
+    assert!(
+        !find_db(dir.path()),
+        "daemon-routed first run must not create the local DB"
+    );
+}
+
 /// `store add` goes through the *strict* load path
 /// (`load_config_scaffolded`) — covers the strict-path half of implicit
 /// scaffolding, distinct from `search`'s lenient path above.
