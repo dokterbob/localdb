@@ -359,35 +359,16 @@ impl UrlFetcher for HttpUrlFetcher {
         let outcome = attempt
             .retry(http::retry_policy(&self.settings))
             .when(http::is_transient)
-            // Feed a `Retry-After` hint to backon, capped at
-            // `INLINE_RETRY_AFTER_CAP` so one oversized value never itself
-            // blows the retry loop's total sleep budget; fall back to
-            // backon's own computed delay when there is no hint.
-            //
-            // The `dur?` at the top is load-bearing and easy to get backwards:
-            // backon calls `.adjust(err, backoff.next())`, and `backoff.next()`
-            // is `None` precisely when `max_retries` or the cumulative sleep
-            // budget (`with_total_delay`) has already been exhausted — i.e.
-            // "stop now" already decided by backon *before* this closure ever
-            // runs. A `Retry-After` hint being present does not un-decide
-            // that: a version of this closure that returned `Some(retry_after)`
-            // unconditionally (checking only the error, never `dur`) would
-            // resurrect a stopped retry loop on every subsequent poll for a
-            // server that keeps sending 429+Retry-After — a real, observed
-            // infinite loop, not a hypothetical one. `Some` must only ever be
-            // returned once backon has confirmed `dur` was `Some` to begin
-            // with; the two `None` cases (backon says stop / no hint from the
-            // server) both fall through to returning `dur` unchanged.
-            .adjust(|err: &http::RetryError, dur: Option<Duration>| {
-                dur?;
-                match err {
-                    http::RetryError::Status {
-                        retry_after: Some(retry_after),
-                        ..
-                    } => Some((*retry_after).min(http::INLINE_RETRY_AFTER_CAP)),
-                    _ => dur,
-                }
-            })
+            // Honor a `Retry-After` hint (capped at `INLINE_RETRY_AFTER_CAP`,
+            // and tracked against this fetch's own cumulative-sleep budget
+            // independently of backon's internal accounting) or fall back to
+            // backon's own computed delay when there is no hint. See
+            // `http::retry_after_adjuster`'s doc comment for the full
+            // contract, including why the `dur?` short-circuit inside it is
+            // load-bearing.
+            .adjust(http::retry_after_adjuster(http::total_retry_budget(
+                &self.settings,
+            )))
             // The only signal of retry activity: progress events are emitted
             // after `fetch()` returns, so the CLI/daemon progress bar shows
             // nothing while a document is being retried.
@@ -913,6 +894,101 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(8),
             "wait must stay bounded, got {elapsed:?}"
+        );
+    }
+
+    /// Defect 1 regression (issue #207 follow-up): a `Retry-After` over
+    /// `http::INLINE_RETRY_AFTER_CAP` (30s) used to be clamped down to the
+    /// cap and slept on inline anyway. It must instead end the fetch
+    /// immediately as `RateLimited` — no inline sleep, and critically, no
+    /// second request either (`.expect(1)` below fails the test if one goes
+    /// out). `max_retries` is set generously (5) specifically to prove the
+    /// loop stops because of the oversized `Retry-After`, not because
+    /// retries were exhausted some other way.
+    #[tokio::test]
+    async fn test_retry_after_over_cap_ends_fetch_immediately_with_no_inline_sleep() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/doc"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "40"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let fetcher = unrestricted_with(&fast_settings(5));
+        let start = std::time::Instant::now();
+        let result = fetcher
+            .fetch(&format!("{}/doc", server.uri()), &FetchMetadata::default())
+            .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(Error::RateLimited { .. })),
+            "expected RateLimited, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "an over-cap Retry-After must never be slept on inline, took {elapsed:?}"
+        );
+    }
+
+    /// Defect 2 regression (issue #207 follow-up): honoring a `Retry-After`
+    /// on every retry used to escape `with_total_delay`'s budget entirely,
+    /// because `backon` only charges *its own* proposed (tiny, at this
+    /// scale) delay against that budget, never the substituted
+    /// `Retry-After` value actually slept on. A server that keeps
+    /// responding with the same `Retry-After` (1s — the finest granularity
+    /// the header supports; delta-seconds only, see `parse_retry_after`)
+    /// must still have its *cumulative* honored waits bounded by
+    /// `http::total_retry_budget` for these settings: `min_retry_delay` 50ms
+    /// × `TOTAL_DELAY_RATIO` 30 = 1.5s — small enough that a 3rd 1s wait
+    /// (bringing the running total to 3s) is refused once the first two
+    /// (totalling 2s) have already met-or-exceeded it.
+    ///
+    /// With the fix: attempt 1 fails (0s spent so far < 1.5s budget,
+    /// honored, running total → 1s), attempt 2 fails (1s spent < 1.5s,
+    /// honored, running total → 2s), attempt 3 fails (2s spent ≥ 1.5s
+    /// budget — refused, loop ends). 3 requests, ~2s of real sleep.
+    /// `max_retries` is set generously (10) specifically so the fix — not
+    /// `max_retries` running out — is what stops the loop; pre-fix, this
+    /// same scenario kept going well past 2s because `backon`'s own
+    /// accounting of its tiny computed delays doesn't approach the 1.5s
+    /// budget until several retries later.
+    #[tokio::test]
+    async fn test_retry_after_cumulative_sleep_is_bounded_by_total_budget() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/doc"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "1"))
+            .mount(&server)
+            .await;
+
+        let settings = http::HttpSettings {
+            max_retries: 10,
+            min_retry_delay: Duration::from_millis(50),
+            ..http::HttpSettings::default()
+        };
+        let fetcher = unrestricted_with(&settings);
+        let start = std::time::Instant::now();
+        let result = fetcher
+            .fetch(&format!("{}/doc", server.uri()), &FetchMetadata::default())
+            .await;
+        let elapsed = start.elapsed();
+        let requests = server.received_requests().await.unwrap_or_default().len();
+
+        assert!(
+            matches!(result, Err(Error::RateLimited { .. })),
+            "expected RateLimited, got {result:?}"
+        );
+        assert!(
+            requests <= 4,
+            "cumulative honored Retry-After sleep should stop the loop well \
+             before max_retries (10) is reached; got {requests} requests"
+        );
+        assert!(
+            elapsed < Duration::from_millis(2500),
+            "cumulative sleep must stay near the ~1.5s budget, not run for \
+             most of max_retries × 1s Retry-After; got {elapsed:?}"
         );
     }
 

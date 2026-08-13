@@ -36,7 +36,8 @@ pub mod retry;
 
 pub use limiter::HostLimiter;
 pub use retry::{
-    is_transient, parse_retry_after, retry_policy, RetryError, INLINE_RETRY_AFTER_CAP,
+    is_transient, parse_retry_after, retry_after_adjuster, retry_policy, total_retry_budget,
+    RetryError, INLINE_RETRY_AFTER_CAP,
 };
 
 /// Default `User-Agent` sent when the operator has not overridden it via

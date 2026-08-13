@@ -45,6 +45,7 @@
 //!
 //! [`is_blocked_error`]: crate::destination::is_blocked_error
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use backon::ExponentialBuilder;
@@ -141,14 +142,34 @@ pub const INLINE_RETRY_AFTER_CAP: Duration = Duration::from_secs(30);
 pub fn retry_policy(cfg: &HttpSettings) -> ExponentialBuilder {
     let min_delay = cfg.min_retry_delay;
     let max_delay = min_delay.saturating_mul(MAX_DELAY_RATIO).max(min_delay);
-    let total_delay = min_delay.saturating_mul(TOTAL_DELAY_RATIO).max(min_delay);
 
     ExponentialBuilder::default()
         .with_jitter()
         .with_min_delay(min_delay)
         .with_max_delay(max_delay)
         .with_max_times(cfg.max_retries as usize)
-        .with_total_delay(Some(total_delay))
+        .with_total_delay(Some(total_retry_budget(cfg)))
+}
+
+/// The `with_total_delay` budget [`retry_policy`] hands `backon` for `cfg`,
+/// exposed separately so a caller's `.adjust()` closure ([`retry_after_
+/// adjuster`]) can enforce the *same* number against the sleeps it actually
+/// causes.
+///
+/// This has to be a real function, not a restated constant at each call
+/// site: `backon` only ever charges *its own proposed* delay against the
+/// budget it was configured with (see [`retry_after_adjuster`]'s doc comment
+/// for why that isn't good enough on its own), so a caller enforcing this
+/// independently needs the exact value `backon` was configured with — and
+/// that value scales with `cfg.min_retry_delay`, which the test suite always
+/// overrides to keep wall-clock time down (see `HttpSettings::
+/// min_retry_delay`'s doc comment). Hardcoding 30s at each `.adjust()` call
+/// site would silently stop tracking the *test* budget once a test shrinks
+/// `min_retry_delay`, defeating the point of the independent tracker for
+/// exactly the tests that most need it to be exercised.
+pub fn total_retry_budget(cfg: &HttpSettings) -> Duration {
+    let min_delay = cfg.min_retry_delay;
+    min_delay.saturating_mul(TOTAL_DELAY_RATIO).max(min_delay)
 }
 
 /// `max_delay / min_delay` at production settings (30 s / 1 s). See
@@ -168,15 +189,129 @@ const MAX_DELAY_RATIO: u32 = 30;
 /// timeout + 30 s total sleep budget ≈ 150 s` — `max_retries = 3` is a retry
 /// *count*, not an attempt count, so it is 4 attempts (1 initial + 3
 /// retries), not 3, that each pay the 30 s per-attempt timeout (see
-/// [`retry_policy`]'s own doc comment on `with_max_times`). Compare roughly
-/// 210 s if the sleep budget were unbounded instead (the same 4 attempts ×
-/// 30 s of timeouts = 120 s, plus the 3 retries between them backing off at
-/// up to 30 s each under the schedule in [`retry_policy`], i.e. up to 90 s of
-/// sleep — 120 s + 90 s = 210 s). 30 s is generous enough to ride out a
+/// [`retry_policy`]'s own doc comment on `with_max_times`).
+///
+/// That 30 s sleep half of the bound is only real because
+/// [`retry_after_adjuster`] tracks its *own* cumulative honored-`Retry-After`
+/// total independently of `backon`. `backon`'s internal `with_total_delay`
+/// accounting only ever charges the delay *it* proposed for a given attempt,
+/// never the value a caller's `.adjust()` closure substitutes in its place —
+/// so a naive adjuster that returns `min(retry_after, INLINE_RETRY_AFTER_CAP)`
+/// without its own tracker lets a server that keeps responding
+/// `Retry-After: 30` blow straight through this budget: `backon` charges
+/// each attempt's own (small, exponentially-growing-from-1s) proposal, sees
+/// plenty of apparent headroom, and keeps allowing retries while the loop
+/// actually sleeps 30 s each time. Three such retries sleep 90 s against a
+/// budget `backon` still believes is barely touched, pushing the real worst
+/// case to roughly 210 s (the same 4 attempts × 30 s of timeouts = 120 s,
+/// plus 90 s of actual sleep instead of the intended 30 s budget) — this was
+/// an observed defect on this branch, not a hypothetical. Once
+/// [`retry_after_adjuster`] enforces the budget itself against the sleeps it
+/// actually causes, 150 s is a real ceiling again, not just backon's
+/// (misinformed) opinion of one. 30 s is generous enough to ride out a
 /// short-lived 429 without making that budget dominate. See [`retry_policy`]
 /// for why a non-default `min_retry_delay` scales this budget down with it
 /// rather than leaving it fixed at 30 s.
 const TOTAL_DELAY_RATIO: u32 = 30;
+
+// ---------------------------------------------------------------------------
+// Retry-After adjustment
+// ---------------------------------------------------------------------------
+
+/// Builds the `.adjust()` closure `backon`'s retry loop calls after every
+/// failed, retryable attempt to decide how long to sleep before the next
+/// one — shared by both outgoing-HTTP retry loops in the workspace
+/// (`fetch::HttpUrlFetcher::fetch` and `embed::http_helper::send_with_retry`)
+/// rather than duplicated near-identically at each, which is exactly the
+/// kind of drift issue #207 set out to eliminate (qlty separately flagged
+/// the sibling duplication between `embed/src/perplexity.rs` and
+/// `embed/src/voyage.rs` on this same PR).
+///
+/// Call this **once per retry loop**, not once per process/client: the
+/// returned closure owns a fresh, zeroed cumulative-sleep tracker, and that
+/// tracker must be scoped to a single `fetch()`/`send_with_retry()` call —
+/// reusing one closure (and its tracker) across multiple documents/requests
+/// would make the second one inherit the first one's spent budget.
+///
+/// `total_budget` should always be [`total_retry_budget`] applied to the
+/// same [`HttpSettings`] passed to [`retry_policy`] for this same retry
+/// loop, so the independent tracking below (point 4) enforces the exact
+/// number `backon` was configured with — including when a test shrinks
+/// `HttpSettings::min_retry_delay` to keep wall-clock time down.
+///
+/// Behavior, in order:
+///
+/// 1. `dur?` — if `backon` has already decided to stop (its own
+///    `max_retries`/`total_delay` accounting exhausted), this closure must
+///    never resurrect that decision. Load-bearing, not stylistic: a version
+///    of this closure that inspected the error before checking `dur`
+///    returned `Some(retry_after)` unconditionally, which resurrects a
+///    stopped retry loop on every subsequent poll against a server that
+///    keeps sending 429 + `Retry-After` — an infinite loop that was actually
+///    observed on this branch, not a hypothetical.
+/// 2. No `Retry-After` on this error (a network-error `RetryError::Request`,
+///    or a `Status` with no parsed header) → fall through to `dur`
+///    unchanged, i.e. `backon`'s own computed exponential-backoff delay.
+/// 3. A `Retry-After` over [`INLINE_RETRY_AFTER_CAP`] → `None`, ending the
+///    retry loop immediately rather than clamping it down to the cap and
+///    sleeping anyway. Waiting that long inline would eat into (or exceed)
+///    `total_budget` on its own; the caller maps the resulting terminal
+///    error to `RateLimited`/`RetriesExhausted`. This function has no side
+///    channel to record a pacing cooldown from the oversized value itself —
+///    a caller that wants that (as `fetch::lib`'s `HttpUrlFetcher::fetch`
+///    does, via `HostLimiter::note_retry_after`) must record it from the
+///    attempt's own response handling, *before* the `Err` carrying it
+///    reaches this closure at all, not from here.
+/// 4. Otherwise: honor the `Retry-After` value, but only if doing so keeps
+///    this loop's *actual* cumulative sleep under `total_budget`, tracked
+///    independently of `backon`'s own internal accounting via an `AtomicU64`
+///    of milliseconds (an atomic rather than a `Cell`/`RefCell` because the
+///    future this closure lives inside is boxed `dyn Future + Send` by
+///    `#[async_trait]` on every `Embedder` impl that calls
+///    `send_with_retry` — a `&Cell`/`&RefCell` held across an `.await` is
+///    not `Send`, since neither type is `Sync`). See [`TOTAL_DELAY_RATIO`]'s
+///    doc comment for *why* this independent tracking is necessary at all
+///    (`backon` only ever charges its own proposed delay against the
+///    budget, never the substituted value returned here). The budget check
+///    happens *before* adding the candidate sleep to the tracker, not
+///    after, so the first honored `Retry-After` in a loop is never rejected
+///    merely for being large by itself — matching `total_budget` equaling
+///    [`INLINE_RETRY_AFTER_CAP`] exactly at production settings, where a
+///    single maximal honored wait is expected to consume the whole budget.
+///    Only a *subsequent* honored wait, once the running total already
+///    covers `total_budget`, is refused.
+pub fn retry_after_adjuster(
+    total_budget: Duration,
+) -> impl FnMut(&RetryError, Option<Duration>) -> Option<Duration> + Send + Sync + 'static {
+    let spent_millis = AtomicU64::new(0);
+
+    move |err: &RetryError, dur: Option<Duration>| {
+        dur?;
+
+        let retry_after = match err {
+            RetryError::Status {
+                retry_after: Some(retry_after),
+                ..
+            } => *retry_after,
+            _ => return dur,
+        };
+
+        if retry_after > INLINE_RETRY_AFTER_CAP {
+            return None;
+        }
+
+        // u64 millis comfortably holds any `Duration` this function ever
+        // sees: every `retry_after` reaching here already passed through
+        // `parse_retry_after`'s `RETRY_AFTER_PARSE_CAP` (120 s = 120_000 ms).
+        let spent_so_far = Duration::from_millis(spent_millis.load(Ordering::Relaxed));
+        if spent_so_far >= total_budget {
+            return None;
+        }
+
+        spent_millis.fetch_add(retry_after.as_millis() as u64, Ordering::Relaxed);
+        Some(retry_after)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Transient-failure classification
@@ -380,5 +515,137 @@ mod tests {
             "a blocked destination must never be classified as transient, \
              even though it surfaces as a connect-error-shaped reqwest::Error"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // total_retry_budget
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn total_retry_budget_matches_retry_policys_own_total_delay_ratio() {
+        // Pins the formula against a literal, not just against itself, so a
+        // future edit to `TOTAL_DELAY_RATIO` (or an accidental divergence
+        // between this function and `retry_policy`'s inline use of it) shows
+        // up here.
+        let cfg = HttpSettings {
+            min_retry_delay: Duration::from_millis(10),
+            ..HttpSettings::default()
+        };
+        assert_eq!(total_retry_budget(&cfg), Duration::from_millis(300));
+    }
+
+    // -----------------------------------------------------------------------
+    // retry_after_adjuster — pure logic, no real sleep, no mock server.
+    //
+    // Exercised again end-to-end through wiremock in `fetch::lib` and
+    // `embed::http_helper`'s own test modules; these pin the same contract
+    // at the closure level, deterministically and without any wall-clock
+    // dependency.
+    // -----------------------------------------------------------------------
+
+    fn status_err_with_retry_after(retry_after: Duration) -> RetryError {
+        RetryError::Status {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            retry_after: Some(retry_after),
+        }
+    }
+
+    #[test]
+    fn adjuster_never_resurrects_a_stopped_loop() {
+        // Regression for the load-bearing `dur?` short-circuit: backon
+        // saying "stop" (`dur = None`) must win even when the error carries
+        // an honorable `Retry-After` — an earlier version of this closure
+        // that checked the error first produced an observed infinite loop
+        // against a server that kept sending 429 + Retry-After.
+        let mut adjust = retry_after_adjuster(Duration::from_secs(60));
+        let err = status_err_with_retry_after(Duration::from_secs(1));
+        assert_eq!(adjust(&err, None), None);
+    }
+
+    #[test]
+    fn adjuster_falls_back_to_backons_delay_with_no_retry_after_hint() {
+        let mut adjust = retry_after_adjuster(Duration::from_secs(60));
+        let no_header = RetryError::Status {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            retry_after: None,
+        };
+        let backons_delay = Some(Duration::from_millis(250));
+        assert_eq!(adjust(&no_header, backons_delay), backons_delay);
+
+        let network_err = RetryError::Request(
+            reqwest::Client::new()
+                .get("not a url")
+                .build()
+                .expect_err("a non-URL request must fail to build"),
+        );
+        assert_eq!(adjust(&network_err, backons_delay), backons_delay);
+    }
+
+    /// Defect 1 regression: a `Retry-After` over the inline cap must end the
+    /// loop (`None`), never get clamped down to the cap and slept on anyway.
+    #[test]
+    fn adjuster_gives_up_on_a_retry_after_over_the_inline_cap() {
+        let mut adjust = retry_after_adjuster(Duration::from_secs(60));
+        let err = status_err_with_retry_after(INLINE_RETRY_AFTER_CAP + Duration::from_secs(1));
+        assert_eq!(adjust(&err, Some(Duration::from_millis(1))), None);
+    }
+
+    /// Guard against over-correcting defect 1: a value *at* the cap is still
+    /// honored, not treated the same as one over it.
+    #[test]
+    fn adjuster_honors_a_retry_after_exactly_at_the_inline_cap() {
+        let mut adjust = retry_after_adjuster(Duration::from_secs(60));
+        let err = status_err_with_retry_after(INLINE_RETRY_AFTER_CAP);
+        assert_eq!(
+            adjust(&err, Some(Duration::from_millis(1))),
+            Some(INLINE_RETRY_AFTER_CAP)
+        );
+    }
+
+    /// Defect 2 regression: the very first honored `Retry-After` is never
+    /// rejected merely for being as large as (or larger than) the total
+    /// budget by itself — matching production, where `total_budget` equals
+    /// `INLINE_RETRY_AFTER_CAP` exactly and a single maximal wait is meant to
+    /// consume the whole budget.
+    #[test]
+    fn adjuster_honors_the_first_wait_even_if_it_alone_covers_the_whole_budget() {
+        let mut adjust = retry_after_adjuster(Duration::from_millis(100));
+        let err = status_err_with_retry_after(Duration::from_millis(100));
+        assert_eq!(
+            adjust(&err, Some(Duration::from_millis(1))),
+            Some(Duration::from_millis(100))
+        );
+    }
+
+    /// Defect 2 regression, the core of it: once the running total of
+    /// *honored* waits already covers the budget, a further honored wait is
+    /// refused — even though `dur` is still `Some` (backon's own, much
+    /// smaller, internal accounting still believes there is room). This is
+    /// exactly the divergence `TOTAL_DELAY_RATIO`'s doc comment describes:
+    /// without this independent tracker, a server that keeps returning
+    /// `Retry-After` near the cap can make the loop sleep for many times the
+    /// configured budget while backon still says "keep going".
+    #[test]
+    fn adjuster_bounds_cumulative_honored_waits_to_the_total_budget() {
+        let mut adjust = retry_after_adjuster(Duration::from_millis(100));
+        let err = status_err_with_retry_after(Duration::from_millis(60));
+        let backons_own_tiny_delay = Some(Duration::from_millis(1));
+
+        // First 60ms wait: 0 spent so far < 100ms budget — honored.
+        assert_eq!(
+            adjust(&err, backons_own_tiny_delay),
+            Some(Duration::from_millis(60))
+        );
+        // Second 60ms wait: 60ms spent so far < 100ms budget — still
+        // honored (the check is against what's already spent, not what the
+        // next wait would bring the total to), bringing the running total
+        // to 120ms.
+        assert_eq!(
+            adjust(&err, backons_own_tiny_delay),
+            Some(Duration::from_millis(60))
+        );
+        // Third wait: 120ms already spent >= 100ms budget — refused, even
+        // though backon's own (uninflated) accounting would still say yes.
+        assert_eq!(adjust(&err, backons_own_tiny_delay), None);
     }
 }

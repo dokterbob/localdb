@@ -102,26 +102,22 @@ pub async fn send_with_retry(
     let outcome = attempt
         .retry(http::retry_policy(settings))
         .when(http::is_transient)
-        // The `dur?` short-circuit here is load-bearing, not stylistic — see
-        // `fetch::lib`'s `.adjust` closure (and its long comment) for the
-        // full reasoning: `backon` calls `.adjust(err, backoff.next())`, and
-        // `backoff.next()` is already `None` exactly when the retry budget
-        // (`max_retries` or the cumulative delay cap) is exhausted, i.e.
-        // "stop" was decided *before* this closure runs. A closure that
-        // returns `Some(retry_after)` based only on the error, ignoring
-        // `dur`, would resurrect a stopped retry loop on every poll against a
-        // server that keeps sending 429 + Retry-After — an observed infinite
-        // loop upstream, not a hypothetical one here.
-        .adjust(|err: &RetryError, dur: Option<Duration>| {
-            dur?;
-            match err {
-                RetryError::Status {
-                    retry_after: Some(retry_after),
-                    ..
-                } => Some((*retry_after).min(http::INLINE_RETRY_AFTER_CAP)),
-                _ => dur,
-            }
-        })
+        // Shared with `fetch::HttpUrlFetcher::fetch` via `fetch::http` rather
+        // than duplicated here — see `http::retry_after_adjuster`'s doc
+        // comment for the full contract (the `dur?` short-circuit inside it
+        // is load-bearing: an earlier version of this closure that skipped
+        // it resurrected a stopped retry loop against a server that kept
+        // sending 429 + Retry-After, an observed infinite loop, not a
+        // hypothetical one).
+        //
+        // Unlike `fetch::lib`'s call site, this crate never records a
+        // `Retry-After` value as a pacing cooldown (see this module's own
+        // doc comment: hosted embedding providers get no proactive per-host
+        // limiter) — so an oversized `Retry-After` ending the loop here
+        // loses nothing extra beyond the terminal error itself.
+        .adjust(http::retry_after_adjuster(http::total_retry_budget(
+            settings,
+        )))
         .notify(|err: &RetryError, dur: Duration| {
             warn!(url = %url, wait = ?dur, error = ?err, "hosted embedding request failed, retrying");
         })
@@ -368,5 +364,99 @@ mod tests {
             }
             other => panic!("expected RetriesExhausted, got {other:?}"),
         }
+    }
+
+    /// Defect 1 regression (issue #207 follow-up), embed-side mirror of
+    /// `fetch::lib`'s `test_retry_after_over_cap_ends_fetch_immediately_
+    /// with_no_inline_sleep`: a `Retry-After` over `http::INLINE_RETRY_
+    /// AFTER_CAP` (30s) used to be clamped to the cap and slept on inline
+    /// anyway. It must instead end the request immediately as
+    /// `RetriesExhausted` — no inline sleep, and exactly one request
+    /// (`.expect(1)` fails the test if a retry goes out). `max_retries` is
+    /// generous (5) so the assertion pins the oversized `Retry-After` as the
+    /// reason the loop stopped, not exhausted retries.
+    #[tokio::test]
+    async fn send_with_retry_over_cap_retry_after_ends_immediately_with_no_inline_sleep() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "40"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+
+        let start = std::time::Instant::now();
+        let error = send_with_retry(
+            &client,
+            &format!("{}/embeddings", server.uri()),
+            json_headers(),
+            br#"{"input":["a"]}"#.to_vec(),
+            &test_settings(5),
+        )
+        .await
+        .expect_err("an over-cap Retry-After must not be retried into success");
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(error, EmbedError::RetriesExhausted { attempts: 1, .. }),
+            "expected RetriesExhausted after exactly 1 attempt, got {error:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "an over-cap Retry-After must never be slept on inline, took {elapsed:?}"
+        );
+    }
+
+    /// Defect 2 regression (issue #207 follow-up), embed-side mirror of
+    /// `fetch::lib`'s `test_retry_after_cumulative_sleep_is_bounded_by_
+    /// total_budget`. See that test's doc comment for the full numeric
+    /// derivation; the shape here is identical since both crates share
+    /// `fetch::http::retry_after_adjuster`: `min_retry_delay` 50ms ×
+    /// `TOTAL_DELAY_RATIO` 30 = 1.5s total budget, a 1s `Retry-After` on
+    /// every response, `max_retries` generous (10) so the fix — not
+    /// `max_retries` running out — is what bounds the loop to ~2s/3
+    /// requests instead of running for several more retries at 1s each.
+    #[tokio::test]
+    async fn send_with_retry_cumulative_sleep_is_bounded_by_total_budget() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "1"))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+
+        let settings = HttpSettings {
+            max_retries: 10,
+            min_retry_delay: Duration::from_millis(50),
+            ..HttpSettings::default()
+        };
+        let start = std::time::Instant::now();
+        let error = send_with_retry(
+            &client,
+            &format!("{}/embeddings", server.uri()),
+            json_headers(),
+            br#"{"input":["a"]}"#.to_vec(),
+            &settings,
+        )
+        .await
+        .expect_err("persistent 429s should exhaust the retry budget");
+        let elapsed = start.elapsed();
+        let requests = server.received_requests().await.unwrap_or_default().len();
+
+        assert!(
+            matches!(error, EmbedError::RetriesExhausted { .. }),
+            "expected RetriesExhausted, got {error:?}"
+        );
+        assert!(
+            requests <= 4,
+            "cumulative honored Retry-After sleep should stop the loop well \
+             before max_retries (10) is reached; got {requests} requests"
+        );
+        assert!(
+            elapsed < Duration::from_millis(2500),
+            "cumulative sleep must stay near the ~1.5s budget; got {elapsed:?}"
+        );
     }
 }
