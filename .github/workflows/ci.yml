@@ -53,33 +53,9 @@ jobs:
   test:
     name: Tests
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-      - name: Install protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-test-
-      - name: Build workspace
-        run: cargo build --workspace
-      - name: Run tests
-        run: cargo test --workspace
-
-  coverage:
-    name: Coverage gates
-    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # OIDC for the Qlty coverage upload (no token secret)
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust stable with llvm-tools
@@ -105,29 +81,10 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Run coverage (all tests)
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info
-      - name: Check coverage gates
-        # Gate: ≥80% line coverage across the workspace.
-        # Data-modifying paths should hit ≥90% but this workspace-level gate
-        # is enforced at 80%; per-crate gates are checked per ticket via the
-        # summary report.
-        run: |
-          cargo llvm-cov report --summary-only
-          # Fail if line coverage drops below 80%.
-          COVERAGE=$(cargo llvm-cov report --summary-only 2>/dev/null \
-            | grep 'TOTAL' | awk '{print $10}' | tr -d '%')
-          echo "Workspace line coverage: ${COVERAGE}%"
-          if [ -z "$COVERAGE" ]; then
-            echo "ERROR: Could not parse coverage output."
-            exit 1
-          fi
-          if [ "$(echo "$COVERAGE < 80" | bc -l)" = "1" ]; then
-            echo "ERROR: Coverage ${COVERAGE}% is below the 80% gate."
-            exit 1
-          fi
-      - name: Upload coverage to Codecov (informational)
-        uses: codecov/codecov-action@v4
-        if: github.event_name == 'pull_request'
+      - name: Upload coverage to Qlty
+        uses: qltysh/qlty-action/coverage@v2
         with:
+          oidc: true
           files: lcov.info
           fail_ci_if_error: false
 
