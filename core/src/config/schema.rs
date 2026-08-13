@@ -298,11 +298,19 @@ fn default_max_retries() -> u32 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimitConfig {
-    /// Maximum sustained requests per second to a single public host.
+    /// Maximum sustained requests per second to a single public host. Must be
+    /// at least 1 — `validate_config` (`core/src/config/loader.rs`) rejects
+    /// `0` at load time, so the emitted JSON Schema declares the same floor
+    /// (`minimum: 1`, not schemars' derived-from-`u32` `minimum: 0`) rather
+    /// than accepting a value the loader will turn around and reject.
+    #[schemars(range(min = 1))]
     #[serde(default = "default_requests_per_second")]
     pub requests_per_second: u32,
 
     /// Maximum burst size above the sustained rate (token bucket capacity).
+    /// Must be at least 1, for the same reason as `requests_per_second`
+    /// above: `validate_config` rejects `0`, so the schema does too.
+    #[schemars(range(min = 1))]
     #[serde(default = "default_burst")]
     pub burst: u32,
 }

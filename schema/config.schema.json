@@ -332,15 +332,15 @@
         "requests_per_second": {
           "type": "integer",
           "format": "uint32",
-          "minimum": 0,
-          "description": "Maximum sustained requests per second to a single public host.",
+          "minimum": 1,
+          "description": "Maximum sustained requests per second to a single public host. Must be\nat least 1 — `validate_config` (`core/src/config/loader.rs`) rejects\n`0` at load time, so the emitted JSON Schema declares the same floor\n(`minimum: 1`, not schemars' derived-from-`u32` `minimum: 0`) rather\nthan accepting a value the loader will turn around and reject.",
           "default": 1
         },
         "burst": {
           "type": "integer",
           "format": "uint32",
-          "minimum": 0,
-          "description": "Maximum burst size above the sustained rate (token bucket capacity).",
+          "minimum": 1,
+          "description": "Maximum burst size above the sustained rate (token bucket capacity).\nMust be at least 1, for the same reason as `requests_per_second`\nabove: `validate_config` rejects `0`, so the schema does too.",
           "default": 4
         }
       },

@@ -348,13 +348,29 @@ mod tests {
             .await;
         let client = reqwest::Client::new();
 
+        // Not `test_settings`: this test injects a real 1s `Retry-After`,
+        // which the retry-budget adjuster (`fetch::http::retry_after_
+        // adjuster`) must actually be able to afford — `test_settings`'s 1ms
+        // `min_retry_delay` floor scales the total budget (`min_retry_delay`
+        // × 30, see `fetch::http::total_retry_budget`) down to ~30ms, far
+        // short of the 1s injected here, so the strict, pre-add budget check
+        // (Finding A / issue #207 follow-up) would refuse this wait outright.
+        // 40ms gives a 1.2s budget, comfortably above the 1s injected. See
+        // `fetch::lib`'s `test_retry_after_seconds_is_honored` for the same
+        // fixture fix on the sibling retry loop.
+        let settings = HttpSettings {
+            max_retries: 2,
+            min_retry_delay: Duration::from_millis(40),
+            ..HttpSettings::default()
+        };
+
         let start = std::time::Instant::now();
         let body = send_with_retry(
             &client,
             &format!("{}/embeddings", server.uri()),
             json_headers(),
             br#"{"input":["a"]}"#.to_vec(),
-            &test_settings(2),
+            &settings,
         )
         .await
         .expect("must eventually succeed");

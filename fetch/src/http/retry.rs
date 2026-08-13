@@ -273,13 +273,21 @@ const TOTAL_DELAY_RATIO: u32 = 30;
 ///    doc comment for *why* this independent tracking is necessary at all
 ///    (`backon` only ever charges its own proposed delay against the
 ///    budget, never the substituted value returned here). The budget check
-///    happens *before* adding the candidate sleep to the tracker, not
-///    after, so the first honored `Retry-After` in a loop is never rejected
-///    merely for being large by itself — matching `total_budget` equaling
-///    [`INLINE_RETRY_AFTER_CAP`] exactly at production settings, where a
-///    single maximal honored wait is expected to consume the whole budget.
-///    Only a *subsequent* honored wait, once the running total already
-///    covers `total_budget`, is refused.
+///    happens *before* adding the candidate sleep to the tracker, and it is
+///    a **pre-add** check — `spent_so_far + retry_after`, not `spent_so_far`
+///    alone, is compared against `total_budget`. A post-hoc check (comparing
+///    only what was already spent) was tried and rejected: at production
+///    settings, where `total_budget` equals [`INLINE_RETRY_AFTER_CAP`]
+///    exactly, a single maximal wait happens to consume the whole budget
+///    either way, which looks like the two forms "collapse" to the same
+///    behavior — but that equivalence only holds for a wait at the cap.
+///    For anything smaller — `Retry-After: 29` against a 30 s budget, say —
+///    a post-hoc check honors a *second* 29 s wait too (`29 s < 30 s` is
+///    still true after the first), sleeping 58 s against a documented 30 s
+///    budget. The pre-add form rejects that second wait: `29 s + 29 s = 58
+///    s > 30 s budget`. A single honored wait exactly at `total_budget` is
+///    still allowed (`0 + total_budget` is not `> total_budget`), so the
+///    production one-maximal-wait case above still behaves identically.
 pub fn retry_after_adjuster(
     total_budget: Duration,
 ) -> impl FnMut(&RetryError, Option<Duration>) -> Option<Duration> + Send + Sync + 'static {
@@ -304,7 +312,7 @@ pub fn retry_after_adjuster(
         // sees: every `retry_after` reaching here already passed through
         // `parse_retry_after`'s `RETRY_AFTER_PARSE_CAP` (120 s = 120_000 ms).
         let spent_so_far = Duration::from_millis(spent_millis.load(Ordering::Relaxed));
-        if spent_so_far >= total_budget {
+        if spent_so_far + retry_after > total_budget {
             return None;
         }
 
@@ -343,9 +351,55 @@ pub enum RetryError {
 
 /// Whether a failed attempt is worth retrying.
 ///
-/// Retryable: HTTP 429, HTTP 408, any 5xx, and a network-level timeout or
-/// connect failure. Everything else is fatal — including every other 4xx,
-/// and (the trap this predicate exists to avoid) an SSRF refusal.
+/// Retryable: HTTP 429, HTTP 408, any 5xx, a network-level timeout or
+/// connect failure, and a body-transport failure — an origin that closes or
+/// resets the connection after sending successful headers but before the
+/// body finishes. Everything else is fatal — including every other 4xx, and
+/// (the trap this predicate exists to avoid) an SSRF refusal.
+///
+/// # `is_body() || is_decode()`, and why both are needed
+///
+/// Both `fetch::lib`'s `classify_response` and `embed::http_helper::
+/// send_with_retry` deliberately read the response body *inside* the
+/// retried closure specifically so a truncated/reset body is retried like
+/// any other transient failure — but until this predicate recognized the
+/// error kinds below, that placement bought nothing.
+///
+/// The obvious guess is `e.is_body()` alone: reqwest's own docs describe it
+/// as "related to the request or response body". It is necessary but not
+/// sufficient. Both call sites read the body via `Response::bytes()` — never
+/// `.json()`, and neither call site's `reqwest` client enables a
+/// compression feature (`fetch/Cargo.toml`'s `default-features = false`
+/// build has none active) — and reqwest 0.12's `Response::bytes()`
+/// (`BodyExt::collect().map_err(crate::error::decode)` in
+/// `async_impl/response.rs`) tags *every* failure it sees, transport or
+/// not, as `Kind::Decode`, not `Kind::Body`. Confirmed empirically (see
+/// `truncated_response_body_is_classified_transient` below): a connection
+/// reset mid-body, driven through a raw TCP listener that promises more
+/// bytes via `Content-Length` than it sends, surfaces as `reqwest::Error {
+/// kind: Decode, source: hyper::Error(Body, Os { kind: ConnectionReset,
+/// .. }) }` — `is_decode()` true, `is_body()` false. `is_body()` is kept
+/// anyway, both for the (currently unreached, in this codebase) streaming
+/// paths (`chunk()`/`bytes_stream()`) where reqwest does use `Kind::Body`,
+/// and as cheap insurance against a future reqwest version changing which
+/// kind `.bytes()` uses.
+///
+/// Retrying `is_decode()` unconditionally would normally be the wrong call
+/// — a *genuine* decode failure (served bytes are not what the caller asked
+/// for, e.g. malformed JSON from `Response::json()`, or a broken gzip
+/// stream) is a data problem the origin will reproduce identically on a
+/// retry, not a transport hiccup a second attempt might avoid, so retrying
+/// it only burns the retry budget on an outcome that cannot change. It is
+/// the right call *here* only because neither call site sharing this
+/// predicate can currently produce that genuine case: `.bytes()` returns
+/// raw, undecoded bytes (any JSON parsing embed's callers do happens later,
+/// outside this retry loop, as a `serde_json::Error` that never reaches
+/// `RetryError` at all), and no compression feature is enabled to make
+/// `Kind::Decode` mean "corrupt gzip stream" either. If either call site
+/// ever starts calling `.json()`/`.text()` on the success path, or a
+/// compression feature gets enabled, this reasoning needs revisiting —
+/// `is_decode()` would then also catch genuine, non-retryable content
+/// failures.
 ///
 /// # Ordering is load-bearing
 ///
@@ -372,7 +426,7 @@ pub fn is_transient(err: &RetryError) -> bool {
             if destination::is_blocked_error(e) {
                 return false;
             }
-            e.is_timeout() || e.is_connect()
+            e.is_timeout() || e.is_connect() || e.is_body() || e.is_decode()
         }
     }
 }
@@ -480,6 +534,87 @@ mod tests {
             "test precondition: must be a connect error"
         );
         assert!(is_transient(&RetryError::Request(err)));
+    }
+
+    /// Finding D regression: a body-transport failure — the origin closes
+    /// the connection after sending headers but before finishing the body
+    /// it promised via `Content-Length` — must be classified transient,
+    /// matching `classify_response`'s own stated intent (`fetch::lib`) of
+    /// reading the body *inside* the retry closure specifically so a
+    /// truncated read gets retried like any other transient failure. Before
+    /// this fix, `is_transient` only checked `is_timeout()`/`is_connect()`,
+    /// neither of which a body-read failure satisfies, so that placement
+    /// bought nothing.
+    ///
+    /// Also pins the `is_body()` vs `is_decode()` finding documented at
+    /// length on [`is_transient`]'s own doc comment: this failure surfaces
+    /// with `is_decode() == true` and `is_body() == false`, the opposite of
+    /// what the error's plain-English shape ("connection reset mid-body")
+    /// would suggest — `Response::bytes()` tags every failure it sees as
+    /// `Kind::Decode`, transport or not. A predicate that only added
+    /// `is_body()` would compile, look plausible, and still not fix this.
+    ///
+    /// Driven against a raw `TcpListener`, not wiremock: wiremock has no way
+    /// to serve a response that lies about its own `Content-Length`, which
+    /// is what is needed to make `Response::bytes()` itself fail rather than
+    /// the initial `send()`.
+    #[tokio::test]
+    async fn truncated_response_body_is_classified_transient() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener must bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener must have a local addr");
+
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            if let Ok((mut socket, _)) = listener.accept().await {
+                // Promises 100 bytes of body, sends 5, then the connection
+                // closes (`socket` dropping at the end of this block) —
+                // reqwest only discovers the mismatch when the body is
+                // actually read, not when headers arrive.
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort")
+                    .await;
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .build()
+            .expect("client must build");
+        let err = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("headers arrive intact; the failure surfaces on body read")
+            .bytes()
+            .await
+            .expect_err("a body shorter than its own Content-Length must fail to read");
+
+        // `Response::bytes()`'s own quirk (see `is_transient`'s doc comment):
+        // this is a transport failure, but reqwest 0.12 tags it
+        // `Kind::Decode`, not `Kind::Body`. Pinned explicitly so a future
+        // reqwest upgrade that changes this is caught here, at the
+        // precondition, rather than silently making the assertion below
+        // pass for the wrong reason.
+        assert!(
+            err.is_decode() && !err.is_body(),
+            "test precondition: expected this reqwest version's `Response::\
+             bytes()` to tag a transport failure as Kind::Decode, not \
+             Kind::Body — if this fails, reqwest's behavior changed and \
+             `is_transient`'s doc comment needs re-checking against it: {err:?}"
+        );
+        assert!(
+            !err.is_timeout() && !err.is_connect(),
+            "test precondition: a truncated body must not itself look like a \
+             timeout or connect error, or this test would not distinguish \
+             the fix from the pre-fix predicate: {err:?}"
+        );
+        assert!(
+            is_transient(&RetryError::Request(err)),
+            "a truncated/reset response body must be classified transient"
+        );
     }
 
     /// Pins the ordering documented on [`is_transient`]: a blocked
@@ -602,19 +737,38 @@ mod tests {
         );
     }
 
-    /// Defect 2 regression: the very first honored `Retry-After` is never
-    /// rejected merely for being as large as (or larger than) the total
-    /// budget by itself — matching production, where `total_budget` equals
-    /// `INLINE_RETRY_AFTER_CAP` exactly and a single maximal wait is meant to
-    /// consume the whole budget.
+    /// Defect 2 regression, replacing an earlier version of this test
+    /// (`adjuster_honors_the_first_wait_even_if_it_alone_covers_the_whole_
+    /// budget`) that only proved the *first* honored wait can equal the
+    /// whole budget — true under both the buggy post-hoc check this module
+    /// used to have (`spent_so_far >= total_budget`) and the pre-add fix
+    /// (`spent_so_far + retry_after > total_budget`), since `0 +
+    /// total_budget` is not `> total_budget` either way. That
+    /// non-distinguishing case was exactly the (wrong) justification
+    /// previously accepted for the post-hoc form: "at production settings
+    /// one maximal wait already consumes the whole budget, so pre-add and
+    /// post-hoc collapse to the same behavior" — true only when the wait is
+    /// itself at the cap. This version adds the case that actually
+    /// separates the two: once the first wait has consumed the whole
+    /// budget, *any* further honored wait — however small — must now be
+    /// refused, because `spent_so_far + retry_after` exceeds `total_budget`
+    /// even though `spent_so_far` alone does not exceed it until that next
+    /// wait is added. The old post-hoc check would have wrongly honored the
+    /// second wait here (`100ms >= 100ms budget` is false, so it would have
+    /// slept an extra 1ms — small in this scaled-down test, but the same
+    /// shape as the real defect: `Retry-After: 29` honored twice against a
+    /// 30s budget).
     #[test]
-    fn adjuster_honors_the_first_wait_even_if_it_alone_covers_the_whole_budget() {
+    fn adjuster_honors_a_first_wait_at_the_whole_budget_but_rejects_any_further_wait() {
         let mut adjust = retry_after_adjuster(Duration::from_millis(100));
         let err = status_err_with_retry_after(Duration::from_millis(100));
         assert_eq!(
             adjust(&err, Some(Duration::from_millis(1))),
             Some(Duration::from_millis(100))
         );
+
+        let tiny_err = status_err_with_retry_after(Duration::from_millis(1));
+        assert_eq!(adjust(&tiny_err, Some(Duration::from_millis(1))), None);
     }
 
     /// Defect 2 regression, the core of it: once the running total of
@@ -627,25 +781,55 @@ mod tests {
     /// configured budget while backon still says "keep going".
     #[test]
     fn adjuster_bounds_cumulative_honored_waits_to_the_total_budget() {
-        let mut adjust = retry_after_adjuster(Duration::from_millis(100));
+        let mut adjust = retry_after_adjuster(Duration::from_millis(150));
         let err = status_err_with_retry_after(Duration::from_millis(60));
         let backons_own_tiny_delay = Some(Duration::from_millis(1));
 
-        // First 60ms wait: 0 spent so far < 100ms budget — honored.
+        // First 60ms wait: 0 spent so far, 0+60=60ms <= 150ms budget —
+        // honored, running total → 60ms.
         assert_eq!(
             adjust(&err, backons_own_tiny_delay),
             Some(Duration::from_millis(60))
         );
-        // Second 60ms wait: 60ms spent so far < 100ms budget — still
-        // honored (the check is against what's already spent, not what the
-        // next wait would bring the total to), bringing the running total
-        // to 120ms.
+        // Second 60ms wait: 60ms spent so far, 60+60=120ms <= 150ms budget —
+        // still honored (the check is against what spending this wait
+        // *would bring the total to*, i.e. pre-add, not against what's
+        // already spent), bringing the running total to 120ms.
         assert_eq!(
             adjust(&err, backons_own_tiny_delay),
             Some(Duration::from_millis(60))
         );
-        // Third wait: 120ms already spent >= 100ms budget — refused, even
-        // though backon's own (uninflated) accounting would still say yes.
+        // Third wait: 120ms already spent, 120+60=180ms > 150ms budget —
+        // refused, even though backon's own (uninflated) accounting would
+        // still say yes, and even though 120ms alone is still < 150ms (the
+        // post-hoc check this replaces would have wrongly honored this
+        // wait too).
+        assert_eq!(adjust(&err, backons_own_tiny_delay), None);
+    }
+
+    /// Defect 2 regression, the exact scenario reported (issue reproduction:
+    /// `Retry-After: 29` honored twice against a documented 30s budget),
+    /// scaled down to stay pure-logic and instantaneous: repeated
+    /// just-under-cap `Retry-After` values must never let cumulative
+    /// honored sleep exceed `total_budget` in aggregate, even though each
+    /// individual value alone would fit comfortably under it.
+    #[test]
+    fn adjuster_rejects_repeated_just_under_cap_waits_once_their_sum_exceeds_the_budget() {
+        let mut adjust = retry_after_adjuster(Duration::from_millis(300));
+        let err = status_err_with_retry_after(Duration::from_millis(290));
+        let backons_own_tiny_delay = Some(Duration::from_millis(1));
+
+        // First 290ms wait: 0 spent so far, 0+290=290ms <= 300ms budget —
+        // honored.
+        assert_eq!(
+            adjust(&err, backons_own_tiny_delay),
+            Some(Duration::from_millis(290))
+        );
+        // Second 290ms wait: 290ms already spent + 290ms candidate =
+        // 580ms > 300ms budget — refused. Under the old post-hoc check
+        // (`spent_so_far >= total_budget`), 290ms < 300ms was still true
+        // here, so this wait was wrongly honored too, sleeping 580ms
+        // against a 300ms budget — the exact defect this test pins.
         assert_eq!(adjust(&err, backons_own_tiny_delay), None);
     }
 }

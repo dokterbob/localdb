@@ -230,6 +230,29 @@ mod tests {
         }
     }
 
+    /// Regression for a real editor/generator trap: `u32`'s derived range is
+    /// `minimum: 0`, but `validate_config` (`core/src/config/loader.rs`)
+    /// rejects `0` for both `rate_limit` fields at load time. Without the
+    /// `#[schemars(range(min = 1))]` attributes on `RateLimitConfig` in
+    /// `core/src/config/schema.rs`, the published schema would call `0`
+    /// valid for a config the loader then refuses.
+    #[test]
+    fn rate_limit_fields_have_minimum_one_not_schemars_default_zero() {
+        let schema = generate_router_schema();
+        let rate_limit = &schema["$defs"]["v1_RateLimitConfig"]["properties"];
+
+        assert_eq!(
+            rate_limit["requests_per_second"]["minimum"],
+            json!(1),
+            "requests_per_second must declare minimum: 1, matching validate_config's floor"
+        );
+        assert_eq!(
+            rate_limit["burst"]["minimum"],
+            json!(1),
+            "burst must declare minimum: 1, matching validate_config's floor"
+        );
+    }
+
     #[test]
     fn router_schema_else_branch_rejects_unknown_version() {
         let schema = generate_router_schema();

@@ -116,9 +116,18 @@ impl HttpUrlFetcher {
     /// first hop is what lets the tests drive the third.
     #[cfg(test)]
     fn new_redirect_guard_only() -> Result<Self, Error> {
-        let settings = http::HttpSettings::default();
-        let limiter = http::HostLimiter::new(&settings);
-        let client = http::client_builder(&settings)
+        Self::new_redirect_guard_only_with(&http::HttpSettings::default())
+    }
+
+    /// Same as [`Self::new_redirect_guard_only`], but with injectable
+    /// settings — for a test that needs the guarded redirect policy *and*
+    /// `fast_settings`' fast retry timing (e.g. a redirect-then-429 test
+    /// that has no interest in exercising the honored-`Retry-After` sleep
+    /// itself, only where its cooldown gets recorded).
+    #[cfg(test)]
+    fn new_redirect_guard_only_with(settings: &http::HttpSettings) -> Result<Self, Error> {
+        let limiter = http::HostLimiter::new(settings);
+        let client = http::client_builder(settings)
             .redirect(destination::guarded_redirect_policy())
             .build()
             .map_err(|e| Error::ProviderUnavailable {
@@ -127,7 +136,7 @@ impl HttpUrlFetcher {
         Ok(Self {
             client,
             policy: DestinationPolicy::Unrestricted,
-            settings,
+            settings: settings.clone(),
             limiter,
         })
     }
@@ -238,8 +247,12 @@ impl UrlFetcher for HttpUrlFetcher {
         }
 
         // Lowercased once, matching `HostLimiter`'s own key normalization —
-        // used both to record a 429's `Retry-After` against this host below
-        // and to name the host in a `RateLimited` message.
+        // this is the *requested* URL's host, used to name the host in a
+        // `RateLimited` message (`map_outcome`, below). Deliberately not
+        // used to record a 429's `Retry-After` cooldown — that uses the
+        // *effective* (post-redirect) host instead, computed from the
+        // response itself once one arrives; see `classify_response`'s doc
+        // comment for why the two must differ on a cross-host redirect.
         let host = parsed_url
             .as_ref()
             .and_then(|u| u.host_str())
@@ -277,7 +290,7 @@ impl UrlFetcher for HttpUrlFetcher {
                 }
             };
 
-            self.classify_response(&host, response).await
+            self.classify_response(response).await
         };
 
         let outcome = attempt
@@ -316,9 +329,16 @@ impl HttpUrlFetcher {
     /// *error* in the closure above) has already been ruled out by the
     /// caller. This function only ever sees a response that was actually
     /// received.
+    ///
+    /// Takes no `host` parameter, deliberately — unlike `fetch`'s pacing
+    /// `acquire()` call, which necessarily runs *before* the request exists
+    /// and so can only ever key off the *requested* URL's host, everything
+    /// this method does with a host (recording a 429's cooldown below)
+    /// happens *after* a response has actually arrived, so it uses that
+    /// response's own effective (post-redirect) host instead. See
+    /// `effective_host` below.
     async fn classify_response(
         &self,
-        host: &Option<String>,
         response: reqwest::Response,
     ) -> Result<FetchResult, http::RetryError> {
         let status = response.status();
@@ -331,6 +351,22 @@ impl HttpUrlFetcher {
             return Ok(FetchResult::Gone);
         }
 
+        // `Response::url()` is the effective URL after any redirects reqwest
+        // followed (reqwest 0.12's default `Policy::limited(10)`, which this
+        // client's builder never overrides) — read here, before
+        // `response.bytes()` consumes the response further down, and reused
+        // both for `final_url` on success and for cooldown attribution on a
+        // 429 below. Deliberately *not* the `host` computed once in `fetch`
+        // from the originally *requested* URL: on a cross-host redirect
+        // (the redirector 30x's to a different host, and *that* host is the
+        // one that actually returns 429), attributing the cooldown to the
+        // requested host would record it against the redirector — a host
+        // that was never the one imposing the limit — leaving the real
+        // limiting host's cooldown unset, so later requests straight to it
+        // (or via a different redirector) would sail through.
+        let effective_url = response.url().clone();
+        let effective_host = effective_url.host_str().map(str::to_lowercase);
+
         if !status.is_success() {
             let retry_after = response
                 .headers()
@@ -338,14 +374,14 @@ impl HttpUrlFetcher {
                 .and_then(|v| v.to_str().ok())
                 .and_then(http::parse_retry_after);
 
-            // Record every 429's `Retry-After` against this host's
-            // cooldown, not only the ones too large to sleep on inline
-            // below (`http::INLINE_RETRY_AFTER_CAP`) — this is what
+            // Record every 429's `Retry-After` against the *effective*
+            // host's cooldown, not only the ones too large to sleep on
+            // inline below (`http::INLINE_RETRY_AFTER_CAP`) — this is what
             // actually holds back *other* requests already in flight or
             // about to be sent to the same host for the rest of the run,
             // which is the mechanism issue #207's 23-req/s log needs.
             if status == StatusCode::TOO_MANY_REQUESTS {
-                if let (Some(host), Some(retry_after)) = (host, retry_after) {
+                if let (Some(host), Some(retry_after)) = (&effective_host, retry_after) {
                     self.limiter.note_retry_after(host, retry_after);
                 }
             }
@@ -356,11 +392,7 @@ impl HttpUrlFetcher {
             });
         }
 
-        // Captured before `response.bytes()` consumes the response below:
-        // `Response::url()` is the effective URL after any redirects reqwest
-        // followed (reqwest 0.12's default `Policy::limited(10)`, which this
-        // client's builder never overrides).
-        let final_url = response.url().to_string();
+        let final_url = effective_url.to_string();
 
         let etag = response
             .headers()
@@ -745,7 +777,22 @@ mod tests {
             .mount(&server)
             .await;
 
-        let fetcher = unrestricted_with(&fast_settings(1));
+        // Not `fast_settings`: this test injects a real 1s `Retry-After`,
+        // which the retry-budget adjuster (`http::retry_after_adjuster`)
+        // must actually be able to afford for the one retry this test
+        // expects to happen. `fast_settings`' 1ms floor scales the total
+        // budget (`min_retry_delay` × 30, see `http::total_retry_budget`)
+        // down to ~30ms — far short of the 1s this test injects — so a
+        // correct (strict, pre-add) budget check would refuse that first
+        // wait outright and the loop would stop after 1 request instead of
+        // the 2 asserted below. 40ms gives a 1.2s budget, comfortably above
+        // the 1s injected.
+        let settings = http::HttpSettings {
+            max_retries: 1,
+            min_retry_delay: Duration::from_millis(40),
+            ..http::HttpSettings::default()
+        };
+        let fetcher = unrestricted_with(&settings);
         let result = fetcher
             .fetch(&format!("{}/doc", server.uri()), &FetchMetadata::default())
             .await;
@@ -858,7 +905,17 @@ mod tests {
             .mount(&server)
             .await;
 
-        let fetcher = unrestricted_with(&fast_settings(2));
+        // Not `fast_settings`: see the comment on the equivalent settings in
+        // `test_429_exhausted_returns_rate_limited` — this test injects a
+        // real 1s `Retry-After`, which needs a budget (`min_retry_delay` ×
+        // 30) of at least 1s to be honorable under the strict, pre-add
+        // budget check. 40ms gives 1.2s of budget.
+        let settings = http::HttpSettings {
+            max_retries: 2,
+            min_retry_delay: Duration::from_millis(40),
+            ..http::HttpSettings::default()
+        };
+        let fetcher = unrestricted_with(&settings);
         let start = std::time::Instant::now();
         let result = fetcher
             .fetch(&format!("{}/doc", server.uri()), &FetchMetadata::default())
@@ -910,7 +967,21 @@ mod tests {
             .mount(&server)
             .await;
 
-        let fetcher = unrestricted_with(&fast_settings(2));
+        // Not `fast_settings`: this test's `Retry-After` targets ~3s out
+        // (see the doc comment above on why not ~1s), so — same reasoning
+        // as `test_retry_after_seconds_is_honored` — the budget
+        // (`min_retry_delay` × 30) needs to be at least 3s. 100ms gives
+        // exactly 3s; the actual parsed `Retry-After` is always strictly
+        // less than 3s (httpdate's whole-second truncation can only make
+        // the formatted timestamp earlier than the true 3s-out target,
+        // never later), so this budget always accommodates it with room to
+        // spare.
+        let settings = http::HttpSettings {
+            max_retries: 2,
+            min_retry_delay: Duration::from_millis(100),
+            ..http::HttpSettings::default()
+        };
+        let fetcher = unrestricted_with(&settings);
         let start = std::time::Instant::now();
         let result = fetcher
             .fetch(&format!("{}/doc", server.uri()), &FetchMetadata::default())
@@ -1270,6 +1341,71 @@ mod tests {
             }
             other => panic!("expected Downloaded, got {other:?}"),
         }
+    }
+
+    /// Finding C regression: a 429's `Retry-After` cooldown must be recorded
+    /// against the host that actually sent the 429 (the *effective*,
+    /// post-redirect host), not the redirector's host — even though `host`
+    /// in `fetch()` is computed once, before the request, from the
+    /// *requested* URL. `/hop` on the `127.0.0.1` literal 302s to `/final`
+    /// on the `localhost` name (both routed to the same wiremock server —
+    /// see `guarded_redirect_follows_a_hostname_hop` above for why this pair
+    /// of hostnames is what lets a test drive a real cross-host redirect
+    /// against one loopback listener), and `/final` returns 429.
+    ///
+    /// Asserted on the limiter directly (`cooldown_is_set_for_test`), not
+    /// through observable timing: both `127.0.0.1` and `localhost` are
+    /// loopback-exempt from `acquire`'s pacing wait (`should_pace`), so
+    /// there is no wait to time either way.
+    ///
+    /// `fast_settings(0)` (via `new_redirect_guard_only_with`), not
+    /// `new_redirect_guard_only`'s production defaults: cooldown recording
+    /// happens on every attempt regardless of whether a retry follows (see
+    /// `classify_response`), so this test needs exactly one 429 response,
+    /// not a real honored-`Retry-After` sleep — `max_retries: 0` gets that
+    /// in one request instead of the 4 (and ~15s of real 5s sleeps) that
+    /// production's `max_retries: 3` would otherwise cause here.
+    #[tokio::test]
+    async fn cross_host_redirect_records_cooldown_against_the_final_host_not_the_redirector() {
+        let server = MockServer::start().await;
+        let port = server.address().port();
+        let target = format!("http://localhost:{port}/final");
+        Mock::given(method("GET"))
+            .and(path("/hop"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", target.as_str()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/final"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "5"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let fetcher = HttpUrlFetcher::new_redirect_guard_only_with(&fast_settings(0))
+            .expect("new_redirect_guard_only_with should succeed in tests");
+        let result = fetcher
+            .fetch(
+                &format!("http://127.0.0.1:{port}/hop"),
+                &FetchMetadata::default(),
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(Error::RateLimited { .. })),
+            "expected RateLimited, got {result:?}"
+        );
+        assert!(
+            fetcher.limiter.cooldown_is_set_for_test("localhost"),
+            "the cooldown must be recorded against localhost, the host that \
+             actually sent the 429"
+        );
+        assert!(
+            !fetcher.limiter.cooldown_is_set_for_test("127.0.0.1"),
+            "the cooldown must not be recorded against 127.0.0.1, the \
+             redirector — it never sent a 429 itself"
+        );
     }
 
     /// `Policy::custom` replaces reqwest's default outright, so the 10-hop cap

@@ -249,6 +249,17 @@ impl<C: Clock> HostLimiter<C> {
         self.cooldowns_lock().get(host).copied()
     }
 
+    /// Crate-visible counterpart of [`Self::cooldown_deadline`], for tests
+    /// outside this module (`fetch::lib`'s redirect-attribution tests) that
+    /// need to assert *which host* a cooldown landed on directly, rather
+    /// than through observable timing — loopback destinations (every
+    /// wiremock fixture in this crate) are exempt from `acquire`'s pacing
+    /// wait (see [`should_pace`]), so there is nothing to time.
+    #[cfg(test)]
+    pub(crate) fn cooldown_is_set_for_test(&self, host: &str) -> bool {
+        self.cooldown_deadline(host).is_some()
+    }
+
     #[cfg(test)]
     fn cooldown_len(&self) -> usize {
         self.cooldowns_lock().len()
