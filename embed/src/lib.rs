@@ -14,11 +14,18 @@
 //!
 //! # Batching, retry, and timeout policy
 //!
-//! Hosted providers use sensible defaults documented in [`retry`]:
-//! - Batch size: 32 chunks per request (configurable)
-//! - Timeout: 30 s per request
-//! - Retries: 3 attempts with exponential back-off (1 s, 2 s, 4 s)
-//! - Retry on: network errors, 429 Too Many Requests, 5xx errors
+//! Batch size and per-request timeout are hosted-provider concerns documented in [`retry`]
+//! (batch size: 32 chunks per request, timeout: 30 s per request, both configurable).
+//!
+//! Retry/backoff/jitter/`Retry-After` handling is **not** reimplemented here — hosted providers
+//! send their requests through [`http_helper::send_with_retry`], which drives `fetch::http`'s
+//! shared outgoing-HTTP retry policy (issue #207): jittered exponential back-off, honoring a
+//! server's `Retry-After` header, retrying on network errors/429/408/5xx, by default up to 3
+//! retries (4 total attempts). Hosted providers are reactive-only: retry policy applies, but
+//! there is deliberately no proactive per-host rate limiter (`fetch::http::HostLimiter`) here —
+//! that mechanism exists for `fetch`'s document ingestion, where many requests can target one
+//! operator-unaware origin; a paid embedding API's own rate limiting is the right place for that
+//! for a hosted provider.
 //!
 //! # Model cache
 //!

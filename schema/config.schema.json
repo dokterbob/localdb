@@ -92,6 +92,18 @@
           },
           "description": "External embedding / LLM providers.",
           "default": []
+        },
+        "http": {
+          "$ref": "#/$defs/v1_HttpConfig",
+          "description": "Outbound HTTP client policy (user agent, retries, per-host rate limiting).",
+          "default": {
+            "user_agent": null,
+            "max_retries": 3,
+            "rate_limit": {
+              "requests_per_second": 1,
+              "burst": 4
+            }
+          }
         }
       },
       "required": [
@@ -282,6 +294,57 @@
         "kind"
       ],
       "description": "External provider configuration."
+    },
+    "v1_HttpConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "user_agent": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "`User-Agent` header sent with every outbound request. `~`/omitted\nmeans `localdb/<version> (+https://github.com/dokterbob/localdb)`.",
+          "default": null
+        },
+        "max_retries": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "description": "Maximum number of retries for a request that fails with a retryable\nstatus (e.g. a rate limit or transient server error) before giving up.",
+          "default": 3
+        },
+        "rate_limit": {
+          "$ref": "#/$defs/v1_RateLimitConfig",
+          "description": "Per-destination-host rate limiting for outbound requests.",
+          "default": {
+            "requests_per_second": 1,
+            "burst": 4
+          }
+        }
+      },
+      "description": "Outbound HTTP client policy: applies to every request localdb makes to\nfetch content (file/URL/feed ingestion) — not to the `server:` block\nabove, which configures the *inbound* daemon listener.\n\nDeliberately top-level rather than nested under `defaults.indexing`: it\ngoverns network behavior, not chunk/embedding semantics, so changing it\nnever bumps a store's `policy_version` or triggers a reindex."
+    },
+    "v1_RateLimitConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "requests_per_second": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "description": "Maximum sustained requests per second to a single public host.",
+          "default": 1
+        },
+        "burst": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "description": "Maximum burst size above the sustained rate (token bucket capacity).",
+          "default": 4
+        }
+      },
+      "description": "Rate limit applied per public destination host for outbound HTTP\nrequests. Loopback and LAN destinations are exempt."
     }
   }
 }

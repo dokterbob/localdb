@@ -61,13 +61,17 @@ impl SearchService {
         let yaml = self.state.yaml_config().await;
         let embed_policy = &yaml.defaults.indexing.embedding;
 
-        let embedder: Box<dyn localdb_core::Embedder> =
-            embed::create_embedder(embed_policy, &yaml.providers, Some(self.state.models_dir()))
-                .map_err(|e| {
-                    ApiError(CoreError::InvalidConfig {
-                        message: e.to_string(),
-                    })
-                })?;
+        let embedder: Box<dyn localdb_core::Embedder> = embed::create_embedder(
+            embed_policy,
+            &yaml.providers,
+            Some(self.state.models_dir()),
+            &(&yaml.http).into(),
+        )
+        .map_err(|e| {
+            ApiError(CoreError::InvalidConfig {
+                message: e.to_string(),
+            })
+        })?;
 
         let target_stores: Vec<_> = if req.store_filter.is_empty() {
             effective.stores.iter().collect()

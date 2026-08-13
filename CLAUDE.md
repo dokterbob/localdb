@@ -34,9 +34,9 @@ workspace):
 | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `core`         | Domain model, traits (`RetrievalStore`, `Embedder`), error taxonomy — no I/O frameworks                                                                                                                          |
 | `cli`          | Thin surface over `core`; `init`, `store`, `source`, `index`, `search` commands                                                                                                                                  |
-| `embed`        | Embedder implementations: ONNX (local), OpenAI-compatible, Perplexity, Voyage                                                                                                                                    |
+| `embed`        | Embedder implementations: ONNX (local), OpenAI-compatible, Perplexity, Voyage; hosted providers depend on `fetch` for retry/`Retry-After` handling (reactive only — no proactive pacing) |
 | `extract`      | Format detection and text extraction (Markdown, plain text, HTML, PDF → Markdown)                                                                                                                                |
-| `fetch`        | The `UrlFetcher` impl (reqwest). Two clients: `new()` unrestricted for operator-configured URLs, `new_public_only()` with the SSRF destination guard for URLs discovered in untrusted content (feed entry links) |
+| `fetch`        | The `UrlFetcher` impl (reqwest) plus the shared outgoing-HTTP layer (issue #207): retry via `backon` (429/408/5xx/timeout, honoring `Retry-After`) and per-host pacing via `governor` (keyed on destination host, loopback/LAN exempt). Two clients: `new()` unrestricted for operator-configured URLs, `new_public_only()` with the SSRF destination guard for URLs discovered in untrusted content (feed entry links) |
 | `ingest`       | Concrete `Ingestor` impls (`FileIngestor`, `UrlIngestor`, future connectors — Atom/RSS, Notion, Telegram, …); depends on `core` + `extract`; owns all acquisition I/O                                            |
 | `localdb`      | Binary entry point; wires all subcommands                                                                                                                                                                        |
 | `mcp`          | `rmcp`-based MCP server, stdio (embedded or daemon-proxied) and HTTP (`/mcp`); tools: `search`, `get_document`, `get_chunks`, `list_stores`                                                                      |
@@ -112,6 +112,13 @@ first if it is wrong.
   `schema/config.schema.json` artifact regenerated via
   `cargo run -p localdb -- internal print-schema > schema/config.schema.json` — the drift-guard test
   (`core/tests/config_schema_drift.rs`) fails otherwise. See `specs/03-config.md` §8.
+- **Outgoing HTTP goes through `fetch::http`, never a bare `reqwest::Client`** (issue #207): retry
+  (429/408/5xx/timeout, honoring `Retry-After`, capped at 30s inline / 30s cumulative budget per
+  document) and per-host pacing (`governor`, default 1 req/s burst 4, loopback/LAN exempt) live once
+  in `fetch` and are shared by `fetch` itself and by `embed`'s hosted providers (reactive-only there
+  — no proactive pacing against paid APIs). Configured via the top-level `http:` config section,
+  deliberately outside `defaults.indexing` so it never affects `policy_version`. See
+  `specs/03-config.md §1-2` and `specs/01-architecture.md §1`.
 
 ## Commit style
 

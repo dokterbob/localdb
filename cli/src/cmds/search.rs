@@ -110,6 +110,7 @@ impl DaemonAwareCommand for SearchCmd<'_> {
             embed_policy,
             &config_loader.config.providers,
             Some(&models_dir),
+            &(&config_loader.config.http).into(),
         )
         .map_err(Error::from)?;
         // Parity with the daemon path (issue #187 review, finding 1):

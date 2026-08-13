@@ -224,5 +224,15 @@ pub async fn job_events(
         next_job_event(state, queue, job_id)
     });
 
-    Ok(Sse::new(stream))
+    // Keep-alive (A5, issue #207): under retry/backoff pacing, minutes can
+    // pass between real `ProgressEvent`s. Without an explicit keep-alive,
+    // nothing on this stream detects a dead peer and nothing holds
+    // intermediaries (proxies, load balancers) open in the meantime. The
+    // client side already tolerates this fine either way — `job_attach.rs`'s
+    // SSE client sets no `.timeout()` and degrades to polling
+    // (`SseAttachError::Fallback`) on any stream failure — but a
+    // keep-alive is what lets the *server* notice a genuinely dead
+    // connection promptly instead of leaving the stream (and the resources
+    // behind it) open indefinitely.
+    Ok(Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default()))
 }

@@ -216,14 +216,14 @@ library — a separate, sibling directory to `models/`, not configurable via `pa
 
 ## Exit codes
 
-| Code | Meaning                                                      |
-| ---- | ------------------------------------------------------------ |
-| 0    | OK                                                           |
-| 1    | Internal error                                               |
-| 2    | Invalid usage or config (clap errors, config parse failures) |
-| 3    | Not found (unknown store, unknown source)                    |
-| 4    | Conflict / already running (duplicate store, second daemon)  |
-| 5    | Unavailable (daemon unreachable, model missing)              |
+| Code | Meaning                                                                    |
+| ---- | --------------------------------------------------------------------------- |
+| 0    | OK                                                                         |
+| 1    | Internal error                                                             |
+| 2    | Invalid usage or config (clap errors, config parse failures)              |
+| 3    | Not found (unknown store, unknown source)                                 |
+| 4    | Conflict / already running (duplicate store, second daemon)               |
+| 5    | Unavailable (daemon unreachable, model missing, rate-limited upstream)     |
 
 ---
 

@@ -44,3 +44,11 @@ defaults:
 #     kind: openai-compatible      # openai-compatible | perplexity | voyage
 #     base_url: http://localhost:11434/v1
 #     api_key_env: OLLAMA_KEY      # env var holding the key — secrets are never inlined
+
+# --- Outbound HTTP policy (optional; applies to file/URL/feed fetches) ---
+# http:
+#   user_agent: ~             # ~ = localdb/<version> (+https://github.com/dokterbob/localdb)
+#   max_retries: 3            # retries for a rate-limited/transient-error response before giving up
+#   rate_limit:
+#     requests_per_second: 1  # per public destination host; loopback/LAN hosts are exempt
+#     burst: 4                # token-bucket burst capacity above the sustained rate

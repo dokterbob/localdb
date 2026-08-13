@@ -166,6 +166,18 @@ fn validate_config(config: &RawConfig) -> Result<(), Error> {
         });
     }
 
+    if config.http.rate_limit.requests_per_second < 1 {
+        return Err(Error::InvalidConfig {
+            message: "http.rate_limit.requests_per_second must be greater than zero".to_string(),
+        });
+    }
+
+    if config.http.rate_limit.burst < 1 {
+        return Err(Error::InvalidConfig {
+            message: "http.rate_limit.burst must be greater than zero".to_string(),
+        });
+    }
+
     Ok(())
 }
 
@@ -421,6 +433,63 @@ defaults:
             "stores: key should be rejected by deny_unknown_fields: {:?}",
             err
         );
+    }
+
+    // --- http.rate_limit validation ---
+
+    #[test]
+    fn http_rate_limit_requests_per_second_zero_rejected() {
+        let yaml = "version: 1\nhttp:\n  rate_limit:\n    requests_per_second: 0\n";
+        let err = load_config_from_str(yaml).unwrap_err();
+        match err {
+            Error::InvalidConfig { message } => {
+                assert!(
+                    message.contains("http.rate_limit.requests_per_second"),
+                    "error message '{}' should mention the offending path",
+                    message
+                );
+            }
+            other => panic!("expected InvalidConfig, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn http_rate_limit_burst_zero_rejected() {
+        let yaml = "version: 1\nhttp:\n  rate_limit:\n    burst: 0\n";
+        let err = load_config_from_str(yaml).unwrap_err();
+        match err {
+            Error::InvalidConfig { message } => {
+                assert!(
+                    message.contains("http.rate_limit.burst"),
+                    "error message '{}' should mention the offending path",
+                    message
+                );
+            }
+            other => panic!("expected InvalidConfig, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn http_rate_limit_negative_requests_per_second_rejected_at_deserialize_time() {
+        // requests_per_second is u32, so a negative literal fails serde_yaml
+        // deserialization before validate_config ever runs — still surfaces
+        // as InvalidConfig, just from the parse arm rather than the
+        // validation arm.
+        let yaml = "version: 1\nhttp:\n  rate_limit:\n    requests_per_second: -1\n";
+        let err = load_config_from_str(yaml).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidConfig { .. }),
+            "negative requests_per_second should fail to deserialize as u32: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn http_rate_limit_valid_values_accepted() {
+        let yaml = "version: 1\nhttp:\n  rate_limit:\n    requests_per_second: 2\n    burst: 8\n";
+        let cfg = load_config_from_str(yaml).expect("valid http.rate_limit should load");
+        assert_eq!(cfg.http.rate_limit.requests_per_second, 2);
+        assert_eq!(cfg.http.rate_limit.burst, 8);
     }
 
     #[test]

@@ -25,6 +25,13 @@ async-trait = "0.1"
 # HTTP client for hosted providers
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 
+# Shared outgoing-HTTP layer (issue #207): user agent, retry/backoff/jitter,
+# and Retry-After handling for hosted-provider requests. `fetch` depends only
+# on `localdb-core`, so pulling it in here does not create a dependency
+# cycle — see `fetch/Cargo.toml`.
+fetch = { workspace = true }
+backon = { workspace = true }
+
 # Local ONNX inference (optional)
 # hf-hub-rustls-tls enables model downloading via HuggingFace Hub (includes hf-hub + rustls)
 #

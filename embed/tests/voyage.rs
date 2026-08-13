@@ -1,4 +1,5 @@
 use embed::{RetryPolicy, VoyageEmbedder};
+use fetch::http::HttpSettings;
 use localdb_core::{DocumentChunks, Embedder};
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -15,17 +16,29 @@ fn make_response(n: usize, dim: usize) -> serde_json::Value {
     serde_json::json!({ "data": data })
 }
 
+/// `HttpSettings` for tests that force a retry: `min_retry_delay` is dialed
+/// down to millisecond scale so the jittered exponential backoff
+/// `fetch::http::retry_policy` builds never adds more than a few
+/// milliseconds of real sleep — see `HttpSettings::min_retry_delay`'s doc
+/// comment, this is exactly the test seam it exists for.
+fn fast_http_settings(max_retries: u32) -> HttpSettings {
+    HttpSettings {
+        max_retries,
+        min_retry_delay: std::time::Duration::from_millis(1),
+        ..HttpSettings::default()
+    }
+}
+
 fn make_embedder(server_uri: &str) -> VoyageEmbedder {
     VoyageEmbedder::new(
         "voyage-test-key",
         None,
         Some(1024),
         RetryPolicy {
-            max_attempts: 3,
-            initial_backoff: std::time::Duration::from_millis(10),
             request_timeout: std::time::Duration::from_secs(5),
             batch_size: 32,
         },
+        fast_http_settings(3),
     )
     .expect("failed to construct embedder")
     .with_base_url(server_uri)
@@ -98,11 +111,10 @@ async fn voyage_embedder_fails_after_max_retries() {
         None,
         Some(1024),
         RetryPolicy {
-            max_attempts: 2,
-            initial_backoff: std::time::Duration::from_millis(10),
             request_timeout: std::time::Duration::from_secs(5),
             batch_size: 32,
         },
+        fast_http_settings(1),
     )
     .expect("failed to construct embedder")
     .with_base_url(server.uri());
@@ -161,11 +173,12 @@ async fn voyage_embedder_timeout_returns_provider_unavailable() {
         None,
         Some(1024),
         RetryPolicy {
-            max_attempts: 1,
-            initial_backoff: std::time::Duration::from_millis(10),
             request_timeout: std::time::Duration::from_millis(50),
             batch_size: 32,
         },
+        // 0 retries: this test asserts *classification* (a timeout becomes
+        // provider_unavailable), not retry behavior.
+        fast_http_settings(0),
     )
     .expect("failed to construct embedder")
     .with_base_url(server.uri());
@@ -194,8 +207,14 @@ async fn voyage_embedder_empty_docs() {
 
 #[test]
 fn voyage_embedder_model_id() {
-    let embedder = VoyageEmbedder::new("key", None, None, RetryPolicy::default())
-        .expect("failed to construct embedder");
+    let embedder = VoyageEmbedder::new(
+        "key",
+        None,
+        None,
+        RetryPolicy::default(),
+        HttpSettings::default(),
+    )
+    .expect("failed to construct embedder");
     assert_eq!(embedder.model_id(), "voyage-context-3");
     assert_eq!(embedder.embedding_dim(), 1024);
 }
@@ -203,7 +222,7 @@ fn voyage_embedder_model_id() {
 #[test]
 fn voyage_embedder_construction_does_not_panic() {
     let retry = RetryPolicy::default();
-    let result = VoyageEmbedder::new("test-api-key", None, None, retry);
+    let result = VoyageEmbedder::new("test-api-key", None, None, retry, HttpSettings::default());
     assert!(
         result.is_ok(),
         "should be able to construct embedder: {:?}",

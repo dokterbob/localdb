@@ -451,14 +451,7 @@ mod tests {
 
     async fn make_state() -> (TempDir, AppState) {
         let dir = tempfile::tempdir().unwrap();
-        let mut yaml_config = RawConfig {
-            version: 1,
-            schema: None,
-            server: Default::default(),
-            paths: Default::default(),
-            defaults: Default::default(),
-            providers: vec![],
-        };
+        let mut yaml_config = RawConfig::default();
         yaml_config.defaults.indexing.embedding = localdb_core::config::schema::EmbeddingPolicy {
             provider: "fake".to_string(),
             model: "default".to_string(),
@@ -634,15 +627,11 @@ mod tests {
 
         let paths = make_resolved_paths(dir.path());
         let config = RawConfig {
-            version: 1,
-            schema: None,
             server: localdb_core::config::schema::ServerConfig {
                 bind: "127.0.0.1".to_string(),
                 port: 0, // let OS assign a free port
             },
-            paths: Default::default(),
-            defaults: Default::default(),
-            providers: vec![],
+            ..Default::default()
         };
 
         let options = DaemonOptions {
@@ -675,15 +664,11 @@ mod tests {
 
         let paths = make_resolved_paths(dir.path());
         let config = RawConfig {
-            version: 1,
-            schema: None,
             server: localdb_core::config::schema::ServerConfig {
                 bind: "127.0.0.1".to_string(),
                 port: 0, // let OS assign a free port
             },
-            paths: Default::default(),
-            defaults: Default::default(),
-            providers: vec![],
+            ..Default::default()
         };
 
         let options1 = DaemonOptions {
@@ -719,14 +704,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("data")).unwrap();
 
         let paths = make_resolved_paths(dir.path());
-        let mut config = RawConfig {
-            version: 1,
-            schema: None,
-            server: localdb_core::config::schema::ServerConfig::default(),
-            paths: Default::default(),
-            defaults: Default::default(),
-            providers: vec![],
-        };
+        let mut config = RawConfig::default();
         config.server.bind = "0.0.0.0".to_string();
         config.server.port = 0; // let OS assign a free port
 
@@ -774,10 +752,6 @@ mod tests {
 
         // Create the state and job queue.
         let yaml_config = RawConfig {
-            version: 1,
-            schema: None,
-            server: Default::default(),
-            paths: Default::default(),
             defaults: localdb_core::config::schema::DefaultsConfig {
                 indexing: localdb_core::config::schema::IndexingPolicyConfig {
                     embedding: localdb_core::config::schema::EmbeddingPolicy {
@@ -787,7 +761,7 @@ mod tests {
                     ..Default::default()
                 },
             },
-            providers: vec![],
+            ..Default::default()
         };
         let queue = JobQueue::new();
         let state = AppState::new(
@@ -985,14 +959,7 @@ mod tests {
     #[tokio::test]
     async fn router_serves_status_endpoint() {
         let dir = tempfile::tempdir().unwrap();
-        let yaml_config = RawConfig {
-            version: 1,
-            schema: None,
-            server: Default::default(),
-            paths: Default::default(),
-            defaults: Default::default(),
-            providers: vec![],
-        };
+        let yaml_config = RawConfig::default();
         let queue = JobQueue::new();
         let state = AppState::new(
             yaml_config,

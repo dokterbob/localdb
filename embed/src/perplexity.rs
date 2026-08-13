@@ -29,6 +29,7 @@
 //! See specs/04-search-pipeline.md §4, specs/03-config.md §6.
 
 use async_trait::async_trait;
+use fetch::http::HttpSettings;
 use localdb_core::{DocumentChunks, EmbeddedDocument, Embedder, Error as CoreError};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::Client;
@@ -74,20 +75,28 @@ pub struct PerplexityEmbedder {
     api_key: String,
     model: String,
     embedding_dim: usize,
-    retry: RetryPolicy,
+    http_settings: HttpSettings,
 }
 
 impl PerplexityEmbedder {
     /// Create a new Perplexity embedder.
+    ///
+    /// `retry` covers batching/timeout policy — only `request_timeout` is
+    /// relevant here (Perplexity embeds one document's chunks per request,
+    /// so `batch_size` does not apply); it is consumed at construction and
+    /// not retained. `http_settings` is the shared outgoing-HTTP policy
+    /// (user agent, retry/backoff/jitter — see `fetch::http`) and is
+    /// retained for use on every request.
     pub fn new(
         api_key: impl Into<String>,
         model: Option<String>,
         embedding_dim: Option<usize>,
         retry: RetryPolicy,
+        http_settings: HttpSettings,
     ) -> Result<Self, EmbedError> {
         let model = model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
         let embedding_dim = embedding_dim.unwrap_or(DEFAULT_DIM);
-        let client = Client::builder()
+        let client = fetch::http::client_builder(&http_settings)
             .timeout(retry.request_timeout)
             .build()
             .map_err(|e| EmbedError::Internal(format!("failed to build HTTP client: {e}")))?;
@@ -97,7 +106,7 @@ impl PerplexityEmbedder {
             api_key: api_key.into(),
             model,
             embedding_dim,
-            retry,
+            http_settings,
         })
     }
 
@@ -105,9 +114,15 @@ impl PerplexityEmbedder {
     ///
     /// Returns `None` if the environment variable is not set.
     pub fn from_env(api_key_env: &str) -> Option<Result<Self, EmbedError>> {
-        std::env::var(api_key_env)
-            .ok()
-            .map(|key| Self::new(key, None, None, RetryPolicy::default()))
+        std::env::var(api_key_env).ok().map(|key| {
+            Self::new(
+                key,
+                None,
+                None,
+                RetryPolicy::default(),
+                HttpSettings::default(),
+            )
+        })
     }
 
     /// Override the base URL (useful for testing).
@@ -150,7 +165,8 @@ impl PerplexityEmbedder {
             message: format!("failed to serialize request: {e}"),
         })?;
 
-        let response = send_with_retry(&self.client, &url, headers, body, &self.retry).await?;
+        let response =
+            send_with_retry(&self.client, &url, headers, body, &self.http_settings).await?;
 
         let resp: PerplexityEmbedResponse =
             serde_json::from_slice(&response).map_err(|e| EmbedError::ProviderError {
@@ -209,6 +225,19 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// `HttpSettings` for tests that force a retry: `min_retry_delay` is
+    /// dialed down to millisecond scale so the jittered exponential backoff
+    /// `fetch::http::retry_policy` builds never adds more than a few
+    /// milliseconds of real sleep — see `HttpSettings::min_retry_delay`'s
+    /// doc comment, this is exactly the test seam it exists for.
+    fn fast_http_settings(max_retries: u32) -> HttpSettings {
+        HttpSettings {
+            max_retries,
+            min_retry_delay: std::time::Duration::from_millis(1),
+            ..HttpSettings::default()
+        }
+    }
+
     fn make_response(n: usize, dim: usize) -> serde_json::Value {
         let data: Vec<serde_json::Value> = (0..n)
             .map(|i| {
@@ -227,11 +256,10 @@ mod tests {
             None,
             Some(768),
             RetryPolicy {
-                max_attempts: 3,
-                initial_backoff: std::time::Duration::from_millis(10),
                 request_timeout: std::time::Duration::from_secs(5),
                 batch_size: 32,
             },
+            fast_http_settings(3),
         )
         .expect("failed to construct embedder")
         .with_base_url(server_uri)
@@ -327,11 +355,10 @@ mod tests {
             None,
             Some(768),
             RetryPolicy {
-                max_attempts: 2,
-                initial_backoff: std::time::Duration::from_millis(10),
                 request_timeout: std::time::Duration::from_secs(5),
                 batch_size: 32,
             },
+            fast_http_settings(1),
         )
         .expect("failed to construct embedder")
         .with_base_url(server.uri());
@@ -400,11 +427,12 @@ mod tests {
             None,
             Some(768),
             RetryPolicy {
-                max_attempts: 1,
-                initial_backoff: std::time::Duration::from_millis(10),
                 request_timeout: std::time::Duration::from_millis(50),
                 batch_size: 32,
             },
+            // 0 retries: this test asserts *classification* (a timeout
+            // becomes provider_unavailable), not retry behavior.
+            fast_http_settings(0),
         )
         .expect("failed to construct embedder")
         .with_base_url(server.uri());
@@ -433,8 +461,14 @@ mod tests {
 
     #[test]
     fn perplexity_embedder_model_id() {
-        let embedder = PerplexityEmbedder::new("key", None, None, RetryPolicy::default())
-            .expect("failed to construct embedder");
+        let embedder = PerplexityEmbedder::new(
+            "key",
+            None,
+            None,
+            RetryPolicy::default(),
+            HttpSettings::default(),
+        )
+        .expect("failed to construct embedder");
         assert_eq!(embedder.model_id(), DEFAULT_MODEL);
         assert_eq!(embedder.embedding_dim(), DEFAULT_DIM);
     }
@@ -442,7 +476,8 @@ mod tests {
     #[test]
     fn perplexity_embedder_construction_does_not_panic() {
         let retry = RetryPolicy::default();
-        let result = PerplexityEmbedder::new("test-api-key", None, None, retry);
+        let result =
+            PerplexityEmbedder::new("test-api-key", None, None, retry, HttpSettings::default());
         assert!(
             result.is_ok(),
             "should be able to construct embedder: {:?}",

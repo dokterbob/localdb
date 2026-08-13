@@ -278,9 +278,7 @@ pub(crate) async fn ensure_default_store(db: &AppDb) -> Result<(), Error> {
 mod tests {
     use super::*;
     use localdb_core::config::loader::ResolvedPaths;
-    use localdb_core::config::schema::{
-        DefaultsConfig, EmbeddingPolicy, PathsConfig, RawConfig, ServerConfig,
-    };
+    use localdb_core::config::schema::{DefaultsConfig, EmbeddingPolicy, RawConfig};
     use tempfile::TempDir;
 
     fn test_ctx(config: Option<PathBuf>) -> CliContext {
@@ -312,12 +310,8 @@ mod tests {
             model: "default".into(),
         };
         let config = RawConfig {
-            version: 1,
-            schema: None,
-            server: ServerConfig::default(),
-            paths: PathsConfig::default(),
             defaults,
-            providers: vec![],
+            ..Default::default()
         };
         let paths = ResolvedPaths {
             config_file: dir.path().join("config.yaml"),

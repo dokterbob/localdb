@@ -174,6 +174,7 @@ pub async fn run_job(
                 &yaml.defaults.indexing.embedding,
                 &yaml.providers,
                 Some(models_dir),
+                &(&yaml.http).into(),
             )?;
             Arc::from(built)
         }
@@ -189,11 +190,15 @@ pub async fn run_job(
     let existing = handle.list_indexed_documents().await?;
     let mut doc_index = DocumentIndex::from_records(existing);
 
-    let url_fetcher = HttpUrlFetcher::new()?;
-    // Destination-restricted client for locators that come from *content*
-    // rather than from the operator (a feed entry's `<link>`) — see
-    // `ingest::FeedIngestor::new`'s doc comment.
-    let entry_fetcher = HttpUrlFetcher::new_public_only()?;
+    // `new_pair` shares one `HostLimiter` between the two fetchers (issue
+    // #207) so per-host pacing holds across both surfaces a run touches a
+    // host through — the operator-configured `url_fetcher` and the
+    // destination-restricted `entry_fetcher` below — rather than each
+    // pacing the same origin independently. Built from `yaml.http` so
+    // operator-configured retry/rate-limit knobs apply; `run_job` is the one
+    // engine both the daemon and the CLI's embedded path share (see the
+    // module doc above), so this single wiring covers both surfaces.
+    let (url_fetcher, entry_fetcher) = HttpUrlFetcher::new_pair(&(&yaml.http).into())?;
 
     let mut stats = IndexJobStats {
         sources_count: sources_to_index.len() as u64,
@@ -290,10 +295,6 @@ mod tests {
 
     fn fake_yaml() -> RawConfig {
         RawConfig {
-            version: 1,
-            schema: None,
-            server: Default::default(),
-            paths: Default::default(),
             defaults: DefaultsConfig {
                 indexing: IndexingPolicyConfig {
                     chunking: Default::default(),
@@ -304,7 +305,7 @@ mod tests {
                     ..Default::default()
                 },
             },
-            providers: vec![],
+            ..Default::default()
         }
     }
 

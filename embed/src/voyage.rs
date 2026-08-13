@@ -27,6 +27,7 @@
 //! See specs/04-search-pipeline.md §4, specs/03-config.md §6.
 
 use async_trait::async_trait;
+use fetch::http::HttpSettings;
 use localdb_core::{DocumentChunks, EmbeddedDocument, Embedder, Error as CoreError};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::Client;
@@ -70,20 +71,28 @@ pub struct VoyageEmbedder {
     api_key: String,
     model: String,
     embedding_dim: usize,
-    retry: RetryPolicy,
+    http_settings: HttpSettings,
 }
 
 impl VoyageEmbedder {
     /// Create a new Voyage embedder.
+    ///
+    /// `retry` covers batching/timeout policy — only `request_timeout` is
+    /// relevant here (Voyage embeds one document's chunks per request, so
+    /// `batch_size` does not apply); it is consumed at construction and not
+    /// retained. `http_settings` is the shared outgoing-HTTP policy (user
+    /// agent, retry/backoff/jitter — see `fetch::http`) and is retained for
+    /// use on every request.
     pub fn new(
         api_key: impl Into<String>,
         model: Option<String>,
         embedding_dim: Option<usize>,
         retry: RetryPolicy,
+        http_settings: HttpSettings,
     ) -> Result<Self, EmbedError> {
         let model = model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
         let embedding_dim = embedding_dim.unwrap_or(DEFAULT_DIM);
-        let client = Client::builder()
+        let client = fetch::http::client_builder(&http_settings)
             .timeout(retry.request_timeout)
             .build()
             .map_err(|e| EmbedError::Internal(format!("failed to build HTTP client: {e}")))?;
@@ -93,15 +102,21 @@ impl VoyageEmbedder {
             api_key: api_key.into(),
             model,
             embedding_dim,
-            retry,
+            http_settings,
         })
     }
 
     /// Create from environment variable for the API key.
     pub fn from_env(api_key_env: &str) -> Option<Result<Self, EmbedError>> {
-        std::env::var(api_key_env)
-            .ok()
-            .map(|key| Self::new(key, None, None, RetryPolicy::default()))
+        std::env::var(api_key_env).ok().map(|key| {
+            Self::new(
+                key,
+                None,
+                None,
+                RetryPolicy::default(),
+                HttpSettings::default(),
+            )
+        })
     }
 
     /// Override the base URL (useful for testing).
@@ -147,7 +162,7 @@ impl VoyageEmbedder {
                 provider: "voyage".to_string(),
                 message: format!("failed to serialize request: {e}"),
             })?,
-            &self.retry,
+            &self.http_settings,
         )
         .await?;
 

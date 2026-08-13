@@ -83,7 +83,13 @@ pub(crate) async fn download_file(
     );
     info!("downloading {url}");
 
-    let mut req = client.get(&url).header("user-agent", "localdb/0.1");
+    // `fetch::http::DEFAULT_USER_AGENT` tracks the real workspace version
+    // (`env!("CARGO_PKG_VERSION")`) — the previous hardcoded "localdb/0.1"
+    // never matched it, not even at the time it was written (the workspace
+    // was already at 0.1.0).
+    let mut req = client
+        .get(&url)
+        .header("user-agent", fetch::http::DEFAULT_USER_AGENT);
     if let Ok(token) = std::env::var("HF_TOKEN") {
         req = req.header("Authorization", format!("Bearer {token}"));
     }

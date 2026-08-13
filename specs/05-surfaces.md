@@ -660,11 +660,12 @@ tool error). Codes are stable API:
 | `extraction_failed`                                                                                 | Recognized, supported format whose contents could not be extracted (corrupt/truncated). Counted in `error_count` in job stats; produces a WARN per file. | 422       |
 | `provider_unavailable`                                                                              | External embedding endpoint down/misconfigured                                                                                                           | 502       |
 | `model_missing`                                                                                     | Local model not yet downloaded; message includes the fix                                                                                                 | 503       |
+| `rate_limited`                                                                                       | Retries against an upstream host exhausted (429/5xx/timeout); not *our* rate limit — an upstream one — but grouped with the other "upstream not currently servable" codes and 502 for that reason | 502       |
 | `index_in_progress`                                                                                 | Conflicting job already running for the scope                                                                                                            | 409       |
 | `internal`                                                                                          | Bug; includes correlation id, logged with backtrace                                                                                                      | 500       |
 
 CLI exit codes: `0` ok, `1` internal, `2` invalid usage/config, `3` not found, `4` conflict/locked,
-`5` unavailable (daemon/provider/model).
+`5` unavailable (daemon/provider/model/rate-limited upstream).
 
 `core::Error::from_code(code, message)` is the one mapping back from a `{code, message}` pair to a
 typed `Error` (the inverse of `code()` above), shared by every surface that receives an error this
@@ -675,13 +676,14 @@ call sites fall back to `internal` for a code `from_code` doesn't recognize (an 
 or one of the three variants — `internal`, `unsupported_format`, `extraction_failed` — whose fields
 don't fit a single `message` string).
 
-Producers pair `message` with `from_code`'s expectations: for the 8 codes `from_code` rebuilds from
+Producers pair `message` with `from_code`'s expectations: for the 9 codes `from_code` rebuilds from
 a single field (the four `*_not_found` codes, plus `invalid_config` / `invalid_request` /
-`provider_unavailable` / `model_missing`), `message` is that bare field with no `Display` prefix — a
-daemon HTTP error body (`server::error::ApiError`) and a failed `IndexJob`'s `error` field both
-store `Error::raw_message()`, not `Error::to_string()`, so `from_code` can re-add the prefix once on
-reconstruction instead of doubling it. Every other code's `message` is the full `Display` string,
-since `from_code` decodes those either to a fixed no-message variant or not at all.
+`provider_unavailable` / `model_missing` / `rate_limited`), `message` is that bare field with no
+`Display` prefix — a daemon HTTP error body (`server::error::ApiError`) and a failed `IndexJob`'s
+`error` field both store `Error::raw_message()`, not `Error::to_string()`, so `from_code` can re-add
+the prefix once on reconstruction instead of doubling it. Every other code's `message` is the full
+`Display` string, since `from_code` decodes those either to a fixed no-message variant or not at
+all.
 
 ### `localdb index --strict`
 

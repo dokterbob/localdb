@@ -1,8 +1,11 @@
 mod destination;
+pub mod http;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
+use backon::Retryable;
 use localdb_core::{
     error::Error,
     ingestion::{FetchMetadata, FetchResult, UrlFetcher},
@@ -25,28 +28,43 @@ enum DestinationPolicy {
 
 /// HTTP URL fetcher backed by reqwest.
 ///
-/// `Clone` (cheap: `reqwest::Client` is internally `Arc`-backed) so callers
-/// can build one client per run and hand each URL-kind source its own boxed
-/// instance without rebuilding the underlying HTTP client per source.
+/// `Clone` (cheap: `reqwest::Client` and `http::HostLimiter` are both
+/// internally `Arc`-backed) so callers can build one client per run and hand
+/// each URL-kind source its own boxed instance without rebuilding the
+/// underlying HTTP client or losing track of per-host pacing state.
 #[derive(Clone)]
 pub struct HttpUrlFetcher {
     client: Client,
     policy: DestinationPolicy,
+    /// Retry-schedule knobs (`max_retries`) applied per fetch. `HostLimiter`
+    /// is the other half of `http::HttpSettings` and lives in its own field
+    /// below rather than being re-derived from this one, because `new_pair`
+    /// needs the *same* `HostLimiter` instance shared between two
+    /// `HttpUrlFetcher`s while each still carries its own copy of the plain
+    /// settings.
+    settings: http::HttpSettings,
+    /// Per-host request pacing (issue #207). Shared between the pair
+    /// returned by [`Self::new_pair`] so pacing is per-host across the whole
+    /// run rather than per-fetcher; `new()`/`new_public_only()` each get
+    /// their own, since nothing else in this crate ever needs those two to
+    /// share one.
+    limiter: http::HostLimiter,
 }
 
 impl HttpUrlFetcher {
     /// A fetcher with no destination restrictions — for operator-configured
     /// URLs. See [`DestinationPolicy::Unrestricted`].
+    ///
+    /// Uses `http::HttpSettings::default()` and a limiter of its own. Callers
+    /// that have an operator-configured `http:` section and want its retry
+    /// and rate-limit knobs applied — and, in particular, callers that also
+    /// build a [`Self::new_public_only`] fetcher for the same run — should
+    /// use [`Self::new_pair`] instead so both fetchers share one
+    /// `HostLimiter`.
     pub fn new() -> Result<Self, Error> {
-        let client = Self::builder()
-            .build()
-            .map_err(|e| Error::ProviderUnavailable {
-                message: format!("failed to build HTTP client: {e}"),
-            })?;
-        Ok(Self {
-            client,
-            policy: DestinationPolicy::Unrestricted,
-        })
+        let settings = http::HttpSettings::default();
+        let limiter = http::HostLimiter::new(&settings);
+        Self::build(DestinationPolicy::Unrestricted, settings, limiter)
     }
 
     /// A fetcher that refuses any destination which is not globally routable,
@@ -56,18 +74,35 @@ impl HttpUrlFetcher {
     /// reported as `Ok(FetchResult::Blocked)`, never as an error: it is a
     /// stable, unambiguous outcome (it will be refused again next run), so it
     /// belongs beside `Gone` rather than in the transient-failure bucket.
+    ///
+    /// Uses `http::HttpSettings::default()` and a limiter of its own — see
+    /// [`Self::new`]'s doc comment for when [`Self::new_pair`] is the better
+    /// choice.
     pub fn new_public_only() -> Result<Self, Error> {
-        let client = Self::builder()
-            .dns_resolver(Arc::new(destination::GuardedResolver))
-            .redirect(destination::guarded_redirect_policy())
-            .build()
-            .map_err(|e| Error::ProviderUnavailable {
-                message: format!("failed to build HTTP client: {e}"),
-            })?;
-        Ok(Self {
-            client,
-            policy: DestinationPolicy::PublicOnly,
-        })
+        let settings = http::HttpSettings::default();
+        let limiter = http::HostLimiter::new(&settings);
+        Self::build(DestinationPolicy::PublicOnly, settings, limiter)
+    }
+
+    /// Build both fetchers a run typically needs — one unrestricted, one
+    /// public-only — sharing a single [`http::HostLimiter`] and the same
+    /// operator-configured `cfg`.
+    ///
+    /// Sharing the limiter is the point: without it, an unrestricted fetch of
+    /// the operator's own feed URL and a public-only fetch of that feed's
+    /// entry links would pace independently against the same origin,
+    /// defeating the purpose of per-host pacing (issue #207) whenever a run
+    /// touches one host through both fetchers. Returns `(unrestricted,
+    /// public_only)`.
+    pub fn new_pair(cfg: &http::HttpSettings) -> Result<(Self, Self), Error> {
+        let limiter = http::HostLimiter::new(cfg);
+        let unrestricted = Self::build(
+            DestinationPolicy::Unrestricted,
+            cfg.clone(),
+            limiter.clone(),
+        )?;
+        let public_only = Self::build(DestinationPolicy::PublicOnly, cfg.clone(), limiter)?;
+        Ok((unrestricted, public_only))
     }
 
     /// Test-only: the guarded **redirect policy** alone — default resolver, no
@@ -81,7 +116,9 @@ impl HttpUrlFetcher {
     /// first hop is what lets the tests drive the third.
     #[cfg(test)]
     fn new_redirect_guard_only() -> Result<Self, Error> {
-        let client = Self::builder()
+        let settings = http::HttpSettings::default();
+        let limiter = http::HostLimiter::new(&settings);
+        let client = http::client_builder(&settings)
             .redirect(destination::guarded_redirect_policy())
             .build()
             .map_err(|e| Error::ProviderUnavailable {
@@ -90,14 +127,38 @@ impl HttpUrlFetcher {
         Ok(Self {
             client,
             policy: DestinationPolicy::Unrestricted,
+            settings,
+            limiter,
         })
     }
 
-    /// Settings shared by both constructors.
-    fn builder() -> reqwest::ClientBuilder {
-        Client::builder()
-            .user_agent("localdb/0.1")
-            .timeout(std::time::Duration::from_secs(30))
+    /// Shared client construction for every constructor above.
+    ///
+    /// All destination-policy-independent settings (user agent, timeout) come
+    /// from `http::client_builder`; the two destination-guard layers that
+    /// only `PublicOnly` applies (`GuardedResolver`, the guarded redirect
+    /// policy) are layered on here, exactly as the pre-#207 `builder()`
+    /// helper did.
+    fn build(
+        policy: DestinationPolicy,
+        settings: http::HttpSettings,
+        limiter: http::HostLimiter,
+    ) -> Result<Self, Error> {
+        let mut builder = http::client_builder(&settings);
+        if policy == DestinationPolicy::PublicOnly {
+            builder = builder
+                .dns_resolver(Arc::new(destination::GuardedResolver))
+                .redirect(destination::guarded_redirect_policy());
+        }
+        let client = builder.build().map_err(|e| Error::ProviderUnavailable {
+            message: format!("failed to build HTTP client: {e}"),
+        })?;
+        Ok(Self {
+            client,
+            policy,
+            settings,
+            limiter,
+        })
     }
 }
 
@@ -121,15 +182,45 @@ fn describe_error(err: &reqwest::Error) -> String {
 
 #[async_trait]
 impl UrlFetcher for HttpUrlFetcher {
+    /// Fetch `url`, retrying transient failures and pacing per-host request
+    /// rate along the way (issue #207).
+    ///
+    /// Structure, in order:
+    ///
+    /// 1. The preflight IP-literal check for `PublicOnly` — unchanged from
+    ///    before this stage, and deliberately *outside* the retried block: a
+    ///    blocked destination is refused once, immediately, never retried.
+    /// 2. A single `limiter.acquire()` before the retried block, not inside
+    ///    it — pacing applies once per `fetch()` call. A request that then
+    ///    goes on to retry several times already paid its host's pacing cost
+    ///    up front; re-acquiring per attempt would make a single slow
+    ///    document pay pacing tax multiple times for no benefit, since the
+    ///    thing pacing protects against (origin-visible request rate) is
+    ///    already satisfied by the one wait.
+    /// 3. The retried block: send, classify the outcome, and — for a
+    ///    success — read the body. The body read happens *inside* the
+    ///    closure so a connection that fails partway through a body is
+    ///    retried too, not just a failed `send()`.
+    /// 4. Terminal mapping from the retry loop's `Result` to this method's
+    ///    `Result<FetchResult, Error>`.
+    ///
+    /// See `http::retry`'s module doc for the closure contract this method
+    /// implements, and its own doc comments below for the per-branch
+    /// reasoning.
     async fn fetch(&self, url: &str, metadata: &FetchMetadata) -> Result<FetchResult, Error> {
         // Preflight (destination guard layer 2). Mandatory for IP literals:
         // hyper-util's connector parses the host as a socket address before it
         // ever consults a custom DNS resolver, so `http://127.0.0.1/` would
         // otherwise never reach `GuardedResolver`. A URL that does not parse
         // is left alone — `send()` below reports it with a better message.
+        //
+        // Parsed once here and reused for pacing/host-keying below, rather
+        // than re-parsing at each use site.
+        let parsed_url = reqwest::Url::parse(url).ok();
+
         if self.policy == DestinationPolicy::PublicOnly {
-            if let Ok(parsed) = reqwest::Url::parse(url) {
-                if destination::ip_literal_host(&parsed)
+            if let Some(parsed) = &parsed_url {
+                if destination::ip_literal_host(parsed)
                     .is_some_and(destination::is_blocked_destination)
                 {
                     tracing::info!(url = %url, "fetch: destination blocked (non-routable IP literal)");
@@ -138,97 +229,254 @@ impl UrlFetcher for HttpUrlFetcher {
             }
         }
 
-        let mut req = self.client.get(url);
-
-        if let Some(etag) = &metadata.etag {
-            req = req.header("If-None-Match", etag);
+        // Proactive pacing (issue #207): wait for this host's token bucket
+        // and any active `Retry-After` cooldown *before* making the first
+        // attempt. A no-op for loopback/LAN destinations and for a URL with
+        // no host at all — see `http::limiter::should_pace`.
+        if let Some(parsed) = &parsed_url {
+            self.limiter.acquire(parsed).await;
         }
-        if let Some(last_modified) = &metadata.last_modified {
-            req = req.header("If-Modified-Since", last_modified);
-        }
 
-        let response = match req.send().await {
-            Ok(response) => response,
-            Err(e) => {
-                // A rejection from the guarded resolver (layer 1) or the
-                // guarded redirect policy (layer 3) reaches us only as an
-                // opaque `reqwest::Error`; recover it so the caller sees the
-                // stable `Blocked` outcome rather than a transient failure.
-                if destination::is_blocked_error(&e) {
-                    tracing::info!(url = %url, "fetch: destination blocked ({e})");
-                    return Ok(FetchResult::Blocked);
+        // Lowercased once, matching `HostLimiter`'s own key normalization —
+        // used both to record a 429's `Retry-After` against this host below
+        // and to name the host in a `RateLimited` message.
+        let host = parsed_url
+            .as_ref()
+            .and_then(|u| u.host_str())
+            .map(str::to_lowercase);
+
+        let attempt = || async {
+            let mut req = self.client.get(url);
+
+            if let Some(etag) = &metadata.etag {
+                req = req.header("If-None-Match", etag);
+            }
+            if let Some(last_modified) = &metadata.last_modified {
+                req = req.header("If-Modified-Since", last_modified);
+            }
+
+            let response = match req.send().await {
+                Ok(response) => response,
+                Err(e) => {
+                    // A rejection from the guarded resolver (layer 1) or the
+                    // guarded redirect policy (layer 3) reaches us only as an
+                    // opaque `reqwest::Error`; recover it so the caller sees
+                    // the stable `Blocked` outcome rather than a transient
+                    // failure. Returned as `Ok`, not `Err(RetryError::
+                    // Request(e))`, so it never even reaches `is_transient`
+                    // below — a blocked destination must never be retried,
+                    // even though it surfaces in the same connect-error shape
+                    // as an ordinary transient network failure (the trap
+                    // `http::retry::is_transient`'s doc comment documents at
+                    // length).
+                    if destination::is_blocked_error(&e) {
+                        tracing::info!(url = %url, "fetch: destination blocked ({e})");
+                        return Ok(FetchResult::Blocked);
+                    }
+                    return Err(http::RetryError::Request(e));
                 }
-                return Err(Error::ProviderUnavailable {
-                    message: format!("HTTP request failed: {}", describe_error(&e)),
+            };
+
+            let status = response.status();
+
+            if status == StatusCode::NOT_MODIFIED {
+                return Ok(FetchResult::NotModified);
+            }
+
+            if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
+                return Ok(FetchResult::Gone);
+            }
+
+            if !status.is_success() {
+                let retry_after = response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(http::parse_retry_after);
+
+                // Record every 429's `Retry-After` against this host's
+                // cooldown, not only the ones too large to sleep on inline
+                // below (`http::INLINE_RETRY_AFTER_CAP`) — this is what
+                // actually holds back *other* requests already in flight or
+                // about to be sent to the same host for the rest of the run,
+                // which is the mechanism issue #207's 23-req/s log needs.
+                if status == StatusCode::TOO_MANY_REQUESTS {
+                    if let (Some(host), Some(retry_after)) = (&host, retry_after) {
+                        self.limiter.note_retry_after(host, retry_after);
+                    }
+                }
+
+                return Err(http::RetryError::Status {
+                    status,
+                    retry_after,
                 });
             }
+
+            // Captured before `response.bytes()` consumes the response below:
+            // `Response::url()` is the effective URL after any redirects reqwest
+            // followed (reqwest 0.12's default `Policy::limited(10)`, which this
+            // client's builder never overrides).
+            let final_url = response.url().to_string();
+
+            let etag = response
+                .headers()
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+
+            let last_modified = response
+                .headers()
+                .get("last-modified")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+
+            let content_type = response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+
+            // Read inside the closure, deliberately: a body that fails to
+            // read to completion (a truncated connection mid-transfer) must
+            // be retried like any other transient failure, not surfaced as a
+            // one-shot error the way it would be if this read happened after
+            // `.retry()` returned.
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(http::RetryError::Request)?
+                .to_vec();
+
+            Ok(FetchResult::Downloaded {
+                bytes,
+                content_type,
+                etag,
+                last_modified,
+                final_url: Some(final_url),
+            })
         };
 
-        let status = response.status();
+        let outcome = attempt
+            .retry(http::retry_policy(&self.settings))
+            .when(http::is_transient)
+            // Feed a `Retry-After` hint to backon, capped at
+            // `INLINE_RETRY_AFTER_CAP` so one oversized value never itself
+            // blows the retry loop's total sleep budget; fall back to
+            // backon's own computed delay when there is no hint.
+            //
+            // The `dur?` at the top is load-bearing and easy to get backwards:
+            // backon calls `.adjust(err, backoff.next())`, and `backoff.next()`
+            // is `None` precisely when `max_retries` or the cumulative sleep
+            // budget (`with_total_delay`) has already been exhausted — i.e.
+            // "stop now" already decided by backon *before* this closure ever
+            // runs. A `Retry-After` hint being present does not un-decide
+            // that: a version of this closure that returned `Some(retry_after)`
+            // unconditionally (checking only the error, never `dur`) would
+            // resurrect a stopped retry loop on every subsequent poll for a
+            // server that keeps sending 429+Retry-After — a real, observed
+            // infinite loop, not a hypothetical one. `Some` must only ever be
+            // returned once backon has confirmed `dur` was `Some` to begin
+            // with; the two `None` cases (backon says stop / no hint from the
+            // server) both fall through to returning `dur` unchanged.
+            .adjust(|err: &http::RetryError, dur: Option<Duration>| {
+                dur?;
+                match err {
+                    http::RetryError::Status {
+                        retry_after: Some(retry_after),
+                        ..
+                    } => Some((*retry_after).min(http::INLINE_RETRY_AFTER_CAP)),
+                    _ => dur,
+                }
+            })
+            // The only signal of retry activity: progress events are emitted
+            // after `fetch()` returns, so the CLI/daemon progress bar shows
+            // nothing while a document is being retried.
+            .notify(|err: &http::RetryError, dur: Duration| {
+                tracing::warn!(url = %url, wait = ?dur, error = ?err, "fetch: retrying after a transient failure");
+            })
+            .await;
 
-        if status == StatusCode::NOT_MODIFIED {
-            return Ok(FetchResult::NotModified);
-        }
-
-        if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
-            return Ok(FetchResult::Gone);
-        }
-
-        if !status.is_success() {
-            return Err(Error::ProviderUnavailable {
+        match outcome {
+            Ok(result) => Ok(result),
+            Err(http::RetryError::Status {
+                status,
+                retry_after,
+            }) if status == StatusCode::TOO_MANY_REQUESTS => {
+                // The one outcome that is not `ProviderUnavailable`: retries
+                // on a 429 were exhausted (the total retry budget, the max
+                // attempt count, or the server's own `Retry-After` was too
+                // large to wait on inline). Distinct from every other
+                // exhausted-retry outcome so a caller — and an operator
+                // reading logs — can tell "the server is overloaded" apart
+                // from "the server is broken", per issue #207.
+                let host_desc = host.as_deref().unwrap_or("unknown host");
+                let retry_after_desc = retry_after
+                    .map(|d| format!(", last Retry-After: {}s", d.as_secs()))
+                    .unwrap_or_default();
+                Err(Error::RateLimited {
+                    message: format!(
+                        "fetching {url} (host {host_desc}); retries exhausted{retry_after_desc}"
+                    ),
+                })
+            }
+            Err(http::RetryError::Status { status, .. }) => Err(Error::ProviderUnavailable {
                 message: format!("HTTP error {status} fetching {url}"),
-            });
+            }),
+            Err(http::RetryError::Request(e)) => Err(Error::ProviderUnavailable {
+                message: format!("HTTP request failed: {}", describe_error(&e)),
+            }),
         }
-
-        // Captured before `response.bytes()` consumes the response below:
-        // `Response::url()` is the effective URL after any redirects reqwest
-        // followed (reqwest 0.12's default `Policy::limited(10)`, which this
-        // client's builder never overrides).
-        let final_url = response.url().to_string();
-
-        let etag = response
-            .headers()
-            .get("etag")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-
-        let last_modified = response
-            .headers()
-            .get("last-modified")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-
-        let content_type = response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| Error::ProviderUnavailable {
-                message: format!("Failed to read response body: {e}"),
-            })?
-            .to_vec();
-
-        Ok(FetchResult::Downloaded {
-            bytes,
-            content_type,
-            etag,
-            last_modified,
-            final_url: Some(final_url),
-        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::SystemTime;
     use wiremock::{
         matchers::{header, header_exists, method, path},
         Mock, MockServer, ResponseTemplate,
     };
+
+    /// Settings for tests that need to exercise the retry loop without
+    /// paying the production 1s-minimum exponential backoff for real:
+    /// `min_retry_delay` is dialed down to 1ms, which `http::retry_policy`
+    /// also scales `max_delay`/`total_delay` down with (see its doc
+    /// comment), so a computed (non-`Retry-After`-driven) backoff never adds
+    /// more than a few milliseconds of real sleep no matter how many retries
+    /// a test forces. A test that wants to prove a server's actual
+    /// `Retry-After` value is honored (e.g. `test_retry_after_seconds_is_
+    /// honored`) still gets a real wait despite this — that value overrides
+    /// the computed backoff entirely in `fetch`'s `.adjust` closure,
+    /// independent of `min_retry_delay`.
+    ///
+    /// Rate limiting is left at the default — every wiremock fixture in this
+    /// module binds `127.0.0.1`, which `http::limiter::should_pace` exempts
+    /// unconditionally, so it never adds latency here regardless of the
+    /// configured rate.
+    fn fast_settings(max_retries: u32) -> http::HttpSettings {
+        http::HttpSettings {
+            max_retries,
+            min_retry_delay: Duration::from_millis(1),
+            ..http::HttpSettings::default()
+        }
+    }
+
+    /// An unrestricted fetcher built through `new_pair` so tests can inject
+    /// `fast_settings` — `new()` itself is fixed to `HttpSettings::default()`
+    /// (3 retries), too slow for a test that wants to force retries.
+    fn unrestricted_with(cfg: &http::HttpSettings) -> HttpUrlFetcher {
+        HttpUrlFetcher::new_pair(cfg)
+            .expect("new_pair should succeed in tests")
+            .0
+    }
+
+    /// The public-only half of the same pairing — see `unrestricted_with`.
+    fn public_only_with(cfg: &http::HttpSettings) -> HttpUrlFetcher {
+        HttpUrlFetcher::new_pair(cfg)
+            .expect("new_pair should succeed in tests")
+            .1
+    }
 
     #[test]
     fn http_url_fetcher_new_returns_err() {
@@ -237,6 +485,31 @@ mod tests {
             result.is_ok(),
             "HttpUrlFetcher::new() should return Ok in normal conditions"
         );
+    }
+
+    #[tokio::test]
+    async fn new_pair_builds_a_working_unrestricted_and_public_only_fetcher() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/doc"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ok"))
+            .mount(&server)
+            .await;
+
+        let (unrestricted, public_only) = HttpUrlFetcher::new_pair(&http::HttpSettings::default())
+            .expect("new_pair should succeed in tests");
+
+        let ok = unrestricted
+            .fetch(&format!("{}/doc", server.uri()), &FetchMetadata::default())
+            .await
+            .unwrap();
+        assert!(matches!(ok, FetchResult::Downloaded { .. }));
+
+        let blocked = public_only
+            .fetch(&format!("{}/doc", server.uri()), &FetchMetadata::default())
+            .await
+            .expect("a blocked destination is Ok(Blocked), never Err");
+        assert!(matches!(blocked, FetchResult::Blocked));
     }
 
     #[tokio::test]
@@ -408,16 +681,257 @@ mod tests {
         assert!(matches!(result, FetchResult::Gone));
     }
 
+    // -----------------------------------------------------------------------
+    // Retry (issue #207): transient status codes get retried, fatal ones
+    // don't, and a 429 that never recovers becomes `Error::RateLimited`.
+    //
+    // Every test here uses `fast_settings` — see its doc comment for why.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_429_then_200_is_retried_and_succeeds() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/doc"))
+            .respond_with(ResponseTemplate::new(429))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/doc"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ok"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let fetcher = unrestricted_with(&fast_settings(2));
+        let result = fetcher
+            .fetch(&format!("{}/doc", server.uri()), &FetchMetadata::default())
+            .await
+            .expect("a 429 followed by a 200 must eventually succeed");
+
+        assert!(matches!(result, FetchResult::Downloaded { .. }));
+        assert_eq!(
+            server.received_requests().await.unwrap_or_default().len(),
+            2,
+            "exactly 2 requests must have reached the server: the initial 429 and one retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_429_exhausted_returns_rate_limited() {
+        let server = MockServer::start().await;
+        // max_retries=1 below means 2 total attempts; `.expect(2)` pins that
+        // exactly, both against this one always-429 mock.
+        Mock::given(method("GET"))
+            .and(path("/doc"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "1"))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let fetcher = unrestricted_with(&fast_settings(1));
+        let result = fetcher
+            .fetch(&format!("{}/doc", server.uri()), &FetchMetadata::default())
+            .await;
+
+        match result {
+            err @ Err(Error::RateLimited { .. }) => {
+                // Assert on the *rendered* error, not the bare `message`
+                // field: `Display` is what an operator actually reads, and
+                // `Error::RateLimited`'s `#[error("rate limited: {message}")]`
+                // already supplies that label. The match arm above is what
+                // pins the variant; there is nothing left for the message
+                // itself to prove except the context it adds.
+                let rendered = err.unwrap_err().to_string();
+                assert!(
+                    rendered.contains("127.0.0.1"),
+                    "rendered error should name the host: {rendered}"
+                );
+                // Regression: the message used to begin "rate limited
+                // fetching ...", which `Display` then prefixed again —
+                // operators saw "rate limited: rate limited fetching ...".
+                // The label belongs to `Display` alone, so it must appear
+                // exactly once.
+                assert_eq!(
+                    rendered.matches("rate limited").count(),
+                    1,
+                    "the 'rate limited' label must not be duplicated between \
+                     Display's prefix and the message: {rendered}"
+                );
+            }
+            other => panic!("expected Err(RateLimited), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_5xx_then_200_is_retried_and_succeeds() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/doc"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/doc"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ok"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let fetcher = unrestricted_with(&fast_settings(2));
+        let result = fetcher
+            .fetch(&format!("{}/doc", server.uri()), &FetchMetadata::default())
+            .await
+            .expect("a 503 followed by a 200 must eventually succeed");
+
+        assert!(matches!(result, FetchResult::Downloaded { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_400_is_not_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/doc"))
+            .respond_with(ResponseTemplate::new(400))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let fetcher = unrestricted_with(&fast_settings(3));
+        let result = fetcher
+            .fetch(&format!("{}/doc", server.uri()), &FetchMetadata::default())
+            .await;
+
+        assert!(matches!(result, Err(Error::ProviderUnavailable { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_403_is_not_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/doc"))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let fetcher = unrestricted_with(&fast_settings(3));
+        let result = fetcher
+            .fetch(&format!("{}/doc", server.uri()), &FetchMetadata::default())
+            .await;
+
+        assert!(matches!(result, Err(Error::ProviderUnavailable { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_retry_after_seconds_is_honored() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/doc"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "1"))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/doc"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ok"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let fetcher = unrestricted_with(&fast_settings(2));
+        let start = std::time::Instant::now();
+        let result = fetcher
+            .fetch(&format!("{}/doc", server.uri()), &FetchMetadata::default())
+            .await
+            .expect("must eventually succeed");
+        let elapsed = start.elapsed();
+
+        assert!(matches!(result, FetchResult::Downloaded { .. }));
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "a 1s Retry-After should be honored inline, waited only {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "wait must stay bounded, got {elapsed:?}"
+        );
+    }
+
+    /// Narrow by design: this only needs to prove the HTTP-date form of
+    /// `Retry-After` is plumbed end to end through `fetch()` (parsed,
+    /// honored as an inline sleep) — the exhaustive parsing cases (delta-
+    /// seconds, an HTTP date in the future, a date in the past collapsing to
+    /// zero, garbage, the absurd-value cap) already live as free, non-sleeping
+    /// unit tests in `http::retry`'s own test module.
+    ///
+    /// Targets ~3s out, not ~1s: `httpdate::fmt_http_date` formats to
+    /// whole-second granularity, so a ~1s-out target can serialize to a
+    /// timestamp that has *already* elapsed by the time the response reaches
+    /// the client, and `parse_retry_after` correctly treats a past date as
+    /// `Duration::ZERO` — that made this test flaky, not `fetch()` buggy. A
+    /// wider target leaves room for that truncation while still keeping the
+    /// real sleep this test incurs (the one deliberate exception to this
+    /// module's "no real sleep" rule for a computed backoff) small.
+    #[tokio::test]
+    async fn test_retry_after_http_date_is_honored() {
+        let server = MockServer::start().await;
+        let target = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(3));
+        Mock::given(method("GET"))
+            .and(path("/doc"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", target.as_str()))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/doc"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ok"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let fetcher = unrestricted_with(&fast_settings(2));
+        let start = std::time::Instant::now();
+        let result = fetcher
+            .fetch(&format!("{}/doc", server.uri()), &FetchMetadata::default())
+            .await
+            .expect("must eventually succeed");
+        let elapsed = start.elapsed();
+
+        assert!(matches!(result, FetchResult::Downloaded { .. }));
+        assert!(
+            elapsed >= Duration::from_millis(1500),
+            "a ~3s-out HTTP-date Retry-After should be honored inline (allowing for \
+             httpdate's whole-second truncation), waited only {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "wait must stay bounded, got {elapsed:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_500_provider_unavailable() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/doc"))
             .respond_with(ResponseTemplate::new(500))
+            .expect(1)
             .mount(&server)
             .await;
 
-        let fetcher = HttpUrlFetcher::new().expect("HttpUrlFetcher::new should succeed in tests");
+        // Pinned to 0 retries: this test asserts *classification* (a 5xx
+        // becomes `ProviderUnavailable`), not retry behavior — `test_5xx_
+        // then_200_is_retried_and_succeeds` above owns that. Without pinning
+        // this to 0, a 5xx is now a retryable status and this would silently
+        // become a multi-second retry test.
+        let fetcher = unrestricted_with(&fast_settings(0));
         let result = fetcher
             .fetch(&format!("{}/doc", server.uri()), &FetchMetadata::default())
             .await;
@@ -427,7 +941,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_connection_refused_provider_unavailable() {
-        let fetcher = HttpUrlFetcher::new().expect("HttpUrlFetcher::new should succeed in tests");
+        // Pinned to 0 retries for the same reason as `test_500_provider_
+        // unavailable` above: a connect failure is retryable now, and this
+        // test's intent is narrow classification, not retry behavior.
+        let fetcher = unrestricted_with(&fast_settings(0));
         let result = fetcher
             .fetch("http://127.0.0.1:1", &FetchMetadata::default())
             .await;
@@ -438,9 +955,10 @@ mod tests {
     // -----------------------------------------------------------------------
     // Destination guard (`new_public_only`)
     //
-    // Every test above uses `new()` deliberately: wiremock binds loopback,
-    // which the guard blocks — which is precisely why the guard is opt-in via
-    // a second constructor rather than applied to the existing client.
+    // Every test above uses `new()`/`unrestricted_with` deliberately:
+    // wiremock binds loopback, which the guard blocks — which is precisely
+    // why the guard is opt-in via a second constructor rather than applied
+    // to the existing client.
     // -----------------------------------------------------------------------
 
     /// The one test where wiremock's loopback binding is the *asset*: it gives
@@ -453,6 +971,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/internal"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(b"secret"))
+            .expect(0)
             .mount(&server)
             .await;
 
@@ -497,18 +1016,31 @@ mod tests {
     /// Layer 1: a *name* that resolves to loopback never reaches the preflight
     /// (it is not an IP literal), so this exercises `GuardedResolver` and the
     /// `reqwest::Error` → `Blocked` recovery walk end to end.
+    ///
+    /// **The regression test this stage exists to add**: the guard's
+    /// rejection reaches `send()` as an ordinary-looking connect error — the
+    /// exact shape `http::retry::is_transient` would otherwise classify as
+    /// transient (see its doc comment on the `is_connect()` trap). Built with
+    /// `fast_settings(3)` (not the default 0) and a wall-clock assertion, not
+    /// just the zero-requests one below: if the retry closure ever regressed
+    /// to routing this through `Err(RetryError::Request(..))` instead of
+    /// short-circuiting to `Ok(Blocked)`, the request count would *still*
+    /// read zero (the guard still refuses every attempt before connecting),
+    /// but the call would take 3 retries' worth of backoff — this is what
+    /// actually catches that regression.
     #[tokio::test]
     async fn public_only_refuses_a_name_that_resolves_to_loopback() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/internal"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(b"secret"))
+            .expect(0)
             .mount(&server)
             .await;
 
         let port = server.address().port();
-        let fetcher =
-            HttpUrlFetcher::new_public_only().expect("new_public_only should succeed in tests");
+        let fetcher = public_only_with(&fast_settings(3));
+        let start = std::time::Instant::now();
         let result = fetcher
             .fetch(
                 &format!("http://localhost:{port}/internal"),
@@ -516,6 +1048,7 @@ mod tests {
             )
             .await
             .expect("a resolver rejection must surface as Ok(Blocked), not Err");
+        let elapsed = start.elapsed();
 
         assert!(
             matches!(result, FetchResult::Blocked),
@@ -532,6 +1065,12 @@ mod tests {
                 .unwrap_or_default()
                 .is_empty(),
             "the guarded resolver must refuse before any connection is made"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "a blocked destination must never be retried — with 3 retries \
+             configured, a naive is_connect()-based classifier would have \
+             burned several seconds of backoff here; got {elapsed:?}"
         );
     }
 
@@ -555,11 +1094,13 @@ mod tests {
                 ResponseTemplate::new(302)
                     .insert_header("location", format!("{}/internal", server.uri())),
             )
+            .expect(1)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
             .and(path("/internal"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(b"secret"))
+            .expect(0)
             .mount(&server)
             .await;
 
@@ -591,11 +1132,13 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/hop"))
             .respond_with(ResponseTemplate::new(302).insert_header("location", target.as_str()))
+            .expect(1)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
             .and(path("/final"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(b"followed"))
+            .expect(1)
             .mount(&server)
             .await;
 
@@ -647,7 +1190,10 @@ mod tests {
             other => panic!("expected ProviderUnavailable, got {other:?}"),
         }
         // Exhausting the budget says nothing about the destination, so it must
-        // NOT be laundered into the stable `Blocked` outcome.
+        // NOT be laundered into the stable `Blocked` outcome. Also not
+        // retried: a redirect-budget error is not `is_connect()`/`is_timeout()`
+        // shaped, so `is_transient` classifies it fatal and the loop below
+        // runs exactly once regardless of `max_retries`.
         assert!(
             server.received_requests().await.unwrap_or_default().len() <= MAX_HOPS_SANITY,
             "the redirect loop must terminate, not spin"
@@ -680,5 +1226,52 @@ mod tests {
             .unwrap();
 
         assert!(matches!(result, FetchResult::Downloaded { .. }));
+    }
+
+    // -----------------------------------------------------------------------
+    // `HostLimiter::acquire` — the async waiting path (issue #207)
+    //
+    // `HostLimiter`'s own test module (`http::limiter`) cannot exercise this:
+    // its `FakeRelativeClock` seam does not implement `ReasonablyRealtime`,
+    // the bound `acquire` requires, so every timing assertion there is
+    // synchronous (`check_ready`) and never actually awaits `acquire`. This
+    // closes that gap using only public API, on the real clock, with a rate
+    // high enough (100 req/s) to keep the wait small and the test fast.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn host_limiter_acquire_waits_for_a_public_host_but_not_for_loopback() {
+        let settings = http::HttpSettings {
+            requests_per_second: 100,
+            burst: 1,
+            ..http::HttpSettings::default()
+        };
+        let limiter = http::HostLimiter::new(&settings);
+
+        let loopback = reqwest::Url::parse("http://127.0.0.1/doc").expect("must parse");
+        let start = std::time::Instant::now();
+        limiter.acquire(&loopback).await;
+        limiter.acquire(&loopback).await;
+        assert!(
+            start.elapsed() < Duration::from_millis(50),
+            "loopback must never be paced, regardless of the configured rate"
+        );
+
+        // A globally-routable IP literal: `acquire` only waits on the token
+        // bucket, it never connects, so this needs no network access despite
+        // the address being real.
+        let public = reqwest::Url::parse("http://1.1.1.1/doc").expect("must parse");
+        limiter.acquire(&public).await; // consumes the sole burst token
+        let start = std::time::Instant::now();
+        limiter.acquire(&public).await; // must wait ~10ms at 100 req/s
+        let waited = start.elapsed();
+        assert!(
+            waited >= Duration::from_millis(5),
+            "expected a measurable wait for a paced public host, got {waited:?}"
+        );
+        assert!(
+            waited < Duration::from_millis(500),
+            "the wait must stay small and bounded, got {waited:?}"
+        );
     }
 }

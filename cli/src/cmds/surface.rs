@@ -204,6 +204,7 @@ pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
         embed_policy,
         &config_loader.config.providers,
         Some(&models_dir),
+        &(&config_loader.config.http).into(),
     ) {
         Ok(e) => e,
         Err(e) => exit_err(&Error::from(e), ctx.json),

@@ -68,9 +68,9 @@ pub fn http_status_for(err: &CoreError) -> StatusCode {
             StatusCode::CONFLICT
         }
 
-        CoreError::DaemonUnreachable | CoreError::ProviderUnavailable { .. } => {
-            StatusCode::BAD_GATEWAY
-        }
+        CoreError::DaemonUnreachable
+        | CoreError::ProviderUnavailable { .. }
+        | CoreError::RateLimited { .. } => StatusCode::BAD_GATEWAY,
 
         CoreError::InvalidConfig { .. }
         | CoreError::UnsupportedFormat { .. }
@@ -131,6 +131,12 @@ mod tests {
         );
         assert_eq!(
             http_status_for(&Error::ProviderUnavailable {
+                message: "m".into()
+            }),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            http_status_for(&Error::RateLimited {
                 message: "m".into()
             }),
             StatusCode::BAD_GATEWAY

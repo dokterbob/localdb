@@ -95,6 +95,7 @@ pub(crate) async fn run_embedded_store_job(
             &config_loader.config.defaults.indexing.embedding,
             &config_loader.config.providers,
             Some(&config_loader.paths.models_dir),
+            &(&config_loader.config.http).into(),
         ) {
             Ok(built) => {
                 #[cfg(test)]
@@ -763,10 +764,6 @@ mod tests {
 
     fn fake_daemon_yaml() -> RawConfig {
         RawConfig {
-            version: 1,
-            schema: None,
-            server: Default::default(),
-            paths: Default::default(),
             defaults: localdb_core::config::schema::DefaultsConfig {
                 indexing: localdb_core::config::schema::IndexingPolicyConfig {
                     chunking: Default::default(),
@@ -777,7 +774,7 @@ mod tests {
                     ..Default::default()
                 },
             },
-            providers: vec![],
+            ..Default::default()
         }
     }
 

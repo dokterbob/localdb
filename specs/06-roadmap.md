@@ -64,7 +64,22 @@ for citations; OCR / scanned PDFs; additional ebook formats (see below); OS keyc
 interactive CLI browse; gRPC (if demanded); entities/graph; backup/export/import strategy (with
 Phase 4); metrics/tracing endpoints (structured logs ship in MVP; Prometheus metrics arrive with the
 daemon-centric Phase 4); per-format native block extraction (beyond `markdown_to_blocks()`
-conversion).
+conversion); per-host max-concurrency alongside `fetch::http::HostLimiter`'s rate pacing (a no-op
+today, since ingestion is fully sequential — would need a companion semaphore, and only earns its
+keep once ingestion goes concurrent); a per-host circuit breaker to short-circuit a feed once every
+entry is coming back rate-limited, rather than paying the per-entry retry cost for each one; the
+scheduler's multi-source starvation, where several URL sources in one store coming due in the same
+60 s tick means only the first wins the per-store in-flight guard and the rest fail submission and
+are never stamped `last_refreshed` (that happens only on completion), so they retry next tick and
+refresh less often than configured overall — pre-existing, amplified by per-host pacing making jobs
+run longer, not fixed by this work; job cancellation (issue #218) — a `localdb job cancel` CLI
+subcommand fronting a new `DELETE /v1/jobs/{id}` HTTP route, neither of which exists yet (both would
+become new entries in [05-surfaces.md](05-surfaces.md) §2/§3); emitting a progress event before the fetch
+rather than only after it returns, so a slow document is visible as in-flight instead of showing
+nothing until `DocumentStarted`/`DocumentFinished` land back-to-back; a job-duration watchdog, now
+that per-host pacing and retry make "slow but fine" and "actually stuck" harder to tell apart from
+the outside; and sub-1-req/s pacing via `governor`'s `Quota::with_period`, should the integer-only
+`requests_per_second` ever prove too coarse.
 
 ### Document & ebook formats
 

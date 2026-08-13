@@ -481,9 +481,10 @@ All errors use the same JSON envelope:
 | `message` | string | Error detail — see below for its exact shape |
 
 For `store_not_found`, `source_not_found`, `resource_not_found`, `job_not_found`, `invalid_config`,
-`invalid_request`, `provider_unavailable`, and `model_missing`, `message` is the _bare_ field the
-error was built from (the id, or the validation/provider detail) — it does **not** carry the
-human-readable prefix a CLI-rendered version of the same error would (e.g. `"store not found: "`).
+`invalid_request`, `provider_unavailable`, `model_missing`, and `rate_limited`, `message` is the
+_bare_ field the error was built from (the id, or the validation/provider/rate-limit detail) — it
+does **not** carry the human-readable prefix a CLI-rendered version of the same error would (e.g.
+`"store not found: "`).
 This lets a daemon-attached client reconstruct the original typed error from `code` + `message`
 (`core::Error::from_code`) and render its own prefix without doubling it; a client that just wants
 display text should combine `code` and `message` itself (e.g. `"store not found: nope"`). Every
@@ -503,6 +504,7 @@ HTTP status codes follow the shared error taxonomy in
 | `unsupported_format`                                                            | 422         | Extractor cannot handle the file                                            |
 | `provider_unavailable`                                                          | 502         | External embedding endpoint down                                            |
 | `model_missing`                                                                 | 503         | Local model not yet downloaded                                              |
+| `rate_limited`                                                                  | 502         | Retries against an upstream host exhausted; grouped with "upstream not currently servable" rather than 429, since it's an upstream limit, not the daemon's own |
 | `index_in_progress`                                                             | 409         | Conflicting job already running for this scope                              |
 | `internal`                                                                      | 500         | Bug; response includes a `correlation_id` for log correlation               |
 
