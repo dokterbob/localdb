@@ -2,7 +2,14 @@
 
 > **EXPERIMENTAL — do not rely on this surface for production use.**
 >
-> The daemon opens the same unified database (`<data_dir>/localdb.db`) as the CLI, so CLI-indexed data IS visible via `/v1/search`, `/v1/documents/{id}`, and `/v1/status`. Ingestion via `POST /v1/jobs` runs the real pipeline through an async job queue ([#187](https://github.com/dokterbob/localdb/issues/187)) — `localdb index` submits a job and attaches to its live progress (`GET /v1/jobs/{id}/events`, SSE) whenever a daemon is running, with identical output to embedded mode; you no longer need to stop the daemon first. It remains experimental as a surface: write concurrency across processes is SQLite WAL + `busy_timeout=5000`, not a dedicated lock.
+> The daemon opens the same unified database (`<data_dir>/localdb.db`) as the CLI, so CLI-indexed
+> data IS visible via `/v1/search`, `/v1/documents/{id}`, and `/v1/status`. Ingestion via
+> `POST /v1/jobs` runs the real pipeline through an async job queue
+> ([#187](https://github.com/dokterbob/localdb/issues/187)) — `localdb index` submits a job and
+> attaches to its live progress (`GET /v1/jobs/{id}/events`, SSE) whenever a daemon is running, with
+> identical output to embedded mode; you no longer need to stop the daemon first. It remains
+> experimental as a surface: write concurrency across processes is SQLite WAL + `busy_timeout=5000`,
+> not a dedicated lock.
 >
 > For design rationale see [specs/05-surfaces.md](../specs/05-surfaces.md) §3.
 
@@ -20,13 +27,12 @@ On startup the daemon prints a single announce line to stdout and then continues
 daemon listening on http://127.0.0.1:7700
 ```
 
-It binds the HTTP listener and also creates a Unix discovery socket at
-`<data_dir>/daemon.sock` so that CLI and MCP processes can detect it, plus a
-`<data_dir>/daemon.url` file recording the daemon's actual client-reachable base URL
-(e.g. `http://192.168.1.5:7700` for a LAN bind, or `http://127.0.0.1:7700` when bound to
-`0.0.0.0`/`::`, since the wildcard address itself isn't connectable). CLI/MCP discovery reads
-this file, so it works for any configured bind address or port — not just the default
-`127.0.0.1:7700`.
+It binds the HTTP listener and also creates a Unix discovery socket at `<data_dir>/daemon.sock` so
+that CLI and MCP processes can detect it, plus a `<data_dir>/daemon.url` file recording the daemon's
+actual client-reachable base URL (e.g. `http://192.168.1.5:7700` for a LAN bind, or
+`http://127.0.0.1:7700` when bound to `0.0.0.0`/`::`, since the wildcard address itself isn't
+connectable). CLI/MCP discovery reads this file, so it works for any configured bind address or port
+— not just the default `127.0.0.1:7700`.
 
 ### Bind address and port
 
@@ -35,8 +41,8 @@ The bind address and port are controlled by the `server` block in `config.yaml`:
 ```yaml
 version: 1
 server:
-  bind: 127.0.0.1   # default; any bind address is accepted (see Trust model below)
-  port: 7700        # default; 0 = OS-assigned
+  bind: 127.0.0.1 # default; any bind address is accepted (see Trust model below)
+  port: 7700 # default; 0 = OS-assigned
 ```
 
 Setting `port: 0` asks the OS for an ephemeral port. The assigned port is shown in the announce
@@ -45,25 +51,23 @@ line.
 ### Trust model
 
 The daemon binds `127.0.0.1` by default with **no authentication**. The documented trust boundary
-is: anything that can reach the bind address is as trusted as the files themselves. Any bind
-address is accepted — binding to a specific non-loopback address (e.g. a LAN or VPN IP) is treated
-as a deliberate trust decision and starts silently. Binding to `0.0.0.0` (all interfaces) logs a
-warning at startup, since that makes the unauthenticated daemon reachable from any network the
-machine is on. See [specs/05-surfaces.md](../specs/05-surfaces.md) §3 for the binding and trust
-decision.
+is: anything that can reach the bind address is as trusted as the files themselves. Any bind address
+is accepted — binding to a specific non-loopback address (e.g. a LAN or VPN IP) is treated as a
+deliberate trust decision and starts silently. Binding to `0.0.0.0` (all interfaces) logs a warning
+at startup, since that makes the unauthenticated daemon reachable from any network the machine is
+on. See [specs/05-surfaces.md](../specs/05-surfaces.md) §3 for the binding and trust decision.
 
 ---
 
 ## MCP over HTTP
 
-Alongside `/v1`, the daemon also mounts `/mcp` — the same four read-only MCP tools
-(`search`, `get_document`, `get_chunks`, `list_stores`) served over the
-[MCP Streamable HTTP transport](https://modelcontextprotocol.io/), for connecting a
-remote MCP client (e.g. Claude Code on another machine, over Tailscale/LAN). It
-inherits this daemon's bind-address trust decision automatically — see
+Alongside `/v1`, the daemon also mounts `/mcp` — the same four read-only MCP tools (`search`,
+`get_document`, `get_chunks`, `list_stores`) served over the
+[MCP Streamable HTTP transport](https://modelcontextprotocol.io/), for connecting a remote MCP
+client (e.g. Claude Code on another machine, over Tailscale/LAN). It inherits this daemon's
+bind-address trust decision automatically — see
 [docs/mcp.md](mcp.md#remote-http-connecting-from-another-machine) for setup and
-[specs/05-surfaces.md](../specs/05-surfaces.md) §4.2 for the transport/error-model
-details.
+[specs/05-surfaces.md](../specs/05-surfaces.md) §4.2 for the transport/error-model details.
 
 ---
 
@@ -82,50 +86,48 @@ curl -s http://127.0.0.1:7700/v1/status
 
 ```json
 {
-    "daemon": true,
-    "store_count": 1,
-    "source_count": 0,
-    "job_count": 0,
-    "stores": [
-        {
-            "name": "notes",
-            "visibility": "private",
-            "backend": "libsql",
-            "document_count": 3,
-            "chunk_count": 30
-        }
-    ],
-    "database": {
-        "path": "/path/to/data/localdb.db",
-        "exists": true,
-        "size_bytes": 90112,
-        "wal_size_bytes": 0,
-        "total_size_bytes": 90112,
-        "bytes_per_chunk": 3003,
-        "largest_tables": [
-            {"name": "chunks", "bytes": 65536}
-        ]
+  "daemon": true,
+  "store_count": 1,
+  "source_count": 0,
+  "job_count": 0,
+  "stores": [
+    {
+      "name": "notes",
+      "visibility": "private",
+      "backend": "libsql",
+      "document_count": 3,
+      "chunk_count": 30
     }
+  ],
+  "database": {
+    "path": "/path/to/data/localdb.db",
+    "exists": true,
+    "size_bytes": 90112,
+    "wal_size_bytes": 0,
+    "total_size_bytes": 90112,
+    "bytes_per_chunk": 3003,
+    "largest_tables": [{ "name": "chunks", "bytes": 65536 }]
+  }
 }
 ```
 
-| Field | Type | Description |
-|---|---|---|
-| `daemon` | bool | Always `true` when the daemon is responding |
-| `store_count` | int | Number of stores known to this daemon instance |
-| `source_count` | int | Total sources across all stores |
-| `job_count` | int | Number of jobs ever created in this daemon session |
+| Field                                              | Type      | Description                                                                                                                                                                 |
+| -------------------------------------------------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `daemon`                                           | bool      | Always `true` when the daemon is responding                                                                                                                                 |
+| `store_count`                                      | int       | Number of stores known to this daemon instance                                                                                                                              |
+| `source_count`                                     | int       | Total sources across all stores                                                                                                                                             |
+| `job_count`                                        | int       | Number of jobs ever created in this daemon session                                                                                                                          |
 | `stores[].document_count` / `stores[].chunk_count` | int\|null | Per-store `RetrievalStore::stats()` figures; `null` if that store's stats call itself failed (a corrupt or mid-migration store must not blank out the report on the others) |
-| `database.path` | string | Path to the shared `localdb.db` file — one physical file backs every store, so this is reported once, not per-store |
-| `database.exists` | bool | Whether the file exists yet (`false` before the first `store add`/`index`) |
-| `database.size_bytes` / `database.wal_size_bytes` | int\|null | Bytes in the main file / `-wal` sidecar; `null` if a stat fails |
-| `database.total_size_bytes` | int | `size_bytes + wal_size_bytes` (missing components treated as 0) — what the disk actually has allocated right now |
-| `database.bytes_per_chunk` | int\|null | `total_size_bytes` divided by the sum of every store's `chunk_count`; `null` with no chunks |
-| `database.largest_tables` | array | Up to 5 `{name, bytes}` rows, the largest on-disk tables via SQLite's `dbstat`, descending; best-effort — empty if `dbstat` querying fails |
+| `database.path`                                    | string    | Path to the shared `localdb.db` file — one physical file backs every store, so this is reported once, not per-store                                                         |
+| `database.exists`                                  | bool      | Whether the file exists yet (`false` before the first `store add`/`index`)                                                                                                  |
+| `database.size_bytes` / `database.wal_size_bytes`  | int\|null | Bytes in the main file / `-wal` sidecar; `null` if a stat fails                                                                                                             |
+| `database.total_size_bytes`                        | int       | `size_bytes + wal_size_bytes` (missing components treated as 0) — what the disk actually has allocated right now                                                            |
+| `database.bytes_per_chunk`                         | int\|null | `total_size_bytes` divided by the sum of every store's `chunk_count`; `null` with no chunks                                                                                 |
+| `database.largest_tables`                          | array     | Up to 5 `{name, bytes}` rows, the largest on-disk tables via SQLite's `dbstat`, descending; best-effort — empty if `dbstat` querying fails                                  |
 
 This is the same shape the embedded CLI's `localdb status --json` reports (see
-[specs/05-surfaces.md](../specs/05-surfaces.md) §2.4) — daemon-routed and embedded `status`
-render identically.
+[specs/05-surfaces.md](../specs/05-surfaces.md) §2.4) — daemon-routed and embedded `status` render
+identically.
 
 ---
 
@@ -139,16 +141,16 @@ curl -s http://127.0.0.1:7700/v1/stores
 
 ```json
 {
-    "items": [
-        {
-            "name": "notes",
-            "id": "01KTVGQ62TQN8X6XN9E5FDZN67",
-            "visibility": "private",
-            "backend": "libsql"
-        }
-    ],
-    "next_cursor": null,
-    "total": 1
+  "items": [
+    {
+      "name": "notes",
+      "id": "01KTVGQ62TQN8X6XN9E5FDZN67",
+      "visibility": "private",
+      "backend": "libsql"
+    }
+  ],
+  "next_cursor": null,
+  "total": 1
 }
 ```
 
@@ -164,10 +166,10 @@ curl -s http://127.0.0.1:7700/v1/stores/notes
 
 ```json
 {
-    "name": "notes",
-    "id": "01KTVGQ62TQN8X6XN9E5FDZN67",
-    "visibility": "private",
-    "backend": "libsql"
+  "name": "notes",
+  "id": "01KTVGQ62TQN8X6XN9E5FDZN67",
+  "visibility": "private",
+  "backend": "libsql"
 }
 ```
 
@@ -186,9 +188,9 @@ curl -s http://127.0.0.1:7700/v1/stores/notes/sources
 
 ```json
 {
-    "items": [],
-    "next_cursor": null,
-    "total": 0
+  "items": [],
+  "next_cursor": null,
+  "total": 0
 }
 ```
 
@@ -205,38 +207,38 @@ curl -s http://127.0.0.1:7700/v1/config
 
 ```json
 {
-    "yaml_config": {
-        "defaults": {
-            "indexing": {
-                "chunking": {
-                    "preset_overrides": {}
-                },
-                "embedding": {
-                    "model": "pplx-embed-context-v1-0.6b",
-                    "provider": "local-onnx"
-                }
-            }
+  "yaml_config": {
+    "defaults": {
+      "indexing": {
+        "chunking": {
+          "preset_overrides": {}
         },
-        "paths": {
-            "data": "/path/to/data",
-            "logs": "/path/to/logs",
-            "models": "/path/to/models"
-        },
-        "providers": [],
-        "server": {
-            "bind": "127.0.0.1",
-            "port": 7700
-        },
-        "stores": [],
-        "version": 1
-    },
-    "effective_stores": [
-        {
-            "name": "notes",
-            "visibility": "private",
-            "backend": "libsql"
+        "embedding": {
+          "model": "pplx-embed-context-v1-0.6b",
+          "provider": "local-onnx"
         }
-    ]
+      }
+    },
+    "paths": {
+      "data": "/path/to/data",
+      "logs": "/path/to/logs",
+      "models": "/path/to/models"
+    },
+    "providers": [],
+    "server": {
+      "bind": "127.0.0.1",
+      "port": 7700
+    },
+    "stores": [],
+    "version": 1
+  },
+  "effective_stores": [
+    {
+      "name": "notes",
+      "visibility": "private",
+      "backend": "libsql"
+    }
+  ]
 }
 ```
 
@@ -248,17 +250,17 @@ DB is the single source of truth — there is no YAML store declaration. Config 
 
 ### `POST /v1/search`
 
-Hybrid search across stores. Returns a ranked citation list over the same data the CLI indexes —
-the daemon and the CLI share `<data_dir>/localdb.db`.
+Hybrid search across stores. Returns a ranked citation list over the same data the CLI indexes — the
+daemon and the CLI share `<data_dir>/localdb.db`.
 
 **Request body:**
 
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `query` | string | yes | Natural language search query |
-| `store_filter` | string[] | no | Store names to search; omit or pass `[]` to search all stores |
-| `limit` | int | no | Maximum results to return (default: 10; not clamped) |
-| `cursor` | string | no | Pagination cursor from a previous response |
+| Field          | Type     | Required | Description                                                   |
+| -------------- | -------- | -------- | ------------------------------------------------------------- |
+| `query`        | string   | yes      | Natural language search query                                 |
+| `store_filter` | string[] | no       | Store names to search; omit or pass `[]` to search all stores |
+| `limit`        | int      | no       | Maximum results to return (default: 10; not clamped)          |
+| `cursor`       | string   | no       | Pagination cursor from a previous response                    |
 
 ```
 curl -s -X POST http://127.0.0.1:7700/v1/search \
@@ -268,9 +270,9 @@ curl -s -X POST http://127.0.0.1:7700/v1/search \
 
 ```json
 {
-    "citations": [],
-    "total_candidates": 0,
-    "next_cursor": null
+  "citations": [],
+  "total_candidates": 0,
+  "next_cursor": null
 }
 ```
 
@@ -282,18 +284,18 @@ Each citation in `citations` follows the canonical Citation shape defined in
 
 ### `POST /v1/jobs`
 
-Submit an index job for a store. This runs the real ingestion pipeline
-(`server::job_exec::run_job`) through an async, single-worker job queue (issue #187) — the
-daemon processes the job asynchronously, in the background; poll `GET /v1/jobs/{id}` or stream
-`GET /v1/jobs/{id}/events` for progress.
+Submit an index job for a store. This runs the real ingestion pipeline (`server::job_exec::run_job`)
+through an async, single-worker job queue (issue #187) — the daemon processes the job
+asynchronously, in the background; poll `GET /v1/jobs/{id}` or stream `GET /v1/jobs/{id}/events` for
+progress.
 
 **Request body:**
 
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `store_name` | string | yes | Name of the store to index |
-| `source_id` | string | no | Index only this source; omit to index the whole store |
-| `deletion_policy` | string | no | `"retain"` (default) — never removes documents; `"delete"` — prunes documents no longer present at their source (mirrors CLI `index --delete`). Any other value is `invalid_request`, 400 |
+| Field             | Type   | Required | Description                                                                                                                                                                               |
+| ----------------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `store_name`      | string | yes      | Name of the store to index                                                                                                                                                                |
+| `source_id`       | string | no       | Index only this source; omit to index the whole store                                                                                                                                     |
+| `deletion_policy` | string | no       | `"retain"` (default) — never removes documents; `"delete"` — prunes documents no longer present at their source (mirrors CLI `index --delete`). Any other value is `invalid_request`, 400 |
 
 ```
 curl -s -X POST http://127.0.0.1:7700/v1/jobs \
@@ -302,7 +304,28 @@ curl -s -X POST http://127.0.0.1:7700/v1/jobs \
 ```
 
 ```json
-{"id":"01KTVM5XMA59N4WGHNZ80QX9B7","store_id":"notes","scope":{"type":"store"},"state":"pending","stats":{"docs_seen":0,"docs_indexed":0,"docs_skipped":0,"docs_deleted":0,"docs_prunable":0,"chunks_written":0,"unsupported_format_count":0,"error_count":0,"sources_count":0},"error":null,"error_code":null,"created_at":"2026-06-11T15:17:59Z","started_at":null,"completed_at":null}
+{
+  "id": "01KTVM5XMA59N4WGHNZ80QX9B7",
+  "store_id": "notes",
+  "scope": { "type": "store" },
+  "state": "pending",
+  "stats": {
+    "docs_seen": 0,
+    "docs_indexed": 0,
+    "docs_skipped": 0,
+    "docs_deleted": 0,
+    "docs_prunable": 0,
+    "chunks_written": 0,
+    "unsupported_format_count": 0,
+    "error_count": 0,
+    "sources_count": 0
+  },
+  "error": null,
+  "error_code": null,
+  "created_at": "2026-06-11T15:17:59Z",
+  "started_at": null,
+  "completed_at": null
+}
 ```
 
 > If you pass `"store"` instead of `"store_name"` the server returns a 422-style deserialisation
@@ -312,10 +335,10 @@ curl -s -X POST http://127.0.0.1:7700/v1/jobs \
 
 A second `POST /v1/jobs` for a store that already has a job queued or running is rejected with
 `index_in_progress`, 409 (see [Error responses](#error-responses)) — the in-flight guard is
-per-store, reserved atomically before the job is created, so two concurrent submissions for the
-same store can never both proceed. Jobs against different stores run concurrently; a single
-sequential worker processes the queue (a worker-pool size >1 is a follow-up, not a correctness
-issue, since the per-store guard already prevents same-store overlap).
+per-store, reserved atomically before the job is created, so two concurrent submissions for the same
+store can never both proceed. Jobs against different stores run concurrently; a single sequential
+worker processes the queue (a worker-pool size >1 is a follow-up, not a correctness issue, since the
+per-store guard already prevents same-store overlap).
 
 ---
 
@@ -329,72 +352,75 @@ curl -s http://127.0.0.1:7700/v1/jobs/01KTVM5XMA59N4WGHNZ80QX9B7
 
 ```json
 {
-    "id": "01KTVM5XMA59N4WGHNZ80QX9B7",
-    "store_id": "notes",
-    "scope": {
-        "type": "store"
-    },
-    "state": "done",
-    "stats": {
-        "docs_seen": 3,
-        "docs_indexed": 3,
-        "docs_skipped": 0,
-        "docs_deleted": 0,
-        "docs_prunable": 0,
-        "chunks_written": 12,
-        "unsupported_format_count": 0,
-        "error_count": 0,
-        "sources_count": 1
-    },
-    "error": null,
-    "error_code": null,
-    "created_at": "2026-06-11T15:17:59Z",
-    "started_at": "2026-06-11T15:17:59Z",
-    "completed_at": "2026-06-11T15:17:59Z"
+  "id": "01KTVM5XMA59N4WGHNZ80QX9B7",
+  "store_id": "notes",
+  "scope": {
+    "type": "store"
+  },
+  "state": "done",
+  "stats": {
+    "docs_seen": 3,
+    "docs_indexed": 3,
+    "docs_skipped": 0,
+    "docs_deleted": 0,
+    "docs_prunable": 0,
+    "chunks_written": 12,
+    "unsupported_format_count": 0,
+    "error_count": 0,
+    "sources_count": 1
+  },
+  "error": null,
+  "error_code": null,
+  "created_at": "2026-06-11T15:17:59Z",
+  "started_at": "2026-06-11T15:17:59Z",
+  "completed_at": "2026-06-11T15:17:59Z"
 }
 ```
 
 **Job fields:**
 
-| Field | Type | Description |
-|---|---|---|
-| `id` | string | ULID job identifier |
-| `store_id` | string | Store name the job runs against |
-| `scope` | object | `{"type":"store"}` for a full-store index, `{"type":"source","source_id":"..."}` for one source. `{"type":"document","resource_id":"..."}` also exists in the type but is currently unreachable — `POST /v1/jobs` has no `resource_id` field to construct it |
-| `state` | string | `"pending"`, `"running"`, `"done"`, or `"failed"` |
-| `stats` | object | Running counters (see below) |
-| `error` | string\|null | Error message if the job failed |
-| `error_code` | string\|null | Stable error code (see [Error responses](#error-responses)) if the job failed with a typed error — e.g. `"invalid_config"` for an embedder-construction failure. `null` for a synthetic queue-level failure (the queue itself full/closed, or the job's task panicking) that never had one, and always `null` on `"done"`. Issue #187 review, finding 3: lets a daemon-attached CLI client reconstruct the original error and exit with the same code an equivalent embedded failure would, instead of every job failure collapsing to a generic internal error. `#[serde(default)]` on the Rust side, so a daemon predating this field omits the key entirely rather than sending `null` — treat a missing key the same as `null` |
-| `created_at` | string | ISO 8601 timestamp |
-| `started_at` | string\|null | ISO 8601 timestamp; null while pending |
-| `completed_at` | string\|null | ISO 8601 timestamp; null while running |
+| Field          | Type         | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| -------------- | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`           | string       | ULID job identifier                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `store_id`     | string       | Store name the job runs against                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `scope`        | object       | `{"type":"store"}` for a full-store index, `{"type":"source","source_id":"..."}` for one source. `{"type":"document","resource_id":"..."}` also exists in the type but is currently unreachable — `POST /v1/jobs` has no `resource_id` field to construct it                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `state`        | string       | `"pending"`, `"running"`, `"done"`, or `"failed"`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `stats`        | object       | Running counters (see below)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `error`        | string\|null | Error message if the job failed                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `error_code`   | string\|null | Stable error code (see [Error responses](#error-responses)) if the job failed with a typed error — e.g. `"invalid_config"` for an embedder-construction failure. `null` for a synthetic queue-level failure (the queue itself full/closed, or the job's task panicking) that never had one, and always `null` on `"done"`. Issue #187 review, finding 3: lets a daemon-attached CLI client reconstruct the original error and exit with the same code an equivalent embedded failure would, instead of every job failure collapsing to a generic internal error. `#[serde(default)]` on the Rust side, so a daemon predating this field omits the key entirely rather than sending `null` — treat a missing key the same as `null` |
+| `created_at`   | string       | ISO 8601 timestamp                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `started_at`   | string\|null | ISO 8601 timestamp; null while pending                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `completed_at` | string\|null | ISO 8601 timestamp; null while running                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 
 **Stats fields:**
 
-| Field | Description |
-|---|---|
-| `docs_seen` | Files/URLs examined |
-| `docs_indexed` | New or changed documents ingested |
-| `docs_skipped` | Documents skipped (unchanged content hash) |
-| `docs_deleted` | Documents removed because the source is gone (only ever non-zero with `deletion_policy: "delete"`) |
-| `docs_prunable` | Documents that would have been deleted had `deletion_policy: "delete"` been requested — always 0 on a run that actually deleted (they were removed and counted in `docs_deleted` instead) |
-| `chunks_written` | Chunks written to the vector store |
-| `unsupported_format_count` | Files skipped due to unrecognised format |
-| `error_count` | Per-document errors |
-| `sources_count` | Number of sources the job's scope resolved to, before any were processed — distinguishes "nothing to index" (0) from "sources existed but nothing needed indexing" (>0, other counters possibly still 0) |
+| Field                      | Description                                                                                                                                                                                              |
+| -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `docs_seen`                | Files/URLs examined                                                                                                                                                                                      |
+| `docs_indexed`             | New or changed documents ingested                                                                                                                                                                        |
+| `docs_skipped`             | Documents skipped (unchanged content hash)                                                                                                                                                               |
+| `docs_deleted`             | Documents removed because the source is gone (only ever non-zero with `deletion_policy: "delete"`)                                                                                                       |
+| `docs_prunable`            | Documents that would have been deleted had `deletion_policy: "delete"` been requested — always 0 on a run that actually deleted (they were removed and counted in `docs_deleted` instead)                |
+| `chunks_written`           | Chunks written to the vector store                                                                                                                                                                       |
+| `unsupported_format_count` | Files skipped due to unrecognised format                                                                                                                                                                 |
+| `error_count`              | Per-document errors                                                                                                                                                                                      |
+| `sources_count`            | Number of sources the job's scope resolved to, before any were processed — distinguishes "nothing to index" (0) from "sources existed but nothing needed indexing" (>0, other counters possibly still 0) |
 
 ---
 
 ### `GET /v1/jobs/{id}/events`
 
-Stream a job's live progress as [Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events) (issue #83).
+Stream a job's live progress as
+[Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events) (issue
+
+# 83)
 
 ```
 curl -N -H 'Accept: text/event-stream' http://127.0.0.1:7700/v1/jobs/01KTVM5XMA59N4WGHNZ80QX9B7/events
 ```
 
-Each in-flight update is an `event: progress` frame, `data:` a JSON-serialized
-`core::ProgressEvent` (internally tagged on `type`):
+Each in-flight update is an `event: progress` frame, `data:` a JSON-serialized `core::ProgressEvent`
+(internally tagged on `type`):
 
 ```
 event: progress
@@ -420,12 +446,12 @@ data: {"id":"01KTVM5XMA59N4WGHNZ80QX9B7","store_id":"notes","scope":{"type":"sto
 ```
 
 A client that connects after the job has already reached a terminal state — or after its live
-progress channel has already been torn down — receives *only* that terminal `job` event,
-immediately; it never sees the `progress` events it missed. Progress delivery is
-lossy/best-effort by design (a lagging subscriber skips ahead rather than stalling the stream or
-buffering unboundedly), but the terminal `job` event is always guaranteed exactly once. Unknown
-`job_id` → `job_not_found`, 404, as an ordinary JSON error response (not an SSE frame — the 404
-happens before the stream opens).
+progress channel has already been torn down — receives _only_ that terminal `job` event,
+immediately; it never sees the `progress` events it missed. Progress delivery is lossy/best-effort
+by design (a lagging subscriber skips ahead rather than stalling the stream or buffering
+unboundedly), but the terminal `job` event is always guaranteed exactly once. Unknown `job_id` →
+`job_not_found`, 404, as an ordinary JSON error response (not an SSE frame — the 404 happens before
+the stream opens).
 
 ---
 
@@ -433,10 +459,10 @@ happens before the stream opens).
 
 List endpoints (`/v1/stores`, `/v1/stores/{name}/sources`) use cursor-based pagination.
 
-| Query parameter | Default | Description |
-|---|---|---|
-| `cursor` | — | Opaque cursor from a previous response's `next_cursor` |
-| `limit` | server default | Maximum items per page |
+| Query parameter | Default        | Description                                            |
+| --------------- | -------------- | ------------------------------------------------------ |
+| `cursor`        | —              | Opaque cursor from a previous response's `next_cursor` |
+| `limit`         | server default | Maximum items per page                                 |
 
 A `next_cursor` of `null` means the last page has been reached.
 
@@ -447,38 +473,39 @@ A `next_cursor` of `null` means the last page has been reached.
 All errors use the same JSON envelope:
 
 ```json
-{"code":"store_not_found","message":"nope"}
+{ "code": "store_not_found", "message": "nope" }
 ```
 
-| Field | Type | Description |
-|---|---|---|
-| `code` | string | Machine-readable error code (stable API) |
+| Field     | Type   | Description                                  |
+| --------- | ------ | -------------------------------------------- |
+| `code`    | string | Machine-readable error code (stable API)     |
 | `message` | string | Error detail — see below for its exact shape |
 
 For `store_not_found`, `source_not_found`, `resource_not_found`, `job_not_found`, `invalid_config`,
-`invalid_request`, `provider_unavailable`, and `model_missing`, `message` is the *bare* field the
+`invalid_request`, `provider_unavailable`, and `model_missing`, `message` is the _bare_ field the
 error was built from (the id, or the validation/provider detail) — it does **not** carry the
-human-readable prefix a CLI-rendered version of the same error would (e.g. `"store not found:
-"`). This lets a daemon-attached client reconstruct the original typed error from `code` +
-`message` (`core::Error::from_code`) and render its own prefix without doubling it; a client that
-just wants display text should combine `code` and `message` itself (e.g. `"store not
-found: nope"`). Every other code's `message` carries the full human-readable string as-is.
+human-readable prefix a CLI-rendered version of the same error would (e.g. `"store not found: "`).
+This lets a daemon-attached client reconstruct the original typed error from `code` + `message`
+(`core::Error::from_code`) and render its own prefix without doubling it; a client that just wants
+display text should combine `code` and `message` itself (e.g. `"store not found: nope"`). Every
+other code's `message` carries the full human-readable string as-is.
 
-HTTP status codes follow the shared error taxonomy in [specs/05-surfaces.md](../specs/05-surfaces.md) §5:
+HTTP status codes follow the shared error taxonomy in
+[specs/05-surfaces.md](../specs/05-surfaces.md) §5:
 
-| Code | HTTP status | Meaning |
-|---|---|---|
-| `store_not_found` / `source_not_found` / `resource_not_found` / `job_not_found` | 404 | Unknown entity |
-| `runtime_state_locked` | 409 | Unified database locked by another process (SQLite `busy_timeout` exceeded) |
-| `daemon_running` | 409 | A second daemon was started against the same data dir |
-| `daemon_unreachable` | 502 | Daemon socket exists but is not responding |
-| `invalid_config` | 422 | Config failed validation |
-| `invalid_request` | 400 | Bad request body or arguments |
-| `unsupported_format` | 422 | Extractor cannot handle the file |
-| `provider_unavailable` | 502 | External embedding endpoint down |
-| `model_missing` | 503 | Local model not yet downloaded |
-| `index_in_progress` | 409 | Conflicting job already running for this scope |
-| `internal` | 500 | Bug; response includes a `correlation_id` for log correlation |
+| Code                                                                            | HTTP status | Meaning                                                                     |
+| ------------------------------------------------------------------------------- | ----------- | --------------------------------------------------------------------------- |
+| `store_not_found` / `source_not_found` / `resource_not_found` / `job_not_found` | 404         | Unknown entity                                                              |
+| `runtime_state_locked`                                                          | 409         | Unified database locked by another process (SQLite `busy_timeout` exceeded) |
+| `daemon_running`                                                                | 409         | A second daemon was started against the same data dir                       |
+| `daemon_unreachable`                                                            | 502         | Daemon socket exists but is not responding                                  |
+| `invalid_config`                                                                | 422         | Config failed validation                                                    |
+| `invalid_request`                                                               | 400         | Bad request body or arguments                                               |
+| `unsupported_format`                                                            | 422         | Extractor cannot handle the file                                            |
+| `provider_unavailable`                                                          | 502         | External embedding endpoint down                                            |
+| `model_missing`                                                                 | 503         | Local model not yet downloaded                                              |
+| `index_in_progress`                                                             | 409         | Conflicting job already running for this scope                              |
+| `internal`                                                                      | 500         | Bug; response includes a `correlation_id` for log correlation               |
 
 ---
 
@@ -486,12 +513,12 @@ HTTP status codes follow the shared error taxonomy in [specs/05-surfaces.md](../
 
 ### Diagnosing a rejected (4xx/5xx) request
 
-`localdb serve` logs every response with status >= 400 at `warn` level, with the
-request's method, path, status, and `Host` header — including responses from the nested
-`/mcp` mount (e.g. rmcp's own DNS-rebinding Host-header check), not just `/v1` routes.
-This surfaces on stderr by default: `localdb`'s default log filter (`warn,pdf_oxide=off`,
-set in `localdb/src/main.rs`) already passes `warn`-level events through, so no `RUST_LOG`
-is needed to see a rejected request logged. Set `RUST_LOG=debug` for more detail.
+`localdb serve` logs every response with status >= 400 at `warn` level, with the request's method,
+path, status, and `Host` header — including responses from the nested `/mcp` mount (e.g. rmcp's own
+DNS-rebinding Host-header check), not just `/v1` routes. This surfaces on stderr by default:
+`localdb`'s default log filter (`warn,pdf_oxide=off`, set in `localdb/src/main.rs`) already passes
+`warn`-level events through, so no `RUST_LOG` is needed to see a rejected request logged. Set
+`RUST_LOG=debug` for more detail.
 
 ### `daemon_running` (exit 4) when starting `localdb serve`
 
