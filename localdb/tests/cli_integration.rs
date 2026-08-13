@@ -439,6 +439,60 @@ fn fresh_install_with_daemon_url_scaffolds_config_but_not_local_db() {
     );
 }
 
+/// `serve` never routes to `LOCALDB_DAEMON_URL` — it always starts a *local*
+/// daemon — so the daemon-url gate that suppresses local `default`-store
+/// creation for routable commands (the test above) must not apply to it
+/// (codex review round 2 on PR #215). Same timeout-kill pattern as
+/// `serve_on_fresh_install_scaffolds_config`: seeding happens during config
+/// load, before the bind attempt, so the outcome of the actual daemon start
+/// doesn't matter.
+#[test]
+fn serve_on_fresh_install_with_daemon_url_still_creates_default_store() {
+    let dir = TempDir::new().unwrap();
+
+    let _ = cmd_with_fresh_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", "http://127.0.0.1:9")
+        .arg("serve")
+        .timeout(std::time::Duration::from_secs(5))
+        .output()
+        .unwrap();
+
+    // `store list` *without* the env var: the local DB must have `default`.
+    cmd_with_fresh_dir(&dir)
+        .args(["store", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("default"));
+}
+
+/// The recovery half of the daemon-url gate (codex review round 2 on PR
+/// #215): a daemon-routed first run scaffolds the config but — correctly —
+/// skips the local `default` store (the test above). That must not strand
+/// the install: the next *locally*-routed command finds no `localdb.db` and
+/// seeds `default` itself, without requiring an explicit `localdb init`.
+#[test]
+fn local_run_after_daemon_routed_first_run_creates_default_store() {
+    let dir = TempDir::new().unwrap();
+
+    // Daemon-routed first run: config scaffolded, no local DB (locked in by
+    // `fresh_install_with_daemon_url_scaffolds_config_but_not_local_db`).
+    cmd_with_fresh_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", "http://127.0.0.1:9")
+        .args(["store", "list"])
+        .assert()
+        .failure()
+        .code(5);
+    assert!(dir.path().join("config.yaml").exists());
+
+    // Local run: config already exists (no scaffolding), but the absent DB
+    // file must still trigger `default`-store seeding.
+    cmd_with_fresh_dir(&dir)
+        .args(["store", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("default"));
+}
+
 /// `store add` goes through the *strict* load path
 /// (`load_config_scaffolded`) — covers the strict-path half of implicit
 /// scaffolding, distinct from `search`'s lenient path above.

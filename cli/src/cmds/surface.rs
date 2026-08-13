@@ -3,8 +3,8 @@ use serde_json::json;
 
 use crate::{
     app_db::{
-        load_config_scaffolded, open_app_db_or_exit, reject_store_flag, resolve_store_scope,
-        StoreScopePolicy, SERVE_REJECT_MESSAGE,
+        load_config_scaffolded, load_config_scaffolded_local, open_app_db_or_exit,
+        reject_store_flag, resolve_store_scope, StoreScopePolicy, SERVE_REJECT_MESSAGE,
     },
     daemon_client::{probe_daemon, CliContext, DaemonState},
     normalize::{exit_err, print_json, visibility_to_string},
@@ -27,11 +27,15 @@ pub(crate) async fn run_serve_async(ctx: &CliContext) {
     // (nothing requires `localdb init` before `localdb serve`), so it now
     // scaffolds config + a `default` store on a genuine first run, the same
     // way the strict `command_table::dispatch` call sites do — see
-    // `app_db::load_config_scaffolded`'s doc comment. Its scaffolding errors
+    // `app_db::load_config_scaffolded`'s doc comment. The `_local` variant
+    // because `serve` never routes to `LOCALDB_DAEMON_URL` — it always
+    // starts a local daemon — so the env var must not suppress the local
+    // `default`-store seeding the way it does for routable commands (see
+    // `load_config_scaffolded_local`'s doc comment). Its scaffolding errors
     // (e.g. the F11 guard on an explicit `--config` with a missing parent)
     // map to the same exit codes the old bare `load_config` hard-fail below
     // did: `Error::InvalidConfig` -> exit 2, via the same `exit_err`.
-    let config_loader = load_config_scaffolded(ctx).await;
+    let config_loader = load_config_scaffolded_local(ctx).await;
 
     // Still required even after scaffolding: `ensure_config_scaffolded` only
     // creates `paths.data`/`models`/`logs` on a genuine first run (no config

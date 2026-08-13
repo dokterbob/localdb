@@ -138,10 +138,12 @@ pub(crate) async fn load_app_db_lenient(ctx: &CliContext) -> (ConfigLoader, AppD
 /// [`crate::scaffold::ensure_config_scaffolded`] — a genuinely first-run
 /// machine (no config anywhere) now gets a real config file and directories
 /// written at the resolved path instead of the old in-memory-only synth
-/// below, and (when scaffolding actually happened) a `default` store, via
-/// [`crate::scaffold::ensure_default_store`], so read-only lenient-path
-/// commands (`status`, `search`, `store list`) have something to show on a
-/// fresh install without requiring a prior `init`.
+/// below, and (when scaffolding actually happened, or the config is still
+/// the pristine scaffolded template with no `localdb.db` yet — see
+/// [`load_config_scaffolded_inner`]'s doc comment) a
+/// `default` store, via [`crate::scaffold::ensure_default_store`], so
+/// read-only lenient-path commands (`status`, `search`, `store list`) have
+/// something to show on a fresh install without requiring a prior `init`.
 ///
 /// This also fixes a latent bug: the pre-scaffolding fallback below (kept
 /// for the no-home-directory edge — see the second `Err` arm) retried with
@@ -160,18 +162,24 @@ pub(crate) async fn load_config_lenient(ctx: &CliContext) -> ConfigLoader {
             Ok(config_loader) => {
                 if scaffold.was_scaffolded {
                     crate::scaffold::log_scaffold_result(&scaffold);
-                    // `LOCALDB_DAEMON_URL` forces daemon routing: the command
-                    // acts on that daemon's store registry, not the local DB,
-                    // so creating `default` locally would be wasted at best
-                    // and misleading at worst (it never shows up on the
-                    // daemon). Skip it; a later daemonless run of `init` (or
-                    // any scaffolding command against a still-absent config)
-                    // creates it.
-                    if ctx.daemon_url.is_none() {
-                        let db = open_app_db_lenient_or_exit(ctx, &config_loader).await;
-                        if let Err(e) = crate::scaffold::ensure_default_store(&db).await {
-                            exit_err(&e, ctx.json);
-                        }
+                }
+                // Same seed rule as `load_config_scaffolded_inner` — see its
+                // doc comment. All lenient-path callers (`search`, `status`,
+                // `store list`) are daemon-routable, so the daemon-url gate
+                // applies unconditionally here: with `LOCALDB_DAEMON_URL`
+                // set the command acts on that daemon's store registry, and
+                // a local `default` would be wasted at best and misleading
+                // at worst. The pristine-template-and-no-DB arm un-strands
+                // exactly that case on the next local run.
+                let needs_seed = scaffold.was_scaffolded
+                    || (!config_loader.paths.db_path().exists()
+                        && crate::scaffold::config_is_pristine_template(
+                            &config_loader.paths.config_file,
+                        ));
+                if needs_seed && ctx.daemon_url.is_none() {
+                    let db = open_app_db_lenient_or_exit(ctx, &config_loader).await;
+                    if let Err(e) = crate::scaffold::ensure_default_store(&db).await {
+                        exit_err(&e, ctx.json);
                     }
                 }
                 config_loader
@@ -294,21 +302,58 @@ pub(crate) fn load_config_for_maintenance(ctx: &CliContext) -> ConfigLoader {
 /// default template and creates the data/models/logs directories; an
 /// existing file (even malformed) is a no-op, and the strict load right
 /// after this reports the same parse error it always did. When scaffolding
-/// *did* just happen, also ensures a `default` store exists — via one extra
-/// `AppDb::open` through the existing `open_app_db_or_exit` helper and
-/// [`crate::scaffold::ensure_default_store`] — so the strict-path commands
+/// just happened — or the config is still the pristine scaffolded template
+/// and `localdb.db` does not exist (see [`load_config_scaffolded_inner`]
+/// for why that case seeds too) — also
+/// ensures a `default` store exists, via one extra `AppDb::open` through the
+/// existing `open_app_db_or_exit` helper and
+/// [`crate::scaffold::ensure_default_store`], so the strict-path commands
 /// that switch to this helper (`store add`/`remove`, `index`, `source
 /// add`/`list`/`remove`, `mcp`) have a store to act on immediately after a
 /// fresh install, without a separate `init` step. This costs one extra DB
-/// open only on the rare first-run path; every subsequent call is a single
-/// no-op scaffold check plus the same strict load `load_config_for_maintenance`
-/// already did.
+/// open only on the rare no-DB path; every subsequent call is a single
+/// no-op scaffold check, one `db_path` stat, plus the same strict load
+/// `load_config_for_maintenance` already did.
 ///
 /// Scaffolding errors (e.g. an explicit `--config` whose parent directory
 /// doesn't exist) map to the same exit codes `init` uses today —
 /// `Error::InvalidConfig` -> exit 2 — via `exit_err`, same as every other
 /// error this function's callers already handle through `load_config_for_maintenance`.
 pub(crate) async fn load_config_scaffolded(ctx: &CliContext) -> ConfigLoader {
+    load_config_scaffolded_inner(ctx, true).await
+}
+
+/// [`load_config_scaffolded`] for commands that are *never* daemon-routed.
+///
+/// Used only by `serve` (`cmds/surface.rs`): `serve` always starts a local
+/// daemon regardless of `LOCALDB_DAEMON_URL`, so the daemon-url gate that
+/// suppresses local `default`-store seeding for routable commands must not
+/// apply to it — with the env var exported, a fresh `localdb serve` would
+/// otherwise scaffold the config but start its daemon with zero stores
+/// (codex review round 2 on PR #215).
+pub(crate) async fn load_config_scaffolded_local(ctx: &CliContext) -> ConfigLoader {
+    load_config_scaffolded_inner(ctx, false).await
+}
+
+/// Shared body of [`load_config_scaffolded`]/[`load_config_scaffolded_local`].
+///
+/// The `default` store is seeded when both hold:
+/// - the command is locally routed — `daemon_routable` is false (`serve`), or
+///   no `LOCALDB_DAEMON_URL` forces routing to a possibly-remote daemon whose
+///   store registry a local insert would never reach (a discovery-socket
+///   daemon on this machine shares the same unified `localdb.db`, so there is
+///   nothing to skip for in that case); and
+/// - the install is still morally fresh: scaffolding just wrote the config,
+///   **or** the config is still the pristine scaffolded template (see
+///   [`crate::scaffold::config_is_pristine_template`]) and `localdb.db` does
+///   not exist. The second arm is the recovery path for a daemon-routed
+///   *first* run (template written, store seeding correctly skipped):
+///   without it that install would be stranded — `was_scaffolded` never
+///   fires again — until an explicit `localdb init`. It never fires for a
+///   hand-written config (content differs from the template) or once any
+///   store has ever been created (the DB file exists), so deleting the
+///   `default` store is still respected.
+async fn load_config_scaffolded_inner(ctx: &CliContext, daemon_routable: bool) -> ConfigLoader {
     let scaffold = match crate::scaffold::ensure_config_scaffolded(ctx).await {
         Ok(s) => s,
         Err(e) => exit_err(&e, ctx.json),
@@ -317,18 +362,14 @@ pub(crate) async fn load_config_scaffolded(ctx: &CliContext) -> ConfigLoader {
     let config_loader = load_config_for_maintenance(ctx);
     if scaffold.was_scaffolded {
         crate::scaffold::log_scaffold_result(&scaffold);
-        // Skip the local `default`-store insert when `LOCALDB_DAEMON_URL`
-        // forces daemon routing — the command acts on that daemon's store
-        // registry, and touching the local embedded DB here could fail the
-        // command on an unrelated local problem or create a store the daemon
-        // never sees. (Without the explicit URL override there is nothing to
-        // skip for: a discovery-socket daemon on this machine shares the same
-        // unified localdb.db, so the insert is visible to it.)
-        if ctx.daemon_url.is_none() {
-            let db = open_app_db_or_exit(ctx, &config_loader).await;
-            if let Err(e) = crate::scaffold::ensure_default_store(&db).await {
-                exit_err(&e, ctx.json);
-            }
+    }
+    let needs_seed = scaffold.was_scaffolded
+        || (!config_loader.paths.db_path().exists()
+            && crate::scaffold::config_is_pristine_template(&config_loader.paths.config_file));
+    if needs_seed && (!daemon_routable || ctx.daemon_url.is_none()) {
+        let db = open_app_db_or_exit(ctx, &config_loader).await;
+        if let Err(e) = crate::scaffold::ensure_default_store(&db).await {
+            exit_err(&e, ctx.json);
         }
     }
     config_loader

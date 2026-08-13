@@ -237,6 +237,17 @@ it always did (§5, `invalid_config`). Exit codes are unchanged: a scaffolding f
 writing the config file — maps through the same `Error::InvalidConfig` -> exit 2 path every other
 config error already used.
 
+Commands forced to a daemon via `LOCALDB_DAEMON_URL` never touch the local database during
+scaffolding: they still write the config file on a first run, but the `default` store belongs to
+whichever store registry the command actually acts on, and that daemon may not share the local
+`localdb.db` at all. That first run therefore leaves the install config-present but DB-absent; it
+is not stranded — the local `default` store is created by the next locally-routed command that
+finds the config still byte-identical to the scaffolded template (i.e. carrying no user intent
+yet) and no `localdb.db`. A hand-written or edited config never triggers this seeding, and once
+any store has ever been created (the DB file exists) a removed `default` store stays removed.
+`serve` always counts as locally routed: it starts a local daemon regardless of
+`LOCALDB_DAEMON_URL`, so the variable never suppresses its seeding.
+
 ## 3. HTTP API
 
 **Decision:** **REST + JSON, the canonical surface for external integrators.** Served only by the

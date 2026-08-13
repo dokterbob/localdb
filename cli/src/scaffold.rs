@@ -156,6 +156,29 @@ fn ensure_config_scaffolded_inner(
     })
 }
 
+/// True iff `config_path` currently holds, byte-for-byte, the pristine
+/// scaffolded template — i.e. the file carries no user intent yet.
+///
+/// Used by `app_db`'s `default`-store seed rule to distinguish the stranded
+/// daemon-routed-first-run state (template written by scaffolding, local
+/// `localdb.db` deliberately never created — codex review round 2 on PR
+/// #215) from a hand-written config whose data dir simply hasn't been
+/// opened yet. Only the former is still morally a fresh install; seeding
+/// `default` under a hand-written config would override the user's explicit
+/// store choices and, e.g., make `store list`'s zero-store exit 2
+/// (specs/05-surfaces.md §2.2) unreachable. A user who edits the scaffolded
+/// template before their first local run opts out of self-healing the same
+/// way; `localdb init`'s unconditional repair still covers them.
+///
+/// An unreadable file is `false`: seeding is best-effort recovery, and the
+/// strict/lenient config load right next to this check is what owns
+/// surfacing read errors.
+pub(crate) fn config_is_pristine_template(config_path: &Path) -> bool {
+    std::fs::read_to_string(config_path)
+        .map(|content| content == render_default_config_template())
+        .unwrap_or(false)
+}
+
 /// Emit a single observability line for a genuine first-run scaffold.
 ///
 /// Called by both `app_db::load_config_scaffolded` and
@@ -443,6 +466,29 @@ mod tests {
         assert!(
             leftovers.is_empty(),
             "expected no leftover temp files, found {leftovers:?}"
+        );
+    }
+
+    // --- config_is_pristine_template ---
+
+    #[test]
+    fn config_is_pristine_template_true_for_scaffolded_false_once_edited() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        assert!(
+            !config_is_pristine_template(&config_path),
+            "an absent file is not the pristine template"
+        );
+
+        std::fs::write(&config_path, render_default_config_template()).unwrap();
+        assert!(config_is_pristine_template(&config_path));
+
+        let mut edited = render_default_config_template();
+        edited.push_str("\n# user note\n");
+        std::fs::write(&config_path, edited).unwrap();
+        assert!(
+            !config_is_pristine_template(&config_path),
+            "any edit must opt the config out of pristine-template seeding"
         );
     }
 
