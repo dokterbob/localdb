@@ -178,6 +178,25 @@ fn validate_config(config: &RawConfig) -> Result<(), Error> {
         });
     }
 
+    // Rejected here rather than at first use: `user_agent` is handed to
+    // `reqwest::ClientBuilder::user_agent`, and a value that is not a legal
+    // header (a newline, a control character) makes *every* `build()` fail —
+    // including the client an index job constructs before it knows whether it
+    // will fetch anything, so a purely path-based job dies too, with an opaque
+    // "failed to build HTTP client" instead of a config error naming the key.
+    //
+    // `HeaderValue::from_str` rather than a hand-rolled ASCII predicate: it is
+    // the exact rule reqwest will apply, so the two cannot drift. (It accepts
+    // obs-text, 0x80-0xFF, which a naive `is_ascii_graphic` check would
+    // wrongly reject.)
+    if let Some(user_agent) = &config.http.user_agent {
+        if http::HeaderValue::from_str(user_agent).is_err() {
+            return Err(Error::InvalidConfig {
+                message: format!("http.user_agent {user_agent:?} is not a valid HTTP header value"),
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -482,6 +501,42 @@ defaults:
             "negative requests_per_second should fail to deserialize as u32: {:?}",
             err
         );
+    }
+
+    // --- http.user_agent validation ---
+
+    /// A control character in `user_agent` makes every
+    /// `reqwest::ClientBuilder::build()` fail, which would abort an index job
+    /// — even one that never fetches a URL — with an opaque client-build
+    /// error. It has to be rejected at load time, naming the key.
+    #[test]
+    fn load_rejects_control_character_in_user_agent() {
+        let yaml = "version: 1\nhttp:\n  user_agent: \"bad\\nagent\"\n";
+        let err = load_config_from_str(yaml).unwrap_err();
+        assert_eq!(err.code(), "invalid_config", "got {err:?}");
+        match err {
+            Error::InvalidConfig { message } => {
+                assert!(
+                    message.contains("http.user_agent"),
+                    "error message '{}' should mention the offending path",
+                    message
+                );
+            }
+            other => panic!("expected InvalidConfig, got {:?}", other),
+        }
+    }
+
+    /// The rule is `HeaderValue`'s, not a hand-rolled ASCII check: an ordinary
+    /// UA string passes, and so does one carrying obs-text (0x80-0xFF), which
+    /// an `is_ascii_graphic` predicate would wrongly reject.
+    #[test]
+    fn load_accepts_valid_user_agent_including_obs_text() {
+        for ua in ["localdb/9.9 (+https://example.test)", "café-agent/1.0"] {
+            let yaml = format!("version: 1\nhttp:\n  user_agent: \"{ua}\"\n");
+            let cfg = load_config_from_str(&yaml)
+                .unwrap_or_else(|e| panic!("{ua:?} should be a valid header value: {e:?}"));
+            assert_eq!(cfg.http.user_agent.as_deref(), Some(ua));
+        }
     }
 
     #[test]

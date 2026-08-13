@@ -431,17 +431,23 @@ pub fn parse_refresh_interval(s: &str) -> Option<u64> {
     }
 }
 
-/// Read and parse the config file.
+/// Read, parse **and validate** the config file.
+///
+/// `load_config_from_str`, not a bare `serde_yaml::from_str`: hot-reload has
+/// to apply the same validation the startup path does, or a value that is
+/// syntactically fine but semantically rejected (`http.rate_limit.burst: 0`,
+/// an `http.user_agent` that is not a legal header value) enters a running
+/// daemon through the file watcher and fails later, opaquely, at the point of
+/// use — which is precisely what validating at load time exists to prevent.
 fn reload_config_file(path: &Path) -> Result<RawConfig, Error> {
     let contents = std::fs::read_to_string(path).map_err(|e| Error::Internal {
         message: format!("cannot read config file '{}': {e}", path.display()),
         correlation_id: "daemon_config_reload".into(),
     })?;
-    let config: RawConfig = serde_yaml::from_str(&contents).map_err(|e| Error::Internal {
-        message: format!("cannot parse config file '{}': {e}", path.display()),
+    localdb_core::config::load_config_from_str(&contents).map_err(|e| Error::Internal {
+        message: format!("cannot load config file '{}': {e}", path.display()),
         correlation_id: "daemon_config_reload".into(),
-    })?;
-    Ok(config)
+    })
 }
 
 #[cfg(test)]
@@ -616,6 +622,30 @@ mod tests {
             "expected Internal with daemon_config_reload correlation id, got: {:?}",
             err
         );
+    }
+
+    /// Hot reload must apply the *same* validation the startup path does, not
+    /// just YAML syntax. Before this, a config that parsed but was rejected by
+    /// `validate_config` entered a running daemon through the file watcher and
+    /// failed later at the point of use — for `http.user_agent`, as an opaque
+    /// "failed to build HTTP client" on the next index job (issue #207).
+    #[test]
+    fn reload_config_file_rejects_a_parseable_but_invalid_config() {
+        let dir = tempfile::tempdir().unwrap();
+        for yaml in [
+            "version: 1\nhttp:\n  user_agent: \"bad\\nagent\"\n",
+            "version: 1\nhttp:\n  rate_limit:\n    burst: 0\n",
+        ] {
+            let path = dir.path().join("config.yaml");
+            std::fs::write(&path, yaml).unwrap();
+
+            let err = reload_config_file(&path)
+                .expect_err("hot reload must reject what startup validation rejects");
+            assert!(
+                matches!(err, Error::Internal { ref correlation_id, .. } if correlation_id == "daemon_config_reload"),
+                "expected Internal with daemon_config_reload correlation id, got: {err:?}"
+            );
+        }
     }
 
     // --- Daemon startup ---

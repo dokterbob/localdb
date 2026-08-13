@@ -55,9 +55,10 @@ pub(crate) fn build_hosted_client(
 ///
 /// # Errors
 /// Returns [`EmbedError::ProviderError`] for a non-retryable failure (e.g. a
-/// 400 or 401 response), or [`EmbedError::RetriesExhausted`] once
-/// `settings.max_retries` — or the retry schedule's total-delay budget — is
-/// exhausted on an otherwise-retryable failure.
+/// 400 or 401 response). Once `settings.max_retries` — or the retry
+/// schedule's total-delay budget — is exhausted on an otherwise-retryable
+/// failure, returns [`EmbedError::RateLimited`] if the final response was a
+/// 429 and [`EmbedError::RetriesExhausted`] otherwise.
 pub async fn send_with_retry(
     client: &reqwest::Client,
     url: &str,
@@ -151,24 +152,39 @@ pub async fn send_with_retry(
             let message = last_message
                 .into_inner()
                 .expect("last_message mutex is never held across a panic");
-            // A status `is_transient` classified `false` never reached the
-            // retry loop's `.when()` more than once — it failed fast on the
-            // first attempt, so it is a fatal provider error, not an
-            // exhausted retry budget.
-            if http::is_transient(&RetryError::Status {
+            let provider = PROVIDER.to_string();
+            // Three outcomes, not two:
+            //
+            // - 429: the provider is rate limiting us and never stopped. Its
+            //   own code, matching what `fetch::map_outcome` emits for the
+            //   same condition on the document-fetch path — an operator
+            //   should raise a quota or slow down, not go looking for an
+            //   outage. `is_transient` always classifies 429 as retryable,
+            //   so this arm is a strict subset of the next one and nothing
+            //   new has to be kept in sync with it.
+            // - Any other transient status (408/5xx): retried until the
+            //   budget ran out — the provider really is unavailable.
+            // - Anything else: `is_transient` classified it `false`, so it
+            //   never reached the retry loop's `.when()` more than once. It
+            //   failed fast on the first attempt, making it a fatal provider
+            //   error rather than an exhausted retry budget.
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                Err(EmbedError::RateLimited {
+                    provider,
+                    attempts,
+                    last_error: message,
+                })
+            } else if http::is_transient(&RetryError::Status {
                 status,
                 retry_after: None,
             }) {
                 Err(EmbedError::RetriesExhausted {
-                    provider: PROVIDER.to_string(),
+                    provider,
                     attempts,
                     last_error: message,
                 })
             } else {
-                Err(EmbedError::ProviderError {
-                    provider: PROVIDER.to_string(),
-                    message,
-                })
+                Err(EmbedError::ProviderError { provider, message })
             }
         }
         Err(RetryError::Request(e)) => Err(EmbedError::RetriesExhausted {
@@ -361,12 +377,14 @@ mod tests {
     }
 
     /// New behavior (issue #207): retries exhausted on a persistently-429
-    /// endpoint produce `EmbedError::RetriesExhausted`, not a hang or a
-    /// generic provider error — the old loop had no way to distinguish
-    /// "server keeps rate-limiting us" from "server is broken" either, since
-    /// it never modeled `Retry-After` at all.
+    /// endpoint produce `EmbedError::RateLimited`, not a hang, a generic
+    /// provider error, or the `RetriesExhausted` a genuinely-down provider
+    /// gets. The old loop could not tell "server keeps rate-limiting us" from
+    /// "server is broken" at all, since it never modeled `Retry-After`; this
+    /// keeps the two apart all the way out to the exit code, matching what
+    /// `fetch` already reports for the same condition.
     #[tokio::test]
-    async fn send_with_retry_exhausted_returns_retries_exhausted() {
+    async fn send_with_retry_exhausted_429_returns_rate_limited() {
         let server = MockServer::start().await;
         // max_retries=1 means 2 total attempts; pin that exactly.
         Mock::given(method("POST"))
@@ -388,7 +406,7 @@ mod tests {
         .expect_err("persistent 429s should exhaust retries");
 
         match error {
-            EmbedError::RetriesExhausted {
+            EmbedError::RateLimited {
                 attempts,
                 last_error,
                 ..
@@ -399,16 +417,56 @@ mod tests {
                     "last_error should carry the final response body: {last_error}"
                 );
             }
-            other => panic!("expected RetriesExhausted, got {other:?}"),
+            other => panic!("expected RateLimited, got {other:?}"),
         }
+        assert_eq!(
+            localdb_core::Error::from(EmbedError::RateLimited {
+                provider: PROVIDER.to_string(),
+                attempts: 2,
+                last_error: "HTTP 429".to_string(),
+            })
+            .code(),
+            "rate_limited",
+            "a persistent 429 must reach the operator as rate_limited"
+        );
+    }
+
+    /// The sibling of the test above, pinning the *other* side of the split: a
+    /// persistently-503 endpoint is a provider outage, not a rate limit, and
+    /// must keep producing `RetriesExhausted`.
+    #[tokio::test]
+    async fn send_with_retry_exhausted_5xx_still_returns_retries_exhausted() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("upstream down"))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+
+        let error = send_with_retry(
+            &client,
+            &format!("{}/embeddings", server.uri()),
+            json_headers(),
+            br#"{"input":["a"]}"#.to_vec(),
+            &test_settings(1),
+        )
+        .await
+        .expect_err("persistent 503s should exhaust retries");
+
+        assert!(
+            matches!(error, EmbedError::RetriesExhausted { attempts: 2, .. }),
+            "expected RetriesExhausted, got {error:?}"
+        );
     }
 
     /// Defect 1 regression (issue #207 follow-up), embed-side mirror of
     /// `fetch::lib`'s `test_retry_after_over_cap_ends_fetch_immediately_
     /// with_no_inline_sleep`: a `Retry-After` over `http::INLINE_RETRY_
     /// AFTER_CAP` (30s) used to be clamped to the cap and slept on inline
-    /// anyway. It must instead end the request immediately as
-    /// `RetriesExhausted` — no inline sleep, and exactly one request
+    /// anyway. It must instead end the request immediately as `RateLimited`
+    /// (the response is a 429) — no inline sleep, and exactly one request
     /// (`.expect(1)` fails the test if a retry goes out). `max_retries` is
     /// generous (5) so the assertion pins the oversized `Retry-After` as the
     /// reason the loop stopped, not exhausted retries.
@@ -436,8 +494,8 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert!(
-            matches!(error, EmbedError::RetriesExhausted { attempts: 1, .. }),
-            "expected RetriesExhausted after exactly 1 attempt, got {error:?}"
+            matches!(error, EmbedError::RateLimited { attempts: 1, .. }),
+            "expected RateLimited after exactly 1 attempt, got {error:?}"
         );
         assert!(
             elapsed < Duration::from_millis(500),
@@ -483,8 +541,8 @@ mod tests {
         let requests = server.received_requests().await.unwrap_or_default().len();
 
         assert!(
-            matches!(error, EmbedError::RetriesExhausted { .. }),
-            "expected RetriesExhausted, got {error:?}"
+            matches!(error, EmbedError::RateLimited { .. }),
+            "expected RateLimited, got {error:?}"
         );
         assert!(
             requests <= 4,

@@ -199,15 +199,31 @@ impl UrlFetcher for HttpUrlFetcher {
     /// 1. The preflight IP-literal check for `PublicOnly` — unchanged from
     ///    before this stage, and deliberately *outside* the retried block: a
     ///    blocked destination is refused once, immediately, never retried.
-    /// 2. A single `limiter.acquire()` before the retried block, not inside
-    ///    it — pacing applies once per `fetch()` call. A request that then
-    ///    goes on to retry several times already paid its host's pacing cost
-    ///    up front; re-acquiring per attempt would make a single slow
-    ///    document pay pacing tax multiple times for no benefit, since the
-    ///    thing pacing protects against (origin-visible request rate) is
-    ///    already satisfied by the one wait.
-    /// 3. The retried block: send, classify the outcome, and — for a
-    ///    success — read the body. The body read happens *inside* the
+    /// 2. The retried block, whose first statement is `limiter.acquire()` —
+    ///    *inside* the retry, so every attempt is paced, not just the first.
+    ///    An earlier version acquired once before the loop, on the reasoning
+    ///    that a document had "already paid" its pacing cost up front. That
+    ///    is backwards: what pacing bounds is the request rate an origin
+    ///    sees, and a retry is another request that origin sees. It made the
+    ///    limiter weakest exactly where it is needed most — a host answering
+    ///    `429` + `Retry-After: 0` got the entire retry sequence back to
+    ///    back, `burst: 1` notwithstanding.
+    ///
+    ///    This does not double-wait on an honored `Retry-After`.
+    ///    `note_retry_after` stores an *absolute deadline*, so once the
+    ///    adjuster has slept that long, the next `acquire()` sees
+    ///    `deadline - now ≈ 0` and only pays the token wait. Same wait,
+    ///    counted once.
+    ///
+    ///    One asymmetry, pre-existing and unchanged by the move: `acquire`
+    ///    paces the *requested* URL's host, while a 429's cooldown is
+    ///    recorded against the *effective* (post-redirect) host — see
+    ///    `classify_response`. On a cross-host redirect the two differ, so
+    ///    the retry is paced against the host that was asked, not the one
+    ///    that rate-limited us. The cooldown still shapes later requests
+    ///    that target the effective host directly.
+    /// 3. Send, classify the outcome, and — for a success — read the body,
+    ///    all still within that block. The body read happens *inside* the
     ///    closure so a connection that fails partway through a body is
     ///    retried too, not just a failed `send()`.
     /// 4. Terminal mapping from the retry loop's `Result` to this method's
@@ -238,14 +254,6 @@ impl UrlFetcher for HttpUrlFetcher {
             }
         }
 
-        // Proactive pacing (issue #207): wait for this host's token bucket
-        // and any active `Retry-After` cooldown *before* making the first
-        // attempt. A no-op for loopback/LAN destinations and for a URL with
-        // no host at all — see `http::limiter::should_pace`.
-        if let Some(parsed) = &parsed_url {
-            self.limiter.acquire(parsed).await;
-        }
-
         // Lowercased once, matching `HostLimiter`'s own key normalization —
         // this is the *requested* URL's host, used to name the host in a
         // `RateLimited` message (`map_outcome`, below). Deliberately not
@@ -259,6 +267,15 @@ impl UrlFetcher for HttpUrlFetcher {
             .map(str::to_lowercase);
 
         let attempt = || async {
+            // Proactive pacing (issue #207): wait for this host's token
+            // bucket and any active `Retry-After` cooldown before *every*
+            // attempt, this one included. A no-op for loopback/LAN
+            // destinations and for a URL with no host at all — see
+            // `http::limiter::should_pace`.
+            if let Some(parsed) = &parsed_url {
+                self.limiter.acquire(parsed).await;
+            }
+
             let mut req = self.client.get(url);
 
             if let Some(etag) = &metadata.etag {
@@ -1517,6 +1534,69 @@ mod tests {
         assert!(
             waited < Duration::from_millis(500),
             "the wait must stay small and bounded, got {waited:?}"
+        );
+    }
+
+    /// Finding 2 regression (issue #207 follow-up). `acquire()` used to run
+    /// exactly once, *before* the retry loop, so every retry after the first
+    /// attempt bypassed pacing entirely: against a host answering `429` +
+    /// `Retry-After: 0`, a `burst: 1` limiter let the whole retry sequence go
+    /// out back to back, at whatever rate the server would answer — the
+    /// precise behavior the per-host limiter exists to prevent, in the one
+    /// situation (a server actively telling us it is overloaded) where it
+    /// matters most.
+    ///
+    /// `localhost`, deliberately, not the fixture's `127.0.0.1` URI: pacing
+    /// keys on the URL's literal host string before any DNS resolution, and
+    /// `should_pace` exempts loopback *IP literals* while pacing every
+    /// *hostname* — which is exactly why the rest of this crate's wiremock
+    /// suite is unaffected by pacing and cannot observe it.
+    ///
+    /// At 10 req/s with a burst of 1, attempt 1 spends the burst token and the
+    /// retry must wait ~100 ms for the next. Without the fix, the retry costs
+    /// only the ~1 ms computed backoff `fast_settings` leaves — a 100× gap, so
+    /// the threshold below is nowhere near a race.
+    #[tokio::test]
+    async fn test_a_retry_reacquires_a_pacing_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/paced"))
+            .respond_with(ResponseTemplate::new(429))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/paced"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ok"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let settings = http::HttpSettings {
+            requests_per_second: 10,
+            burst: 1,
+            ..fast_settings(2)
+        };
+        let fetcher = unrestricted_with(&settings);
+        let url = format!("http://localhost:{}/paced", server.address().port());
+
+        let start = std::time::Instant::now();
+        let result = fetcher
+            .fetch(&url, &FetchMetadata::default())
+            .await
+            .expect("must succeed on the retry");
+        let elapsed = start.elapsed();
+
+        assert!(matches!(result, FetchResult::Downloaded { .. }));
+        assert!(
+            elapsed >= Duration::from_millis(80),
+            "the retry must re-acquire a pacing token (~100ms at 10 req/s); \
+             the whole fetch took only {elapsed:?}, so pacing was bypassed"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "pacing a single retry must stay bounded, got {elapsed:?}"
         );
     }
 }

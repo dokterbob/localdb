@@ -29,6 +29,23 @@ pub enum EmbedError {
         last_error: String,
     },
 
+    /// The provider was still rate-limiting us when the retry budget ran out.
+    ///
+    /// Distinct from [`Self::RetriesExhausted`] because it is a distinct
+    /// operator situation — back off or raise the plan's quota, rather than
+    /// "the provider is broken" — and because `fetch` already surfaces the
+    /// identical condition on the document-fetch path as
+    /// `localdb_core::Error::RateLimited` (see `fetch::map_outcome`). A
+    /// `status` field on `RetriesExhausted` would have been the alternative,
+    /// but its other construction site is a *network* error carrying no
+    /// status at all, so the field would be `Option` and almost always `None`.
+    #[error("provider {provider} is rate limiting after {attempts} attempts: {last_error}")]
+    RateLimited {
+        provider: String,
+        attempts: u32,
+        last_error: String,
+    },
+
     /// Request timed out.
     #[error("embedding request to {provider} timed out after {timeout_secs}s")]
     Timeout { provider: String, timeout_secs: u64 },
@@ -83,6 +100,13 @@ impl From<EmbedError> for localdb_core::Error {
                 last_error,
             } => localdb_core::Error::ProviderUnavailable {
                 message: format!("{provider} unavailable after {attempts} attempts: {last_error}"),
+            },
+            EmbedError::RateLimited {
+                provider,
+                attempts,
+                last_error,
+            } => localdb_core::Error::RateLimited {
+                message: format!("{provider} rate limited after {attempts} attempts: {last_error}"),
             },
             EmbedError::Timeout {
                 provider,
@@ -140,6 +164,22 @@ mod tests {
         };
         let core: CoreError = e.into();
         assert_eq!(core.code(), "provider_unavailable");
+    }
+
+    /// A hosted provider that keeps returning 429 until the retry budget runs
+    /// out must surface as `rate_limited`, the same code `fetch::map_outcome`
+    /// already emits for the identical condition on the document-fetch path —
+    /// not as the `provider_unavailable` that a genuinely broken provider
+    /// produces.
+    #[test]
+    fn rate_limited_maps_to_rate_limited_not_provider_unavailable() {
+        let e = EmbedError::RateLimited {
+            provider: "hosted-http".to_string(),
+            attempts: 4,
+            last_error: "HTTP 429: slow down".to_string(),
+        };
+        let core: CoreError = e.into();
+        assert_eq!(core.code(), "rate_limited");
     }
 
     #[test]
