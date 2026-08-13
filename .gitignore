@@ -1,4 +1,6 @@
 /target/
+# Local coverage report output (cargo llvm-cov); CI regenerates its own.
+lcov.info
 .claude/worktrees/
 .omo/
 .claude/tmp/

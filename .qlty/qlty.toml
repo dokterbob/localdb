@@ -1,0 +1,69 @@
+# Qlty Cloud configuration — analyzed on PRs by the Qlty GitHub App and usable
+# locally via `qlty check`. Deliberately complementary to CI: rustfmt/clippy are
+# NOT enabled here because .github/workflows/ci.yml already enforces them as
+# hard gates (and clippy needs protoc + a full compile, which Qlty Cloud's
+# sandbox lacks). Every plugin below is pinned to a tool version, so linter
+# upgrades only happen via an explicit commit bumping these pins.
+
+config_version = "0"
+
+exclude_patterns = [
+  "target/**",
+  "schema/config.schema.json", # generated artifact (see CLAUDE.md)
+  "lcov.info",
+  # Test inputs with intentional (sometimes intentionally odd) formatting;
+  # linting or reformatting them would invalidate what they exercise.
+  "**/tests/fixtures/**",
+]
+
+test_patterns = [
+  "**/tests/**",
+]
+
+# Plugin *definitions* come embedded in the qlty CLI binary itself; current
+# CLIs reject repository-style pins of the default source outright, so the
+# definition set is pinned by CLI version, not here. Tool versions below stay
+# our explicit pins.
+[[source]]
+name = "default"
+default = true
+
+# Structural analysis CI doesn't do: duplication + complexity smells
+[smells]
+mode = "comment"
+
+# Formatter: wraps Markdown prose at 100 columns (see .prettierrc) via
+# `qlty fmt`. Scoped to Markdown only — the definition override below stops
+# prettier from churning YAML/JSON files it would otherwise claim.
+[plugins.definitions.prettier]
+file_types = ["markdown"]
+
+[[plugin]]
+name = "prettier"
+version = "3.6.2"
+
+# Linters for files the Rust toolchain ignores
+[[plugin]]
+name = "actionlint" # .github/workflows/*.yml
+version = "1.7.9"
+
+[[plugin]]
+name = "yamllint"
+version = "1.37.1"
+
+[[plugin]]
+name = "markdownlint" # README, docs/, specs/
+version = "0.46.0"
+# Lint only — never `markdownlint --fix`. Its fix driver doesn't pick up
+# .markdownlint.yaml the way the lint driver does, and with MD018 active it
+# rewrites issue refs prettier wrapped to a line start ("#83)") into real
+# headings ("# 83)"), corrupting prose. prettier owns all formatting.
+drivers = ["lint"]
+
+[[plugin]]
+name = "shellcheck"
+version = "0.11.0"
+
+[[plugin]]
+name = "gitleaks" # secrets scanning
+version = "8.29.1"

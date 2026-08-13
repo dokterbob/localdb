@@ -4,30 +4,29 @@
 
 ## Prerequisites
 
-localdb requires **Rust 1.88 or later** on every platform (the `pdf_oxide` PDF parser pulls
-in `image` 0.25, which needs 1.88; the macOS CoreML path's edition-2024 `hf-hub` 1.0 floor of
-1.85 is subsumed). The easiest way to install and manage Rust is
-[rustup](https://rustup.rs/):
+localdb requires **Rust 1.88 or later** on every platform (the `pdf_oxide` PDF parser pulls in
+`image` 0.25, which needs 1.88; the macOS CoreML path's edition-2024 `hf-hub` 1.0 floor of 1.85 is
+subsumed). The easiest way to install and manage Rust is [rustup](https://rustup.rs/):
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-No external dependencies (OpenSSL, etc.) are required — the binary is statically linked on
-Linux and links only system libraries on macOS.
+No external dependencies (OpenSSL, etc.) are required — the binary is statically linked on Linux and
+links only system libraries on macOS.
 
 ## Supported platforms
 
 The release workflow produces binaries for:
 
-| Platform | Target triple | Embedding backend |
-|---|---|---|
-| macOS Apple Silicon | `aarch64-apple-darwin` | CoreML (ANE/GPU) built in, ONNX fallback |
-| Linux x86_64 | `x86_64-unknown-linux-gnu` | ONNX CPU |
-| Linux arm64 | `aarch64-unknown-linux-gnu` | ONNX CPU |
+| Platform            | Target triple               | Embedding backend                        |
+| ------------------- | --------------------------- | ---------------------------------------- |
+| macOS Apple Silicon | `aarch64-apple-darwin`      | CoreML (ANE/GPU) built in, ONNX fallback |
+| Linux x86_64        | `x86_64-unknown-linux-gnu`  | ONNX CPU                                 |
+| Linux arm64         | `aarch64-unknown-linux-gnu` | ONNX CPU                                 |
 
-The macOS binary includes CoreML acceleration automatically — no `--features` flag or config
-change is required. See [release-engineering.md](release-engineering.md) for pipeline details.
+The macOS binary includes CoreML acceleration automatically — no `--features` flag or config change
+is required. See [release-engineering.md](release-engineering.md) for pipeline details.
 
 ## Install from a pre-built tarball
 
@@ -58,8 +57,8 @@ cd localdb
 cargo install --path localdb
 ```
 
-This places the `localdb` binary in `~/.cargo/bin/`. Make sure that directory is on your
-`PATH` (rustup adds it automatically).
+This places the `localdb` binary in `~/.cargo/bin/`. Make sure that directory is on your `PATH`
+(rustup adds it automatically).
 
 Verify the install:
 
@@ -83,10 +82,10 @@ Note: the default 'local' provider downloads its embedding model on first index.
       Hosted providers (openai-compatible, perplexity, voyage) require an API key in config.
 ```
 
-**This message is accurate.** The default embedder (`pplx-embed-context-v1-0.6b`) is
-downloaded from the public HuggingFace repo `perplexity-ai/pplx-embed-context-v1-0.6b`
-(~706 MB) the first time `localdb index` or `localdb search` runs. No API key or license
-click-through is required. The model is cached under `paths.models` for subsequent runs.
+**This message is accurate.** The default embedder (`pplx-embed-context-v1-0.6b`) is downloaded from
+the public HuggingFace repo `perplexity-ai/pplx-embed-context-v1-0.6b` (~706 MB) the first time
+`localdb index` or `localdb search` runs. No API key or license click-through is required. The model
+is cached under `paths.models` for subsequent runs.
 
 For details on the embedding pipeline and alternative model options, see
 [architecture.md](architecture.md) and
@@ -94,5 +93,5 @@ For details on the embedding pipeline and alternative model options, see
 
 ## Next step
 
-Once installed, follow the [Quick Start guide](quickstart.md) to index your first files and
-run a search.
+Once installed, follow the [Quick Start guide](quickstart.md) to index your first files and run a
+search.

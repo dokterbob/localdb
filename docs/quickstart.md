@@ -23,12 +23,12 @@ Initialized localdb at ~/Library/Application Support/com.localdb.localdb.localdb
   Data:   ~/Library/Application Support/com.localdb.localdb.localdb/data
 ```
 
-(Paths shown are the macOS defaults — see [configuration.md](configuration.md) for Linux
-paths and the `--config` flag. Yes, the `com.localdb.localdb.localdb` segment is verbose;
-see [architecture.md known gaps](architecture.md#known-gaps).)
+(Paths shown are the macOS defaults — see [configuration.md](configuration.md) for Linux paths and
+the `--config` flag. Yes, the `com.localdb.localdb.localdb` segment is verbose; see
+[architecture.md known gaps](architecture.md#known-gaps).)
 
-The generated `config.yaml` is a commented template with every key at its default value, spelled
-out for discoverability — not a bare stub. It starts:
+The generated `config.yaml` is a commented template with every key at its default value, spelled out
+for discoverability — not a bare stub. It starts:
 
 ```yaml
 # yaml-language-server: $schema=https://raw.githubusercontent.com/dokterbob/localdb/main/schema/config.schema.json
@@ -50,15 +50,15 @@ See [configuration.md](configuration.md#config-is-created-for-you) for the full 
 the `$schema` editor-integration section.
 
 > **Note on the model download:** the default embedder (`provider: local`,
-> `pplx-embed-context-v1-0.6b`) is downloaded from HuggingFace (~706 MB) the first time `localdb
-> index` or `localdb search` runs — not at init/first-run time. No API key or license
+> `pplx-embed-context-v1-0.6b`) is downloaded from HuggingFace (~706 MB) the first time
+> `localdb index` or `localdb search` runs — not at init/first-run time. No API key or license
 > click-through is required. Subsequent runs use the cached model. See
 > [install.md#a-note-on-embedding-models](install.md#a-note-on-embedding-models).
 
 ## Step 2 — (Optional) Override data paths
 
-By default the data directory follows your platform's standard location. To keep everything under
-a single directory (useful for development or isolation), add a `paths` block to your config:
+By default the data directory follows your platform's standard location. To keep everything under a
+single directory (useful for development or isolation), add a `paths` block to your config:
 
 ```yaml
 version: 1
@@ -182,8 +182,8 @@ localdb search --limit 1 rank fusion
 
 ### JSON output
 
-Pass `--json` to get machine-readable citations. The citation shape is the canonical
-`localdb` Citation object (see [../specs/02-domain-model.md](../specs/02-domain-model.md) §6):
+Pass `--json` to get machine-readable citations. The citation shape is the canonical `localdb`
+Citation object (see [../specs/02-domain-model.md](../specs/02-domain-model.md) §6):
 
 ```bash
 localdb search -s notes --json hybrid search
@@ -201,9 +201,7 @@ localdb search -s notes --json hybrid search
       "chunk_position": {
         "seq_in_block": 0
       },
-      "heading_path": [
-        "LanceDB notes"
-      ],
+      "heading_path": ["LanceDB notes"],
       "location": {
         "span": {
           "end": 157,
@@ -252,17 +250,16 @@ localdb search -s notes --json hybrid search
 }
 ```
 
-(The structural fields above — `block`, `chunk_position`, `heading_path`,
-`location.span`, `snippet`, `metadata`, `chunk_id`, `resource_id` and
-`provenance.content_hash` — are captured from a real indexing run. `score`,
-`store` and `provenance.fetched_at` are illustrative.)
+(The structural fields above — `block`, `chunk_position`, `heading_path`, `location.span`,
+`snippet`, `metadata`, `chunk_id`, `resource_id` and `provenance.content_hash` — are captured from a
+real indexing run. `score`, `store` and `provenance.fetched_at` are illustrative.)
 
 (Output truncated to one result; paths shown from a scratch run.)
 
-**Score fields:** `bm25` is the BM25 full-text score; `dense` is the normalized Hamming
-similarity (`1.0 − hamming_dist / nbits`) from the binary-quantized local ONNX embedder
-(`pplx-embed-context-v1-0.6b` by default). `fused` is the Reciprocal Rank Fusion score
-used for final ranking, combining both components.
+**Score fields:** `bm25` is the BM25 full-text score; `dense` is the normalized Hamming similarity
+(`1.0 − hamming_dist / nbits`) from the binary-quantized local ONNX embedder
+(`pplx-embed-context-v1-0.6b` by default). `fused` is the Reciprocal Rank Fusion score used for
+final ranking, combining both components.
 
 ## Step 8 — Verify status after indexing
 
@@ -281,6 +278,5 @@ stores (1):
 - **Configuration reference:** [configuration.md](configuration.md) — full YAML schema, path
   overrides, per-store indexing policy.
 - **CLI reference:** [cli.md](cli.md) — all commands, flags, exit codes, and JSON shapes.
-- **MCP integration:** [mcp.md](mcp.md) — connecting localdb to AI agents via the MCP stdio
-  server.
+- **MCP integration:** [mcp.md](mcp.md) — connecting localdb to AI agents via the MCP stdio server.
 - **Architecture and design:** [../specs/01-architecture.md](../specs/01-architecture.md)
