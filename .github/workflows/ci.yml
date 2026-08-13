@@ -53,33 +53,6 @@ jobs:
   test:
     name: Tests
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-      - name: Install protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-test-
-      - name: Build workspace
-        run: cargo build --workspace
-      - name: Run tests
-        run: cargo test --workspace
-
-  coverage:
-    name: Coverage gates
-    runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write  # OIDC for the Qlty coverage upload (no token secret)
@@ -109,13 +82,11 @@ jobs:
       - name: Run coverage (all tests)
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info
       - name: Upload coverage to Qlty
-        # Unconditional (not PR-only): the README badge and trends read
-        # default-branch coverage, so pushes to main must upload too. Runs
-        # before the 80% gate so a failing PR still reports its coverage.
         uses: qltysh/qlty-action/coverage@v2
         with:
           oidc: true
           files: lcov.info
+          fail_ci_if_error: false
 
   coreml:
     name: CoreML backend (macOS)
