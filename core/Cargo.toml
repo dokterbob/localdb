@@ -33,4 +33,8 @@ schemars = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }
 tempfile = "3"
 extract = { path = "../extract" }
-jsonschema = "0.49"
+# default-features off: the default `resolve-http` feature drags reqwest 0.13
+# into the test build graph with `rustls-no-provider`, which breaks rmcp's
+# daemon-proxy client under `cargo test` (rustls provider ambiguity; CI-only
+# on Linux). Our schema validation is fully in-memory — no resolvers needed.
+jsonschema = { version = "0.49", default-features = false }
