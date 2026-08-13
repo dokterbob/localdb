@@ -140,9 +140,8 @@ fn ensure_config_scaffolded_inner(
         models_dir.as_path(),
         logs_dir.as_path(),
     ] {
-        std::fs::create_dir_all(dir).map_err(|e| Error::Internal {
+        std::fs::create_dir_all(dir).map_err(|e| Error::InvalidConfig {
             message: format!("cannot create directory '{}': {}", dir.display(), e),
-            correlation_id: "scaffold_config_mkdir".to_string(),
         })?;
     }
 
@@ -197,20 +196,18 @@ fn write_config_atomically(config_path: &Path, content: &str) -> Result<(), Erro
     ));
 
     let result = std::fs::write(&tmp_path, content)
-        .map_err(|e| Error::Internal {
+        .map_err(|e| Error::InvalidConfig {
             message: format!(
                 "cannot write temp config file '{}': {}",
                 tmp_path.display(),
                 e
             ),
-            correlation_id: "scaffold_config_tmp_write".to_string(),
         })
         .and_then(|()| match std::fs::hard_link(&tmp_path, config_path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-            Err(e) => Err(Error::Internal {
+            Err(e) => Err(Error::InvalidConfig {
                 message: format!("cannot link config file '{}': {}", config_path.display(), e),
-                correlation_id: "scaffold_config_link".to_string(),
             }),
         });
 
@@ -361,6 +358,28 @@ mod tests {
         let config_path = dir.path().join("missing-parent").join("config.yaml");
         let ctx = test_ctx(Some(config_path));
         let platform = synthetic_platform(&dir);
+
+        let err = ensure_config_scaffolded_inner(&ctx, &platform).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidConfig { .. }),
+            "expected InvalidConfig, got {err:?}"
+        );
+    }
+
+    /// Scaffolding I/O failures are `invalid_config`/exit 2 per
+    /// specs/05-surfaces.md §2.5, same as the F11 missing-parent guard —
+    /// not `internal`/exit 1. The data dir's parent is a regular *file*, so
+    /// `create_dir_all` fails with `NotADirectory` (portable across the unix
+    /// platforms CI runs on).
+    #[test]
+    fn ensure_config_scaffolded_io_failure_is_invalid_config() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let ctx = test_ctx(Some(config_path));
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"i am a file, not a directory").unwrap();
+        let mut platform = synthetic_platform(&dir);
+        platform.data_dir = blocker.join("data");
 
         let err = ensure_config_scaffolded_inner(&ctx, &platform).unwrap_err();
         assert!(

@@ -232,9 +232,10 @@ scaffolding one into existence underneath themselves — their config-load path
 
 Scaffolding fires only when the resolved config path does not exist at all; a present-but-malformed
 file is left untouched, and the command's normal strict/lenient load surfaces the same parse error
-it always did (§5, `invalid_config`). Exit codes are unchanged: a scaffolding failure (e.g. an
-explicit `--config` whose parent directory doesn't exist) maps through the same
-`Error::InvalidConfig` -> exit 2 path every other config error already used.
+it always did (§5, `invalid_config`). Exit codes are unchanged: a scaffolding failure — an explicit
+`--config` whose parent directory doesn't exist, or an I/O failure creating the directories or
+writing the config file — maps through the same `Error::InvalidConfig` -> exit 2 path every other
+config error already used.
 
 ## 3. HTTP API
 
