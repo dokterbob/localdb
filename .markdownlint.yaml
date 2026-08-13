@@ -11,3 +11,10 @@ MD013:
 # markdownlint's own notion of column style disagrees with prettier's output,
 # so the style check is redundant noise here.
 MD060: false
+
+# These docs are full of "issue #83"-style references, and prettier may wrap
+# one to the start of a line. MD018's auto-fix then rewrites `#83)` into the
+# heading `# 83)` — real corruption we've had to repair. A wrapped issue ref
+# is prose, not a malformed heading; genuine `#Heading` typos are far rarer
+# than issue refs here, so the rule is off.
+MD018: false

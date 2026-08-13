@@ -84,9 +84,7 @@ visible. Multi-process is the first-class concurrency model — the daemon is on
 (`server::job_exec::run_job`) through an async, single-worker job queue with a per-store in-flight
 guard (issue #187) — not a stub; a second submission for a store already running rejects with
 `index_in_progress`, 409. `GET /jobs/{id}/events` streams the job's live progress over SSE (issue
-
-# 83). The URL-refresh scheduler submits through the same job engine. See
-
+#83). The URL-refresh scheduler submits through the same job engine. See
 [specs/05-surfaces.md](../specs/05-surfaces.md) §3.
 
 ### `mcp`

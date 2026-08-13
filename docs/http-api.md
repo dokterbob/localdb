@@ -412,8 +412,7 @@ curl -s http://127.0.0.1:7700/v1/jobs/01KTVM5XMA59N4WGHNZ80QX9B7
 
 Stream a job's live progress as
 [Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events) (issue
-
-# 83)
+#83).
 
 ```
 curl -N -H 'Accept: text/event-stream' http://127.0.0.1:7700/v1/jobs/01KTVM5XMA59N4WGHNZ80QX9B7/events

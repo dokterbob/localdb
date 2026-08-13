@@ -49,8 +49,7 @@ against a live daemon they fail the same way every other daemon-aware write comm
 migration-weight-class design.
 
 A schema migration that rebuilds a large on-disk structure (e.g. v6 `shrink_vector_index`, issue
-
-# 177) frees pages onto SQLite's own free list without shrinking the database file — only `VACUUM`
+#177) frees pages onto SQLite's own free list without shrinking the database file — only `VACUUM`
 
 (`db vacuum`) returns that space to the filesystem, and it's a separate, explicit step rather than
 something `db migrate` runs automatically (it needs roughly the store's current size again in free
@@ -145,10 +144,15 @@ Additional rules:
 - A multi-item `--json` batch (`source add`/`add` across more than one `--store`, local or
   daemon-routed) that fails partway through — after at least one earlier item already succeeded —
   does not discard the buffered results: it prints one JSON document
-  `{"status": "error", "error": {"code": <error code>, "message": <text>}, "results": [<items completed so far>]}`
+
+  ```text
+  {"status": "error", "error": {"code": <error code>, "message": <text>}, "results": [<items completed so far>]}
+  ```
+
   to stdout, then exits with the failing error's normal exit code, instead of routing through the
   usual stderr-only error shape. The buffered `results` are output data, not merely an error
   message, so — like every other `--json` document — they belong on stdout.
+
 - `source add`'s per-item output — `{"id": ..., "store": {"name": ...}, "kind": ...}` per source,
   wrapped as described above — is identical whether the source was persisted locally or via a
   daemon; the daemon transport never echoes its own raw persisted-record response. Text mode is
@@ -172,8 +176,7 @@ and now also surfaces `refresh` for both `url` and `feed` sources. The **human**
 store-name column still follows §2.2's scope rule — prepended only when more than one store is in
 _the resolved scope_, independent of which of those stores actually contributed a row to the output
 (a scope of two stores where only one has any sources still gets the column on that one row — issue
-
-# 187 review, finding 1). The **`--json`** `store` field (`{"name": ...}`) is different: it is
+#187 review, finding 1). The **`--json`** `store` field (`{"name": ...}`) is different: it is
 
 emitted **unconditionally**, on every row regardless of how many stores are in scope, matching the
 pre-existing embedded behavior — there never was a single-store special case on the `--json` path,

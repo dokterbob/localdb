@@ -653,7 +653,7 @@ the MCP server will start normally.
 This isn't an auth prompt — it's almost always `rmcp`'s DNS-rebinding `Host`-header check rejecting
 the request with `403 Forbidden: Host header is not allowed`, which some MCP clients surface as a
 generic auth failure. As of this release, localdb automatically allow-lists the daemon's own bind
-address (see [Remote / HTTP](#remote-http-connecting-from-another-machine) above), so this should no
-longer happen for a supported (non-wildcard) bind — if you still hit it, confirm the daemon's
+address (see [Remote / HTTP](#remote--http--connecting-from-another-machine) above), so this should
+no longer happen for a supported (non-wildcard) bind — if you still hit it, confirm the daemon's
 `config.yaml` `server.bind` matches the address/port you're actually connecting to, and that you've
 restarted `localdb serve` after changing it.

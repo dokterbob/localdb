@@ -4,3 +4,9 @@ extends: default
 rules:
   line-length:
     max: 120
+  # Repo convention is no `---` document-start marker (workflows, issue
+  # templates, and config.template.yaml all omit it).
+  document-start: disable
+  # Don't flag GitHub workflows' `on:` key as a truthy value.
+  truthy:
+    check-keys: false

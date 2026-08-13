@@ -120,9 +120,9 @@ comes from). Request: either call the post-processor from `to_markdown()`, or ex
 
 **Repo:** yfedoseev/pdf_oxide · **Type:** bug / heuristic-tuning
 
-`fence_monospace_blocks()` wraps a paragraph in a bare
-```fence whenever its glyph runs report`is_monospace`. On typeset novels this fires on ordinary quoted dialogue, so narrative prose is emitted as a code block and downstream consumers label it `block_kind:
-"code"`.
+`fence_monospace_blocks()` wraps a paragraph in a bare ` ``` ` fence whenever its glyph runs report
+`is_monospace`. On typeset novels this fires on ordinary quoted dialogue, so narrative prose is
+emitted as a code block and downstream consumers label it `block_kind: "code"`.
 
 Relatedly, `detect_headings`' font-clustering promotes multi-line terminal transcripts to `#`
 headings in technical books; `is_valid_heading_text` / `demote_body_like_headings` do not catch

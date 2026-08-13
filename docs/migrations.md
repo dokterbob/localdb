@@ -405,8 +405,12 @@ per-branch.
   `reopen_with_legacy_schema_version_is_refused_without_mutation` for the pattern). To actually
   advance a test fixture, call `store_libsql::migrate_store` directly instead of relying on `open`.
 - Any test whose failure message asserted the old v1–v3 "no migration path" wording is now instead
-  the `db migrate` hint
-  (`"database schema version {v} predates the migration baseline (v4); run 'localdb db migrate' to erase and rebuild it..."`).
+  the `db migrate` hint:
+
+  ```text
+  database schema version {v} predates the migration baseline (v4); run 'localdb db migrate' to erase and rebuild it...
+  ```
+
   This is a small, sanctioned amendment to D13 ("never destructive silently") rather than a reversal
   of it: the rebuild path still exists, is still the only way to bring a legacy store forward, and
   is still gated behind an explicit confirmation prompt (`cli/src/cmds/db.rs`'s
