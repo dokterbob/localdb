@@ -1,0 +1,22 @@
+#!/bin/sh
+# Auto-format staged Markdown with qlty (prettier prose-wrap at 100 columns)
+# so line-length lint findings never reach a PR.
+#
+# Opt in once per clone:
+#     git config core.hooksPath .githooks
+#
+# Deliberately non-blocking: it silently does nothing when the qlty CLI is
+# not installed (https://qlty.sh), and it never rejects a commit.
+#
+# Caveat: formatted files are re-staged whole, so a partially staged Markdown
+# file will have its unstaged hunks staged too.
+
+command -v qlty >/dev/null 2>&1 || exit 0
+
+md_files=$(git diff --cached --name-only --diff-filter=ACMR -- '*.md')
+[ -n "$md_files" ] || exit 0
+
+printf '%s\n' "$md_files" | tr '\n' '\0' | xargs -0 qlty fmt --no-error --no-progress >/dev/null 2>&1
+printf '%s\n' "$md_files" | tr '\n' '\0' | xargs -0 git add
+
+exit 0

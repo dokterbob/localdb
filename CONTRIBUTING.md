@@ -60,6 +60,16 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 Both must be clean before a PR is opened. CI enforces this with `--deny warnings`.
 
+Markdown prose wraps at 100 columns, enforced by Qlty Cloud on PRs and auto-fixed by
+[the qlty CLI](https://qlty.sh) (`qlty fmt --all`, config in `.qlty/qlty.toml` + `.prettierrc`).
+To have staged Markdown formatted automatically on commit, opt in once per clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+The hook is non-blocking: it does nothing if `qlty` is not installed and never rejects a commit.
+
 ---
 
 ## Spec-first rule

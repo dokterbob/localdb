@@ -11,6 +11,9 @@ exclude_patterns = [
   "target/**",
   "schema/config.schema.json", # generated artifact (see CLAUDE.md)
   "lcov.info",
+  # Test inputs with intentional (sometimes intentionally odd) formatting;
+  # linting or reformatting them would invalidate what they exercise.
+  "**/tests/fixtures/**",
 ]
 
 test_patterns = [
@@ -28,6 +31,16 @@ default = true
 # Structural analysis CI doesn't do: duplication + complexity smells
 [smells]
 mode = "comment"
+
+# Formatter: wraps Markdown prose at 100 columns (see .prettierrc) via
+# `qlty fmt`. Scoped to Markdown only — the definition override below stops
+# prettier from churning YAML/JSON files it would otherwise claim.
+[plugins.definitions.prettier]
+file_types = ["markdown"]
+
+[[plugin]]
+name = "prettier"
+version = "3.6.2"
 
 # Linters for files the Rust toolchain ignores
 [[plugin]]

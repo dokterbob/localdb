@@ -1,0 +1,6 @@
+# yamllint's default 80-column limit is tighter than this repo's style;
+# match the 100-column docs convention with headroom for long CI expressions.
+extends: default
+rules:
+  line-length:
+    max: 120

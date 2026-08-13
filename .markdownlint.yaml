@@ -1,0 +1,13 @@
+# Aligned with prettier (.prettierrc): prose wraps at 100 columns via
+# `qlty fmt`. Tables and code blocks are exempt from the length check because
+# prettier cannot wrap them.
+MD013:
+  line_length: 100
+  heading_line_length: 100
+  code_blocks: false
+  tables: false
+
+# prettier owns table formatting (it aligns all pipe tables on `qlty fmt`);
+# markdownlint's own notion of column style disagrees with prettier's output,
+# so the style check is redundant noise here.
+MD060: false

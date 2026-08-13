@@ -10,6 +10,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo llvm-cov --workspace --lcov --output-path lcov.info
 cargo llvm-cov report --summary-only
+qlty fmt --all        # wrap Markdown prose at 100 cols (qlty CLI, optional locally)
 ```
 
 All five commands run in CI (`.github/workflows/ci.yml`).
