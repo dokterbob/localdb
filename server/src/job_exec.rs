@@ -291,6 +291,7 @@ mod tests {
     fn fake_yaml() -> RawConfig {
         RawConfig {
             version: 1,
+            schema: None,
             server: Default::default(),
             paths: Default::default(),
             defaults: DefaultsConfig {

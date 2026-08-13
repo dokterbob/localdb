@@ -3,8 +3,8 @@ use serde_json::json;
 
 use crate::{
     app_db::{
-        apply_daemon_store_scope, default_store_row, load_config_for_maintenance,
-        load_config_lenient, open_app_db_lenient_or_exit, open_app_db_or_exit, reject_store_flag,
+        apply_daemon_store_scope, default_store_row, load_config_lenient, load_config_scaffolded,
+        open_app_db_lenient_or_exit, open_app_db_or_exit, reject_store_flag,
         resolve_store_scope_inner, AppDb, StoreScopePolicy, STORE_ADD_REJECT_MESSAGE,
         STORE_REMOVE_REJECT_MESSAGE,
     },
@@ -108,7 +108,7 @@ pub(crate) async fn run_store_add_async(ctx: &CliContext, name: &str) {
         exit_err(&e, ctx.json);
     }
 
-    let config_loader = load_config_for_maintenance(ctx);
+    let config_loader = load_config_scaffolded(ctx).await;
     let outcome = dispatch(&StoreAddCmd { name }, ctx, &config_loader, || {
         open_app_db_or_exit(ctx, &config_loader)
     })
@@ -217,7 +217,7 @@ pub fn run_store_list(ctx: &CliContext) {
 
 pub(crate) async fn run_store_list_async(ctx: &CliContext) {
     // F1-cli: use lenient loader so store list works even with malformed config.
-    let config_loader = load_config_lenient(ctx);
+    let config_loader = load_config_lenient(ctx).await;
     let outcome = dispatch(&StoreListCmd, ctx, &config_loader, || {
         open_app_db_lenient_or_exit(ctx, &config_loader)
     })
@@ -310,7 +310,7 @@ pub(crate) async fn run_store_remove_async(ctx: &CliContext, name: &str) {
         exit_err(&e, ctx.json);
     }
 
-    let config_loader = load_config_for_maintenance(ctx);
+    let config_loader = load_config_scaffolded(ctx).await;
 
     let prompt = format!(
         "This permanently deletes store '{}', its sources, and its index data. Continue?",

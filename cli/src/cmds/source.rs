@@ -10,7 +10,7 @@ use server::JobQueue;
 
 use crate::{
     app_db::{
-        load_config_for_maintenance, open_app_db_or_exit, resolve_daemon_store_scope,
+        load_config_scaffolded, open_app_db_or_exit, resolve_daemon_store_scope,
         resolve_store_scope, resolve_store_scope_inner, AppDb, StoreScopePolicy,
     },
     cmds::index::IndexErrorMode,
@@ -521,7 +521,7 @@ pub(crate) async fn run_source_add_async(
     let kind = kind.as_str();
     let fetch_full_content = !no_fetch_full_content;
 
-    let config_loader = load_config_for_maintenance(ctx);
+    let config_loader = load_config_scaffolded(ctx).await;
 
     // Normalize path sources: validate existence, promote single files, apply
     // excludes. Store-independent, so this runs once regardless of how many
@@ -842,7 +842,7 @@ pub fn run_source_list(ctx: &CliContext) {
 }
 
 pub(crate) async fn run_source_list_async(ctx: &CliContext) {
-    let config_loader = load_config_for_maintenance(ctx);
+    let config_loader = load_config_scaffolded(ctx).await;
     // The store-name column / "no sources on store X" message key off the
     // *resolved scope's* store names (`scope_store_names`), never off which
     // of them happened to return an item (issue #187 review, finding 1) — a
@@ -1032,7 +1032,7 @@ pub fn run_source_remove(ctx: &CliContext, id: &str) {
 }
 
 pub(crate) async fn run_source_remove_async(ctx: &CliContext, id: &str) {
-    let config_loader = load_config_for_maintenance(ctx);
+    let config_loader = load_config_scaffolded(ctx).await;
 
     // #3: If the argument looks like a path or URL (not a ULID/UUID), it must
     // be resolved against a specific store's sources, so an explicit --store

@@ -182,6 +182,12 @@ fn resolve_content_length(content_length: Option<i64>) -> usize {
 /// be a store id or a store name (#144: this lets a caller round-trip the
 /// `store.id`/`store.name` from a prior `search` citation straight back in).
 /// Unknown store id/name → returns a tool error with code `store_not_found`.
+// `CallToolResult` crossed clippy's result_large_err threshold once the
+// workspace `schemars` dep gained `preserve_order` (serde_json's Map
+// switches from BTreeMap to IndexMap, growing `serde_json::Value`). Boxing
+// every `Err(CallToolResult)` call site in this crate is out of scope for
+// that change; allow the lint on the affected functions instead.
+#[allow(clippy::result_large_err)]
 fn select_mcp_stores(
     stores: &[AvailableStore],
     store_names: &[String],
@@ -526,6 +532,7 @@ const GET_CHUNKS_MAX_LIMIT: usize = 200;
 /// error rather than a silent default or clamp (clamping `0` up to `1` would
 /// silently return a chunk the caller did not ask for). A valid `limit` is
 /// capped at `GET_CHUNKS_MAX_LIMIT`.
+#[allow(clippy::result_large_err)] // see note on select_mcp_stores above
 fn resolve_limit(limit: Option<i64>) -> Result<usize, CallToolResult> {
     match limit {
         None => Ok(GET_CHUNKS_DEFAULT_LIMIT),
@@ -545,6 +552,7 @@ fn resolve_limit(limit: Option<i64>) -> Result<usize, CallToolResult> {
 }
 
 /// Resolve `GetChunksArgs::offset` to a validated `usize` (absent → 0).
+#[allow(clippy::result_large_err)] // see note on select_mcp_stores above
 fn resolve_offset(offset: Option<i64>) -> Result<usize, CallToolResult> {
     match offset {
         None => Ok(0),
@@ -564,6 +572,7 @@ fn resolve_offset(offset: Option<i64>) -> Result<usize, CallToolResult> {
 /// underlying functions separately, since the anchor path needs `limit`
 /// resolved before `offset` even applies).
 #[cfg(test)]
+#[allow(clippy::result_large_err)] // see note on select_mcp_stores above
 fn resolve_get_chunks_pagination(args: &GetChunksArgs) -> Result<(usize, usize), CallToolResult> {
     let offset = resolve_offset(args.offset)?;
     let limit = resolve_limit(args.limit)?;
@@ -574,6 +583,7 @@ fn resolve_get_chunks_pagination(args: &GetChunksArgs) -> Result<(usize, usize),
 /// `anchor_block_seq` are pairwise mutually exclusive — specifying more than
 /// one is a tool-level `invalid_request` error, not a silent precedence rule.
 /// See specs/05-surfaces.md §4.1.
+#[allow(clippy::result_large_err)] // see note on select_mcp_stores above
 fn check_anchor_mutual_exclusivity(args: &GetChunksArgs) -> Result<(), CallToolResult> {
     let specified_count = [
         args.offset.is_some(),
@@ -596,6 +606,7 @@ fn check_anchor_mutual_exclusivity(args: &GetChunksArgs) -> Result<(), CallToolR
 /// Resolve `anchor_chunk_id` to its 0-based index in `sorted_chunks` (already
 /// sorted by `(block_seq, seq_in_block, ...)`): an exact `chunk_id` match.
 /// Unknown id → `chunk_not_found`.
+#[allow(clippy::result_large_err)] // see note on select_mcp_stores above
 fn resolve_anchor_chunk_id(
     sorted_chunks: &[localdb_core::ChunkRecord],
     anchor_chunk_id: &str,
@@ -617,6 +628,7 @@ fn resolve_anchor_chunk_id(
 /// the first position satisfying the predicate is automatically tie-broken
 /// by the lowest `seq_in_block` at that `block_seq`. `anchor_block_seq` past
 /// every block in the resource → `chunk_not_found`.
+#[allow(clippy::result_large_err)] // see note on select_mcp_stores above
 fn resolve_anchor_block_seq(
     sorted_chunks: &[localdb_core::ChunkRecord],
     anchor_block_seq: u32,

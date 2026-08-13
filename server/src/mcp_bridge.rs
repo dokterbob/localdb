@@ -177,6 +177,7 @@ mod tests {
         // `ModelMissing`, the Codex-flagged bug this test now pins).
         let mut yaml_config = RawConfig {
             version: 1,
+            schema: None,
             server: Default::default(),
             paths: Default::default(),
             defaults: Default::default(),
@@ -204,6 +205,7 @@ mod tests {
     async fn returns_real_embedder_and_store_handles_when_provider_available() {
         let mut yaml_config = RawConfig {
             version: 1,
+            schema: None,
             server: Default::default(),
             paths: Default::default(),
             defaults: Default::default(),

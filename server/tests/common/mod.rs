@@ -38,6 +38,7 @@ pub(crate) async fn make_app() -> (TempDir, Router) {
 fn fake_yaml_config() -> RawConfig {
     RawConfig {
         version: 1,
+        schema: None,
         server: Default::default(),
         paths: Default::default(),
         defaults: DefaultsConfig {

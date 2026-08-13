@@ -453,6 +453,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut yaml_config = RawConfig {
             version: 1,
+            schema: None,
             server: Default::default(),
             paths: Default::default(),
             defaults: Default::default(),
@@ -634,6 +635,7 @@ mod tests {
         let paths = make_resolved_paths(dir.path());
         let config = RawConfig {
             version: 1,
+            schema: None,
             server: localdb_core::config::schema::ServerConfig {
                 bind: "127.0.0.1".to_string(),
                 port: 0, // let OS assign a free port
@@ -674,6 +676,7 @@ mod tests {
         let paths = make_resolved_paths(dir.path());
         let config = RawConfig {
             version: 1,
+            schema: None,
             server: localdb_core::config::schema::ServerConfig {
                 bind: "127.0.0.1".to_string(),
                 port: 0, // let OS assign a free port
@@ -718,6 +721,7 @@ mod tests {
         let paths = make_resolved_paths(dir.path());
         let mut config = RawConfig {
             version: 1,
+            schema: None,
             server: localdb_core::config::schema::ServerConfig::default(),
             paths: Default::default(),
             defaults: Default::default(),
@@ -771,6 +775,7 @@ mod tests {
         // Create the state and job queue.
         let yaml_config = RawConfig {
             version: 1,
+            schema: None,
             server: Default::default(),
             paths: Default::default(),
             defaults: localdb_core::config::schema::DefaultsConfig {
@@ -982,6 +987,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let yaml_config = RawConfig {
             version: 1,
+            schema: None,
             server: Default::default(),
             paths: Default::default(),
             defaults: Default::default(),

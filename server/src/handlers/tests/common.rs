@@ -36,6 +36,7 @@ pub(crate) async fn make_app_with_queue_and_state(
     let dir = tempfile::tempdir().unwrap();
     let yaml_config = localdb_core::config::schema::RawConfig {
         version: 1,
+        schema: None,
         server: Default::default(),
         paths: Default::default(),
         defaults: localdb_core::config::schema::DefaultsConfig {
@@ -101,6 +102,7 @@ pub(crate) async fn make_state_with_fake_config() -> (TempDir, AppState) {
     let dir = tempfile::tempdir().unwrap();
     let yaml_config = localdb_core::config::schema::RawConfig {
         version: 1,
+        schema: None,
         server: Default::default(),
         paths: Default::default(),
         defaults: localdb_core::config::schema::DefaultsConfig {

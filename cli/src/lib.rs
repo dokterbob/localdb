@@ -11,11 +11,13 @@ mod command_table;
 mod daemon_client;
 mod job_attach;
 mod normalize;
+mod scaffold;
 
 mod cmds {
     pub(crate) mod db;
     pub(crate) mod index;
     pub(crate) mod init;
+    pub(crate) mod internal;
     pub(crate) mod search;
     pub(crate) mod source;
     pub(crate) mod status;
@@ -27,6 +29,7 @@ pub use app_db::AppDb;
 pub use cmds::db::{run_db_downgrade, run_db_migrate, run_db_status, run_db_vacuum};
 pub use cmds::index::run_index;
 pub use cmds::init::run_init;
+pub use cmds::internal::run_internal_print_schema;
 pub use cmds::search::run_search;
 pub use cmds::source::{run_source_add, run_source_list, run_source_remove};
 pub use cmds::status::run_status;

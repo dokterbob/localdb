@@ -545,7 +545,7 @@ mod tests {
     use localdb_core::config::schema::RawConfig;
     use localdb_core::{SourceKind, SourceRow};
 
-    use crate::app_db::{load_config_for_maintenance, open_app_db_or_exit};
+    use crate::app_db::{load_config_scaffolded, open_app_db_or_exit};
     use crate::cmds::store::run_store_add_async;
 
     fn test_ctx() -> CliContext {
@@ -599,7 +599,7 @@ mod tests {
             daemon_url: None,
             config_env: None,
         };
-        let config_loader = load_config_for_maintenance(&ctx);
+        let config_loader = load_config_scaffolded(&ctx).await;
         let db = open_app_db_or_exit(&ctx, &config_loader).await;
         (dir, config_loader, db, ctx)
     }
@@ -764,6 +764,7 @@ mod tests {
     fn fake_daemon_yaml() -> RawConfig {
         RawConfig {
             version: 1,
+            schema: None,
             server: Default::default(),
             paths: Default::default(),
             defaults: localdb_core::config::schema::DefaultsConfig {

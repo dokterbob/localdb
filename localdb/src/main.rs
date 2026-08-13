@@ -173,6 +173,21 @@ pub enum Command {
         #[arg(long)]
         no_fetch_full_content: bool,
     },
+
+    /// Internal maintenance subcommands. Not part of the public surface —
+    /// build/release tooling only.
+    #[command(subcommand, hide = true)]
+    Internal(InternalCommand),
+}
+
+/// Hidden `internal` subcommands (build/release tooling, not user-facing).
+#[derive(Debug, Subcommand)]
+pub enum InternalCommand {
+    /// Print the generated router JSON Schema for `config.yaml` to stdout.
+    ///
+    /// Pure codegen: no config load, no daemon probe. Used to (re)generate
+    /// the committed `schema/config.schema.json` artifact.
+    PrintSchema,
 }
 
 /// `--kind` override for `source add` / `add` (see [`Command::Add`]).
@@ -340,6 +355,15 @@ fn main() {
 
     let cli = Cli::parse();
 
+    // `internal` subcommands are pure stdout tooling (build/release codegen)
+    // and must never load config, probe the daemon, or go through
+    // `command_table::dispatch` — handled first, before `CliContext` (and
+    // the config/daemon env vars it reads) is even constructed.
+    if let Command::Internal(InternalCommand::PrintSchema) = &cli.command {
+        cli::run_internal_print_schema();
+        return;
+    }
+
     let ctx = CliContext {
         config: cli.config,
         json: cli.json,
@@ -424,6 +448,12 @@ fn main() {
                     *no_fetch_full_content,
                 );
             }
+        }
+        // Unreachable: handled and returned from above, before `ctx` even
+        // exists, so this arm never actually dispatches — required only for
+        // match exhaustiveness over `Command`.
+        Command::Internal(InternalCommand::PrintSchema) => {
+            unreachable!("Command::Internal is handled and returns before this match")
         }
     }
 }

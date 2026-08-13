@@ -6,6 +6,7 @@
 //!
 //! See specs/03-config.md §1, §5.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -16,11 +17,16 @@ use std::collections::HashMap;
 /// Raw YAML config shape — the user's config file.
 ///
 /// `#[serde(deny_unknown_fields)]` enforces strict key rejection.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RawConfig {
     /// Schema version; must be 1 in MVP. Required.
     pub version: u32,
+
+    /// Editor schema reference (`$schema:` key), written by the auto-generated
+    /// config template; accepted and semantically ignored on load.
+    #[serde(rename = "$schema", default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
 
     /// HTTP server settings.
     #[serde(default)]
@@ -44,7 +50,7 @@ pub struct RawConfig {
 // ---------------------------------------------------------------------------
 
 /// HTTP server configuration.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// Bind address; loopback-only by default.
@@ -80,7 +86,7 @@ fn default_port() -> u16 {
 /// Optional platform path overrides.
 ///
 /// `None` means use the platform default from `PlatformPaths`.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PathsConfig {
     /// Override for data directory (indexes, runtime-state DB, lock, socket).
@@ -101,7 +107,7 @@ pub struct PathsConfig {
 // ---------------------------------------------------------------------------
 
 /// Global defaults; stores inherit from here unless they override.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DefaultsConfig {
     /// Default indexing policy for all stores.
@@ -113,7 +119,7 @@ pub struct DefaultsConfig {
 ///
 /// A change to any field triggers a reindex (policy_version changes).
 /// See specs/03-config.md §2 and specs/04-search-pipeline.md §4.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct IndexingPolicyConfig {
     /// Chunking settings.
@@ -156,7 +162,7 @@ fn default_parser_ids() -> Vec<String> {
 }
 
 /// Chunking policy configuration.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ChunkingPolicy {
     /// Per-source-kind preset overrides (e.g. `prose`, `code`, `messages`).
@@ -165,7 +171,7 @@ pub struct ChunkingPolicy {
 }
 
 /// Embedding policy configuration.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EmbeddingPolicy {
     /// Model name / path.
@@ -204,7 +210,7 @@ fn default_embedding_provider() -> String {
 // ---------------------------------------------------------------------------
 
 /// External provider configuration.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
     /// Provider name (user-assigned label).
@@ -233,6 +239,15 @@ mod tests {
         assert_eq!(cfg.server.bind, "127.0.0.1");
         assert_eq!(cfg.server.port, 7700);
         assert!(cfg.providers.is_empty());
+        assert_eq!(cfg.schema, None);
+    }
+
+    #[test]
+    fn raw_config_accepts_dollar_schema_key() {
+        let yaml = "version: 1\n$schema: https://example.com/x.json\n";
+        let cfg: RawConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.version, 1);
+        assert_eq!(cfg.schema, Some("https://example.com/x.json".to_string()));
     }
 
     #[test]
