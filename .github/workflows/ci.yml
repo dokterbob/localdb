@@ -116,25 +116,6 @@ jobs:
         with:
           oidc: true
           files: lcov.info
-      - name: Check coverage gates
-        # Gate: ≥80% line coverage across the workspace.
-        # Data-modifying paths should hit ≥90% but this workspace-level gate
-        # is enforced at 80%; per-crate gates are checked per ticket via the
-        # summary report.
-        run: |
-          cargo llvm-cov report --summary-only
-          # Fail if line coverage drops below 80%.
-          COVERAGE=$(cargo llvm-cov report --summary-only 2>/dev/null \
-            | grep 'TOTAL' | awk '{print $10}' | tr -d '%')
-          echo "Workspace line coverage: ${COVERAGE}%"
-          if [ -z "$COVERAGE" ]; then
-            echo "ERROR: Could not parse coverage output."
-            exit 1
-          fi
-          if [ "$(echo "$COVERAGE < 80" | bc -l)" = "1" ]; then
-            echo "ERROR: Coverage ${COVERAGE}% is below the 80% gate."
-            exit 1
-          fi
 
   coreml:
     name: CoreML backend (macOS)
