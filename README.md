@@ -1,5 +1,7 @@
 # localdb
 
+[![Code Coverage](https://qlty.sh/badges/32c0fdf3-b30a-44fc-993a-a45a573b1d56/coverage.svg)](https://qlty.sh/gh/dokterbob/projects/localdb)
+
 **Point it at your stuff. Search it instantly — from the terminal, or from any AI assistant you
 already use.** Notes, specs, PDFs, Word/Excel/PowerPoint docs, EPUBs, bookmarked pages — one
 `localdb index` later, hybrid (keyword + semantic) search returns cited, byte-exact excerpts in

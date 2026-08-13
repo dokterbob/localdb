@@ -1,0 +1,51 @@
+# Qlty Cloud configuration — analyzed on PRs by the Qlty GitHub App and usable
+# locally via `qlty check`. Deliberately complementary to CI: rustfmt/clippy are
+# NOT enabled here because .github/workflows/ci.yml already enforces them as
+# hard gates (and clippy needs protoc + a full compile, which Qlty Cloud's
+# sandbox lacks). Every plugin below is pinned to a tool version, so linter
+# upgrades only happen via an explicit commit bumping these pins.
+
+config_version = "0"
+
+exclude_patterns = [
+  "target/**",
+  "schema/config.schema.json", # generated artifact (see CLAUDE.md)
+  "lcov.info",
+]
+
+test_patterns = [
+  "**/tests/**",
+]
+
+# Plugin *definitions* come embedded in the qlty CLI binary itself; current
+# CLIs reject repository-style pins of the default source outright, so the
+# definition set is pinned by CLI version, not here. Tool versions below stay
+# our explicit pins.
+[[source]]
+name = "default"
+default = true
+
+# Structural analysis CI doesn't do: duplication + complexity smells
+[smells]
+mode = "comment"
+
+# Linters for files the Rust toolchain ignores
+[[plugin]]
+name = "actionlint" # .github/workflows/*.yml
+version = "1.7.9"
+
+[[plugin]]
+name = "yamllint"
+version = "1.37.1"
+
+[[plugin]]
+name = "markdownlint" # README, docs/, specs/
+version = "0.46.0"
+
+[[plugin]]
+name = "shellcheck"
+version = "0.11.0"
+
+[[plugin]]
+name = "gitleaks" # secrets scanning
+version = "8.29.1"
