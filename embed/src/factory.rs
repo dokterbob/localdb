@@ -190,52 +190,52 @@ fn create_openai_compatible(
     Ok(Box::new(embedder))
 }
 
+/// Build a hosted, document-context provider (`perplexity`, `voyage`) whose
+/// `ProviderConfig` lookup, missing-block/missing-key error messages, and
+/// embedder construction call all follow the same shape — only the provider
+/// `kind` string and the concrete constructor differ. `ctor` is one of
+/// `PerplexityEmbedder::new`/`VoyageEmbedder::new` partially applied to
+/// everything but the resolved `api_key`; `E` is boxed here so both call
+/// sites can share this one function despite returning different concrete
+/// `Embedder` types.
+fn create_hosted_contextual<E: Embedder + 'static>(
+    providers: &[ProviderConfig],
+    kind: &str,
+    http_settings: &fetch::http::HttpSettings,
+    ctor: impl FnOnce(String, fetch::http::HttpSettings) -> Result<E, EmbedError>,
+) -> Result<BoxedEmbedder, EmbedError> {
+    let provider = provider_config(
+        providers,
+        kind,
+        &format!(
+            "no {kind} provider block in config; add a 'providers:' entry \
+             with kind: {kind} and api_key_env pointing to your API key"
+        ),
+    )?;
+    let api_key = required_api_key(
+        provider,
+        &format!("{kind} provider requires 'api_key_env' to be set in config"),
+    )?;
+    let embedder = ctor(api_key, http_settings.clone())?;
+    Ok(Box::new(embedder))
+}
+
 fn create_perplexity(
     providers: &[ProviderConfig],
     http_settings: &fetch::http::HttpSettings,
 ) -> Result<BoxedEmbedder, EmbedError> {
-    let provider = provider_config(
-        providers,
-        "perplexity",
-        "no perplexity provider block in config; add a 'providers:' entry \
-         with kind: perplexity and api_key_env pointing to your API key",
-    )?;
-    let api_key = required_api_key(
-        provider,
-        "perplexity provider requires 'api_key_env' to be set in config",
-    )?;
-    let embedder = crate::PerplexityEmbedder::new(
-        api_key,
-        None,
-        None,
-        crate::RetryPolicy::default(),
-        http_settings.clone(),
-    )?;
-    Ok(Box::new(embedder))
+    create_hosted_contextual(providers, "perplexity", http_settings, |api_key, http| {
+        crate::PerplexityEmbedder::new(api_key, None, None, crate::RetryPolicy::default(), http)
+    })
 }
 
 fn create_voyage(
     providers: &[ProviderConfig],
     http_settings: &fetch::http::HttpSettings,
 ) -> Result<BoxedEmbedder, EmbedError> {
-    let provider = provider_config(
-        providers,
-        "voyage",
-        "no voyage provider block in config; add a 'providers:' entry \
-         with kind: voyage and api_key_env pointing to your API key",
-    )?;
-    let api_key = required_api_key(
-        provider,
-        "voyage provider requires 'api_key_env' to be set in config",
-    )?;
-    let embedder = crate::VoyageEmbedder::new(
-        api_key,
-        None,
-        None,
-        crate::RetryPolicy::default(),
-        http_settings.clone(),
-    )?;
-    Ok(Box::new(embedder))
+    create_hosted_contextual(providers, "voyage", http_settings, |api_key, http| {
+        crate::VoyageEmbedder::new(api_key, None, None, crate::RetryPolicy::default(), http)
+    })
 }
 
 fn provider_config<'a>(

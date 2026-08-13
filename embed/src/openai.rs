@@ -85,10 +85,8 @@ impl OpenAiEmbedder {
         retry: RetryPolicy,
         http_settings: HttpSettings,
     ) -> Result<Self, EmbedError> {
-        let client = fetch::http::client_builder(&http_settings)
-            .timeout(retry.request_timeout)
-            .build()
-            .map_err(|e| EmbedError::Internal(format!("failed to build HTTP client: {e}")))?;
+        let client =
+            crate::http_helper::build_hosted_client(&http_settings, retry.request_timeout)?;
 
         Ok(Self {
             client,

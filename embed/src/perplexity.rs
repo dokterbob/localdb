@@ -94,12 +94,14 @@ impl PerplexityEmbedder {
         retry: RetryPolicy,
         http_settings: HttpSettings,
     ) -> Result<Self, EmbedError> {
-        let model = model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
-        let embedding_dim = embedding_dim.unwrap_or(DEFAULT_DIM);
-        let client = fetch::http::client_builder(&http_settings)
-            .timeout(retry.request_timeout)
-            .build()
-            .map_err(|e| EmbedError::Internal(format!("failed to build HTTP client: {e}")))?;
+        let (client, model, embedding_dim) = crate::http_helper::resolve_contextual_defaults(
+            &http_settings,
+            &retry,
+            model,
+            DEFAULT_MODEL,
+            embedding_dim,
+            DEFAULT_DIM,
+        )?;
         Ok(Self {
             client,
             base_url: DEFAULT_BASE_URL.to_string(),

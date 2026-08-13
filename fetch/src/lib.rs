@@ -277,83 +277,7 @@ impl UrlFetcher for HttpUrlFetcher {
                 }
             };
 
-            let status = response.status();
-
-            if status == StatusCode::NOT_MODIFIED {
-                return Ok(FetchResult::NotModified);
-            }
-
-            if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
-                return Ok(FetchResult::Gone);
-            }
-
-            if !status.is_success() {
-                let retry_after = response
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(http::parse_retry_after);
-
-                // Record every 429's `Retry-After` against this host's
-                // cooldown, not only the ones too large to sleep on inline
-                // below (`http::INLINE_RETRY_AFTER_CAP`) — this is what
-                // actually holds back *other* requests already in flight or
-                // about to be sent to the same host for the rest of the run,
-                // which is the mechanism issue #207's 23-req/s log needs.
-                if status == StatusCode::TOO_MANY_REQUESTS {
-                    if let (Some(host), Some(retry_after)) = (&host, retry_after) {
-                        self.limiter.note_retry_after(host, retry_after);
-                    }
-                }
-
-                return Err(http::RetryError::Status {
-                    status,
-                    retry_after,
-                });
-            }
-
-            // Captured before `response.bytes()` consumes the response below:
-            // `Response::url()` is the effective URL after any redirects reqwest
-            // followed (reqwest 0.12's default `Policy::limited(10)`, which this
-            // client's builder never overrides).
-            let final_url = response.url().to_string();
-
-            let etag = response
-                .headers()
-                .get("etag")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string());
-
-            let last_modified = response
-                .headers()
-                .get("last-modified")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string());
-
-            let content_type = response
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string());
-
-            // Read inside the closure, deliberately: a body that fails to
-            // read to completion (a truncated connection mid-transfer) must
-            // be retried like any other transient failure, not surfaced as a
-            // one-shot error the way it would be if this read happened after
-            // `.retry()` returned.
-            let bytes = response
-                .bytes()
-                .await
-                .map_err(http::RetryError::Request)?
-                .to_vec();
-
-            Ok(FetchResult::Downloaded {
-                bytes,
-                content_type,
-                etag,
-                last_modified,
-                final_url: Some(final_url),
-            })
+            self.classify_response(&host, response).await
         };
 
         let outcome = attempt
@@ -377,6 +301,115 @@ impl UrlFetcher for HttpUrlFetcher {
             })
             .await;
 
+        Self::map_outcome(url, &host, outcome)
+    }
+}
+
+impl HttpUrlFetcher {
+    /// Turn a response that actually arrived into a `FetchResult` or a
+    /// retryable/fatal `RetryError` — the second half of `fetch`'s retried
+    /// closure, split out to shrink `fetch`'s own branch count.
+    ///
+    /// Does **not** participate in destination-guard ordering: by the time
+    /// this is called, `req.send()` already returned `Ok`, so the guard
+    /// refusal path (`destination::is_blocked_error`, checked on a `send()`
+    /// *error* in the closure above) has already been ruled out by the
+    /// caller. This function only ever sees a response that was actually
+    /// received.
+    async fn classify_response(
+        &self,
+        host: &Option<String>,
+        response: reqwest::Response,
+    ) -> Result<FetchResult, http::RetryError> {
+        let status = response.status();
+
+        if status == StatusCode::NOT_MODIFIED {
+            return Ok(FetchResult::NotModified);
+        }
+
+        if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
+            return Ok(FetchResult::Gone);
+        }
+
+        if !status.is_success() {
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(http::parse_retry_after);
+
+            // Record every 429's `Retry-After` against this host's
+            // cooldown, not only the ones too large to sleep on inline
+            // below (`http::INLINE_RETRY_AFTER_CAP`) — this is what
+            // actually holds back *other* requests already in flight or
+            // about to be sent to the same host for the rest of the run,
+            // which is the mechanism issue #207's 23-req/s log needs.
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                if let (Some(host), Some(retry_after)) = (host, retry_after) {
+                    self.limiter.note_retry_after(host, retry_after);
+                }
+            }
+
+            return Err(http::RetryError::Status {
+                status,
+                retry_after,
+            });
+        }
+
+        // Captured before `response.bytes()` consumes the response below:
+        // `Response::url()` is the effective URL after any redirects reqwest
+        // followed (reqwest 0.12's default `Policy::limited(10)`, which this
+        // client's builder never overrides).
+        let final_url = response.url().to_string();
+
+        let etag = response
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        let last_modified = response
+            .headers()
+            .get("last-modified")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        // Read inside the closure, deliberately: a body that fails to
+        // read to completion (a truncated connection mid-transfer) must
+        // be retried like any other transient failure, not surfaced as a
+        // one-shot error the way it would be if this read happened after
+        // `.retry()` returned.
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(http::RetryError::Request)?
+            .to_vec();
+
+        Ok(FetchResult::Downloaded {
+            bytes,
+            content_type,
+            etag,
+            last_modified,
+            final_url: Some(final_url),
+        })
+    }
+
+    /// Map the retry loop's terminal `Result` to `fetch`'s own return type —
+    /// the fourth step described in `fetch`'s own doc comment. Split out
+    /// purely to shrink `fetch`'s branch count; this runs only after the
+    /// retry loop (and every destination-guard check inside it) has already
+    /// finished, so it has no bearing on guard ordering.
+    fn map_outcome(
+        url: &str,
+        host: &Option<String>,
+        outcome: Result<FetchResult, http::RetryError>,
+    ) -> Result<FetchResult, Error> {
         match outcome {
             Ok(result) => Ok(result),
             Err(http::RetryError::Status {
