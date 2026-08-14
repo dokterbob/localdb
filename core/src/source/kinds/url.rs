@@ -1,6 +1,7 @@
 use crate::backend::SourceRow;
 use crate::error::Error;
-use crate::source::spec::ParsedSourceSpec;
+use crate::source::kinds::SourceKindDef;
+use crate::source::spec::{required_string_field, ParsedSourceSpec};
 use crate::types::{SourceKind, SourceSpec};
 
 /// Parse a `"url"`-kind JSON source spec. Body of the `"url"` arm of
@@ -9,13 +10,7 @@ use crate::types::{SourceKind, SourceSpec};
 /// # Errors
 /// Returns `Error::InvalidRequest` if required fields are missing or malformed.
 pub fn parse_url_spec(spec: &serde_json::Value) -> Result<ParsedSourceSpec, Error> {
-    let url = spec
-        .get("url")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .ok_or_else(|| Error::InvalidRequest {
-            message: "url source requires 'url'".to_string(),
-        })?;
+    let url = required_string_field(spec, "url", "url source requires 'url'")?;
     Ok(ParsedSourceSpec {
         kind: SourceKind::Url,
         root: None,
@@ -32,5 +27,27 @@ pub fn url_row_to_spec(row: &SourceRow, refresh_interval_secs: Option<u64>) -> S
     SourceSpec::Url {
         url: row.url.clone().unwrap_or_default(),
         refresh_interval_secs,
+    }
+}
+
+/// [`SourceKindDef`] for `"url"` sources: one-line delegations to
+/// [`parse_url_spec`] / [`url_row_to_spec`].
+pub(in crate::source) struct UrlKind;
+
+impl SourceKindDef for UrlKind {
+    fn kind_str(&self) -> &'static str {
+        "url"
+    }
+
+    fn kind(&self) -> SourceKind {
+        SourceKind::Url
+    }
+
+    fn parse_spec(&self, spec: &serde_json::Value) -> Result<ParsedSourceSpec, Error> {
+        parse_url_spec(spec)
+    }
+
+    fn row_to_spec(&self, row: &SourceRow, refresh_interval_secs: Option<u64>) -> SourceSpec {
+        url_row_to_spec(row, refresh_interval_secs)
     }
 }

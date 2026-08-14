@@ -1,6 +1,7 @@
 use crate::backend::SourceRow;
 use crate::error::Error;
-use crate::source::spec::{string_array_field, ParsedSourceSpec};
+use crate::source::kinds::SourceKindDef;
+use crate::source::spec::{required_string_field, string_array_field, ParsedSourceSpec};
 use crate::types::{SourceKind, SourceSpec};
 use std::path::Path;
 
@@ -142,13 +143,7 @@ pub fn normalize_path_source(raw_path: &str) -> Result<(String, Vec<String>, Vec
 /// # Errors
 /// Returns `Error::InvalidRequest` if required fields are missing or malformed.
 pub fn parse_path_spec(spec: &serde_json::Value) -> Result<ParsedSourceSpec, Error> {
-    let root = spec
-        .get("root")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .ok_or_else(|| Error::InvalidRequest {
-            message: "path source requires 'root'".to_string(),
-        })?;
+    let root = required_string_field(spec, "root", "path source requires 'root'")?;
     let include = string_array_field(spec, "include")?;
     let exclude = string_array_field(spec, "exclude")?;
     Ok(ParsedSourceSpec {
@@ -168,5 +163,27 @@ pub fn path_row_to_spec(row: &SourceRow, _refresh_interval_secs: Option<u64>) ->
         root: row.root.clone().unwrap_or_default(),
         include: row.include.clone(),
         exclude: row.exclude.clone(),
+    }
+}
+
+/// [`SourceKindDef`] for `"path"` sources: one-line delegations to
+/// [`parse_path_spec`] / [`path_row_to_spec`].
+pub(in crate::source) struct PathKind;
+
+impl SourceKindDef for PathKind {
+    fn kind_str(&self) -> &'static str {
+        "path"
+    }
+
+    fn kind(&self) -> SourceKind {
+        SourceKind::Path
+    }
+
+    fn parse_spec(&self, spec: &serde_json::Value) -> Result<ParsedSourceSpec, Error> {
+        parse_path_spec(spec)
+    }
+
+    fn row_to_spec(&self, row: &SourceRow, refresh_interval_secs: Option<u64>) -> SourceSpec {
+        path_row_to_spec(row, refresh_interval_secs)
     }
 }

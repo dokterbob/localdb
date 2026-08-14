@@ -18,6 +18,23 @@ pub struct ParsedSourceSpec {
     pub config_json: Option<String>,
 }
 
+/// Extract a required string field from a JSON source spec, or fail with
+/// `missing_message` if it is absent or not a JSON string. Shared shape
+/// behind the `"root"` (path), `"url"` (url), and `"url"` (feed) required
+/// fields (issue #213).
+pub(in crate::source) fn required_string_field(
+    spec: &serde_json::Value,
+    field: &str,
+    missing_message: &str,
+) -> Result<String, Error> {
+    spec.get(field)
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .ok_or_else(|| Error::InvalidRequest {
+            message: missing_message.to_string(),
+        })
+}
+
 pub(in crate::source) fn string_array_field(
     spec: &serde_json::Value,
     field: &str,

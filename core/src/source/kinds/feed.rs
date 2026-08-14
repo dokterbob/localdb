@@ -1,7 +1,8 @@
 use crate::backend::SourceRow;
 use crate::config::validate_max_entries;
 use crate::error::Error;
-use crate::source::spec::ParsedSourceSpec;
+use crate::source::kinds::SourceKindDef;
+use crate::source::spec::{required_string_field, ParsedSourceSpec};
 use crate::types::{SourceKind, SourceSpec};
 
 // ---------------------------------------------------------------------------
@@ -82,13 +83,7 @@ pub fn build_feed_config_json(max_entries: Option<u32>, fetch_full_content: bool
 /// # Errors
 /// Returns `Error::InvalidRequest` if required fields are missing or malformed.
 pub fn parse_feed_spec(spec: &serde_json::Value) -> Result<ParsedSourceSpec, Error> {
-    let url = spec
-        .get("url")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .ok_or_else(|| Error::InvalidRequest {
-            message: "feed source requires 'url'".to_string(),
-        })?;
+    let url = required_string_field(spec, "url", "feed source requires 'url'")?;
     // Full parse, not a prefix check: `https://[` and bare `https://`
     // start with the right prefix but fail `url::Url::parse`, and a
     // prefix-validated row would persist a source whose every index
@@ -155,5 +150,27 @@ pub fn feed_row_to_spec(row: &SourceRow, refresh_interval_secs: Option<u64>) -> 
         max_entries: feed_config.max_entries,
         fetch_full_content: feed_config.fetch_full_content,
         refresh_interval_secs,
+    }
+}
+
+/// [`SourceKindDef`] for `"feed"` sources: one-line delegations to
+/// [`parse_feed_spec`] / [`feed_row_to_spec`].
+pub(in crate::source) struct FeedKind;
+
+impl SourceKindDef for FeedKind {
+    fn kind_str(&self) -> &'static str {
+        "feed"
+    }
+
+    fn kind(&self) -> SourceKind {
+        SourceKind::Feed
+    }
+
+    fn parse_spec(&self, spec: &serde_json::Value) -> Result<ParsedSourceSpec, Error> {
+        parse_feed_spec(spec)
+    }
+
+    fn row_to_spec(&self, row: &SourceRow, refresh_interval_secs: Option<u64>) -> SourceSpec {
+        feed_row_to_spec(row, refresh_interval_secs)
     }
 }

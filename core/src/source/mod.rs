@@ -1,5 +1,4 @@
 use crate::error::Error;
-use crate::types::SourceKind;
 
 mod kinds;
 mod spec;
@@ -16,12 +15,10 @@ pub use spec::ParsedSourceSpec;
 /// # Errors
 /// Returns `Error::InvalidRequest` if required fields are missing or malformed.
 pub fn parse_source_spec(kind: &str, spec: &serde_json::Value) -> Result<ParsedSourceSpec, Error> {
-    match kind {
-        "path" => kinds::path::parse_path_spec(spec),
-        "url" => kinds::url::parse_url_spec(spec),
-        "feed" => kinds::feed::parse_feed_spec(spec),
-        other => Err(Error::InvalidRequest {
-            message: format!("unknown source kind '{other}'"),
+    match kinds::KINDS.iter().find(|def| def.kind_str() == kind) {
+        Some(def) => def.parse_spec(spec),
+        None => Err(Error::InvalidRequest {
+            message: format!("unknown source kind '{kind}'"),
         }),
     }
 }
@@ -56,11 +53,7 @@ pub fn source_row_to_source(row: &crate::backend::SourceRow) -> crate::types::So
         .and_then(|s| crate::config::validate_refresh_interval(s).ok())
         .flatten();
 
-    let spec = match row.kind {
-        SourceKind::Url => kinds::url::url_row_to_spec(row, refresh_interval_secs),
-        SourceKind::Path => kinds::path::path_row_to_spec(row, refresh_interval_secs),
-        SourceKind::Feed => kinds::feed::feed_row_to_spec(row, refresh_interval_secs),
-    };
+    let spec = kinds::kind_def(&row.kind).row_to_spec(row, refresh_interval_secs);
 
     Source {
         id: row.id.clone(),
