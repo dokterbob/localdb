@@ -45,20 +45,7 @@ pub fn parse_source_spec(kind: &str, spec: &serde_json::Value) -> Result<ParsedS
 pub fn source_row_to_source(row: &crate::backend::SourceRow) -> crate::types::Source {
     use crate::types::Source;
 
-    // C5: `refresh` is stored as the raw human-readable string the user gave
-    // `localdb source add --refresh` (e.g. "24h"), validated at write time
-    // but never converted to seconds for storage — the seconds value must be
-    // recomputed here on every read. Tolerant: a row that somehow holds an
-    // invalid string (should never happen post-validation, but this is a
-    // read path and must not panic/error on stale data) falls back to `None`
-    // rather than failing the whole reconstruction.
-    let refresh_interval_secs = row
-        .refresh
-        .as_deref()
-        .and_then(|s| crate::config::validate_refresh_interval(s).ok())
-        .flatten();
-
-    let spec = kinds::kind_def(&row.kind).row_to_spec(row, refresh_interval_secs);
+    let spec = kinds::kind_def(&row.kind).row_to_spec(row);
 
     Source {
         id: row.id.clone(),

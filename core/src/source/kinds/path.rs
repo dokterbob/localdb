@@ -1,6 +1,7 @@
 //! `"path"`-kind sources: default include/exclude globs, spec parsing, and the `SourceKindDef`
 //! impl.
 
+use super::SourceKindDef;
 use crate::backend::SourceRow;
 use crate::error::Error;
 use crate::source::spec::{required_string_field, string_array_field, ParsedSourceSpec};
@@ -139,43 +140,38 @@ pub fn normalize_path_source(raw_path: &str) -> Result<(String, Vec<String>, Vec
     Ok((root, include_globs, exclude_globs))
 }
 
-/// Parse a `"path"`-kind JSON source spec. Body of the `"path"` arm of
-/// [`crate::source::parse_source_spec`].
-///
-/// # Errors
-/// Returns `Error::InvalidRequest` if required fields are missing or malformed.
-pub fn parse_path_spec(spec: &serde_json::Value) -> Result<ParsedSourceSpec, Error> {
-    let root = required_string_field(spec, "root", "path source requires 'root'")?;
-    let include = string_array_field(spec, "include")?;
-    let exclude = string_array_field(spec, "exclude")?;
-    Ok(ParsedSourceSpec {
-        kind: SourceKind::Path,
-        root: Some(root),
-        url: None,
-        include,
-        exclude,
-        config_json: None,
-    })
-}
-
-/// Reconstruct a `SourceSpec::Path` from its persisted `SourceRow` form. Body
-/// of the `SourceKind::Path` arm of [`crate::source::source_row_to_source`].
-pub fn path_row_to_spec(row: &SourceRow, _refresh_interval_secs: Option<u64>) -> SourceSpec {
-    SourceSpec::Path {
-        root: row.root.clone().unwrap_or_default(),
-        include: row.include.clone(),
-        exclude: row.exclude.clone(),
-    }
-}
-
-/// [`crate::source::kinds::SourceKindDef`] for `"path"` sources: one-line delegations to
-/// [`parse_path_spec`] / [`path_row_to_spec`].
+/// [`SourceKindDef`] for `"path"` sources.
 pub(in crate::source) struct PathKind;
 
-crate::source::kinds::impl_source_kind_def!(
-    PathKind,
-    "path",
-    SourceKind::Path,
-    parse_path_spec,
-    path_row_to_spec
-);
+impl SourceKindDef for PathKind {
+    fn kind_str(&self) -> &'static str {
+        "path"
+    }
+
+    fn kind(&self) -> SourceKind {
+        SourceKind::Path
+    }
+
+    /// Body of the historical `"path"` arm of [`crate::source::parse_source_spec`].
+    fn parse_spec(&self, spec: &serde_json::Value) -> Result<ParsedSourceSpec, Error> {
+        let root = required_string_field(spec, "root", "path source requires 'root'")?;
+        let include = string_array_field(spec, "include")?;
+        let exclude = string_array_field(spec, "exclude")?;
+        Ok(ParsedSourceSpec {
+            kind: SourceKind::Path,
+            root: Some(root),
+            url: None,
+            include,
+            exclude,
+            config_json: None,
+        })
+    }
+
+    fn row_to_spec(&self, row: &SourceRow) -> SourceSpec {
+        SourceSpec::Path {
+            root: row.root.clone().unwrap_or_default(),
+            include: row.include.clone(),
+            exclude: row.exclude.clone(),
+        }
+    }
+}

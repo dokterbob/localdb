@@ -1,6 +1,7 @@
 //! `"feed"`-kind sources: `config_json` round-trip (`FeedConfig`), spec parsing, and the
 //! `SourceKindDef` impl.
 
+use super::SourceKindDef;
 use crate::backend::SourceRow;
 use crate::config::validate_max_entries;
 use crate::error::Error;
@@ -79,90 +80,85 @@ pub fn build_feed_config_json(max_entries: Option<u32>, fetch_full_content: bool
     .to_string()
 }
 
-/// Parse a `"feed"`-kind JSON source spec. Body of the `"feed"` arm of
-/// [`crate::source::parse_source_spec`].
-///
-/// # Errors
-/// Returns `Error::InvalidRequest` if required fields are missing or malformed.
-pub fn parse_feed_spec(spec: &serde_json::Value) -> Result<ParsedSourceSpec, Error> {
-    let url = required_string_field(spec, "url", "feed source requires 'url'")?;
-    // Full parse, not a prefix check: `https://[` and bare `https://`
-    // start with the right prefix but fail `url::Url::parse`, and a
-    // prefix-validated row would persist a source whose every index
-    // run fails whole-source at the ingestor's fail-fast Uri::parse.
-    let scheme_ok =
-        crate::uri::Uri::parse(&url).is_some_and(|u| matches!(u.scheme(), "http" | "https"));
-    if !scheme_ok {
-        return Err(Error::InvalidRequest {
-            message: format!("feed source 'url' must be a valid http(s) URL: '{url}'"),
-        });
-    }
-    // Strict decode: a present, non-null `max_entries` must be an
-    // integer that fits u32. `as_u64()` alone would silently treat
-    // negatives/floats as absent and `as u32` would truncate huge
-    // values (e.g. 4294967297 -> 1), mutating the caller's stated
-    // intent instead of rejecting it — this arm is the single
-    // validation authority for both CLI and HTTP surfaces.
-    let max_entries = match spec.get("max_entries") {
-        None | Some(serde_json::Value::Null) => None,
-        Some(v) => match v.as_u64().filter(|&n| n <= u64::from(u32::MAX)) {
-            Some(n) => Some(n as u32),
-            None => {
-                return Err(Error::InvalidRequest {
-                    message: format!(
-                        "feed source 'max_entries' must be a positive integer no \
-                         greater than {}: {v}",
-                        u32::MAX
-                    ),
-                })
-            }
-        },
-    };
-    let max_entries = validate_max_entries(max_entries)?;
-    // Strict decode, mirroring `max_entries`: `as_bool()` alone would
-    // treat a mistyped value (e.g. the string "false") as absent and
-    // silently default discovery mode ON against the caller's stated
-    // intent.
-    let fetch_full_content = match spec.get("fetch_full_content") {
-        None | Some(serde_json::Value::Null) => true,
-        Some(serde_json::Value::Bool(b)) => *b,
-        Some(v) => {
-            return Err(Error::InvalidRequest {
-                message: format!("feed source 'fetch_full_content' must be a boolean: {v}"),
-            })
-        }
-    };
-    let config_json = build_feed_config_json(max_entries, fetch_full_content);
-    Ok(ParsedSourceSpec {
-        kind: SourceKind::Feed,
-        root: None,
-        url: Some(url),
-        include: Vec::new(),
-        exclude: Vec::new(),
-        config_json: Some(config_json),
-    })
-}
-
-/// Reconstruct a `SourceSpec::Feed` from its persisted `SourceRow` form. Body
-/// of the `SourceKind::Feed` arm of [`crate::source::source_row_to_source`].
-pub fn feed_row_to_spec(row: &SourceRow, refresh_interval_secs: Option<u64>) -> SourceSpec {
-    let feed_config = parse_feed_config_json(row.config_json.as_deref());
-    SourceSpec::Feed {
-        url: row.url.clone().unwrap_or_default(),
-        max_entries: feed_config.max_entries,
-        fetch_full_content: feed_config.fetch_full_content,
-        refresh_interval_secs,
-    }
-}
-
-/// [`crate::source::kinds::SourceKindDef`] for `"feed"` sources: one-line delegations to
-/// [`parse_feed_spec`] / [`feed_row_to_spec`].
+/// [`SourceKindDef`] for `"feed"` sources.
 pub(in crate::source) struct FeedKind;
 
-crate::source::kinds::impl_source_kind_def!(
-    FeedKind,
-    "feed",
-    SourceKind::Feed,
-    parse_feed_spec,
-    feed_row_to_spec
-);
+impl SourceKindDef for FeedKind {
+    fn kind_str(&self) -> &'static str {
+        "feed"
+    }
+
+    fn kind(&self) -> SourceKind {
+        SourceKind::Feed
+    }
+
+    /// Body of the historical `"feed"` arm of [`crate::source::parse_source_spec`].
+    fn parse_spec(&self, spec: &serde_json::Value) -> Result<ParsedSourceSpec, Error> {
+        let url = required_string_field(spec, "url", "feed source requires 'url'")?;
+        // Full parse, not a prefix check: `https://[` and bare `https://`
+        // start with the right prefix but fail `url::Url::parse`, and a
+        // prefix-validated row would persist a source whose every index
+        // run fails whole-source at the ingestor's fail-fast Uri::parse.
+        let scheme_ok =
+            crate::uri::Uri::parse(&url).is_some_and(|u| matches!(u.scheme(), "http" | "https"));
+        if !scheme_ok {
+            return Err(Error::InvalidRequest {
+                message: format!("feed source 'url' must be a valid http(s) URL: '{url}'"),
+            });
+        }
+        // Strict decode: a present, non-null `max_entries` must be an
+        // integer that fits u32. `as_u64()` alone would silently treat
+        // negatives/floats as absent and `as u32` would truncate huge
+        // values (e.g. 4294967297 -> 1), mutating the caller's stated
+        // intent instead of rejecting it — this arm is the single
+        // validation authority for both CLI and HTTP surfaces.
+        let max_entries = match spec.get("max_entries") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => match v.as_u64().filter(|&n| n <= u64::from(u32::MAX)) {
+                Some(n) => Some(n as u32),
+                None => {
+                    return Err(Error::InvalidRequest {
+                        message: format!(
+                            "feed source 'max_entries' must be a positive integer no \
+                         greater than {}: {v}",
+                            u32::MAX
+                        ),
+                    })
+                }
+            },
+        };
+        let max_entries = validate_max_entries(max_entries)?;
+        // Strict decode, mirroring `max_entries`: `as_bool()` alone would
+        // treat a mistyped value (e.g. the string "false") as absent and
+        // silently default discovery mode ON against the caller's stated
+        // intent.
+        let fetch_full_content = match spec.get("fetch_full_content") {
+            None | Some(serde_json::Value::Null) => true,
+            Some(serde_json::Value::Bool(b)) => *b,
+            Some(v) => {
+                return Err(Error::InvalidRequest {
+                    message: format!("feed source 'fetch_full_content' must be a boolean: {v}"),
+                })
+            }
+        };
+        let config_json = build_feed_config_json(max_entries, fetch_full_content);
+        Ok(ParsedSourceSpec {
+            kind: SourceKind::Feed,
+            root: None,
+            url: Some(url),
+            include: Vec::new(),
+            exclude: Vec::new(),
+            config_json: Some(config_json),
+        })
+    }
+
+    fn row_to_spec(&self, row: &SourceRow) -> SourceSpec {
+        let feed_config = parse_feed_config_json(row.config_json.as_deref());
+        SourceSpec::Feed {
+            url: row.url.clone().unwrap_or_default(),
+            max_entries: feed_config.max_entries,
+            fetch_full_content: feed_config.fetch_full_content,
+            refresh_interval_secs: super::refresh_interval_from(row),
+        }
+    }
+}

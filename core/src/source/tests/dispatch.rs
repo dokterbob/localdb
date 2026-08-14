@@ -3,8 +3,8 @@
 
 use crate::source::kinds;
 use crate::source::kinds::tests::common::invalid_request;
-use crate::source::{parse_source_spec, ParsedSourceSpec};
-use crate::types::SourceKind;
+use crate::source::{parse_source_spec, source_row_to_source, ParsedSourceSpec};
+use crate::types::{SourceKind, SourceSpec};
 
 #[test]
 fn parse_source_spec_handles_url_and_rejects_missing_and_unknown_specs() {
@@ -88,9 +88,140 @@ fn kinds_registry_has_three_entries_in_dispatch_order_and_kind_def_round_trips()
     let kind_strs: Vec<&str> = kinds::KINDS.iter().map(|def| def.kind_str()).collect();
     assert_eq!(kind_strs, vec!["path", "url", "feed"]);
 
-    // kind_def is a compile-time-exhaustive match: a new SourceKind variant added without a
-    // matching arm fails to compile, not silently falls through at runtime.
-    for kind in [SourceKind::Path, SourceKind::Url, SourceKind::Feed] {
-        assert_eq!(kinds::kind_def(&kind).kind(), kind);
+    // Force ALL_KINDS to stay exhaustive: adding a SourceKind variant makes this
+    // wildcard-free match a compile error, pointing here to extend the list.
+    const ALL_KINDS: [SourceKind; 3] = [SourceKind::Path, SourceKind::Url, SourceKind::Feed];
+    match ALL_KINDS[0] {
+        SourceKind::Path | SourceKind::Url | SourceKind::Feed => {}
     }
+
+    for kind in ALL_KINDS {
+        // kind_def is a compile-time-exhaustive match: a new SourceKind variant added without
+        // a matching arm fails to compile, not silently falls through at runtime.
+        assert_eq!(kinds::kind_def(&kind).kind(), kind);
+        // The write-path KINDS array has no such compiler link — a variant missing from it
+        // parses as "unknown source kind" at runtime even though the read path supports it,
+        // so registry completeness is pinned here instead.
+        assert!(
+            kinds::KINDS.iter().any(|def| def.kind() == kind),
+            "KINDS registry is missing an entry for {kind:?} — \
+             parse_source_spec would reject its wire name"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// source_row_to_source (read path): per-kind SourceRow -> Source reconstruction,
+// including the tolerant refresh-interval recompute.
+// ---------------------------------------------------------------------------
+
+fn row(kind: SourceKind) -> crate::backend::SourceRow {
+    crate::backend::SourceRow {
+        id: "src-1".to_string(),
+        store_id: "store-1".to_string(),
+        kind,
+        root: None,
+        url: None,
+        include: Vec::new(),
+        exclude: Vec::new(),
+        preset: "auto".to_string(),
+        refresh: None,
+        created_at: "2026-01-01T00:00:00Z".to_string(),
+        config_json: None,
+    }
+}
+
+#[test]
+fn source_row_to_source_reconstructs_each_kind() {
+    // Given
+    let path_row = crate::backend::SourceRow {
+        root: Some("/tmp/docs".to_string()),
+        include: vec!["**/*.md".to_string()],
+        exclude: vec!["**/.git".to_string()],
+        ..row(SourceKind::Path)
+    };
+    let url_row = crate::backend::SourceRow {
+        url: Some("https://example.com/page".to_string()),
+        refresh: Some("24h".to_string()),
+        ..row(SourceKind::Url)
+    };
+    let feed_row = crate::backend::SourceRow {
+        url: Some("https://example.com/feed.xml".to_string()),
+        refresh: Some("30m".to_string()),
+        config_json: Some(r#"{"max_entries": 10, "fetch_full_content": false}"#.to_string()),
+        ..row(SourceKind::Feed)
+    };
+
+    // When
+    let path_source = source_row_to_source(&path_row);
+    let url_source = source_row_to_source(&url_row);
+    let feed_source = source_row_to_source(&feed_row);
+
+    // Then
+    assert_eq!(path_source.id, "src-1");
+    assert_eq!(path_source.store_id, "store-1");
+    assert_eq!(path_source.kind, SourceKind::Path);
+    assert_eq!(path_source.source_preset, "auto");
+    assert_eq!(
+        path_source.spec,
+        SourceSpec::Path {
+            root: "/tmp/docs".to_string(),
+            include: vec!["**/*.md".to_string()],
+            exclude: vec!["**/.git".to_string()],
+        }
+    );
+    assert_eq!(
+        url_source.spec,
+        SourceSpec::Url {
+            url: "https://example.com/page".to_string(),
+            refresh_interval_secs: Some(86_400),
+        }
+    );
+    assert_eq!(
+        feed_source.spec,
+        SourceSpec::Feed {
+            url: "https://example.com/feed.xml".to_string(),
+            max_entries: Some(10),
+            fetch_full_content: false,
+            refresh_interval_secs: Some(1_800),
+        }
+    );
+}
+
+#[test]
+fn source_row_to_source_tolerates_invalid_refresh_and_config_json() {
+    // Given: stale rows whose refresh/config_json would fail write-time
+    // validation — the read path must fall back, never error.
+    let url_row = crate::backend::SourceRow {
+        url: Some("https://example.com/page".to_string()),
+        refresh: Some("soonish".to_string()),
+        ..row(SourceKind::Url)
+    };
+    let feed_row = crate::backend::SourceRow {
+        url: Some("https://example.com/feed.xml".to_string()),
+        config_json: Some("{not json".to_string()),
+        ..row(SourceKind::Feed)
+    };
+
+    // When
+    let url_source = source_row_to_source(&url_row);
+    let feed_source = source_row_to_source(&feed_row);
+
+    // Then
+    assert_eq!(
+        url_source.spec,
+        SourceSpec::Url {
+            url: "https://example.com/page".to_string(),
+            refresh_interval_secs: None,
+        }
+    );
+    assert_eq!(
+        feed_source.spec,
+        SourceSpec::Feed {
+            url: "https://example.com/feed.xml".to_string(),
+            max_entries: None,
+            fetch_full_content: true,
+            refresh_interval_secs: None,
+        }
+    );
 }
