@@ -117,9 +117,7 @@ where
 mod tests {
     use super::*;
     use localdb_core::config::loader::ResolvedPaths;
-    use localdb_core::config::schema::{
-        DefaultsConfig, EmbeddingPolicy, PathsConfig, RawConfig, ServerConfig,
-    };
+    use localdb_core::config::schema::{DefaultsConfig, EmbeddingPolicy, RawConfig};
     use tempfile::TempDir;
 
     /// A minimal `DaemonAwareCommand` whose two branches return distinct,
@@ -156,12 +154,8 @@ mod tests {
             model: "default".into(),
         };
         let config = RawConfig {
-            version: 1,
-            schema: None,
-            server: ServerConfig::default(),
-            paths: PathsConfig::default(),
             defaults,
-            providers: vec![],
+            ..Default::default()
         };
         let paths = ResolvedPaths {
             config_file: dir.path().join("config.yaml"),

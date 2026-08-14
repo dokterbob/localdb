@@ -388,9 +388,7 @@ pub(crate) async fn run_status_async(ctx: &CliContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use localdb_core::config::schema::{
-        DefaultsConfig, EmbeddingPolicy, PathsConfig, RawConfig, ServerConfig,
-    };
+    use localdb_core::config::schema::{DefaultsConfig, EmbeddingPolicy, RawConfig};
     use localdb_core::{SourceKind, SourceRow, StoreRow, TableSize};
     use tempfile::TempDir;
 
@@ -630,12 +628,8 @@ mod tests {
             model: "default".into(),
         };
         let config = RawConfig {
-            version: 1,
-            schema: None,
-            server: ServerConfig::default(),
-            paths: PathsConfig::default(),
             defaults,
-            providers: vec![],
+            ..Default::default()
         };
         let paths = localdb_core::config::loader::ResolvedPaths {
             config_file: dir.path().join("config.yaml"),

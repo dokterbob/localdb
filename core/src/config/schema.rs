@@ -43,6 +43,24 @@ pub struct RawConfig {
     /// External embedding / LLM providers.
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
+
+    /// Outbound HTTP client policy (user agent, retries, per-host rate limiting).
+    #[serde(default)]
+    pub http: HttpConfig,
+}
+
+impl Default for RawConfig {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            schema: None,
+            server: ServerConfig::default(),
+            paths: PathsConfig::default(),
+            defaults: DefaultsConfig::default(),
+            providers: Vec::new(),
+            http: HttpConfig::default(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -228,6 +246,92 @@ pub struct ProviderConfig {
     pub api_key_env: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// HTTP
+// ---------------------------------------------------------------------------
+
+/// Outbound HTTP client policy: applies to every request localdb makes to
+/// fetch content (file/URL/feed ingestion) — not to the `server:` block
+/// above, which configures the *inbound* daemon listener.
+///
+/// Deliberately top-level rather than nested under `defaults.indexing`: it
+/// governs network behavior, not chunk/embedding semantics, so changing it
+/// never bumps a store's `policy_version` or triggers a reindex.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HttpConfig {
+    /// `User-Agent` header sent with every outbound request. `~`/omitted
+    /// means `localdb/<version> (+https://github.com/dokterbob/localdb)`.
+    #[serde(default)]
+    pub user_agent: Option<String>,
+
+    /// Maximum number of retries for a request that fails with a retryable
+    /// status (e.g. a rate limit or transient server error) before giving up.
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+
+    /// Per-destination-host rate limiting for outbound requests.
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            user_agent: default_user_agent(),
+            max_retries: default_max_retries(),
+            rate_limit: RateLimitConfig::default(),
+        }
+    }
+}
+
+fn default_user_agent() -> Option<String> {
+    None
+}
+
+fn default_max_retries() -> u32 {
+    3
+}
+
+/// Rate limit applied per public destination host for outbound HTTP
+/// requests. Loopback and LAN destinations are exempt.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitConfig {
+    /// Maximum sustained requests per second to a single public host. Must be
+    /// at least 1 — `validate_config` (`core/src/config/loader.rs`) rejects
+    /// `0` at load time, so the emitted JSON Schema declares the same floor
+    /// (`minimum: 1`, not schemars' derived-from-`u32` `minimum: 0`) rather
+    /// than accepting a value the loader will turn around and reject.
+    #[schemars(range(min = 1))]
+    #[serde(default = "default_requests_per_second")]
+    pub requests_per_second: u32,
+
+    /// Maximum burst size above the sustained rate (token bucket capacity).
+    /// Must be at least 1, for the same reason as `requests_per_second`
+    /// above: `validate_config` rejects `0`, so the schema does too.
+    #[schemars(range(min = 1))]
+    #[serde(default = "default_burst")]
+    pub burst: u32,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            requests_per_second: default_requests_per_second(),
+            burst: default_burst(),
+        }
+    }
+}
+
+fn default_requests_per_second() -> u32 {
+    1
+}
+
+fn default_burst() -> u32 {
+    4
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,6 +366,59 @@ mod tests {
         let yaml = "version: 1\nserver:\n  bind: 127.0.0.1\n  port: 7700\n  typo_field: bad\n";
         let result: Result<RawConfig, _> = serde_yaml::from_str(yaml);
         assert!(result.is_err(), "unknown server key should be rejected");
+    }
+
+    #[test]
+    fn raw_config_defaults_include_http() {
+        let cfg: RawConfig = serde_yaml::from_str("version: 1").unwrap();
+        assert_eq!(cfg.http, HttpConfig::default());
+        assert_eq!(cfg.http.user_agent, None);
+        assert_eq!(cfg.http.max_retries, 3);
+        assert_eq!(cfg.http.rate_limit.requests_per_second, 1);
+        assert_eq!(cfg.http.rate_limit.burst, 4);
+    }
+
+    #[test]
+    fn http_config_defaults() {
+        let h = HttpConfig::default();
+        assert_eq!(h.user_agent, None);
+        assert_eq!(h.max_retries, 3);
+        assert_eq!(h.rate_limit, RateLimitConfig::default());
+    }
+
+    #[test]
+    fn rate_limit_config_defaults() {
+        let r = RateLimitConfig::default();
+        assert_eq!(r.requests_per_second, 1);
+        assert_eq!(r.burst, 4);
+    }
+
+    #[test]
+    fn unknown_key_in_http_rejected() {
+        let yaml = "version: 1\nhttp:\n  max_retries: 3\n  typo_field: bad\n";
+        let result: Result<RawConfig, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_err(), "unknown http key should be rejected");
+    }
+
+    #[test]
+    fn unknown_key_in_http_rate_limit_rejected() {
+        let yaml =
+            "version: 1\nhttp:\n  rate_limit:\n    requests_per_second: 1\n    typo_field: bad\n";
+        let result: Result<RawConfig, _> = serde_yaml::from_str(yaml);
+        assert!(
+            result.is_err(),
+            "unknown http.rate_limit key should be rejected"
+        );
+    }
+
+    #[test]
+    fn raw_config_default_matches_bare_version_1() {
+        // Default::default() must agree with parsing a minimal config, since
+        // work item 2 relies on `..Default::default()` at every literal
+        // construction site standing in for "every field at its platform
+        // default" exactly as a bare `version: 1` config would produce.
+        let parsed: RawConfig = serde_yaml::from_str("version: 1").unwrap();
+        assert_eq!(parsed, RawConfig::default());
     }
 
     #[test]

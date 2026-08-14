@@ -6,7 +6,7 @@ use tokio::sync::RwLock;
 use localdb_core::{
     config::{
         policy::compute_policy_version,
-        schema::{EmbeddingPolicy, IndexingPolicyConfig, ProviderConfig, RawConfig},
+        schema::{EmbeddingPolicy, HttpConfig, IndexingPolicyConfig, ProviderConfig, RawConfig},
     },
     ingestion::now_rfc3339,
     store_factory, DeletionPolicy, Embedder, Error, IndexJobScope, IndexJobStats, ProgressSink,
@@ -53,9 +53,15 @@ pub struct AppState {
     inner: Arc<Inner>,
 }
 
-/// Cached embedder plus the `(EmbeddingPolicy, providers snapshot)` key that
-/// produced it. See `Inner::embedder_cache` / `AppState::get_or_build_embedder`.
-type EmbedderCacheEntry = (EmbeddingPolicy, Vec<ProviderConfig>, Arc<dyn Embedder>);
+/// Cached embedder plus the `(EmbeddingPolicy, providers snapshot, http
+/// config)` key that produced it. See `Inner::embedder_cache` /
+/// `AppState::get_or_build_embedder`.
+type EmbedderCacheEntry = (
+    EmbeddingPolicy,
+    Vec<ProviderConfig>,
+    HttpConfig,
+    Arc<dyn Embedder>,
+);
 
 struct Inner {
     yaml_config: RwLock<RawConfig>,
@@ -70,8 +76,14 @@ struct Inner {
     /// full `providers` snapshot that together determined the cached
     /// embedder's identity (Codex review finding F2, issue #187; provider
     /// settings added for finding H1, issue #212 — a hosted provider's
-    /// `base_url`/`api_key_env` can change under an unchanged policy). See
-    /// `AppState::get_or_build_embedder`.
+    /// `base_url`/`api_key_env` can change under an unchanged policy).
+    /// `http` (issue #207 adversarial review, finding 1) is in the key for
+    /// the same reason as `providers`: a hosted provider's client is built
+    /// from `http:` too (user agent, retry count), so an operator changing
+    /// `http.max_retries` via config reload with an otherwise-unchanged
+    /// policy/providers must still rebuild — without this, the stale cached
+    /// embedder would keep using the *old* `http:` settings indefinitely.
+    /// See `AppState::get_or_build_embedder`.
     embedder_cache: RwLock<Option<EmbedderCacheEntry>>,
     /// Test-only construction counter for the `embed::create_embedder` call
     /// made by `get_or_build_embedder`, so tests can assert the embedder is
@@ -235,40 +247,44 @@ impl AppState {
     }
 
     /// Get the embedder for `yaml`'s embedding policy, building it only when
-    /// the policy or the provider settings it resolves against have changed
-    /// since the last build (Codex review finding F2, issue #187; extended
-    /// for finding H1, issue #212).
+    /// the policy, the provider settings it resolves against, or the
+    /// outbound HTTP policy have changed since the last build (Codex review
+    /// finding F2, issue #187; extended for finding H1, issue #212, and for
+    /// `http:` at finding 1 of the issue #207 adversarial review).
     ///
     /// Before this cache existed, every job execution called
     /// `embed::create_embedder` from scratch — for the default local
     /// ONNX/CoreML provider that reloads the model weights on every single
     /// job. The single-slot cache below is keyed by `EmbeddingPolicy`
     /// (`yaml.defaults.indexing.embedding`, the model+provider pair that
-    /// determines embedder identity) *and* the full `yaml.providers`
-    /// snapshot: the same policy over an unchanged providers list hits the
-    /// cache; a changed policy, or a changed `providers` entry (e.g. a
-    /// hosted provider's `base_url`/`api_key_env` edited under an otherwise
-    /// unchanged policy), misses and rebuilds. Comparing the whole `Vec`
-    /// rather than isolating "the provider this policy resolves to" is
-    /// deliberate — simpler, and an unrelated provider edit costing one
-    /// extra rebuild is an acceptable trade. A config reload
-    /// (`reload_yaml_config`) needs no explicit cache flush — the caller
-    /// always passes the freshly reloaded `yaml`, so a changed policy or
-    /// providers list simply fails the equality check below on the next
-    /// call and rebuilds naturally.
+    /// determines embedder identity), the full `yaml.providers` snapshot,
+    /// and `yaml.http`: the same policy over an unchanged providers list and
+    /// `http:` block hits the cache; a changed policy, a changed `providers`
+    /// entry (e.g. a hosted provider's `base_url`/`api_key_env` edited under
+    /// an otherwise unchanged policy), or a changed `http:` block (e.g.
+    /// `max_retries`/`user_agent` edited for a hosted provider's client),
+    /// misses and rebuilds. Comparing the whole `Vec`/`HttpConfig` rather
+    /// than isolating "the provider this policy resolves to" is deliberate —
+    /// simpler, and an unrelated provider/http edit costing one extra
+    /// rebuild is an acceptable trade. A config reload (`reload_yaml_config`)
+    /// needs no explicit cache flush — the caller always passes the freshly
+    /// reloaded `yaml`, so a changed policy, providers list, or http block
+    /// simply fails the equality check below on the next call and rebuilds
+    /// naturally.
     pub async fn get_or_build_embedder(
         &self,
         yaml: &RawConfig,
     ) -> Result<Arc<dyn Embedder>, Error> {
         let policy = &yaml.defaults.indexing.embedding;
         let providers = &yaml.providers;
+        let http = &yaml.http;
 
-        // Fast path: an unchanged policy + providers snapshot only ever
-        // needs a read lock.
+        // Fast path: an unchanged policy + providers + http snapshot only
+        // ever needs a read lock.
         {
             let cache = self.inner.embedder_cache.read().await;
-            if let Some((cached_policy, cached_providers, embedder)) = cache.as_ref() {
-                if cached_policy == policy && cached_providers == providers {
+            if let Some((cached_policy, cached_providers, cached_http, embedder)) = cache.as_ref() {
+                if cached_policy == policy && cached_providers == providers && cached_http == http {
                     return Ok(embedder.clone());
                 }
             }
@@ -276,10 +292,10 @@ impl AppState {
 
         let mut cache = self.inner.embedder_cache.write().await;
         // Re-check under the write lock: another caller may have already
-        // rebuilt for this exact policy + providers snapshot while we were
-        // waiting on it.
-        if let Some((cached_policy, cached_providers, embedder)) = cache.as_ref() {
-            if cached_policy == policy && cached_providers == providers {
+        // rebuilt for this exact policy + providers + http snapshot while we
+        // were waiting on it.
+        if let Some((cached_policy, cached_providers, cached_http, embedder)) = cache.as_ref() {
+            if cached_policy == policy && cached_providers == providers && cached_http == http {
                 return Ok(embedder.clone());
             }
         }
@@ -293,9 +309,16 @@ impl AppState {
         let policy_owned = policy.clone();
         let providers_owned = providers.clone();
         let providers_for_build = providers_owned.clone();
+        let http_owned = http.clone();
+        let http_settings_for_build = fetch::http::HttpSettings::from(&http_owned);
         let models_dir = self.inner.models_dir.clone();
         let built = localdb_core::run_blocking(move || {
-            embed::create_embedder(&policy_owned, &providers_for_build, Some(&models_dir))
+            embed::create_embedder(
+                &policy_owned,
+                &providers_for_build,
+                Some(&models_dir),
+                &http_settings_for_build,
+            )
         })?;
         let embedder: Arc<dyn Embedder> = Arc::from(built);
 
@@ -304,7 +327,12 @@ impl AppState {
             .embedder_build_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-        *cache = Some((policy.clone(), providers_owned, embedder.clone()));
+        *cache = Some((
+            policy.clone(),
+            providers_owned,
+            http_owned,
+            embedder.clone(),
+        ));
         Ok(embedder)
     }
 
@@ -702,14 +730,7 @@ mod tests {
 
     async fn make_state() -> (TempDir, AppState) {
         let dir = tempfile::tempdir().unwrap();
-        let mut yaml_config = RawConfig {
-            version: 1,
-            schema: None,
-            server: Default::default(),
-            paths: Default::default(),
-            defaults: Default::default(),
-            providers: vec![],
-        };
+        let mut yaml_config = RawConfig::default();
         yaml_config.defaults.indexing.embedding = localdb_core::config::schema::EmbeddingPolicy {
             provider: "fake".to_string(),
             model: "default".to_string(),
@@ -736,14 +757,7 @@ mod tests {
     // --- from_backend (issue #187 stage 3) ---------------------------------
 
     fn fake_yaml_config() -> RawConfig {
-        let mut yaml_config = RawConfig {
-            version: 1,
-            schema: None,
-            server: Default::default(),
-            paths: Default::default(),
-            defaults: Default::default(),
-            providers: vec![],
-        };
+        let mut yaml_config = RawConfig::default();
         yaml_config.defaults.indexing.embedding = localdb_core::config::schema::EmbeddingPolicy {
             provider: "fake".to_string(),
             model: "default".to_string(),
@@ -1491,6 +1505,49 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&first, &second),
             "a rebuilt embedder must not be the same Arc as the stale cached one"
+        );
+    }
+
+    /// An unchanged `EmbeddingPolicy` and `providers` but a changed `http:`
+    /// block (e.g. editing `max_retries` or `user_agent`) must still miss
+    /// the cache and rebuild — the cache key is policy, providers, *and*
+    /// `http`, not policy+providers alone (issue #207 adversarial review,
+    /// finding 1). Without this, an operator flipping `http.max_retries` via
+    /// a live config reload would keep getting an embedder built from the
+    /// *old* `http:` snapshot indefinitely, since the policy/providers
+    /// equality check alone would report a cache hit.
+    #[tokio::test]
+    async fn get_or_build_embedder_rebuilds_on_http_config_change() {
+        let (_dir, state) = make_state().await;
+        let old_yaml = state.yaml_config().await;
+        let first = state.get_or_build_embedder(&old_yaml).await.unwrap();
+
+        let mut new_yaml = old_yaml.clone();
+        new_yaml.http.max_retries = old_yaml.http.max_retries + 1;
+        state.reload_yaml_config(new_yaml.clone()).await;
+        let second = state.get_or_build_embedder(&new_yaml).await.unwrap();
+
+        assert_eq!(
+            state.embedder_build_count(),
+            2,
+            "a changed http.max_retries under an unchanged policy/providers should rebuild"
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "a rebuilt embedder must not be the same Arc as the stale cached one"
+        );
+
+        // A third call with the same (already-changed) http config must hit
+        // the cache again — this isn't a "rebuild on every call" regression.
+        let third = state.get_or_build_embedder(&new_yaml).await.unwrap();
+        assert_eq!(
+            state.embedder_build_count(),
+            2,
+            "an unchanged http config on a subsequent call should hit the cache, not rebuild"
+        );
+        assert!(
+            Arc::ptr_eq(&second, &third),
+            "third call should return the cached Arc from the second build"
         );
     }
 }

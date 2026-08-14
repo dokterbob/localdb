@@ -50,6 +50,13 @@ providers: # optional external endpoints, OpenAI-compatible
     kind: openai-compatible
     base_url: http://localhost:11434/v1
     api_key_env: OLLAMA_KEY # secrets come from env/keychain, never inline (§6)
+
+http: # outbound fetch policy: retry + per-host pacing; outside defaults.indexing, see §2
+  user_agent: ~ # ~ = localdb/<version> (+https://github.com/dokterbob/localdb)
+  max_retries: 3
+  rate_limit:
+    requests_per_second: 1 # per public destination host; loopback/LAN hosts are exempt
+    burst: 4
 ```
 
 ## 2. Indexing policy: one unit per store
@@ -65,6 +72,11 @@ they version together: any change to a store's effective `indexing` policy chang
 `policy_version` hash and **triggers a reindex of that store**
 ([04-search-pipeline.md](04-search-pipeline.md) §4). **Rejected:** independent global chunking and
 embedding knobs — allows silently incoherent combinations and unclear reindex semantics.
+
+The top-level `http:` section (§1) is deliberately **not** nested under `defaults.indexing`: it
+governs outbound fetch behavior (retry, per-host pacing), not chunk/embedding coherence, and
+`compute_policy_version` only ever hashes `&IndexingPolicyConfig`. A change to `http.*` therefore
+never touches `policy_version` and never triggers a reindex.
 
 `parsers` is an ordered list of parser IDs tried in sequence; the first parser to return a document
 wins (chain of responsibility). The valid IDs are `pdf`, `epub`, `office`, `html`, `markdown`, and
@@ -141,6 +153,9 @@ path; `paths.*` in config override the rest.
 - **Validation:** fail fast at load with path-precise errors
   (`stores[0].sources[1].refresh: invalid duration`). Surfaces map this to `invalid_config`
   ([05-surfaces.md](05-surfaces.md) §5).
+- **`http.rate_limit`:** `requests_per_second` and `burst` are both `u32` and must each be `>= 1`;
+  `0` is rejected with a path-precise message (`http.rate_limit.requests_per_second must be greater
+  than zero`, and likewise for `burst`) rather than silently disabling pacing.
 - **Unknown keys:** hard error, not a warning. Catches typos (`chunking` vs `chunkng`) — the cost of
   strictness is low while there is no plugin ecosystem. Revisit if third-party extensions appear.
 - **Versioning:** top-level `version: 1` required. Breaking schema changes bump the version; the

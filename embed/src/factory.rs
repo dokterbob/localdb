@@ -100,10 +100,33 @@ pub fn infer_dim_encoding(
         })
 }
 
+/// # `http_settings`
+///
+/// Threaded through to the three hosted providers only (`openai-compatible`,
+/// `perplexity`, `voyage`) — every request they make is an outbound HTTP call
+/// this crate builds itself, so the operator's `http:` config (user agent,
+/// retry count, per-host rate limit — see `specs/03-config.md` §2/§8) must
+/// reach the `reqwest::Client` and retry loop those constructors build. Local
+/// providers (`local`/`local-onnx`/`local-coreml`) never make an HTTP request
+/// to embed a document — inference runs in-process — so the parameter is
+/// simply unused on those branches; it is still required here (rather than
+/// threaded conditionally) so every caller pays the same cost of remembering
+/// it exists, instead of only the three call paths that currently need it.
+///
+/// Callers already hold a `localdb_core::config::schema::HttpConfig` (the
+/// parsed `http:` YAML section); convert it once with
+/// `fetch::http::HttpSettings::from(&cfg.http)` (or `(&cfg.http).into()`) —
+/// the same conversion `fetch::HttpUrlFetcher::new_pair` uses for document/
+/// URL/feed fetches — and pass the same instance here. Keeping the parameter
+/// typed as `fetch::http::HttpSettings` rather than `HttpConfig` keeps this
+/// crate, like `fetch` itself, free of `core`'s config-format concerns (no
+/// need to know about `#[serde(default = ...)]` defaulting here) and reuses
+/// a conversion that already exists rather than inventing a second one.
 pub fn create_embedder(
     policy: &EmbeddingPolicy,
     providers: &[ProviderConfig],
     models_dir: Option<&Path>,
+    http_settings: &fetch::http::HttpSettings,
 ) -> Result<BoxedEmbedder, EmbedError> {
     match policy.provider.as_str() {
         "fake" => create_fake(policy),
@@ -116,9 +139,9 @@ pub fn create_embedder(
         "local-onnx" => create_onnx(policy, models_dir),
         #[cfg(not(feature = "local-onnx"))]
         "local-onnx" => create_onnx_unavailable(),
-        "openai-compatible" => create_openai_compatible(policy, providers),
-        "perplexity" => create_perplexity(providers),
-        "voyage" => create_voyage(providers),
+        "openai-compatible" => create_openai_compatible(policy, providers, http_settings),
+        "perplexity" => create_perplexity(providers, http_settings),
+        "voyage" => create_voyage(providers, http_settings),
         unknown => unknown_provider(unknown),
     }
 }
@@ -142,6 +165,7 @@ fn unknown_provider(unknown: &str) -> Result<BoxedEmbedder, EmbedError> {
 fn create_openai_compatible(
     policy: &EmbeddingPolicy,
     providers: &[ProviderConfig],
+    http_settings: &fetch::http::HttpSettings,
 ) -> Result<BoxedEmbedder, EmbedError> {
     let provider = provider_config(
         providers,
@@ -161,39 +185,57 @@ fn create_openai_compatible(
         1536,
         None,
         crate::RetryPolicy::default(),
+        http_settings.clone(),
     )?;
     Ok(Box::new(embedder))
 }
 
-fn create_perplexity(providers: &[ProviderConfig]) -> Result<BoxedEmbedder, EmbedError> {
+/// Build a hosted, document-context provider (`perplexity`, `voyage`) whose
+/// `ProviderConfig` lookup, missing-block/missing-key error messages, and
+/// embedder construction call all follow the same shape — only the provider
+/// `kind` string and the concrete constructor differ. `ctor` is one of
+/// `PerplexityEmbedder::new`/`VoyageEmbedder::new` partially applied to
+/// everything but the resolved `api_key`; `E` is boxed here so both call
+/// sites can share this one function despite returning different concrete
+/// `Embedder` types.
+fn create_hosted_contextual<E: Embedder + 'static>(
+    providers: &[ProviderConfig],
+    kind: &str,
+    http_settings: &fetch::http::HttpSettings,
+    ctor: impl FnOnce(String, fetch::http::HttpSettings) -> Result<E, EmbedError>,
+) -> Result<BoxedEmbedder, EmbedError> {
     let provider = provider_config(
         providers,
-        "perplexity",
-        "no perplexity provider block in config; add a 'providers:' entry \
-         with kind: perplexity and api_key_env pointing to your API key",
+        kind,
+        &format!(
+            "no {kind} provider block in config; add a 'providers:' entry \
+             with kind: {kind} and api_key_env pointing to your API key"
+        ),
     )?;
     let api_key = required_api_key(
         provider,
-        "perplexity provider requires 'api_key_env' to be set in config",
+        &format!("{kind} provider requires 'api_key_env' to be set in config"),
     )?;
-    let embedder =
-        crate::PerplexityEmbedder::new(api_key, None, None, crate::RetryPolicy::default())?;
+    let embedder = ctor(api_key, http_settings.clone())?;
     Ok(Box::new(embedder))
 }
 
-fn create_voyage(providers: &[ProviderConfig]) -> Result<BoxedEmbedder, EmbedError> {
-    let provider = provider_config(
-        providers,
-        "voyage",
-        "no voyage provider block in config; add a 'providers:' entry \
-         with kind: voyage and api_key_env pointing to your API key",
-    )?;
-    let api_key = required_api_key(
-        provider,
-        "voyage provider requires 'api_key_env' to be set in config",
-    )?;
-    let embedder = crate::VoyageEmbedder::new(api_key, None, None, crate::RetryPolicy::default())?;
-    Ok(Box::new(embedder))
+fn create_perplexity(
+    providers: &[ProviderConfig],
+    http_settings: &fetch::http::HttpSettings,
+) -> Result<BoxedEmbedder, EmbedError> {
+    create_hosted_contextual(providers, "perplexity", http_settings, |api_key, http| {
+        crate::PerplexityEmbedder::new(api_key, None, None, crate::RetryPolicy::default(), http)
+    })
+}
+
+fn create_voyage(
+    providers: &[ProviderConfig],
+    http_settings: &fetch::http::HttpSettings,
+) -> Result<BoxedEmbedder, EmbedError> {
+    create_hosted_contextual(providers, "voyage", http_settings, |api_key, http| {
+        crate::VoyageEmbedder::new(api_key, None, None, crate::RetryPolicy::default(), http)
+    })
 }
 
 fn provider_config<'a>(
@@ -377,21 +419,23 @@ mod tests {
     #[test]
     fn fake_provider_creates_fake_embedder() {
         let policy = fake_policy("fake", "bge-small-en-v1.5");
-        let embedder = create_embedder(&policy, &[], None).unwrap();
+        let embedder =
+            create_embedder(&policy, &[], None, &fetch::http::HttpSettings::default()).unwrap();
         assert_eq!(embedder.embedding_dim(), 384);
     }
 
     #[test]
     fn fake_provider_default_dim() {
         let policy = fake_policy("fake", "unknown-model");
-        let embedder = create_embedder(&policy, &[], None).unwrap();
+        let embedder =
+            create_embedder(&policy, &[], None, &fetch::http::HttpSettings::default()).unwrap();
         assert_eq!(embedder.embedding_dim(), 128);
     }
 
     #[test]
     fn unknown_provider_returns_error() {
         let policy = fake_policy("does-not-exist", "some-model");
-        let result = create_embedder(&policy, &[], None);
+        let result = create_embedder(&policy, &[], None, &fetch::http::HttpSettings::default());
         assert!(result.is_err(), "unknown provider should return Err");
     }
 
@@ -405,7 +449,12 @@ mod tests {
             base_url: None,
             api_key_env: None,
         };
-        let result = create_embedder(&policy, &[provider], None);
+        let result = create_embedder(
+            &policy,
+            &[provider],
+            None,
+            &fetch::http::HttpSettings::default(),
+        );
         assert!(
             matches!(result, Err(EmbedError::ProviderNotConfigured(_))),
             "missing api_key_env should return ProviderNotConfigured, got: {:?}",
@@ -424,7 +473,12 @@ mod tests {
             api_key_env: Some("LOCALDB_TEST_UNSET_VAR_PERPLEXITY_XYZ".to_string()),
         };
         std::env::remove_var("LOCALDB_TEST_UNSET_VAR_PERPLEXITY_XYZ");
-        let result = create_embedder(&policy, &[provider], None);
+        let result = create_embedder(
+            &policy,
+            &[provider],
+            None,
+            &fetch::http::HttpSettings::default(),
+        );
         assert!(
             matches!(result, Err(EmbedError::ProviderNotConfigured(_))),
             "unset api key env var should return ProviderNotConfigured, got: {:?}",
@@ -442,7 +496,12 @@ mod tests {
             base_url: None,
             api_key_env: None,
         };
-        let result = create_embedder(&policy, &[provider], None);
+        let result = create_embedder(
+            &policy,
+            &[provider],
+            None,
+            &fetch::http::HttpSettings::default(),
+        );
         assert!(
             matches!(result, Err(EmbedError::ProviderNotConfigured(_))),
             "missing api_key_env should return ProviderNotConfigured, got: {:?}",
@@ -461,7 +520,12 @@ mod tests {
             api_key_env: Some("LOCALDB_TEST_UNSET_VAR_VOYAGE_XYZ".to_string()),
         };
         std::env::remove_var("LOCALDB_TEST_UNSET_VAR_VOYAGE_XYZ");
-        let result = create_embedder(&policy, &[provider], None);
+        let result = create_embedder(
+            &policy,
+            &[provider],
+            None,
+            &fetch::http::HttpSettings::default(),
+        );
         assert!(
             matches!(result, Err(EmbedError::ProviderNotConfigured(_))),
             "unset api key env var should return ProviderNotConfigured, got: {:?}",
@@ -473,7 +537,8 @@ mod tests {
     fn infer_dim_encoding_matches_fake_default() {
         let policy = fake_policy("fake", "unknown-model");
         let (dim, encoding) = infer_dim_encoding(&policy, &[]).unwrap();
-        let embedder = create_embedder(&policy, &[], None).unwrap();
+        let embedder =
+            create_embedder(&policy, &[], None, &fetch::http::HttpSettings::default()).unwrap();
         assert_eq!(dim, embedder.embedding_dim());
         assert_eq!(encoding, embedder.vector_encoding());
     }
@@ -482,7 +547,8 @@ mod tests {
     fn infer_dim_encoding_matches_fake_bge_dim() {
         let policy = fake_policy("fake", "bge-small-en-v1.5");
         let (dim, encoding) = infer_dim_encoding(&policy, &[]).unwrap();
-        let embedder = create_embedder(&policy, &[], None).unwrap();
+        let embedder =
+            create_embedder(&policy, &[], None, &fetch::http::HttpSettings::default()).unwrap();
         assert_eq!(dim, embedder.embedding_dim());
         assert_eq!(encoding, embedder.vector_encoding());
     }

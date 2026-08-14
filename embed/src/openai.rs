@@ -17,6 +17,7 @@
 //! See specs/03-config.md §1, §6.
 
 use async_trait::async_trait;
+use fetch::http::HttpSettings;
 use localdb_core::{DocumentChunks, EmbeddedDocument, Embedder, Error as CoreError};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::Client;
@@ -60,6 +61,7 @@ pub struct OpenAiEmbedder {
     dimensions: Option<usize>,
     embedding_dim: usize,
     retry: RetryPolicy,
+    http_settings: HttpSettings,
 }
 
 impl OpenAiEmbedder {
@@ -71,7 +73,9 @@ impl OpenAiEmbedder {
     /// * `model` - Model name, e.g. `text-embedding-3-small`
     /// * `embedding_dim` - Expected embedding dimension
     /// * `dimensions` - Optional dimension for truncation
-    /// * `retry` - Retry/timeout policy
+    /// * `retry` - Batching/timeout policy
+    /// * `http_settings` - Shared outgoing-HTTP policy (user agent,
+    ///   retry/backoff/jitter — see `fetch::http`)
     pub fn new(
         base_url: impl Into<String>,
         api_key: Option<String>,
@@ -79,11 +83,10 @@ impl OpenAiEmbedder {
         embedding_dim: usize,
         dimensions: Option<usize>,
         retry: RetryPolicy,
+        http_settings: HttpSettings,
     ) -> Result<Self, EmbedError> {
-        let client = Client::builder()
-            .timeout(retry.request_timeout)
-            .build()
-            .map_err(|e| EmbedError::Internal(format!("failed to build HTTP client: {e}")))?;
+        let client =
+            crate::http_helper::build_hosted_client(&http_settings, retry.request_timeout)?;
 
         Ok(Self {
             client,
@@ -93,6 +96,7 @@ impl OpenAiEmbedder {
             dimensions,
             embedding_dim,
             retry,
+            http_settings,
         })
     }
 
@@ -114,6 +118,7 @@ impl OpenAiEmbedder {
             embedding_dim,
             None,
             RetryPolicy::default(),
+            HttpSettings::default(),
         )
     }
 
@@ -143,7 +148,7 @@ impl OpenAiEmbedder {
         }
 
         let response_bytes =
-            send_with_retry(&self.client, &url, headers, body, &self.retry).await?;
+            send_with_retry(&self.client, &url, headers, body, &self.http_settings).await?;
         let resp: EmbedResponse =
             serde_json::from_slice(&response_bytes).map_err(|e| EmbedError::ProviderError {
                 provider: "openai-compatible".to_string(),
@@ -221,6 +226,19 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// `HttpSettings` for tests that force a retry: `min_retry_delay` is
+    /// dialed down to millisecond scale so the jittered exponential backoff
+    /// `fetch::http::retry_policy` builds never adds more than a few
+    /// milliseconds of real sleep — see `HttpSettings::min_retry_delay`'s
+    /// doc comment, this is exactly the test seam it exists for.
+    fn fast_http_settings(max_retries: u32) -> HttpSettings {
+        HttpSettings {
+            max_retries,
+            min_retry_delay: std::time::Duration::from_millis(1),
+            ..HttpSettings::default()
+        }
+    }
+
     fn make_response(n: usize, dim: usize) -> serde_json::Value {
         let data: Vec<serde_json::Value> = (0..n)
             .map(|i| {
@@ -256,6 +274,7 @@ mod tests {
             1536,
             None,
             RetryPolicy::default(),
+            HttpSettings::default(),
         )
         .expect("failed to construct embedder");
 
@@ -285,8 +304,16 @@ mod tests {
             batch_size: 32,
             ..Default::default()
         };
-        let embedder = OpenAiEmbedder::new(server.uri(), None, "test-model", 64, None, policy)
-            .expect("failed to construct embedder");
+        let embedder = OpenAiEmbedder::new(
+            server.uri(),
+            None,
+            "test-model",
+            64,
+            None,
+            policy,
+            HttpSettings::default(),
+        )
+        .expect("failed to construct embedder");
 
         let docs = vec![
             DocumentChunks {
@@ -324,13 +351,19 @@ mod tests {
             .await;
 
         let policy = RetryPolicy {
-            max_attempts: 3,
-            initial_backoff: std::time::Duration::from_millis(10),
             request_timeout: std::time::Duration::from_secs(5),
             batch_size: 32,
         };
-        let embedder = OpenAiEmbedder::new(server.uri(), None, "test-model", 64, None, policy)
-            .expect("failed to construct embedder");
+        let embedder = OpenAiEmbedder::new(
+            server.uri(),
+            None,
+            "test-model",
+            64,
+            None,
+            policy,
+            fast_http_settings(3),
+        )
+        .expect("failed to construct embedder");
 
         let docs = vec![DocumentChunks {
             document_context: "ctx".to_string(),
@@ -351,13 +384,19 @@ mod tests {
             .await;
 
         let policy = RetryPolicy {
-            max_attempts: 2,
-            initial_backoff: std::time::Duration::from_millis(10),
             request_timeout: std::time::Duration::from_secs(5),
             batch_size: 32,
         };
-        let embedder = OpenAiEmbedder::new(server.uri(), None, "test-model", 64, None, policy)
-            .expect("failed to construct embedder");
+        let embedder = OpenAiEmbedder::new(
+            server.uri(),
+            None,
+            "test-model",
+            64,
+            None,
+            policy,
+            fast_http_settings(1),
+        )
+        .expect("failed to construct embedder");
 
         let docs = vec![DocumentChunks {
             document_context: "ctx".to_string(),
@@ -380,13 +419,19 @@ mod tests {
             .await;
 
         let policy = RetryPolicy {
-            max_attempts: 3,
-            initial_backoff: std::time::Duration::from_millis(10),
             request_timeout: std::time::Duration::from_secs(5),
             batch_size: 32,
         };
-        let embedder = OpenAiEmbedder::new(server.uri(), None, "test-model", 64, None, policy)
-            .expect("failed to construct embedder");
+        let embedder = OpenAiEmbedder::new(
+            server.uri(),
+            None,
+            "test-model",
+            64,
+            None,
+            policy,
+            fast_http_settings(3),
+        )
+        .expect("failed to construct embedder");
 
         let docs = vec![DocumentChunks {
             document_context: "ctx".to_string(),
@@ -409,6 +454,7 @@ mod tests {
             64,
             None,
             RetryPolicy::default(),
+            HttpSettings::default(),
         )
         .expect("failed to construct embedder");
         let result = embedder.embed_documents(vec![]).await;
@@ -425,6 +471,7 @@ mod tests {
             3072,
             None,
             RetryPolicy::default(),
+            HttpSettings::default(),
         )
         .expect("failed to construct embedder");
         assert_eq!(embedder.model_id(), "text-embedding-3-large");
@@ -452,6 +499,7 @@ mod tests {
             64,
             None,
             RetryPolicy::default(),
+            HttpSettings::default(),
         )
         .expect("failed to construct embedder");
 
@@ -482,14 +530,23 @@ mod tests {
             .await;
 
         let policy = RetryPolicy {
-            max_attempts: 1,
-            initial_backoff: std::time::Duration::from_millis(10),
             // Very short timeout so the delayed response triggers a timeout
             request_timeout: std::time::Duration::from_millis(50),
             batch_size: 32,
         };
-        let embedder = OpenAiEmbedder::new(server.uri(), None, "test-model", 64, None, policy)
-            .expect("failed to construct embedder");
+        // 0 retries: this test asserts *classification* (a timeout becomes
+        // provider_unavailable), not retry behavior — a timeout is otherwise
+        // a transient failure fetch::http::is_transient would retry.
+        let embedder = OpenAiEmbedder::new(
+            server.uri(),
+            None,
+            "test-model",
+            64,
+            None,
+            policy,
+            fast_http_settings(0),
+        )
+        .expect("failed to construct embedder");
 
         let docs = vec![DocumentChunks {
             document_context: "ctx".to_string(),
@@ -524,12 +581,18 @@ mod tests {
 
         let policy = RetryPolicy {
             batch_size: 2,
-            max_attempts: 1,
-            initial_backoff: std::time::Duration::from_millis(10),
             request_timeout: std::time::Duration::from_secs(5),
         };
-        let embedder = OpenAiEmbedder::new(server.uri(), None, "test-model", 64, None, policy)
-            .expect("failed to construct embedder");
+        let embedder = OpenAiEmbedder::new(
+            server.uri(),
+            None,
+            "test-model",
+            64,
+            None,
+            policy,
+            fast_http_settings(0),
+        )
+        .expect("failed to construct embedder");
 
         let docs = vec![
             DocumentChunks {
@@ -562,6 +625,7 @@ mod tests {
             1536,
             None,
             retry,
+            HttpSettings::default(),
         );
         assert!(
             result.is_ok(),

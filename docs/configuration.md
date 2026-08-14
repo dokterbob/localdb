@@ -102,6 +102,14 @@ defaults:
 #     kind: openai-compatible      # openai-compatible | perplexity | voyage
 #     base_url: http://localhost:11434/v1
 #     api_key_env: OLLAMA_KEY      # env var holding the key — secrets are never inlined
+
+# --- Outbound HTTP policy (optional; applies to file/URL/feed fetches) ---
+# http:
+#   user_agent: ~             # ~ = localdb/<version> (+https://github.com/dokterbob/localdb)
+#   max_retries: 3            # retries for a rate-limited/transient-error response before giving up
+#   rate_limit:
+#     requests_per_second: 1  # per public destination host; loopback/LAN hosts are exempt
+#     burst: 4                # token-bucket burst capacity above the sustained rate
 ```
 
 `version: 1` is the only required field; every other key shown above is already at its default
@@ -169,6 +177,41 @@ server:
 > **Experimental:** the HTTP daemon is an early preview. It opens the same unified database
 > (`<data_dir>/localdb.db`) as the CLI, so CLI-indexed data IS visible, and `POST /v1/jobs` runs
 > real ingestion through an async job queue. See [Daemon limitations](#daemon-limitations).
+
+---
+
+### `http`
+
+Outbound HTTP policy for file/URL/feed fetches: retry, `Retry-After` handling, and per-host pacing
+(issue #207). Sits outside `defaults.indexing`, so changing it never touches a store's
+`policy_version` and never triggers a reindex.
+
+```yaml
+http:
+  user_agent: ~ # ~ = localdb/<version> (+https://github.com/dokterbob/localdb)
+  max_retries: 3 # retries for a rate-limited/transient-error response before giving up
+  rate_limit:
+    requests_per_second: 1 # per public destination host; loopback/LAN hosts are exempt
+    burst: 4 # token-bucket burst capacity above the sustained rate
+```
+
+| Field                          | Default | Notes                                                                     |
+| ------------------------------- | ------- | -------------------------------------------------------------------------- |
+| `user_agent`                    | `~`     | `~`/omitted means `localdb/<version> (+https://github.com/dokterbob/localdb)` |
+| `max_retries`                   | `3`     | Retries for a 429/408/5xx response or a network timeout/connect failure before giving up; other 4xx statuses are never retried |
+| `rate_limit.requests_per_second` | `1`     | Sustained requests per second to a single public destination host (integer; must be `>= 1`) |
+| `rate_limit.burst`               | `4`     | Token-bucket burst capacity above the sustained rate (integer; must be `>= 1`) |
+
+Loopback and private/link-local destination hosts (a `url` source or a feed's own URL pointed at a
+homelab or LAN service) are exempt from `rate_limit` pacing — they're operator-owned, so pacing
+them protects against nothing. Retry still applies to them. Hosted embedding providers (`embed`)
+get retry and `Retry-After` handling from the same layer but no proactive pacing — a deliberate
+choice, since they're paid APIs the operator already controls the request rate to.
+
+A `Retry-After` header is honored up to 30 s inline (a larger value gives up on the current
+document with `rate_limited` rather than blocking the job); it's also recorded as that host's
+pacing cooldown (capped at 60 s) regardless, so a server's own guidance still shapes the rate of
+later requests even when the current document didn't wait for it.
 
 ---
 
@@ -351,6 +394,14 @@ providers:
     kind: openai-compatible
     base_url: http://localhost:11434/v1
     api_key_env: OLLAMA_KEY
+
+# --- Outbound HTTP policy (optional; retry + per-host pacing for file/URL/feed fetches) ---
+http:
+  user_agent: ~
+  max_retries: 3
+  rate_limit:
+    requests_per_second: 1
+    burst: 4
 ```
 
 For design decisions behind each section, see [specs/03-config.md](../specs/03-config.md).

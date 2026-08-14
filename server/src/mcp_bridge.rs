@@ -55,6 +55,7 @@ pub async fn build_available_stores(
         yaml.defaults.indexing.embedding.clone(),
         yaml.providers.clone(),
         state.models_dir().to_path_buf(),
+        fetch::http::HttpSettings::from(&yaml.http),
     ));
 
     Ok((stores, embedder))
@@ -71,6 +72,16 @@ struct LazyEmbedder {
     embed_policy: EmbeddingPolicy,
     providers: Vec<ProviderConfig>,
     models_dir: std::path::PathBuf,
+    /// Operator's `http:` config, converted once at construction time (issue
+    /// #207 adversarial review, finding 1) — without this, a hosted
+    /// provider's client would silently fall back to
+    /// `fetch::http::HttpSettings::default()` no matter what the operator
+    /// set under `http:` in `config.yaml`. Snapshotted here rather than
+    /// re-read from `AppState` on each `get_or_init` call because this
+    /// struct already snapshots `embed_policy`/`providers` the same way —
+    /// see the module doc for why this whole projection is a startup-time
+    /// snapshot, not a per-session rebuild.
+    http_settings: fetch::http::HttpSettings,
     inner: OnceCell<Result<Box<dyn Embedder>, Error>>,
 }
 
@@ -79,11 +90,13 @@ impl LazyEmbedder {
         embed_policy: EmbeddingPolicy,
         providers: Vec<ProviderConfig>,
         models_dir: std::path::PathBuf,
+        http_settings: fetch::http::HttpSettings,
     ) -> Self {
         Self {
             embed_policy,
             providers,
             models_dir,
+            http_settings,
             inner: OnceCell::new(),
         }
     }
@@ -91,8 +104,13 @@ impl LazyEmbedder {
     async fn get_or_init(&self) -> &Result<Box<dyn Embedder>, Error> {
         self.inner
             .get_or_init(|| async {
-                embed::create_embedder(&self.embed_policy, &self.providers, Some(&self.models_dir))
-                    .map_err(Error::from)
+                embed::create_embedder(
+                    &self.embed_policy,
+                    &self.providers,
+                    Some(&self.models_dir),
+                    &self.http_settings,
+                )
+                .map_err(Error::from)
             })
             .await
     }
@@ -175,14 +193,7 @@ mod tests {
         // the failure only surfaces on the first `embed_documents` call,
         // asserted below with the mapped error (not a hard-coded
         // `ModelMissing`, the Codex-flagged bug this test now pins).
-        let mut yaml_config = RawConfig {
-            version: 1,
-            schema: None,
-            server: Default::default(),
-            paths: Default::default(),
-            defaults: Default::default(),
-            providers: vec![],
-        };
+        let mut yaml_config = RawConfig::default();
         yaml_config.defaults.indexing.embedding = EmbeddingPolicy {
             provider: "perplexity".to_string(),
             model: "default".to_string(),
@@ -203,14 +214,7 @@ mod tests {
 
     #[tokio::test]
     async fn returns_real_embedder_and_store_handles_when_provider_available() {
-        let mut yaml_config = RawConfig {
-            version: 1,
-            schema: None,
-            server: Default::default(),
-            paths: Default::default(),
-            defaults: Default::default(),
-            providers: vec![],
-        };
+        let mut yaml_config = RawConfig::default();
         yaml_config.defaults.indexing.embedding = EmbeddingPolicy {
             provider: "fake".to_string(),
             model: "default".to_string(),

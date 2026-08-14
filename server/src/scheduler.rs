@@ -250,10 +250,7 @@ impl UrlRefreshScheduler {
                 .await;
 
             if let Err(e) = submit_result {
-                warn!(
-                    "URL refresh scheduler: failed to submit job for source '{}': {}",
-                    record.source_id, e
-                );
+                log_submit_failure(&record.source_id, &e);
             }
         }
     }
@@ -275,6 +272,34 @@ impl UrlRefreshScheduler {
     /// Number of registered URL sources.
     pub async fn source_count(&self) -> usize {
         self.records.read().await.len()
+    }
+}
+
+/// Log a failed job submission for a due source at the right level.
+///
+/// A5/A8 (issue #207): `last_refreshed` is only stamped on completion (see
+/// `tick`'s doc comment), so a source stays "due" until its job actually
+/// finishes. Under normal (fast, ~2s) jobs, re-submission racing an
+/// already-running job was a rare timing coincidence. Under real pacing
+/// (backon/governor slowing per-host requests to ~1 req/s), a single job can
+/// legitimately run for 50s+ — comfortably longer than this scheduler's 60s
+/// tick interval — so *every* tick re-submits while the previous run is
+/// still in flight and hits the per-store in-flight guard
+/// (`Error::IndexInProgress`). That is an expected outcome of pacing, not a
+/// failure worth a `warn!` on every tick; every other submission error still
+/// warns normally.
+fn log_submit_failure(source_id: &str, err: &Error) {
+    if matches!(err, Error::IndexInProgress) {
+        debug!(
+            "URL refresh scheduler: job already in progress for source '{}', \
+             skipping this tick",
+            source_id
+        );
+    } else {
+        warn!(
+            "URL refresh scheduler: failed to submit job for source '{}': {}",
+            source_id, err
+        );
     }
 }
 
@@ -597,14 +622,7 @@ mod tests {
         let queue = JobQueue::new();
         let scheduler = UrlRefreshScheduler::new(queue.clone());
 
-        let mut yaml_config = localdb_core::config::schema::RawConfig {
-            version: 1,
-            schema: None,
-            server: Default::default(),
-            paths: Default::default(),
-            defaults: Default::default(),
-            providers: vec![],
-        };
+        let mut yaml_config = localdb_core::config::schema::RawConfig::default();
         yaml_config.defaults.indexing.embedding = localdb_core::config::schema::EmbeddingPolicy {
             provider: "fake".to_string(),
             model: "default".to_string(),
@@ -698,14 +716,7 @@ mod tests {
         let queue = JobQueue::new();
         let scheduler = UrlRefreshScheduler::new(queue.clone());
 
-        let mut yaml_config = localdb_core::config::schema::RawConfig {
-            version: 1,
-            schema: None,
-            server: Default::default(),
-            paths: Default::default(),
-            defaults: Default::default(),
-            providers: vec![],
-        };
+        let mut yaml_config = localdb_core::config::schema::RawConfig::default();
         yaml_config.defaults.indexing.embedding = localdb_core::config::schema::EmbeddingPolicy {
             provider: "fake".to_string(),
             model: "default".to_string(),

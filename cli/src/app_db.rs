@@ -680,7 +680,7 @@ pub(crate) async fn resolve_store_scope_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use localdb_core::config::schema::{DefaultsConfig, PathsConfig, RawConfig, ServerConfig};
+    use localdb_core::config::schema::{DefaultsConfig, RawConfig};
     use localdb_core::{ids::new_ulid, ingestion::now_rfc3339, types::SourceKind, SourceRow};
     use tempfile::TempDir;
 
@@ -691,12 +691,8 @@ mod tests {
             model: "default".into(),
         };
         let config = RawConfig {
-            version: 1,
-            schema: None,
-            server: ServerConfig::default(),
-            paths: PathsConfig::default(),
             defaults,
-            providers: vec![],
+            ..Default::default()
         };
         let paths = ResolvedPaths {
             config_file: dir.path().join("config.yaml"),

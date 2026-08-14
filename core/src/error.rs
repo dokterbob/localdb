@@ -99,6 +99,12 @@ pub enum Error {
         message: String,
         correlation_id: String,
     },
+
+    /// Upstream rate limit exceeded; retries exhausted.
+    ///
+    /// CLI exit code: 5
+    #[error("rate limited: {message}")]
+    RateLimited { message: String },
 }
 
 impl Error {
@@ -120,6 +126,7 @@ impl Error {
             Error::ModelMissing { .. } => "model_missing",
             Error::IndexInProgress => "index_in_progress",
             Error::Internal { .. } => "internal",
+            Error::RateLimited { .. } => "rate_limited",
         }
     }
 
@@ -160,6 +167,7 @@ impl Error {
             "index_in_progress" => Error::IndexInProgress,
             "provider_unavailable" => Error::ProviderUnavailable { message },
             "model_missing" => Error::ModelMissing { message },
+            "rate_limited" => Error::RateLimited { message },
             _ => return None,
         })
     }
@@ -168,11 +176,12 @@ impl Error {
     /// variant from, without the `Display` prefix (e.g. `"invalid config: "`)
     /// that `{self}` / `to_string()` adds.
     ///
-    /// `Some` exactly for the 8 variants `from_code` maps back into via a
-    /// single `message` string: the four not-found variants' `id`, and
-    /// `InvalidConfig`/`InvalidRequest`/`ProviderUnavailable`/`ModelMissing`'s
-    /// `message`. `None` for every other variant, including ones `from_code`
-    /// *decodes* to (`RuntimeStateLocked`, `DaemonRunning`,
+    /// `Some` exactly for the 9 variants `from_code` maps back into via a
+    /// single `message` string: the four `id`-carrying not-found variants,
+    /// and
+    /// `InvalidConfig`/`InvalidRequest`/`ProviderUnavailable`/`ModelMissing`/
+    /// `RateLimited`'s `message`. `None` for every other variant, including
+    /// ones `from_code` *decodes* to (`RuntimeStateLocked`, `DaemonRunning`,
     /// `DaemonUnreachable`, `IndexInProgress` carry no message at all) and
     /// ones it can't round-trip at all (`Internal`, `UnsupportedFormat`,
     /// `ExtractionFailed`).
@@ -194,7 +203,8 @@ impl Error {
             Error::InvalidConfig { message }
             | Error::InvalidRequest { message }
             | Error::ProviderUnavailable { message }
-            | Error::ModelMissing { message } => Some(message),
+            | Error::ModelMissing { message }
+            | Error::RateLimited { message } => Some(message),
             Error::RuntimeStateLocked
             | Error::DaemonRunning
             | Error::DaemonUnreachable
@@ -217,7 +227,8 @@ impl Error {
             Error::RuntimeStateLocked | Error::DaemonRunning | Error::IndexInProgress => 4,
             Error::DaemonUnreachable
             | Error::ProviderUnavailable { .. }
-            | Error::ModelMissing { .. } => 5,
+            | Error::ModelMissing { .. }
+            | Error::RateLimited { .. } => 5,
             Error::UnsupportedFormat { .. } | Error::ExtractionFailed { .. } => 2,
         }
     }
@@ -302,6 +313,13 @@ mod tests {
                 "internal",
                 1,
             ),
+            (
+                Error::RateLimited {
+                    message: "m".into(),
+                },
+                "rate_limited",
+                5,
+            ),
         ];
 
         for (err, expected_code, expected_exit) in cases {
@@ -368,6 +386,9 @@ mod tests {
             Error::ModelMissing {
                 message: "x".into(),
             },
+            Error::RateLimited {
+                message: "x".into(),
+            },
         ];
         for err in cases {
             let decoded = Error::from_code(err.code(), "x".to_string());
@@ -400,7 +421,7 @@ mod tests {
         assert_eq!(Error::from_code("extraction_failed", "x".to_string()), None);
     }
 
-    // -- raw_message: the 8 reconstructible variants, and a few that aren't -
+    // -- raw_message: the 9 reconstructible variants, and a few that aren't -
 
     #[test]
     fn raw_message_returns_the_bare_field_for_reconstructible_variants() {
@@ -447,6 +468,13 @@ mod tests {
         );
         assert_eq!(
             Error::ModelMissing {
+                message: "x".into()
+            }
+            .raw_message(),
+            Some("x")
+        );
+        assert_eq!(
+            Error::RateLimited {
                 message: "x".into()
             }
             .raw_message(),
@@ -508,6 +536,13 @@ mod tests {
         );
         assert_eq!(
             Error::ModelMissing {
+                message: "m".into()
+            }
+            .exit_code(),
+            5
+        );
+        assert_eq!(
+            Error::RateLimited {
                 message: "m".into()
             }
             .exit_code(),

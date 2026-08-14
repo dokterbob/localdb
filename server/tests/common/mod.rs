@@ -37,10 +37,6 @@ pub(crate) async fn make_app() -> (TempDir, Router) {
 
 fn fake_yaml_config() -> RawConfig {
     RawConfig {
-        version: 1,
-        schema: None,
-        server: Default::default(),
-        paths: Default::default(),
         defaults: DefaultsConfig {
             indexing: IndexingPolicyConfig {
                 chunking: Default::default(),
@@ -51,7 +47,7 @@ fn fake_yaml_config() -> RawConfig {
                 ..Default::default()
             },
         },
-        providers: vec![],
+        ..Default::default()
     }
 }
 

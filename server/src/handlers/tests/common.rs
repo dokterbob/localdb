@@ -35,10 +35,6 @@ pub(crate) async fn make_app_with_queue_and_state(
 ) -> (TempDir, Router, AppState) {
     let dir = tempfile::tempdir().unwrap();
     let yaml_config = localdb_core::config::schema::RawConfig {
-        version: 1,
-        schema: None,
-        server: Default::default(),
-        paths: Default::default(),
         defaults: localdb_core::config::schema::DefaultsConfig {
             indexing: localdb_core::config::schema::IndexingPolicyConfig {
                 chunking: Default::default(),
@@ -49,7 +45,7 @@ pub(crate) async fn make_app_with_queue_and_state(
                 ..Default::default()
             },
         },
-        providers: vec![],
+        ..Default::default()
     };
     let state = AppState::new(
         yaml_config,
@@ -101,10 +97,6 @@ pub(crate) async fn json_body(body: axum::body::Body) -> serde_json::Value {
 pub(crate) async fn make_state_with_fake_config() -> (TempDir, AppState) {
     let dir = tempfile::tempdir().unwrap();
     let yaml_config = localdb_core::config::schema::RawConfig {
-        version: 1,
-        schema: None,
-        server: Default::default(),
-        paths: Default::default(),
         defaults: localdb_core::config::schema::DefaultsConfig {
             indexing: localdb_core::config::schema::IndexingPolicyConfig {
                 chunking: Default::default(),
@@ -115,7 +107,7 @@ pub(crate) async fn make_state_with_fake_config() -> (TempDir, AppState) {
                 ..Default::default()
             },
         },
-        providers: vec![],
+        ..Default::default()
     };
     let queue = crate::job_queue::JobQueue::new();
     let state = AppState::new(
