@@ -1,5 +1,6 @@
 //! Prose chunker: Markdown-structure-aware split via `text-splitter`.
 
+use crate::block::{Block, BlockKind};
 use crate::chunker::output::{finalize_ids, ChunkOutput};
 use crate::chunker::sizers::{ChunkSizer, TsSizer};
 use crate::chunker::ChunkerConfig;
@@ -7,6 +8,7 @@ use crate::types::Span;
 use crate::Error;
 
 use super::code::chunk_code;
+use super::{chunk_each, ChunkContext, FormatChunker, GroupScope};
 
 /// `chunk_prose`'s Layer D backstop threshold multiplier: a block is delegated to
 /// `chunk_code` when its longest whitespace-free run exceeds this many multiples of the
@@ -139,4 +141,39 @@ pub(in crate::chunker) fn chunk_prose(
     finalize_ids(resource_id, &mut chunks);
 
     Ok(chunks)
+}
+
+// ---------------------------------------------------------------------------
+// FormatChunker impl
+// ---------------------------------------------------------------------------
+
+/// `FormatChunker` for prose-shaped blocks (`Heading`, `Text`) under non-code presets.
+/// `Code` claims Heading/Text first when `config.preset == "code"` (registry precedence in
+/// [`super::FORMATS`]), so this impl's `claims` doesn't need to check the preset itself.
+pub(in crate::chunker) struct Prose;
+
+impl FormatChunker for Prose {
+    fn name(&self) -> &'static str {
+        "prose"
+    }
+
+    fn scope(&self) -> GroupScope {
+        GroupScope::Run
+    }
+
+    fn claims(&self, block: &Block, _config: &ChunkerConfig) -> bool {
+        matches!(block.kind, BlockKind::Heading { .. } | BlockKind::Text)
+    }
+
+    fn chunk(&self, ctx: &ChunkContext<'_>, blocks: &[&Block]) -> Result<Vec<ChunkOutput>, Error> {
+        chunk_each(ctx, blocks, |ctx, block| {
+            chunk_prose(
+                ctx.resource_id,
+                &block.text,
+                ctx.config,
+                ctx.sizer,
+                block.seq,
+            )
+        })
+    }
 }

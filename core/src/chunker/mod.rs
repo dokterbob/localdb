@@ -37,9 +37,7 @@ pub use output::ChunkOutput;
 pub use preset::preset_for;
 pub use sizers::{CharSizer, ChunkSizer, TokenSizer};
 
-use formats::code::chunk_code;
-use formats::prose::chunk_prose;
-use formats::table::chunk_table;
+use formats::{ChunkContext, GroupScope, FORMATS};
 use output::finalize_ids;
 
 use crate::Error;
@@ -50,12 +48,15 @@ use crate::Error;
 
 /// Chunk a sequence of typed [`Block`]s into `ChunkOutput` records.
 ///
-/// Dispatches by block kind:
-/// - `Message`, `Segment` → messages chunker (sliding window over all such blocks).
-/// - `Heading`, `Text` → prose chunker (per block).
-/// - `Code` → code chunker (per block).
+/// Dispatches each non-empty block to the first [`formats::FormatChunker`] in
+/// [`formats::FORMATS`] whose `claims` returns true for it (registry order encodes claim
+/// precedence — see that constant's doc comment):
+/// - `Message`, `Segment` → messages chunker (sliding window over all such blocks,
+///   document-scoped: runs once over the whole doc, ahead of everything else).
+/// - `Heading`, `Text` → code chunker when `config.preset == "code"`, else prose chunker.
+/// - `Code` → code chunker.
 /// - `Table` → table chunker (row-based packer; falls back to the code chunker for
-///   malformed tables — see [`chunk_table`]).
+///   malformed tables).
 /// - `Reference`, `Attachment`, `Frontmatter`, `Image` → single chunk per block.
 ///
 /// For each sub-chunk within a block:
@@ -63,98 +64,82 @@ use crate::Error;
 /// - `seq_in_block` is set to the chunk's index within that block.
 /// - `heading_path` is derived from `heading_path_from_blocks`.
 ///
-/// Blocks with empty text are skipped.
+/// Blocks with empty text are skipped. A block claimed by no format is a bug (a new
+/// `BlockKind` added without a `FormatChunker` to handle it) — this fails loudly rather
+/// than silently dropping content.
 pub fn chunk_blocks(
     resource_id: &str,
     blocks: &[crate::block::Block],
     config: &ChunkerConfig,
     sizer: &dyn ChunkSizer,
 ) -> Result<Vec<ChunkOutput>, Error> {
-    use crate::block::BlockKind;
-    use crate::markdown_blocks::heading_path_from_blocks;
+    let ctx = ChunkContext {
+        resource_id,
+        config,
+        sizer,
+        blocks,
+    };
 
-    let mut out: Vec<ChunkOutput> = Vec::new();
-
-    // First pass: collect Message/Segment blocks and dispatch them together.
-    let msg_blocks: Vec<&crate::block::Block> = blocks
+    // Pair every non-empty block with the index of the FIRST format in `FORMATS` that
+    // claims it.
+    let claimed: Vec<(&crate::block::Block, usize)> = blocks
         .iter()
-        .filter(|b| {
-            !b.text.is_empty()
-                && matches!(
-                    b.kind,
-                    BlockKind::Message { .. } | BlockKind::Segment { .. }
-                )
+        .filter(|b| !b.text.is_empty())
+        .map(|b| {
+            let idx = FORMATS
+                .iter()
+                .position(|f| f.claims(b, config))
+                .unwrap_or_else(|| {
+                    unreachable!("block kind {:?} claimed by no FormatChunker", b.kind)
+                });
+            (b, idx)
         })
         .collect();
 
-    if !msg_blocks.is_empty() {
-        let msg_chunks = chunk_messages(resource_id, blocks, config, sizer)?;
-        out.extend(msg_chunks);
+    let mut out: Vec<ChunkOutput> = Vec::new();
+
+    // Document-scoped formats (today: only `Messages`) run once over the whole doc, ahead
+    // of everything else — same as the old dispatch's first pass. Iterating `FORMATS` in
+    // registry order keeps this deterministic if more Document-scoped formats appear later.
+    for (fmt_idx, fmt) in FORMATS.iter().enumerate() {
+        if matches!(fmt.scope(), GroupScope::Document)
+            && claimed.iter().any(|(_, idx)| *idx == fmt_idx)
+        {
+            tracing::trace!(
+                format = fmt.name(),
+                "chunk_blocks: document-scoped dispatch"
+            );
+            out.extend(fmt.chunk(&ctx, &[])?);
+        }
     }
 
-    // Second pass: handle all non-message blocks individually.
-    for block in blocks {
-        if block.text.is_empty() {
+    // Remaining (Run-scoped) blocks: walk in doc order, partitioning into maximal runs of
+    // consecutive same-format blocks so each format's `chunk` sees a contiguous group.
+    // Per-block formats chunk each block independently inside `chunk_each`, so the
+    // concatenation across runs is identical to dispatching block-by-block.
+    let mut i = 0;
+    while i < claimed.len() {
+        let (_, idx) = claimed[i];
+        if matches!(FORMATS[idx].scope(), GroupScope::Document) {
+            i += 1;
             continue;
         }
-
-        let is_msg = matches!(
-            block.kind,
-            BlockKind::Message { .. } | BlockKind::Segment { .. }
+        let start = i;
+        while i < claimed.len() && claimed[i].1 == idx {
+            i += 1;
+        }
+        let run: Vec<&crate::block::Block> = claimed[start..i].iter().map(|(b, _)| *b).collect();
+        tracing::trace!(
+            format = FORMATS[idx].name(),
+            block_count = run.len(),
+            "chunk_blocks: run-scoped dispatch"
         );
-        if is_msg {
-            continue; // already handled above
-        }
-
-        let heading_path = heading_path_from_blocks(blocks, block.seq);
-
-        let sub_chunks: Vec<ChunkOutput> = match &block.kind {
-            // Prose-style blocks: route through code chunker when preset == "code"
-            BlockKind::Heading { .. } | BlockKind::Text => {
-                if config.preset == "code" {
-                    chunk_code(resource_id, &block.text, config, block.seq)?
-                } else {
-                    chunk_prose(resource_id, &block.text, config, sizer, block.seq)?
-                }
-            }
-            // Code blocks
-            BlockKind::Code { .. } => chunk_code(resource_id, &block.text, config, block.seq)?,
-            // Table blocks: dedicated row-based packer (specs/04-search-pipeline.md §3).
-            BlockKind::Table { .. } => {
-                chunk_table(resource_id, &block.text, config, sizer, block.seq)?
-            }
-            // Single-block pass-through
-            BlockKind::Reference { .. }
-            | BlockKind::Attachment { .. }
-            | BlockKind::Frontmatter { .. }
-            | BlockKind::Image { .. } => {
-                let text = &block.text;
-                vec![ChunkOutput::placeholder(
-                    text.clone(),
-                    crate::types::Span::new(0, text.len()),
-                    heading_path.clone(),
-                    block.seq,
-                    0,
-                )]
-            }
-            // Message/Segment already dispatched above
-            BlockKind::Message { .. } | BlockKind::Segment { .. } => unreachable!(),
-        };
-
-        for (i, mut c) in sub_chunks.into_iter().enumerate() {
-            c.block_seq = block.seq;
-            c.seq_in_block = i as u32;
-            c.block_kind = Some(block.kind.kind_str().to_string());
-            if c.heading_path.is_empty() {
-                c.heading_path = heading_path.clone();
-            }
-            out.push(c);
-        }
+        out.extend(FORMATS[idx].chunk(&ctx, &run)?);
     }
 
     // Final pass: every chunk's block_seq/seq_in_block is now settled (block-dispatched
-    // chunks were just finalized above; message-window chunks were finalized inside
-    // `chunk_messages` after its own end-of-sequence fix-up). Compute ids here too —
+    // chunks were stamped by `chunk_each` above; message-window chunks were finalized
+    // inside `chunk_messages` after its own end-of-sequence fix-up). Compute ids here too —
     // idempotent for chunks that are already finalized, and the only place ids are
     // assigned for the single-block pass-through kinds.
     finalize_ids(resource_id, &mut out);

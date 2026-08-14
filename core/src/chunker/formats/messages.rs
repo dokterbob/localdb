@@ -1,5 +1,6 @@
 //! Messages chunker: sliding-window chunker over `Message`/`Segment` blocks.
 
+use crate::block::Block;
 use crate::chunker::output::{finalize_ids, ChunkOutput};
 use crate::chunker::sizers::ChunkSizer;
 use crate::chunker::ChunkerConfig;
@@ -7,6 +8,7 @@ use crate::ids::ContentId;
 use crate::Error;
 
 use super::prose::chunk_prose;
+use super::{ChunkContext, FormatChunker, GroupScope};
 
 // ---------------------------------------------------------------------------
 // Messages chunker
@@ -194,4 +196,36 @@ pub fn chunk_messages(
     finalize_ids(resource_id, &mut out);
 
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// FormatChunker impl
+// ---------------------------------------------------------------------------
+
+/// `FormatChunker` for `Message`/`Segment` blocks. Document-scoped: `chunk` is invoked once
+/// over the FULL document (see [`GroupScope::Document`]), since message windows span
+/// multiple blocks. `chunk_messages` does its own filtering/stamping/finalization
+/// internally, so the claimed-subset `blocks` argument is ignored in favor of
+/// `ctx.blocks` — exactly as today's dispatch calls it.
+pub(in crate::chunker) struct Messages;
+
+impl FormatChunker for Messages {
+    fn name(&self) -> &'static str {
+        "messages"
+    }
+
+    fn scope(&self) -> GroupScope {
+        GroupScope::Document
+    }
+
+    fn claims(&self, block: &Block, _config: &ChunkerConfig) -> bool {
+        matches!(
+            block.kind,
+            crate::block::BlockKind::Message { .. } | crate::block::BlockKind::Segment { .. }
+        )
+    }
+
+    fn chunk(&self, ctx: &ChunkContext<'_>, _blocks: &[&Block]) -> Result<Vec<ChunkOutput>, Error> {
+        chunk_messages(ctx.resource_id, ctx.blocks, ctx.config, ctx.sizer)
+    }
 }

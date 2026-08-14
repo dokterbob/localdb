@@ -1,9 +1,12 @@
 //! Code chunker (interim): line-based text packer over the Markdown string.
 
+use crate::block::{Block, BlockKind};
 use crate::chunker::output::{finalize_ids, ChunkOutput};
 use crate::chunker::ChunkerConfig;
 use crate::types::Span;
 use crate::Error;
+
+use super::{chunk_each, ChunkContext, FormatChunker, GroupScope};
 
 /// Returns the largest byte index ≤ `index` that is a valid UTF-8 char boundary.
 /// MSRV-safe replacement for `str::floor_char_boundary` (stable since 1.91).
@@ -179,4 +182,35 @@ fn line_offsets(s: &str) -> impl Iterator<Item = (usize, &str)> {
         offset += line.len();
         (start, line)
     })
+}
+
+// ---------------------------------------------------------------------------
+// FormatChunker impl
+// ---------------------------------------------------------------------------
+
+/// `FormatChunker` for `Code` blocks, plus `Heading`/`Text` blocks when
+/// `config.preset == "code"` (registry precedence puts this ahead of `Prose` in
+/// [`super::FORMATS`] so that routing wins).
+pub(in crate::chunker) struct Code;
+
+impl FormatChunker for Code {
+    fn name(&self) -> &'static str {
+        "code"
+    }
+
+    fn scope(&self) -> GroupScope {
+        GroupScope::Run
+    }
+
+    fn claims(&self, block: &Block, config: &ChunkerConfig) -> bool {
+        matches!(block.kind, BlockKind::Code { .. })
+            || (matches!(block.kind, BlockKind::Heading { .. } | BlockKind::Text)
+                && config.preset == "code")
+    }
+
+    fn chunk(&self, ctx: &ChunkContext<'_>, blocks: &[&Block]) -> Result<Vec<ChunkOutput>, Error> {
+        chunk_each(ctx, blocks, |ctx, block| {
+            chunk_code(ctx.resource_id, &block.text, ctx.config, block.seq)
+        })
+    }
 }

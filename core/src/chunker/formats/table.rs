@@ -1,5 +1,6 @@
 //! Table chunker: row-based packer for `Table` blocks.
 
+use crate::block::{Block, BlockKind};
 use crate::chunker::output::{finalize_ids, ChunkOutput};
 use crate::chunker::sizers::ChunkSizer;
 use crate::chunker::ChunkerConfig;
@@ -7,6 +8,7 @@ use crate::types::Span;
 use crate::Error;
 
 use super::code::chunk_code;
+use super::{chunk_each, ChunkContext, FormatChunker, GroupScope};
 
 // ---------------------------------------------------------------------------
 // Table chunker
@@ -171,6 +173,39 @@ fn flush_table_batch(
     ));
     *seq_in_block += 1;
     pending.clear();
+}
+
+// ---------------------------------------------------------------------------
+// FormatChunker impl
+// ---------------------------------------------------------------------------
+
+/// `FormatChunker` for `Table` blocks.
+pub(in crate::chunker) struct Table;
+
+impl FormatChunker for Table {
+    fn name(&self) -> &'static str {
+        "table"
+    }
+
+    fn scope(&self) -> GroupScope {
+        GroupScope::Run
+    }
+
+    fn claims(&self, block: &Block, _config: &ChunkerConfig) -> bool {
+        matches!(block.kind, BlockKind::Table { .. })
+    }
+
+    fn chunk(&self, ctx: &ChunkContext<'_>, blocks: &[&Block]) -> Result<Vec<ChunkOutput>, Error> {
+        chunk_each(ctx, blocks, |ctx, block| {
+            chunk_table(
+                ctx.resource_id,
+                &block.text,
+                ctx.config,
+                ctx.sizer,
+                block.seq,
+            )
+        })
+    }
 }
 
 /// Recognize a Markdown table separator row, e.g. `|---|---|` or `| :--- | ---: |`.
