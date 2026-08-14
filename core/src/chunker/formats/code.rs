@@ -20,6 +20,32 @@ fn floor_char_boundary(s: &str, index: usize) -> usize {
     i
 }
 
+/// Flush the byte range `[start, end)` of `markdown` into a placeholder chunk, snapping both
+/// ends to the nearest UTF-8 char boundary and skipping the push if the snapped range is empty.
+/// Appends to `chunks` and advances `*seq_in_block` on push.
+fn flush_range(
+    markdown: &str,
+    start: usize,
+    end: usize,
+    block_seq: u32,
+    seq_in_block: &mut u32,
+    chunks: &mut Vec<ChunkOutput>,
+) {
+    let cs = floor_char_boundary(markdown, start);
+    let ce = floor_char_boundary(markdown, end);
+    if cs < ce {
+        let chunk_text = &markdown[cs..ce];
+        chunks.push(ChunkOutput::placeholder(
+            chunk_text.to_string(),
+            Span::new(cs, ce),
+            vec![],
+            block_seq,
+            *seq_in_block,
+        ));
+        *seq_in_block += 1;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Code chunker (interim)
 // ---------------------------------------------------------------------------
@@ -52,19 +78,14 @@ pub(in crate::chunker) fn chunk_code(
         if line.chars().count() > target {
             // Flush any pending content first.
             if current_end > current_start {
-                let cs = floor_char_boundary(markdown, current_start);
-                let ce = floor_char_boundary(markdown, current_end);
-                if cs < ce {
-                    let chunk_text = &markdown[cs..ce];
-                    chunks.push(ChunkOutput::placeholder(
-                        chunk_text.to_string(),
-                        Span::new(cs, ce),
-                        vec![],
-                        block_seq,
-                        seq_in_block,
-                    ));
-                    seq_in_block += 1;
-                }
+                flush_range(
+                    markdown,
+                    current_start,
+                    current_end,
+                    block_seq,
+                    &mut seq_in_block,
+                    &mut chunks,
+                );
             }
 
             // Split the overlong line into target-sized char pieces, preferring to land
@@ -127,19 +148,14 @@ pub(in crate::chunker) fn chunk_code(
         let current_size = current_end.saturating_sub(current_start);
 
         if current_size > 0 && current_size + (line_end - line_start) > target {
-            let cs = floor_char_boundary(markdown, current_start);
-            let ce = floor_char_boundary(markdown, current_end);
-            if cs < ce {
-                let chunk_text = &markdown[cs..ce];
-                chunks.push(ChunkOutput::placeholder(
-                    chunk_text.to_string(),
-                    Span::new(cs, ce),
-                    vec![],
-                    block_seq,
-                    seq_in_block,
-                ));
-                seq_in_block += 1;
-            }
+            flush_range(
+                markdown,
+                current_start,
+                current_end,
+                block_seq,
+                &mut seq_in_block,
+                &mut chunks,
+            );
             current_start = line_start;
         }
 
@@ -151,18 +167,14 @@ pub(in crate::chunker) fn chunk_code(
 
     // Flush remaining content.
     if current_end > current_start {
-        let cs = floor_char_boundary(markdown, current_start);
-        let ce = floor_char_boundary(markdown, current_end);
-        if cs < ce {
-            let chunk_text = &markdown[cs..ce];
-            chunks.push(ChunkOutput::placeholder(
-                chunk_text.to_string(),
-                Span::new(cs, ce),
-                vec![],
-                block_seq,
-                seq_in_block,
-            ));
-        }
+        flush_range(
+            markdown,
+            current_start,
+            current_end,
+            block_seq,
+            &mut seq_in_block,
+            &mut chunks,
+        );
     }
 
     // Ids depend on `block_seq`/`seq_in_block`, both final at this point.

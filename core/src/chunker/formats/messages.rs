@@ -1,6 +1,6 @@
 //! Messages chunker: sliding-window chunker over `Message`/`Segment` blocks.
 
-use crate::block::Block;
+use crate::block::{Block, BlockKind};
 use crate::chunker::output::{finalize_ids, ChunkOutput};
 use crate::chunker::sizers::ChunkSizer;
 use crate::chunker::ChunkerConfig;
@@ -34,6 +34,61 @@ fn format_segment_prefix(speaker: Option<&str>, start_ms: u64, end_ms: u64) -> S
     }
 }
 
+/// Whether `kind` is a message-window "turn" (`Message` or `Segment`).
+fn is_turn_block(kind: &BlockKind) -> bool {
+    matches!(kind, BlockKind::Message { .. } | BlockKind::Segment { .. })
+}
+
+/// Format the turn-prefix label for a `Message`/`Segment` block's kind.
+fn turn_prefix(kind: &BlockKind) -> String {
+    match kind {
+        BlockKind::Message {
+            sender, timestamp, ..
+        } => format_message_prefix(sender, timestamp.as_deref()),
+        BlockKind::Segment {
+            speaker,
+            start_ms,
+            end_ms,
+        } => format_segment_prefix(speaker.as_deref(), *start_ms, *end_ms),
+        _ => unreachable!(),
+    }
+}
+
+/// Split a single turn that alone exceeds `max_tokens` using prose-chunker logic, prepending
+/// the sender/speaker prefix to each sub-chunk. Extracted from `chunk_messages`'s oversized-
+/// single-turn branch — pure code motion, no logic change.
+fn chunk_oversized_turn(
+    resource_id: &str,
+    block: &Block,
+    config: &ChunkerConfig,
+    sizer: &dyn ChunkSizer,
+) -> Result<Vec<ChunkOutput>, Error> {
+    // Split the raw message body (without prefix) using prose chunker,
+    // then prepend the sender/speaker context to each sub-chunk.
+    let prefix = turn_prefix(&block.kind);
+    let prose_chunks = chunk_prose(resource_id, &block.text, config, sizer, block.seq)?;
+    let first_seq = block.seq;
+    let kind_str = block.kind.kind_str().to_string();
+    let mut out = Vec::with_capacity(prose_chunks.len());
+    for (i, pc) in prose_chunks.into_iter().enumerate() {
+        let prefixed_text = format!("{prefix}{}", pc.text);
+        // Id is a placeholder here — sub-chunk position within the FULL message-chunk
+        // sequence (across all windows) isn't known until the "Fix seq_in_block" pass
+        // below runs; `finalize_ids` computes the real id afterward.
+        out.push(ChunkOutput {
+            id: ContentId::new(),
+            text: prefixed_text,
+            span: pc.span,
+            heading_path: vec![],
+            block_seq: first_seq,
+            seq_in_block: i as u32,
+            window_block_seqs: vec![first_seq],
+            block_kind: Some(kind_str.clone()),
+        });
+    }
+    Ok(out)
+}
+
 /// Messages chunker: sliding-window chunker over `Message` and `Segment` blocks.
 ///
 /// Each `Message`/`Segment` block is one "turn". The window covers `window_turns`
@@ -51,8 +106,6 @@ pub fn chunk_messages(
     config: &ChunkerConfig,
     sizer: &dyn ChunkSizer,
 ) -> Result<Vec<ChunkOutput>, Error> {
-    use crate::block::BlockKind;
-
     let max_tokens = config.resolved_target_tokens();
     let window_turns = config.resolved_window_turns();
     let stride_turns = config.resolved_stride_turns();
@@ -61,13 +114,7 @@ pub fn chunk_messages(
     // Collect only Message/Segment blocks, in order.
     let turns: Vec<&crate::block::Block> = blocks
         .iter()
-        .filter(|b| {
-            !b.text.is_empty()
-                && matches!(
-                    b.kind,
-                    BlockKind::Message { .. } | BlockKind::Segment { .. }
-                )
-        })
+        .filter(|b| !b.text.is_empty() && is_turn_block(&b.kind))
         .collect();
 
     if turns.is_empty() {
@@ -77,20 +124,7 @@ pub fn chunk_messages(
     // Build prefixed text for each turn.
     let turn_texts: Vec<String> = turns
         .iter()
-        .map(|b| {
-            let prefix = match &b.kind {
-                BlockKind::Message {
-                    sender, timestamp, ..
-                } => format_message_prefix(sender, timestamp.as_deref()),
-                BlockKind::Segment {
-                    speaker,
-                    start_ms,
-                    end_ms,
-                } => format_segment_prefix(speaker.as_deref(), *start_ms, *end_ms),
-                _ => unreachable!(),
-            };
-            format!("{prefix}{}", b.text)
-        })
+        .map(|b| format!("{}{}", turn_prefix(&b.kind), b.text))
         .collect();
 
     let mut out: Vec<ChunkOutput> = Vec::new();
@@ -124,39 +158,8 @@ pub fn chunk_messages(
 
         // If even a single turn is too long, split it with prose chunker logic.
         if actual_end == window_start + 1 && sizer.size(&turn_texts[window_start]) > max_tokens {
-            // Split the raw message body (without prefix) using prose chunker,
-            // then prepend the sender/speaker context to each sub-chunk.
             let block = turns[window_start];
-            let prefix = match &block.kind {
-                crate::block::BlockKind::Message {
-                    sender, timestamp, ..
-                } => format_message_prefix(sender, timestamp.as_deref()),
-                crate::block::BlockKind::Segment {
-                    speaker,
-                    start_ms,
-                    end_ms,
-                } => format_segment_prefix(speaker.as_deref(), *start_ms, *end_ms),
-                _ => unreachable!(),
-            };
-            let prose_chunks = chunk_prose(resource_id, &block.text, config, sizer, block.seq)?;
-            let first_seq = block.seq;
-            let kind_str = block.kind.kind_str().to_string();
-            for (i, pc) in prose_chunks.into_iter().enumerate() {
-                let prefixed_text = format!("{prefix}{}", pc.text);
-                // Id is a placeholder here — sub-chunk position within the FULL message-chunk
-                // sequence (across all windows) isn't known until the "Fix seq_in_block" pass
-                // below runs; `finalize_ids` computes the real id afterward.
-                out.push(ChunkOutput {
-                    id: ContentId::new(),
-                    text: prefixed_text,
-                    span: pc.span,
-                    heading_path: vec![],
-                    block_seq: first_seq,
-                    seq_in_block: i as u32,
-                    window_block_seqs: vec![first_seq],
-                    block_kind: Some(kind_str.clone()),
-                });
-            }
+            out.extend(chunk_oversized_turn(resource_id, block, config, sizer)?);
         } else {
             let window_text: String = turn_texts[window_start..actual_end].join("\n\n");
             let first_seq = turns[window_start].seq;
@@ -219,10 +222,7 @@ impl FormatChunker for Messages {
     }
 
     fn claims(&self, block: &Block, _config: &ChunkerConfig) -> bool {
-        matches!(
-            block.kind,
-            crate::block::BlockKind::Message { .. } | crate::block::BlockKind::Segment { .. }
-        )
+        is_turn_block(&block.kind)
     }
 
     fn chunk(&self, ctx: &ChunkContext<'_>, _blocks: &[&Block]) -> Result<Vec<ChunkOutput>, Error> {
