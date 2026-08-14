@@ -1,6 +1,8 @@
+//! `"path"`-kind sources: default include/exclude globs, spec parsing, and the `SourceKindDef`
+//! impl.
+
 use crate::backend::SourceRow;
 use crate::error::Error;
-use crate::source::kinds::SourceKindDef;
 use crate::source::spec::{required_string_field, string_array_field, ParsedSourceSpec};
 use crate::types::{SourceKind, SourceSpec};
 use std::path::Path;
@@ -166,24 +168,14 @@ pub fn path_row_to_spec(row: &SourceRow, _refresh_interval_secs: Option<u64>) ->
     }
 }
 
-/// [`SourceKindDef`] for `"path"` sources: one-line delegations to
+/// [`crate::source::kinds::SourceKindDef`] for `"path"` sources: one-line delegations to
 /// [`parse_path_spec`] / [`path_row_to_spec`].
 pub(in crate::source) struct PathKind;
 
-impl SourceKindDef for PathKind {
-    fn kind_str(&self) -> &'static str {
-        "path"
-    }
-
-    fn kind(&self) -> SourceKind {
-        SourceKind::Path
-    }
-
-    fn parse_spec(&self, spec: &serde_json::Value) -> Result<ParsedSourceSpec, Error> {
-        parse_path_spec(spec)
-    }
-
-    fn row_to_spec(&self, row: &SourceRow, refresh_interval_secs: Option<u64>) -> SourceSpec {
-        path_row_to_spec(row, refresh_interval_secs)
-    }
-}
+crate::source::kinds::impl_source_kind_def!(
+    PathKind,
+    "path",
+    SourceKind::Path,
+    parse_path_spec,
+    path_row_to_spec
+);

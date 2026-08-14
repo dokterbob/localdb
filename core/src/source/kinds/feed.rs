@@ -1,7 +1,9 @@
+//! `"feed"`-kind sources: `config_json` round-trip (`FeedConfig`), spec parsing, and the
+//! `SourceKindDef` impl.
+
 use crate::backend::SourceRow;
 use crate::config::validate_max_entries;
 use crate::error::Error;
-use crate::source::kinds::SourceKindDef;
 use crate::source::spec::{required_string_field, ParsedSourceSpec};
 use crate::types::{SourceKind, SourceSpec};
 
@@ -153,24 +155,14 @@ pub fn feed_row_to_spec(row: &SourceRow, refresh_interval_secs: Option<u64>) -> 
     }
 }
 
-/// [`SourceKindDef`] for `"feed"` sources: one-line delegations to
+/// [`crate::source::kinds::SourceKindDef`] for `"feed"` sources: one-line delegations to
 /// [`parse_feed_spec`] / [`feed_row_to_spec`].
 pub(in crate::source) struct FeedKind;
 
-impl SourceKindDef for FeedKind {
-    fn kind_str(&self) -> &'static str {
-        "feed"
-    }
-
-    fn kind(&self) -> SourceKind {
-        SourceKind::Feed
-    }
-
-    fn parse_spec(&self, spec: &serde_json::Value) -> Result<ParsedSourceSpec, Error> {
-        parse_feed_spec(spec)
-    }
-
-    fn row_to_spec(&self, row: &SourceRow, refresh_interval_secs: Option<u64>) -> SourceSpec {
-        feed_row_to_spec(row, refresh_interval_secs)
-    }
-}
+crate::source::kinds::impl_source_kind_def!(
+    FeedKind,
+    "feed",
+    SourceKind::Feed,
+    parse_feed_spec,
+    feed_row_to_spec
+);

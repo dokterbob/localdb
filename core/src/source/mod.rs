@@ -1,3 +1,8 @@
+//! Source spec parsing and validation: `parse_source_spec` (write path, request JSON ->
+//! `ParsedSourceSpec`) and `source_row_to_source` (read path, persisted `SourceRow` -> domain
+//! `Source`), both dispatched per-kind through the [`kinds`] registry — the seam future
+//! connectors (Notion, Telegram, …) plug into.
+
 use crate::error::Error;
 
 mod kinds;

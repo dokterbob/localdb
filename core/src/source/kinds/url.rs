@@ -1,6 +1,7 @@
+//! `"url"`-kind sources: spec parsing and the `SourceKindDef` impl.
+
 use crate::backend::SourceRow;
 use crate::error::Error;
-use crate::source::kinds::SourceKindDef;
 use crate::source::spec::{required_string_field, ParsedSourceSpec};
 use crate::types::{SourceKind, SourceSpec};
 
@@ -30,24 +31,14 @@ pub fn url_row_to_spec(row: &SourceRow, refresh_interval_secs: Option<u64>) -> S
     }
 }
 
-/// [`SourceKindDef`] for `"url"` sources: one-line delegations to
+/// [`crate::source::kinds::SourceKindDef`] for `"url"` sources: one-line delegations to
 /// [`parse_url_spec`] / [`url_row_to_spec`].
 pub(in crate::source) struct UrlKind;
 
-impl SourceKindDef for UrlKind {
-    fn kind_str(&self) -> &'static str {
-        "url"
-    }
-
-    fn kind(&self) -> SourceKind {
-        SourceKind::Url
-    }
-
-    fn parse_spec(&self, spec: &serde_json::Value) -> Result<ParsedSourceSpec, Error> {
-        parse_url_spec(spec)
-    }
-
-    fn row_to_spec(&self, row: &SourceRow, refresh_interval_secs: Option<u64>) -> SourceSpec {
-        url_row_to_spec(row, refresh_interval_secs)
-    }
-}
+crate::source::kinds::impl_source_kind_def!(
+    UrlKind,
+    "url",
+    SourceKind::Url,
+    parse_url_spec,
+    url_row_to_spec
+);

@@ -1,3 +1,5 @@
+//! `ParsedSourceSpec` and the small JSON-field helpers shared across source kinds.
+
 use crate::error::Error;
 use crate::types::SourceKind;
 
