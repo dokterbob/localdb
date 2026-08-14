@@ -79,12 +79,12 @@ pub(in crate::chunker) fn chunk_each<F>(
     f: F,
 ) -> Result<Vec<ChunkOutput>, Error>
 where
-    F: Fn(&ChunkContext<'_>, &Block) -> Result<Vec<ChunkOutput>, Error>,
+    F: Fn(&Block) -> Result<Vec<ChunkOutput>, Error>,
 {
     let mut out = Vec::new();
     for block in blocks {
         let heading_path = heading_path_from_blocks(ctx.blocks, block.seq);
-        let sub_chunks = f(ctx, block)?;
+        let sub_chunks = f(block)?;
         for (i, mut c) in sub_chunks.into_iter().enumerate() {
             c.block_seq = block.seq;
             c.seq_in_block = i as u32;

@@ -38,7 +38,7 @@ impl FormatChunker for Passthrough {
     }
 
     fn chunk(&self, ctx: &ChunkContext<'_>, blocks: &[&Block]) -> Result<Vec<ChunkOutput>, Error> {
-        chunk_each(ctx, blocks, |_ctx, block| {
+        chunk_each(ctx, blocks, |block| {
             let text = &block.text;
             Ok(vec![ChunkOutput::placeholder(
                 text.clone(),

@@ -196,7 +196,7 @@ impl FormatChunker for Table {
     }
 
     fn chunk(&self, ctx: &ChunkContext<'_>, blocks: &[&Block]) -> Result<Vec<ChunkOutput>, Error> {
-        chunk_each(ctx, blocks, |ctx, block| {
+        chunk_each(ctx, blocks, |block| {
             chunk_table(
                 ctx.resource_id,
                 &block.text,

@@ -226,10 +226,10 @@ pub fn chunk_messages(
 // ---------------------------------------------------------------------------
 
 /// `FormatChunker` for `Message`/`Segment` blocks. Document-scoped: `chunk` is invoked once
-/// over the FULL document (see [`GroupScope::Document`]), since message windows span
-/// multiple blocks. `chunk_messages` does its own filtering/stamping/finalization
-/// internally, so the claimed-subset `blocks` argument is ignored in favor of
-/// `ctx.blocks` — exactly as today's dispatch calls it.
+/// with all the document's claimed turn blocks (see [`GroupScope::Document`]), since
+/// message windows span multiple blocks. `chunk_messages` does its own filtering/stamping/
+/// finalization internally over the full document, so the claimed-subset `blocks` argument
+/// is ignored in favor of `ctx.blocks`.
 pub(in crate::chunker) struct Messages;
 
 impl FormatChunker for Messages {

@@ -166,7 +166,7 @@ impl FormatChunker for Prose {
     }
 
     fn chunk(&self, ctx: &ChunkContext<'_>, blocks: &[&Block]) -> Result<Vec<ChunkOutput>, Error> {
-        chunk_each(ctx, blocks, |ctx, block| {
+        chunk_each(ctx, blocks, |block| {
             chunk_prose(
                 ctx.resource_id,
                 &block.text,

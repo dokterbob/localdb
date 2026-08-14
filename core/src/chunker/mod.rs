@@ -7,7 +7,8 @@
 //!
 //! Presets (specs/04-search-pipeline.md §3):
 //! - `prose` (default): Markdown-structure-aware split (via `text-splitter`),
-//!   token-accurate to the model tokenizer, target ~512 tokens with ~64 overlap.
+//!   token-accurate to the model tokenizer, target ≈256 tokens with no overlap
+//!   (late chunking supplies cross-chunk context — see [`ChunkerConfig::prose`]).
 //!   The splitter receives real Markdown (headings, fences, bullets preserved).
 //! - `code` (interim): simple line-based text packer; the future AST chunker
 //!   (text-splitter::CodeSplitter) will supersede this. See specs/04-search-pipeline.md §2.
@@ -104,39 +105,41 @@ pub fn chunk_blocks(
     // of everything else — same as the old dispatch's first pass. Iterating `FORMATS` in
     // registry order keeps this deterministic if more Document-scoped formats appear later.
     for (fmt_idx, fmt) in FORMATS.iter().enumerate() {
-        if matches!(fmt.scope(), GroupScope::Document)
-            && claimed.iter().any(|(_, idx)| *idx == fmt_idx)
-        {
-            tracing::trace!(
-                format = fmt.name(),
-                "chunk_blocks: document-scoped dispatch"
-            );
-            out.extend(fmt.chunk(&ctx, &[])?);
+        if !matches!(fmt.scope(), GroupScope::Document) {
+            continue;
         }
+        let group: Vec<&crate::block::Block> = claimed
+            .iter()
+            .filter(|(_, idx)| *idx == fmt_idx)
+            .map(|(b, _)| *b)
+            .collect();
+        if group.is_empty() {
+            continue;
+        }
+        tracing::trace!(
+            format = fmt.name(),
+            block_count = group.len(),
+            "chunk_blocks: document-scoped dispatch"
+        );
+        out.extend(fmt.chunk(&ctx, &group)?);
     }
 
-    // Remaining (Run-scoped) blocks: walk in doc order, partitioning into maximal runs of
+    // Remaining (Run-scoped) blocks: walk in doc order, partitioned into maximal runs of
     // consecutive same-format blocks so each format's `chunk` sees a contiguous group.
     // Per-block formats chunk each block independently inside `chunk_each`, so the
     // concatenation across runs is identical to dispatching block-by-block.
-    let mut i = 0;
-    while i < claimed.len() {
-        let (_, idx) = claimed[i];
+    for run in claimed.chunk_by(|(_, a), (_, b)| a == b) {
+        let (_, idx) = run[0];
         if matches!(FORMATS[idx].scope(), GroupScope::Document) {
-            i += 1;
-            continue;
+            continue; // already dispatched above
         }
-        let start = i;
-        while i < claimed.len() && claimed[i].1 == idx {
-            i += 1;
-        }
-        let run: Vec<&crate::block::Block> = claimed[start..i].iter().map(|(b, _)| *b).collect();
+        let group: Vec<&crate::block::Block> = run.iter().map(|(b, _)| *b).collect();
         tracing::trace!(
             format = FORMATS[idx].name(),
-            block_count = run.len(),
+            block_count = group.len(),
             "chunk_blocks: run-scoped dispatch"
         );
-        out.extend(FORMATS[idx].chunk(&ctx, &run)?);
+        out.extend(FORMATS[idx].chunk(&ctx, &group)?);
     }
 
     // Final pass: every chunk's block_seq/seq_in_block is now settled (block-dispatched
