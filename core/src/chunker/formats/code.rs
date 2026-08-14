@@ -1,0 +1,182 @@
+//! Code chunker (interim): line-based text packer over the Markdown string.
+
+use crate::chunker::output::{finalize_ids, ChunkOutput};
+use crate::chunker::ChunkerConfig;
+use crate::types::Span;
+use crate::Error;
+
+/// Returns the largest byte index ≤ `index` that is a valid UTF-8 char boundary.
+/// MSRV-safe replacement for `str::floor_char_boundary` (stable since 1.91).
+#[inline]
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    let index = index.min(s.len());
+    let mut i = index;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+// ---------------------------------------------------------------------------
+// Code chunker (interim)
+// ---------------------------------------------------------------------------
+
+/// Code chunker: interim line-based text packer over the Markdown string.
+///
+/// NOTE: This is a temporary downgrade from the old block-driven code chunker.
+/// It will be superseded by `text-splitter::CodeSplitter` (tree-sitter) when
+/// code sources become a focus. See specs/04-search-pipeline.md §2.
+pub(in crate::chunker) fn chunk_code(
+    resource_id: &str,
+    markdown: &str,
+    config: &ChunkerConfig,
+    block_seq: u32,
+) -> Result<Vec<ChunkOutput>, Error> {
+    if markdown.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let target = config.resolved_target_tokens(); // used as char budget
+    let mut chunks = Vec::new();
+    let mut seq_in_block = 0u32;
+    let mut current_start = 0usize;
+    let mut current_end = 0usize;
+
+    for (line_start, line) in line_offsets(markdown) {
+        let line_end = line_start + line.len();
+
+        // Hard-split overlong lines at char boundaries.
+        if line.chars().count() > target {
+            // Flush any pending content first.
+            if current_end > current_start {
+                let cs = floor_char_boundary(markdown, current_start);
+                let ce = floor_char_boundary(markdown, current_end);
+                if cs < ce {
+                    let chunk_text = &markdown[cs..ce];
+                    chunks.push(ChunkOutput::placeholder(
+                        chunk_text.to_string(),
+                        Span::new(cs, ce),
+                        vec![],
+                        block_seq,
+                        seq_in_block,
+                    ));
+                    seq_in_block += 1;
+                }
+            }
+
+            // Split the overlong line into target-sized char pieces, preferring to land
+            // the cut on whitespace rather than mid-word (#191).
+            let mut pos = line_start;
+            while pos < line_end {
+                let slice = &markdown[pos..line_end];
+                let byte_len: usize = slice
+                    .char_indices()
+                    .take(target)
+                    .last()
+                    .map(|(i, c)| i + c.len_utf8())
+                    .unwrap_or(slice.len());
+                if byte_len == 0 {
+                    break; // safety: prevent infinite loop
+                }
+
+                // Back off to the last whitespace within this window, if any. Bounded to
+                // the `target`-char window already sliced above (via `byte_len`), so this
+                // stays O(n) overall — each window is scanned at most once, not re-scanned
+                // from the start of the line. The whitespace char is kept at the END of the
+                // current piece (its length includes it), so the next piece starts clean on
+                // a non-whitespace char; either attachment choice keeps the cut point off an
+                // alphanumeric-alphanumeric boundary, since one side is whitespace.
+                let mut cut_len = byte_len;
+                let window = &slice[..byte_len];
+                if let Some((ws_byte_idx, ws_ch)) =
+                    window.char_indices().rev().find(|(_, c)| c.is_whitespace())
+                {
+                    let candidate_len = ws_byte_idx + ws_ch.len_utf8();
+                    // Only back off when the resulting piece is still substantial (> half
+                    // the window) — otherwise (e.g. whitespace right near the window start)
+                    // keep the hard char cut so pieces don't degenerate to near-empty.
+                    // When there's no whitespace at all (base64/URLs), this branch never
+                    // fires and we fall through to the hard char cut, unchanged.
+                    if candidate_len * 2 > byte_len {
+                        cut_len = candidate_len;
+                    }
+                }
+
+                let piece_end = (pos + cut_len).min(line_end);
+                if pos < piece_end {
+                    let chunk_text = &markdown[pos..piece_end];
+                    chunks.push(ChunkOutput::placeholder(
+                        chunk_text.to_string(),
+                        Span::new(pos, piece_end),
+                        vec![],
+                        block_seq,
+                        seq_in_block,
+                    ));
+                    seq_in_block += 1;
+                }
+                pos = piece_end;
+            }
+            current_start = line_end;
+            current_end = line_end;
+            continue;
+        }
+
+        let current_size = current_end.saturating_sub(current_start);
+
+        if current_size > 0 && current_size + (line_end - line_start) > target {
+            let cs = floor_char_boundary(markdown, current_start);
+            let ce = floor_char_boundary(markdown, current_end);
+            if cs < ce {
+                let chunk_text = &markdown[cs..ce];
+                chunks.push(ChunkOutput::placeholder(
+                    chunk_text.to_string(),
+                    Span::new(cs, ce),
+                    vec![],
+                    block_seq,
+                    seq_in_block,
+                ));
+                seq_in_block += 1;
+            }
+            current_start = line_start;
+        }
+
+        if current_size == 0 {
+            current_start = line_start;
+        }
+        current_end = line_end;
+    }
+
+    // Flush remaining content.
+    if current_end > current_start {
+        let cs = floor_char_boundary(markdown, current_start);
+        let ce = floor_char_boundary(markdown, current_end);
+        if cs < ce {
+            let chunk_text = &markdown[cs..ce];
+            chunks.push(ChunkOutput::placeholder(
+                chunk_text.to_string(),
+                Span::new(cs, ce),
+                vec![],
+                block_seq,
+                seq_in_block,
+            ));
+        }
+    }
+
+    // Ids depend on `block_seq`/`seq_in_block`, both final at this point.
+    finalize_ids(resource_id, &mut chunks);
+
+    Ok(chunks)
+}
+
+/// Iterate over lines in `s`, yielding `(byte_offset_of_line_start, line_slice)`.
+///
+/// `split_inclusive('\n')` keeps the newline at the end of each slice, so
+/// `line_start + line.len()` == start of the next line.
+fn line_offsets(s: &str) -> impl Iterator<Item = (usize, &str)> {
+    let mut offset = 0;
+    s.split_inclusive('\n').map(move |line| {
+        let start = offset;
+        offset += line.len();
+        (start, line)
+    })
+}
