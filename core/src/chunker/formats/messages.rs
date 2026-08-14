@@ -89,6 +89,34 @@ fn chunk_oversized_turn(
     Ok(out)
 }
 
+/// Shrink `window_end_excl` down to the largest window end (> `window_start`) whose joined
+/// turn text fits within `max_tokens`, shrinking from the end so every turn appears in at
+/// least one window (shrinking from the front would silently skip leading turns). Returns
+/// `window_end_excl` unchanged if it already fits. Extracted from `chunk_messages`'s window
+/// loop — pure code motion, no logic change.
+fn fit_window_end(
+    turn_texts: &[String],
+    window_start: usize,
+    window_end_excl: usize,
+    sizer: &dyn ChunkSizer,
+    max_tokens: usize,
+) -> usize {
+    let candidate_text: String = turn_texts[window_start..window_end_excl].join("\n\n");
+    if sizer.size(&candidate_text) <= max_tokens {
+        return window_end_excl;
+    }
+
+    let mut actual_end = window_end_excl;
+    while actual_end > window_start + 1 {
+        let candidate: String = turn_texts[window_start..actual_end].join("\n\n");
+        if sizer.size(&candidate) <= max_tokens {
+            break;
+        }
+        actual_end -= 1;
+    }
+    actual_end
+}
+
 /// Messages chunker: sliding-window chunker over `Message` and `Segment` blocks.
 ///
 /// Each `Message`/`Segment` block is one "turn". The window covers `window_turns`
@@ -134,22 +162,14 @@ pub fn chunk_messages(
     while window_start < n {
         let window_end_excl = (window_start + window_turns).min(n);
 
-        // Determine how many turns fit within the token budget. We shrink from
-        // the END so that every turn appears in at least one window (shrinking
-        // from the front would silently skip leading turns).
-        let candidate_text: String = turn_texts[window_start..window_end_excl].join("\n\n");
-
-        let mut actual_end = window_end_excl;
-        if sizer.size(&candidate_text) > max_tokens {
-            // Shrink window from end to fit token budget.
-            while actual_end > window_start + 1 {
-                let candidate: String = turn_texts[window_start..actual_end].join("\n\n");
-                if sizer.size(&candidate) <= max_tokens {
-                    break;
-                }
-                actual_end -= 1;
-            }
-        }
+        // Determine how many turns fit within the token budget.
+        let actual_end = fit_window_end(
+            &turn_texts,
+            window_start,
+            window_end_excl,
+            sizer,
+            max_tokens,
+        );
 
         let window_seqs: Vec<u32> = turns[window_start..actual_end]
             .iter()

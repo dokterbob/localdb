@@ -1,5 +1,7 @@
 //! Per-source-format chunking implementations, dispatched from `chunk_blocks` via the
-//! [`FormatChunker`] trait and the [`FORMATS`] registry.
+//! [`FormatChunker`] trait: each block goes to the first format in the [`FORMATS`] registry
+//! whose `claims` returns true (registry order = claim precedence), grouped per format's
+//! [`GroupScope`] before `chunk` runs.
 
 pub(in crate::chunker) mod code;
 pub(in crate::chunker) mod messages;

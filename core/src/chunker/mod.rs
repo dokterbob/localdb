@@ -1,7 +1,9 @@
 //! Chunking logic for the ingestion pipeline.
 //!
 //! Entry point: [`chunk_blocks`] — operates on typed [`Block`]s produced by
-//! `markdown_to_blocks()` and dispatches to the preset-specific helpers below.
+//! `markdown_to_blocks()` and dispatches each block to the first claiming
+//! [`formats::FormatChunker`] in the [`formats::FORMATS`] registry; see that module for the
+//! trait/registry/dispatch contract.
 //!
 //! Presets (specs/04-search-pipeline.md §3):
 //! - `prose` (default): Markdown-structure-aware split (via `text-splitter`),
