@@ -4,3 +4,6 @@ pub(in crate::chunker) mod code;
 pub(in crate::chunker) mod messages;
 pub(in crate::chunker) mod prose;
 pub(in crate::chunker) mod table;
+
+#[cfg(test)]
+mod tests;
