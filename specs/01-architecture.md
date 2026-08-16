@@ -91,7 +91,11 @@ when one is running, CLI and MCP become thin clients of its HTTP API.
   session running `localdb index`, and an optional `localdb serve` daemon may all share one data
   directory as peers. The daemon is no longer special. SQLite admits one writer at a time.
   Concurrent writers serialise via `busy_timeout`. An exhausted busy-timeout maps to
-  `Error::RuntimeStateLocked` (exit 4).
+  `Error::RuntimeStateLocked` (exit 4). Within a process, `store-libsql` realises WAL's
+  concurrent-reader benefit directly: writes serialise on a single writer connection (transactions
+  via `BEGIN IMMEDIATE`), while reads are served from a small pool of read-only connections that
+  never queue behind a writer. Cross-process coordination is unchanged — WAL plus `busy_timeout`
+  remains the sole primitive between separate OS processes.
 - **Daemon-exclusive capabilities:** continuous file watching, scheduled URL refresh, the HTTP API
   and (later) web UI, background job queue. Embedded mode does one-shot equivalents (`localdb index`
   = scan now; no watching).

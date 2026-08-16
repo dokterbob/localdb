@@ -52,7 +52,9 @@ a backend. The two backends emit index-interchangeable vectors. See
 The `RetrievalStore` trait implementation backed by libsql (DiskANN vectors + FTS5 BM25). A single
 unified database file at `<data_dir>/localdb.db` holds everything. BM25 full-text search uses
 SQLite's FTS5 virtual table. Dense search uses the DiskANN vector index (`libsql_vector_idx`). RRF
-fusion is done in `core`. See [specs/01-architecture.md](../specs/01-architecture.md) §2.
+fusion is done in `core`. In-process, writes serialise on one mutex-guarded writer connection while
+reads are served from a small round-robin pool of read-only connections, so reads no longer block
+on writes within a process. See [specs/01-architecture.md](../specs/01-architecture.md) §2.
 
 Schema changes go through an explicit migrations runner (`store-libsql/src/migrations/`): a frozen
 baseline DDL snapshot (`baseline.rs`, `PRAGMA user_version = 4`) plus a linear, numbered chain of
