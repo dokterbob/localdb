@@ -21,10 +21,16 @@
 //! the rendered "up" SQL (or `RustStep::apply`) runs, the rendered "down" SQL
 //! (or unsupported reason) is persisted as a `schema_migrations` row, and
 //! `PRAGMA user_version` is advanced — all before committing. On any failure
-//! the transaction is rolled back **explicitly** rather than relying on
-//! `Drop`, since drop-rollback semantics for local libsql connections were
-//! unconfirmed at the time this runner was written (see the partial-failure
-//! test below, which is the gate for that assumption).
+//! the transaction is rolled back **explicitly**, not via `Drop`. Dropping an
+//! uncommitted `libsql::Transaction` does run a synchronous ROLLBACK (its
+//! default `DropBehavior::Rollback`) — but that Drop path calls
+//! `do_rollback().unwrap()`, which **panics** if the rollback itself errors,
+//! potentially leaving the connection wedged inside an open transaction.
+//! Explicit `rollback()` returns a `Result` we can log and handle instead, so
+//! it's deliberately kept as the primary error path here; Drop-rollback is a
+//! backstop for panics/task aborts only, not a substitute for the explicit
+//! arms below — do not "simplify" them away in favor of Drop (see the
+//! partial-failure test below, which pins this behavior).
 
 use std::time::{Duration, Instant};
 
@@ -134,6 +140,10 @@ pub async fn apply_pending_with_progress(
             .map_err(map_libsql_err)?;
 
         if let Err(e) = apply_one(&tx, migration, ctx).await {
+            // Explicit rollback, not Drop — see this module's "Applying
+            // steps" doc comment for why. Drop-rollback exists as a backstop
+            // for panics/task aborts, but its failure path panics; do not
+            // remove this arm to "rely on Drop" instead.
             if let Err(rollback_err) = tx.rollback().await {
                 tracing::error!(
                     migration = migration.name,
@@ -283,6 +293,10 @@ pub async fn seed_for_fresh_create(
         .map_err(map_libsql_err)?;
 
     if let Err(e) = seed_all_and_stamp(&tx, chain, ctx).await {
+        // Explicit rollback, not Drop — see this module's "Applying steps"
+        // doc comment for why. Drop-rollback exists as a backstop for
+        // panics/task aborts, but its failure path panics; do not remove
+        // this arm to "rely on Drop" instead.
         if let Err(rollback_err) = tx.rollback().await {
             tracing::error!(error = %rollback_err, "rollback after failed seed also failed");
         }
