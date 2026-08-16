@@ -315,10 +315,6 @@ impl LibsqlDb {
     /// can interleave with it. Callers must explicitly `commit()` or
     /// `rollback()`; letting a `WriteTx` drop uncommitted is a backstop only
     /// (see the module doc comment and `WriteTx`'s doc comment).
-    ///
-    /// `#[allow(dead_code)]`: no production call site uses this yet (only
-    /// tests) — wired up in the tenant write rewrite (next commit).
-    #[allow(dead_code)]
     pub(crate) async fn write_tx(&self) -> Result<WriteTx<'_>, Error> {
         let guard = self.writer.lock().await;
         let tx = guard
@@ -344,11 +340,6 @@ impl LibsqlDb {
 /// aborts): the primary error path is always an explicit `rollback()`,
 /// because libsql's drop-rollback `.unwrap()`s on failure and would panic
 /// rather than propagate an error.
-///
-/// `#[allow(dead_code)]` on the struct and its `commit`/`rollback` methods:
-/// no production call site constructs a `WriteTx` yet (only tests, via
-/// `write_tx()`) — wired up in the tenant write rewrite (next commit).
-#[allow(dead_code)]
 pub(crate) struct WriteTx<'a> {
     tx: Transaction,
     _guard: MutexGuard<'a, Connection>,
@@ -362,7 +353,6 @@ impl Deref for WriteTx<'_> {
     }
 }
 
-#[allow(dead_code)]
 impl WriteTx<'_> {
     /// Commit the transaction.
     pub(crate) async fn commit(self) -> Result<(), Error> {

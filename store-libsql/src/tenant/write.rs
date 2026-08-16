@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 
 use libsql::{params, Connection};
 use localdb_core::{ChunkRecord, Error, VectorEncoding};
@@ -6,6 +8,46 @@ use localdb_core::{ChunkRecord, Error, VectorEncoding};
 use super::TenantStore;
 use crate::connection::map_libsql_err;
 use crate::vectors;
+
+/// A boxed, single-use future returned by an [`in_write_tx`] closure.
+///
+/// This is the standard "boxed HRTB async closure" pattern: a bare generic
+/// `Fut: Future<...>` associated type can't itself vary per higher-ranked
+/// lifetime (the closure needs to borrow a fresh `&'c Connection` on each
+/// call and hold it across `.await` points), but a `Pin<Box<dyn Future<...>
+/// + 'c>>` trait object can, because its type explicitly names `'c`.
+type WriteFut<'c, T> = Pin<Box<dyn Future<Output = Result<T, Error>> + Send + 'c>>;
+
+/// Run `f` against a fresh [`crate::connection::LibsqlDb::write_tx`],
+/// committing on success and rolling back explicitly on failure.
+///
+/// Explicit rollback is the primary error path here, not `WriteTx`'s `Drop`
+/// backstop: if the rollback itself fails, that's logged rather than
+/// propagated (or panicking, which is what an unhandled `Drop`-rollback
+/// failure would do) — the original write error `e` is still what's
+/// returned to the caller, since that's the failure the caller actually
+/// needs to see and react to.
+async fn in_write_tx<T, F>(store: &TenantStore, f: F) -> Result<T, Error>
+where
+    F: for<'c> FnOnce(&'c Connection) -> WriteFut<'c, T>,
+{
+    let tx = store.conn().write_tx().await?;
+    match f(&tx).await {
+        Ok(v) => {
+            tx.commit().await?;
+            Ok(v)
+        }
+        Err(e) => {
+            if let Err(rollback_err) = tx.rollback().await {
+                tracing::error!(
+                    error = %rollback_err,
+                    "explicit rollback after write failure also failed"
+                );
+            }
+            Err(e)
+        }
+    }
+}
 
 pub(crate) async fn upsert_chunks(
     store: &TenantStore,
@@ -21,39 +63,31 @@ pub(crate) async fn upsert_chunks(
             ));
         }
     }
-    let conn = store.conn().writer().await;
     let count = records.len();
-    conn.execute("BEGIN", ()).await.map_err(map_libsql_err)?;
-    let inner = upsert_chunks_inner(&conn, &records, store.encoding()).await;
-    match inner {
-        Ok(()) => {
-            conn.execute("COMMIT", ()).await.map_err(map_libsql_err)?;
+    let encoding = store.encoding();
+    in_write_tx(store, move |conn: &Connection| -> WriteFut<'_, usize> {
+        Box::pin(async move {
+            upsert_chunks_inner(conn, &records, encoding).await?;
             Ok(count)
-        }
-        Err(e) => {
-            let _ = conn.execute("ROLLBACK", ()).await;
-            Err(e)
-        }
-    }
+        })
+    })
+    .await
 }
 
 pub(crate) async fn delete_by_resource(
     store: &TenantStore,
     resource_id: &str,
 ) -> Result<usize, Error> {
-    let conn = store.conn().writer().await;
-    conn.execute("BEGIN", ()).await.map_err(map_libsql_err)?;
-    let inner = delete_document_inner(&conn, store.store_id(), resource_id).await;
-    match inner {
-        Ok(count) => {
-            conn.execute("COMMIT", ()).await.map_err(map_libsql_err)?;
-            Ok(count)
-        }
-        Err(e) => {
-            let _ = conn.execute("ROLLBACK", ()).await;
-            Err(e)
-        }
-    }
+    // Owned, not borrowed: the closure below must satisfy `for<'c> FnOnce(&'c
+    // Connection) -> WriteFut<'c, T>` for *any* `'c`, including lifetimes
+    // longer than `store`/`resource_id`'s own — so it can only borrow the
+    // freshly-supplied `&'c Connection`, nothing else.
+    let store_id = store.store_id().to_string();
+    let resource_id = resource_id.to_string();
+    in_write_tx(store, move |conn: &Connection| -> WriteFut<'_, usize> {
+        Box::pin(async move { delete_document_inner(conn, &store_id, &resource_id).await })
+    })
+    .await
 }
 
 /// Connection-level helper: delete all chunks and the resource row for a
@@ -61,12 +95,12 @@ pub(crate) async fn delete_by_resource(
 /// `resources`).
 ///
 /// This is the shared implementation behind both the standalone
-/// `delete_by_resource` (wrapped in its own BEGIN/COMMIT-or-ROLLBACK, used for
-/// source removal / store clearing) and the in-transaction delete performed by
+/// `delete_by_resource` (wrapped in its own `write_tx`, used for source
+/// removal / store clearing) and the in-transaction delete performed by
 /// `upsert_chunks_and_blocks` when replacing a document (issue #79): the
-/// latter runs this against the transaction's own connection, between
-/// `BEGIN` and the replacement insert, so a failure anywhere in that
-/// transaction rolls back the delete along with the insert.
+/// latter runs this against the transaction's own connection, before the
+/// replacement insert, so a failure anywhere in that transaction rolls back
+/// the delete along with the insert.
 async fn delete_document_inner(
     conn: &Connection,
     store_id: &str,
@@ -95,19 +129,11 @@ pub(crate) async fn delete_by_store(store: &TenantStore, store_id: &str) -> Resu
             handle = store.store_id()
         ));
     }
-    let conn = store.conn().writer().await;
-    conn.execute("BEGIN", ()).await.map_err(map_libsql_err)?;
-    let inner = delete_by_store_inner(&conn, store_id).await;
-    match inner {
-        Ok(chunk_count) => {
-            conn.execute("COMMIT", ()).await.map_err(map_libsql_err)?;
-            Ok(chunk_count)
-        }
-        Err(e) => {
-            let _ = conn.execute("ROLLBACK", ()).await;
-            Err(e)
-        }
-    }
+    let store_id = store_id.to_string();
+    in_write_tx(store, move |conn: &Connection| -> WriteFut<'_, usize> {
+        Box::pin(async move { delete_by_store_inner(conn, &store_id).await })
+    })
+    .await
 }
 
 async fn delete_by_store_inner(conn: &Connection, store_id: &str) -> Result<usize, Error> {
@@ -139,40 +165,13 @@ pub(crate) async fn upsert_blocks(
     resource_id: &str,
     blocks: &[localdb_core::block::Block],
 ) -> Result<(), localdb_core::Error> {
-    let conn = store.conn().writer().await;
-    for block in blocks {
-        let kind_str = block.kind.kind_str();
-        let metadata_json =
-            serde_json::to_string(&block.kind).map_err(|e| localdb_core::Error::Internal {
-                message: format!("block metadata serialize: {e}"),
-                correlation_id: "store_upsert_blocks_meta".to_string(),
-            })?;
-        let location_json = block
-            .location
-            .as_ref()
-            .map(|loc| serde_json::to_string(loc).unwrap_or_default());
-        conn.execute(
-            "INSERT INTO blocks (store_id, resource_id, seq, kind, text, metadata_json, location_json)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(store_id, resource_id, seq) DO UPDATE SET
-                 kind = excluded.kind,
-                 text = excluded.text,
-                 metadata_json = excluded.metadata_json,
-                 location_json = excluded.location_json",
-            libsql::params![
-                store.store_id(),
-                resource_id,
-                block.seq as i64,
-                kind_str,
-                block.text.as_str(),
-                metadata_json.as_str(),
-                location_json.as_deref(),
-            ],
-        )
-        .await
-        .map_err(crate::connection::map_libsql_err)?;
-    }
-    Ok(())
+    let store_id = store.store_id().to_string();
+    let resource_id = resource_id.to_string();
+    let blocks = blocks.to_vec();
+    in_write_tx(store, move |conn: &Connection| -> WriteFut<'_, ()> {
+        Box::pin(async move { upsert_blocks_inner(conn, &store_id, &resource_id, &blocks).await })
+    })
+    .await
 }
 
 async fn upsert_chunks_inner(
@@ -304,7 +303,7 @@ async fn upsert_chunks_inner(
 /// replacing an existing document first.
 ///
 /// Unlike calling `upsert_chunks` and `upsert_blocks` separately (two
-/// transactions), this wraps both writes in one BEGIN/COMMIT so the resource
+/// transactions), this wraps both writes in one `write_tx` so the resource
 /// can never appear indexed (chunks present) but un-blocked.
 ///
 /// When `replaces_resource_id` is `Some(old_id)`, the old document's chunks,
@@ -337,31 +336,30 @@ pub(crate) async fn upsert_chunks_and_blocks(
             });
         }
     }
-    let conn = store.conn().writer().await;
     let count = records.len();
-    conn.execute("BEGIN", ()).await.map_err(map_libsql_err)?;
-    let inner = async {
-        if let Some(old_id) = replaces_resource_id {
-            delete_document_inner(&conn, store.store_id(), old_id).await?;
-        }
-        upsert_chunks_inner(&conn, &records, store.encoding()).await?;
-        upsert_blocks_inner(&conn, store.store_id(), resource_id, blocks).await?;
-        Ok::<(), localdb_core::Error>(())
-    }
-    .await;
-    match inner {
-        Ok(()) => {
-            conn.execute("COMMIT", ()).await.map_err(map_libsql_err)?;
+    let store_id = store.store_id().to_string();
+    let encoding = store.encoding();
+    let resource_id = resource_id.to_string();
+    let blocks = blocks.to_vec();
+    let replaces_resource_id = replaces_resource_id.map(str::to_string);
+    in_write_tx(store, move |conn: &Connection| -> WriteFut<'_, usize> {
+        Box::pin(async move {
+            if let Some(old_id) = replaces_resource_id.as_deref() {
+                delete_document_inner(conn, &store_id, old_id).await?;
+            }
+            upsert_chunks_inner(conn, &records, encoding).await?;
+            upsert_blocks_inner(conn, &store_id, &resource_id, &blocks).await?;
             Ok(count)
-        }
-        Err(e) => {
-            let _ = conn.execute("ROLLBACK", ()).await;
-            Err(e)
-        }
-    }
+        })
+    })
+    .await
 }
 
-/// Inner (connection-level) helper for upserting blocks within an existing transaction.
+/// Inner (connection-level) helper for upserting blocks within an existing
+/// `write_tx`. The sole implementation shared by both the standalone
+/// `upsert_blocks` (its own single-purpose `write_tx`) and
+/// `upsert_chunks_and_blocks` (blocks upserted as one step of a larger
+/// transaction).
 async fn upsert_blocks_inner(
     conn: &Connection,
     store_id: &str,
