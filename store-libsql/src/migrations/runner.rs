@@ -21,10 +21,27 @@
 //! the rendered "up" SQL (or `RustStep::apply`) runs, the rendered "down" SQL
 //! (or unsupported reason) is persisted as a `schema_migrations` row, and
 //! `PRAGMA user_version` is advanced — all before committing. On any failure
-//! the transaction is rolled back **explicitly** rather than relying on
-//! `Drop`, since drop-rollback semantics for local libsql connections were
-//! unconfirmed at the time this runner was written (see the partial-failure
-//! test below, which is the gate for that assumption).
+//! the transaction is rolled back **explicitly**, not via `Drop`. Explicit
+//! `rollback()` returns a `Result` we can log and act on, so it's
+//! deliberately kept as the primary error path here — strictly better than
+//! the alternative: dropping an uncommitted `libsql::Transaction` does run a
+//! synchronous ROLLBACK too (its default `DropBehavior::Rollback`, a
+//! backstop for panics/task aborts), but that Drop path calls
+//! `do_rollback().unwrap()`, which **panics** if the rollback fails instead
+//! of returning an error we could act on.
+//!
+//! Even the explicit path isn't fully panic-proof, though: if the ROLLBACK
+//! statement itself errors, `Transaction::rollback` returns that `Err` while
+//! the connection is still non-autocommit, so `Transaction`'s own `Drop`
+//! then retries a rollback — and if *that* also fails, libsql panics before
+//! our `tracing::error!` below ever runs (see vendored libsql 0.10.0-pre.4's
+//! `local::Transaction::commit`/`rollback`). So explicit rollback reliably
+//! handles and logs the common, first-order failure; a *persistently*
+//! failing ROLLBACK (disk gone, etc.) still panics regardless, an upstream
+//! libsql limitation, not something fixable here — do not "simplify" the
+//! explicit arms below away in favor of Drop on the strength of that caveat
+//! (see the partial-failure test below, which pins the first-order-failure
+//! behavior this comment describes).
 
 use std::time::{Duration, Instant};
 
@@ -134,6 +151,11 @@ pub async fn apply_pending_with_progress(
             .map_err(map_libsql_err)?;
 
         if let Err(e) = apply_one(&tx, migration, ctx).await {
+            // Explicit rollback, not Drop — see this module's "Applying
+            // steps" doc comment for the full rationale, including the
+            // caveat that even this explicit path can still panic if the
+            // ROLLBACK itself fails persistently. Do not remove this arm to
+            // "rely on Drop" instead — explicit remains strictly better.
             if let Err(rollback_err) = tx.rollback().await {
                 tracing::error!(
                     migration = migration.name,
@@ -283,6 +305,11 @@ pub async fn seed_for_fresh_create(
         .map_err(map_libsql_err)?;
 
     if let Err(e) = seed_all_and_stamp(&tx, chain, ctx).await {
+        // Explicit rollback, not Drop — see this module's "Applying steps"
+        // doc comment for the full rationale, including the caveat that even
+        // this explicit path can still panic if the ROLLBACK itself fails
+        // persistently. Do not remove this arm to "rely on Drop" instead —
+        // explicit remains strictly better.
         if let Err(rollback_err) = tx.rollback().await {
             tracing::error!(error = %rollback_err, "rollback after failed seed also failed");
         }

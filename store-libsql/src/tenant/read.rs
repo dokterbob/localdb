@@ -48,7 +48,7 @@ pub(crate) async fn dense_search(
     limit: usize,
     filters: &[MetadataFilter],
 ) -> Result<Vec<SearchResult>, Error> {
-    let conn = store.conn().conn().await;
+    let conn = store.conn().reader();
     let filter_clauses = build_filter_clauses(filters);
     let encoding = store.encoding();
     let dim = store.embedding_dim();
@@ -142,7 +142,7 @@ pub(crate) async fn bm25_search(
     if query_text.trim().is_empty() {
         return Ok(Vec::new());
     }
-    let conn = store.conn().conn().await;
+    let conn = store.conn().reader();
     let escaped_query = escape_fts5_query(query_text);
     let filter_clauses = build_filter_clauses(filters);
     let escaped_store_id = store.store_id().replace('\'', "''");
@@ -175,28 +175,27 @@ pub(crate) async fn bm25_search(
 }
 
 pub(crate) async fn stats(store: &TenantStore) -> Result<StoreStats, Error> {
-    let conn = store.conn().conn().await;
+    let conn = store.conn().reader();
+    // A single statement, not two separate `SELECT COUNT(*)` queries: two
+    // statements read at two different points in time, so a write could
+    // commit between them (in-process now that writes are serialized through
+    // one writer connection, and always possible cross-process) and leave
+    // chunk_count/document_count mutually inconsistent. Both subqueries here
+    // run as one atomic read against a single consistent snapshot.
     let mut rows = conn
         .query(
-            "SELECT COUNT(*) FROM chunks WHERE store_id = ?",
-            params![store.store_id().to_string()],
+            "SELECT (SELECT COUNT(*) FROM chunks WHERE store_id = ?) AS chunk_count,
+                    (SELECT COUNT(*) FROM resources WHERE store_id = ?) AS document_count",
+            params![store.store_id().to_string(), store.store_id().to_string()],
         )
         .await
         .map_err(map_libsql_err)?;
-    let chunk_count = match rows.next().await.map_err(map_libsql_err)? {
-        Some(row) => row.get::<u64>(0).map_err(map_libsql_err)?,
-        None => 0,
-    };
-    let mut rows = conn
-        .query(
-            "SELECT COUNT(*) FROM resources WHERE store_id = ?",
-            params![store.store_id().to_string()],
-        )
-        .await
-        .map_err(map_libsql_err)?;
-    let document_count = match rows.next().await.map_err(map_libsql_err)? {
-        Some(row) => row.get::<u64>(0).map_err(map_libsql_err)?,
-        None => 0,
+    let (chunk_count, document_count) = match rows.next().await.map_err(map_libsql_err)? {
+        Some(row) => (
+            row.get::<u64>(0).map_err(map_libsql_err)?,
+            row.get::<u64>(1).map_err(map_libsql_err)?,
+        ),
+        None => (0, 0),
     };
     Ok(StoreStats {
         chunk_count,
@@ -208,7 +207,7 @@ pub(crate) async fn get_chunk(
     store: &TenantStore,
     chunk_id: &str,
 ) -> Result<Option<ChunkRecord>, Error> {
-    let conn = store.conn().conn().await;
+    let conn = store.conn().reader();
     let mut rows = conn
         .query(
             &format!(
@@ -231,7 +230,7 @@ pub(crate) async fn get_chunks_for_resource(
     store: &TenantStore,
     resource_id: &str,
 ) -> Result<Vec<ChunkRecord>, Error> {
-    let conn = store.conn().conn().await;
+    let conn = store.conn().reader();
     let mut rows = conn
         .query(
             &format!(
@@ -262,7 +261,7 @@ pub(crate) async fn get_blocks_for_resource(
     store: &TenantStore,
     resource_id: &str,
 ) -> Result<Vec<localdb_core::block::Block>, Error> {
-    let conn = store.conn().conn().await;
+    let conn = store.conn().reader();
     let mut rows = conn
         .query(
             "SELECT seq, kind, text, metadata_json, location_json
@@ -283,7 +282,7 @@ pub(crate) async fn get_blocks_for_resource(
 pub(crate) async fn list_indexed_documents(
     store: &TenantStore,
 ) -> Result<Vec<DocumentRecord>, Error> {
-    let conn = store.conn().conn().await;
+    let conn = store.conn().reader();
     // `resources.id` maps back to `DocumentRecord.resource_id`.
     let mut rows = conn
         .query(

@@ -1,15 +1,33 @@
-//! Single libsql connection over the unified schema.
+//! Single libsql database over the unified schema, split into a writer/reader
+//! connection pool.
 //!
-//! Holds a `Database` + `Connection` behind a `tokio::sync::Mutex`. Every
+//! One dedicated **writer** connection is held behind a `tokio::sync::Mutex`:
+//! all mutating access goes through it, either directly (via `writer()`) or
+//! transactionally (via `write_tx()`, which returns a
+//! [`WriteTx`] wrapping a `libsql::Transaction`). Every fallible call site
+//! commits/rolls back a `WriteTx` explicitly rather than relying on `Drop` as
+//! the primary path: explicit `commit()`/`rollback()` return a `Result` we
+//! can log and act on, whereas `WriteTx`'s `Drop`-rollback (a backstop for
+//! panics/task aborts only) panics if its rollback fails. See `WriteTx`'s doc
+//! comment for a caveat this doesn't fully eliminate — even the explicit
+//! path can still panic, in the same narrow case Drop would panic on too.
 //!
-//! Cross-process serialisation is SQLite's job: WAL admits one writer at a
-//! time per file, `busy_timeout=5000` makes contenders wait, and an
+//! Alongside the writer sits a small pool of independent, read-only **reader**
+//! connections (`PRAGMA query_only=ON`), handed out round-robin by
+//! `reader()`. Readers never take the writer mutex, so they can't block on or
+//! be blocked by a write transaction; they simply see whatever's already
+//! committed (or, mid-write, whatever WAL readers always see).
+//!
+//! Cross-process serialisation is still SQLite's job: WAL admits one writer
+//! at a time per file, `busy_timeout=5000` makes contenders wait, and an
 //! exhausted busy-timeout maps to the existing `Error::RuntimeStateLocked`
 //! (exit 4). There is no advisory file lock — see proposal §3 (Decision 3).
 
+use std::ops::Deref;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use libsql::{Builder, Connection, Database};
+use libsql::{Builder, Connection, Database, Transaction, TransactionBehavior};
 use tokio::sync::{Mutex, MutexGuard};
 
 use localdb_core::{Error, VectorEncoding};
@@ -58,13 +76,22 @@ fn classify_version(version: i64, head: i64) -> VersionDisposition {
 
 /// A shared libsql handle to the unified single-file store.
 ///
-/// Cheap to keep behind `Arc`. All writes go through the single mutex-guarded
-/// connection.
+/// Cheap to keep behind `Arc`. All single-statement writes go through the
+/// mutex-guarded `writer` connection via `writer()`; multi-statement
+/// transactional writes go through `write_tx()`. Pure reads go through the
+/// `readers` pool via `reader()`.
 pub(crate) struct LibsqlDb {
-    /// The owning `Database`. Kept alive for the `Connection`'s lifetime.
+    /// The owning `Database`. Kept alive for the connections' lifetime.
     #[allow(dead_code)]
     db: Database,
-    conn: Mutex<Connection>,
+    /// The single writer connection. All mutating access is serialised
+    /// through this mutex.
+    writer: Mutex<Connection>,
+    /// Independent, read-only (`PRAGMA query_only=ON`) connections, handed
+    /// out round-robin by `reader()`. Never empty after a successful `open`.
+    readers: Vec<Connection>,
+    /// Round-robin cursor into `readers`.
+    next_reader: AtomicUsize,
 }
 
 impl LibsqlDb {
@@ -115,18 +142,7 @@ impl LibsqlDb {
             correlation_id: "libsql_db_connect".to_string(),
         })?;
 
-        // PRAGMA ordering matters. Setting `busy_timeout` first ensures the
-        // subsequent `journal_mode=WAL` switch waits on a contended writer
-        // instead of failing with `SQLITE_BUSY`.
-        conn.query("PRAGMA busy_timeout=5000", ())
-            .await
-            .map_err(map_libsql_err)?;
-        conn.query("PRAGMA journal_mode=WAL", ())
-            .await
-            .map_err(map_libsql_err)?;
-        conn.query("PRAGMA foreign_keys=ON", ())
-            .await
-            .map_err(map_libsql_err)?;
+        configure_connection(&conn, true).await?;
 
         let version = schema::get_schema_version(&conn)
             .await
@@ -250,17 +266,162 @@ impl LibsqlDb {
 
         validate_embedding_column(&conn, embedding_dim, encoding).await?;
 
+        // Readers are created as the LAST step, after every fallible check
+        // above has passed — a refused open (legacy/pending/too-new/bad
+        // embedding shape) never pays for opening a reader pool it won't use.
+        let reader_count = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2)
+            .clamp(2, 4);
+        let mut readers = Vec::with_capacity(reader_count);
+        for _ in 0..reader_count {
+            let reader = db.connect().map_err(|e| Error::Internal {
+                message: format!("cannot open reader connection: {e}"),
+                correlation_id: "libsql_db_reader_connect".to_string(),
+            })?;
+            configure_connection(&reader, false).await?;
+            reader
+                .query("PRAGMA query_only=ON", ())
+                .await
+                .map_err(map_libsql_err)?;
+            readers.push(reader);
+        }
+
         Ok(Self {
             db,
-            conn: Mutex::new(conn),
+            writer: Mutex::new(conn),
+            readers,
+            next_reader: AtomicUsize::new(0),
         })
     }
 
-    /// Acquire the underlying connection mutex.
-    ///
-    pub(crate) async fn conn(&self) -> MutexGuard<'_, Connection> {
-        self.conn.lock().await
+    /// Acquire the writer connection mutex directly (no transaction).
+    pub(crate) async fn writer(&self) -> MutexGuard<'_, Connection> {
+        self.writer.lock().await
     }
+
+    /// Hand out one of the read-only reader connections, round-robin.
+    ///
+    /// Synchronous — this never takes the writer mutex or awaits anything,
+    /// it just clones a `Connection` handle out of `readers`.
+    pub(crate) fn reader(&self) -> Connection {
+        let idx = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.readers.len();
+        self.readers[idx].clone()
+    }
+
+    /// Begin a write transaction: locks the writer mutex, then opens a
+    /// `TransactionBehavior::Immediate` transaction on it.
+    ///
+    /// The returned [`WriteTx`] holds the mutex guard for its own lifetime,
+    /// so no other writer (direct via `writer()`, or another `write_tx()`)
+    /// can interleave with it. Callers must explicitly `commit()` or
+    /// `rollback()`; letting a `WriteTx` drop uncommitted is a backstop only
+    /// (see the module doc comment and `WriteTx`'s doc comment).
+    pub(crate) async fn write_tx(&self) -> Result<WriteTx<'_>, Error> {
+        let guard = self.writer.lock().await;
+        let tx = guard
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await
+            .map_err(map_libsql_err)?;
+        Ok(WriteTx { tx, _guard: guard })
+    }
+}
+
+/// A write transaction plus the writer-mutex guard that authorized it.
+///
+/// # Field order is load-bearing
+///
+/// Rust drops struct fields in declaration order, so `tx` is dropped BEFORE
+/// `_guard`. `libsql::Transaction`'s default `DropBehavior::Rollback` means
+/// dropping an uncommitted `tx` synchronously issues a ROLLBACK; declaring
+/// `tx` first guarantees that ROLLBACK completes while the writer mutex is
+/// still held by `_guard`. If the order were reversed, another `write_tx()`
+/// caller could acquire the freed mutex and `BEGIN` a new transaction on the
+/// same connection while the old transaction's ROLLBACK is still in flight —
+/// corrupting transaction state. This Drop-rollback is a backstop path only
+/// (panics/task aborts): the primary error path is always an explicit
+/// `commit()`/`rollback()` call, because those return a `Result` we can log
+/// and act on, whereas an *unhandled* Drop-rollback failure panics.
+///
+/// # Even the explicit path isn't fully panic-proof
+///
+/// Per vendored libsql 0.10.0-pre.4 (`local::Transaction::commit`/
+/// `rollback`): if the COMMIT/ROLLBACK statement itself errors, the method
+/// returns that `Err` while the transaction is still open (non-autocommit) —
+/// so `Transaction`'s own `Drop` then fires and retries a rollback. If that
+/// retry succeeds, our original error still reaches the caller normally (a
+/// free retry, no different from any other `Err`); if the retry *also*
+/// fails, libsql panics (`do_rollback().unwrap()`) before our `map_err`/
+/// logging ever runs — the `Err` we would have returned is lost, replaced by
+/// the panic. So explicit `commit()`/`rollback()` reliably handles and logs
+/// the common, first-order failure; a *persistently* failing COMMIT/ROLLBACK
+/// (disk gone, corruption) still panics regardless, an upstream libsql
+/// limitation no call-site discipline here can eliminate. That's not a
+/// reason to "simplify" the explicit calls away in favor of Drop, though —
+/// explicit remains strictly better: it handles and logs every failure Drop
+/// silently can't, and only loses to Drop's own panic in the exact
+/// double-failure case Drop would panic on too. Separately: if a write body
+/// itself panics while a `WriteTx` is alive, unwinding drops it and this
+/// backstop rollback runs; if *that* rollback also fails, panicking while
+/// already unwinding from another panic aborts the whole process (Rust's
+/// double-panic rule), not just the current task.
+pub(crate) struct WriteTx<'a> {
+    tx: Transaction,
+    _guard: MutexGuard<'a, Connection>,
+}
+
+impl Deref for WriteTx<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        &self.tx
+    }
+}
+
+impl WriteTx<'_> {
+    /// Commit the transaction.
+    pub(crate) async fn commit(self) -> Result<(), Error> {
+        self.tx.commit().await.map_err(map_libsql_err)
+    }
+
+    /// Roll back the transaction explicitly. Prefer this over letting a
+    /// `WriteTx` drop uncommitted — see the struct's doc comment.
+    pub(crate) async fn rollback(self) -> Result<(), Error> {
+        self.tx.rollback().await.map_err(map_libsql_err)
+    }
+}
+
+/// Apply the standard pragma sequence to a connection: `busy_timeout=5000`
+/// first, then (if `apply_wal`) `journal_mode=WAL`, then `foreign_keys=ON`.
+///
+/// Order matters: `busy_timeout` must precede `journal_mode=WAL` so a
+/// contended switch waits instead of failing with `SQLITE_BUSY`, and
+/// `foreign_keys` can't be toggled inside a transaction so it's set here,
+/// outside of one. `apply_wal` is `false` for reader connections: the writer
+/// connection already switched the file's on-disk journal mode to WAL (a
+/// per-file, not per-connection, setting) during `open`, so a reader
+/// re-issuing that pragma would be redundant.
+///
+/// `pub(crate)` rather than private: `migrations::maintenance` opens its own
+/// connections outside `LibsqlDb::open` and reuses this same sequence
+/// (`open_for_maintenance` with `apply_wal=true`, `open_for_readonly_inspection`
+/// with `apply_wal=false`).
+pub(crate) async fn configure_connection(conn: &Connection, apply_wal: bool) -> Result<(), Error> {
+    // PRAGMA ordering matters. Setting `busy_timeout` first ensures a
+    // subsequent contended `journal_mode=WAL` switch waits instead of
+    // failing with `SQLITE_BUSY`.
+    conn.query("PRAGMA busy_timeout=5000", ())
+        .await
+        .map_err(map_libsql_err)?;
+    if apply_wal {
+        conn.query("PRAGMA journal_mode=WAL", ())
+            .await
+            .map_err(map_libsql_err)?;
+    }
+    conn.query("PRAGMA foreign_keys=ON", ())
+        .await
+        .map_err(map_libsql_err)?;
+    Ok(())
 }
 
 /// Refuse if `chunks.embedding`'s actual column type doesn't match what
@@ -353,824 +514,4 @@ pub(crate) fn map_libsql_err(e: libsql::Error) -> Error {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    /// Everything about a database file's on-disk schema state that `open`
-    /// must leave untouched when it refuses a version-mismatched store:
-    /// `sqlite_master`'s DDL rows, `PRAGMA user_version`, and — if the
-    /// bookkeeping table happens to exist — its rows. Used to prove several
-    /// refusal branches are pure reads.
-    #[derive(Debug, PartialEq)]
-    struct DbDump {
-        master_rows: Vec<(String, String, String)>,
-        user_version: i64,
-        migration_rows: Vec<table::MigrationRow>,
-    }
-
-    async fn dump_db(path: &std::path::Path) -> DbDump {
-        let db = libsql::Builder::new_local(path).build().await.unwrap();
-        let conn = db.connect().unwrap();
-
-        let mut rows = conn
-            .query(
-                "SELECT type, name, COALESCE(sql, '') FROM sqlite_master \
-                 WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
-                (),
-            )
-            .await
-            .unwrap();
-        let mut master_rows = Vec::new();
-        while let Some(row) = rows.next().await.unwrap() {
-            master_rows.push((
-                row.get::<String>(0).unwrap(),
-                row.get::<String>(1).unwrap(),
-                row.get::<String>(2).unwrap(),
-            ));
-        }
-
-        let user_version = schema::get_schema_version(&conn).await.unwrap();
-
-        let mut exists = conn
-            .query(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'",
-                (),
-            )
-            .await
-            .unwrap();
-        let migration_rows = if exists.next().await.unwrap().is_some() {
-            table::list_rows_desc_above(&conn, i64::MIN).await.unwrap()
-        } else {
-            Vec::new()
-        };
-
-        DbDump {
-            master_rows,
-            user_version,
-            migration_rows,
-        }
-    }
-
-    #[tokio::test]
-    async fn open_creates_new_db() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("localdb.db");
-        assert!(!path.exists());
-        let _db = LibsqlDb::open(&path, 4, VectorEncoding::Float32)
-            .await
-            .unwrap();
-        assert!(path.exists(), "DB file should be created on open");
-    }
-
-    #[tokio::test]
-    async fn open_creates_parent_directory() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("subdir").join("nested").join("localdb.db");
-        let _db = LibsqlDb::open(&path, 4, VectorEncoding::Float32)
-            .await
-            .unwrap();
-        assert!(
-            path.exists(),
-            "DB file should be created in new directories"
-        );
-    }
-
-    #[tokio::test]
-    async fn second_open_succeeds_on_existing_file() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("localdb.db");
-        let _db1 = LibsqlDb::open(&path, 4, VectorEncoding::Float32)
-            .await
-            .unwrap();
-        let _db2 = LibsqlDb::open(&path, 4, VectorEncoding::Float32)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn open_rejects_encoding_mismatch_on_reopen() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("localdb.db");
-
-        // Open as Float32
-        let db = LibsqlDb::open(&path, 4, VectorEncoding::Float32)
-            .await
-            .unwrap();
-        drop(db);
-
-        // Reopen as Binary — should fail with InvalidConfig
-        let result = LibsqlDb::open(&path, 4, VectorEncoding::Binary).await;
-        match result {
-            Err(Error::InvalidConfig { message }) => {
-                assert!(
-                    message.contains("mismatch"),
-                    "error should mention mismatch: {message}"
-                );
-            }
-            Err(other) => panic!("expected InvalidConfig, got: {other:?}"),
-            Ok(_) => panic!("expected InvalidConfig, but reopen succeeded"),
-        }
-    }
-
-    /// The encoding-mismatch refusal must not be masked by migration-checksum
-    /// verification.
-    ///
-    /// Since schema v6 (`chain::shrink_vector_index_up`) a migration's
-    /// rendered SQL depends on `ctx.encoding`, so its stored checksum does
-    /// too. Reopening a Float32 store as Binary therefore *also* trips a
-    /// checksum mismatch — and if `verify_checksums` runs first, the user gets
-    /// an `Internal` "migration drift" error blaming corrupt bookkeeping
-    /// instead of the `InvalidConfig` that names the actual problem. This pins
-    /// the ordering in `LibsqlDb::open`'s `AtHead` branch.
-    #[tokio::test]
-    async fn encoding_mismatch_beats_migration_checksum_mismatch() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("localdb.db");
-
-        // 1024 dims: the production default, and the shape whose v6 up-SQL
-        // actually differs between the two encodings.
-        let db = LibsqlDb::open(&path, 1024, VectorEncoding::Binary)
-            .await
-            .unwrap();
-        drop(db);
-
-        match LibsqlDb::open(&path, 1024, VectorEncoding::Float32).await {
-            Err(Error::InvalidConfig { message }) => {
-                assert!(
-                    message.contains("embedding schema mismatch"),
-                    "must name the embedding mismatch, not migration drift: {message}"
-                );
-            }
-            Err(other) => panic!(
-                "expected InvalidConfig naming the embedding mismatch; \
-                 got {other:?} — checksum verification is running first again"
-            ),
-            Ok(_) => panic!("expected InvalidConfig, but reopen succeeded"),
-        }
-    }
-
-    #[tokio::test]
-    async fn refuses_to_open_with_legacy_stores_dir() {
-        let dir = tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("stores").join("notes")).unwrap();
-        let result =
-            LibsqlDb::open(&dir.path().join("localdb.db"), 4, VectorEncoding::Float32).await;
-        match result {
-            Err(Error::InvalidConfig { message }) => {
-                assert!(message.contains("legacy") || message.contains("stores"));
-            }
-            Err(other) => panic!("expected InvalidConfig, got: {other:?}"),
-            Ok(_) => panic!("expected InvalidConfig"),
-        }
-    }
-
-    #[tokio::test]
-    async fn open_rejects_dim_mismatch_on_reopen() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("localdb.db");
-
-        let db = LibsqlDb::open(&path, 4, VectorEncoding::Float32)
-            .await
-            .unwrap();
-        drop(db);
-
-        match LibsqlDb::open(&path, 8, VectorEncoding::Float32).await {
-            Err(Error::InvalidConfig { message }) => {
-                assert!(
-                    message.contains("mismatch"),
-                    "error should mention mismatch: {message}"
-                );
-            }
-            Err(other) => panic!("expected InvalidConfig, got: {other:?}"),
-            Ok(_) => panic!("expected InvalidConfig, but reopen with different dim succeeded"),
-        }
-    }
-
-    #[tokio::test]
-    async fn foreign_keys_pragma_is_enabled() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("localdb.db");
-        let db = LibsqlDb::open(&path, 4, VectorEncoding::Float32)
-            .await
-            .unwrap();
-        let conn = db.conn().await;
-        let mut rows = conn.query("PRAGMA foreign_keys", ()).await.unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        let on: i64 = row.get(0).unwrap();
-        assert_eq!(on, 1, "PRAGMA foreign_keys should be ON after open");
-    }
-
-    #[tokio::test]
-    async fn wal_pragma_is_enabled() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("localdb.db");
-        let db = LibsqlDb::open(&path, 4, VectorEncoding::Float32)
-            .await
-            .unwrap();
-        let conn = db.conn().await;
-        let mut rows = conn.query("PRAGMA journal_mode", ()).await.unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        let mode: String = row.get(0).unwrap();
-        assert_eq!(
-            mode.to_ascii_lowercase(),
-            "wal",
-            "journal_mode should be WAL after open"
-        );
-    }
-
-    #[tokio::test]
-    async fn map_libsql_err_lock_strings_become_runtime_state_locked() {
-        let busy = libsql::Error::SqliteFailure(5, "database is locked".to_string());
-        assert!(matches!(map_libsql_err(busy), Error::RuntimeStateLocked));
-
-        let busy2 = libsql::Error::SqliteFailure(5, "SQLITE_BUSY: writer".to_string());
-        assert!(matches!(map_libsql_err(busy2), Error::RuntimeStateLocked));
-    }
-
-    #[tokio::test]
-    async fn map_libsql_err_other_becomes_internal() {
-        let other = libsql::Error::SqliteFailure(1, "no such table: foo".to_string());
-        match map_libsql_err(other) {
-            Error::Internal { message, .. } => {
-                assert!(message.contains("no such table"));
-            }
-            e => panic!("expected Internal, got {e:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn reopen_with_legacy_schema_version_is_refused_without_mutation() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test.db");
-        // Stamp version 1 (pre-baseline legacy) on a raw libsql DB (bypassing
-        // LibsqlDb::open).
-        {
-            let db = libsql::Builder::new_local(&path).build().await.unwrap();
-            let conn = db.connect().unwrap();
-            conn.query("PRAGMA user_version = 1", ()).await.unwrap();
-        }
-
-        let before = dump_db(&path).await;
-        let result = LibsqlDb::open(&path, 4, VectorEncoding::Float32).await;
-        let after = dump_db(&path).await;
-
-        match result {
-            Err(Error::InvalidConfig { message }) => {
-                assert!(
-                    message.contains("db migrate"),
-                    "error should point at 'localdb db migrate': {message}"
-                );
-                assert!(
-                    message.contains("predates"),
-                    "error should explain the version predates the baseline: {message}"
-                );
-            }
-            Err(other) => panic!("expected InvalidConfig, got: {other:?}"),
-            Ok(_) => panic!("expected InvalidConfig, but reopen of legacy schema succeeded"),
-        }
-
-        assert_eq!(
-            before, after,
-            "a refused open of a legacy-version store must not mutate it at all"
-        );
-    }
-
-    /// A DB stamped at the pre-#128 v4 schema (old `chunks.block_id` column
-    /// and `idx_chunks_store_resource` index, `user_version=4`, no
-    /// `schema_migrations` table) is exactly the `Pending` disposition this
-    /// binary's compiled chain now makes reachable (head is 5, one migration
-    /// past baseline) — `LibsqlDb::open` must refuse it with a `db migrate`
-    /// hint and leave it byte-for-byte untouched, not silently wipe and
-    /// reinitialise it the way the pre-framework binary used to.
-    #[tokio::test]
-    async fn reopen_with_v4_era_block_id_schema_is_refused_without_mutation() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test.db");
-        {
-            let db = libsql::Builder::new_local(&path).build().await.unwrap();
-            let conn = db.connect().unwrap();
-            // Old (v4) chunks table shape: has block_id, old index name.
-            conn.execute(
-                "CREATE TABLE chunks (
-                    rowid         INTEGER PRIMARY KEY,
-                    store_id      TEXT NOT NULL,
-                    id            TEXT NOT NULL,
-                    resource_id   TEXT NOT NULL,
-                    block_id      INTEGER NOT NULL,
-                    block_seq     INTEGER NOT NULL,
-                    seq_in_block  INTEGER NOT NULL DEFAULT 0,
-                    block_kind    TEXT,
-                    text          TEXT NOT NULL,
-                    heading_path  TEXT NOT NULL,
-                    embedding     F32_BLOB(4) NOT NULL,
-                    location_json TEXT,
-                    UNIQUE (store_id, id)
-                )",
-                (),
-            )
-            .await
-            .unwrap();
-            conn.execute(
-                "CREATE INDEX idx_chunks_store_resource ON chunks(store_id, resource_id)",
-                (),
-            )
-            .await
-            .unwrap();
-            conn.query("PRAGMA user_version = 4", ()).await.unwrap();
-        }
-
-        let before = dump_db(&path).await;
-        let result = LibsqlDb::open(&path, 4, localdb_core::VectorEncoding::Float32).await;
-        let after = dump_db(&path).await;
-
-        match result {
-            Err(Error::InvalidConfig { message }) => {
-                assert!(
-                    message.contains("db migrate"),
-                    "error should point at 'localdb db migrate': {message}"
-                );
-                assert!(
-                    message.contains("behind"),
-                    "error should explain the version is behind this build: {message}"
-                );
-            }
-            Err(other) => panic!("expected InvalidConfig, got: {other:?}"),
-            Ok(_) => panic!(
-                "expected InvalidConfig, but reopen of a pending v4-era block_id schema succeeded"
-            ),
-        }
-
-        assert_eq!(
-            before, after,
-            "a refused open of a pending store must not mutate it at all — block_id, the old \
-             index, and user_version=4 must all still be exactly as they were"
-        );
-    }
-
-    #[tokio::test]
-    async fn fresh_db_and_reopen_both_succeed() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test.db");
-        LibsqlDb::open(&path, 4, localdb_core::VectorEncoding::Float32)
-            .await
-            .unwrap();
-        LibsqlDb::open(&path, 4, localdb_core::VectorEncoding::Float32)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn reopen_with_newer_schema_version_returns_invalid_config_error() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test.db");
-        let head = chain::head_version(&chain::migrations());
-        // Stamp a version head + 1 on a raw libsql DB (bypassing LibsqlDb::open).
-        {
-            let db = libsql::Builder::new_local(&path).build().await.unwrap();
-            let conn = db.connect().unwrap();
-            let future_version = head + 1;
-            conn.query(&format!("PRAGMA user_version = {future_version}"), ())
-                .await
-                .unwrap();
-        }
-
-        let before = dump_db(&path).await;
-        let result = LibsqlDb::open(&path, 4, localdb_core::VectorEncoding::Float32).await;
-        let after = dump_db(&path).await;
-
-        match result {
-            Err(Error::InvalidConfig { message }) => {
-                assert!(
-                    message.contains("newer"),
-                    "error should mention 'newer': {message}"
-                );
-                assert!(
-                    message.contains("db downgrade"),
-                    "error should point at 'localdb db downgrade': {message}"
-                );
-            }
-            Err(other) => panic!("expected InvalidConfig, got: {other:?}"),
-            Ok(_) => panic!("expected InvalidConfig, but reopen with newer schema succeeded"),
-        }
-
-        assert_eq!(
-            before, after,
-            "a refused open of a too-new store must not mutate it at all"
-        );
-    }
-
-    // -- classify_version: the pure five-way dispatch helper, exercised
-    // directly against a synthetic head (in addition to the real chain's
-    // current head, which `reopen_with_v4_era_block_id_schema_is_refused_
-    // without_mutation` above already exercises `Pending` through).
-    #[test]
-    fn classify_version_covers_all_five_branches() {
-        let baseline = chain::BASELINE_VERSION;
-        assert_eq!(classify_version(0, baseline), VersionDisposition::Fresh);
-        assert_eq!(
-            classify_version(1, baseline),
-            VersionDisposition::Legacy,
-            "1 < BASELINE_VERSION is legacy"
-        );
-        assert_eq!(
-            classify_version(baseline, baseline + 2),
-            VersionDisposition::Pending,
-            "at baseline but behind a (synthetic) head is pending"
-        );
-        assert_eq!(
-            classify_version(baseline, baseline),
-            VersionDisposition::AtHead
-        );
-        assert_eq!(
-            classify_version(baseline + 1, baseline),
-            VersionDisposition::TooNew
-        );
-    }
-
-    // Plan test 12 (superseded): opening a raw v4 store that predates the
-    // migrations framework (no `schema_migrations` table at all) used to be
-    // silently backfilled with just the baseline row when the real chain
-    // was empty — back then `head == BASELINE_VERSION`, so a bare-baseline
-    // store genuinely was `AtHead`. Now that a real chain entry exists, that
-    // same store is `Pending` instead (see
-    // `reopen_with_v4_era_block_id_schema_is_refused_without_mutation`
-    // above), so `AtHead`'s backfill path (`table::ensure_baseline_row`
-    // followed by `checksum::verify_checksums`) is only ever reachable with
-    // *some* bookkeeping already in place.
-    //
-    // This test now pins the resulting behavior for a store that is
-    // fabricated to claim head's `user_version` without ever having run
-    // through the framework (impossible via any real code path once the
-    // chain is non-empty, since reaching head always means `apply_pending`
-    // or `seed_for_fresh_create` ran and left chain-entry rows behind): it
-    // must be refused as corrupt bookkeeping, not silently trusted just
-    // because the version number matches.
-    #[tokio::test]
-    async fn at_head_store_missing_chain_entry_rows_is_refused_not_silently_trusted() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test.db");
-        let head = chain::head_version(&chain::migrations());
-
-        // Build a store with today's head DDL and `user_version` stamped
-        // straight to head, but no `schema_migrations` table at all.
-        {
-            let db = libsql::Builder::new_local(&path).build().await.unwrap();
-            let conn = db.connect().unwrap();
-            conn.query("PRAGMA foreign_keys = ON", ()).await.unwrap();
-            schema::create_schema(&conn, 4, VectorEncoding::Float32)
-                .await
-                .unwrap();
-            conn.query(&format!("PRAGMA user_version = {head}"), ())
-                .await
-                .unwrap();
-        }
-
-        match LibsqlDb::open(&path, 4, VectorEncoding::Float32).await {
-            Err(Error::Internal { message, .. }) => {
-                assert!(
-                    message.contains("missing a row"),
-                    "error should explain the bookkeeping is incomplete: {message}"
-                );
-            }
-            Err(other) => panic!("expected Internal, got: {other:?}"),
-            Ok(_) => panic!(
-                "expected Internal error: an at-head store with no chain-entry bookkeeping \
-                 rows must not be silently trusted"
-            ),
-        }
-    }
-
-    // Fix 1 (adversarial review, track 4): the fabricated at-head store above
-    // (real chain head > BASELINE_VERSION, no `schema_migrations` table) must
-    // be refused WITHOUT `open` having created the table (or its baseline
-    // row) first. Before this fix, the `AtHead` branch unconditionally
-    // created the table and — because it was absent — backfilled the
-    // baseline row, then only afterward let `verify_checksums` refuse for the
-    // still-missing v{head} chain-entry row: a store `open` refuses had
-    // already been mutated. This pins that the table stays entirely absent
-    // and `user_version` is untouched.
-    #[tokio::test]
-    async fn at_head_store_with_no_migrations_table_is_refused_without_creating_it() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test.db");
-        let head = chain::head_version(&chain::migrations());
-        assert!(
-            head > chain::BASELINE_VERSION,
-            "this test's premise requires a non-empty real chain, so a table-absent \
-             at-head store is never legitimately backfillable"
-        );
-
-        // Build a store with today's head DDL and `user_version` stamped
-        // straight to head, but no `schema_migrations` table at all.
-        {
-            let db = libsql::Builder::new_local(&path).build().await.unwrap();
-            let conn = db.connect().unwrap();
-            conn.query("PRAGMA foreign_keys = ON", ()).await.unwrap();
-            schema::create_schema(&conn, 4, VectorEncoding::Float32)
-                .await
-                .unwrap();
-            conn.query(&format!("PRAGMA user_version = {head}"), ())
-                .await
-                .unwrap();
-        }
-
-        let before = dump_db(&path).await;
-        assert!(
-            !before
-                .master_rows
-                .iter()
-                .any(|(_, name, _)| name == "schema_migrations"),
-            "precondition: schema_migrations must not exist yet"
-        );
-
-        let result = LibsqlDb::open(&path, 4, VectorEncoding::Float32).await;
-        let after = dump_db(&path).await;
-
-        match result {
-            Err(Error::Internal { message, .. }) => {
-                assert!(
-                    message.contains("missing a row"),
-                    "error should explain the bookkeeping is incomplete: {message}"
-                );
-            }
-            Err(other) => panic!("expected Internal, got: {other:?}"),
-            Ok(_) => panic!(
-                "expected Internal error: an at-head store with no chain-entry bookkeeping \
-                 rows must not be silently trusted"
-            ),
-        }
-
-        assert_eq!(
-            before, after,
-            "a refused open of a fabricated table-absent at-head store must not mutate it at \
-             all"
-        );
-        assert!(
-            !after
-                .master_rows
-                .iter()
-                .any(|(_, name, _)| name == "schema_migrations"),
-            "open must not have created schema_migrations while refusing this store: {:?}",
-            after.master_rows
-        );
-        assert_eq!(
-            after.user_version, head,
-            "user_version must remain exactly as stamped, untouched by the refused open"
-        );
-    }
-
-    // Plan test 13: a brand-new store created via `LibsqlDb::open` seeds
-    // exactly one bookkeeping row per real chain entry plus the baseline row,
-    // and stamps user_version to head.
-    #[tokio::test]
-    async fn fresh_open_seeds_baseline_plus_chain_rows() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test.db");
-
-        let db = LibsqlDb::open(&path, 4, VectorEncoding::Float32)
-            .await
-            .unwrap();
-        let conn = db.conn().await;
-
-        let user_version = schema::get_schema_version(&conn).await.unwrap();
-        assert_eq!(user_version, chain::head_version(&chain::migrations()));
-        assert_eq!(
-            user_version,
-            chain::BASELINE_VERSION + chain::migrations().len() as i64,
-            "head == baseline + the real chain's length"
-        );
-
-        let rows = table::list_rows_desc_above(&conn, i64::MIN).await.unwrap();
-        assert_eq!(
-            rows.len(),
-            1 + chain::migrations().len(),
-            "baseline row plus one row per real chain entry should exist"
-        );
-        assert!(
-            rows.iter()
-                .any(|r| r.version == chain::BASELINE_VERSION && r.name == "baseline"),
-            "baseline row missing: {rows:?}"
-        );
-    }
-
-    // Codex review #152 fix 1: a database that only got as far as
-    // `create_schema` (no seeding, no stamp — simulating a crash between
-    // `create_schema` finishing and `seed_for_fresh_create` committing) must
-    // still open successfully: `user_version` is still 0, so `open`
-    // classifies it as `Fresh` and re-runs `create_schema` (idempotent) plus
-    // seeding, landing at head with the baseline row present.
-    #[tokio::test]
-    async fn crash_before_seeding_reclassifies_as_fresh_and_recovers_on_reopen() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test.db");
-
-        // Simulate the interrupted fresh-create: run create_schema directly,
-        // bypassing LibsqlDb::open, and never seed schema_migrations or stamp
-        // user_version — exactly what create_schema alone now leaves behind.
-        {
-            let db = libsql::Builder::new_local(&path).build().await.unwrap();
-            let conn = db.connect().unwrap();
-            conn.query("PRAGMA foreign_keys = ON", ()).await.unwrap();
-            schema::create_schema(&conn, 4, VectorEncoding::Float32)
-                .await
-                .unwrap();
-        }
-
-        // Confirm the simulated crash point: schema exists, but user_version
-        // is still 0.
-        {
-            let db = libsql::Builder::new_local(&path).build().await.unwrap();
-            let conn = db.connect().unwrap();
-            assert_eq!(
-                schema::get_schema_version(&conn).await.unwrap(),
-                0,
-                "create_schema alone must not stamp user_version"
-            );
-        }
-
-        // Reopening via the normal path must succeed — classified as Fresh —
-        // and end up healthy at head with the baseline row present.
-        let db = LibsqlDb::open(&path, 4, VectorEncoding::Float32)
-            .await
-            .unwrap();
-        let conn = db.conn().await;
-
-        let v = schema::get_schema_version(&conn).await.unwrap();
-        assert_eq!(v, chain::head_version(&chain::migrations()));
-
-        let rows = table::list_rows_desc_above(&conn, i64::MIN).await.unwrap();
-        assert!(
-            rows.iter()
-                .any(|r| r.version == chain::BASELINE_VERSION && r.name == "baseline"),
-            "recovered store should have the baseline row: {rows:?}"
-        );
-    }
-
-    // Checksum drift: a healthy at-head store whose baseline row's checksum
-    // has been tampered with must refuse to open (Error::Internal) without
-    // mutating anything further.
-    #[tokio::test]
-    async fn checksum_drift_on_healthy_store_returns_internal_error() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test.db");
-
-        // Build then close a healthy at-head store.
-        let db = LibsqlDb::open(&path, 4, VectorEncoding::Float32)
-            .await
-            .unwrap();
-        drop(db);
-
-        // Corrupt the baseline row's checksum directly.
-        {
-            let raw_db = libsql::Builder::new_local(&path).build().await.unwrap();
-            let conn = raw_db.connect().unwrap();
-            conn.execute(
-                "UPDATE schema_migrations SET checksum = 'tampered' WHERE version = ?",
-                libsql::params![chain::BASELINE_VERSION],
-            )
-            .await
-            .unwrap();
-        }
-
-        let before = dump_db(&path).await;
-        let result = LibsqlDb::open(&path, 4, VectorEncoding::Float32).await;
-        let after = dump_db(&path).await;
-
-        match result {
-            Err(Error::Internal { message, .. }) => {
-                assert!(
-                    message.contains("checksum mismatch"),
-                    "error should mention checksum mismatch: {message}"
-                );
-            }
-            Err(other) => panic!("expected Internal, got: {other:?}"),
-            Ok(_) => panic!("expected Internal error due to checksum drift, but open succeeded"),
-        }
-
-        assert_eq!(
-            before, after,
-            "a refused open due to checksum drift must not mutate the store"
-        );
-    }
-
-    // C1: same latent bug as migrate.rs's v0 branch, but in `open`'s `Fresh`
-    // disposition — a store that only got as far as `create_schema` (chunks
-    // built with dim 4, user_version still 0, simulating an interrupted
-    // earlier fresh-create) must be refused when reopened with a mismatched
-    // dim, and refused BEFORE `seed_for_fresh_create` stamps user_version to
-    // head — not stamped-then-rejected on the next open.
-    #[tokio::test]
-    async fn open_refuses_and_leaves_store_unstamped_on_fresh_create_recovery_dim_mismatch() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test.db");
-
-        {
-            let db = libsql::Builder::new_local(&path).build().await.unwrap();
-            let conn = db.connect().unwrap();
-            conn.query("PRAGMA foreign_keys = ON", ()).await.unwrap();
-            schema::create_schema(&conn, 4, VectorEncoding::Float32)
-                .await
-                .unwrap();
-        }
-
-        let before = dump_db(&path).await;
-        let result = LibsqlDb::open(&path, 8, VectorEncoding::Float32).await;
-        let after = dump_db(&path).await;
-
-        match result {
-            Err(Error::InvalidConfig { message }) => {
-                assert!(
-                    message.contains("mismatch"),
-                    "error should mention mismatch: {message}"
-                );
-            }
-            Err(other) => panic!("expected InvalidConfig, got: {other:?}"),
-            Ok(_) => panic!("expected InvalidConfig, but reopen with mismatched dim succeeded"),
-        }
-
-        assert_eq!(
-            before, after,
-            "a refused fresh-create recovery due to an embedding shape mismatch must not \
-             mutate the store — user_version must remain 0 and no schema_migrations rows \
-             may be written"
-        );
-        assert_eq!(after.user_version, 0, "must remain unstamped at v0");
-        assert!(
-            after.migration_rows.is_empty(),
-            "no schema_migrations rows should have been written: {:?}",
-            after.migration_rows
-        );
-    }
-
-    // C3: `AtHead`'s bookkeeping backfill must only apply when
-    // `schema_migrations` was ABSENT before this open (the raw
-    // pre-framework case) — if the table already exists but its baseline row
-    // is missing (corrupt bookkeeping), `open` must refuse via
-    // `verify_checksums`'s missing-row error, not silently recreate the row
-    // and let the store pass as healthy.
-    #[tokio::test]
-    async fn at_head_open_refuses_and_does_not_backfill_baseline_row_when_table_present_but_row_missing(
-    ) {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test.db");
-
-        // Build then close a healthy at-head store (schema_migrations table
-        // present, baseline + chain rows seeded).
-        let db = LibsqlDb::open(&path, 4, VectorEncoding::Float32)
-            .await
-            .unwrap();
-        drop(db);
-
-        // Corrupt bookkeeping: the table exists, but its baseline row is
-        // gone (as opposed to `checksum_drift_on_healthy_store_returns_
-        // internal_error` above, which tampers the row's checksum instead of
-        // deleting it).
-        {
-            let raw_db = libsql::Builder::new_local(&path).build().await.unwrap();
-            let conn = raw_db.connect().unwrap();
-            conn.execute(
-                "DELETE FROM schema_migrations WHERE version = ?",
-                libsql::params![chain::BASELINE_VERSION],
-            )
-            .await
-            .unwrap();
-        }
-
-        let before = dump_db(&path).await;
-        let result = LibsqlDb::open(&path, 4, VectorEncoding::Float32).await;
-        let after = dump_db(&path).await;
-
-        match result {
-            Err(Error::Internal { message, .. }) => {
-                assert!(
-                    message.contains("missing a row"),
-                    "error should explain the bookkeeping is incomplete: {message}"
-                );
-                assert!(
-                    message.contains("baseline"),
-                    "error should name the missing baseline row: {message}"
-                );
-            }
-            Err(other) => panic!("expected Internal, got: {other:?}"),
-            Ok(_) => panic!(
-                "expected Internal error: a store whose schema_migrations table exists but \
-                 whose baseline row is missing must not be silently trusted"
-            ),
-        }
-
-        assert_eq!(
-            before, after,
-            "open must not backfill the baseline row (or otherwise mutate the store) when \
-             schema_migrations already existed but was missing a required row"
-        );
-        assert!(
-            !after
-                .migration_rows
-                .iter()
-                .any(|r| r.version == chain::BASELINE_VERSION),
-            "the baseline row must remain missing, not silently recreated: {:?}",
-            after.migration_rows
-        );
-    }
-}
+mod tests;

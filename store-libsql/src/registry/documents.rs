@@ -11,7 +11,7 @@ pub(crate) async fn find_document(
     db: &LibsqlDb,
     doc_id: &str,
 ) -> Result<Option<DocumentInfo>, Error> {
-    let conn = db.conn().await;
+    let conn = db.reader();
     // Column mapping from resources → DocumentInfo:
     //   resources.id           → DocumentInfo.id
     //   resources.added_at     → DocumentInfo.fetched_at

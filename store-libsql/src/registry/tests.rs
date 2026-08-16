@@ -448,7 +448,7 @@ async fn metadata_json_round_trips_tagged_document_kind() {
     handle.upsert_chunks(vec![record]).await.unwrap();
 
     // Raw column check: the persisted JSON must be tagged.
-    let conn = api.conn.conn().await;
+    let conn = api.conn.reader();
     let mut rows = conn
         .query(
             "SELECT metadata_json FROM resources WHERE id = ?",
@@ -528,7 +528,7 @@ async fn find_document_tolerates_invalid_metadata_json() {
     // Corrupt the persisted metadata_json directly with syntactically
     // invalid JSON — this is distinct from the benign legacy-untagged case
     // (which is still valid JSON, just the wrong shape).
-    let conn = api.conn.conn().await;
+    let conn = api.conn.writer().await;
     conn.execute(
         "UPDATE resources SET metadata_json = ? WHERE id = ?",
         libsql::params!["{not valid json".to_string(), "doc-1".to_string()],
@@ -690,7 +690,7 @@ async fn check_constraint_allows_feed_kind_with_null_root_and_url() {
     api.upsert_store(&make_store("store-1", "notes"))
         .await
         .unwrap();
-    let conn = api.conn.conn().await;
+    let conn = api.conn.writer().await;
     let result = conn
         .execute(
             "INSERT INTO sources (id, store_id, kind, root, url, include, exclude, \
