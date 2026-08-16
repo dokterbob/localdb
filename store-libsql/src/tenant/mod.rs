@@ -13,6 +13,9 @@ pub(crate) mod rows;
 pub(crate) mod sql;
 pub(crate) mod write;
 
+#[cfg(test)]
+mod tests;
+
 pub(crate) struct TenantStore {
     conn: Arc<LibsqlDb>,
     store_id: String,
