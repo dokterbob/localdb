@@ -64,9 +64,11 @@ pub fn http_status_for(err: &CoreError) -> StatusCode {
         | CoreError::ResourceNotFound { .. }
         | CoreError::JobNotFound { .. } => StatusCode::NOT_FOUND,
 
-        CoreError::RuntimeStateLocked | CoreError::DaemonRunning | CoreError::IndexInProgress => {
-            StatusCode::CONFLICT
-        }
+        CoreError::RuntimeStateLocked
+        | CoreError::DaemonRunning
+        | CoreError::IndexInProgress
+        | CoreError::JobCancelled
+        | CoreError::JobAlreadyTerminal => StatusCode::CONFLICT,
 
         CoreError::DaemonUnreachable
         | CoreError::ProviderUnavailable { .. }
@@ -119,6 +121,11 @@ mod tests {
         assert_eq!(http_status_for(&Error::DaemonRunning), StatusCode::CONFLICT);
         assert_eq!(
             http_status_for(&Error::IndexInProgress),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(http_status_for(&Error::JobCancelled), StatusCode::CONFLICT);
+        assert_eq!(
+            http_status_for(&Error::JobAlreadyTerminal),
             StatusCode::CONFLICT
         );
     }

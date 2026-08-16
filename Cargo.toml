@@ -53,6 +53,11 @@ blake3 = "1"
 # Async utilities
 futures = "0.3"
 async-trait = "0.1"
+# `tokio_util::sync::CancellationToken` (issue #218) — per-job cooperative
+# cancellation signal the job queue races a running job's future against.
+# Already resolved transitively (a dependency of `axum`/`tokio` itself); this
+# adds a direct dependency for `server`, not a new crate to the graph.
+tokio-util = "0.7"
 
 # Platform paths
 directories = "6"

@@ -31,6 +31,7 @@ Single binary, subcommand tree. Global flags: `--config`, `--json`, `--store <na
 | `db migrate`                                               | Apply pending migrations with per-step progress; legacy v1–v3 rebuild and any other destructive step require confirmation; prints a `localdb index` hint when a weight-class-3 migration ran; not store-scoped, `-s` is rejected, exit 2 (§2.2)                                                                                                                                                                                                                                                | direct write                                                                                              | error `daemon_running`                                                                                                                                                                                                                                                                                |
 | `db downgrade [--to N]`                                    | Reverse migrations down to version `N` (default: one step) using stored down-SQL; requires confirmation; refuses cleanly on a step with `down_unsupported_reason`; not store-scoped, `-s` is rejected, exit 2 (§2.2)                                                                                                                                                                                                                                                                           | direct write                                                                                              | error `daemon_running`                                                                                                                                                                                                                                                                                |
 | `db vacuum`                                                | Reclaim disk space a prior migration or bulk delete freed onto SQLite's free list but never returned to the file (e.g. after `db migrate` runs the v6 `shrink_vector_index` step) by running `VACUUM`; data-preserving, no confirmation prompt, but warns that it needs roughly the store's current size again in free disk space and can take minutes on a large store; not store-scoped, `-s` is rejected, exit 2 (§2.2)                                                                     | direct write                                                                                              | error `daemon_running`                                                                                                                                                                                                                                                                                |
+| `job cancel <id>`                                          | Request cancellation of a queued or running job on a daemon's job queue (issue #218); daemon-only — no embedded equivalent, so it always requires a running daemon and `-s` is rejected, exit 2 (§2.2). Exit 0 cancellation requested (`202` + the job's snapshot), exit 3 unknown job id, exit 4 job already reached a terminal state                                                                                                                                                          | n/a — exit 5 (`daemon_unreachable`) without a running daemon                                              | `DELETE /v1/jobs/{id}`                                                                                                                                                                                                                                                                                 |
 
 Output: human-readable by default (citations as `uri:heading_path` + snippet), `--json` emits the
 canonical structures for scripting. The CLI is **command-oriented**; interactive browse is a roadmap
@@ -275,11 +276,12 @@ later if a consumer demands it).
 - **Resources** (`/v1`): `GET/POST /stores`, `GET/PATCH/DELETE /stores/{name}`,
   `GET/POST /stores/{name}/sources`, `POST /search` (body: query, store filter, metadata filters,
   limit; citations carry full `Metadata`), `GET /documents/{id}` (response includes
-  `metadata: Metadata`), `POST /jobs` (index requests), `GET /jobs/{id}`, `GET /jobs/{id}/events`
-  (SSE, below), `GET /status`, `GET /config` (resolved config). Store records (`GET/POST /stores`,
-  `GET /stores/{name}`) include `id` alongside `name`/`visibility`/`backend`. Despite the `{name}`
-  path param, stores are still looked up and returned with their `id` intact — `{name}` is only how
-  the route addresses _which_ store, not a claim that `id` is dropped from the shape.
+  `metadata: Metadata`), `POST /jobs` (index requests), `GET/DELETE /jobs/{id}` (the latter cancels,
+  issue #218), `GET /jobs/{id}/events` (SSE, below), `GET /status`, `GET /config` (resolved config).
+  Store records (`GET/POST /stores`, `GET /stores/{name}`) include `id` alongside
+  `name`/`visibility`/`backend`. Despite the `{name}` path param, stores are still looked up and
+  returned with their `id` intact — `{name}` is only how the route addresses _which_ store, not a
+  claim that `id` is dropped from the shape.
 - **Feed sources:** `POST /stores/{name}/sources` accepts
   `{kind: "feed", spec: {url, max_entries, fetch_full_content}, preset, refresh}` — `spec` mirrors
   `SourceSpec::Feed` ([02-domain-model.md](02-domain-model.md) §2). Validation failures
@@ -315,6 +317,27 @@ later if a consumer demands it).
   embedded failure would, instead of collapsing every job failure to a generic internal error.
   `#[serde(default)]`, so a daemon predating this field omits the key entirely rather than sending
   `null`.
+- **`DELETE /jobs/{id}`** (issue #218): requests cancellation of a queued or running job. `202` +
+  the job's snapshot at the moment cancellation was requested — not a guarantee it has already
+  stopped; poll `GET /jobs/{id}` or watch `GET /jobs/{id}/events` for the eventual terminal state.
+  `404 job_not_found` for an unknown job id. `409 job_already_terminal` for a job that already
+  reached `done` or `failed` — cancellation must never overwrite a recorded outcome, so
+  `JobQueue::cancel` checks the registry's terminal state before ever touching the job's
+  cancellation token. Pending jobs cancel without ever starting; a running job's task is aborted and
+  its teardown (issue #217's transaction rollback) is awaited before the per-store in-flight guard
+  is released, so a cancelled write is data-safe the same way a crash mid-write already was.
+  **Deliberate design decision:** cancellation does not add a fifth `IndexJobState` — it reuses
+  the existing `Failed` terminal state with `error_code: "job_cancelled"`, reconstructed via
+  `Error::from_code` (§5) exactly like any other typed job failure. This means every surface that
+  already renders a `Failed` job (attach polling, SSE, `--json`) needs no changes to display a
+  cancellation; the CLI's `job cancel` gets its own exit code (4) only because
+  `core::Error::JobCancelled`'s `exit_code()` says so, not because of any special-casing. A
+  cancellation racing normal completion always loses cleanly: the `409` above is returned instead of
+  the outcome being overwritten, so the job's recorded state always reflects what actually happened
+  first. Cancellation takes effect at the task's next `.await` yield point, not instantly — a
+  CPU-bound phase (parsing, embedding inference) runs to the end of its current operation before the
+  worker observes the cancellation, so a `202` may precede the terminal state by roughly the length
+  of that operation; deeper preemption of a blocking phase is a known follow-up, not implemented here.
 - **`GET /jobs/{id}/events`** (SSE, issue #83): streams the job's live progress as
   `text/event-stream`. Each in-flight update is an `event: progress` frame whose `data:` is one
   JSON-serialized `core::ProgressEvent` (internally tagged `type`: `source_started`, `discovered`,
@@ -662,6 +685,8 @@ tool error). Codes are stable API:
 | `model_missing`                                                                                     | Local model not yet downloaded; message includes the fix                                                                                                 | 503       |
 | `rate_limited`                                                                                       | Retries against an upstream host exhausted (429/5xx/timeout); not _our_ rate limit — an upstream one — but grouped with the other "upstream not currently servable" codes and 502 for that reason | 502       |
 | `index_in_progress`                                                                                 | Conflicting job already running for the scope                                                                                                            | 409       |
+| `job_already_terminal`                                                                              | `DELETE /v1/jobs/{id}` requested for a job already `done`/`failed`; cancellation never overwrites a recorded outcome (issue #218)                        | 409       |
+| `job_cancelled`                                                                                     | A job's `Failed` state whose cause was cancellation via `DELETE /v1/jobs/{id}` (issue #218); not a request's own error — it appears as the job's `error_code`, and a daemon-attached CLI (e.g. `localdb index`) reconstructs it via `Error::from_code` to exit 4 the same way a direct `job cancel` caller does | n/a (job outcome, never a live response) |
 | `internal`                                                                                          | Bug; includes correlation id, logged with backtrace                                                                                                      | 500       |
 
 CLI exit codes: `0` ok, `1` internal, `2` invalid usage/config, `3` not found, `4` conflict/locked,

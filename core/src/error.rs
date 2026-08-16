@@ -91,6 +91,27 @@ pub enum Error {
     #[error("index already in progress for this scope")]
     IndexInProgress,
 
+    /// A job was cancelled via `DELETE /v1/jobs/{id}` (issue #218) before it
+    /// reached a normal terminal state. Recorded as the job's `Failed`
+    /// state with `error_code: "job_cancelled"` — never a fifth
+    /// `IndexJobState` variant — so `cli::job_attach::finish_job`
+    /// reconstructs exactly this variant via `Error::from_code` when a
+    /// daemon-attached CLI (e.g. `localdb index`) observes a job it didn't
+    /// itself cancel end this way.
+    ///
+    /// CLI exit code: 4
+    #[error("job was cancelled")]
+    JobCancelled,
+
+    /// `DELETE /v1/jobs/{id}` was requested for a job that has already
+    /// reached a terminal state (`done` or `failed`) — cancellation must
+    /// never overwrite a recorded outcome, so this is reported instead of
+    /// silently no-oping or retroactively rewriting the job's history.
+    ///
+    /// CLI exit code: 4
+    #[error("job already reached a terminal state; cannot cancel")]
+    JobAlreadyTerminal,
+
     /// Internal bug; includes correlation id, logged with backtrace.
     ///
     /// CLI exit code: 1
@@ -125,6 +146,8 @@ impl Error {
             Error::ProviderUnavailable { .. } => "provider_unavailable",
             Error::ModelMissing { .. } => "model_missing",
             Error::IndexInProgress => "index_in_progress",
+            Error::JobCancelled => "job_cancelled",
+            Error::JobAlreadyTerminal => "job_already_terminal",
             Error::Internal { .. } => "internal",
             Error::RateLimited { .. } => "rate_limited",
         }
@@ -165,6 +188,8 @@ impl Error {
             "invalid_config" => Error::InvalidConfig { message },
             "invalid_request" => Error::InvalidRequest { message },
             "index_in_progress" => Error::IndexInProgress,
+            "job_cancelled" => Error::JobCancelled,
+            "job_already_terminal" => Error::JobAlreadyTerminal,
             "provider_unavailable" => Error::ProviderUnavailable { message },
             "model_missing" => Error::ModelMissing { message },
             "rate_limited" => Error::RateLimited { message },
@@ -211,6 +236,8 @@ impl Error {
             | Error::UnsupportedFormat { .. }
             | Error::ExtractionFailed { .. }
             | Error::IndexInProgress
+            | Error::JobCancelled
+            | Error::JobAlreadyTerminal
             | Error::Internal { .. } => None,
         }
     }
@@ -224,7 +251,11 @@ impl Error {
             | Error::SourceNotFound { .. }
             | Error::ResourceNotFound { .. }
             | Error::JobNotFound { .. } => 3,
-            Error::RuntimeStateLocked | Error::DaemonRunning | Error::IndexInProgress => 4,
+            Error::RuntimeStateLocked
+            | Error::DaemonRunning
+            | Error::IndexInProgress
+            | Error::JobCancelled
+            | Error::JobAlreadyTerminal => 4,
             Error::DaemonUnreachable
             | Error::ProviderUnavailable { .. }
             | Error::ModelMissing { .. }
@@ -305,6 +336,8 @@ mod tests {
                 5,
             ),
             (Error::IndexInProgress, "index_in_progress", 4),
+            (Error::JobCancelled, "job_cancelled", 4),
+            (Error::JobAlreadyTerminal, "job_already_terminal", 4),
             (
                 Error::Internal {
                     message: "bug".into(),
@@ -380,6 +413,8 @@ mod tests {
                 message: "x".into(),
             },
             Error::IndexInProgress,
+            Error::JobCancelled,
+            Error::JobAlreadyTerminal,
             Error::ProviderUnavailable {
                 message: "x".into(),
             },
@@ -492,6 +527,8 @@ mod tests {
         assert_eq!(Error::DaemonRunning.raw_message(), None);
         assert_eq!(Error::DaemonUnreachable.raw_message(), None);
         assert_eq!(Error::IndexInProgress.raw_message(), None);
+        assert_eq!(Error::JobCancelled.raw_message(), None);
+        assert_eq!(Error::JobAlreadyTerminal.raw_message(), None);
         assert_eq!(
             Error::UnsupportedFormat {
                 format: "pdf".into()
@@ -522,6 +559,33 @@ mod tests {
         assert_eq!(Error::RuntimeStateLocked.exit_code(), 4);
         assert_eq!(Error::DaemonRunning.exit_code(), 4);
         assert_eq!(Error::IndexInProgress.exit_code(), 4);
+        assert_eq!(Error::JobCancelled.exit_code(), 4);
+        assert_eq!(Error::JobAlreadyTerminal.exit_code(), 4);
+    }
+
+    /// A failed `IndexJob`'s `error_code: "job_cancelled"` must reconstruct
+    /// through `Error::from_code` into exactly `Error::JobCancelled` — the
+    /// mechanism `cli::job_attach::finish_job` relies on to give a
+    /// daemon-attached CLI (e.g. `localdb index` watching a job someone else
+    /// cancelled) the same exit code (4) a direct `job cancel` caller gets,
+    /// with zero special-casing in `finish_job` itself (issue #218).
+    #[test]
+    fn job_cancelled_round_trips_through_from_code() {
+        assert_eq!(
+            Error::from_code("job_cancelled", "job was cancelled".to_string()),
+            Some(Error::JobCancelled)
+        );
+    }
+
+    #[test]
+    fn job_already_terminal_round_trips_through_from_code() {
+        assert_eq!(
+            Error::from_code(
+                "job_already_terminal",
+                "job already reached a terminal state; cannot cancel".to_string()
+            ),
+            Some(Error::JobAlreadyTerminal)
+        );
     }
 
     #[test]

@@ -1747,6 +1747,214 @@ fn source_remove_with_daemon_running_exits_cleanly_without_panic() {
 }
 
 // ---------------------------------------------------------------------------
+// job cancel (issue #218)
+// ---------------------------------------------------------------------------
+
+/// `job cancel` requires a running daemon — no daemon detected must exit 5
+/// (`daemon_unreachable`), the same outcome every other daemon-only path in
+/// this crate gives.
+#[test]
+fn job_cancel_with_no_daemon_running_exits_5() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["job", "cancel", "01HRQHB7FN3WMX4AZDV3S9VCTZ"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `--store` is rejected outright (exit 2) — checked before any daemon
+/// probe, so this needs no daemon at all.
+#[test]
+fn job_cancel_with_store_flag_exits_2() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args([
+            "--store",
+            "notes",
+            "job",
+            "cancel",
+            "01HRQHB7FN3WMX4AZDV3S9VCTZ",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--store is not applicable"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Reads a full raw HTTP/1.1 request off `stream` (request line + headers,
+/// draining any body per `Content-Length`) and replies with `status`/`body`.
+/// Returns `false` without writing anything if the peer closed the
+/// connection before sending a request line at all — `probe_daemon`'s
+/// health check (`probe_daemon_health_inner`) is a bare
+/// `TcpStream::connect_timeout` with no HTTP request sent, so every mock
+/// daemon in this file sees one such empty connection before the real
+/// request; callers loop past a `false` return to reach it.
+fn respond_to_one_http_request(stream: &mut std::net::TcpStream, status: &str, body: &str) -> bool {
+    use std::io::{BufRead, BufReader, Write};
+
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut content_length: usize = 0;
+    let mut first_line = String::new();
+    if reader.read_line(&mut first_line).is_err() || first_line.is_empty() {
+        return false;
+    }
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).is_err() || line == "\r\n" || line.is_empty() {
+            break;
+        }
+        if let Some(v) = line
+            .to_ascii_lowercase()
+            .strip_prefix("content-length:")
+            .map(str::trim)
+            .and_then(|v| v.trim().parse::<usize>().ok())
+        {
+            content_length = v;
+        }
+    }
+    if content_length > 0 {
+        let mut buf = vec![0u8; content_length];
+        let _ = std::io::Read::read_exact(&mut reader, &mut buf);
+    }
+
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes());
+    true
+}
+
+/// Spawn a mock daemon that answers the first *genuine* HTTP request (i.e.
+/// skipping past `probe_daemon`'s bare-connect health check, see
+/// `respond_to_one_http_request`) with `status`/`body`, then returns its
+/// port. Mirrors `store_add_routes_to_daemon_when_running`'s
+/// `listener.incoming()` loop for the same reason: a single `accept()`
+/// would consume the health-check connection and leave the real request
+/// with nothing listening.
+fn spawn_one_shot_mock_daemon(status: &'static str, body: &'static str) -> u16 {
+    let (listener, port) = start_mock_daemon();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            if respond_to_one_http_request(&mut stream, status, body) {
+                break;
+            }
+        }
+    });
+    port
+}
+
+#[test]
+fn job_cancel_routes_to_daemon_and_reports_success_exits_0() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let job_body = r#"{"id":"01HRQHB7FN3WMX4AZDV3S9VCTZ","store_id":"s1","scope":{"type":"store"},"state":"running","stats":{"docs_indexed":0,"chunks_written":0,"docs_skipped":0,"error_count":0,"sources_count":0,"docs_deleted":0,"docs_prunable":0},"created_at":"2026-01-01T00:00:00Z"}"#;
+    let port = spawn_one_shot_mock_daemon("202 Accepted", job_body);
+    std::fs::write(
+        data_dir.join("daemon.sock"),
+        format!("http://127.0.0.1:{}", port),
+    )
+    .unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["job", "cancel", "01HRQHB7FN3WMX4AZDV3S9VCTZ"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "exit={:?} stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn job_cancel_unknown_id_daemon_reports_exit_3() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let err_body = r#"{"code":"job_not_found","message":"no-such-job"}"#;
+    let port = spawn_one_shot_mock_daemon("404 Not Found", err_body);
+    std::fs::write(
+        data_dir.join("daemon.sock"),
+        format!("http://127.0.0.1:{}", port),
+    )
+    .unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["job", "cancel", "no-such-job"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn job_cancel_already_terminal_daemon_reports_exit_4() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let err_body = r#"{"code":"job_already_terminal","message":"job already reached a terminal state; cannot cancel"}"#;
+    let port = spawn_one_shot_mock_daemon("409 Conflict", err_body);
+    std::fs::write(
+        data_dir.join("daemon.sock"),
+        format!("http://127.0.0.1:{}", port),
+    )
+    .unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["job", "cancel", "01HRQHB7FN3WMX4AZDV3S9VCTZ"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Regression guard for #67 — concurrent DB access no longer fails
 //
 // Previously, holding the redb handle open in-process (e.g. by a daemon or

@@ -7,15 +7,27 @@
 //! background worker task (one worker per queue for simplicity). The work
 //! itself is an async future (`server::job_exec::run_job` in production) —
 //! the worker `tokio::spawn`s it and awaits the `JoinHandle`, rather than
-//! `spawn_blocking`: the ingestion pipeline does its own `spawn_blocking` for
-//! CPU-bound work internally (specs/01-architecture.md §6), so the queue
-//! itself stays on the async runtime.
+//! `spawn_blocking`: the ingestion pipeline does its own blocking dispatch
+//! for CPU-bound work internally (`core::blocking::run_blocking`, which
+//! uses `tokio::task::block_in_place` on a multi-thread runtime — see
+//! specs/01-architecture.md §6), so the queue itself stays on the async
+//! runtime.
 //!
 //! A per-store in-flight guard (`inflight`) rejects a second submission for a
 //! store that already has a job queued or running, at submit time, with
 //! `Error::IndexInProgress` — before real ingestion, two concurrent jobs
 //! against the same store could race on the same `DocumentIndex`/store
 //! handle.
+//!
+//! Cancellation (issue #218) latency: `run_worker` races a running job's
+//! future against its `CancellationToken` in one `tokio::select!`, which
+//! only gets a chance to observe the token when the task future actually
+//! yields control back to the executor — an `.await` on another task, an
+//! I/O readiness wait, a timer. `block_in_place` does NOT yield: it blocks
+//! the current worker thread until the closure returns, so a cancellation
+//! requested mid-parse or mid-embedding-batch does not take effect until
+//! that CPU-bound operation finishes on its own. See `run_worker`'s
+//! `select!` for where this matters in practice.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -24,11 +36,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use localdb_core::{
     complete_index_job, create_index_job, fail_index_job, fail_index_job_with_error,
-    start_index_job, Error, IndexJob, IndexJobScope, IndexJobStats, ProgressEvent, ProgressSink,
+    start_index_job, Error, IndexJob, IndexJobScope, IndexJobState, IndexJobStats, ProgressEvent,
+    ProgressSink,
 };
 
 /// Maximum number of pending jobs in the channel.
@@ -67,6 +81,13 @@ struct QueuedJob {
     /// guard once the worker finishes (successfully or not).
     store_id: String,
     task: JobTask,
+    /// This job's cancellation signal (issue #218) — the same
+    /// `CancellationToken` clone held in this job's `JobHandle` (in
+    /// `JobQueue::handles`) at submit time, so triggering it (from
+    /// `JobQueue::cancel`, potentially long before the worker ever
+    /// dequeues this `QueuedJob`) is visible here too. Cheap to clone:
+    /// `CancellationToken` is `Arc`-backed.
+    cancel_token: CancellationToken,
 }
 
 /// Shared job registry: job_id → IndexJob.
@@ -75,31 +96,46 @@ pub type JobRegistry = Arc<RwLock<HashMap<String, IndexJob>>>;
 /// Shared set of store ids with a job currently queued or running.
 type InFlightSet = Arc<RwLock<HashSet<String>>>;
 
-/// Shared per-job progress-event registry: job_id → broadcast sender.
+/// A live job's two per-job handles: its progress-event broadcast sender
+/// (issue #83) and its cancellation token (issue #218), held together in one
+/// registry entry — they share the exact same lifecycle (created together in
+/// `submit`, torn down together in `run_worker` once the job is terminal),
+/// so keeping them in two separate `Arc<RwLock<HashMap<..>>>` maps (as an
+/// earlier version of this file did) only bought two lock acquisitions and
+/// two lookups everywhere instead of one, for no benefit.
+struct JobHandle {
+    events: broadcast::Sender<ProgressEvent>,
+    cancel_token: CancellationToken,
+}
+
+/// Shared per-job handle registry: job_id → [`JobHandle`].
 ///
 /// An entry exists from `submit` until the job reaches a terminal state, at
-/// which point `run_worker` removes it — dropping the queue's own `Sender`
-/// clone. Once every clone (the queue's and the task's `ProgressSink`) is
-/// dropped, subscribed receivers observe `RecvError::Closed`, which is how
-/// `GET /v1/jobs/{id}/events` (issue #83) knows to stop waiting for more
-/// progress and fetch the terminal `IndexJob` from the registry instead.
+/// which point `run_worker` removes it — dropping the queue's own `events`
+/// `Sender` clone. Once every clone (the queue's and the task's
+/// `ProgressSink`) is dropped, subscribed receivers observe
+/// `RecvError::Closed`, which is how `GET /v1/jobs/{id}/events` (issue #83)
+/// knows to stop waiting for more progress and fetch the terminal `IndexJob`
+/// from the registry instead.
 ///
 /// Removal always happens *after* the registry's own state update in
 /// `run_worker` (see there), so a subscriber that observes the channel close
 /// is guaranteed to find the job already terminal in the registry — no
-/// window where the terminal event could be missed.
-type EventRegistry = Arc<RwLock<HashMap<String, broadcast::Sender<ProgressEvent>>>>;
+/// window where the terminal event could be missed. `JobQueue::cancel`
+/// relies on the same ordering: a non-terminal `IndexJob` in the registry
+/// guarantees this job's entry (and so its `cancel_token`) is still present.
+type HandleRegistry = Arc<RwLock<HashMap<String, JobHandle>>>;
 
 /// A handle to the job queue.
 ///
-/// Clone-safe: underlying channel, registry, in-flight set, and event
+/// Clone-safe: underlying channel, registry, in-flight set, and handle
 /// registry are Arc'd.
 #[derive(Clone)]
 pub struct JobQueue {
     sender: mpsc::Sender<QueuedJob>,
     registry: JobRegistry,
     inflight: InFlightSet,
-    events: EventRegistry,
+    handles: HandleRegistry,
     /// Capacity of each job's progress-event broadcast channel — normally
     /// `EVENT_CHANNEL_CAPACITY`, shrinkable in tests via
     /// `new_with_event_capacity` (issue #187 review, finding 4d) so a test
@@ -132,20 +168,20 @@ impl JobQueue {
         let (sender, receiver) = mpsc::channel::<QueuedJob>(QUEUE_CAPACITY);
         let registry: JobRegistry = Arc::new(RwLock::new(HashMap::new()));
         let inflight: InFlightSet = Arc::new(RwLock::new(HashSet::new()));
-        let events: EventRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let handles: HandleRegistry = Arc::new(RwLock::new(HashMap::new()));
 
         let worker_registry = registry.clone();
         let worker_inflight = inflight.clone();
-        let worker_events = events.clone();
+        let worker_handles = handles.clone();
         tokio::spawn(async move {
-            run_worker(receiver, worker_registry, worker_inflight, worker_events).await;
+            run_worker(receiver, worker_registry, worker_inflight, worker_handles).await;
         });
 
         Self {
             sender,
             registry,
             inflight,
-            events,
+            handles,
             event_capacity,
         }
     }
@@ -194,13 +230,23 @@ impl JobQueue {
             reg.insert(job_id.clone(), job.clone());
         }
 
-        // Create this job's progress-event channel and the sink that feeds
-        // it, before enqueuing — so `subscribe(job_id)` works the instant
-        // `submit` returns, even before the worker has picked the job up.
+        // Create this job's progress-event channel, its sink, and its
+        // cancellation token, before enqueuing — so `subscribe(job_id)`
+        // (issue #83) and `JobQueue::cancel(job_id)` (issue #218) both work
+        // the instant `submit` returns, even before the worker has picked
+        // the job up (the latter is what makes cancelling a still-`Pending`
+        // job possible at all).
         let (tx, _rx) = broadcast::channel::<ProgressEvent>(self.event_capacity);
+        let cancel_token = CancellationToken::new();
         {
-            let mut events = self.events.write().await;
-            events.insert(job_id.clone(), tx.clone());
+            let mut handles = self.handles.write().await;
+            handles.insert(
+                job_id.clone(),
+                JobHandle {
+                    events: tx.clone(),
+                    cancel_token: cancel_token.clone(),
+                },
+            );
         }
         let sink: ProgressSink = {
             let tx = tx.clone();
@@ -216,6 +262,7 @@ impl JobQueue {
             id: job_id.clone(),
             store_id: store_id.to_string(),
             task: Box::new(move || Box::pin(task(sink))),
+            cancel_token,
         };
 
         if let Err(e) = self.sender.send(queued).await {
@@ -228,8 +275,8 @@ impl JobQueue {
             if let Some(j) = reg.get_mut(&job_id) {
                 fail_index_job(j, "job queue is full or closed".to_string());
             }
-            let mut events = self.events.write().await;
-            events.remove(&job_id);
+            let mut handles = self.handles.write().await;
+            handles.remove(&job_id);
         }
 
         // Return the current state of the job (it's Pending until the worker picks it up).
@@ -241,6 +288,78 @@ impl JobQueue {
     pub async fn get_job(&self, id: &str) -> Option<IndexJob> {
         let reg = self.registry.read().await;
         reg.get(id).cloned()
+    }
+
+    /// Request cancellation of `job_id` (issue #218; `DELETE /v1/jobs/{id}`).
+    ///
+    /// - Unknown job id: `Error::JobNotFound`.
+    /// - Job already terminal (`Done`/`Failed`) *before* the token is ever
+    ///   touched: `Error::JobAlreadyTerminal` unconditionally, including a
+    ///   job that was already `Failed`/`job_cancelled` (e.g. a repeated
+    ///   cancel) — a cancel landing after normal completion (or after a
+    ///   real failure) must never overwrite the recorded outcome, so this
+    ///   check happens against the registry, not the cancellation token,
+    ///   strictly before the token is touched at all.
+    /// - Otherwise (`Pending` or `Running`): triggers this job's
+    ///   `CancellationToken`, then re-checks the registry once more (see
+    ///   below) before answering. A `Pending` job's worker iteration
+    ///   observes the token before ever starting the pipeline (see
+    ///   `run_worker`); a `Running` job's `tokio::select!` observes it at
+    ///   its next scheduling point (subject to this crate's
+    ///   `block_in_place` cancellation-latency caveat — see this module's
+    ///   doc comment).
+    ///
+    /// The pre-trigger check and the token trigger are two separate lock
+    /// acquisitions (`registry` and `handles` are distinct `RwLock`s), so a
+    /// job can race to a terminal state in between — on a multi-thread
+    /// runtime, `run_worker` can observe the just-triggered token and
+    /// finish recording `Failed`/`job_cancelled` before this function's own
+    /// post-trigger read ever runs. Without a second look this would either
+    /// report "cancellation requested" for a job that, in fact, already
+    /// finished by some *other* means (issue #218 review, fix 3), or —
+    /// naively treating any post-trigger-terminal job as a conflict — hand
+    /// the very caller whose cancellation just worked a confusing `409`
+    /// (issue #218 review, fix 5). `resolve_post_trigger_outcome` (below)
+    /// is what tells those two cases apart: a job that is terminal *because
+    /// this cancellation reached it* (`Failed` with
+    /// `error_code: "job_cancelled"`) is success, indistinguishable from —
+    /// and no less valid a response than — a `Pending`/`Running` snapshot
+    /// taken a moment earlier; any other terminal state (`Done`, or
+    /// `Failed` with a different `error_code`) is a genuine conflict, since
+    /// the job reached its own outcome first, unrelated to this cancel.
+    /// Even this narrows rather than eliminates the window — the one gap
+    /// that genuinely can't be closed this way is between this function
+    /// returning and the response reaching the caller, exactly what
+    /// "202 = requested, not guaranteed" already covers.
+    pub async fn cancel(&self, job_id: &str) -> Result<IndexJob, Error> {
+        Self::terminal_check(&self.registry, job_id).await?;
+
+        if let Some(handle) = self.handles.read().await.get(job_id) {
+            handle.cancel_token.cancel();
+        }
+
+        let reg = self.registry.read().await;
+        let job = reg.get(job_id).ok_or_else(|| Error::JobNotFound {
+            id: job_id.to_string(),
+        })?;
+        resolve_post_trigger_outcome(job)
+    }
+
+    /// The pre-trigger half of `cancel`'s bracketing check: `Ok(job)` for a
+    /// known, non-terminal job; `Err(JobNotFound)` for an unknown id;
+    /// `Err(JobAlreadyTerminal)` for one already `Done`/`Failed` —
+    /// unconditionally, unlike [`resolve_post_trigger_outcome`] below,
+    /// since nothing has been triggered yet for a repeated cancel to have
+    /// legitimately caused.
+    async fn terminal_check(registry: &JobRegistry, job_id: &str) -> Result<IndexJob, Error> {
+        let reg = registry.read().await;
+        let job = reg.get(job_id).ok_or_else(|| Error::JobNotFound {
+            id: job_id.to_string(),
+        })?;
+        if matches!(job.state, IndexJobState::Done | IndexJobState::Failed) {
+            return Err(Error::JobAlreadyTerminal);
+        }
+        Ok(job.clone())
     }
 
     /// List all jobs.
@@ -257,8 +376,8 @@ impl JobQueue {
     /// `get_job`", not as "unknown job id" (a job that never existed is a
     /// separate case the caller should check via `get_job` first).
     pub async fn subscribe(&self, job_id: &str) -> Option<broadcast::Receiver<ProgressEvent>> {
-        let events = self.events.read().await;
-        events.get(job_id).map(|tx| tx.subscribe())
+        let handles = self.handles.read().await;
+        handles.get(job_id).map(|h| h.events.subscribe())
     }
 
     /// Test-only: a clone of a live job's progress-event `Sender`, for
@@ -275,8 +394,8 @@ impl JobQueue {
         &self,
         job_id: &str,
     ) -> Option<broadcast::Sender<ProgressEvent>> {
-        let events = self.events.read().await;
-        events.get(job_id).cloned()
+        let handles = self.handles.read().await;
+        handles.get(job_id).map(|h| h.events.clone())
     }
 }
 
@@ -285,71 +404,191 @@ async fn run_worker(
     mut receiver: mpsc::Receiver<QueuedJob>,
     registry: JobRegistry,
     inflight: InFlightSet,
-    events: EventRegistry,
+    handles: HandleRegistry,
 ) {
     while let Some(queued) = receiver.recv().await {
         let job_id = queued.id.clone();
         let store_id = queued.store_id.clone();
-        info!("starting job {}", job_id);
+        let cancel_token = queued.cancel_token;
 
-        // Mark as running
-        {
+        // A job cancelled while it was still `Pending` (issue #218): the
+        // token was triggered before this worker ever dequeued it — never
+        // start the pipeline at all, not even one poll of the task future.
+        // `(queued.task)()` (which *builds* the future) is deliberately
+        // never called on this path.
+        if cancel_token.is_cancelled() {
+            info!("job {} was cancelled before starting", job_id);
             let mut reg = registry.write().await;
             if let Some(job) = reg.get_mut(&job_id) {
-                start_index_job(job);
+                fail_index_job_with_error(job, &Error::JobCancelled);
             }
-        }
+        } else {
+            info!("starting job {}", job_id);
 
-        // Build and run the job's future on the async runtime — the
-        // ingestion pipeline does its own `spawn_blocking` internally for
-        // CPU-bound work, so the queue worker itself stays async
-        // (specs/01-architecture.md §6).
-        let fut = (queued.task)();
-        let result = tokio::spawn(fut).await;
+            // Mark as running
+            {
+                let mut reg = registry.write().await;
+                if let Some(job) = reg.get_mut(&job_id) {
+                    start_index_job(job);
+                }
+            }
 
-        // Update registry
-        {
-            let mut reg = registry.write().await;
-            if let Some(job) = reg.get_mut(&job_id) {
-                match result {
-                    Ok(Ok(stats)) => {
-                        info!("job {} completed: {:?}", job_id, stats);
-                        complete_index_job(job, stats);
-                    }
-                    Ok(Err(e)) => {
-                        warn!("job {} failed: {}", job_id, e);
-                        fail_index_job_with_error(job, &e);
-                    }
-                    Err(join_err) => {
-                        error!("job {} panicked: {}", job_id, join_err);
-                        fail_index_job(job, format!("task panicked: {}", join_err));
+            // Build and run the job's future on the async runtime — the
+            // ingestion pipeline does its own blocking dispatch for
+            // CPU-bound work internally (`core::blocking::run_blocking`,
+            // specs/01-architecture.md §6), so the queue worker itself
+            // stays async. Raced against the cancellation token in one
+            // `select!` (issue #218): this is what covers an in-progress
+            // `backon` retry sleep or a `governor` pacing wait without
+            // threading the token through `core`/`ingest` at all — but
+            // only at a genuine `.await` yield point. A `block_in_place`
+            // call (this module's doc comment) blocks the worker thread
+            // without yielding, so cancellation requested mid-parse or
+            // mid-embedding-batch takes effect only once that operation
+            // returns on its own, not before.
+            let fut = (queued.task)();
+            let mut handle = tokio::spawn(fut);
+            let outcome = tokio::select! {
+                r = &mut handle => JobOutcome::Finished(r),
+                _ = cancel_token.cancelled() => {
+                    // `abort()` only *requests* cancellation. If the task
+                    // had already finished by the time this branch won the
+                    // race — the natural-completion/cancel race — `abort()`
+                    // is a no-op and the re-awaited handle below resolves
+                    // to the task's real result, not a cancellation
+                    // `JoinError`; `resolve_aborted` (issue #218 review,
+                    // fix 1) tells the two apart so a real result always
+                    // wins over the cancellation flag. Only when `abort()`
+                    // actually pre-empted the task (its future dropped,
+                    // triggering Wave 1's synchronous mid-write rollback
+                    // guarantee) does the re-await resolve to a
+                    // `JoinError` with `is_cancelled() == true`. Either
+                    // way, awaiting the handle again blocks until the task
+                    // has genuinely stopped running, so the in-flight
+                    // guard released below is never premature — no window
+                    // where a fresh submission for this store could start
+                    // while the old task is still being torn down.
+                    handle.abort();
+                    resolve_aborted((&mut handle).await)
+                }
+            };
+
+            // Update registry
+            {
+                let mut reg = registry.write().await;
+                if let Some(job) = reg.get_mut(&job_id) {
+                    match outcome {
+                        JobOutcome::Finished(Ok(Ok(stats))) => {
+                            info!("job {} completed: {:?}", job_id, stats);
+                            complete_index_job(job, stats);
+                        }
+                        JobOutcome::Finished(Ok(Err(e))) => {
+                            warn!("job {} failed: {}", job_id, e);
+                            fail_index_job_with_error(job, &e);
+                        }
+                        JobOutcome::Finished(Err(join_err)) => {
+                            error!("job {} panicked: {}", job_id, join_err);
+                            fail_index_job(job, format!("task panicked: {}", join_err));
+                        }
+                        JobOutcome::Cancelled => {
+                            info!("job {} cancelled", job_id);
+                            fail_index_job_with_error(job, &Error::JobCancelled);
+                        }
                     }
                 }
             }
         }
 
-        // Tear down this job's progress-event channel now that it's
-        // terminal — *after* the registry update above, never before: a
-        // subscriber that observes the channel close (`RecvError::Closed`)
-        // must always find the job already terminal when it then reads the
-        // registry (see `EventRegistry`'s doc comment and issue #83's
-        // no-missed-terminal-event requirement). Dropping this last
-        // `Sender` clone (the `ProgressSink` given to the task already went
-        // out of scope when the task future completed) is what actually
+        // Tear down this job's handle (progress-event channel + cancel
+        // token) now that it's terminal — *after* the registry update
+        // above, never before: a subscriber that observes the channel
+        // close (`RecvError::Closed`) must always find the job already
+        // terminal when it then reads the registry (see
+        // `HandleRegistry`'s doc comment and issue #83's
+        // no-missed-terminal-event requirement); `JobQueue::cancel` relies
+        // on the same ordering. Dropping the events `Sender`'s last clone
+        // (the `ProgressSink` given to the task already went out of scope
+        // when the task future completed or was dropped) is what actually
         // closes the channel for any subscribed receivers.
         {
-            let mut events = events.write().await;
-            events.remove(&job_id);
+            let mut handles = handles.write().await;
+            handles.remove(&job_id);
         }
 
         // Release the in-flight guard now that this store's job is done
-        // (successfully or not) — a new submission for it may proceed.
+        // (successfully, failed, or cancelled) — a new submission for it
+        // may proceed.
         {
             let mut guard = inflight.write().await;
             guard.remove(&store_id);
         }
     }
     info!("job queue worker stopped");
+}
+
+/// Outcome of racing a running job's future against its cancellation token
+/// in `run_worker`'s `tokio::select!` (issue #218).
+#[derive(Debug)]
+enum JobOutcome {
+    /// The task's `JoinHandle` resolved on its own — either a normal
+    /// `Ok`/`Err` result, or `Err(JoinError)` if it panicked.
+    Finished(Result<Result<IndexJobStats, Error>, tokio::task::JoinError>),
+    /// The cancellation token fired first, and the task was actually
+    /// aborted before it produced a result.
+    Cancelled,
+}
+
+/// Resolve a `JoinHandle`'s re-await *after* `handle.abort()` was called in
+/// `run_worker`'s cancellation branch (issue #218 review, fix 1).
+///
+/// `abort()` only requests cancellation — if the task had already finished
+/// before this branch of the `select!` won the race (the
+/// natural-completion/cancel race: the job's future resolved to a real
+/// `Ok`/`Err` a moment before the cancellation signal was even observed),
+/// `abort()` is a complete no-op and the re-awaited handle resolves to that
+/// real result, not a cancellation error. Reporting `Cancelled` in that case
+/// would silently discard a genuinely-completed (and, per Wave 1, durably
+/// committed) run — recording `Failed`/`job_cancelled` over it, or masking
+/// a real failure's error code. So: a real result (`Ok(_)`, or `Err` from a
+/// genuine panic — `is_cancelled() == false`) always wins over the
+/// cancellation flag; only `Err(join_err)` with `join_err.is_cancelled()`
+/// means the abort actually pre-empted the task before it produced
+/// anything, which is the only case this reports as `Cancelled`.
+fn resolve_aborted(
+    joined: Result<Result<IndexJobStats, Error>, tokio::task::JoinError>,
+) -> JobOutcome {
+    match joined {
+        Err(join_err) if join_err.is_cancelled() => JobOutcome::Cancelled,
+        other => JobOutcome::Finished(other),
+    }
+}
+
+/// Decide `JobQueue::cancel`'s response from the job's registry state
+/// *after* its cancellation token has been triggered (issue #218 review,
+/// fix 3, then fix 5).
+///
+/// A job observed non-terminal here is the ordinary "cancellation
+/// requested" case: `Ok(job)`. A job observed terminal needs one more
+/// distinction, unlike the *pre*-trigger check (`terminal_check`, which
+/// treats every terminal state as a conflict): the token trigger and this
+/// read are two separate lock acquisitions, so `run_worker` can
+/// legitimately race this very call and finish recording
+/// `Failed`/`job_cancelled` before this function ever runs. That specific
+/// terminal state — and only that one — means the outcome the caller asked
+/// for was actually achieved (by this call, or rarely a concurrent one),
+/// so it is `Ok(job)`, not a conflict; reporting `Err(JobAlreadyTerminal)`
+/// there would hand the very caller whose cancellation just worked a
+/// confusing `409`. Any *other* terminal state — `Done`, or `Failed` with a
+/// different `error_code` — reached its own outcome first, unrelated to
+/// this cancel, and stays `Err(JobAlreadyTerminal)`.
+fn resolve_post_trigger_outcome(job: &IndexJob) -> Result<IndexJob, Error> {
+    let is_terminal = matches!(job.state, IndexJobState::Done | IndexJobState::Failed);
+    let is_this_cancellation =
+        job.state == IndexJobState::Failed && job.error_code.as_deref() == Some("job_cancelled");
+    if is_terminal && !is_this_cancellation {
+        return Err(Error::JobAlreadyTerminal);
+    }
+    Ok(job.clone())
 }
 
 impl Default for JobQueue {
@@ -359,466 +598,4 @@ impl Default for JobQueue {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use localdb_core::IndexJobState;
-
-    /// Shared trivial task body used by every test below that only cares
-    /// "the job completes successfully with no stats to speak of" — a plain
-    /// function item (not a closure literal) so its body is one piece of
-    /// code shared by every call site, rather than a separate,
-    /// separately-instrumented closure per call site (several of which,
-    /// written inline, would never actually run to completion within their
-    /// own test — e.g. a submission that's expected to be rejected before
-    /// the worker ever invokes its task).
-    async fn ok_job(_progress: ProgressSink) -> Result<IndexJobStats, Error> {
-        Ok(IndexJobStats::default())
-    }
-
-    /// Poll `queue.get_job(job_id)` until it reports `Done`, panicking if
-    /// `deadline` elapses first — the shared wait-for-completion pattern
-    /// used throughout this module's tests so a task's body is guaranteed
-    /// to have actually run (not just been scheduled) before the test
-    /// inspects it.
-    async fn wait_for_done(queue: &JobQueue, job_id: &str) -> IndexJob {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let job = queue.get_job(job_id).await.unwrap();
-            if job.state == IndexJobState::Done || job.state == IndexJobState::Failed {
-                return job;
-            }
-            if std::time::Instant::now() > deadline {
-                panic!("job did not reach a terminal state in time: {job:?}");
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    }
-
-    #[tokio::test]
-    async fn submit_creates_job_in_known_state() {
-        let queue = JobQueue::new();
-        let job = queue
-            .submit("store-1", IndexJobScope::Store, ok_job)
-            .await
-            .unwrap();
-        assert_eq!(job.store_id, "store-1");
-        // State can be Pending or Running depending on timing — but it exists
-        assert!(
-            job.state == IndexJobState::Pending
-                || job.state == IndexJobState::Running
-                || job.state == IndexJobState::Done,
-            "unexpected state: {:?}",
-            job.state
-        );
-        // Drive it to completion too, so `ok_job`'s body is guaranteed to
-        // have actually run at least once under coverage.
-        let done = wait_for_done(&queue, &job.id).await;
-        assert_eq!(done.state, IndexJobState::Done);
-    }
-
-    #[tokio::test]
-    async fn job_completes_successfully() {
-        let queue = JobQueue::new();
-        let stats = IndexJobStats {
-            docs_indexed: 5,
-            ..Default::default()
-        };
-        let job = queue
-            .submit(
-                "store-1",
-                IndexJobScope::Store,
-                move |_progress| async move { Ok(stats) },
-            )
-            .await
-            .unwrap();
-        let job_id = job.id.clone();
-
-        // Poll until done (with timeout)
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            if std::time::Instant::now() > deadline {
-                panic!("job did not complete in time");
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            let current = queue.get_job(&job_id).await.unwrap();
-            if current.state == IndexJobState::Done {
-                assert_eq!(current.stats.docs_indexed, 5);
-                break;
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn job_fails_on_error() {
-        let queue = JobQueue::new();
-        let job = queue
-            .submit("store-1", IndexJobScope::Store, |_progress| async {
-                Err(Error::Internal {
-                    message: "something went wrong".to_string(),
-                    correlation_id: "test".to_string(),
-                })
-            })
-            .await
-            .unwrap();
-        let job_id = job.id.clone();
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            if std::time::Instant::now() > deadline {
-                panic!("job did not fail in time");
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            let current = queue.get_job(&job_id).await.unwrap();
-            if current.state == IndexJobState::Failed {
-                assert!(current.error.is_some());
-                assert_eq!(current.error_code.as_deref(), Some("internal"));
-                break;
-            }
-        }
-    }
-
-    /// Issue #187 review, finding 3: a task failing with a typed
-    /// `core::Error` must have that error's stable `code()` land in the
-    /// terminal job's `error_code` — not just its stringified `error`
-    /// message — so a daemon-attached CLI (`cli::job_attach::finish_job`)
-    /// can reconstruct the original variant via `Error::from_code` and exit
-    /// with the same code an embedded pre-flight failure of the same kind
-    /// would. `GET /v1/jobs/{id}` and the SSE terminal `job` event both
-    /// serialize this `IndexJob` directly, so this also pins the wire shape.
-    #[tokio::test]
-    async fn job_failure_with_a_typed_error_carries_its_stable_code_in_error_code() {
-        let queue = JobQueue::new();
-        let job = queue
-            .submit("store-1", IndexJobScope::Store, |_progress| async {
-                Err(Error::InvalidConfig {
-                    message: "unconfigured embedder provider".to_string(),
-                })
-            })
-            .await
-            .unwrap();
-
-        let done = wait_for_done(&queue, &job.id).await;
-        assert_eq!(done.state, IndexJobState::Failed);
-        assert_eq!(done.error_code.as_deref(), Some("invalid_config"));
-        // Exact match, not `.contains`: `done.error` must be the *bare*
-        // message, with no "invalid config: " `Display` prefix — the
-        // consumer (`cli::job_attach::finish_job`) reconstructs the typed
-        // error via `Error::from_code(error_code, error)`, which adds that
-        // prefix itself. A prefixed `done.error` here would double it (issue
-        // #187 review, finding F4).
-        assert_eq!(
-            done.error.as_deref(),
-            Some("unconfigured embedder provider")
-        );
-
-        // The JSON wire shape (what `GET /v1/jobs/{id}` and the SSE terminal
-        // `job` event actually send) must carry the same field.
-        let json = serde_json::to_value(&done).unwrap();
-        assert_eq!(json["error_code"], "invalid_config");
-    }
-
-    #[tokio::test]
-    async fn get_nonexistent_job_returns_none() {
-        let queue = JobQueue::new();
-        let result = queue.get_job("nonexistent-id").await;
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn list_jobs_returns_all() {
-        let queue = JobQueue::new();
-        queue
-            .submit("store-1", IndexJobScope::Store, ok_job)
-            .await
-            .unwrap();
-        queue
-            .submit("store-2", IndexJobScope::Store, ok_job)
-            .await
-            .unwrap();
-
-        // Give time to process
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let jobs = queue.list_jobs().await;
-        assert_eq!(jobs.len(), 2);
-    }
-
-    // --- In-flight guard (#187) ---------------------------------------
-
-    #[tokio::test]
-    async fn second_submit_for_same_store_is_rejected_while_first_is_inflight() {
-        let queue = JobQueue::new();
-        // A slow first job that blocks until we let it go, so the second
-        // submission is guaranteed to observe it still in flight.
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-        let release_rx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
-        let release_rx_for_task = release_rx.clone();
-
-        queue
-            .submit(
-                "store-1",
-                IndexJobScope::Store,
-                move |_progress| async move {
-                    if let Some(rx) = release_rx_for_task.lock().await.take() {
-                        let _ = rx.await;
-                    }
-                    Ok(IndexJobStats::default())
-                },
-            )
-            .await
-            .unwrap();
-
-        let second = queue.submit("store-1", IndexJobScope::Store, ok_job).await;
-        assert!(
-            matches!(second, Err(Error::IndexInProgress)),
-            "expected IndexInProgress, got: {:?}",
-            second
-        );
-
-        // Release the blocked first job and drive it to completion, so its
-        // task body (the `move |_progress| async move { ... }` closure
-        // above) is guaranteed to actually run under coverage rather than
-        // merely being scheduled.
-        let _ = release_tx.send(());
-        let job_id = queue
-            .list_jobs()
-            .await
-            .into_iter()
-            .find(|j| j.store_id == "store-1")
-            .expect("the first submission's job must be registered")
-            .id;
-        let done = wait_for_done(&queue, &job_id).await;
-        assert_eq!(done.state, IndexJobState::Done);
-    }
-
-    #[tokio::test]
-    async fn two_distinct_stores_both_queue_fine() {
-        let queue = JobQueue::new();
-        let a = queue.submit("store-a", IndexJobScope::Store, ok_job).await;
-        let b = queue.submit("store-b", IndexJobScope::Store, ok_job).await;
-        assert!(a.is_ok());
-        assert!(b.is_ok());
-    }
-
-    #[tokio::test]
-    async fn guard_is_released_after_job_completes_allowing_resubmission() {
-        let queue = JobQueue::new();
-        let job = queue
-            .submit("store-1", IndexJobScope::Store, ok_job)
-            .await
-            .unwrap();
-        wait_for_done(&queue, &job.id).await;
-
-        // Poll for the guard release too — it happens just after the
-        // registry update, so a resubmission may race it by a tick.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let resubmit = queue.submit("store-1", IndexJobScope::Store, ok_job).await;
-            if resubmit.is_ok() {
-                break;
-            }
-            if std::time::Instant::now() > deadline {
-                panic!("guard was never released after job completion");
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    }
-
-    #[tokio::test]
-    async fn guard_is_released_after_job_fails() {
-        let queue = JobQueue::new();
-        let job = queue
-            .submit("store-1", IndexJobScope::Store, |_progress| async {
-                Err(Error::Internal {
-                    message: "boom".to_string(),
-                    correlation_id: "test".to_string(),
-                })
-            })
-            .await
-            .unwrap();
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            if std::time::Instant::now() > deadline {
-                panic!("job did not fail in time");
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            if queue.get_job(&job.id).await.unwrap().state == IndexJobState::Failed {
-                break;
-            }
-        }
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let resubmit = queue.submit("store-1", IndexJobScope::Store, ok_job).await;
-            if resubmit.is_ok() {
-                break;
-            }
-            if std::time::Instant::now() > deadline {
-                panic!("guard was never released after job failure");
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    }
-
-    // --- Progress-event subscription (#83) -----------------------------
-
-    /// `subscribe` must find a channel for a freshly-submitted job (the
-    /// channel is created in `submit`, before the worker ever picks the job
-    /// up) and must find no channel once the job is terminal — `run_worker`
-    /// tears it down right after the registry update.
-    #[tokio::test]
-    async fn subscribe_finds_channel_before_terminal_and_none_after() {
-        let queue = JobQueue::new();
-        let job = queue
-            .submit("store-1", IndexJobScope::Store, ok_job)
-            .await
-            .unwrap();
-
-        assert!(
-            queue.subscribe(&job.id).await.is_some(),
-            "expected a channel for a freshly-submitted job"
-        );
-
-        wait_for_done(&queue, &job.id).await;
-
-        assert!(
-            queue.subscribe(&job.id).await.is_none(),
-            "expected no channel for a job that has already reached a terminal state"
-        );
-    }
-
-    /// A subscriber must actually observe events the task's `ProgressSink`
-    /// sends — the whole point of threading a per-job sink through `submit`
-    /// (issue #83). Uses the same block-until-released pattern as the
-    /// in-flight guard tests above, so the subscription is guaranteed to be
-    /// in place before the task sends its event.
-    #[tokio::test]
-    async fn subscriber_observes_events_sent_via_the_tasks_progress_sink() {
-        let queue = JobQueue::new();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-
-        let job = queue
-            .submit(
-                "store-1",
-                IndexJobScope::Store,
-                move |progress| async move {
-                    let _ = release_rx.await;
-                    progress(localdb_core::ProgressEvent::Discovered { total: 3 });
-                    Ok(IndexJobStats::default())
-                },
-            )
-            .await
-            .unwrap();
-
-        let mut rx = queue.subscribe(&job.id).await.unwrap();
-        release_tx.send(()).unwrap();
-
-        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-            .await
-            .expect("timed out waiting for progress event")
-            .expect("channel closed before delivering the event");
-        match event {
-            localdb_core::ProgressEvent::Discovered { total } => assert_eq!(total, 3),
-            other => panic!("unexpected event: {other:?}"),
-        }
-    }
-
-    // --- Worker resilience -----------------------------------------------
-
-    /// A task future that panics must be recorded as a normal job failure
-    /// (via `tokio::spawn`'s `JoinError`), not crash the worker loop or the
-    /// process — the whole point of running each job's future through
-    /// `tokio::spawn` rather than awaiting it inline.
-    #[tokio::test]
-    async fn job_whose_task_panics_is_recorded_as_failed_not_worker_crashing() {
-        let queue = JobQueue::new();
-        let job = queue
-            .submit("store-1", IndexJobScope::Store, |_progress| async {
-                panic!("simulated task panic");
-                #[allow(unreachable_code)]
-                Ok(IndexJobStats::default())
-            })
-            .await
-            .unwrap();
-
-        let done = wait_for_done(&queue, &job.id).await;
-        assert_eq!(done.state, IndexJobState::Failed);
-        assert!(
-            done.error
-                .as_deref()
-                .unwrap_or_default()
-                .contains("panicked"),
-            "expected the panic to surface in the job's error text, got: {:?}",
-            done.error
-        );
-
-        // The worker loop itself must have survived: a second, unrelated
-        // submission still gets processed normally afterwards.
-        let job2 = queue
-            .submit("store-2", IndexJobScope::Store, ok_job)
-            .await
-            .unwrap();
-        let done2 = wait_for_done(&queue, &job2.id).await;
-        assert_eq!(done2.state, IndexJobState::Done);
-    }
-
-    /// `submit` must report the job as `Failed` (not panic or hang) when the
-    /// worker side of the channel is already gone — the "queue full or
-    /// closed" branch. Constructed directly (this test lives in the same
-    /// module as `JobQueue`'s private fields) with a receiver dropped
-    /// up front and no `run_worker` task spawned, so the very first `send`
-    /// in `submit` is guaranteed to hit a closed channel rather than one
-    /// that's merely unpolled.
-    #[tokio::test]
-    async fn submit_fails_the_job_when_the_worker_channel_is_already_closed() {
-        let (sender, receiver) = mpsc::channel::<QueuedJob>(1);
-        drop(receiver);
-        let queue = JobQueue {
-            sender,
-            registry: Arc::new(RwLock::new(HashMap::new())),
-            inflight: Arc::new(RwLock::new(HashSet::new())),
-            events: Arc::new(RwLock::new(HashMap::new())),
-            event_capacity: EVENT_CHANNEL_CAPACITY,
-        };
-
-        let job = queue
-            .submit("store-1", IndexJobScope::Store, ok_job)
-            .await
-            .expect("submit itself still returns Ok — the failure is recorded on the job");
-
-        assert_eq!(job.state, IndexJobState::Failed);
-        assert_eq!(
-            job.error.as_deref(),
-            Some("job queue is full or closed"),
-            "unexpected error: {:?}",
-            job.error
-        );
-        // The in-flight guard for this store must have been released too —
-        // a fresh submission (against a real, working queue) must not see
-        // a stale reservation.
-        assert!(
-            !queue.inflight.read().await.contains("store-1"),
-            "the in-flight guard must be released on a send failure"
-        );
-        // And the just-created progress-event channel must have been torn
-        // down, matching a normally-terminal job.
-        assert!(
-            queue.subscribe(&job.id).await.is_none(),
-            "no progress channel should remain for a job that never ran"
-        );
-    }
-
-    // --- Default -----------------------------------------------------------
-
-    #[tokio::test]
-    async fn default_constructs_a_working_queue() {
-        let queue = JobQueue::default();
-        let job = queue
-            .submit("store-1", IndexJobScope::Store, ok_job)
-            .await
-            .unwrap();
-        let done = wait_for_done(&queue, &job.id).await;
-        assert_eq!(done.state, IndexJobState::Done);
-    }
-}
+mod tests;

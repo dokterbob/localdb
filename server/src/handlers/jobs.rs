@@ -98,6 +98,25 @@ pub async fn get_job(
         .ok_or(ApiError(CoreError::JobNotFound { id: job_id }))
 }
 
+/// `DELETE /v1/jobs/{id}` — request cancellation of a queued or running job
+/// (issue #218).
+///
+/// `202` + the job's snapshot at the moment cancellation was requested (not
+/// a guarantee it has already stopped — poll `GET /v1/jobs/{id}` or watch
+/// `GET /v1/jobs/{id}/events` for the eventual `failed`/`job_cancelled`
+/// terminal state). `404` for an unknown job id; `409 job_already_terminal`
+/// for a job that already reached `done` or `failed` — a cancel landing
+/// after normal completion must never overwrite the recorded outcome, which
+/// is exactly what `JobQueue::cancel` guarantees by checking the registry's
+/// terminal state before ever touching the job's cancellation token.
+pub async fn cancel_job(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+) -> Result<(StatusCode, Json<IndexJob>), ApiError> {
+    let job = state.job_queue().cancel(&job_id).await?;
+    Ok((StatusCode::ACCEPTED, Json(job)))
+}
+
 /// The state machine driving `GET /v1/jobs/{id}/events`'s SSE stream
 /// (issue #83).
 ///

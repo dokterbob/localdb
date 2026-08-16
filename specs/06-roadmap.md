@@ -72,13 +72,11 @@ scheduler's multi-source starvation, where several URL sources in one store comi
 60 s tick means only the first wins the per-store in-flight guard and the rest fail submission and
 are never stamped `last_refreshed` (that happens only on completion), so they retry next tick and
 refresh less often than configured overall — pre-existing, amplified by per-host pacing making jobs
-run longer, not fixed by this work; job cancellation (issue #218) — a `localdb job cancel` CLI
-subcommand fronting a new `DELETE /v1/jobs/{id}` HTTP route, neither of which exists yet (both would
-become new entries in [05-surfaces.md](05-surfaces.md) §2/§3); emitting a progress event before the fetch
-rather than only after it returns, so a slow document is visible as in-flight instead of showing
-nothing until `DocumentStarted`/`DocumentFinished` land back-to-back; a job-duration watchdog, now
-that per-host pacing and retry make "slow but fine" and "actually stuck" harder to tell apart from
-the outside; and sub-1-req/s pacing via `governor`'s `Quota::with_period`, should the integer-only
+run longer, not fixed by this work; emitting a progress event before the fetch rather than only
+after it returns, so a slow document is visible as in-flight instead of showing nothing until
+`DocumentStarted`/`DocumentFinished` land back-to-back; a job-duration watchdog, now that per-host
+pacing and retry make "slow but fine" and "actually stuck" harder to tell apart from the outside;
+and sub-1-req/s pacing via `governor`'s `Quota::with_period`, should the integer-only
 `requests_per_second` ever prove too coarse.
 
 ### Document & ebook formats
