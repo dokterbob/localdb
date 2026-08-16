@@ -293,32 +293,44 @@ impl JobQueue {
     /// Request cancellation of `job_id` (issue #218; `DELETE /v1/jobs/{id}`).
     ///
     /// - Unknown job id: `Error::JobNotFound`.
-    /// - Job already terminal (`Done`/`Failed`): `Error::JobAlreadyTerminal`
-    ///   — a cancel landing after normal completion (or after a real
-    ///   failure) must never overwrite the recorded outcome, so the
-    ///   terminal-state check happens against the registry, not the
-    ///   cancellation token, and happens *before* the token is ever
-    ///   touched.
+    /// - Job already terminal (`Done`/`Failed`) *before* the token is ever
+    ///   touched: `Error::JobAlreadyTerminal` unconditionally, including a
+    ///   job that was already `Failed`/`job_cancelled` (e.g. a repeated
+    ///   cancel) — a cancel landing after normal completion (or after a
+    ///   real failure) must never overwrite the recorded outcome, so this
+    ///   check happens against the registry, not the cancellation token,
+    ///   strictly before the token is touched at all.
     /// - Otherwise (`Pending` or `Running`): triggers this job's
-    ///   `CancellationToken` and returns its current snapshot — "202,
-    ///   cancellation requested", not a guarantee the job has stopped yet.
-    ///   A `Pending` job's worker iteration observes the token before ever
-    ///   starting the pipeline (see `run_worker`); a `Running` job's
-    ///   `tokio::select!` observes it at its next scheduling point (subject
-    ///   to this crate's `block_in_place` cancellation-latency caveat — see
-    ///   this module's doc comment).
+    ///   `CancellationToken`, then re-checks the registry once more (see
+    ///   below) before answering. A `Pending` job's worker iteration
+    ///   observes the token before ever starting the pipeline (see
+    ///   `run_worker`); a `Running` job's `tokio::select!` observes it at
+    ///   its next scheduling point (subject to this crate's
+    ///   `block_in_place` cancellation-latency caveat — see this module's
+    ///   doc comment).
     ///
-    /// The terminal check and the token trigger are two separate lock
+    /// The pre-trigger check and the token trigger are two separate lock
     /// acquisitions (`registry` and `handles` are distinct `RwLock`s), so a
-    /// job can race to genuine completion in between — the trigger would
-    /// then no-op against a token nobody's listening to anymore, and
-    /// without a second look this would still report "cancellation
-    /// requested" for a job that had, in fact, already finished (issue #218
-    /// review, fix 3). Re-checking the registry after the trigger narrows
-    /// that window to the one gap that genuinely can't be closed this way:
-    /// between this function returning and the response reaching the
-    /// caller — exactly what "202 = requested, not guaranteed" already
-    /// covers.
+    /// job can race to a terminal state in between — on a multi-thread
+    /// runtime, `run_worker` can observe the just-triggered token and
+    /// finish recording `Failed`/`job_cancelled` before this function's own
+    /// post-trigger read ever runs. Without a second look this would either
+    /// report "cancellation requested" for a job that, in fact, already
+    /// finished by some *other* means (issue #218 review, fix 3), or —
+    /// naively treating any post-trigger-terminal job as a conflict — hand
+    /// the very caller whose cancellation just worked a confusing `409`
+    /// (issue #218 review, fix 5). `resolve_post_trigger_outcome` (below)
+    /// is what tells those two cases apart: a job that is terminal *because
+    /// this cancellation reached it* (`Failed` with
+    /// `error_code: "job_cancelled"`) is success, indistinguishable from —
+    /// and no less valid a response than — a `Pending`/`Running` snapshot
+    /// taken a moment earlier; any other terminal state (`Done`, or
+    /// `Failed` with a different `error_code`) is a genuine conflict, since
+    /// the job reached its own outcome first, unrelated to this cancel.
+    /// Even this narrows rather than eliminates the window — the one gap
+    /// that genuinely can't be closed this way is between this function
+    /// returning and the response reaching the caller, exactly what
+    /// "202 = requested, not guaranteed" already covers.
     pub async fn cancel(&self, job_id: &str) -> Result<IndexJob, Error> {
         Self::terminal_check(&self.registry, job_id).await?;
 
@@ -326,12 +338,19 @@ impl JobQueue {
             handle.cancel_token.cancel();
         }
 
-        Self::terminal_check(&self.registry, job_id).await
+        let reg = self.registry.read().await;
+        let job = reg.get(job_id).ok_or_else(|| Error::JobNotFound {
+            id: job_id.to_string(),
+        })?;
+        resolve_post_trigger_outcome(job)
     }
 
-    /// Shared by both ends of `cancel`'s bracketing check: `Ok(job)` for a
+    /// The pre-trigger half of `cancel`'s bracketing check: `Ok(job)` for a
     /// known, non-terminal job; `Err(JobNotFound)` for an unknown id;
-    /// `Err(JobAlreadyTerminal)` for one already `Done`/`Failed`.
+    /// `Err(JobAlreadyTerminal)` for one already `Done`/`Failed` —
+    /// unconditionally, unlike [`resolve_post_trigger_outcome`] below,
+    /// since nothing has been triggered yet for a repeated cancel to have
+    /// legitimately caused.
     async fn terminal_check(registry: &JobRegistry, job_id: &str) -> Result<IndexJob, Error> {
         let reg = registry.read().await;
         let job = reg.get(job_id).ok_or_else(|| Error::JobNotFound {
@@ -542,6 +561,34 @@ fn resolve_aborted(
         Err(join_err) if join_err.is_cancelled() => JobOutcome::Cancelled,
         other => JobOutcome::Finished(other),
     }
+}
+
+/// Decide `JobQueue::cancel`'s response from the job's registry state
+/// *after* its cancellation token has been triggered (issue #218 review,
+/// fix 3, then fix 5).
+///
+/// A job observed non-terminal here is the ordinary "cancellation
+/// requested" case: `Ok(job)`. A job observed terminal needs one more
+/// distinction, unlike the *pre*-trigger check (`terminal_check`, which
+/// treats every terminal state as a conflict): the token trigger and this
+/// read are two separate lock acquisitions, so `run_worker` can
+/// legitimately race this very call and finish recording
+/// `Failed`/`job_cancelled` before this function ever runs. That specific
+/// terminal state — and only that one — means the outcome the caller asked
+/// for was actually achieved (by this call, or rarely a concurrent one),
+/// so it is `Ok(job)`, not a conflict; reporting `Err(JobAlreadyTerminal)`
+/// there would hand the very caller whose cancellation just worked a
+/// confusing `409`. Any *other* terminal state — `Done`, or `Failed` with a
+/// different `error_code` — reached its own outcome first, unrelated to
+/// this cancel, and stays `Err(JobAlreadyTerminal)`.
+fn resolve_post_trigger_outcome(job: &IndexJob) -> Result<IndexJob, Error> {
+    let is_terminal = matches!(job.state, IndexJobState::Done | IndexJobState::Failed);
+    let is_this_cancellation =
+        job.state == IndexJobState::Failed && job.error_code.as_deref() == Some("job_cancelled");
+    if is_terminal && !is_this_cancellation {
+        return Err(Error::JobAlreadyTerminal);
+    }
+    Ok(job.clone())
 }
 
 impl Default for JobQueue {
