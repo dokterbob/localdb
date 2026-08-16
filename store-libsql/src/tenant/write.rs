@@ -1,38 +1,29 @@
 use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
 
 use libsql::{params, Connection};
 use localdb_core::{ChunkRecord, Error, VectorEncoding};
 
 use super::TenantStore;
-use crate::connection::map_libsql_err;
+use crate::connection::{map_libsql_err, WriteTx};
 use crate::vectors;
 
-/// A boxed, single-use future returned by an [`in_write_tx`] closure.
+/// Commit `result`'s transaction on `Ok`, roll back explicitly on `Err`
+/// (logging a rollback failure rather than propagating it), returning the
+/// original error either way — that's the failure the caller actually needs
+/// to see and react to.
 ///
-/// This is the standard "boxed HRTB async closure" pattern: a bare generic
-/// `Fut: Future<...>` associated type can't itself vary per higher-ranked
-/// lifetime (the closure needs to borrow a fresh `&'c Connection` on each
-/// call and hold it across `.await` points), but a `Pin<Box<dyn Future<...>
-/// + 'c>>` trait object can, because its type explicitly names `'c`.
-type WriteFut<'c, T> = Pin<Box<dyn Future<Output = Result<T, Error>> + Send + 'c>>;
-
-/// Run `f` against a fresh [`crate::connection::LibsqlDb::write_tx`],
-/// committing on success and rolling back explicitly on failure.
-///
-/// Explicit rollback is the primary error path here, not `WriteTx`'s `Drop`
-/// backstop: if the rollback itself fails, that's logged rather than
-/// propagated (or panicking, which is what an unhandled `Drop`-rollback
-/// failure would do) — the original write error `e` is still what's
-/// returned to the caller, since that's the failure the caller actually
-/// needs to see and react to.
-async fn in_write_tx<T, F>(store: &TenantStore, f: F) -> Result<T, Error>
-where
-    F: for<'c> FnOnce(&'c Connection) -> WriteFut<'c, T>,
-{
-    let tx = store.conn().write_tx().await?;
-    match f(&tx).await {
+/// Explicit rollback here — not `WriteTx`'s `Drop` backstop — is the primary
+/// error path: `commit()`/`rollback()` return a `Result` we can log and
+/// handle, which Drop's own rollback can't (it panics on failure instead).
+/// That said, this isn't fully panic-proof either — see
+/// [`crate::connection::WriteTx`]'s doc comment for the caveat: a
+/// persistently-failing COMMIT/ROLLBACK can still panic inside libsql before
+/// this function's error handling ever runs. Do not "simplify" the arms
+/// below away in favor of Drop on the strength of that caveat — explicit
+/// remains strictly better, handling and logging every failure Drop can't
+/// return at all.
+async fn finish_write_tx<T>(tx: WriteTx<'_>, result: Result<T, Error>) -> Result<T, Error> {
+    match result {
         Ok(v) => {
             tx.commit().await?;
             Ok(v)
@@ -64,30 +55,20 @@ pub(crate) async fn upsert_chunks(
         }
     }
     let count = records.len();
-    let encoding = store.encoding();
-    in_write_tx(store, move |conn: &Connection| -> WriteFut<'_, usize> {
-        Box::pin(async move {
-            upsert_chunks_inner(conn, &records, encoding).await?;
-            Ok(count)
-        })
-    })
-    .await
+    let tx = store.conn().write_tx().await?;
+    let result = upsert_chunks_inner(&tx, &records, store.encoding())
+        .await
+        .map(|()| count);
+    finish_write_tx(tx, result).await
 }
 
 pub(crate) async fn delete_by_resource(
     store: &TenantStore,
     resource_id: &str,
 ) -> Result<usize, Error> {
-    // Owned, not borrowed: the closure below must satisfy `for<'c> FnOnce(&'c
-    // Connection) -> WriteFut<'c, T>` for *any* `'c`, including lifetimes
-    // longer than `store`/`resource_id`'s own — so it can only borrow the
-    // freshly-supplied `&'c Connection`, nothing else.
-    let store_id = store.store_id().to_string();
-    let resource_id = resource_id.to_string();
-    in_write_tx(store, move |conn: &Connection| -> WriteFut<'_, usize> {
-        Box::pin(async move { delete_document_inner(conn, &store_id, &resource_id).await })
-    })
-    .await
+    let tx = store.conn().write_tx().await?;
+    let result = delete_document_inner(&tx, store.store_id(), resource_id).await;
+    finish_write_tx(tx, result).await
 }
 
 /// Connection-level helper: delete all chunks and the resource row for a
@@ -129,11 +110,9 @@ pub(crate) async fn delete_by_store(store: &TenantStore, store_id: &str) -> Resu
             handle = store.store_id()
         ));
     }
-    let store_id = store_id.to_string();
-    in_write_tx(store, move |conn: &Connection| -> WriteFut<'_, usize> {
-        Box::pin(async move { delete_by_store_inner(conn, &store_id).await })
-    })
-    .await
+    let tx = store.conn().write_tx().await?;
+    let result = delete_by_store_inner(&tx, store_id).await;
+    finish_write_tx(tx, result).await
 }
 
 async fn delete_by_store_inner(conn: &Connection, store_id: &str) -> Result<usize, Error> {
@@ -165,13 +144,9 @@ pub(crate) async fn upsert_blocks(
     resource_id: &str,
     blocks: &[localdb_core::block::Block],
 ) -> Result<(), localdb_core::Error> {
-    let store_id = store.store_id().to_string();
-    let resource_id = resource_id.to_string();
-    let blocks = blocks.to_vec();
-    in_write_tx(store, move |conn: &Connection| -> WriteFut<'_, ()> {
-        Box::pin(async move { upsert_blocks_inner(conn, &store_id, &resource_id, &blocks).await })
-    })
-    .await
+    let tx = store.conn().write_tx().await?;
+    let result = upsert_blocks_inner(&tx, store.store_id(), resource_id, blocks).await;
+    finish_write_tx(tx, result).await
 }
 
 async fn upsert_chunks_inner(
@@ -337,22 +312,22 @@ pub(crate) async fn upsert_chunks_and_blocks(
         }
     }
     let count = records.len();
-    let store_id = store.store_id().to_string();
-    let encoding = store.encoding();
-    let resource_id = resource_id.to_string();
-    let blocks = blocks.to_vec();
-    let replaces_resource_id = replaces_resource_id.map(str::to_string);
-    in_write_tx(store, move |conn: &Connection| -> WriteFut<'_, usize> {
-        Box::pin(async move {
-            if let Some(old_id) = replaces_resource_id.as_deref() {
-                delete_document_inner(conn, &store_id, old_id).await?;
-            }
-            upsert_chunks_inner(conn, &records, encoding).await?;
-            upsert_blocks_inner(conn, &store_id, &resource_id, &blocks).await?;
-            Ok(count)
-        })
-    })
-    .await
+    let tx = store.conn().write_tx().await?;
+    // Inline `async` block, not a separate closure/helper: it only borrows
+    // `&tx` (and the still-owned `store`/`records`/`resource_id`/`blocks`/
+    // `replaces_resource_id` locals) for the duration of this single
+    // `.await` right below — an ordinary borrow the compiler checks against
+    // this function's own scope, no `'static` bound or boxing required.
+    let result: Result<usize, localdb_core::Error> = async {
+        if let Some(old_id) = replaces_resource_id {
+            delete_document_inner(&tx, store.store_id(), old_id).await?;
+        }
+        upsert_chunks_inner(&tx, &records, store.encoding()).await?;
+        upsert_blocks_inner(&tx, store.store_id(), resource_id, blocks).await?;
+        Ok(count)
+    }
+    .await;
+    finish_write_tx(tx, result).await
 }
 
 /// Inner (connection-level) helper for upserting blocks within an existing

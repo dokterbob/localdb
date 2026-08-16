@@ -4,11 +4,13 @@
 //! One dedicated **writer** connection is held behind a `tokio::sync::Mutex`:
 //! all mutating access goes through it, either directly (via `writer()`) or
 //! transactionally (via `write_tx()`, which returns a
-//! [`WriteTx`] wrapping a `libsql::Transaction`). A `WriteTx`'s `Drop` runs a
-//! synchronous ROLLBACK if neither `commit()` nor `rollback()` was called —
-//! that's a backstop for panics/task-aborts only, not the primary error
-//! path, because libsql's drop-rollback `.unwrap()`s on a ROLLBACK failure;
-//! every fallible call site rolls back explicitly instead.
+//! [`WriteTx`] wrapping a `libsql::Transaction`). Every fallible call site
+//! commits/rolls back a `WriteTx` explicitly rather than relying on `Drop` as
+//! the primary path: explicit `commit()`/`rollback()` return a `Result` we
+//! can log and act on, whereas `WriteTx`'s `Drop`-rollback (a backstop for
+//! panics/task aborts only) panics if its rollback fails. See `WriteTx`'s doc
+//! comment for a caveat this doesn't fully eliminate — even the explicit
+//! path can still panic, in the same narrow case Drop would panic on too.
 //!
 //! Alongside the writer sits a small pool of independent, read-only **reader**
 //! connections (`PRAGMA query_only=ON`), handed out round-robin by
@@ -336,10 +338,33 @@ impl LibsqlDb {
 /// still held by `_guard`. If the order were reversed, another `write_tx()`
 /// caller could acquire the freed mutex and `BEGIN` a new transaction on the
 /// same connection while the old transaction's ROLLBACK is still in flight —
-/// corrupting transaction state. This is a backstop path only (panics/task
-/// aborts): the primary error path is always an explicit `rollback()`,
-/// because libsql's drop-rollback `.unwrap()`s on failure and would panic
-/// rather than propagate an error.
+/// corrupting transaction state. This Drop-rollback is a backstop path only
+/// (panics/task aborts): the primary error path is always an explicit
+/// `commit()`/`rollback()` call, because those return a `Result` we can log
+/// and act on, whereas an *unhandled* Drop-rollback failure panics.
+///
+/// # Even the explicit path isn't fully panic-proof
+///
+/// Per vendored libsql 0.10.0-pre.4 (`local::Transaction::commit`/
+/// `rollback`): if the COMMIT/ROLLBACK statement itself errors, the method
+/// returns that `Err` while the transaction is still open (non-autocommit) —
+/// so `Transaction`'s own `Drop` then fires and retries a rollback. If that
+/// retry succeeds, our original error still reaches the caller normally (a
+/// free retry, no different from any other `Err`); if the retry *also*
+/// fails, libsql panics (`do_rollback().unwrap()`) before our `map_err`/
+/// logging ever runs — the `Err` we would have returned is lost, replaced by
+/// the panic. So explicit `commit()`/`rollback()` reliably handles and logs
+/// the common, first-order failure; a *persistently* failing COMMIT/ROLLBACK
+/// (disk gone, corruption) still panics regardless, an upstream libsql
+/// limitation no call-site discipline here can eliminate. That's not a
+/// reason to "simplify" the explicit calls away in favor of Drop, though —
+/// explicit remains strictly better: it handles and logs every failure Drop
+/// silently can't, and only loses to Drop's own panic in the exact
+/// double-failure case Drop would panic on too. Separately: if a write body
+/// itself panics while a `WriteTx` is alive, unwinding drops it and this
+/// backstop rollback runs; if *that* rollback also fails, panicking while
+/// already unwinding from another panic aborts the whole process (Rust's
+/// double-panic rule), not just the current task.
 pub(crate) struct WriteTx<'a> {
     tx: Transaction,
     _guard: MutexGuard<'a, Connection>,

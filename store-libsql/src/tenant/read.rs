@@ -176,27 +176,26 @@ pub(crate) async fn bm25_search(
 
 pub(crate) async fn stats(store: &TenantStore) -> Result<StoreStats, Error> {
     let conn = store.conn().reader();
+    // A single statement, not two separate `SELECT COUNT(*)` queries: two
+    // statements read at two different points in time, so a write could
+    // commit between them (in-process now that writes are serialized through
+    // one writer connection, and always possible cross-process) and leave
+    // chunk_count/document_count mutually inconsistent. Both subqueries here
+    // run as one atomic read against a single consistent snapshot.
     let mut rows = conn
         .query(
-            "SELECT COUNT(*) FROM chunks WHERE store_id = ?",
-            params![store.store_id().to_string()],
+            "SELECT (SELECT COUNT(*) FROM chunks WHERE store_id = ?) AS chunk_count,
+                    (SELECT COUNT(*) FROM resources WHERE store_id = ?) AS document_count",
+            params![store.store_id().to_string(), store.store_id().to_string()],
         )
         .await
         .map_err(map_libsql_err)?;
-    let chunk_count = match rows.next().await.map_err(map_libsql_err)? {
-        Some(row) => row.get::<u64>(0).map_err(map_libsql_err)?,
-        None => 0,
-    };
-    let mut rows = conn
-        .query(
-            "SELECT COUNT(*) FROM resources WHERE store_id = ?",
-            params![store.store_id().to_string()],
-        )
-        .await
-        .map_err(map_libsql_err)?;
-    let document_count = match rows.next().await.map_err(map_libsql_err)? {
-        Some(row) => row.get::<u64>(0).map_err(map_libsql_err)?,
-        None => 0,
+    let (chunk_count, document_count) = match rows.next().await.map_err(map_libsql_err)? {
+        Some(row) => (
+            row.get::<u64>(0).map_err(map_libsql_err)?,
+            row.get::<u64>(1).map_err(map_libsql_err)?,
+        ),
+        None => (0, 0),
     };
     Ok(StoreStats {
         chunk_count,
