@@ -242,7 +242,9 @@ impl DaemonAwareCommand for IndexCmd<'_> {
         // deliberately keeps going under `WarnAndContinue` so one bad
         // source doesn't fail the add.
         let mut embedder: Option<Arc<dyn Embedder>> = None;
-        let queue = JobQueue::new();
+        // Embedded mode stays single-worker deliberately (issue #208):
+        // `server.job_workers` only governs the daemon's own job queue.
+        let queue = JobQueue::with_workers(1);
         for store_row in &store_rows {
             let label = if multi {
                 Some(store_row.name.as_str())

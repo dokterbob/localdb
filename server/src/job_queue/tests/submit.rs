@@ -164,3 +164,26 @@ async fn default_constructs_a_working_queue() {
     let done = wait_for_done(&queue, &job.id).await;
     assert_eq!(done.state, IndexJobState::Done);
 }
+
+/// `JobQueue::new` is documented as equivalent to `with_workers(1)`.
+#[tokio::test]
+async fn new_stores_a_worker_count_of_one() {
+    let queue = JobQueue::new();
+    assert_eq!(queue.worker_count(), 1);
+}
+
+/// Issue #208: `with_workers` stores the configured count, but the pool
+/// itself isn't wired up yet — a queue built with `workers: 4` must still
+/// process jobs (there's still exactly one background worker underneath).
+#[tokio::test]
+async fn with_workers_stores_the_count_and_still_runs_jobs() {
+    let queue = JobQueue::with_workers(4);
+    assert_eq!(queue.worker_count(), 4);
+
+    let job = queue
+        .submit("store-1", IndexJobScope::Store, ok_job)
+        .await
+        .unwrap();
+    let done = wait_for_done(&queue, &job.id).await;
+    assert_eq!(done.state, IndexJobState::Done);
+}

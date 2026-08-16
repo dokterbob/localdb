@@ -452,7 +452,9 @@ impl DaemonAwareCommand for SourceAddCmd<'_> {
         // `IndexErrorMode::WarnAndContinue` it never returns `Err`, so a failure
         // only ever warns to stderr and `source add` itself always succeeds.
         let mut embedder: Option<Arc<dyn Embedder>> = None;
-        let queue = JobQueue::new();
+        // Embedded mode stays single-worker deliberately (issue #208):
+        // `server.job_workers` only governs the daemon's own job queue.
+        let queue = JobQueue::with_workers(1);
         for (row, src_id) in &to_index {
             if !ctx.json {
                 eprintln!("Auto-indexing source {} ...", src_id);

@@ -78,6 +78,12 @@ pub struct ServerConfig {
     /// Port to listen on.
     #[serde(default = "default_port")]
     pub port: u16,
+
+    /// Number of daemon job-queue workers. Jobs for the same store never run
+    /// concurrently regardless of this setting; values greater than 1 enable
+    /// cross-store parallelism. Default 1.
+    #[serde(default = "default_job_workers")]
+    pub job_workers: usize,
 }
 
 impl Default for ServerConfig {
@@ -85,6 +91,7 @@ impl Default for ServerConfig {
         Self {
             bind: default_bind(),
             port: default_port(),
+            job_workers: default_job_workers(),
         }
     }
 }
@@ -95,6 +102,10 @@ fn default_bind() -> String {
 
 fn default_port() -> u16 {
     7700
+}
+
+fn default_job_workers() -> usize {
+    1
 }
 
 // ---------------------------------------------------------------------------
@@ -433,6 +444,7 @@ mod tests {
         let s = ServerConfig::default();
         assert_eq!(s.bind, "127.0.0.1");
         assert_eq!(s.port, 7700);
+        assert_eq!(s.job_workers, 1);
     }
 
     /// This list is duplicated in `extract::registry::default_parser_ids`

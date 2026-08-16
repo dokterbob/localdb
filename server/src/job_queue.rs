@@ -142,14 +142,34 @@ pub struct JobQueue {
     /// can force `broadcast::error::RecvError::Lagged` deterministically
     /// with only a handful of events instead of needing 1024+.
     event_capacity: usize,
+    /// Configured worker-pool size (issue #208, `server.job_workers` config
+    /// key). Stored for the next step's consumption; `with_workers` still
+    /// spawns exactly one worker regardless of this value — see
+    /// `worker_count`'s doc comment. Only read via the `#[cfg(test)]`
+    /// `worker_count` accessor until the pool itself is wired up, hence the
+    /// blanket allow here rather than on the (production) field use sites.
+    #[allow(dead_code)]
+    workers: usize,
 }
 
 impl JobQueue {
     /// Create a new job queue and start the background worker.
     ///
     /// Returns the queue handle. The worker runs until the sender is dropped.
+    /// Equivalent to `with_workers(1)`.
     pub fn new() -> Self {
-        Self::with_event_capacity(EVENT_CHANNEL_CAPACITY)
+        Self::with_workers(1)
+    }
+
+    /// Create a new job queue configured for `workers` job-queue workers
+    /// (issue #208, `server.job_workers` config key).
+    ///
+    /// The worker count is stored on the returned queue but not yet acted
+    /// on: this constructor still spawns exactly one worker regardless of
+    /// `workers`.
+    // #208: worker pool wired in the next commit
+    pub fn with_workers(workers: usize) -> Self {
+        Self::with_capacity(EVENT_CHANNEL_CAPACITY, workers)
     }
 
     /// Test-only: identical to [`JobQueue::new`], but with a caller-chosen
@@ -161,10 +181,19 @@ impl JobQueue {
     /// real progress events. Production behavior (`new()`) is unaffected.
     #[cfg(test)]
     pub(crate) fn new_with_event_capacity(capacity: usize) -> Self {
-        Self::with_event_capacity(capacity)
+        Self::with_capacity(capacity, 1)
     }
 
-    fn with_event_capacity(event_capacity: usize) -> Self {
+    /// Test-only: the worker-pool size this queue was constructed with (see
+    /// `with_workers`) — not yet consulted by the worker itself (issue #208;
+    /// wired in a later commit), but observable here so a test can pin that
+    /// the value survives construction.
+    #[cfg(test)]
+    pub(crate) fn worker_count(&self) -> usize {
+        self.workers
+    }
+
+    fn with_capacity(event_capacity: usize, workers: usize) -> Self {
         let (sender, receiver) = mpsc::channel::<QueuedJob>(QUEUE_CAPACITY);
         let registry: JobRegistry = Arc::new(RwLock::new(HashMap::new()));
         let inflight: InFlightSet = Arc::new(RwLock::new(HashSet::new()));
@@ -173,6 +202,9 @@ impl JobQueue {
         let worker_registry = registry.clone();
         let worker_inflight = inflight.clone();
         let worker_handles = handles.clone();
+        // #208: worker pool wired in the next commit — exactly one worker
+        // spawned regardless of `workers`, matching JobQueue::new's
+        // documented behavior until the pool itself is implemented.
         tokio::spawn(async move {
             run_worker(receiver, worker_registry, worker_inflight, worker_handles).await;
         });
@@ -183,6 +215,7 @@ impl JobQueue {
             inflight,
             handles,
             event_capacity,
+            workers,
         }
     }
 
