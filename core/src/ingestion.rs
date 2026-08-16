@@ -1626,6 +1626,34 @@ mod tests {
         assert_eq!(job.error_code.as_deref(), Some("internal"));
     }
 
+    /// Issue #218 review, fix 2: cancelling a still-`Pending` job (before
+    /// the worker ever calls `start_index_job` on it) goes straight
+    /// `Pending -> Failed` — the one path that leaves `started_at: None` on
+    /// a terminal job, since the job never actually ran. Pins the exact
+    /// record shape `IndexJobState`'s doc comment now documents, produced
+    /// the same way `server::job_queue::run_worker` produces it for a
+    /// pending-cancelled job: `fail_index_job_with_error` called on a job
+    /// that never went through `start_index_job`.
+    #[test]
+    fn fail_index_job_with_error_on_a_still_pending_job_leaves_started_at_none() {
+        let mut job = create_index_job("store-1", IndexJobScope::Store);
+        assert_eq!(job.state, IndexJobState::Pending);
+        assert!(job.started_at.is_none());
+
+        fail_index_job_with_error(&mut job, &Error::JobCancelled);
+
+        assert_eq!(job.state, IndexJobState::Failed);
+        assert_eq!(job.error_code.as_deref(), Some("job_cancelled"));
+        assert!(
+            job.started_at.is_none(),
+            "a job cancelled before it ever started must not gain a started_at"
+        );
+        assert!(
+            job.completed_at.is_some(),
+            "the job is still terminal and must record when that happened"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // glob_match tests
     // ---------------------------------------------------------------------------

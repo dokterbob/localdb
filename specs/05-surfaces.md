@@ -334,7 +334,10 @@ later if a consumer demands it).
   `core::Error::JobCancelled`'s `exit_code()` says so, not because of any special-casing. A
   cancellation racing normal completion always loses cleanly: the `409` above is returned instead of
   the outcome being overwritten, so the job's recorded state always reflects what actually happened
-  first.
+  first. Cancellation takes effect at the task's next `.await` yield point, not instantly — a
+  CPU-bound phase (parsing, embedding inference) runs to the end of its current operation before the
+  worker observes the cancellation, so a `202` may precede the terminal state by roughly the length
+  of that operation; deeper preemption of a blocking phase is a known follow-up, not implemented here.
 - **`GET /jobs/{id}/events`** (SSE, issue #83): streams the job's live progress as
   `text/event-stream`. Each in-flight update is an `event: progress` frame whose `data:` is one
   JSON-serialized `core::ProgressEvent` (internally tagged `type`: `source_started`, `discovered`,

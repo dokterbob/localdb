@@ -65,9 +65,8 @@ async fn submit_fails_the_job_when_the_worker_channel_is_already_closed() {
         sender,
         registry: Arc::new(RwLock::new(HashMap::new())),
         inflight: Arc::new(RwLock::new(HashSet::new())),
-        events: Arc::new(RwLock::new(HashMap::new())),
+        handles: Arc::new(RwLock::new(HashMap::new())),
         event_capacity: EVENT_CHANNEL_CAPACITY,
-        cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
     };
 
     let job = queue

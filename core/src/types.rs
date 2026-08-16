@@ -461,7 +461,11 @@ pub struct IndexJob {
     /// When the job was created (RFC 3339).
     pub created_at: String,
 
-    /// When the job started running (RFC 3339), if it has.
+    /// When the job started running (RFC 3339), if it has. `None` for a
+    /// still-`Pending` job, and also stays `None` on a job cancelled while
+    /// still `Pending` (see [`IndexJobState`]'s doc comment) even though
+    /// that job is terminal — `completed_at.is_some()` does not imply
+    /// `started_at.is_some()`.
     #[serde(default)]
     pub started_at: Option<String>,
 
@@ -483,6 +487,17 @@ pub enum IndexJobScope {
 }
 
 /// State of an index job: pending → running → done | failed.
+///
+/// One edge is not on that spine: `pending → failed` directly, with
+/// `error_code: "job_cancelled"` (issue #218) — an operator can cancel a job
+/// that is still queued, before the worker ever starts it. That job's
+/// `started_at` stays `None` (it never ran) while `completed_at` is set (it
+/// did reach a terminal state) — the only path that produces that
+/// particular pair. Every other terminal job has `started_at: Some(_)`,
+/// since `running → done`/`running → failed` are the only other ways to
+/// reach a terminal state. A consumer must not assume `completed_at.is_some()
+/// implies started_at.is_some()` (e.g. when computing a duration) for
+/// exactly this reason.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IndexJobState {

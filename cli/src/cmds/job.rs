@@ -15,7 +15,7 @@ use localdb_core::{Error, IndexJob};
 
 use crate::app_db::{load_config_scaffolded, reject_store_flag};
 use crate::daemon_client::{
-    daemon_delete, encode_path_segment, probe_daemon, CliContext, DaemonState,
+    daemon_request_async, encode_path_segment, probe_daemon, CliContext, DaemonState,
 };
 use crate::normalize::{exit_err, print_json};
 
@@ -33,8 +33,13 @@ const JOB_CANCEL_REJECT_MESSAGE: &str =
 /// `cli::job_attach::attach_daemon_job`'s testing style) without going
 /// through `exit_err`'s process-exiting error path.
 pub(crate) async fn cancel_daemon_job(base_url: &str, id: &str) -> Result<IndexJob, Error> {
+    // `id` is percent-encoded before it's interpolated into the URL path
+    // segment — see `encode_path_segment`'s doc comment; same class of bug
+    // as `store remove`/`source remove`'s DELETE call sites
+    // (`cli/src/cmds/store.rs`, `cli/src/cmds/source.rs`), which this
+    // mirrors.
     let url = format!("{base_url}/v1/jobs/{}", encode_path_segment(id));
-    let v = daemon_delete(&url).await?;
+    let v = daemon_request_async(reqwest::Method::DELETE, &url, None).await?;
     serde_json::from_value(v).map_err(|e| Error::Internal {
         message: format!("cannot parse job from daemon: {}", e),
         correlation_id: "daemon_job_cancel_parse".to_string(),
