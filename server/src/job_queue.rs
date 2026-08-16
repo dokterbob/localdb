@@ -3,9 +3,14 @@
 //! Accepts `IndexJob` submissions, executes them via the ingestion pipeline,
 //! and tracks state/stats so HTTP callers can poll `GET /jobs/{id}`.
 //!
-//! Jobs are queued via a tokio channel and executed sequentially by a
-//! background worker task (one worker per queue for simplicity). The work
-//! itself is an async future (`server::job_exec::run_job` in production) —
+//! Jobs are queued via a tokio channel and executed by a pool of background
+//! worker tasks (issue #208, `server.job_workers` config key; defaults to
+//! 1, matching the historical single-worker behavior) — see
+//! `JobQueue::with_workers` and `run_worker`. All workers share the one
+//! channel receiver, so jobs for *different* stores can run concurrently
+//! across workers; jobs for the *same* store stay serialized regardless of
+//! worker count, via the per-store in-flight guard below. The work itself
+//! is an async future (`server::job_exec::run_job` in production) —
 //! the worker `tokio::spawn`s it and awaits the `JoinHandle`, rather than
 //! `spawn_blocking`: the ingestion pipeline does its own blocking dispatch
 //! for CPU-bound work internally (`core::blocking::run_blocking`, which
@@ -35,7 +40,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, Mutex as AsyncMutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -143,12 +148,10 @@ pub struct JobQueue {
     /// with only a handful of events instead of needing 1024+.
     event_capacity: usize,
     /// Configured worker-pool size (issue #208, `server.job_workers` config
-    /// key). Stored for the next step's consumption; `with_workers` still
-    /// spawns exactly one worker regardless of this value — see
-    /// `worker_count`'s doc comment. Only read via the `#[cfg(test)]`
-    /// `worker_count` accessor until the pool itself is wired up, hence the
-    /// blanket allow here rather than on the (production) field use sites.
-    #[allow(dead_code)]
+    /// key) — the number of `run_worker` tasks spawned in `with_capacity`,
+    /// all sharing the one `mpsc::Receiver<QueuedJob>` behind an
+    /// `Arc<AsyncMutex<_>>` (see `with_capacity`). Also readable via the
+    /// `#[cfg(test)]` `worker_count` accessor.
     workers: usize,
 }
 
@@ -161,13 +164,16 @@ impl JobQueue {
         Self::with_workers(1)
     }
 
-    /// Create a new job queue configured for `workers` job-queue workers
+    /// Create a new job queue backed by `workers` job-queue worker tasks
     /// (issue #208, `server.job_workers` config key).
     ///
-    /// The worker count is stored on the returned queue but not yet acted
-    /// on: this constructor still spawns exactly one worker regardless of
-    /// `workers`.
-    // #208: worker pool wired in the next commit
+    /// All `workers` tasks pull from the same `mpsc::Receiver<QueuedJob>`,
+    /// serialized behind an `Arc<tokio::sync::Mutex<_>>` (see
+    /// `with_capacity`) — whichever worker is idle picks up the next queued
+    /// job. The per-store in-flight guard (`submit`'s `inflight` check) is
+    /// unaffected by the worker count: it still serializes jobs for the
+    /// *same* store regardless of how many workers exist, but jobs for
+    /// *different* stores can now run concurrently across workers.
     pub fn with_workers(workers: usize) -> Self {
         Self::with_capacity(EVENT_CHANNEL_CAPACITY, workers)
     }
@@ -185,9 +191,8 @@ impl JobQueue {
     }
 
     /// Test-only: the worker-pool size this queue was constructed with (see
-    /// `with_workers`) — not yet consulted by the worker itself (issue #208;
-    /// wired in a later commit), but observable here so a test can pin that
-    /// the value survives construction.
+    /// `with_workers`) — lets a test pin that the value survives
+    /// construction and drives the number of `run_worker` tasks spawned.
     #[cfg(test)]
     pub(crate) fn worker_count(&self) -> usize {
         self.workers
@@ -199,24 +204,42 @@ impl JobQueue {
         let inflight: InFlightSet = Arc::new(RwLock::new(HashSet::new()));
         let handles: HandleRegistry = Arc::new(RwLock::new(HashMap::new()));
 
-        let worker_registry = registry.clone();
-        let worker_inflight = inflight.clone();
-        let worker_handles = handles.clone();
-        // #208: worker pool wired in the next commit — exactly one worker
-        // spawned regardless of `workers`, matching JobQueue::new's
-        // documented behavior until the pool itself is implemented.
-        tokio::spawn(async move {
-            run_worker(receiver, worker_registry, worker_inflight, worker_handles).await;
-        });
-
-        Self {
+        let queue = Self {
             sender,
             registry,
             inflight,
             handles,
             event_capacity,
             workers,
+        };
+
+        // All `queue.workers` worker tasks share this one receiver, guarded
+        // by an async mutex: each iteration locks, awaits the next queued
+        // job, drops the lock, then processes the job — so only the wait
+        // for a job (not the job itself) holds the lock, letting the other
+        // workers process jobs concurrently in the meantime. KISS (issue
+        // #208 design): no work-stealing, no per-worker sub-queues — the
+        // shared-receiver-behind-a-mutex approach needs no new
+        // dependencies and keeps `submit`'s per-store in-flight guard as
+        // the only cross-job coordination this module needs.
+        let shared_receiver = Arc::new(AsyncMutex::new(receiver));
+        for _ in 0..queue.workers {
+            let worker_receiver = shared_receiver.clone();
+            let worker_registry = queue.registry.clone();
+            let worker_inflight = queue.inflight.clone();
+            let worker_handles = queue.handles.clone();
+            tokio::spawn(async move {
+                run_worker(
+                    worker_receiver,
+                    worker_registry,
+                    worker_inflight,
+                    worker_handles,
+                )
+                .await;
+            });
         }
+
+        queue
     }
 
     /// Submit a new indexing job for `store_id`.
@@ -432,131 +455,174 @@ impl JobQueue {
     }
 }
 
-/// Background worker: pulls queued jobs and executes them.
+/// One worker of the pool (issue #208): repeatedly locks the shared
+/// receiver, awaits the next queued job, drops the lock, then processes
+/// that job to completion before looping back for another. Several of
+/// these run concurrently (one per `JobQueue::with_workers(N)`'s `N`), all
+/// sharing the single `mpsc::Receiver<QueuedJob>` behind `receiver`'s
+/// `Arc<AsyncMutex<_>>` — whichever worker's `lock().await` + `recv().await`
+/// resolves first gets the next job. The lock is held only across the
+/// `recv().await` itself, never across `process_job`, so one worker
+/// processing a long-running job never blocks the others from picking up
+/// further work.
+///
+/// Cancellation stays per-job/per-worker: each `QueuedJob` carries its own
+/// `CancellationToken` (set in `submit`), and `process_job` only ever races
+/// *that* job's future against *that* token — nothing here is shared
+/// mutable state across concurrent jobs beyond the registry/inflight/handles
+/// maps, which are already `RwLock`-guarded for concurrent access.
+///
+/// Exits its loop once `recv()` returns `None` — the channel has closed
+/// because every `JobQueue` (and so every `mpsc::Sender` clone) has been
+/// dropped. With `N` workers, `N` copies of this loop each observe that and
+/// exit independently; nothing here coordinates that shutdown further.
 async fn run_worker(
-    mut receiver: mpsc::Receiver<QueuedJob>,
+    receiver: Arc<AsyncMutex<mpsc::Receiver<QueuedJob>>>,
     registry: JobRegistry,
     inflight: InFlightSet,
     handles: HandleRegistry,
 ) {
-    while let Some(queued) = receiver.recv().await {
-        let job_id = queued.id.clone();
-        let store_id = queued.store_id.clone();
-        let cancel_token = queued.cancel_token;
+    loop {
+        let queued = {
+            let mut rx = receiver.lock().await;
+            rx.recv().await
+        };
+        let Some(queued) = queued else {
+            break;
+        };
+        process_job(queued, &registry, &inflight, &handles).await;
+    }
+    info!("job queue worker stopped");
+}
 
-        // A job cancelled while it was still `Pending` (issue #218): the
-        // token was triggered before this worker ever dequeued it — never
-        // start the pipeline at all, not even one poll of the task future.
-        // `(queued.task)()` (which *builds* the future) is deliberately
-        // never called on this path.
-        if cancel_token.is_cancelled() {
-            info!("job {} was cancelled before starting", job_id);
+/// Run a single dequeued job to a terminal state: starts it (unless it was
+/// already cancelled while `Pending`), races it against its cancellation
+/// token, records the outcome, then tears down its handle and releases the
+/// per-store in-flight guard. This is the per-job body that used to live
+/// directly inside `run_worker`'s `while let` loop (issue #208) — factored
+/// out so `run_worker` can call it from any of the pool's worker tasks
+/// without duplicating the logic.
+async fn process_job(
+    queued: QueuedJob,
+    registry: &JobRegistry,
+    inflight: &InFlightSet,
+    handles: &HandleRegistry,
+) {
+    let job_id = queued.id.clone();
+    let store_id = queued.store_id.clone();
+    let cancel_token = queued.cancel_token;
+
+    // A job cancelled while it was still `Pending` (issue #218): the
+    // token was triggered before this worker ever dequeued it — never
+    // start the pipeline at all, not even one poll of the task future.
+    // `(queued.task)()` (which *builds* the future) is deliberately
+    // never called on this path.
+    if cancel_token.is_cancelled() {
+        info!("job {} was cancelled before starting", job_id);
+        let mut reg = registry.write().await;
+        if let Some(job) = reg.get_mut(&job_id) {
+            fail_index_job_with_error(job, &Error::JobCancelled);
+        }
+    } else {
+        info!("starting job {}", job_id);
+
+        // Mark as running
+        {
             let mut reg = registry.write().await;
             if let Some(job) = reg.get_mut(&job_id) {
-                fail_index_job_with_error(job, &Error::JobCancelled);
+                start_index_job(job);
             }
-        } else {
-            info!("starting job {}", job_id);
+        }
 
-            // Mark as running
-            {
-                let mut reg = registry.write().await;
-                if let Some(job) = reg.get_mut(&job_id) {
-                    start_index_job(job);
-                }
+        // Build and run the job's future on the async runtime — the
+        // ingestion pipeline does its own blocking dispatch for
+        // CPU-bound work internally (`core::blocking::run_blocking`,
+        // specs/01-architecture.md §6), so the queue worker itself
+        // stays async. Raced against the cancellation token in one
+        // `select!` (issue #218): this is what covers an in-progress
+        // `backon` retry sleep or a `governor` pacing wait without
+        // threading the token through `core`/`ingest` at all — but
+        // only at a genuine `.await` yield point. A `block_in_place`
+        // call (this module's doc comment) blocks the worker thread
+        // without yielding, so cancellation requested mid-parse or
+        // mid-embedding-batch takes effect only once that operation
+        // returns on its own, not before.
+        let fut = (queued.task)();
+        let mut handle = tokio::spawn(fut);
+        let outcome = tokio::select! {
+            r = &mut handle => JobOutcome::Finished(r),
+            _ = cancel_token.cancelled() => {
+                // `abort()` only *requests* cancellation. If the task
+                // had already finished by the time this branch won the
+                // race — the natural-completion/cancel race — `abort()`
+                // is a no-op and the re-awaited handle below resolves
+                // to the task's real result, not a cancellation
+                // `JoinError`; `resolve_aborted` (issue #218 review,
+                // fix 1) tells the two apart so a real result always
+                // wins over the cancellation flag. Only when `abort()`
+                // actually pre-empted the task (its future dropped,
+                // triggering Wave 1's synchronous mid-write rollback
+                // guarantee) does the re-await resolve to a
+                // `JoinError` with `is_cancelled() == true`. Either
+                // way, awaiting the handle again blocks until the task
+                // has genuinely stopped running, so the in-flight
+                // guard released below is never premature — no window
+                // where a fresh submission for this store could start
+                // while the old task is still being torn down.
+                handle.abort();
+                resolve_aborted((&mut handle).await)
             }
+        };
 
-            // Build and run the job's future on the async runtime — the
-            // ingestion pipeline does its own blocking dispatch for
-            // CPU-bound work internally (`core::blocking::run_blocking`,
-            // specs/01-architecture.md §6), so the queue worker itself
-            // stays async. Raced against the cancellation token in one
-            // `select!` (issue #218): this is what covers an in-progress
-            // `backon` retry sleep or a `governor` pacing wait without
-            // threading the token through `core`/`ingest` at all — but
-            // only at a genuine `.await` yield point. A `block_in_place`
-            // call (this module's doc comment) blocks the worker thread
-            // without yielding, so cancellation requested mid-parse or
-            // mid-embedding-batch takes effect only once that operation
-            // returns on its own, not before.
-            let fut = (queued.task)();
-            let mut handle = tokio::spawn(fut);
-            let outcome = tokio::select! {
-                r = &mut handle => JobOutcome::Finished(r),
-                _ = cancel_token.cancelled() => {
-                    // `abort()` only *requests* cancellation. If the task
-                    // had already finished by the time this branch won the
-                    // race — the natural-completion/cancel race — `abort()`
-                    // is a no-op and the re-awaited handle below resolves
-                    // to the task's real result, not a cancellation
-                    // `JoinError`; `resolve_aborted` (issue #218 review,
-                    // fix 1) tells the two apart so a real result always
-                    // wins over the cancellation flag. Only when `abort()`
-                    // actually pre-empted the task (its future dropped,
-                    // triggering Wave 1's synchronous mid-write rollback
-                    // guarantee) does the re-await resolve to a
-                    // `JoinError` with `is_cancelled() == true`. Either
-                    // way, awaiting the handle again blocks until the task
-                    // has genuinely stopped running, so the in-flight
-                    // guard released below is never premature — no window
-                    // where a fresh submission for this store could start
-                    // while the old task is still being torn down.
-                    handle.abort();
-                    resolve_aborted((&mut handle).await)
-                }
-            };
-
-            // Update registry
-            {
-                let mut reg = registry.write().await;
-                if let Some(job) = reg.get_mut(&job_id) {
-                    match outcome {
-                        JobOutcome::Finished(Ok(Ok(stats))) => {
-                            info!("job {} completed: {:?}", job_id, stats);
-                            complete_index_job(job, stats);
-                        }
-                        JobOutcome::Finished(Ok(Err(e))) => {
-                            warn!("job {} failed: {}", job_id, e);
-                            fail_index_job_with_error(job, &e);
-                        }
-                        JobOutcome::Finished(Err(join_err)) => {
-                            error!("job {} panicked: {}", job_id, join_err);
-                            fail_index_job(job, format!("task panicked: {}", join_err));
-                        }
-                        JobOutcome::Cancelled => {
-                            info!("job {} cancelled", job_id);
-                            fail_index_job_with_error(job, &Error::JobCancelled);
-                        }
+        // Update registry
+        {
+            let mut reg = registry.write().await;
+            if let Some(job) = reg.get_mut(&job_id) {
+                match outcome {
+                    JobOutcome::Finished(Ok(Ok(stats))) => {
+                        info!("job {} completed: {:?}", job_id, stats);
+                        complete_index_job(job, stats);
+                    }
+                    JobOutcome::Finished(Ok(Err(e))) => {
+                        warn!("job {} failed: {}", job_id, e);
+                        fail_index_job_with_error(job, &e);
+                    }
+                    JobOutcome::Finished(Err(join_err)) => {
+                        error!("job {} panicked: {}", job_id, join_err);
+                        fail_index_job(job, format!("task panicked: {}", join_err));
+                    }
+                    JobOutcome::Cancelled => {
+                        info!("job {} cancelled", job_id);
+                        fail_index_job_with_error(job, &Error::JobCancelled);
                     }
                 }
             }
         }
-
-        // Tear down this job's handle (progress-event channel + cancel
-        // token) now that it's terminal — *after* the registry update
-        // above, never before: a subscriber that observes the channel
-        // close (`RecvError::Closed`) must always find the job already
-        // terminal when it then reads the registry (see
-        // `HandleRegistry`'s doc comment and issue #83's
-        // no-missed-terminal-event requirement); `JobQueue::cancel` relies
-        // on the same ordering. Dropping the events `Sender`'s last clone
-        // (the `ProgressSink` given to the task already went out of scope
-        // when the task future completed or was dropped) is what actually
-        // closes the channel for any subscribed receivers.
-        {
-            let mut handles = handles.write().await;
-            handles.remove(&job_id);
-        }
-
-        // Release the in-flight guard now that this store's job is done
-        // (successfully, failed, or cancelled) — a new submission for it
-        // may proceed.
-        {
-            let mut guard = inflight.write().await;
-            guard.remove(&store_id);
-        }
     }
-    info!("job queue worker stopped");
+
+    // Tear down this job's handle (progress-event channel + cancel
+    // token) now that it's terminal — *after* the registry update
+    // above, never before: a subscriber that observes the channel
+    // close (`RecvError::Closed`) must always find the job already
+    // terminal when it then reads the registry (see
+    // `HandleRegistry`'s doc comment and issue #83's
+    // no-missed-terminal-event requirement); `JobQueue::cancel` relies
+    // on the same ordering. Dropping the events `Sender`'s last clone
+    // (the `ProgressSink` given to the task already went out of scope
+    // when the task future completed or was dropped) is what actually
+    // closes the channel for any subscribed receivers.
+    {
+        let mut handles = handles.write().await;
+        handles.remove(&job_id);
+    }
+
+    // Release the in-flight guard now that this store's job is done
+    // (successfully, failed, or cancelled) — a new submission for it
+    // may proceed.
+    {
+        let mut guard = inflight.write().await;
+        guard.remove(&store_id);
+    }
 }
 
 /// Outcome of racing a running job's future against its cancellation token

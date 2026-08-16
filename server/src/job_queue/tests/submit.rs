@@ -172,9 +172,11 @@ async fn new_stores_a_worker_count_of_one() {
     assert_eq!(queue.worker_count(), 1);
 }
 
-/// Issue #208: `with_workers` stores the configured count, but the pool
-/// itself isn't wired up yet — a queue built with `workers: 4` must still
-/// process jobs (there's still exactly one background worker underneath).
+/// Issue #208: `with_workers` stores the configured count and spawns that
+/// many worker tasks (see `job_queue/tests/worker_pool.rs` for tests that
+/// exercise concurrency across workers) — this test just pins the basics:
+/// a queue built with `workers: 4` reports that count and still processes
+/// jobs normally.
 #[tokio::test]
 async fn with_workers_stores_the_count_and_still_runs_jobs() {
     let queue = JobQueue::with_workers(4);
