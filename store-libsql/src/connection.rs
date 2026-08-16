@@ -408,8 +408,9 @@ impl WriteTx<'_> {
 /// re-issuing that pragma would be redundant.
 ///
 /// `pub(crate)` rather than private: `migrations::maintenance` opens its own
-/// connections outside `LibsqlDb::open` and needs this same sequence (a
-/// later step wires that call site up).
+/// connections outside `LibsqlDb::open` and reuses this same sequence
+/// (`open_for_maintenance` with `apply_wal=true`, `open_for_readonly_inspection`
+/// with `apply_wal=false`).
 pub(crate) async fn configure_connection(conn: &Connection, apply_wal: bool) -> Result<(), Error> {
     // PRAGMA ordering matters. Setting `busy_timeout` first ensures a
     // subsequent contended `journal_mode=WAL` switch waits instead of

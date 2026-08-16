@@ -13,7 +13,7 @@ use libsql::{Builder, Connection, Database, OpenFlags};
 
 use localdb_core::Error;
 
-use crate::connection::map_libsql_err;
+use crate::connection::configure_connection;
 
 /// Open the libsql database at `path` for a maintenance command.
 ///
@@ -51,18 +51,12 @@ pub(crate) async fn open_for_maintenance(path: &Path) -> Result<(Database, Conne
         correlation_id: "libsql_maintenance_connect".to_string(),
     })?;
 
-    // PRAGMA ordering matters. Setting `busy_timeout` first ensures the
-    // subsequent `journal_mode=WAL` switch waits on a contended writer
-    // instead of failing with `SQLITE_BUSY` (mirrors `LibsqlDb::open`).
-    conn.query("PRAGMA busy_timeout=5000", ())
-        .await
-        .map_err(map_libsql_err)?;
-    conn.query("PRAGMA journal_mode=WAL", ())
-        .await
-        .map_err(map_libsql_err)?;
-    conn.query("PRAGMA foreign_keys=ON", ())
-        .await
-        .map_err(map_libsql_err)?;
+    // Same pragma sequence as `LibsqlDb::open`'s writer connection, via the
+    // shared helper: `busy_timeout` first so the subsequent `journal_mode=WAL`
+    // switch waits on a contended writer instead of failing with
+    // `SQLITE_BUSY`, then `journal_mode=WAL` (apply_wal=true), then
+    // `foreign_keys=ON`.
+    configure_connection(&conn, true).await?;
 
     Ok((db, conn))
 }
@@ -107,14 +101,10 @@ pub(crate) async fn open_for_readonly_inspection(
         correlation_id: "libsql_maintenance_connect".to_string(),
     })?;
 
-    // Same busy_timeout as open_for_maintenance; deliberately NOT
-    // journal_mode=WAL (see doc comment above).
-    conn.query("PRAGMA busy_timeout=5000", ())
-        .await
-        .map_err(map_libsql_err)?;
-    conn.query("PRAGMA foreign_keys=ON", ())
-        .await
-        .map_err(map_libsql_err)?;
+    // Same busy_timeout/foreign_keys as open_for_maintenance, via the shared
+    // helper with apply_wal=false: deliberately NOT journal_mode=WAL (see
+    // doc comment above).
+    configure_connection(&conn, false).await?;
 
     Ok((db, conn))
 }
