@@ -301,11 +301,13 @@ impl AppState {
         }
 
         // Build while still holding the write lock. This is deliberate: it
-        // guarantees at most one embedder is ever built per policy change,
-        // at the cost of serializing concurrent builders behind a cold/
-        // changed cache. Acceptable today because the job engine runs a
-        // single worker (issue #187) — there is never more than one job in
-        // flight to contend for this lock.
+        // guarantees at most one embedder is ever built per policy change —
+        // the write-lock + double-checked-cache pattern serializes concurrent
+        // builders safely. With `server.job_workers` > 1 (issue #208), two
+        // cross-store jobs can race to build the cache on a cold start (or
+        // after a policy change) and one simply waits behind the lock;
+        // correctness is unchanged, the only cost is transient latency for
+        // whichever job waits.
         let policy_owned = policy.clone();
         let providers_owned = providers.clone();
         let providers_for_build = providers_owned.clone();

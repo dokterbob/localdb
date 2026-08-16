@@ -295,17 +295,22 @@ later if a consumer demands it).
   so a feed source's `refresh` is persisted and round-tripped but has no effect until a manual
   `POST /jobs` (or CLI `index`) runs.
 - **Long-running work:** indexing is a **job resource**, and `POST /jobs` runs the real ingestion
-  pipeline (`server::job_exec::run_job`) through an async, single-worker queue (issue #187) — not a
-  stub. Body: `{store_name, source_id?, deletion_policy?}`; `store_name` is required, `source_id`
-  narrows the job to one source (omit to index the whole store), `deletion_policy` is `"retain"`
-  (default — nothing is ever removed) or `"delete"` (prunes documents no longer present at their
-  source, mirroring CLI `index --delete`) — any other value is `invalid_request`, 400. `POST /jobs`
-  → `202` + the created `IndexJob`. A second `POST /jobs` for a store that already has a job queued
-  or running is rejected with `index_in_progress`, 409 (§5) — one job per store at a time; a
-  per-store in-flight guard is reserved atomically at submit time, before the job is created, so two
-  concurrent submissions can never both proceed. Jobs for _different_ stores run concurrently
-  against a single sequential worker (job worker pool size N>1 is a follow-up, not v1 scope). The
-  URL-refresh scheduler submits jobs through this same engine, not a separate code path. Clients
+  pipeline (`server::job_exec::run_job`) through an async job queue with a configurable worker pool
+  (`server.job_workers`, default 1, issue #208) — not a stub. Body: `{store_name, source_id?,
+  deletion_policy?}`; `store_name` is required, `source_id` narrows the job to one source (omit to
+  index the whole store), `deletion_policy` is `"retain"` (default — nothing is ever removed) or
+  `"delete"` (prunes documents no longer present at their source, mirroring CLI `index --delete`) —
+  any other value is `invalid_request`, 400. `POST /jobs` → `202` + the created `IndexJob`. A second
+  `POST /jobs` for a store that already has a job queued or running is rejected with
+  `index_in_progress`, 409 (§5) — same-store submissions always conflict, regardless of worker
+  count; a per-store in-flight guard is reserved atomically at submit time, before the job is
+  created, so two concurrent submissions for the same store can never both proceed. Jobs for
+  _different_ stores run concurrently, up to `server.job_workers` workers sharing one queue (issue
+  #208) — all workers pull from the same channel, so cross-store jobs genuinely overlap while the
+  per-store guard keeps same-store jobs serialized no matter how many workers are configured.
+  Embedded (non-daemon) CLI indexing always runs its own single-worker queue and never reads
+  `server.job_workers`. The URL-refresh scheduler submits jobs through this same engine, not a
+  separate code path. Clients
   poll `GET /jobs/{id}` for the current `IndexJob` (state `pending`/`running`/`done`/`failed`,
   `stats`, `error`, `error_code`, timestamps) or stream `GET /jobs/{id}/events` for live progress
   (below). `error_code` (issue #187 review, finding 3) is the failing `core::Error`'s stable

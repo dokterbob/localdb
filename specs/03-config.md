@@ -13,6 +13,7 @@ version: 1
 server:
   bind: 127.0.0.1 # local-only by default; see 05-surfaces.md §3
   port: 7700
+  job_workers: 1 # daemon job-queue workers; see §5
 
 paths: # all optional; platform defaults in §4
   data: ~ # index data, socket
@@ -156,6 +157,12 @@ path; `paths.*` in config override the rest.
 - **`http.rate_limit`:** `requests_per_second` and `burst` are both `u32` and must each be `>= 1`;
   `0` is rejected with a path-precise message (`http.rate_limit.requests_per_second must be greater
   than zero`, and likewise for `burst`) rather than silently disabling pacing.
+- **`server.job_workers`:** number of workers in the daemon's job queue (issue #208). `usize`,
+  default `1`. `0` is rejected at load with `server.job_workers must be greater than zero`. Values
+  greater than 1 let jobs for **different** stores run concurrently; jobs for the **same** store
+  are always serialized via the per-store in-flight guard, regardless of worker count — see
+  [05-surfaces.md](05-surfaces.md) §3. Embedded (non-daemon) CLI indexing is unaffected: it always
+  runs its own single-worker queue and never reads this key.
 - **Unknown keys:** hard error, not a warning. Catches typos (`chunking` vs `chunkng`) — the cost of
   strictness is low while there is no plugin ecosystem. Revisit if third-party extensions appear.
 - **Versioning:** top-level `version: 1` required. Breaking schema changes bump the version; the
