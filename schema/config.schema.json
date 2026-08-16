@@ -133,8 +133,8 @@
         "job_workers": {
           "type": "integer",
           "format": "uint",
-          "minimum": 0,
-          "description": "Number of daemon job-queue workers. Jobs for the same store never run\nconcurrently regardless of this setting; values greater than 1 enable\ncross-store parallelism. Default 1.",
+          "minimum": 1,
+          "description": "Number of daemon job-queue workers. Jobs for the same store never run\nconcurrently regardless of this setting; values greater than 1 enable\ncross-store parallelism. Default 1. Must be at least 1 —\n`validate_config` (`core/src/config/loader.rs`) rejects `0` at load\ntime, so the emitted JSON Schema declares the same floor\n(`minimum: 1`, not schemars' derived-from-`usize` `minimum: 0`)\nrather than accepting a value the loader will turn around and\nreject — same fix as `RateLimitConfig`'s `requests_per_second`/\n`burst` below.",
           "default": 1
         }
       },

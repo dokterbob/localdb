@@ -81,7 +81,14 @@ pub struct ServerConfig {
 
     /// Number of daemon job-queue workers. Jobs for the same store never run
     /// concurrently regardless of this setting; values greater than 1 enable
-    /// cross-store parallelism. Default 1.
+    /// cross-store parallelism. Default 1. Must be at least 1 —
+    /// `validate_config` (`core/src/config/loader.rs`) rejects `0` at load
+    /// time, so the emitted JSON Schema declares the same floor
+    /// (`minimum: 1`, not schemars' derived-from-`usize` `minimum: 0`)
+    /// rather than accepting a value the loader will turn around and
+    /// reject — same fix as `RateLimitConfig`'s `requests_per_second`/
+    /// `burst` below.
+    #[schemars(range(min = 1))]
     #[serde(default = "default_job_workers")]
     pub job_workers: usize,
 }

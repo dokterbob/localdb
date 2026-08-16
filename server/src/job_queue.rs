@@ -33,6 +33,19 @@
 //! requested mid-parse or mid-embedding-batch does not take effect until
 //! that CPU-bound operation finishes on its own. See `run_worker`'s
 //! `select!` for where this matters in practice.
+//!
+//! Panic isolation (issue #208 review, concurrency-breaker finding): a
+//! panic *inside* a job's future is already caught by `tokio::spawn` and
+//! surfaces as a normal `JoinError`-backed failure. `process_job` also
+//! wraps the one *synchronous*, caller-supplied panic seam — building
+//! that future by calling `(queued.task)()` — in `std::panic::catch_unwind`,
+//! converting a panic there into the same kind of recorded job failure
+//! rather than letting it unwind out of the worker task. With a pool of
+//! `N` workers (rather than one), an unguarded panic there would both
+//! strand the job `Running` forever (its in-flight guard and progress
+//! channel never released — permanent `IndexInProgress` for that store)
+//! *and* silently shrink the pool to `N-1`, since nothing respawns a
+//! worker task that unwinds away. See `process_job`'s doc comment.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -534,6 +547,38 @@ async fn process_job(
             }
         }
 
+        // Build the job's future. This is the one synchronous,
+        // caller-supplied panic seam in this function (issue #208 review,
+        // concurrency-breaker finding): `queued.task` is an arbitrary
+        // `FnOnce` handed in by `submit`'s caller, and unlike a panic
+        // *inside* the future it produces (which `tokio::spawn` below
+        // already catches and surfaces as a `JoinError`), a panic while
+        // merely *building* that future would, uncaught, unwind straight
+        // out of this async fn — skipping every line below it, including
+        // the terminal-state write, the handle-registry removal, and the
+        // in-flight-guard release. With a worker pool (issue #208) that's
+        // a double failure: the job would be stuck `Running` forever (SSE
+        // subscribers hang waiting on a channel nothing ever closes, and
+        // the store's in-flight guard never releases — permanent
+        // `IndexInProgress` for that store until a daemon restart), *and*
+        // the worker task that panicked dies with nothing to respawn it,
+        // silently shrinking the pool by one. `catch_unwind` converts
+        // that panic into a plain `JobOutcome::TaskBuildPanicked`, which
+        // flows through the *exact* same registry-update match and the
+        // teardown code below every other outcome already goes
+        // through — no separate cleanup path to keep in sync, and no
+        // Drop-based guard needed (the `JobRegistry`/`HandleRegistry`/
+        // `InFlightSet` locks are `tokio::sync::RwLock`s, which can't be
+        // acquired from `Drop` on a runtime thread anyway).
+        //
+        // Every other line in this function (the registry/handles/
+        // inflight bookkeeping, the `match` below) operates purely on
+        // this module's own already-validated data — no caller-supplied
+        // code runs there, so `(queued.task)()` is the only realistic
+        // panic seam to guard.
+        let build_result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || (queued.task)()));
+
         // Build and run the job's future on the async runtime — the
         // ingestion pipeline does its own blocking dispatch for
         // CPU-bound work internally (`core::blocking::run_blocking`,
@@ -547,31 +592,35 @@ async fn process_job(
         // without yielding, so cancellation requested mid-parse or
         // mid-embedding-batch takes effect only once that operation
         // returns on its own, not before.
-        let fut = (queued.task)();
-        let mut handle = tokio::spawn(fut);
-        let outcome = tokio::select! {
-            r = &mut handle => JobOutcome::Finished(r),
-            _ = cancel_token.cancelled() => {
-                // `abort()` only *requests* cancellation. If the task
-                // had already finished by the time this branch won the
-                // race — the natural-completion/cancel race — `abort()`
-                // is a no-op and the re-awaited handle below resolves
-                // to the task's real result, not a cancellation
-                // `JoinError`; `resolve_aborted` (issue #218 review,
-                // fix 1) tells the two apart so a real result always
-                // wins over the cancellation flag. Only when `abort()`
-                // actually pre-empted the task (its future dropped,
-                // triggering Wave 1's synchronous mid-write rollback
-                // guarantee) does the re-await resolve to a
-                // `JoinError` with `is_cancelled() == true`. Either
-                // way, awaiting the handle again blocks until the task
-                // has genuinely stopped running, so the in-flight
-                // guard released below is never premature — no window
-                // where a fresh submission for this store could start
-                // while the old task is still being torn down.
-                handle.abort();
-                resolve_aborted((&mut handle).await)
+        let outcome = match build_result {
+            Ok(fut) => {
+                let mut handle = tokio::spawn(fut);
+                tokio::select! {
+                    r = &mut handle => JobOutcome::Finished(r),
+                    _ = cancel_token.cancelled() => {
+                        // `abort()` only *requests* cancellation. If the task
+                        // had already finished by the time this branch won the
+                        // race — the natural-completion/cancel race — `abort()`
+                        // is a no-op and the re-awaited handle below resolves
+                        // to the task's real result, not a cancellation
+                        // `JoinError`; `resolve_aborted` (issue #218 review,
+                        // fix 1) tells the two apart so a real result always
+                        // wins over the cancellation flag. Only when `abort()`
+                        // actually pre-empted the task (its future dropped,
+                        // triggering Wave 1's synchronous mid-write rollback
+                        // guarantee) does the re-await resolve to a
+                        // `JoinError` with `is_cancelled() == true`. Either
+                        // way, awaiting the handle again blocks until the task
+                        // has genuinely stopped running, so the in-flight
+                        // guard released below is never premature — no window
+                        // where a fresh submission for this store could start
+                        // while the old task is still being torn down.
+                        handle.abort();
+                        resolve_aborted((&mut handle).await)
+                    }
+                }
             }
+            Err(panic_payload) => JobOutcome::TaskBuildPanicked(panic_message(&panic_payload)),
         };
 
         // Update registry
@@ -594,6 +643,19 @@ async fn process_job(
                     JobOutcome::Cancelled => {
                         info!("job {} cancelled", job_id);
                         fail_index_job_with_error(job, &Error::JobCancelled);
+                    }
+                    JobOutcome::TaskBuildPanicked(msg) => {
+                        error!(
+                            "job {} panicked while building its task future: {}",
+                            job_id, msg
+                        );
+                        fail_index_job_with_error(
+                            job,
+                            &Error::Internal {
+                                message: format!("worker panicked during job processing: {msg}"),
+                                correlation_id: "job_worker_task_build_panic".to_string(),
+                            },
+                        );
                     }
                 }
             }
@@ -635,6 +697,46 @@ enum JobOutcome {
     /// The cancellation token fired first, and the task was actually
     /// aborted before it produced a result.
     Cancelled,
+    /// `(queued.task)()` itself — the caller-supplied `FnOnce` that builds
+    /// the job's future, called synchronously before `tokio::spawn` ever
+    /// gets a future to run — panicked (issue #208 review, concurrency-
+    /// breaker finding). Caught via `catch_unwind` in `process_job`;
+    /// carries the panic's extracted message so it can be recorded as a
+    /// normal `Error::Internal` job failure through the same
+    /// registry-update `match` every other outcome goes through.
+    TaskBuildPanicked(String),
+}
+
+/// Extract a human-readable message from a caught panic payload (issue
+/// #208 review, concurrency-breaker finding) — `Box<dyn Any + Send>`
+/// doesn't implement `Display` on its own, so this does the same
+/// downcast dance the default panic hook does internally. Covers the two
+/// payload shapes an ordinary `panic!` produces — a `&'static str` for a
+/// string-literal panic message, a `String` for a formatted one (e.g.
+/// `panic!("{}", x)`) — and falls back to a fixed message for anything
+/// else (a custom payload via `panic_any`), rather than silently
+/// reporting nothing.
+///
+/// Unwraps any number of extra `Box<dyn Any + Send>` layers first:
+/// verified empirically (this crate's tests) that on this toolchain
+/// (rustc 1.97.0) a panic crossing a boxed `dyn FnOnce` call boundary
+/// inside an `async fn` — exactly `process_job`'s `catch_unwind` around
+/// `(queued.task)()` — arrives re-boxed at least once, i.e. the payload's
+/// own concrete type is `Box<dyn Any + Send>` rather than the original
+/// `&str`/`String` directly. Looping here rather than special-casing one
+/// level keeps this correct regardless of exactly how many layers a given
+/// toolchain adds.
+fn panic_message(mut payload: &(dyn std::any::Any + Send)) -> String {
+    while let Some(inner) = payload.downcast_ref::<Box<dyn std::any::Any + Send>>() {
+        payload = inner.as_ref();
+    }
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
 }
 
 /// Resolve a `JoinHandle`'s re-await *after* `handle.abort()` was called in
