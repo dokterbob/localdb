@@ -1,15 +1,31 @@
-//! Single libsql connection over the unified schema.
+//! Single libsql database over the unified schema, split into a writer/reader
+//! connection pool.
 //!
-//! Holds a `Database` + `Connection` behind a `tokio::sync::Mutex`. Every
+//! One dedicated **writer** connection is held behind a `tokio::sync::Mutex`:
+//! all mutating access goes through it, either directly (via `conn()`
+//! /`writer()`) or transactionally (via `write_tx()`, which returns a
+//! [`WriteTx`] wrapping a `libsql::Transaction`). A `WriteTx`'s `Drop` runs a
+//! synchronous ROLLBACK if neither `commit()` nor `rollback()` was called —
+//! that's a backstop for panics/task-aborts only, not the primary error
+//! path, because libsql's drop-rollback `.unwrap()`s on a ROLLBACK failure;
+//! every fallible call site rolls back explicitly instead.
 //!
-//! Cross-process serialisation is SQLite's job: WAL admits one writer at a
-//! time per file, `busy_timeout=5000` makes contenders wait, and an
+//! Alongside the writer sits a small pool of independent, read-only **reader**
+//! connections (`PRAGMA query_only=ON`), handed out round-robin by
+//! `reader()`. Readers never take the writer mutex, so they can't block on or
+//! be blocked by a write transaction; they simply see whatever's already
+//! committed (or, mid-write, whatever WAL readers always see).
+//!
+//! Cross-process serialisation is still SQLite's job: WAL admits one writer
+//! at a time per file, `busy_timeout=5000` makes contenders wait, and an
 //! exhausted busy-timeout maps to the existing `Error::RuntimeStateLocked`
 //! (exit 4). There is no advisory file lock — see proposal §3 (Decision 3).
 
+use std::ops::Deref;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use libsql::{Builder, Connection, Database};
+use libsql::{Builder, Connection, Database, Transaction, TransactionBehavior};
 use tokio::sync::{Mutex, MutexGuard};
 
 use localdb_core::{Error, VectorEncoding};
@@ -58,13 +74,30 @@ fn classify_version(version: i64, head: i64) -> VersionDisposition {
 
 /// A shared libsql handle to the unified single-file store.
 ///
-/// Cheap to keep behind `Arc`. All writes go through the single mutex-guarded
-/// connection.
+/// Cheap to keep behind `Arc`. All writes go through the single
+/// mutex-guarded `writer` connection; reads may use either `writer`/`conn`
+/// (for callers not yet migrated — see `conn()`'s doc comment) or the
+/// `readers` pool via `reader()`.
 pub(crate) struct LibsqlDb {
-    /// The owning `Database`. Kept alive for the `Connection`'s lifetime.
+    /// The owning `Database`. Kept alive for the connections' lifetime.
     #[allow(dead_code)]
     db: Database,
-    conn: Mutex<Connection>,
+    /// The single writer connection. All mutating access is serialised
+    /// through this mutex.
+    writer: Mutex<Connection>,
+    /// Independent, read-only (`PRAGMA query_only=ON`) connections, handed
+    /// out round-robin by `reader()`. Never empty after a successful `open`.
+    ///
+    /// `#[allow(dead_code)]`: only exercised via `reader()`, whose only
+    /// callers today are tests — no production call site reads through the
+    /// pool yet. Remove once the mechanical sweep (see `conn()`'s doc
+    /// comment) lands real callers.
+    #[allow(dead_code)]
+    readers: Vec<Connection>,
+    /// Round-robin cursor into `readers`. Same transitional `allow` as
+    /// `readers` above.
+    #[allow(dead_code)]
+    next_reader: AtomicUsize,
 }
 
 impl LibsqlDb {
@@ -115,18 +148,7 @@ impl LibsqlDb {
             correlation_id: "libsql_db_connect".to_string(),
         })?;
 
-        // PRAGMA ordering matters. Setting `busy_timeout` first ensures the
-        // subsequent `journal_mode=WAL` switch waits on a contended writer
-        // instead of failing with `SQLITE_BUSY`.
-        conn.query("PRAGMA busy_timeout=5000", ())
-            .await
-            .map_err(map_libsql_err)?;
-        conn.query("PRAGMA journal_mode=WAL", ())
-            .await
-            .map_err(map_libsql_err)?;
-        conn.query("PRAGMA foreign_keys=ON", ())
-            .await
-            .map_err(map_libsql_err)?;
+        configure_connection(&conn, true).await?;
 
         let version = schema::get_schema_version(&conn)
             .await
@@ -250,17 +272,160 @@ impl LibsqlDb {
 
         validate_embedding_column(&conn, embedding_dim, encoding).await?;
 
+        // Readers are created as the LAST step, after every fallible check
+        // above has passed — a refused open (legacy/pending/too-new/bad
+        // embedding shape) never pays for opening a reader pool it won't use.
+        let reader_count = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2)
+            .clamp(2, 4);
+        let mut readers = Vec::with_capacity(reader_count);
+        for _ in 0..reader_count {
+            let reader = db.connect().map_err(|e| Error::Internal {
+                message: format!("cannot open reader connection: {e}"),
+                correlation_id: "libsql_db_reader_connect".to_string(),
+            })?;
+            configure_connection(&reader, false).await?;
+            reader
+                .query("PRAGMA query_only=ON", ())
+                .await
+                .map_err(map_libsql_err)?;
+            readers.push(reader);
+        }
+
         Ok(Self {
             db,
-            conn: Mutex::new(conn),
+            writer: Mutex::new(conn),
+            readers,
+            next_reader: AtomicUsize::new(0),
         })
     }
 
-    /// Acquire the underlying connection mutex.
-    ///
-    pub(crate) async fn conn(&self) -> MutexGuard<'_, Connection> {
-        self.conn.lock().await
+    /// Acquire the writer connection mutex directly (no transaction).
+    pub(crate) async fn writer(&self) -> MutexGuard<'_, Connection> {
+        self.writer.lock().await
     }
+
+    /// Alias for [`Self::writer`]. Existing call sites (25 as of this
+    /// writing) still use this name; a later mechanical sweep will replace
+    /// them with `writer()`/`write_tx()` and remove this alias.
+    pub(crate) async fn conn(&self) -> MutexGuard<'_, Connection> {
+        self.writer().await
+    }
+
+    /// Hand out one of the read-only reader connections, round-robin.
+    ///
+    /// Synchronous — this never takes the writer mutex or awaits anything,
+    /// it just clones a `Connection` handle out of `readers`.
+    ///
+    /// `#[allow(dead_code)]`: no production call site uses this yet (only
+    /// tests) — see `readers`' doc comment.
+    #[allow(dead_code)]
+    pub(crate) fn reader(&self) -> Connection {
+        let idx = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.readers.len();
+        self.readers[idx].clone()
+    }
+
+    /// Begin a write transaction: locks the writer mutex, then opens a
+    /// `TransactionBehavior::Immediate` transaction on it.
+    ///
+    /// The returned [`WriteTx`] holds the mutex guard for its own lifetime,
+    /// so no other writer (direct via `conn()`/`writer()`, or another
+    /// `write_tx()`) can interleave with it. Callers must explicitly
+    /// `commit()` or `rollback()`; letting a `WriteTx` drop uncommitted is a
+    /// backstop only (see the module doc comment and `WriteTx`'s doc
+    /// comment).
+    ///
+    /// `#[allow(dead_code)]`: no production call site uses this yet (only
+    /// tests) — see `readers`' doc comment.
+    #[allow(dead_code)]
+    pub(crate) async fn write_tx(&self) -> Result<WriteTx<'_>, Error> {
+        let guard = self.writer.lock().await;
+        let tx = guard
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await
+            .map_err(map_libsql_err)?;
+        Ok(WriteTx { tx, _guard: guard })
+    }
+}
+
+/// A write transaction plus the writer-mutex guard that authorized it.
+///
+/// # Field order is load-bearing
+///
+/// Rust drops struct fields in declaration order, so `tx` is dropped BEFORE
+/// `_guard`. `libsql::Transaction`'s default `DropBehavior::Rollback` means
+/// dropping an uncommitted `tx` synchronously issues a ROLLBACK; declaring
+/// `tx` first guarantees that ROLLBACK completes while the writer mutex is
+/// still held by `_guard`. If the order were reversed, another `write_tx()`
+/// caller could acquire the freed mutex and `BEGIN` a new transaction on the
+/// same connection while the old transaction's ROLLBACK is still in flight —
+/// corrupting transaction state. This is a backstop path only (panics/task
+/// aborts): the primary error path is always an explicit `rollback()`,
+/// because libsql's drop-rollback `.unwrap()`s on failure and would panic
+/// rather than propagate an error.
+///
+/// `#[allow(dead_code)]` on the struct and its `commit`/`rollback` methods:
+/// no production call site constructs a `WriteTx` yet (only tests, via
+/// `write_tx()`) — see `readers`' doc comment on `LibsqlDb`.
+#[allow(dead_code)]
+pub(crate) struct WriteTx<'a> {
+    tx: Transaction,
+    _guard: MutexGuard<'a, Connection>,
+}
+
+impl Deref for WriteTx<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        &self.tx
+    }
+}
+
+#[allow(dead_code)]
+impl WriteTx<'_> {
+    /// Commit the transaction.
+    pub(crate) async fn commit(self) -> Result<(), Error> {
+        self.tx.commit().await.map_err(map_libsql_err)
+    }
+
+    /// Roll back the transaction explicitly. Prefer this over letting a
+    /// `WriteTx` drop uncommitted — see the struct's doc comment.
+    pub(crate) async fn rollback(self) -> Result<(), Error> {
+        self.tx.rollback().await.map_err(map_libsql_err)
+    }
+}
+
+/// Apply the standard pragma sequence to a connection: `busy_timeout=5000`
+/// first, then (if `apply_wal`) `journal_mode=WAL`, then `foreign_keys=ON`.
+///
+/// Order matters: `busy_timeout` must precede `journal_mode=WAL` so a
+/// contended switch waits instead of failing with `SQLITE_BUSY`, and
+/// `foreign_keys` can't be toggled inside a transaction so it's set here,
+/// outside of one. `apply_wal` is `false` for reader connections: the writer
+/// connection already switched the file's on-disk journal mode to WAL (a
+/// per-file, not per-connection, setting) during `open`, so a reader
+/// re-issuing that pragma would be redundant.
+///
+/// `pub(crate)` rather than private: `migrations::maintenance` opens its own
+/// connections outside `LibsqlDb::open` and needs this same sequence (a
+/// later step wires that call site up).
+pub(crate) async fn configure_connection(conn: &Connection, apply_wal: bool) -> Result<(), Error> {
+    // PRAGMA ordering matters. Setting `busy_timeout` first ensures a
+    // subsequent contended `journal_mode=WAL` switch waits instead of
+    // failing with `SQLITE_BUSY`.
+    conn.query("PRAGMA busy_timeout=5000", ())
+        .await
+        .map_err(map_libsql_err)?;
+    if apply_wal {
+        conn.query("PRAGMA journal_mode=WAL", ())
+            .await
+            .map_err(map_libsql_err)?;
+    }
+    conn.query("PRAGMA foreign_keys=ON", ())
+        .await
+        .map_err(map_libsql_err)?;
+    Ok(())
 }
 
 /// Refuse if `chunks.embedding`'s actual column type doesn't match what
