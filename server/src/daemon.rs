@@ -204,7 +204,8 @@ async fn server_future(listener: TcpListener, router: Router) {
 ///   GET/POST /stores, GET/PATCH/DELETE /stores/{id},
 ///   GET/POST /stores/{id}/sources, DELETE /sources/{id},
 ///   GET /documents/{id}, POST /search,
-///   POST /jobs, GET /jobs/{id}, GET /jobs/{id}/events, GET /status, GET /config.
+///   POST /jobs, GET/DELETE /jobs/{id}, GET /jobs/{id}/events, GET /status,
+///   GET /config.
 ///
 /// `mcp_stores`/`mcp_embedder` are the startup-time snapshot built by
 /// `mcp_bridge::build_available_stores` (specs/05-surfaces.md §4) — see
@@ -239,7 +240,10 @@ pub fn build_router(
         .route("/v1/documents/{id}", get(handlers::get_document))
         .route("/v1/search", post(handlers::search))
         .route("/v1/jobs", post(handlers::create_job))
-        .route("/v1/jobs/{id}", get(handlers::get_job))
+        .route(
+            "/v1/jobs/{id}",
+            get(handlers::get_job).delete(handlers::cancel_job),
+        )
         .route("/v1/jobs/{id}/events", get(handlers::job_events))
         .route("/v1/status", get(handlers::get_status))
         .route("/v1/config", get(handlers::get_config))

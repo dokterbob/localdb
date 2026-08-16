@@ -109,6 +109,14 @@ pub enum Command {
     #[command(subcommand)]
     Db(DbCommand),
 
+    /// Manage running/queued jobs on a daemon.
+    ///
+    /// Daemon-only: there is no embedded equivalent, since an embedded job
+    /// lives and dies within a single command invocation. `--store` is
+    /// rejected outright (exit 2): a job id is already globally unique.
+    #[command(subcommand)]
+    Job(JobCommand),
+
     /// Run a one-shot scan-and-index job.
     ///
     /// Indexes every store when `--store` is omitted; pass `--store <NAME>`
@@ -284,6 +292,20 @@ pub enum DbCommand {
     Vacuum,
 }
 
+/// Job management subcommands (issue #218).
+#[derive(Debug, Subcommand)]
+pub enum JobCommand {
+    /// Request cancellation of a queued or running job.
+    ///
+    /// Requires a running daemon (exit 5 without one). Exit codes: 0
+    /// cancellation requested (202), 3 unknown job id, 4 job already
+    /// reached a terminal state.
+    Cancel {
+        /// Job ID.
+        id: String,
+    },
+}
+
 /// Source management subcommands.
 ///
 /// `--store` is a filter: omitted, `list` and `remove <ULID>` span every
@@ -421,6 +443,9 @@ fn main() {
             DbCommand::Downgrade { to } => cli::run_db_downgrade(&ctx, *to),
             DbCommand::Vacuum => cli::run_db_vacuum(&ctx),
         },
+        Command::Job(cmd) => match cmd {
+            JobCommand::Cancel { id } => cli::run_job_cancel(&ctx, id),
+        },
         Command::Index {
             source,
             strict,
@@ -477,7 +502,8 @@ mod tests {
         let subcommand_names: Vec<&str> = cmd.get_subcommands().map(|sc| sc.get_name()).collect();
 
         for expected in &[
-            "init", "serve", "mcp", "status", "store", "source", "db", "index", "search", "add",
+            "init", "serve", "mcp", "status", "store", "source", "db", "job", "index", "search",
+            "add",
         ] {
             assert!(
                 subcommand_names.contains(expected),
@@ -551,6 +577,36 @@ mod tests {
                 sub_names.contains(expected),
                 "db {expected} subcommand missing; found: {sub_names:?}",
             );
+        }
+    }
+
+    /// Verify the job subcommands are present.
+    #[test]
+    fn job_subcommands_present() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let job_cmd = cmd
+            .get_subcommands()
+            .find(|sc| sc.get_name() == "job")
+            .expect("job subcommand missing");
+
+        let sub_names: Vec<&str> = job_cmd.get_subcommands().map(|sc| sc.get_name()).collect();
+
+        assert!(
+            sub_names.contains(&"cancel"),
+            "job cancel subcommand missing; found: {sub_names:?}",
+        );
+    }
+
+    /// `localdb job cancel <id>` parses the job id as a positional arg.
+    #[test]
+    fn job_cancel_parses() {
+        let cli = Cli::try_parse_from(["localdb", "job", "cancel", "01HRQHB7FN3WMX4AZDV3S9VCTZ"])
+            .unwrap();
+        if let Command::Job(JobCommand::Cancel { id }) = cli.command {
+            assert_eq!(id, "01HRQHB7FN3WMX4AZDV3S9VCTZ");
+        } else {
+            panic!("expected Job(Cancel) command");
         }
     }
 

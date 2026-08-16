@@ -449,8 +449,10 @@ pub(crate) const SERVE_REJECT_MESSAGE: &str =
 
 /// Pure decision logic behind `reject_store_flag`, factored out so the
 /// rejection can be unit-tested without going through `exit_err`'s
-/// `process::exit`.
-fn reject_store_flag_inner(ctx: &CliContext, message: &str) -> Result<(), Error> {
+/// `process::exit`. `pub(crate)` so a command whose reject-message lives
+/// outside this file (e.g. `cmds::job`'s `JOB_CANCEL_REJECT_MESSAGE`) can
+/// still unit-test its own message being wired up correctly.
+pub(crate) fn reject_store_flag_inner(ctx: &CliContext, message: &str) -> Result<(), Error> {
     if ctx.stores.is_empty() {
         return Ok(());
     }

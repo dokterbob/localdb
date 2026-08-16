@@ -725,3 +725,97 @@ async fn deletion_policy_explicit_retain_behaves_like_default() {
     assert_eq!(final_job["state"], "done", "job: {:?}", final_job);
     assert_eq!(final_job["stats"]["docs_deleted"], 0);
 }
+
+// --- DELETE /v1/jobs/{id} (cancellation, issue #218) --------------------
+
+async fn delete_job(app: &axum::Router, job_id: &str) -> axum::http::Response<Body> {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(format!("/v1/jobs/{}", job_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn delete_job_unknown_id_returns_404() {
+    let (_dir, app) = make_app().await;
+    let resp = delete_job(&app, "nonexistent-job-id").await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = json_body(resp.into_body()).await;
+    assert_eq!(body["code"], "job_not_found");
+}
+
+/// A job already `done` must refuse cancellation with 409, and must not
+/// have its recorded outcome touched.
+#[tokio::test]
+async fn delete_job_on_a_completed_job_returns_409_and_leaves_it_done() {
+    let (_dir, app) = make_app().await;
+    post_json(&app, "/v1/stores", json!({"name": "test"})).await;
+    let job = post_json(&app, "/v1/jobs", json!({"store_name": "test"})).await;
+    let job_id = job["id"].as_str().unwrap().to_string();
+    let final_job = poll_job_to_terminal(&app, &job_id).await;
+    assert_eq!(final_job["state"], "done");
+
+    let resp = delete_job(&app, &job_id).await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = json_body(resp.into_body()).await;
+    assert_eq!(body["code"], "job_already_terminal");
+
+    // The job's recorded outcome must be completely untouched.
+    let get_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/jobs/{}", job_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let after = json_body(get_resp.into_body()).await;
+    assert_eq!(after["state"], "done");
+}
+
+/// A running job's `DELETE` returns 202 immediately (cancellation
+/// requested, not a guarantee the job has already stopped), and the job
+/// eventually reaches `failed` with `error_code: "job_cancelled"`. Built
+/// around a real submitted job parked on a `oneshot` this test controls,
+/// through `make_app_with_queue_and_state` so the test can submit directly
+/// on the queue (getting a guaranteed-parked task) while still exercising
+/// the real HTTP `DELETE` route against it.
+#[tokio::test]
+async fn delete_job_on_a_running_job_returns_202_and_it_eventually_reaches_job_cancelled() {
+    let (_dir, app, state) =
+        super::common::make_app_with_queue_and_state(crate::job_queue::JobQueue::new()).await;
+
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+    let (_never_tx, never_rx) = tokio::sync::oneshot::channel::<()>();
+    let job = state
+        .job_queue()
+        .submit(
+            "running-store",
+            localdb_core::IndexJobScope::Store,
+            move |_progress| async move {
+                let _ = started_tx.send(());
+                let _ = never_rx.await;
+                Ok(localdb_core::IndexJobStats::default())
+            },
+        )
+        .await
+        .unwrap();
+    started_rx.await.unwrap();
+
+    let resp = delete_job(&app, &job.id).await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body = json_body(resp.into_body()).await;
+    assert_eq!(body["id"], job.id);
+
+    let final_job = poll_job_to_terminal(&app, &job.id).await;
+    assert_eq!(final_job["state"], "failed", "job: {:?}", final_job);
+    assert_eq!(final_job["error_code"], "job_cancelled");
+}

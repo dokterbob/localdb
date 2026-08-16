@@ -16,6 +16,7 @@
 //!   POST /search                  — hybrid search
 //!   POST /jobs                    — submit index job
 //!   GET  /jobs/:id                — get job by ID
+//!   DELETE /jobs/:id              — cancel a queued or running job
 //!   GET  /jobs/:id/events         — stream live job progress (SSE)
 //!   GET  /status                  — daemon status
 //!   GET  /config                  — resolved config
@@ -34,7 +35,7 @@ mod stores;
 
 pub use config::get_config;
 pub use documents::get_document;
-pub use jobs::{create_job, get_job, job_events};
+pub use jobs::{cancel_job, create_job, get_job, job_events};
 pub use search::search;
 pub use sources::{create_source, delete_source, list_sources};
 pub use status::get_status;

@@ -24,11 +24,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use localdb_core::{
     complete_index_job, create_index_job, fail_index_job, fail_index_job_with_error,
-    start_index_job, Error, IndexJob, IndexJobScope, IndexJobStats, ProgressEvent, ProgressSink,
+    start_index_job, Error, IndexJob, IndexJobScope, IndexJobState, IndexJobStats, ProgressEvent,
+    ProgressSink,
 };
 
 /// Maximum number of pending jobs in the channel.
@@ -67,6 +69,12 @@ struct QueuedJob {
     /// guard once the worker finishes (successfully or not).
     store_id: String,
     task: JobTask,
+    /// This job's cancellation signal (issue #218) — the same
+    /// `CancellationToken` clone registered in `JobQueue::cancel_tokens` at
+    /// submit time, so triggering it (from `JobQueue::cancel`, potentially
+    /// long before the worker ever dequeues this `QueuedJob`) is visible
+    /// here too. Cheap to clone: `CancellationToken` is `Arc`-backed.
+    cancel_token: CancellationToken,
 }
 
 /// Shared job registry: job_id → IndexJob.
@@ -74,6 +82,17 @@ pub type JobRegistry = Arc<RwLock<HashMap<String, IndexJob>>>;
 
 /// Shared set of store ids with a job currently queued or running.
 type InFlightSet = Arc<RwLock<HashSet<String>>>;
+
+/// Shared per-job cancellation-token registry: job_id → `CancellationToken`
+/// (issue #218).
+///
+/// An entry exists from `submit` until the job reaches a terminal state, at
+/// which point `run_worker` removes it — mirroring `EventRegistry`'s
+/// lifecycle exactly, including the ordering guarantee: removal always
+/// happens *after* the registry's own terminal-state write, so
+/// `JobQueue::cancel` reading a non-terminal `IndexJob` from the registry is
+/// guaranteed to still find this job's token present.
+type CancelRegistry = Arc<RwLock<HashMap<String, CancellationToken>>>;
 
 /// Shared per-job progress-event registry: job_id → broadcast sender.
 ///
@@ -106,6 +125,8 @@ pub struct JobQueue {
     /// can force `broadcast::error::RecvError::Lagged` deterministically
     /// with only a handful of events instead of needing 1024+.
     event_capacity: usize,
+    /// Per-job cancellation tokens (issue #218) — see [`CancelRegistry`].
+    cancel_tokens: CancelRegistry,
 }
 
 impl JobQueue {
@@ -133,12 +154,21 @@ impl JobQueue {
         let registry: JobRegistry = Arc::new(RwLock::new(HashMap::new()));
         let inflight: InFlightSet = Arc::new(RwLock::new(HashSet::new()));
         let events: EventRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let cancel_tokens: CancelRegistry = Arc::new(RwLock::new(HashMap::new()));
 
         let worker_registry = registry.clone();
         let worker_inflight = inflight.clone();
         let worker_events = events.clone();
+        let worker_cancel_tokens = cancel_tokens.clone();
         tokio::spawn(async move {
-            run_worker(receiver, worker_registry, worker_inflight, worker_events).await;
+            run_worker(
+                receiver,
+                worker_registry,
+                worker_inflight,
+                worker_events,
+                worker_cancel_tokens,
+            )
+            .await;
         });
 
         Self {
@@ -147,6 +177,7 @@ impl JobQueue {
             inflight,
             events,
             event_capacity,
+            cancel_tokens,
         }
     }
 
@@ -212,10 +243,22 @@ impl JobQueue {
             })
         };
 
+        // This job's cancellation signal (issue #218), registered before
+        // enqueuing for the same reason `events` is: `JobQueue::cancel`
+        // must be able to find and trigger it the instant `submit` returns,
+        // even before the worker has picked the job up (the "cancel a
+        // pending job" path).
+        let cancel_token = CancellationToken::new();
+        {
+            let mut tokens = self.cancel_tokens.write().await;
+            tokens.insert(job_id.clone(), cancel_token.clone());
+        }
+
         let queued = QueuedJob {
             id: job_id.clone(),
             store_id: store_id.to_string(),
             task: Box::new(move || Box::pin(task(sink))),
+            cancel_token,
         };
 
         if let Err(e) = self.sender.send(queued).await {
@@ -230,6 +273,8 @@ impl JobQueue {
             }
             let mut events = self.events.write().await;
             events.remove(&job_id);
+            let mut tokens = self.cancel_tokens.write().await;
+            tokens.remove(&job_id);
         }
 
         // Return the current state of the job (it's Pending until the worker picks it up).
@@ -241,6 +286,52 @@ impl JobQueue {
     pub async fn get_job(&self, id: &str) -> Option<IndexJob> {
         let reg = self.registry.read().await;
         reg.get(id).cloned()
+    }
+
+    /// Request cancellation of `job_id` (issue #218; `DELETE /v1/jobs/{id}`).
+    ///
+    /// - Unknown job id: `Error::JobNotFound`.
+    /// - Job already terminal (`Done`/`Failed`): `Error::JobAlreadyTerminal`
+    ///   — a cancel landing after normal completion (or after a real
+    ///   failure) must never overwrite the recorded outcome, so the
+    ///   terminal-state check happens against the registry, not the
+    ///   cancellation token, and happens *before* the token is ever
+    ///   touched.
+    /// - Otherwise (`Pending` or `Running`): triggers this job's
+    ///   `CancellationToken` and returns its current snapshot — "202,
+    ///   cancellation requested", not a guarantee the job has stopped yet.
+    ///   A `Pending` job's worker iteration observes the token before ever
+    ///   starting the pipeline (see `run_worker`); a `Running` job's
+    ///   `tokio::select!` observes it at its next scheduling point,
+    ///   covering an in-progress `backon` retry sleep or `governor` pacing
+    ///   wait with no change needed in `core`/`ingest`.
+    pub async fn cancel(&self, job_id: &str) -> Result<IndexJob, Error> {
+        let snapshot = {
+            let reg = self.registry.read().await;
+            let job = reg
+                .get(job_id)
+                .ok_or_else(|| Error::JobNotFound {
+                    id: job_id.to_string(),
+                })?
+                .clone();
+            if matches!(job.state, IndexJobState::Done | IndexJobState::Failed) {
+                return Err(Error::JobAlreadyTerminal);
+            }
+            job
+        };
+
+        // The registry read above guarantees this job isn't terminal yet,
+        // and `run_worker` only ever removes a job's token *after* writing
+        // its terminal state (see `CancelRegistry`'s doc comment) — so the
+        // token is guaranteed present here bar the token having been
+        // removed in the narrow window between that read and this one, in
+        // which case the job simply finished on its own and there is
+        // nothing left to cancel.
+        if let Some(token) = self.cancel_tokens.read().await.get(job_id) {
+            token.cancel();
+        }
+
+        Ok(snapshot)
     }
 
     /// List all jobs.
@@ -286,70 +377,130 @@ async fn run_worker(
     registry: JobRegistry,
     inflight: InFlightSet,
     events: EventRegistry,
+    cancel_tokens: CancelRegistry,
 ) {
     while let Some(queued) = receiver.recv().await {
         let job_id = queued.id.clone();
         let store_id = queued.store_id.clone();
-        info!("starting job {}", job_id);
+        let cancel_token = queued.cancel_token;
 
-        // Mark as running
-        {
+        // A job cancelled while it was still `Pending` (issue #218): the
+        // token was triggered before this worker ever dequeued it — never
+        // start the pipeline at all, not even one poll of the task future.
+        // `(queued.task)()` (which *builds* the future) is deliberately
+        // never called on this path.
+        if cancel_token.is_cancelled() {
+            info!("job {} was cancelled before starting", job_id);
             let mut reg = registry.write().await;
             if let Some(job) = reg.get_mut(&job_id) {
-                start_index_job(job);
+                fail_index_job_with_error(job, &Error::JobCancelled);
             }
-        }
+        } else {
+            info!("starting job {}", job_id);
 
-        // Build and run the job's future on the async runtime — the
-        // ingestion pipeline does its own `spawn_blocking` internally for
-        // CPU-bound work, so the queue worker itself stays async
-        // (specs/01-architecture.md §6).
-        let fut = (queued.task)();
-        let result = tokio::spawn(fut).await;
+            // Mark as running
+            {
+                let mut reg = registry.write().await;
+                if let Some(job) = reg.get_mut(&job_id) {
+                    start_index_job(job);
+                }
+            }
 
-        // Update registry
-        {
-            let mut reg = registry.write().await;
-            if let Some(job) = reg.get_mut(&job_id) {
-                match result {
-                    Ok(Ok(stats)) => {
-                        info!("job {} completed: {:?}", job_id, stats);
-                        complete_index_job(job, stats);
-                    }
-                    Ok(Err(e)) => {
-                        warn!("job {} failed: {}", job_id, e);
-                        fail_index_job_with_error(job, &e);
-                    }
-                    Err(join_err) => {
-                        error!("job {} panicked: {}", job_id, join_err);
-                        fail_index_job(job, format!("task panicked: {}", join_err));
+            // Build and run the job's future on the async runtime — the
+            // ingestion pipeline does its own `spawn_blocking` internally
+            // for CPU-bound work, so the queue worker itself stays async
+            // (specs/01-architecture.md §6). Raced against the
+            // cancellation token in one `select!` (issue #218): this is
+            // what covers a `backon` retry sleep or a `governor` pacing
+            // wait deep inside the pipeline without threading the token
+            // through `core`/`ingest` at all — any `.await` point in the
+            // task future is a valid cancellation point.
+            let fut = (queued.task)();
+            let mut handle = tokio::spawn(fut);
+            let outcome = tokio::select! {
+                r = &mut handle => JobOutcome::Finished(r),
+                _ = cancel_token.cancelled() => {
+                    // `abort()` only *requests* cancellation — the task is
+                    // actually torn down (its future dropped, triggering
+                    // Wave 1's synchronous mid-write rollback guarantee) at
+                    // its next scheduling point. Awaiting the handle again
+                    // blocks until that has genuinely happened, so the
+                    // in-flight guard released below is never premature —
+                    // no window where a fresh submission for this store
+                    // could start while the aborted task is still being
+                    // torn down.
+                    handle.abort();
+                    let _ = (&mut handle).await;
+                    JobOutcome::Cancelled
+                }
+            };
+
+            // Update registry
+            {
+                let mut reg = registry.write().await;
+                if let Some(job) = reg.get_mut(&job_id) {
+                    match outcome {
+                        JobOutcome::Finished(Ok(Ok(stats))) => {
+                            info!("job {} completed: {:?}", job_id, stats);
+                            complete_index_job(job, stats);
+                        }
+                        JobOutcome::Finished(Ok(Err(e))) => {
+                            warn!("job {} failed: {}", job_id, e);
+                            fail_index_job_with_error(job, &e);
+                        }
+                        JobOutcome::Finished(Err(join_err)) => {
+                            error!("job {} panicked: {}", job_id, join_err);
+                            fail_index_job(job, format!("task panicked: {}", join_err));
+                        }
+                        JobOutcome::Cancelled => {
+                            info!("job {} cancelled", job_id);
+                            fail_index_job_with_error(job, &Error::JobCancelled);
+                        }
                     }
                 }
             }
         }
 
-        // Tear down this job's progress-event channel now that it's
-        // terminal — *after* the registry update above, never before: a
-        // subscriber that observes the channel close (`RecvError::Closed`)
-        // must always find the job already terminal when it then reads the
-        // registry (see `EventRegistry`'s doc comment and issue #83's
-        // no-missed-terminal-event requirement). Dropping this last
-        // `Sender` clone (the `ProgressSink` given to the task already went
-        // out of scope when the task future completed) is what actually
-        // closes the channel for any subscribed receivers.
+        // Tear down this job's progress-event channel and cancellation
+        // token now that it's terminal — *after* the registry update
+        // above, never before: a subscriber that observes the channel
+        // close (`RecvError::Closed`) must always find the job already
+        // terminal when it then reads the registry (see `EventRegistry`'s
+        // doc comment and issue #83's no-missed-terminal-event
+        // requirement); `JobQueue::cancel` relies on the same ordering for
+        // `CancelRegistry` (see its doc comment). Dropping the events
+        // `Sender`'s last clone (the `ProgressSink` given to the task
+        // already went out of scope when the task future completed or was
+        // dropped) is what actually closes the channel for any subscribed
+        // receivers.
         {
             let mut events = events.write().await;
             events.remove(&job_id);
         }
+        {
+            let mut tokens = cancel_tokens.write().await;
+            tokens.remove(&job_id);
+        }
 
         // Release the in-flight guard now that this store's job is done
-        // (successfully or not) — a new submission for it may proceed.
+        // (successfully, failed, or cancelled) — a new submission for it
+        // may proceed.
         {
             let mut guard = inflight.write().await;
             guard.remove(&store_id);
         }
     }
     info!("job queue worker stopped");
+}
+
+/// Outcome of racing a running job's future against its cancellation token
+/// in `run_worker`'s `tokio::select!` (issue #218).
+enum JobOutcome {
+    /// The task's `JoinHandle` resolved on its own — either a normal
+    /// `Ok`/`Err` result, or `Err(JoinError)` if it panicked.
+    Finished(Result<Result<IndexJobStats, Error>, tokio::task::JoinError>),
+    /// The cancellation token fired first, and the task was aborted.
+    Cancelled,
 }
 
 impl Default for JobQueue {

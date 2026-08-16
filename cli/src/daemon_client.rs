@@ -176,6 +176,16 @@ pub(crate) async fn daemon_request_async(
     }
 }
 
+/// Issue a `DELETE` request against a running daemon and return its parsed
+/// JSON response — the `job cancel`/issue #218 counterpart to the existing
+/// GET/POST call sites, which spell out `daemon_request_async`'s `method`
+/// argument inline. `daemon_request_async` already accepts any
+/// `reqwest::Method`; this just names the verb at the one call site
+/// (`cli::cmds::job::cancel_daemon_job`) that needs it.
+pub(crate) async fn daemon_delete(url: &str) -> Result<serde_json::Value, Error> {
+    daemon_request_async(reqwest::Method::DELETE, url, None).await
+}
+
 /// Map a daemon HTTP error body's stable `code` string (see
 /// `server/src/error.rs` and specs/05-surfaces.md §5) to a `core::Error`.
 ///
