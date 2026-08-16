@@ -48,7 +48,7 @@ pub(crate) async fn dense_search(
     limit: usize,
     filters: &[MetadataFilter],
 ) -> Result<Vec<SearchResult>, Error> {
-    let conn = store.conn().conn().await;
+    let conn = store.conn().reader();
     let filter_clauses = build_filter_clauses(filters);
     let encoding = store.encoding();
     let dim = store.embedding_dim();
@@ -142,7 +142,7 @@ pub(crate) async fn bm25_search(
     if query_text.trim().is_empty() {
         return Ok(Vec::new());
     }
-    let conn = store.conn().conn().await;
+    let conn = store.conn().reader();
     let escaped_query = escape_fts5_query(query_text);
     let filter_clauses = build_filter_clauses(filters);
     let escaped_store_id = store.store_id().replace('\'', "''");
@@ -175,7 +175,7 @@ pub(crate) async fn bm25_search(
 }
 
 pub(crate) async fn stats(store: &TenantStore) -> Result<StoreStats, Error> {
-    let conn = store.conn().conn().await;
+    let conn = store.conn().reader();
     let mut rows = conn
         .query(
             "SELECT COUNT(*) FROM chunks WHERE store_id = ?",
@@ -208,7 +208,7 @@ pub(crate) async fn get_chunk(
     store: &TenantStore,
     chunk_id: &str,
 ) -> Result<Option<ChunkRecord>, Error> {
-    let conn = store.conn().conn().await;
+    let conn = store.conn().reader();
     let mut rows = conn
         .query(
             &format!(
@@ -231,7 +231,7 @@ pub(crate) async fn get_chunks_for_resource(
     store: &TenantStore,
     resource_id: &str,
 ) -> Result<Vec<ChunkRecord>, Error> {
-    let conn = store.conn().conn().await;
+    let conn = store.conn().reader();
     let mut rows = conn
         .query(
             &format!(
@@ -262,7 +262,7 @@ pub(crate) async fn get_blocks_for_resource(
     store: &TenantStore,
     resource_id: &str,
 ) -> Result<Vec<localdb_core::block::Block>, Error> {
-    let conn = store.conn().conn().await;
+    let conn = store.conn().reader();
     let mut rows = conn
         .query(
             "SELECT seq, kind, text, metadata_json, location_json
@@ -283,7 +283,7 @@ pub(crate) async fn get_blocks_for_resource(
 pub(crate) async fn list_indexed_documents(
     store: &TenantStore,
 ) -> Result<Vec<DocumentRecord>, Error> {
-    let conn = store.conn().conn().await;
+    let conn = store.conn().reader();
     // `resources.id` maps back to `DocumentRecord.resource_id`.
     let mut rows = conn
         .query(

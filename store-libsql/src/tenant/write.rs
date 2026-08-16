@@ -21,7 +21,7 @@ pub(crate) async fn upsert_chunks(
             ));
         }
     }
-    let conn = store.conn().conn().await;
+    let conn = store.conn().writer().await;
     let count = records.len();
     conn.execute("BEGIN", ()).await.map_err(map_libsql_err)?;
     let inner = upsert_chunks_inner(&conn, &records, store.encoding()).await;
@@ -41,7 +41,7 @@ pub(crate) async fn delete_by_resource(
     store: &TenantStore,
     resource_id: &str,
 ) -> Result<usize, Error> {
-    let conn = store.conn().conn().await;
+    let conn = store.conn().writer().await;
     conn.execute("BEGIN", ()).await.map_err(map_libsql_err)?;
     let inner = delete_document_inner(&conn, store.store_id(), resource_id).await;
     match inner {
@@ -95,7 +95,7 @@ pub(crate) async fn delete_by_store(store: &TenantStore, store_id: &str) -> Resu
             handle = store.store_id()
         ));
     }
-    let conn = store.conn().conn().await;
+    let conn = store.conn().writer().await;
     conn.execute("BEGIN", ()).await.map_err(map_libsql_err)?;
     let inner = delete_by_store_inner(&conn, store_id).await;
     match inner {
@@ -139,7 +139,7 @@ pub(crate) async fn upsert_blocks(
     resource_id: &str,
     blocks: &[localdb_core::block::Block],
 ) -> Result<(), localdb_core::Error> {
-    let conn = store.conn().conn().await;
+    let conn = store.conn().writer().await;
     for block in blocks {
         let kind_str = block.kind.kind_str();
         let metadata_json =
@@ -337,7 +337,7 @@ pub(crate) async fn upsert_chunks_and_blocks(
             });
         }
     }
-    let conn = store.conn().conn().await;
+    let conn = store.conn().writer().await;
     let count = records.len();
     conn.execute("BEGIN", ()).await.map_err(map_libsql_err)?;
     let inner = async {

@@ -24,7 +24,7 @@ use crate::connection::{map_libsql_err, LibsqlDb};
 /// must not depend on for its exit code (see `StoreBackend::largest_tables`'s
 /// doc comment).
 pub(crate) async fn largest_tables(db: &LibsqlDb, limit: usize) -> Result<Vec<TableSize>, Error> {
-    let conn = db.conn().await;
+    let conn = db.reader();
     let mut rows = match conn
         .query(
             // The `sqlite_%` filter is applied to the RESOLVED name, not to

@@ -82,7 +82,7 @@ async fn fresh_open_seeds_baseline_plus_chain_rows() {
     let db = LibsqlDb::open(&path, 4, VectorEncoding::Float32)
         .await
         .unwrap();
-    let conn = db.conn().await;
+    let conn = db.reader();
 
     let user_version = schema::get_schema_version(&conn).await.unwrap();
     assert_eq!(user_version, chain::head_version(&chain::migrations()));
@@ -145,7 +145,7 @@ async fn crash_before_seeding_reclassifies_as_fresh_and_recovers_on_reopen() {
     let db = LibsqlDb::open(&path, 4, VectorEncoding::Float32)
         .await
         .unwrap();
-    let conn = db.conn().await;
+    let conn = db.reader();
 
     let v = schema::get_schema_version(&conn).await.unwrap();
     assert_eq!(v, chain::head_version(&chain::migrations()));

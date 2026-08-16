@@ -49,7 +49,7 @@ async fn get_chunk_tolerates_invalid_metadata_json() {
 
     // Corrupt the persisted metadata_json directly with syntactically
     // invalid JSON.
-    let conn = backend.conn.conn().await;
+    let conn = backend.conn.writer().await;
     conn.execute(
         "UPDATE resources SET metadata_json = ? WHERE id = ?",
         libsql::params!["{not valid json".to_string(), "doc-1".to_string()],

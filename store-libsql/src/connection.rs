@@ -2,8 +2,8 @@
 //! connection pool.
 //!
 //! One dedicated **writer** connection is held behind a `tokio::sync::Mutex`:
-//! all mutating access goes through it, either directly (via `conn()`
-//! /`writer()`) or transactionally (via `write_tx()`, which returns a
+//! all mutating access goes through it, either directly (via `writer()`) or
+//! transactionally (via `write_tx()`, which returns a
 //! [`WriteTx`] wrapping a `libsql::Transaction`). A `WriteTx`'s `Drop` runs a
 //! synchronous ROLLBACK if neither `commit()` nor `rollback()` was called —
 //! that's a backstop for panics/task-aborts only, not the primary error
@@ -74,9 +74,9 @@ fn classify_version(version: i64, head: i64) -> VersionDisposition {
 
 /// A shared libsql handle to the unified single-file store.
 ///
-/// Cheap to keep behind `Arc`. All writes go through the single
-/// mutex-guarded `writer` connection; reads may use either `writer`/`conn`
-/// (for callers not yet migrated — see `conn()`'s doc comment) or the
+/// Cheap to keep behind `Arc`. All single-statement writes go through the
+/// mutex-guarded `writer` connection via `writer()`; multi-statement
+/// transactional writes go through `write_tx()`. Pure reads go through the
 /// `readers` pool via `reader()`.
 pub(crate) struct LibsqlDb {
     /// The owning `Database`. Kept alive for the connections' lifetime.
@@ -87,16 +87,8 @@ pub(crate) struct LibsqlDb {
     writer: Mutex<Connection>,
     /// Independent, read-only (`PRAGMA query_only=ON`) connections, handed
     /// out round-robin by `reader()`. Never empty after a successful `open`.
-    ///
-    /// `#[allow(dead_code)]`: only exercised via `reader()`, whose only
-    /// callers today are tests — no production call site reads through the
-    /// pool yet. Remove once the mechanical sweep (see `conn()`'s doc
-    /// comment) lands real callers.
-    #[allow(dead_code)]
     readers: Vec<Connection>,
-    /// Round-robin cursor into `readers`. Same transitional `allow` as
-    /// `readers` above.
-    #[allow(dead_code)]
+    /// Round-robin cursor into `readers`.
     next_reader: AtomicUsize,
 }
 
@@ -306,21 +298,10 @@ impl LibsqlDb {
         self.writer.lock().await
     }
 
-    /// Alias for [`Self::writer`]. Existing call sites (25 as of this
-    /// writing) still use this name; a later mechanical sweep will replace
-    /// them with `writer()`/`write_tx()` and remove this alias.
-    pub(crate) async fn conn(&self) -> MutexGuard<'_, Connection> {
-        self.writer().await
-    }
-
     /// Hand out one of the read-only reader connections, round-robin.
     ///
     /// Synchronous — this never takes the writer mutex or awaits anything,
     /// it just clones a `Connection` handle out of `readers`.
-    ///
-    /// `#[allow(dead_code)]`: no production call site uses this yet (only
-    /// tests) — see `readers`' doc comment.
-    #[allow(dead_code)]
     pub(crate) fn reader(&self) -> Connection {
         let idx = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.readers.len();
         self.readers[idx].clone()
@@ -330,14 +311,13 @@ impl LibsqlDb {
     /// `TransactionBehavior::Immediate` transaction on it.
     ///
     /// The returned [`WriteTx`] holds the mutex guard for its own lifetime,
-    /// so no other writer (direct via `conn()`/`writer()`, or another
-    /// `write_tx()`) can interleave with it. Callers must explicitly
-    /// `commit()` or `rollback()`; letting a `WriteTx` drop uncommitted is a
-    /// backstop only (see the module doc comment and `WriteTx`'s doc
-    /// comment).
+    /// so no other writer (direct via `writer()`, or another `write_tx()`)
+    /// can interleave with it. Callers must explicitly `commit()` or
+    /// `rollback()`; letting a `WriteTx` drop uncommitted is a backstop only
+    /// (see the module doc comment and `WriteTx`'s doc comment).
     ///
     /// `#[allow(dead_code)]`: no production call site uses this yet (only
-    /// tests) — see `readers`' doc comment.
+    /// tests) — wired up in the tenant write rewrite (next commit).
     #[allow(dead_code)]
     pub(crate) async fn write_tx(&self) -> Result<WriteTx<'_>, Error> {
         let guard = self.writer.lock().await;
@@ -367,7 +347,7 @@ impl LibsqlDb {
 ///
 /// `#[allow(dead_code)]` on the struct and its `commit`/`rollback` methods:
 /// no production call site constructs a `WriteTx` yet (only tests, via
-/// `write_tx()`) — see `readers`' doc comment on `LibsqlDb`.
+/// `write_tx()`) — wired up in the tenant write rewrite (next commit).
 #[allow(dead_code)]
 pub(crate) struct WriteTx<'a> {
     tx: Transaction,

@@ -14,7 +14,7 @@ async fn foreign_keys_pragma_is_enabled() {
     let db = LibsqlDb::open(&path, 4, VectorEncoding::Float32)
         .await
         .unwrap();
-    let conn = db.conn().await;
+    let conn = db.reader();
     let mut rows = conn.query("PRAGMA foreign_keys", ()).await.unwrap();
     let row = rows.next().await.unwrap().unwrap();
     let on: i64 = row.get(0).unwrap();
@@ -28,7 +28,7 @@ async fn wal_pragma_is_enabled() {
     let db = LibsqlDb::open(&path, 4, VectorEncoding::Float32)
         .await
         .unwrap();
-    let conn = db.conn().await;
+    let conn = db.reader();
     let mut rows = conn.query("PRAGMA journal_mode", ()).await.unwrap();
     let row = rows.next().await.unwrap().unwrap();
     let mode: String = row.get(0).unwrap();
