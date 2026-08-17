@@ -12,6 +12,7 @@
 //!   GET  /stores/:name/sources    — list sources for a store
 //!   POST /stores/:name/sources    — add source to a store
 //!   DELETE /sources/:id           — remove a source by ID
+//!   GET  /stores/:name/documents  — list documents in a store
 //!   GET  /documents/:id           — get document by ID
 //!   POST /search                  — hybrid search
 //!   GET  /jobs                    — list every job
@@ -35,7 +36,7 @@ mod status;
 mod stores;
 
 pub use config::get_config;
-pub use documents::get_document;
+pub use documents::{get_document, list_documents};
 pub use jobs::{cancel_job, create_job, get_job, job_events, list_jobs};
 pub use search::search;
 pub use sources::{create_source, delete_source, list_sources};

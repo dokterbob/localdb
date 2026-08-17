@@ -203,7 +203,7 @@ async fn server_future(listener: TcpListener, router: Router) {
 /// Routes per specs/05-surfaces.md §3:
 ///   GET/POST /stores, GET/PATCH/DELETE /stores/{id},
 ///   GET/POST /stores/{id}/sources, DELETE /sources/{id},
-///   GET /documents/{id}, POST /search,
+///   GET /stores/{id}/documents, GET /documents/{id}, POST /search,
 ///   GET/POST /jobs, GET/DELETE /jobs/{id}, GET /jobs/{id}/events, GET /status,
 ///   GET /config.
 ///
@@ -237,6 +237,7 @@ pub fn build_router(
             get(handlers::list_sources).post(handlers::create_source),
         )
         .route("/v1/sources/{id}", delete(handlers::delete_source))
+        .route("/v1/stores/{name}/documents", get(handlers::list_documents))
         .route("/v1/documents/{id}", get(handlers::get_document))
         .route("/v1/search", post(handlers::search))
         .route(

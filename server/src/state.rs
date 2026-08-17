@@ -9,9 +9,11 @@ use localdb_core::{
         policy::compute_policy_version,
         schema::{EmbeddingPolicy, HttpConfig, IndexingPolicyConfig, ProviderConfig, RawConfig},
     },
+    get_document_detail_scoped,
     ingestion::now_rfc3339,
-    store_factory, DeletionPolicy, Embedder, Error, IndexJobScope, IndexJobStats, ProgressSink,
-    SourceRow, Store, StoreBackend, StoreBackendConfig, StoreRow, StoreVisibility,
+    resolve_named_stores, store_factory, DeletionPolicy, DocumentDetail, DocumentInfo, Embedder,
+    Error, IndexJobScope, IndexJobStats, ProgressSink, SourceRow, Store, StoreBackend,
+    StoreBackendConfig, StoreRow, StoreVisibility,
 };
 use store_libsql::SqliteBackend;
 
@@ -670,6 +672,51 @@ impl AppState {
             .into_iter()
             .map(source_row_to_record)
             .collect()
+    }
+
+    /// List documents in a store, ordered by `uri`, optionally filtered to a
+    /// single source.
+    ///
+    /// Returns `Error::StoreNotFound` if the store doesn't exist. An unknown
+    /// `source_id` is a pure filter, not an error — see
+    /// `StoreBackend::list_documents`'s doc comment.
+    pub async fn list_documents(
+        &self,
+        store_name: &str,
+        source_id: Option<&str>,
+    ) -> Result<Vec<DocumentInfo>, Error> {
+        let store = self
+            .inner
+            .backend
+            .get_store_by_name(store_name)
+            .await?
+            .ok_or_else(|| Error::StoreNotFound {
+                id: store_name.to_string(),
+            })?;
+        self.inner
+            .backend
+            .list_documents(&store.id, source_id)
+            .await
+    }
+
+    /// Look up a single document by id, optionally scoped to a caller-visible
+    /// set of store names.
+    ///
+    /// `store_names` resolves through the same `resolve_named_stores` helper
+    /// `?store=` scoping uses elsewhere (`resolve_status_scope`) — an unknown
+    /// name is `Error::StoreNotFound` (→ 404). The resolved store ids are
+    /// then handed to `get_document_detail_scoped`, which applies its own
+    /// 0/1/many semantics: an empty list preserves the existing cross-store
+    /// ambiguity error, one id SQL-scopes the lookup, and more than one id
+    /// resolves unscoped followed by a membership check.
+    pub async fn get_document(
+        &self,
+        doc_id: &str,
+        store_names: &[String],
+    ) -> Result<DocumentDetail, Error> {
+        let stores = resolve_named_stores(self.backend(), store_names).await?;
+        let store_ids: Vec<String> = stores.into_iter().map(|s| s.id).collect();
+        get_document_detail_scoped(self.backend(), doc_id, &store_ids, true).await
     }
 
     /// Remove a source by ID.
