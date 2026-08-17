@@ -710,7 +710,9 @@ async fn sse_events_lagged_subscriber_still_receives_terminal_job_event() {
         .expect("job channel should still be open (task hasn't completed)");
     for i in 0..5usize {
         raw_tx
-            .send(ProgressEvent::Discovered { total: i })
+            .send(crate::job_queue::JobEvent::Progress(
+                ProgressEvent::Discovered { total: i },
+            ))
             .expect("subscriber above should still be attached to receive this");
     }
     // Drop this Sender clone before completing the job, so the queue's own

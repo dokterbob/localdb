@@ -176,10 +176,12 @@ pub(crate) async fn run_embedded_store_job(
     Ok((summary, Some(job_id)))
 }
 
-/// Subscribe to `job_id`'s live progress on the local queue, feeding every
-/// event into the CLI's progress sink until the channel closes (the job has
-/// gone terminal — see `JobQueue`'s `EventRegistry` doc comment), then read
-/// back the terminal `IndexJob` from the registry.
+/// Subscribe to `job_id`'s live events on the local queue, feeding every
+/// progress event into the CLI's progress sink until the in-band terminal
+/// snapshot arrives ([`server::JobEvent::Terminal`], PR #229 round-3
+/// review), and return that snapshot. Falls back to a registry read only
+/// when no channel exists anymore (the job raced to terminal before this
+/// subscribed) or on the defensive channel-closed-without-terminal path.
 async fn drive_embedded_job(
     queue: &JobQueue,
     job_id: &str,
@@ -190,15 +192,22 @@ async fn drive_embedded_job(
     if let Some(mut rx) = queue.subscribe(job_id).await {
         loop {
             match rx.recv().await {
-                Ok(event) => {
+                Ok(server::JobEvent::Progress(event)) => {
                     if let Some(s) = &sink {
                         s(event);
                     }
                 }
+                // The job's final state, delivered through the channel
+                // itself — no registry read, so terminal-job eviction
+                // (`MAX_TERMINAL_JOBS`) can never cost an attached CLI its
+                // result.
+                Ok(server::JobEvent::Terminal(job)) => return *job,
                 // Progress is lossy-tolerant by design (see `job_queue.rs`'s
                 // `EVENT_CHANNEL_CAPACITY` doc comment) — a lagging
                 // subscriber skips ahead rather than stalling.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                // Defensive: `subscribe`'s contract guarantees `Terminal`
+                // arrives before the close, so this should be unreachable.
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
@@ -256,16 +265,21 @@ fn emit_source_error(mode: IndexErrorMode, source_id: &str, err: SourceError<'_>
 /// `IndexSummary` under `WarnAndContinue` (`source add`'s auto-index, D3).
 ///
 /// Prints the job id (issue #218-followups Fix A) as soon as it's known —
-/// before attaching — with a one-line cancel hint, since this is exactly
-/// the case `localdb job cancel <id>` can reach (unlike
-/// [`run_embedded_store_job`]'s throwaway local queue): `job <id> (cancel
-/// with: localdb job cancel <id>)`, `[label] `-prefixed when
-/// `progress_label` is `Some` (multi-store runs), to stderr, suppressed
-/// under `--json` (stdout must stay clean JSON, matching every other
-/// progress-ish line this module emits via `crate::progress`). Also
-/// returned alongside the summary so `--json` output can surface it too —
-/// `None` only on the two early-return paths before a job id is ever known
-/// (a submission failure, or a malformed submission response).
+/// before attaching — since this is exactly the case
+/// `localdb job cancel <id>` can reach (unlike
+/// [`run_embedded_store_job`]'s throwaway local queue). Always to stderr
+/// (stdout must stay clean JSON under `--json`, matching every other
+/// progress-ish line this module emits via `crate::progress`), in a
+/// mode-appropriate shape: human mode gets `job <id> (cancel with: localdb
+/// job cancel <id>)`, `[label] `-prefixed when `progress_label` is `Some`
+/// (multi-store runs); `--json` mode gets one JSON line
+/// `{"job_id": "<id>"}` (plus a `"store"` field when `progress_label` is
+/// `Some`) — PR #229 round-3 review: suppressing it entirely left `--json`
+/// callers with no way to learn the id until the job was already terminal.
+/// Also returned alongside the summary so the final `--json` document can
+/// surface it too — `None` only on the two early-return paths before a job
+/// id is ever known (a submission failure, or a malformed submission
+/// response).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_daemon_store_job(
     ctx: &CliContext,
@@ -323,16 +337,10 @@ pub(crate) async fn run_daemon_store_job(
         }
     };
 
-    if !ctx.json {
-        let hint = format!("job {job_id} (cancel with: localdb job cancel {job_id})");
-        eprintln!(
-            "{}",
-            match progress_label {
-                Some(label) => format!("[{label}] {hint}"),
-                None => hint,
-            }
-        );
-    }
+    eprintln!(
+        "{}",
+        pre_attach_job_id_line(ctx.json, &job_id, progress_label)
+    );
 
     let final_job = match attach_daemon_job(base_url, &job_id, ctx.json, progress_label).await {
         Ok(j) => j,
@@ -361,6 +369,34 @@ pub(crate) async fn run_daemon_store_job(
         final_job.error_code,
     )?;
     Ok((summary, Some(job_id)))
+}
+
+/// The stderr line announcing a freshly-submitted daemon job's id, emitted
+/// before attaching blocks (issue #218-followups Fix A) — the one moment
+/// `localdb job cancel <id>` is actionable.
+///
+/// Human mode: `job <id> (cancel with: localdb job cancel <id>)`,
+/// `[label] `-prefixed for multi-store runs. `--json` mode (PR #229 round-3
+/// review): one JSON line `{"job_id": "<id>"}`, plus a `"store"` field when
+/// a label is present — previously the id was suppressed entirely under
+/// `--json`, so a machine caller couldn't learn it until the job was
+/// already terminal (and possibly not at all, on the attach-failure paths
+/// where the final document carries no id). Stderr in both modes: stdout
+/// must stay one clean JSON document under `--json` (specs/05 §2.1).
+fn pre_attach_job_id_line(json_mode: bool, job_id: &str, progress_label: Option<&str>) -> String {
+    if json_mode {
+        let mut line = serde_json::json!({ "job_id": job_id });
+        if let Some(label) = progress_label {
+            line["store"] = serde_json::Value::String(label.to_string());
+        }
+        line.to_string()
+    } else {
+        let hint = format!("job {job_id} (cancel with: localdb job cancel {job_id})");
+        match progress_label {
+            Some(label) => format!("[{label}] {hint}"),
+            None => hint,
+        }
+    }
 }
 
 /// Attach to `job_id` on a running daemon until it reaches a terminal
@@ -596,6 +632,38 @@ mod tests {
 
     use crate::app_db::{load_config_scaffolded, open_app_db_or_exit};
     use crate::cmds::store::run_store_add_async;
+
+    /// PR #229 round-3 review: `--json` mode must expose the submitted job
+    /// id on stderr *before* attach blocks — as one parseable JSON line —
+    /// or a machine caller can never reach `localdb job cancel <id>` in
+    /// time. Human mode keeps the pre-existing cancel hint verbatim.
+    #[test]
+    fn pre_attach_job_id_line_shapes() {
+        // JSON, single store: exactly {"job_id": ...}, parseable.
+        let line = pre_attach_job_id_line(true, "job-1", None);
+        let v: serde_json::Value = serde_json::from_str(&line).expect("must be valid JSON");
+        assert_eq!(v, serde_json::json!({ "job_id": "job-1" }));
+
+        // JSON, multi-store: a `store` field disambiguates, mirroring the
+        // human hint's `[label]` prefix.
+        let line = pre_attach_job_id_line(true, "job-2", Some("books"));
+        let v: serde_json::Value = serde_json::from_str(&line).expect("must be valid JSON");
+        assert_eq!(
+            v,
+            serde_json::json!({ "job_id": "job-2", "store": "books" })
+        );
+
+        // Human, both label shapes: pinned wording (issue #218-followups
+        // Fix A).
+        assert_eq!(
+            pre_attach_job_id_line(false, "job-3", None),
+            "job job-3 (cancel with: localdb job cancel job-3)"
+        );
+        assert_eq!(
+            pre_attach_job_id_line(false, "job-3", Some("books")),
+            "[books] job job-3 (cancel with: localdb job cancel job-3)"
+        );
+    }
 
     fn test_ctx() -> CliContext {
         CliContext {

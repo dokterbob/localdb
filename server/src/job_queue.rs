@@ -98,9 +98,35 @@ const QUEUE_CAPACITY: usize = 64;
 /// Bounded rather than unbounded: a slow or absent SSE subscriber must never
 /// let a fast-producing ingestion run grow memory without limit. A lagging
 /// subscriber instead sees `RecvError::Lagged` and skips ahead — progress is
-/// documented as lossy-tolerant (unlike the terminal `job` event, which is
-/// derived from the registry, never from this channel alone).
+/// documented as lossy-tolerant, unlike the terminal [`JobEvent::Terminal`]
+/// event, which lag can never drop: it is the last message ever sent on the
+/// channel, so nothing newer can displace it from the ring buffer.
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
+
+/// What a job's per-job broadcast channel carries (issues #83/#218-followups
+/// PR #229 round-3 review).
+///
+/// `Terminal` exists so an attached subscriber receives the job's final
+/// state **in-band**, from the channel itself, rather than by re-reading the
+/// registry after observing the channel close. The registry read used to be
+/// the only path, and it raced bounded terminal-job retention: under a
+/// same-second burst of completions at the [`MAX_TERMINAL_JOBS`] cap, a
+/// *later* job's terminal write could evict this job between its channel
+/// closing and its subscriber's `get_job` — the SSE stream then ended with
+/// no terminal frame, and the CLI's polling fallback got a 404 and reported
+/// a successful job as an attach failure. Delivering the snapshot through
+/// the channel removes the dependency on registry retention entirely for
+/// attached consumers; `evict_oldest_terminal_jobs_over_cap`'s
+/// self-protection remains for the unattached `get_job`/poll path.
+#[derive(Debug, Clone)]
+pub enum JobEvent {
+    /// A live progress event from the job's task (lossy-tolerant).
+    Progress(ProgressEvent),
+    /// The job's terminal registry snapshot, sent exactly once as the
+    /// channel's final message, immediately before teardown (guaranteed,
+    /// never dropped by lag — see [`EVENT_CHANNEL_CAPACITY`]).
+    Terminal(Box<IndexJob>),
+}
 
 /// Maximum number of terminal (`Done`/`Failed`) jobs retained in the
 /// registry (issue #218-followups Fix 2, PR #229 review). Pending/Running
@@ -161,24 +187,27 @@ type InFlightSet = Arc<RwLock<HashSet<String>>>;
 /// earlier version of this file did) only bought two lock acquisitions and
 /// two lookups everywhere instead of one, for no benefit.
 struct JobHandle {
-    events: broadcast::Sender<ProgressEvent>,
+    events: broadcast::Sender<JobEvent>,
     cancel_token: CancellationToken,
 }
 
 /// Shared per-job handle registry: job_id → [`JobHandle`].
 ///
 /// An entry exists from `submit` until the job reaches a terminal state, at
-/// which point `run_worker` removes it — dropping the queue's own `events`
-/// `Sender` clone. Once every clone (the queue's and the task's
-/// `ProgressSink`) is dropped, subscribed receivers observe
-/// `RecvError::Closed`, which is how `GET /v1/jobs/{id}/events` (issue #83)
-/// knows to stop waiting for more progress and fetch the terminal `IndexJob`
-/// from the registry instead.
+/// which point the teardown sends the job's [`JobEvent::Terminal`] snapshot
+/// and removes the entry **under one `handles` write lock** (see
+/// `process_job`'s teardown comment) — so every receiver that ever existed
+/// either was subscribed when the terminal snapshot was sent (and will read
+/// it in-band) or `subscribe` returned `None` to its caller in the first
+/// place. Removing the entry drops the queue's own `events` `Sender` clone;
+/// once every clone (the queue's and the task's `ProgressSink`) is dropped,
+/// subscribed receivers observe `RecvError::Closed` after draining — by
+/// then they have always already seen the `Terminal` snapshot.
 ///
 /// Removal always happens *after* the registry's own state update in
-/// `run_worker` (see there), so a subscriber that observes the channel close
-/// is guaranteed to find the job already terminal in the registry — no
-/// window where the terminal event could be missed. `JobQueue::cancel`
+/// `run_worker` (see there), so even a caller that only learns of the close
+/// out-of-band still finds the job terminal in the registry (subject to
+/// retention, see `evict_oldest_terminal_jobs_over_cap`). `JobQueue::cancel`
 /// relies on the same ordering: a non-terminal `IndexJob` in the registry
 /// guarantees this job's entry (and so its `cancel_token`) is still present.
 type HandleRegistry = Arc<RwLock<HashMap<String, JobHandle>>>;
@@ -350,7 +379,7 @@ impl JobQueue {
         // exists, so `cancel` (see there) can now treat "registry-visible,
         // non-terminal, no handle" as an internal-invariant violation
         // instead of a legitimate case to handle quietly.
-        let (tx, _rx) = broadcast::channel::<ProgressEvent>(self.event_capacity);
+        let (tx, _rx) = broadcast::channel::<JobEvent>(self.event_capacity);
         let cancel_token = CancellationToken::new();
         {
             let mut handles = self.handles.write().await;
@@ -380,7 +409,7 @@ impl JobQueue {
                 // No receivers is the common case (nobody is watching
                 // `/events`) — `send` returning `Err` there is expected, not
                 // an error worth logging.
-                let _ = tx.send(event);
+                let _ = tx.send(JobEvent::Progress(event));
             })
         };
 
@@ -397,15 +426,25 @@ impl JobQueue {
             // it won't run `run_worker`'s release path.
             let mut inflight = self.inflight.write().await;
             inflight.remove(store_id);
-            let mut reg = self.registry.write().await;
-            if let Some(j) = reg.get_mut(&job_id) {
-                fail_index_job(j, "job queue is full or closed".to_string());
-            }
-            // This is a terminal write too (issue #218-followups Fix 2,
-            // PR #229 review) — every path that can move a job to
-            // `Done`/`Failed` runs eviction, not just `process_job`'s.
-            evict_oldest_terminal_jobs_over_cap(&mut reg, MAX_TERMINAL_JOBS, &job_id);
+            let terminal_snapshot = {
+                let mut reg = self.registry.write().await;
+                if let Some(j) = reg.get_mut(&job_id) {
+                    fail_index_job(j, "job queue is full or closed".to_string());
+                }
+                // This is a terminal write too (issue #218-followups Fix 2,
+                // PR #229 review) — every path that can move a job to
+                // `Done`/`Failed` runs eviction, not just `process_job`'s.
+                evict_oldest_terminal_jobs_over_cap(&mut reg, MAX_TERMINAL_JOBS, &job_id);
+                // Snapshot inside the same write scope that made the job
+                // terminal — `protect_id` above guarantees the entry is
+                // still present here (see `process_job`'s teardown for the
+                // same pattern and why).
+                reg.get(&job_id).cloned()
+            };
             let mut handles = self.handles.write().await;
+            if let Some(job) = terminal_snapshot {
+                let _ = tx.send(JobEvent::Terminal(Box::new(job)));
+            }
             handles.remove(&job_id);
         }
 
@@ -529,14 +568,21 @@ impl JobQueue {
         reg.values().cloned().collect()
     }
 
-    /// Subscribe to a job's live progress events (issue #83).
+    /// Subscribe to a job's live event stream (issue #83): zero or more
+    /// [`JobEvent::Progress`] items, then exactly one [`JobEvent::Terminal`]
+    /// carrying the job's final registry snapshot (PR #229 round-3 review),
+    /// after which the channel closes.
     ///
     /// Returns `None` once the job has reached a terminal state and its
     /// channel has been torn down — callers should treat that the same as
-    /// "no more progress events, go read the terminal `IndexJob` from
-    /// `get_job`", not as "unknown job id" (a job that never existed is a
-    /// separate case the caller should check via `get_job` first).
-    pub async fn subscribe(&self, job_id: &str) -> Option<broadcast::Receiver<ProgressEvent>> {
+    /// "no more events, go read the terminal `IndexJob` from `get_job`",
+    /// not as "unknown job id" (a job that never existed is a separate case
+    /// the caller should check via `get_job` first). The teardown sends
+    /// `Terminal` and removes the handle under one `handles` write lock, so
+    /// a `Some(rx)` from here always yields the `Terminal` event — there is
+    /// no window to subscribe after the snapshot was sent but before the
+    /// handle disappears.
+    pub async fn subscribe(&self, job_id: &str) -> Option<broadcast::Receiver<JobEvent>> {
         let handles = self.handles.read().await;
         handles.get(job_id).map(|h| h.events.subscribe())
     }
@@ -554,7 +600,7 @@ impl JobQueue {
     pub(crate) async fn test_progress_sender(
         &self,
         job_id: &str,
-    ) -> Option<broadcast::Sender<ProgressEvent>> {
+    ) -> Option<broadcast::Sender<JobEvent>> {
         let handles = self.handles.read().await;
         handles.get(job_id).map(|h| h.events.clone())
     }
@@ -632,7 +678,7 @@ async fn process_job(
     // worker starts it never runs." `(queued.task)()` (which *builds* the
     // future) is deliberately never called on the cancelled path — not
     // even one poll of the task future.
-    let already_cancelled = {
+    let (already_cancelled, mut terminal_snapshot) = {
         let mut reg = registry.write().await;
         let cancelled = cancel_token.is_cancelled();
         if let Some(job) = reg.get_mut(&job_id) {
@@ -645,11 +691,18 @@ async fn process_job(
         // Only the `cancelled` branch above is a terminal write — the
         // `start_index_job` branch moves to `Running`, not terminal, so
         // nothing to evict there (issue #218-followups Fix 2, PR #229
-        // review).
-        if cancelled {
+        // review). The snapshot for the in-band `JobEvent::Terminal` (see
+        // the teardown below) is taken inside this same write scope:
+        // eviction's `protect_id` guarantees the entry is still present
+        // here, and no other job's terminal write can evict it before this
+        // scope ends.
+        let snapshot = if cancelled {
             evict_oldest_terminal_jobs_over_cap(&mut reg, MAX_TERMINAL_JOBS, &job_id);
-        }
-        cancelled
+            reg.get(&job_id).cloned()
+        } else {
+            None
+        };
+        (cancelled, snapshot)
     };
 
     if already_cancelled {
@@ -771,24 +824,36 @@ async fn process_job(
             }
             // Every arm of the match above is a terminal write (issue
             // #218-followups Fix 2, PR #229 review) — evict once per job
-            // completion, not per arm.
+            // completion, not per arm. Snapshot inside this same write
+            // scope, same reasoning as the cancelled-before-start branch
+            // above (protect_id keeps the entry present; no other job's
+            // terminal write can evict it before this scope ends).
             evict_oldest_terminal_jobs_over_cap(&mut reg, MAX_TERMINAL_JOBS, &job_id);
+            terminal_snapshot = reg.get(&job_id).cloned();
         }
     }
 
-    // Tear down this job's handle (progress-event channel + cancel
-    // token) now that it's terminal — *after* the registry update
-    // above, never before: a subscriber that observes the channel
-    // close (`RecvError::Closed`) must always find the job already
-    // terminal when it then reads the registry (see
-    // `HandleRegistry`'s doc comment and issue #83's
-    // no-missed-terminal-event requirement); `JobQueue::cancel` relies
-    // on the same ordering. Dropping the events `Sender`'s last clone
-    // (the `ProgressSink` given to the task already went out of scope
-    // when the task future completed or was dropped) is what actually
-    // closes the channel for any subscribed receivers.
+    // Tear down this job's handle (event channel + cancel token) now that
+    // it's terminal — *after* the registry update above, never before
+    // (`JobQueue::cancel` relies on that ordering: a non-terminal registry
+    // entry guarantees the handle exists). The terminal snapshot is sent
+    // and the handle removed under ONE `handles` write lock (PR #229
+    // round-3 review): `subscribe` takes the same lock, so every receiver
+    // either existed when `JobEvent::Terminal` was sent (and reads the
+    // job's final state in-band, immune to terminal-job eviction races —
+    // see `JobEvent`'s doc comment) or never got a receiver at all.
+    // Dropping the events `Sender`'s last clone (the `ProgressSink` given
+    // to the task already went out of scope when the task future completed
+    // or was dropped) is what actually closes the channel for any
+    // subscribed receivers — after they have drained the `Terminal` event.
     {
         let mut handles = handles.write().await;
+        if let Some(job) = terminal_snapshot {
+            if let Some(handle) = handles.get(&job_id) {
+                // No receivers → `Err`, expected and fine (nobody attached).
+                let _ = handle.events.send(JobEvent::Terminal(Box::new(job)));
+            }
+        }
         handles.remove(&job_id);
     }
 

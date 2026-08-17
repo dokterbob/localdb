@@ -15,7 +15,7 @@ use localdb_core::{
 };
 
 use crate::error::ApiError;
-use crate::job_queue::JobQueue;
+use crate::job_queue::{JobEvent, JobQueue};
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -134,14 +134,14 @@ pub async fn cancel_job(
 /// (issue #83).
 ///
 /// `Live(rx)` streams `progress` events off the job's broadcast channel
-/// until it closes, then (in the same poll) fetches the terminal `IndexJob`
-/// from the registry and transitions to `Finished` after yielding it.
-/// `Terminal(job)` is the "already done at subscribe time" and
+/// until the in-band `JobEvent::Terminal` snapshot arrives (PR #229 round-3
+/// review), yields it as the final `job` frame, and transitions to
+/// `Finished`. `Terminal(job)` is the "already done at subscribe time" and
 /// "channel-already-torn-down" fast paths: it yields the given job's
 /// terminal event immediately and transitions to `Finished`. `Finished` ends
 /// the stream.
 enum JobEventState {
-    Live(broadcast::Receiver<ProgressEvent>),
+    Live(broadcast::Receiver<JobEvent>),
     Terminal(Box<IndexJob>),
     Finished,
 }
@@ -180,15 +180,30 @@ async fn next_job_event(
     match state {
         JobEventState::Live(mut rx) => loop {
             match rx.recv().await {
-                Ok(event) => return Some((progress_sse_event(&event), JobEventState::Live(rx))),
+                Ok(JobEvent::Progress(event)) => {
+                    return Some((progress_sse_event(&event), JobEventState::Live(rx)))
+                }
+                // The job's final state, delivered in-band as the channel's
+                // guaranteed last message (PR #229 round-3 review) — never
+                // dropped by lag, and immune to terminal-job eviction: no
+                // registry read involved, so a burst of later completions
+                // evicting this job's registry entry can't cost an attached
+                // subscriber its terminal frame.
+                Ok(JobEvent::Terminal(job)) => {
+                    return Some((terminal_job_event(&job), JobEventState::Finished));
+                }
                 // Progress is lossy-tolerant by design: a lagging subscriber
                 // skips ahead rather than buffering unboundedly or stalling
-                // the stream. Only the terminal event (below) is guaranteed.
+                // the stream. Only the terminal event (above) is guaranteed.
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                // The channel only closes after `run_worker` has already
-                // committed the job's terminal state to the registry (see
-                // `EventRegistry`'s doc comment in `job_queue.rs`) — so this
-                // `get_job` is guaranteed to see it.
+                // Defensive only: `subscribe`'s contract (see its doc
+                // comment) is that a successfully-obtained receiver always
+                // yields `JobEvent::Terminal` before the channel closes, so
+                // this arm should be unreachable. Falling back to the
+                // registry keeps the stream correct even if that invariant
+                // ever regresses — though the job may already be evicted
+                // (`None` ends the stream without a terminal frame, the
+                // pre-round-3 behavior).
                 Err(broadcast::error::RecvError::Closed) => {
                     let job = queue.get_job(&job_id).await?;
                     return Some((terminal_job_event(&job), JobEventState::Finished));
