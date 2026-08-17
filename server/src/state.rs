@@ -674,17 +674,21 @@ impl AppState {
             .collect()
     }
 
-    /// List documents in a store, ordered by `uri`, optionally filtered to a
-    /// single source.
+    /// List a page of documents in a store, ordered by `uri`, optionally
+    /// filtered to a single source, plus the un-paginated total.
     ///
     /// Returns `Error::StoreNotFound` if the store doesn't exist. An unknown
     /// `source_id` is a pure filter, not an error — see
-    /// `StoreBackend::list_documents`'s doc comment.
+    /// `StoreBackend::list_documents`'s doc comment. `limit`/`offset` are
+    /// forwarded to the backend, which performs the pagination in its own
+    /// query rather than this loading every document in the store.
     pub async fn list_documents(
         &self,
         store_name: &str,
         source_id: Option<&str>,
-    ) -> Result<Vec<DocumentInfo>, Error> {
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<(Vec<DocumentInfo>, u64), Error> {
         let store = self
             .inner
             .backend
@@ -693,10 +697,17 @@ impl AppState {
             .ok_or_else(|| Error::StoreNotFound {
                 id: store_name.to_string(),
             })?;
-        self.inner
+        let items = self
+            .inner
             .backend
-            .list_documents(&store.id, source_id)
-            .await
+            .list_documents(&store.id, source_id, limit, offset)
+            .await?;
+        let total = self
+            .inner
+            .backend
+            .count_documents(&store.id, source_id)
+            .await?;
+        Ok((items, total))
     }
 
     /// Look up a single document by id, optionally scoped to a caller-visible

@@ -130,17 +130,27 @@ pub trait StoreBackend: Send + Sync + 'static {
         store_id: Option<&str>,
     ) -> Result<Option<DocumentInfo>, Error>;
 
-    /// List every document in `store_id`, ordered by `uri`, optionally
-    /// filtered to a single `source_id`.
+    /// List documents in `store_id`, ordered by `uri`, optionally filtered to
+    /// a single `source_id`, and paginated by `limit`/`offset`.
     ///
-    /// An unknown `source_id` is a pure filter — it yields an empty list
-    /// rather than an error, matching `find_document`'s "no error on a miss"
-    /// posture for read paths.
+    /// `limit: None` returns every row from `offset` onward, uncapped.
+    /// `offset` past the end of the (filtered) result set yields an empty
+    /// list, not an error. An unknown `source_id` is a pure filter — it
+    /// yields an empty list rather than an error, matching `find_document`'s
+    /// "no error on a miss" posture for read paths.
     async fn list_documents(
         &self,
         store_id: &str,
         source_id: Option<&str>,
+        limit: Option<usize>,
+        offset: usize,
     ) -> Result<Vec<DocumentInfo>, Error>;
+
+    /// Count documents in `store_id`, optionally filtered to a single
+    /// `source_id` — the un-paginated total backing a paginated
+    /// `list_documents` call's envelope. Same "unknown `source_id` is a pure
+    /// filter" posture as `list_documents`.
+    async fn count_documents(&self, store_id: &str, source_id: Option<&str>) -> Result<u64, Error>;
 
     async fn retrieval_store(&self, store_id: &str) -> Result<Arc<dyn RetrievalStore>, Error>;
 

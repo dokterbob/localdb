@@ -206,7 +206,7 @@ List documents registered in a store. Response is paginated (see [Pagination](#p
 | --------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------ |
 | `source`  | string | no       | Restrict to documents from this source id. An unknown id is a pure filter — it returns an empty page, not an error |
 | `cursor`  | string | no       | Pagination cursor from a previous response                                                                         |
-| `limit`   | int    | no       | Maximum items per page                                                                                             |
+| `limit`   | int    | no       | Maximum items per page (must be ≥ 1; `0` is rejected as `invalid_request`)                                         |
 
 ```text
 curl -s http://127.0.0.1:7700/v1/stores/notes/documents
@@ -543,12 +543,13 @@ the stream opens).
 
 ## Pagination
 
-List endpoints (`/v1/stores`, `/v1/stores/{name}/sources`) use cursor-based pagination.
+List endpoints (`/v1/stores`, `/v1/stores/{name}/sources`, `/v1/stores/{name}/documents`) use
+cursor-based pagination.
 
-| Query parameter | Default        | Description                                            |
-| --------------- | -------------- | ------------------------------------------------------ |
-| `cursor`        | —              | Opaque cursor from a previous response's `next_cursor` |
-| `limit`         | server default | Maximum items per page                                 |
+| Query parameter | Default        | Description                                                    |
+| --------------- | -------------- | -------------------------------------------------------------- |
+| `cursor`        | —              | Opaque cursor from a previous response's `next_cursor`         |
+| `limit`         | server default | Maximum items per page; must be ≥ 1 (`0` is `invalid_request`) |
 
 A `next_cursor` of `null` means the last page has been reached.
 

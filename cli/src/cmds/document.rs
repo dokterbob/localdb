@@ -154,7 +154,7 @@ impl DaemonAwareCommand for DocumentListCmd {
         for row in &rows {
             let docs = db
                 .backend()
-                .list_documents(&row.id, self.source.as_deref())
+                .list_documents(&row.id, self.source.as_deref(), None, 0)
                 .await?;
             for d in &docs {
                 all.push(document_info_to_list_item(d, &row.name));

@@ -137,7 +137,19 @@ impl StoreBackend for StoresBackend {
         &self,
         _store_id: &str,
         _source_id: Option<&str>,
+        _limit: Option<usize>,
+        _offset: usize,
     ) -> Result<Vec<DocumentInfo>, Error> {
+        unimplemented!(
+            "not exercised via get_document; see tools/tests/list_documents.rs's own backend"
+        )
+    }
+
+    async fn count_documents(
+        &self,
+        _store_id: &str,
+        _source_id: Option<&str>,
+    ) -> Result<u64, Error> {
         unimplemented!(
             "not exercised via get_document; see tools/tests/list_documents.rs's own backend"
         )

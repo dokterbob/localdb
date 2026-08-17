@@ -97,12 +97,26 @@ impl StoreBackend for FakeBackend {
         &self,
         store_id: &str,
         source_id: Option<&str>,
+        limit: Option<usize>,
+        offset: usize,
     ) -> Result<Vec<DocumentInfo>, Error> {
         let docs = self.documents.get(store_id).cloned().unwrap_or_default();
-        Ok(docs
+        let filtered = docs
+            .into_iter()
+            .filter(|d| source_id.map(|s| d.source_id == s).unwrap_or(true));
+        Ok(match limit {
+            Some(limit) => filtered.skip(offset).take(limit).collect(),
+            None => filtered.skip(offset).collect(),
+        })
+    }
+
+    async fn count_documents(&self, store_id: &str, source_id: Option<&str>) -> Result<u64, Error> {
+        let docs = self.documents.get(store_id).cloned().unwrap_or_default();
+        let count = docs
             .into_iter()
             .filter(|d| source_id.map(|s| d.source_id == s).unwrap_or(true))
-            .collect())
+            .count();
+        Ok(count as u64)
     }
 
     async fn retrieval_store(&self, _store_id: &str) -> Result<Arc<dyn RetrievalStore>, Error> {

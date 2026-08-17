@@ -91,8 +91,14 @@ impl StoreBackend for SqliteBackend {
         &self,
         store_id: &str,
         source_id: Option<&str>,
+        limit: Option<usize>,
+        offset: usize,
     ) -> Result<Vec<DocumentInfo>, Error> {
-        registry::documents::list_documents(&self.conn, store_id, source_id).await
+        registry::documents::list_documents(&self.conn, store_id, source_id, limit, offset).await
+    }
+
+    async fn count_documents(&self, store_id: &str, source_id: Option<&str>) -> Result<u64, Error> {
+        registry::documents::count_documents(&self.conn, store_id, source_id).await
     }
 
     async fn retrieval_store(&self, store_id: &str) -> Result<Arc<dyn RetrievalStore>, Error> {

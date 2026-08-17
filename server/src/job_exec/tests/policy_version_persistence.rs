@@ -78,8 +78,15 @@ impl StoreBackend for FailingUpsertBackend {
         &self,
         store_id: &str,
         source_id: Option<&str>,
+        limit: Option<usize>,
+        offset: usize,
     ) -> Result<Vec<DocumentInfo>, Error> {
-        self.inner.list_documents(store_id, source_id).await
+        self.inner
+            .list_documents(store_id, source_id, limit, offset)
+            .await
+    }
+    async fn count_documents(&self, store_id: &str, source_id: Option<&str>) -> Result<u64, Error> {
+        self.inner.count_documents(store_id, source_id).await
     }
     async fn retrieval_store(&self, store_id: &str) -> Result<Arc<dyn RetrievalStore>, Error> {
         self.inner.retrieval_store(store_id).await

@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use localdb_core::Error as CoreError;
 
-use super::{parse_cursor, PaginatedList, PaginationParams};
+use super::{parse_cursor, parse_limit, PaginatedList, PaginationParams};
 use crate::error::ApiError;
 use crate::state::{AppState, SourceRecord};
 
@@ -17,16 +17,12 @@ pub async fn list_sources(
     Query(pagination): Query<PaginationParams>,
 ) -> Result<Json<PaginatedList<SourceRecord>>, ApiError> {
     let offset = parse_cursor(pagination.cursor.as_deref())?;
+    let limit = parse_limit(pagination.limit)?;
 
     let all = state.list_sources(&store_name).await?;
     let total = all.len();
     let page = all.into_iter().skip(offset).collect::<Vec<_>>();
-    Ok(Json(PaginatedList::new(
-        page,
-        offset,
-        pagination.limit,
-        total,
-    )))
+    Ok(Json(PaginatedList::new(page, offset, limit, total)))
 }
 
 #[derive(Debug, Deserialize)]

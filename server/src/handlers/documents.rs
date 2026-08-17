@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use localdb_core::metadata::Metadata;
 use localdb_core::DocumentInfo;
 
-use super::{default_limit, parse_cursor, PaginatedList};
+use super::{default_limit, parse_cursor, parse_limit, PaginatedList};
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -79,11 +79,15 @@ pub async fn list_documents(
     axum::extract::Query(query): axum::extract::Query<ListDocumentsQuery>,
 ) -> Result<Json<PaginatedList<DocumentInfo>>, ApiError> {
     let offset = parse_cursor(query.cursor.as_deref())?;
+    let limit = parse_limit(query.limit)?;
 
-    let all = state
-        .list_documents(&store_name, query.source.as_deref())
+    let (page, total) = state
+        .list_documents(&store_name, query.source.as_deref(), Some(limit), offset)
         .await?;
-    let total = all.len();
-    let page = all.into_iter().skip(offset).collect::<Vec<_>>();
-    Ok(Json(PaginatedList::new(page, offset, query.limit, total)))
+    Ok(Json(PaginatedList::new(
+        page,
+        offset,
+        limit,
+        total as usize,
+    )))
 }

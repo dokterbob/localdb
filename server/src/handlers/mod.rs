@@ -72,6 +72,45 @@ pub(crate) fn parse_cursor(cursor: Option<&str>) -> Result<usize, ApiError> {
     }
 }
 
+/// Reject `?limit=0` on a list endpoint rather than reinterpreting it.
+///
+/// A zero limit truncates every page to empty while `PaginatedList::new`'s
+/// `next_cursor` still advances by the unchanged offset (`offset + 0 <
+/// total`), so a client following cursors would loop forever on the same
+/// empty page. Rejecting outright — rather than clamping up to 1 — matches
+/// the MCP `list_documents`/`get_chunks` tools' own `resolve_limit`
+/// (`mcp/src/tools/mod.rs`): clamping `0` up to `1` would silently return an
+/// item the caller did not ask for.
+pub(crate) fn parse_limit(limit: usize) -> Result<usize, ApiError> {
+    if limit == 0 {
+        return Err(ApiError(localdb_core::Error::InvalidRequest {
+            message: "limit must be at least 1".to_string(),
+        }));
+    }
+    Ok(limit)
+}
+
+#[cfg(test)]
+mod parse_limit_tests {
+    use super::parse_limit;
+
+    #[test]
+    fn zero_is_rejected_as_invalid_request() {
+        let err = parse_limit(0).expect_err("limit=0 must be rejected");
+        match err.0 {
+            localdb_core::Error::InvalidRequest { .. } => {}
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nonzero_passes_through_unchanged() {
+        assert_eq!(parse_limit(1).unwrap(), 1);
+        assert_eq!(parse_limit(20).unwrap(), 20);
+        assert_eq!(parse_limit(usize::MAX).unwrap(), usize::MAX);
+    }
+}
+
 /// A paginated list response.
 #[derive(Debug, Serialize)]
 pub struct PaginatedList<T: Serialize> {

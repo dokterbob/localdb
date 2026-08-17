@@ -8,7 +8,7 @@ use serde::Deserialize;
 use localdb_core::Error as CoreError;
 use localdb_core::StoreVisibility;
 
-use super::{parse_cursor, PaginatedList, PaginationParams};
+use super::{parse_cursor, parse_limit, PaginatedList, PaginationParams};
 use crate::error::ApiError;
 use crate::state::{AppState, StoreRecord};
 
@@ -18,6 +18,7 @@ pub async fn list_stores(
 ) -> Result<Json<PaginatedList<StoreRecord>>, ApiError> {
     let effective = state.effective_config().await?;
     let offset = parse_cursor(pagination.cursor.as_deref())?;
+    let limit = parse_limit(pagination.limit)?;
 
     let all: Vec<StoreRecord> = effective
         .stores
@@ -32,12 +33,7 @@ pub async fn list_stores(
 
     let total = all.len();
     let page = all.into_iter().skip(offset).collect::<Vec<_>>();
-    Ok(Json(PaginatedList::new(
-        page,
-        offset,
-        pagination.limit,
-        total,
-    )))
+    Ok(Json(PaginatedList::new(page, offset, limit, total)))
 }
 
 #[derive(Debug, Deserialize)]

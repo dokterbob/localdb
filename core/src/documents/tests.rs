@@ -115,6 +115,8 @@ impl StoreBackend for FakeBackend {
         &self,
         store_id: &str,
         source_id: Option<&str>,
+        limit: Option<usize>,
+        offset: usize,
     ) -> Result<Vec<DocumentInfo>, Error> {
         let mut out: Vec<DocumentInfo> = self
             .documents
@@ -125,7 +127,22 @@ impl StoreBackend for FakeBackend {
             .cloned()
             .collect();
         out.sort_by(|a, b| a.uri.cmp(&b.uri));
-        Ok(out)
+        let paged = match limit {
+            Some(limit) => out.into_iter().skip(offset).take(limit).collect(),
+            None => out.into_iter().skip(offset).collect(),
+        };
+        Ok(paged)
+    }
+
+    async fn count_documents(&self, store_id: &str, source_id: Option<&str>) -> Result<u64, Error> {
+        let count = self
+            .documents
+            .values()
+            .flatten()
+            .filter(|d| d.store_id == store_id)
+            .filter(|d| source_id.map(|s| d.source_id == s).unwrap_or(true))
+            .count();
+        Ok(count as u64)
     }
 
     async fn retrieval_store(&self, store_id: &str) -> Result<Arc<dyn RetrievalStore>, Error> {

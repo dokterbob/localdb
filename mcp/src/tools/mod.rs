@@ -881,8 +881,21 @@ pub async fn tool_list_documents(
         Err(result) => return result,
     };
 
-    let documents = match backend
-        .list_documents(&handle.id, args.source.as_deref())
+    let total = match backend
+        .count_documents(&handle.id, args.source.as_deref())
+        .await
+    {
+        Ok(n) => n,
+        Err(e) => {
+            return typed_error(
+                e.code(),
+                format!("failed to count documents in store '{}': {e}", handle.name),
+            )
+        }
+    };
+
+    let page = match backend
+        .list_documents(&handle.id, args.source.as_deref(), Some(limit), offset)
         .await
     {
         Ok(docs) => docs,
@@ -893,18 +906,11 @@ pub async fn tool_list_documents(
             )
         }
     };
-
-    let total = documents.len();
-    let end = offset.saturating_add(limit).min(total);
-    let page: Vec<Value> = if offset >= total {
-        Vec::new()
-    } else {
-        documents[offset..end]
-            .iter()
-            .map(|d| serde_json::to_value(d).unwrap_or(Value::Null))
-            .collect()
-    };
     let returned = page.len();
+    let documents: Vec<Value> = page
+        .iter()
+        .map(|d| serde_json::to_value(d).unwrap_or(Value::Null))
+        .collect();
 
     success_json(&serde_json::json!({
         "store": {
@@ -915,7 +921,7 @@ pub async fn tool_list_documents(
         "offset": offset,
         "limit": limit,
         "returned": returned,
-        "documents": page,
+        "documents": documents,
     }))
 }
 

@@ -392,6 +392,30 @@ async fn list_documents_pagination_cursor_and_limit() {
     assert!(body["next_cursor"].is_null());
 }
 
+/// Regression test: `?limit=0` must be rejected outright, not silently
+/// truncate every page to empty while `next_cursor` keeps advancing by the
+/// unchanged offset — a client following cursors would otherwise loop
+/// forever on the same empty page.
+#[tokio::test]
+async fn list_documents_zero_limit_returns_400_invalid_request() {
+    let (_dir, state) = make_state_with_fake_config().await;
+    seed_many_chunks(&state, 3).await;
+
+    let app = build_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/stores/store-A/documents?limit=0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(resp.into_body()).await;
+    assert_eq!(body["code"], "invalid_request");
+}
+
 // --- GET /v1/documents/{id}?store= ---
 
 #[tokio::test]

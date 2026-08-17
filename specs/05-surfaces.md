@@ -446,6 +446,17 @@ later if a consumer demands it).
   `GET /stores` and `GET /stores/{name}/sources` compute the same `offset + limit` internally but
   treat an overflow there as end-of-list (`next_cursor: null`) instead of an error, since an
   offset/limit pair that large can never address a real page of either list.
+- **`?limit=0` is rejected, not clamped:** `GET /stores`, `GET /stores/{name}/sources`, and
+  `GET /stores/{name}/documents` all reject an explicit `limit=0` as `invalid_request`, HTTP 400
+  (`server::handlers::parse_limit`) — a zero limit would otherwise truncate every page to empty
+  while `next_cursor` keeps advancing by the unchanged offset, so a client following cursors would
+  loop forever on the same empty page. Matches the MCP `list_documents`/`get_chunks` tools' own
+  `resolve_limit`, which rejects the same input for the same reason rather than clamping it up to 1.
+- **`GET /stores/{name}/documents` paginates in the backend query, not in memory:** `limit`/`offset`
+  are pushed into `StoreBackend::list_documents`'s SQL (`LIMIT`/`OFFSET`), and the paginated
+  envelope's `total` comes from a separate `StoreBackend::count_documents` query, rather than
+  loading and deserializing every document in the store per page request. `document list`'s embedded
+  CLI path and the MCP `list_documents` tool push their own pagination down the same way.
 - **`localdb search` clamps identically in embedded and daemon mode (issue #187 review, finding
   1):** the 100-item cap above is not a `/v1/search`-only concern — `localdb search --limit <huge>`
   must return the same number of results whether or not a daemon happens to be running, since that
