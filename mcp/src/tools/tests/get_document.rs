@@ -490,3 +490,48 @@ async fn get_document_omitted_store_keeps_first_match_backward_compat() {
         "omitted store must keep pre-#144 first-match-wins behavior"
     );
 }
+
+// -----------------------------------------------------------------------
+// `StoresBackend::find_document` — trait contract for an unscoped lookup
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn stores_backend_find_document_unscoped_rejects_cross_store_ambiguity() {
+    let (av_a, av_b) = duplicate_doc_stores("dup-doc").await;
+    let stores = vec![av_a, av_b];
+    let backend = backend_for(&stores);
+
+    let err = backend
+        .find_document("dup-doc", None)
+        .await
+        .expect_err("a document present in two stores must be ambiguous when unscoped");
+    match err {
+        localdb_core::Error::InvalidRequest { message } => {
+            assert!(
+                message.contains("dup-doc") && message.contains("multiple stores"),
+                "unexpected message: {message}"
+            );
+        }
+        other => panic!("expected Error::InvalidRequest, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn stores_backend_find_document_unscoped_returns_unique_match() {
+    let (av_a, av_b) = duplicate_doc_stores("dup-doc").await;
+    // Only store A actually holds "solo-doc".
+    let stores = vec![av_a, av_b];
+    let backend = backend_for(&stores);
+
+    let info = backend
+        .find_document("solo-doc-does-not-exist", None)
+        .await
+        .unwrap();
+    assert!(info.is_none());
+
+    let info = backend.find_document("dup-doc", Some("store-A-id")).await;
+    assert!(
+        info.is_ok(),
+        "scoped lookup must still succeed unambiguously"
+    );
+}

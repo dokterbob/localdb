@@ -29,9 +29,12 @@ use super::AvailableStore;
 /// used before `StoreBackend` threading: fetch a candidate store's chunks
 /// for the id and treat the first chunk as the document's registry row,
 /// discarding a store whose chunk's own `store_id` doesn't match the store
-/// being queried (a federated/mismatched-data guard). `list_documents` and
-/// every store/source-registry method are `unimplemented!()` — this double
-/// only backs `get_document_detail`'s two calls, `find_document` and
+/// being queried (a federated/mismatched-data guard). An unscoped lookup
+/// (`store_id: None`) that matches in more than one store returns the same
+/// cross-store ambiguity error the real `store-libsql` backend returns,
+/// mirroring the trait's documented contract. `list_documents` and every
+/// store/source-registry method are `unimplemented!()` — this double only
+/// backs `get_document_detail`'s two calls, `find_document` and
 /// `retrieval_store`.
 pub struct StoresBackend {
     stores: Vec<AvailableStore>,
@@ -104,30 +107,30 @@ impl StoreBackend for StoresBackend {
             None => self.stores.iter().collect(),
         };
 
+        // Collect every matching store's document, not just the first — an
+        // unscoped lookup (`store_id: None`) needs the full match count to
+        // tell "unique" apart from "ambiguous"; a scoped lookup filters
+        // `scoped` down to at most one store above, so this loop still
+        // short-circuits after a single match in that case.
+        let mut found = Vec::new();
         for store in scoped {
-            let chunks = store.store.get_chunks_for_resource(doc_id).await?;
-            let Some(first) = chunks.first() else {
-                continue;
-            };
-            if first.store_id != store.descriptor.id {
-                continue;
+            if let Some(info) = lookup_in_store(store, doc_id).await? {
+                found.push(info);
+                if store_id.is_some() {
+                    break;
+                }
             }
-            return Ok(Some(DocumentInfo {
-                store_id: first.store_id.clone(),
-                id: first.resource_id.clone(),
-                source_id: first.source_id.clone(),
-                ingestor_kind: first.ingestor_kind.clone(),
-                uri: first.uri.clone(),
-                title: first.metadata.title().map(|t| t.to_string()),
-                mime: first.mime.clone(),
-                content_hash: first.content_hash.clone(),
-                fetched_at: first.fetched_at.clone(),
-                origin_store: first.origin_store.clone(),
-                policy_version: first.policy_version.clone(),
-                metadata: first.metadata.clone(),
-            }));
         }
-        Ok(None)
+
+        match found.len() {
+            0 => Ok(None),
+            1 => Ok(found.pop()),
+            _ => Err(Error::InvalidRequest {
+                message: format!(
+                    "document '{doc_id}' exists in multiple stores; use store-scoped search to disambiguate"
+                ),
+            }),
+        }
     }
 
     async fn list_documents(
@@ -153,4 +156,38 @@ impl StoreBackend for StoresBackend {
     async fn largest_tables(&self, _limit: usize) -> Result<Vec<TableSize>, Error> {
         Ok(Vec::new())
     }
+}
+
+/// Look up `doc_id` in a single candidate `store`, treating its first chunk
+/// as the document's registry row — the double has no independent document
+/// registry, so a chunk is the only source of `DocumentInfo` fields.
+///
+/// Returns `None` (not an error) when the store has no chunk for `doc_id`,
+/// or when the chunk's own `store_id` doesn't match `store`'s descriptor id
+/// (a federated/mismatched-data guard).
+async fn lookup_in_store(
+    store: &AvailableStore,
+    doc_id: &str,
+) -> Result<Option<DocumentInfo>, Error> {
+    let chunks = store.store.get_chunks_for_resource(doc_id).await?;
+    let Some(first) = chunks.first() else {
+        return Ok(None);
+    };
+    if first.store_id != store.descriptor.id {
+        return Ok(None);
+    }
+    Ok(Some(DocumentInfo {
+        store_id: first.store_id.clone(),
+        id: first.resource_id.clone(),
+        source_id: first.source_id.clone(),
+        ingestor_kind: first.ingestor_kind.clone(),
+        uri: first.uri.clone(),
+        title: first.metadata.title().map(|t| t.to_string()),
+        mime: first.mime.clone(),
+        content_hash: first.content_hash.clone(),
+        fetched_at: first.fetched_at.clone(),
+        origin_store: first.origin_store.clone(),
+        policy_version: first.policy_version.clone(),
+        metadata: first.metadata.clone(),
+    }))
 }
