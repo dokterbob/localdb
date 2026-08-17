@@ -293,6 +293,43 @@ fn never_evicts_terminal_jobs_within_the_retention_grace() {
 // Wiring: the real constants, through JobQueue::submit
 // ---------------------------------------------------------------------------
 
+/// Aged-out overflow is trimmed by `list_jobs` itself (PR #229 round-6
+/// review): eviction otherwise only runs on terminal writes, so a burst
+/// past the cap with no *subsequent* completions would keep its overflow
+/// entries forever. Stages aged terminal entries directly in the registry
+/// (`test_insert_job` — real jobs get wall-clock `completed_at`, which
+/// can't age past the grace inside a deterministic test) and asserts one
+/// `list_jobs` call, with no terminal write anywhere in between, trims
+/// them to the cap.
+#[tokio::test]
+async fn list_jobs_trims_aged_overflow_without_a_terminal_write() {
+    let queue = JobQueue::new();
+    let overflow = 5;
+    let total = MAX_TERMINAL_JOBS + overflow;
+    for i in 0..total {
+        let id = format!("aged-{i:03}");
+        queue
+            .test_insert_job(terminal_job(&id, "2020-01-01T00:00:00Z"))
+            .await;
+    }
+
+    let listed = queue.list_jobs().await;
+
+    assert_eq!(
+        listed.len(),
+        MAX_TERMINAL_JOBS,
+        "list_jobs must sweep aged-out terminal overflow down to the cap"
+    );
+    for i in 0..overflow {
+        let id = format!("aged-{i:03}");
+        assert!(
+            queue.get_job(&id).await.is_none(),
+            "the {overflow} oldest-by-(completed_at, id) entries must be the evicted ones \
+             ({id} should be gone)"
+        );
+    }
+}
+
 /// Proves the production wiring of the retention grace (PR #229 round-5
 /// review): a burst of completions past `MAX_TERMINAL_JOBS` evicts
 /// *nothing*, because every job just completed and is inside

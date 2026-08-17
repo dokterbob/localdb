@@ -608,8 +608,24 @@ impl JobQueue {
     }
 
     /// List all jobs.
+    ///
+    /// Also trims aged-out terminal jobs first (PR #229 round-6 review):
+    /// eviction otherwise only runs on terminal *writes*, so a burst that
+    /// exceeded [`MAX_TERMINAL_JOBS`] within the retention grace — followed
+    /// by no further completions — would keep its overflow entries
+    /// indefinitely (aging past the cutoff never re-invokes eviction on its
+    /// own). Sweeping here bounds this response itself, the reason the cap
+    /// exists; a write lock instead of a read lock is fine at list
+    /// frequency. `protect_id` is irrelevant on a read path — no job is
+    /// mid-transition — so an id no job can have is passed.
     pub async fn list_jobs(&self) -> Vec<IndexJob> {
-        let reg = self.registry.read().await;
+        let mut reg = self.registry.write().await;
+        evict_oldest_terminal_jobs_over_cap(
+            &mut reg,
+            MAX_TERMINAL_JOBS,
+            "",
+            &terminal_eviction_cutoff(),
+        );
         reg.values().cloned().collect()
     }
 
@@ -641,6 +657,18 @@ impl JobQueue {
     /// race against a real task's own progress reporting. `None` once the
     /// job is terminal and its channel entry has been removed, same as
     /// `subscribe`.
+    /// Test-only: insert a hand-built job directly into the registry —
+    /// bypassing `submit`/the worker — so wiring tests can stage *aged*
+    /// terminal entries. Real jobs always get wall-clock `completed_at`
+    /// timestamps, which a test cannot push past the retention grace
+    /// deterministically (a real minute-long wait would violate #181's
+    /// deterministic-tests rule).
+    #[cfg(test)]
+    pub(crate) async fn test_insert_job(&self, job: IndexJob) {
+        let mut reg = self.registry.write().await;
+        reg.insert(job.id.clone(), job);
+    }
+
     #[cfg(test)]
     pub(crate) async fn test_progress_sender(
         &self,

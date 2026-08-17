@@ -290,8 +290,8 @@ later if a consumer demands it).
   evicted, even over the cap — a client that just received its id from `POST /jobs` must always be
   able to resolve it on its first `GET /jobs/{id}`/`GET /jobs/{id}/events` request, even if the job
   completed (and a burst of other completions landed) before that request arrived; the cap is
-  therefore a target the registry returns to as entries age past the grace, not a hard ceiling
-  during a burst.
+  therefore a target the registry returns to as entries age past the grace — trimmed on the next
+  terminal write or `GET /jobs` read, whichever comes first — not a hard ceiling during a burst.
   No pagination on `GET /jobs` this round — the response stays bounded anyway: the non-terminal set
   is capped by the per-store in-flight guard (at most one `pending`/`running` job per store), and
   the terminal set by the cap plus at most one grace window's worth of burst; this may be revisited
