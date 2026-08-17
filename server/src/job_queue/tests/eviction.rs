@@ -12,9 +12,15 @@
 //! production does; hand-built fixtures with distinct `completed_at`
 //! strings sidestep that entirely. The one real end-to-end test below
 //! (through `JobQueue::submit` at the real `MAX_TERMINAL_JOBS` cap) proves
-//! the wiring and `get_job`'s post-eviction behavior instead, using a
-//! weaker but still deterministic assertion (exact evicted *count*, not
-//! which specific ids) — see its own doc comment for why.
+//! the wiring and `get_job`'s post-eviction behavior with an exact evicted
+//! *count* — see its own doc comment for why it still doesn't pin which
+//! specific ids, even now that ties break deterministically by id (PR #229
+//! round-3 review).
+//!
+//! `PROTECT_NONE` below: the pure tests that aren't about the
+//! self-protection rule pass an id that matches nothing in their fixture,
+//! so protection is inert and the test exercises only the ordering/cap
+//! logic. The self-protection rule has its own dedicated test.
 
 use std::collections::HashMap;
 
@@ -47,6 +53,10 @@ fn terminal_job(id: &str, completed_at: &str) -> IndexJob {
     sample_job(id, IndexJobState::Done, Some(completed_at))
 }
 
+/// A `protect_id` that matches no fixture job — for tests where the
+/// self-protection rule is not the subject (see module doc).
+const PROTECT_NONE: &str = "no-such-job";
+
 // ---------------------------------------------------------------------------
 // evict_oldest_terminal_jobs_over_cap — pure function, hand-built fixtures
 // ---------------------------------------------------------------------------
@@ -62,10 +72,10 @@ fn is_a_no_op_when_terminal_count_is_at_or_under_cap() {
         );
     }
 
-    evict_oldest_terminal_jobs_over_cap(&mut registry, 3);
+    evict_oldest_terminal_jobs_over_cap(&mut registry, 3, PROTECT_NONE);
     assert_eq!(registry.len(), 3, "at the cap exactly: nothing evicted");
 
-    evict_oldest_terminal_jobs_over_cap(&mut registry, 5);
+    evict_oldest_terminal_jobs_over_cap(&mut registry, 5, PROTECT_NONE);
     assert_eq!(registry.len(), 3, "under the cap: nothing evicted");
 }
 
@@ -81,7 +91,7 @@ fn respects_the_cap() {
     }
     assert_eq!(registry.len(), 10);
 
-    evict_oldest_terminal_jobs_over_cap(&mut registry, 4);
+    evict_oldest_terminal_jobs_over_cap(&mut registry, 4, PROTECT_NONE);
 
     assert_eq!(
         registry.len(),
@@ -116,7 +126,7 @@ fn removes_oldest_first_by_completed_at() {
         terminal_job("second-newest", "2020-01-04T00:00:00Z"),
     );
 
-    evict_oldest_terminal_jobs_over_cap(&mut registry, 3);
+    evict_oldest_terminal_jobs_over_cap(&mut registry, 3, PROTECT_NONE);
 
     assert_eq!(registry.len(), 3);
     assert!(
@@ -156,7 +166,7 @@ fn never_evicts_pending_or_running_even_when_they_push_the_total_past_the_cap() 
     // of the 5 terminal jobs are evicted — the two non-terminal jobs are
     // never candidates at all, regardless of how far over the cap the
     // *terminal* count is.
-    evict_oldest_terminal_jobs_over_cap(&mut registry, 2);
+    evict_oldest_terminal_jobs_over_cap(&mut registry, 2, PROTECT_NONE);
 
     assert!(
         registry.contains_key("pending-job"),
@@ -181,6 +191,57 @@ fn never_evicts_pending_or_running_even_when_they_push_the_total_past_the_cap() 
     );
 }
 
+#[test]
+fn ties_on_completed_at_break_deterministically_by_id() {
+    // All five jobs completed within the same second — the exact burst
+    // scenario from the PR #229 round-3 review: `completed_at` has
+    // whole-second resolution, so the primary sort key ties across the
+    // board and the id tie-break alone must decide, deterministically
+    // (ULIDs sort lexicographically; these hand-picked ids stand in for
+    // that ordering).
+    let mut registry: HashMap<String, IndexJob> = HashMap::new();
+    for id in ["tie-e", "tie-a", "tie-c", "tie-b", "tie-d"] {
+        registry.insert(id.to_string(), terminal_job(id, "2020-01-01T00:00:00Z"));
+    }
+
+    evict_oldest_terminal_jobs_over_cap(&mut registry, 3, PROTECT_NONE);
+
+    assert_eq!(registry.len(), 3);
+    assert!(
+        !registry.contains_key("tie-a") && !registry.contains_key("tie-b"),
+        "with all completed_at equal, the two lexicographically-smallest ids must be evicted"
+    );
+    assert!(registry.contains_key("tie-c"));
+    assert!(registry.contains_key("tie-d"));
+    assert!(registry.contains_key("tie-e"));
+}
+
+#[test]
+fn never_evicts_the_job_whose_transition_triggered_the_eviction() {
+    // The protected job sorts as the single oldest candidate (it ties the
+    // others on completed_at and has the smallest id) — without the
+    // protection rule it would be evicted by its own terminal transition,
+    // closing its progress channel while `get_job` on its id already 404s
+    // (the attach-failure scenario from the PR #229 round-3 review).
+    let mut registry: HashMap<String, IndexJob> = HashMap::new();
+    for id in ["job-a", "job-b", "job-c", "job-d"] {
+        registry.insert(id.to_string(), terminal_job(id, "2020-01-01T00:00:00Z"));
+    }
+
+    evict_oldest_terminal_jobs_over_cap(&mut registry, 3, "job-a");
+
+    assert!(
+        registry.contains_key("job-a"),
+        "the job whose terminal write triggered eviction must survive it, \
+         even when it sorts oldest"
+    );
+    assert!(
+        !registry.contains_key("job-b"),
+        "the next candidate in (completed_at, id) order is evicted instead"
+    );
+    assert_eq!(registry.len(), 3);
+}
+
 // ---------------------------------------------------------------------------
 // Wiring: the real MAX_TERMINAL_JOBS cap, through JobQueue::submit
 // ---------------------------------------------------------------------------
@@ -192,12 +253,14 @@ fn never_evicts_pending_or_running_even_when_they_push_the_total_past_the_cap() 
 ///
 /// Can't assert *which* specific ids were evicted: `completed_at` is a
 /// fixed constant under `#[cfg(test)]` (see this module's doc comment), so
-/// every job submitted here ties on the real sort key, and which of the
-/// tied entries eviction happens to remove is HashMap-iteration-order
-/// dependent — unspecified, not something a test should pin. What *is*
-/// deterministic regardless of that tie-break: the terminal count never
-/// exceeds the cap, and exactly the overflow amount of ids become
-/// unresolvable via `get_job` once every submitted job has settled.
+/// every job submitted here ties on the primary sort key, and the id
+/// tie-break (PR #229 round-3 review) — while deterministic given the ids —
+/// doesn't map to submission order for jobs whose ULIDs share a millisecond
+/// (the random component decides within one ms). What *is* deterministic
+/// regardless: the terminal count never exceeds the cap, and exactly the
+/// overflow amount of ids become unresolvable via `get_job` once every
+/// submitted job has settled. The tie-break's id-ordering itself is pinned
+/// by the pure-function tests above, where ids are hand-chosen.
 #[tokio::test]
 async fn eviction_caps_the_registry_and_get_job_returns_none_for_evicted_jobs() {
     let queue = JobQueue::new();

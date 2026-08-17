@@ -404,7 +404,7 @@ impl JobQueue {
             // This is a terminal write too (issue #218-followups Fix 2,
             // PR #229 review) — every path that can move a job to
             // `Done`/`Failed` runs eviction, not just `process_job`'s.
-            evict_oldest_terminal_jobs_over_cap(&mut reg, MAX_TERMINAL_JOBS);
+            evict_oldest_terminal_jobs_over_cap(&mut reg, MAX_TERMINAL_JOBS, &job_id);
             let mut handles = self.handles.write().await;
             handles.remove(&job_id);
         }
@@ -647,7 +647,7 @@ async fn process_job(
         // nothing to evict there (issue #218-followups Fix 2, PR #229
         // review).
         if cancelled {
-            evict_oldest_terminal_jobs_over_cap(&mut reg, MAX_TERMINAL_JOBS);
+            evict_oldest_terminal_jobs_over_cap(&mut reg, MAX_TERMINAL_JOBS, &job_id);
         }
         cancelled
     };
@@ -772,7 +772,7 @@ async fn process_job(
             // Every arm of the match above is a terminal write (issue
             // #218-followups Fix 2, PR #229 review) — evict once per job
             // completion, not per arm.
-            evict_oldest_terminal_jobs_over_cap(&mut reg, MAX_TERMINAL_JOBS);
+            evict_oldest_terminal_jobs_over_cap(&mut reg, MAX_TERMINAL_JOBS, &job_id);
         }
     }
 
@@ -801,39 +801,66 @@ async fn process_job(
     }
 }
 
-/// Evict the oldest terminal (`Done`/`Failed`) jobs, by `completed_at`,
-/// until `registry` holds at most `cap` of them (issue #218-followups Fix
-/// 2, PR #229 review). Pending/Running jobs are never touched — only the
-/// terminal subset is counted against `cap` at all. A no-op when terminal
-/// count is already at or under `cap` (the common case).
+/// Evict the oldest terminal (`Done`/`Failed`) jobs, by `(completed_at,
+/// id)`, until `registry` holds at most `cap` of them (issue #218-followups
+/// Fix 2, PR #229 review). Pending/Running jobs are never touched — only
+/// the terminal subset is counted against `cap` at all. A no-op when
+/// terminal count is already at or under `cap` (the common case).
 ///
 /// Called inline, still holding the caller's registry write lock, right
 /// after every write that transitions a job to a terminal state (`submit`'s
 /// send-failure path, and both of `process_job`'s terminal-write sites) —
 /// so eviction is atomic with the write that triggered it, no separate lock
-/// acquisition needed.
+/// acquisition needed. `protect_id` is the job whose terminal transition
+/// triggered this call: it is never an eviction candidate, no matter how it
+/// sorts (PR #229 round-3 review). Without that guarantee, `completed_at`'s
+/// whole-second resolution means a burst of >`cap` completions inside one
+/// second all tie on the sort key, and the just-completed job could evict
+/// *itself* — `process_job` would then close its progress channel while
+/// `get_job` on its id already 404s, so a CLI attached to that job
+/// (`next_job_event` → poll fallback) reports a successful job as an attach
+/// failure. Protecting the transitioning job can leave the registry one
+/// over `cap` for the duration of that job's own tick in a same-second
+/// burst — the next terminal write evicts it normally once it is no longer
+/// the one in transition.
 ///
 /// `completed_at` is an RFC 3339 string
 /// (`localdb_core::ingestion::now_rfc3339`, fixed-width/zero-padded/UTC),
 /// which sorts correctly under plain string comparison — no need to parse
-/// it into a real timestamp type just to order by it. `cap` is a parameter
-/// (not read from `MAX_TERMINAL_JOBS` internally) purely so tests can drive
-/// this with a small, readable cap instead of needing `MAX_TERMINAL_JOBS`
-/// (200) real entries to observe eviction.
-fn evict_oldest_terminal_jobs_over_cap(registry: &mut HashMap<String, IndexJob>, cap: usize) {
-    let mut terminal: Vec<(String, String)> = registry
+/// it into a real timestamp type just to order by it. Ties (same second)
+/// break deterministically by job id — a ULID, so lexicographic order is
+/// creation order at millisecond granularity (within one millisecond a
+/// ULID's random component makes the order arbitrary, but still a fixed
+/// property of the ids, not of `HashMap` iteration order, which varies run
+/// to run). `cap` is a parameter (not read from
+/// `MAX_TERMINAL_JOBS` internally) purely so tests can drive this with a
+/// small, readable cap instead of needing `MAX_TERMINAL_JOBS` (200) real
+/// entries to observe eviction.
+fn evict_oldest_terminal_jobs_over_cap(
+    registry: &mut HashMap<String, IndexJob>,
+    cap: usize,
+    protect_id: &str,
+) {
+    let terminal_count = registry
         .values()
         .filter(|j| matches!(j.state, IndexJobState::Done | IndexJobState::Failed))
-        .map(|j| (j.id.clone(), j.completed_at.clone().unwrap_or_default()))
-        .collect();
-    if terminal.len() <= cap {
+        .count();
+    if terminal_count <= cap {
         return;
     }
 
-    // Oldest first: ascending by `completed_at`.
-    terminal.sort_by(|a, b| a.1.cmp(&b.1));
-    let overflow = terminal.len() - cap;
-    for (id, _) in terminal.into_iter().take(overflow) {
+    let mut candidates: Vec<(String, String)> = registry
+        .values()
+        .filter(|j| matches!(j.state, IndexJobState::Done | IndexJobState::Failed))
+        .filter(|j| j.id != protect_id)
+        .map(|j| (j.completed_at.clone().unwrap_or_default(), j.id.clone()))
+        .collect();
+
+    // Oldest first: ascending by `(completed_at, id)` — tuple order chosen
+    // so a plain sort is the sort we want.
+    candidates.sort();
+    let overflow = terminal_count - cap;
+    for (_, id) in candidates.into_iter().take(overflow) {
         registry.remove(&id);
     }
 }
