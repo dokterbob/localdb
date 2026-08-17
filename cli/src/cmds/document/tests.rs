@@ -1,4 +1,5 @@
 use super::*;
+use crate::cmds::listing::{store_column_width, ScopedListItem};
 use localdb_core::metadata::DocumentMetadata;
 use localdb_core::{DocumentDetail, DublinCoreMetadata};
 
@@ -75,7 +76,7 @@ fn daemon_item_to_document_list_item_tolerates_missing_optional_title() {
 fn document_list_item_human_line_includes_title_when_present() {
     let info = test_document_info("doc-1", "/tmp/notes.md", Some("Notes"));
     let item = document_info_to_list_item(&info, "s");
-    let line = document_list_item_human_line(&item, false, 0);
+    let line = item.human_line(false, 0);
     assert_eq!(line, "doc-1 /tmp/notes.md (Notes)");
 }
 
@@ -83,7 +84,7 @@ fn document_list_item_human_line_includes_title_when_present() {
 fn document_list_item_human_line_omits_parens_without_title() {
     let info = test_document_info("doc-1", "/tmp/notes.md", None);
     let item = document_info_to_list_item(&info, "s");
-    let line = document_list_item_human_line(&item, false, 0);
+    let line = item.human_line(false, 0);
     assert_eq!(line, "doc-1 /tmp/notes.md");
 }
 
@@ -93,7 +94,7 @@ fn document_list_item_human_line_multi_store_prefixes_padded_name() {
     let width = store_column_width(["books", "default"].into_iter());
     assert_eq!(width, 9); // "default" (7) + 2
     let item = document_info_to_list_item(&info, "books");
-    let line = document_list_item_human_line(&item, true, width);
+    let line = item.human_line(true, width);
     assert_eq!(line, "books    doc-1 /tmp/notes.md");
 }
 
@@ -101,7 +102,7 @@ fn document_list_item_human_line_multi_store_prefixes_padded_name() {
 fn document_list_item_json_shape() {
     let info = test_document_info("doc-1", "/tmp/notes.md", Some("Notes"));
     let item = document_info_to_list_item(&info, "mystore");
-    let v = document_list_item_json(&item);
+    let v = item.json_row();
     assert_eq!(v["id"], "doc-1");
     assert_eq!(v["uri"], "/tmp/notes.md");
     assert_eq!(v["title"], "Notes");
@@ -275,7 +276,7 @@ fn document_get_result_json_always_includes_text_regardless_of_flag() {
     assert_eq!(v["metadata"]["kind"], "document");
 }
 
-// --- render_document_list: empty-scope messaging ---
-// (`render_document_get`/`render_document_list` themselves only ever
+// --- document list rendering: empty-scope messaging ---
+// (`render_document_get`/`render_scoped_list` themselves only ever
 // `println!`, so their observable behavior beyond the pure helpers above is
 // covered at the CLI-integration level in `localdb/tests/cli_document.rs`.)

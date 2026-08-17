@@ -18,6 +18,7 @@ use crate::{
         load_config_scaffolded, open_app_db_or_exit, resolve_daemon_store_scope_inner,
         resolve_store_scope_inner, AppDb, StoreScopePolicy,
     },
+    cmds::listing::{render_scoped_list, ScopedListItem},
     command_table::{dispatch, DaemonAwareCommand},
     daemon_client::{daemon_request_async, encode_path_segment, walk_daemon_pages, CliContext},
     normalize::{print_json, validate_store_name},
@@ -164,77 +165,33 @@ impl DaemonAwareCommand for DocumentListCmd {
     }
 }
 
-/// Width of the store-name column: longest name in scope plus two spaces of
-/// separation before the document line begins. Only used when `>1` store is
-/// in scope; callers pass `0` (ignored) otherwise. Identical to
-/// `cmds::source::store_column_width`, duplicated here rather than shared —
-/// this module deliberately never imports from `cmds::source`, per the
-/// module-size/no-shared-coupling constraint on this wave of work.
-fn store_column_width<'a>(names: impl Iterator<Item = &'a str>) -> usize {
-    names.map(str::len).max().unwrap_or(0) + 2
-}
+impl ScopedListItem for DocumentListItem {
+    const JSON_KEY: &'static str = "documents";
+    const EMPTY_NOUN: &'static str = "documents";
 
-/// Build one `document list --json` row.
-fn document_list_item_json(d: &DocumentListItem) -> serde_json::Value {
-    json!({
-        "id": d.id,
-        "uri": d.uri,
-        "title": d.title,
-        "store": { "name": d.store_name },
-        "store_id": d.store_id,
-        "source_id": d.source_id,
-        "content_hash": d.content_hash,
-        "fetched_at": d.fetched_at,
-    })
-}
-
-/// Format a single `document list` line, with or without a leading
-/// store-name column. `col_width` is only consulted when `with_store_column`
-/// is true.
-fn document_list_item_human_line(
-    d: &DocumentListItem,
-    with_store_column: bool,
-    col_width: usize,
-) -> String {
-    let body = match d.title.as_deref() {
-        Some(t) if !t.is_empty() => format!("{} {} ({})", d.id, d.uri, t),
-        _ => format!("{} {}", d.id, d.uri),
-    };
-    if with_store_column {
-        format!("{:<width$}{}", d.store_name, body, width = col_width)
-    } else {
-        body
-    }
-}
-
-fn render_document_list(items: &[DocumentListItem], scope_store_names: &[String], json_mode: bool) {
-    if json_mode {
-        let json_documents: Vec<serde_json::Value> =
-            items.iter().map(document_list_item_json).collect();
-        print_json(&json!({ "documents": json_documents }));
-        return;
+    fn json_row(&self) -> serde_json::Value {
+        json!({
+            "id": self.id,
+            "uri": self.uri,
+            "title": self.title,
+            "store": { "name": self.store_name },
+            "store_id": self.store_id,
+            "source_id": self.source_id,
+            "content_hash": self.content_hash,
+            "fetched_at": self.fetched_at,
+        })
     }
 
-    if items.is_empty() {
-        if scope_store_names.len() == 1 {
-            println!("No documents on store '{}'.", scope_store_names[0]);
+    fn human_line(&self, with_store_column: bool, col_width: usize) -> String {
+        let body = match self.title.as_deref() {
+            Some(t) if !t.is_empty() => format!("{} {} ({})", self.id, self.uri, t),
+            _ => format!("{} {}", self.id, self.uri),
+        };
+        if with_store_column {
+            format!("{:<width$}{}", self.store_name, body, width = col_width)
         } else {
-            println!("No documents in scope.");
+            body
         }
-        return;
-    }
-
-    // Output gains a store-name column only when more than one store is in
-    // scope; a single store in scope keeps the plain per-line format — same
-    // convention as `cmds::source::render_source_list`.
-    let multi = scope_store_names.len() > 1;
-    let col_width = if multi {
-        store_column_width(scope_store_names.iter().map(String::as_str))
-    } else {
-        0
-    };
-    for d in items {
-        println!("{}", document_list_item_human_line(d, multi, col_width));
     }
 }
 
@@ -253,7 +210,7 @@ pub(crate) async fn run_document_list_async(ctx: &CliContext, source: Option<&st
         open_app_db_or_exit(ctx, &config_loader)
     })
     .await;
-    render_document_list(&items, &scope_store_names, ctx.json);
+    render_scoped_list(&items, &scope_store_names, ctx.json);
 }
 
 // ---------------------------------------------------------------------------

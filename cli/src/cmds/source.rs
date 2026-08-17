@@ -14,6 +14,7 @@ use crate::{
         resolve_store_scope, resolve_store_scope_inner, AppDb, StoreScopePolicy,
     },
     cmds::index::IndexErrorMode,
+    cmds::listing::{render_scoped_list, ScopedListItem},
     command_table::{dispatch, DaemonAwareCommand},
     daemon_client::{daemon_request_async, encode_path_segment, walk_daemon_pages, CliContext},
     job_attach,
@@ -734,106 +735,58 @@ impl DaemonAwareCommand for SourceListCmd {
     }
 }
 
-/// Width of the store-name column: longest name in scope plus two spaces of
-/// separation before the source line begins. Only used when `>1` store is in
-/// scope; callers pass `0` (ignored) otherwise.
-fn store_column_width<'a>(names: impl Iterator<Item = &'a str>) -> usize {
-    names.map(str::len).max().unwrap_or(0) + 2
-}
+impl ScopedListItem for SourceListItem {
+    const JSON_KEY: &'static str = "sources";
+    const EMPTY_NOUN: &'static str = "sources";
 
-/// Build one `source list --json` row. Feed sources get their parsed
-/// `max_entries` / `fetch_full_content` fields; `refresh` is surfaced for
-/// both url and feed sources (#116).
-///
-/// D4/D2 (issue #187 stages 3/5): the `store` field is emitted
-/// unconditionally, matching the pre-existing embedded behavior — the spec's
-/// "only when more than one store is in scope" claim (§2.3) is itself wrong
-/// and gets corrected in the docs stage, not here (no behavior churn).
-///
-/// `store_id` (issue #187 review, finding 2) sits alongside `store.name` —
-/// pre-existing embedded behavior (and documented in `docs/cli.md`'s worked
-/// example) that the shared renderer dropped when both transports were
-/// unified onto it; restored here so it's populated by both.
-fn source_list_item_json(s: &SourceListItem) -> serde_json::Value {
-    let mut obj = json!({
-        "id": s.id,
-        "store": { "name": s.store_name },
-        "store_id": s.store_id,
-        "kind": s.kind,
-        "root": s.root,
-        "url": s.url,
-        "preset": s.preset,
-    });
-    if s.kind == "url" || s.kind == "feed" {
-        obj["refresh"] = json!(s.refresh);
-    }
-    if s.kind == "feed" {
-        obj["max_entries"] = json!(s.max_entries);
-        obj["fetch_full_content"] = json!(s.fetch_full_content);
-    }
-    obj
-}
-
-/// Format a single `source list` line, with or without a leading store-name
-/// column. `col_width` is only consulted when `with_store_column` is true.
-fn source_list_item_human_line(
-    s: &SourceListItem,
-    with_store_column: bool,
-    col_width: usize,
-) -> String {
-    let loc = s.root.as_deref().or(s.url.as_deref()).unwrap_or("?");
-    let body = if s.kind == "feed" {
-        let max_entries_str = s
-            .max_entries
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "unbounded".to_string());
-        let full_content_str = if s.fetch_full_content.unwrap_or(true) {
-            "on"
-        } else {
-            "off"
-        };
-        format!(
-            "{} [{}] {} (max_entries={}, full_content={})",
-            s.id, s.kind, loc, max_entries_str, full_content_str
-        )
-    } else {
-        format!("{} [{}] {}", s.id, s.kind, loc)
-    };
-    if with_store_column {
-        format!("{:<width$}{}", s.store_name, body, width = col_width)
-    } else {
-        body
-    }
-}
-
-fn render_source_list(items: &[SourceListItem], scope_store_names: &[String], json_mode: bool) {
-    if json_mode {
-        let json_sources: Vec<serde_json::Value> =
-            items.iter().map(source_list_item_json).collect();
-        print_json(&json!({ "sources": json_sources }));
-        return;
-    }
-
-    if items.is_empty() {
-        if scope_store_names.len() == 1 {
-            println!("No sources on store '{}'.", scope_store_names[0]);
-        } else {
-            println!("No sources in scope.");
+    /// Feed sources get their parsed `max_entries` / `fetch_full_content`
+    /// fields; `refresh` is surfaced for both url and feed sources. The
+    /// `store` field is emitted unconditionally, matching pre-existing
+    /// embedded behavior. `store_id` sits alongside `store.name`.
+    fn json_row(&self) -> serde_json::Value {
+        let mut obj = json!({
+            "id": self.id,
+            "store": { "name": self.store_name },
+            "store_id": self.store_id,
+            "kind": self.kind,
+            "root": self.root,
+            "url": self.url,
+            "preset": self.preset,
+        });
+        if self.kind == "url" || self.kind == "feed" {
+            obj["refresh"] = json!(self.refresh);
         }
-        return;
+        if self.kind == "feed" {
+            obj["max_entries"] = json!(self.max_entries);
+            obj["fetch_full_content"] = json!(self.fetch_full_content);
+        }
+        obj
     }
 
-    // Output gains a store-name column only when more than one store is in
-    // scope; a single store in scope keeps the pre-existing output format
-    // (specs/05-surfaces.md §2.2).
-    let multi = scope_store_names.len() > 1;
-    let col_width = if multi {
-        store_column_width(scope_store_names.iter().map(String::as_str))
-    } else {
-        0
-    };
-    for s in items {
-        println!("{}", source_list_item_human_line(s, multi, col_width));
+    fn human_line(&self, with_store_column: bool, col_width: usize) -> String {
+        let loc = self.root.as_deref().or(self.url.as_deref()).unwrap_or("?");
+        let body = if self.kind == "feed" {
+            let max_entries_str = self
+                .max_entries
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "unbounded".to_string());
+            let full_content_str = if self.fetch_full_content.unwrap_or(true) {
+                "on"
+            } else {
+                "off"
+            };
+            format!(
+                "{} [{}] {} (max_entries={}, full_content={})",
+                self.id, self.kind, loc, max_entries_str, full_content_str
+            )
+        } else {
+            format!("{} [{}] {}", self.id, self.kind, loc)
+        };
+        if with_store_column {
+            format!("{:<width$}{}", self.store_name, body, width = col_width)
+        } else {
+            body
+        }
     }
 }
 
@@ -855,7 +808,7 @@ pub(crate) async fn run_source_list_async(ctx: &CliContext) {
         open_app_db_or_exit(ctx, &config_loader)
     })
     .await;
-    render_source_list(&items, &scope_store_names, ctx.json);
+    render_scoped_list(&items, &scope_store_names, ctx.json);
 }
 
 // ---------------------------------------------------------------------------
@@ -1065,17 +1018,18 @@ pub(crate) async fn run_source_remove_async(ctx: &CliContext, id: &str) {
 /// `run_source_list_async` actually uses.
 #[cfg(test)]
 fn source_to_human_line(s: &SourceRow) -> String {
-    source_list_item_human_line(&source_row_to_list_item(s, "?"), false, 0)
+    source_row_to_list_item(s, "?").human_line(false, 0)
 }
 
 #[cfg(test)]
 fn source_to_json_value(s: &SourceRow, store_name: &str) -> serde_json::Value {
-    source_list_item_json(&source_row_to_list_item(s, store_name))
+    source_row_to_list_item(s, store_name).json_row()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmds::listing::store_column_width;
 
     fn test_source_row(root: Option<&str>, url: Option<&str>) -> SourceRow {
         SourceRow {
@@ -1113,7 +1067,7 @@ mod tests {
         let width = store_column_width(["books", "default"].into_iter());
         assert_eq!(width, 9); // "default" (7) + 2
         let item = source_row_to_list_item(&src, "books");
-        let line = source_list_item_human_line(&item, true, width);
+        let line = item.human_line(true, width);
         assert_eq!(
             line,
             "books    01HRQHB7FN3WMX4AZDV3S9VCTZ [path] /Volumes/Archive/books"
@@ -1125,12 +1079,6 @@ mod tests {
         let src = test_source_row(None, Some("https://example.com"));
         let line = source_to_human_line(&src);
         assert_eq!(line, "01HRQHB7FN3WMX4AZDV3S9VCTZ [url] https://example.com");
-    }
-
-    #[test]
-    fn store_column_width_uses_longest_name_plus_two() {
-        assert_eq!(store_column_width(["a", "bb", "ccc"].into_iter()), 5);
-        assert_eq!(store_column_width(std::iter::empty()), 2);
     }
 
     fn feed_row(

@@ -20,6 +20,7 @@ mod cmds {
     pub(crate) mod init;
     pub(crate) mod internal;
     pub(crate) mod job;
+    pub(crate) mod listing;
     pub(crate) mod search;
     pub(crate) mod source;
     pub(crate) mod status;
