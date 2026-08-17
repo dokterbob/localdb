@@ -116,7 +116,31 @@ pub trait StoreBackend: Send + Sync + 'static {
         store_id: &str,
     ) -> Result<Option<SourceRow>, Error>;
 
-    async fn find_document(&self, doc_id: &str) -> Result<Option<DocumentInfo>, Error>;
+    /// Look up a single document by id.
+    ///
+    /// `store_id: Some(_)` scopes the lookup to that store — the query itself
+    /// carries the filter, so a document id shared across stores never
+    /// ambiguates. `None` looks up the id across every store; if more than
+    /// one store holds a document with that id, implementations return
+    /// `Error::InvalidRequest` rather than guessing which one the caller
+    /// meant.
+    async fn find_document(
+        &self,
+        doc_id: &str,
+        store_id: Option<&str>,
+    ) -> Result<Option<DocumentInfo>, Error>;
+
+    /// List every document in `store_id`, ordered by `uri`, optionally
+    /// filtered to a single `source_id`.
+    ///
+    /// An unknown `source_id` is a pure filter — it yields an empty list
+    /// rather than an error, matching `find_document`'s "no error on a miss"
+    /// posture for read paths.
+    async fn list_documents(
+        &self,
+        store_id: &str,
+        source_id: Option<&str>,
+    ) -> Result<Vec<DocumentInfo>, Error>;
 
     async fn retrieval_store(&self, store_id: &str) -> Result<Arc<dyn RetrievalStore>, Error>;
 

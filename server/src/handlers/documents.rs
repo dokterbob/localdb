@@ -30,7 +30,7 @@ pub async fn get_document(
 ) -> Result<Json<DocumentRecord>, ApiError> {
     let info = state
         .backend()
-        .find_document(&doc_id)
+        .find_document(&doc_id, None)
         .await
         .map_err(ApiError)?
         .ok_or(ApiError(CoreError::ResourceNotFound { id: doc_id.clone() }))?;

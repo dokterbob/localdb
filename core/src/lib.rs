@@ -11,6 +11,7 @@ pub mod chunker;
 pub mod citation;
 pub mod config;
 pub mod diagnostics;
+pub mod documents;
 pub mod embedder;
 pub mod error;
 pub mod heading_index;
@@ -42,6 +43,9 @@ pub use chunker::{chunk_blocks, CharSizer, ChunkOutput, ChunkSizer, ChunkerConfi
 /// Re-export key types at the crate root for convenience.
 pub use citation::Citation;
 pub use diagnostics::{bytes_per_chunk, compute_db_file_size, format_bytes, DbFileSize};
+pub use documents::{
+    get_document_detail, get_document_detail_scoped, reconstruct_document_text, DocumentDetail,
+};
 pub use embedder::{
     DocumentChunks, EmbeddedDocument, Embedder, FakeEmbedder, TokenCounter, VectorEncoding,
 };

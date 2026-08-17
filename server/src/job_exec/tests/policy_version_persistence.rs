@@ -67,8 +67,19 @@ impl StoreBackend for FailingUpsertBackend {
     ) -> Result<Option<SourceRow>, Error> {
         self.inner.find_source_by_root_or_url(value, store_id).await
     }
-    async fn find_document(&self, doc_id: &str) -> Result<Option<DocumentInfo>, Error> {
-        self.inner.find_document(doc_id).await
+    async fn find_document(
+        &self,
+        doc_id: &str,
+        store_id: Option<&str>,
+    ) -> Result<Option<DocumentInfo>, Error> {
+        self.inner.find_document(doc_id, store_id).await
+    }
+    async fn list_documents(
+        &self,
+        store_id: &str,
+        source_id: Option<&str>,
+    ) -> Result<Vec<DocumentInfo>, Error> {
+        self.inner.list_documents(store_id, source_id).await
     }
     async fn retrieval_store(&self, store_id: &str) -> Result<Arc<dyn RetrievalStore>, Error> {
         self.inner.retrieval_store(store_id).await

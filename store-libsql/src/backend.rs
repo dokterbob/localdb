@@ -79,8 +79,20 @@ impl StoreBackend for SqliteBackend {
         registry::sources::find_source_by_root_or_url(&self.conn, value, store_id).await
     }
 
-    async fn find_document(&self, doc_id: &str) -> Result<Option<DocumentInfo>, Error> {
-        registry::documents::find_document(&self.conn, doc_id).await
+    async fn find_document(
+        &self,
+        doc_id: &str,
+        store_id: Option<&str>,
+    ) -> Result<Option<DocumentInfo>, Error> {
+        registry::documents::find_document(&self.conn, doc_id, store_id).await
+    }
+
+    async fn list_documents(
+        &self,
+        store_id: &str,
+        source_id: Option<&str>,
+    ) -> Result<Vec<DocumentInfo>, Error> {
+        registry::documents::list_documents(&self.conn, store_id, source_id).await
     }
 
     async fn retrieval_store(&self, store_id: &str) -> Result<Arc<dyn RetrievalStore>, Error> {

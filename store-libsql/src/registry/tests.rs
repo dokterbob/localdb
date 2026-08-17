@@ -1,7 +1,7 @@
 use localdb_core::metadata::{DocumentMetadata, DublinCoreMetadata, Metadata};
 use localdb_core::store::ChunkRecord;
 use localdb_core::types::{SourceKind, Span, StoreVisibility};
-use localdb_core::{SourceRow, StoreBackend, StoreBackendConfig, StoreRow, VectorEncoding};
+use localdb_core::{Error, SourceRow, StoreBackend, StoreBackendConfig, StoreRow, VectorEncoding};
 use tempfile::tempdir;
 
 use crate::SqliteBackend;
@@ -466,7 +466,7 @@ async fn metadata_json_round_trips_tagged_document_kind() {
 
     // Round trip via the public find_document API.
     let info = api
-        .find_document("doc-1")
+        .find_document("doc-1", None)
         .await
         .unwrap()
         .expect("document must be found");
@@ -538,7 +538,7 @@ async fn find_document_tolerates_invalid_metadata_json() {
     drop(conn);
 
     let info = api
-        .find_document("doc-1")
+        .find_document("doc-1", None)
         .await
         .unwrap()
         .expect("document must still be found despite invalid metadata_json");
@@ -704,5 +704,243 @@ async fn check_constraint_allows_feed_kind_with_null_root_and_url() {
         result.is_ok(),
         "CHECK constraint must accept kind='feed' with NULL root and url; got: {:?}",
         result.err()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Documents (list_documents / store-scoped find_document)
+// ---------------------------------------------------------------------------
+
+fn make_document_chunk(
+    chunk_id: &str,
+    resource_id: &str,
+    store_id: &str,
+    source_id: &str,
+    uri: &str,
+) -> ChunkRecord {
+    ChunkRecord {
+        id: chunk_id.to_string(),
+        resource_id: resource_id.to_string(),
+        store_id: store_id.to_string(),
+        text: "some chunk text".to_string(),
+        span: Span::new(0, 15),
+        heading_path: vec![],
+        embedding: vec![0.1, 0.2, 0.3, 0.4],
+        policy_version: "v1".to_string(),
+        fetched_at: "2026-07-01T00:00:00Z".to_string(),
+        content_hash: "abc123".to_string(),
+        origin_store: store_id.to_string(),
+        source_id: source_id.to_string(),
+        ingestor_kind: "path".to_string(),
+        mime: Some("text/markdown".to_string()),
+        uri: uri.to_string(),
+        metadata: Metadata::default(),
+        block_seq: 0,
+        seq_in_block: 0,
+        block_kind: None,
+        page: None,
+        window_block_seqs: vec![],
+    }
+}
+
+#[tokio::test]
+async fn list_documents_filters_by_store() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    api.upsert_store(&make_store("store-2", "other"))
+        .await
+        .unwrap();
+    api.upsert_source(&make_path_source("src-1", "store-1", "/a"))
+        .await
+        .unwrap();
+    api.upsert_source(&make_path_source("src-2", "store-2", "/b"))
+        .await
+        .unwrap();
+
+    let handle1 = api.retrieval_store("store-1").await.unwrap();
+    handle1
+        .upsert_chunks(vec![make_document_chunk(
+            "c1",
+            "doc-1",
+            "store-1",
+            "src-1",
+            "file:///a/1.md",
+        )])
+        .await
+        .unwrap();
+    let handle2 = api.retrieval_store("store-2").await.unwrap();
+    handle2
+        .upsert_chunks(vec![make_document_chunk(
+            "c2",
+            "doc-2",
+            "store-2",
+            "src-2",
+            "file:///b/1.md",
+        )])
+        .await
+        .unwrap();
+
+    let docs = api.list_documents("store-1", None).await.unwrap();
+    assert_eq!(docs.len(), 1, "must only return store-1's document");
+    assert_eq!(docs[0].id, "doc-1");
+}
+
+#[tokio::test]
+async fn list_documents_filters_by_source() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    api.upsert_source(&make_path_source("src-1", "store-1", "/a"))
+        .await
+        .unwrap();
+    api.upsert_source(&make_path_source("src-2", "store-1", "/b"))
+        .await
+        .unwrap();
+
+    let handle = api.retrieval_store("store-1").await.unwrap();
+    handle
+        .upsert_chunks(vec![
+            make_document_chunk("c1", "doc-1", "store-1", "src-1", "file:///a/1.md"),
+            make_document_chunk("c2", "doc-2", "store-1", "src-2", "file:///b/1.md"),
+        ])
+        .await
+        .unwrap();
+
+    let docs = api.list_documents("store-1", Some("src-1")).await.unwrap();
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0].id, "doc-1");
+}
+
+#[tokio::test]
+async fn list_documents_cross_store_source_id_yields_empty() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    api.upsert_store(&make_store("store-2", "other"))
+        .await
+        .unwrap();
+    api.upsert_source(&make_path_source("src-1", "store-1", "/a"))
+        .await
+        .unwrap();
+    api.upsert_source(&make_path_source("src-2", "store-2", "/b"))
+        .await
+        .unwrap();
+
+    let handle1 = api.retrieval_store("store-1").await.unwrap();
+    handle1
+        .upsert_chunks(vec![make_document_chunk(
+            "c1",
+            "doc-1",
+            "store-1",
+            "src-1",
+            "file:///a/1.md",
+        )])
+        .await
+        .unwrap();
+
+    // src-2 belongs to store-2, not store-1: filtering store-1 by src-2 is an
+    // unknown-source-id-for-this-store filter, which yields an empty list
+    // rather than an error or leaking store-2's data.
+    let docs = api.list_documents("store-1", Some("src-2")).await.unwrap();
+    assert!(docs.is_empty());
+}
+
+#[tokio::test]
+async fn list_documents_orders_by_uri() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    api.upsert_source(&make_path_source("src-1", "store-1", "/a"))
+        .await
+        .unwrap();
+
+    let handle = api.retrieval_store("store-1").await.unwrap();
+    handle
+        .upsert_chunks(vec![
+            make_document_chunk("c1", "doc-z", "store-1", "src-1", "file:///z.md"),
+            make_document_chunk("c2", "doc-a", "store-1", "src-1", "file:///a.md"),
+            make_document_chunk("c3", "doc-m", "store-1", "src-1", "file:///m.md"),
+        ])
+        .await
+        .unwrap();
+
+    let docs = api.list_documents("store-1", None).await.unwrap();
+    let uris: Vec<&str> = docs.iter().map(|d| d.uri.as_str()).collect();
+    assert_eq!(
+        uris,
+        vec!["file:///a.md", "file:///m.md", "file:///z.md"],
+        "documents must come back ordered by uri regardless of insertion order"
+    );
+}
+
+/// Mirrors `find_document_errors_when_id_exists_in_multiple_stores`
+/// (`store-libsql/tests/conformance.rs`): the same document id lives in two
+/// stores. A store-scoped lookup resolves to exactly that store's row with
+/// no ambiguity; the unscoped lookup still errors.
+#[tokio::test]
+async fn find_document_with_store_id_disambiguates_cross_store_id() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-A", "store-A"))
+        .await
+        .unwrap();
+    api.upsert_store(&make_store("store-B", "store-B"))
+        .await
+        .unwrap();
+    api.upsert_source(&make_path_source("src-A", "store-A", "/a"))
+        .await
+        .unwrap();
+    api.upsert_source(&make_path_source("src-B", "store-B", "/b"))
+        .await
+        .unwrap();
+
+    let handle_a = api.retrieval_store("store-A").await.unwrap();
+    handle_a
+        .upsert_chunks(vec![make_document_chunk(
+            "chunk-a",
+            "doc-shared",
+            "store-A",
+            "src-A",
+            "file:///a/doc.md",
+        )])
+        .await
+        .unwrap();
+    let handle_b = api.retrieval_store("store-B").await.unwrap();
+    handle_b
+        .upsert_chunks(vec![make_document_chunk(
+            "chunk-b",
+            "doc-shared",
+            "store-B",
+            "src-B",
+            "file:///b/doc.md",
+        )])
+        .await
+        .unwrap();
+
+    let found_a = api
+        .find_document("doc-shared", Some("store-A"))
+        .await
+        .unwrap()
+        .expect("doc-shared must be found scoped to store-A");
+    assert_eq!(found_a.store_id, "store-A");
+    assert_eq!(found_a.uri, "file:///a/doc.md");
+
+    let found_b = api
+        .find_document("doc-shared", Some("store-B"))
+        .await
+        .unwrap()
+        .expect("doc-shared must be found scoped to store-B");
+    assert_eq!(found_b.store_id, "store-B");
+    assert_eq!(found_b.uri, "file:///b/doc.md");
+
+    let unscoped = api.find_document("doc-shared", None).await;
+    assert!(
+        matches!(unscoped, Err(Error::InvalidRequest { .. })),
+        "the unscoped lookup must still error as ambiguous; got: {:?}",
+        unscoped
     );
 }

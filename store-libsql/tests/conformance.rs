@@ -553,7 +553,7 @@ async fn find_document_errors_when_id_exists_in_multiple_stores() {
         .await
         .unwrap();
 
-    let result = db.find_document("doc-shared").await;
+    let result = db.find_document("doc-shared", None).await;
     assert!(
         matches!(result, Err(Error::InvalidRequest { .. })),
         "expected InvalidRequest for ambiguous cross-store document; got: {:?}",

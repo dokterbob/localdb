@@ -10,12 +10,31 @@ use crate::connection::{map_libsql_err, parse_metadata_json_lenient, LibsqlDb};
 pub(crate) async fn find_document(
     db: &LibsqlDb,
     doc_id: &str,
+    store_id: Option<&str>,
 ) -> Result<Option<DocumentInfo>, Error> {
     let conn = db.reader();
     // Column mapping from resources → DocumentInfo:
     //   resources.id           → DocumentInfo.id
     //   resources.added_at     → DocumentInfo.fetched_at
     //   resources.metadata_json → DocumentInfo.metadata
+    if let Some(store_id) = store_id {
+        // `UNIQUE(store_id, id)` guarantees at most one row here, so there is
+        // no ambiguity path to handle.
+        let mut rows = conn
+            .query(
+                "SELECT store_id, id, source_id, ingestor_kind, uri, title, mime,
+                            content_hash, added_at, origin_store, policy_version, metadata_json
+                     FROM resources WHERE id = ? AND store_id = ?",
+                libsql::params![doc_id.to_string(), store_id.to_string()],
+            )
+            .await
+            .map_err(map_libsql_err)?;
+        return match rows.next().await.map_err(map_libsql_err)? {
+            Some(row) => Ok(Some(row_to_document_info(&row)?)),
+            None => Ok(None),
+        };
+    }
+
     let mut rows = conn
         .query(
             "SELECT store_id, id, source_id, ingestor_kind, uri, title, mime,
@@ -38,6 +57,41 @@ pub(crate) async fn find_document(
                 ),
             }),
         }
+}
+
+/// List every document in `store_id`, ordered by `uri`, optionally filtered
+/// to a single `source_id`.
+pub(crate) async fn list_documents(
+    db: &LibsqlDb,
+    store_id: &str,
+    source_id: Option<&str>,
+) -> Result<Vec<DocumentInfo>, Error> {
+    let conn = db.reader();
+    let mut rows = match source_id {
+        Some(source_id) => conn
+            .query(
+                "SELECT store_id, id, source_id, ingestor_kind, uri, title, mime,
+                            content_hash, added_at, origin_store, policy_version, metadata_json
+                     FROM resources WHERE store_id = ? AND source_id = ? ORDER BY uri",
+                libsql::params![store_id.to_string(), source_id.to_string()],
+            )
+            .await
+            .map_err(map_libsql_err)?,
+        None => conn
+            .query(
+                "SELECT store_id, id, source_id, ingestor_kind, uri, title, mime,
+                            content_hash, added_at, origin_store, policy_version, metadata_json
+                     FROM resources WHERE store_id = ? ORDER BY uri",
+                libsql::params![store_id.to_string()],
+            )
+            .await
+            .map_err(map_libsql_err)?,
+    };
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(map_libsql_err)? {
+        out.push(row_to_document_info(&row)?);
+    }
+    Ok(out)
 }
 
 fn row_to_document_info(row: &libsql::Row) -> Result<DocumentInfo, Error> {

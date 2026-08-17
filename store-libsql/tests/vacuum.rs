@@ -203,7 +203,7 @@ async fn vacuum_shrinks_store_file_after_bulk_delete_and_search_still_works() {
     );
     assert_eq!(results[0].chunk.id, "keep-chunk-0");
 
-    let doc = backend.find_document("keep-doc").await.unwrap();
+    let doc = backend.find_document("keep-doc", None).await.unwrap();
     assert!(
         doc.is_some(),
         "the keeper resource's own row must also have survived the vacuum"
