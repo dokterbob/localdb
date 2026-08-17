@@ -122,6 +122,7 @@ async fn run_job_continues_when_persisting_the_refreshed_policy_version_fails() 
             yaml: &yaml,
             models_dir: state.models_dir(),
             embedder: None,
+            fetchers: None,
             progress: None,
             on_source_error: None,
         },

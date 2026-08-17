@@ -134,6 +134,14 @@ pub(crate) async fn run_embedded_store_job(
                     yaml: &yaml,
                     models_dir: &models_dir,
                     embedder: Some(built_embedder),
+                    // The embedded CLI path runs one job at a time (its own
+                    // local, single-worker `JobQueue`) — there's no second
+                    // concurrent job to share a fetcher pair with, so this
+                    // always falls back to `run_job`'s own fresh
+                    // `HttpUrlFetcher::new_pair` build, identical to this
+                    // field not existing (issue #208 PR #227 review; see
+                    // `JobExecDeps::fetchers`'s doc comment).
+                    fetchers: None,
                     progress: Some(progress),
                     on_source_error: Some(on_source_error),
                 };

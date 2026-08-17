@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use fetch::HttpUrlFetcher;
 use tokio::sync::RwLock;
 
 use localdb_core::{
@@ -63,6 +64,12 @@ type EmbedderCacheEntry = (
     Arc<dyn Embedder>,
 );
 
+/// Cached HTTP fetcher pair (`(unrestricted, public_only)`, the split
+/// `fetch::HttpUrlFetcher::new_pair` returns — see `job_exec::JobExecDeps::fetchers`'s
+/// doc comment for why that split must never collapse) plus the `HttpConfig`
+/// that produced it. See `Inner::fetcher_cache` / `AppState::get_or_build_fetchers`.
+type FetcherCacheEntry = (HttpConfig, Arc<(HttpUrlFetcher, HttpUrlFetcher)>);
+
 struct Inner {
     yaml_config: RwLock<RawConfig>,
     data_dir: PathBuf,
@@ -85,6 +92,29 @@ struct Inner {
     /// embedder would keep using the *old* `http:` settings indefinitely.
     /// See `AppState::get_or_build_embedder`.
     embedder_cache: RwLock<Option<EmbedderCacheEntry>>,
+    /// Single-slot HTTP fetcher-pair cache, keyed by `HttpConfig` alone —
+    /// unlike `embedder_cache`, a fetcher pair's identity depends on nothing
+    /// but the outbound HTTP policy (issue #208 PR #227 review): with
+    /// `server.job_workers` > 1, each job used to build its own fresh
+    /// `HttpUrlFetcher::new_pair` (and so its own fresh `HostLimiter`),
+    /// which multiplied `http.rate_limit.requests_per_second` by however
+    /// many jobs for different stores happened to run concurrently against
+    /// the same destination host, and meant one job observing a
+    /// `Retry-After` cooldown never slowed the others — both violate issue
+    /// #207's "per destination host, process-wide" pacing contract. Mirrors
+    /// `embedder_cache`'s invalidation exactly: an unchanged `http:` block
+    /// hits the cache; a changed one (operator edits
+    /// `requests_per_second`/`burst`/`max_retries` and the daemon's
+    /// config-file watcher reloads it, `reload_yaml_config`) misses and
+    /// rebuilds on the next call — no explicit flush needed. Wrapped in an
+    /// `Arc` (unlike `embedder_cache`'s bare `Arc<dyn Embedder>`, which is
+    /// already reference-counted on its own) purely so
+    /// `AppState::get_or_build_fetchers` can hand back one cheap `Arc::clone`
+    /// per call and so tests can assert sharing via `Arc::ptr_eq` — the pair
+    /// itself (`HttpUrlFetcher`) is already `Clone` internally, so this
+    /// isn't needed for correctness, only for a cheap, directly-testable
+    /// identity check. See `AppState::get_or_build_fetchers`.
+    fetcher_cache: RwLock<Option<FetcherCacheEntry>>,
     /// Test-only construction counter for the `embed::create_embedder` call
     /// made by `get_or_build_embedder`, so tests can assert the embedder is
     /// built once per distinct `EmbeddingPolicy` rather than once per job.
@@ -182,6 +212,7 @@ impl AppState {
                 job_queue,
                 url_scheduler,
                 embedder_cache: RwLock::new(None),
+                fetcher_cache: RwLock::new(None),
                 #[cfg(test)]
                 embedder_build_count: std::sync::atomic::AtomicUsize::new(0),
             }),
@@ -338,6 +369,59 @@ impl AppState {
         Ok(embedder)
     }
 
+    /// Get the HTTP fetcher pair for `yaml.http`, building it only when the
+    /// outbound HTTP policy has changed since the last build (issue #208 PR
+    /// #227 review — see `Inner::fetcher_cache`'s doc comment for the full
+    /// rationale).
+    ///
+    /// Same double-checked-locking shape as [`Self::get_or_build_embedder`]
+    /// immediately above, for the same reason: with `server.job_workers` > 1
+    /// two cross-store jobs can race to build the cache on a cold start (or
+    /// after an `http:` config reload), and one simply waits behind the
+    /// write lock — correctness is unchanged, the only cost is transient
+    /// latency for whichever job waits. Returns the cache's own `Arc` (not
+    /// an unwrapped tuple) so a caller building many jobs in sequence only
+    /// ever pays one cheap `Arc::clone` per call, and so a test can assert
+    /// sharing directly via `Arc::ptr_eq` — see
+    /// `get_or_build_fetchers_builds_once_across_repeated_calls` below.
+    pub async fn get_or_build_fetchers(
+        &self,
+        yaml: &RawConfig,
+    ) -> Result<Arc<(HttpUrlFetcher, HttpUrlFetcher)>, Error> {
+        let http = &yaml.http;
+
+        // Fast path: an unchanged http snapshot only ever needs a read lock.
+        {
+            let cache = self.inner.fetcher_cache.read().await;
+            if let Some((cached_http, pair)) = cache.as_ref() {
+                if cached_http == http {
+                    return Ok(pair.clone());
+                }
+            }
+        }
+
+        let mut cache = self.inner.fetcher_cache.write().await;
+        // Re-check under the write lock: another caller may have already
+        // rebuilt for this exact http snapshot while we were waiting on it.
+        if let Some((cached_http, pair)) = cache.as_ref() {
+            if cached_http == http {
+                return Ok(pair.clone());
+            }
+        }
+
+        let http_owned = http.clone();
+        let settings = fetch::http::HttpSettings::from(&http_owned);
+        // `new_pair` shares one `HostLimiter` between the two fetchers
+        // (issue #207) so per-host pacing holds across both surfaces a run
+        // touches a host through — see `job_exec::JobExecDeps::fetchers`'s
+        // doc comment for why the unrestricted/public-only split itself
+        // must be preserved by every caller of this cache.
+        let pair = Arc::new(HttpUrlFetcher::new_pair(&settings)?);
+
+        *cache = Some((http_owned, pair.clone()));
+        Ok(pair)
+    }
+
     /// Run one scoped index job end to end: resolve `scope`'s sources,
     /// build/reuse the cached embedder only if there's actually something to
     /// index, assemble `JobExecDeps`, and hand off to `job_exec::run_job`.
@@ -349,9 +433,15 @@ impl AppState {
     /// #156/#185) and in what happens to the result afterward (the HTTP path
     /// returns it as the job's stats; the scheduler also stamps
     /// `last_refreshed` once it settles). Both call sites still resolve
-    /// `sources` before deciding whether to build an embedder — never pay
-    /// for a (potentially huge) embedding model just to discover the scope
-    /// is empty or unresolvable (Codex review finding G1, issue #187).
+    /// `sources` before deciding whether to build an embedder or fetch a
+    /// fetcher pair — never pay for a (potentially huge) embedding model, or
+    /// populate the fetcher cache, just to discover the scope is empty or
+    /// unresolvable (Codex review finding G1, issue #187).
+    ///
+    /// This is *the* call site (issue #208 PR #227 review) that makes every
+    /// daemon job share one `AppState`-cached fetcher pair per `http:`
+    /// config, closing the per-host pacing gap `server.job_workers` > 1
+    /// otherwise opened — see `Inner::fetcher_cache`'s doc comment.
     pub(crate) async fn run_scoped_job(
         &self,
         store_row: &StoreRow,
@@ -366,11 +456,17 @@ impl AppState {
         } else {
             Some(self.get_or_build_embedder(&yaml).await?)
         };
+        let fetchers = if sources.is_empty() {
+            None
+        } else {
+            Some((*self.get_or_build_fetchers(&yaml).await?).clone())
+        };
         let deps = job_exec::JobExecDeps {
             backend: self.backend(),
             yaml: &yaml,
             models_dir: self.models_dir(),
             embedder,
+            fetchers,
             progress: Some(progress),
             on_source_error: None,
         };
@@ -1547,6 +1643,74 @@ mod tests {
             2,
             "an unchanged http config on a subsequent call should hit the cache, not rebuild"
         );
+        assert!(
+            Arc::ptr_eq(&second, &third),
+            "third call should return the cached Arc from the second build"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // get_or_build_fetchers (issue #208 PR #227 review): mirrors the
+    // get_or_build_embedder tests immediately above — same cache shape,
+    // same invalidation rule, same reason to test it. Deterministic
+    // Arc-identity assertions only, per the review's own guidance: a
+    // timing-based pacing test would be unreliable (repo #181; see also
+    // `verifying-http-pacing-e2e` — wall-clock A/B races the embedding
+    // step and is unsuited to a unit test).
+    // -----------------------------------------------------------------
+
+    /// Three calls with an unchanged `http:` config — standing in for three
+    /// separate `run_scoped_job` invocations, i.e. three daemon jobs
+    /// (`server.job_workers` > 1 lets them run concurrently) — must all
+    /// return the exact same cached `Arc<(HttpUrlFetcher, HttpUrlFetcher)>`.
+    /// This is what actually closes the issue #227 review finding: since
+    /// the pair's own `HostLimiter` lives inside it (shared between the
+    /// pair's two fetchers via `HttpUrlFetcher::new_pair`), returning the
+    /// same `Arc` means every job that reused it paces through the exact
+    /// same limiter state — not a fresh one each time.
+    #[tokio::test]
+    async fn get_or_build_fetchers_builds_once_across_repeated_calls() {
+        let (_dir, state) = make_state().await;
+        let yaml = state.yaml_config().await;
+
+        let a = state.get_or_build_fetchers(&yaml).await.unwrap();
+        let b = state.get_or_build_fetchers(&yaml).await.unwrap();
+        let c = state.get_or_build_fetchers(&yaml).await.unwrap();
+
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "second call should return the cached Arc"
+        );
+        assert!(
+            Arc::ptr_eq(&a, &c),
+            "third call should return the cached Arc"
+        );
+    }
+
+    /// A changed `http:` block (e.g. an operator editing
+    /// `http.rate_limit.requests_per_second` and the daemon's config-file
+    /// watcher reloading it) must miss the cache and rebuild a fresh pair —
+    /// otherwise every job would keep pacing through a `HostLimiter` built
+    /// from stale rate-limit settings indefinitely.
+    #[tokio::test]
+    async fn get_or_build_fetchers_rebuilds_on_http_config_change() {
+        let (_dir, state) = make_state().await;
+        let old_yaml = state.yaml_config().await;
+        let first = state.get_or_build_fetchers(&old_yaml).await.unwrap();
+
+        let mut new_yaml = old_yaml.clone();
+        new_yaml.http.max_retries = old_yaml.http.max_retries + 1;
+        state.reload_yaml_config(new_yaml.clone()).await;
+        let second = state.get_or_build_fetchers(&new_yaml).await.unwrap();
+
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "a rebuilt fetcher pair must not be the same Arc as the stale cached one"
+        );
+
+        // A third call with the same (already-changed) http config must hit
+        // the cache again — this isn't a "rebuild on every call" regression.
+        let third = state.get_or_build_fetchers(&new_yaml).await.unwrap();
         assert!(
             Arc::ptr_eq(&second, &third),
             "third call should return the cached Arc from the second build"

@@ -20,6 +20,16 @@
 //! the embedder, cannot open the store handle, an unresolvable job scope)
 //! returns `Err` — the caller fails the job honestly instead of reporting
 //! fabricated success.
+//!
+//! HTTP fetcher-pair sharing (issue #208 PR #227 review): `run_job` itself
+//! stays agnostic to *how* it got a fetcher pair — see
+//! [`JobExecDeps::fetchers`]. The daemon (`server::state::AppState::run_scoped_job`)
+//! passes a pair reused across jobs via `AppState::get_or_build_fetchers`,
+//! so per-host pacing (issue #207) holds across concurrent
+//! `server.job_workers` jobs rather than each getting its own
+//! `HostLimiter`. The CLI's embedded path always passes `None` (a single
+//! job at a time — nothing to share), which falls back to building a fresh
+//! pair right here, unchanged from before this field existed.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -45,6 +55,26 @@ pub struct JobExecDeps<'a> {
     /// multi-store loop, mirroring the CLI's `run_embedded_index_with`
     /// threading). `None` builds one via `embed::create_embedder`.
     pub embedder: Option<Arc<dyn Embedder>>,
+    /// An already-built fetcher pair to reuse — `(unrestricted,
+    /// public_only)`, exactly `HttpUrlFetcher::new_pair`'s own return shape
+    /// (issue #208 PR #227 review). `None` builds a fresh pair via
+    /// `new_pair` right below, identical to this field not existing at all —
+    /// the CLI's embedded path always passes `None` here (a single job at a
+    /// time, so there is nothing to share; see `cli::job_attach::run_embedded_store_job`).
+    /// `Some` is how a caller running many jobs in sequence against the same
+    /// `http:` config shares one pacing `HostLimiter` across them
+    /// (`server::state::AppState::get_or_build_fetchers`) instead of every
+    /// job getting its own — without this, `server.job_workers` > 1 let
+    /// concurrent jobs against the same destination host each get the full
+    /// configured per-host budget, multiplying the effective rate limit by
+    /// however many jobs happened to run at once, and let one job's
+    /// `Retry-After` cooldown go unobserved by the others (issue #207's
+    /// "per destination host, process-wide" pacing contract). Preserve the
+    /// unrestricted-vs-public-only split exactly as passed — never swap
+    /// which fetcher goes where in `run_job` below, and never let the
+    /// unrestricted fetcher reach a path that requires the public-only
+    /// SSRF guard.
+    pub fetchers: Option<(HttpUrlFetcher, HttpUrlFetcher)>,
     /// Progress sink threaded into `run_source_ingestion`. `None` in this
     /// stage — a later stage wires a real sink that reports into the
     /// `IndexJob`'s pollable state.
@@ -127,6 +157,7 @@ pub async fn run_job(
         yaml,
         models_dir,
         embedder,
+        fetchers,
         progress,
         on_source_error,
     } = deps;
@@ -190,15 +221,24 @@ pub async fn run_job(
     let existing = handle.list_indexed_documents().await?;
     let mut doc_index = DocumentIndex::from_records(existing);
 
-    // `new_pair` shares one `HostLimiter` between the two fetchers (issue
-    // #207) so per-host pacing holds across both surfaces a run touches a
-    // host through — the operator-configured `url_fetcher` and the
-    // destination-restricted `entry_fetcher` below — rather than each
-    // pacing the same origin independently. Built from `yaml.http` so
-    // operator-configured retry/rate-limit knobs apply; `run_job` is the one
-    // engine both the daemon and the CLI's embedded path share (see the
-    // module doc above), so this single wiring covers both surfaces.
-    let (url_fetcher, entry_fetcher) = HttpUrlFetcher::new_pair(&(&yaml.http).into())?;
+    // `deps.fetchers` (issue #208 PR #227 review): a daemon job reuses the
+    // `AppState`-cached pair (`AppState::get_or_build_fetchers`) so per-host
+    // pacing holds across concurrent jobs for different stores, not just
+    // within this one job. `None` (the CLI's embedded path, and any other
+    // caller that doesn't share a fetcher cache) falls back to the original
+    // per-job `new_pair` call — `new_pair` shares one `HostLimiter` between
+    // the two fetchers (issue #207) so per-host pacing holds across both
+    // surfaces a run touches a host through — the operator-configured
+    // `url_fetcher` and the destination-restricted `entry_fetcher` below —
+    // rather than each pacing the same origin independently. Built from
+    // `yaml.http` so operator-configured retry/rate-limit knobs apply;
+    // `run_job` is the one engine both the daemon and the CLI's embedded
+    // path share (see the module doc above), so this one wiring point
+    // covers both surfaces regardless of which branch runs.
+    let (url_fetcher, entry_fetcher) = match fetchers {
+        Some(pair) => pair,
+        None => HttpUrlFetcher::new_pair(&(&yaml.http).into())?,
+    };
 
     let mut stats = IndexJobStats {
         sources_count: sources_to_index.len() as u64,
