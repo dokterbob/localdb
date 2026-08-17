@@ -281,6 +281,13 @@ later if a consumer demands it).
   issue #218-followups Fix A; the latter submits an index request), `GET/DELETE /jobs/{id}` (the
   latter cancels, issue #218), `GET /jobs/{id}/events` (SSE, below), `GET /status`, `GET /config`
   (resolved config).
+  **Jobs are ephemeral operational records with bounded retention, not history** (issue
+  #218-followups Fix 2): the registry keeps every `pending`/`running` job, but caps how many
+  terminal (`done`/`failed`) jobs it retains at `MAX_TERMINAL_JOBS` (200, `server::job_queue`) —
+  once a terminal write pushes the terminal count over the cap, the oldest terminal jobs by
+  `completed_at` are evicted first, so `GET /jobs` never grows unbounded in a long-running daemon.
+  No pagination on `GET /jobs` this round — the bounded terminal set makes it unnecessary; this may
+  be revisited if the cap itself is ever made configurable/larger.
   Store records (`GET/POST /stores`, `GET /stores/{name}`) include `id` alongside
   `name`/`visibility`/`backend`. Despite the `{name}` path param, stores are still looked up and
   returned with their `id` intact — `{name}` is only how the route addresses _which_ store, not a
@@ -316,7 +323,11 @@ later if a consumer demands it).
   separate code path. Clients
   poll `GET /jobs/{id}` for the current `IndexJob` (state `pending`/`running`/`done`/`failed`,
   `stats`, `error`, `error_code`, timestamps) or stream `GET /jobs/{id}/events` for live progress
-  (below). `error_code` (issue #187 review, finding 3) is the failing `core::Error`'s stable
+  (below). Because job records are ephemeral with bounded retention (above), `GET /jobs/{id}` for a
+  job id that has aged out past the terminal-job cap returns `404 job_not_found` — the same response
+  as an id that never existed; a client that stops polling a terminal job and comes back much later
+  should not assume a `404` means the id was invalid. `error_code` (issue #187 review, finding 3) is
+  the failing `core::Error`'s stable
   `code()` string (§5) when the job's `Failed` state came from a typed error — `null`/absent for a
   synthetic queue-level failure (the queue itself full/closed, or the job's task panicking) that
   never had one, and always absent on `done`. `error_code` + `error` round-trip through the same

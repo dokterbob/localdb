@@ -303,3 +303,63 @@ async fn cancellation_preempts_a_never_resolving_await_point() {
     assert_eq!(done.state, IndexJobState::Failed);
     assert_eq!(done.error_code.as_deref(), Some("job_cancelled"));
 }
+
+// ---------------------------------------------------------------------------
+// Publication-before-handle window (issue #218-followups PR #229 review)
+// ---------------------------------------------------------------------------
+
+/// The exact scenario the bug report described: a client sees a job via
+/// `GET /v1/jobs`/`GET /jobs/{id}` (here, the `IndexJob` `submit` itself
+/// returns — the same registry entry) and cancels it immediately. Before
+/// `submit` was reordered to install the handle before the registry entry,
+/// this could land in a window where the registry showed the job
+/// non-terminal but no handle existed yet — `cancel` would silently report
+/// success (`Ok`, the ordinary "cancellation requested" case) without ever
+/// triggering the token, and the job went on to run normally.
+///
+/// Deterministic without controlling whether the worker has already
+/// dequeued the job or not by the time `cancel` runs (unlike the
+/// pending-cancel and running-cancel tests above, which each pin one of
+/// those cases via a blocking first job): the task is parked on a `oneshot`
+/// this test never sends, so if cancellation is a no-op — the bug this
+/// closes — `wait_for_done` below hangs until its own 5s deadline and
+/// panics, regardless of whether the race landed on the `Pending` or
+/// `Running` side. Either way, the only way this test can pass is if the
+/// task body genuinely never resumes past `gate_rx.await` — the same
+/// "never resumes" guarantee `running_job_cancelled_mid_task_...` above
+/// pins for the already-`Running` case, now also covered without needing
+/// to force it.
+#[tokio::test]
+async fn cancel_immediately_after_submit_always_triggers_never_silently_no_ops() {
+    let queue = JobQueue::new();
+
+    // Never sent — the only way out of this await is cancellation.
+    let (_gate_tx, gate_rx) = oneshot::channel::<()>();
+
+    let job = queue
+        .submit(
+            "store-1",
+            IndexJobScope::Store,
+            move |_progress| async move {
+                let _ = gate_rx.await;
+                #[allow(unreachable_code)]
+                Ok(IndexJobStats::default())
+            },
+        )
+        .await
+        .unwrap();
+
+    // Exactly the id a client would have learned from this same `IndexJob`
+    // (or, over HTTP, from the `GET /v1/jobs`/`GET /jobs/{id}` response
+    // that reads the same registry entry) — cancel it right away, with no
+    // synchronization forcing either the `Pending` or `Running` case.
+    let result = queue.cancel(&job.id).await;
+    assert!(
+        result.is_ok(),
+        "cancel immediately after submit must always find a handle to trigger, got: {result:?}"
+    );
+
+    let done = wait_for_done(&queue, &job.id).await;
+    assert_eq!(done.state, IndexJobState::Failed);
+    assert_eq!(done.error_code.as_deref(), Some("job_cancelled"));
+}

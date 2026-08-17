@@ -2,6 +2,7 @@
 
 mod cancellation;
 mod common;
+mod eviction;
 mod inflight_guard;
 mod progress_events;
 mod resolve_aborted;

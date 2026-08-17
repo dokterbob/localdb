@@ -57,6 +57,22 @@
 //! against this worker having already decided (moments earlier, under a
 //! then-separate lock) to start it anyway. See `cancel`'s and
 //! `process_job`'s doc comments for the full reasoning.
+//!
+//! Publication order (issue #218-followups PR #229 review): `submit`
+//! installs a job's `JobHandle` (its cancel token and progress channel)
+//! *before* inserting the job into the registry, not after. A job is never
+//! visible to `list_jobs`/`get_job` (so, `GET /v1/jobs`/`GET /jobs/{id}`)
+//! until its handle already exists — closing a window where a client that
+//! saw a job that way and cancelled it immediately could find a
+//! non-terminal registry entry but no handle yet, and `cancel` would
+//! silently report success without ever triggering anything. See `submit`'s
+//! and `cancel`'s doc comments.
+//!
+//! Bounded terminal-job retention (issue #218-followups Fix 2, PR #229
+//! review): the registry evicts the oldest `Done`/`Failed` jobs once their
+//! count exceeds [`MAX_TERMINAL_JOBS`], so a long-running daemon's job
+//! history doesn't grow without bound. See
+//! `evict_oldest_terminal_jobs_over_cap`.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -85,6 +101,18 @@ const QUEUE_CAPACITY: usize = 64;
 /// documented as lossy-tolerant (unlike the terminal `job` event, which is
 /// derived from the registry, never from this channel alone).
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
+
+/// Maximum number of terminal (`Done`/`Failed`) jobs retained in the
+/// registry (issue #218-followups Fix 2, PR #229 review). Pending/Running
+/// jobs are never evicted regardless of this cap — only completed history
+/// is bounded. Without this, a long-running daemon with scheduled URL/feed
+/// refreshes would grow the registry without bound, and `GET /v1/jobs`
+/// clones+serializes the whole thing on every call. Jobs are an ephemeral
+/// operational record, not a permanent history — see
+/// `evict_oldest_terminal_jobs_over_cap` and specs/05-surfaces.md's
+/// `GET /jobs`/`GET /jobs/{id}` entries for the resulting contract (an
+/// evicted job's id eventually 404s).
+const MAX_TERMINAL_JOBS: usize = 200;
 
 /// A pinned, boxed future producing a job's final stats (or a typed error) —
 /// the async equivalent of the old synchronous `JobTask` closure.
@@ -304,18 +332,24 @@ impl JobQueue {
         let job = create_index_job(store_id, scope);
         let job_id = job.id.clone();
 
-        // Register before enqueuing so callers can poll immediately.
-        {
-            let mut reg = self.registry.write().await;
-            reg.insert(job_id.clone(), job.clone());
-        }
-
         // Create this job's progress-event channel, its sink, and its
-        // cancellation token, before enqueuing — so `subscribe(job_id)`
-        // (issue #83) and `JobQueue::cancel(job_id)` (issue #218) both work
-        // the instant `submit` returns, even before the worker has picked
-        // the job up (the latter is what makes cancelling a still-`Pending`
-        // job possible at all).
+        // cancellation token, and install the handle BEFORE the job is ever
+        // registry-visible (issue #218-followups PR #229 review —
+        // publication-before-handle window). Publishing the registry entry
+        // first used to leave a window where a client that observed the job
+        // via `list_jobs`/`get_job` (so, `GET /v1/jobs` or `GET
+        // /v1/jobs/{id}`) and called `cancel` immediately could find the
+        // registry entry (non-terminal — nothing to reject) but no handle
+        // yet: `cancel`'s handle lookup came back empty, so it silently
+        // skipped triggering anything and *still* reported success (the
+        // ordinary "cancellation requested" `Ok`, since the job was
+        // non-terminal) — a cancel that appeared to work but cancelled
+        // nothing, and the job went on to run normally. Installing the
+        // handle first closes this structurally: nothing outside `submit`
+        // can ever observe this job in the registry before its handle
+        // exists, so `cancel` (see there) can now treat "registry-visible,
+        // non-terminal, no handle" as an internal-invariant violation
+        // instead of a legitimate case to handle quietly.
         let (tx, _rx) = broadcast::channel::<ProgressEvent>(self.event_capacity);
         let cancel_token = CancellationToken::new();
         {
@@ -328,6 +362,18 @@ impl JobQueue {
                 },
             );
         }
+
+        // Register only now that the handle exists — the first point this
+        // job becomes visible to `list_jobs`/`get_job`/`cancel`. Still
+        // ahead of enqueuing, so `subscribe(job_id)` (issue #83) also works
+        // the instant `submit` returns, even before the worker has picked
+        // the job up (which is what makes cancelling a still-`Pending` job
+        // possible at all).
+        {
+            let mut reg = self.registry.write().await;
+            reg.insert(job_id.clone(), job.clone());
+        }
+
         let sink: ProgressSink = {
             let tx = tx.clone();
             Arc::new(move |event: ProgressEvent| {
@@ -355,6 +401,10 @@ impl JobQueue {
             if let Some(j) = reg.get_mut(&job_id) {
                 fail_index_job(j, "job queue is full or closed".to_string());
             }
+            // This is a terminal write too (issue #218-followups Fix 2,
+            // PR #229 review) — every path that can move a job to
+            // `Done`/`Failed` runs eviction, not just `process_job`'s.
+            evict_oldest_terminal_jobs_over_cap(&mut reg, MAX_TERMINAL_JOBS);
             let mut handles = self.handles.write().await;
             handles.remove(&job_id);
         }
@@ -439,8 +489,32 @@ impl JobQueue {
             return Err(Error::JobAlreadyTerminal);
         }
 
-        if let Some(handle) = self.handles.read().await.get(job_id) {
-            handle.cancel_token.cancel();
+        match self.handles.read().await.get(job_id) {
+            Some(handle) => handle.cancel_token.cancel(),
+            None => {
+                // Issue #218-followups PR #229 review: since `submit` now
+                // installs the handle *before* the job is ever
+                // registry-visible (see its doc comment), a registry-visible
+                // non-terminal job missing its handle here is not a
+                // legitimate race to shrug off — it's a broken invariant in
+                // this module. Surface it loudly (debug builds) and as an
+                // honest internal error (all builds) rather than silently
+                // reporting "cancellation requested" for a cancel that
+                // triggered nothing, which is exactly the bug this
+                // restructuring fixes.
+                debug_assert!(
+                    false,
+                    "job {job_id} is registry-visible and non-terminal but has no handle — \
+                     submit() must install the handle before the registry entry"
+                );
+                return Err(Error::Internal {
+                    message: format!(
+                        "job {job_id} has no cancellation handle despite being non-terminal \
+                         in the registry (internal invariant violation)"
+                    ),
+                    correlation_id: "job_cancel_missing_handle".to_string(),
+                });
+            }
         }
 
         let job = reg.get(job_id).ok_or_else(|| Error::JobNotFound {
@@ -568,6 +642,13 @@ async fn process_job(
                 start_index_job(job);
             }
         }
+        // Only the `cancelled` branch above is a terminal write — the
+        // `start_index_job` branch moves to `Running`, not terminal, so
+        // nothing to evict there (issue #218-followups Fix 2, PR #229
+        // review).
+        if cancelled {
+            evict_oldest_terminal_jobs_over_cap(&mut reg, MAX_TERMINAL_JOBS);
+        }
         cancelled
     };
 
@@ -688,6 +769,10 @@ async fn process_job(
                     }
                 }
             }
+            // Every arm of the match above is a terminal write (issue
+            // #218-followups Fix 2, PR #229 review) — evict once per job
+            // completion, not per arm.
+            evict_oldest_terminal_jobs_over_cap(&mut reg, MAX_TERMINAL_JOBS);
         }
     }
 
@@ -713,6 +798,43 @@ async fn process_job(
     {
         let mut guard = inflight.write().await;
         guard.remove(&store_id);
+    }
+}
+
+/// Evict the oldest terminal (`Done`/`Failed`) jobs, by `completed_at`,
+/// until `registry` holds at most `cap` of them (issue #218-followups Fix
+/// 2, PR #229 review). Pending/Running jobs are never touched — only the
+/// terminal subset is counted against `cap` at all. A no-op when terminal
+/// count is already at or under `cap` (the common case).
+///
+/// Called inline, still holding the caller's registry write lock, right
+/// after every write that transitions a job to a terminal state (`submit`'s
+/// send-failure path, and both of `process_job`'s terminal-write sites) —
+/// so eviction is atomic with the write that triggered it, no separate lock
+/// acquisition needed.
+///
+/// `completed_at` is an RFC 3339 string
+/// (`localdb_core::ingestion::now_rfc3339`, fixed-width/zero-padded/UTC),
+/// which sorts correctly under plain string comparison — no need to parse
+/// it into a real timestamp type just to order by it. `cap` is a parameter
+/// (not read from `MAX_TERMINAL_JOBS` internally) purely so tests can drive
+/// this with a small, readable cap instead of needing `MAX_TERMINAL_JOBS`
+/// (200) real entries to observe eviction.
+fn evict_oldest_terminal_jobs_over_cap(registry: &mut HashMap<String, IndexJob>, cap: usize) {
+    let mut terminal: Vec<(String, String)> = registry
+        .values()
+        .filter(|j| matches!(j.state, IndexJobState::Done | IndexJobState::Failed))
+        .map(|j| (j.id.clone(), j.completed_at.clone().unwrap_or_default()))
+        .collect();
+    if terminal.len() <= cap {
+        return;
+    }
+
+    // Oldest first: ascending by `completed_at`.
+    terminal.sort_by(|a, b| a.1.cmp(&b.1));
+    let overflow = terminal.len() - cap;
+    for (id, _) in terminal.into_iter().take(overflow) {
+        registry.remove(&id);
     }
 }
 
