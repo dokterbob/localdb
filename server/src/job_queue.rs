@@ -46,6 +46,17 @@
 //! channel never released — permanent `IndexInProgress` for that store)
 //! *and* silently shrink the pool to `N-1`, since nothing respawns a
 //! worker task that unwinds away. See `process_job`'s doc comment.
+//!
+//! Pending-cancel atomicity (issue #218-followups Fix B): `process_job`'s
+//! check of `cancel_token.is_cancelled()` and its resulting registry write
+//! (either straight to `Failed`/`job_cancelled`, or to `Running`) happen
+//! inside the *same* `registry.write().await` critical section that
+//! `JobQueue::cancel` holds across its own check-and-trigger. Sharing that
+//! lock is what makes the two mutually exclusive, so a `cancel()` call that
+//! observes a job `Pending` and triggers its token can never lose a race
+//! against this worker having already decided (moments earlier, under a
+//! then-separate lock) to start it anyway. See `cancel`'s and
+//! `process_job`'s doc comments for the full reasoning.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -378,57 +389,64 @@ impl JobQueue {
     ///   `block_in_place` cancellation-latency caveat — see this module's
     ///   doc comment).
     ///
-    /// The pre-trigger check and the token trigger are two separate lock
-    /// acquisitions (`registry` and `handles` are distinct `RwLock`s), so a
-    /// job can race to a terminal state in between — on a multi-thread
-    /// runtime, `run_worker` can observe the just-triggered token and
-    /// finish recording `Failed`/`job_cancelled` before this function's own
-    /// post-trigger read ever runs. Without a second look this would either
-    /// report "cancellation requested" for a job that, in fact, already
-    /// finished by some *other* means (issue #218 review, fix 3), or —
-    /// naively treating any post-trigger-terminal job as a conflict — hand
-    /// the very caller whose cancellation just worked a confusing `409`
-    /// (issue #218 review, fix 5). `resolve_post_trigger_outcome` (below)
-    /// is what tells those two cases apart: a job that is terminal *because
-    /// this cancellation reached it* (`Failed` with
-    /// `error_code: "job_cancelled"`) is success, indistinguishable from —
-    /// and no less valid a response than — a `Pending`/`Running` snapshot
-    /// taken a moment earlier; any other terminal state (`Done`, or
-    /// `Failed` with a different `error_code`) is a genuine conflict, since
-    /// the job reached its own outcome first, unrelated to this cancel.
-    /// Even this narrows rather than eliminates the window — the one gap
-    /// that genuinely can't be closed this way is between this function
-    /// returning and the response reaching the caller, exactly what
-    /// "202 = requested, not guaranteed" already covers.
+    /// Check-and-trigger happens inside ONE `registry.write().await`
+    /// critical section (issue #218-followups Fix B), the same lock
+    /// `process_job`'s own check-and-transition holds (see there) — this is
+    /// what actually closes the race, not merely reordering steps within
+    /// this function. Previously the terminal check (a `registry.read()`)
+    /// and the token trigger (`cancel_token.cancel()`, lock-free) were two
+    /// separate steps with no lock held across both: a worker that had
+    /// already read `is_cancelled() == false` moments earlier, in its own
+    /// then-separate critical section, could still go on to mark the job
+    /// `Running` and spawn it — even though this call, having observed the
+    /// job `Pending`, had by then already decided to cancel it. Contradicts
+    /// the documented "a pending job cancelled before the worker starts it
+    /// never runs" guarantee.
+    ///
+    /// Holding the *same* write lock across both this function's
+    /// check-and-trigger and `process_job`'s check-and-transition makes the
+    /// two mutually exclusive: whichever acquires the lock first fully
+    /// determines the job's fate before the other ever runs. So either this
+    /// call's trigger happens-before the worker's check (which then
+    /// observes `is_cancelled() == true` and never starts the job), or the
+    /// worker's transition-to-`Running` happens-before this call's check
+    /// (which then observes `Running`, not `Pending`, and falls through to
+    /// the ordinary running-job cancel path — the task's own
+    /// `tokio::select!` observes the token at its next scheduling point).
+    /// Since nothing else can touch the registry while this lock is held,
+    /// the post-trigger read below is guaranteed to return the exact same
+    /// snapshot the pre-trigger check already saw (Pending or Running,
+    /// never a terminal state caused by this very trigger — that write
+    /// requires the same lock this call is still holding). Kept as an
+    /// explicit second read through [`resolve_post_trigger_outcome`] anyway
+    /// (issue #218 review, fix 3/5) rather than special-cased away, so a
+    /// future change to this locking can't silently regress the
+    /// Pending/Running-vs-terminal distinction it draws.
+    ///
+    /// Lock ordering: this is the one place in this module that holds
+    /// `registry` and `handles` at once — always `registry` first, then
+    /// `handles`, never the reverse anywhere else in this file — so this
+    /// can't deadlock against anything else.
     pub async fn cancel(&self, job_id: &str) -> Result<IndexJob, Error> {
-        Self::terminal_check(&self.registry, job_id).await?;
-
-        if let Some(handle) = self.handles.read().await.get(job_id) {
-            handle.cancel_token.cancel();
-        }
-
-        let reg = self.registry.read().await;
-        let job = reg.get(job_id).ok_or_else(|| Error::JobNotFound {
-            id: job_id.to_string(),
-        })?;
-        resolve_post_trigger_outcome(job)
-    }
-
-    /// The pre-trigger half of `cancel`'s bracketing check: `Ok(job)` for a
-    /// known, non-terminal job; `Err(JobNotFound)` for an unknown id;
-    /// `Err(JobAlreadyTerminal)` for one already `Done`/`Failed` —
-    /// unconditionally, unlike [`resolve_post_trigger_outcome`] below,
-    /// since nothing has been triggered yet for a repeated cancel to have
-    /// legitimately caused.
-    async fn terminal_check(registry: &JobRegistry, job_id: &str) -> Result<IndexJob, Error> {
-        let reg = registry.read().await;
+        // Write lock, not read: exclusivity against `process_job`'s own
+        // critical section is the point (see this method's doc comment
+        // above), even though this function itself never mutates the map.
+        let reg = self.registry.write().await;
         let job = reg.get(job_id).ok_or_else(|| Error::JobNotFound {
             id: job_id.to_string(),
         })?;
         if matches!(job.state, IndexJobState::Done | IndexJobState::Failed) {
             return Err(Error::JobAlreadyTerminal);
         }
-        Ok(job.clone())
+
+        if let Some(handle) = self.handles.read().await.get(job_id) {
+            handle.cancel_token.cancel();
+        }
+
+        let job = reg.get(job_id).ok_or_else(|| Error::JobNotFound {
+            id: job_id.to_string(),
+        })?;
+        resolve_post_trigger_outcome(job)
     }
 
     /// List all jobs.
@@ -525,27 +543,38 @@ async fn process_job(
     let store_id = queued.store_id.clone();
     let cancel_token = queued.cancel_token;
 
-    // A job cancelled while it was still `Pending` (issue #218): the
-    // token was triggered before this worker ever dequeued it — never
-    // start the pipeline at all, not even one poll of the task future.
-    // `(queued.task)()` (which *builds* the future) is deliberately
-    // never called on this path.
-    if cancel_token.is_cancelled() {
-        info!("job {} was cancelled before starting", job_id);
+    // Atomically decide whether this job was already cancelled by the time
+    // this worker reached it, or should start running now (issue
+    // #218-followups Fix B). Both the `is_cancelled()` check and the
+    // resulting registry write happen inside ONE `registry.write().await`
+    // critical section — the same lock `JobQueue::cancel` now holds across
+    // its own check-and-trigger (see there). Whichever of the two
+    // acquires the lock first fully determines the job's fate before the
+    // other ever runs, closing the window where a `cancel()` call that
+    // observed the job `Pending` could trigger the token *between* this
+    // worker's old, separate `is_cancelled()` read and its
+    // `start_index_job` write — previously enough for the job to start
+    // running anyway, contradicting "a pending job cancelled before the
+    // worker starts it never runs." `(queued.task)()` (which *builds* the
+    // future) is deliberately never called on the cancelled path — not
+    // even one poll of the task future.
+    let already_cancelled = {
         let mut reg = registry.write().await;
+        let cancelled = cancel_token.is_cancelled();
         if let Some(job) = reg.get_mut(&job_id) {
-            fail_index_job_with_error(job, &Error::JobCancelled);
-        }
-    } else {
-        info!("starting job {}", job_id);
-
-        // Mark as running
-        {
-            let mut reg = registry.write().await;
-            if let Some(job) = reg.get_mut(&job_id) {
+            if cancelled {
+                fail_index_job_with_error(job, &Error::JobCancelled);
+            } else {
                 start_index_job(job);
             }
         }
+        cancelled
+    };
+
+    if already_cancelled {
+        info!("job {} was cancelled before starting", job_id);
+    } else {
+        info!("starting job {}", job_id);
 
         // Build the job's future. This is the one synchronous,
         // caller-supplied panic seam in this function (issue #208 review,
@@ -770,18 +799,23 @@ fn resolve_aborted(
 ///
 /// A job observed non-terminal here is the ordinary "cancellation
 /// requested" case: `Ok(job)`. A job observed terminal needs one more
-/// distinction, unlike the *pre*-trigger check (`terminal_check`, which
-/// treats every terminal state as a conflict): the token trigger and this
-/// read are two separate lock acquisitions, so `run_worker` can
-/// legitimately race this very call and finish recording
-/// `Failed`/`job_cancelled` before this function ever runs. That specific
-/// terminal state — and only that one — means the outcome the caller asked
-/// for was actually achieved (by this call, or rarely a concurrent one),
-/// so it is `Ok(job)`, not a conflict; reporting `Err(JobAlreadyTerminal)`
-/// there would hand the very caller whose cancellation just worked a
-/// confusing `409`. Any *other* terminal state — `Done`, or `Failed` with a
-/// different `error_code` — reached its own outcome first, unrelated to
-/// this cancel, and stays `Err(JobAlreadyTerminal)`.
+/// distinction, unlike the *pre*-trigger check (`cancel`'s own initial
+/// read, which treats every terminal state as a conflict): a terminal
+/// state whose cause was *this* cancellation (`Failed` with
+/// `error_code: "job_cancelled"`) means the outcome the caller asked for
+/// was actually achieved, so it is `Ok(job)`, not a conflict; reporting
+/// `Err(JobAlreadyTerminal)` there would hand the very caller whose
+/// cancellation just worked a confusing `409`. Any *other* terminal state —
+/// `Done`, or `Failed` with a different `error_code` — reached its own
+/// outcome first, unrelated to this cancel, and stays
+/// `Err(JobAlreadyTerminal)`. Since issue #218-followups Fix B, `cancel`
+/// holds the registry write lock continuously across its pre-trigger check,
+/// the trigger itself, and this function's read, so in practice the state
+/// this function sees can never actually be the "terminal because of this
+/// very cancellation" case anymore (that write requires the same lock
+/// `cancel` is still holding) — this function is kept as the single source
+/// of truth for the distinction anyway, as a safety net against a future
+/// locking change silently reintroducing the race it was written for.
 fn resolve_post_trigger_outcome(job: &IndexJob) -> Result<IndexJob, Error> {
     let is_terminal = matches!(job.state, IndexJobState::Done | IndexJobState::Failed);
     let is_this_cancellation =

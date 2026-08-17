@@ -103,10 +103,18 @@ pub(crate) static EMBEDDER_BUILD_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// summary renderers below combine and format. Kept separate from
 /// `IndexSummary` (which has no notion of *which* store it came from) so the
 /// single-store and multi-store rendering paths can share one code path.
+///
+/// `job_id` (issue #218-followups Fix A) is deliberately *not* a field of
+/// `IndexSummary` itself: `IndexSummary` is summed across stores via `add`
+/// and compared for equality throughout this module's tests, and a job id
+/// has no sensible sum and is different (or absent) per store — keeping it
+/// alongside `summary` here, rather than inside it, means `total_summary`'s
+/// fold never has to decide what to do with it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StoreIndexOutcome {
     pub(crate) store_name: String,
     pub(crate) summary: IndexSummary,
+    pub(crate) job_id: Option<String>,
 }
 
 /// `localdb index [--source <id>] [--strict]`
@@ -156,7 +164,7 @@ impl DaemonAwareCommand for IndexCmd<'_> {
         let mut outcomes = Vec::with_capacity(target_names.len());
         for name in &target_names {
             let label = if multi { Some(name.as_str()) } else { None };
-            let summary = match job_attach::run_daemon_store_job(
+            let (summary, job_id) = match job_attach::run_daemon_store_job(
                 ctx,
                 base_url,
                 name,
@@ -167,12 +175,13 @@ impl DaemonAwareCommand for IndexCmd<'_> {
             )
             .await
             {
-                Ok(summary) => summary,
+                Ok(v) => v,
                 Err(e) => exit_err(&e, ctx.json),
             };
             outcomes.push(StoreIndexOutcome {
                 store_name: name.clone(),
                 summary,
+                job_id,
             });
         }
         Ok(outcomes)
@@ -257,7 +266,7 @@ impl DaemonAwareCommand for IndexCmd<'_> {
                 },
                 None => IndexJobScope::Store,
             };
-            let summary = match job_attach::run_embedded_store_job(
+            let (summary, job_id) = match job_attach::run_embedded_store_job(
                 ctx,
                 &queue,
                 config_loader,
@@ -271,12 +280,13 @@ impl DaemonAwareCommand for IndexCmd<'_> {
             )
             .await
             {
-                Ok(summary) => summary,
+                Ok(v) => v,
                 Err(e) => exit_err(&e, ctx.json),
             };
             outcomes.push(StoreIndexOutcome {
                 store_name: store_row.name.clone(),
                 summary,
+                job_id,
             });
         }
         Ok(outcomes)
@@ -481,21 +491,44 @@ fn summary_fields_json(summary: &IndexSummary, strict: bool) -> serde_json::Valu
     })
 }
 
+/// Build one outcome's JSON fields, plus its `job_id` when it has one
+/// (issue #218-followups Fix A) — inserted only when `Some`, so a store
+/// with no sources (whose `summary_fields_json` short-circuits to the
+/// `{"status":"ok","message":"no sources to index"}` shape, and whose
+/// `job_id` is always `None` since no job was ever submitted for it) keeps
+/// that exact pre-existing shape with no extra key. `job_id` is populated
+/// identically for both transports: the daemon's real job id, or the
+/// embedded engine's own local `JobQueue` id — see
+/// `job_attach::run_daemon_store_job`/`run_embedded_store_job`'s doc
+/// comments for why both are surfaced here rather than gated to
+/// daemon-only cancellability.
+fn store_outcome_json(outcome: &StoreIndexOutcome, strict: bool) -> serde_json::Value {
+    let mut fields = summary_fields_json(&outcome.summary, strict);
+    if let (Some(obj), Some(job_id)) = (fields.as_object_mut(), &outcome.job_id) {
+        obj.insert("job_id".to_string(), json!(job_id));
+    }
+    fields
+}
+
 /// Render the JSON report for a set of store outcomes.
 ///
 /// A single outcome renders as the exact pre-existing flat object (no
 /// wrapping, no `store` field) so `--json` output for the single-store case
-/// is unchanged. More than one outcome wraps into `{"stores": [...], "total":
-/// {...}}`, each store entry carrying a `store` name field. Pure function —
-/// unit-tested directly below.
+/// is unchanged, plus a `job_id` field (issue #218-followups Fix A) when a
+/// job was actually submitted. More than one outcome wraps into
+/// `{"stores": [...], "total": {...}}`, each store entry carrying a `store`
+/// name field and its own `job_id` when it has one — `total` never gets a
+/// `job_id`, since it spans however many stores/jobs contributed to it and
+/// no single id could represent that. Pure function — unit-tested directly
+/// below.
 pub(crate) fn render_index_json(outcomes: &[StoreIndexOutcome], strict: bool) -> serde_json::Value {
     if let [only] = outcomes {
-        return summary_fields_json(&only.summary, strict);
+        return store_outcome_json(only, strict);
     }
     let stores: Vec<serde_json::Value> = outcomes
         .iter()
         .map(|o| {
-            let mut fields = summary_fields_json(&o.summary, strict);
+            let mut fields = store_outcome_json(o, strict);
             if let Some(obj) = fields.as_object_mut() {
                 obj.insert("store".to_string(), json!(o.store_name));
             }
@@ -527,6 +560,17 @@ mod tests {
         StoreIndexOutcome {
             store_name: name.to_string(),
             summary,
+            job_id: None,
+        }
+    }
+
+    /// Like [`outcome`], but with an explicit `job_id` — for the
+    /// `job_id`-in-JSON tests below (issue #218-followups Fix A).
+    fn outcome_with_job(name: &str, summary: IndexSummary, job_id: &str) -> StoreIndexOutcome {
+        StoreIndexOutcome {
+            store_name: name.to_string(),
+            summary,
+            job_id: Some(job_id.to_string()),
         }
     }
 
@@ -674,6 +718,31 @@ mod tests {
         );
     }
 
+    /// Issue #218-followups Fix A: a single-store outcome carrying a job id
+    /// gains a `job_id` field in the flat JSON shape.
+    #[test]
+    fn render_index_json_single_store_includes_job_id_when_present() {
+        let outcomes = vec![outcome_with_job(
+            "books",
+            with_sources(3, 1, 6, 0, 0),
+            "01HRQHB7FN3WMX4AZDV3S9VCTZ",
+        )];
+        let v = render_index_json(&outcomes, false);
+        assert_eq!(v["job_id"], json!("01HRQHB7FN3WMX4AZDV3S9VCTZ"));
+    }
+
+    /// A store with no sources never submitted a job at all — no `job_id`
+    /// key at all, not `null`, preserving the exact pre-existing shape.
+    #[test]
+    fn render_index_json_no_sources_never_gains_a_job_id_key() {
+        let outcomes = vec![outcome("books", IndexSummary::default())];
+        let v = render_index_json(&outcomes, false);
+        assert!(
+            v.get("job_id").is_none(),
+            "a store with no sources never submitted a job, so no job_id key should appear"
+        );
+    }
+
     #[test]
     fn render_index_json_single_store_no_sources_matches_legacy_shape() {
         let outcomes = vec![outcome("books", IndexSummary::default())];
@@ -729,6 +798,24 @@ mod tests {
                     "docs_prunable": 0,
                 },
             })
+        );
+    }
+
+    /// Issue #218-followups Fix A: each multi-store entry carries its own
+    /// `job_id` (each store submitted a genuinely distinct job); `total`
+    /// never gets one, since it spans every contributing job.
+    #[test]
+    fn render_index_json_multi_store_carries_a_job_id_per_store_but_never_on_total() {
+        let outcomes = vec![
+            outcome_with_job("books", with_sources(3, 1, 6, 0, 0), "job-books"),
+            outcome_with_job("notes", with_sources(1, 0, 2, 0, 1), "job-notes"),
+        ];
+        let v = render_index_json(&outcomes, false);
+        assert_eq!(v["stores"][0]["job_id"], json!("job-books"));
+        assert_eq!(v["stores"][1]["job_id"], json!("job-notes"));
+        assert!(
+            v["total"].get("job_id").is_none(),
+            "the combined total must never carry a single job_id"
         );
     }
 

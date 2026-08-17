@@ -81,6 +81,63 @@ async fn post_job_returns_202() {
     assert!(body["id"].as_str().is_some());
 }
 
+/// `GET /v1/jobs` (issue #218-followups Fix A): returns the raw array of
+/// every job on the queue, regardless of store — not wrapped in a
+/// pagination envelope like `/v1/stores`/`/v1/sources`.
+#[tokio::test]
+async fn list_jobs_returns_every_job_across_stores() {
+    let (_dir, app) = make_app().await;
+    post_json(&app, "/v1/stores", json!({"name": "a"})).await;
+    post_json(&app, "/v1/stores", json!({"name": "b"})).await;
+
+    let job_a = post_json(&app, "/v1/jobs", json!({"store_name": "a"})).await;
+    let job_b = post_json(&app, "/v1/jobs", json!({"store_name": "b"})).await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/jobs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp.into_body()).await;
+    let jobs = body
+        .as_array()
+        .expect("GET /v1/jobs must return a raw array");
+    let ids: Vec<&str> = jobs
+        .iter()
+        .map(|j| j["id"].as_str().expect("each job must have an id"))
+        .collect();
+    assert!(
+        ids.contains(&job_a["id"].as_str().unwrap())
+            && ids.contains(&job_b["id"].as_str().unwrap()),
+        "expected both submitted jobs in the list, got: {ids:?}"
+    );
+}
+
+/// An empty queue's `GET /v1/jobs` is an empty array, not an error or a
+/// missing key.
+#[tokio::test]
+async fn list_jobs_returns_empty_array_when_no_jobs_exist() {
+    let (_dir, app) = make_app().await;
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/jobs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp.into_body()).await;
+    assert_eq!(body, json!([]));
+}
+
 #[tokio::test]
 async fn get_job_not_found_returns_404() {
     let (_dir, app) = make_app().await;

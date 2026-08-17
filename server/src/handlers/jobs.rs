@@ -86,6 +86,19 @@ pub async fn create_job(
     Ok((StatusCode::ACCEPTED, Json(job)))
 }
 
+/// `GET /v1/jobs` — list every job on the daemon's queue, regardless of
+/// state or store (issue #218-followups Fix A).
+///
+/// Returns the raw `IndexJob[]` array directly (no pagination envelope,
+/// unlike `/v1/stores`/`/v1/sources` — `JobQueue::list_jobs` is already an
+/// in-memory snapshot with no unbounded-growth concern the other list
+/// endpoints paginate against). Order is whatever `JobQueue::list_jobs`
+/// returns (registry iteration order — not guaranteed stable), same as
+/// every other consumer of that method.
+pub async fn list_jobs(State(state): State<AppState>) -> Json<Vec<IndexJob>> {
+    Json(state.job_queue().list_jobs().await)
+}
+
 pub async fn get_job(
     State(state): State<AppState>,
     Path(job_id): Path<String>,

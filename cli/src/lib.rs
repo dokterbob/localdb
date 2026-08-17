@@ -31,7 +31,7 @@ pub use cmds::db::{run_db_downgrade, run_db_migrate, run_db_status, run_db_vacuu
 pub use cmds::index::run_index;
 pub use cmds::init::run_init;
 pub use cmds::internal::run_internal_print_schema;
-pub use cmds::job::run_job_cancel;
+pub use cmds::job::{run_job_cancel, run_job_list};
 pub use cmds::search::run_search;
 pub use cmds::source::{run_source_add, run_source_list, run_source_remove};
 pub use cmds::status::run_status;

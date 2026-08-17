@@ -163,7 +163,6 @@ impl UrlRefreshScheduler {
             let source_id_for_closure = source_id.clone();
             let store_name_for_closure = record.store_name.clone();
             let state_for_closure = self.state.read().await.clone();
-            let records_for_closure = self.records.clone();
 
             let submit_result = self
                 .queue
@@ -178,79 +177,89 @@ impl UrlRefreshScheduler {
                             source_id_for_closure, store_name_for_closure
                         );
 
-                        // Kept as a separate binding (not read back out of
-                        // `source_id_for_closure`, which the inner future
-                        // below moves) so the stamping step after it can
-                        // still name the source.
-                        let source_id_for_stamp = source_id_for_closure.clone();
-
-                        // Run the refresh, capturing its outcome as a value
-                        // instead of short-circuiting via `?` — `last_refreshed`
-                        // must be stamped once the job reaches *any* terminal
-                        // state (below), including the "no state attached" /
-                        // "store not found" early-exit paths, not only a
-                        // failure surfaced by `job_exec::run_job` itself.
-                        let result: Result<localdb_core::IndexJobStats, Error> = async move {
-                            let state = state_for_closure.ok_or_else(|| Error::Internal {
-                                message: "URL refresh scheduler has no state attached".to_string(),
-                                correlation_id: "url_refresh_no_state".to_string(),
+                        let state = state_for_closure.ok_or_else(|| Error::Internal {
+                            message: "URL refresh scheduler has no state attached".to_string(),
+                            correlation_id: "url_refresh_no_state".to_string(),
+                        })?;
+                        let store_row = state
+                            .backend()
+                            .get_store_by_name(&store_name_for_closure)
+                            .await?
+                            .ok_or_else(|| Error::StoreNotFound {
+                                id: store_name_for_closure.clone(),
                             })?;
-                            let store_row = state
-                                .backend()
-                                .get_store_by_name(&store_name_for_closure)
-                                .await?
-                                .ok_or_else(|| Error::StoreNotFound {
-                                    id: store_name_for_closure.clone(),
-                                })?;
-                            let refresh_scope = IndexJobScope::Source {
-                                source_id: source_id_for_closure.clone(),
-                            };
-                            // Shared with `handlers::jobs::create_job` via
-                            // `AppState::run_scoped_job` (#187 review, DRY
-                            // finding): resolves the scoped source before
-                            // deciding whether to build/reuse an embedder —
-                            // a scope that fails to resolve (e.g. the source
-                            // was deleted) surfaces that error before paying
-                            // for a (potentially huge) embedding model
-                            // build, and a resolved-but-empty scope never
-                            // builds one at all (Codex review finding G1,
-                            // issue #187). Only the deletion policy differs
-                            // between the two callers: a scheduled refresh
-                            // always uses `Retain`, never pruning documents
-                            // on its own (issues #156/#185).
-                            state
-                                .run_scoped_job(
-                                    &store_row,
-                                    refresh_scope,
-                                    localdb_core::DeletionPolicy::Retain,
-                                    progress,
-                                )
-                                .await
-                        }
-                        .await;
-
-                        // Record completion time now, not at submit time
-                        // (#187 review F1): stamping at submit made a slow
-                        // job look "refreshed" while it was still running,
-                        // drifting scheduling away from actual completion.
-                        // A failed job is stamped too — it must never
-                        // tight-loop retrying; it waits out a full interval
-                        // just like a successful refresh does. Only touch
-                        // the record if it's still registered: the source
-                        // may have been unregistered mid-flight, and
-                        // completion must never re-insert a removed record.
-                        let mut records = records_for_closure.write().await;
-                        if let Some(r) = records.get_mut(&source_id_for_stamp) {
-                            r.last_refreshed = Some(Instant::now());
-                        }
-
-                        result
+                        let refresh_scope = IndexJobScope::Source {
+                            source_id: source_id_for_closure.clone(),
+                        };
+                        // Shared with `handlers::jobs::create_job` via
+                        // `AppState::run_scoped_job` (#187 review, DRY
+                        // finding): resolves the scoped source before
+                        // deciding whether to build/reuse an embedder —
+                        // a scope that fails to resolve (e.g. the source
+                        // was deleted) surfaces that error before paying
+                        // for a (potentially huge) embedding model
+                        // build, and a resolved-but-empty scope never
+                        // builds one at all (Codex review finding G1,
+                        // issue #187). Only the deletion policy differs
+                        // between the two callers: a scheduled refresh
+                        // always uses `Retain`, never pruning documents
+                        // on its own (issues #156/#185).
+                        state
+                            .run_scoped_job(
+                                &store_row,
+                                refresh_scope,
+                                localdb_core::DeletionPolicy::Retain,
+                                progress,
+                            )
+                            .await
                     },
                 )
                 .await;
 
-            if let Err(e) = submit_result {
-                log_submit_failure(&record.source_id, &e);
+            match submit_result {
+                Ok(job) => {
+                    // Wait for *this* job to reach a terminal state and
+                    // stamp `last_refreshed` then, from a task that lives
+                    // entirely outside the job's own submitted future
+                    // (issue #218-followups Fix C). Previously the stamp
+                    // was the tail expression of the closure above — but a
+                    // cancelled job's future is `handle.abort()`ed by
+                    // `job_queue::process_job`, which drops everything
+                    // still pending inside it, including that stamp, before
+                    // it ever runs. A cancelled refresh was therefore never
+                    // stamped and got resubmitted on the very next tick —
+                    // the backoff a cancellation is supposed to buy was
+                    // silently undone. Watching from a separate task
+                    // instead observes the registry's terminal write
+                    // (`process_job` commits it before tearing down the
+                    // progress channel — see `HandleRegistry`'s doc comment
+                    // in `job_queue.rs`) regardless of *how* the job got
+                    // there: normal completion, a real failure, or
+                    // cancellation all stamp the same way now.
+                    let queue_for_wait = self.queue.clone();
+                    let records_for_wait = self.records.clone();
+                    let source_id_for_wait = record.source_id.clone();
+                    let job_id = job.id.clone();
+                    tokio::spawn(async move {
+                        wait_for_job_terminal(&queue_for_wait, &job_id).await;
+                        // Record completion time now, not at submit time
+                        // (#187 review F1): stamping at submit made a slow
+                        // job look "refreshed" while it was still running,
+                        // drifting scheduling away from actual completion.
+                        // A failed (or cancelled) job is stamped too — it
+                        // must never tight-loop retrying; it waits out a
+                        // full interval just like a successful refresh
+                        // does. Only touch the record if it's still
+                        // registered: the source may have been
+                        // unregistered mid-flight, and completion must
+                        // never re-insert a removed record.
+                        let mut records = records_for_wait.write().await;
+                        if let Some(r) = records.get_mut(&source_id_for_wait) {
+                            r.last_refreshed = Some(Instant::now());
+                        }
+                    });
+                }
+                Err(e) => log_submit_failure(&record.source_id, &e),
             }
         }
     }
@@ -272,6 +281,29 @@ impl UrlRefreshScheduler {
     /// Number of registered URL sources.
     pub async fn source_count(&self) -> usize {
         self.records.read().await.len()
+    }
+}
+
+/// Wait until `job_id` reaches a terminal state (issue #218-followups Fix
+/// C), observed via its progress-event channel closing — mirrors
+/// `cli::job_attach::drive_embedded_job`'s wait pattern, but discards the
+/// progress events themselves; only the channel's closure matters here.
+/// Per `HandleRegistry`'s doc comment in `job_queue.rs`, that closure is
+/// guaranteed to happen only *after* `job_queue::process_job` has already
+/// committed the job's terminal state to the registry — so by the time this
+/// returns, the caller can trust the job is genuinely done, failed, or
+/// cancelled, regardless of which. If `subscribe` returns `None` the job
+/// was already terminal (and torn down) by the time this ran — nothing more
+/// to wait for.
+async fn wait_for_job_terminal(queue: &JobQueue, job_id: &str) {
+    if let Some(mut rx) = queue.subscribe(job_id).await {
+        loop {
+            match rx.recv().await {
+                Ok(_) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
     }
 }
 
@@ -316,6 +348,33 @@ mod tests {
     fn make_scheduler() -> UrlRefreshScheduler {
         let queue = JobQueue::new();
         UrlRefreshScheduler::new(queue)
+    }
+
+    /// Poll `scheduler.records` until `source_id`'s `last_refreshed` is
+    /// set, up to 5s. Since issue #218-followups Fix C, the stamp lands on
+    /// a separate spawned task (`wait_for_job_terminal` + the stamp itself)
+    /// woken by the job's own terminal transition, independently scheduled
+    /// from whatever poll a test itself uses to observe that same terminal
+    /// state — so a test that needs to see the stamp must poll for it in
+    /// its own right, not assume it's already visible the instant the
+    /// job's state is.
+    async fn wait_for_last_refreshed_stamp(scheduler: &UrlRefreshScheduler, source_id: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            {
+                let records = scheduler.records.read().await;
+                if records
+                    .get(source_id)
+                    .is_some_and(|r| r.last_refreshed.is_some())
+                {
+                    return;
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("last_refreshed for '{source_id}' was never stamped in time");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]
@@ -503,6 +562,15 @@ mod tests {
     /// "submitted but not yet complete" window is reliably observable on a
     /// single-threaded test runtime (the worker task doesn't get to run
     /// until this test task itself yields, e.g. via `sleep`).
+    ///
+    /// Since issue #218-followups Fix C, the stamp itself happens on a
+    /// separate spawned task that wakes up once the job's progress channel
+    /// closes (see `wait_for_job_terminal`) — deliberately *not* inline
+    /// with the job's own future — so "the job is Failed" and "the stamp
+    /// has landed" are two independently-scheduled events; the final
+    /// assertion below polls for the stamp with its own bounded deadline
+    /// rather than asserting it's already visible the instant this test's
+    /// own poll first observes `Failed`.
     #[tokio::test]
     async fn last_refreshed_is_recorded_on_completion_not_on_submission() {
         let queue = JobQueue::new();
@@ -551,11 +619,9 @@ mod tests {
             }
         }
 
-        let records = scheduler.records.read().await;
-        assert!(
-            records.get("src-timing").unwrap().last_refreshed.is_some(),
-            "last_refreshed must be set once the job reaches a terminal state"
-        );
+        // The stamp lands asynchronously (a separate task, woken by the
+        // same terminal transition) — poll for it with its own deadline.
+        wait_for_last_refreshed_stamp(&scheduler, "src-timing").await;
     }
 
     /// #187 review F1: a failed job must still be stamped with
@@ -592,6 +658,11 @@ mod tests {
             }
         }
 
+        // The stamp itself lands on a separate task (Fix C) — wait for it
+        // before ticking again, or the second tick could race a
+        // not-yet-stamped record and wrongly consider it still due.
+        wait_for_last_refreshed_stamp(&scheduler, "src-retry").await;
+
         // A second tick immediately after the failure must not resubmit:
         // the interval (1 hour) has not elapsed since `last_refreshed` was
         // stamped at completion.
@@ -603,6 +674,105 @@ mod tests {
             jobs.len(),
             1,
             "a failed job must not be resubmitted before a full interval has elapsed"
+        );
+    }
+
+    /// Issue #218-followups Fix C: a cancelled refresh job must not be
+    /// resubmitted on the tick immediately following its cancellation —
+    /// before this fix, `last_refreshed` was stamped as the tail
+    /// expression of the job's own submitted closure, which
+    /// `job_queue::process_job` drops entirely (along with everything else
+    /// still pending inside it) when it `handle.abort()`s a cancelled
+    /// task. A cancelled refresh was therefore never stamped and got
+    /// resubmitted on the very next tick — undoing the backoff the
+    /// cancellation was supposed to buy. Constructed deterministically: a
+    /// blocker job on a *different* store occupies the queue's sole worker
+    /// (mirrors `job_queue::tests::cancellation`'s pending-cancel test)
+    /// so the scheduler's own tick-submitted refresh job is guaranteed to
+    /// still be `Pending` when this test cancels it.
+    #[tokio::test]
+    async fn cancelled_refresh_job_is_not_resubmitted_on_the_immediately_following_tick() {
+        let queue = JobQueue::new();
+        let scheduler = UrlRefreshScheduler::new(queue.clone());
+
+        scheduler
+            .register(
+                "src-cancel".to_string(),
+                "store-C".to_string(),
+                "https://example.com/".to_string(),
+                Some(3600), // 1 hour — long enough that only the cancel-stamp, not a real elapsed interval, could suppress resubmission.
+            )
+            .await;
+
+        // Occupy the queue's sole worker with an unrelated job parked on a
+        // gate this test controls, so the scheduler's own submission
+        // (below) is guaranteed to still be Pending when this test cancels
+        // it.
+        let (blocker_release_tx, blocker_release_rx) = tokio::sync::oneshot::channel::<()>();
+        queue
+            .submit(
+                "blocker-store",
+                IndexJobScope::Store,
+                move |_progress| async move {
+                    let _ = blocker_release_rx.await;
+                    Ok(localdb_core::IndexJobStats::default())
+                },
+            )
+            .await
+            .unwrap();
+
+        scheduler.tick().await;
+
+        let jobs = queue.list_jobs().await;
+        let refresh_job = jobs
+            .iter()
+            .find(|j| j.store_id == "store-C")
+            .expect("tick() should have submitted the refresh job")
+            .clone();
+        assert_eq!(
+            refresh_job.state,
+            IndexJobState::Pending,
+            "the refresh job must still be queued behind the blocker job"
+        );
+
+        queue.cancel(&refresh_job.id).await.unwrap();
+
+        // Release the blocker so the worker can move on to (not-)running
+        // the refresh job.
+        let _ = blocker_release_tx.send(());
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if std::time::Instant::now() > deadline {
+                panic!("cancelled refresh job did not reach a terminal state in time");
+            }
+            let job = queue.get_job(&refresh_job.id).await.unwrap();
+            if job.state == IndexJobState::Failed {
+                assert_eq!(job.error_code.as_deref(), Some("job_cancelled"));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // The stamp lands on a separate task (Fix C) — wait for it before
+        // ticking again, or the next tick could race a not-yet-stamped
+        // record and wrongly consider it still due.
+        wait_for_last_refreshed_stamp(&scheduler, "src-cancel").await;
+
+        // A tick immediately after the cancellation must not resubmit: the
+        // interval (1 hour) has not elapsed since `last_refreshed` was
+        // stamped at cancellation — exactly the same backoff an ordinary
+        // failure gets
+        // (`failed_job_is_not_resubmitted_before_a_full_interval_elapses`
+        // above), now also honored for cancellation.
+        scheduler.tick().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let jobs = queue.list_jobs().await;
+        let refresh_jobs_for_source = jobs.iter().filter(|j| j.store_id == "store-C").count();
+        assert_eq!(
+            refresh_jobs_for_source, 1,
+            "a cancelled refresh job must not be resubmitted before a full interval has elapsed"
         );
     }
 
@@ -689,12 +859,11 @@ mod tests {
                     );
                     // #187 review F1: `last_refreshed` must be recorded
                     // once the job actually completes, not back when it was
-                    // merely submitted.
-                    let records = scheduler.records.read().await;
-                    assert!(
-                        records.get(&source.id).unwrap().last_refreshed.is_some(),
-                        "last_refreshed must be set once the refresh job completes"
-                    );
+                    // merely submitted. The stamp itself lands on a
+                    // separate task (issue #218-followups Fix C), so poll
+                    // for it rather than asserting it's already visible the
+                    // instant this loop observes `Done`.
+                    wait_for_last_refreshed_stamp(&scheduler, &source.id).await;
                     break;
                 }
             }

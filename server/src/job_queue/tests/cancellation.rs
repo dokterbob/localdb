@@ -13,7 +13,7 @@
 //! (a `oneshot` it either never sends, or sends only after asserting on the
 //! cancelled outcome).
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
@@ -112,10 +112,11 @@ async fn cancel_after_a_real_failure_returns_job_already_terminal_and_preserves_
 // ---------------------------------------------------------------------------
 
 /// A job still sitting in the queue when cancelled must never run its
-/// pipeline at all — not even one poll of its task future. Constructed
-/// deterministically: the queue has exactly one background worker
-/// (`job_queue.rs`'s module doc comment), so a first job parked on a gate
-/// this test controls guarantees a second submission (to a *different*
+/// pipeline at all — not even one poll of its task future, and not even a
+/// call to the task-building `FnOnce` itself (issue #218-followups Fix B).
+/// Constructed deterministically: the queue has exactly one background
+/// worker (`job_queue.rs`'s module doc comment), so a first job parked on a
+/// gate this test controls guarantees a second submission (to a *different*
 /// store — the in-flight guard is per-store, so this isn't what blocks it)
 /// stays `Pending` until the first job is released.
 #[tokio::test]
@@ -138,18 +139,24 @@ async fn pending_job_cancelled_before_the_worker_starts_it_never_runs_and_is_rec
 
     // Job 2: a distinct store (so the in-flight guard doesn't reject the
     // submission), guaranteed to still be sitting in the channel — the one
-    // worker is busy on job 1.
+    // worker is busy on job 1. `invoked` is set synchronously by the
+    // task-building `FnOnce` itself, *before* it returns the async block
+    // that increments `ran` — proving `process_job` never even calls
+    // `(queued.task)()` for a job cancelled before it starts (Fix B's
+    // atomic check-and-transition), not merely that the resulting future's
+    // body never ran (which `ran` alone already covered before this fix).
     let ran = Arc::new(AtomicUsize::new(0));
+    let invoked = Arc::new(AtomicBool::new(false));
     let ran_for_task = ran.clone();
+    let invoked_for_task = invoked.clone();
     let job2 = queue
-        .submit(
-            "store-2",
-            IndexJobScope::Store,
-            move |_progress| async move {
+        .submit("store-2", IndexJobScope::Store, move |_progress| {
+            invoked_for_task.store(true, Ordering::SeqCst);
+            async move {
                 ran_for_task.fetch_add(1, Ordering::SeqCst);
                 Ok(IndexJobStats::default())
-            },
-        )
+            }
+        })
         .await
         .unwrap();
     assert_eq!(
@@ -167,6 +174,10 @@ async fn pending_job_cancelled_before_the_worker_starts_it_never_runs_and_is_rec
 
     assert_eq!(done2.state, IndexJobState::Failed);
     assert_eq!(done2.error_code.as_deref(), Some("job_cancelled"));
+    assert!(
+        !invoked.load(Ordering::SeqCst),
+        "a pending job cancelled before the worker reached it must never even build its task future"
+    );
     assert_eq!(
         ran.load(Ordering::SeqCst),
         0,
