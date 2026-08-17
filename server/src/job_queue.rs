@@ -71,8 +71,10 @@
 //! Bounded terminal-job retention (issue #218-followups Fix 2, PR #229
 //! review): the registry evicts the oldest `Done`/`Failed` jobs once their
 //! count exceeds [`MAX_TERMINAL_JOBS`], so a long-running daemon's job
-//! history doesn't grow without bound. See
-//! `evict_oldest_terminal_jobs_over_cap`.
+//! history doesn't grow without bound — except jobs terminal for less than
+//! [`TERMINAL_RETENTION_GRACE_SECS`], which are never evicted (PR #229
+//! round-5 review; covers a submitter's first post-submit attach/poll).
+//! See `evict_oldest_terminal_jobs_over_cap`.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -138,7 +140,45 @@ pub enum JobEvent {
 /// `evict_oldest_terminal_jobs_over_cap` and specs/05-surfaces.md's
 /// `GET /jobs`/`GET /jobs/{id}` entries for the resulting contract (an
 /// evicted job's id eventually 404s).
+///
+/// The cap is a target, not a hard ceiling: jobs terminal for less than
+/// [`TERMINAL_RETENTION_GRACE_SECS`] are never evicted (PR #229 round-5
+/// review), so a burst of >cap completions inside the grace window can
+/// exceed it temporarily — bounded by the burst itself, and trimmed back to
+/// the cap as entries age past the grace.
 const MAX_TERMINAL_JOBS: usize = 200;
+
+/// How long a terminal job is immune to eviction after completing (PR #229
+/// round-5 review), regardless of `MAX_TERMINAL_JOBS` pressure.
+///
+/// Covers the submit→first-attach window that in-band terminal delivery
+/// ([`JobEvent::Terminal`]) cannot: a daemon client can only subscribe to
+/// `GET /v1/jobs/{id}/events` (or start polling `GET /v1/jobs/{id}`) after
+/// `POST /v1/jobs` has returned, so a job that completes and is evicted in
+/// that gap would 404 its own submitter's very first attach request. With
+/// the grace, the client's first request always still finds the job (any
+/// realistic submit→attach latency is far under a minute); once attached,
+/// the SSE stream's terminal frame is delivered in-band and eviction is
+/// irrelevant. `job_exec::run_job` never finishes meaningfully faster than
+/// the grace on a non-trivial store anyway — this exists for the empty/tiny
+/// store case where a job can complete in milliseconds.
+const TERMINAL_RETENTION_GRACE_SECS: u64 = 60;
+
+/// The eviction cutoff for "now": terminal jobs whose `completed_at` is at
+/// or after this instant are within [`TERMINAL_RETENTION_GRACE_SECS`] and
+/// must not be evicted. Same fixed-width RFC 3339 shape as `completed_at`
+/// itself (`localdb_core::ingestion::now_rfc3339`), so plain string
+/// comparison orders correctly.
+fn terminal_eviction_cutoff() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    localdb_core::ingestion::format_secs_rfc3339(
+        now_secs.saturating_sub(TERMINAL_RETENTION_GRACE_SECS),
+    )
+}
 
 /// A pinned, boxed future producing a job's final stats (or a typed error) —
 /// the async equivalent of the old synchronous `JobTask` closure.
@@ -434,7 +474,12 @@ impl JobQueue {
                 // This is a terminal write too (issue #218-followups Fix 2,
                 // PR #229 review) — every path that can move a job to
                 // `Done`/`Failed` runs eviction, not just `process_job`'s.
-                evict_oldest_terminal_jobs_over_cap(&mut reg, MAX_TERMINAL_JOBS, &job_id);
+                evict_oldest_terminal_jobs_over_cap(
+                    &mut reg,
+                    MAX_TERMINAL_JOBS,
+                    &job_id,
+                    &terminal_eviction_cutoff(),
+                );
                 // Snapshot inside the same write scope that made the job
                 // terminal — `protect_id` above guarantees the entry is
                 // still present here (see `process_job`'s teardown for the
@@ -697,7 +742,12 @@ async fn process_job(
         // here, and no other job's terminal write can evict it before this
         // scope ends.
         let snapshot = if cancelled {
-            evict_oldest_terminal_jobs_over_cap(&mut reg, MAX_TERMINAL_JOBS, &job_id);
+            evict_oldest_terminal_jobs_over_cap(
+                &mut reg,
+                MAX_TERMINAL_JOBS,
+                &job_id,
+                &terminal_eviction_cutoff(),
+            );
             reg.get(&job_id).cloned()
         } else {
             None
@@ -790,37 +840,7 @@ async fn process_job(
         {
             let mut reg = registry.write().await;
             if let Some(job) = reg.get_mut(&job_id) {
-                match outcome {
-                    JobOutcome::Finished(Ok(Ok(stats))) => {
-                        info!("job {} completed: {:?}", job_id, stats);
-                        complete_index_job(job, stats);
-                    }
-                    JobOutcome::Finished(Ok(Err(e))) => {
-                        warn!("job {} failed: {}", job_id, e);
-                        fail_index_job_with_error(job, &e);
-                    }
-                    JobOutcome::Finished(Err(join_err)) => {
-                        error!("job {} panicked: {}", job_id, join_err);
-                        fail_index_job(job, format!("task panicked: {}", join_err));
-                    }
-                    JobOutcome::Cancelled => {
-                        info!("job {} cancelled", job_id);
-                        fail_index_job_with_error(job, &Error::JobCancelled);
-                    }
-                    JobOutcome::TaskBuildPanicked(msg) => {
-                        error!(
-                            "job {} panicked while building its task future: {}",
-                            job_id, msg
-                        );
-                        fail_index_job_with_error(
-                            job,
-                            &Error::Internal {
-                                message: format!("worker panicked during job processing: {msg}"),
-                                correlation_id: "job_worker_task_build_panic".to_string(),
-                            },
-                        );
-                    }
-                }
+                apply_job_outcome(job, &job_id, outcome);
             }
             // Every arm of the match above is a terminal write (issue
             // #218-followups Fix 2, PR #229 review) — evict once per job
@@ -828,7 +848,12 @@ async fn process_job(
             // scope, same reasoning as the cancelled-before-start branch
             // above (protect_id keeps the entry present; no other job's
             // terminal write can evict it before this scope ends).
-            evict_oldest_terminal_jobs_over_cap(&mut reg, MAX_TERMINAL_JOBS, &job_id);
+            evict_oldest_terminal_jobs_over_cap(
+                &mut reg,
+                MAX_TERMINAL_JOBS,
+                &job_id,
+                &terminal_eviction_cutoff(),
+            );
             terminal_snapshot = reg.get(&job_id).cloned();
         }
     }
@@ -866,6 +891,46 @@ async fn process_job(
     }
 }
 
+/// Apply a finished job's [`JobOutcome`] to its registry entry: every arm
+/// is a terminal write (`Done` for a clean finish, `Failed` — typed where
+/// possible — for everything else), logged at a severity matching how
+/// surprising the outcome is. Factored out of `process_job` purely so its
+/// registry-update section reads as one step (qlty function-complexity);
+/// the caller still owns the lock, eviction, and snapshot sequencing.
+fn apply_job_outcome(job: &mut IndexJob, job_id: &str, outcome: JobOutcome) {
+    match outcome {
+        JobOutcome::Finished(Ok(Ok(stats))) => {
+            info!("job {} completed: {:?}", job_id, stats);
+            complete_index_job(job, stats);
+        }
+        JobOutcome::Finished(Ok(Err(e))) => {
+            warn!("job {} failed: {}", job_id, e);
+            fail_index_job_with_error(job, &e);
+        }
+        JobOutcome::Finished(Err(join_err)) => {
+            error!("job {} panicked: {}", job_id, join_err);
+            fail_index_job(job, format!("task panicked: {}", join_err));
+        }
+        JobOutcome::Cancelled => {
+            info!("job {} cancelled", job_id);
+            fail_index_job_with_error(job, &Error::JobCancelled);
+        }
+        JobOutcome::TaskBuildPanicked(msg) => {
+            error!(
+                "job {} panicked while building its task future: {}",
+                job_id, msg
+            );
+            fail_index_job_with_error(
+                job,
+                &Error::Internal {
+                    message: format!("worker panicked during job processing: {msg}"),
+                    correlation_id: "job_worker_task_build_panic".to_string(),
+                },
+            );
+        }
+    }
+}
+
 /// Evict the oldest terminal (`Done`/`Failed`) jobs, by `(completed_at,
 /// id)`, until `registry` holds at most `cap` of them (issue #218-followups
 /// Fix 2, PR #229 review). Pending/Running jobs are never touched — only
@@ -897,14 +962,25 @@ async fn process_job(
 /// creation order at millisecond granularity (within one millisecond a
 /// ULID's random component makes the order arbitrary, but still a fixed
 /// property of the ids, not of `HashMap` iteration order, which varies run
-/// to run). `cap` is a parameter (not read from
-/// `MAX_TERMINAL_JOBS` internally) purely so tests can drive this with a
-/// small, readable cap instead of needing `MAX_TERMINAL_JOBS` (200) real
-/// entries to observe eviction.
+/// to run).
+///
+/// `cutoff` (PR #229 round-5 review) is the retention-grace boundary:
+/// only terminal jobs strictly older than it (`completed_at < cutoff`) are
+/// eviction candidates. Production passes [`terminal_eviction_cutoff`]
+/// (now minus [`TERMINAL_RETENTION_GRACE_SECS`]); see that constant's doc
+/// for why recently-terminal jobs must survive even over-cap. When the
+/// protected/grace-covered set alone exceeds `cap`, the registry stays
+/// over cap until entries age out — deliberate, bounded by the burst.
+///
+/// `cap` and `cutoff` are parameters (not read from the constants
+/// internally) purely so tests can drive this with small, readable values
+/// instead of needing `MAX_TERMINAL_JOBS` (200) real entries or a real
+/// minute-long wait to observe the behavior.
 fn evict_oldest_terminal_jobs_over_cap(
     registry: &mut HashMap<String, IndexJob>,
     cap: usize,
     protect_id: &str,
+    cutoff: &str,
 ) {
     let terminal_count = registry
         .values()
@@ -918,6 +994,7 @@ fn evict_oldest_terminal_jobs_over_cap(
         .values()
         .filter(|j| matches!(j.state, IndexJobState::Done | IndexJobState::Failed))
         .filter(|j| j.id != protect_id)
+        .filter(|j| j.completed_at.as_deref().unwrap_or_default() < cutoff)
         .map(|j| (j.completed_at.clone().unwrap_or_default(), j.id.clone()))
         .collect();
 

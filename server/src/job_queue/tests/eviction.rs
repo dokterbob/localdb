@@ -4,23 +4,21 @@
 //! without bound.
 //!
 //! The pure eviction function (`evict_oldest_terminal_jobs_over_cap`) is
-//! tested directly against hand-built registries below, with a small,
-//! test-chosen `cap` — not the real `MAX_TERMINAL_JOBS` (200), since
-//! `completed_at` is a fixed constant under `#[cfg(test)]`
-//! (`localdb_core::ingestion::now_rfc3339`), so this crate's tests can't
-//! rely on real wall-clock ordering to prove "oldest first" the way
-//! production does; hand-built fixtures with distinct `completed_at`
-//! strings sidestep that entirely. The one real end-to-end test below
-//! (through `JobQueue::submit` at the real `MAX_TERMINAL_JOBS` cap) proves
-//! the wiring and `get_job`'s post-eviction behavior with an exact evicted
-//! *count* — see its own doc comment for why it still doesn't pin which
-//! specific ids, even now that ties break deterministically by id (PR #229
-//! round-3 review).
+//! tested directly against hand-built registries below, with small,
+//! test-chosen `cap`/`cutoff` values — not the real `MAX_TERMINAL_JOBS`
+//! (200) or a real minute-long grace wait; hand-built fixtures with
+//! explicit `completed_at` strings make ordering, grace, and protection
+//! each provable in isolation. The one real end-to-end test below (through
+//! `JobQueue::submit` at the real constants) pins the production-wired
+//! consequence of the retention grace (PR #229 round-5 review): a burst of
+//! fresh completions past the cap evicts *nothing*, so a submitter's first
+//! post-submit attach/poll can never 404.
 //!
 //! `PROTECT_NONE` below: the pure tests that aren't about the
 //! self-protection rule pass an id that matches nothing in their fixture,
 //! so protection is inert and the test exercises only the ordering/cap
-//! logic. The self-protection rule has its own dedicated test.
+//! logic. The self-protection rule has its own dedicated test; same idea
+//! for `CUTOFF_EVICT_ALL` and the grace rule.
 
 use std::collections::HashMap;
 
@@ -30,10 +28,10 @@ use super::common::{ok_job, wait_for_done};
 use crate::job_queue::{evict_oldest_terminal_jobs_over_cap, JobQueue, MAX_TERMINAL_JOBS};
 
 /// Build a sample terminal or non-terminal `IndexJob` for the pure eviction
-/// tests below — `completed_at` is the field eviction sorts by, always
-/// explicit here rather than derived from `localdb_core::ingestion::now_rfc3339`
-/// (stubbed to a fixed constant under `#[cfg(test)]`, so it can't express
-/// real ordering).
+/// tests below — `completed_at` is the field eviction sorts and
+/// grace-filters by, always explicit here so ordering and grace are fully
+/// under the test's control (real jobs get wall-clock timestamps from
+/// `localdb_core::ingestion::now_rfc3339`).
 fn sample_job(id: &str, state: IndexJobState, completed_at: Option<&str>) -> IndexJob {
     IndexJob {
         id: id.to_string(),
@@ -57,6 +55,12 @@ fn terminal_job(id: &str, completed_at: &str) -> IndexJob {
 /// self-protection rule is not the subject (see module doc).
 const PROTECT_NONE: &str = "no-such-job";
 
+/// A `cutoff` far past every fixture's `completed_at` — every terminal
+/// fixture is older than it, so the retention grace (PR #229 round-5
+/// review) is inert and the test exercises only the ordering/cap logic.
+/// The grace rule has its own dedicated test.
+const CUTOFF_EVICT_ALL: &str = "9999-01-01T00:00:00Z";
+
 // ---------------------------------------------------------------------------
 // evict_oldest_terminal_jobs_over_cap — pure function, hand-built fixtures
 // ---------------------------------------------------------------------------
@@ -72,10 +76,10 @@ fn is_a_no_op_when_terminal_count_is_at_or_under_cap() {
         );
     }
 
-    evict_oldest_terminal_jobs_over_cap(&mut registry, 3, PROTECT_NONE);
+    evict_oldest_terminal_jobs_over_cap(&mut registry, 3, PROTECT_NONE, CUTOFF_EVICT_ALL);
     assert_eq!(registry.len(), 3, "at the cap exactly: nothing evicted");
 
-    evict_oldest_terminal_jobs_over_cap(&mut registry, 5, PROTECT_NONE);
+    evict_oldest_terminal_jobs_over_cap(&mut registry, 5, PROTECT_NONE, CUTOFF_EVICT_ALL);
     assert_eq!(registry.len(), 3, "under the cap: nothing evicted");
 }
 
@@ -91,7 +95,7 @@ fn respects_the_cap() {
     }
     assert_eq!(registry.len(), 10);
 
-    evict_oldest_terminal_jobs_over_cap(&mut registry, 4, PROTECT_NONE);
+    evict_oldest_terminal_jobs_over_cap(&mut registry, 4, PROTECT_NONE, CUTOFF_EVICT_ALL);
 
     assert_eq!(
         registry.len(),
@@ -126,7 +130,7 @@ fn removes_oldest_first_by_completed_at() {
         terminal_job("second-newest", "2020-01-04T00:00:00Z"),
     );
 
-    evict_oldest_terminal_jobs_over_cap(&mut registry, 3, PROTECT_NONE);
+    evict_oldest_terminal_jobs_over_cap(&mut registry, 3, PROTECT_NONE, CUTOFF_EVICT_ALL);
 
     assert_eq!(registry.len(), 3);
     assert!(
@@ -166,7 +170,7 @@ fn never_evicts_pending_or_running_even_when_they_push_the_total_past_the_cap() 
     // of the 5 terminal jobs are evicted — the two non-terminal jobs are
     // never candidates at all, regardless of how far over the cap the
     // *terminal* count is.
-    evict_oldest_terminal_jobs_over_cap(&mut registry, 2, PROTECT_NONE);
+    evict_oldest_terminal_jobs_over_cap(&mut registry, 2, PROTECT_NONE, CUTOFF_EVICT_ALL);
 
     assert!(
         registry.contains_key("pending-job"),
@@ -204,7 +208,7 @@ fn ties_on_completed_at_break_deterministically_by_id() {
         registry.insert(id.to_string(), terminal_job(id, "2020-01-01T00:00:00Z"));
     }
 
-    evict_oldest_terminal_jobs_over_cap(&mut registry, 3, PROTECT_NONE);
+    evict_oldest_terminal_jobs_over_cap(&mut registry, 3, PROTECT_NONE, CUTOFF_EVICT_ALL);
 
     assert_eq!(registry.len(), 3);
     assert!(
@@ -228,7 +232,7 @@ fn never_evicts_the_job_whose_transition_triggered_the_eviction() {
         registry.insert(id.to_string(), terminal_job(id, "2020-01-01T00:00:00Z"));
     }
 
-    evict_oldest_terminal_jobs_over_cap(&mut registry, 3, "job-a");
+    evict_oldest_terminal_jobs_over_cap(&mut registry, 3, "job-a", CUTOFF_EVICT_ALL);
 
     assert!(
         registry.contains_key("job-a"),
@@ -242,30 +246,69 @@ fn never_evicts_the_job_whose_transition_triggered_the_eviction() {
     assert_eq!(registry.len(), 3);
 }
 
+/// The retention grace (PR #229 round-5 review): terminal jobs younger
+/// than the cutoff are never eviction candidates, even when the terminal
+/// count is over cap — the registry deliberately stays over cap until they
+/// age out. Also pins the mixed case: aged entries are still trimmed while
+/// fresh ones survive.
+#[test]
+fn never_evicts_terminal_jobs_within_the_retention_grace() {
+    let mut registry: HashMap<String, IndexJob> = HashMap::new();
+    // Three aged jobs (before the cutoff) and three fresh ones (at/after
+    // the cutoff — a burst that just completed).
+    for (id, at) in [
+        ("aged-a", "2020-01-01T00:00:00Z"),
+        ("aged-b", "2020-01-02T00:00:00Z"),
+        ("aged-c", "2020-01-03T00:00:00Z"),
+        ("fresh-a", "2020-06-01T00:00:00Z"),
+        ("fresh-b", "2020-06-01T00:00:01Z"),
+        ("fresh-c", "2020-06-01T00:00:02Z"),
+    ] {
+        registry.insert(id.to_string(), terminal_job(id, at));
+    }
+    let cutoff = "2020-06-01T00:00:00Z"; // fresh-* are >= cutoff → protected
+
+    // Cap 1 with 6 terminal entries: overflow is 5, but only the three
+    // aged entries are candidates — the registry stays over cap rather
+    // than touching anything within the grace.
+    evict_oldest_terminal_jobs_over_cap(&mut registry, 1, PROTECT_NONE, cutoff);
+
+    assert!(
+        !registry.contains_key("aged-a")
+            && !registry.contains_key("aged-b")
+            && !registry.contains_key("aged-c"),
+        "aged entries must still be trimmed"
+    );
+    for id in ["fresh-a", "fresh-b", "fresh-c"] {
+        assert!(
+            registry.contains_key(id),
+            "a terminal job within the retention grace must never be evicted \
+             ({id} was) — over-cap is deliberate until entries age out"
+        );
+    }
+    assert_eq!(registry.len(), 3, "over cap by the fresh burst, by design");
+}
+
 // ---------------------------------------------------------------------------
-// Wiring: the real MAX_TERMINAL_JOBS cap, through JobQueue::submit
+// Wiring: the real constants, through JobQueue::submit
 // ---------------------------------------------------------------------------
 
-/// Proves eviction is actually wired into `process_job`'s terminal-write
-/// path (not just correct in isolation), and that `get_job` on an evicted
-/// id returns `None` — the direct, guaranteed consequence of eviction
-/// removing the registry entry `get_job` reads from.
-///
-/// Can't assert *which* specific ids were evicted: `completed_at` is a
-/// fixed constant under `#[cfg(test)]` (see this module's doc comment), so
-/// every job submitted here ties on the primary sort key, and the id
-/// tie-break (PR #229 round-3 review) — while deterministic given the ids —
-/// doesn't map to submission order for jobs whose ULIDs share a millisecond
-/// (the random component decides within one ms). What *is* deterministic
-/// regardless: the terminal count never exceeds the cap, and exactly the
-/// overflow amount of ids become unresolvable via `get_job` once every
-/// submitted job has settled. The tie-break's id-ordering itself is pinned
-/// by the pure-function tests above, where ids are hand-chosen.
+/// Proves the production wiring of the retention grace (PR #229 round-5
+/// review): a burst of completions past `MAX_TERMINAL_JOBS` evicts
+/// *nothing*, because every job just completed and is inside
+/// `TERMINAL_RETENTION_GRACE_SECS`. This is the guarantee that closes the
+/// submit→first-attach gap — a daemon client that just got its job id from
+/// `POST /v1/jobs` can always still resolve it via `GET /v1/jobs/{id}`
+/// (or subscribe) on its first request, no matter how many other jobs
+/// completed in between; an in-flight `run_worker` teardown can therefore
+/// never 404 a freshly-submitted job's poll fallback. Aged-entry trimming
+/// at the cap is pinned by the pure-function tests above (a real test of
+/// it here would need a minute-long wait — non-deterministic timing, per
+/// #181's deterministic-tests rule).
 #[tokio::test]
-async fn eviction_caps_the_registry_and_get_job_returns_none_for_evicted_jobs() {
+async fn fresh_terminal_burst_past_the_cap_is_fully_retained_and_resolvable() {
     let queue = JobQueue::new();
-    let overflow = 5;
-    let total = MAX_TERMINAL_JOBS + overflow;
+    let total = MAX_TERMINAL_JOBS + 5;
 
     let mut ids = Vec::with_capacity(total);
     for i in 0..total {
@@ -276,18 +319,15 @@ async fn eviction_caps_the_registry_and_get_job_returns_none_for_evicted_jobs() 
         ids.push(job.id);
     }
 
-    // Every submitted job must settle (Done, since `ok_job` never fails) —
-    // bounded poll per id, mirroring `wait_for_done`'s own deadline
-    // discipline, but tolerating that some ids may already be evicted
-    // (and so unresolvable) by the time we get to checking them.
+    // Every submitted job must settle (Done, since `ok_job` never fails).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
         let jobs = queue.list_jobs().await;
-        let still_running = jobs
-            .iter()
-            .filter(|j| !matches!(j.state, IndexJobState::Done | IndexJobState::Failed))
-            .count();
-        if still_running == 0 {
+        let all_settled = jobs.len() == total
+            && jobs
+                .iter()
+                .all(|j| matches!(j.state, IndexJobState::Done | IndexJobState::Failed));
+        if all_settled {
             break;
         }
         if std::time::Instant::now() > deadline {
@@ -296,32 +336,19 @@ async fn eviction_caps_the_registry_and_get_job_returns_none_for_evicted_jobs() 
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
-    let final_jobs = queue.list_jobs().await;
-    assert_eq!(
-        final_jobs.len(),
-        MAX_TERMINAL_JOBS,
-        "the registry must never hold more than MAX_TERMINAL_JOBS terminal jobs"
-    );
-
-    let mut missing = 0;
+    // Nothing evicted: all `total` jobs completed within the grace window
+    // (this test runs in seconds, the grace is 60s), so the registry is
+    // deliberately over cap and every single id — including the ones whose
+    // completion pushed the count past MAX_TERMINAL_JOBS — still resolves.
     for id in &ids {
-        if queue.get_job(id).await.is_none() {
-            missing += 1;
-        }
+        assert!(
+            queue.get_job(id).await.is_some(),
+            "job {id} completed within the retention grace and must still \
+             be resolvable via get_job"
+        );
     }
-    assert_eq!(
-        missing, overflow,
-        "exactly the overflow amount of submitted jobs must now be unresolvable via get_job \
-         (evicted), regardless of which specific ones the tie-break picked"
-    );
 
-    // Sanity: `wait_for_done` on a *surviving* id still resolves normally —
-    // eviction didn't corrupt the registry for jobs it left alone. Any
-    // entry still in `final_jobs` is, by definition, a survivor.
-    let surviving_id = final_jobs
-        .first()
-        .map(|j| j.id.clone())
-        .expect("at least one job must have survived eviction");
-    let done = wait_for_done(&queue, &surviving_id).await;
+    // Sanity: a resolved entry is a normal, fully-formed terminal job.
+    let done = wait_for_done(&queue, &ids[0]).await;
     assert_eq!(done.state, IndexJobState::Done);
 }

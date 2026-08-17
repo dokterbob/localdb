@@ -286,8 +286,16 @@ later if a consumer demands it).
   terminal (`done`/`failed`) jobs it retains at `MAX_TERMINAL_JOBS` (200, `server::job_queue`) —
   once a terminal write pushes the terminal count over the cap, the oldest terminal jobs by
   `completed_at` are evicted first, so `GET /jobs` never grows unbounded in a long-running daemon.
-  No pagination on `GET /jobs` this round — the bounded terminal set makes it unnecessary; this may
-  be revisited if the cap itself is ever made configurable/larger.
+  Jobs terminal for less than a retention grace (`TERMINAL_RETENTION_GRACE_SECS`, 60s) are never
+  evicted, even over the cap — a client that just received its id from `POST /jobs` must always be
+  able to resolve it on its first `GET /jobs/{id}`/`GET /jobs/{id}/events` request, even if the job
+  completed (and a burst of other completions landed) before that request arrived; the cap is
+  therefore a target the registry returns to as entries age past the grace, not a hard ceiling
+  during a burst.
+  No pagination on `GET /jobs` this round — the response stays bounded anyway: the non-terminal set
+  is capped by the per-store in-flight guard (at most one `pending`/`running` job per store), and
+  the terminal set by the cap plus at most one grace window's worth of burst; this may be revisited
+  if the cap itself is ever made configurable/larger.
   Store records (`GET/POST /stores`, `GET /stores/{name}`) include `id` alongside
   `name`/`visibility`/`backend`. Despite the `{name}` path param, stores are still looked up and
   returned with their `id` intact — `{name}` is only how the route addresses _which_ store, not a
