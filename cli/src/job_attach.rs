@@ -733,6 +733,19 @@ mod tests {
     /// instead).
     #[tokio::test]
     async fn run_embedded_store_job_warns_and_continues_on_an_invalid_chunker_preset() {
+        // Held for the rest of this test (issue #218-followups fallout):
+        // this test drives a real `embed::create_embedder` build as a side
+        // effect of the call below, incrementing the same process-wide
+        // `EMBEDDER_BUILD_COUNT` that
+        // `cmds::source::tests::source_add_across_two_stores_builds_embedder_once`
+        // measures — without this lock, `cargo test`'s default parallel
+        // execution can interleave that increment into the other test's
+        // measurement window. See `EMBEDDER_BUILD_COUNT_TEST_LOCK`'s doc
+        // comment in `cmds::index`.
+        let _embedder_count_guard = crate::cmds::index::EMBEDDER_BUILD_COUNT_TEST_LOCK
+            .lock()
+            .await;
+
         let (_dir, config_loader, db, ctx) = test_config_and_db().await;
         run_store_add_async(&ctx, "docs").await;
         let store = db

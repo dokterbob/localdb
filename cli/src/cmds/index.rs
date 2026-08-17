@@ -92,12 +92,35 @@ impl IndexErrorMode {
 /// embedder is built once across an N-store run, not once per store (Codex
 /// review round 2, finding 6). Compiled out entirely in non-test builds.
 ///
-/// Shared per test binary, so it's only safe to assert on because no other
-/// test in this crate currently drives `run_embedded_store_job`'s
-/// embedder-construction path concurrently; a test reading it resets the
-/// counter to 0 immediately before exercising the call it's measuring.
+/// Shared per test binary (a process-wide `static`), so more than one test
+/// touching it must never run concurrently — `cargo test`'s default. Two
+/// tests do today: `cmds::source::tests::source_add_across_two_stores_builds_embedder_once`
+/// (resets it, drives a real 2-store `source add`, asserts exactly one
+/// build) and `job_attach::tests::run_embedded_store_job_warns_and_continues_on_an_invalid_chunker_preset`
+/// (drives one real build as a side effect, without itself reading the
+/// counter). Both must hold [`EMBEDDER_BUILD_COUNT_TEST_LOCK`] for their
+/// entire counter-sensitive critical section — see its doc comment for why
+/// this file was the wrong place to *stop* being safe against interleaving
+/// once a second such test existed (issue #218-followups fallout: this
+/// stale "no other test" claim was exactly how that regression slipped
+/// through — the counter itself was never wrong, the missing exclusion
+/// between tests was).
 #[cfg(test)]
 pub(crate) static EMBEDDER_BUILD_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Serializes every test that touches [`EMBEDDER_BUILD_COUNT`] against each
+/// other (issue #218-followups fallout). An async-aware mutex, not
+/// `std::sync::Mutex`: the critical section each test needs spans real
+/// `.await` points (the auto-index run itself), and holding a blocking
+/// `std::sync::MutexGuard` across an `.await` is exactly what
+/// `clippy::await_holding_lock` (enabled workspace-wide) exists to catch —
+/// this crate's tests should not need an `#[allow]` to stay
+/// interleaving-safe. Each `#[tokio::test]` gets its own dedicated runtime,
+/// so awaiting this lock from one test only ever waits on *another test's*
+/// guard, never risks a single-runtime self-deadlock.
+#[cfg(test)]
+pub(crate) static EMBEDDER_BUILD_COUNT_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
 
 /// A single store's index outcome, paired with its name — the unit the
 /// summary renderers below combine and format. Kept separate from

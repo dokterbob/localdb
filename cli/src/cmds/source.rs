@@ -1398,6 +1398,8 @@ mod tests {
 
     /// `source add` scoped to two stores must build the (potentially ~706 MB
     /// local) embedder once for the whole request, not once per store.
+    /// Holds `EMBEDDER_BUILD_COUNT_TEST_LOCK` for its whole body (issue
+    /// #218-followups fallout) — see that lock's doc comment.
     ///
     /// Drives `run_source_add_async` end to end against a real temp DB/config
     /// (provider `fake`, so it's fully offline and cheap) and asserts on
@@ -1411,10 +1413,21 @@ mod tests {
     /// exactly as `run_index_async` already does for `localdb index`.
     #[tokio::test]
     async fn source_add_across_two_stores_builds_embedder_once() {
-        use crate::cmds::index::EMBEDDER_BUILD_COUNT;
+        use crate::cmds::index::{EMBEDDER_BUILD_COUNT, EMBEDDER_BUILD_COUNT_TEST_LOCK};
         use crate::cmds::store::run_store_add_async;
         use std::sync::atomic::Ordering;
         use tempfile::TempDir;
+
+        // Held for the rest of this test (issue #218-followups fallout):
+        // `job_attach::tests::run_embedded_store_job_warns_and_continues_on_an_invalid_chunker_preset`
+        // also drives a real embedder build and shares this same
+        // process-wide counter — without this lock, `cargo test`'s default
+        // parallel execution can interleave that test's increment into
+        // this one's measurement window (observed: count == 2 instead of
+        // 1, indistinguishable from the real per-store-rebuild regression
+        // this test exists to catch). See `EMBEDDER_BUILD_COUNT_TEST_LOCK`'s
+        // doc comment.
+        let _embedder_count_guard = EMBEDDER_BUILD_COUNT_TEST_LOCK.lock().await;
 
         let dir = TempDir::new().unwrap();
         let note_path = dir.path().join("note.md");
@@ -1443,10 +1456,9 @@ mod tests {
         run_store_add_async(&base_ctx, "a").await;
         run_store_add_async(&base_ctx, "b").await;
 
-        // Reset just before the call under test: no other test in this crate
-        // currently drives `run_embedded_index_with`'s embedder-construction
-        // path, so this is safe against `cargo test`'s parallel test threads
-        // (see the counter's doc comment).
+        // Reset just before the call under test: safe against `cargo
+        // test`'s parallel test threads only because `_embedder_count_guard`
+        // above excludes the one other counter-touching test.
         EMBEDDER_BUILD_COUNT.store(0, Ordering::SeqCst);
 
         let add_ctx = CliContext {
