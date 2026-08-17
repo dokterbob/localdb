@@ -38,6 +38,19 @@ pub struct UrlRefreshRecord {
     pub interval: Option<Duration>,
     /// Time of the last successful refresh.
     pub last_refreshed: Option<Instant>,
+    /// A refresh job for this source has been submitted and its completion
+    /// watcher has not yet stamped `last_refreshed` (PR #229 round-7
+    /// review). `tick` skips sources with this set: `last_refreshed` is
+    /// only written by the detached watcher task *after* the job's terminal
+    /// transition, and the job queue's per-store in-flight guard is
+    /// released *before* that watcher gets to run — so without this flag, a
+    /// tick landing in that window would see a stale timestamp and a free
+    /// guard, and resubmit immediately, defeating the full-interval backoff
+    /// a completed (or cancelled) refresh is supposed to buy. Set on
+    /// successful submit, cleared by the watcher in the same write that
+    /// stamps the timestamp; a failed submit never sets it (the next tick
+    /// should retry, as before).
+    pub refresh_inflight: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -110,6 +123,7 @@ impl UrlRefreshScheduler {
             url,
             interval: interval_secs.map(Duration::from_secs),
             last_refreshed: None,
+            refresh_inflight: false,
         };
         let mut records = self.records.write().await;
         records.insert(source_id, record);
@@ -140,6 +154,15 @@ impl UrlRefreshScheduler {
         {
             let records = self.records.read().await;
             for record in records.values() {
+                // A source whose previous refresh hasn't been stamped yet is
+                // never due, regardless of its timestamp (PR #229 round-7
+                // review — see `refresh_inflight`'s doc comment): the stamp
+                // lands after the job queue's in-flight guard is already
+                // released, so the guard alone can't suppress a resubmit in
+                // that window.
+                if record.refresh_inflight {
+                    continue;
+                }
                 if let Some(interval) = record.interval {
                     let is_due = match record.last_refreshed {
                         None => true,
@@ -236,6 +259,20 @@ impl UrlRefreshScheduler {
                     // in `job_queue.rs`) regardless of *how* the job got
                     // there: normal completion, a real failure, or
                     // cancellation all stamp the same way now.
+                    // Suppress this source before the watcher below exists
+                    // to clear it (PR #229 round-7 review): from here until
+                    // the watcher stamps, `tick` must not consider the
+                    // source due — the queue's own in-flight guard stops
+                    // covering it the moment `process_job` finishes, which
+                    // can be before the watcher ever runs. Serial `tick`s
+                    // (one `run` loop) mean no due-check can interleave
+                    // between the submit above and this write.
+                    {
+                        let mut records = self.records.write().await;
+                        if let Some(r) = records.get_mut(&record.source_id) {
+                            r.refresh_inflight = true;
+                        }
+                    }
                     let queue_for_wait = self.queue.clone();
                     let records_for_wait = self.records.clone();
                     let source_id_for_wait = record.source_id.clone();
@@ -252,10 +289,15 @@ impl UrlRefreshScheduler {
                         // does. Only touch the record if it's still
                         // registered: the source may have been
                         // unregistered mid-flight, and completion must
-                        // never re-insert a removed record.
+                        // never re-insert a removed record. Clearing
+                        // `refresh_inflight` in the same write as the stamp
+                        // means `tick` always sees either "suppressed" or
+                        // "freshly stamped", never the stale-timestamp gap
+                        // between them (PR #229 round-7 review).
                         let mut records = records_for_wait.write().await;
                         if let Some(r) = records.get_mut(&source_id_for_wait) {
                             r.last_refreshed = Some(Instant::now());
+                            r.refresh_inflight = false;
                         }
                     });
                 }
@@ -622,6 +664,64 @@ mod tests {
         // The stamp lands asynchronously (a separate task, woken by the
         // same terminal transition) — poll for it with its own deadline.
         wait_for_last_refreshed_stamp(&scheduler, "src-timing").await;
+    }
+
+    /// PR #229 round-7 review: a source whose refresh job has been
+    /// submitted but whose completion watcher has not yet stamped
+    /// `last_refreshed` is never due — even when its timestamp is stale
+    /// and the job queue would accept a submission. The queue's per-store
+    /// in-flight guard is released by `process_job` *before* the watcher
+    /// task gets scheduled, so the guard alone cannot suppress a resubmit
+    /// in that window; `refresh_inflight` must. Stages the window directly
+    /// (flag set, queue empty, timestamp stale) — the real interleaving
+    /// depends on task scheduling order and can't be forced
+    /// deterministically, but the flag's set/clear wiring is covered by
+    /// the stamp-lifecycle tests around this one.
+    #[tokio::test]
+    async fn tick_skips_sources_with_an_unstamped_inflight_refresh() {
+        let queue = JobQueue::new();
+        let scheduler = UrlRefreshScheduler::new(queue.clone());
+        scheduler
+            .register(
+                "src-window".to_string(),
+                "store-W".to_string(),
+                "https://example.com/".to_string(),
+                Some(0),
+            )
+            .await;
+
+        // The exact race window: a previous refresh was submitted
+        // (`refresh_inflight` set by `tick`), its job has fully left the
+        // queue (guard released — the queue is empty), and the watcher has
+        // not yet stamped (`last_refreshed` still `None`, maximally stale).
+        {
+            let mut records = scheduler.records.write().await;
+            records.get_mut("src-window").unwrap().refresh_inflight = true;
+        }
+
+        scheduler.tick().await;
+
+        assert_eq!(
+            queue.list_jobs().await.len(),
+            0,
+            "a tick in the unstamped-inflight window must not submit a refresh"
+        );
+
+        // Watcher completion: stamp + clear in one write, exactly as the
+        // real watcher does. With interval 0 the source is immediately due
+        // again by timestamp — the next tick may submit normally.
+        {
+            let mut records = scheduler.records.write().await;
+            let r = records.get_mut("src-window").unwrap();
+            r.last_refreshed = Some(Instant::now());
+            r.refresh_inflight = false;
+        }
+        scheduler.tick().await;
+        assert_eq!(
+            queue.list_jobs().await.len(),
+            1,
+            "once stamped and cleared, a due source submits normally again"
+        );
     }
 
     /// #187 review F1: a failed job must still be stamped with
