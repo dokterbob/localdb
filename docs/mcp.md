@@ -3,7 +3,7 @@
 localdb ships an MCP server that exposes your indexed stores to any MCP-capable AI agent (Claude
 Desktop, Claude Code, custom agents). It's built on the official [`rmcp`](https://docs.rs/rmcp) SDK
 and speaks the [MCP 2025-06-18 protocol](https://modelcontextprotocol.io/). Two transports are
-available, both serving the same four read-only tools:
+available, both serving the same five read-only tools:
 
 - **Stdio** (`localdb mcp`) — the default, no daemon required.
 - **HTTP** (`/mcp`, mounted on a running `localdb serve` daemon) — for connecting a remote MCP
@@ -57,7 +57,7 @@ claude mcp add localdb -- localdb mcp --config /path/to/config.yaml
 
 ### Remote / HTTP — connecting from another machine
 
-If you run `localdb serve`, it mounts the same four MCP tools at `/mcp` alongside its `/v1` REST
+If you run `localdb serve`, it mounts the same five MCP tools at `/mcp` alongside its `/v1` REST
 API. This is how to point an MCP client at localdb running on a different machine — e.g. a home
 server reachable over Tailscale, or a NAS on your LAN.
 
@@ -125,10 +125,10 @@ reads to its client as broken rather than as empty.
 
 The scope is enforced in both process modes, by different mechanisms:
 
-| Mode                 | How                                                                                                                                                                                                                                                                                          |
-| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Embedded (no daemon) | Only the scoped stores are opened. Nothing else is reachable because nothing else exists in the process.                                                                                                                                                                                     |
-| Daemon-proxied       | The scope is applied to every relayed `tools/call`: `search`'s `stores` and `get_document`/`get_chunks`'s `store` arguments are filled in when absent and rejected when they name a store outside the scope, and `list_stores` is filtered so out-of-scope stores cannot even be enumerated. |
+| Mode                 | How                                                                                                                                                                                                                                                                                                                                                                                                            |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Embedded (no daemon) | Only the scoped stores are opened. Nothing else is reachable because nothing else exists in the process.                                                                                                                                                                                                                                                                                                       |
+| Daemon-proxied       | The scope is applied to every relayed `tools/call`: `search`'s `stores` and `get_document`/`get_chunks`/`list_documents`'s `store` arguments are filled in (or, for `get_document`/`get_chunks`/`list_documents`, tried against each scoped store in turn) when absent, and rejected when they name a store outside the scope, and `list_stores` is filtered so out-of-scope stores cannot even be enumerated. |
 
 Proxied mode has to work through tool arguments because there is no transport-level channel: rmcp's
 HTTP service factory is a synchronous `Fn()` with no access to the request, so neither
@@ -146,7 +146,7 @@ An out-of-scope store name comes back as an ordinary tool-level error:
 }
 ```
 
-While the tool set is fixed at four read-only tools, a scoped session relays only those four; any
+While the tool set is fixed at five read-only tools, a scoped session relays only those five; any
 other tool name is rejected, so a future mutating tool cannot slip through unscoped on the day it
 lands.
 
@@ -161,7 +161,7 @@ lands.
 
 ## Tools
 
-The server exposes four read-only tools. Write tools are reserved for a future `--allow-write`
+The server exposes five read-only tools. Write tools are reserved for a future `--allow-write`
 release.
 
 **`--allow-write` currently has no effect.** v1 registers no mutating tool on any transport, so the
@@ -567,6 +567,92 @@ List all available stores with their names, visibility, and document/chunk count
   }
 }
 ```
+
+---
+
+### `list_documents`
+
+List every document registered in a store, optionally filtered to a source, paginated by
+offset/limit. Use this to enumerate what's indexed without going through `search`.
+
+**Input schema:**
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "store": {
+      "description": "Store id or name to list documents from",
+      "type": "string"
+    },
+    "source": {
+      "default": null,
+      "description": "Optional source id to restrict the listing to",
+      "type": ["string", "null"]
+    },
+    "offset": {
+      "default": null,
+      "description": "Number of documents to skip before the first returned document (default: 0)",
+      "format": "int64",
+      "minimum": 0,
+      "type": ["integer", "null"]
+    },
+    "limit": {
+      "default": null,
+      "description": "Maximum number of documents to return (default: 50, max: 200)",
+      "format": "int64",
+      "maximum": 200,
+      "minimum": 1,
+      "type": ["integer", "null"]
+    }
+  },
+  "required": ["store"],
+  "type": "object"
+}
+```
+
+> Unlike `search`'s `stores` and `get_document`'s/`get_chunks`'s `store`, `store` here is
+> **required** — listing is inherently a single-store operation, so there is no "scan every
+> available store" default. An unknown store id/name returns `store_not_found`, resolved the same
+> way as `search`'s `stores` argument. An unknown `source` id is a pure filter — it yields an empty
+> `documents` list, not an error.
+
+**Example call:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 9,
+  "method": "tools/call",
+  "params": {
+    "name": "list_documents",
+    "arguments": { "store": "notes" }
+  }
+}
+```
+
+**Example result:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 9,
+  "result": {
+    "isError": false,
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"store\": {\n    \"id\": \"01KTVGQ62TQN8X6XN9E5FDZN67\",\n    \"name\": \"notes\"\n  },\n  \"total\": 1,\n  \"offset\": 0,\n  \"limit\": 50,\n  \"returned\": 1,\n  \"documents\": [\n    {\n      \"store_id\": \"01KTVGQ62TQN8X6XN9E5FDZN67\",\n      \"id\": \"5e16a53946004c13b941685cddaed55d9267965abe65462bbe75d8e6184f15e7\",\n      \"source_id\": \"01KTVH6AY4DC84HWW7M2PP4F0X\",\n      \"ingestor_kind\": \"file\",\n      \"uri\": \"file:///home/user/notes/meeting.txt\",\n      \"title\": null,\n      \"mime\": \"text/plain\",\n      \"content_hash\": \"226aa53267d613baa9aaf444cf661ef20a2e9d8e1e9d140819ee2f7044320e4b\",\n      \"fetched_at\": \"2026-06-11T14:17:30Z\",\n      \"origin_store\": \"01KTVGQ62TQN8X6XN9E5FDZN67\",\n      \"policy_version\": \"...\",\n      \"metadata\": { \"kind\": \"document\", \"format\": \"text/plain\", \"...\": \"...\" }\n    }\n  ]\n}"
+      }
+    ]
+  }
+}
+```
+
+Each entry in `documents` is the document registry row (`DocumentInfo`) serialized verbatim — the
+same shape `GET /v1/stores/{name}/documents` returns per item (see
+[docs/http-api.md](http-api.md#get-v1storesnamedocuments)) — not the `get_document` tool's shape
+(which adds `chunk_count`/`text` and omits `mime`/`ingestor_kind`/`origin_store`/`policy_version`).
 
 ---
 
