@@ -32,6 +32,7 @@ Single binary, subcommand tree. Global flags: `--config`, `--json`, `--store <na
 | `db downgrade [--to N]`                                    | Reverse migrations down to version `N` (default: one step) using stored down-SQL; requires confirmation; refuses cleanly on a step with `down_unsupported_reason`; not store-scoped, `-s` is rejected, exit 2 (§2.2)                                                                                                                                                                                                                                                                           | direct write                                                                                              | error `daemon_running`                                                                                                                                                                                                                                                                                |
 | `db vacuum`                                                | Reclaim disk space a prior migration or bulk delete freed onto SQLite's free list but never returned to the file (e.g. after `db migrate` runs the v6 `shrink_vector_index` step) by running `VACUUM`; data-preserving, no confirmation prompt, but warns that it needs roughly the store's current size again in free disk space and can take minutes on a large store; not store-scoped, `-s` is rejected, exit 2 (§2.2)                                                                     | direct write                                                                                              | error `daemon_running`                                                                                                                                                                                                                                                                                |
 | `job cancel <id>`                                          | Request cancellation of a queued or running job on a daemon's job queue (issue #218); daemon-only — no embedded equivalent, so it always requires a running daemon and `-s` is rejected, exit 2 (§2.2). Exit 0 cancellation requested (`202` + the job's snapshot), exit 3 unknown job id, exit 4 job already reached a terminal state                                                                                                                                                          | n/a — exit 5 (`daemon_unreachable`) without a running daemon                                              | `DELETE /v1/jobs/{id}`                                                                                                                                                                                                                                                                                 |
+| `job list`                                                 | List every job on a daemon's job queue, regardless of state or store; daemon-only like `job cancel` — `-s` is rejected, exit 2 (§2.2). Table columns: id, store, state, error_code, created_at; `--json` emits the raw `IndexJob[]` array `GET /v1/jobs` returns                                                                                                                                                                                                    | n/a — exit 5 (`daemon_unreachable`) without a running daemon                                              | `GET /v1/jobs`                                                                                                                                                                                                                                                                                          |
 
 Output: human-readable by default (citations as `uri:heading_path` + snippet), `--json` emits the
 canonical structures for scripting. The CLI is **command-oriented**; interactive browse is a roadmap
@@ -276,8 +277,25 @@ later if a consumer demands it).
 - **Resources** (`/v1`): `GET/POST /stores`, `GET/PATCH/DELETE /stores/{name}`,
   `GET/POST /stores/{name}/sources`, `POST /search` (body: query, store filter, metadata filters,
   limit; citations carry full `Metadata`), `GET /documents/{id}` (response includes
-  `metadata: Metadata`), `POST /jobs` (index requests), `GET/DELETE /jobs/{id}` (the latter cancels,
-  issue #218), `GET /jobs/{id}/events` (SSE, below), `GET /status`, `GET /config` (resolved config).
+  `metadata: Metadata`), `GET/POST /jobs` (the former lists every job regardless of state or
+  store; the latter submits an index request), `GET/DELETE /jobs/{id}` (the
+  latter cancels, issue #218), `GET /jobs/{id}/events` (SSE, below), `GET /status`, `GET /config`
+  (resolved config).
+  **Jobs are ephemeral operational records with bounded retention, not history**: the registry
+  keeps every `pending`/`running` job, but caps how many
+  terminal (`done`/`failed`) jobs it retains at `MAX_TERMINAL_JOBS` (200, `server::job_queue`) —
+  once a terminal write pushes the terminal count over the cap, the oldest terminal jobs by
+  `completed_at` are evicted first, so `GET /jobs` never grows unbounded in a long-running daemon.
+  Jobs terminal for less than a retention grace (`TERMINAL_RETENTION_GRACE_SECS`, 60s) are never
+  evicted, even over the cap — a client that just received its id from `POST /jobs` must always be
+  able to resolve it on its first `GET /jobs/{id}`/`GET /jobs/{id}/events` request, even if the job
+  completed (and a burst of other completions landed) before that request arrived; the cap is
+  therefore a target the registry returns to as entries age past the grace — trimmed on the next
+  terminal write or `GET /jobs` read, whichever comes first — not a hard ceiling during a burst.
+  No pagination on `GET /jobs` this round — the response stays bounded anyway: the non-terminal set
+  is capped by the per-store in-flight guard (at most one `pending`/`running` job per store), and
+  the terminal set by the cap plus at most one grace window's worth of burst; this may be revisited
+  if the cap itself is ever made configurable/larger.
   Store records (`GET/POST /stores`, `GET /stores/{name}`) include `id` alongside
   `name`/`visibility`/`backend`. Despite the `{name}` path param, stores are still looked up and
   returned with their `id` intact — `{name}` is only how the route addresses _which_ store, not a
@@ -313,7 +331,11 @@ later if a consumer demands it).
   separate code path. Clients
   poll `GET /jobs/{id}` for the current `IndexJob` (state `pending`/`running`/`done`/`failed`,
   `stats`, `error`, `error_code`, timestamps) or stream `GET /jobs/{id}/events` for live progress
-  (below). `error_code` (issue #187 review, finding 3) is the failing `core::Error`'s stable
+  (below). Because job records are ephemeral with bounded retention (above), `GET /jobs/{id}` for a
+  job id that has aged out past the terminal-job cap returns `404 job_not_found` — the same response
+  as an id that never existed; a client that stops polling a terminal job and comes back much later
+  should not assume a `404` means the id was invalid. `error_code` (issue #187 review, finding 3) is
+  the failing `core::Error`'s stable
   `code()` string (§5) when the job's `Failed` state came from a typed error — `null`/absent for a
   synthetic queue-level failure (the queue itself full/closed, or the job's task panicking) that
   never had one, and always absent on `done`. `error_code` + `error` round-trip through the same
@@ -336,13 +358,21 @@ later if a consumer demands it).
   `Error::from_code` (§5) exactly like any other typed job failure. This means every surface that
   already renders a `Failed` job (attach polling, SSE, `--json`) needs no changes to display a
   cancellation; the CLI's `job cancel` gets its own exit code (4) only because
-  `core::Error::JobCancelled`'s `exit_code()` says so, not because of any special-casing. A
-  cancellation racing normal completion always loses cleanly: the `409` above is returned instead of
-  the outcome being overwritten, so the job's recorded state always reflects what actually happened
-  first. Cancellation takes effect at the task's next `.await` yield point, not instantly — a
-  CPU-bound phase (parsing, embedding inference) runs to the end of its current operation before the
-  worker observes the cancellation, so a `202` may precede the terminal state by roughly the length
-  of that operation; deeper preemption of a blocking phase is a known follow-up, not implemented here.
+  `core::Error::JobCancelled`'s `exit_code()` says so, not because of any special-casing. **A `202`
+  is not a guarantee the job was actually interrupted**: `409` is
+  returned only when `JobQueue::cancel`'s own two registry reads (before and after triggering the
+  token) observe the job already terminal for a reason unrelated to this call — in that case the
+  recorded outcome is left untouched. Otherwise the call returns `202` and triggers the
+  cancellation token, but the job can still go on to reach `done`, or `failed` for an unrelated
+  reason, in the moment immediately after the response is sent — the HTTP response and the job's
+  eventual terminal state are decided independently, not atomically together. Callers must always
+  inspect the job's actual terminal state (`GET /jobs/{id}` or `GET /jobs/{id}/events`) rather than
+  assume a `202` implies the job stopped; only `error_code: "job_cancelled"` on that terminal state
+  confirms cancellation actually took effect. Cancellation takes effect at the task's next `.await`
+  yield point, not instantly — a CPU-bound phase (parsing, embedding inference) runs to the end of
+  its current operation before the worker observes the cancellation, so a `202` may precede the
+  terminal state by roughly the length of that operation; deeper preemption of a blocking phase is a
+  known follow-up, not implemented here.
 - **`GET /jobs/{id}/events`** (SSE, issue #83): streams the job's live progress as
   `text/event-stream`. Each in-flight update is an `event: progress` frame whose `data:` is one
   JSON-serialized `core::ProgressEvent` (internally tagged `type`: `source_started`, `discovered`,

@@ -7,7 +7,7 @@ use tempfile::TempDir;
 
 use crate::handlers::{
     cancel_job, create_job, create_source, create_store, delete_source, delete_store, get_config,
-    get_document, get_job, get_status, get_store, job_events, list_sources, list_stores,
+    get_document, get_job, get_status, get_store, job_events, list_jobs, list_sources, list_stores,
     patch_store, search,
 };
 use crate::state::AppState;
@@ -82,7 +82,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/v1/sources/{id}", delete(delete_source))
         .route("/v1/documents/{id}", get(get_document))
         .route("/v1/search", post(search))
-        .route("/v1/jobs", post(create_job))
+        .route("/v1/jobs", get(list_jobs).post(create_job))
         .route("/v1/jobs/{id}", get(get_job).delete(cancel_job))
         .route("/v1/jobs/{id}/events", get(job_events))
         .route("/v1/status", get(get_status))

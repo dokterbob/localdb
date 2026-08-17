@@ -63,7 +63,58 @@ async fn subscriber_observes_events_sent_via_the_tasks_progress_sink() {
         .expect("timed out waiting for progress event")
         .expect("channel closed before delivering the event");
     match event {
-        localdb_core::ProgressEvent::Discovered { total } => assert_eq!(total, 3),
+        crate::job_queue::JobEvent::Progress(localdb_core::ProgressEvent::Discovered { total }) => {
+            assert_eq!(total, 3)
+        }
         other => panic!("unexpected event: {other:?}"),
+    }
+}
+
+/// The channel's final message is always the job's terminal snapshot
+/// (`JobEvent::Terminal`) — a subscriber attached
+/// before completion reads the job's final state in-band, without ever
+/// touching the registry. This is what makes an attached consumer immune
+/// to terminal-job eviction (`MAX_TERMINAL_JOBS`): even if a burst of
+/// later completions evicts this job's registry entry before the
+/// subscriber polls, the terminal state still arrives through the channel.
+#[tokio::test]
+async fn subscriber_receives_terminal_snapshot_in_band_as_final_event() {
+    let queue = JobQueue::new();
+    let job = queue
+        .submit("store-1", IndexJobScope::Store, ok_job)
+        .await
+        .unwrap();
+
+    let mut rx = queue
+        .subscribe(&job.id)
+        .await
+        .expect("channel must exist for a freshly-submitted job");
+
+    // Drain until the channel closes; the last event received must be the
+    // terminal snapshot, in a terminal state, for this job.
+    let mut last = None;
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for the channel to deliver/close")
+        {
+            Ok(event) => last = Some(event),
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
+    match last {
+        Some(crate::job_queue::JobEvent::Terminal(terminal)) => {
+            assert_eq!(terminal.id, job.id);
+            assert!(
+                matches!(
+                    terminal.state,
+                    localdb_core::IndexJobState::Done | localdb_core::IndexJobState::Failed
+                ),
+                "in-band snapshot must be terminal, got {:?}",
+                terminal.state
+            );
+        }
+        other => panic!("channel's final event must be JobEvent::Terminal, got {other:?}"),
     }
 }

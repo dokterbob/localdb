@@ -60,6 +60,17 @@ use crate::daemon_client::{daemon_request_async, encode_path_segment, CliContext
 /// shared engine) and whether a job-level failure aborts the caller
 /// (`StrictExit`, `index`) or is swallowed into a warning
 /// (`WarnAndContinue`, `source add`'s auto-index).
+///
+/// Returns the job id alongside the summary —
+/// `Some(job.id)` whenever a job actually got submitted to the local queue,
+/// `None` on every early-return path above that (no sources to index, or a
+/// pre-flight embedder-build failure warned away under `WarnAndContinue`)
+/// where no job ever existed to have an id. Included unconditionally rather
+/// than gated behind daemon-only cancellability: it's freely available here
+/// (the local `JobQueue::submit` call already returns it) and useful for
+/// tracing/correlating a run's own log lines even though `localdb job
+/// cancel` itself only ever targets a *daemon's* queue, never this
+/// throwaway embedded one.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_embedded_store_job(
     ctx: &CliContext,
@@ -72,20 +83,20 @@ pub(crate) async fn run_embedded_store_job(
     mode: IndexErrorMode,
     embedder: &mut Option<Arc<dyn Embedder>>,
     progress_label: Option<&str>,
-) -> Result<IndexSummary, Error> {
+) -> Result<(IndexSummary, Option<String>), Error> {
     let sources = match job_exec::resolve_job_sources(db.backend(), &store_row.id, &scope).await {
         Ok(s) => s,
         Err(e) => {
             return if mode.warn() {
                 eprintln!("warning: cannot list sources for auto-index: {}", e);
-                Ok(IndexSummary::default())
+                Ok((IndexSummary::default(), None))
             } else {
                 Err(e)
             };
         }
     };
     if sources.is_empty() {
-        return Ok(IndexSummary::default());
+        return Ok((IndexSummary::default(), None));
     }
 
     let built_embedder = if let Some(e) = embedder.as_ref() {
@@ -109,7 +120,7 @@ pub(crate) async fn run_embedded_store_job(
                 let e = Error::from(e);
                 return if mode.warn() {
                     eprintln!("warning: cannot create embedder for auto-index: {}", e);
-                    Ok(IndexSummary::default())
+                    Ok((IndexSummary::default(), None))
                 } else {
                     Err(e)
                 };
@@ -151,22 +162,26 @@ pub(crate) async fn run_embedded_store_job(
             }
         })
         .await?;
+    let job_id = job.id.clone();
 
     let final_job = drive_embedded_job(queue, &job.id, ctx.json, progress_label).await;
-    finish_job(
+    let summary = finish_job(
         mode,
         "auto-index",
         final_job.state,
         final_job.stats,
         final_job.error,
         final_job.error_code,
-    )
+    )?;
+    Ok((summary, Some(job_id)))
 }
 
-/// Subscribe to `job_id`'s live progress on the local queue, feeding every
-/// event into the CLI's progress sink until the channel closes (the job has
-/// gone terminal — see `JobQueue`'s `EventRegistry` doc comment), then read
-/// back the terminal `IndexJob` from the registry.
+/// Subscribe to `job_id`'s live events on the local queue, feeding every
+/// progress event into the CLI's progress sink until the in-band terminal
+/// snapshot arrives ([`server::JobEvent::Terminal`]), and return that
+/// snapshot. Falls back to a registry read only
+/// when no channel exists anymore (the job raced to terminal before this
+/// subscribed) or on the defensive channel-closed-without-terminal path.
 async fn drive_embedded_job(
     queue: &JobQueue,
     job_id: &str,
@@ -177,15 +192,22 @@ async fn drive_embedded_job(
     if let Some(mut rx) = queue.subscribe(job_id).await {
         loop {
             match rx.recv().await {
-                Ok(event) => {
+                Ok(server::JobEvent::Progress(event)) => {
                     if let Some(s) = &sink {
                         s(event);
                     }
                 }
+                // The job's final state, delivered through the channel
+                // itself — no registry read, so terminal-job eviction
+                // (`MAX_TERMINAL_JOBS`) can never cost an attached CLI its
+                // result.
+                Ok(server::JobEvent::Terminal(job)) => return *job,
                 // Progress is lossy-tolerant by design (see `job_queue.rs`'s
                 // `EVENT_CHANNEL_CAPACITY` doc comment) — a lagging
                 // subscriber skips ahead rather than stalling.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                // Defensive: `subscribe`'s contract guarantees `Terminal`
+                // arrives before the close, so this should be unreachable.
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
@@ -241,6 +263,23 @@ fn emit_source_error(mode: IndexErrorMode, source_id: &str, err: SourceError<'_>
 /// submission failure, an attach failure, or a job that ends `Failed` is a
 /// hard `Err` under `StrictExit` (`index`) and a warned, defaulted
 /// `IndexSummary` under `WarnAndContinue` (`source add`'s auto-index, D3).
+///
+/// Prints the job id as soon as it's known —
+/// before attaching — since this is exactly the case
+/// `localdb job cancel <id>` can reach (unlike
+/// [`run_embedded_store_job`]'s throwaway local queue). Always to stderr
+/// (stdout must stay clean JSON under `--json`, matching every other
+/// progress-ish line this module emits via `crate::progress`), in a
+/// mode-appropriate shape: human mode gets `job <id> (cancel with: localdb
+/// job cancel <id>)`, `[label] `-prefixed when `progress_label` is `Some`
+/// (multi-store runs); `--json` mode gets one JSON line
+/// `{"job_id": "<id>"}` (plus a `"store"` field when `progress_label` is
+/// `Some`) — suppressing it entirely left `--json`
+/// callers with no way to learn the id until the job was already terminal.
+/// Also returned alongside the summary so the final `--json` document can
+/// surface it too — `None` only on the two early-return paths before a job
+/// id is ever known (a submission failure, or a malformed submission
+/// response).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_daemon_store_job(
     ctx: &CliContext,
@@ -250,7 +289,7 @@ pub(crate) async fn run_daemon_store_job(
     deletion: DeletionPolicy,
     mode: IndexErrorMode,
     progress_label: Option<&str>,
-) -> Result<IndexSummary, Error> {
+) -> Result<(IndexSummary, Option<String>), Error> {
     let mut body = serde_json::json!({ "store_name": store_name });
     if let Some(sid) = source_id {
         body["source_id"] = serde_json::Value::String(sid.to_string());
@@ -276,7 +315,7 @@ pub(crate) async fn run_daemon_store_job(
                     "warning: cannot submit auto-index job for store '{}': {}",
                     store_name, e
                 );
-                Ok(IndexSummary::default())
+                Ok((IndexSummary::default(), None))
             } else {
                 Err(e)
             };
@@ -291,12 +330,17 @@ pub(crate) async fn run_daemon_store_job(
             };
             return if mode.warn() {
                 eprintln!("warning: {}", e);
-                Ok(IndexSummary::default())
+                Ok((IndexSummary::default(), None))
             } else {
                 Err(e)
             };
         }
     };
+
+    eprintln!(
+        "{}",
+        pre_attach_job_id_line(ctx.json, &job_id, progress_label)
+    );
 
     let final_job = match attach_daemon_job(base_url, &job_id, ctx.json, progress_label).await {
         Ok(j) => j,
@@ -306,21 +350,53 @@ pub(crate) async fn run_daemon_store_job(
                     "warning: cannot attach to auto-index job '{}': {}",
                     job_id, e
                 );
-                Ok(IndexSummary::default())
+                // The job id itself is known even though attaching to it
+                // failed — unlike the two earlier early-return paths,
+                // where no job (and so no id) exists at all yet.
+                Ok((IndexSummary::default(), Some(job_id)))
             } else {
                 Err(e)
             };
         }
     };
 
-    finish_job(
+    let summary = finish_job(
         mode,
         &format!("auto-index job for store '{}'", store_name),
         final_job.state,
         final_job.stats,
         final_job.error,
         final_job.error_code,
-    )
+    )?;
+    Ok((summary, Some(job_id)))
+}
+
+/// The stderr line announcing a freshly-submitted daemon job's id, emitted
+/// before attaching blocks — the one moment
+/// `localdb job cancel <id>` is actionable.
+///
+/// Human mode: `job <id> (cancel with: localdb job cancel <id>)`,
+/// `[label] `-prefixed for multi-store runs. `--json` mode: one JSON line
+/// `{"job_id": "<id>"}`, plus a `"store"` field when
+/// a label is present — previously the id was suppressed entirely under
+/// `--json`, so a machine caller couldn't learn it until the job was
+/// already terminal (and possibly not at all, on the attach-failure paths
+/// where the final document carries no id). Stderr in both modes: stdout
+/// must stay one clean JSON document under `--json` (specs/05 §2.1).
+fn pre_attach_job_id_line(json_mode: bool, job_id: &str, progress_label: Option<&str>) -> String {
+    if json_mode {
+        let mut line = serde_json::json!({ "job_id": job_id });
+        if let Some(label) = progress_label {
+            line["store"] = serde_json::Value::String(label.to_string());
+        }
+        line.to_string()
+    } else {
+        let hint = format!("job {job_id} (cancel with: localdb job cancel {job_id})");
+        match progress_label {
+            Some(label) => format!("[{label}] {hint}"),
+            None => hint,
+        }
+    }
 }
 
 /// Attach to `job_id` on a running daemon until it reaches a terminal
@@ -557,6 +633,37 @@ mod tests {
     use crate::app_db::{load_config_scaffolded, open_app_db_or_exit};
     use crate::cmds::store::run_store_add_async;
 
+    /// `--json` mode must expose the submitted job
+    /// id on stderr *before* attach blocks — as one parseable JSON line —
+    /// or a machine caller can never reach `localdb job cancel <id>` in
+    /// time. Human mode keeps the pre-existing cancel hint verbatim.
+    #[test]
+    fn pre_attach_job_id_line_shapes() {
+        // JSON, single store: exactly {"job_id": ...}, parseable.
+        let line = pre_attach_job_id_line(true, "job-1", None);
+        let v: serde_json::Value = serde_json::from_str(&line).expect("must be valid JSON");
+        assert_eq!(v, serde_json::json!({ "job_id": "job-1" }));
+
+        // JSON, multi-store: a `store` field disambiguates, mirroring the
+        // human hint's `[label]` prefix.
+        let line = pre_attach_job_id_line(true, "job-2", Some("books"));
+        let v: serde_json::Value = serde_json::from_str(&line).expect("must be valid JSON");
+        assert_eq!(
+            v,
+            serde_json::json!({ "job_id": "job-2", "store": "books" })
+        );
+
+        // Human, both label shapes: pinned wording.
+        assert_eq!(
+            pre_attach_job_id_line(false, "job-3", None),
+            "job job-3 (cancel with: localdb job cancel job-3)"
+        );
+        assert_eq!(
+            pre_attach_job_id_line(false, "job-3", Some("books")),
+            "[books] job job-3 (cancel with: localdb job cancel job-3)"
+        );
+    }
+
     fn test_ctx() -> CliContext {
         CliContext {
             config: None,
@@ -656,7 +763,7 @@ mod tests {
             "expected SourceNotFound, got: {err:?}"
         );
 
-        let summary = run_embedded_store_job(
+        let (summary, job_id) = run_embedded_store_job(
             &ctx,
             &queue,
             &config_loader,
@@ -675,6 +782,10 @@ mod tests {
             IndexSummary::default(),
             "WarnAndContinue must swallow the same failure into a defaulted summary"
         );
+        assert_eq!(
+            job_id, None,
+            "no job was ever submitted for an unresolvable scope"
+        );
     }
 
     /// A source row with a preset the CLI itself never writes (always
@@ -689,6 +800,19 @@ mod tests {
     /// instead).
     #[tokio::test]
     async fn run_embedded_store_job_warns_and_continues_on_an_invalid_chunker_preset() {
+        // Held for the rest of this test:
+        // this test drives a real `embed::create_embedder` build as a side
+        // effect of the call below, incrementing the same process-wide
+        // `EMBEDDER_BUILD_COUNT` that
+        // `cmds::source::tests::source_add_across_two_stores_builds_embedder_once`
+        // measures — without this lock, `cargo test`'s default parallel
+        // execution can interleave that increment into the other test's
+        // measurement window. See `EMBEDDER_BUILD_COUNT_TEST_LOCK`'s doc
+        // comment in `cmds::index`.
+        let _embedder_count_guard = crate::cmds::index::EMBEDDER_BUILD_COUNT_TEST_LOCK
+            .lock()
+            .await;
+
         let (_dir, config_loader, db, ctx) = test_config_and_db().await;
         run_store_add_async(&ctx, "docs").await;
         let store = db
@@ -717,7 +841,7 @@ mod tests {
 
         let queue = JobQueue::new();
         let mut embedder: Option<Arc<dyn Embedder>> = None;
-        let summary = run_embedded_store_job(
+        let (summary, job_id) = run_embedded_store_job(
             &ctx,
             &queue,
             &config_loader,
@@ -740,6 +864,10 @@ mod tests {
         assert_eq!(
             summary, expected,
             "the invalid preset must count as exactly one source error, never abort the run"
+        );
+        assert!(
+            job_id.is_some(),
+            "a job did get submitted here (it just reported a per-source error)"
         );
     }
 
@@ -831,7 +959,7 @@ mod tests {
             "expected StoreNotFound, got: {err:?}"
         );
 
-        let summary = run_daemon_store_job(
+        let (summary, job_id) = run_daemon_store_job(
             &ctx,
             &base_url,
             "nonexistent-store",
@@ -843,6 +971,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(summary, IndexSummary::default());
+        assert_eq!(
+            job_id, None,
+            "submission itself failed, so no job id was ever assigned"
+        );
     }
 
     #[tokio::test]
@@ -1025,7 +1157,7 @@ mod tests {
             .jobs_post
             .push_back((202, r#"{"status":"accepted"}"#.to_string()));
         let base_url = spawn_mock_daemon(warn_responses).await;
-        let summary = run_daemon_store_job(
+        let (summary, job_id) = run_daemon_store_job(
             &ctx,
             &base_url,
             "store-x",
@@ -1037,6 +1169,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(summary, IndexSummary::default());
+        assert_eq!(
+            job_id, None,
+            "the malformed submission response never yielded a usable job id"
+        );
     }
 
     #[tokio::test]
@@ -1212,7 +1348,7 @@ mod tests {
         warn_responses.events.push_back((404, String::new()));
         warn_responses.poll.push_back((500, "boom".to_string()));
         let base_url = spawn_mock_daemon(warn_responses).await;
-        let summary = run_daemon_store_job(
+        let (summary, job_id) = run_daemon_store_job(
             &ctx,
             &base_url,
             "store-x",
@@ -1224,6 +1360,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(summary, IndexSummary::default());
+        assert_eq!(
+            job_id.as_deref(),
+            Some("job-5"),
+            "the job id is known even though attaching to it failed"
+        );
         // Both instances must have propagated the same underlying attach
         // failure (a daemon error surfaced from the failed poll), just
         // under different mode semantics.

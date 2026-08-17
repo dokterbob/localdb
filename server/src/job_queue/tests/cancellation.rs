@@ -13,7 +13,7 @@
 //! (a `oneshot` it either never sends, or sends only after asserting on the
 //! cancelled outcome).
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
@@ -112,10 +112,11 @@ async fn cancel_after_a_real_failure_returns_job_already_terminal_and_preserves_
 // ---------------------------------------------------------------------------
 
 /// A job still sitting in the queue when cancelled must never run its
-/// pipeline at all — not even one poll of its task future. Constructed
-/// deterministically: the queue has exactly one background worker
-/// (`job_queue.rs`'s module doc comment), so a first job parked on a gate
-/// this test controls guarantees a second submission (to a *different*
+/// pipeline at all — not even one poll of its task future, and not even a
+/// call to the task-building `FnOnce` itself.
+/// Constructed deterministically: the queue has exactly one background
+/// worker (`job_queue.rs`'s module doc comment), so a first job parked on a
+/// gate this test controls guarantees a second submission (to a *different*
 /// store — the in-flight guard is per-store, so this isn't what blocks it)
 /// stays `Pending` until the first job is released.
 #[tokio::test]
@@ -138,18 +139,24 @@ async fn pending_job_cancelled_before_the_worker_starts_it_never_runs_and_is_rec
 
     // Job 2: a distinct store (so the in-flight guard doesn't reject the
     // submission), guaranteed to still be sitting in the channel — the one
-    // worker is busy on job 1.
+    // worker is busy on job 1. `invoked` is set synchronously by the
+    // task-building `FnOnce` itself, *before* it returns the async block
+    // that increments `ran` — proving `process_job` never even calls
+    // `(queued.task)()` for a job cancelled before it starts (Fix B's
+    // atomic check-and-transition), not merely that the resulting future's
+    // body never ran (which `ran` alone already covered before this fix).
     let ran = Arc::new(AtomicUsize::new(0));
+    let invoked = Arc::new(AtomicBool::new(false));
     let ran_for_task = ran.clone();
+    let invoked_for_task = invoked.clone();
     let job2 = queue
-        .submit(
-            "store-2",
-            IndexJobScope::Store,
-            move |_progress| async move {
+        .submit("store-2", IndexJobScope::Store, move |_progress| {
+            invoked_for_task.store(true, Ordering::SeqCst);
+            async move {
                 ran_for_task.fetch_add(1, Ordering::SeqCst);
                 Ok(IndexJobStats::default())
-            },
-        )
+            }
+        })
         .await
         .unwrap();
     assert_eq!(
@@ -167,6 +174,10 @@ async fn pending_job_cancelled_before_the_worker_starts_it_never_runs_and_is_rec
 
     assert_eq!(done2.state, IndexJobState::Failed);
     assert_eq!(done2.error_code.as_deref(), Some("job_cancelled"));
+    assert!(
+        !invoked.load(Ordering::SeqCst),
+        "a pending job cancelled before the worker reached it must never even build its task future"
+    );
     assert_eq!(
         ran.load(Ordering::SeqCst),
         0,
@@ -288,6 +299,66 @@ async fn cancellation_preempts_a_never_resolving_await_point() {
     // failure mode if cancellation were merely cooperative here, since
     // nothing internal to `pending()` can ever wake this task up on its
     // own.
+    let done = wait_for_done(&queue, &job.id).await;
+    assert_eq!(done.state, IndexJobState::Failed);
+    assert_eq!(done.error_code.as_deref(), Some("job_cancelled"));
+}
+
+// ---------------------------------------------------------------------------
+// Publication-before-handle window
+// ---------------------------------------------------------------------------
+
+/// The exact scenario the bug report described: a client sees a job via
+/// `GET /v1/jobs`/`GET /jobs/{id}` (here, the `IndexJob` `submit` itself
+/// returns — the same registry entry) and cancels it immediately. Before
+/// `submit` was reordered to install the handle before the registry entry,
+/// this could land in a window where the registry showed the job
+/// non-terminal but no handle existed yet — `cancel` would silently report
+/// success (`Ok`, the ordinary "cancellation requested" case) without ever
+/// triggering the token, and the job went on to run normally.
+///
+/// Deterministic without controlling whether the worker has already
+/// dequeued the job or not by the time `cancel` runs (unlike the
+/// pending-cancel and running-cancel tests above, which each pin one of
+/// those cases via a blocking first job): the task is parked on a `oneshot`
+/// this test never sends, so if cancellation is a no-op — the bug this
+/// closes — `wait_for_done` below hangs until its own 5s deadline and
+/// panics, regardless of whether the race landed on the `Pending` or
+/// `Running` side. Either way, the only way this test can pass is if the
+/// task body genuinely never resumes past `gate_rx.await` — the same
+/// "never resumes" guarantee `running_job_cancelled_mid_task_...` above
+/// pins for the already-`Running` case, now also covered without needing
+/// to force it.
+#[tokio::test]
+async fn cancel_immediately_after_submit_always_triggers_never_silently_no_ops() {
+    let queue = JobQueue::new();
+
+    // Never sent — the only way out of this await is cancellation.
+    let (_gate_tx, gate_rx) = oneshot::channel::<()>();
+
+    let job = queue
+        .submit(
+            "store-1",
+            IndexJobScope::Store,
+            move |_progress| async move {
+                let _ = gate_rx.await;
+                #[allow(unreachable_code)]
+                Ok(IndexJobStats::default())
+            },
+        )
+        .await
+        .unwrap();
+
+    // Exactly the id a client would have learned from this same `IndexJob`
+    // (or, over HTTP, from the `GET /v1/jobs`/`GET /jobs/{id}` response
+    // that reads the same registry entry) — cancel it right away, with no
+    // synchronization forcing either the `Pending` or `Running` case.
+    let result = queue.cancel(&job.id).await;
+    assert!(
+        result.is_ok(),
+        "cancel immediately after submit must always find a handle to trigger, got: {result:?}"
+    );
+
     let done = wait_for_done(&queue, &job.id).await;
     assert_eq!(done.state, IndexJobState::Failed);
     assert_eq!(done.error_code.as_deref(), Some("job_cancelled"));

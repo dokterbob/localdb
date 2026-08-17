@@ -6405,9 +6405,32 @@ fn index_shape_parity_between_embedded_and_daemon_mock() {
         "text summary must be byte-identical between embedded and daemon-mock"
     );
     let daemon_v: serde_json::Value = serde_json::from_str(&daemon_json_stdout).unwrap();
+
+    // Both transports now surface a `job_id` —
+    // the embedded engine's own local queue id, the mock's fixed
+    // "job-parity" here — but by construction these are two genuinely
+    // different, run-specific ids and can never be shape-identical the way
+    // every other field is. Assert both are *present* (parity of the key
+    // existing), then strip it from each before the full-shape comparison.
+    assert!(
+        embedded_v.get("job_id").and_then(|v| v.as_str()).is_some(),
+        "expected a job_id in the embedded run's JSON: {embedded_v}"
+    );
+    assert!(
+        daemon_v.get("job_id").and_then(|v| v.as_str()).is_some(),
+        "expected a job_id in the daemon-mock run's JSON: {daemon_v}"
+    );
+    let mut embedded_v_no_job_id = embedded_v.clone();
+    let mut daemon_v_no_job_id = daemon_v.clone();
+    embedded_v_no_job_id
+        .as_object_mut()
+        .unwrap()
+        .remove("job_id");
+    daemon_v_no_job_id.as_object_mut().unwrap().remove("job_id");
     assert_eq!(
-        embedded_v, daemon_v,
-        "--json summary must be identical between embedded and daemon-mock"
+        embedded_v_no_job_id, daemon_v_no_job_id,
+        "--json summary (aside from the necessarily-distinct job_id) must be identical \
+         between embedded and daemon-mock"
     );
 }
 

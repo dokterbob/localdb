@@ -113,7 +113,9 @@ pub enum Command {
     ///
     /// Daemon-only: there is no embedded equivalent, since an embedded job
     /// lives and dies within a single command invocation. `--store` is
-    /// rejected outright (exit 2): a job id is already globally unique.
+    /// rejected outright (exit 2) on every subcommand: `cancel` operates on
+    /// a job id, which is already globally unique; `list` spans every job
+    /// regardless of store.
     #[command(subcommand)]
     Job(JobCommand),
 
@@ -304,6 +306,12 @@ pub enum JobCommand {
         /// Job ID.
         id: String,
     },
+
+    /// List every job on the daemon's queue, regardless of state or store.
+    ///
+    /// Requires a running daemon (exit 5 without one); `--store` is
+    /// rejected outright (exit 2, §2.2) — a job list is not store-scoped.
+    List,
 }
 
 /// Source management subcommands.
@@ -445,6 +453,7 @@ fn main() {
         },
         Command::Job(cmd) => match cmd {
             JobCommand::Cancel { id } => cli::run_job_cancel(&ctx, id),
+            JobCommand::List => cli::run_job_list(&ctx),
         },
         Command::Index {
             source,
@@ -592,10 +601,19 @@ mod tests {
 
         let sub_names: Vec<&str> = job_cmd.get_subcommands().map(|sc| sc.get_name()).collect();
 
-        assert!(
-            sub_names.contains(&"cancel"),
-            "job cancel subcommand missing; found: {sub_names:?}",
-        );
+        for expected in &["cancel", "list"] {
+            assert!(
+                sub_names.contains(expected),
+                "job {expected} subcommand missing; found: {sub_names:?}",
+            );
+        }
+    }
+
+    /// `localdb job list` parses with no arguments.
+    #[test]
+    fn job_list_parses() {
+        let cli = Cli::try_parse_from(["localdb", "job", "list"]).unwrap();
+        assert!(matches!(cli.command, Command::Job(JobCommand::List)));
     }
 
     /// `localdb job cancel <id>` parses the job id as a positional arg.

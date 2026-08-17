@@ -14,6 +14,7 @@
 //!   DELETE /sources/:id           — remove a source by ID
 //!   GET  /documents/:id           — get document by ID
 //!   POST /search                  — hybrid search
+//!   GET  /jobs                    — list every job
 //!   POST /jobs                    — submit index job
 //!   GET  /jobs/:id                — get job by ID
 //!   DELETE /jobs/:id              — cancel a queued or running job
@@ -35,7 +36,7 @@ mod stores;
 
 pub use config::get_config;
 pub use documents::get_document;
-pub use jobs::{cancel_job, create_job, get_job, job_events};
+pub use jobs::{cancel_job, create_job, get_job, job_events, list_jobs};
 pub use search::search;
 pub use sources::{create_source, delete_source, list_sources};
 pub use status::get_status;

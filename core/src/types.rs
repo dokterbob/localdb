@@ -488,16 +488,23 @@ pub enum IndexJobScope {
 
 /// State of an index job: pending → running → done | failed.
 ///
-/// One edge is not on that spine: `pending → failed` directly, with
-/// `error_code: "job_cancelled"` (issue #218) — an operator can cancel a job
-/// that is still queued, before the worker ever starts it. That job's
-/// `started_at` stays `None` (it never ran) while `completed_at` is set (it
-/// did reach a terminal state) — the only path that produces that
-/// particular pair. Every other terminal job has `started_at: Some(_)`,
-/// since `running → done`/`running → failed` are the only other ways to
-/// reach a terminal state. A consumer must not assume `completed_at.is_some()
-/// implies started_at.is_some()` (e.g. when computing a duration) for
-/// exactly this reason.
+/// One edge is not on that spine: `pending → failed` directly. Two distinct
+/// producers reach it, both leaving
+/// `started_at: None` (the job never ran) while `completed_at` is set (it
+/// did reach a terminal state):
+/// - An operator cancels a job that is still queued, before the worker ever
+///   starts it (issue #218) — `error_code: "job_cancelled"`.
+/// - `JobQueue::submit` fails to hand the job to a worker at all (the
+///   channel is full or already closed) — a synthetic queue-level failure
+///   with `error_code: None` (`fail_index_job`, not
+///   `fail_index_job_with_error`), same as any other producer that never
+///   had a typed `core::Error` to carry.
+///
+/// Every other terminal job has `started_at: Some(_)`, since `running →
+/// done`/`running → failed` are the only other ways to reach a terminal
+/// state. A consumer must not assume `completed_at.is_some() implies
+/// started_at.is_some()` (e.g. when computing a duration) for exactly this
+/// reason.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IndexJobState {
