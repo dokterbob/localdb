@@ -101,6 +101,14 @@ pub enum Command {
     #[command(subcommand)]
     Source(SourceCommand),
 
+    /// Read documents indexed into a store.
+    ///
+    /// With `--store` omitted, `list` spans every store; `get` looks up the
+    /// given document id across every store, disambiguating by scope when
+    /// the id exists in more than one.
+    #[command(subcommand)]
+    Document(DocumentCommand),
+
     /// Inspect or migrate the database schema.
     ///
     /// Operates on the whole database file, not a single store: `--store` is
@@ -367,6 +375,37 @@ pub enum SourceCommand {
     },
 }
 
+/// Document read subcommands.
+///
+/// `--store` is a filter for `list`; omitted, it spans every store. `get`
+/// resolves its id across the `--store` scope: zero flags looks it up
+/// across every store (exit 2 if the id exists in more than one), one flag
+/// scopes the lookup unambiguously, and more than one flag checks the found
+/// document's store against the given set.
+#[derive(Debug, Subcommand)]
+pub enum DocumentCommand {
+    /// List documents across stores.
+    ///
+    /// Lists every store's documents when `--store` is omitted; pass
+    /// `--store` (repeatable) to narrow. A store-name column appears
+    /// whenever more than one store is in scope.
+    List {
+        /// Limit to documents from a specific source (by ID).
+        #[arg(long, value_name = "SOURCE_ID")]
+        source: Option<String>,
+    },
+    /// Get a single document by id.
+    ///
+    /// Unknown id: exit 3.
+    Get {
+        /// Document ID.
+        id: String,
+        /// Include the document's reconstructed full text in the output.
+        #[arg(long)]
+        text: bool,
+    },
+}
+
 fn main() {
     // Initialize structured logging. In embedded mode (no daemon), emit to stderr.
     // The PDF parser (pdf_oxide) emits high-volume, per-glyph/per-object noise
@@ -445,6 +484,10 @@ fn main() {
                 }
             }
         },
+        Command::Document(cmd) => match cmd {
+            DocumentCommand::List { source } => cli::run_document_list(&ctx, source.as_deref()),
+            DocumentCommand::Get { id, text } => cli::run_document_get(&ctx, id, *text),
+        },
         Command::Db(cmd) => match cmd {
             DbCommand::Status => cli::run_db_status(&ctx),
             DbCommand::Migrate => cli::run_db_migrate(&ctx),
@@ -511,8 +554,8 @@ mod tests {
         let subcommand_names: Vec<&str> = cmd.get_subcommands().map(|sc| sc.get_name()).collect();
 
         for expected in &[
-            "init", "serve", "mcp", "status", "store", "source", "db", "job", "index", "search",
-            "add",
+            "init", "serve", "mcp", "status", "store", "source", "document", "db", "job", "index",
+            "search", "add",
         ] {
             assert!(
                 subcommand_names.contains(expected),
@@ -565,6 +608,29 @@ mod tests {
             assert!(
                 sub_names.contains(expected),
                 "source {expected} subcommand missing; found: {sub_names:?}",
+            );
+        }
+    }
+
+    /// Verify the document subcommands are present.
+    #[test]
+    fn document_subcommands_present() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let document_cmd = cmd
+            .get_subcommands()
+            .find(|sc| sc.get_name() == "document")
+            .expect("document subcommand missing");
+
+        let sub_names: Vec<&str> = document_cmd
+            .get_subcommands()
+            .map(|sc| sc.get_name())
+            .collect();
+
+        for expected in &["list", "get"] {
+            assert!(
+                sub_names.contains(expected),
+                "document {expected} subcommand missing; found: {sub_names:?}",
             );
         }
     }
