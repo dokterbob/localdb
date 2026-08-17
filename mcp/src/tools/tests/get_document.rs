@@ -14,7 +14,7 @@ use localdb_core::{ChunkRecord, Span};
 use crate::args::GetDocumentArgs;
 use crate::tools::{tool_get_document, AvailableStore, StoreDescriptor};
 
-use super::common::{duplicate_doc_stores, make_chunk, make_descriptor, text_of};
+use super::common::{backend_for, duplicate_doc_stores, make_chunk, make_descriptor, text_of};
 
 #[tokio::test]
 async fn tool_get_document_returns_identical_json_for_fixed_document() {
@@ -88,7 +88,8 @@ async fn tool_get_document_returns_identical_json_for_fixed_document() {
         store: None,
     };
 
-    let result = tool_get_document(&stores, args).await;
+    let backend = backend_for(&stores);
+    let result = tool_get_document(&stores, backend.as_ref(), args).await;
     assert_ne!(result.is_error, Some(true));
     assert_eq!(result.content.len(), 1);
 
@@ -217,7 +218,8 @@ async fn tool_get_document_reconstructs_table_without_duplicated_header() {
         store: None,
     };
 
-    let result = tool_get_document(&stores, args).await;
+    let backend = backend_for(&stores);
+    let result = tool_get_document(&stores, backend.as_ref(), args).await;
     assert_ne!(result.is_error, Some(true));
     let rendered_text = text_of(&result);
     let parsed: Value = serde_json::from_str(&rendered_text).unwrap();
@@ -262,7 +264,9 @@ async fn get_document_returns_not_found_when_store_id_mismatches() {
         uri: None,
         store: None,
     };
-    let result = tool_get_document(&[av], args).await;
+    let stores = [av];
+    let backend = backend_for(&stores);
+    let result = tool_get_document(&stores, backend.as_ref(), args).await;
 
     // The tool should hide the document (not leak existence) and return not-found.
     assert_eq!(
@@ -291,7 +295,9 @@ async fn get_document_succeeds_when_store_id_matches() {
         uri: None,
         store: None,
     };
-    let result = tool_get_document(&[av], args).await;
+    let stores = [av];
+    let backend = backend_for(&stores);
+    let result = tool_get_document(&stores, backend.as_ref(), args).await;
 
     assert_ne!(
         result.is_error,
@@ -330,7 +336,9 @@ async fn get_document_metadata_carries_through() {
         uri: None,
         store: None,
     };
-    let result = tool_get_document(&[av], args).await;
+    let stores = [av];
+    let backend = backend_for(&stores);
+    let result = tool_get_document(&stores, backend.as_ref(), args).await;
 
     assert_ne!(result.is_error, Some(true));
     let text = text_of(&result);
@@ -358,7 +366,9 @@ async fn get_document_empty_id_returns_typed_error() {
         uri: None,
         store: None,
     };
-    let result = tool_get_document(&[av], args).await;
+    let stores = [av];
+    let backend = backend_for(&stores);
+    let result = tool_get_document(&stores, backend.as_ref(), args).await;
     assert_eq!(result.is_error, Some(true));
     let text = text_of(&result);
     let parsed: serde_json::Value = serde_json::from_str(&text).expect("must be JSON");
@@ -375,7 +385,9 @@ async fn get_document_empty_id_with_uri_mentions_search_result() {
         uri: Some("file:///docs/guide.md".to_string()),
         store: None,
     };
-    let result = tool_get_document(&[av], args).await;
+    let stores = [av];
+    let backend = backend_for(&stores);
+    let result = tool_get_document(&stores, backend.as_ref(), args).await;
     assert_eq!(result.is_error, Some(true));
     let text = text_of(&result);
     let parsed: serde_json::Value = serde_json::from_str(&text).expect("must be JSON");
@@ -397,6 +409,7 @@ async fn get_document_empty_id_with_uri_mentions_search_result() {
 async fn get_document_with_store_name_disambiguates_duplicate_id_across_stores() {
     let (av_a, av_b) = duplicate_doc_stores("dup-doc").await;
     let stores = vec![av_a, av_b];
+    let backend = backend_for(&stores);
 
     let mut args_a = GetDocumentArgs {
         id: "dup-doc".to_string(),
@@ -404,7 +417,7 @@ async fn get_document_with_store_name_disambiguates_duplicate_id_across_stores()
         store: None,
     };
     args_a.store = Some("store-a".to_string());
-    let result_a = tool_get_document(&stores, args_a).await;
+    let result_a = tool_get_document(&stores, backend.as_ref(), args_a).await;
     assert_ne!(result_a.is_error, Some(true));
     let parsed_a: serde_json::Value = serde_json::from_str(&text_of(&result_a)).unwrap();
     assert_eq!(parsed_a["text"].as_str().unwrap(), "from store A");
@@ -415,7 +428,7 @@ async fn get_document_with_store_name_disambiguates_duplicate_id_across_stores()
         uri: None,
         store: Some("store-b".to_string()),
     };
-    let result_b = tool_get_document(&stores, args_b).await;
+    let result_b = tool_get_document(&stores, backend.as_ref(), args_b).await;
     assert_ne!(result_b.is_error, Some(true));
     let parsed_b: serde_json::Value = serde_json::from_str(&text_of(&result_b)).unwrap();
     assert_eq!(parsed_b["text"].as_str().unwrap(), "from store B");
@@ -426,13 +439,14 @@ async fn get_document_with_store_name_disambiguates_duplicate_id_across_stores()
 async fn get_document_with_store_id_also_disambiguates() {
     let (av_a, av_b) = duplicate_doc_stores("dup-doc").await;
     let stores = vec![av_a, av_b];
+    let backend = backend_for(&stores);
 
     let args = GetDocumentArgs {
         id: "dup-doc".to_string(),
         uri: None,
         store: Some("store-B-id".to_string()),
     };
-    let result = tool_get_document(&stores, args).await;
+    let result = tool_get_document(&stores, backend.as_ref(), args).await;
     assert_ne!(result.is_error, Some(true));
     let parsed: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
     assert_eq!(parsed["text"].as_str().unwrap(), "from store B");
@@ -443,13 +457,14 @@ async fn get_document_with_store_id_also_disambiguates() {
 async fn get_document_unknown_store_returns_store_not_found() {
     let (av_a, av_b) = duplicate_doc_stores("dup-doc").await;
     let stores = vec![av_a, av_b];
+    let backend = backend_for(&stores);
 
     let args = GetDocumentArgs {
         id: "dup-doc".to_string(),
         uri: None,
         store: Some("no-such-store".to_string()),
     };
-    let result = tool_get_document(&stores, args).await;
+    let result = tool_get_document(&stores, backend.as_ref(), args).await;
     assert_eq!(result.is_error, Some(true));
     let parsed: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
     assert_eq!(parsed["error"]["code"].as_str().unwrap(), "store_not_found");
@@ -459,13 +474,14 @@ async fn get_document_unknown_store_returns_store_not_found() {
 async fn get_document_omitted_store_keeps_first_match_backward_compat() {
     let (av_a, av_b) = duplicate_doc_stores("dup-doc").await;
     let stores = vec![av_a, av_b];
+    let backend = backend_for(&stores);
 
     let args = GetDocumentArgs {
         id: "dup-doc".to_string(),
         uri: None,
         store: None,
     };
-    let result = tool_get_document(&stores, args).await;
+    let result = tool_get_document(&stores, backend.as_ref(), args).await;
     assert_ne!(result.is_error, Some(true));
     let parsed: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
     assert_eq!(

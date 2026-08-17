@@ -20,9 +20,10 @@
 //! synchronous `Fn() -> Result<S, io::Error>` service factory with no access
 //! to the HTTP request, so the daemon cannot hand out a per-connection scoped
 //! handler however the client asks: not via `/mcp?store=x`, not via a header.
-//! But `search.stores`, `get_document.store` and `get_chunks.store` exist
-//! precisely to name stores, and `tools.rs` already honours them — so the
-//! scope travels as an argument, per request, instead of per connection.
+//! But `search.stores`, `get_document.store`, `get_chunks.store`, and
+//! `list_documents.store` exist precisely to name stores, and `tools.rs`
+//! already honours them — so the scope travels as an argument, per request,
+//! instead of per connection.
 //!
 //! **This is scoping, not a security boundary.** The daemon's `/mcp` is
 //! loopback and unauthenticated: anything that can open a socket can bypass
@@ -320,7 +321,11 @@ impl ProxyHandler {
         self.relay(request).await
     }
 
-    /// `get_document` / `get_chunks`: both take a single optional `store`.
+    /// `get_document` / `get_chunks` / `list_documents`: each takes a single
+    /// `store` argument (optional on the first two, required on
+    /// `list_documents` — the injection/rejection logic below treats them
+    /// identically either way, since it only ever inspects the raw JSON
+    /// argument, not the tool's own required-ness).
     ///
     /// An explicit value is canonicalized and scope-checked. Rejecting an
     /// out-of-scope explicit value is the load-bearing half: injecting only
@@ -486,7 +491,7 @@ impl ServerHandler for ProxyHandler {
     }
 
     /// Relayed unchanged in both modes: the tool *set* is store-independent
-    /// — the same four read-only tools regardless of which stores are in
+    /// — the same five read-only tools regardless of which stores are in
     /// scope — so there is nothing here to filter.
     async fn list_tools(
         &self,
@@ -512,10 +517,12 @@ impl ServerHandler for ProxyHandler {
 
         match request.name.as_ref() {
             "search" => self.call_search_scoped(request, scope).await,
-            "get_document" | "get_chunks" => self.call_single_store_scoped(request, scope).await,
+            "get_document" | "get_chunks" | "list_documents" => {
+                self.call_single_store_scoped(request, scope).await
+            }
             "list_stores" => self.call_list_stores_scoped(request, scope).await,
             // Deliberately a denylist-free allowlist: a scoped session
-            // relays only the four tools whose store semantics are known
+            // relays only the five tools whose store semantics are known
             // here. Falling through to a verbatim relay would mean the first
             // mutating tool ever added (`--allow-write`, specs/05-surfaces.md
             // §4) silently bypasses the scope on the day it lands. Making

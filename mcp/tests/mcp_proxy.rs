@@ -80,12 +80,14 @@ async fn seeded_store(store_id: &str, store_name: &str, text: &str) -> (Availabl
 /// `DaemonState::Running::base_url` shape, which `ProxyHandler::connect`
 /// appends `/mcp` to itself).
 async fn serve_upstream(stores: Vec<AvailableStore>) -> String {
+    let backend: Arc<dyn localdb_core::StoreBackend> =
+        Arc::new(mcp::tools::StoresBackend::new(&stores));
     let embedder: Arc<dyn localdb_core::Embedder> = Arc::new(FakeEmbedder::new(4));
 
     // `vec![]` disables rmcp's Host-header allowlist entirely — these tests
     // exercise proxy forwarding, not the allowlist itself, and connect
     // over a real loopback socket regardless.
-    let service = mcp::build_streamable_http_service(stores, embedder, vec![]);
+    let service = mcp::build_streamable_http_service(stores, backend, embedder, vec![]);
     let app = Router::new().nest_service("/mcp", service);
 
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -179,7 +181,13 @@ async fn proxy_forwards_tool_list_and_calls_unchanged() {
     names.sort_unstable();
     assert_eq!(
         names,
-        vec!["get_chunks", "get_document", "list_stores", "search"],
+        vec![
+            "get_chunks",
+            "get_document",
+            "list_documents",
+            "list_stores",
+            "search"
+        ],
         "the proxy must expose exactly the upstream's tool set, unchanged"
     );
 
@@ -453,7 +461,7 @@ async fn proxy_connect_unknown_store_name_errors() {
     }
 }
 
-/// A scoped session serves only the four tools whose store semantics the
+/// A scoped session serves only the five tools whose store semantics the
 /// proxy knows. Any other name is refused rather than relayed, so the first
 /// mutating tool added under `--allow-write` cannot silently bypass the
 /// scope on the day it lands.
@@ -498,8 +506,11 @@ async fn mcp_tool_set_identical_with_and_without_allow_write() {
             },
             Box::new(FakeStore::new()),
         );
+        let stores = vec![store];
+        let backend: Arc<dyn localdb_core::StoreBackend> =
+            Arc::new(mcp::tools::StoresBackend::new(&stores));
         let embedder: Arc<dyn localdb_core::Embedder> = Arc::new(FakeEmbedder::new(4));
-        let handler = mcp::McpHandler::new(vec![store], embedder, allow_write);
+        let handler = mcp::McpHandler::new(stores, backend, embedder, allow_write);
 
         let (server_transport, client_transport) = tokio::io::duplex(8192);
         tokio::spawn(async move {
@@ -524,13 +535,19 @@ async fn mcp_tool_set_identical_with_and_without_allow_write() {
 
     assert_eq!(
         without,
-        vec!["get_chunks", "get_document", "list_stores", "search"],
+        vec![
+            "get_chunks",
+            "get_document",
+            "list_documents",
+            "list_stores",
+            "search"
+        ],
         "v1's read-only tool set"
     );
     assert_eq!(
         with, without,
         "`--allow-write` registers no additional tool in v1 — if this fails, a mutating \
          tool was added: revisit the CLI's no-op warning AND `ProxyHandler::call_tool`'s \
-         scoping gate, which currently refuses every tool outside this four-tool set"
+         scoping gate, which currently refuses every tool outside this five-tool set"
     );
 }

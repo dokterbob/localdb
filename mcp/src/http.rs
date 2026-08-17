@@ -12,21 +12,22 @@ use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
 
-use localdb_core::Embedder;
+use localdb_core::{Embedder, StoreBackend};
 
 use crate::handler::McpHandler;
 use crate::tools::AvailableStore;
 
 /// Build the Streamable HTTP tower service serving `McpHandler`.
 ///
-/// `stores` and `embedder` are a startup-time snapshot (see
+/// `stores`, `backend`, and `embedder` are a startup-time snapshot (see
 /// `server::mcp_bridge::build_available_stores`), not rebuilt per session:
 /// rmcp's service factory below is a synchronous `Fn() -> Result<S,
 /// io::Error>`, so there is no hook to redo the async `AppState` lookups
-/// per HTTP session. The factory clones `stores`/`embedder` per session
-/// instead — cheap, since `AvailableStore::store` and `embedder` are both
-/// already `Arc`-backed — which satisfies the sync boundary without a
-/// `block_on` bridge. A store added later via `/v1/stores` is therefore
+/// per HTTP session. The factory clones `stores`/`backend`/`embedder` per
+/// session instead — cheap, since `AvailableStore::store`, `backend`, and
+/// `embedder` are all already `Arc`-backed — which satisfies the sync
+/// boundary without a `block_on` bridge. A store added later via `/v1/stores`
+/// is therefore
 /// invisible over MCP until the daemon restarts; an accepted, documented
 /// gap (specs/05-surfaces.md §4), not something this function works around.
 ///
@@ -60,6 +61,7 @@ use crate::tools::AvailableStore;
 /// Do not "simplify" this back to always using `::default()`.
 pub fn build_streamable_http_service(
     stores: Vec<AvailableStore>,
+    backend: Arc<dyn StoreBackend>,
     embedder: Arc<dyn Embedder>,
     allowed_hosts: Vec<String>,
 ) -> StreamableHttpService<McpHandler, LocalSessionManager> {
@@ -69,7 +71,14 @@ pub fn build_streamable_http_service(
         StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts)
     };
     StreamableHttpService::new(
-        move || Ok(McpHandler::new(stores.clone(), embedder.clone(), false)),
+        move || {
+            Ok(McpHandler::new(
+                stores.clone(),
+                backend.clone(),
+                embedder.clone(),
+                false,
+            ))
+        },
         Default::default(),
         config,
     )

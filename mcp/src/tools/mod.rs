@@ -1,4 +1,5 @@
-//! MCP tool implementations: search, get_document, get_chunks, list_stores.
+//! MCP tool implementations: search, get_document, get_chunks, list_stores,
+//! list_documents.
 //!
 //! Each tool receives its arguments as an already-typed struct from
 //! `args.rs` (rmcp's `Parameters<T>` extractor deserializes `tools/call`
@@ -16,12 +17,13 @@ use rmcp::model::{CallToolResult, Content};
 
 use localdb_core::{
     citation::Citation,
+    get_document_detail,
     search::{QueryRequest, QueryResponse, SearchOrchestrator, StoreHandle},
     store::{RetrievalStore, StoreStats},
-    Embedder, SEARCH_MAX_LIMIT,
+    DocumentDetail, Embedder, Error, StoreBackend, SEARCH_MAX_LIMIT,
 };
 
-use crate::args::{GetChunksArgs, GetDocumentArgs, SearchArgs};
+use crate::args::{GetChunksArgs, GetDocumentArgs, ListDocumentsArgs, SearchArgs};
 
 // ---------------------------------------------------------------------------
 // Typed error helper
@@ -356,21 +358,26 @@ pub fn render_citations_text(citations: &[Citation], max_chars: usize) -> String
 
 /// Execute the `get_document` tool.
 ///
-/// Looks up a document by ID across the available stores and returns
-/// normalized text + metadata.
+/// Looks up a document by ID via `backend` (the shared read model,
+/// `localdb_core::get_document_detail`) and returns normalized text +
+/// metadata.
 ///
-/// Returns `resource_not_found` error if no matching chunks are found.
+/// Returns `resource_not_found` error if no document with that id is found.
 ///
-/// Note: URI-based lookup is not supported in v1 (the `RetrievalStore` trait
-/// provides `get_chunks_for_resource` by ID only). Callers must use a
-/// document ID obtained from a prior `search` call. `id` is a required
-/// field on `GetDocumentArgs`, so a caller omitting it entirely never
-/// reaches this function — rmcp's `Parameters<T>` extractor fails first,
-/// which is still a tool-level error (see `mcp/src/lib.rs`'s two-tier error
-/// model doc), just with a generic rmcp-authored message. An explicit empty
-/// string still reaches here and is rejected below (with a more specific
-/// message when `uri` was given instead, preserving v1's guidance).
-pub async fn tool_get_document(stores: &[AvailableStore], args: GetDocumentArgs) -> CallToolResult {
+/// Note: URI-based lookup is not supported in v1 (the shared read model
+/// looks up by id only). Callers must use a document ID obtained from a
+/// prior `search` call. `id` is a required field on `GetDocumentArgs`, so a
+/// caller omitting it entirely never reaches this function — rmcp's
+/// `Parameters<T>` extractor fails first, which is still a tool-level error
+/// (see `mcp/src/lib.rs`'s two-tier error model doc), just with a generic
+/// rmcp-authored message. An explicit empty string still reaches here and is
+/// rejected below (with a more specific message when `uri` was given
+/// instead, preserving v1's guidance).
+pub async fn tool_get_document(
+    stores: &[AvailableStore],
+    backend: &dyn StoreBackend,
+    args: GetDocumentArgs,
+) -> CallToolResult {
     if args.id.trim().is_empty() {
         if args.uri.is_some() {
             return typed_error(
@@ -383,138 +390,120 @@ pub async fn tool_get_document(stores: &[AvailableStore], args: GetDocumentArgs)
             "invalid arguments: 'id' must not be empty",
         );
     }
-    match find_document_chunks(stores, &args.id, args.store.as_deref()).await {
-        Ok(Some((store, chunks))) => {
-            let resource_id = chunks[0].resource_id.clone();
-            let blocks = match store.store.get_blocks_for_resource(&resource_id).await {
-                Ok(blocks) => blocks,
+
+    if let Some(store_value) = &args.store {
+        let handles = match select_mcp_stores(stores, std::slice::from_ref(store_value)) {
+            Ok(handles) => handles,
+            Err(result) => return result,
+        };
+        let handle = &handles[0];
+        return match get_document_from_store(
+            backend,
+            &handle.id,
+            &handle.name,
+            &handle.store,
+            &args.id,
+        )
+        .await
+        {
+            Ok(Some(json)) => success_json(&json),
+            Ok(None) => typed_error(
+                "resource_not_found",
+                format!("no document with id '{}' found in any store", args.id),
+            ),
+            Err(result) => result,
+        };
+    }
+
+    // Note: `store` is omitted. Scan the session's available stores in
+    // order and return whichever holds the id first — if the id exists in
+    // more than one store, which copy comes back depends on iteration
+    // order, not on any tie-break rule (a plain "first match wins", not a
+    // documented precedence).
+    for store in stores {
+        match get_document_from_store(
+            backend,
+            &store.descriptor.id,
+            &store.descriptor.name,
+            &store.store,
+            &args.id,
+        )
+        .await
+        {
+            Ok(Some(json)) => return success_json(&json),
+            Ok(None) => continue,
+            Err(result) => return result,
+        }
+    }
+    typed_error(
+        "resource_not_found",
+        format!("no document with id '{}' found in any store", args.id),
+    )
+}
+
+/// Look up one document, scoped to a single store, via the shared
+/// `get_document_detail` read model — `Ok(None)` means the store has no
+/// document with that id (the caller decides how to report that); any other
+/// backend error becomes a ready-to-return `CallToolResult`.
+///
+/// `store_id`/`store_name`/`retrieval_store` describe the same store from
+/// two angles: `store_id` scopes the `backend` lookup (`DocumentInfo`,
+/// text), while `retrieval_store` (the session's own `RetrievalStore`
+/// handle) supplies the `chunk_count` `DocumentDetail` doesn't carry.
+async fn get_document_from_store(
+    backend: &dyn StoreBackend,
+    store_id: &str,
+    store_name: &str,
+    retrieval_store: &Arc<dyn RetrievalStore>,
+    doc_id: &str,
+) -> Result<Option<Value>, CallToolResult> {
+    match get_document_detail(backend, doc_id, Some(store_id), true).await {
+        Ok(detail) => {
+            let chunks = match retrieval_store
+                .get_chunks_for_resource(&detail.info.id)
+                .await
+            {
+                Ok(chunks) => chunks,
                 Err(e) => {
-                    return typed_error(
+                    return Err(typed_error(
                         e.code(),
-                        format!(
-                            "error fetching blocks for document from store '{}': {e}",
-                            store.descriptor.name
-                        ),
-                    )
+                        format!("error fetching document from store '{store_name}': {e}"),
+                    ))
                 }
             };
-            success_json(&document_json(store, &chunks, &blocks))
+            Ok(Some(document_json(&detail, store_name, chunks.len())))
         }
-        Ok(None) => typed_error(
-            "resource_not_found",
-            format!("no document with id '{}' found in any store", args.id),
-        ),
-        Err(result) => result,
+        Err(Error::ResourceNotFound { .. }) => Ok(None),
+        Err(e) => Err(typed_error(
+            e.code(),
+            format!("error fetching document from store '{store_name}': {e}"),
+        )),
     }
 }
 
-/// Look up a document's chunks by id, optionally scoped to a single store.
+/// Build the `get_document` JSON payload from the shared read model's
+/// [`DocumentDetail`].
 ///
-/// `store_filter`, when present, is a store id or name (#144) — e.g. the
-/// `store.id`/`store.name` from a prior `search` citation. It is resolved via
-/// [`select_mcp_stores`] (the same id-or-name resolver `search`'s `stores`
-/// argument uses) rather than a parallel matcher, so an unknown store id/name
-/// produces the same `store_not_found` error shape as `search`. Once
-/// resolved, the scan below is restricted to that single store; an absent
-/// `store_filter` keeps the pre-#144 behavior of scanning every available
-/// store and returning whichever matches first.
-async fn find_document_chunks<'a>(
-    stores: &'a [AvailableStore],
-    doc_id: &str,
-    store_filter: Option<&str>,
-) -> Result<Option<(&'a AvailableStore, Vec<localdb_core::ChunkRecord>)>, CallToolResult> {
-    let scoped: Vec<&'a AvailableStore> = match store_filter {
-        Some(store_id_or_name) => {
-            let handles =
-                select_mcp_stores(stores, std::slice::from_ref(&store_id_or_name.to_string()))?;
-            let handle = &handles[0];
-            stores
-                .iter()
-                .filter(|s| s.descriptor.id == handle.id)
-                .collect()
-        }
-        None => stores.iter().collect(),
-    };
-
-    for store in scoped {
-        let chunks = match store.store.get_chunks_for_resource(doc_id).await {
-            Ok(chunks) => chunks,
-            Err(e) => {
-                return Err(typed_error(
-                    e.code(),
-                    format!(
-                        "error fetching document from store '{}': {e}",
-                        store.descriptor.name
-                    ),
-                ));
-            }
-        };
-        if chunks.is_empty() {
-            continue;
-        }
-        let first = &chunks[0];
-        if first.store_id != store.descriptor.id {
-            continue;
-        }
-        return Ok(Some((store, chunks)));
-    }
-    Ok(None)
-}
-
-/// Build the `get_document` JSON payload.
-///
-/// `text` is reconstructed from `blocks` when available — each block's
-/// canonical text is stored exactly once (see
-/// `RetrievalStore::get_blocks_for_resource`), so joining these avoids the
-/// duplicated header/separator rows that joining `ChunkRecord.text` produces
-/// for a multi-chunk table (the table chunker intentionally re-emits the
-/// header + separator in every chunk, spec 04 §3) — and likewise avoids
-/// duplicating overlapping turns across message-window chunks (#129). Blocks
-/// are joined with `"\n\n"`, matching the blank-line separation Markdown
-/// extraction strips out between sibling blocks (the same separator
-/// `chunker.rs`'s message-window path already uses when it joins multiple
-/// blocks' texts into one chunk).
-///
-/// Falls back to the legacy chunk-text join when `blocks` is empty: rows
-/// indexed before the Resource/Block architecture existed never persisted
-/// blocks, and `FakeStore`-backed tests that only call `upsert_chunks`
-/// (not `upsert_chunks_and_blocks`/`upsert_blocks`) have none either. All
-/// other fields (title, metadata, uri, chunk_count, etc.) always come from
-/// the chunk records regardless of which path produced `text`.
-fn document_json(
-    store: &AvailableStore,
-    chunks: &[localdb_core::ChunkRecord],
-    blocks: &[localdb_core::block::Block],
-) -> Value {
-    let first = &chunks[0];
-    let full_text = if blocks.is_empty() {
-        chunks
-            .iter()
-            .map(|c| c.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n")
-    } else {
-        blocks
-            .iter()
-            .map(|b| b.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n")
-    };
+/// `chunk_count` is passed in separately rather than read off `detail`:
+/// `DocumentDetail` deliberately carries only `info` + reconstructed `text`
+/// (see `core/src/documents.rs`), so the caller supplies the chunk count it
+/// already fetched to compute it.
+fn document_json(detail: &DocumentDetail, store_name: &str, chunk_count: usize) -> Value {
     serde_json::json!({
-        "resource_id": first.resource_id,
-        "uri": first.uri,
-        "title": first.metadata.title(),
+        "resource_id": detail.info.id,
+        "uri": detail.info.uri,
+        "title": detail.info.metadata.title(),
         "store": {
-            "id": store.descriptor.id,
-            "name": store.descriptor.name,
+            "id": detail.info.store_id,
+            "name": store_name,
         },
         "provenance": {
-            "fetched_at": first.fetched_at,
-            "content_hash": first.content_hash,
+            "fetched_at": detail.info.fetched_at,
+            "content_hash": detail.info.content_hash,
         },
-        "metadata": first.metadata,
-        "chunk_count": chunks.len(),
-        "text": full_text,
+        "metadata": detail.info.metadata,
+        "chunk_count": chunk_count,
+        "text": detail.text.as_deref().unwrap_or(""),
     })
 }
 
@@ -649,6 +638,65 @@ fn centered_window(anchor_idx: usize, total: usize, limit: usize) -> (usize, usi
     (offset, offset + limit)
 }
 
+/// Look up a document's chunks by id, optionally scoped to a single store.
+///
+/// `store_filter`, when present, is a store id or name (#144) — e.g. the
+/// `store.id`/`store.name` from a prior `search` citation. It is resolved via
+/// [`select_mcp_stores`] (the same id-or-name resolver `search`'s `stores`
+/// argument uses) rather than a parallel matcher, so an unknown store id/name
+/// produces the same `store_not_found` error shape as `search`. Once
+/// resolved, the scan below is restricted to that single store; an absent
+/// `store_filter` scans every available store and returns whichever matches
+/// first.
+///
+/// `get_document` resolves through the shared `localdb_core::get_document_detail`
+/// read model instead of this scan (see `get_document_from_store`) — but
+/// `get_chunks` still needs the full, ordered `ChunkRecord` list to paginate
+/// over, which that read model doesn't expose, so it keeps this brute-force
+/// scan over the session's own `RetrievalStore` handles.
+async fn find_chunks_for_resource<'a>(
+    stores: &'a [AvailableStore],
+    doc_id: &str,
+    store_filter: Option<&str>,
+) -> Result<Option<(&'a AvailableStore, Vec<localdb_core::ChunkRecord>)>, CallToolResult> {
+    let scoped: Vec<&'a AvailableStore> = match store_filter {
+        Some(store_id_or_name) => {
+            let handles =
+                select_mcp_stores(stores, std::slice::from_ref(&store_id_or_name.to_string()))?;
+            let handle = &handles[0];
+            stores
+                .iter()
+                .filter(|s| s.descriptor.id == handle.id)
+                .collect()
+        }
+        None => stores.iter().collect(),
+    };
+
+    for store in scoped {
+        let chunks = match store.store.get_chunks_for_resource(doc_id).await {
+            Ok(chunks) => chunks,
+            Err(e) => {
+                return Err(typed_error(
+                    e.code(),
+                    format!(
+                        "error fetching document from store '{}': {e}",
+                        store.descriptor.name
+                    ),
+                ));
+            }
+        };
+        if chunks.is_empty() {
+            continue;
+        }
+        let first = &chunks[0];
+        if first.store_id != store.descriptor.id {
+            continue;
+        }
+        return Ok(Some((store, chunks)));
+    }
+    Ok(None)
+}
+
 /// Execute the `get_chunks` tool.
 ///
 /// Looks up a document's chunks across the available stores and returns
@@ -698,7 +746,7 @@ pub async fn tool_get_chunks(stores: &[AvailableStore], args: GetChunksArgs) -> 
         Ok(v) => v,
         Err(result) => return result,
     };
-    match find_document_chunks(stores, &args.resource_id, args.store.as_deref()).await {
+    match find_chunks_for_resource(stores, &args.resource_id, args.store.as_deref()).await {
         Ok(Some((store, mut chunks))) => {
             chunks.sort_by(|a, b| {
                 (a.block_seq, a.seq_in_block, a.span.start, a.span.end, &a.id).cmp(&(
@@ -797,6 +845,82 @@ fn chunks_json(
         "chunks": page,
     })
 }
+
+// ---------------------------------------------------------------------------
+// Tool: list_documents
+// ---------------------------------------------------------------------------
+
+/// Execute the `list_documents` tool.
+///
+/// Lists every document registered in `args.store` (required — an id or
+/// name, resolved via [`select_mcp_stores`] exactly like every other tool's
+/// store argument), optionally filtered to `args.source`, paginated by
+/// `args.offset`/`args.limit` (the same `resolve_offset`/`resolve_limit`
+/// helpers `get_chunks` uses, including their defaults and range errors).
+///
+/// An unknown `store` is `store_not_found`, matching `search`/`get_document`.
+/// An unknown `source` is a pure filter — it yields an empty `documents`
+/// list, not an error, matching `StoreBackend::list_documents`'s contract.
+pub async fn tool_list_documents(
+    stores: &[AvailableStore],
+    backend: &dyn StoreBackend,
+    args: ListDocumentsArgs,
+) -> CallToolResult {
+    let handles = match select_mcp_stores(stores, std::slice::from_ref(&args.store)) {
+        Ok(handles) => handles,
+        Err(result) => return result,
+    };
+    let handle = &handles[0];
+
+    let offset = match resolve_offset(args.offset) {
+        Ok(v) => v,
+        Err(result) => return result,
+    };
+    let limit = match resolve_limit(args.limit) {
+        Ok(v) => v,
+        Err(result) => return result,
+    };
+
+    let documents = match backend
+        .list_documents(&handle.id, args.source.as_deref())
+        .await
+    {
+        Ok(docs) => docs,
+        Err(e) => {
+            return typed_error(
+                e.code(),
+                format!("failed to list documents in store '{}': {e}", handle.name),
+            )
+        }
+    };
+
+    let total = documents.len();
+    let end = offset.saturating_add(limit).min(total);
+    let page: Vec<Value> = if offset >= total {
+        Vec::new()
+    } else {
+        documents[offset..end]
+            .iter()
+            .map(|d| serde_json::to_value(d).unwrap_or(Value::Null))
+            .collect()
+    };
+    let returned = page.len();
+
+    success_json(&serde_json::json!({
+        "store": {
+            "id": handle.id,
+            "name": handle.name,
+        },
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "returned": returned,
+        "documents": page,
+    }))
+}
+
+mod stores_backend;
+pub use stores_backend::StoresBackend;
 
 #[cfg(test)]
 mod tests;

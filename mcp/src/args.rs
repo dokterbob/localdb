@@ -84,9 +84,8 @@ pub struct GetDocumentArgs {
     /// `store.name` carried by a `search` result's citation (#144). Resolved
     /// with the same id-or-name matching `search`'s `stores` argument uses
     /// (`tools::select_mcp_stores`); an unknown store is a `store_not_found`
-    /// tool error. When omitted, `tools::find_document_chunks` keeps the
-    /// pre-#144 behavior: scan every available store and return whichever
-    /// matches first.
+    /// tool error. When omitted, `tools::tool_get_document` scans every
+    /// available store and returns whichever holds the id first.
     #[serde(default)]
     #[schemars(
         description = "Store id or name to restrict the lookup to (e.g. the store.id or store.name from a search result's citation). Defaults to scanning all available stores and returning the first match."
@@ -143,12 +142,49 @@ pub struct GetChunksArgs {
     /// `store.name` carried by a `search` result's citation (#144). Resolved
     /// with the same id-or-name matching `search`'s `stores` argument uses
     /// (`tools::select_mcp_stores`); an unknown store is a `store_not_found`
-    /// tool error. When omitted, `tools::find_document_chunks` keeps the
-    /// pre-#144 behavior: scan every available store and return whichever
-    /// matches first.
+    /// tool error. When omitted, `tools::find_chunks_for_resource` scans
+    /// every available store and returns whichever matches first.
     #[serde(default)]
     #[schemars(
         description = "Store id or name to restrict the lookup to (e.g. the store.id or store.name from a search result's citation). Defaults to scanning all available stores and returning the first match."
     )]
     pub store: Option<String>,
+}
+
+/// Arguments for the `list_documents` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListDocumentsArgs {
+    /// Store id or name to list documents from. Required (unlike `search`'s
+    /// `stores` and `get_document`'s/`get_chunks`'s `store`, which default to
+    /// scanning every available store): listing is inherently a single-store
+    /// operation. Missing or non-string input fails deserialization (a
+    /// tool-level "failed to deserialize parameters" error, see `lib.rs`); an
+    /// unknown id/name is a tool-level `store_not_found` error, resolved with
+    /// the same id-or-name matching `search`'s `stores` argument uses
+    /// (`tools::select_mcp_stores`).
+    #[schemars(description = "Store id or name to list documents from")]
+    pub store: String,
+
+    /// Optional source id to restrict the listing to. Unknown source ids
+    /// yield an empty `documents` list rather than an error.
+    #[serde(default)]
+    #[schemars(description = "Optional source id to restrict the listing to")]
+    pub source: Option<String>,
+
+    /// Number of documents to skip before the first returned document
+    /// (default: 0).
+    #[serde(default)]
+    #[schemars(
+        description = "Number of documents to skip before the first returned document (default: 0)",
+        range(min = 0)
+    )]
+    pub offset: Option<i64>,
+
+    /// Maximum number of documents to return (default: 50, max: 200).
+    #[serde(default)]
+    #[schemars(
+        description = "Maximum number of documents to return (default: 50, max: 200)",
+        range(min = 1, max = 200)
+    )]
+    pub limit: Option<i64>,
 }

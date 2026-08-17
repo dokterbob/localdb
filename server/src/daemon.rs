@@ -221,6 +221,13 @@ pub fn build_router(
     mcp_embedder: Arc<dyn Embedder>,
     mcp_allowed_hosts: Vec<String>,
 ) -> Router {
+    // Grabbed before `.with_state(state)` below moves `state` into the
+    // router — `AppState::backend_arc` is the same `Arc<dyn StoreBackend>`
+    // `mcp_stores`' own `AvailableStore::store` handles were themselves
+    // resolved from (`mcp_bridge::build_available_stores`), so `/mcp`'s
+    // `get_document`/`list_documents` tools see the same document registry
+    // as every `/v1` route.
+    let mcp_backend = state.backend_arc();
     Router::new()
         .route(
             "/v1/stores",
@@ -254,7 +261,12 @@ pub fn build_router(
         .with_state(state)
         .nest_service(
             "/mcp",
-            mcp::build_streamable_http_service(mcp_stores, mcp_embedder, mcp_allowed_hosts),
+            mcp::build_streamable_http_service(
+                mcp_stores,
+                mcp_backend,
+                mcp_embedder,
+                mcp_allowed_hosts,
+            ),
         )
         // Applied *after* `nest_service` so this layer wraps the whole
         // composed router — including the nested rmcp `/mcp` mount, whose

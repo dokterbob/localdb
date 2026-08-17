@@ -5,6 +5,7 @@
 //! - `get_document`: fetch normalized text + metadata by id
 //! - `get_chunks`: fetch a document's chunks in order, paginated
 //! - `list_stores`: names, visibility, chunk/document counts
+//! - `list_documents`: every document registered in a store, paginated
 //!
 //! ## Implementation
 //! Built on the official [`rmcp`](https://docs.rs/rmcp) SDK: `McpHandler`

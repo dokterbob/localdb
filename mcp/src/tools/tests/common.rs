@@ -1,11 +1,22 @@
 //! Shared test helpers for `tools` tests.
 
+use std::sync::Arc;
+
 use rmcp::model::CallToolResult;
 
 use localdb_core::store::{FakeStore, RetrievalStore};
-use localdb_core::{types::Span, ChunkRecord};
+use localdb_core::{types::Span, ChunkRecord, StoreBackend};
 
-use crate::tools::{AvailableStore, StoreDescriptor};
+use crate::tools::{AvailableStore, StoreDescriptor, StoresBackend};
+
+/// Build a `StoreBackend` derived on demand from `stores` — see
+/// `StoresBackend`'s doc comment. Lets `get_document` tests pass a real
+/// `&dyn StoreBackend` to `tool_get_document` without maintaining a second,
+/// parallel document registry alongside the `AvailableStore` fixtures they
+/// already build.
+pub(in crate::tools) fn backend_for(stores: &[AvailableStore]) -> Arc<dyn StoreBackend> {
+    Arc::new(StoresBackend::new(stores))
+}
 
 pub(in crate::tools) fn make_descriptor(id: &str, name: &str) -> StoreDescriptor {
     StoreDescriptor {

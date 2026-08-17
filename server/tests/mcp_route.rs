@@ -74,8 +74,14 @@ async fn mcp_route_lists_and_calls_tools_over_real_http() {
     names.sort_unstable();
     assert_eq!(
         names,
-        vec!["get_chunks", "get_document", "list_stores", "search"],
-        "the four read-only tools should be registered over HTTP just as over stdio"
+        vec![
+            "get_chunks",
+            "get_document",
+            "list_documents",
+            "list_stores",
+            "search"
+        ],
+        "the five read-only tools should be registered over HTTP just as over stdio"
     );
 
     let result = client
