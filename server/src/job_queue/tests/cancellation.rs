@@ -113,7 +113,7 @@ async fn cancel_after_a_real_failure_returns_job_already_terminal_and_preserves_
 
 /// A job still sitting in the queue when cancelled must never run its
 /// pipeline at all — not even one poll of its task future, and not even a
-/// call to the task-building `FnOnce` itself (issue #218-followups Fix B).
+/// call to the task-building `FnOnce` itself.
 /// Constructed deterministically: the queue has exactly one background
 /// worker (`job_queue.rs`'s module doc comment), so a first job parked on a
 /// gate this test controls guarantees a second submission (to a *different*
@@ -305,7 +305,7 @@ async fn cancellation_preempts_a_never_resolving_await_point() {
 }
 
 // ---------------------------------------------------------------------------
-// Publication-before-handle window (issue #218-followups PR #229 review)
+// Publication-before-handle window
 // ---------------------------------------------------------------------------
 
 /// The exact scenario the bug report described: a client sees a job via

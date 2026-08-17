@@ -1398,8 +1398,8 @@ mod tests {
 
     /// `source add` scoped to two stores must build the (potentially ~706 MB
     /// local) embedder once for the whole request, not once per store.
-    /// Holds `EMBEDDER_BUILD_COUNT_TEST_LOCK` for its whole body (issue
-    /// #218-followups fallout) — see that lock's doc comment.
+    /// Holds `EMBEDDER_BUILD_COUNT_TEST_LOCK` for its whole body — see that
+    /// lock's doc comment.
     ///
     /// Drives `run_source_add_async` end to end against a real temp DB/config
     /// (provider `fake`, so it's fully offline and cheap) and asserts on
@@ -1418,7 +1418,7 @@ mod tests {
         use std::sync::atomic::Ordering;
         use tempfile::TempDir;
 
-        // Held for the rest of this test (issue #218-followups fallout):
+        // Held for the rest of this test:
         // `job_attach::tests::run_embedded_store_job_warns_and_continues_on_an_invalid_chunker_preset`
         // also drives a real embedder build and shares this same
         // process-wide counter — without this lock, `cargo test`'s default

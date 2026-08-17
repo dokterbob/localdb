@@ -1,5 +1,5 @@
 //! `localdb job cancel`/`localdb job list` — manage jobs on a daemon's job
-//! queue (issue #218, issue #218-followups Fix A).
+//! queue (issue #218).
 //!
 //! Daemon-only, unlike every other dual-transport command in this crate:
 //! there is no meaningful embedded equivalent. The CLI's embedded indexing
@@ -32,7 +32,7 @@ const JOB_LIST_REJECT_MESSAGE: &str =
     "`job list` shows every job regardless of store; --store is not applicable";
 
 /// Resolve the daemon's base URL for a daemon-only command (`job cancel`,
-/// `job list`) — issue #218-followups Fix F.
+/// `job list`).
 ///
 /// When `ctx.daemon_url` is set (`LOCALDB_DAEMON_URL`), `probe_daemon`
 /// already treats it as authoritative and never touches `data_dir` at all
@@ -109,8 +109,7 @@ pub(crate) async fn run_job_cancel_async(ctx: &CliContext, id: &str) {
     }
 }
 
-/// `GET /v1/jobs` against a running daemon, parsing the full job list
-/// (issue #218-followups Fix A).
+/// `GET /v1/jobs` against a running daemon, parsing the full job list.
 pub(crate) async fn list_daemon_jobs(base_url: &str) -> Result<Vec<IndexJob>, Error> {
     let url = format!("{base_url}/v1/jobs");
     let v = daemon_request_async(reqwest::Method::GET, &url, None).await?;
@@ -199,7 +198,7 @@ fn job_state_str(state: &localdb_core::IndexJobState) -> &'static str {
 }
 
 /// `localdb job list`'s plain-text table: id, store, state, error_code,
-/// created_at (issue #218-followups Fix A).
+/// created_at.
 fn print_job_list_table(jobs: &[IndexJob]) {
     if jobs.is_empty() {
         println!("No jobs.");
@@ -396,7 +395,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // `job list` (issue #218-followups Fix A)
+    // `job list`
     // -----------------------------------------------------------------
 
     #[tokio::test]

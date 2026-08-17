@@ -71,7 +71,7 @@ async fn subscriber_observes_events_sent_via_the_tasks_progress_sink() {
 }
 
 /// The channel's final message is always the job's terminal snapshot
-/// (`JobEvent::Terminal`, PR #229 round-3 review) — a subscriber attached
+/// (`JobEvent::Terminal`) — a subscriber attached
 /// before completion reads the job's final state in-band, without ever
 /// touching the registry. This is what makes an attached consumer immune
 /// to terminal-job eviction (`MAX_TERMINAL_JOBS`): even if a burst of

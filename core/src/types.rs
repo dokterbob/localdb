@@ -489,7 +489,7 @@ pub enum IndexJobScope {
 /// State of an index job: pending → running → done | failed.
 ///
 /// One edge is not on that spine: `pending → failed` directly. Two distinct
-/// producers reach it (issue #218-followups Fix E), both leaving
+/// producers reach it, both leaving
 /// `started_at: None` (the job never ran) while `completed_at` is set (it
 /// did reach a terminal state):
 /// - An operator cancels a job that is still queued, before the worker ever

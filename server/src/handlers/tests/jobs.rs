@@ -81,7 +81,7 @@ async fn post_job_returns_202() {
     assert!(body["id"].as_str().is_some());
 }
 
-/// `GET /v1/jobs` (issue #218-followups Fix A): returns the raw array of
+/// `GET /v1/jobs`: returns the raw array of
 /// every job on the queue, regardless of store — not wrapped in a
 /// pagination envelope like `/v1/stores`/`/v1/sources`.
 #[tokio::test]

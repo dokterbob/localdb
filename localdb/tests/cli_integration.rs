@@ -6406,7 +6406,7 @@ fn index_shape_parity_between_embedded_and_daemon_mock() {
     );
     let daemon_v: serde_json::Value = serde_json::from_str(&daemon_json_stdout).unwrap();
 
-    // Issue #218-followups Fix A: both transports now surface a `job_id` —
+    // Both transports now surface a `job_id` —
     // the embedded engine's own local queue id, the mock's fixed
     // "job-parity" here — but by construction these are two genuinely
     // different, run-specific ids and can never be shape-identical the way

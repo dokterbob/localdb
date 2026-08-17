@@ -61,7 +61,7 @@ use crate::daemon_client::{daemon_request_async, encode_path_segment, CliContext
 /// (`StrictExit`, `index`) or is swallowed into a warning
 /// (`WarnAndContinue`, `source add`'s auto-index).
 ///
-/// Returns the job id alongside the summary (issue #218-followups Fix A) —
+/// Returns the job id alongside the summary —
 /// `Some(job.id)` whenever a job actually got submitted to the local queue,
 /// `None` on every early-return path above that (no sources to index, or a
 /// pre-flight embedder-build failure warned away under `WarnAndContinue`)
@@ -178,8 +178,8 @@ pub(crate) async fn run_embedded_store_job(
 
 /// Subscribe to `job_id`'s live events on the local queue, feeding every
 /// progress event into the CLI's progress sink until the in-band terminal
-/// snapshot arrives ([`server::JobEvent::Terminal`], PR #229 round-3
-/// review), and return that snapshot. Falls back to a registry read only
+/// snapshot arrives ([`server::JobEvent::Terminal`]), and return that
+/// snapshot. Falls back to a registry read only
 /// when no channel exists anymore (the job raced to terminal before this
 /// subscribed) or on the defensive channel-closed-without-terminal path.
 async fn drive_embedded_job(
@@ -264,7 +264,7 @@ fn emit_source_error(mode: IndexErrorMode, source_id: &str, err: SourceError<'_>
 /// hard `Err` under `StrictExit` (`index`) and a warned, defaulted
 /// `IndexSummary` under `WarnAndContinue` (`source add`'s auto-index, D3).
 ///
-/// Prints the job id (issue #218-followups Fix A) as soon as it's known —
+/// Prints the job id as soon as it's known —
 /// before attaching — since this is exactly the case
 /// `localdb job cancel <id>` can reach (unlike
 /// [`run_embedded_store_job`]'s throwaway local queue). Always to stderr
@@ -274,7 +274,7 @@ fn emit_source_error(mode: IndexErrorMode, source_id: &str, err: SourceError<'_>
 /// job cancel <id>)`, `[label] `-prefixed when `progress_label` is `Some`
 /// (multi-store runs); `--json` mode gets one JSON line
 /// `{"job_id": "<id>"}` (plus a `"store"` field when `progress_label` is
-/// `Some`) — PR #229 round-3 review: suppressing it entirely left `--json`
+/// `Some`) — suppressing it entirely left `--json`
 /// callers with no way to learn the id until the job was already terminal.
 /// Also returned alongside the summary so the final `--json` document can
 /// surface it too — `None` only on the two early-return paths before a job
@@ -372,12 +372,12 @@ pub(crate) async fn run_daemon_store_job(
 }
 
 /// The stderr line announcing a freshly-submitted daemon job's id, emitted
-/// before attaching blocks (issue #218-followups Fix A) — the one moment
+/// before attaching blocks — the one moment
 /// `localdb job cancel <id>` is actionable.
 ///
 /// Human mode: `job <id> (cancel with: localdb job cancel <id>)`,
-/// `[label] `-prefixed for multi-store runs. `--json` mode (PR #229 round-3
-/// review): one JSON line `{"job_id": "<id>"}`, plus a `"store"` field when
+/// `[label] `-prefixed for multi-store runs. `--json` mode: one JSON line
+/// `{"job_id": "<id>"}`, plus a `"store"` field when
 /// a label is present — previously the id was suppressed entirely under
 /// `--json`, so a machine caller couldn't learn it until the job was
 /// already terminal (and possibly not at all, on the attach-failure paths
@@ -633,7 +633,7 @@ mod tests {
     use crate::app_db::{load_config_scaffolded, open_app_db_or_exit};
     use crate::cmds::store::run_store_add_async;
 
-    /// PR #229 round-3 review: `--json` mode must expose the submitted job
+    /// `--json` mode must expose the submitted job
     /// id on stderr *before* attach blocks — as one parseable JSON line —
     /// or a machine caller can never reach `localdb job cancel <id>` in
     /// time. Human mode keeps the pre-existing cancel hint verbatim.
@@ -653,8 +653,7 @@ mod tests {
             serde_json::json!({ "job_id": "job-2", "store": "books" })
         );
 
-        // Human, both label shapes: pinned wording (issue #218-followups
-        // Fix A).
+        // Human, both label shapes: pinned wording.
         assert_eq!(
             pre_attach_job_id_line(false, "job-3", None),
             "job job-3 (cancel with: localdb job cancel job-3)"
@@ -801,7 +800,7 @@ mod tests {
     /// instead).
     #[tokio::test]
     async fn run_embedded_store_job_warns_and_continues_on_an_invalid_chunker_preset() {
-        // Held for the rest of this test (issue #218-followups fallout):
+        // Held for the rest of this test:
         // this test drives a real `embed::create_embedder` build as a side
         // effect of the call below, incrementing the same process-wide
         // `EMBEDDER_BUILD_COUNT` that

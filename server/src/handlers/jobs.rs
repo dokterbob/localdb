@@ -87,7 +87,7 @@ pub async fn create_job(
 }
 
 /// `GET /v1/jobs` — list every job on the daemon's queue, regardless of
-/// state or store (issue #218-followups Fix A).
+/// state or store.
 ///
 /// Returns the raw `IndexJob[]` array directly (no pagination envelope,
 /// unlike `/v1/stores`/`/v1/sources` — `JobQueue::list_jobs` is already an
@@ -134,8 +134,8 @@ pub async fn cancel_job(
 /// (issue #83).
 ///
 /// `Live(rx)` streams `progress` events off the job's broadcast channel
-/// until the in-band `JobEvent::Terminal` snapshot arrives (PR #229 round-3
-/// review), yields it as the final `job` frame, and transitions to
+/// until the in-band `JobEvent::Terminal` snapshot arrives, yields it as the
+/// final `job` frame, and transitions to
 /// `Finished`. `Terminal(job)` is the "already done at subscribe time" and
 /// "channel-already-torn-down" fast paths: it yields the given job's
 /// terminal event immediately and transitions to `Finished`. `Finished` ends
@@ -184,7 +184,7 @@ async fn next_job_event(
                     return Some((progress_sse_event(&event), JobEventState::Live(rx)))
                 }
                 // The job's final state, delivered in-band as the channel's
-                // guaranteed last message (PR #229 round-3 review) — never
+                // guaranteed last message — never
                 // dropped by lag, and immune to terminal-job eviction: no
                 // registry read involved, so a burst of later completions
                 // evicting this job's registry entry can't cost an attached

@@ -294,7 +294,7 @@ pub enum DbCommand {
     Vacuum,
 }
 
-/// Job management subcommands (issue #218, issue #218-followups Fix A).
+/// Job management subcommands (issue #218).
 #[derive(Debug, Subcommand)]
 pub enum JobCommand {
     /// Request cancellation of a queued or running job.
@@ -609,7 +609,7 @@ mod tests {
         }
     }
 
-    /// `localdb job list` parses with no arguments (issue #218-followups Fix A).
+    /// `localdb job list` parses with no arguments.
     #[test]
     fn job_list_parses() {
         let cli = Cli::try_parse_from(["localdb", "job", "list"]).unwrap();

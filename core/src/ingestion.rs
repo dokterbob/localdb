@@ -641,7 +641,7 @@ pub fn now_rfc3339() -> String {
 /// Format a Unix timestamp as RFC 3339 (UTC, no sub-second precision),
 /// without requiring chrono. Public so callers that need an RFC 3339 string
 /// for an instant *other* than now — e.g. `server`'s terminal-job eviction
-/// cutoff (now minus a retention grace, PR #229 round-5 review) — can
+/// cutoff (now minus a retention grace) — can
 /// produce one that compares correctly against [`now_rfc3339`] output.
 pub fn format_secs_rfc3339(secs: u64) -> String {
     let (y, mo, d, h, mi, s) = secs_to_ymd_hms(secs);

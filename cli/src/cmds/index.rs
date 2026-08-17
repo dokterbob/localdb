@@ -101,7 +101,7 @@ impl IndexErrorMode {
 /// counter). Both must hold [`EMBEDDER_BUILD_COUNT_TEST_LOCK`] for their
 /// entire counter-sensitive critical section — see its doc comment for why
 /// this file was the wrong place to *stop* being safe against interleaving
-/// once a second such test existed (issue #218-followups fallout: this
+/// once a second such test existed (this
 /// stale "no other test" claim was exactly how that regression slipped
 /// through — the counter itself was never wrong, the missing exclusion
 /// between tests was).
@@ -109,7 +109,7 @@ impl IndexErrorMode {
 pub(crate) static EMBEDDER_BUILD_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Serializes every test that touches [`EMBEDDER_BUILD_COUNT`] against each
-/// other (issue #218-followups fallout). An async-aware mutex, not
+/// other. An async-aware mutex, not
 /// `std::sync::Mutex`: the critical section each test needs spans real
 /// `.await` points (the auto-index run itself), and holding a blocking
 /// `std::sync::MutexGuard` across an `.await` is exactly what
@@ -127,7 +127,7 @@ pub(crate) static EMBEDDER_BUILD_COUNT_TEST_LOCK: tokio::sync::Mutex<()> =
 /// `IndexSummary` (which has no notion of *which* store it came from) so the
 /// single-store and multi-store rendering paths can share one code path.
 ///
-/// `job_id` (issue #218-followups Fix A) is deliberately *not* a field of
+/// `job_id` is deliberately *not* a field of
 /// `IndexSummary` itself: `IndexSummary` is summed across stores via `add`
 /// and compared for equality throughout this module's tests, and a job id
 /// has no sensible sum and is different (or absent) per store — keeping it
@@ -515,7 +515,7 @@ fn summary_fields_json(summary: &IndexSummary, strict: bool) -> serde_json::Valu
 }
 
 /// Build one outcome's JSON fields, plus its `job_id` when it has one
-/// (issue #218-followups Fix A) — inserted only when `Some`, so a store
+/// — inserted only when `Some`, so a store
 /// with no sources (whose `summary_fields_json` short-circuits to the
 /// `{"status":"ok","message":"no sources to index"}` shape, and whose
 /// `job_id` is always `None` since no job was ever submitted for it) keeps
@@ -537,7 +537,7 @@ fn store_outcome_json(outcome: &StoreIndexOutcome, strict: bool) -> serde_json::
 ///
 /// A single outcome renders as the exact pre-existing flat object (no
 /// wrapping, no `store` field) so `--json` output for the single-store case
-/// is unchanged, plus a `job_id` field (issue #218-followups Fix A) when a
+/// is unchanged, plus a `job_id` field when a
 /// job was actually submitted. More than one outcome wraps into
 /// `{"stores": [...], "total": {...}}`, each store entry carrying a `store`
 /// name field and its own `job_id` when it has one — `total` never gets a
@@ -588,7 +588,7 @@ mod tests {
     }
 
     /// Like [`outcome`], but with an explicit `job_id` — for the
-    /// `job_id`-in-JSON tests below (issue #218-followups Fix A).
+    /// `job_id`-in-JSON tests below.
     fn outcome_with_job(name: &str, summary: IndexSummary, job_id: &str) -> StoreIndexOutcome {
         StoreIndexOutcome {
             store_name: name.to_string(),
@@ -741,7 +741,7 @@ mod tests {
         );
     }
 
-    /// Issue #218-followups Fix A: a single-store outcome carrying a job id
+    /// A single-store outcome carrying a job id
     /// gains a `job_id` field in the flat JSON shape.
     #[test]
     fn render_index_json_single_store_includes_job_id_when_present() {
@@ -824,7 +824,7 @@ mod tests {
         );
     }
 
-    /// Issue #218-followups Fix A: each multi-store entry carries its own
+    /// Each multi-store entry carries its own
     /// `job_id` (each store submitted a genuinely distinct job); `total`
     /// never gets one, since it spans every contributing job.
     #[test]

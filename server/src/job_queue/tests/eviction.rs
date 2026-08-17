@@ -1,5 +1,5 @@
-//! Bounded terminal-job retention (issue #218-followups Fix 2, PR #229
-//! review): the registry evicts the oldest `Done`/`Failed` jobs once their
+//! Bounded terminal-job retention: the registry evicts the oldest
+//! `Done`/`Failed` jobs once their
 //! count exceeds a cap, so a long-running daemon's job history doesn't grow
 //! without bound.
 //!
@@ -10,7 +10,7 @@
 //! explicit `completed_at` strings make ordering, grace, and protection
 //! each provable in isolation. The one real end-to-end test below (through
 //! `JobQueue::submit` at the real constants) pins the production-wired
-//! consequence of the retention grace (PR #229 round-5 review): a burst of
+//! consequence of the retention grace: a burst of
 //! fresh completions past the cap evicts *nothing*, so a submitter's first
 //! post-submit attach/poll can never 404.
 //!
@@ -56,8 +56,8 @@ fn terminal_job(id: &str, completed_at: &str) -> IndexJob {
 const PROTECT_NONE: &str = "no-such-job";
 
 /// A `cutoff` far past every fixture's `completed_at` — every terminal
-/// fixture is older than it, so the retention grace (PR #229 round-5
-/// review) is inert and the test exercises only the ordering/cap logic.
+/// fixture is older than it, so the retention grace is inert and the test
+/// exercises only the ordering/cap logic.
 /// The grace rule has its own dedicated test.
 const CUTOFF_EVICT_ALL: &str = "9999-01-01T00:00:00Z";
 
@@ -198,7 +198,7 @@ fn never_evicts_pending_or_running_even_when_they_push_the_total_past_the_cap() 
 #[test]
 fn ties_on_completed_at_break_deterministically_by_id() {
     // All five jobs completed within the same second — the exact burst
-    // scenario from the PR #229 round-3 review: `completed_at` has
+    // scenario: `completed_at` has
     // whole-second resolution, so the primary sort key ties across the
     // board and the id tie-break alone must decide, deterministically
     // (ULIDs sort lexicographically; these hand-picked ids stand in for
@@ -226,7 +226,7 @@ fn never_evicts_the_job_whose_transition_triggered_the_eviction() {
     // others on completed_at and has the smallest id) — without the
     // protection rule it would be evicted by its own terminal transition,
     // closing its progress channel while `get_job` on its id already 404s
-    // (the attach-failure scenario from the PR #229 round-3 review).
+    // (the attach-failure scenario ).
     let mut registry: HashMap<String, IndexJob> = HashMap::new();
     for id in ["job-a", "job-b", "job-c", "job-d"] {
         registry.insert(id.to_string(), terminal_job(id, "2020-01-01T00:00:00Z"));
@@ -246,7 +246,7 @@ fn never_evicts_the_job_whose_transition_triggered_the_eviction() {
     assert_eq!(registry.len(), 3);
 }
 
-/// The retention grace (PR #229 round-5 review): terminal jobs younger
+/// The retention grace: terminal jobs younger
 /// than the cutoff are never eviction candidates, even when the terminal
 /// count is over cap — the registry deliberately stays over cap until they
 /// age out. Also pins the mixed case: aged entries are still trimmed while
@@ -293,8 +293,8 @@ fn never_evicts_terminal_jobs_within_the_retention_grace() {
 // Wiring: the real constants, through JobQueue::submit
 // ---------------------------------------------------------------------------
 
-/// Aged-out overflow is trimmed by `list_jobs` itself (PR #229 round-6
-/// review): eviction otherwise only runs on terminal writes, so a burst
+/// Aged-out overflow is trimmed by `list_jobs` itself: eviction otherwise only
+/// runs on terminal writes, so a burst
 /// past the cap with no *subsequent* completions would keep its overflow
 /// entries forever. Stages aged terminal entries directly in the registry
 /// (`test_insert_job` — real jobs get wall-clock `completed_at`, which
@@ -330,8 +330,8 @@ async fn list_jobs_trims_aged_overflow_without_a_terminal_write() {
     }
 }
 
-/// Proves the production wiring of the retention grace (PR #229 round-5
-/// review): a burst of completions past `MAX_TERMINAL_JOBS` evicts
+/// Proves the production wiring of the retention grace: a burst of completions
+/// past `MAX_TERMINAL_JOBS` evicts
 /// *nothing*, because every job just completed and is inside
 /// `TERMINAL_RETENTION_GRACE_SECS`. This is the guarantee that closes the
 /// submit→first-attach gap — a daemon client that just got its job id from

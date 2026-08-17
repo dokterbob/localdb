@@ -47,7 +47,7 @@
 //! *and* silently shrink the pool to `N-1`, since nothing respawns a
 //! worker task that unwinds away. See `process_job`'s doc comment.
 //!
-//! Pending-cancel atomicity (issue #218-followups Fix B): `process_job`'s
+//! Pending-cancel atomicity: `process_job`'s
 //! check of `cancel_token.is_cancelled()` and its resulting registry write
 //! (either straight to `Failed`/`job_cancelled`, or to `Running`) happen
 //! inside the *same* `registry.write().await` critical section that
@@ -58,7 +58,7 @@
 //! then-separate lock) to start it anyway. See `cancel`'s and
 //! `process_job`'s doc comments for the full reasoning.
 //!
-//! Publication order (issue #218-followups PR #229 review): `submit`
+//! Publication order: `submit`
 //! installs a job's `JobHandle` (its cancel token and progress channel)
 //! *before* inserting the job into the registry, not after. A job is never
 //! visible to `list_jobs`/`get_job` (so, `GET /v1/jobs`/`GET /jobs/{id}`)
@@ -68,12 +68,12 @@
 //! silently report success without ever triggering anything. See `submit`'s
 //! and `cancel`'s doc comments.
 //!
-//! Bounded terminal-job retention (issue #218-followups Fix 2, PR #229
-//! review): the registry evicts the oldest `Done`/`Failed` jobs once their
+//! Bounded terminal-job retention: the registry evicts the oldest
+//! `Done`/`Failed` jobs once their
 //! count exceeds [`MAX_TERMINAL_JOBS`], so a long-running daemon's job
 //! history doesn't grow without bound — except jobs terminal for less than
-//! [`TERMINAL_RETENTION_GRACE_SECS`], which are never evicted (PR #229
-//! round-5 review; covers a submitter's first post-submit attach/poll).
+//! [`TERMINAL_RETENTION_GRACE_SECS`], which are never evicted (covering a
+//! submitter's first post-submit attach/poll).
 //! See `evict_oldest_terminal_jobs_over_cap`.
 
 use std::collections::HashMap;
@@ -105,8 +105,7 @@ const QUEUE_CAPACITY: usize = 64;
 /// channel, so nothing newer can displace it from the ring buffer.
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
-/// What a job's per-job broadcast channel carries (issues #83/#218-followups
-/// PR #229 round-3 review).
+/// What a job's per-job broadcast channel carries (issue #83).
 ///
 /// `Terminal` exists so an attached subscriber receives the job's final
 /// state **in-band**, from the channel itself, rather than by re-reading the
@@ -131,7 +130,7 @@ pub enum JobEvent {
 }
 
 /// Maximum number of terminal (`Done`/`Failed`) jobs retained in the
-/// registry (issue #218-followups Fix 2, PR #229 review). Pending/Running
+/// registry. Pending/Running
 /// jobs are never evicted regardless of this cap — only completed history
 /// is bounded. Without this, a long-running daemon with scheduled URL/feed
 /// refreshes would grow the registry without bound, and `GET /v1/jobs`
@@ -142,14 +141,14 @@ pub enum JobEvent {
 /// evicted job's id eventually 404s).
 ///
 /// The cap is a target, not a hard ceiling: jobs terminal for less than
-/// [`TERMINAL_RETENTION_GRACE_SECS`] are never evicted (PR #229 round-5
-/// review), so a burst of >cap completions inside the grace window can
+/// [`TERMINAL_RETENTION_GRACE_SECS`] are never evicted, so a burst of >cap
+/// completions inside the grace window can
 /// exceed it temporarily — bounded by the burst itself, and trimmed back to
 /// the cap as entries age past the grace.
 const MAX_TERMINAL_JOBS: usize = 200;
 
-/// How long a terminal job is immune to eviction after completing (PR #229
-/// round-5 review), regardless of `MAX_TERMINAL_JOBS` pressure.
+/// How long a terminal job is immune to eviction after completing, regardless
+/// of `MAX_TERMINAL_JOBS` pressure.
 ///
 /// Covers the submit→first-attach window that in-band terminal delivery
 /// ([`JobEvent::Terminal`]) cannot: a daemon client can only subscribe to
@@ -403,8 +402,8 @@ impl JobQueue {
 
         // Create this job's progress-event channel, its sink, and its
         // cancellation token, and install the handle BEFORE the job is ever
-        // registry-visible (issue #218-followups PR #229 review —
-        // publication-before-handle window). Publishing the registry entry
+        // registry-visible (publication-before-handle window). Publishing the
+        // registry entry
         // first used to leave a window where a client that observed the job
         // via `list_jobs`/`get_job` (so, `GET /v1/jobs` or `GET
         // /v1/jobs/{id}`) and called `cancel` immediately could find the
@@ -471,8 +470,8 @@ impl JobQueue {
                 if let Some(j) = reg.get_mut(&job_id) {
                     fail_index_job(j, "job queue is full or closed".to_string());
                 }
-                // This is a terminal write too (issue #218-followups Fix 2,
-                // PR #229 review) — every path that can move a job to
+                // This is a terminal write too — every path that can move a
+                // job to
                 // `Done`/`Failed` runs eviction, not just `process_job`'s.
                 evict_oldest_terminal_jobs_over_cap(
                     &mut reg,
@@ -524,7 +523,7 @@ impl JobQueue {
     ///   doc comment).
     ///
     /// Check-and-trigger happens inside ONE `registry.write().await`
-    /// critical section (issue #218-followups Fix B), the same lock
+    /// critical section, the same lock
     /// `process_job`'s own check-and-transition holds (see there) — this is
     /// what actually closes the race, not merely reordering steps within
     /// this function. Previously the terminal check (a `registry.read()`)
@@ -576,7 +575,7 @@ impl JobQueue {
         match self.handles.read().await.get(job_id) {
             Some(handle) => handle.cancel_token.cancel(),
             None => {
-                // Issue #218-followups PR #229 review: since `submit` now
+                // Since `submit` now
                 // installs the handle *before* the job is ever
                 // registry-visible (see its doc comment), a registry-visible
                 // non-terminal job missing its handle here is not a
@@ -609,7 +608,7 @@ impl JobQueue {
 
     /// List all jobs.
     ///
-    /// Also trims aged-out terminal jobs first (PR #229 round-6 review):
+    /// Also trims aged-out terminal jobs first:
     /// eviction otherwise only runs on terminal *writes*, so a burst that
     /// exceeded [`MAX_TERMINAL_JOBS`] within the retention grace — followed
     /// by no further completions — would keep its overflow entries
@@ -631,7 +630,7 @@ impl JobQueue {
 
     /// Subscribe to a job's live event stream (issue #83): zero or more
     /// [`JobEvent::Progress`] items, then exactly one [`JobEvent::Terminal`]
-    /// carrying the job's final registry snapshot (PR #229 round-3 review),
+    /// carrying the job's final registry snapshot,
     /// after which the channel closes.
     ///
     /// Returns `None` once the job has reached a terminal state and its
@@ -737,8 +736,8 @@ async fn process_job(
     let cancel_token = queued.cancel_token;
 
     // Atomically decide whether this job was already cancelled by the time
-    // this worker reached it, or should start running now (issue
-    // #218-followups Fix B). Both the `is_cancelled()` check and the
+    // this worker reached it, or should start running now. Both the
+    // `is_cancelled()` check and the
     // resulting registry write happen inside ONE `registry.write().await`
     // critical section — the same lock `JobQueue::cancel` now holds across
     // its own check-and-trigger (see there). Whichever of the two
@@ -763,8 +762,8 @@ async fn process_job(
         }
         // Only the `cancelled` branch above is a terminal write — the
         // `start_index_job` branch moves to `Running`, not terminal, so
-        // nothing to evict there (issue #218-followups Fix 2, PR #229
-        // review). The snapshot for the in-band `JobEvent::Terminal` (see
+        // nothing to evict there. The snapshot for the in-band
+        // `JobEvent::Terminal` (see
         // the teardown below) is taken inside this same write scope:
         // eviction's `protect_id` guarantees the entry is still present
         // here, and no other job's terminal write can evict it before this
@@ -870,8 +869,8 @@ async fn process_job(
             if let Some(job) = reg.get_mut(&job_id) {
                 apply_job_outcome(job, &job_id, outcome);
             }
-            // Every arm of the match above is a terminal write (issue
-            // #218-followups Fix 2, PR #229 review) — evict once per job
+            // Every arm of the match above is a terminal write — evict once
+            // per job
             // completion, not per arm. Snapshot inside this same write
             // scope, same reasoning as the cancelled-before-start branch
             // above (protect_id keeps the entry present; no other job's
@@ -890,8 +889,8 @@ async fn process_job(
     // it's terminal — *after* the registry update above, never before
     // (`JobQueue::cancel` relies on that ordering: a non-terminal registry
     // entry guarantees the handle exists). The terminal snapshot is sent
-    // and the handle removed under ONE `handles` write lock (PR #229
-    // round-3 review): `subscribe` takes the same lock, so every receiver
+    // and the handle removed under ONE `handles` write lock: `subscribe` takes
+    // the same lock, so every receiver
     // either existed when `JobEvent::Terminal` was sent (and reads the
     // job's final state in-band, immune to terminal-job eviction races —
     // see `JobEvent`'s doc comment) or never got a receiver at all.
@@ -960,8 +959,8 @@ fn apply_job_outcome(job: &mut IndexJob, job_id: &str, outcome: JobOutcome) {
 }
 
 /// Evict the oldest terminal (`Done`/`Failed`) jobs, by `(completed_at,
-/// id)`, until `registry` holds at most `cap` of them (issue #218-followups
-/// Fix 2, PR #229 review). Pending/Running jobs are never touched — only
+/// id)`, until `registry` holds at most `cap` of them. Pending/Running jobs
+/// are never touched — only
 /// the terminal subset is counted against `cap` at all. A no-op when
 /// terminal count is already at or under `cap` (the common case).
 ///
@@ -971,7 +970,7 @@ fn apply_job_outcome(job: &mut IndexJob, job_id: &str, outcome: JobOutcome) {
 /// so eviction is atomic with the write that triggered it, no separate lock
 /// acquisition needed. `protect_id` is the job whose terminal transition
 /// triggered this call: it is never an eviction candidate, no matter how it
-/// sorts (PR #229 round-3 review). Without that guarantee, `completed_at`'s
+/// sorts. Without that guarantee, `completed_at`'s
 /// whole-second resolution means a burst of >`cap` completions inside one
 /// second all tie on the sort key, and the just-completed job could evict
 /// *itself* — `process_job` would then close its progress channel while
@@ -992,7 +991,7 @@ fn apply_job_outcome(job: &mut IndexJob, job_id: &str, outcome: JobOutcome) {
 /// property of the ids, not of `HashMap` iteration order, which varies run
 /// to run).
 ///
-/// `cutoff` (PR #229 round-5 review) is the retention-grace boundary:
+/// `cutoff` is the retention-grace boundary:
 /// only terminal jobs strictly older than it (`completed_at < cutoff`) are
 /// eviction candidates. Production passes [`terminal_eviction_cutoff`]
 /// (now minus [`TERMINAL_RETENTION_GRACE_SECS`]); see that constant's doc
@@ -1127,7 +1126,7 @@ fn resolve_aborted(
 /// cancellation just worked a confusing `409`. Any *other* terminal state —
 /// `Done`, or `Failed` with a different `error_code` — reached its own
 /// outcome first, unrelated to this cancel, and stays
-/// `Err(JobAlreadyTerminal)`. Since issue #218-followups Fix B, `cancel`
+/// `Err(JobAlreadyTerminal)`. `cancel`
 /// holds the registry write lock continuously across its pre-trigger check,
 /// the trigger itself, and this function's read, so in practice the state
 /// this function sees can never actually be the "terminal because of this

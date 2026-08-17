@@ -39,8 +39,8 @@ pub struct UrlRefreshRecord {
     /// Time of the last successful refresh.
     pub last_refreshed: Option<Instant>,
     /// A refresh job for this source has been submitted and its completion
-    /// watcher has not yet stamped `last_refreshed` (PR #229 round-7
-    /// review). `tick` skips sources with this set: `last_refreshed` is
+    /// watcher has not yet stamped `last_refreshed`. `tick` skips sources with
+    /// this set: `last_refreshed` is
     /// only written by the detached watcher task *after* the job's terminal
     /// transition, and the job queue's per-store in-flight guard is
     /// released *before* that watcher gets to run — so without this flag, a
@@ -155,8 +155,8 @@ impl UrlRefreshScheduler {
             let records = self.records.read().await;
             for record in records.values() {
                 // A source whose previous refresh hasn't been stamped yet is
-                // never due, regardless of its timestamp (PR #229 round-7
-                // review — see `refresh_inflight`'s doc comment): the stamp
+                // never due, regardless of its timestamp (see
+                // `refresh_inflight`'s doc comment): the stamp
                 // lands after the job queue's in-flight guard is already
                 // released, so the guard alone can't suppress a resubmit in
                 // that window.
@@ -243,24 +243,23 @@ impl UrlRefreshScheduler {
                 Ok(job) => {
                     // Wait for *this* job to reach a terminal state and
                     // stamp `last_refreshed` then, from a task that lives
-                    // entirely outside the job's own submitted future
-                    // (issue #218-followups Fix C). Previously the stamp
-                    // was the tail expression of the closure above — but a
+                    // entirely outside the job's own submitted future. The
+                    // stamp must not sit inside the closure above: a
                     // cancelled job's future is `handle.abort()`ed by
                     // `job_queue::process_job`, which drops everything
-                    // still pending inside it, including that stamp, before
-                    // it ever runs. A cancelled refresh was therefore never
-                    // stamped and got resubmitted on the very next tick —
-                    // the backoff a cancellation is supposed to buy was
-                    // silently undone. Watching from a separate task
-                    // instead observes the registry's terminal write
-                    // (`process_job` commits it before tearing down the
-                    // progress channel — see `HandleRegistry`'s doc comment
-                    // in `job_queue.rs`) regardless of *how* the job got
-                    // there: normal completion, a real failure, or
-                    // cancellation all stamp the same way now.
+                    // still pending inside it — a stamp there would never
+                    // run for a cancelled refresh, which would then be
+                    // resubmitted on the very next tick, silently undoing
+                    // the backoff a cancellation is supposed to buy.
+                    // Watching from a separate task instead observes the
+                    // registry's terminal write (`process_job` commits it
+                    // before tearing down the progress channel — see
+                    // `HandleRegistry`'s doc comment in `job_queue.rs`)
+                    // regardless of *how* the job got there: normal
+                    // completion, a real failure, and cancellation all
+                    // stamp the same way.
                     // Suppress this source before the watcher below exists
-                    // to clear it (PR #229 round-7 review): from here until
+                    // to clear it: from here until
                     // the watcher stamps, `tick` must not consider the
                     // source due — the queue's own in-flight guard stops
                     // covering it the moment `process_job` finishes, which
@@ -293,7 +292,7 @@ impl UrlRefreshScheduler {
                         // `refresh_inflight` in the same write as the stamp
                         // means `tick` always sees either "suppressed" or
                         // "freshly stamped", never the stale-timestamp gap
-                        // between them (PR #229 round-7 review).
+                        // between them.
                         let mut records = records_for_wait.write().await;
                         if let Some(r) = records.get_mut(&source_id_for_wait) {
                             r.last_refreshed = Some(Instant::now());
@@ -326,8 +325,8 @@ impl UrlRefreshScheduler {
     }
 }
 
-/// Wait until `job_id` reaches a terminal state (issue #218-followups Fix
-/// C), observed via its progress-event channel closing — mirrors
+/// Wait until `job_id` reaches a terminal state, observed via its
+/// progress-event channel closing — mirrors
 /// `cli::job_attach::drive_embedded_job`'s wait pattern, but discards the
 /// progress events themselves; only the channel's closure matters here.
 /// Per `HandleRegistry`'s doc comment in `job_queue.rs`, that closure is
@@ -393,7 +392,7 @@ mod tests {
     }
 
     /// Poll `scheduler.records` until `source_id`'s `last_refreshed` is
-    /// set, up to 5s. Since issue #218-followups Fix C, the stamp lands on
+    /// set, up to 5s. The stamp lands on
     /// a separate spawned task (`wait_for_job_terminal` + the stamp itself)
     /// woken by the job's own terminal transition, independently scheduled
     /// from whatever poll a test itself uses to observe that same terminal
@@ -605,7 +604,7 @@ mod tests {
     /// single-threaded test runtime (the worker task doesn't get to run
     /// until this test task itself yields, e.g. via `sleep`).
     ///
-    /// Since issue #218-followups Fix C, the stamp itself happens on a
+    /// The stamp itself happens on a
     /// separate spawned task that wakes up once the job's progress channel
     /// closes (see `wait_for_job_terminal`) — deliberately *not* inline
     /// with the job's own future — so "the job is Failed" and "the stamp
@@ -666,7 +665,7 @@ mod tests {
         wait_for_last_refreshed_stamp(&scheduler, "src-timing").await;
     }
 
-    /// PR #229 round-7 review: a source whose refresh job has been
+    /// A source whose refresh job has been
     /// submitted but whose completion watcher has not yet stamped
     /// `last_refreshed` is never due — even when its timestamp is stale
     /// and the job queue would accept a submission. The queue's per-store
@@ -777,15 +776,15 @@ mod tests {
         );
     }
 
-    /// Issue #218-followups Fix C: a cancelled refresh job must not be
+    /// A cancelled refresh job must not be
     /// resubmitted on the tick immediately following its cancellation —
-    /// before this fix, `last_refreshed` was stamped as the tail
-    /// expression of the job's own submitted closure, which
-    /// `job_queue::process_job` drops entirely (along with everything else
-    /// still pending inside it) when it `handle.abort()`s a cancelled
-    /// task. A cancelled refresh was therefore never stamped and got
-    /// resubmitted on the very next tick — undoing the backoff the
-    /// cancellation was supposed to buy. Constructed deterministically: a
+    /// were `last_refreshed` stamped as the tail expression of the job's
+    /// own submitted closure, `job_queue::process_job` would drop that
+    /// stamp (along with everything else still pending inside the future)
+    /// when it `handle.abort()`s a cancelled task, and the never-stamped
+    /// refresh would be resubmitted on the very next tick — undoing the
+    /// backoff the cancellation is supposed to buy; hence the detached
+    /// watcher task (see `tick`). Constructed deterministically: a
     /// blocker job on a *different* store occupies the queue's sole worker
     /// (mirrors `job_queue::tests::cancellation`'s pending-cancel test)
     /// so the scheduler's own tick-submitted refresh job is guaranteed to
@@ -960,7 +959,7 @@ mod tests {
                     // #187 review F1: `last_refreshed` must be recorded
                     // once the job actually completes, not back when it was
                     // merely submitted. The stamp itself lands on a
-                    // separate task (issue #218-followups Fix C), so poll
+                    // separate task, so poll
                     // for it rather than asserting it's already visible the
                     // instant this loop observes `Done`.
                     wait_for_last_refreshed_stamp(&scheduler, &source.id).await;
