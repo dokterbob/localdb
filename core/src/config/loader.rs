@@ -166,6 +166,12 @@ fn validate_config(config: &RawConfig) -> Result<(), Error> {
         });
     }
 
+    if config.server.job_workers < 1 {
+        return Err(Error::InvalidConfig {
+            message: "server.job_workers must be greater than zero".to_string(),
+        });
+    }
+
     if config.http.rate_limit.requests_per_second < 1 {
         return Err(Error::InvalidConfig {
             message: "http.rate_limit.requests_per_second must be greater than zero".to_string(),
@@ -452,6 +458,37 @@ defaults:
             "stores: key should be rejected by deny_unknown_fields: {:?}",
             err
         );
+    }
+
+    // --- server.job_workers validation ---
+
+    #[test]
+    fn server_job_workers_absent_defaults_to_one() {
+        let cfg = load_config_from_str("version: 1\n").expect("minimal config should load");
+        assert_eq!(cfg.server.job_workers, 1);
+    }
+
+    #[test]
+    fn server_job_workers_set_is_respected() {
+        let yaml = "version: 1\nserver:\n  job_workers: 4\n";
+        let cfg = load_config_from_str(yaml).expect("valid server.job_workers should load");
+        assert_eq!(cfg.server.job_workers, 4);
+    }
+
+    #[test]
+    fn server_job_workers_zero_rejected() {
+        let yaml = "version: 1\nserver:\n  job_workers: 0\n";
+        let err = load_config_from_str(yaml).unwrap_err();
+        match err {
+            Error::InvalidConfig { message } => {
+                assert!(
+                    message.contains("server.job_workers"),
+                    "error message '{}' should mention the offending path",
+                    message
+                );
+            }
+            other => panic!("expected InvalidConfig, got {:?}", other),
+        }
     }
 
     // --- http.rate_limit validation ---

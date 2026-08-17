@@ -105,7 +105,7 @@ fn bind_socket_guard(options: &DaemonOptions) -> Result<SocketGuard, Error> {
 async fn build_daemon_state(
     options: &DaemonOptions,
 ) -> Result<(AppState, UrlRefreshScheduler), Error> {
-    let queue = JobQueue::new();
+    let queue = JobQueue::with_workers(options.config.server.job_workers);
     let url_scheduler = UrlRefreshScheduler::new(queue.clone());
     let state = AppState::new(
         options.config.clone(),
@@ -664,6 +664,7 @@ mod tests {
             server: localdb_core::config::schema::ServerConfig {
                 bind: "127.0.0.1".to_string(),
                 port: 0, // let OS assign a free port
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -701,6 +702,7 @@ mod tests {
             server: localdb_core::config::schema::ServerConfig {
                 bind: "127.0.0.1".to_string(),
                 port: 0, // let OS assign a free port
+                ..Default::default()
             },
             ..Default::default()
         };

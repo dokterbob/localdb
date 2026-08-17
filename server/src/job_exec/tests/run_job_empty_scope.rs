@@ -31,6 +31,7 @@ async fn run_job_with_no_sources_returns_default_stats_and_passes_the_embedder_t
             yaml: &yaml,
             models_dir: state.models_dir(),
             embedder: Some(embedder.clone()),
+            fetchers: None,
             progress: None,
             on_source_error: None,
         },

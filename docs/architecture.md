@@ -83,10 +83,12 @@ queue. Opens the same unified database (`<data_dir>/localdb.db`) as the CLI; CLI
 visible. Multi-process is the first-class concurrency model — the daemon is one writer among peers
 (CLI sessions, multiple stdio MCP servers); concurrent writers serialise via SQLite WAL +
 `busy_timeout=5000`. Ingestion via `POST /v1/jobs` runs the real pipeline
-(`server::job_exec::run_job`) through an async, single-worker job queue with a per-store in-flight
-guard (issue #187) — not a stub; a second submission for a store already running rejects with
-`index_in_progress`, 409. `GET /jobs/{id}/events` streams the job's live progress over SSE (issue
-#83). The URL-refresh scheduler submits through the same job engine. See
+(`server::job_exec::run_job`) through an async job queue with a configurable worker pool
+(`server.job_workers`, default 1) and a per-store in-flight guard (issues #187, #208) — not a
+stub; a second submission for a store already running rejects with `index_in_progress`, 409, while
+jobs for different stores run concurrently up to `server.job_workers` workers. `GET
+/jobs/{id}/events` streams the job's live progress over SSE (issue #83). The URL-refresh scheduler
+submits through the same job engine. See
 [specs/05-surfaces.md](../specs/05-surfaces.md) §3.
 
 ### `mcp`
@@ -311,18 +313,20 @@ store-list snapshot and daemon-proxied `localdb mcp --store`) are related but di
 open.
 
 **1. ~~HTTP daemon `POST /v1/jobs` is a no-op~~ — RESOLVED.**
-([#187](https://github.com/dokterbob/localdb/issues/187)) `POST /v1/jobs` now runs the real
-ingestion pipeline (`server::job_exec::run_job`) through an async, single-worker job queue with a
-per-store in-flight guard — a duplicate submission for a store already running rejects with
-`index_in_progress` (409), rather than silently no-opping. `localdb index` submits a job to the
-daemon and attaches to `GET /v1/jobs/{id}/events` (SSE, issue #83) for live progress, falling back
-to polling `GET /v1/jobs/{id}` if the stream can't be established; the summary, `--json`, and
-`--strict` output are identical to embedded mode. `index --delete` also works daemon-attached now
-(`deletion_policy` on the job request). Stopping the daemon before `localdb index` is no longer
-necessary. See [specs/05-surfaces.md](../specs/05-surfaces.md) §2/§3 for the full contract. Still a
-deliberate v1 scope cut: the job queue runs one job at a time (per process, not per store) — a
-worker-pool size is a follow-up, not blocking correctness since the per-store guard already prevents
-two concurrent jobs on the same store from racing.
+([#187](https://github.com/dokterbob/localdb/issues/187),
+[#208](https://github.com/dokterbob/localdb/issues/208)) `POST /v1/jobs` now runs the real
+ingestion pipeline (`server::job_exec::run_job`) through an async job queue with a configurable
+worker pool (`server.job_workers`, default 1) and a per-store in-flight guard — a duplicate
+submission for a store already running rejects with `index_in_progress` (409), rather than silently
+no-opping. `localdb index` submits a job to the daemon and attaches to `GET /v1/jobs/{id}/events`
+(SSE, issue #83) for live progress, falling back to polling `GET /v1/jobs/{id}` if the stream can't
+be established; the summary, `--json`, and `--strict` output are identical to embedded mode. `index
+--delete` also works daemon-attached now (`deletion_policy` on the job request). Stopping the
+daemon before `localdb index` is no longer necessary. See
+[specs/05-surfaces.md](../specs/05-surfaces.md) §2/§3 for the full contract. The worker-pool size
+(`server.job_workers`) is operator-configurable as of #208: values greater than 1 let jobs for
+different stores run concurrently, while the per-store guard still prevents two concurrent jobs on
+the same store from racing regardless of pool size.
 
 **Gap #2. `source add` does not validate path existence.**
 ([#14](https://github.com/dokterbob/localdb/issues/14)) **Resolved as of 2026-06-28:**

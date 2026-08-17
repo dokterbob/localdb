@@ -91,14 +91,15 @@ first if it is wrong.
   CLI-indexed data — the daemon opens the same unified `localdb.db` as the CLI, not an in-memory
   store, and there is no separate write-lock (SQLite WAL + `busy_timeout=5000` serialise concurrent
   writers). `POST /v1/jobs` (ingestion) runs the real pipeline (`server/src/job_exec.rs`) through an
-  async, single-worker queue with a per-store in-flight guard (issue #187) — a duplicate submission
-  for a store already running gets `index_in_progress`, HTTP 409 / CLI exit 4. `localdb index`
-  submits a job to the daemon and attaches to its live progress via SSE (`GET /v1/jobs/{id}/events`,
-  issue #83, falling back to polling), rendering an identical summary/`--json`/`--strict` to
-  embedded mode; `--delete` works daemon-attached too. **Stopping the daemon before running
-  `localdb index` is no longer required.** Still experimental as a surface — no auth, and only one
-  job runs at a time (job worker pool size N>1 is a follow-up). See `specs/05-surfaces.md §2-3` and
-  `docs/architecture.md#known-gaps`.
+  async job queue with a configurable worker pool (`server.job_workers`, default 1, issue #208) and
+  a per-store in-flight guard (issue #187) — a duplicate submission for a store already running gets
+  `index_in_progress`, HTTP 409 / CLI exit 4, regardless of worker count; jobs for different stores
+  run concurrently up to `server.job_workers` workers, but same-store jobs are always serialized.
+  `localdb index` submits a job to the daemon and attaches to its live progress via SSE (`GET
+  /v1/jobs/{id}/events`, issue #83, falling back to polling), rendering an identical
+  summary/`--json`/`--strict` to embedded mode; `--delete` works daemon-attached too. **Stopping the
+  daemon before running `localdb index` is no longer required.** Still experimental as a surface —
+  no auth. See `specs/05-surfaces.md §2-3` and `docs/architecture.md#known-gaps`.
 - **Schema changes require a chain entry AND a `create_schema` fold-in**: every migration is written
   twice — once in `store-libsql/src/migrations/chain.rs`'s `migrations()`, once folded into
   `schema::create_schema` — the drift-guard test

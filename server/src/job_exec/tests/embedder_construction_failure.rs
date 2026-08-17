@@ -54,6 +54,7 @@ async fn run_job_propagates_an_embedder_construction_failure() {
             yaml: &yaml,
             models_dir: state.models_dir(),
             embedder: None,
+            fetchers: None,
             progress: None,
             on_source_error: None,
         },

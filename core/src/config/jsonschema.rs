@@ -253,6 +253,24 @@ mod tests {
         );
     }
 
+    /// Same trap as `rate_limit_fields_have_minimum_one_not_schemars_default_zero`
+    /// above, for `ServerConfig::job_workers` (issue #208): `usize`'s
+    /// derived range is `minimum: 0`, but `validate_config` rejects `0` at
+    /// load time. Without `#[schemars(range(min = 1))]` on `job_workers` in
+    /// `core/src/config/schema.rs`, the published schema would call `0`
+    /// valid for a config the loader then refuses.
+    #[test]
+    fn job_workers_has_minimum_one_not_schemars_default_zero() {
+        let schema = generate_router_schema();
+        let server = &schema["$defs"]["v1_ServerConfig"]["properties"];
+
+        assert_eq!(
+            server["job_workers"]["minimum"],
+            json!(1),
+            "job_workers must declare minimum: 1, matching validate_config's floor"
+        );
+    }
+
     #[test]
     fn router_schema_else_branch_rejects_unknown_version() {
         let schema = generate_router_schema();

@@ -16,6 +16,7 @@ $schema: {{SCHEMA_URL}}
 server:
   bind: 127.0.0.1   # loopback only; set to 0.0.0.0 to listen on all interfaces
   port: 7700        # set to 0 to let the OS assign an ephemeral port
+  job_workers: 1    # daemon job-queue workers; jobs for the same store never run concurrently
 
 # --- Path overrides (optional; platform defaults apply to omitted keys) ---
 # paths:
