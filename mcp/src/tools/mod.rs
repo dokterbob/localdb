@@ -397,15 +397,7 @@ pub async fn tool_get_document(
             Err(result) => return result,
         };
         let handle = &handles[0];
-        return match get_document_from_store(
-            backend,
-            &handle.id,
-            &handle.name,
-            &handle.store,
-            &args.id,
-        )
-        .await
-        {
+        return match get_document_from_store(backend, &handle.id, &handle.name, &args.id).await {
             Ok(Some(json)) => success_json(&json),
             Ok(None) => typed_error(
                 "resource_not_found",
@@ -425,7 +417,6 @@ pub async fn tool_get_document(
             backend,
             &store.descriptor.id,
             &store.descriptor.name,
-            &store.store,
             &args.id,
         )
         .await
@@ -446,33 +437,17 @@ pub async fn tool_get_document(
 /// document with that id (the caller decides how to report that); any other
 /// backend error becomes a ready-to-return `CallToolResult`.
 ///
-/// `store_id`/`store_name`/`retrieval_store` describe the same store from
-/// two angles: `store_id` scopes the `backend` lookup (`DocumentInfo`,
-/// text), while `retrieval_store` (the session's own `RetrievalStore`
-/// handle) supplies the `chunk_count` `DocumentDetail` doesn't carry.
+/// `store_id` scopes the `backend` lookup (`DocumentInfo`, text, chunk
+/// count); `store_name` is only used to label the store in the returned
+/// JSON and in error messages.
 async fn get_document_from_store(
     backend: &dyn StoreBackend,
     store_id: &str,
     store_name: &str,
-    retrieval_store: &Arc<dyn RetrievalStore>,
     doc_id: &str,
 ) -> Result<Option<Value>, CallToolResult> {
     match get_document_detail(backend, doc_id, Some(store_id), true).await {
-        Ok(detail) => {
-            let chunks = match retrieval_store
-                .get_chunks_for_resource(&detail.info.id)
-                .await
-            {
-                Ok(chunks) => chunks,
-                Err(e) => {
-                    return Err(typed_error(
-                        e.code(),
-                        format!("error fetching document from store '{store_name}': {e}"),
-                    ))
-                }
-            };
-            Ok(Some(document_json(&detail, store_name, chunks.len())))
-        }
+        Ok(detail) => Ok(Some(document_json(&detail, store_name))),
         Err(Error::ResourceNotFound { .. }) => Ok(None),
         Err(e) => Err(typed_error(
             e.code(),
@@ -484,11 +459,10 @@ async fn get_document_from_store(
 /// Build the `get_document` JSON payload from the shared read model's
 /// [`DocumentDetail`].
 ///
-/// `chunk_count` is passed in separately rather than read off `detail`:
-/// `DocumentDetail` deliberately carries only `info` + reconstructed `text`
-/// (see `core/src/documents.rs`), so the caller supplies the chunk count it
-/// already fetched to compute it.
-fn document_json(detail: &DocumentDetail, store_name: &str, chunk_count: usize) -> Value {
+/// `chunk_count` comes straight off `detail` — populated by the same chunk
+/// fetch that built `text`, since `get_document_from_store` always requests
+/// `include_text: true`.
+fn document_json(detail: &DocumentDetail, store_name: &str) -> Value {
     serde_json::json!({
         "resource_id": detail.info.id,
         "uri": detail.info.uri,
@@ -502,7 +476,7 @@ fn document_json(detail: &DocumentDetail, store_name: &str, chunk_count: usize) 
             "content_hash": detail.info.content_hash,
         },
         "metadata": detail.info.metadata,
-        "chunk_count": chunk_count,
+        "chunk_count": detail.chunk_count.unwrap_or(0),
         "text": detail.text.as_deref().unwrap_or(""),
     })
 }

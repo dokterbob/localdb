@@ -24,6 +24,12 @@ mod tests;
 pub struct DocumentDetail {
     pub info: DocumentInfo,
     pub text: Option<String>,
+    /// The document's chunk count, carried out of the same chunk fetch that
+    /// builds `text` — `Some(chunks.len())` when `include_text` was true,
+    /// `None` when it was false (chunks were never fetched, so no count is
+    /// available). Surfaces that need a chunk count for `include_text: true`
+    /// lookups read it from here instead of re-fetching the chunk list.
+    pub chunk_count: Option<usize>,
 }
 
 /// Look up a document plus, when `include_text` is set, its reconstructed
@@ -50,16 +56,21 @@ pub async fn get_document_detail(
             id: doc_id.to_string(),
         })?;
 
-    let text = if include_text {
+    let (text, chunk_count) = if include_text {
         let store = backend.retrieval_store(&info.store_id).await?;
         let chunks = store.get_chunks_for_resource(&info.id).await?;
         let blocks = store.get_blocks_for_resource(&info.id).await?;
-        Some(reconstruct_document_text(&chunks, &blocks))
+        let text = reconstruct_document_text(&chunks, &blocks);
+        (Some(text), Some(chunks.len()))
     } else {
-        None
+        (None, None)
     };
 
-    Ok(DocumentDetail { info, text })
+    Ok(DocumentDetail {
+        info,
+        text,
+        chunk_count,
+    })
 }
 
 /// Like [`get_document_detail`], but scoped to a caller-visible set of store

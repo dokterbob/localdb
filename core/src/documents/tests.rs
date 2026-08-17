@@ -230,6 +230,37 @@ async fn get_document_detail_without_text_leaves_text_none() {
 
     assert_eq!(detail.info.id, "doc-1");
     assert!(detail.text.is_none());
+    assert_eq!(
+        detail.chunk_count, None,
+        "chunk_count must be None when include_text is false — chunks are never fetched"
+    );
+}
+
+#[tokio::test]
+async fn get_document_detail_with_text_populates_chunk_count() {
+    let store = FakeStore::new();
+    store
+        .upsert_chunks(vec![
+            make_chunk("chunk-1", "doc-1", "store-a", "chunk one"),
+            make_chunk("chunk-2", "doc-1", "store-a", "chunk two"),
+            make_chunk("chunk-3", "doc-1", "store-a", "chunk three"),
+        ])
+        .await
+        .unwrap();
+
+    let backend = FakeBackend::new()
+        .with_document(make_document_info("doc-1", "store-a", "file:///a.md"))
+        .with_store("store-a", Arc::new(store));
+
+    let detail = get_document_detail(&backend, "doc-1", None, true)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        detail.chunk_count,
+        Some(3),
+        "chunk_count must equal the number of chunks fetched to build text"
+    );
 }
 
 #[tokio::test]

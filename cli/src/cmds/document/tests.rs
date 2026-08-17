@@ -134,6 +134,7 @@ fn document_get_result_from_detail_populates_text_from_detail() {
     let detail = DocumentDetail {
         info,
         text: Some("full document text".to_string()),
+        chunk_count: Some(2),
     };
     let result = DocumentGetResult::from_detail(detail);
     assert_eq!(result.id, "doc-1");
@@ -143,7 +144,11 @@ fn document_get_result_from_detail_populates_text_from_detail() {
 #[test]
 fn document_get_result_from_detail_defaults_missing_text_to_empty_string() {
     let info = test_document_info("doc-1", "/tmp/notes.md", None);
-    let detail = DocumentDetail { info, text: None };
+    let detail = DocumentDetail {
+        info,
+        text: None,
+        chunk_count: None,
+    };
     let result = DocumentGetResult::from_detail(detail);
     assert_eq!(result.text, "");
 }

@@ -695,15 +695,18 @@ server starts and exposes zero stores (§2.2's empty-scope exception).
   `/mcp?store=x` nor a custom header can select a scoped handler on the daemon side. The tool
   arguments already carry store scope, though — `search.stores`, `get_document.store`,
   `get_chunks.store`, `list_documents.store` — so `ProxyHandler` validates and injects them on each
-  relayed `tools/call`: an explicit store argument outside the scope is a tool-level
-  `invalid_request` naming the allowed set; an absent one (`get_document`/`get_chunks`/
-  `list_documents` alike — the proxy inspects only the raw JSON argument, not whether the tool
-  itself requires it) is tried against each scoped store in turn, keeping the first non-error
+  relayed `tools/call`, differently per tool depending on whether its `store` is optional or
+  required: an explicit store argument outside the scope is always a tool-level `invalid_request`
+  naming the allowed set, regardless of tool. For `get_document`/`get_chunks`, whose `store` is
+  optional, an absent one is tried against each scoped store in turn, keeping the first non-error
   result, which preserves each tool's documented "omitted store scans every available store, first
-  match wins" behavior narrowed to the scope; and `list_stores`' response is filtered so an agent
-  cannot even enumerate stores it may not read. While the tool set is fixed at five read-only tools,
-  a scoped proxy relays _only_ those five and rejects any other name with `invalid_request` — a
-  future mutating tool must be given an explicit scoping rule before it can pass through.
+  match wins" behavior narrowed to the scope. `list_documents.store` is required, not optional, so
+  the proxy never injects it: an absent (or wrong-typed) `store` is relayed unmodified, and the
+  upstream's own missing-required-argument error surfaces exactly as it would in embedded mode or an
+  unscoped proxy. `list_stores`' response is filtered so an agent cannot even enumerate stores it
+  may not read. While the tool set is fixed at five read-only tools, a scoped proxy relays _only_
+  those five and rejects any other name with `invalid_request` — a future mutating tool must be
+  given an explicit scoping rule before it can pass through.
 
 **This is scoping, not a security boundary.** The daemon's `/mcp` is loopback and unauthenticated,
 so anything that can open a socket can bypass `localdb mcp` and talk to the unscoped endpoint
