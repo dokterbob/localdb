@@ -20,9 +20,10 @@
 //! synchronous `Fn() -> Result<S, io::Error>` service factory with no access
 //! to the HTTP request, so the daemon cannot hand out a per-connection scoped
 //! handler however the client asks: not via `/mcp?store=x`, not via a header.
-//! But `search.stores`, `get_document.store` and `get_chunks.store` exist
-//! precisely to name stores, and `tools.rs` already honours them — so the
-//! scope travels as an argument, per request, instead of per connection.
+//! But `search.stores`, `get_document.store`, `get_chunks.store`, and
+//! `list_documents.store` exist precisely to name stores, and `tools.rs`
+//! already honours them — so the scope travels as an argument, per request,
+//! instead of per connection.
 //!
 //! **This is scoping, not a security boundary.** The daemon's `/mcp` is
 //! loopback and unauthenticated: anything that can open a socket can bypass
@@ -320,12 +321,17 @@ impl ProxyHandler {
         self.relay(request).await
     }
 
-    /// `get_document` / `get_chunks`: both take a single optional `store`.
+    /// `get_document` / `get_chunks`: each takes a single, optional `store`
+    /// argument that defaults to scanning every available store.
     ///
     /// An explicit value is canonicalized and scope-checked. Rejecting an
     /// out-of-scope explicit value is the load-bearing half: injecting only
     /// when absent would let a caller name any store on the daemon and read
     /// it, which is the exact leak this scoping exists to prevent.
+    ///
+    /// `list_documents`' `store` is required, not optional, so it is not
+    /// handled here — see `call_list_documents_scoped`, which never injects
+    /// a store on the caller's behalf.
     async fn call_single_store_scoped(
         &self,
         mut request: CallToolRequestParams,
@@ -371,6 +377,36 @@ impl ProxyHandler {
                 // answer at all, so it gets a scope rejection.
                 Ok(last.unwrap_or_else(|| scope_rejection("<none>", &scope.allowed_names())))
             }
+        }
+    }
+
+    /// `list_documents`: unlike `search`'s `stores` and `get_document`'s/
+    /// `get_chunks`'s `store`, `ListDocumentsArgs::store` is required — there
+    /// is no "scan every available store" default to fall back to. An
+    /// omitted `store` must surface the same missing-required-argument error
+    /// a caller would get in embedded mode or an unscoped proxy, not silently
+    /// resolve to some scoped store, so this never injects one: an explicit
+    /// value is canonicalized and scope-checked exactly like
+    /// `call_single_store_scoped`'s explicit-value arm, and anything else
+    /// (absent, `null`, or wrong-typed) is relayed unmodified, letting the
+    /// upstream's own required-argument deserialization error surface.
+    async fn call_list_documents_scoped(
+        &self,
+        mut request: CallToolRequestParams,
+        scope: &ProxyScope,
+    ) -> Result<CallToolResult, McpError> {
+        let args = request.arguments.get_or_insert_with(Default::default);
+
+        match args.get("store") {
+            Some(serde_json::Value::String(value)) => {
+                let id = match scope.canonicalize(value) {
+                    Ok(id) => id,
+                    Err(rejection) => return Ok(rejection),
+                };
+                args.insert("store".to_string(), serde_json::json!(id));
+                self.relay(request).await
+            }
+            _ => self.relay(request).await,
         }
     }
 
@@ -486,7 +522,7 @@ impl ServerHandler for ProxyHandler {
     }
 
     /// Relayed unchanged in both modes: the tool *set* is store-independent
-    /// — the same four read-only tools regardless of which stores are in
+    /// — the same five read-only tools regardless of which stores are in
     /// scope — so there is nothing here to filter.
     async fn list_tools(
         &self,
@@ -513,9 +549,10 @@ impl ServerHandler for ProxyHandler {
         match request.name.as_ref() {
             "search" => self.call_search_scoped(request, scope).await,
             "get_document" | "get_chunks" => self.call_single_store_scoped(request, scope).await,
+            "list_documents" => self.call_list_documents_scoped(request, scope).await,
             "list_stores" => self.call_list_stores_scoped(request, scope).await,
             // Deliberately a denylist-free allowlist: a scoped session
-            // relays only the four tools whose store semantics are known
+            // relays only the five tools whose store semantics are known
             // here. Falling through to a verbatim relay would mean the first
             // mutating tool ever added (`--allow-write`, specs/05-surfaces.md
             // §4) silently bypasses the scope on the day it lands. Making

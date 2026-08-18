@@ -116,7 +116,41 @@ pub trait StoreBackend: Send + Sync + 'static {
         store_id: &str,
     ) -> Result<Option<SourceRow>, Error>;
 
-    async fn find_document(&self, doc_id: &str) -> Result<Option<DocumentInfo>, Error>;
+    /// Look up a single document by id.
+    ///
+    /// `store_id: Some(_)` scopes the lookup to that store — the query itself
+    /// carries the filter, so a document id shared across stores never
+    /// ambiguates. `None` looks up the id across every store; if more than
+    /// one store holds a document with that id, implementations return
+    /// `Error::InvalidRequest` rather than guessing which one the caller
+    /// meant.
+    async fn find_document(
+        &self,
+        doc_id: &str,
+        store_id: Option<&str>,
+    ) -> Result<Option<DocumentInfo>, Error>;
+
+    /// List documents in `store_id`, ordered by `uri`, optionally filtered to
+    /// a single `source_id`, and paginated by `limit`/`offset`.
+    ///
+    /// `limit: None` returns every row from `offset` onward, uncapped.
+    /// `offset` past the end of the (filtered) result set yields an empty
+    /// list, not an error. An unknown `source_id` is a pure filter — it
+    /// yields an empty list rather than an error, matching `find_document`'s
+    /// "no error on a miss" posture for read paths.
+    async fn list_documents(
+        &self,
+        store_id: &str,
+        source_id: Option<&str>,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Vec<DocumentInfo>, Error>;
+
+    /// Count documents in `store_id`, optionally filtered to a single
+    /// `source_id` — the un-paginated total backing a paginated
+    /// `list_documents` call's envelope. Same "unknown `source_id` is a pure
+    /// filter" posture as `list_documents`.
+    async fn count_documents(&self, store_id: &str, source_id: Option<&str>) -> Result<u64, Error>;
 
     async fn retrieval_store(&self, store_id: &str) -> Result<Arc<dyn RetrievalStore>, Error>;
 

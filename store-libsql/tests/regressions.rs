@@ -340,7 +340,7 @@ async fn indexed_resource_persists_ingestion_time_not_feed_date_in_added_at() {
     );
 
     let info = db
-        .find_document(&resource.id)
+        .find_document(&resource.id, None)
         .await
         .unwrap()
         .expect("the indexed resource must be readable back");

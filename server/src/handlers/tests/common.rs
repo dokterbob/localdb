@@ -7,8 +7,8 @@ use tempfile::TempDir;
 
 use crate::handlers::{
     cancel_job, create_job, create_source, create_store, delete_source, delete_store, get_config,
-    get_document, get_job, get_status, get_store, job_events, list_jobs, list_sources, list_stores,
-    patch_store, search,
+    get_document, get_job, get_status, get_store, job_events, list_documents, list_jobs,
+    list_sources, list_stores, patch_store, search,
 };
 use crate::state::AppState;
 
@@ -80,6 +80,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
             get(list_sources).post(create_source),
         )
         .route("/v1/sources/{id}", delete(delete_source))
+        .route("/v1/stores/{name}/documents", get(list_documents))
         .route("/v1/documents/{id}", get(get_document))
         .route("/v1/search", post(search))
         .route("/v1/jobs", get(list_jobs).post(create_job))
@@ -132,14 +133,35 @@ pub(crate) struct SeedChunkInput {
 }
 
 pub(crate) async fn seed_store_a_chunk(state: &AppState, input: SeedChunkInput) {
-    use localdb_core::Embedder;
+    seed_chunk_in_store(state, "store-A", input).await;
+}
 
-    state.add_store("store-A", "private").await.unwrap();
+/// Like [`seed_store_a_chunk`], but into a caller-named store — lets a test
+/// seed the same document id into two different stores (e.g. to exercise
+/// `?store=` disambiguation on `GET /v1/documents/{id}`) without colliding on
+/// `add_store`'s "already exists" check.
+pub(crate) async fn seed_chunk_in_store(state: &AppState, store_name: &str, input: SeedChunkInput) {
+    state.add_store(store_name, "private").await.unwrap();
     let source = state
-        .add_source("store-A", "path", json!({"root": "/tmp"}), "prose", None)
+        .add_source(store_name, "path", json!({"root": "/tmp"}), "prose", None)
         .await
         .unwrap();
-    let store_id = source.store_id.clone();
+    seed_chunk_with_source(state, &source.store_id, &source.id, input).await;
+}
+
+/// Like [`seed_chunk_in_store`], but into a caller-supplied, already-existing
+/// `(store_id, source_id)` pair rather than creating a fresh store+source —
+/// lets a test seed two documents under two different sources within the
+/// *same* store (e.g. to exercise `?source=` filtering on `GET
+/// /v1/stores/{name}/documents`).
+pub(crate) async fn seed_chunk_with_source(
+    state: &AppState,
+    store_id: &str,
+    source_id: &str,
+    input: SeedChunkInput,
+) {
+    use localdb_core::Embedder;
+
     let embedder = localdb_core::FakeEmbedder::new(128);
     let docs = vec![localdb_core::embedder::DocumentChunks {
         document_context: input.text.to_string(),
@@ -158,7 +180,7 @@ pub(crate) async fn seed_store_a_chunk(state: &AppState, input: SeedChunkInput) 
     let chunk = localdb_core::ChunkRecord {
         id: input.chunk_id.to_string(),
         resource_id: input.doc_id.to_string(),
-        store_id: store_id.clone(),
+        store_id: store_id.to_string(),
         text: input.text.to_string(),
         span: localdb_core::types::Span::new(0, input.text.len()),
         heading_path: vec![],
@@ -166,8 +188,8 @@ pub(crate) async fn seed_store_a_chunk(state: &AppState, input: SeedChunkInput) 
         policy_version: "v1".to_string(),
         fetched_at: "2026-06-10T12:00:00Z".to_string(),
         content_hash: "abc123".to_string(),
-        origin_store: store_id.clone(),
-        source_id: source.id,
+        origin_store: store_id.to_string(),
+        source_id: source_id.to_string(),
         ingestor_kind: "path".to_string(),
         mime: Some("text/plain".to_string()),
         uri: input.uri.to_string(),
@@ -180,7 +202,7 @@ pub(crate) async fn seed_store_a_chunk(state: &AppState, input: SeedChunkInput) 
     };
     state
         .backend()
-        .retrieval_store(&store_id)
+        .retrieval_store(store_id)
         .await
         .unwrap()
         .upsert_chunks(vec![chunk])

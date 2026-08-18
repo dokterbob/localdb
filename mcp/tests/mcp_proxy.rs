@@ -23,11 +23,115 @@ use rmcp::{
 
 use localdb_core::{
     ids::{chunk_id, content_hash, new_ulid, resource_id},
+    metadata::Metadata,
     store::{ChunkRecord, FakeStore, RetrievalStore},
     types::Span,
-    FakeEmbedder,
+    DocumentInfo, Error, FakeEmbedder, SourceRow, StoreBackend, StoreBackendConfig, StoreRow,
+    TableSize,
 };
 use mcp::{proxy::ProxyHandler, AvailableStore, StoreDescriptor};
+
+// ---------------------------------------------------------------------------
+// A `StoreBackend` whose only real behavior is `list_documents`/
+// `count_documents` — `mcp::tools::StoresBackend` (used by every other proxy
+// test in this file) deliberately leaves those `unimplemented!()`, since it
+// only exists to back `get_document`'s two calls
+// (`find_document`/`retrieval_store`). Modeled on `core/src/documents/
+// tests.rs`'s own `FakeBackend`.
+// ---------------------------------------------------------------------------
+
+struct DocumentRegistryBackend {
+    documents: std::collections::HashMap<String, Vec<DocumentInfo>>,
+}
+
+#[async_trait::async_trait]
+impl StoreBackend for DocumentRegistryBackend {
+    async fn open(_config: StoreBackendConfig) -> Result<Self, Error> {
+        unimplemented!("never constructed via the trait's own open()")
+    }
+    async fn upsert_store(&self, _store: &StoreRow) -> Result<(), Error> {
+        unimplemented!("not exercised by list_documents")
+    }
+    async fn delete_store(&self, _id: &str) -> Result<bool, Error> {
+        unimplemented!("not exercised by list_documents")
+    }
+    async fn get_store(&self, _id: &str) -> Result<Option<StoreRow>, Error> {
+        unimplemented!("not exercised by list_documents")
+    }
+    async fn get_store_by_name(&self, _name: &str) -> Result<Option<StoreRow>, Error> {
+        unimplemented!("not exercised by list_documents")
+    }
+    async fn list_stores(&self) -> Result<Vec<StoreRow>, Error> {
+        unimplemented!("not exercised by list_documents")
+    }
+    async fn upsert_source(&self, _source: &SourceRow) -> Result<(), Error> {
+        unimplemented!("not exercised by list_documents")
+    }
+    async fn delete_source(&self, _id: &str) -> Result<bool, Error> {
+        unimplemented!("not exercised by list_documents")
+    }
+    async fn get_source(&self, _id: &str) -> Result<Option<SourceRow>, Error> {
+        unimplemented!("not exercised by list_documents")
+    }
+    async fn list_sources(&self, _store_id: &str) -> Result<Vec<SourceRow>, Error> {
+        unimplemented!("not exercised by list_documents")
+    }
+    async fn find_source_by_root_or_url(
+        &self,
+        _value: &str,
+        _store_id: &str,
+    ) -> Result<Option<SourceRow>, Error> {
+        unimplemented!("not exercised by list_documents")
+    }
+    async fn find_document(
+        &self,
+        _doc_id: &str,
+        _store_id: Option<&str>,
+    ) -> Result<Option<DocumentInfo>, Error> {
+        unimplemented!("not exercised by list_documents")
+    }
+    async fn list_documents(
+        &self,
+        store_id: &str,
+        _source_id: Option<&str>,
+        _limit: Option<usize>,
+        _offset: usize,
+    ) -> Result<Vec<DocumentInfo>, Error> {
+        Ok(self.documents.get(store_id).cloned().unwrap_or_default())
+    }
+    async fn count_documents(
+        &self,
+        store_id: &str,
+        _source_id: Option<&str>,
+    ) -> Result<u64, Error> {
+        Ok(self.documents.get(store_id).map(|d| d.len()).unwrap_or(0) as u64)
+    }
+    async fn retrieval_store(&self, store_id: &str) -> Result<Arc<dyn RetrievalStore>, Error> {
+        Err(Error::StoreNotFound {
+            id: store_id.to_string(),
+        })
+    }
+    async fn largest_tables(&self, _limit: usize) -> Result<Vec<TableSize>, Error> {
+        Ok(Vec::new())
+    }
+}
+
+fn make_document_info(id: &str, store_id: &str, uri: &str) -> DocumentInfo {
+    DocumentInfo {
+        store_id: store_id.to_string(),
+        id: id.to_string(),
+        source_id: "src-1".to_string(),
+        ingestor_kind: "path".to_string(),
+        uri: uri.to_string(),
+        title: None,
+        mime: None,
+        content_hash: "hash".to_string(),
+        fetched_at: "2026-01-01T00:00:00Z".to_string(),
+        origin_store: store_id.to_string(),
+        policy_version: "v1".to_string(),
+        metadata: Metadata::default(),
+    }
+}
 
 /// Build one `AvailableStore` seeded with a single chunk, returning it
 /// alongside the seeded document's id (for `get_chunks`/`get_document` round
@@ -74,18 +178,36 @@ async fn seeded_store(store_id: &str, store_name: &str, text: &str) -> (Availabl
     (AvailableStore::from_arc(sd, store), doc_id)
 }
 
-/// Serve the given stores as a real upstream MCP-over-HTTP "daemon".
+/// Serve the given stores as a real upstream MCP-over-HTTP "daemon", backed
+/// by `mcp::tools::StoresBackend` — the shared test double every proxy test
+/// but the `list_documents`-success one uses. `StoresBackend` only backs
+/// `get_document`'s two calls (`find_document`/`retrieval_store`);
+/// `list_documents`/`count_documents` are `unimplemented!()` on it, so a
+/// test that needs a real `list_documents` answer from upstream must use
+/// `serve_upstream_with_backend` with a backend of its own instead.
 ///
 /// Returns its bare base URL (no `/mcp` suffix — matches `probe_daemon`'s
 /// `DaemonState::Running::base_url` shape, which `ProxyHandler::connect`
 /// appends `/mcp` to itself).
 async fn serve_upstream(stores: Vec<AvailableStore>) -> String {
+    let backend: Arc<dyn localdb_core::StoreBackend> =
+        Arc::new(mcp::tools::StoresBackend::new(&stores));
+    serve_upstream_with_backend(stores, backend).await
+}
+
+/// Serve the given stores as a real upstream MCP-over-HTTP "daemon" over an
+/// explicit `StoreBackend`, for tests that need a tool `StoresBackend`
+/// doesn't fully back (e.g. `list_documents`).
+async fn serve_upstream_with_backend(
+    stores: Vec<AvailableStore>,
+    backend: Arc<dyn localdb_core::StoreBackend>,
+) -> String {
     let embedder: Arc<dyn localdb_core::Embedder> = Arc::new(FakeEmbedder::new(4));
 
     // `vec![]` disables rmcp's Host-header allowlist entirely — these tests
     // exercise proxy forwarding, not the allowlist itself, and connect
     // over a real loopback socket regardless.
-    let service = mcp::build_streamable_http_service(stores, embedder, vec![]);
+    let service = mcp::build_streamable_http_service(stores, backend, embedder, vec![]);
     let app = Router::new().nest_service("/mcp", service);
 
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -124,6 +246,50 @@ async fn start_two_store_daemon() -> (String, String, String) {
         books_doc,
         hydra_doc,
     )
+}
+
+/// Start a two-store upstream (`books`/`hydra`, same ids/names as
+/// `start_two_store_daemon`) backed by `DocumentRegistryBackend`, so
+/// `list_documents` returns real data instead of panicking on
+/// `StoresBackend`'s `unimplemented!()`. Each store holds one document.
+async fn start_two_store_daemon_with_documents() -> String {
+    let books = AvailableStore::new(
+        StoreDescriptor {
+            id: "id-books".to_string(),
+            name: "books".to_string(),
+            visibility: "private".to_string(),
+        },
+        Box::new(FakeStore::new()),
+    );
+    let hydra = AvailableStore::new(
+        StoreDescriptor {
+            id: "id-hydra".to_string(),
+            name: "hydra".to_string(),
+            visibility: "private".to_string(),
+        },
+        Box::new(FakeStore::new()),
+    );
+
+    let mut documents = std::collections::HashMap::new();
+    documents.insert(
+        "id-books".to_string(),
+        vec![make_document_info(
+            "doc-books-1",
+            "id-books",
+            "file:///books/1.md",
+        )],
+    );
+    documents.insert(
+        "id-hydra".to_string(),
+        vec![make_document_info(
+            "doc-hydra-1",
+            "id-hydra",
+            "file:///hydra/1.md",
+        )],
+    );
+    let backend: Arc<dyn StoreBackend> = Arc::new(DocumentRegistryBackend { documents });
+
+    serve_upstream_with_backend(vec![books, hydra], backend).await
 }
 
 /// Connect a proxy scoped to `books` against a two-store upstream.
@@ -179,7 +345,13 @@ async fn proxy_forwards_tool_list_and_calls_unchanged() {
     names.sort_unstable();
     assert_eq!(
         names,
-        vec!["get_chunks", "get_document", "list_stores", "search"],
+        vec![
+            "get_chunks",
+            "get_document",
+            "list_documents",
+            "list_stores",
+            "search"
+        ],
         "the proxy must expose exactly the upstream's tool set, unchanged"
     );
 
@@ -386,6 +558,96 @@ async fn proxy_scoped_get_document_rejects_out_of_scope_explicit_store() {
     let _ = client.cancel().await;
 }
 
+/// `list_documents`' `store` argument is required (unlike `get_document`'s/
+/// `get_chunks`' optional one), so a scoped proxy must never inject a store
+/// on the caller's behalf: an omitted `store` has to surface the upstream's
+/// own missing-required-argument error, not silently return whichever
+/// scoped store happens to come first.
+#[tokio::test]
+async fn proxy_scoped_list_documents_omitted_store_errors_instead_of_picking_first_store() {
+    let (base_url, _books_doc, _hydra_doc) = start_two_store_daemon().await;
+    let client = client_for(scoped_to_books(&base_url).await).await;
+
+    let result = client
+        .call_tool(CallToolRequestParams::new("list_documents"))
+        .await
+        .expect("a missing required argument is a tool-level error, not a transport failure");
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "omitted store must be an error"
+    );
+    let text = result.content[0].as_text().unwrap().text.clone();
+    assert!(
+        text.starts_with("failed to deserialize parameters:"),
+        "an omitted `store` must surface the same missing-required-argument error embedded \
+         mode and an unscoped proxy would give, not a `books`-store result: {text}"
+    );
+
+    let _ = client.cancel().await;
+}
+
+/// An explicit, in-scope `store` still works normally through a scoped
+/// proxy — the fix for the omitted-store case must not turn `list_documents`
+/// into a tool that can never succeed when scoped.
+#[tokio::test]
+async fn proxy_scoped_list_documents_explicit_in_scope_store_works() {
+    let base_url = start_two_store_daemon_with_documents().await;
+    let client = client_for(scoped_to_books(&base_url).await).await;
+
+    let args = serde_json::json!({ "store": "books" })
+        .as_object()
+        .cloned()
+        .unwrap();
+    let result = client
+        .call_tool(CallToolRequestParams::new("list_documents").with_arguments(args))
+        .await
+        .expect("list_documents succeeds through a scoped proxy for an in-scope store");
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "an in-scope explicit store must not be rejected: {:?}",
+        result_json(&result)
+    );
+    let parsed = result_json(&result);
+    assert_eq!(parsed["store"]["name"], "books");
+    assert_eq!(parsed["total"], 1);
+
+    let _ = client.cancel().await;
+}
+
+/// Naming an out-of-scope store explicitly on `list_documents` is a
+/// tool-level `invalid_request` naming the allowed set, same as
+/// `get_document`/`get_chunks`/`search` — never the store's own results.
+#[tokio::test]
+async fn proxy_scoped_list_documents_rejects_out_of_scope_store() {
+    let (base_url, _books_doc, _hydra_doc) = start_two_store_daemon().await;
+    let client = client_for(scoped_to_books(&base_url).await).await;
+
+    let args = serde_json::json!({ "store": "hydra" })
+        .as_object()
+        .cloned()
+        .unwrap();
+    let result = client
+        .call_tool(CallToolRequestParams::new("list_documents").with_arguments(args))
+        .await
+        .expect("the rejection is a tool result, not a transport failure");
+
+    assert_eq!(result.is_error, Some(true));
+    let parsed = result_json(&result);
+    assert_eq!(parsed["error"]["code"], "invalid_request");
+    let message = parsed["error"]["message"].as_str().unwrap();
+    assert!(message.contains("hydra"), "{message}");
+    assert!(
+        message.contains("books"),
+        "the error should name the allowed set: {message}"
+    );
+
+    let _ = client.cancel().await;
+}
+
 /// Without `--store`, nothing above applies: the proxy stays the verbatim
 /// relay it has always been, including reaching every upstream store. This is
 /// the control for all the scoped assertions.
@@ -453,7 +715,7 @@ async fn proxy_connect_unknown_store_name_errors() {
     }
 }
 
-/// A scoped session serves only the four tools whose store semantics the
+/// A scoped session serves only the five tools whose store semantics the
 /// proxy knows. Any other name is refused rather than relayed, so the first
 /// mutating tool added under `--allow-write` cannot silently bypass the
 /// scope on the day it lands.
@@ -498,8 +760,11 @@ async fn mcp_tool_set_identical_with_and_without_allow_write() {
             },
             Box::new(FakeStore::new()),
         );
+        let stores = vec![store];
+        let backend: Arc<dyn localdb_core::StoreBackend> =
+            Arc::new(mcp::tools::StoresBackend::new(&stores));
         let embedder: Arc<dyn localdb_core::Embedder> = Arc::new(FakeEmbedder::new(4));
-        let handler = mcp::McpHandler::new(vec![store], embedder, allow_write);
+        let handler = mcp::McpHandler::new(stores, backend, embedder, allow_write);
 
         let (server_transport, client_transport) = tokio::io::duplex(8192);
         tokio::spawn(async move {
@@ -524,13 +789,19 @@ async fn mcp_tool_set_identical_with_and_without_allow_write() {
 
     assert_eq!(
         without,
-        vec!["get_chunks", "get_document", "list_stores", "search"],
+        vec![
+            "get_chunks",
+            "get_document",
+            "list_documents",
+            "list_stores",
+            "search"
+        ],
         "v1's read-only tool set"
     );
     assert_eq!(
         with, without,
         "`--allow-write` registers no additional tool in v1 — if this fails, a mutating \
          tool was added: revisit the CLI's no-op warning AND `ProxyHandler::call_tool`'s \
-         scoping gate, which currently refuses every tool outside this four-tool set"
+         scoping gate, which currently refuses every tool outside this five-tool set"
     );
 }

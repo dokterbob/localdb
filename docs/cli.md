@@ -13,14 +13,14 @@ For the HTTP daemon surface see [docs/http-api.md](http-api.md). For the MCP std
 
 These flags are accepted by every subcommand.
 
-| Flag                 | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--config <PATH>`    | Path to the config file. Default: the platform config dir — `~/Library/Application Support/com.localdb.localdb.localdb/config.yaml` on macOS, `~/.config/localdb/config.yaml` on Linux. Can also be set via the `LOCALDB_CONFIG` environment variable.                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `--json`             | Emit machine-readable JSON instead of human-readable text. All JSON shapes are stable API.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `-s, --store <NAME>` | Narrow to these stores; repeatable. It is a **filter**, so omitting it means **all stores** for `search`, `status`, `store list`, `source list`, `source remove <ULID>`, `index` and `mcp`. Three exceptions: `source add` (and the `add` alias) defaults to the store named `default`, exit 2 if absent; `source remove <path\|url>` requires it, exit 2 without it; and `init`, `serve`, `store add`, `store remove`, `db status`/`migrate`/`downgrade`/`vacuum` **reject it outright** (exit 2) because they aren't store-scoped. An explicit name is always validated — unknown is exit 3, never silently ignored. See [specs/05-surfaces.md §2.2](../specs/05-surfaces.md#22-store-scope). |
-| `-y, --yes`          | Skip confirmation prompts for destructive operations (`db migrate` legacy rebuild, `db downgrade`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| `-h, --help`         | Print help.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `-V, --version`      | Print version.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| Flag                 | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `--config <PATH>`    | Path to the config file. Default: the platform config dir — `~/Library/Application Support/com.localdb.localdb.localdb/config.yaml` on macOS, `~/.config/localdb/config.yaml` on Linux. Can also be set via the `LOCALDB_CONFIG` environment variable.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `--json`             | Emit machine-readable JSON instead of human-readable text. All JSON shapes are stable API.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `-s, --store <NAME>` | Narrow to these stores; repeatable. It is a **filter**, so omitting it means **all stores** for `search`, `status`, `store list`, `source list`, `source remove <ULID>`, `document list`, `document get`, `index` and `mcp`. Three exceptions: `source add` (and the `add` alias) defaults to the store named `default`, exit 2 if absent; `source remove <path\|url>` requires it, exit 2 without it; and `init`, `serve`, `store add`, `store remove`, `db status`/`migrate`/`downgrade`/`vacuum` **reject it outright** (exit 2) because they aren't store-scoped. An explicit name is always validated — unknown is exit 3, never silently ignored. `document get`'s omitted case can additionally be `invalid_request` (exit 2) if the id exists in more than one store — see below. See [specs/05-surfaces.md §2.2](../specs/05-surfaces.md#22-store-scope). |
+| `-y, --yes`          | Skip confirmation prompts for destructive operations (`db migrate` legacy rebuild, `db downgrade`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `-h, --help`         | Print help.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `-V, --version`      | Print version.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 
 **Environment variable:** `LOCALDB_CONFIG=<path>` is equivalent to `--config <path>`.
 
@@ -415,6 +415,148 @@ exit: 2
 
 An explicit `--store` still hard-filters a ULID removal: if the source exists but lives outside the
 named scope, this is `source_not_found` (exit `3`) rather than a silent redirect to its real store.
+
+---
+
+## `localdb document`
+
+Read documents indexed into a store. With `--store` omitted, `list` spans every store like
+`source list`; `get` looks up the given document id across every store, disambiguating by scope when
+the id exists in more than one — the same "id identifies its own store" idea as
+`source remove <ULID>`, except a document id (unlike a ULID) can legitimately exist in more than one
+store, so the omitted-`--store` case can be a genuine ambiguity error (specs/05-surfaces.md §2.2).
+
+```text
+Read documents indexed into a store
+
+Usage: localdb document [OPTIONS] <COMMAND>
+
+Commands:
+  list  List documents across stores
+  get   Get a single document by id
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+      --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
+      --json           Emit JSON output instead of human-readable text
+  -s, --store <NAME>   Operate on these stores (repeatable); a filter, not a selector
+  -y, --yes            Skip confirmation prompts for destructive operations
+  -h, --help           Print help (see more with '--help')
+  -V, --version        Print version
+```
+
+### `localdb document list`
+
+```text
+List documents across stores
+
+Usage: localdb document list [OPTIONS]
+
+Options:
+      --config <PATH>       Path to config file (default: platform data dir / localdb / config.yaml)
+      --source <SOURCE_ID>  Limit to documents from a specific source (by ID)
+      --json                Emit JSON output instead of human-readable text
+  -s, --store <NAME>        Operate on these stores (repeatable); a filter, not a selector
+  -y, --yes                 Skip confirmation prompts for destructive operations
+  -h, --help                Print help (see more with '--help')
+  -V, --version             Print version
+```
+
+Omit `--store` and this lists **every** store's documents; pass `--store` (repeatable) to narrow.
+`--source` filters to one source's documents — an unknown source id yields an empty list, not an
+error. A store-name column appears in the output only when more than one store is in scope, exactly
+like `source list` (specs/05-surfaces.md §2.2).
+
+```text
+$ localdb document list --store notes
+a86bf252232bcec2a7da314d11e4c6005918f7930c7b9e1b081ef528034a34e8 file:///home/user/notes/meeting.txt
+
+$ localdb document list --store notes --json
+{
+  "documents": [
+    {
+      "id": "a86bf252232bcec2a7da314d11e4c6005918f7930c7b9e1b081ef528034a34e8",
+      "uri": "file:///home/user/notes/meeting.txt",
+      "title": null,
+      "store": {
+        "name": "notes"
+      },
+      "store_id": "01KTVGQ62TQN8X6XN9E5FDZN67",
+      "source_id": "01KTVH6AY4DC84HWW7M2PP4F0X",
+      "content_hash": "e3732cc41f646a4bc94bc3611b8b6fd9d7f31f1c192748d586f55b8e7e171fd2",
+      "fetched_at": "2026-08-17T20:25:09Z"
+    }
+  ]
+}
+```
+
+(ids shown from a scratch run)
+
+### `localdb document get`
+
+```text
+Get a single document by id
+
+Usage: localdb document get [OPTIONS] <ID>
+
+Arguments:
+  <ID>  Document ID
+
+Options:
+      --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
+      --text           Include the document's reconstructed full text in the output
+      --json           Emit JSON output instead of human-readable text
+  -s, --store <NAME>   Operate on these stores (repeatable); a filter, not a selector
+  -y, --yes            Skip confirmation prompts for destructive operations
+  -h, --help           Print help (see more with '--help')
+  -V, --version        Print version
+```
+
+Prints the document's identity and metadata by default; pass `--text` to append its reconstructed
+full text (rebuilt from persisted blocks, falling back to joined chunk text — same reconstruction
+`core::documents::reconstruct_document_text` uses everywhere). `--json` always includes the text
+regardless of `--text` — that flag only governs the human-readable renderer. An unknown id exits
+`3`.
+
+`--store` resolves the id's owning store with the same three-way rule as `source remove <ULID>`'s
+argument shape, extended for a genuinely-ambiguous id (specs/05-surfaces.md §2.2):
+
+| `--store` passed | Behavior                                                                                                              |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------- |
+| none             | Looks the id up across every store; `invalid_request` (exit `2`) if it exists in more than one store                  |
+| exactly one      | Scopes the lookup to that store unambiguously                                                                         |
+| more than one    | Looks the id up unscoped, then checks its store against the given set (`resource_not_found`, exit `3`, if outside it) |
+
+```text
+$ localdb document get a86bf252232bcec2a7da314d11e4c6005918f7930c7b9e1b081ef528034a34e8
+id: a86bf252232bcec2a7da314d11e4c6005918f7930c7b9e1b081ef528034a34e8
+uri: file:///home/user/notes/meeting.txt
+store_id: 01KTVGQ62TQN8X6XN9E5FDZN67
+source_id: 01KTVH6AY4DC84HWW7M2PP4F0X
+content_hash: e3732cc41f646a4bc94bc3611b8b6fd9d7f31f1c192748d586f55b8e7e171fd2
+fetched_at: 2026-08-17T20:25:09Z
+dc.format: text/plain
+
+$ localdb document get a86bf252232bcec2a7da314d11e4c6005918f7930c7b9e1b081ef528034a34e8 --text
+id: a86bf252232bcec2a7da314d11e4c6005918f7930c7b9e1b081ef528034a34e8
+uri: file:///home/user/notes/meeting.txt
+store_id: 01KTVGQ62TQN8X6XN9E5FDZN67
+source_id: 01KTVH6AY4DC84HWW7M2PP4F0X
+content_hash: e3732cc41f646a4bc94bc3611b8b6fd9d7f31f1c192748d586f55b8e7e171fd2
+fetched_at: 2026-08-17T20:25:09Z
+dc.format: text/plain
+
+Meeting 2026-06-02: decided to adopt reciprocal rank fusion for combining dense and sparse retrieval results.
+
+$ localdb document get doesnotexist
+error: resource not found: doesnotexist
+exit: 3
+```
+
+Only Dublin Core fields actually present are printed (`dc.format` above; a document with richer
+metadata would also show `dc.creator`, `dc.subject`, etc. — see specs/02-domain-model.md §7).
+
+(output shown from a scratch run)
 
 ---
 

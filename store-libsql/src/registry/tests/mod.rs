@@ -1,7 +1,7 @@
 use localdb_core::metadata::{DocumentMetadata, DublinCoreMetadata, Metadata};
 use localdb_core::store::ChunkRecord;
 use localdb_core::types::{SourceKind, Span, StoreVisibility};
-use localdb_core::{SourceRow, StoreBackend, StoreBackendConfig, StoreRow, VectorEncoding};
+use localdb_core::{Error, SourceRow, StoreBackend, StoreBackendConfig, StoreRow, VectorEncoding};
 use tempfile::tempdir;
 
 use crate::SqliteBackend;
@@ -466,7 +466,7 @@ async fn metadata_json_round_trips_tagged_document_kind() {
 
     // Round trip via the public find_document API.
     let info = api
-        .find_document("doc-1")
+        .find_document("doc-1", None)
         .await
         .unwrap()
         .expect("document must be found");
@@ -538,7 +538,7 @@ async fn find_document_tolerates_invalid_metadata_json() {
     drop(conn);
 
     let info = api
-        .find_document("doc-1")
+        .find_document("doc-1", None)
         .await
         .unwrap()
         .expect("document must still be found despite invalid metadata_json");
@@ -706,3 +706,5 @@ async fn check_constraint_allows_feed_kind_with_null_root_and_url() {
         result.err()
     );
 }
+
+mod documents;

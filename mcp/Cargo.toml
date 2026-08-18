@@ -8,6 +8,7 @@ description = "MCP server (stdio and HTTP): read-only search, get_document, get_
 
 [dependencies]
 localdb-core = { path = "../core" }
+async-trait = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

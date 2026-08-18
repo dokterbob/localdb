@@ -3,8 +3,8 @@
 > **EXPERIMENTAL — do not rely on this surface for production use.**
 >
 > The daemon opens the same unified database (`<data_dir>/localdb.db`) as the CLI, so CLI-indexed
-> data IS visible via `/v1/search`, `/v1/documents/{id}`, and `/v1/status`. Ingestion via
-> `POST /v1/jobs` runs the real pipeline through an async job queue
+> data IS visible via `/v1/search`, `/v1/documents/{id}`, `/v1/stores/{name}/documents`, and
+> `/v1/status`. Ingestion via `POST /v1/jobs` runs the real pipeline through an async job queue
 > ([#187](https://github.com/dokterbob/localdb/issues/187)) — `localdb index` submits a job and
 > attaches to its live progress (`GET /v1/jobs/{id}/events`, SSE) whenever a daemon is running, with
 > identical output to embedded mode; you no longer need to stop the daemon first. It remains
@@ -61,8 +61,8 @@ on. See [specs/05-surfaces.md](../specs/05-surfaces.md) §3 for the binding and 
 
 ## MCP over HTTP
 
-Alongside `/v1`, the daemon also mounts `/mcp` — the same four read-only MCP tools (`search`,
-`get_document`, `get_chunks`, `list_stores`) served over the
+Alongside `/v1`, the daemon also mounts `/mcp` — the same five read-only MCP tools (`search`,
+`get_document`, `get_chunks`, `list_stores`, `list_documents`) served over the
 [MCP Streamable HTTP transport](https://modelcontextprotocol.io/), for connecting a remote MCP
 client (e.g. Claude Code on another machine, over Tailscale/LAN). It inherits this daemon's
 bind-address trust decision automatically — see
@@ -192,6 +192,93 @@ curl -s http://127.0.0.1:7700/v1/stores/notes/sources
   "next_cursor": null,
   "total": 0
 }
+```
+
+---
+
+### `GET /v1/stores/{name}/documents`
+
+List documents registered in a store. Response is paginated (see [Pagination](#pagination)).
+
+**Query parameters:**
+
+| Parameter | Type   | Required | Description                                                                                                        |
+| --------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------ |
+| `source`  | string | no       | Restrict to documents from this source id. An unknown id is a pure filter — it returns an empty page, not an error |
+| `cursor`  | string | no       | Pagination cursor from a previous response                                                                         |
+| `limit`   | int    | no       | Maximum items per page (must be ≥ 1; `0` is rejected as `invalid_request`)                                         |
+
+```text
+curl -s http://127.0.0.1:7700/v1/stores/notes/documents
+```
+
+```json
+{
+  "items": [
+    {
+      "store_id": "01KTVGQ62TQN8X6XN9E5FDZN67",
+      "id": "a86bf252232bcec2a7da314d11e4c6005918f7930c7b9e1b081ef528034a34e8",
+      "source_id": "01KTVH6AY4DC84HWW7M2PP4F0X",
+      "ingestor_kind": "file",
+      "uri": "file:///home/user/notes/meeting.txt",
+      "title": null,
+      "mime": "text/plain",
+      "content_hash": "e3732cc41f646a4bc94bc3611b8b6fd9d7f31f1c192748d586f55b8e7e171fd2",
+      "fetched_at": "2026-08-17T20:25:09Z",
+      "origin_store": "01KTVGQ62TQN8X6XN9E5FDZN67",
+      "policy_version": "a739e16768e0b8872b7220d37c37b9c9729d8eee52aa47575401035593411a69",
+      "metadata": { "kind": "document", "format": "text/plain", "...": "..." }
+    }
+  ],
+  "next_cursor": null,
+  "total": 1
+}
+```
+
+Returns `404` with error code `store_not_found` if the store does not exist (see
+[Error responses](#error-responses)).
+
+---
+
+### `GET /v1/documents/{id}`
+
+Fetch a single document's identity, metadata, and reconstructed full text by id.
+
+**Query parameters:**
+
+| Parameter | Type     | Required | Description                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| --------- | -------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `store`   | string[] | no       | Repeatable — scope the lookup to specific stores by name. Omitted: looks the id up across every store (`invalid_request`, 400, if more than one store holds a document with that id). Exactly one: scopes the lookup unambiguously. More than one: resolves unscoped, then checks the found document's store against the given set. Same 0/1/many semantics as CLI `document get -s` (specs/05-surfaces.md §2.2), available in the daemon from day one |
+
+```text
+curl -s http://127.0.0.1:7700/v1/documents/a86bf252232bcec2a7da314d11e4c6005918f7930c7b9e1b081ef528034a34e8
+```
+
+```json
+{
+  "id": "a86bf252232bcec2a7da314d11e4c6005918f7930c7b9e1b081ef528034a34e8",
+  "uri": "file:///home/user/notes/meeting.txt",
+  "title": null,
+  "store_id": "01KTVGQ62TQN8X6XN9E5FDZN67",
+  "source_id": "01KTVH6AY4DC84HWW7M2PP4F0X",
+  "content_hash": "e3732cc41f646a4bc94bc3611b8b6fd9d7f31f1c192748d586f55b8e7e171fd2",
+  "fetched_at": "2026-08-17T20:25:09Z",
+  "normalized_text": "Meeting 2026-06-02: decided to adopt reciprocal rank fusion for combining dense and sparse retrieval results.",
+  "metadata": { "kind": "document", "format": "text/plain", "...": "..." }
+}
+```
+
+`normalized_text` is the document's reconstructed full text — always present in the response; there
+is no query parameter that omits it (the CLI's `document get --text` is purely a rendering choice on
+top of the same always-fetched text, specs/05-surfaces.md §2). `metadata` is the full `Metadata`
+enum, same shape as a search citation's `metadata` field
+([specs/02-domain-model.md](../specs/02-domain-model.md) §7).
+
+Returns `404` with error code `resource_not_found` if no document with that id exists in scope, or
+`store_not_found` if a named `?store=` does not exist.
+
+```text
+curl -s "http://127.0.0.1:7700/v1/documents/<id>?store=notes&store=books"
 ```
 
 ---
@@ -456,12 +543,13 @@ the stream opens).
 
 ## Pagination
 
-List endpoints (`/v1/stores`, `/v1/stores/{name}/sources`) use cursor-based pagination.
+List endpoints (`/v1/stores`, `/v1/stores/{name}/sources`, `/v1/stores/{name}/documents`) use
+cursor-based pagination.
 
-| Query parameter | Default        | Description                                            |
-| --------------- | -------------- | ------------------------------------------------------ |
-| `cursor`        | —              | Opaque cursor from a previous response's `next_cursor` |
-| `limit`         | server default | Maximum items per page                                 |
+| Query parameter | Default        | Description                                                    |
+| --------------- | -------------- | -------------------------------------------------------------- |
+| `cursor`        | —              | Opaque cursor from a previous response's `next_cursor`         |
+| `limit`         | server default | Maximum items per page; must be ≥ 1 (`0` is `invalid_request`) |
 
 A `next_cursor` of `null` means the last page has been reached.
 
@@ -484,29 +572,29 @@ For `store_not_found`, `source_not_found`, `resource_not_found`, `job_not_found`
 `invalid_request`, `provider_unavailable`, `model_missing`, and `rate_limited`, `message` is the
 _bare_ field the error was built from (the id, or the validation/provider/rate-limit detail) — it
 does **not** carry the human-readable prefix a CLI-rendered version of the same error would (e.g.
-`"store not found: "`).
-This lets a daemon-attached client reconstruct the original typed error from `code` + `message`
-(`core::Error::from_code`) and render its own prefix without doubling it; a client that just wants
-display text should combine `code` and `message` itself (e.g. `"store not found: nope"`). Every
-other code's `message` carries the full human-readable string as-is.
+`"store not found: "`). This lets a daemon-attached client reconstruct the original typed error from
+`code` + `message` (`core::Error::from_code`) and render its own prefix without doubling it; a
+client that just wants display text should combine `code` and `message` itself (e.g.
+`"store not found: nope"`). Every other code's `message` carries the full human-readable string
+as-is.
 
 HTTP status codes follow the shared error taxonomy in
 [specs/05-surfaces.md](../specs/05-surfaces.md) §5:
 
-| Code                                                                            | HTTP status | Meaning                                                                     |
-| ------------------------------------------------------------------------------- | ----------- | --------------------------------------------------------------------------- |
-| `store_not_found` / `source_not_found` / `resource_not_found` / `job_not_found` | 404         | Unknown entity                                                              |
-| `runtime_state_locked`                                                          | 409         | Unified database locked by another process (SQLite `busy_timeout` exceeded) |
-| `daemon_running`                                                                | 409         | A second daemon was started against the same data dir                       |
-| `daemon_unreachable`                                                            | 502         | Daemon socket exists but is not responding                                  |
-| `invalid_config`                                                                | 422         | Config failed validation                                                    |
-| `invalid_request`                                                               | 400         | Bad request body or arguments                                               |
-| `unsupported_format`                                                            | 422         | Extractor cannot handle the file                                            |
-| `provider_unavailable`                                                          | 502         | External embedding endpoint down                                            |
-| `model_missing`                                                                 | 503         | Local model not yet downloaded                                              |
+| Code                                                                            | HTTP status | Meaning                                                                                                                                                        |
+| ------------------------------------------------------------------------------- | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `store_not_found` / `source_not_found` / `resource_not_found` / `job_not_found` | 404         | Unknown entity                                                                                                                                                 |
+| `runtime_state_locked`                                                          | 409         | Unified database locked by another process (SQLite `busy_timeout` exceeded)                                                                                    |
+| `daemon_running`                                                                | 409         | A second daemon was started against the same data dir                                                                                                          |
+| `daemon_unreachable`                                                            | 502         | Daemon socket exists but is not responding                                                                                                                     |
+| `invalid_config`                                                                | 422         | Config failed validation                                                                                                                                       |
+| `invalid_request`                                                               | 400         | Bad request body or arguments                                                                                                                                  |
+| `unsupported_format`                                                            | 422         | Extractor cannot handle the file                                                                                                                               |
+| `provider_unavailable`                                                          | 502         | External embedding endpoint down                                                                                                                               |
+| `model_missing`                                                                 | 503         | Local model not yet downloaded                                                                                                                                 |
 | `rate_limited`                                                                  | 502         | Retries against an upstream host exhausted; grouped with "upstream not currently servable" rather than 429, since it's an upstream limit, not the daemon's own |
-| `index_in_progress`                                                             | 409         | Conflicting job already running for this scope                              |
-| `internal`                                                                      | 500         | Bug; response includes a `correlation_id` for log correlation               |
+| `index_in_progress`                                                             | 409         | Conflicting job already running for this scope                                                                                                                 |
+| `internal`                                                                      | 500         | Bug; response includes a `correlation_id` for log correlation                                                                                                  |
 
 ---
 

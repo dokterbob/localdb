@@ -524,6 +524,12 @@ Dublin Core struct that lived in the parser boundary and was easily confused wit
 exactly one Dublin-Core-shaped struct in the codebase, not two. Resources, chunks, and citations all
 carry the tagged `Metadata` enum; nothing downstream of parsing sees the untagged flat form.
 
+**Reads (`document get`/`document list`, specs/05-surfaces.md §2, §3, §4):** CLI, HTTP, and MCP each
+surface a document's registry row plus this tagged `Metadata` verbatim. Because the write path
+already stored the enum in its tagged shape from the start, adding these read surfaces needed no
+rewrite of stored data — they are exactly the Resource-based reads this section's shape was already
+built to answer.
+
 ## 8. Extraction & parsing
 
 ### Ingestor trait (acquisition + structuring)

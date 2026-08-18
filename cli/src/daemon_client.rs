@@ -229,12 +229,17 @@ pub(crate) fn encode_path_segment(s: &str) -> String {
 const MAX_DAEMON_PAGES: usize = 10_000;
 
 /// Walk a paginated daemon list endpoint (`GET {base_url}{path}`, optionally
-/// suffixed with `?cursor=<encoded>`) to exhaustion, invoking `on_page` with
+/// suffixed with `?cursor=<encoded>` or, when `path` already carries a query
+/// string of its own, `&cursor=<encoded>`) to exhaustion, invoking `on_page` with
 /// each page's raw `items` array. `on_page` returns `true` to stop walking
 /// early (e.g. once a sought item has been found) or `false` to continue to
 /// the next page. `path` must already be fully formed (any dynamic segment,
-/// e.g. a store name, pre-encoded via [`encode_path_segment`]) — this
-/// function only ever appends the `?cursor=` query value itself.
+/// e.g. a store name or an existing `?filter=value` query string, pre-encoded
+/// via [`encode_path_segment`]) — this function only ever appends the
+/// cursor's query value itself, joined with `?` when `path` carries no query
+/// string yet or `&` when it already does (e.g. `path` already ending in
+/// `?source=<id>`), so the cursor is never merged into the same key as an
+/// existing query parameter.
 ///
 /// Shared by every daemon-routed command that paginates a list endpoint
 /// (`resolve_daemon_store_scope`'s `GET /v1/stores` walk, `index`'s
@@ -269,7 +274,10 @@ pub(crate) async fn walk_daemon_pages(
 
     for _ in 0..MAX_DAEMON_PAGES {
         let url = match &cursor {
-            Some(c) => format!("{base_url}{path}?cursor={}", encode_path_segment(c)),
+            Some(c) => {
+                let sep = if path.contains('?') { '&' } else { '?' };
+                format!("{base_url}{path}{sep}cursor={}", encode_path_segment(c))
+            }
             None => format!("{base_url}{path}"),
         };
         let resp = daemon_request_async(reqwest::Method::GET, &url, None).await?;

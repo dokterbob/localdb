@@ -126,6 +126,40 @@ async fn delete_source_removes_it() {
     assert_eq!(body["items"].as_array().unwrap().len(), 0);
 }
 
+/// Regression test: `?limit=0` must be rejected outright on `GET
+/// /v1/stores/{name}/sources` — same bug and fix as `GET
+/// /v1/stores/{name}/documents` (`server/src/handlers/tests/documents.rs`'s
+/// `list_documents_zero_limit_returns_400_invalid_request`), since both
+/// routes share `PaginatedList::new`/`parse_limit`.
+#[tokio::test]
+async fn list_sources_zero_limit_returns_400_invalid_request() {
+    let (_dir, app) = make_app().await;
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/stores")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"name": "docs"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/stores/docs/sources?limit=0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(resp.into_body()).await;
+    assert_eq!(body["code"], "invalid_request");
+}
+
 #[tokio::test]
 async fn delete_nonexistent_source_returns_404() {
     let (_dir, app) = make_app().await;

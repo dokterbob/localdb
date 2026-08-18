@@ -1,11 +1,17 @@
 //! `probe_daemon`/`probe_daemon_health_inner` socket discovery,
-//! `decode_daemon_error` daemon-error-code mapping, and
-//! `encode_path_segment` URL-segment percent-encoding.
+//! `decode_daemon_error` daemon-error-code mapping,
+//! `encode_path_segment` URL-segment percent-encoding, and
+//! `walk_daemon_pages` pagination.
 
+use std::sync::Arc;
+
+use axum::{extract::State, routing::get, Router};
 use tempfile::TempDir;
+use tokio::sync::Mutex;
 
 use crate::daemon_client::{
-    decode_daemon_error, encode_path_segment, probe_daemon, probe_daemon_health_inner, DaemonState,
+    decode_daemon_error, encode_path_segment, probe_daemon, probe_daemon_health_inner,
+    walk_daemon_pages, DaemonState,
 };
 use localdb_core::Error;
 
@@ -172,4 +178,96 @@ fn encode_path_segment_escapes_fragment_char() {
 fn encode_path_segment_escapes_query_and_path_delimiters() {
     assert_eq!(encode_path_segment("a?b=c"), "a%3Fb%3Dc");
     assert_eq!(encode_path_segment("a/b"), "a%2Fb");
+}
+
+// ---------------------------------------------------------------------------
+// walk_daemon_pages: cursor separator
+// ---------------------------------------------------------------------------
+
+/// Records every raw request URI (path + query) the mock server observed, so
+/// the test can assert on the exact separator `walk_daemon_pages` chose.
+type SeenUris = Arc<Mutex<Vec<String>>>;
+
+async fn mock_paginated_endpoint(
+    State(seen): State<SeenUris>,
+    uri: axum::http::Uri,
+) -> axum::Json<serde_json::Value> {
+    let raw = uri
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_default();
+    let mut guard = seen.lock().await;
+    let is_first = guard.is_empty();
+    guard.push(raw);
+    drop(guard);
+
+    if is_first {
+        // First page: no cursor yet, hands back one item and a next_cursor
+        // so `walk_daemon_pages` issues a second request.
+        axum::Json(serde_json::json!({ "items": [{"n": 1}], "next_cursor": "page2" }))
+    } else {
+        axum::Json(serde_json::json!({ "items": [{"n": 2}], "next_cursor": null }))
+    }
+}
+
+/// `walk_daemon_pages` must append the cursor with `&`, not a second `?`,
+/// when `path` already carries its own query string (e.g. `document
+/// list --source <id>`'s `?source=<id>`) — otherwise the second and later
+/// pages would request a URL like `/v1/stores/x/documents?source=a?cursor=page2`,
+/// whose second `?` axum's `Query` extractor treats as a literal character in
+/// the `source` value rather than the start of the `cursor` parameter.
+#[tokio::test]
+async fn walk_daemon_pages_joins_cursor_with_ampersand_when_path_already_has_a_query_string() {
+    let seen: SeenUris = Arc::new(Mutex::new(Vec::new()));
+    let router = Router::new()
+        .route("/v1/things", get(mock_paginated_endpoint))
+        .with_state(seen.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let base_url = format!("http://{addr}");
+
+    let mut total_items = 0;
+    walk_daemon_pages(&base_url, "/v1/things?source=abc", |items| {
+        total_items += items.len();
+        false
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(total_items, 2, "both pages must have been walked");
+    let requests = seen.lock().await;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], "/v1/things?source=abc");
+    assert_eq!(
+        requests[1], "/v1/things?source=abc&cursor=page2",
+        "the cursor must be joined with '&', not a second '?', when the path already has a query string"
+    );
+}
+
+/// Same guard for the pre-existing, more common case: `path` with no query
+/// string of its own still gets `?cursor=`, not `&cursor=`.
+#[tokio::test]
+async fn walk_daemon_pages_joins_cursor_with_question_mark_when_path_has_no_query_string() {
+    let seen: SeenUris = Arc::new(Mutex::new(Vec::new()));
+    let router = Router::new()
+        .route("/v1/things", get(mock_paginated_endpoint))
+        .with_state(seen.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let base_url = format!("http://{addr}");
+
+    walk_daemon_pages(&base_url, "/v1/things", |_items| false)
+        .await
+        .unwrap();
+
+    let requests = seen.lock().await;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], "/v1/things");
+    assert_eq!(requests[1], "/v1/things?cursor=page2");
 }

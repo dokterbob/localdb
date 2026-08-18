@@ -15,10 +15,12 @@ mod scaffold;
 
 mod cmds {
     pub(crate) mod db;
+    pub(crate) mod document;
     pub(crate) mod index;
     pub(crate) mod init;
     pub(crate) mod internal;
     pub(crate) mod job;
+    pub(crate) mod listing;
     pub(crate) mod search;
     pub(crate) mod source;
     pub(crate) mod status;
@@ -28,6 +30,7 @@ mod cmds {
 
 pub use app_db::AppDb;
 pub use cmds::db::{run_db_downgrade, run_db_migrate, run_db_status, run_db_vacuum};
+pub use cmds::document::{run_document_get, run_document_list};
 pub use cmds::index::run_index;
 pub use cmds::init::run_init;
 pub use cmds::internal::run_internal_print_schema;

@@ -14,31 +14,48 @@ use rmcp::{
     tool, tool_handler, tool_router, ServerHandler,
 };
 
-use localdb_core::Embedder;
+use localdb_core::{Embedder, StoreBackend};
 
-use crate::args::{GetChunksArgs, GetDocumentArgs, SearchArgs};
+use crate::args::{GetChunksArgs, GetDocumentArgs, ListDocumentsArgs, SearchArgs};
 use crate::tools::{self, AvailableStore};
 
 /// Embedded-stdio MCP server handler: holds the resolved stores, the
-/// embedder used for `search`, and whether `--allow-write` was passed
-/// (parsed but always rejected in v1 — no mutating tool is registered).
+/// backend `get_document`/`list_documents` resolve document registry rows
+/// through, the embedder used for `search`, and whether `--allow-write` was
+/// passed (parsed but always rejected in v1 — no mutating tool is
+/// registered).
+///
+/// `backend` and `stores` are threaded separately rather than one replacing
+/// the other: `stores` (each an `AvailableStore` — a session-scoped
+/// `RetrievalStore` handle) is what `search`/`get_chunks`/`list_stores`
+/// query directly, while `backend` is the shared `StoreBackend` those
+/// `AvailableStore` handles were themselves resolved from — `get_document`/
+/// `list_documents` need it for the document-registry lookups
+/// (`StoreBackend::find_document`/`list_documents`) `RetrievalStore` doesn't
+/// expose. Every tool still resolves a caller-supplied store name through
+/// `stores` (via `tools::select_mcp_stores`) before it ever reaches
+/// `backend`, so `--store` session scoping is unaffected by this field's
+/// presence — see `tools::get_document_from_store`/`tool_list_documents`.
 #[derive(Clone)]
 pub struct McpHandler {
     pub stores: Vec<AvailableStore>,
+    pub backend: Arc<dyn StoreBackend>,
     pub embedder: Arc<dyn Embedder>,
     pub allow_write: bool,
     tool_router: ToolRouter<Self>,
 }
 
 impl McpHandler {
-    /// Create a new handler over the given stores and embedder.
+    /// Create a new handler over the given stores, backend, and embedder.
     pub fn new(
         stores: Vec<AvailableStore>,
+        backend: Arc<dyn StoreBackend>,
         embedder: Arc<dyn Embedder>,
         allow_write: bool,
     ) -> Self {
         Self {
             stores,
+            backend,
             embedder,
             allow_write,
             tool_router: Self::tool_router(),
@@ -62,7 +79,7 @@ impl McpHandler {
         description = "Fetch the normalized text and metadata for a document by its ID or URI. Pass 'store' (id or name, e.g. from a search citation) to disambiguate when the same document id exists in multiple stores."
     )]
     async fn get_document(&self, Parameters(args): Parameters<GetDocumentArgs>) -> CallToolResult {
-        tools::tool_get_document(&self.stores, args).await
+        tools::tool_get_document(&self.stores, self.backend.as_ref(), args).await
     }
 
     /// Fetch a document's chunks in order, paginated by offset/limit or by
@@ -81,6 +98,18 @@ impl McpHandler {
     )]
     async fn list_stores(&self) -> CallToolResult {
         tools::tool_list_stores(&self.stores).await
+    }
+
+    /// List every document registered in a store, optionally filtered to a
+    /// source, paginated by offset/limit.
+    #[tool(
+        description = "List every document registered in a store (required 'store': id or name), optionally filtered by 'source' id, paginated by offset/limit (default 50, max 200)."
+    )]
+    async fn list_documents(
+        &self,
+        Parameters(args): Parameters<ListDocumentsArgs>,
+    ) -> CallToolResult {
+        tools::tool_list_documents(&self.stores, self.backend.as_ref(), args).await
     }
 }
 

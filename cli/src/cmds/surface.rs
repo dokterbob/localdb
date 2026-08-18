@@ -224,7 +224,12 @@ pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
         available.push(AvailableStore::from_arc(descriptor, handle));
     }
 
-    let handler = McpHandler::new(available, std::sync::Arc::from(embedder), allow_write);
+    let handler = McpHandler::new(
+        available,
+        db.backend_arc(),
+        std::sync::Arc::from(embedder),
+        allow_write,
+    );
 
     if let Err(e) = mcp::serve_embedded_stdio(handler).await {
         exit_err(

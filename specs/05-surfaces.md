@@ -25,14 +25,16 @@ Single binary, subcommand tree. Global flags: `--config`, `--json`, `--store <na
 | `store add/list/remove`                                    | Manage runtime-owned stores; `list` spans all stores if `-s` is omitted, `add`/`remove` name their store as an argument so `-s` is rejected, exit 2 (§2.2)                                                                                                                                                                                                                                                                                                                                     | direct write                                                                                              | routed to daemon                                                                                                                                                                                                                                                                                      |
 | `source add/list/remove`                                   | Manage sources on a store; `list` and `remove <ULID>` span all stores if `-s` is omitted, `add` defaults to the store named `default` (exit 2 if absent), `remove <path\|url>` requires `-s` (§2.2)                                                                                                                                                                                                                                                                                            | direct write                                                                                              | `add`/`list`/`remove` all routed to daemon                                                                                                                                                                                                                                                            |
 | `add <path\|url>...`                                       | Alias for `source add` — add one or more sources to a store; same `default`-store rule as `source add` (§2.2)                                                                                                                                                                                                                                                                                                                                                                                  | direct write                                                                                              | routed to daemon                                                                                                                                                                                                                                                                                      |
+| `document list [--store S]... [--source ID]`               | List documents across stores; all stores if `-s` is omitted, `-s` is a filter (§2.2); `--source` narrows to one source's documents; a store-name column appears whenever more than one store is in scope                                                                                                                                                                                                                                                                                       | direct read                                                                                               | `GET /v1/stores/{name}/documents` per resolved store                                                                                                                                                                                                                                                  |
+| `document get <id> [--store S]... [--text]`                | Look up one document by id; identity + metadata by default, `--text` appends the reconstructed full text (`--json` always includes it); unknown id is exit 3; `-s` resolves 0/1/many against the id's owning store (§2.2)                                                                                                                                                                                                                                                                      | direct read                                                                                               | `GET /v1/documents/{id}?store=` (repeatable)                                                                                                                                                                                                                                                          |
 | `index [--store S]... [--source ID] [--strict] [--delete]` | One-shot scan & index; submits an `IndexJob` per resolved store through the shared async job engine (`server::job_exec::run_job`); all stores if `-s` is omitted (§2.2); `--delete` works in both modes                                                                                                                                                                                                                                                                                        | submits to a local, in-process job queue; live progress to stderr as the job's own progress events arrive | submits `POST /v1/jobs` (with `deletion_policy`), then attaches via `GET /v1/jobs/{id}/events` (SSE) for live progress, falling back to polling `GET /v1/jobs/{id}` every 500ms if the stream can't be established or drops; identical summary/`--json`/`--strict` output to embedded mode either way |
 | `search <query>... [--limit N] [--content-length N]`       | Hybrid search with citations; `--content-length` is a **soft cap** on human-readable snippet chars (default 1000; JSON output always full text) — see §4 for the snapping behavior shared with MCP                                                                                                                                                                                                                                                                                             | embedded read                                                                                             | via API                                                                                                                                                                                                                                                                                               |
 | `db status`                                                | Inspect schema state: current version, head version, pending/unsupported steps. Never refuses, even on a store newer than the binary; not store-scoped, `-s` is rejected, exit 2 (§2.2)                                                                                                                                                                                                                                                                                                        | reads directly                                                                                            | error `daemon_running`                                                                                                                                                                                                                                                                                |
 | `db migrate`                                               | Apply pending migrations with per-step progress; legacy v1–v3 rebuild and any other destructive step require confirmation; prints a `localdb index` hint when a weight-class-3 migration ran; not store-scoped, `-s` is rejected, exit 2 (§2.2)                                                                                                                                                                                                                                                | direct write                                                                                              | error `daemon_running`                                                                                                                                                                                                                                                                                |
 | `db downgrade [--to N]`                                    | Reverse migrations down to version `N` (default: one step) using stored down-SQL; requires confirmation; refuses cleanly on a step with `down_unsupported_reason`; not store-scoped, `-s` is rejected, exit 2 (§2.2)                                                                                                                                                                                                                                                                           | direct write                                                                                              | error `daemon_running`                                                                                                                                                                                                                                                                                |
 | `db vacuum`                                                | Reclaim disk space a prior migration or bulk delete freed onto SQLite's free list but never returned to the file (e.g. after `db migrate` runs the v6 `shrink_vector_index` step) by running `VACUUM`; data-preserving, no confirmation prompt, but warns that it needs roughly the store's current size again in free disk space and can take minutes on a large store; not store-scoped, `-s` is rejected, exit 2 (§2.2)                                                                     | direct write                                                                                              | error `daemon_running`                                                                                                                                                                                                                                                                                |
-| `job cancel <id>`                                          | Request cancellation of a queued or running job on a daemon's job queue (issue #218); daemon-only — no embedded equivalent, so it always requires a running daemon and `-s` is rejected, exit 2 (§2.2). Exit 0 cancellation requested (`202` + the job's snapshot), exit 3 unknown job id, exit 4 job already reached a terminal state                                                                                                                                                          | n/a — exit 5 (`daemon_unreachable`) without a running daemon                                              | `DELETE /v1/jobs/{id}`                                                                                                                                                                                                                                                                                 |
-| `job list`                                                 | List every job on a daemon's job queue, regardless of state or store; daemon-only like `job cancel` — `-s` is rejected, exit 2 (§2.2). Table columns: id, store, state, error_code, created_at; `--json` emits the raw `IndexJob[]` array `GET /v1/jobs` returns                                                                                                                                                                                                    | n/a — exit 5 (`daemon_unreachable`) without a running daemon                                              | `GET /v1/jobs`                                                                                                                                                                                                                                                                                          |
+| `job cancel <id>`                                          | Request cancellation of a queued or running job on a daemon's job queue (issue #218); daemon-only — no embedded equivalent, so it always requires a running daemon and `-s` is rejected, exit 2 (§2.2). Exit 0 cancellation requested (`202` + the job's snapshot), exit 3 unknown job id, exit 4 job already reached a terminal state                                                                                                                                                         | n/a — exit 5 (`daemon_unreachable`) without a running daemon                                              | `DELETE /v1/jobs/{id}`                                                                                                                                                                                                                                                                                |
+| `job list`                                                 | List every job on a daemon's job queue, regardless of state or store; daemon-only like `job cancel` — `-s` is rejected, exit 2 (§2.2). Table columns: id, store, state, error_code, created_at; `--json` emits the raw `IndexJob[]` array `GET /v1/jobs` returns                                                                                                                                                                                                                               | n/a — exit 5 (`daemon_unreachable`) without a running daemon                                              | `GET /v1/jobs`                                                                                                                                                                                                                                                                                        |
 
 Output: human-readable by default (citations as `uri:heading_path` + snippet), `--json` emits the
 canonical structures for scripting. The CLI is **command-oriented**; interactive browse is a roadmap
@@ -66,14 +68,15 @@ rather than requiring `--yes` confirmation.
 An unknown name is `store_not_found`, exit 3. When explicit, `-s` always wins over any default
 below. When `-s` is omitted, the default depends on the command:
 
-| Command                                                         | `-s` omitted                                    | Rationale                                                                                                                                                       |
-| --------------------------------------------------------------- | ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `search`, `status`, `store list`, `source list`, `index`, `mcp` | **all stores**                                  | `-s` is a _filter_; only the _default_ changes — an explicit name is still validated and resolved (unknown → `store_not_found`, exit 3), never silently ignored |
-| `source remove <ULID>`                                          | **all stores**                                  | a ULID identifies its owning store on its own; scoping it to `default` makes a valid id fail                                                                    |
-| `source remove <path\|url>`                                     | n/a — **exit 2**                                | a path/url can exist in several stores; this one really is a guess                                                                                              |
-| `source add`, `add` alias                                       | **store named `default`**; **exit 2** if absent | the one write that must pick a single target, and must not pick it by guessing                                                                                  |
-| `store add`, `store remove`, `init`, `serve`                    | n/a — **exit 2 if `-s` is passed**              | the store is named by the command's own argument, or there is no store concept yet, or the daemon serves every store regardless                                 |
-| `db status`/`migrate`/`downgrade`/`vacuum`                      | n/a — **exit 2 if `-s` is passed**              | not store-scoped                                                                                                                                                |
+| Command                                                                          | `-s` omitted                                    | Rationale                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| -------------------------------------------------------------------------------- | ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `search`, `status`, `store list`, `source list`, `document list`, `index`, `mcp` | **all stores**                                  | `-s` is a _filter_; only the _default_ changes — an explicit name is still validated and resolved (unknown → `store_not_found`, exit 3), never silently ignored                                                                                                                                                                                                                                                                                                                   |
+| `source remove <ULID>`                                                           | **all stores**                                  | a ULID identifies its owning store on its own; scoping it to `default` makes a valid id fail                                                                                                                                                                                                                                                                                                                                                                                      |
+| `document get <id>`                                                              | **all stores**                                  | a document id identifies its owning store on its own, like a source ULID — but unlike a ULID it can legitimately exist in more than one store (the same content indexed twice); omitted `-s` looks the id up across every store and is a cross-store ambiguity error (`invalid_request`, exit 2) if more than one store holds it, one `-s` scopes the lookup unambiguously, and more than one `-s` resolves unscoped then checks the found document's store against the given set |
+| `source remove <path\|url>`                                                      | n/a — **exit 2**                                | a path/url can exist in several stores; this one really is a guess                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `source add`, `add` alias                                                        | **store named `default`**; **exit 2** if absent | the one write that must pick a single target, and must not pick it by guessing                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `store add`, `store remove`, `init`, `serve`                                     | n/a — **exit 2 if `-s` is passed**              | the store is named by the command's own argument, or there is no store concept yet, or the daemon serves every store regardless                                                                                                                                                                                                                                                                                                                                                   |
+| `db status`/`migrate`/`downgrade`/`vacuum`                                       | n/a — **exit 2 if `-s` is passed**              | not store-scoped                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 
 Every "exit 2 if `-s` is passed" row above exists for one reason: silently ignoring a flag the user
 believed in is the #178 failure mode again.
@@ -275,31 +278,47 @@ later if a consumer demands it).
   discovery file so CLI/MCP clients can find it regardless of bind address or port
   ([01-architecture.md](01-architecture.md) §3).
 - **Resources** (`/v1`): `GET/POST /stores`, `GET/PATCH/DELETE /stores/{name}`,
-  `GET/POST /stores/{name}/sources`, `POST /search` (body: query, store filter, metadata filters,
-  limit; citations carry full `Metadata`), `GET /documents/{id}` (response includes
-  `metadata: Metadata`), `GET/POST /jobs` (the former lists every job regardless of state or
-  store; the latter submits an index request), `GET/DELETE /jobs/{id}` (the
-  latter cancels, issue #218), `GET /jobs/{id}/events` (SSE, below), `GET /status`, `GET /config`
-  (resolved config).
-  **Jobs are ephemeral operational records with bounded retention, not history**: the registry
-  keeps every `pending`/`running` job, but caps how many
-  terminal (`done`/`failed`) jobs it retains at `MAX_TERMINAL_JOBS` (200, `server::job_queue`) —
-  once a terminal write pushes the terminal count over the cap, the oldest terminal jobs by
-  `completed_at` are evicted first, so `GET /jobs` never grows unbounded in a long-running daemon.
-  Jobs terminal for less than a retention grace (`TERMINAL_RETENTION_GRACE_SECS`, 60s) are never
-  evicted, even over the cap — a client that just received its id from `POST /jobs` must always be
-  able to resolve it on its first `GET /jobs/{id}`/`GET /jobs/{id}/events` request, even if the job
-  completed (and a burst of other completions landed) before that request arrived; the cap is
-  therefore a target the registry returns to as entries age past the grace — trimmed on the next
-  terminal write or `GET /jobs` read, whichever comes first — not a hard ceiling during a burst.
-  No pagination on `GET /jobs` this round — the response stays bounded anyway: the non-terminal set
-  is capped by the per-store in-flight guard (at most one `pending`/`running` job per store), and
-  the terminal set by the cap plus at most one grace window's worth of burst; this may be revisited
-  if the cap itself is ever made configurable/larger.
-  Store records (`GET/POST /stores`, `GET /stores/{name}`) include `id` alongside
-  `name`/`visibility`/`backend`. Despite the `{name}` path param, stores are still looked up and
-  returned with their `id` intact — `{name}` is only how the route addresses _which_ store, not a
-  claim that `id` is dropped from the shape.
+  `GET/POST /stores/{name}/sources`, `GET /stores/{name}/documents`, `POST /search` (body: query,
+  store filter, metadata filters, limit; citations carry full `Metadata`),
+  `GET /documents/{id}?store=` (repeatable; response includes `metadata: Metadata`),
+  `GET/POST /jobs` (the former lists every job regardless of state or store; the latter submits an
+  index request), `GET/DELETE /jobs/{id}` (the latter cancels, issue #218), `GET /jobs/{id}/events`
+  (SSE, below), `GET /status`, `GET /config` (resolved config). **Jobs are ephemeral operational
+  records with bounded retention, not history**: the registry keeps every `pending`/`running` job,
+  but caps how many terminal (`done`/`failed`) jobs it retains at `MAX_TERMINAL_JOBS` (200,
+  `server::job_queue`) — once a terminal write pushes the terminal count over the cap, the oldest
+  terminal jobs by `completed_at` are evicted first, so `GET /jobs` never grows unbounded in a
+  long-running daemon. Jobs terminal for less than a retention grace
+  (`TERMINAL_RETENTION_GRACE_SECS`, 60s) are never evicted, even over the cap — a client that just
+  received its id from `POST /jobs` must always be able to resolve it on its first
+  `GET /jobs/{id}`/`GET /jobs/{id}/events` request, even if the job completed (and a burst of other
+  completions landed) before that request arrived; the cap is therefore a target the registry
+  returns to as entries age past the grace — trimmed on the next terminal write or `GET /jobs` read,
+  whichever comes first — not a hard ceiling during a burst. No pagination on `GET /jobs` this round
+  — the response stays bounded anyway: the non-terminal set is capped by the per-store in-flight
+  guard (at most one `pending`/`running` job per store), and the terminal set by the cap plus at
+  most one grace window's worth of burst; this may be revisited if the cap itself is ever made
+  configurable/larger. Store records (`GET/POST /stores`, `GET /stores/{name}`) include `id`
+  alongside `name`/`visibility`/`backend`. Despite the `{name}` path param, stores are still looked
+  up and returned with their `id` intact — `{name}` is only how the route addresses _which_ store,
+  not a claim that `id` is dropped from the shape.
+- **Document reads:** `GET /stores/{name}/documents?source=&cursor=&limit=` lists every document
+  registered in a store, in the same paginated envelope as `GET /stores/{name}/sources` (below).
+  `?source=` is a pure filter, not a lookup — an unknown source id yields an empty page rather than
+  an error, matching `StoreBackend::list_documents`'s "no error on a miss" contract for read paths;
+  an unknown store name is `store_not_found`, 404. `GET /documents/{id}?store=` (repeatable) looks
+  up a single document by id: the response is a `DocumentRecord` (`id`, `uri`, `title`, `store_id`,
+  `source_id`, `content_hash`, `fetched_at`, `normalized_text`, `metadata`) — `normalized_text` is
+  the document's reconstructed full text, always present in the response (there is no daemon-side
+  equivalent of the CLI's `--text` flag; that's purely a rendering choice on the CLI side, §2).
+  `?store=` gives the same 0/1/many scoping as the CLI's `-s` on `document get` (§2.2): omitted
+  looks the id up across every store (`invalid_request`, 400, if more than one store holds it),
+  exactly one name scopes the lookup unambiguously, and more than one name resolves unscoped then
+  checks the found document's store against the given set; an unknown store name is
+  `store_not_found`, 404. This store-name disambiguation exists in the daemon from day one — unlike
+  #188's known gap on daemon-routed `source remove --store` (syntactic-only validation), `?store=`
+  here is resolved by the handler itself against the real store registry, so the CLI's `-s`
+  semantics on `document get` hold identically whether attached to a daemon or running embedded.
 - **Feed sources:** `POST /stores/{name}/sources` accepts
   `{kind: "feed", spec: {url, max_entries, fetch_full_content}, preset, refresh}` — `spec` mirrors
   `SourceSpec::Feed` ([02-domain-model.md](02-domain-model.md) §2). Validation failures
@@ -314,28 +333,27 @@ later if a consumer demands it).
   `POST /jobs` (or CLI `index`) runs.
 - **Long-running work:** indexing is a **job resource**, and `POST /jobs` runs the real ingestion
   pipeline (`server::job_exec::run_job`) through an async job queue with a configurable worker pool
-  (`server.job_workers`, default 1, issue #208) — not a stub. Body: `{store_name, source_id?,
-  deletion_policy?}`; `store_name` is required, `source_id` narrows the job to one source (omit to
-  index the whole store), `deletion_policy` is `"retain"` (default — nothing is ever removed) or
-  `"delete"` (prunes documents no longer present at their source, mirroring CLI `index --delete`) —
-  any other value is `invalid_request`, 400. `POST /jobs` → `202` + the created `IndexJob`. A second
-  `POST /jobs` for a store that already has a job queued or running is rejected with
-  `index_in_progress`, 409 (§5) — same-store submissions always conflict, regardless of worker
-  count; a per-store in-flight guard is reserved atomically at submit time, before the job is
-  created, so two concurrent submissions for the same store can never both proceed. Jobs for
-  _different_ stores run concurrently, up to `server.job_workers` workers sharing one queue (issue
-  #208) — all workers pull from the same channel, so cross-store jobs genuinely overlap while the
-  per-store guard keeps same-store jobs serialized no matter how many workers are configured.
-  Embedded (non-daemon) CLI indexing always runs its own single-worker queue and never reads
-  `server.job_workers`. The URL-refresh scheduler submits jobs through this same engine, not a
-  separate code path. Clients
-  poll `GET /jobs/{id}` for the current `IndexJob` (state `pending`/`running`/`done`/`failed`,
-  `stats`, `error`, `error_code`, timestamps) or stream `GET /jobs/{id}/events` for live progress
-  (below). Because job records are ephemeral with bounded retention (above), `GET /jobs/{id}` for a
-  job id that has aged out past the terminal-job cap returns `404 job_not_found` — the same response
-  as an id that never existed; a client that stops polling a terminal job and comes back much later
-  should not assume a `404` means the id was invalid. `error_code` (issue #187 review, finding 3) is
-  the failing `core::Error`'s stable
+  (`server.job_workers`, default 1, issue #208) — not a stub. Body:
+  `{store_name, source_id?, deletion_policy?}`; `store_name` is required, `source_id` narrows the
+  job to one source (omit to index the whole store), `deletion_policy` is `"retain"` (default —
+  nothing is ever removed) or `"delete"` (prunes documents no longer present at their source,
+  mirroring CLI `index --delete`) — any other value is `invalid_request`, 400. `POST /jobs` →
+  `202` + the created `IndexJob`. A second `POST /jobs` for a store that already has a job queued or
+  running is rejected with `index_in_progress`, 409 (§5) — same-store submissions always conflict,
+  regardless of worker count; a per-store in-flight guard is reserved atomically at submit time,
+  before the job is created, so two concurrent submissions for the same store can never both
+  proceed. Jobs for _different_ stores run concurrently, up to `server.job_workers` workers sharing
+  one queue (issue #208) — all workers pull from the same channel, so cross-store jobs genuinely
+  overlap while the per-store guard keeps same-store jobs serialized no matter how many workers are
+  configured. Embedded (non-daemon) CLI indexing always runs its own single-worker queue and never
+  reads `server.job_workers`. The URL-refresh scheduler submits jobs through this same engine, not a
+  separate code path. Clients poll `GET /jobs/{id}` for the current `IndexJob` (state
+  `pending`/`running`/`done`/`failed`, `stats`, `error`, `error_code`, timestamps) or stream
+  `GET /jobs/{id}/events` for live progress (below). Because job records are ephemeral with bounded
+  retention (above), `GET /jobs/{id}` for a job id that has aged out past the terminal-job cap
+  returns `404 job_not_found` — the same response as an id that never existed; a client that stops
+  polling a terminal job and comes back much later should not assume a `404` means the id was
+  invalid. `error_code` (issue #187 review, finding 3) is the failing `core::Error`'s stable
   `code()` string (§5) when the job's `Failed` state came from a typed error — `null`/absent for a
   synthetic queue-level failure (the queue itself full/closed, or the job's task panicking) that
   never had one, and always absent on `done`. `error_code` + `error` round-trip through the same
@@ -353,26 +371,26 @@ later if a consumer demands it).
   cancellation token. Pending jobs cancel without ever starting; a running job's task is aborted and
   its teardown (issue #217's transaction rollback) is awaited before the per-store in-flight guard
   is released, so a cancelled write is data-safe the same way a crash mid-write already was.
-  **Deliberate design decision:** cancellation does not add a fifth `IndexJobState` — it reuses
-  the existing `Failed` terminal state with `error_code: "job_cancelled"`, reconstructed via
+  **Deliberate design decision:** cancellation does not add a fifth `IndexJobState` — it reuses the
+  existing `Failed` terminal state with `error_code: "job_cancelled"`, reconstructed via
   `Error::from_code` (§5) exactly like any other typed job failure. This means every surface that
   already renders a `Failed` job (attach polling, SSE, `--json`) needs no changes to display a
   cancellation; the CLI's `job cancel` gets its own exit code (4) only because
   `core::Error::JobCancelled`'s `exit_code()` says so, not because of any special-casing. **A `202`
-  is not a guarantee the job was actually interrupted**: `409` is
-  returned only when `JobQueue::cancel`'s own two registry reads (before and after triggering the
-  token) observe the job already terminal for a reason unrelated to this call — in that case the
-  recorded outcome is left untouched. Otherwise the call returns `202` and triggers the
-  cancellation token, but the job can still go on to reach `done`, or `failed` for an unrelated
-  reason, in the moment immediately after the response is sent — the HTTP response and the job's
-  eventual terminal state are decided independently, not atomically together. Callers must always
-  inspect the job's actual terminal state (`GET /jobs/{id}` or `GET /jobs/{id}/events`) rather than
-  assume a `202` implies the job stopped; only `error_code: "job_cancelled"` on that terminal state
-  confirms cancellation actually took effect. Cancellation takes effect at the task's next `.await`
-  yield point, not instantly — a CPU-bound phase (parsing, embedding inference) runs to the end of
-  its current operation before the worker observes the cancellation, so a `202` may precede the
-  terminal state by roughly the length of that operation; deeper preemption of a blocking phase is a
-  known follow-up, not implemented here.
+  is not a guarantee the job was actually interrupted**: `409` is returned only when
+  `JobQueue::cancel`'s own two registry reads (before and after triggering the token) observe the
+  job already terminal for a reason unrelated to this call — in that case the recorded outcome is
+  left untouched. Otherwise the call returns `202` and triggers the cancellation token, but the job
+  can still go on to reach `done`, or `failed` for an unrelated reason, in the moment immediately
+  after the response is sent — the HTTP response and the job's eventual terminal state are decided
+  independently, not atomically together. Callers must always inspect the job's actual terminal
+  state (`GET /jobs/{id}` or `GET /jobs/{id}/events`) rather than assume a `202` implies the job
+  stopped; only `error_code: "job_cancelled"` on that terminal state confirms cancellation actually
+  took effect. Cancellation takes effect at the task's next `.await` yield point, not instantly — a
+  CPU-bound phase (parsing, embedding inference) runs to the end of its current operation before the
+  worker observes the cancellation, so a `202` may precede the terminal state by roughly the length
+  of that operation; deeper preemption of a blocking phase is a known follow-up, not implemented
+  here.
 - **`GET /jobs/{id}/events`** (SSE, issue #83): streams the job's live progress as
   `text/event-stream`. Each in-flight update is an `event: progress` frame whose `data:` is one
   JSON-serialized `core::ProgressEvent` (internally tagged `type`: `source_started`, `discovered`,
@@ -428,6 +446,17 @@ later if a consumer demands it).
   `GET /stores` and `GET /stores/{name}/sources` compute the same `offset + limit` internally but
   treat an overflow there as end-of-list (`next_cursor: null`) instead of an error, since an
   offset/limit pair that large can never address a real page of either list.
+- **`?limit=0` is rejected, not clamped:** `GET /stores`, `GET /stores/{name}/sources`, and
+  `GET /stores/{name}/documents` all reject an explicit `limit=0` as `invalid_request`, HTTP 400
+  (`server::handlers::parse_limit`) — a zero limit would otherwise truncate every page to empty
+  while `next_cursor` keeps advancing by the unchanged offset, so a client following cursors would
+  loop forever on the same empty page. Matches the MCP `list_documents`/`get_chunks` tools' own
+  `resolve_limit`, which rejects the same input for the same reason rather than clamping it up to 1.
+- **`GET /stores/{name}/documents` paginates in the backend query, not in memory:** `limit`/`offset`
+  are pushed into `StoreBackend::list_documents`'s SQL (`LIMIT`/`OFFSET`), and the paginated
+  envelope's `total` comes from a separate `StoreBackend::count_documents` query, rather than
+  loading and deserializing every document in the store per page request. `document list`'s embedded
+  CLI path and the MCP `list_documents` tool push their own pagination down the same way.
 - **`localdb search` clamps identically in embedded and daemon mode (issue #187 review, finding
   1):** the 100-item cap above is not a `/v1/search`-only concern — `localdb search --limit <huge>`
   must return the same number of results whether or not a daemon happens to be running, since that
@@ -448,8 +477,10 @@ optional content_length → Citation list as structured content; each citation c
 `Metadata`), `get_document` (id or uri, optional store → block texts + `metadata: Metadata`),
 `get_chunks` (resource_id, optional store, optional offset/limit, or optional
 anchor_chunk_id/anchor_block_seq (§4.1) → the resource's chunks in order, paginated), `list_stores`
-(names, visibility, counts). **Mutating tools** (`add_source`, `reindex`, …) are a follow-up behind
-an explicit opt-in flag (`localdb mcp --allow-write`), never on by default.
+(names, visibility, counts), `list_documents` (args: store required, optional source, optional
+offset/limit → `{store: {id, name}, total, offset, limit, returned, documents: DocumentInfo[]}`,
+paginated the same way as `get_chunks`). **Mutating tools** (`add_source`, `reindex`, …) are a
+follow-up behind an explicit opt-in flag (`localdb mcp --allow-write`), never on by default.
 
 Because v1 registers no mutating tool at all, `--allow-write` currently has **no effect**: the tool
 set is byte-identical with and without it. Passing it prints a non-fatal stderr warning saying so,
@@ -646,7 +677,7 @@ MCP is served over two transports, built on the official `rmcp` SDK:
   until the daemon restarts (see `mcp::http::build_streamable_http_service`'s doc comment). HTTP MCP
   sessions always run with `allow_write = false`.
 
-Tool registration (the four read-only tools) and business logic are identical on both transports and
+Tool registration (the five read-only tools) and business logic are identical on both transports and
 in both stdio modes — only the code path serving the request differs.
 
 ### 4.2.1 `--store` scoping over stdio
@@ -663,12 +694,19 @@ server starts and exposes zero stores (§2.2's empty-scope exception).
   `Fn() -> Result<S, io::Error>` service factory with no access to the HTTP request, so neither
   `/mcp?store=x` nor a custom header can select a scoped handler on the daemon side. The tool
   arguments already carry store scope, though — `search.stores`, `get_document.store`,
-  `get_chunks.store` — so `ProxyHandler` validates and injects them on each relayed `tools/call`: an
-  absent store argument is filled in from the scope, an explicit one outside the scope is a
-  tool-level `invalid_request` naming the allowed set, and `list_stores`' response is filtered so an
-  agent cannot even enumerate stores it may not read. While the tool set is fixed at four read-only
-  tools, a scoped proxy relays _only_ those four and rejects any other name with `invalid_request` —
-  a future mutating tool must be given an explicit scoping rule before it can pass through.
+  `get_chunks.store`, `list_documents.store` — so `ProxyHandler` validates and injects them on each
+  relayed `tools/call`, differently per tool depending on whether its `store` is optional or
+  required: an explicit store argument outside the scope is always a tool-level `invalid_request`
+  naming the allowed set, regardless of tool. For `get_document`/`get_chunks`, whose `store` is
+  optional, an absent one is tried against each scoped store in turn, keeping the first non-error
+  result, which preserves each tool's documented "omitted store scans every available store, first
+  match wins" behavior narrowed to the scope. `list_documents.store` is required, not optional, so
+  the proxy never injects it: an absent (or wrong-typed) `store` is relayed unmodified, and the
+  upstream's own missing-required-argument error surfaces exactly as it would in embedded mode or an
+  unscoped proxy. `list_stores`' response is filtered so an agent cannot even enumerate stores it
+  may not read. While the tool set is fixed at five read-only tools, a scoped proxy relays _only_
+  those five and rejects any other name with `invalid_request` — a future mutating tool must be
+  given an explicit scoping rule before it can pass through.
 
 **This is scoping, not a security boundary.** The daemon's `/mcp` is loopback and unauthenticated,
 so anything that can open a socket can bypass `localdb mcp` and talk to the unscoped endpoint
@@ -707,25 +745,29 @@ store validation would have used.
 One enum in `core`; every surface maps it mechanically (HTTP status / CLI exit code + stderr / MCP
 tool error). Codes are stable API:
 
-| Code                                                                                                | Meaning                                                                                                                                                  | HTTP      |
-| --------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | --------- |
-| `store_not_found` / `source_not_found` / `resource_not_found` / `job_not_found` / `chunk_not_found` | Unknown entity                                                                                                                                           | 404       |
-| `runtime_state_locked`                                                                              | Unified database locked by another process (busy timeout exceeded)                                                                                       | 409       |
-| `daemon_running` / `daemon_unreachable`                                                             | Process-model conflicts                                                                                                                                  | 409 / 502 |
-| `invalid_config`                                                                                    | Config failed validation (path-precise message)                                                                                                          | 422       |
-| `invalid_request`                                                                                   | Bad arguments/body                                                                                                                                       | 400       |
-| `unsupported_format`                                                                                | Extraction can't handle the file type (informational in job stats)                                                                                       | 422       |
-| `extraction_failed`                                                                                 | Recognized, supported format whose contents could not be extracted (corrupt/truncated). Counted in `error_count` in job stats; produces a WARN per file. | 422       |
-| `provider_unavailable`                                                                              | External embedding endpoint down/misconfigured                                                                                                           | 502       |
-| `model_missing`                                                                                     | Local model not yet downloaded; message includes the fix                                                                                                 | 503       |
-| `rate_limited`                                                                                       | Retries against an upstream host exhausted (429/5xx/timeout); not _our_ rate limit — an upstream one — but grouped with the other "upstream not currently servable" codes and 502 for that reason | 502       |
-| `index_in_progress`                                                                                 | Conflicting job already running for the scope                                                                                                            | 409       |
-| `job_already_terminal`                                                                              | `DELETE /v1/jobs/{id}` requested for a job already `done`/`failed`; cancellation never overwrites a recorded outcome (issue #218)                        | 409       |
+| Code                                                                                                | Meaning                                                                                                                                                                                                                                                                                                         | HTTP                                     |
+| --------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------- |
+| `store_not_found` / `source_not_found` / `resource_not_found` / `job_not_found` / `chunk_not_found` | Unknown entity                                                                                                                                                                                                                                                                                                  | 404                                      |
+| `runtime_state_locked`                                                                              | Unified database locked by another process (busy timeout exceeded)                                                                                                                                                                                                                                              | 409                                      |
+| `daemon_running` / `daemon_unreachable`                                                             | Process-model conflicts                                                                                                                                                                                                                                                                                         | 409 / 502                                |
+| `invalid_config`                                                                                    | Config failed validation (path-precise message)                                                                                                                                                                                                                                                                 | 422                                      |
+| `invalid_request`                                                                                   | Bad arguments/body                                                                                                                                                                                                                                                                                              | 400                                      |
+| `unsupported_format`                                                                                | Extraction can't handle the file type (informational in job stats)                                                                                                                                                                                                                                              | 422                                      |
+| `extraction_failed`                                                                                 | Recognized, supported format whose contents could not be extracted (corrupt/truncated). Counted in `error_count` in job stats; produces a WARN per file.                                                                                                                                                        | 422                                      |
+| `provider_unavailable`                                                                              | External embedding endpoint down/misconfigured                                                                                                                                                                                                                                                                  | 502                                      |
+| `model_missing`                                                                                     | Local model not yet downloaded; message includes the fix                                                                                                                                                                                                                                                        | 503                                      |
+| `rate_limited`                                                                                      | Retries against an upstream host exhausted (429/5xx/timeout); not _our_ rate limit — an upstream one — but grouped with the other "upstream not currently servable" codes and 502 for that reason                                                                                                               | 502                                      |
+| `index_in_progress`                                                                                 | Conflicting job already running for the scope                                                                                                                                                                                                                                                                   | 409                                      |
+| `job_already_terminal`                                                                              | `DELETE /v1/jobs/{id}` requested for a job already `done`/`failed`; cancellation never overwrites a recorded outcome (issue #218)                                                                                                                                                                               | 409                                      |
 | `job_cancelled`                                                                                     | A job's `Failed` state whose cause was cancellation via `DELETE /v1/jobs/{id}` (issue #218); not a request's own error — it appears as the job's `error_code`, and a daemon-attached CLI (e.g. `localdb index`) reconstructs it via `Error::from_code` to exit 4 the same way a direct `job cancel` caller does | n/a (job outcome, never a live response) |
-| `internal`                                                                                          | Bug; includes correlation id, logged with backtrace                                                                                                      | 500       |
+| `internal`                                                                                          | Bug; includes correlation id, logged with backtrace                                                                                                                                                                                                                                                             | 500                                      |
 
 CLI exit codes: `0` ok, `1` internal, `2` invalid usage/config, `3` not found, `4` conflict/locked,
 `5` unavailable (daemon/provider/model/rate-limited upstream).
+
+`chunk_not_found` is MCP-local, not part of the core taxonomy above: it is authored directly by the
+`get_chunks` tool's anchor-resolution paths (§4.1) rather than a `core::Error` variant, so it never
+appears on an HTTP response body or a job's `error_code`, and has no CLI exit code of its own.
 
 `core::Error::from_code(code, message)` is the one mapping back from a `{code, message}` pair to a
 typed `Error` (the inverse of `code()` above), shared by every surface that receives an error this
