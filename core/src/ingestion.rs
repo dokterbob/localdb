@@ -1931,6 +1931,75 @@ mod tests {
         assert!(files[0].uri.as_str().starts_with("file://"));
     }
 
+    /// `enumerate_dir` canonicalizes before building the URI, and on Windows
+    /// `canonicalize()` returns a verbatim `\\?\C:\...` path. The URI is the
+    /// resource's stable identity — it is what the delete-sweep compares
+    /// against stored documents — so a verbatim prefix or a stray backslash
+    /// leaking into it would make every re-index look like a different
+    /// resource, and the sweep would delete the previous one. Assert the
+    /// verbatim prefix is gone and the URI still resolves back to the file.
+    #[cfg(windows)]
+    #[test]
+    fn enumerate_path_source_uris_drop_the_windows_verbatim_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("test.md");
+        std::fs::write(&file, b"content").unwrap();
+
+        // Precondition: canonicalization really does produce a verbatim path,
+        // so this test is exercising what it claims to.
+        let canonical = file.canonicalize().unwrap();
+        assert!(
+            canonical.to_string_lossy().starts_with(r"\\?\"),
+            "expected a verbatim path from canonicalize(), got {}",
+            canonical.display()
+        );
+
+        let root = dir.path().to_str().unwrap();
+        let files = enumerate_path_source(root, &[], &[])
+            .unwrap()
+            .files()
+            .to_vec();
+        assert_eq!(files.len(), 1);
+
+        let uri = &files[0].uri;
+        let s = uri.as_str();
+        assert!(s.starts_with("file:///"), "unexpected URI shape: {s}");
+        assert!(!s.contains("//%3F/"), "verbatim prefix leaked into {s}");
+        assert!(!s.contains('\\') && !s.contains("%5C"), "backslash in {s}");
+
+        // Round-trips: reparsing is stable, and the URI still names the file.
+        assert_eq!(Uri::parse(s).as_ref(), Some(uri));
+        let resolved = uri.as_url().to_file_path().expect("URI must be a file path");
+        assert!(resolved.is_file(), "{} should exist", resolved.display());
+    }
+
+    /// Globs are matched against the root-relative path, which on Windows is
+    /// backslash-separated. `globset` normalizes separators, but nothing until
+    /// now built a Windows path to prove it — and a silent mismatch here would
+    /// make every nested file invisible to indexing.
+    #[cfg(windows)]
+    #[test]
+    fn enumerate_path_source_globs_match_backslash_separated_relative_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("notes").join("deep");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("keep.md"), b"# keep").unwrap();
+        std::fs::write(nested.join("skip.txt"), b"skip").unwrap();
+
+        let root = dir.path().to_str().unwrap();
+        let files = enumerate_path_source(root, &["**/*.md".to_string()], &[])
+            .unwrap()
+            .files()
+            .to_vec();
+
+        assert_eq!(
+            files.len(),
+            1,
+            "expected the nested .md to match, got {files:?}"
+        );
+        assert!(files[0].uri.as_str().ends_with("/notes/deep/keep.md"));
+    }
+
     #[test]
     fn enumerate_path_source_handles_non_ascii_filenames() {
         let dir = tempfile::tempdir().unwrap();
