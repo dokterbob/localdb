@@ -1,0 +1,54 @@
+<%#
+  Homebrew formula template for the dokterbob/homebrew-localdb tap.
+
+  Rendered by homebrew/render.rb (called from
+  .github/workflows/homebrew-tap-publish.yml) with values taken verbatim
+  from dist's dist-manifest.json — URLs and sha256s are never re-derived.
+
+  Hand-maintained rather than dist's built-in Homebrew publisher because the
+  generated formula cannot express `service do`, completions, or a custom
+  `test do`.
+%>class Localdb < Formula
+  desc "Local-first knowledge server with hybrid search"
+  homepage "https://github.com/dokterbob/localdb"
+  version "<%= version %>"
+  license "AGPL-3.0-or-later"
+
+  on_macos do
+    on_arm do
+      url "<%= url["aarch64-apple-darwin"] %>"
+      sha256 "<%= sha256["aarch64-apple-darwin"] %>"
+    end
+  end
+
+  on_linux do
+    on_intel do
+      url "<%= url["x86_64-unknown-linux-gnu"] %>"
+      sha256 "<%= sha256["x86_64-unknown-linux-gnu"] %>"
+    end
+    on_arm do
+      url "<%= url["aarch64-unknown-linux-gnu"] %>"
+      sha256 "<%= sha256["aarch64-unknown-linux-gnu"] %>"
+    end
+  end
+
+  def install
+    bin.install "localdb"
+    # `localdb completions <shell>` is pure clap codegen — never touches the
+    # embedded ONNX runtime, config, or network.
+    generate_completions_from_executable(bin/"localdb", "completions")
+  end
+
+  # Opt-in daemon: `brew services start localdb` runs the HTTP API server
+  # with file watching and scheduled refresh. Off by default.
+  service do
+    run [opt_bin/"localdb", "serve"]
+    keep_alive true
+    log_path var/"log/localdb.log"
+    error_log_path var/"log/localdb.log"
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/localdb --version")
+  end
+end

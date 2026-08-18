@@ -1,0 +1,70 @@
+# Publish the Homebrew formula to the dokterbob/homebrew-localdb tap.
+#
+# Called by the dist-generated release.yml as `custom-homebrew-tap-publish`
+# (dist-workspace.toml `publish-jobs`), after `host` has uploaded the release
+# artifacts and `custom-release-checks` has passed. Single writer of the tap.
+#
+# Renders homebrew/localdb.rb.erb from dist's final dist-manifest.json
+# (URLs/sha256s verbatim — never re-derived) and pushes Formula/localdb.rb.
+#
+# Secrets: HOMEBREW_TAP_TOKEN — fine-grained PAT with contents:write on
+# dokterbob/homebrew-localdb.
+
+name: homebrew-tap-publish
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        description: "dist-manifest plan JSON from the plan job"
+        required: true
+        type: string
+
+jobs:
+  publish:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout localdb (template + render script)
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Fetch built artifacts
+        # Brings both the final dist-manifest.json (from the host job) and the
+        # per-tarball .sha256 checksum files render.rb reads.
+        uses: actions/download-artifact@v8
+        with:
+          pattern: artifacts-*
+          path: artifacts/
+          merge-multiple: true
+
+      - name: Render formula
+        run: |
+          set -euo pipefail
+          ruby homebrew/render.rb artifacts/dist-manifest.json artifacts homebrew/localdb.rb.erb > localdb.rb
+          ruby -c localdb.rb
+          cat localdb.rb
+
+      - name: Checkout tap
+        uses: actions/checkout@v6
+        with:
+          repository: dokterbob/homebrew-localdb
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Commit and push formula
+        run: |
+          set -euo pipefail
+          VERSION=$(ruby -rjson -e 'puts JSON.parse(File.read("artifacts/dist-manifest.json")).fetch("releases").find { |r| r["app_name"] == "localdb" }.fetch("app_version")')
+          mkdir -p tap/Formula
+          cp localdb.rb tap/Formula/localdb.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/localdb.rb
+          if git diff --cached --quiet; then
+            echo "Formula unchanged; nothing to push."
+            exit 0
+          fi
+          git commit -m "localdb ${VERSION}"
+          git push

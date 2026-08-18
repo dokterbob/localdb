@@ -1,0 +1,80 @@
+# Release automation (release-plz; see release-plz.toml + docs/release-engineering.md).
+#
+# Two jobs, the standard release-plz pattern:
+#   - release-plz-pr: on every push to main, maintain the rolling release PR
+#     (workspace version bump + CHANGELOG.md via cliff.toml). Merge that PR
+#     to cut a release.
+#   - release-plz-release: after a push to main (i.e. also right after the
+#     release PR merges), tag the released version `vX.Y.Z` if it isn't
+#     tagged yet. The tag push triggers the dist pipeline (release.yml),
+#     which builds artifacts and creates the GitHub Release.
+#
+# RELEASE_PLZ_TOKEN must be a PAT (not GITHUB_TOKEN): tags pushed with the
+# default workflow token do not trigger other workflows, so dist would never
+# fire. `contents: write` on this repo is enough.
+
+name: release-plz
+
+permissions:
+  pull-requests: write
+  contents: write
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  # release-plz runs `cargo package` in temp copies/worktrees of the repo
+  # (git_only change detection, with verification builds); a fixed absolute
+  # target dir lets those builds share one cache (kept warm by rust-cache).
+  CARGO_TARGET_DIR: /tmp/release-plz-target
+
+jobs:
+  release-plz-release:
+    name: tag release
+    runs-on: ubuntu-22.04
+    # One release at a time; queue instead of cancel so a merge right after a
+    # release PR still gets processed.
+    concurrency:
+      group: release-plz-release
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Run release-plz release
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+
+  release-plz-pr:
+    name: maintain release PR
+    runs-on: ubuntu-22.04
+    concurrency:
+      group: release-plz-pr
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Run release-plz release-pr
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}

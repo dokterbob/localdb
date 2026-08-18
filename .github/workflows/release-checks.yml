@@ -1,0 +1,155 @@
+# Artifact-shape checks for the dist release pipeline (issue #133 lineage).
+#
+# Called by the dist-generated release.yml as `custom-release-checks`
+# (dist-workspace.toml `host-jobs`), after the build jobs upload their
+# tarballs to workflow scratch storage. It gates `custom-homebrew-tap-publish`:
+# a failure here stops the tap from advancing (the GitHub Release itself is
+# created by dist's `host` job, which 0.32.0 offers no pre-hook for).
+#
+# Checks, ported from the legacy hand-rolled release.yml:
+#   - dynamic-dependency allowlist (ldd on Linux, otool -L on macOS)
+#   - GLIBC floor <= 2.35 (Ubuntu 22.04) on the binary AND on the embedded
+#     ONNX Runtime, which the binary extracts to the cache dir on first use
+#   - `--version` smoke (binary runs at all, reports a commit SHA)
+
+name: release-checks
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        description: "dist-manifest plan JSON from the plan job"
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: check (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ubuntu-22.04 (glibc 2.35) deliberately: running the binary here
+          # end-to-end proves the floor operationally (issue #133), on both
+          # Linux architectures.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Fetch built artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: artifacts-*
+          path: artifacts/
+          merge-multiple: true
+
+      - name: Extract binary from tarball
+        run: |
+          set -euo pipefail
+          TARBALL=$(find artifacts/ -name "localdb-*${{ matrix.target }}.tar.xz" | head -1)
+          if [ -z "$TARBALL" ]; then
+            echo "ERROR: no tarball found for ${{ matrix.target }}" >&2
+            find artifacts/ -type f >&2
+            exit 1
+          fi
+          mkdir -p extracted
+          tar -xf "$TARBALL" -C extracted
+          BINARY=$(find extracted -name localdb -type f | head -1)
+          echo "BINARY=$BINARY" >> "$GITHUB_ENV"
+          ls -lh "$BINARY"
+
+      - name: Verify no unexpected dynamic dependencies
+        run: |
+          set -euo pipefail
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            # Allow only the platform baseline — no external shared libs like libssl.
+            ldd "$BINARY" | tee /dev/stderr | \
+              grep -vE '(linux-vdso|libgcc_s|libc\.|libm\.|libdl\.|libpthread|ld-linux|ld-musl)' | \
+              grep -v "0x0" | \
+              (! grep -q "=>")
+            echo "Dynamic dependency check passed."
+          else
+            otool -L "$BINARY" | tee /dev/stderr
+            # Assert only system libraries are linked (no unexpected .dylib from /usr/local or /opt).
+            if otool -L "$BINARY" | tail -n +2 | grep -vE '(/usr/lib/|/System/Library/|@rpath|@loader_path)'; then
+              echo "ERROR: macOS binary has unexpected dynamic dependencies listed above." >&2
+              exit 1
+            fi
+            echo "macOS dynamic dependency check passed."
+          fi
+
+      - name: Version smoke
+        run: |
+          set -euo pipefail
+          "$BINARY" --version
+          # A release binary must know its commit (vergen); 'unknown' means the
+          # pipeline built outside a git checkout, which would be a regression.
+          "$BINARY" --version | grep -qE 'commit: [0-9a-f]{7,40}'
+
+      - name: Verify glibc floor (binary + embedded ONNX Runtime)
+        # Two glibc floors matter (issue #133):
+        #   1. Our own Rust code — set by the build runner, hence the
+        #      ubuntu-22.04 runner pins in dist-workspace.toml.
+        #   2. The embedded ONNX Runtime .so (embed/build.rs pins Microsoft's
+        #      official build) — extracted to the cache dir on first embedder
+        #      use, re-checked here as a regression guard in case the pinned
+        #      version/asset ever changes.
+        # Ubuntu 22.04 ships glibc 2.35, so both must stay at or below that.
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+
+          check_glibc_floor() {
+            local file="$1"
+            local max
+            max=$(objdump -T "$file" | grep -oE 'GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?' | sort -V -u | tail -1)
+            echo "$file: max ${max:-<none found>}"
+            if [ -n "$max" ]; then
+              local ver="${max#GLIBC_}"
+              local highest
+              highest=$(printf '%s\n2.35\n' "$ver" | sort -V | tail -1)
+              if [ "$highest" != "2.35" ]; then
+                echo "ERROR: $file requires GLIBC > $ver > 2.35; Ubuntu 22.04 ships 2.35, so this would break on Mint 21 / Ubuntu 22.04. See issue #133." >&2
+                exit 1
+              fi
+            fi
+          }
+
+          check_glibc_floor "$BINARY"
+
+          # Trigger the runtime extraction of the embedded libonnxruntime by
+          # running a real (tiny) local-model index, then check the extracted .so.
+          export XDG_CACHE_HOME="$RUNNER_TEMP/cache"
+          WORK="$RUNNER_TEMP/glibc-smoke"
+          mkdir -p "$WORK/data" "$WORK/docs"
+          cat > "$WORK/config.yaml" <<EOF
+          version: 1
+          paths:
+            data: $WORK/data
+          defaults:
+            indexing:
+              embedding:
+                provider: local
+                model: bge-small-en-v1.5
+          EOF
+          echo "# hello glibc floor check" > "$WORK/docs/note.md"
+          export LOCALDB_CONFIG="$WORK/config.yaml"
+          "$BINARY" init
+          "$BINARY" store add smoke
+          "$BINARY" --store smoke source add "$WORK/docs"
+          "$BINARY" --store smoke index
+
+          ORT_LIB=$(find "$XDG_CACHE_HOME/localdb/ort" -name 'libonnxruntime*' -type f | head -1)
+          if [ -z "$ORT_LIB" ]; then
+            echo "ERROR: indexing did not extract an embedded libonnxruntime into the cache dir" >&2
+            find "$XDG_CACHE_HOME" -type f >&2 || true
+            exit 1
+          fi
+          check_glibc_floor "$ORT_LIB"

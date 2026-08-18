@@ -128,6 +128,12 @@ first if it is wrong.
   path deps carry exact `=X.Y.Z` pins that release-plz rewrites on each bump — load-bearing, see
   `release-plz.toml` and `cliff.toml`.
 
+- **`.github/workflows/release.yml` is generated — never hand-edit it**: edit `dist-workspace.toml`
+  and rerun `dist generate`; `dist generate --check` and the workflow-shape tests in
+  `localdb/tests/packaging.rs` guard the wiring. The custom jobs live in hand-maintained
+  `workflow_call` workflows (`release-checks.yml`, `homebrew-tap-publish.yml`, `smoke-test.yml`);
+  `release-plz.yml` feeds the tags.
+
 ## Commit style
 
 Ticket branches use a `TXX:` prefix (e.g. `T12: add packaging & release workflow`). Review commits

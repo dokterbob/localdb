@@ -101,7 +101,29 @@ caveats (including the `⚠️` partial marks) are in [docs/comparison.md](docs/
 
 ## Install
 
-### From source (works today)
+> **Note:** the Homebrew, shell-installer and tarball channels go live with the first tagged
+> release. Until then, install from source.
+
+### Homebrew (macOS and Linux)
+
+```bash
+brew install dokterbob/localdb/localdb
+```
+
+Prebuilt binaries with shell completions installed for you. To run the HTTP daemon under
+`brew services` (optional — every command also works daemonless):
+
+```bash
+brew services start localdb
+```
+
+### Shell installer
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dokterbob/localdb/releases/latest/download/localdb-installer.sh | sh
+```
+
+### From source
 
 Requires a Rust toolchain (**1.88 or later, on every platform** — the `pdf_oxide` PDF parser
 declares that floor, and it subsumes the older per-platform split of Linux 1.82 / macOS 1.85).
@@ -130,10 +152,9 @@ Download and install from the [Releases](https://github.com/dokterbob/localdb/re
 
 ```bash
 # Replace VERSION and PLATFORM with your values from the table above
-VERSION=0.1.0
 PLATFORM=aarch64-apple-darwin   # or x86_64-unknown-linux-gnu / aarch64-unknown-linux-gnu
-curl -L "https://github.com/dokterbob/localdb/releases/download/v${VERSION}/localdb-v${VERSION}-${PLATFORM}.tar.gz" \
-  | tar -xz -C /usr/local/bin --strip-components=1 "localdb-v${VERSION}-${PLATFORM}/localdb"
+curl -L "https://github.com/dokterbob/localdb/releases/latest/download/localdb-${PLATFORM}.tar.xz" \
+  | tar -xJ -C /usr/local/bin --strip-components=1 "localdb-${PLATFORM}/localdb"
 localdb --version
 ```
 
