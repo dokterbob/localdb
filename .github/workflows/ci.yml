@@ -131,14 +131,31 @@ jobs:
         include:
           - os: macos-latest
             target: aarch64-apple-darwin
+            packages: "-p localdb"
           # Pinned to ubuntu-22.04 (not ubuntu-latest): our own Rust code inherits the
           # build machine's glibc floor, and this job now actually links (see the `cargo
           # build` step below), so a stale ubuntu-latest pin here would let a #133-style
           # glibc regression slip through CI again.
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+            packages: "-p localdb"
           - os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
+            packages: "-p localdb"
+          # Windows is a work in progress (#239): `server` still binds a Unix domain
+          # socket as its daemon sentinel, and `embed`'s ONNX Runtime is embedded only
+          # for Linux/macOS, so `-p localdb` cannot build here yet. Build the portable
+          # crates instead — that keeps this lane green while still proving the part
+          # that is most likely to break silently, namely that libsql-ffi's bundled
+          # SQLite compiles under MSVC. Widened to `-p localdb` once #239 phases 1-2
+          # land.
+          #
+          # Pinned to windows-2022 for the same reason the Linux entries pin
+          # ubuntu-22.04: windows-latest now maps to Windows Server 2025 + VS 2026,
+          # a moving toolchain target.
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            packages: "-p localdb-core -p localdb-extract -p localdb-fetch -p localdb-ingest -p localdb-store-libsql"
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust stable
@@ -171,4 +188,4 @@ jobs:
         # binary for each target instead.
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --target ${{ matrix.target }} -p localdb
+        run: cargo build --release --target ${{ matrix.target }} ${{ matrix.packages }}
