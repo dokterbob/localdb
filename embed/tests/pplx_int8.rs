@@ -15,7 +15,8 @@
 //! `perplexity-ai/pplx-embed-v1-0.6b`.  The token is not needed once the
 //! files are cached under `<platform-cache>/localdb/models/pplx-embed-v1-0.6b/`.
 
-#![cfg(feature = "local-onnx")]
+// Needs a real, initialized ONNX Runtime, which only exists when build.rs embedded one.
+#![cfg(ort_embedded)]
 
 use embed::PplxOnnxEmbedder;
 use localdb_core::{DocumentChunks, Embedder};

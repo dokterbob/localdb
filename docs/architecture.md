@@ -53,8 +53,8 @@ The `RetrievalStore` trait implementation backed by libsql (DiskANN vectors + FT
 unified database file at `<data_dir>/localdb.db` holds everything. BM25 full-text search uses
 SQLite's FTS5 virtual table. Dense search uses the DiskANN vector index (`libsql_vector_idx`). RRF
 fusion is done in `core`. In-process, writes serialise on one mutex-guarded writer connection while
-reads are served from a small round-robin pool of read-only connections, so reads no longer block
-on writes within a process. See [specs/01-architecture.md](../specs/01-architecture.md) §2.
+reads are served from a small round-robin pool of read-only connections, so reads no longer block on
+writes within a process. See [specs/01-architecture.md](../specs/01-architecture.md) §2.
 
 Schema changes go through an explicit migrations runner (`store-libsql/src/migrations/`): a frozen
 baseline DDL snapshot (`baseline.rs`, `PRAGMA user_version = 4`) plus a linear, numbered chain of
@@ -84,12 +84,11 @@ visible. Multi-process is the first-class concurrency model — the daemon is on
 (CLI sessions, multiple stdio MCP servers); concurrent writers serialise via SQLite WAL +
 `busy_timeout=5000`. Ingestion via `POST /v1/jobs` runs the real pipeline
 (`server::job_exec::run_job`) through an async job queue with a configurable worker pool
-(`server.job_workers`, default 1) and a per-store in-flight guard (issues #187, #208) — not a
-stub; a second submission for a store already running rejects with `index_in_progress`, 409, while
-jobs for different stores run concurrently up to `server.job_workers` workers. `GET
-/jobs/{id}/events` streams the job's live progress over SSE (issue #83). The URL-refresh scheduler
-submits through the same job engine. See
-[specs/05-surfaces.md](../specs/05-surfaces.md) §3.
+(`server.job_workers`, default 1) and a per-store in-flight guard (issues #187, #208) — not a stub;
+a second submission for a store already running rejects with `index_in_progress`, 409, while jobs
+for different stores run concurrently up to `server.job_workers` workers. `GET /jobs/{id}/events`
+streams the job's live progress over SSE (issue #83). The URL-refresh scheduler submits through the
+same job engine. See [specs/05-surfaces.md](../specs/05-surfaces.md) §3.
 
 ### `mcp`
 
@@ -220,14 +219,14 @@ library — a separate, sibling directory to `models/`, not configurable via `pa
 
 ## Exit codes
 
-| Code | Meaning                                                                    |
-| ---- | --------------------------------------------------------------------------- |
-| 0    | OK                                                                         |
-| 1    | Internal error                                                             |
-| 2    | Invalid usage or config (clap errors, config parse failures)              |
-| 3    | Not found (unknown store, unknown source)                                 |
-| 4    | Conflict / already running (duplicate store, second daemon)               |
-| 5    | Unavailable (daemon unreachable, model missing, rate-limited upstream)     |
+| Code | Meaning                                                                |
+| ---- | ---------------------------------------------------------------------- |
+| 0    | OK                                                                     |
+| 1    | Internal error                                                         |
+| 2    | Invalid usage or config (clap errors, config parse failures)           |
+| 3    | Not found (unknown store, unknown source)                              |
+| 4    | Conflict / already running (duplicate store, second daemon)            |
+| 5    | Unavailable (daemon unreachable, model missing, rate-limited upstream) |
 
 ---
 
@@ -270,7 +269,15 @@ instead of the embedded one:
 - `ORT_DYLIB_PATH` (runtime env var): `ensure_ort_initialized` honours this directly and `dlopen`s
   that path instead of extracting the embedded copy.
 - `LOCALDB_ORT_LIB` (build-time env var, read by `embed/build.rs`): points the _build_ at a local
-  ONNX Runtime library to embed instead of downloading one (offline/distro builds).
+  ONNX Runtime library to embed instead of downloading one (offline/distro builds). It is honoured
+  on every target, including ones localdb ships no ONNX Runtime asset for — that is precisely when
+  someone needs it.
+
+`build.rs` emits `cargo:rustc-cfg=ort_embedded` exactly when it embeds a runtime, and nothing else
+ever emits it. `ort_runtime`'s real implementation and `factory`'s local-ONNX constructors both gate
+on that one cfg rather than each restating "feature on **and** a supported target". On a build
+without it, `provider: local` and `provider: local-onnx` fail immediately with an error naming the
+cause and the alternatives, instead of reaching `ort` with nothing initialized behind it.
 
 Both overrides require ONNX Runtime **≥ 1.24** — `fastembed`'s own (unconditional) `ort` dependency
 declaration requests the `api-24` feature regardless of which `fastembed` features we enable, so
@@ -314,14 +321,14 @@ open.
 
 **1. ~~HTTP daemon `POST /v1/jobs` is a no-op~~ — RESOLVED.**
 ([#187](https://github.com/dokterbob/localdb/issues/187),
-[#208](https://github.com/dokterbob/localdb/issues/208)) `POST /v1/jobs` now runs the real
-ingestion pipeline (`server::job_exec::run_job`) through an async job queue with a configurable
-worker pool (`server.job_workers`, default 1) and a per-store in-flight guard — a duplicate
-submission for a store already running rejects with `index_in_progress` (409), rather than silently
-no-opping. `localdb index` submits a job to the daemon and attaches to `GET /v1/jobs/{id}/events`
-(SSE, issue #83) for live progress, falling back to polling `GET /v1/jobs/{id}` if the stream can't
-be established; the summary, `--json`, and `--strict` output are identical to embedded mode. `index
---delete` also works daemon-attached now (`deletion_policy` on the job request). Stopping the
+[#208](https://github.com/dokterbob/localdb/issues/208)) `POST /v1/jobs` now runs the real ingestion
+pipeline (`server::job_exec::run_job`) through an async job queue with a configurable worker pool
+(`server.job_workers`, default 1) and a per-store in-flight guard — a duplicate submission for a
+store already running rejects with `index_in_progress` (409), rather than silently no-opping.
+`localdb index` submits a job to the daemon and attaches to `GET /v1/jobs/{id}/events` (SSE, issue
+#83) for live progress, falling back to polling `GET /v1/jobs/{id}` if the stream can't be
+established; the summary, `--json`, and `--strict` output are identical to embedded mode.
+`index --delete` also works daemon-attached now (`deletion_policy` on the job request). Stopping the
 daemon before `localdb index` is no longer necessary. See
 [specs/05-surfaces.md](../specs/05-surfaces.md) §2/§3 for the full contract. The worker-pool size
 (`server.job_workers`) is operator-configurable as of #208: values greater than 1 let jobs for

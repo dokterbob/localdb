@@ -25,6 +25,16 @@
 //! This script is a no-op unless the `local-onnx` feature is enabled and the target OS is
 //! Linux or macOS (Windows/other targets get no embedded runtime and `local-onnx` simply
 //! isn't buildable there yet).
+//!
+//! # The `ort_embedded` cfg
+//!
+//! Whenever this script embeds a runtime it emits `cargo:rustc-cfg=ort_embedded`, and it is
+//! the only thing that ever does. Everything that must not compile without an embedded
+//! runtime — `ort_runtime::imp`, `factory`'s local-ONNX constructors — gates on that one
+//! cfg rather than restating `all(feature = "local-onnx", any(target_os = …))` in each
+//! place. Restating it invites skew, and skew here is silent: the two ends of it are a
+//! `provider: local` that dies deep inside a half-initialized ORT call and one that never
+//! compiles at all.
 
 use std::{
     env, fs,
@@ -73,10 +83,26 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=LOCALDB_ORT_LIB");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_LOCAL_ONNX");
+    // Declare the cfg unconditionally, including on the paths below that never set it —
+    // otherwise `#[cfg(ort_embedded)]` trips the `unexpected_cfgs` lint, which CI denies.
+    println!("cargo:rustc-check-cfg=cfg(ort_embedded)");
 
     if env::var("CARGO_FEATURE_LOCAL_ONNX").is_err() {
         // local-onnx disabled: nothing to embed. (Other features, e.g. local-coreml, never
         // touch ort/this build script's outputs.)
+        return;
+    }
+
+    // Escape hatch for offline/distro builds: use a caller-provided ONNX Runtime library
+    // directly, skipping the download+verify path entirely. Checked before the target gate
+    // below, because a target we ship no asset for is exactly when someone needs it.
+    if let Ok(local_lib) = env::var("LOCALDB_ORT_LIB") {
+        let local_path = PathBuf::from(&local_lib);
+        if !local_path.is_file() {
+            panic!("LOCALDB_ORT_LIB={local_lib} does not point to an existing file");
+        }
+        let sha256 = sha256_file(&local_path);
+        emit_outputs(&local_path, &sha256);
         return;
     }
 
@@ -105,18 +131,6 @@ fn main() {
     };
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is set by cargo"));
-
-    // Escape hatch for offline/distro builds: use a caller-provided ONNX Runtime library
-    // directly, skipping the download+verify path entirely.
-    if let Ok(local_lib) = env::var("LOCALDB_ORT_LIB") {
-        let local_path = PathBuf::from(&local_lib);
-        if !local_path.is_file() {
-            panic!("LOCALDB_ORT_LIB={local_lib} does not point to an existing file");
-        }
-        let sha256 = sha256_file(&local_path);
-        emit_outputs(&local_path, &sha256);
-        return;
-    }
 
     let lib_filename = Path::new(asset.payload_in_tar)
         .file_name()
@@ -147,6 +161,9 @@ fn emit_outputs(lib_path: &Path, sha256: &str) {
     );
     println!("cargo:rustc-env=LOCALDB_ORT_LIB_SHA256={sha256}");
     println!("cargo:rustc-env=LOCALDB_ORT_VERSION={ORT_VERSION}");
+    // The single source of truth for "this build has an embedded ONNX Runtime". Emitted
+    // here and nowhere else, so it cannot disagree with the env vars above.
+    println!("cargo:rustc-cfg=ort_embedded");
 }
 
 /// Download `asset`'s tarball into `out_dir` (skipping the download if it's already present
