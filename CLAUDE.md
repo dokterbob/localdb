@@ -30,18 +30,18 @@ workspace):
 
 ## Crate map
 
-| Crate          | Role                                                                                                                                                                                                             |
-| -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `core`         | Domain model, traits (`RetrievalStore`, `Embedder`), error taxonomy — no I/O frameworks                                                                                                                          |
-| `cli`          | Thin surface over `core`; `init`, `store`, `source`, `index`, `search` commands                                                                                                                                  |
-| `embed`        | Embedder implementations: ONNX (local), OpenAI-compatible, Perplexity, Voyage; hosted providers depend on `fetch` for retry/`Retry-After` handling (reactive only — no proactive pacing) |
-| `extract`      | Format detection and text extraction (Markdown, plain text, HTML, PDF → Markdown)                                                                                                                                |
+| Crate          | Role                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `core`         | Domain model, traits (`RetrievalStore`, `Embedder`), error taxonomy — no I/O frameworks                                                                                                                                                                                                                                                                                                                                 |
+| `cli`          | Thin surface over `core`; `init`, `store`, `source`, `index`, `search` commands                                                                                                                                                                                                                                                                                                                                         |
+| `embed`        | Embedder implementations: ONNX (local), OpenAI-compatible, Perplexity, Voyage; hosted providers depend on `fetch` for retry/`Retry-After` handling (reactive only — no proactive pacing)                                                                                                                                                                                                                                |
+| `extract`      | Format detection and text extraction (Markdown, plain text, HTML, PDF → Markdown)                                                                                                                                                                                                                                                                                                                                       |
 | `fetch`        | The `UrlFetcher` impl (reqwest) plus the shared outgoing-HTTP layer (issue #207): retry via `backon` (429/408/5xx/timeout, honoring `Retry-After`) and per-host pacing via `governor` (keyed on destination host, loopback/LAN exempt). Two clients: `new()` unrestricted for operator-configured URLs, `new_public_only()` with the SSRF destination guard for URLs discovered in untrusted content (feed entry links) |
-| `ingest`       | Concrete `Ingestor` impls (`FileIngestor`, `UrlIngestor`, future connectors — Atom/RSS, Notion, Telegram, …); depends on `core` + `extract`; owns all acquisition I/O                                            |
-| `localdb`      | Binary entry point; wires all subcommands                                                                                                                                                                        |
-| `mcp`          | `rmcp`-based MCP server, stdio (embedded or daemon-proxied) and HTTP (`/mcp`); tools: `search`, `get_document`, `get_chunks`, `list_stores`                                                                      |
-| `server`       | HTTP daemon (`/v1` axum routes), background jobs, file-watch, discovery-socket lifecycle                                                                                                                         |
-| `store-libsql` | `RetrievalStore` impl: libsql (DiskANN vectors + FTS5 BM25); RRF fusion lives in `core`, not here                                                                                                                |
+| `ingest`       | Concrete `Ingestor` impls (`FileIngestor`, `UrlIngestor`, future connectors — Atom/RSS, Notion, Telegram, …); depends on `core` + `extract`; owns all acquisition I/O                                                                                                                                                                                                                                                   |
+| `localdb`      | Binary entry point; wires all subcommands                                                                                                                                                                                                                                                                                                                                                                               |
+| `mcp`          | `rmcp`-based MCP server, stdio (embedded or daemon-proxied) and HTTP (`/mcp`); tools: `search`, `get_document`, `get_chunks`, `list_stores`                                                                                                                                                                                                                                                                             |
+| `server`       | HTTP daemon (`/v1` axum routes), background jobs, file-watch, discovery-socket lifecycle                                                                                                                                                                                                                                                                                                                                |
+| `store-libsql` | `RetrievalStore` impl: libsql (DiskANN vectors + FTS5 BM25); RRF fusion lives in `core`, not here                                                                                                                                                                                                                                                                                                                       |
 
 **Design authority is `specs/`** — read the relevant spec before changing behavior; fix the spec
 first if it is wrong.
@@ -95,8 +95,8 @@ first if it is wrong.
   a per-store in-flight guard (issue #187) — a duplicate submission for a store already running gets
   `index_in_progress`, HTTP 409 / CLI exit 4, regardless of worker count; jobs for different stores
   run concurrently up to `server.job_workers` workers, but same-store jobs are always serialized.
-  `localdb index` submits a job to the daemon and attaches to its live progress via SSE (`GET
-  /v1/jobs/{id}/events`, issue #83, falling back to polling), rendering an identical
+  `localdb index` submits a job to the daemon and attaches to its live progress via SSE
+  (`GET /v1/jobs/{id}/events`, issue #83, falling back to polling), rendering an identical
   summary/`--json`/`--strict` to embedded mode; `--delete` works daemon-attached too. **Stopping the
   daemon before running `localdb index` is no longer required.** Still experimental as a surface —
   no auth. See `specs/05-surfaces.md §2-3` and `docs/architecture.md#known-gaps`.
@@ -120,6 +120,13 @@ first if it is wrong.
   — no proactive pacing against paid APIs). Configured via the top-level `http:` config section,
   deliberately outside `defaults.indexing` so it never affects `policy_version`. See
   `specs/03-config.md §1-2` and `specs/01-architecture.md §1`.
+
+- **`[workspace.package].version` is release-plz-owned — never hand-bump it**: release-plz maintains
+  a rolling release PR (version bump + CHANGELOG.md via `cliff.toml`); merging that PR tags
+  `vX.Y.Z`, which triggers the dist release pipeline. All crates inherit the workspace version and
+  bump in lockstep under one bare `vX.Y.Z` tag (created only for the `localdb` package); internal
+  path deps carry exact `=X.Y.Z` pins that release-plz rewrites on each bump — load-bearing, see
+  `release-plz.toml` and `cliff.toml`.
 
 ## Commit style
 

@@ -8,6 +8,44 @@
 use clap::{Parser, Subcommand};
 use cli::CliContext;
 
+/// Build-stamp version strings, from the vergen-gitcl env vars emitted by
+/// `build.rs`. Git-less builds (source tarballs) degrade to `unknown`.
+mod version {
+    /// vergen's placeholder when a value could not be determined.
+    const IDEMPOTENT: &str = "VERGEN_IDEMPOTENT_OUTPUT";
+
+    fn stamp(v: Option<&'static str>) -> Option<&'static str> {
+        v.filter(|s| !s.is_empty() && *s != IDEMPOTENT)
+    }
+
+    fn commit() -> String {
+        match stamp(option_env!("VERGEN_GIT_SHA")) {
+            Some(sha) if stamp(option_env!("VERGEN_GIT_DIRTY")) == Some("true") => {
+                format!("{sha}-dirty")
+            }
+            Some(sha) => sha.to_string(),
+            None => "unknown".to_string(),
+        }
+    }
+
+    /// `-V`: `0.1.0 (abc1234)`.
+    pub fn short() -> String {
+        format!("{} ({})", env!("CARGO_PKG_VERSION"), commit())
+    }
+
+    /// `--version`: adds build timestamp and CI run number when known.
+    pub fn long() -> String {
+        let mut s = format!("{}\ncommit: {}", env!("CARGO_PKG_VERSION"), commit());
+        if let Some(ts) = stamp(option_env!("VERGEN_BUILD_TIMESTAMP")) {
+            s.push_str(&format!("\nbuilt: {ts}"));
+        }
+        if let Some(run) = option_env!("LOCALDB_CI_RUN_NUMBER") {
+            s.push_str(&format!("\nci build: {run}"));
+        }
+        s
+    }
+}
+
 /// localdb — local-first knowledge server with hybrid search.
 ///
 /// Indexes your files and URLs into a local store. Search with
@@ -16,7 +54,8 @@ use cli::CliContext;
 #[derive(Debug, Parser)]
 #[command(
     name = "localdb",
-    version,
+    version = version::short(),
+    long_version = version::long(),
     about = "Local-first knowledge server with hybrid search",
     long_about = None,
     propagate_version = true,
@@ -190,6 +229,18 @@ pub enum Command {
         /// fetching each entry's full page content (feed sources only).
         #[arg(long)]
         no_fetch_full_content: bool,
+    },
+
+    /// Generate a shell completion script on stdout.
+    ///
+    /// Pure codegen: no config load, no daemon probe, works before `init`.
+    /// Install e.g. with `localdb completions zsh >
+    /// "${fpath[1]}/_localdb"` or `localdb completions bash >>
+    /// ~/.bash_completion`.
+    Completions {
+        /// Shell to generate completions for.
+        #[arg(value_enum)]
+        shell: cli::Shell,
     },
 
     /// Internal maintenance subcommands. Not part of the public surface —
@@ -433,6 +484,14 @@ fn main() {
         return;
     }
 
+    // `completions` is the same kind of pure stdout codegen — handled before
+    // `CliContext` so it works with no config, store, or daemon.
+    if let Command::Completions { shell } = &cli.command {
+        use clap::CommandFactory;
+        cli::run_completions(*shell, &mut Cli::command());
+        return;
+    }
+
     let ctx = CliContext {
         config: cli.config,
         json: cli.json,
@@ -527,10 +586,13 @@ fn main() {
             }
         }
         // Unreachable: handled and returned from above, before `ctx` even
-        // exists, so this arm never actually dispatches — required only for
+        // exists, so these arms never actually dispatch — required only for
         // match exhaustiveness over `Command`.
         Command::Internal(InternalCommand::PrintSchema) => {
             unreachable!("Command::Internal is handled and returns before this match")
+        }
+        Command::Completions { .. } => {
+            unreachable!("Command::Completions is handled and returns before this match")
         }
     }
 }

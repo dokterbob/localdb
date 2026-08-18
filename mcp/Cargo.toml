@@ -3,11 +3,13 @@ name = "mcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 rust-version.workspace = true
 description = "MCP server (stdio and HTTP): read-only search, get_document, get_chunks, list_stores"
 
 [dependencies]
-localdb-core = { path = "../core" }
+localdb-core = { path = "../core", version = "=0.1.0" }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

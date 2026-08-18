@@ -3,10 +3,12 @@ name = "store-libsql"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-localdb-core = { path = "../core" }
+localdb-core = { path = "../core", version = "=0.1.0" }
 libsql = "0.10.0-pre.4"
 tokio = { workspace = true }
 async-trait = { workspace = true }

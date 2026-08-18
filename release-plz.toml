@@ -1,0 +1,52 @@
+# release-plz configuration (https://release-plz.ieni.dev/docs/config).
+#
+# Release flow: release-plz maintains a rolling release PR (workspace version
+# bump + CHANGELOG.md update); merging that PR makes release-plz push the
+# bare `vX.Y.Z` tag, which triggers the dist release pipeline
+# (.github/workflows/release.yml). dist owns the GitHub Release, so
+# git_release_enable stays off here — release-plz only bumps, changelogs,
+# and tags.
+#
+# Single-tag scheme: every crate inherits [workspace.package].version, so all
+# crates bump in lockstep and one bare `vX.Y.Z` tag describes the release.
+# Every package must share the same git_tag_name template — that is how
+# git_only mode finds each package's last released version (a package whose
+# template matches no tag would be treated as an initial release on every
+# run) — but only `localdb` actually creates the tag.
+
+[workspace]
+# Nothing is published to crates.io: versions come from git tags, not the registry.
+git_only = true
+# dist creates the GitHub Release (with artifacts); release-plz must not.
+git_release_enable = false
+# Only the `localdb` package below creates the tag; the shared template here
+# is what the other packages use to *find* the current version.
+git_tag_enable = false
+git_tag_name = "v{{ version }}"
+# One workspace-level changelog (enabled on `localdb` below), no per-crate ones.
+changelog_update = false
+publish = false
+semver_check = false
+dependencies_update = false
+# Deprecated in favor of an inline [changelog] section, but deliberately kept:
+# one cliff.toml is the single source of truth for both release-plz and the
+# `git-cliff` CLI.
+changelog_config = "cliff.toml"
+
+[[package]]
+name = "localdb"
+changelog_update = true
+# The workspace-level changelog at the repo root, spanning every crate.
+changelog_path = "./CHANGELOG.md"
+changelog_include = [
+    "localdb-core",
+    "extract",
+    "fetch",
+    "ingest",
+    "store-libsql",
+    "embed",
+    "server",
+    "mcp",
+    "cli",
+]
+git_tag_enable = true

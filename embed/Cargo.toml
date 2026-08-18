@@ -3,6 +3,8 @@ name = "embed"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 rust-version.workspace = true
 description = "Embedder implementations: local ONNX, OpenAI-compatible, and contextualized providers"
 
@@ -14,7 +16,7 @@ local-onnx = ["dep:fastembed", "dep:ort", "dep:tokenizers", "dep:ndarray"]
 local-coreml = ["dep:objc2", "dep:objc2-core-ml", "dep:objc2-foundation", "dep:half", "dep:tokenizers", "dep:hf-hub", "dep:block2"]
 
 [dependencies]
-localdb-core = { path = "../core" }
+localdb-core = { path = "../core", version = "=0.1.0" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
