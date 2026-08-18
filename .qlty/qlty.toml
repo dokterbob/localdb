@@ -10,6 +10,9 @@ config_version = "0"
 exclude_patterns = [
   "target/**",
   "schema/config.schema.json", # generated artifact (see CLAUDE.md)
+  # Generated verbatim by `dist generate` (never hand-edited, so yamllint
+  # line-length findings there are unfixable); see CLAUDE.md.
+  ".github/workflows/release.yml",
   "lcov.info",
   # Test inputs with intentional (sometimes intentionally odd) formatting;
   # linting or reformatting them would invalidate what they exercise.

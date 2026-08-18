@@ -1,7 +1,7 @@
 /// Regression test confirming anytomd hangs on large XLSX files.
 ///
 /// Run with:
-///   cargo test -p extract --test anytomd_xlsx_bug -- --ignored --nocapture
+///   cargo test -p localdb-extract --test anytomd_xlsx_bug -- --ignored --nocapture
 #[ignore]
 #[test]
 fn anytomd_xlsx_hangs_on_large_file() {

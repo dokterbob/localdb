@@ -23,6 +23,12 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-22.04
+    # Single writer of the tap even across overlapping release runs (two tags
+    # merged close together): queue, never cancel, so a lost race can't leave
+    # the tap on the older release.
+    concurrency:
+      group: homebrew-tap-publish
+      cancel-in-progress: false
     steps:
       - name: Checkout localdb (template + render script)
         uses: actions/checkout@v6
@@ -55,7 +61,11 @@ jobs:
       - name: Commit and push formula
         run: |
           set -euo pipefail
-          VERSION=$(ruby -rjson -e 'puts JSON.parse(File.read("artifacts/dist-manifest.json")).fetch("releases").find { |r| r["app_name"] == "localdb" }.fetch("app_version")')
+          VERSION=$(ruby -rjson -e '
+            manifest = JSON.parse(File.read("artifacts/dist-manifest.json"))
+            release = manifest.fetch("releases").find { |r| r["app_name"] == "localdb" }
+            puts release.fetch("app_version")
+          ')
           mkdir -p tap/Formula
           cp localdb.rb tap/Formula/localdb.rb
           cd tap

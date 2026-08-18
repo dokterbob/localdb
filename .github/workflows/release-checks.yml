@@ -69,11 +69,19 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ runner.os }}" = "Linux" ]; then
-            # Allow only the platform baseline — no external shared libs like libssl.
-            ldd "$BINARY" | tee /dev/stderr | \
-              grep -vE '(linux-vdso|libgcc_s|libc\.|libm\.|libdl\.|libpthread|ld-linux|ld-musl)' | \
-              grep -v "0x0" | \
-              (! grep -q "=>")
+            # Allow only the platform baseline — no external shared libs like
+            # libssl. (Not written as one pipeline: with pipefail, a fully
+            # clean binary would make the filtering grep exit 1 and fail the
+            # step despite being the success case.)
+            ldd "$BINARY"
+            VIOLATIONS=$(ldd "$BINARY" \
+              | grep -vE '(linux-vdso|libgcc_s|libc\.|libm\.|libdl\.|libpthread|ld-linux|ld-musl)' \
+              | grep -v "0x0" | grep "=>" || true)
+            if [ -n "$VIOLATIONS" ]; then
+              echo "ERROR: Linux binary has unexpected dynamic dependencies:" >&2
+              echo "$VIOLATIONS" >&2
+              exit 1
+            fi
             echo "Dynamic dependency check passed."
           else
             otool -L "$BINARY" | tee /dev/stderr
@@ -116,7 +124,8 @@ jobs:
               local highest
               highest=$(printf '%s\n2.35\n' "$ver" | sort -V | tail -1)
               if [ "$highest" != "2.35" ]; then
-                echo "ERROR: $file requires GLIBC > $ver > 2.35; Ubuntu 22.04 ships 2.35, so this would break on Mint 21 / Ubuntu 22.04. See issue #133." >&2
+                echo "ERROR: $file requires GLIBC $ver > 2.35; Ubuntu 22.04 ships 2.35," >&2
+                echo "so this would break on Mint 21 / Ubuntu 22.04. See issue #133." >&2
                 exit 1
               fi
             fi
