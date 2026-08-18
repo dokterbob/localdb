@@ -27,6 +27,11 @@ host-jobs = ["./release-checks"]
 # dist-manifest.json and pushes it to the tap.
 publish-jobs = ["./homebrew-tap-publish"]
 post-announce-jobs = ["./smoke-test"]
+# Prereleases run the full publish chain, tap included: the tap currently has
+# no users, and exercising homebrew-tap-publish end-to-end on an rc is the
+# point of cutting one. Revisit (flip to false) once the tap has real users,
+# so an rc formula never displaces a stable one for `brew install`.
+publish-prereleases = true
 
 
 # The tap-publish job checks out this repo (render script + template) and
