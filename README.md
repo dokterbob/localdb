@@ -14,11 +14,13 @@ enriched by what the people you trust have found, with provenance at every hop. 
 that is built in from day one: content-addressed documents, per-chunk provenance, and stores as
 first-class shareable units. See [VISION.md](VISION.md).
 
-**Status: v0.1.0 pre-release.** Hybrid search uses real dense embeddings via the default local model
+**Status: v0.1.0 released.** Hybrid search uses real dense embeddings via the default local model
 (`pplx-embed-context-v1-0.6b`, ONNX on CPU by default; CoreML ANE/GPU on Apple Silicon macOS
 automatically); the first `localdb index` or `localdb search` downloads ~706 MB from HuggingFace (no
-API key required). The HTTP daemon reads from and writes to the same unified database as the CLI;
-ingestion via `POST /v1/jobs` is currently a no-op. See [What works today](#what-works-today) below.
+API key required). The HTTP daemon reads from and writes to the same unified database as the CLI,
+and ingestion via `POST /v1/jobs` runs the real indexing pipeline through an async job queue with
+live SSE progress, cancellation, and a worker pool — it remains experimental, with no auth. See
+[What works today](#what-works-today) below.
 
 **License:** [AGPL-3.0-or-later](LICENSE).
 
@@ -69,8 +71,9 @@ caveats (including the `⚠️` partial marks) are in [docs/comparison.md](docs/
 - **Document metadata** — `DocumentMetadata` (Dublin Core: title, creator, date, description, …)
   extracted from frontmatter and carried on every citation, so agents can attribute sources
   properly.
-- **Local files and URLs** — `localdb source add ~/notes` or
-  `localdb source add https://example.com/page`; incremental re-index skips unchanged content.
+- **Local files, URLs, and feeds** — `localdb source add ~/notes` or
+  `localdb source add https://example.com/page`; `--kind feed` for Atom/RSS with per-source refresh
+  intervals; incremental re-index skips unchanged content.
 - **Embedded-first** — `localdb search` opens the store in-process; nothing needs to be running. The
   MCP server works the same way.
 - **MCP server** — `localdb mcp` exposes four read-only tools (`search`, `list_stores`,
@@ -237,11 +240,14 @@ See [docs/mcp.md](docs/mcp.md) for full tool schemas, the HTTP/remote setup, and
 localdb serve   # binds http://127.0.0.1:7700 by default
 ```
 
-The daemon exposes a REST API, plus the same MCP tools over HTTP at `/mcp` (see
-[MCP hookup](#mcp-hookup) above). It is **experimental**: ingestion via `POST /v1/jobs` is currently
-a no-op. The daemon reads and writes the same unified database as the CLI, so CLI-indexed data is
-visible to it. See [docs/http-api.md](docs/http-api.md) for endpoint reference and known
-limitations.
+The daemon exposes the REST API, plus the same MCP tools over HTTP at `/mcp` (see
+[MCP hookup](#mcp-hookup) above). Ingestion via `POST /v1/jobs` runs the real indexing pipeline
+through an async job queue — a configurable worker pool, live progress over SSE at
+`GET /v1/jobs/{id}/events`, and cancellation via `DELETE /v1/jobs/{id}` (`localdb job cancel`);
+`localdb index` submits to and attaches to a running daemon automatically. The daemon reads and
+writes the same unified database as the CLI, so CLI-indexed data is visible to it. It remains
+**experimental** and unauthenticated — anything that can reach the bind address is trusted. See
+[docs/http-api.md](docs/http-api.md) for endpoint reference and known limitations.
 
 ---
 
@@ -255,6 +261,7 @@ actionable hint (exit 2) instead of silently rebuilding — run one of:
 localdb db status              # current version, pending migrations, history — never refuses
 localdb db migrate              # apply pending migrations (confirmation only for a legacy v1-v3 rebuild)
 localdb db downgrade [--to N]   # step back using stored down-SQL (always confirms)
+localdb db vacuum               # reclaim disk space freed by migrations/deletes (SQLite VACUUM)
 ```
 
 An older `localdb` binary can still downgrade a store a newer binary migrated forward — every
@@ -270,11 +277,14 @@ migration's down-SQL is stored as data in the database itself, not read from com
 | Search ranking        | Hybrid BM25 + dense (RRF fusion). Default embedder is `pplx-embed-context-v1-0.6b` (local ONNX, ~706 MB download on first use).                                                                                                                                                                              |
 | Embedding models      | Downloaded automatically on first `localdb index` or `localdb search` from the public HuggingFace repo `perplexity-ai/pplx-embed-context-v1-0.6b`. No API key required.                                                                                                                                      |
 | Embedding backend     | Default provider `local` runs ONNX on CPU. On Apple Silicon macOS, the macOS binary includes CoreML by default and auto-selects the ANE/GPU backend at runtime, falling back to ONNX otherwise. CoreML/ONNX indexes are interchangeable. Force a backend with `local-coreml` / `local-onnx`.                 |
-| HTTP daemon           | Experimental preview. Ingestion via POST /v1/jobs is a no-op; reads and writes the unified database.                                                                                                                                                                                                         |
+| HTTP daemon           | Experimental — no auth. Ingestion via POST /v1/jobs runs the real pipeline through an async job queue (configurable worker pool, SSE progress, cancellation); `localdb index` attaches automatically; reads and writes the unified database same as the CLI.                                                 |
 | YAML-declared stores  | Appear in `store list` but **cannot be indexed** (`localdb index` only resolves runtime stores). Use `localdb store add` + `localdb source add` instead.                                                                                                                                                     |
 | CLI while daemon runs | CLI and daemon can run concurrently. SQLite WAL and busy_timeout serialise concurrent writes.                                                                                                                                                                                                                |
 | MCP while daemon runs | `localdb mcp` now detects a running daemon and proxies to its `/mcp` route automatically, rather than conflicting with it. `--store` narrowing is honored in both modes, but since the daemon's `/mcp` is unauthenticated it is a guardrail, not containment — see [docs/mcp.md](docs/mcp.md#store-scoping). |
 | MCP over HTTP         | `/mcp` on the daemon snapshots the store list once at startup — a store added later via `/v1/stores` isn't visible over MCP until restart.                                                                                                                                                                   |
+| Job control           | `localdb job list` / `localdb job cancel <id>` manage a daemon's job queue; daemon-only (exit 5 without one).                                                                                                                                                                                                |
+| Document commands     | `localdb document list [--source ID]` / `localdb document get <id> [--text]` read indexed documents, embedded or daemon-attached.                                                                                                                                                                            |
+| Shell completions     | `localdb completions <shell>` for bash/zsh/fish/elvish/powershell — pure codegen, works before `init`, never probes the daemon.                                                                                                                                                                              |
 
 Docs sync: the old Known Gaps entries for source path validation and the macOS bundle ID are
 resolved in code and reflected in `docs/architecture.md`. `--store` scoping is now consistent across
