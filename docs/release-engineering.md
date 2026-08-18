@@ -154,6 +154,34 @@ does work — dist only needs the tag — but the changelog and version pins won
 - Legacy `v0.1.0preN` tags predate this pipeline; both `cliff.toml`'s `tag_pattern` and
   release-plz's tag template ignore them.
 
+## Footguns (each of these has bitten once — the behaviors are permanent)
+
+- **release-plz tags any untagged manifest version on the next push to main.** That is the release
+  mechanism itself (release-PR merge = new version on main = tag), but it has two sharp edges.
+  First, adopting release-plz in a repo whose current version was never tagged releases that version
+  immediately — this is exactly how v0.1.0 shipped. Second, **deleting a `vX.Y.Z` tag while
+  `Cargo.toml` still says `X.Y.Z` re-tags and re-releases it on the next push**. To retire a botched
+  release, land the version bump past it (merge the next release PR) _before_ deleting its tag.
+- **Hand-edits to a release PR survive only until the next push to main.** release-plz
+  force-push-refreshes its PR on every main push; a release PR containing commits from anyone else
+  is **closed and recreated fresh** instead (the edits stay in the closed PR). Curate the changelog
+  as the last step before merging, and merge promptly.
+- **Release PRs track packaged files only.** Merges touching nothing inside a crate (docs, CI,
+  workflows, qlty/cliff config, this file) neither open nor update a release PR — "release-plz ran
+  but nothing happened" is the expected outcome for such pushes.
+- **`CARGO_TARGET_DIR` in release-plz.yml must end in `/target`.** release-plz's `git_only` change
+  detection lists extracted comparison packages straight from disk only when they sit under a
+  literal `target/package/` path; any other basename makes it fall back to `cargo package --list`
+  inside the extracted standalone package, where path deps are stripped and our unpublished crates
+  fail to resolve against crates.io. (Candidate upstream report — the heuristic lives in
+  release-plz's `package_compare.rs`.)
+- **Prereleases update the Homebrew tap** while `publish-prereleases = true` (set in
+  `dist-workspace.toml`). To cut one: edit the release PR's version to `X.Y.Z-rc.N` (workspace
+  version + the internal dep requirements) — the resulting `vX.Y.Z-rc.N` tag makes dist mark the
+  GitHub Release as a prerelease automatically. Flip `publish-prereleases` off once the tap has real
+  users, or an rc formula will displace the stable one for `brew install`. After an rc, the next
+  release PR proposes a bump computed from the rc — edit it to the intended final version.
+
 ## Known gaps / future work
 
 - **CUDA**: today the ONNX sessions register no execution providers (CPU-only). A `local-cuda`
