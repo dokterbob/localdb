@@ -119,6 +119,40 @@ jobs:
       - name: Run clippy with local-coreml (deny warnings)
         run: cargo clippy -p localdb-embed --features local-coreml --all-targets -- -D warnings
 
+  windows:
+    name: Windows-only branches (scoped tests)
+    # `#[cfg(windows)]` code never compiles on the Linux `test` job, so it is
+    # invisible to the coverage gate and would rot unnoticed without a lane that
+    # actually compiles and runs it. Scoped to the crates that carry those
+    # branches today — the daemon sentinel in `server`, path/URI handling in
+    # `core` — and widened as the rest of the workspace becomes portable (#239).
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable with clippy
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-windows-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-windows-
+      - name: Run tests
+        run: cargo test -p localdb-core -p localdb-server
+      - name: Run clippy (deny warnings)
+        run: cargo clippy -p localdb-core -p localdb-server --all-targets -- -D warnings
+
   # Demonstrate the coverage gate: this job has a dummy function with a test.
   # The function and test live in the core crate (error.rs / tests).
   # If tests are removed, coverage will drop and the coverage job will fail.
@@ -142,20 +176,19 @@ jobs:
           - os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
             packages: "-p localdb"
-          # Windows is a work in progress (#239): `server` still binds a Unix domain
-          # socket as its daemon sentinel, and `embed`'s ONNX Runtime is embedded only
-          # for Linux/macOS, so `-p localdb` cannot build here yet. Build the portable
-          # crates instead — that keeps this lane green while still proving the part
-          # that is most likely to break silently, namely that libsql-ffi's bundled
-          # SQLite compiles under MSVC. Widened to `-p localdb` once #239 phases 1-2
-          # land.
+          # Windows is a work in progress (#239): `embed` has no embedded ONNX
+          # Runtime for this target yet, so `-p localdb` would build a binary whose
+          # default embedder cannot run. Build the crates that are portable today
+          # instead, which keeps this lane green while still proving the part most
+          # likely to break silently — that libsql-ffi's bundled SQLite compiles
+          # under MSVC. Widened to `-p localdb` once #239 phase 2 lands.
           #
           # Pinned to windows-2022 for the same reason the Linux entries pin
           # ubuntu-22.04: windows-latest now maps to Windows Server 2025 + VS 2026,
           # a moving toolchain target.
           - os: windows-2022
             target: x86_64-pc-windows-msvc
-            packages: "-p localdb-core -p localdb-extract -p localdb-fetch -p localdb-ingest -p localdb-store-libsql"
+            packages: "-p localdb-core -p localdb-extract -p localdb-fetch -p localdb-ingest -p localdb-store-libsql -p localdb-server"
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust stable
