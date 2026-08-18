@@ -101,9 +101,6 @@ caveats (including the `⚠️` partial marks) are in [docs/comparison.md](docs/
 
 ## Install
 
-> **Note:** the Homebrew, shell-installer and tarball channels go live with the first tagged
-> release. Until then, install from source.
-
 ### Homebrew (macOS and Linux)
 
 ```bash

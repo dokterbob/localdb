@@ -30,10 +30,6 @@ is required. See [release-engineering.md](release-engineering.md) for pipeline d
 
 ## Install with Homebrew (macOS and Linux)
 
-> **Note:** No GitHub release has been tagged yet. The Homebrew tap, shell installer and tarballs
-> below go live with the first release. Until then, use the `cargo install --path localdb` path
-> described below.
-
 ```bash
 brew install dokterbob/localdb/localdb
 ```
