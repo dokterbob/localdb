@@ -24,6 +24,15 @@ abort "no localdb release in manifest" unless release
 
 version = release.fetch("app_version")
 
+# Download URLs come from the manifest's hosting info, which dist builds from
+# the tag the release run was actually triggered by — never reconstructed
+# from the version (the workflow's tag pattern accepts more shapes than
+# `vX.Y.Z`, and a fabricated tag would 404).
+hosting = release.dig("hosting", "github")
+abort "manifest has no github hosting info (not produced by `dist host`?)" unless hosting
+base = hosting.fetch("artifact_base_url").chomp("/") + hosting.fetch("artifact_download_path")
+base += "/" unless base.end_with?("/")
+
 url = {}
 sha256 = {}
 manifest.fetch("artifacts").each do |name, artifact|
@@ -37,7 +46,7 @@ manifest.fetch("artifacts").each do |name, artifact|
   abort "malformed checksum in #{checksum_file}" unless checksum&.match?(/\A[0-9a-f]{64}\z/)
 
   (artifact["target_triples"] || []).each do |triple|
-    url[triple] = "https://github.com/dokterbob/localdb/releases/download/v#{version}/#{name}"
+    url[triple] = base + name
     sha256[triple] = checksum
   end
 end
