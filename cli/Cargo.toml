@@ -3,21 +3,25 @@ name = "cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 rust-version.workspace = true
 description = "CLI command implementations, thin layer on core / daemon client"
 
 [dependencies]
-localdb-core = { path = "../core" }
-store-libsql = { path = "../store-libsql" }
-extract = { path = "../extract" }
-ingest = { path = "../ingest" }
-embed = { path = "../embed", features = ["local-onnx"] }
-fetch = { path = "../fetch" }
-mcp = { path = "../mcp" }
-server = { path = "../server" }
+localdb-core = { path = "../core", version = "=0.1.0" }
+store-libsql = { path = "../store-libsql", version = "=0.1.0" }
+extract = { path = "../extract", version = "=0.1.0" }
+ingest = { path = "../ingest", version = "=0.1.0" }
+embed = { path = "../embed", version = "=0.1.0", features = ["local-onnx"] }
+fetch = { path = "../fetch", version = "=0.1.0" }
+mcp = { path = "../mcp", version = "=0.1.0" }
+server = { path = "../server", version = "=0.1.0" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }
+clap = { workspace = true }
+clap_complete = "4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 indicatif = { workspace = true }
 percent-encoding = { workspace = true }
@@ -32,7 +36,7 @@ futures = { workspace = true }
 # On macOS, auto-enable CoreML so any localdb build (release tarball or cargo install)
 # picks up ANE/GPU acceleration without needing --features. Cargo unions this with the
 # local-onnx feature above; Linux never pulls objc2/block2/etc.
-embed = { path = "../embed", features = ["local-coreml"] }
+embed = { path = "../embed", version = "=0.1.0", features = ["local-coreml"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -16,7 +16,9 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/dokterbob/localdb"
+homepage = "https://github.com/dokterbob/localdb"
 rust-version = "1.88"
 
 [workspace.dependencies]
@@ -29,7 +31,7 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 
 # CLI argument parsing
-clap = { version = "4", features = ["derive", "color", "env"] }
+clap = { version = "4", features = ["derive", "color", "env", "string"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -93,15 +95,15 @@ httpdate = "1.0"
 http = "1"
 
 # Internal crates
-localdb-core = { path = "core" }
-extract = { path = "extract" }
-fetch = { path = "fetch" }
-ingest = { path = "ingest" }
-store-libsql = { path = "store-libsql" }
-embed = { path = "embed" }
-server = { path = "server" }
-mcp = { path = "mcp" }
-cli = { path = "cli" }
+localdb-core = { path = "core", version = "=0.1.0" }
+extract = { path = "extract", version = "=0.1.0" }
+fetch = { path = "fetch", version = "=0.1.0" }
+ingest = { path = "ingest", version = "=0.1.0" }
+store-libsql = { path = "store-libsql", version = "=0.1.0" }
+embed = { path = "embed", version = "=0.1.0" }
+server = { path = "server", version = "=0.1.0" }
+mcp = { path = "mcp", version = "=0.1.0" }
+cli = { path = "cli", version = "=0.1.0" }
 
 [profile.dev]
 opt-level = 0
@@ -110,3 +112,9 @@ debug = "line-tables-only"
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+# The profile cargo-dist builds release artifacts with; stripping here
+# replaces the release pipeline's manual `strip` step.
+[profile.dist]
+inherits = "release"
+strip = true

@@ -75,6 +75,33 @@ fn version_matches_cargo_toml() {
         .stdout(predicate::str::contains(cargo_version));
 }
 
+/// `--version` (long form) must identify the exact build: either a git SHA
+/// (7+ hex chars, from vergen) or the literal `unknown` when built outside a
+/// git checkout (e.g. from a source tarball).
+#[test]
+fn long_version_contains_commit_sha_or_unknown() {
+    let out = cmd().arg("--version").assert().success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_lowercase();
+
+    let has_sha = stdout
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|tok| tok.len() >= 7 && tok.chars().all(|c| c.is_ascii_hexdigit()));
+    assert!(
+        has_sha || stdout.contains("unknown"),
+        "--version must contain a commit SHA (or 'unknown' for git-less builds); got: {stdout}",
+    );
+}
+
+/// The workspace license must match what LICENSE/README/docs declare.
+#[test]
+fn workspace_license_is_agpl() {
+    assert_eq!(
+        env!("CARGO_PKG_LICENSE"),
+        "AGPL-3.0-or-later",
+        "workspace [workspace.package].license must match the LICENSE file (AGPL-3.0-or-later)",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // T12-AC2: release workflow exists and covers three targets
 // ---------------------------------------------------------------------------
@@ -137,6 +164,39 @@ fn release_workflow_uploads_artifacts() {
         || content.contains("gh release upload")
         || content.contains("release_assets");
     assert!(has_upload, "release workflow must upload release artifacts",);
+}
+
+// ---------------------------------------------------------------------------
+// Shell completions: `localdb completions <shell>` (specs/05-surfaces.md §2)
+// ---------------------------------------------------------------------------
+
+/// Every supported shell generates a non-empty completion script mentioning
+/// the binary name, exit 0. Pure codegen: must work without config or store.
+#[test]
+fn completions_generate_for_all_shells() {
+    for shell in &["bash", "zsh", "fish", "elvish", "powershell"] {
+        let out = cmd()
+            .args(["completions", shell])
+            .output()
+            .expect("completions must run");
+        assert!(
+            out.status.success(),
+            "completions {shell} must exit 0; stderr: {}",
+            String::from_utf8_lossy(&out.stderr),
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("localdb"),
+            "completions {shell} output must mention 'localdb'; got {} bytes",
+            stdout.len(),
+        );
+    }
+}
+
+/// An unknown shell is a usage error (clap rejects it, exit 2).
+#[test]
+fn completions_unknown_shell_is_usage_error() {
+    cmd().args(["completions", "tcsh"]).assert().code(2);
 }
 
 // ---------------------------------------------------------------------------

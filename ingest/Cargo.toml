@@ -3,13 +3,15 @@ name = "ingest"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 rust-version.workspace = true
 description = "Content-acquisition ingestors implementing core::ingestor::Ingestor (file, URL)"
 
 [dependencies]
-localdb-core = { path = "../core" }
-extract = { path = "../extract" }
-fetch = { path = "../fetch" }
+localdb-core = { path = "../core", version = "=0.1.0" }
+extract = { path = "../extract", version = "=0.1.0" }
+fetch = { path = "../fetch", version = "=0.1.0" }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

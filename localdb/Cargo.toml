@@ -3,6 +3,8 @@ name = "localdb"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 rust-version.workspace = true
 description = "Local-first knowledge server — single binary with embedded store and MCP/CLI surfaces"
 
@@ -11,11 +13,14 @@ name = "localdb"
 path = "src/main.rs"
 
 [dependencies]
-cli = { path = "../cli" }
+cli = { path = "../cli", version = "=0.1.0" }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[build-dependencies]
+vergen-gitcl = { version = "10", features = ["build"] }
 
 [dev-dependencies]
 assert_cmd = "2"

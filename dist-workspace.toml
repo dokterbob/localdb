@@ -1,0 +1,37 @@
+# cargo-dist configuration (release pipeline; see docs/release-engineering.md).
+#
+# Inert until .github/workflows/release.yml is regenerated from it via
+# `dist generate` — that regeneration lands in a separate, hand-pushed PR
+# because CI tokens cannot write workflow files.
+
+[workspace]
+members = ["cargo:."]
+
+[dist]
+cargo-dist-version = "0.32.0"
+ci = ["github"]
+installers = ["shell", "homebrew"]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+tap = "dokterbob/homebrew-localdb"
+github-attestations = true
+# Publish gate: artifact checks (dylib allowlist, glibc floor, --version
+# smoke) must pass before anything is uploaded or published.
+host-jobs = ["./release-checks"]
+# NOT the builtin "homebrew" publisher: dist's generated formula cannot
+# express `service do`, completions, or a custom `test do`, so a custom job
+# renders our hand-maintained template (homebrew/localdb.rb.erb) from
+# dist-manifest.json and pushes it to the tap.
+publish-jobs = ["./homebrew-tap-publish"]
+post-announce-jobs = ["./smoke-test"]
+
+# Runner pinning. ubuntu-22.04 keeps the glibc-2.35 floor for x86_64;
+# ubuntu-22.04-arm builds aarch64 natively (avoids dist's default zigbuild
+# cross path). macos-14 is Apple Silicon.
+[dist.github-custom-runners]
+x86_64-unknown-linux-gnu = "ubuntu-22.04"
+aarch64-unknown-linux-gnu = "ubuntu-22.04-arm"
+aarch64-apple-darwin = "macos-14"
