@@ -173,8 +173,8 @@ does work — dist only needs the tag — but the changelog and version pins won
   detection lists extracted comparison packages straight from disk only when they sit under a
   literal `target/package/` path; any other basename makes it fall back to `cargo package --list`
   inside the extracted standalone package, where path deps are stripped and our unpublished crates
-  fail to resolve against crates.io. (Candidate upstream report — the heuristic lives in
-  release-plz's `package_compare.rs`.)
+  fail to resolve against crates.io. Reported upstream:
+  [release-plz/release-plz#2995](https://github.com/release-plz/release-plz/issues/2995).
 - **Prereleases update the Homebrew tap** while `publish-prereleases = true` (set in
   `dist-workspace.toml`). To cut one: edit the release PR's version to `X.Y.Z-rc.N` (workspace
   version + the internal dep requirements) — the resulting `vX.Y.Z-rc.N` tag makes dist mark the
