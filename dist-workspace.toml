@@ -28,6 +28,13 @@ host-jobs = ["./release-checks"]
 publish-jobs = ["./homebrew-tap-publish"]
 post-announce-jobs = ["./smoke-test"]
 
+
+# The tap-publish job checks out this repo (render script + template) and
+# pushes to the tap with its own PAT; job-level permissions replace GitHub's
+# defaults wholesale, so contents:read must be granted explicitly.
+[dist.github-custom-job-permissions.homebrew-tap-publish]
+contents = "read"
+
 # Runner pinning. ubuntu-22.04 keeps the glibc-2.35 floor for x86_64;
 # ubuntu-22.04-arm builds aarch64 natively (avoids dist's default zigbuild
 # cross path). macos-14 is Apple Silicon.

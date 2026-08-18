@@ -80,7 +80,7 @@ entries — never edits to that file.
 6. **Run the store-libsql test suite:**
 
    ```sh
-   cargo test -p store-libsql
+   cargo test -p localdb-store-libsql
    ```
 
    Also run `cargo test --workspace` before opening a PR — other crates' tests (e.g. anything

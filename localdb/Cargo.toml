@@ -13,7 +13,7 @@ name = "localdb"
 path = "src/main.rs"
 
 [dependencies]
-cli = { path = "../cli", version = "=0.1.0" }
+localdb-cli = { path = "../cli", version = "0.1.0" }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }

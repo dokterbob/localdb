@@ -1,5 +1,5 @@
 [package]
-name = "ingest"
+name = "localdb-ingest"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,10 +8,15 @@ homepage.workspace = true
 rust-version.workspace = true
 description = "Content-acquisition ingestors implementing core::ingestor::Ingestor (file, URL)"
 
+[lib]
+# Keep the short crate name in code (`use ingest::…`); only the
+# package name is namespaced (crates.io collision hygiene — see docs/release-engineering.md).
+name = "ingest"
+
 [dependencies]
-localdb-core = { path = "../core", version = "=0.1.0" }
-extract = { path = "../extract", version = "=0.1.0" }
-fetch = { path = "../fetch", version = "=0.1.0" }
+localdb-core = { path = "../core", version = "0.1.0" }
+localdb-extract = { path = "../extract", version = "0.1.0" }
+localdb-fetch = { path = "../fetch", version = "0.1.0" }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

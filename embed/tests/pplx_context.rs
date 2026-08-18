@@ -10,7 +10,7 @@
 //! # Running
 //!
 //! ```sh
-//! cargo test -p embed --features local-onnx -- --ignored pplx_embed_context
+//! cargo test -p localdb-embed --features local-onnx -- --ignored pplx_embed_context
 //! ```
 
 #![cfg(feature = "local-onnx")]
@@ -69,7 +69,7 @@ async fn pplx_embed_context_oversized_document_windowed() {
 /// Run locally with:
 ///
 /// ```sh
-/// cargo test -p embed --features local-onnx -- --ignored pplx_embed_context
+/// cargo test -p localdb-embed --features local-onnx -- --ignored pplx_embed_context
 /// ```
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "slow: downloads ~706 MB of quantized ONNX model files on first run; run with --ignored"]

@@ -28,20 +28,45 @@ The release workflow produces binaries for:
 The macOS binary includes CoreML acceleration automatically — no `--features` flag or config change
 is required. See [release-engineering.md](release-engineering.md) for pipeline details.
 
-## Install from a pre-built tarball
+## Install with Homebrew (macOS and Linux)
 
-> **Note:** No GitHub release has been tagged yet. Tarballs will be published once a release is
-> tagged. Until then, use the `cargo install --path localdb` path described below.
+> **Note:** No GitHub release has been tagged yet. The Homebrew tap, shell installer and tarballs
+> below go live with the first release. Until then, use the `cargo install --path localdb` path
+> described below.
+
+```bash
+brew install dokterbob/localdb/localdb
+```
+
+The formula installs a prebuilt binary for your platform plus shell completions (bash/zsh/fish). The
+HTTP daemon can optionally run under `brew services` (`launchd` on macOS, `systemd` on Linux):
+
+```bash
+brew services start localdb   # runs `localdb serve`, restarts it on failure
+brew services stop localdb
+```
+
+Every command works daemonless too — the service is opt-in.
+
+## Install with the shell installer
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dokterbob/localdb/releases/latest/download/localdb-installer.sh | sh
+```
+
+Downloads the right tarball for your platform, installs into `~/.local/bin` and offers to update
+your `PATH`.
+
+## Install from a pre-built tarball
 
 Once a release is tagged, download the tarball for your platform from the
 [releases page](https://github.com/dokterbob/localdb/releases/latest) and extract the binary:
 
 ```bash
 # Example: macOS Apple Silicon
-VERSION=0.1.0
 PLATFORM=aarch64-apple-darwin
-curl -L "https://github.com/dokterbob/localdb/releases/download/v${VERSION}/localdb-v${VERSION}-${PLATFORM}.tar.gz" \
-  | tar -xz -C /usr/local/bin --strip-components=1 "localdb-v${VERSION}-${PLATFORM}/localdb"
+curl -L "https://github.com/dokterbob/localdb/releases/latest/download/localdb-${PLATFORM}.tar.xz" \
+  | tar -xJ -C /usr/local/bin --strip-components=1 "localdb-${PLATFORM}/localdb"
 localdb --version
 ```
 
@@ -71,6 +96,18 @@ You can also install directly from the git repository without cloning:
 
 ```bash
 cargo install --git https://github.com/dokterbob/localdb localdb
+```
+
+## Shell completions
+
+Homebrew installs completions automatically. For other install paths, `localdb completions <shell>`
+prints the script (bash, zsh, fish, elvish, powershell) — e.g.:
+
+```bash
+# zsh (put anywhere on your $fpath)
+localdb completions zsh > ~/.zfunc/_localdb
+# bash
+localdb completions bash >> ~/.bash_completion
 ```
 
 ## A note on embedding models

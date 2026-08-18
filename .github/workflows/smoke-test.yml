@@ -1,0 +1,69 @@
+# End-to-end smoke test of released artifacts (install → init → index →
+# search), driven by smoke_test.sh.
+#
+# Called by the dist-generated release.yml as `custom-smoke-test`
+# (dist-workspace.toml `post-announce-jobs`): runs after the GitHub Release
+# is announced, strictly informational — it can no longer block the release,
+# it exists to tell us immediately if a published artifact is broken.
+
+name: smoke-test
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        description: "dist-manifest plan JSON from the plan job"
+        required: true
+        type: string
+
+jobs:
+  smoke:
+    name: smoke (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu-22.04: proves the glibc-2.35 scenario from issue #133
+        # (≈ Linux Mint 21.x) end-to-end (extraction + dlopen + index +
+        # search), not just at link time.
+        # ubuntu-latest: a current Linux, for good measure.
+        # macos-latest: the embedded-runtime mechanism is identical on macOS,
+        # so it gets the same end-to-end proof.
+        os: [ubuntu-22.04, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Determine artifact pattern for this OS
+        id: artifact
+        run: |
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            echo "pattern=*aarch64-apple-darwin.tar.xz" >> "$GITHUB_OUTPUT"
+          else
+            echo "pattern=*x86_64-unknown-linux-gnu.tar.xz" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch built artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: artifacts-*
+          path: artifacts/
+          merge-multiple: true
+
+      - name: Install binary from tarball
+        run: |
+          set -euo pipefail
+          TARBALL=$(find artifacts/ -name "${{ steps.artifact.outputs.pattern }}" | head -1)
+          if [ -z "$TARBALL" ]; then
+            echo "ERROR: no tarball matching ${{ steps.artifact.outputs.pattern }}" >&2
+            find artifacts/ -type f >&2
+            exit 1
+          fi
+          tar -xf "$TARBALL" -C "$RUNNER_TEMP"
+          BINDIR=$(find "$RUNNER_TEMP" -name localdb -type f | head -1 | xargs dirname)
+          echo "$BINDIR" >> "$GITHUB_PATH"
+
+      - name: Run smoke test script
+        run: bash smoke_test.sh
