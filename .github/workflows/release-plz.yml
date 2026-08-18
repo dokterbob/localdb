@@ -28,7 +28,13 @@ env:
   # release-plz runs `cargo package` in temp copies/worktrees of the repo
   # (git_only change detection, with verification builds); a fixed absolute
   # target dir lets those builds share one cache (kept warm by rust-cache).
-  CARGO_TARGET_DIR: /tmp/release-plz-target
+  # The final path component MUST literally be `target`: release-plz's
+  # git_only change detection lists extracted packages straight from disk
+  # only when they sit under a `target/package/` dir — any other name makes
+  # it fall back to `cargo package --list` inside the extracted standalone
+  # package, where path deps are stripped and internal crates get resolved
+  # against crates.io (and fail, since they are not published).
+  CARGO_TARGET_DIR: /tmp/release-plz/target
 
 jobs:
   release-plz-release:
