@@ -35,7 +35,7 @@ http = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
 tempfile = "3"
-extract = { path = "../extract" }
+localdb-extract = { path = "../extract" }
 # default-features off: the default `resolve-http` feature drags reqwest 0.13
 # into the test build graph with `rustls-no-provider`, which breaks rmcp's
 # daemon-proxy client under `cargo test` (rustls provider ambiguity; CI-only

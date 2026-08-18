@@ -897,31 +897,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
-name = "cli"
-version = "0.1.0"
-dependencies = [
- "axum 0.8.9",
- "clap",
- "clap_complete",
- "embed",
- "extract",
- "fetch",
- "futures",
- "indicatif 0.17.11",
- "ingest",
- "localdb-core",
- "mcp",
- "percent-encoding",
- "reqwest 0.12.28",
- "serde_json",
- "server",
- "store-libsql",
- "tempfile",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "cmake"
 version = "0.1.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1701,41 +1676,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "embed"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "backon",
- "block2",
- "dirs 5.0.1",
- "fastembed",
- "fetch",
- "flate2",
- "futures-util",
- "half",
- "hex",
- "hf-hub 1.0.0-rc.1",
- "localdb-core",
- "ndarray",
- "objc2",
- "objc2-core-ml",
- "objc2-foundation",
- "ort",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tar",
- "tempfile",
- "thiserror 2.0.18",
- "tokenizers",
- "tokio",
- "tracing",
- "ureq 2.8.0",
- "wiremock",
-]
-
-[[package]]
 name = "encode_unicode"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1805,23 +1745,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1a05365e3b1c6d1650318537c7460c6923f1abdd272ad6842baa2b509957a06"
 dependencies = [
  "num-traits",
-]
-
-[[package]]
-name = "extract"
-version = "0.1.0"
-dependencies = [
- "anytomd",
- "infer",
- "localdb-core",
- "mime_guess",
- "pdf_oxide",
- "pulldown-cmark",
- "rbook",
- "scraper 0.27.0",
- "serde_json",
- "tracing",
- "zip 2.4.2",
 ]
 
 [[package]]
@@ -1918,21 +1841,6 @@ dependencies = [
  "siphasher",
  "url",
  "uuid",
-]
-
-[[package]]
-name = "fetch"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "backon",
- "governor",
- "httpdate",
- "localdb-core",
- "reqwest 0.12.28",
- "tokio",
- "tracing",
- "wiremock",
 ]
 
 [[package]]
@@ -2961,22 +2869,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ingest"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "extract",
- "feed-rs",
- "fetch",
- "localdb-core",
- "mediatype",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "inotify"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3487,8 +3379,8 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "clap",
- "cli",
  "libsql",
+ "localdb-cli",
  "localdb-core",
  "predicates",
  "serde_json",
@@ -3499,6 +3391,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "localdb-cli"
+version = "0.1.0"
+dependencies = [
+ "axum 0.8.9",
+ "clap",
+ "clap_complete",
+ "futures",
+ "indicatif 0.17.11",
+ "localdb-core",
+ "localdb-embed",
+ "localdb-extract",
+ "localdb-fetch",
+ "localdb-ingest",
+ "localdb-mcp",
+ "localdb-server",
+ "localdb-store-libsql",
+ "percent-encoding",
+ "reqwest 0.12.28",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "localdb-core"
 version = "0.1.0"
 dependencies = [
@@ -3506,11 +3423,11 @@ dependencies = [
  "blake3",
  "directories",
  "dirs 6.0.0",
- "extract",
  "globset",
  "hex",
  "http 1.4.2",
  "jsonschema",
+ "localdb-extract",
  "percent-encoding",
  "pulldown-cmark",
  "schemars",
@@ -3524,6 +3441,147 @@ dependencies = [
  "tracing",
  "ulid",
  "url",
+]
+
+[[package]]
+name = "localdb-embed"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "backon",
+ "block2",
+ "dirs 5.0.1",
+ "fastembed",
+ "flate2",
+ "futures-util",
+ "half",
+ "hex",
+ "hf-hub 1.0.0-rc.1",
+ "localdb-core",
+ "localdb-fetch",
+ "ndarray",
+ "objc2",
+ "objc2-core-ml",
+ "objc2-foundation",
+ "ort",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokenizers",
+ "tokio",
+ "tracing",
+ "ureq 2.8.0",
+ "wiremock",
+]
+
+[[package]]
+name = "localdb-extract"
+version = "0.1.0"
+dependencies = [
+ "anytomd",
+ "infer",
+ "localdb-core",
+ "mime_guess",
+ "pdf_oxide",
+ "pulldown-cmark",
+ "rbook",
+ "scraper 0.27.0",
+ "serde_json",
+ "tracing",
+ "zip 2.4.2",
+]
+
+[[package]]
+name = "localdb-fetch"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "backon",
+ "governor",
+ "httpdate",
+ "localdb-core",
+ "reqwest 0.12.28",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
+name = "localdb-ingest"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "feed-rs",
+ "localdb-core",
+ "localdb-extract",
+ "localdb-fetch",
+ "mediatype",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "localdb-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum 0.8.9",
+ "localdb-core",
+ "rmcp",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "localdb-server"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum 0.8.9",
+ "axum-extra",
+ "futures",
+ "localdb-core",
+ "localdb-embed",
+ "localdb-extract",
+ "localdb-fetch",
+ "localdb-ingest",
+ "localdb-mcp",
+ "localdb-store-libsql",
+ "notify-debouncer-mini",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tower 0.5.3",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "localdb-store-libsql"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "libsql",
+ "localdb-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3649,21 +3707,6 @@ checksum = "a06de3016e9fae57a36fd14dba131fccf49f74b40b7fbdb472f96e361ec71a08"
 dependencies = [
  "autocfg",
  "rawpointer",
-]
-
-[[package]]
-name = "mcp"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum 0.8.9",
- "localdb-core",
- "rmcp",
- "schemars",
- "serde",
- "serde_json",
- "tokio",
 ]
 
 [[package]]
@@ -5728,34 +5771,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "server"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum 0.8.9",
- "axum-extra",
- "embed",
- "extract",
- "fetch",
- "futures",
- "ingest",
- "localdb-core",
- "mcp",
- "notify-debouncer-mini",
- "rmcp",
- "serde",
- "serde_json",
- "serde_yaml",
- "store-libsql",
- "tempfile",
- "tokio",
- "tokio-util",
- "tower 0.5.3",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "servo_arc"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5982,21 +5997,6 @@ checksum = "2a3fe7c28c6512e766b0874335db33c94ad7b8f9054228ae1c2abd47ce7d335e"
 dependencies = [
  "approx",
  "num-traits",
-]
-
-[[package]]
-name = "store-libsql"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "blake3",
- "libsql",
- "localdb-core",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
 ]
 
 [[package]]

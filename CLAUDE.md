@@ -30,6 +30,10 @@ workspace):
 
 ## Crate map
 
+Directories are short, **package names are prefixed**: `cargo -p` uses `localdb-<dir>`
+(`-p localdb-cli`, `-p localdb-embed`, …; the binary is `-p localdb`). Each crate pins `[lib] name`
+to the short directory name, so imports in code stay unprefixed (`use extract::…`).
+
 | Crate          | Role                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `core`         | Domain model, traits (`RetrievalStore`, `Embedder`), error taxonomy — no I/O frameworks                                                                                                                                                                                                                                                                                                                                 |
@@ -125,8 +129,8 @@ first if it is wrong.
   a rolling release PR (version bump + CHANGELOG.md via `cliff.toml`); merging that PR tags
   `vX.Y.Z`, which triggers the dist release pipeline. All crates inherit the workspace version and
   bump in lockstep under one bare `vX.Y.Z` tag (created only for the `localdb` package); internal
-  path deps carry exact `=X.Y.Z` pins that release-plz rewrites on each bump — load-bearing, see
-  `release-plz.toml` and `cliff.toml`.
+  path deps carry a `version = "X.Y.Z"` requirement that release-plz keeps in sync on each bump
+  (`cargo package` requires one — see `docs/release-engineering.md`).
 
 - **`.github/workflows/release.yml` is generated — never hand-edit it**: edit `dist-workspace.toml`
   and rerun `dist generate`; `dist generate --check` and the workflow-shape tests in

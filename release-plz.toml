@@ -40,13 +40,13 @@ changelog_update = true
 changelog_path = "./CHANGELOG.md"
 changelog_include = [
     "localdb-core",
-    "extract",
-    "fetch",
-    "ingest",
-    "store-libsql",
-    "embed",
-    "server",
-    "mcp",
-    "cli",
+    "localdb-extract",
+    "localdb-fetch",
+    "localdb-ingest",
+    "localdb-store-libsql",
+    "localdb-embed",
+    "localdb-server",
+    "localdb-mcp",
+    "localdb-cli",
 ]
 git_tag_enable = true

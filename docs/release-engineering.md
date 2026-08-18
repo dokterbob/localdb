@@ -46,12 +46,18 @@ hand-maintained `workflow_call` workflows:
 ## Version and changelog policy
 
 - `[workspace.package].version` is **release-plz-owned**. All 10 crates use
-  `version.workspace = true`; internal path deps carry **exact pins** (`version = "=X.Y.Z"`), which
-  release-plz rewrites on each bump. The exact pins are load-bearing: several of our short crate
-  names (`extract`, `fetch`, `embed`, …) exist on crates.io, and during release-plz's `git_only`
-  change detection `cargo package` resolves internal deps through an overlay registry that only
-  shadows crates.io at the _same_ version — a caret pin would silently resolve to a newer crates.io
-  stranger.
+  `version.workspace = true`; internal path deps carry a `version = "X.Y.Z"` requirement
+  (`cargo package` demands one), which release-plz keeps in sync on each bump.
+- **Package names are namespaced** (`localdb-extract`, `localdb-embed`, …) while each crate's
+  `[lib] name` stays short, so imports are unprefixed (`use extract::…`) but nothing in the
+  workspace can ever be resolved against an unrelated crates.io package — the short names
+  (`extract`, `fetch`, `embed`, …) are all taken by strangers there, and release-plz's `git_only`
+  change detection runs `cargo package`, which resolves internal deps through an overlay registry
+  that only shadows crates.io at the _same_ name and version. The `localdb-*` names are currently
+  unclaimed on crates.io; the plan is to claim them once the project matures. Until then a squatter
+  publishing a higher-versioned `localdb-*` crate could confuse that overlay resolution — if that
+  ever becomes a live concern before the names are claimed, tightening the internal requirements to
+  exact `=X.Y.Z` pins closes it.
 - `release-plz.toml` uses the single-tag scheme: every package shares
   `git_tag_name = "v{{ version }}"` (that template is how `git_only` mode finds each package's last
   released version), but only `localdb` creates the tag.

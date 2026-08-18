@@ -1,5 +1,5 @@
 [package]
-name = "extract"
+name = "localdb-extract"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,8 +8,13 @@ homepage.workspace = true
 rust-version.workspace = true
 description = "Format detection and extraction to a normalized Markdown document"
 
+[lib]
+# Keep the short crate name in code (`use extract::…`); only the
+# package name is namespaced (crates.io collision hygiene — see docs/release-engineering.md).
+name = "extract"
+
 [dependencies]
-localdb-core = { path = "../core", version = "=0.1.0" }
+localdb-core = { path = "../core", version = "0.1.0" }
 
 # Markdown parsing
 pulldown-cmark = "0.13"

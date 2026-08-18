@@ -1,5 +1,5 @@
 [package]
-name = "fetch"
+name = "localdb-fetch"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,8 +8,13 @@ homepage.workspace = true
 rust-version.workspace = true
 description = "HTTP URL fetcher implementation for localdb ingestion"
 
+[lib]
+# Keep the short crate name in code (`use fetch::…`); only the
+# package name is namespaced (crates.io collision hygiene — see docs/release-engineering.md).
+name = "fetch"
+
 [dependencies]
-localdb-core = { path = "../core", version = "=0.1.0" }
+localdb-core = { path = "../core", version = "0.1.0" }
 async-trait = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # Real dependency, not just dev: `destination::GuardedResolver` resolves names
