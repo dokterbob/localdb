@@ -98,9 +98,10 @@ pub fn probe_daemon(data_dir: &Path, daemon_url_override: Option<&str>) -> Daemo
     let socket_path = data_dir.join("daemon.sock");
     let url_path = data_dir.join("daemon.url");
     if socket_path.exists() {
-        // `daemon.sock` itself is a live Unix socket, not a text file — the
-        // daemon records its actual base URL separately in `daemon.url` so
-        // discovery works for non-default binds/ports, not just 127.0.0.1:7700.
+        // `daemon.sock` is the daemon's liveness sentinel, not a text file to
+        // read a URL out of — the daemon records its actual base URL separately
+        // in `daemon.url` so discovery works for non-default binds/ports, not
+        // just 127.0.0.1:7700.
         let base_url = std::fs::read_to_string(&url_path)
             .ok()
             .map(|s| s.trim().to_string())
