@@ -21,6 +21,7 @@ The format follows [Common Changelog](https://common-changelog.org).
 # Common Changelog: `## [x.y.z] - yyyy-mm-dd`, one imperative one-liner per
 # change, each linking its commit; groups in fixed order.
 body = """
+
 {% if version %}\
 ## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
 {% else %}\
