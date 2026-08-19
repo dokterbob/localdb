@@ -135,10 +135,7 @@ pub fn create_embedder(
         "local-coreml" => create_coreml(policy, models_dir),
         #[cfg(not(all(target_os = "macos", feature = "local-coreml")))]
         "local-coreml" => create_coreml_unavailable(),
-        #[cfg(ort_embedded)]
         "local-onnx" => create_onnx(policy, models_dir),
-        #[cfg(not(ort_embedded))]
-        "local-onnx" => create_onnx_unavailable(),
         "openai-compatible" => create_openai_compatible(policy, providers, http_settings),
         "perplexity" => create_perplexity(providers, http_settings),
         "voyage" => create_voyage(providers, http_settings),
@@ -320,10 +317,16 @@ const NO_LOCAL_ONNX: &str = if cfg!(feature = "local-onnx") {
      'perplexity', 'voyage')."
 };
 
+/// Stand-in for [`create_onnx`] on builds with no embedded ONNX Runtime. Same signature, so
+/// every caller stays free of `#[cfg]` — the whole conditional surface for local ONNX is
+/// this one pair of definitions.
 #[cfg(not(ort_embedded))]
-fn create_onnx_unavailable() -> Result<BoxedEmbedder, EmbedError> {
+fn create_onnx(
+    _policy: &EmbeddingPolicy,
+    _models_dir: Option<&Path>,
+) -> Result<BoxedEmbedder, EmbedError> {
     Err(EmbedError::Internal(format!(
-        "provider 'local-onnx' is unavailable: {NO_LOCAL_ONNX}"
+        "no local ONNX backend: {NO_LOCAL_ONNX}"
     )))
 }
 
@@ -358,61 +361,34 @@ fn create_onnx(
     }
 }
 
-#[allow(clippy::needless_return)]
+/// `provider: local` — pick the best local backend for this build and model.
+///
+/// CoreML gets first refusal on Apple Silicon for the one model it serves; everything else,
+/// including a CoreML that fails to load, falls through to ONNX. Both backends emit
+/// index-interchangeable vectors, so which one answers is not observable in the index.
+///
+/// When no ONNX Runtime is embedded, `create_onnx` is the stand-in above and reports why —
+/// which is the whole reason this function needs no `#[cfg]` of its own beyond the CoreML
+/// branch.
 fn create_local_auto(
     policy: &EmbeddingPolicy,
     models_dir: Option<&Path>,
 ) -> Result<BoxedEmbedder, EmbedError> {
     #[cfg(all(target_os = "macos", feature = "local-coreml"))]
-    {
-        if policy.model == "pplx-embed-context-v1-0.6b" {
-            let cache_dir = models_dir.map(|p| p.to_path_buf());
-            match crate::pplx_context_coreml::PplxContextCoreMLEmbedder::new(cache_dir, true) {
-                Ok(embedder) => return Ok(Box::new(embedder)),
-                Err(e) => {
-                    #[cfg(ort_embedded)]
-                    {
-                        tracing::warn!(
-                            error = %e,
-                            "CoreML embedder unavailable; falling back to ONNX"
-                        );
-                        return create_onnx(policy, models_dir);
-                    }
-                    #[cfg(not(ort_embedded))]
-                    {
-                        return Err(e);
-                    }
-                }
-            }
-        }
-        #[cfg(ort_embedded)]
-        {
-            return create_onnx(policy, models_dir);
-        }
-        #[cfg(not(ort_embedded))]
-        {
-            return Err(EmbedError::Internal(format!(
-                "provider 'local' with model '{}' needs a local ONNX backend (only \
-                 'pplx-embed-context-v1-0.6b' runs on CoreML): {NO_LOCAL_ONNX}",
-                policy.model
-            )));
+    if policy.model == "pplx-embed-context-v1-0.6b" {
+        let cache_dir = models_dir.map(|p| p.to_path_buf());
+        match crate::pplx_context_coreml::PplxContextCoreMLEmbedder::new(cache_dir, true) {
+            Ok(embedder) => return Ok(Box::new(embedder)),
+            // Not fatal on its own — ONNX serves this model too. If it can't, the error
+            // from below explains that, and this line is the record of why CoreML didn't.
+            Err(e) => tracing::warn!(
+                error = %e,
+                "CoreML embedder unavailable; falling back to ONNX"
+            ),
         }
     }
 
-    #[cfg(not(all(target_os = "macos", feature = "local-coreml")))]
-    {
-        #[cfg(ort_embedded)]
-        {
-            return create_onnx(policy, models_dir);
-        }
-        #[cfg(not(ort_embedded))]
-        {
-            let _ = (policy, models_dir);
-            return Err(EmbedError::Internal(format!(
-                "provider 'local' has no local backend available: {NO_LOCAL_ONNX}"
-            )));
-        }
-    }
+    create_onnx(policy, models_dir)
 }
 
 #[cfg(test)]
