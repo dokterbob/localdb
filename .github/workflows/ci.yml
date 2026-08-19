@@ -149,7 +149,11 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-windows-
       - name: Run tests
-        run: cargo test -p localdb-core -p localdb-server
+        # --no-fail-fast: a Windows failure usually means a portability
+        # assumption nobody had reason to question, and there is rarely just
+        # one. Stopping at the first crate would surface them a runner round
+        # trip at a time.
+        run: cargo test --no-fail-fast -p localdb-core -p localdb-server
       - name: Run clippy (deny warnings)
         run: cargo clippy -p localdb-core -p localdb-server --all-targets -- -D warnings
 
