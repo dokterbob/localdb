@@ -208,8 +208,8 @@ and a vector index to maintain, which is not free.
 In the interest of the same honesty as the README's
 [What works today](../README.md#what-works-today) table:
 
-- **v0.1.0 pre-release.** Several of the projects above (Khoj, Basic Memory, AnythingLLM, Onyx) have
-  years of production use and large user bases; localdb does not yet.
+- **As of v0.1.0.** Several of the projects above (Khoj, Basic Memory, AnythingLLM, Onyx) have years
+  of production use and large user bases; localdb does not yet.
 - **Connector breadth.** Onyx alone ships 40+ SaaS/enterprise connectors today (Slack, Confluence,
   Notion, Google Drive, and more); localdb indexes local files and URLs only, with connectors for
   richer content types on the roadmap but not yet shipped (see below).
