@@ -192,7 +192,9 @@ jobs:
           # a moving toolchain target.
           - os: windows-2022
             target: x86_64-pc-windows-msvc
-            packages: "-p localdb-core -p localdb-extract -p localdb-fetch -p localdb-ingest -p localdb-store-libsql -p localdb-server"
+            packages: >-
+              -p localdb-core -p localdb-extract -p localdb-fetch
+              -p localdb-ingest -p localdb-store-libsql -p localdb-server
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust stable
