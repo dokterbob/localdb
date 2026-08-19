@@ -171,7 +171,7 @@ the same structure. See [specs/02-domain-model.md](../specs/02-domain-model.md) 
          │
     ┌────┴────────────────┐
     │ sentinel present     │ sentinel absent
-    │ and held             │ (or missing)
+    │ and responsive       │ (or unresponsive)
     ▼                      ▼
   thin client          embedded mode
   (HTTP to daemon)     open store in-process

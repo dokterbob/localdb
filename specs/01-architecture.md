@@ -81,12 +81,16 @@ when one is running, CLI and MCP become thin clients of its HTTP API.
 
 - **Discovery:** a platform-appropriate sentinel at a well-known path in the data dir (a Unix domain
   socket on Unix; an exclusively-locked file on Windows) ([03-config.md](03-config.md) §4). Sentinel
-  present and held → route through daemon; otherwise → embedded mode. No configuration needed for
-  the common case. The daemon also records its actual client-reachable base URL in a sibling
-  `daemon.url` file at startup (substituting loopback for an unspecified/wildcard bind, since that
-  address isn't itself connectable) so discovery works for any configured
-  `server.bind`/`server.port` ([05-surfaces.md](05-surfaces.md) §3), not just the default
-  `127.0.0.1:7700`.
+  present **and** the daemon's HTTP API responsive → route through daemon; otherwise → embedded
+  mode, removing the stale sentinel on the way. Presence alone is not enough: the daemon claims the
+  sentinel before it binds TCP and writes `daemon.url`, so there is a window in which it is held by
+  a daemon that cannot yet serve. Holding the sentinel exclusively is a separate guarantee — it is
+  the single-daemon mutex, and it is why a second `localdb serve` fails with `daemon_running` rather
+  than racing the first. No configuration needed for the common case. The daemon also records its
+  actual client-reachable base URL in a sibling `daemon.url` file at startup (substituting loopback
+  for an unspecified/wildcard bind, since that address isn't itself connectable) so discovery works
+  for any configured `server.bind`/`server.port` ([05-surfaces.md](05-surfaces.md) §3), not just the
+  default `127.0.0.1:7700`.
 - **Concurrency model:** SQLite WAL and `busy_timeout=5000` is the sole concurrency primitive. No
   advisory file lock. Multi-process is the first-class topology. Multiple stdio MCP servers, a CLI
   session running `localdb index`, and an optional `localdb serve` daemon may all share one data
