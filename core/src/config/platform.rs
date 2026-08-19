@@ -94,7 +94,7 @@ impl PlatformPaths {
         })
     }
 
-    /// Path to the unix socket (`<data_dir>/daemon.sock`).
+    /// Path to the daemon sentinel (`<data_dir>/daemon.sock`).
     pub fn socket_path(&self) -> PathBuf {
         self.data_dir.join("daemon.sock")
     }

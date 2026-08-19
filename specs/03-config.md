@@ -145,9 +145,9 @@ See [05-surfaces.md](05-surfaces.md) §2.2 / §3 for the CLI flags and HTTP body
 | Model cache                     | `~/Library/Caches/localdb/models/`                  | `$XDG_CACHE_HOME/localdb/models/`      |
 | Logs                            | `~/Library/Logs/localdb/`                           | `$XDG_STATE_HOME/localdb/logs/`        |
 
-Unix socket: `<data>/daemon.sock`; daemon discovery URL: `<data>/daemon.url`
-([01-architecture.md](01-architecture.md) §3). `--config` / `LOCALDB_CONFIG` override the config
-path; `paths.*` in config override the rest.
+Daemon sentinel: `<data>/daemon.sock` (Unix domain socket on Unix, exclusive-lock file on Windows);
+daemon discovery URL: `<data>/daemon.url` ([01-architecture.md](01-architecture.md) §3). `--config`
+/ `LOCALDB_CONFIG` override the config path; `paths.*` in config override the rest.
 
 ## 5. Validation, unknown keys, versioning
 
@@ -155,12 +155,13 @@ path; `paths.*` in config override the rest.
   (`stores[0].sources[1].refresh: invalid duration`). Surfaces map this to `invalid_config`
   ([05-surfaces.md](05-surfaces.md) §5).
 - **`http.rate_limit`:** `requests_per_second` and `burst` are both `u32` and must each be `>= 1`;
-  `0` is rejected with a path-precise message (`http.rate_limit.requests_per_second must be greater
-  than zero`, and likewise for `burst`) rather than silently disabling pacing.
+  `0` is rejected with a path-precise message
+  (`http.rate_limit.requests_per_second must be greater than zero`, and likewise for `burst`) rather
+  than silently disabling pacing.
 - **`server.job_workers`:** number of workers in the daemon's job queue (issue #208). `usize`,
   default `1`. `0` is rejected at load with `server.job_workers must be greater than zero`. Values
-  greater than 1 let jobs for **different** stores run concurrently; jobs for the **same** store
-  are always serialized via the per-store in-flight guard, regardless of worker count — see
+  greater than 1 let jobs for **different** stores run concurrently; jobs for the **same** store are
+  always serialized via the per-store in-flight guard, regardless of worker count — see
   [05-surfaces.md](05-surfaces.md) §3. Embedded (non-daemon) CLI indexing is unaffected: it always
   runs its own single-worker queue and never reads this key.
 - **Unknown keys:** hard error, not a warning. Catches typos (`chunking` vs `chunkng`) — the cost of

@@ -23,6 +23,7 @@ fn warn_if_unspecified_does_not_panic_for_any_input() {
 /// resolve to unspecified on the platforms we run on — this test binds each
 /// one for real and checks `local_addr().ip().is_unspecified()`, instead of
 /// just asserting the (already-known-correct) canonical `"0.0.0.0"` case.
+#[cfg(unix)]
 #[tokio::test]
 async fn wildcard_aliases_resolve_to_unspecified_when_actually_bound() {
     for alias in ["0", "[::]", "000.000.000.000"] {
@@ -33,6 +34,39 @@ async fn wildcard_aliases_resolve_to_unspecified_when_actually_bound() {
             bound_addr.ip().is_unspecified(),
             "bind alias {alias:?} resolved to {bound_addr}, expected an unspecified address"
         );
+    }
+}
+
+/// The same guarantee, stated for a resolver that accepts fewer spellings.
+///
+/// Windows' `getaddrinfo` rejects the `inet_aton`-era shorthands (`"0"`,
+/// `"000.000.000.000"`) that Unix still resolves, so requiring every alias to
+/// bind would assert a resolver quirk rather than the property that matters.
+/// Refusing a spelling is a perfectly good answer — the daemon fails to start
+/// with the bind error — and reading `local_addr()` instead of the config
+/// string is exactly what makes that safe. What must never happen is a
+/// wildcard spelling binding to some *concrete* address, which would leave
+/// `client_base_url` advertising an address the daemon isn't reachable on.
+#[cfg(windows)]
+#[tokio::test]
+async fn wildcard_aliases_resolve_to_unspecified_when_actually_bound() {
+    // Anchor: the canonical spelling must bind, so this can never pass by
+    // every alias being refused.
+    let (_listener, bound_addr) = bind_tcp_listener("0.0.0.0", 0)
+        .await
+        .expect("bind(\"0.0.0.0\") must succeed");
+    assert!(
+        bound_addr.ip().is_unspecified(),
+        "bind 0.0.0.0 resolved to {bound_addr}, expected an unspecified address"
+    );
+
+    for alias in ["0", "[::]", "000.000.000.000"] {
+        if let Ok((_listener, bound_addr)) = bind_tcp_listener(alias, 0).await {
+            assert!(
+                bound_addr.ip().is_unspecified(),
+                "bind alias {alias:?} resolved to {bound_addr}, expected an unspecified address"
+            );
+        }
     }
 }
 
