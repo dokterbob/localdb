@@ -3,8 +3,11 @@ name: CI
 on:
   push:
     branches: ["main", "ticket/**"]
+  # No base-branch filter: a stacked PR targets its parent branch rather than
+  # `main`, and filtering on the base would leave exactly those PRs with no
+  # checks at all — the ones carrying work that has not been merged anywhere
+  # yet, and so the ones least safe to leave unverified.
   pull_request:
-    branches: ["main"]
 
 env:
   CARGO_TERM_COLOR: always
