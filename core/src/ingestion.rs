@@ -1969,7 +1969,8 @@ mod tests {
 
         // Round-trips: reparsing is stable, and the URI still names the file.
         assert_eq!(Uri::parse(s).as_ref(), Some(uri));
-        let resolved = uri.as_url().to_file_path().expect("URI must be a file path");
+        let url = uri.as_url();
+        let resolved = url.to_file_path().expect("URI must be a file path");
         assert!(resolved.is_file(), "{} should exist", resolved.display());
     }
 
