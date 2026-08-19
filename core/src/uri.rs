@@ -123,6 +123,33 @@ impl<'de> Deserialize<'de> for Uri {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    /// Root of the absolute paths these tests build.
+    ///
+    /// `Url::from_file_path` — the one failure mode of [`Uri::from_file_path`] — rejects
+    /// any path it does not consider absolute, and on Windows that means a path without a
+    /// drive prefix. Hardcoding `/home/user` therefore made every `from_file_path` test
+    /// assert Unix path syntax rather than the encoding behaviour it was written for.
+    #[cfg(unix)]
+    const ABS_ROOT: &str = "/home/user";
+    #[cfg(windows)]
+    const ABS_ROOT: &str = r"C:\home\user";
+
+    /// The `file://` prefix that [`abs`] paths serialize to on this platform.
+    #[cfg(unix)]
+    const ABS_URI_PREFIX: &str = "file:///home/user/";
+    #[cfg(windows)]
+    const ABS_URI_PREFIX: &str = "file:///C:/home/user/";
+
+    /// An absolute path to `rel` under [`ABS_ROOT`], for whichever OS is running.
+    ///
+    /// `rel` is always `/`-separated; joining component by component is what turns it into
+    /// native separators, so callers never write a platform's syntax.
+    fn abs(rel: &str) -> PathBuf {
+        rel.split('/')
+            .fold(PathBuf::from(ABS_ROOT), |path, part| path.join(part))
+    }
 
     #[test]
     fn parse_valid_file_uri() {
@@ -210,7 +237,7 @@ mod tests {
 
     #[test]
     fn display_decoded_ampersand_in_filename() {
-        let uri = Uri::from_file_path(Path::new("/home/user/foo&bar.md")).unwrap();
+        let uri = Uri::from_file_path(&abs("foo&bar.md")).unwrap();
         let decoded = uri.display_decoded();
         // Old: "file:/home/user/foobar.md" (the `&` and everything it was
         // "separating" got silently merged away).
@@ -222,7 +249,7 @@ mod tests {
 
     #[test]
     fn display_decoded_trailing_equals_in_filename() {
-        let uri = Uri::from_file_path(Path::new("/home/user/notes=")).unwrap();
+        let uri = Uri::from_file_path(&abs("notes=")).unwrap();
         let decoded = uri.display_decoded();
         // Old: "file:/home/user/notes" (the trailing `=` vanished because
         // form_urlencoded treats it as a key/value separator with an empty
@@ -236,7 +263,7 @@ mod tests {
 
     #[test]
     fn display_decoded_literal_plus_not_turned_into_space() {
-        let uri = Uri::from_file_path(Path::new("/home/user/foo+bar.md")).unwrap();
+        let uri = Uri::from_file_path(&abs("foo+bar.md")).unwrap();
         let decoded = uri.display_decoded();
         // Old: "file:/home/user/foo bar.md" (form_urlencoded decodes a
         // literal `+` byte as an encoded space).
@@ -248,7 +275,7 @@ mod tests {
 
     #[test]
     fn display_decoded_non_ascii_with_plus() {
-        let uri = Uri::from_file_path(Path::new("/home/user/café+notes.md")).unwrap();
+        let uri = Uri::from_file_path(&abs("café+notes.md")).unwrap();
         let decoded = uri.display_decoded();
         // Old: "file:/home/user/café notes.md" — the percent-encoded 'é'
         // decodes fine on its own, but the literal `+` still gets turned
@@ -307,7 +334,7 @@ mod tests {
     fn display_decoded_leaves_printable_non_ascii_alone() {
         // Guard against over-sanitizing: ordinary international filenames
         // must still render as themselves.
-        let uri = Uri::from_file_path(Path::new("/home/user/日本語 café.md")).unwrap();
+        let uri = Uri::from_file_path(&abs("日本語 café.md")).unwrap();
         let decoded = uri.display_decoded();
         assert!(
             decoded.ends_with("日本語 café.md"),
@@ -355,9 +382,9 @@ mod tests {
 
     #[test]
     fn from_file_path_builds_file_uri() {
-        let uri = Uri::from_file_path(Path::new("/home/user/docs/test.md")).unwrap();
+        let uri = Uri::from_file_path(&abs("docs/test.md")).unwrap();
         assert_eq!(uri.scheme(), "file");
-        assert_eq!(uri.as_str(), "file:///home/user/docs/test.md");
+        assert_eq!(uri.as_str(), format!("{ABS_URI_PREFIX}docs/test.md"));
     }
 
     #[test]
@@ -367,13 +394,13 @@ mod tests {
 
     #[test]
     fn from_file_path_encodes_space() {
-        let uri = Uri::from_file_path(Path::new("/home/user/my file.md")).unwrap();
-        assert_eq!(uri.as_str(), "file:///home/user/my%20file.md");
+        let uri = Uri::from_file_path(&abs("my file.md")).unwrap();
+        assert_eq!(uri.as_str(), format!("{ABS_URI_PREFIX}my%20file.md"));
     }
 
     #[test]
     fn from_file_path_encodes_non_ascii() {
-        let uri = Uri::from_file_path(Path::new("/home/user/中文.md")).unwrap();
+        let uri = Uri::from_file_path(&abs("中文.md")).unwrap();
         assert!(uri.as_str().contains("%E4%B8%AD%E6%96%87"));
     }
 

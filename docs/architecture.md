@@ -70,25 +70,26 @@ authoring guide, and [specs/02-domain-model.md](../specs/02-domain-model.md) §9
 ### `cli`
 
 Command implementations. A thin layer on `core` and the daemon client; no business logic. Each
-command handler acquires config and runtime state, probes the daemon socket, then either delegates
-to the HTTP API (thin-client mode) or opens the store in-process (embedded mode). Calls
+command handler acquires config and runtime state, probes the daemon socket/lock, then either
+delegates to the HTTP API (thin-client mode) or opens the store in-process (embedded mode). Calls
 `embed::create_embedder` from the config policy to obtain the embedder for `index` and `search`;
 `FakeEmbedder` is used only in unit tests.
 
 ### `server`
 
-The axum-based HTTP API daemon. Exposes the `/v1` REST surface, manages the daemon unix socket for
-discovery, runs the file-watcher (`notify`), the URL refresh scheduler, and the background job
-queue. Opens the same unified database (`<data_dir>/localdb.db`) as the CLI; CLI-indexed data is
-visible. Multi-process is the first-class concurrency model — the daemon is one writer among peers
-(CLI sessions, multiple stdio MCP servers); concurrent writers serialise via SQLite WAL +
-`busy_timeout=5000`. Ingestion via `POST /v1/jobs` runs the real pipeline
-(`server::job_exec::run_job`) through an async job queue with a configurable worker pool
-(`server.job_workers`, default 1) and a per-store in-flight guard (issues #187, #208) — not a stub;
-a second submission for a store already running rejects with `index_in_progress`, 409, while jobs
-for different stores run concurrently up to `server.job_workers` workers. `GET /jobs/{id}/events`
-streams the job's live progress over SSE (issue #83). The URL-refresh scheduler submits through the
-same job engine. See [specs/05-surfaces.md](../specs/05-surfaces.md) §3.
+The axum-based HTTP API daemon. Exposes the `/v1` REST surface, manages the daemon sentinel (Unix
+domain socket on Unix, exclusive-lock file on Windows) for discovery, runs the file-watcher
+(`notify`), the URL refresh scheduler, and the background job queue. Opens the same unified database
+(`<data_dir>/localdb.db`) as the CLI; CLI-indexed data is visible. Multi-process is the first-class
+concurrency model — the daemon is one writer among peers (CLI sessions, multiple stdio MCP servers);
+concurrent writers serialise via SQLite WAL + `busy_timeout=5000`. Ingestion via `POST /v1/jobs`
+runs the real pipeline (`server::job_exec::run_job`) through an async job queue with a configurable
+worker pool (`server.job_workers`, default 1) and a per-store in-flight guard (issues #187, #208) —
+not a stub; a second submission for a store already running rejects with `index_in_progress`, 409,
+while jobs for different stores run concurrently up to `server.job_workers` workers.
+`GET /jobs/{id}/events` streams the job's live progress over SSE (issue #83). The URL-refresh
+scheduler submits through the same job engine. See [specs/05-surfaces.md](../specs/05-surfaces.md)
+§3.
 
 ### `mcp`
 
@@ -169,18 +170,18 @@ the same structure. See [specs/02-domain-model.md](../specs/02-domain-model.md) 
   probe <data_dir>/daemon.sock
          │
     ┌────┴────────────────┐
-    │ socket present       │ socket absent
-    │ and responsive       │ (or missing)
+    │ sentinel present     │ sentinel absent
+    │ and responsive       │ (or unresponsive)
     ▼                      ▼
   thin client          embedded mode
   (HTTP to daemon)     open store in-process
 ```
 
-On every invocation, CLI and MCP probe a unix socket at `<data_dir>/daemon.sock`. If a daemon is
-running and responsive, the command routes over HTTP. If not, the store is opened in-process (libsql
-database; embeddings come from the configured embedder, defaulting to the local ONNX model). No
-configuration is needed for the common case. See
-[specs/01-architecture.md](../specs/01-architecture.md) §3.
+On every invocation, CLI and MCP probe a platform-appropriate sentinel at `<data_dir>/daemon.sock`
+(a Unix domain socket on Unix, an exclusively-locked file on Windows). If a daemon is running and
+responsive, the command routes over HTTP. If not, the store is opened in-process (libsql database;
+embeddings come from the configured embedder, defaulting to the local ONNX model). No configuration
+is needed for the common case. See [specs/01-architecture.md](../specs/01-architecture.md) §3.
 
 ---
 
@@ -197,7 +198,7 @@ the former; `paths.data` the latter). After `localdb init` and `localdb index`:
   localdb.db                   # SQLite (WAL): unified database
   localdb.db-wal               # WAL sidecar (libsql managed)
   localdb.db-shm               # shared-memory sidecar (libsql managed)
-  daemon.sock                  # unix socket (present only while daemon runs)
+  daemon.sock                  # daemon sentinel (present only while daemon runs)
 ```
 
 The default `data_dir` on macOS is `~/Library/Application Support/com.localdb.localdb.localdb/data`
