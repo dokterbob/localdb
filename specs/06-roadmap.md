@@ -52,10 +52,12 @@ libsql setup when **all** hold:
 
 ## 4. Packaging roadmap
 
-MVP: `cargo install` + GitHub release tarballs (macOS arm64, Linux x86_64/arm64). Then: **Homebrew**
-formula with `brew services` (launchd) for the daemon; **systemd** unit for Linux; web UI assets
-embedded in the binary at Phase 3. Model files are never bundled
-([04-search-pipeline.md](04-search-pipeline.md) §4).
+MVP: `cargo install` + GitHub release tarballs (macOS arm64, Linux x86_64/arm64). **Delivered since
+v0.1.0:** the dist release pipeline (tarballs + shell installer + attestations) and the **Homebrew**
+tap (`brew install dokterbob/localdb/localdb`) with shell completions and `brew services` for the
+daemon (launchd on macOS, systemd under brew on Linux) — see `docs/release-engineering.md`. Still
+ahead: a bare **systemd** unit for non-brew Linux installs; web UI assets embedded in the binary at
+Phase 3. Model files are never bundled ([04-search-pipeline.md](04-search-pipeline.md) §4).
 
 ## 5. Consolidated "later" list
 
