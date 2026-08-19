@@ -1,3 +1,10 @@
+# Check text files out with LF everywhere, including Windows, where Git's
+# default autocrlf would otherwise hand them back with CRLF. Committed
+# artifacts are compared byte-for-byte against freshly generated output — see
+# the `schema/config.schema.json` drift guard in core/tests/config_schema_drift.rs
+# — and a rewritten line ending makes an identical file look stale.
+* text=auto eol=lf
+
 # Hand-built PDF test fixtures have no NUL bytes; without this, Git treats them
 # as text and rewrites LF->CRLF on autocrlf checkouts, shifting xref offsets and
 # stream /Length counts and corrupting the fixtures. Force binary handling.
