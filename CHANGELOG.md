@@ -4,6 +4,14 @@ All notable changes to this project are documented in this file.
 
 The format follows [Common Changelog](https://common-changelog.org).
 
+## [0.1.1] - 2026-08-20
+
+### Changed
+
+- Fail fast when no ONNX Runtime is embedded ([#239](https://github.com/dokterbob/localdb/pull/239)) ([#241](https://github.com/dokterbob/localdb/pull/241)) ([`6f2733b`](https://github.com/dokterbob/localdb/commit/6f2733b23a52d0675c95ceb302db04623895c64c))
+- Windows: make the daemon sentinel portable ([#239](https://github.com/dokterbob/localdb/pull/239)) ([#240](https://github.com/dokterbob/localdb/pull/240)) ([`502f54d`](https://github.com/dokterbob/localdb/commit/502f54dd9437a8faf4193f0fe7374375ef52d085))
+
+
 ## [0.1.0] - 2026-08-18
 
 _First release._
