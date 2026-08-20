@@ -135,10 +135,7 @@ pub fn create_embedder(
         "local-coreml" => create_coreml(policy, models_dir),
         #[cfg(not(all(target_os = "macos", feature = "local-coreml")))]
         "local-coreml" => create_coreml_unavailable(),
-        #[cfg(feature = "local-onnx")]
         "local-onnx" => create_onnx(policy, models_dir),
-        #[cfg(not(feature = "local-onnx"))]
-        "local-onnx" => create_onnx_unavailable(),
         "openai-compatible" => create_openai_compatible(policy, providers, http_settings),
         "perplexity" => create_perplexity(providers, http_settings),
         "voyage" => create_voyage(providers, http_settings),
@@ -303,16 +300,37 @@ fn create_coreml_unavailable() -> Result<BoxedEmbedder, EmbedError> {
     ))
 }
 
-#[cfg(not(feature = "local-onnx"))]
-fn create_onnx_unavailable() -> Result<BoxedEmbedder, EmbedError> {
-    Err(EmbedError::Internal(
-        "provider 'local-onnx' requires the 'local-onnx' feature flag. \
-         Rebuild with `--features local-onnx` or choose a hosted provider."
-            .to_string(),
-    ))
+/// Why this build has no local ONNX backend. Two distinct causes, and telling them apart
+/// matters: one is a build flag the user can just turn on, the other is a platform localdb
+/// embeds no ONNX Runtime for at all (see `embed/build.rs`). `build.rs` emits the
+/// `ort_embedded` cfg exactly when it embeds one, so this text and the cfg gates below
+/// cannot disagree about which case holds.
+#[cfg(not(ort_embedded))]
+const NO_LOCAL_ONNX: &str = if cfg!(feature = "local-onnx") {
+    "localdb embeds an ONNX Runtime only for Linux and macOS, so local inference is \
+     unavailable on this platform. Build with LOCALDB_ORT_LIB set to your own ONNX Runtime \
+     shared library, or choose a hosted provider ('openai-compatible', 'perplexity', \
+     'voyage')."
+} else {
+    "this binary was built without the 'local-onnx' feature. Rebuild with \
+     `--features local-onnx`, or choose a hosted provider ('openai-compatible', \
+     'perplexity', 'voyage')."
+};
+
+/// Stand-in for [`create_onnx`] on builds with no embedded ONNX Runtime. Same signature, so
+/// every caller stays free of `#[cfg]` — the whole conditional surface for local ONNX is
+/// this one pair of definitions.
+#[cfg(not(ort_embedded))]
+fn create_onnx(
+    _policy: &EmbeddingPolicy,
+    _models_dir: Option<&Path>,
+) -> Result<BoxedEmbedder, EmbedError> {
+    Err(EmbedError::Internal(format!(
+        "no local ONNX backend: {NO_LOCAL_ONNX}"
+    )))
 }
 
-#[cfg(feature = "local-onnx")]
+#[cfg(ort_embedded)]
 fn create_onnx(
     policy: &EmbeddingPolicy,
     models_dir: Option<&Path>,
@@ -343,65 +361,45 @@ fn create_onnx(
     }
 }
 
-#[allow(clippy::needless_return)]
+/// `provider: local` — pick the best local backend for this build and model.
+///
+/// CoreML gets first refusal on Apple Silicon for the one model it serves; everything else,
+/// including a CoreML that fails to load, falls through to ONNX. Both backends emit
+/// index-interchangeable vectors, so which one answers is not observable in the index.
+///
+/// When no ONNX Runtime is embedded, `create_onnx` is the stand-in above and reports why —
+/// which is the whole reason this function needs no `#[cfg]` of its own beyond the CoreML
+/// branch.
 fn create_local_auto(
     policy: &EmbeddingPolicy,
     models_dir: Option<&Path>,
 ) -> Result<BoxedEmbedder, EmbedError> {
     #[cfg(all(target_os = "macos", feature = "local-coreml"))]
-    {
-        if policy.model == "pplx-embed-context-v1-0.6b" {
-            let cache_dir = models_dir.map(|p| p.to_path_buf());
-            match crate::pplx_context_coreml::PplxContextCoreMLEmbedder::new(cache_dir, true) {
-                Ok(embedder) => return Ok(Box::new(embedder)),
-                Err(e) => {
-                    #[cfg(feature = "local-onnx")]
-                    {
-                        tracing::warn!(
-                            error = %e,
-                            "CoreML embedder unavailable; falling back to ONNX"
-                        );
-                        return create_onnx(policy, models_dir);
-                    }
-                    #[cfg(not(feature = "local-onnx"))]
-                    {
-                        return Err(e);
-                    }
+    if policy.model == "pplx-embed-context-v1-0.6b" {
+        let cache_dir = models_dir.map(|p| p.to_path_buf());
+        match crate::pplx_context_coreml::PplxContextCoreMLEmbedder::new(cache_dir, true) {
+            Ok(embedder) => return Ok(Box::new(embedder)),
+            // Not fatal on its own — ONNX serves this model too. If it can't, the error
+            // from below explains that, and this line is the record of why CoreML didn't.
+            //
+            // Unless there is no ONNX to fall back to. A build with `local-coreml` but no
+            // embedded runtime has just produced the only account of what actually went
+            // wrong — a failed model download, an unloadable bundle — and `create_onnx`
+            // below would replace it with a description of a build flag the operator did
+            // not choose and cannot act on.
+            Err(e) => {
+                if !cfg!(ort_embedded) {
+                    return Err(e);
                 }
+                tracing::warn!(
+                    error = %e,
+                    "CoreML embedder unavailable; falling back to ONNX"
+                );
             }
-        }
-        #[cfg(feature = "local-onnx")]
-        {
-            return create_onnx(policy, models_dir);
-        }
-        #[cfg(not(feature = "local-onnx"))]
-        {
-            return Err(EmbedError::Internal(format!(
-                "provider 'local' with model '{}' needs the 'local-onnx' feature \
-                 (only 'pplx-embed-context-v1-0.6b' is available via CoreML). \
-                 Rebuild with `--features local-onnx`.",
-                policy.model
-            )));
         }
     }
 
-    #[cfg(not(all(target_os = "macos", feature = "local-coreml")))]
-    {
-        #[cfg(feature = "local-onnx")]
-        {
-            return create_onnx(policy, models_dir);
-        }
-        #[cfg(not(feature = "local-onnx"))]
-        {
-            let _ = (policy, models_dir);
-            return Err(EmbedError::Internal(
-                "provider 'local' requires a local backend: rebuild with \
-                 `--features local-onnx` (all platforms) or `--features local-coreml` \
-                 (macOS), or choose a hosted provider."
-                    .to_string(),
-            ));
-        }
-    }
+    create_onnx(policy, models_dir)
 }
 
 #[cfg(test)]
@@ -430,6 +428,37 @@ mod tests {
         let embedder =
             create_embedder(&policy, &[], None, &fetch::http::HttpSettings::default()).unwrap();
         assert_eq!(embedder.embedding_dim(), 128);
+    }
+
+    /// `local` is the default provider, so on a build with no embedded ONNX Runtime the
+    /// very first `localdb index` lands here. It must fail as a clean, actionable error
+    /// rather than diving into ORT code that was never initialized — the failure mode
+    /// this cfg gate exists to prevent.
+    #[cfg(not(ort_embedded))]
+    #[test]
+    fn local_providers_are_unavailable_without_an_embedded_runtime() {
+        // `bge-small-en-v1.5` deliberately: CoreML serves only the pplx context model, so
+        // this stays an ONNX-backend question on a macOS `local-coreml` build too, instead
+        // of wandering into CoreML construction and its model download.
+        for provider in ["local", "local-onnx"] {
+            let policy = fake_policy(provider, "bge-small-en-v1.5");
+            let Err(err) =
+                create_embedder(&policy, &[], None, &fetch::http::HttpSettings::default())
+            else {
+                panic!("'{provider}' must not claim to build a local embedder");
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains("openai-compatible"),
+                "'{provider}' error must point at a way forward, got: {msg}"
+            );
+            // Exactly one of the two causes, never a blend of both.
+            assert_eq!(
+                msg.contains("only for Linux and macOS"),
+                cfg!(feature = "local-onnx"),
+                "'{provider}' names the wrong cause: {msg}"
+            );
+        }
     }
 
     #[test]

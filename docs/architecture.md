@@ -270,7 +270,15 @@ instead of the embedded one:
 - `ORT_DYLIB_PATH` (runtime env var): `ensure_ort_initialized` honours this directly and `dlopen`s
   that path instead of extracting the embedded copy.
 - `LOCALDB_ORT_LIB` (build-time env var, read by `embed/build.rs`): points the _build_ at a local
-  ONNX Runtime library to embed instead of downloading one (offline/distro builds).
+  ONNX Runtime library to embed instead of downloading one (offline/distro builds). It is honoured
+  on every target, including ones localdb ships no ONNX Runtime asset for — that is precisely when
+  someone needs it.
+
+`build.rs` emits `cargo:rustc-cfg=ort_embedded` exactly when it embeds a runtime, and nothing else
+ever emits it. `ort_runtime`'s real implementation and `factory`'s local-ONNX constructors both gate
+on that one cfg rather than each restating "feature on **and** a supported target". On a build
+without it, `provider: local` and `provider: local-onnx` fail immediately with an error naming the
+cause and the alternatives, instead of reaching `ort` with nothing initialized behind it.
 
 Both overrides require ONNX Runtime **≥ 1.24** — `fastembed`'s own (unconditional) `ort` dependency
 declaration requests the `api-24` feature regardless of which `fastembed` features we enable, so
