@@ -3,8 +3,11 @@ name: CI
 on:
   push:
     branches: ["main", "ticket/**"]
+  # No base-branch filter: a stacked PR targets its parent branch rather than
+  # `main`, and filtering on the base would leave exactly those PRs with no
+  # checks at all — the ones carrying work that has not been merged anywhere
+  # yet, and so the ones least safe to leave unverified.
   pull_request:
-    branches: ["main"]
 
 env:
   CARGO_TERM_COLOR: always
@@ -119,6 +122,44 @@ jobs:
       - name: Run clippy with local-coreml (deny warnings)
         run: cargo clippy -p localdb-embed --features local-coreml --all-targets -- -D warnings
 
+  windows:
+    name: Windows-only branches (scoped tests)
+    # `#[cfg(windows)]` code never compiles on the Linux `test` job, so it is
+    # invisible to the coverage gate and would rot unnoticed without a lane that
+    # actually compiles and runs it. Scoped to the crates that carry those
+    # branches today — the daemon sentinel in `server`, path/URI handling in
+    # `core` — and widened as the rest of the workspace becomes portable (#239).
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable with clippy
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-windows-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-windows-
+      - name: Run tests
+        # --no-fail-fast: a Windows failure usually means a portability
+        # assumption nobody had reason to question, and there is rarely just
+        # one. Stopping at the first crate would surface them a runner round
+        # trip at a time.
+        run: cargo test --no-fail-fast -p localdb-core -p localdb-server
+      - name: Run clippy (deny warnings)
+        run: cargo clippy -p localdb-core -p localdb-server --all-targets -- -D warnings
+
   # Demonstrate the coverage gate: this job has a dummy function with a test.
   # The function and test live in the core crate (error.rs / tests).
   # If tests are removed, coverage will drop and the coverage job will fail.
@@ -131,14 +172,32 @@ jobs:
         include:
           - os: macos-latest
             target: aarch64-apple-darwin
+            packages: "-p localdb"
           # Pinned to ubuntu-22.04 (not ubuntu-latest): our own Rust code inherits the
           # build machine's glibc floor, and this job now actually links (see the `cargo
           # build` step below), so a stale ubuntu-latest pin here would let a #133-style
           # glibc regression slip through CI again.
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+            packages: "-p localdb"
           - os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
+            packages: "-p localdb"
+          # Windows is a work in progress (#239): `embed` has no embedded ONNX
+          # Runtime for this target yet, so `-p localdb` would build a binary whose
+          # default embedder cannot run. Build the crates that are portable today
+          # instead, which keeps this lane green while still proving the part most
+          # likely to break silently — that libsql-ffi's bundled SQLite compiles
+          # under MSVC. Widened to `-p localdb` once #239 phase 2 lands.
+          #
+          # Pinned to windows-2022 for the same reason the Linux entries pin
+          # ubuntu-22.04: windows-latest now maps to Windows Server 2025 + VS 2026,
+          # a moving toolchain target.
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            packages: >-
+              -p localdb-core -p localdb-extract -p localdb-fetch
+              -p localdb-ingest -p localdb-store-libsql -p localdb-server
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust stable
@@ -171,4 +230,4 @@ jobs:
         # binary for each target instead.
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --target ${{ matrix.target }} -p localdb
+        run: cargo build --release --target ${{ matrix.target }} ${{ matrix.packages }}
