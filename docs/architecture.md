@@ -255,9 +255,13 @@ agreement), so switching backends needs no reindex. See [specs/03-config.md](../
 `load-dynamic` feature — the `localdb` executable links no ONNX Runtime ABI at all and instead
 `dlopen`s a shared library at a path chosen at runtime. `embed/build.rs` downloads _Microsoft's
 official_ ONNX Runtime release (pinned to 1.24.4) for the build's target platform (`linux-x64`,
-`linux-aarch64`, `osx-arm64`), verifies it against a pinned sha256, and embeds it into the `embed`
-crate via `include_bytes!`. On first construction of any local-ONNX embedder,
-`embed::ort_runtime::ensure_ort_initialized` extracts that embedded library to
+`linux-aarch64`, `osx-arm64`, `win-x64`), verifies it against a pinned sha256, and embeds it into
+the `embed` crate via `include_bytes!`. The Linux and macOS assets are gzip tarballs and the Windows
+one a zip; either way exactly one entry is extracted, named by a compile-time constant — which is
+what keeps the Windows archive's 382 MB `onnxruntime.pdb` out of the binary. Windows needs only
+`onnxruntime.dll`: `onnxruntime_providers_shared.dll` is the loader shim for shared execution
+providers (CUDA, TensorRT), and localdb registers none. On first construction of any local-ONNX
+embedder, `embed::ort_runtime::ensure_ort_initialized` extracts that embedded library to
 `<cache_dir>/localdb/ort/<version>/` (mirroring the model-cache convention; idempotent — skipped if
 an up-to-date copy is already there) and calls `ort::init_from` on it before any other `ort` API is
 touched. Embedding the runtime grows the `localdb` binary by roughly 12–20 MB depending on platform

@@ -144,10 +144,7 @@ mod imp {
     /// Pure filesystem logic — no `ort`/dlopen calls — so it's directly unit-testable
     /// without touching process-global ort state.
     fn ensure_extracted(dest: &Path) -> Result<(), EmbedError> {
-        let up_to_date = ModelCache::sha256_file(dest)
-            .map(|h| h == EMBEDDED_LIB_SHA256)
-            .unwrap_or(false);
-        if up_to_date {
+        if is_up_to_date(dest) {
             return Ok(());
         }
 
@@ -156,10 +153,50 @@ mod imp {
         }
         // Atomic write: temp file in the same directory, then rename (matches the
         // model_cache.rs download_model pattern).
-        let tmp = PathBuf::from(format!("{}.tmp", dest.display()));
+        let tmp = tmp_path(dest);
         fs::write(&tmp, EMBEDDED_LIB_BYTES).map_err(EmbedError::Io)?;
-        fs::rename(&tmp, dest).map_err(EmbedError::Io)?;
+        if let Err(err) = fs::rename(&tmp, dest) {
+            let _ = fs::remove_file(&tmp);
+            return recover_from_rename_failure(err, dest);
+        }
         Ok(())
+    }
+
+    /// Whether `dest` already holds exactly the embedded library.
+    fn is_up_to_date(dest: &Path) -> bool {
+        ModelCache::sha256_file(dest)
+            .map(|h| h == EMBEDDED_LIB_SHA256)
+            .unwrap_or(false)
+    }
+
+    /// Staging path for the atomic write, namespaced by process id.
+    ///
+    /// Two localdb processes hitting a cold cache extract at the same time. Under one shared
+    /// `.tmp` name they interleave writes into the same file and then rename whatever mixture
+    /// results into place; the sha256 check on the next run would catch it, but only after a
+    /// failed load. Distinct staging names make the two extractions independent, and the
+    /// rename — the only shared step — atomic.
+    fn tmp_path(dest: &Path) -> PathBuf {
+        PathBuf::from(format!("{}.{}.tmp", dest.display(), std::process::id()))
+    }
+
+    /// Decide whether a failed rename is fatal.
+    ///
+    /// Windows refuses to replace a file that another process currently has loaded, so a
+    /// concurrent localdb running inference sends us here where POSIX would have renamed
+    /// silently. Losing the rename only matters if we lost to the *wrong* bytes: `dest`
+    /// holding a byte-exact copy of the library we were about to write means the caller's
+    /// postcondition already holds and the winner did our work for us. Any other state —
+    /// missing, truncated, a different ONNX Runtime build — propagates the original error.
+    fn recover_from_rename_failure(err: std::io::Error, dest: &Path) -> Result<(), EmbedError> {
+        if is_up_to_date(dest) {
+            tracing::debug!(
+                path = %dest.display(),
+                "another process installed the embedded ONNX Runtime first"
+            );
+            return Ok(());
+        }
+        Err(EmbedError::Io(err))
     }
 
     #[cfg(test)]
@@ -218,6 +255,64 @@ mod imp {
             ensure_extracted(&dest).unwrap();
 
             assert!(dest.is_file());
+        }
+
+        /// The staging file is per-process, so two concurrent extractions cannot write into
+        /// each other's.
+        #[test]
+        fn tmp_path_is_namespaced_by_process_id() {
+            let tmp = tmp_path(Path::new("/cache/libonnxruntime.test"));
+            let tmp = tmp.to_string_lossy();
+
+            assert!(tmp.ends_with(".tmp"), "{tmp}");
+            assert!(
+                tmp.contains(&std::process::id().to_string()),
+                "staging path {tmp} is shared between processes"
+            );
+            assert!(tmp.contains("libonnxruntime.test"), "{tmp}");
+        }
+
+        /// Losing the rename to a process that installed the *same* library is success: the
+        /// postcondition callers rely on — the embedded library is at `dest` — already holds.
+        #[test]
+        fn rename_failure_succeeds_when_the_winner_wrote_the_same_library() {
+            let dir = TempDir::new().unwrap();
+            let dest = dir.path().join("libonnxruntime.test");
+            fs::write(&dest, EMBEDDED_LIB_BYTES).unwrap();
+
+            recover_from_rename_failure(sharing_violation(), &dest)
+                .expect("a destination holding the embedded library is not a failure");
+        }
+
+        /// The case that must never be swallowed: reporting success would leave the process
+        /// about to `dlopen` a library that is not the one this binary was built against.
+        #[test]
+        fn rename_failure_propagates_when_the_destination_holds_other_bytes() {
+            let dir = TempDir::new().unwrap();
+            let dest = dir.path().join("libonnxruntime.test");
+            fs::write(&dest, b"a different ONNX Runtime build").unwrap();
+
+            let err = recover_from_rename_failure(sharing_violation(), &dest)
+                .expect_err("a mismatched destination must not be reported as success");
+            assert!(matches!(err, EmbedError::Io(_)), "{err:?}");
+        }
+
+        #[test]
+        fn rename_failure_propagates_when_the_destination_is_missing() {
+            let dir = TempDir::new().unwrap();
+            let dest = dir.path().join("libonnxruntime.test");
+
+            recover_from_rename_failure(sharing_violation(), &dest)
+                .expect_err("an absent destination must not be reported as success");
+        }
+
+        /// Stand-in for the Windows `ERROR_SHARING_VIOLATION` that motivates the recovery
+        /// path. Only its identity as an error matters here, not its kind.
+        fn sharing_violation() -> std::io::Error {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "the process cannot access the file because it is being used by another process",
+            )
         }
 
         #[test]

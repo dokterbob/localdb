@@ -85,9 +85,11 @@ first if it is wrong.
 - **ONNX Runtime is loaded dynamically, never statically linked** (issue #133): `embed`'s `ort`
   dependency uses `load-dynamic`, and `embed/build.rs` embeds Microsoft's _official_ ONNX Runtime
   build (pinned version, sha256-verified) for every `local-onnx` target — Linux x64, Linux aarch64,
-  and macOS aarch64 alike. `embed::ort_runtime::ensure_ort_initialized` extracts it to the user's
-  cache dir and calls `ort::init_from` before any other `ort` API is touched. Never re-enable
-  `ort`'s `download-binaries` or any `api-*` default feature (`embed/Cargo.toml` pins
+  macOS aarch64, and Windows x64 alike. `embed::ort_runtime::ensure_ort_initialized` extracts it to
+  the user's cache dir and calls `ort::init_from` before any other `ort` API is touched. Whether a
+  build has an embedded runtime is signalled by exactly one thing, `build.rs`'s `ort_embedded` cfg;
+  gate on that rather than restating `all(feature = "local-onnx", any(target_os = …))`. Never
+  re-enable `ort`'s `download-binaries` or any `api-*` default feature (`embed/Cargo.toml` pins
   `default-features = false` deliberately) — `download-binaries` reintroduces pyke.io's prebuilt
   archive, which gave release binaries a `GLIBC_2.38` floor and broke startup on glibc-2.35 distros
   (Mint 21, Ubuntu 22.04); see `docs/architecture.md` §"ONNX Runtime loading" and `pykeio/ort#523`.

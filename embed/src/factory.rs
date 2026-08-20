@@ -307,9 +307,9 @@ fn create_coreml_unavailable() -> Result<BoxedEmbedder, EmbedError> {
 /// cannot disagree about which case holds.
 #[cfg(not(ort_embedded))]
 const NO_LOCAL_ONNX: &str = if cfg!(feature = "local-onnx") {
-    "localdb embeds an ONNX Runtime only for Linux and macOS, so local inference is \
-     unavailable on this platform. Build with LOCALDB_ORT_LIB set to your own ONNX Runtime \
-     shared library, or choose a hosted provider ('openai-compatible', 'perplexity', \
+    "localdb embeds an ONNX Runtime only for Linux, macOS, and Windows, so local inference \
+     is unavailable on this platform. Build with LOCALDB_ORT_LIB set to your own ONNX \
+     Runtime shared library, or choose a hosted provider ('openai-compatible', 'perplexity', \
      'voyage')."
 } else {
     "this binary was built without the 'local-onnx' feature. Rebuild with \
@@ -454,7 +454,7 @@ mod tests {
             );
             // Exactly one of the two causes, never a blend of both.
             assert_eq!(
-                msg.contains("only for Linux and macOS"),
+                msg.contains("only for Linux, macOS, and Windows"),
                 cfg!(feature = "local-onnx"),
                 "'{provider}' names the wrong cause: {msg}"
             );

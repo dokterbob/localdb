@@ -101,3 +101,7 @@ sha2 = "0.10"
 hex = "0.4"
 flate2 = "1"
 tar = "0.4"
+# Windows' ONNX Runtime release is a zip, not a tarball. Every entry in it is plain
+# deflate-compressed (verified against the pinned 1.24.4 asset), so no other codec feature is
+# needed — and default-features would pull in bzip2/zstd C dependencies for nothing.
+zip = { version = "2", default-features = false, features = ["deflate"] }
