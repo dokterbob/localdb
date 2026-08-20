@@ -29,22 +29,23 @@ use crate::error::EmbedError;
 /// caches the outcome; every subsequent call (from any local-ONNX embedder constructor)
 /// returns that cached `Result` cheaply.
 ///
-/// On platforms/build configurations where no ONNX Runtime is embedded (the `local-onnx`
-/// feature is disabled, or the target OS has no embedded runtime), this is a no-op that
-/// always returns `Ok(())` — callers on those configurations never reach ORT-dependent code
-/// anyway (see `factory.rs`'s `local-onnx`-gated call sites).
-#[cfg(all(feature = "local-onnx", any(target_os = "linux", target_os = "macos")))]
+/// On build configurations where no ONNX Runtime is embedded — signalled by `build.rs` not
+/// emitting the `ort_embedded` cfg, because the `local-onnx` feature is off or the target OS
+/// has no embedded runtime — this is a no-op that always returns `Ok(())`. Callers on those
+/// configurations never reach ORT-dependent code anyway: `factory.rs` gates its local-ONNX
+/// constructors on the same cfg and returns a clean error instead.
+#[cfg(ort_embedded)]
 pub fn ensure_ort_initialized() -> Result<(), EmbedError> {
     imp::ensure_ort_initialized()
 }
 
 /// No-op stub: no ONNX Runtime is embedded for this build configuration.
-#[cfg(not(all(feature = "local-onnx", any(target_os = "linux", target_os = "macos"))))]
+#[cfg(not(ort_embedded))]
 pub fn ensure_ort_initialized() -> Result<(), EmbedError> {
     Ok(())
 }
 
-#[cfg(all(feature = "local-onnx", any(target_os = "linux", target_os = "macos")))]
+#[cfg(ort_embedded)]
 mod imp {
     use std::{
         fs,

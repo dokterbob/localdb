@@ -13,7 +13,8 @@
 //! cargo test -p localdb-embed --features local-onnx -- --ignored pplx_embed_context
 //! ```
 
-#![cfg(feature = "local-onnx")]
+// Needs a real, initialized ONNX Runtime, which only exists when build.rs embedded one.
+#![cfg(ort_embedded)]
 
 use embed::PplxContextOnnxEmbedder;
 use localdb_core::{DocumentChunks, Embedder};

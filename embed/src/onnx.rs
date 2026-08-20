@@ -205,12 +205,19 @@ impl Embedder for OnnxEmbedder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(ort_embedded)]
     use localdb_core::{DocumentChunks, Embedder};
+    #[cfg(ort_embedded)]
     use tempfile::TempDir;
 
     /// Helper: create an ONNX embedder with a temp cache dir.
     ///
     /// Downloads the model if not already cached.
+    ///
+    /// Gated, along with every test that calls it, on there actually being an embedded
+    /// ONNX Runtime: without one `ensure_ort_initialized` is a no-op stub, so loading a
+    /// model would reach `ort` with nothing initialized behind it.
+    #[cfg(ort_embedded)]
     fn make_embedder() -> (TempDir, OnnxEmbedder) {
         let dir = TempDir::new().unwrap();
         let embedder = OnnxEmbedder::new(
@@ -222,12 +229,14 @@ mod tests {
         (dir, embedder)
     }
 
+    #[cfg(ort_embedded)]
     #[tokio::test(flavor = "multi_thread")]
     async fn onnx_embedder_returns_correct_dim() {
         let (_dir, embedder) = make_embedder();
         assert_eq!(embedder.embedding_dim(), 384, "BGE Small EN has 384 dims");
     }
 
+    #[cfg(ort_embedded)]
     #[tokio::test(flavor = "multi_thread")]
     async fn onnx_embedder_returns_correct_shape() {
         let (_dir, embedder) = make_embedder();
@@ -247,6 +256,7 @@ mod tests {
         assert_eq!(result[0][1].len(), 384, "BGE Small EN dim = 384");
     }
 
+    #[cfg(ort_embedded)]
     #[tokio::test(flavor = "multi_thread")]
     async fn onnx_embedder_is_deterministic() {
         let (_dir, embedder) = make_embedder();
@@ -262,6 +272,7 @@ mod tests {
         assert_eq!(r1[0][0], r2[0][0], "ONNX embedder must be deterministic");
     }
 
+    #[cfg(ort_embedded)]
     #[tokio::test(flavor = "multi_thread")]
     async fn onnx_embedder_distinct_texts_produce_distinct_vectors() {
         let (_dir, embedder) = make_embedder();
@@ -281,6 +292,7 @@ mod tests {
         );
     }
 
+    #[cfg(ort_embedded)]
     #[tokio::test(flavor = "multi_thread")]
     async fn onnx_embedder_similar_texts_are_closer() {
         let (_dir, embedder) = make_embedder();
@@ -319,6 +331,7 @@ mod tests {
         );
     }
 
+    #[cfg(ort_embedded)]
     #[tokio::test(flavor = "multi_thread")]
     async fn onnx_embedder_empty_docs() {
         let (_dir, embedder) = make_embedder();
@@ -326,6 +339,7 @@ mod tests {
         assert!(result.is_empty());
     }
 
+    #[cfg(ort_embedded)]
     #[tokio::test(flavor = "multi_thread")]
     async fn onnx_embedder_multi_doc() {
         let (_dir, embedder) = make_embedder();
