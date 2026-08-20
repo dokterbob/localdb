@@ -126,9 +126,9 @@ jobs:
     name: Windows-only branches (scoped tests)
     # `#[cfg(windows)]` code never compiles on the Linux `test` job, so it is
     # invisible to the coverage gate and would rot unnoticed without a lane that
-    # actually compiles and runs it. Scoped to the crates that carry those
-    # branches today — the daemon sentinel in `server`, path/URI handling in
-    # `core` — and widened as the rest of the workspace becomes portable (#239).
+    # actually compiles and runs it. Scoped to the crates that carry Windows-only
+    # behaviour: the daemon sentinel in `server`, path/URI handling in `core`, and
+    # the embedded ONNX Runtime in `embed` (#239).
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -157,8 +157,22 @@ jobs:
         # one. Stopping at the first crate would surface them a runner round
         # trip at a time.
         run: cargo test --no-fail-fast -p localdb-core -p localdb-server
+      - name: Run embed tests against the embedded ONNX Runtime
+        # The session tests in `embed/src/onnx.rs` are the only thing that
+        # actually dlopens the extracted `onnxruntime.dll` and builds a real ORT
+        # session, so this step is what shows the Windows runtime *works* rather
+        # than merely compiles — including whether a CPU-only session needs
+        # `onnxruntime_providers_shared.dll`, which we deliberately do not embed.
+        #
+        # `local-onnx` is not a default feature, and without it `build.rs` embeds
+        # nothing and every one of those tests cfgs out: a green vacuum. Kept a
+        # separate step from the one above so a single `--features` applies
+        # unambiguously to the one package that has it.
+        run: cargo test --no-fail-fast -p localdb-embed --features local-onnx
       - name: Run clippy (deny warnings)
-        run: cargo clippy -p localdb-core -p localdb-server --all-targets -- -D warnings
+        run: |
+          cargo clippy -p localdb-core -p localdb-server --all-targets -- -D warnings
+          cargo clippy -p localdb-embed --features local-onnx --all-targets -- -D warnings
 
   # Demonstrate the coverage gate: this job has a dummy function with a test.
   # The function and test live in the core crate (error.rs / tests).
@@ -183,21 +197,18 @@ jobs:
           - os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
             packages: "-p localdb"
-          # Windows is a work in progress (#239): `embed` has no embedded ONNX
-          # Runtime for this target yet, so `-p localdb` would build a binary whose
-          # default embedder cannot run. Build the crates that are portable today
-          # instead, which keeps this lane green while still proving the part most
-          # likely to break silently — that libsql-ffi's bundled SQLite compiles
-          # under MSVC. Widened to `-p localdb` once #239 phase 2 lands.
-          #
           # Pinned to windows-2022 for the same reason the Linux entries pin
           # ubuntu-22.04: windows-latest now maps to Windows Server 2025 + VS 2026,
           # a moving toolchain target.
+          #
+          # `-p localdb` here is doing more than a compile check: `cli` enables
+          # `local-onnx` on every target, so building the binary runs `embed`'s
+          # build script, which downloads the Windows ONNX Runtime zip, verifies it
+          # against its pinned sha256, and embeds `onnxruntime.dll`. That is the
+          # only place the zip-extraction branch runs against the real asset.
           - os: windows-2022
             target: x86_64-pc-windows-msvc
-            packages: >-
-              -p localdb-core -p localdb-extract -p localdb-fetch
-              -p localdb-ingest -p localdb-store-libsql -p localdb-server
+            packages: "-p localdb"
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust stable
