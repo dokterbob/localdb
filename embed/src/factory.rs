@@ -381,10 +381,21 @@ fn create_local_auto(
             Ok(embedder) => return Ok(Box::new(embedder)),
             // Not fatal on its own — ONNX serves this model too. If it can't, the error
             // from below explains that, and this line is the record of why CoreML didn't.
-            Err(e) => tracing::warn!(
-                error = %e,
-                "CoreML embedder unavailable; falling back to ONNX"
-            ),
+            //
+            // Unless there is no ONNX to fall back to. A build with `local-coreml` but no
+            // embedded runtime has just produced the only account of what actually went
+            // wrong — a failed model download, an unloadable bundle — and `create_onnx`
+            // below would replace it with a description of a build flag the operator did
+            // not choose and cannot act on.
+            Err(e) => {
+                if !cfg!(ort_embedded) {
+                    return Err(e);
+                }
+                tracing::warn!(
+                    error = %e,
+                    "CoreML embedder unavailable; falling back to ONNX"
+                );
+            }
         }
     }
 
