@@ -6,23 +6,7 @@ automatically along the way; an explicit init step is optional.
 
 For installation instructions, see [install.md](install.md).
 
-## Step 1 — (Optional) Override data paths
-
-By default the data directory follows your platform's standard location. To keep everything under a
-single directory (useful for development or isolation), add a `paths` block to your config:
-
-```yaml
-version: 1
-paths:
-  data: ~/localdb/data
-  models: ~/localdb/models
-  logs: ~/localdb/logs
-```
-
-The config file path can also be set with the `LOCALDB_CONFIG` environment variable or the
-`--config <path>` flag on any command.
-
-## Step 2 — Check initial status
+## Step 1 — Check initial status
 
 Confirm the installation is working:
 
@@ -44,6 +28,22 @@ for the full generated file and the `$schema` editor-integration section. If you
 explicitly up front instead of implicitly on first use — e.g. to review the generated paths, or to
 pre-download the embedding model with `--download-model` — see `localdb init` in
 [cli.md](cli.md#localdb-init).
+
+## Step 2 — (Optional) Override data paths
+
+By default the data directory follows your platform's standard location. To keep everything under a
+single directory (useful for development or isolation), add a `paths` block to your config:
+
+```yaml
+version: 1
+paths:
+  data: ~/localdb/data
+  models: ~/localdb/models
+  logs: ~/localdb/logs
+```
+
+The config file path can also be set with the `LOCALDB_CONFIG` environment variable or the
+`--config <path>` flag on any command.
 
 ## Step 3 — Create a store
 

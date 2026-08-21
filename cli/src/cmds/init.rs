@@ -2,13 +2,16 @@ use std::path::Path;
 
 use serde_json::json;
 
+use localdb_core::config::loader::ConfigLoader;
+
 use crate::{
     app_db::{
-        load_config_lenient, open_app_db_from_loader, reject_store_flag, INIT_REJECT_MESSAGE,
+        load_config_for_maintenance, open_app_db_from_loader, reject_store_flag,
+        INIT_REJECT_MESSAGE,
     },
     daemon_client::CliContext,
     normalize::{exit_err, print_json},
-    scaffold::{ensure_config_scaffolded, ensure_default_store},
+    scaffold::{ensure_config_scaffolded, ensure_default_store, ScaffoldResult},
 };
 
 /// `localdb init`
@@ -20,9 +23,10 @@ use crate::{
 /// one), prints every resolved path, and — best-effort — ensures a
 /// `default` store exists (via [`ensure_default_store`]).
 ///
-/// Never required: every other command scaffolds the same config and
-/// directories on first use (issue #119/#120). `init` exists for operators
-/// who want to inspect/prepare their setup before running anything else.
+/// Never required: every other command except `db status`/`migrate`/
+/// `downgrade`/`vacuum` scaffolds the same config and directories on first
+/// use. `init` exists for operators who want to inspect/prepare their setup
+/// before running anything else.
 ///
 /// Unlike the implicit paths (`app_db::load_config_scaffolded`/
 /// `load_config_lenient`, which only call `ensure_default_store` when
@@ -80,16 +84,13 @@ pub(crate) async fn run_init_async(ctx: &CliContext, download_model: bool) {
         }
     }
 
-    // `load_config_lenient` cannot hard-exit for `init`: its internal seed
-    // path only fires when scaffolding *just* happened (`was_scaffolded`) or
-    // when there is no `localdb.db` file yet *and* the config is still the
-    // pristine template. `ensure_config_scaffolded` already ran above, so
-    // `was_scaffolded` is false on this call; and the old/too-new-schema case
-    // this function exists to tolerate is by definition a case where a
-    // `localdb.db` file already exists. Both disjuncts are false, so the
-    // internal `open_app_db_lenient_or_exit`/`exit_err` inside
-    // `load_config_lenient` is unreachable from `init`.
-    let loader = load_config_lenient(ctx).await;
+    // Config only, no DB open: the best-effort match further down is what
+    // must observe *every* DB-open failure (missing migration, unwritable
+    // data dir, full disk) and turn it into a warning rather than a hard
+    // exit. `load_config_for_maintenance` only parses/resolves the config
+    // already scaffolded above — it never touches the database — so nothing
+    // here can `exit_err` ahead of that match.
+    let loader = load_config_for_maintenance(ctx);
 
     // Optional: prepare the embedder up front. `create_embedder` already
     // dispatches every provider and performs whatever download is needed —
@@ -117,11 +118,8 @@ pub(crate) async fn run_init_async(ctx: &CliContext, download_model: bool) {
     // directories — warn on *any* open error, no classification, and exit 0
     // regardless. `open_app_db_from_loader`'s error already carries the
     // actionable "run `localdb db migrate`" text for the schema case.
-    let (default_store, warnings) = match open_app_db_from_loader(&loader).await {
-        Ok(db) => match ensure_default_store(&db).await {
-            Ok(()) => ("ok", vec![]),
-            Err(e) => ("skipped", vec![e.to_string()]),
-        },
+    let (default_store, warnings) = match seed_default_store(&loader).await {
+        Ok(()) => ("ok", vec![]),
         Err(e) => ("skipped", vec![e.to_string()]),
     };
 
@@ -137,30 +135,53 @@ pub(crate) async fn run_init_async(ctx: &CliContext, download_model: bool) {
             "warnings": warnings,
         }));
     } else {
+        print_human_summary(&scaffold, model_download, default_store, &warnings);
+    }
+}
+
+/// Open the DB and ensure the `default` store exists, as one fallible step.
+///
+/// The DB-open failure and the store-seed failure are indistinguishable to
+/// `run_init_async` — both mean `default_store: "skipped"` plus the error
+/// text as a warning — so they share one `?` chain rather than two arms that
+/// would have to stay in sync.
+async fn seed_default_store(loader: &ConfigLoader) -> Result<(), localdb_core::Error> {
+    let db = open_app_db_from_loader(loader).await?;
+    ensure_default_store(&db).await
+}
+
+/// The human-readable (non-`--json`) summary `run_init_async` prints on
+/// success. Presentation only — `run_init_async` keeps every branch of
+/// control flow; this just renders its outcome.
+fn print_human_summary(
+    scaffold: &ScaffoldResult,
+    model_download: &str,
+    default_store: &str,
+    warnings: &[String],
+) {
+    println!(
+        "Initialized localdb at {}",
+        scaffold
+            .config_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .display()
+    );
+    println!("  Config: {}", scaffold.config_path.display());
+    println!("  Data:   {}", scaffold.data_dir.display());
+    println!("  Models: {}", scaffold.models_dir.display());
+    println!("  Logs:   {}", scaffold.logs_dir.display());
+    println!();
+    if model_download != "ok" {
         println!(
-            "Initialized localdb at {}",
-            scaffold
-                .config_path
-                .parent()
-                .unwrap_or(Path::new("."))
-                .display()
+            "Note: the default 'local' provider downloads its embedding model on first index."
         );
-        println!("  Config: {}", scaffold.config_path.display());
-        println!("  Data:   {}", scaffold.data_dir.display());
-        println!("  Models: {}", scaffold.models_dir.display());
-        println!("  Logs:   {}", scaffold.logs_dir.display());
-        println!();
-        if model_download != "ok" {
-            println!(
-                "Note: the default 'local' provider downloads its embedding model on first index."
-            );
-            println!("      Hosted providers (openai-compatible, perplexity, voyage) require an API key in config.");
-        }
-        if default_store != "skipped" {
-            println!("Run `localdb store add <name>` to create a store.");
-        }
-        for w in &warnings {
-            eprintln!("Warning: {w}");
-        }
+        println!("      Hosted providers (openai-compatible, perplexity, voyage) require an API key in config.");
+    }
+    if default_store != "skipped" {
+        println!("Run `localdb store add <name>` to create a store.");
+    }
+    for w in warnings {
+        eprintln!("Warning: {w}");
     }
 }

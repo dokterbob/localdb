@@ -45,11 +45,12 @@ taxonomy that drives them.
 
 ## `localdb init`
 
-**Optional bootstrap — never a prerequisite.** Every other command scaffolds the config file and
-data/models/logs directories implicitly on first use, so you never have to run `init` before
-`store add`, `source add`, `index`, or `search`. Run it if you'd rather do that setup explicitly up
-front: it prints every resolved path, and `--download-model` lets you pull the embedding model ahead
-of time instead of on the first `index`/`search`.
+**Optional bootstrap — never a prerequisite.** Every other command except
+`db status`/`migrate`/`downgrade`/`vacuum` scaffolds the config file and data/models/logs
+directories implicitly on first use, so you never have to run `init` before `store add`,
+`source add`, `index`, or `search`. Run it if you'd rather do that setup explicitly up front: it
+prints every resolved path, and `--download-model` lets you pull the embedding model ahead of time
+instead of on the first `index`/`search`.
 
 ```
 Optional bootstrap: write the config, create the data/models/logs directories, and print the resolved paths

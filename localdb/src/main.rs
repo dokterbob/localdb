@@ -98,8 +98,8 @@ pub enum Command {
     /// Optional bootstrap: write the config, create the data/models/logs
     /// directories, and print the resolved paths.
     ///
-    /// Never required — every command scaffolds on first use. Not store-scoped:
-    /// passing `--store` exits 2.
+    /// Never required — every command except `db status`/`migrate`/`downgrade`/`vacuum`
+    /// scaffolds on first use. Not store-scoped: passing `--store` exits 2.
     Init {
         /// Prepare the configured embedder now, downloading a local model up
         /// front instead of on the first `index`/`search`.
