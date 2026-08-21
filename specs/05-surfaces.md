@@ -41,6 +41,15 @@ Output: human-readable by default (citations as `uri:heading_path` + snippet), `
 canonical structures for scripting. The CLI is **command-oriented**; interactive browse is a roadmap
 item with the web UI.
 
+**stdout/stderr contract (issue #260).** In `--json` mode, stdout is the _only_ channel guaranteed
+to be pure, parseable JSON — on success (the command's own output) and on failure alike
+(`{"error": <code>, "message": <text>}`, written by `cli::normalize::exit_err`, or the richer
+partial-results shape in §2.2 for a multi-item batch). stderr carries diagnostics only — progress
+lines, warnings — in both human and `--json` modes, and is never a promised source of structured
+data; a caller must not parse it. This holds regardless of what emits to stderr (a local-model
+download's progress bar included), because nothing there is ever expected to be machine-readable in
+the first place.
+
 ### 2.1 Schema migrations
 
 All schema-version mismatches on open — on every surface, CLI, HTTP daemon, and MCP alike — map to
@@ -155,9 +164,10 @@ Additional rules:
   {"status": "error", "error": {"code": <error code>, "message": <text>}, "results": [<items completed so far>]}
   ```
 
-  to stdout, then exits with the failing error's normal exit code, instead of routing through the
-  usual stderr-only error shape. The buffered `results` are output data, not merely an error
-  message, so — like every other `--json` document — they belong on stdout.
+  to stdout, then exits with the failing error's normal exit code, rather than the bare
+  `{"error", "message"}` shape a single-command failure gets (§2, above). The buffered `results` are
+  output data, not merely an error message, so — like every other `--json` document — they belong on
+  stdout.
 
 - `source add`'s per-item output — `{"id": ..., "store": {"name": ...}, "kind": ...}` per source,
   wrapped as described above — is identical whether the source was persisted locally or via a
