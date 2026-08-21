@@ -55,14 +55,21 @@ pub(crate) fn format_snippet(snippet: &str, max_chars: usize) -> String {
 }
 
 /// Print an error and exit with the correct exit code.
+///
+/// In `--json` mode the error envelope goes to **stdout**, not stderr —
+/// stdout is the only channel a `--json` caller is ever guaranteed to be
+/// pure JSON, success or failure (specs/05-surfaces.md §2.2, issue #260).
+/// stderr in `--json` mode carries diagnostics only (progress, warnings) and
+/// is never meant to be parsed, so nothing that lands there — including a
+/// local-model download's progress output — can corrupt a machine-readable
+/// result.
 pub fn exit_err(err: &Error, json_mode: bool) -> ! {
     let code = err.exit_code();
     if json_mode {
-        let v = json!({
+        print_json(&json!({
             "error": err.code(),
             "message": err.to_string(),
-        });
-        eprintln!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        }));
     } else {
         eprintln!("error: {}", err);
     }
@@ -79,10 +86,10 @@ pub fn exit_err(err: &Error, json_mode: bool) -> ! {
 /// validate-then-persist restructuring across the multi-argument axis is
 /// tracked separately as #174). Mirrors `cmds::index::report_index_outcomes`'s
 /// existing pattern: print a `"status"`-tagged JSON document to stdout, then
-/// exit explicitly, rather than routing through `exit_err`'s stderr-only
-/// shape — `results` is output data a caller may need, not just an error
-/// message, so it belongs on stdout like every other `--json` document
-/// (specs/05-surfaces.md §2.2).
+/// exit explicitly. Both this and plain `exit_err` write to stdout now;
+/// this helper exists because `results` is additional output data a caller
+/// may need to preserve, and `exit_err`'s bare `{"error", "message"}` shape
+/// has no field for it.
 ///
 /// Only meaningful in `--json` mode: non-JSON output already prints each
 /// success as it happens, so callers should keep using `exit_err` directly
