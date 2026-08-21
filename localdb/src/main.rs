@@ -95,11 +95,17 @@ pub struct Cli {
 /// See specs/05-surfaces.md §2.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Initialize config and data directory; prompt for first-run model download.
+    /// Optional bootstrap: write the config, create the data/models/logs
+    /// directories, and print the resolved paths.
     ///
-    /// Runs before any store exists. Not store-scoped: passing `--store`
-    /// exits 2.
-    Init,
+    /// Never required — every command except `db status`/`migrate`/`downgrade`/`vacuum`
+    /// scaffolds on first use. Not store-scoped: passing `--store` exits 2.
+    Init {
+        /// Prepare the configured embedder now, downloading a local model up
+        /// front instead of on the first `index`/`search`.
+        #[arg(long)]
+        download_model: bool,
+    },
 
     /// Start the HTTP API daemon (file watching, scheduled refresh, REST API).
     ///
@@ -506,7 +512,7 @@ fn main() {
     };
 
     match &cli.command {
-        Command::Init => cli::run_init(&ctx),
+        Command::Init { download_model } => cli::run_init(&ctx, *download_model),
         Command::Serve => cli::run_serve(&ctx),
         Command::Mcp { allow_write } => cli::run_mcp(&ctx, *allow_write),
         Command::Status => cli::run_status(&ctx),
@@ -764,6 +770,26 @@ mod tests {
                 .unwrap()
                 .command,
             Command::Db(DbCommand::Vacuum)
+        ));
+    }
+
+    /// `localdb init`/`localdb init --download-model` parse the new flag.
+    #[test]
+    fn init_download_model_flag_parses() {
+        assert!(matches!(
+            Cli::try_parse_from(["localdb", "init"]).unwrap().command,
+            Command::Init {
+                download_model: false
+            }
+        ));
+
+        assert!(matches!(
+            Cli::try_parse_from(["localdb", "init", "--download-model"])
+                .unwrap()
+                .command,
+            Command::Init {
+                download_model: true
+            }
         ));
     }
 

@@ -53,8 +53,8 @@ The `RetrievalStore` trait implementation backed by libsql (DiskANN vectors + FT
 unified database file at `<data_dir>/localdb.db` holds everything. BM25 full-text search uses
 SQLite's FTS5 virtual table. Dense search uses the DiskANN vector index (`libsql_vector_idx`). RRF
 fusion is done in `core`. In-process, writes serialise on one mutex-guarded writer connection while
-reads are served from a small round-robin pool of read-only connections, so reads no longer block
-on writes within a process. See [specs/01-architecture.md](../specs/01-architecture.md) §2.
+reads are served from a small round-robin pool of read-only connections, so reads no longer block on
+writes within a process. See [specs/01-architecture.md](../specs/01-architecture.md) §2.
 
 Schema changes go through an explicit migrations runner (`store-libsql/src/migrations/`): a frozen
 baseline DDL snapshot (`baseline.rs`, `PRAGMA user_version = 4`) plus a linear, numbered chain of
@@ -84,12 +84,11 @@ visible. Multi-process is the first-class concurrency model — the daemon is on
 (CLI sessions, multiple stdio MCP servers); concurrent writers serialise via SQLite WAL +
 `busy_timeout=5000`. Ingestion via `POST /v1/jobs` runs the real pipeline
 (`server::job_exec::run_job`) through an async job queue with a configurable worker pool
-(`server.job_workers`, default 1) and a per-store in-flight guard (issues #187, #208) — not a
-stub; a second submission for a store already running rejects with `index_in_progress`, 409, while
-jobs for different stores run concurrently up to `server.job_workers` workers. `GET
-/jobs/{id}/events` streams the job's live progress over SSE (issue #83). The URL-refresh scheduler
-submits through the same job engine. See
-[specs/05-surfaces.md](../specs/05-surfaces.md) §3.
+(`server.job_workers`, default 1) and a per-store in-flight guard (issues #187, #208) — not a stub;
+a second submission for a store already running rejects with `index_in_progress`, 409, while jobs
+for different stores run concurrently up to `server.job_workers` workers. `GET /jobs/{id}/events`
+streams the job's live progress over SSE (issue #83). The URL-refresh scheduler submits through the
+same job engine. See [specs/05-surfaces.md](../specs/05-surfaces.md) §3.
 
 ### `mcp`
 
@@ -188,7 +187,8 @@ configuration is needed for the common case. See
 ## On-disk layout
 
 The config file and the data directory are independent paths (`--config` / `LOCALDB_CONFIG` choose
-the former; `paths.data` the latter). After `localdb init` and `localdb index`:
+the former; `paths.data` the latter). Both are created implicitly on first use (or explicitly via
+`localdb init`); after `localdb index` has run:
 
 ```
 <config_dir>/
@@ -201,8 +201,7 @@ the former; `paths.data` the latter). After `localdb init` and `localdb index`:
   daemon.sock                  # unix socket (present only while daemon runs)
 ```
 
-The default `data_dir` on macOS is `~/Library/Application Support/com.localdb.localdb.localdb/data`
-(the bundle ID is intentionally verbose — see [Known gaps §4](#known-gaps)). Override with
+The default `data_dir` on macOS is `~/Library/Application Support/localdb/data`. Override with
 `paths.data` in `config.yaml` or point to a custom config with `--config`.
 
 The `models/` directory (configured via `paths.models`) is populated on first `localdb index` or
@@ -220,14 +219,14 @@ library — a separate, sibling directory to `models/`, not configurable via `pa
 
 ## Exit codes
 
-| Code | Meaning                                                                    |
-| ---- | --------------------------------------------------------------------------- |
-| 0    | OK                                                                         |
-| 1    | Internal error                                                             |
-| 2    | Invalid usage or config (clap errors, config parse failures)              |
-| 3    | Not found (unknown store, unknown source)                                 |
-| 4    | Conflict / already running (duplicate store, second daemon)               |
-| 5    | Unavailable (daemon unreachable, model missing, rate-limited upstream)     |
+| Code | Meaning                                                                |
+| ---- | ---------------------------------------------------------------------- |
+| 0    | OK                                                                     |
+| 1    | Internal error                                                         |
+| 2    | Invalid usage or config (clap errors, config parse failures)           |
+| 3    | Not found (unknown store, unknown source)                              |
+| 4    | Conflict / already running (duplicate store, second daemon)            |
+| 5    | Unavailable (daemon unreachable, model missing, rate-limited upstream) |
 
 ---
 
@@ -314,14 +313,14 @@ open.
 
 **1. ~~HTTP daemon `POST /v1/jobs` is a no-op~~ — RESOLVED.**
 ([#187](https://github.com/dokterbob/localdb/issues/187),
-[#208](https://github.com/dokterbob/localdb/issues/208)) `POST /v1/jobs` now runs the real
-ingestion pipeline (`server::job_exec::run_job`) through an async job queue with a configurable
-worker pool (`server.job_workers`, default 1) and a per-store in-flight guard — a duplicate
-submission for a store already running rejects with `index_in_progress` (409), rather than silently
-no-opping. `localdb index` submits a job to the daemon and attaches to `GET /v1/jobs/{id}/events`
-(SSE, issue #83) for live progress, falling back to polling `GET /v1/jobs/{id}` if the stream can't
-be established; the summary, `--json`, and `--strict` output are identical to embedded mode. `index
---delete` also works daemon-attached now (`deletion_policy` on the job request). Stopping the
+[#208](https://github.com/dokterbob/localdb/issues/208)) `POST /v1/jobs` now runs the real ingestion
+pipeline (`server::job_exec::run_job`) through an async job queue with a configurable worker pool
+(`server.job_workers`, default 1) and a per-store in-flight guard — a duplicate submission for a
+store already running rejects with `index_in_progress` (409), rather than silently no-opping.
+`localdb index` submits a job to the daemon and attaches to `GET /v1/jobs/{id}/events` (SSE, issue
+#83) for live progress, falling back to polling `GET /v1/jobs/{id}` if the stream can't be
+established; the summary, `--json`, and `--strict` output are identical to embedded mode.
+`index --delete` also works daemon-attached now (`deletion_policy` on the job request). Stopping the
 daemon before `localdb index` is no longer necessary. See
 [specs/05-surfaces.md](../specs/05-surfaces.md) §2/§3 for the full contract. The worker-pool size
 (`server.job_workers`) is operator-configurable as of #208: values greater than 1 let jobs for
@@ -337,12 +336,10 @@ exist on disk. Validation is deferred to index time. The source spec validation 
 
 **Gap #3. macOS default paths use a verbose bundle ID.**
 ([#15](https://github.com/dokterbob/localdb/issues/15)) **Resolved as of 2026-06-28:**
-`core/src/config/platform.rs` now uses `ProjectDirs::from("", "", "localdb")` for clean default
-paths. The default config, data, and model-cache locations on macOS all live under the bundle ID
-`com.localdb.localdb.localdb` (e.g. data at
-`~/Library/Application Support/com.localdb.localdb.localdb/data`). The triple-repeat comes from
-`ProjectDirs::from("com.localdb", "localdb", "localdb")` in `core/src/config/platform.rs`. Specs/03
-shows shorter `localdb/` paths. Cosmetic; override with `paths.*` in config for cleaner locations.
+`core/src/config/platform.rs` now uses `ProjectDirs::from("", "", "localdb")`, so macOS defaults
+live under a plain `localdb` segment — config and data at `~/Library/Application Support/localdb/`,
+the model cache at `~/Library/Caches/localdb/models/`, logs at `~/Library/Logs/localdb/` — matching
+the paths `specs/03-config.md` specifies.
 
 **4. The CoreML context bundle ships only the L512 sequence-length bucket.** The CoreML backend
 (`local-coreml` feature; see [Platform notes](#platform-notes)) reads its bucket manifest from HF

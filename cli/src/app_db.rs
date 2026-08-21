@@ -112,25 +112,12 @@ pub(crate) async fn open_app_db_or_exit(ctx: &CliContext, config_loader: &Config
     }
 }
 
-/// F1-cli: Load config with fallback to platform defaults for read-only commands.
-///
-/// When the config file is malformed or unreadable, read-only commands (search,
-/// store list, status) should still work using platform default config and an
-/// empty temp DB, rather than hard failing.
-///
-/// A thin wrapper over [`load_config_lenient`] (the config half) and
-/// [`open_app_db_lenient_or_exit`] (the DB-open half) — see
+/// The config-only half of the fallback-to-platform-defaults behavior used by
+/// every lenient-path command (`search`, `status`, `store list`) — pairs with
+/// [`open_app_db_lenient_or_exit`] (the DB-open half); see
 /// [`open_app_db_or_exit`]'s doc comment for why `command_table::dispatch`
 /// call sites, and every other caller in this crate, use the two halves
-/// separately instead.
-pub(crate) async fn load_app_db_lenient(ctx: &CliContext) -> (ConfigLoader, AppDb) {
-    let config_loader = load_config_lenient(ctx).await;
-    let db = open_app_db_lenient_or_exit(ctx, &config_loader).await;
-    (config_loader, db)
-}
-
-/// The config-only half of [`load_app_db_lenient`]'s fallback-to-platform-defaults
-/// behavior — see that function's doc comment. Factored out so
+/// separately rather than through a combined wrapper. Factored out so
 /// `command_table::dispatch` call sites can select their DB-open moment
 /// independently (issue #187 review, finding G4).
 ///
@@ -241,9 +228,10 @@ pub(crate) async fn load_config_lenient(ctx: &CliContext) -> ConfigLoader {
     }
 }
 
-/// The DB-open half of [`load_app_db_lenient`], including its
-/// `RuntimeStateLocked` 100ms-retry. Exits on failure via `exit_err`, exactly
-/// as `load_app_db_lenient` always did — factored out for the same reason as
+/// The DB-open half of the lenient path, pairing with
+/// [`load_config_lenient`] (the config half), including its
+/// `RuntimeStateLocked` 100ms-retry. Exits on failure via `exit_err` —
+/// factored out for the same reason as
 /// `open_app_db_or_exit` (issue #187 review, finding G4): so
 /// `command_table::dispatch` call sites can defer the open until the daemon
 /// probe comes back `NotRunning`.

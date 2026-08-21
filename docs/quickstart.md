@@ -6,54 +6,38 @@ automatically along the way; an explicit init step is optional.
 
 For installation instructions, see [install.md](install.md).
 
-## Step 1 — (Optional) Initialize
+## Step 1 — Check initial status
 
-An explicit init step is no longer required: the config file, data/models/logs directories, and a
-store named `default` are created automatically the first time you run any command below — the
-`store add` in Step 4 would create them just as well if you skipped straight to it. `localdb init`
-still exists as an explicit, idempotent way to set things up first:
+Confirm the installation is working:
 
 ```bash
-localdb init
+localdb status
 ```
 
 ```
-Initialized localdb at ~/Library/Application Support/com.localdb.localdb.localdb
-  Config: ~/Library/Application Support/com.localdb.localdb.localdb/config.yaml
-  Data:   ~/Library/Application Support/com.localdb.localdb.localdb/data
+daemon: not running (embedded mode)
+stores (1):
+  default [libsql] 0 documents, 0 chunks
+
+database: ~/Library/Application Support/localdb/data/localdb.db
+  size: 140.0 KB (+ 0 B WAL)
+  largest tables:
+    sources — 24.0 KB
+    resources — 16.0 KB
+    chunks — 16.0 KB
+    stores — 12.0 KB
+    blocks — 12.0 KB
 ```
 
-(Paths shown are the macOS defaults — see [configuration.md](configuration.md) for Linux paths and
-the `--config` flag. Yes, the `com.localdb.localdb.localdb` segment is verbose; see
-[architecture.md known gaps](architecture.md#known-gaps).)
-
-The generated `config.yaml` is a commented template with every key at its default value, spelled out
-for discoverability — not a bare stub. It starts:
-
-```yaml
-# yaml-language-server: $schema=https://raw.githubusercontent.com/dokterbob/localdb/main/schema/config.schema.json
-#
-# localdb configuration — generated automatically on first run.
-# Full reference: docs/configuration.md
-#
-# Every key below is optional except `version`. Unknown keys are a hard
-# error (typos are caught, not silently ignored).
-# `$schema` (above and below) enables autocomplete/inline validation in any
-# editor speaking the yaml-language-server protocol (VS Code + "YAML"
-# extension, Zed, most LSP-aware editors).
-
-version: 1
-$schema: https://raw.githubusercontent.com/dokterbob/localdb/main/schema/config.schema.json
-```
-
-See [configuration.md](configuration.md#config-is-created-for-you) for the full generated file and
-the `$schema` editor-integration section.
-
-> **Note on the model download:** the default embedder (`provider: local`,
-> `pplx-embed-context-v1-0.6b`) is downloaded from HuggingFace (~706 MB) the first time
-> `localdb index` or `localdb search` runs — not at init/first-run time. No API key or license
-> click-through is required. Subsequent runs use the cached model. See
-> [install.md#a-note-on-embedding-models](install.md#a-note-on-embedding-models).
+Running this — or any command other than `db status`/`migrate`/`downgrade`/`vacuum` — is what
+creates the config file, along with the data/models/logs directories, on first use; there's no
+separate init step required. Scaffolding also creates a `default` store, which is why it already
+shows up above. The generated `config.yaml` is a commented template with every key at its default
+value, spelled out for discoverability, not a bare stub; see
+[configuration.md#config-is-created-for-you](configuration.md#config-is-created-for-you) for the
+full generated file and the `$schema` editor-integration section. If you'd rather do this explicitly
+up front instead of implicitly on first use — e.g. to review the generated paths, or to pre-download
+the embedding model with `--download-model` — see `localdb init` in [cli.md](cli.md#localdb-init).
 
 ## Step 2 — (Optional) Override data paths
 
@@ -71,21 +55,7 @@ paths:
 The config file path can also be set with the `LOCALDB_CONFIG` environment variable or the
 `--config <path>` flag on any command.
 
-## Step 3 — Check initial status
-
-Confirm the installation is working:
-
-```bash
-localdb status
-```
-
-```
-daemon: not running (embedded mode)
-stores (0):
-  (none)
-```
-
-## Step 4 — Create a store
+## Step 3 — Create a store
 
 A store is a named, isolated index. Create one called `notes`:
 
@@ -104,12 +74,14 @@ localdb store list
 ```
 
 ```
+default [libsql]
 notes [libsql]
 ```
 
-The `[libsql]` label is the storage backend.
+`default` is the store scaffolding created back in Step 1; `notes` is the one just added. The
+`[libsql]` label is the storage backend.
 
-## Step 5 — Add a source
+## Step 4 — Add a source
 
 Point the `notes` store at a directory of files. Here we use `~/notes` as the source path:
 
@@ -131,7 +103,7 @@ localdb source list --store notes
 01KTVH6AY4DC84HWW7M2PP4F0X [path] /home/user/notes
 ```
 
-## Step 6 — Index
+## Step 5 — Index
 
 Scan the source directory and write chunks to the store:
 
@@ -146,6 +118,13 @@ Index complete: 3 indexed, 0 skipped, 3 chunks written, 0 unsupported, 0 errors
 
 (Output reflects a corpus of three files; your counts will differ.)
 
+> **Note on the model download:** the default embedder (`provider: local`,
+> `pplx-embed-context-v1-0.6b`) is downloaded from HuggingFace (~706 MB) the first time
+> `localdb index` or `localdb search` runs. No API key or license click-through is required.
+> Subsequent runs use the cached model. To fetch it ahead of time instead, run
+> `localdb init --download-model` (see [cli.md](cli.md#localdb-init)). See
+> [install.md#a-note-on-embedding-models](install.md#a-note-on-embedding-models) for details.
+
 After indexing, the on-disk layout under the data directory looks like:
 
 ```
@@ -155,7 +134,7 @@ data/
   localdb.db-shm        # shared-memory sidecar (libsql managed)
 ```
 
-## Step 7 — Search
+## Step 6 — Search
 
 Run a plain-text search across the indexed store:
 
@@ -261,7 +240,7 @@ real indexing run. `score`, `store` and `provenance.fetched_at` are illustrative
 (`pplx-embed-context-v1-0.6b` by default). `fused` is the Reciprocal Rank Fusion score used for
 final ranking, combining both components.
 
-## Step 8 — Verify status after indexing
+## Step 7 — Verify status after indexing
 
 ```bash
 localdb status

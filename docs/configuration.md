@@ -23,7 +23,7 @@ LOCALDB_CONFIG=~/myproject/localdb.yaml localdb status
 
 | Platform | Default path                                                                           |
 | -------- | -------------------------------------------------------------------------------------- |
-| macOS    | `~/Library/Application Support/com.localdb.localdb.localdb/config.yaml`                |
+| macOS    | `~/Library/Application Support/localdb/config.yaml`                                    |
 | Linux    | `$XDG_CONFIG_HOME/localdb/config.yaml` (falls back to `~/.config/localdb/config.yaml`) |
 
 Whichever path this resolves to, it's created automatically the first time you run a command against
@@ -31,11 +31,6 @@ it if nothing is there yet (see [Config is created for you](#config-is-created-f
 `localdb init` writes to the same resolved path explicitly, if you'd rather run it up front. The
 config location and the data directory are **independent** — the config file does not have to live
 inside the data directory. See `paths.data` below.
-
-> **Note (macOS bundle ID):** on macOS the platform-directories library derives a bundle identifier
-> `com.localdb.localdb.localdb` that is used for the config dir, data dir, and model cache (the spec
-> table in [specs/03-config.md](../specs/03-config.md) shows the intended shorter `localdb/` paths —
-> a known divergence). Override `paths.*` in the config for cleaner locations.
 
 ---
 
@@ -195,23 +190,23 @@ http:
     burst: 4 # token-bucket burst capacity above the sustained rate
 ```
 
-| Field                          | Default | Notes                                                                     |
-| ------------------------------- | ------- | -------------------------------------------------------------------------- |
-| `user_agent`                    | `~`     | `~`/omitted means `localdb/<version> (+https://github.com/dokterbob/localdb)` |
-| `max_retries`                   | `3`     | Retries for a 429/408/5xx response or a network timeout/connect failure before giving up; other 4xx statuses are never retried |
-| `rate_limit.requests_per_second` | `1`     | Sustained requests per second to a single public destination host (integer; must be `>= 1`) |
-| `rate_limit.burst`               | `4`     | Token-bucket burst capacity above the sustained rate (integer; must be `>= 1`) |
+| Field                            | Default | Notes                                                                                                                          |
+| -------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `user_agent`                     | `~`     | `~`/omitted means `localdb/<version> (+https://github.com/dokterbob/localdb)`                                                  |
+| `max_retries`                    | `3`     | Retries for a 429/408/5xx response or a network timeout/connect failure before giving up; other 4xx statuses are never retried |
+| `rate_limit.requests_per_second` | `1`     | Sustained requests per second to a single public destination host (integer; must be `>= 1`)                                    |
+| `rate_limit.burst`               | `4`     | Token-bucket burst capacity above the sustained rate (integer; must be `>= 1`)                                                 |
 
 Loopback and private/link-local destination hosts (a `url` source or a feed's own URL pointed at a
-homelab or LAN service) are exempt from `rate_limit` pacing — they're operator-owned, so pacing
-them protects against nothing. Retry still applies to them. Hosted embedding providers (`embed`)
-get retry and `Retry-After` handling from the same layer but no proactive pacing — a deliberate
-choice, since they're paid APIs the operator already controls the request rate to.
+homelab or LAN service) are exempt from `rate_limit` pacing — they're operator-owned, so pacing them
+protects against nothing. Retry still applies to them. Hosted embedding providers (`embed`) get
+retry and `Retry-After` handling from the same layer but no proactive pacing — a deliberate choice,
+since they're paid APIs the operator already controls the request rate to.
 
-A `Retry-After` header is honored up to 30 s inline (a larger value gives up on the current
-document with `rate_limited` rather than blocking the job); it's also recorded as that host's
-pacing cooldown (capped at 60 s) regardless, so a server's own guidance still shapes the rate of
-later requests even when the current document didn't wait for it.
+A `Retry-After` header is honored up to 30 s inline (a larger value gives up on the current document
+with `rate_limited` rather than blocking the job); it's also recorded as that host's pacing cooldown
+(capped at 60 s) regardless, so a server's own guidance still shapes the rate of later requests even
+when the current document didn't wait for it.
 
 ---
 
@@ -228,11 +223,11 @@ paths:
 
 **Platform defaults:**
 
-| Item                            | macOS                                                             | Linux                             |
-| ------------------------------- | ----------------------------------------------------------------- | --------------------------------- |
-| Data (unified database, socket) | `~/Library/Application Support/com.localdb.localdb.localdb/data/` | `$XDG_DATA_HOME/localdb/`         |
-| Model cache                     | `~/Library/Caches/com.localdb.localdb.localdb/models/`            | `$XDG_CACHE_HOME/localdb/models/` |
-| Logs                            | `~/Library/Logs/localdb/`                                         | `$XDG_STATE_HOME/localdb/logs/`   |
+| Item                            | macOS                                         | Linux                             |
+| ------------------------------- | --------------------------------------------- | --------------------------------- |
+| Data (unified database, socket) | `~/Library/Application Support/localdb/data/` | `$XDG_DATA_HOME/localdb/`         |
+| Model cache                     | `~/Library/Caches/localdb/models/`            | `$XDG_CACHE_HOME/localdb/models/` |
+| Logs                            | `~/Library/Logs/localdb/`                     | `$XDG_STATE_HOME/localdb/logs/`   |
 
 Tilde expansion (`~`) is supported.
 

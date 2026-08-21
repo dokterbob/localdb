@@ -192,7 +192,7 @@ impl ModelCache {
         if !self.allow_download {
             return Err(EmbedError::ModelMissing(format!(
                 "model '{}' is not in the cache at '{}'. \
-                 Run `localdb init` to download models, or set `LOCALDB_ALLOW_MODEL_DOWNLOAD=1`.",
+                 Run `localdb init --download-model` to download models, or set `LOCALDB_ALLOW_MODEL_DOWNLOAD=1`.",
                 spec.model_id,
                 self.model_dir(&spec.model_id).display()
             )));

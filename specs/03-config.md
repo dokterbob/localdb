@@ -155,12 +155,13 @@ path; `paths.*` in config override the rest.
   (`stores[0].sources[1].refresh: invalid duration`). Surfaces map this to `invalid_config`
   ([05-surfaces.md](05-surfaces.md) §5).
 - **`http.rate_limit`:** `requests_per_second` and `burst` are both `u32` and must each be `>= 1`;
-  `0` is rejected with a path-precise message (`http.rate_limit.requests_per_second must be greater
-  than zero`, and likewise for `burst`) rather than silently disabling pacing.
+  `0` is rejected with a path-precise message
+  (`http.rate_limit.requests_per_second must be greater than zero`, and likewise for `burst`) rather
+  than silently disabling pacing.
 - **`server.job_workers`:** number of workers in the daemon's job queue (issue #208). `usize`,
   default `1`. `0` is rejected at load with `server.job_workers must be greater than zero`. Values
-  greater than 1 let jobs for **different** stores run concurrently; jobs for the **same** store
-  are always serialized via the per-store in-flight guard, regardless of worker count — see
+  greater than 1 let jobs for **different** stores run concurrently; jobs for the **same** store are
+  always serialized via the per-store in-flight guard, regardless of worker count — see
   [05-surfaces.md](05-surfaces.md) §3. Embedded (non-daemon) CLI indexing is unaffected: it always
   runs its own single-worker queue and never reads this key.
 - **Unknown keys:** hard error, not a warning. Catches typos (`chunking` vs `chunkng`) — the cost of
@@ -216,8 +217,11 @@ A genuinely absent config file is no longer a hard stop. Every CLI command that 
 `serve` — creates one on first use, transparently, before doing its own work, whether it goes
 through the strict load path (`store add`/`remove`, `source add`/`list`/`remove`, `index`, `mcp`,
 `serve`) or the lenient, fallback-to-platform-defaults read path (`search`, `status`, `store list`).
-`localdb init` ([05-surfaces.md](05-surfaces.md) §2) remains available as an explicit, idempotent
-alias — useful for setting things up before running anything else, but no longer required.
+`localdb init` ([05-surfaces.md](05-surfaces.md) §2) remains available as an optional, explicit
+bootstrap — it runs this same scaffolding, prints every resolved path, and, with `--download-model`,
+prepares the configured embedder up front (downloading a local model rather than deferring to the
+first `index`/`search`). It is never required: every command above scaffolds implicitly on first
+use.
 
 On a genuine first run (the resolved config path does not exist at all), scaffolding:
 

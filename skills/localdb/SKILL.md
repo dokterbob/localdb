@@ -18,25 +18,22 @@ no daemon or GPU needed.
 ## CLI crib sheet
 
 ```bash
-# 1. Initialize config and data directory (first time only)
-localdb init
-
-# 2. Create a runtime store
+# 1. Create a runtime store
 localdb store add notes
 
-# 3. Register a directory as a source on that store
+# 2. Register a directory as a source on that store
 localdb source add ~/notes --store notes
 
-# 3a. Or index a URL source
+# 2a. Or index a URL source
 localdb source add https://example.com/doc --store notes
 
-# 4. Index all sources in the store
+# 3. Index all sources in the store
 localdb index --store notes
 
-# 5. Search and get JSON citations
+# 4. Search and get JSON citations
 localdb search "reciprocal rank fusion" --store notes --json
 
-# 6. Extract URI + snippet from each citation with jq
+# 5. Extract URI + snippet from each citation with jq
 localdb search "your query" --store notes --json \
   | jq -r '.citations[] | "\(.uri)\n  \(.snippet)"'
 ```
