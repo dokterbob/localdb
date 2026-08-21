@@ -10,16 +10,22 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# The toolchain, its components, and its cross-compile targets all come from
+# `rust-toolchain.toml`. Runners ship with rustup, which reads that file and
+# provisions on demand, so no job installs a toolchain of its own — a job that
+# did would pin a *second*, different compiler and silently reintroduce the
+# drift the file exists to prevent. `rustup show active-toolchain` is a
+# named, cacheable step purely so provisioning failures and timings are legible
+# in the log rather than folded into the first cargo command.
+
 jobs:
   fmt:
     name: Formatting
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust stable with rustfmt
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain
       - name: Check formatting
         run: cargo fmt --all --check
 
@@ -28,10 +34,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust stable with clippy
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain
       - name: Install protoc
         uses: arduino/setup-protoc@v3
         with:
@@ -44,7 +48,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-clippy-
       - name: Run clippy (deny warnings)
@@ -58,10 +62,8 @@ jobs:
       id-token: write  # OIDC for the Qlty coverage upload (no token secret)
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust stable with llvm-tools
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain
       - name: Install protoc
         uses: arduino/setup-protoc@v3
         with:
@@ -74,7 +76,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-coverage-
       - name: Install cargo-llvm-cov
@@ -93,11 +95,10 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust stable with clippy
-        # @stable satisfies the local-coreml MSRV of Rust 1.85.
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      - name: Install the pinned toolchain
+        # `rust-toolchain.toml`'s channel also has to satisfy the local-coreml
+        # MSRV of Rust 1.85, which is above the workspace MSRV.
+        run: rustup show active-toolchain
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -106,7 +107,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-coreml-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-coreml-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-coreml-
       - name: Build embed with local-coreml
@@ -141,10 +142,11 @@ jobs:
             target: aarch64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      - name: Install the pinned toolchain
+        # Every target in this matrix is declared in `rust-toolchain.toml`, so
+        # rustup provisions them here; adding a target to the matrix without
+        # adding it there fails this step.
+        run: rustup show active-toolchain
       - name: Install protoc
         uses: arduino/setup-protoc@v3
         with:
@@ -161,7 +163,7 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
             ${{ runner.os }}-${{ matrix.target }}-cargo-
       - name: Build localdb for target
