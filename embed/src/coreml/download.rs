@@ -240,8 +240,13 @@ pub(crate) fn select_context_files(
 /// - `revision`: pinned commit sha.
 /// - `want`: requested fixed bucket sizes.
 /// - `into`: optional target directory; when `None`, the HF cache is used.
-/// - `show_progress`: reserved for future progress wiring (currently the
-///   hf-hub client handles its own retries; progress events are not surfaced).
+/// - `show_progress`: the caller's `DownloadProgress` intent (issue #261),
+///   threaded down honestly from `create_embedder` — but not yet acted on
+///   here: the `hf-hub` client this function drives handles its own
+///   retries and does not expose progress events to surface either way, so
+///   there is nothing to draw or suppress today. Kept as a parameter (rather
+///   than dropped) so this function's signature does not silently regress if
+///   `hf-hub` grows progress callbacks later.
 ///
 /// Returns the snapshot root directory such that
 /// `<root>/context/L512-int8/encoder.mlmodelc` resolves.
@@ -252,6 +257,7 @@ pub(crate) async fn download_bundle(
     into: Option<PathBuf>,
     show_progress: bool,
 ) -> Result<PathBuf, EmbedError> {
+    // Deliberate no-op — see `show_progress` above.
     let _ = show_progress;
     let (owner, name) = split_repo(repo)?;
 

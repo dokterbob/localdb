@@ -348,11 +348,16 @@ impl AppState {
         let http_settings_for_build = fetch::http::HttpSettings::from(&http_owned);
         let models_dir = self.inner.models_dir.clone();
         let built = localdb_core::run_blocking(move || {
+            // The cache key is `(EmbeddingPolicy, Vec<ProviderConfig>, HttpConfig)` —
+            // `DownloadProgress` isn't part of it. That's fine only because the
+            // daemon always passes the constant `Silent` here; if this ever
+            // varies per call, the cache key must grow to include it.
             embed::create_embedder(
                 &policy_owned,
                 &providers_for_build,
                 Some(&models_dir),
                 &http_settings_for_build,
+                embed::DownloadProgress::Silent,
             )
         })?;
         let embedder: Arc<dyn Embedder> = Arc::from(built);

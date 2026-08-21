@@ -107,6 +107,7 @@ pub(crate) async fn run_embedded_store_job(
             &config_loader.config.providers,
             Some(&config_loader.paths.models_dir),
             &(&config_loader.config.http).into(),
+            crate::progress::download_progress_for(ctx.json),
         ) {
             Ok(built) => {
                 #[cfg(test)]

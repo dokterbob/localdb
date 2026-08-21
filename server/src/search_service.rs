@@ -66,6 +66,7 @@ impl SearchService {
             &yaml.providers,
             Some(self.state.models_dir()),
             &(&yaml.http).into(),
+            embed::DownloadProgress::Silent,
         )
         .map_err(|e| {
             ApiError(CoreError::InvalidConfig {

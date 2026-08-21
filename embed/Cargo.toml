@@ -19,6 +19,9 @@ default = []
 local-onnx = ["dep:fastembed", "dep:ort", "dep:tokenizers", "dep:ndarray"]
 # Enable local CoreML inference (macOS/Apple Silicon only)
 local-coreml = ["dep:objc2", "dep:objc2-core-ml", "dep:objc2-foundation", "dep:half", "dep:tokenizers", "dep:hf-hub", "dep:block2"]
+# Exposes `create_embedder`'s last-received `DownloadProgress` so downstream
+# crates can prove they thread the caller's intent through (issue #261).
+test-support = []
 
 [dependencies]
 localdb-core = { path = "../core", version = "0.1.0" }

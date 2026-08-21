@@ -206,6 +206,7 @@ pub async fn run_job(
                 &yaml.providers,
                 Some(models_dir),
                 &(&yaml.http).into(),
+                embed::DownloadProgress::Silent,
             )?;
             Arc::from(built)
         }

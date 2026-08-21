@@ -111,6 +111,7 @@ impl DaemonAwareCommand for SearchCmd<'_> {
             &config_loader.config.providers,
             Some(&models_dir),
             &(&config_loader.config.http).into(),
+            crate::progress::download_progress_for(ctx.json),
         )
         .map_err(Error::from)?;
         // Parity with the daemon path (issue #187 review, finding 1):

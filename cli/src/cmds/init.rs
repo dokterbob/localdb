@@ -110,6 +110,7 @@ pub(crate) async fn run_init_async(ctx: &CliContext, download_model: bool) {
             &loader.config.providers,
             Some(&loader.paths.models_dir),
             &(&loader.config.http).into(),
+            crate::progress::download_progress_for(ctx.json),
         ) {
             Ok(_) => "ok",
             Err(e) => exit_err(&localdb_core::Error::from(e), ctx.json),

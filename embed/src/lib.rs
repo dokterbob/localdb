@@ -66,7 +66,10 @@ pub mod pplx_context_coreml;
 
 pub use contextual::{ContextualEmbedder, ContextualProviderSpec};
 pub use error::EmbedError;
-pub use factory::{create_embedder, infer_dim_encoding};
+pub use factory::{create_embedder, infer_dim_encoding, DownloadProgress};
+
+#[cfg(any(test, feature = "test-support"))]
+pub use factory::{last_download_progress, reset_last_download_progress};
 pub use model_cache::{ModelCache, ModelSpec};
 pub use openai::OpenAiEmbedder;
 pub use perplexity::{Perplexity, PerplexityEmbedder};

@@ -45,6 +45,9 @@ localdb-embed = { path = "../embed", version = "0.1.0", features = ["local-corem
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Test seam for asserting the CLI passes the correct `embed::DownloadProgress`
+# variant at each `create_embedder` call site (issue #261).
+localdb-embed = { path = "../embed", version = "0.1.0", features = ["test-support"] }
 # Real-server test harnesses for `job_attach.rs`'s daemon-routed paths
 # (submit/attach/SSE/poll-fallback error branches): both a real
 # `server::daemon::build_router` instance and a small hand-rolled mock router

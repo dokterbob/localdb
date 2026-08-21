@@ -100,6 +100,37 @@ pub fn infer_dim_encoding(
         })
 }
 
+/// Whether `create_embedder` may draw local-model *download* progress to
+/// stderr while constructing a local provider.
+///
+/// An enum rather than a bare `bool`: a bool call site reads
+/// `create_embedder(&policy, &providers, dir, &http, false)`, and nothing at
+/// that call site says what `false` means — it invites an inversion bug
+/// (silently drawing progress when the caller meant to suppress it, or vice
+/// versa) that a type-checked `DownloadProgress::Silent` rules out by
+/// construction. `cli::cmds::index::IndexErrorMode` is the in-repo precedent
+/// for this pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadProgress {
+    /// Suppress local-model download progress. Required for any caller whose
+    /// stderr is read as structured output (e.g. the CLI's `--json` error
+    /// envelope, issue #261) — an `indicatif` bar sharing that stream would
+    /// otherwise corrupt it.
+    Silent,
+    /// Allow local-model download progress to draw to stderr.
+    Show,
+}
+
+impl DownloadProgress {
+    // Only called from the `local-onnx`/`local-coreml` constructor call
+    // sites below, which convert to the `bool` those constructors take —
+    // with neither feature enabled, nothing calls it, hence the `allow`.
+    #[allow(dead_code)]
+    fn as_bool(self) -> bool {
+        matches!(self, Self::Show)
+    }
+}
+
 /// # `http_settings`
 ///
 /// Threaded through to the three hosted providers only (`openai-compatible`,
@@ -122,21 +153,44 @@ pub fn infer_dim_encoding(
 /// crate, like `fetch` itself, free of `core`'s config-format concerns (no
 /// need to know about `#[serde(default = ...)]` defaulting here) and reuses
 /// a conversion that already exists rather than inventing a second one.
+///
+/// # `download_progress`
+///
+/// Only affects the *local* provider branches (`local`, `local-onnx`,
+/// `local-coreml`) — hosted providers (`openai-compatible`, `perplexity`,
+/// `voyage`) download nothing, so the parameter is simply unused on those
+/// branches. Of the local branches, only the fastembed-backed path
+/// (`bge-small-en-v1.5`, built in `onnx.rs`) currently draws a live
+/// `indicatif` progress bar that bypasses `tracing` entirely (issue #261);
+/// the pplx ONNX paths (`pplx_onnx.rs`, `pplx_context_onnx.rs`) log download
+/// progress via `tracing::info!` instead, so they stay quiet unless the
+/// caller sets `RUST_LOG=info`, and the CoreML path
+/// (`coreml/download.rs`'s `download_bundle`) is a documented no-op today.
+/// It is required on every branch anyway — same reasoning as
+/// `http_settings` above — so correctness never depends on which local
+/// provider the operator happened to pick.
 pub fn create_embedder(
     policy: &EmbeddingPolicy,
     providers: &[ProviderConfig],
     models_dir: Option<&Path>,
     http_settings: &fetch::http::HttpSettings,
+    download_progress: DownloadProgress,
 ) -> Result<BoxedEmbedder, EmbedError> {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        *LAST_DOWNLOAD_PROGRESS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(download_progress);
+    }
     match policy.provider.as_str() {
         "fake" => create_fake(policy),
-        "local" => create_local_auto(policy, models_dir),
+        "local" => create_local_auto(policy, models_dir, download_progress),
         #[cfg(all(target_os = "macos", feature = "local-coreml"))]
-        "local-coreml" => create_coreml(policy, models_dir),
+        "local-coreml" => create_coreml(policy, models_dir, download_progress),
         #[cfg(not(all(target_os = "macos", feature = "local-coreml")))]
         "local-coreml" => create_coreml_unavailable(),
         #[cfg(feature = "local-onnx")]
-        "local-onnx" => create_onnx(policy, models_dir),
+        "local-onnx" => create_onnx(policy, models_dir, download_progress),
         #[cfg(not(feature = "local-onnx"))]
         "local-onnx" => create_onnx_unavailable(),
         "openai-compatible" => create_openai_compatible(policy, providers, http_settings),
@@ -144,6 +198,47 @@ pub fn create_embedder(
         "voyage" => create_voyage(providers, http_settings),
         unknown => unknown_provider(unknown),
     }
+}
+
+/// Test seam (gated behind `cfg(test)` or the `test-support` feature):
+/// records the [`DownloadProgress`] most recently passed to
+/// [`create_embedder`], across every provider branch — the record happens
+/// before the provider `match`, so it fires even for `provider: "fake"`,
+/// which does zero I/O and would otherwise give a downstream caller nothing
+/// to assert against.
+///
+/// Downstream crates (`server`, `cli`) that need to prove they thread their
+/// own caller's intent through `create_embedder` — rather than a hardcoded
+/// literal — enable this crate's `test-support` feature as a dev-dependency
+/// and read it via [`last_download_progress`]/[`reset_last_download_progress`].
+///
+/// This does **not** prove that fastembed's `indicatif` bar actually goes
+/// quiet when the resulting bool is `false` — that behavior is fastembed's
+/// (and, beneath it, `hf-hub`'s) contract, not something observable from
+/// here. It only proves that the value `create_embedder` received is the
+/// value that reaches the constructor call.
+#[cfg(any(test, feature = "test-support"))]
+static LAST_DOWNLOAD_PROGRESS: std::sync::Mutex<Option<DownloadProgress>> =
+    std::sync::Mutex::new(None);
+
+/// Returns the [`DownloadProgress`] most recently passed to
+/// [`create_embedder`], or `None` if it has not been called since process
+/// start (or since the last [`reset_last_download_progress`]).
+#[cfg(any(test, feature = "test-support"))]
+pub fn last_download_progress() -> Option<DownloadProgress> {
+    *LAST_DOWNLOAD_PROGRESS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Clears the value [`last_download_progress`] returns, so a test can
+/// distinguish "`create_embedder` was never called" from "`create_embedder`
+/// was called with `Silent`".
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_last_download_progress() {
+    *LAST_DOWNLOAD_PROGRESS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 fn create_fake(policy: &EmbeddingPolicy) -> Result<BoxedEmbedder, EmbedError> {
@@ -279,12 +374,15 @@ fn required_api_key(
 fn create_coreml(
     policy: &EmbeddingPolicy,
     models_dir: Option<&Path>,
+    download_progress: DownloadProgress,
 ) -> Result<BoxedEmbedder, EmbedError> {
     let cache_dir = models_dir.map(|p| p.to_path_buf());
     match policy.model.as_str() {
         "pplx-embed-context-v1-0.6b" => {
-            let embedder =
-                crate::pplx_context_coreml::PplxContextCoreMLEmbedder::new(cache_dir, true)?;
+            let embedder = crate::pplx_context_coreml::PplxContextCoreMLEmbedder::new(
+                cache_dir,
+                download_progress.as_bool(),
+            )?;
             Ok(Box::new(embedder))
         }
         unknown => Err(EmbedError::Internal(format!(
@@ -316,24 +414,27 @@ fn create_onnx_unavailable() -> Result<BoxedEmbedder, EmbedError> {
 fn create_onnx(
     policy: &EmbeddingPolicy,
     models_dir: Option<&Path>,
+    download_progress: DownloadProgress,
 ) -> Result<BoxedEmbedder, EmbedError> {
     // Idempotent: extracts/dlopens the embedded ONNX Runtime once per process. Also called
     // at the top of each embedder constructor below (OnnxEmbedder::new etc.) so that direct
     // construction (tests, examples) doesn't skip it — the OnceLock makes the repeat cheap.
     crate::ort_runtime::ensure_ort_initialized()?;
     let cache_dir = models_dir.map(|p| p.to_path_buf());
+    let show_progress = download_progress.as_bool();
     match policy.model.as_str() {
         "pplx-embed-context-v1-0.6b" => {
-            let embedder = crate::pplx_context_onnx::PplxContextOnnxEmbedder::new(cache_dir, true)?;
+            let embedder =
+                crate::pplx_context_onnx::PplxContextOnnxEmbedder::new(cache_dir, show_progress)?;
             Ok(Box::new(embedder))
         }
         "pplx-embed-v1-0.6b" => {
-            let embedder = crate::pplx_onnx::PplxOnnxEmbedder::new(cache_dir, true)?;
+            let embedder = crate::pplx_onnx::PplxOnnxEmbedder::new(cache_dir, show_progress)?;
             Ok(Box::new(embedder))
         }
         "bge-small-en-v1.5" => {
             use crate::onnx::{ModelChoice, OnnxEmbedder};
-            let embedder = OnnxEmbedder::new(ModelChoice::BgeSmallEnV15, cache_dir, true)?;
+            let embedder = OnnxEmbedder::new(ModelChoice::BgeSmallEnV15, cache_dir, show_progress)?;
             Ok(Box::new(embedder))
         }
         unknown => Err(EmbedError::Internal(format!(
@@ -347,12 +448,16 @@ fn create_onnx(
 fn create_local_auto(
     policy: &EmbeddingPolicy,
     models_dir: Option<&Path>,
+    download_progress: DownloadProgress,
 ) -> Result<BoxedEmbedder, EmbedError> {
     #[cfg(all(target_os = "macos", feature = "local-coreml"))]
     {
         if policy.model == "pplx-embed-context-v1-0.6b" {
             let cache_dir = models_dir.map(|p| p.to_path_buf());
-            match crate::pplx_context_coreml::PplxContextCoreMLEmbedder::new(cache_dir, true) {
+            match crate::pplx_context_coreml::PplxContextCoreMLEmbedder::new(
+                cache_dir,
+                download_progress.as_bool(),
+            ) {
                 Ok(embedder) => return Ok(Box::new(embedder)),
                 Err(e) => {
                     #[cfg(feature = "local-onnx")]
@@ -361,7 +466,7 @@ fn create_local_auto(
                             error = %e,
                             "CoreML embedder unavailable; falling back to ONNX"
                         );
-                        return create_onnx(policy, models_dir);
+                        return create_onnx(policy, models_dir, download_progress);
                     }
                     #[cfg(not(feature = "local-onnx"))]
                     {
@@ -372,7 +477,7 @@ fn create_local_auto(
         }
         #[cfg(feature = "local-onnx")]
         {
-            return create_onnx(policy, models_dir);
+            return create_onnx(policy, models_dir, download_progress);
         }
         #[cfg(not(feature = "local-onnx"))]
         {
@@ -389,11 +494,11 @@ fn create_local_auto(
     {
         #[cfg(feature = "local-onnx")]
         {
-            return create_onnx(policy, models_dir);
+            return create_onnx(policy, models_dir, download_progress);
         }
         #[cfg(not(feature = "local-onnx"))]
         {
-            let _ = (policy, models_dir);
+            let _ = (policy, models_dir, download_progress);
             return Err(EmbedError::Internal(
                 "provider 'local' requires a local backend: rebuild with \
                  `--features local-onnx` (all platforms) or `--features local-coreml` \
@@ -419,23 +524,41 @@ mod tests {
     #[test]
     fn fake_provider_creates_fake_embedder() {
         let policy = fake_policy("fake", "bge-small-en-v1.5");
-        let embedder =
-            create_embedder(&policy, &[], None, &fetch::http::HttpSettings::default()).unwrap();
+        let embedder = create_embedder(
+            &policy,
+            &[],
+            None,
+            &fetch::http::HttpSettings::default(),
+            DownloadProgress::Silent,
+        )
+        .unwrap();
         assert_eq!(embedder.embedding_dim(), 384);
     }
 
     #[test]
     fn fake_provider_default_dim() {
         let policy = fake_policy("fake", "unknown-model");
-        let embedder =
-            create_embedder(&policy, &[], None, &fetch::http::HttpSettings::default()).unwrap();
+        let embedder = create_embedder(
+            &policy,
+            &[],
+            None,
+            &fetch::http::HttpSettings::default(),
+            DownloadProgress::Silent,
+        )
+        .unwrap();
         assert_eq!(embedder.embedding_dim(), 128);
     }
 
     #[test]
     fn unknown_provider_returns_error() {
         let policy = fake_policy("does-not-exist", "some-model");
-        let result = create_embedder(&policy, &[], None, &fetch::http::HttpSettings::default());
+        let result = create_embedder(
+            &policy,
+            &[],
+            None,
+            &fetch::http::HttpSettings::default(),
+            DownloadProgress::Silent,
+        );
         assert!(result.is_err(), "unknown provider should return Err");
     }
 
@@ -454,6 +577,7 @@ mod tests {
             &[provider],
             None,
             &fetch::http::HttpSettings::default(),
+            DownloadProgress::Silent,
         );
         assert!(
             matches!(result, Err(EmbedError::ProviderNotConfigured(_))),
@@ -478,6 +602,7 @@ mod tests {
             &[provider],
             None,
             &fetch::http::HttpSettings::default(),
+            DownloadProgress::Silent,
         );
         assert!(
             matches!(result, Err(EmbedError::ProviderNotConfigured(_))),
@@ -501,6 +626,7 @@ mod tests {
             &[provider],
             None,
             &fetch::http::HttpSettings::default(),
+            DownloadProgress::Silent,
         );
         assert!(
             matches!(result, Err(EmbedError::ProviderNotConfigured(_))),
@@ -525,6 +651,7 @@ mod tests {
             &[provider],
             None,
             &fetch::http::HttpSettings::default(),
+            DownloadProgress::Silent,
         );
         assert!(
             matches!(result, Err(EmbedError::ProviderNotConfigured(_))),
@@ -537,8 +664,14 @@ mod tests {
     fn infer_dim_encoding_matches_fake_default() {
         let policy = fake_policy("fake", "unknown-model");
         let (dim, encoding) = infer_dim_encoding(&policy, &[]).unwrap();
-        let embedder =
-            create_embedder(&policy, &[], None, &fetch::http::HttpSettings::default()).unwrap();
+        let embedder = create_embedder(
+            &policy,
+            &[],
+            None,
+            &fetch::http::HttpSettings::default(),
+            DownloadProgress::Silent,
+        )
+        .unwrap();
         assert_eq!(dim, embedder.embedding_dim());
         assert_eq!(encoding, embedder.vector_encoding());
     }
@@ -547,8 +680,14 @@ mod tests {
     fn infer_dim_encoding_matches_fake_bge_dim() {
         let policy = fake_policy("fake", "bge-small-en-v1.5");
         let (dim, encoding) = infer_dim_encoding(&policy, &[]).unwrap();
-        let embedder =
-            create_embedder(&policy, &[], None, &fetch::http::HttpSettings::default()).unwrap();
+        let embedder = create_embedder(
+            &policy,
+            &[],
+            None,
+            &fetch::http::HttpSettings::default(),
+            DownloadProgress::Silent,
+        )
+        .unwrap();
         assert_eq!(dim, embedder.embedding_dim());
         assert_eq!(encoding, embedder.vector_encoding());
     }

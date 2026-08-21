@@ -109,6 +109,7 @@ impl LazyEmbedder {
                     &self.providers,
                     Some(&self.models_dir),
                     &self.http_settings,
+                    embed::DownloadProgress::Silent,
                 )
                 .map_err(Error::from)
             })

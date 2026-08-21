@@ -88,6 +88,23 @@ pub fn build_progress_sink(json_mode: bool, store_label: Option<&str>) -> Option
     }
 }
 
+/// Map CLI JSON mode to the download-progress mode passed to
+/// `embed::create_embedder`.
+///
+/// `--json` mode's stderr carries the machine-readable JSON error envelope
+/// (`cli::normalize::exit_err`) — an `indicatif` download bar sharing that
+/// stream would interleave with it and break a consumer parsing stderr as
+/// structured output (issue #261). `indicatif` bypasses `tracing`, so the
+/// CLI's tracing filter can't silence it; this has to be threaded through
+/// explicitly instead.
+pub fn download_progress_for(json_mode: bool) -> embed::DownloadProgress {
+    if json_mode {
+        embed::DownloadProgress::Silent
+    } else {
+        embed::DownloadProgress::Show
+    }
+}
+
 /// Prefix `line` with `[label] ` when `label` is `Some`; pass it through
 /// unchanged otherwise.
 fn prefixed(label: &Option<String>, line: &str) -> String {
@@ -598,6 +615,16 @@ mod tests {
     fn format_plain_progress_zero() {
         let s = format_plain_progress(0, 0, 0);
         assert_eq!(s, "indexed 0 (0 chunks)");
+    }
+
+    #[test]
+    fn download_progress_for_json_mode_is_silent() {
+        assert_eq!(download_progress_for(true), embed::DownloadProgress::Silent);
+    }
+
+    #[test]
+    fn download_progress_for_human_mode_is_show() {
+        assert_eq!(download_progress_for(false), embed::DownloadProgress::Show);
     }
 
     #[test]

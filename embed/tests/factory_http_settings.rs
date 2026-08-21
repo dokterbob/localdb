@@ -37,7 +37,7 @@
 //! `embed/src/factory.rs`), so this test's coverage of the threading itself
 //! generalizes; it is the network destination, not the wiring, that differs.
 
-use embed::create_embedder;
+use embed::{create_embedder, DownloadProgress};
 use fetch::http::HttpSettings;
 use localdb_core::config::schema::{EmbeddingPolicy, ProviderConfig};
 use localdb_core::DocumentChunks;
@@ -97,8 +97,14 @@ async fn create_embedder_threads_custom_user_agent_to_openai_compatible_request(
     let policy = openai_policy();
     let providers = [openai_provider(&server.uri())];
 
-    let embedder = create_embedder(&policy, &providers, None, &http_settings)
-        .expect("openai-compatible embedder should construct");
+    let embedder = create_embedder(
+        &policy,
+        &providers,
+        None,
+        &http_settings,
+        DownloadProgress::Silent,
+    )
+    .expect("openai-compatible embedder should construct");
 
     let result = embedder.embed_documents(one_doc()).await;
     assert!(
@@ -131,8 +137,14 @@ async fn create_embedder_default_http_settings_use_the_shared_default_user_agent
     let policy = openai_policy();
     let providers = [openai_provider(&server.uri())];
 
-    let embedder = create_embedder(&policy, &providers, None, &HttpSettings::default())
-        .expect("openai-compatible embedder should construct");
+    let embedder = create_embedder(
+        &policy,
+        &providers,
+        None,
+        &HttpSettings::default(),
+        DownloadProgress::Silent,
+    )
+    .expect("openai-compatible embedder should construct");
 
     let result = embedder.embed_documents(one_doc()).await;
     assert!(
@@ -168,8 +180,14 @@ async fn create_embedder_threads_custom_max_retries_to_openai_compatible_request
     let policy = openai_policy();
     let providers = [openai_provider(&server.uri())];
 
-    let embedder = create_embedder(&policy, &providers, None, &http_settings)
-        .expect("openai-compatible embedder should construct");
+    let embedder = create_embedder(
+        &policy,
+        &providers,
+        None,
+        &http_settings,
+        DownloadProgress::Silent,
+    )
+    .expect("openai-compatible embedder should construct");
 
     let result = embedder.embed_documents(one_doc()).await;
     assert!(
@@ -204,8 +222,14 @@ async fn create_embedder_zero_max_retries_makes_exactly_one_request() {
     let policy = openai_policy();
     let providers = [openai_provider(&server.uri())];
 
-    let embedder = create_embedder(&policy, &providers, None, &http_settings)
-        .expect("openai-compatible embedder should construct");
+    let embedder = create_embedder(
+        &policy,
+        &providers,
+        None,
+        &http_settings,
+        DownloadProgress::Silent,
+    )
+    .expect("openai-compatible embedder should construct");
 
     let result = embedder.embed_documents(one_doc()).await;
     assert!(result.is_err(), "endpoint always returns 500");
