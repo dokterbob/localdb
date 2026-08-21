@@ -440,6 +440,7 @@ pub async fn tool_get_document(
 /// `store_id` scopes the `backend` lookup (`DocumentInfo`, text, chunk
 /// count); `store_name` is only used to label the store in the returned
 /// JSON and in error messages.
+#[allow(clippy::result_large_err)] // see note on select_mcp_stores above
 async fn get_document_from_store(
     backend: &dyn StoreBackend,
     store_id: &str,
@@ -628,6 +629,7 @@ fn centered_window(anchor_idx: usize, total: usize, limit: usize) -> (usize, usi
 /// `get_chunks` still needs the full, ordered `ChunkRecord` list to paginate
 /// over, which that read model doesn't expose, so it keeps this brute-force
 /// scan over the session's own `RetrievalStore` handles.
+#[allow(clippy::result_large_err)] // see note on select_mcp_stores above
 async fn find_chunks_for_resource<'a>(
     stores: &'a [AvailableStore],
     doc_id: &str,
