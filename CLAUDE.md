@@ -16,6 +16,13 @@ qlty fmt --all        # wrap Markdown prose at 100 cols (qlty CLI, optional loca
 All the cargo commands run in CI (`.github/workflows/ci.yml`); `qlty fmt` is local-only.
 `cargo llvm-cov` requires the `llvm-tools-preview` component and `cargo-llvm-cov` installed.
 
+**The toolchain is pinned** in `rust-toolchain.toml`, so local lints match CI's exactly — a new
+stable release cannot turn every open PR red on its own. New lints arrive by bumping `channel`
+there, deliberately, in one PR. Run `cargo --version` and check it against `channel`: a `cargo`
+installed by anything other than rustup (Homebrew's `rust` formula, a distro package) ignores the
+pin, and you will lint against a different compiler than CI does. Note this is **not** the MSRV —
+that is `Cargo.toml`'s `rust-version`, and it moves separately.
+
 **Coverage gates:** workspace line coverage must be ≥ 80%; data-modifying paths must be ≥ 90%.
 Design rationale and enforcement detail: `specs/01-architecture.md §7`. Default workflow is **TDD**
 — write the failing test first.

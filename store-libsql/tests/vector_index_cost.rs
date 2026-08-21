@@ -68,7 +68,9 @@ async fn index_meta(conn: &Connection) -> Vec<(u8, u64)> {
         .await
         .unwrap();
     let blob: Vec<u8> = rows.next().await.unwrap().unwrap().get(0).unwrap();
-    blob.chunks_exact(9)
+    let (chunks, _remainder) = blob.as_chunks::<9>();
+    chunks
+        .iter()
         .map(|r| (r[0], u64::from_le_bytes(r[1..9].try_into().unwrap())))
         .collect()
 }
