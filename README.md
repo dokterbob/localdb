@@ -166,27 +166,24 @@ cut a release.
 ## 60-second quickstart
 
 ```bash
-# 1. Create a config file
-localdb init
-
-# 2. Create a store
+# 1. Create a store
 localdb store add notes
 
-# 3. Add sources — local directories and/or URLs
+# 2. Add sources — local directories and/or URLs
 localdb source add ~/notes --store notes
 localdb source add https://example.com/page --store notes   # optional
 
-# 4. Index
+# 3. Index
 localdb index --store notes
 
-# 5. Check what got indexed
+# 4. Check what got indexed
 localdb status
 
-# 6. Search
+# 5. Search
 localdb search "how does rust handle errors" --store notes
 ```
 
-Example output from step 6 (paths shown from a scratch run):
+Example output from step 5 (paths shown from a scratch run):
 
 ```
 1. file:///private/tmp/.../notes/rust-error-handling.md > Error handling in Rust

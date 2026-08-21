@@ -108,17 +108,13 @@ localdb completions bash >> ~/.bash_completion
 
 ## A note on embedding models
 
-`localdb init` prints:
+The default embedder (`pplx-embed-context-v1-0.6b`) is downloaded from the public HuggingFace repo
+`perplexity-ai/pplx-embed-context-v1-0.6b` (~706 MB) the first time `localdb index` or
+`localdb search` runs. No API key or license click-through is required. The model is cached under
+`paths.models` for subsequent runs.
 
-```
-Note: the default 'local' provider downloads its embedding model on first index.
-      Hosted providers (openai-compatible, perplexity, voyage) require an API key in config.
-```
-
-**This message is accurate.** The default embedder (`pplx-embed-context-v1-0.6b`) is downloaded from
-the public HuggingFace repo `perplexity-ai/pplx-embed-context-v1-0.6b` (~706 MB) the first time
-`localdb index` or `localdb search` runs. No API key or license click-through is required. The model
-is cached under `paths.models` for subsequent runs.
+To fetch it ahead of time instead of on the first `index`/`search`, run
+`localdb init --download-model` (see [cli.md](cli.md#localdb-init)).
 
 For details on the embedding pipeline and alternative model options, see
 [architecture.md](architecture.md) and

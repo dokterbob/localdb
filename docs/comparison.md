@@ -46,8 +46,8 @@ matches all at once:
   (`IngestorKind::Notion`, `Telegram`, `Signal`, `HackMd`, `Email`, `Transcription`, `Feed`)
   reserved for connectors landing next — see [specs/06-roadmap.md](../specs/06-roadmap.md) Phase 2
   and "Where localdb is headed" below.
-- **Sensible defaults.** `localdb init` to a working `search` is four commands (see the
-  [README quickstart](../README.md#60-second-quickstart)); the default embedding backend
+- **Sensible defaults.** No init step required — `store add` to a working `search` is three commands
+  (see the [README quickstart](../README.md#60-second-quickstart)); the default embedding backend
   auto-selects CoreML on Apple Silicon and falls back to ONNX elsewhere; no API key is required to
   start.
 - **Agent-first, not chat-first.** The CLI and MCP server are the primary surfaces, not a bolted-on

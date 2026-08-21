@@ -45,50 +45,88 @@ taxonomy that drives them.
 
 ## `localdb init`
 
-Initialize config and data directory.
+**Optional bootstrap — never a prerequisite.** Every other command scaffolds the config file and
+data/models/logs directories implicitly on first use, so you never have to run `init` before
+`store add`, `source add`, `index`, or `search`. Run it if you'd rather do that setup explicitly up
+front: it prints every resolved path, and `--download-model` lets you pull the embedding model ahead
+of time instead of on the first `index`/`search`.
 
 ```
-Initialize config and data directory; prompt for first-run model download
+Optional bootstrap: write the config, create the data/models/logs directories, and print the resolved paths
 
 Usage: localdb init [OPTIONS]
 
 Options:
-      --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
-      --json           Emit JSON output instead of human-readable text
-  -s, --store <NAME>   Operate on these stores (repeatable); a filter, not a selector
-  -y, --yes            Skip confirmation prompts for destructive operations
-  -h, --help           Print help (see more with '--help')
-  -V, --version        Print version
+      --config <PATH>   Path to config file (default: platform data dir / localdb / config.yaml)
+      --download-model  Prepare the configured embedder now, downloading a local model up front instead of on the first `index`/`search`
+      --json            Emit JSON output instead of human-readable text
+  -s, --store <NAME>    Operate on these stores (repeatable); a filter, not a selector
+  -y, --yes             Skip confirmation prompts for destructive operations
+  -h, --help            Print help (see more with '--help')
+  -V, --version         Print version
 ```
 
-Creates the config file and data directory if they do not exist. Prints the paths it created. The
-generated config file contains only `version: 1`; add `paths` and other keys as needed (see
-[specs/03-config.md](../specs/03-config.md)).
+Writes the config file (if it doesn't already exist) and creates the data/models/logs directories,
+then prints all four resolved paths. The generated config file is the full commented template with
+every key at its default value, not a bare stub — see
+[configuration.md#config-is-created-for-you](configuration.md#config-is-created-for-you). It also
+creates a store named `default`, unless the database can't be opened (see below).
+
+**`--download-model`:** prepares the configured embedder immediately. For the default local provider
+this downloads the ~706 MB model (`pplx-embed-context-v1-0.6b`, from HuggingFace, no API key or
+license click-through required) right away instead of deferring it to the first `index` or `search`.
+For a hosted provider (`openai-compatible`, `perplexity`, `voyage`) it just validates that the
+client can be constructed (e.g. that an API key is present). When this flag succeeds, `init` omits
+the "downloads its embedding model on first index" note from its output, since it's no longer true.
+
+**If the database can't be opened** — most commonly because it needs a schema migration — `init`
+prints a `Warning: ...` on stderr and still exits `0`. It still writes the config and creates the
+directories; it just skips creating the `default` store. For example:
+
+```
+Warning: invalid config: database schema version 5 is behind this build (v6); run 'localdb db migrate' to apply pending migrations
+```
 
 **Not store-scoped:** `init` runs before any store exists — the only store it creates is `default`,
 which `--store` cannot rename or redirect — so passing `--store` exits `2` rather than being
 silently ignored. The check runs first, so a misused flag creates no directories and writes no
 config.
 
-**Note on embedding models:** `init` prints a note about model download. It is accurate: the default
-embedder (`pplx-embed-context-v1-0.6b`, local ONNX) is downloaded from HuggingFace (~706 MB) the
-first time `localdb index` or `localdb search` runs. See the note in [`index`](#localdb-index) for
-details.
-
-**Example:**
+**Example (healthy run):**
 
 ```
-$ localdb init --config ~/notes/localdb-config.yaml
-Initialized localdb at ~/notes
-  Config: ~/notes/localdb-config.yaml
-  Data:   ~/Library/Application Support/com.localdb.localdb.localdb/data
+$ localdb init
+Initialized localdb at ~/Library/Application Support/localdb
+  Config: ~/Library/Application Support/localdb/config.yaml
+  Data:   ~/Library/Application Support/localdb/data
+  Models: ~/Library/Caches/localdb/models
+  Logs:   ~/Library/Logs/localdb
 
 Note: the default 'local' provider downloads its embedding model on first index.
       Hosted providers (openai-compatible, perplexity, voyage) require an API key in config.
 Run `localdb store add <name>` to create a store.
 ```
 
-(The data path defaults to the platform data dir unless `paths.data` is overridden in the config.)
+(The local-model note is omitted when `--download-model` succeeded; the `Run localdb store add` line
+is omitted when the default store was skipped because the database couldn't be opened. Paths shown
+are the macOS defaults.)
+
+**`--json` output:**
+
+```json
+{
+  "status": "ok",
+  "config_path": "…",
+  "data_dir": "…",
+  "models_dir": "…",
+  "logs_dir": "…",
+  "default_store": "ok",
+  "model_download": "skipped",
+  "warnings": []
+}
+```
+
+`default_store` and `model_download` are each `"ok"` or `"skipped"`.
 
 ---
 
@@ -1100,22 +1138,19 @@ The server reads newline-delimited JSON-RPC from stdin and writes responses to s
 ## Typical workflow
 
 ```sh
-# 1. Initialize (first time only)
-localdb init
-
-# 2. Create a runtime store
+# 1. Create a runtime store
 localdb store add notes
 
-# 3. Register a source directory
+# 2. Register a source directory
 localdb source add ~/notes --store notes
 
-# 4. Index
+# 3. Index
 localdb index --store notes
 
-# 5. Search
+# 4. Search
 localdb search "how does rust handle errors"
 
-# 6. Search with JSON output for scripting
+# 5. Search with JSON output for scripting
 localdb search "hybrid search" --store notes --json
 ```
 
