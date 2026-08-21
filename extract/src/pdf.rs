@@ -1202,10 +1202,8 @@ fn xmp_title(doc: &PdfDocument) -> Option<String> {
 /// and must go straight to the table.
 fn decode_pdf_text_string(bytes: &[u8]) -> String {
     if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
-        let units: Vec<u16> = bytes[2..]
-            .chunks_exact(2)
-            .map(|c| u16::from_be_bytes([c[0], c[1]]))
-            .collect();
+        let (chunks, _remainder) = bytes[2..].as_chunks::<2>();
+        let units: Vec<u16> = chunks.iter().map(|c| u16::from_be_bytes(*c)).collect();
         String::from_utf16_lossy(&units)
     } else if bytes.len() >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF {
         String::from_utf8_lossy(&bytes[3..]).into_owned()
