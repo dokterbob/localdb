@@ -341,6 +341,178 @@ fn init_is_idempotent() {
     cmd_with_dir(&dir).arg("init").assert().success();
 }
 
+/// `init --json` prints every resolved path — `models_dir`/`logs_dir` are new
+/// fields alongside the pre-existing `config_path`/`data_dir` (issue #225).
+#[test]
+fn init_json_output_includes_models_and_logs_dir() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["--json", "init"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "init --json should exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|_| panic!("init --json must emit valid JSON; got: {stdout}"));
+    assert!(v.get("models_dir").and_then(|x| x.as_str()).is_some());
+    assert!(v.get("logs_dir").and_then(|x| x.as_str()).is_some());
+}
+
+/// On a healthy fresh install, `init --json` reports an empty `warnings`
+/// list, a successfully-created `default` store, and (with no
+/// `--download-model` flag) a skipped model download (issue #225).
+#[test]
+fn init_json_output_includes_warnings_and_default_store_on_healthy_run() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["--json", "init"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "init --json should exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|_| panic!("init --json must emit valid JSON; got: {stdout}"));
+    assert_eq!(
+        v["warnings"].as_array().unwrap(),
+        &Vec::<serde_json::Value>::new()
+    );
+    assert_eq!(v["default_store"].as_str().unwrap(), "ok");
+    assert_eq!(v["model_download"].as_str().unwrap(), "skipped");
+}
+
+/// `init` on a DB that needs a schema migration (pre-baseline "legacy"
+/// version) must warn and exit 0 rather than hard-fail — `init`'s real job
+/// is the config + directories, not opening the store (issue #225). It must
+/// also not mutate a store it could not open.
+#[test]
+fn init_on_legacy_schema_db_warns_and_exits_0() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let db_path = data_dir.join("localdb.db");
+
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(stamp_user_version(&db_path, 2));
+
+    let output = cmd_with_dir(&dir)
+        .args(["--json", "init"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code().unwrap(),
+        0,
+        "init against a legacy-schema store must still exit 0; stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|_| panic!("init --json must emit valid JSON; got: {stdout}"));
+    assert_eq!(v["default_store"].as_str().unwrap(), "skipped");
+    let warnings = v["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1);
+    assert!(
+        warnings[0].as_str().unwrap().contains("db migrate"),
+        "warning should point at `localdb db migrate`; got: {warnings:?}"
+    );
+
+    // Config + all four directories must still have been created.
+    assert!(dir.path().join("config.yaml").exists());
+    assert!(data_dir.exists());
+    let config_content = std::fs::read_to_string(dir.path().join("config.yaml")).unwrap();
+    assert!(config_content.contains("provider: fake"));
+
+    // `init` must not have mutated the store it could not open.
+    let version = tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let db = libsql::Builder::new_local(&db_path).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        let mut rows = conn.query("PRAGMA user_version", ()).await.unwrap();
+        let v: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        v
+    });
+    assert_eq!(
+        version, 2,
+        "init warning on an unopenable store must not touch it"
+    );
+}
+
+/// Mirrors `init_on_legacy_schema_db_warns_and_exits_0` for the opposite
+/// side of the same code path: a schema *newer* than this binary understands
+/// (`VersionDisposition::TooNew`) must also warn and exit 0, not hard-fail
+/// (issue #225).
+#[test]
+fn init_on_too_new_schema_db_warns_and_exits_0() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    let db_path = data_dir.join("localdb.db");
+
+    // `store add` creates a fresh store at head, seeding a real schema this
+    // binary understands and can open normally (mirrors
+    // `source_list_routes_to_daemon_when_local_db_schema_is_incompatible`).
+    cmd_with_dir(&dir)
+        .args(["store", "add", "s1"])
+        .assert()
+        .success();
+
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(stamp_user_version(&db_path, 999_999));
+
+    let output = cmd_with_dir(&dir)
+        .args(["--json", "init"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code().unwrap(),
+        0,
+        "init against a too-new-schema store must still exit 0; stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|_| panic!("init --json must emit valid JSON; got: {stdout}"));
+    assert_eq!(v["default_store"].as_str().unwrap(), "skipped");
+    let warnings = v["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1);
+    assert!(
+        warnings[0].as_str().unwrap().contains("db downgrade"),
+        "warning should point at `localdb db downgrade` (too-new schema); got: {warnings:?}"
+    );
+
+    assert!(dir.path().join("config.yaml").exists());
+    assert!(data_dir.exists());
+
+    let version = tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let db = libsql::Builder::new_local(&db_path).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        let mut rows = conn.query("PRAGMA user_version", ()).await.unwrap();
+        let v: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        v
+    });
+    assert_eq!(
+        version, 999_999,
+        "init warning on an unopenable store must not touch it"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // implicit config scaffolding (issue #119/#120)
 // ---------------------------------------------------------------------------

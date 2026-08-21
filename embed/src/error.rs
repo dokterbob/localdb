@@ -6,7 +6,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum EmbedError {
     /// Local model is not in the cache and downloads are disabled.
-    #[error("model missing: {0}\nHint: run `localdb init` to download the default model, or set `LOCALDB_ALLOW_MODEL_DOWNLOAD=1`.")]
+    #[error("model missing: {0}\nHint: run `localdb init --download-model` to download the default model, or set `LOCALDB_ALLOW_MODEL_DOWNLOAD=1`.")]
     ModelMissing(String),
 
     /// The model checksum does not match the expected value.

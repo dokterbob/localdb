@@ -118,7 +118,7 @@ impl OnnxEmbedder {
         let model = TextEmbedding::try_new(opts).map_err(|e| {
             EmbedError::ModelMissing(format!(
                 "failed to load ONNX model '{}': {e}. \
-                 Run `localdb init` to download models, or ensure the model cache is populated.",
+                 Run `localdb init --download-model` to download models, or ensure the model cache is populated.",
                 model_choice.model_id()
             ))
         })?;
