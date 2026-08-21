@@ -105,6 +105,40 @@ pub fn download_progress_for(json_mode: bool) -> embed::DownloadProgress {
     }
 }
 
+/// Serializes every test that drives a real `embed::create_embedder` call
+/// against every other such test, so a `embed::reset_last_download_progress`
+/// / `embed::last_download_progress()` window in one test can't observe a
+/// value some other test's concurrent build just wrote.
+///
+/// An async-aware `tokio::sync::Mutex`, not `std::sync::Mutex`: each
+/// critical section spans real `.await` points (the command run itself),
+/// and holding a blocking `std::sync::MutexGuard` across an `.await` is
+/// exactly what `clippy::await_holding_lock` (enabled workspace-wide) exists
+/// to catch — this crate's tests should not need an `#[allow]` to stay
+/// interleaving-safe. Each `#[tokio::test]` gets its own dedicated runtime,
+/// so awaiting this lock from one test only ever waits on *another test's*
+/// guard, never risks a single-runtime self-deadlock.
+///
+/// Distinct from `cmds::index::EMBEDDER_BUILD_COUNT_TEST_LOCK`: that lock
+/// guards a different piece of process-wide state (a build counter) for a
+/// different pair of tests. Held today by the four threading tests in
+/// `download_progress_tests` — `run_init_async_threads_download_progress`,
+/// `search_run_embedded_threads_download_progress`,
+/// `run_mcp_async_threads_download_progress`, and
+/// `run_embedded_store_job_threads_download_progress` — plus the two
+/// pre-existing tests that build a real embedder as a side effect of driving
+/// one of those same call sites,
+/// `job_attach::tests::run_embedded_store_job_warns_and_continues_on_an_invalid_chunker_preset`
+/// and `cmds::source::tests::source_add_across_two_stores_builds_embedder_once`.
+/// Any future test that calls (even transitively) `embed::create_embedder`
+/// must take this lock too, or it can silently clobber another test's
+/// captured value — same failure mode `EMBEDDER_BUILD_COUNT_TEST_LOCK`'s own
+/// doc comment describes, and the reason this comment names holders rather
+/// than asserting the list above is exhaustive.
+#[cfg(test)]
+pub(crate) static DOWNLOAD_PROGRESS_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
 /// Prefix `line` with `[label] ` when `label` is `Some`; pass it through
 /// unchanged otherwise.
 fn prefixed(label: &Option<String>, line: &str) -> String {

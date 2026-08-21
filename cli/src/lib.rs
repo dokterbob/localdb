@@ -9,6 +9,8 @@ pub mod progress;
 mod app_db;
 mod command_table;
 mod daemon_client;
+#[cfg(test)]
+mod download_progress_tests;
 mod job_attach;
 mod normalize;
 mod scaffold;

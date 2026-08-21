@@ -801,15 +801,25 @@ mod tests {
     /// instead).
     #[tokio::test]
     async fn run_embedded_store_job_warns_and_continues_on_an_invalid_chunker_preset() {
-        // Held for the rest of this test:
-        // this test drives a real `embed::create_embedder` build as a side
-        // effect of the call below, incrementing the same process-wide
-        // `EMBEDDER_BUILD_COUNT` that
-        // `cmds::source::tests::source_add_across_two_stores_builds_embedder_once`
-        // measures — without this lock, `cargo test`'s default parallel
-        // execution can interleave that increment into the other test's
-        // measurement window. See `EMBEDDER_BUILD_COUNT_TEST_LOCK`'s doc
-        // comment in `cmds::index`.
+        // Held for the rest of this test, in this order (the consistent
+        // order every holder of both locks uses — see
+        // `progress::DOWNLOAD_PROGRESS_TEST_LOCK`'s doc comment):
+        //
+        // - `DOWNLOAD_PROGRESS_TEST_LOCK`: this test drives a real
+        //   `embed::create_embedder` build, which records to the same
+        //   process-wide `LAST_DOWNLOAD_PROGRESS` the
+        //   `download_progress_tests` module's four threading tests reset
+        //   and assert on — without this lock, this build could land inside
+        //   one of their reset/assert windows and clobber the value they
+        //   captured.
+        // - `EMBEDDER_BUILD_COUNT_TEST_LOCK`: that same build increments the
+        //   process-wide `EMBEDDER_BUILD_COUNT` that
+        //   `cmds::source::tests::source_add_across_two_stores_builds_embedder_once`
+        //   measures — without this lock, `cargo test`'s default parallel
+        //   execution can interleave that increment into the other test's
+        //   measurement window. See `EMBEDDER_BUILD_COUNT_TEST_LOCK`'s doc
+        //   comment in `cmds::index`.
+        let _download_guard = crate::progress::DOWNLOAD_PROGRESS_TEST_LOCK.lock().await;
         let _embedder_count_guard = crate::cmds::index::EMBEDDER_BUILD_COUNT_TEST_LOCK
             .lock()
             .await;

@@ -1366,15 +1366,27 @@ mod tests {
         use std::sync::atomic::Ordering;
         use tempfile::TempDir;
 
-        // Held for the rest of this test:
-        // `job_attach::tests::run_embedded_store_job_warns_and_continues_on_an_invalid_chunker_preset`
-        // also drives a real embedder build and shares this same
-        // process-wide counter — without this lock, `cargo test`'s default
-        // parallel execution can interleave that test's increment into
-        // this one's measurement window (observed: count == 2 instead of
-        // 1, indistinguishable from the real per-store-rebuild regression
-        // this test exists to catch). See `EMBEDDER_BUILD_COUNT_TEST_LOCK`'s
-        // doc comment.
+        // Held for the rest of this test, in this order (the consistent
+        // order every holder of both locks uses — see
+        // `progress::DOWNLOAD_PROGRESS_TEST_LOCK`'s doc comment):
+        //
+        // - `DOWNLOAD_PROGRESS_TEST_LOCK`: this test drives a real
+        //   `embed::create_embedder` build, which records to the same
+        //   process-wide `LAST_DOWNLOAD_PROGRESS` the
+        //   `download_progress_tests` module's four threading tests reset
+        //   and assert on — without this lock, this build could land inside
+        //   one of their reset/assert windows and clobber the value they
+        //   captured.
+        // - `EMBEDDER_BUILD_COUNT_TEST_LOCK`:
+        //   `job_attach::tests::run_embedded_store_job_warns_and_continues_on_an_invalid_chunker_preset`
+        //   also drives a real embedder build and shares this same
+        //   process-wide counter — without this lock, `cargo test`'s default
+        //   parallel execution can interleave that test's increment into
+        //   this one's measurement window (observed: count == 2 instead of
+        //   1, indistinguishable from the real per-store-rebuild regression
+        //   this test exists to catch). See `EMBEDDER_BUILD_COUNT_TEST_LOCK`'s
+        //   doc comment.
+        let _download_guard = crate::progress::DOWNLOAD_PROGRESS_TEST_LOCK.lock().await;
         let _embedder_count_guard = EMBEDDER_BUILD_COUNT_TEST_LOCK.lock().await;
 
         let dir = TempDir::new().unwrap();
