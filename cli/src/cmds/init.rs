@@ -84,12 +84,15 @@ pub(crate) async fn run_init_async(ctx: &CliContext, download_model: bool) {
         }
     }
 
-    // Config only, no DB open: the best-effort match further down is what
-    // must observe *every* DB-open failure (missing migration, unwritable
-    // data dir, full disk) and turn it into a warning rather than a hard
-    // exit. `load_config_for_maintenance` only parses/resolves the config
-    // already scaffolded above — it never touches the database — so nothing
-    // here can `exit_err` ahead of that match.
+    // Config only, no DB open. The match further down is what has to observe
+    // *every* DB-open failure (missing migration, unwritable data dir, full
+    // disk) and turn it into a warning; a loader that opens the database
+    // itself would exit first and never reach it.
+    //
+    // An unparseable config is still a hard exit here, exactly as it is for
+    // every other command — `ensure_config_scaffolded` above leaves an
+    // existing malformed file untouched, so this is the call that reports it.
+    // Only the *database* is best-effort for `init`, not the config.
     let loader = load_config_for_maintenance(ctx);
 
     // Optional: prepare the embedder up front. `create_embedder` already

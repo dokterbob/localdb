@@ -408,6 +408,40 @@ fn init_json_output_includes_warnings_and_default_store_on_healthy_run() {
     assert_eq!(v["model_download"].as_str().unwrap(), "skipped");
 }
 
+/// Only the *database* is best-effort for `init`, not the config: an
+/// existing config that does not parse is a hard exit 2, exactly as it is
+/// for every other command. Scaffolding leaves a malformed file's bytes
+/// untouched, so `init` is the command that reports it rather than one that
+/// warns past it and claims `"status": "ok"`.
+#[test]
+fn init_on_malformed_config_exits_2_without_warning() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("config.yaml"), "%bad: [unclosed\n").unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .args(["--json", "init"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "a malformed config must exit 2, not be folded into `warnings`; stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid_config"),
+        "error envelope should classify this as invalid_config; got: {stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("\"status\""),
+        "no success envelope should be printed; got stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
 /// `init --download-model` against `provider: fake` (no network, no real
 /// download) must report `model_download: "ok"` in `--json` output, and — in
 /// the human-readable summary, which is the only surface that ever prints
