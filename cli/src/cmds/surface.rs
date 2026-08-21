@@ -10,6 +10,31 @@ use crate::{
     normalize::{exit_err, print_json, visibility_to_string},
 };
 
+/// Build the embedder `localdb mcp` answers queries with, in embedded mode.
+///
+/// A free function rather than an inline block in `run_mcp_async` so a test
+/// can assert what this call site threads into `create_embedder` without
+/// entering `mcp::serve_embedded_stdio`'s loop. That loop reads the calling
+/// process's real stdin through a blocking read, which a
+/// `tokio::time::timeout` cannot cancel — wrapping `run_mcp_async` in one
+/// drops the future but leaves the runtime waiting on the read at shutdown
+/// whenever stdin is open and idle.
+pub(crate) fn build_mcp_embedder(
+    ctx: &CliContext,
+    config_loader: &localdb_core::config::loader::ConfigLoader,
+) -> Box<dyn localdb_core::Embedder> {
+    match embed::create_embedder(
+        &config_loader.config.defaults.indexing.embedding,
+        &config_loader.config.providers,
+        Some(&config_loader.paths.models_dir),
+        &(&config_loader.config.http).into(),
+        crate::progress::download_progress_for(ctx.json),
+    ) {
+        Ok(e) => e,
+        Err(e) => exit_err(&Error::from(e), ctx.json),
+    }
+}
+
 /// `localdb serve` — start the HTTP daemon (specs/05-surfaces.md §3).
 pub fn run_serve(ctx: &CliContext) {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -198,18 +223,7 @@ pub(crate) async fn run_mcp_async(ctx: &CliContext, allow_write: bool) {
     let db = open_app_db_or_exit(ctx, &config_loader).await;
     let scoped_stores = resolve_store_scope(ctx, &db, StoreScopePolicy::AllStoresAllowEmpty).await;
 
-    let embed_policy = &config_loader.config.defaults.indexing.embedding;
-    let models_dir = config_loader.paths.models_dir.clone();
-    let embedder = match embed::create_embedder(
-        embed_policy,
-        &config_loader.config.providers,
-        Some(&models_dir),
-        &(&config_loader.config.http).into(),
-        crate::progress::download_progress_for(ctx.json),
-    ) {
-        Ok(e) => e,
-        Err(e) => exit_err(&Error::from(e), ctx.json),
-    };
+    let embedder = build_mcp_embedder(ctx, &config_loader);
 
     let mut available: Vec<AvailableStore> = Vec::new();
     for store_row in &scoped_stores {

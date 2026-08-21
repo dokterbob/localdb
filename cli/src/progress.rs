@@ -124,7 +124,7 @@ pub fn download_progress_for(json_mode: bool) -> embed::DownloadProgress {
 /// different pair of tests. Held today by the four threading tests in
 /// `download_progress_tests` — `run_init_async_threads_download_progress`,
 /// `search_run_embedded_threads_download_progress`,
-/// `run_mcp_async_threads_download_progress`, and
+/// `build_mcp_embedder_threads_download_progress`, and
 /// `run_embedded_store_job_threads_download_progress` — plus the two
 /// pre-existing tests that build a real embedder as a side effect of driving
 /// one of those same call sites,

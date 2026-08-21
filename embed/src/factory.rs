@@ -172,6 +172,18 @@ impl DownloadProgress {
 /// progress via `tracing::info!` instead, so they stay quiet unless the
 /// caller sets `RUST_LOG=info`, and the CoreML path
 /// (`coreml/download.rs`'s `download_bundle`) is a documented no-op today.
+///
+/// The scope is deliberately *progress rendering*, not `tracing` output.
+/// `Silent` does not suppress `tracing`, and `hf_download.rs`'s start/skip/
+/// completion `info!` lines fire regardless — which is what lets the daemon
+/// pass `Silent` and still log every download it performs. Under
+/// `RUST_LOG=info` those lines do reach stderr, but so do dozens of
+/// unrelated `info!`/`warn!` sites across `core`, `fetch`, and
+/// `store-libsql`: whether `--json` mode owes a caller a pure-JSON stderr at
+/// all is issue #260's question, and no per-emitter gate here would settle
+/// it. What this parameter fixes is the one emitter no `RUST_LOG` setting
+/// can reach, because it bypasses `tracing` entirely.
+///
 /// It is required on every branch anyway — same reasoning as
 /// `http_settings` above — so correctness never depends on which local
 /// provider the operator happened to pick.

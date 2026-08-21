@@ -2,7 +2,8 @@
 //! `embed::create_embedder` from each of the four CLI call sites that
 //! compute it via `crate::progress::download_progress_for(ctx.json)` (issue
 //! #261): `cmds::init::run_init_async`, `cmds::search::SearchCmd::run_embedded`,
-//! `cmds::surface::run_mcp_async`, and `job_attach::run_embedded_store_job`.
+//! `cmds::surface::build_mcp_embedder` (the step `run_mcp_async` reaches
+//! `create_embedder` through), and `job_attach::run_embedded_store_job`.
 //!
 //! Each test drives the real command function against a real temp
 //! config/DB with `provider: fake` (offline, no model download) and asserts
@@ -23,7 +24,6 @@
 //! fastembed's own `indicatif` usage — nothing this crate controls.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use localdb_core::ingestion::DeletionPolicy;
 use localdb_core::{Embedder, IndexJobScope, SourceKind, SourceRow};
@@ -34,7 +34,7 @@ use crate::cmds::index::{IndexErrorMode, EMBEDDER_BUILD_COUNT_TEST_LOCK};
 use crate::cmds::init::run_init_async;
 use crate::cmds::search::SearchCmd;
 use crate::cmds::store::run_store_add_async;
-use crate::cmds::surface::run_mcp_async;
+use crate::cmds::surface::build_mcp_embedder;
 use crate::command_table::DaemonAwareCommand;
 use crate::daemon_client::CliContext;
 use crate::job_attach::run_embedded_store_job;
@@ -133,34 +133,36 @@ async fn search_run_embedded_threads_download_progress() {
     }
 }
 
-/// `run_mcp_async` builds its embedder before ever entering
-/// `mcp::serve_embedded_stdio`'s stdio loop, so the assertion below is
-/// reachable regardless of what the loop itself does with this test
-/// binary's real stdin. It is wrapped in a bounded `timeout` purely as a
-/// safety net against that loop blocking on stdin in an environment where it
-/// is not already at EOF (unlike the subprocess-driven
-/// `localdb/tests/cli_integration.rs::mcp_exits_cleanly_on_stdin_eof`, which
-/// controls its child's stdin directly, this test calls `run_mcp_async`
-/// in-process and inherits this test binary's own stdin) — the value under
-/// test is already recorded by the time `create_embedder` returns, well
-/// before the loop starts, so the assertion does not depend on the loop, or
-/// the timeout, ever firing.
+/// Drives `build_mcp_embedder` — the embedder-construction step of
+/// `localdb mcp`'s embedded mode — rather than `run_mcp_async` as a whole.
+///
+/// `run_mcp_async` continues into `mcp::serve_embedded_stdio`, whose loop
+/// reads the calling process's real stdin through a blocking read. A
+/// `tokio::time::timeout` around it drops the future but cannot cancel that
+/// read, so whenever stdin is open and idle — an interactive `cargo test`, a
+/// CI runner that keeps an input pipe attached — the per-test runtime waits
+/// on it at shutdown. Calling the construction step directly removes any
+/// dependence on this binary's stdin.
+///
+/// `run_mcp_async` reaches `create_embedder` only through this function, so
+/// the value asserted here is the value that call site threads.
 #[tokio::test]
-async fn run_mcp_async_threads_download_progress() {
+async fn build_mcp_embedder_threads_download_progress() {
     let _guard = DOWNLOAD_PROGRESS_TEST_LOCK.lock().await;
 
     for json in [true, false] {
         let dir = tempfile::tempdir().unwrap();
         let config_path = write_fake_config(dir.path());
         let ctx = ctx_with(config_path, json);
+        let config_loader = load_config_scaffolded(&ctx).await;
 
         embed::reset_last_download_progress();
-        let _ = tokio::time::timeout(Duration::from_secs(5), run_mcp_async(&ctx, false)).await;
+        let _embedder = build_mcp_embedder(&ctx, &config_loader);
 
         assert_eq!(
             embed::last_download_progress(),
             Some(expected_progress(json)),
-            "run_mcp_async, json={json}"
+            "build_mcp_embedder, json={json}"
         );
     }
 }
