@@ -3375,7 +3375,7 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
 name = "localdb"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -3392,7 +3392,7 @@ dependencies = [
 
 [[package]]
 name = "localdb-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum 0.8.9",
  "clap",
@@ -3417,7 +3417,7 @@ dependencies = [
 
 [[package]]
 name = "localdb-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3445,7 +3445,7 @@ dependencies = [
 
 [[package]]
 name = "localdb-embed"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "backon",
@@ -3480,7 +3480,7 @@ dependencies = [
 
 [[package]]
 name = "localdb-extract"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anytomd",
  "infer",
@@ -3497,7 +3497,7 @@ dependencies = [
 
 [[package]]
 name = "localdb-fetch"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "backon",
@@ -3512,7 +3512,7 @@ dependencies = [
 
 [[package]]
 name = "localdb-ingest"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "feed-rs",
@@ -3528,7 +3528,7 @@ dependencies = [
 
 [[package]]
 name = "localdb-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3543,7 +3543,7 @@ dependencies = [
 
 [[package]]
 name = "localdb-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
@@ -3571,7 +3571,7 @@ dependencies = [
 
 [[package]]
 name = "localdb-store-libsql"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "blake3",
