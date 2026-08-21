@@ -4,6 +4,14 @@ All notable changes to this project are documented in this file.
 
 The format follows [Common Changelog](https://common-changelog.org).
 
+## [0.1.1] - 2026-08-21
+
+### Changed
+
+- Pin the Rust toolchain, and fix the lints the newer stable flags ([#257](https://github.com/dokterbob/localdb/pull/257)) ([`4ae121b`](https://github.com/dokterbob/localdb/commit/4ae121b1601978237694f5bf4c307b0bd16a585d))
+- Make `localdb init` honest and optional ([#225](https://github.com/dokterbob/localdb/pull/225)) ([#256](https://github.com/dokterbob/localdb/pull/256)) ([`b574ef4`](https://github.com/dokterbob/localdb/commit/b574ef424b18ce507ec3681c09a8da7987607f4d))
+
+
 ## [0.1.0] - 2026-08-18
 
 _First release._
