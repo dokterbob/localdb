@@ -96,7 +96,9 @@ pub(crate) async fn run_init_async(ctx: &CliContext, download_model: bool) {
     // no provider-name special-casing here (issue #225): for a hosted
     // provider this just validates the client can be constructed.
     let model_download = if download_model {
-        eprintln!("Preparing embedding model (a local model downloads ~706 MB on first use)…");
+        eprintln!(
+            "Preparing the configured embedder (a local model downloads ~706 MB on first use)…"
+        );
         match embed::create_embedder(
             &loader.config.defaults.indexing.embedding,
             &loader.config.providers,
