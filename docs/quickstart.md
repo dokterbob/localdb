@@ -16,14 +16,24 @@ localdb status
 
 ```
 daemon: not running (embedded mode)
-stores (0):
-  (none)
+stores (1):
+  default [libsql] 0 documents, 0 chunks
+
+database: ~/Library/Application Support/localdb/data/localdb.db
+  size: 140.0 KB (+ 0 B WAL)
+  largest tables:
+    sources — 24.0 KB
+    resources — 16.0 KB
+    chunks — 16.0 KB
+    stores — 12.0 KB
+    blocks — 12.0 KB
 ```
 
 Running this — or any command other than `db status`/`migrate`/`downgrade`/`vacuum` — is what
 creates the config file, along with the data/models/logs directories, on first use; there's no
-separate init step required. The generated `config.yaml` is a commented template with every key at
-its default value, spelled out for discoverability, not a bare stub; see
+separate init step required. Scaffolding also creates a `default` store, which is why it already
+shows up above. The generated `config.yaml` is a commented template with every key at its default
+value, spelled out for discoverability, not a bare stub; see
 [configuration.md#config-is-created-for-you](configuration.md#config-is-created-for-you) for the
 full generated file and the `$schema` editor-integration section. If you'd rather do this explicitly
 up front instead of implicitly on first use — e.g. to review the generated paths, or to pre-download
@@ -64,10 +74,12 @@ localdb store list
 ```
 
 ```
+default [libsql]
 notes [libsql]
 ```
 
-The `[libsql]` label is the storage backend.
+`default` is the store scaffolding created back in Step 1; `notes` is the one just added. The
+`[libsql]` label is the storage backend.
 
 ## Step 4 — Add a source
 

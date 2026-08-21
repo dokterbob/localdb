@@ -201,8 +201,7 @@ the former; `paths.data` the latter). Both are created implicitly on first use (
   daemon.sock                  # unix socket (present only while daemon runs)
 ```
 
-The default `data_dir` on macOS is `~/Library/Application Support/com.localdb.localdb.localdb/data`
-(the bundle ID is intentionally verbose — see [Known gaps §4](#known-gaps)). Override with
+The default `data_dir` on macOS is `~/Library/Application Support/localdb/data`. Override with
 `paths.data` in `config.yaml` or point to a custom config with `--config`.
 
 The `models/` directory (configured via `paths.models`) is populated on first `localdb index` or
@@ -337,12 +336,10 @@ exist on disk. Validation is deferred to index time. The source spec validation 
 
 **Gap #3. macOS default paths use a verbose bundle ID.**
 ([#15](https://github.com/dokterbob/localdb/issues/15)) **Resolved as of 2026-06-28:**
-`core/src/config/platform.rs` now uses `ProjectDirs::from("", "", "localdb")` for clean default
-paths. The default config, data, and model-cache locations on macOS all live under the bundle ID
-`com.localdb.localdb.localdb` (e.g. data at
-`~/Library/Application Support/com.localdb.localdb.localdb/data`). The triple-repeat comes from
-`ProjectDirs::from("com.localdb", "localdb", "localdb")` in `core/src/config/platform.rs`. Specs/03
-shows shorter `localdb/` paths. Cosmetic; override with `paths.*` in config for cleaner locations.
+`core/src/config/platform.rs` now uses `ProjectDirs::from("", "", "localdb")`, so macOS defaults
+live under a plain `localdb` segment — config and data at `~/Library/Application Support/localdb/`,
+the model cache at `~/Library/Caches/localdb/models/`, logs at `~/Library/Logs/localdb/` — matching
+the paths `specs/03-config.md` specifies.
 
 **4. The CoreML context bundle ships only the L512 sequence-length bucket.** The CoreML backend
 (`local-coreml` feature; see [Platform notes](#platform-notes)) reads its bucket manifest from HF
