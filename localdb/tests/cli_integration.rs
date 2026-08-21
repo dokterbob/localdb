@@ -85,6 +85,22 @@ fn write_config_with_data_dir(dir: &TempDir, extra: &str) {
     std::fs::write(dir.path().join("config.yaml"), &config).unwrap();
 }
 
+/// True if this test process is running as euid 0 (root). Mode bits
+/// (`chmod`) are ignored for root, so permission-denied regression tests
+/// must skip rather than silently pass without proving anything. Shells out
+/// to `id -u` instead of adding a `libc`/`nix` dependency for a single
+/// integration-test check.
+#[cfg(unix)]
+fn running_as_root() -> bool {
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false)
+}
+
 // ---------------------------------------------------------------------------
 // Basic CLI surface tests (from T01 acceptance criteria, still valid)
 // ---------------------------------------------------------------------------
@@ -392,6 +408,76 @@ fn init_json_output_includes_warnings_and_default_store_on_healthy_run() {
     assert_eq!(v["model_download"].as_str().unwrap(), "skipped");
 }
 
+/// `init --download-model` against `provider: fake` (no network, no real
+/// download) must report `model_download: "ok"` in `--json` output, and — in
+/// the human-readable summary, which is the only surface that ever prints
+/// it — the "downloads on first index" note must be suppressed once the
+/// model has actually been prepared (issue #225).
+#[test]
+fn init_download_model_json_reports_ok() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["--json", "init", "--download-model"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "init --download-model against a fake provider should exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|_| panic!("init --json must emit valid JSON; got: {stdout}"));
+    assert_eq!(v["model_download"].as_str().unwrap(), "ok");
+
+    // Same config, human output this time: the note only ever prints when
+    // `model_download != "ok"`, so its absence here is the real assertion —
+    // the JSON call above cannot exercise `print_human_summary` at all.
+    let human_output = cmd_with_dir(&dir)
+        .args(["init", "--download-model"])
+        .output()
+        .unwrap();
+    assert!(human_output.status.success());
+    let human_stdout = String::from_utf8_lossy(&human_output.stdout);
+    assert!(
+        !human_stdout.contains("downloads its embedding model"),
+        "the 'downloads on first index' note must be suppressed once the model \
+         download itself reports ok; got: {human_stdout}"
+    );
+}
+
+/// `init --download-model` against a hosted provider with no matching
+/// `providers:` block must fail fast (exit 2, `InvalidConfig`) rather than
+/// silently skip — `create_embedder` is called unconditionally, no
+/// provider-name special-casing (issue #225). No network involved: the
+/// failure is a config-shape error before any HTTP call would be made.
+#[test]
+fn init_download_model_failure_exits_2_and_names_providers_block() {
+    let dir = TempDir::new().unwrap();
+    write_config_with_data_dir(
+        &dir,
+        "defaults:\n  indexing:\n    embedding:\n      provider: perplexity\n      model: pplx-embed-context-v1\n",
+    );
+
+    let output = cmd_with_dir(&dir)
+        .args(["init", "--download-model"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "init --download-model with an unconfigured provider should exit 2; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("providers:"),
+        "error should name the missing 'providers:' config block; got: {stderr}"
+    );
+}
+
 /// `init` on a DB that needs a schema migration (pre-baseline "legacy"
 /// version) must warn and exit 0 rather than hard-fail — `init`'s real job
 /// is the config + directories, not opening the store (issue #225). It must
@@ -510,6 +596,147 @@ fn init_on_too_new_schema_db_warns_and_exits_0() {
     assert_eq!(
         version, 999_999,
         "init warning on an unopenable store must not touch it"
+    );
+}
+
+/// Same legacy-schema seed as `init_on_legacy_schema_db_warns_and_exits_0`,
+/// but without `--json`: the human-output `Warning:` loop
+/// (`print_human_summary`) must surface the actionable `db migrate` text on
+/// stderr, and — since `default_store` is `"skipped"` here, not a freshly
+/// created store — the `store add` hint must be absent.
+#[test]
+fn init_on_legacy_schema_db_prints_warning_without_store_add_hint() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let db_path = data_dir.join("localdb.db");
+
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(stamp_user_version(&db_path, 2));
+
+    let output = cmd_with_dir(&dir).arg("init").output().unwrap();
+    assert!(
+        output.status.success(),
+        "init against a legacy-schema store must still exit 0; stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Warning:"),
+        "human output should carry a `Warning:` line; got stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("db migrate"),
+        "warning should point at `localdb db migrate`; got stderr: {stderr}"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("store add"),
+        "the `store add` hint must not print when default_store was skipped; got stdout: {stdout}"
+    );
+}
+
+/// A genuine first run whose database cannot be created — unwritable data
+/// dir, full disk — must warn and exit 0, not hard-fail (issue #225).
+///
+/// This is the first-run variant of the guarantee
+/// `init_on_legacy_schema_db_warns_and_exits_0` covers: `init`'s job is the
+/// config and the directories, so *every* DB-open failure folds into
+/// `warnings` / `default_store: "skipped"`. It is worth pinning separately
+/// because a first run is the one state where the config is still the
+/// pristine scaffolded template with no `localdb.db` beside it — the
+/// condition that makes the lenient config loader open the database itself,
+/// where a failure would escape as a hard exit before `run_init_async` ever
+/// gets to decide. `run_init_async` loads config through
+/// `load_config_for_maintenance`, which parses and resolves only, and
+/// confines the open to `seed_default_store`.
+#[test]
+#[cfg(unix)]
+fn init_on_unwritable_data_dir_after_fresh_scaffold_warns_and_exits_0() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Mode bits are ignored for root, so this scenario can't be reproduced
+    // and the test would pass without proving anything — skip rather than
+    // give a false green.
+    if running_as_root() {
+        eprintln!("skipping init_on_unwritable_data_dir_after_fresh_scaffold_warns_and_exits_0: running as euid 0, permission bits are ignored");
+        return;
+    }
+
+    let dir = TempDir::new().unwrap();
+
+    // Genuine first run — must be `cmd_with_fresh_dir`, not
+    // `write_default_config`: the seed condition this test targets
+    // (`config_is_pristine_template`) requires the config to be
+    // byte-identical to `render_default_config_template()`, which only a
+    // real first-run scaffold produces. This call writes the pristine
+    // template, all four directories, and `localdb.db`.
+    cmd_with_fresh_dir(&dir).arg("init").assert().success();
+
+    // Recursive find idiom from
+    // `fresh_install_with_daemon_url_scaffolds_config_but_not_local_db`
+    // above, adapted to return the path instead of a bool: `localdb.db`
+    // lives under a platform-resolved data dir this test process must not
+    // compute itself (`PlatformPaths::resolve()` reads *this* process's
+    // env, not the child's).
+    fn find_db(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
+            let p = e.path();
+            if p.is_dir() {
+                find_db(&p)
+            } else if p.file_name().is_some_and(|n| n == "localdb.db") {
+                Some(p)
+            } else {
+                None
+            }
+        })
+    }
+    let db_path =
+        find_db(dir.path()).expect("fresh `init` must have scaffolded a local localdb.db");
+    let data_dir = db_path
+        .parent()
+        .expect("localdb.db must have a parent dir")
+        .to_path_buf();
+
+    // Seed condition: config is pristine (untouched since the first run
+    // above) AND the DB does not exist.
+    std::fs::remove_file(&db_path).unwrap();
+
+    // Make the DB's directory unwritable so recreating `localdb.db` fails —
+    // the DB-open failure this whole test exists to turn into a warning
+    // instead of a hard exit.
+    std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let output = cmd_with_fresh_dir(&dir)
+        .args(["init", "--json"])
+        .output()
+        .unwrap();
+
+    // Restore permissions immediately, before any assert, so `TempDir`'s
+    // `Drop` can clean up even if an assertion below panics (house idiom —
+    // see `source_add_auto_index_permission_denied_warns_but_succeeds`).
+    let _ = std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o755));
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        0,
+        "init on a first run whose DB cannot be created must warn, not hard-fail; \
+         stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|_| panic!("init --json must emit valid JSON; got: {stdout}"));
+    assert_eq!(v["default_store"].as_str().unwrap(), "skipped");
+    assert!(
+        !v["warnings"].as_array().unwrap().is_empty(),
+        "expected at least one warning describing the DB-open failure; got: {stdout}"
     );
 }
 

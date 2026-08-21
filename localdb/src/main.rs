@@ -776,19 +776,21 @@ mod tests {
     /// `localdb init`/`localdb init --download-model` parse the new flag.
     #[test]
     fn init_download_model_flag_parses() {
-        let cli = Cli::try_parse_from(["localdb", "init"]).unwrap();
-        if let Command::Init { download_model } = cli.command {
-            assert!(!download_model);
-        } else {
-            panic!("expected Init command");
-        }
+        assert!(matches!(
+            Cli::try_parse_from(["localdb", "init"]).unwrap().command,
+            Command::Init {
+                download_model: false
+            }
+        ));
 
-        let cli = Cli::try_parse_from(["localdb", "init", "--download-model"]).unwrap();
-        if let Command::Init { download_model } = cli.command {
-            assert!(download_model);
-        } else {
-            panic!("expected Init command");
-        }
+        assert!(matches!(
+            Cli::try_parse_from(["localdb", "init", "--download-model"])
+                .unwrap()
+                .command,
+            Command::Init {
+                download_model: true
+            }
+        ));
     }
 
     /// `localdb db downgrade --to N` parses `N` as an `i64`.
