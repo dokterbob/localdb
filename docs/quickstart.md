@@ -20,14 +20,14 @@ stores (0):
   (none)
 ```
 
-Running this (or any other command) is what creates the config file, along with the data/models/logs
-directories, on first use — there's no separate init step. The generated `config.yaml` is a
-commented template with every key at its default value, spelled out for discoverability, not a bare
-stub; see [configuration.md#config-is-created-for-you](configuration.md#config-is-created-for-you)
-for the full generated file and the `$schema` editor-integration section. If you'd rather do this
-explicitly up front instead of implicitly on first use — e.g. to review the generated paths, or to
-pre-download the embedding model with `--download-model` — see `localdb init` in
-[cli.md](cli.md#localdb-init).
+Running this — or any command other than `db status`/`migrate`/`downgrade`/`vacuum` — is what
+creates the config file, along with the data/models/logs directories, on first use; there's no
+separate init step required. The generated `config.yaml` is a commented template with every key at
+its default value, spelled out for discoverability, not a bare stub; see
+[configuration.md#config-is-created-for-you](configuration.md#config-is-created-for-you) for the
+full generated file and the `$schema` editor-integration section. If you'd rather do this explicitly
+up front instead of implicitly on first use — e.g. to review the generated paths, or to pre-download
+the embedding model with `--download-model` — see `localdb init` in [cli.md](cli.md#localdb-init).
 
 ## Step 2 — (Optional) Override data paths
 

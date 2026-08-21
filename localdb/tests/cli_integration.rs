@@ -466,6 +466,17 @@ fn init_download_model_json_reports_ok() {
         .unwrap_or_else(|_| panic!("init --json must emit valid JSON; got: {stdout}"));
     assert_eq!(v["model_download"].as_str().unwrap(), "ok");
 
+    // The cosmetic "Preparing the configured embedder..." progress line is
+    // gated on `!ctx.json`, not on `download_model` alone — a `--json`
+    // caller's stderr must stay free of it, since anything printed there on
+    // the failure path would prefix the machine-readable error envelope
+    // (`normalize::exit_err`) with non-JSON text.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("Preparing the configured embedder"),
+        "the progress line must be suppressed under --json; got stderr: {stderr}"
+    );
+
     // Same config, human output this time: the note only ever prints when
     // `model_download != "ok"`, so its absence here is the real assertion —
     // the JSON call above cannot exercise `print_human_summary` at all.
@@ -479,6 +490,14 @@ fn init_download_model_json_reports_ok() {
         !human_stdout.contains("downloads its embedding model"),
         "the 'downloads on first index' note must be suppressed once the model \
          download itself reports ok; got: {human_stdout}"
+    );
+
+    // Human mode still gets the progress line: it is suppressed under
+    // `--json`, not dropped outright.
+    let human_stderr = String::from_utf8_lossy(&human_output.stderr);
+    assert!(
+        human_stderr.contains("Preparing the configured embedder"),
+        "human-mode run should still print the progress line; got stderr: {human_stderr}"
     );
 }
 
@@ -509,6 +528,53 @@ fn init_download_model_failure_exits_2_and_names_providers_block() {
     assert!(
         stderr.contains("providers:"),
         "error should name the missing 'providers:' config block; got: {stderr}"
+    );
+}
+
+/// Same failure as `init_download_model_failure_exits_2_and_names_providers_block`,
+/// but under `--json`: stderr must be the JSON error envelope and nothing
+/// else. `normalize::exit_err` writes that envelope to stderr, which is also
+/// where the `"Preparing the configured embedder..."` progress line would go
+/// — so any progress text that escapes the `!ctx.json` gate lands directly
+/// in front of it and a consumer parsing stderr as the documented
+/// machine-readable error object fails to decode it.
+///
+/// A `.contains("providers:")` check cannot catch that: a corrupting prefix
+/// and the JSON substring coexist happily in one stderr. Parsing the *whole*
+/// stderr string as a single JSON value is what pins it (issue #225).
+#[test]
+fn init_download_model_json_failure_stderr_is_pure_json() {
+    let dir = TempDir::new().unwrap();
+    write_config_with_data_dir(
+        &dir,
+        "defaults:\n  indexing:\n    embedding:\n      provider: perplexity\n      model: pplx-embed-context-v1\n",
+    );
+
+    let output = cmd_with_dir(&dir)
+        .args(["--json", "init", "--download-model"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "init --download-model with an unconfigured provider should exit 2; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.is_empty(),
+        "no success envelope should be printed; got stdout: {stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let v: serde_json::Value = serde_json::from_str(&stderr).unwrap_or_else(|_| {
+        panic!("--json error envelope must be pure JSON; got stderr: {stderr}")
+    });
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("providers:"),
+        "error message should name the missing 'providers:' config block; got: {v}"
     );
 }
 
