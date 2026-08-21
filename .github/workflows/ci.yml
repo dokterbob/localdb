@@ -48,9 +48,15 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          # The toolchain hash sits in the restore-key *prefix*, ahead of the
+          # lockfile hash. A `target/` built by another compiler is unusable,
+          # so a channel bump has to miss the prefix too — putting both hashes
+          # in the exact key alone would still let the broad prefix restore the
+          # previous compiler's artifacts. A lockfile change still restores
+          # partially, within the same toolchain.
+          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-clippy-
+            ${{ runner.os }}-cargo-clippy-${{ hashFiles('rust-toolchain.toml') }}-
       - name: Run clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -76,9 +82,10 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          # Toolchain hash in the prefix — see the clippy job.
+          key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-coverage-
+            ${{ runner.os }}-cargo-coverage-${{ hashFiles('rust-toolchain.toml') }}-
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Run coverage (all tests)
@@ -107,9 +114,10 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-coreml-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          # Toolchain hash in the prefix — see the clippy job.
+          key: ${{ runner.os }}-cargo-coreml-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-coreml-
+            ${{ runner.os }}-cargo-coreml-${{ hashFiles('rust-toolchain.toml') }}-
       - name: Build embed with local-coreml
         run: cargo build -p localdb-embed --features local-coreml
       - name: Run embed tests with local-coreml
@@ -163,7 +171,10 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          # No toolchain hash here, unlike the jobs above: this caches only
+          # downloaded sources, never `target/`, and those are the same bytes
+          # whichever compiler consumes them.
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-${{ matrix.target }}-cargo-
       - name: Build localdb for target
