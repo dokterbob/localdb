@@ -122,9 +122,15 @@ pub enum DownloadProgress {
 }
 
 impl DownloadProgress {
-    // Only called from the `local-onnx`/`local-coreml` constructor call
-    // sites below, which convert to the `bool` those constructors take —
-    // with neither feature enabled, nothing calls it, hence the `allow`.
+    /// The single point where the caller's intent becomes the `bool` every
+    /// local-provider constructor takes. Inverting it here would silently
+    /// undo the whole contract at every call site at once, which is why it
+    /// has a direct unit test rather than relying on the `create_embedder`
+    /// tests — those all use `provider: "fake"`, which returns before the
+    /// provider match ever reaches a conversion.
+    ///
+    /// Called only from the `local-onnx`/`local-coreml` branches below; with
+    /// neither feature enabled no non-test code calls it, hence the `allow`.
     #[allow(dead_code)]
     fn as_bool(self) -> bool {
         matches!(self, Self::Show)
@@ -519,6 +525,18 @@ mod tests {
             provider: provider.to_string(),
             model: model.to_string(),
         }
+    }
+
+    /// Guards the enum→`bool` conversion the local-provider constructors
+    /// consume. Every other test in this module and in `cli` drives
+    /// `create_embedder` with `provider: "fake"`, which returns before the
+    /// provider match, so an inverted `as_bool` would otherwise reach a
+    /// release with the whole suite green — `Silent` would draw an
+    /// `indicatif` bar into the CLI's `--json` error envelope (issue #261).
+    #[test]
+    fn as_bool_shows_only_for_show() {
+        assert!(DownloadProgress::Show.as_bool());
+        assert!(!DownloadProgress::Silent.as_bool());
     }
 
     #[test]
