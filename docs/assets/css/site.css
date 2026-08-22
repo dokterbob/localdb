@@ -44,29 +44,9 @@ a {
 .site-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
   gap: 24px;
   padding: 28px 0 20px;
-}
-
-.brand {
-  display: inline-flex;
-  align-items: center;
-  gap: 12px;
-  color: var(--ink);
-  font-size: 1.1rem;
-  font-weight: 750;
-  letter-spacing: 0;
-  text-decoration: none;
-}
-
-.brand-icon {
-  display: block;
-  width: 44px;
-  height: 44px;
-  border: 1px solid rgba(23, 32, 28, 0.14);
-  border-radius: 10px;
-  object-fit: cover;
 }
 
 .top-nav {
@@ -93,7 +73,7 @@ a {
 }
 
 .page {
-  padding: 54px 0 72px;
+  padding: 42px 0 72px;
 }
 
 .hero {
@@ -103,11 +83,9 @@ a {
 
 .hero-logo {
   display: block;
-  width: min(360px, 78vw);
-  height: 118px;
-  margin: 0 0 18px -18px;
-  object-fit: cover;
-  object-position: center;
+  width: min(430px, 86vw);
+  height: auto;
+  margin: 0 0 34px;
 }
 
 .eyebrow {
