@@ -5,10 +5,11 @@ title: localdb docs
 
 <section class="hero">
   <div class="eyebrow">Local-first retrieval for agents</div>
-  <h1>Search your files with citations, from the terminal or an AI assistant.</h1>
+  <h1>localdb</h1>
   <p>
-    localdb indexes notes, PDFs, EPUBs, Office documents, HTML, and plain text into a private
-    hybrid search store with structured citations and MCP access.
+    Search your files with citations, from the terminal or an AI assistant. localdb indexes notes,
+    PDFs, EPUBs, Office documents, HTML, and plain text into a private hybrid search store with
+    structured citations and MCP access.
   </p>
   <div class="hero-actions">
     <a class="button primary" href="{{ '/quickstart.html' | relative_url }}">Start with the quickstart</a>
