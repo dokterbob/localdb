@@ -44,9 +44,22 @@ a {
 .site-header {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: space-between;
   gap: 24px;
-  padding: 28px 0 20px;
+  padding: 22px 0 18px;
+}
+
+.site-brand {
+  display: inline-flex;
+  align-items: center;
+  width: min(228px, 48vw);
+  text-decoration: none;
+}
+
+.site-brand img {
+  display: block;
+  width: 100%;
+  height: auto;
 }
 
 .top-nav {
@@ -73,19 +86,12 @@ a {
 }
 
 .page {
-  padding: 42px 0 72px;
+  padding: 34px 0 72px;
 }
 
 .hero {
   max-width: 870px;
-  padding: 26px 0 38px;
-}
-
-.hero-logo {
-  display: block;
-  width: min(430px, 86vw);
-  height: auto;
-  margin: 0 0 34px;
+  padding: 44px 0 38px;
 }
 
 .eyebrow {
