@@ -4,6 +4,7 @@ title: localdb docs
 ---
 
 <section class="hero">
+  <img class="hero-logo" src="{{ '/assets/images/localdb-logo-light.png' | relative_url }}" alt="localdb">
   <div class="eyebrow">Local-first retrieval for agents</div>
   <h1>Search your files with citations, from the terminal or an AI assistant.</h1>
   <p>

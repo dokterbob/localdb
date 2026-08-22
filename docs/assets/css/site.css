@@ -60,16 +60,13 @@ a {
   text-decoration: none;
 }
 
-.brand-mark {
-  display: inline-grid;
-  min-width: 44px;
+.brand-icon {
+  display: block;
+  width: 44px;
   height: 44px;
-  place-items: center;
   border: 1px solid rgba(23, 32, 28, 0.14);
-  background: var(--ink);
-  color: #f7f2e8;
-  font-size: 0.78rem;
-  font-weight: 800;
+  border-radius: 10px;
+  object-fit: cover;
 }
 
 .top-nav {
@@ -102,6 +99,15 @@ a {
 .hero {
   max-width: 870px;
   padding: 26px 0 38px;
+}
+
+.hero-logo {
+  display: block;
+  width: min(360px, 78vw);
+  height: 118px;
+  margin: 0 0 18px -18px;
+  object-fit: cover;
+  object-position: center;
 }
 
 .eyebrow {
@@ -394,10 +400,12 @@ td {
   align-items: flex-start;
 }
 
-.footer-brand .brand-mark {
-  border-color: rgba(255, 248, 236, 0.24);
-  background: #fff8ec;
-  color: var(--ink);
+.footer-logo {
+  display: block;
+  width: 190px;
+  height: auto;
+  margin: -20px 0 -18px -24px;
+  object-fit: contain;
 }
 
 .footer-brand strong {

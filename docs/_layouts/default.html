@@ -5,12 +5,14 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="description" content="{{ site.description | escape }}">
     <title>{% if page.title %}{{ page.title | escape }} | {% endif %}{{ site.title | escape }}</title>
+    <link rel="icon" type="image/png" href="{{ '/assets/images/localdb-icon-192.png' | relative_url }}">
+    <link rel="apple-touch-icon" href="{{ '/assets/images/localdb-icon-192.png' | relative_url }}">
     <link rel="stylesheet" href="{{ '/assets/css/site.css' | relative_url }}">
   </head>
   <body>
     <header class="site-header">
       <a class="brand" href="{{ '/' | relative_url }}">
-        <span class="brand-mark">ldb</span>
+        <img class="brand-icon" src="{{ '/assets/images/localdb-icon-192.png' | relative_url }}" alt="" width="44" height="44">
         <span>localdb</span>
       </a>
       <nav class="top-nav" aria-label="Primary navigation">
@@ -29,7 +31,7 @@
     <footer class="site-footer">
       <div class="footer-panel">
         <div class="footer-brand">
-          <span class="brand-mark">ldb</span>
+          <img class="footer-logo" src="{{ '/assets/images/localdb-logo-dark.png' | relative_url }}" alt="localdb" width="536" height="360">
           <div>
             <strong>localdb</strong>
             <p>Search, cite, and keep it local.</p>
