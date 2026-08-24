@@ -3,7 +3,7 @@
 `localdb` is a local-first hybrid-search document index. This page is the complete reference for its
 command-line interface (v0.1.0).
 
-For design decisions and process-model details see [specs/05-surfaces.md](../specs/05-surfaces.md).
+For design decisions and process-model details see [specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md).
 For the HTTP daemon surface see [docs/http-api.md](http-api.md). For the MCP stdio surface see
 [docs/mcp.md](mcp.md).
 
@@ -17,7 +17,7 @@ These flags are accepted by every subcommand.
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `--config <PATH>`    | Path to the config file. Default: the platform config dir — `~/Library/Application Support/localdb/config.yaml` on macOS, `~/.config/localdb/config.yaml` on Linux. Can also be set via the `LOCALDB_CONFIG` environment variable.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `--json`             | Emit machine-readable JSON instead of human-readable text. All JSON shapes are stable API.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| `-s, --store <NAME>` | Narrow to these stores; repeatable. It is a **filter**, so omitting it means **all stores** for `search`, `status`, `store list`, `source list`, `source remove <ULID>`, `document list`, `document get`, `index` and `mcp`. Three exceptions: `source add` (and the `add` alias) defaults to the store named `default`, exit 2 if absent; `source remove <path\|url>` requires it, exit 2 without it; and `init`, `serve`, `store add`, `store remove`, `db status`/`migrate`/`downgrade`/`vacuum` **reject it outright** (exit 2) because they aren't store-scoped. An explicit name is always validated — unknown is exit 3, never silently ignored. `document get`'s omitted case can additionally be `invalid_request` (exit 2) if the id exists in more than one store — see below. See [specs/05-surfaces.md §2.2](../specs/05-surfaces.md#22-store-scope). |
+| `-s, --store <NAME>` | Narrow to these stores; repeatable. It is a **filter**, so omitting it means **all stores** for `search`, `status`, `store list`, `source list`, `source remove <ULID>`, `document list`, `document get`, `index` and `mcp`. Three exceptions: `source add` (and the `add` alias) defaults to the store named `default`, exit 2 if absent; `source remove <path\|url>` requires it, exit 2 without it; and `init`, `serve`, `store add`, `store remove`, `db status`/`migrate`/`downgrade`/`vacuum` **reject it outright** (exit 2) because they aren't store-scoped. An explicit name is always validated — unknown is exit 3, never silently ignored. `document get`'s omitted case can additionally be `invalid_request` (exit 2) if the id exists in more than one store — see below. See [specs/05-surfaces.md §2.2](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md#22-store-scope). |
 | `-y, --yes`          | Skip confirmation prompts for destructive operations (`db migrate` legacy rebuild, `db downgrade`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `-h, --help`         | Print help.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `-V, --version`      | Print version.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
@@ -29,7 +29,7 @@ These flags are accepted by every subcommand.
 ## Exit codes
 
 Exit codes are stable API. See
-[specs/05-surfaces.md §5](../specs/05-surfaces.md#5-shared-error-taxonomy) for the full error
+[specs/05-surfaces.md §5](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md#5-shared-error-taxonomy) for the full error
 taxonomy that drives them.
 
 | Code | Meaning                 | Example trigger                                               |
@@ -631,7 +631,7 @@ the summary JSON itself).
 
 **Embeddings:** the CLI calls `embed::create_embedder` from the config policy. The default embedder
 (`pplx-embed-context-v1-0.6b`, local ONNX) is downloaded automatically on first run (~706 MB). See
-[specs/04-search-pipeline.md](../specs/04-search-pipeline.md) for the pipeline.
+[specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md) for the pipeline.
 
 ```
 $ localdb index --store notes
@@ -683,7 +683,7 @@ Omit `--store` and every store is searched; pass `--store` (repeatable) to narro
 > treats `--limit 5` as part of the query.
 
 Runs hybrid BM25 + dense-vector search across the targeted stores and returns ranked citations. The
-Citation JSON shape is documented in [specs/02-domain-model.md](../specs/02-domain-model.md) §6.
+Citation JSON shape is documented in [specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md) §6.
 
 **Ranking:** hybrid BM25 + dense (RRF fusion). With the default binary-quantized local model,
 `dense` is the normalized Hamming similarity (`1.0 - hamming_dist / nbits`); a float32 embedder
@@ -783,7 +783,7 @@ real indexing run. `score`, `store` and `provenance.fetched_at` are illustrative
 There is no top-level `document_id`, `block_seq`, `block_kind`, or `span` in the Citation shape —
 those are superseded by `resource_id`, the nested `block {seq, kind}`,
 `chunk_position {seq_in_block}`, and `location {span, window_block_seqs}` respectively. See
-[specs/02-domain-model.md](../specs/02-domain-model.md) §6.
+[specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md) §6.
 
 ---
 
@@ -791,7 +791,7 @@ those are superseded by `resource_id`, the nested `block {seq, kind}`,
 
 Inspect or migrate the database schema. See [docs/migrations.md](migrations.md) for the full
 migration walkthrough and the migration-authoring guide, and
-[specs/05-surfaces.md §2.1](../specs/05-surfaces.md#21-schema-migrations) for the design.
+[specs/05-surfaces.md §2.1](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md#21-schema-migrations) for the design.
 
 ```
 Inspect or migrate the database schema (specs/05-surfaces.md §2.1)

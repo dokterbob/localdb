@@ -44,11 +44,11 @@ matches all at once:
   by pure-Rust or embedded libraries, no shelling out to a converter binary or a separate Tika/JVM
   process. And this is a floor, not a ceiling: the domain model already has typed slots
   (`IngestorKind::Notion`, `Telegram`, `Signal`, `HackMd`, `Email`, `Transcription`, `Feed`)
-  reserved for connectors landing next — see [specs/06-roadmap.md](../specs/06-roadmap.md) Phase 2
+  reserved for connectors landing next — see [specs/06-roadmap.md](https://github.com/dokterbob/localdb/blob/main/specs/06-roadmap.md) Phase 2
   and "Where localdb is headed" below.
 - **Sensible defaults.** No init step required — `store add` to a working `search` is four commands:
   `store add`, `source add`, `index`, `search` (see the
-  [README quickstart](../README.md#60-second-quickstart), which also shows an optional `status`
+  [README quickstart](https://github.com/dokterbob/localdb/blob/main/README.md#60-second-quickstart), which also shows an optional `status`
   check); the default embedding backend auto-selects CoreML on Apple Silicon and falls back to ONNX
   elsewhere; no API key is required to start.
 - **Agent-first, not chat-first.** The CLI and MCP server are the primary surfaces, not a bolted-on
@@ -207,7 +207,7 @@ and a vector index to maintain, which is not free.
 ## Where localdb is behind
 
 In the interest of the same honesty as the README's
-[What works today](../README.md#what-works-today) table:
+[What works today](https://github.com/dokterbob/localdb/blob/main/README.md#what-works-today) table:
 
 - **As of v0.1.0.** Several of the projects above (Khoj, Basic Memory, AnythingLLM, Onyx) have years
   of production use and large user bases; localdb does not yet.
@@ -216,18 +216,18 @@ In the interest of the same honesty as the README's
   richer content types on the roadmap but not yet shipped (see below).
 - **No GUI or chat interface.** localdb is CLI + MCP only. Anyone wanting a chat-first experience
   out of the box (GPT4All, Khoj, AnythingLLM) will find localdb requires an external agent or client
-  to talk to. A web UI is planned (Phase 3 of [specs/06-roadmap.md](../specs/06-roadmap.md)) but
+  to talk to. A web UI is planned (Phase 3 of [specs/06-roadmap.md](https://github.com/dokterbob/localdb/blob/main/specs/06-roadmap.md)) but
   CLI, MCP, and agents remain the primary surfaces for the foreseeable future.
 - **Single-user, single-node.** There is no multi-tenant deployment story today, unlike Onyx.
 - **MCP is read-only today.** Mutating tools (`add_source`, `reindex`, and similar) are specified as
   the next planned addition, gated behind an explicit `localdb mcp --allow-write` opt-in flag that
-  will never be on by default (see [specs/05-surfaces.md §4](../specs/05-surfaces.md)) — but they
+  will never be on by default (see [specs/05-surfaces.md §4](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md)) — but they
   are not shipped yet. There is deliberately no plan for in-place _edit_ tools: an agent that needs
   to change indexed content can re-add the source and let incremental re-index pick up the change,
   which is a smaller, more auditable surface than exposing note-editing verbs the way Basic Memory
   does.
 - **No knowledge graph / entity layer yet.** An entities/graph layer is tracked in
-  [specs/06-roadmap.md](../specs/06-roadmap.md) ("tracked but unscheduled: entities/graph layer,
+  [specs/06-roadmap.md](https://github.com/dokterbob/localdb/blob/main/specs/06-roadmap.md) ("tracked but unscheduled: entities/graph layer,
   metadata-only entities first, graph extraction only after baseline retrieval quality is proven")
   but is not designed or built. Basic Memory already has one.
 - **File-watch-triggered re-indexing isn't live yet.** `POST /v1/jobs` itself runs real ingestion
@@ -241,7 +241,7 @@ In the interest of the same honesty as the README's
 
 ## Where localdb is headed that nobody else is
 
-Per [VISION.md](../VISION.md), the long-horizon goal is **federation**: the ability to search
+Per [VISION.md](https://github.com/dokterbob/localdb/blob/main/VISION.md), the long-horizon goal is **federation**: the ability to search
 datasets far larger than any one person could assemble alone, by securely sharing direct,
 credentialed access to stores — someone's curated book collection, a Wikipedia-scale corpus, a
 friend's notes — without proxying content through intermediaries or inventing homegrown crypto.
@@ -255,7 +255,7 @@ Two nearer-term axes sit ahead of federation on the roadmap:
 - **Ingest all the things.** Files and URLs are indexed today; the domain model already reserves
   typed slots for what's next (`IngestorKind::Notion`, `Telegram`, `Signal`, `HackMd`, `Email`,
   `Transcription`, `Feed` — see `core/src/block.rs`), tracked as Phase 2 in
-  [specs/06-roadmap.md](../specs/06-roadmap.md). This would put localdb ahead of the content-scoped
+  [specs/06-roadmap.md](https://github.com/dokterbob/localdb/blob/main/specs/06-roadmap.md). This would put localdb ahead of the content-scoped
   competitors (GPT4All, Basic Memory) on content coverage well before federation is in scope —
   though it's worth being honest that Onyx's connector library is already larger today (see "Where
   localdb is behind").
