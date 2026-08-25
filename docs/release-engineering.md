@@ -59,7 +59,7 @@ hand-maintained `workflow_call` workflows:
   ever becomes a live concern before the names are claimed, tightening the internal requirements to
   exact `=X.Y.Z` pins closes it.
 - `release-plz.toml` uses the single-tag scheme: every package shares
-  `git_tag_name = "v{{ version }}"` (that template is how `git_only` mode finds each package's last
+  `git_tag_name = "v{% raw %}{{ version }}{% endraw %}"` (that template is how `git_only` mode finds each package's last
   released version), but only `localdb` creates the tag.
 - `CHANGELOG.md` follows [Common Changelog](https://common-changelog.org), rendered by `cliff.toml`
   (shared by release-plz and the `git-cliff` CLI). Commits are grouped by first-word heuristics

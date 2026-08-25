@@ -2,7 +2,7 @@
 
 localdb is configured through a single YAML file. This document covers every field, platform
 defaults, config lookup rules, and validation behaviour. For the ownership model and design
-rationale, see [specs/03-config.md](../specs/03-config.md).
+rationale, see [specs/03-config.md](https://github.com/dokterbob/localdb/blob/main/specs/03-config.md).
 
 ---
 
@@ -109,7 +109,7 @@ defaults:
 
 `version: 1` is the only required field; every other key shown above is already at its default
 value, spelled out for discoverability rather than left implicit. See
-[specs/03-config.md §8](../specs/03-config.md#8-config-file-generation-and-schema) for the full
+[specs/03-config.md §8](https://github.com/dokterbob/localdb/blob/main/specs/03-config.md#8-config-file-generation-and-schema) for the full
 generation and schema design.
 
 ---
@@ -249,7 +249,7 @@ defaults:
 
 > **Default embedder:** `provider: local`, `model: pplx-embed-context-v1-0.6b`. `local` auto-picks a
 > backend: CoreML (ANE/GPU) on Apple Silicon macOS builds, ONNX (CPU) everywhere else — see
-> [specs/03-config.md §7](../specs/03-config.md#7-local-embedding-provider-selection-local--local-coreml--local-onnx)
+> [specs/03-config.md §7](https://github.com/dokterbob/localdb/blob/main/specs/03-config.md#7-local-embedding-provider-selection-local--local-coreml--local-onnx)
 > to force one explicitly with `local-coreml`/`local-onnx`. The first `localdb index` or
 > `localdb search` downloads the model (~706 MB) from the public HuggingFace repo
 > `perplexity-ai/pplx-embed-context-v1-0.6b` — no API key required. The model is cached under
@@ -279,7 +279,7 @@ providers:
 | `api_key_env` | Environment variable that holds the API key (never inline the key) |
 
 Secrets must come from the environment. See
-[specs/03-config.md §6](../specs/03-config.md#6-secrets).
+[specs/03-config.md §6](https://github.com/dokterbob/localdb/blob/main/specs/03-config.md#6-secrets).
 
 ---
 
@@ -290,7 +290,7 @@ Stores and sources are managed exclusively via the CLI (`localdb store add`, `lo
 or HTTP API — no store declarations in YAML are supported. The unified database
 (`<data_dir>/localdb.db`) is the single source of truth for all stores and sources.
 
-For full details, see [specs/03-config.md §3](../specs/03-config.md#3-store-and-source-management).
+For full details, see [specs/03-config.md §3](https://github.com/dokterbob/localdb/blob/main/specs/03-config.md#3-store-and-source-management).
 
 ---
 
@@ -399,4 +399,4 @@ http:
     burst: 4
 ```
 
-For design decisions behind each section, see [specs/03-config.md](../specs/03-config.md).
+For design decisions behind each section, see [specs/03-config.md](https://github.com/dokterbob/localdb/blob/main/specs/03-config.md).

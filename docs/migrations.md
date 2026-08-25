@@ -2,8 +2,8 @@
 
 > Covers the schema-migrations framework landed for issue
 > [#127](https://github.com/dokterbob/localdb/issues/127). Design rationale lives in
-> [specs/02-domain-model.md](../specs/02-domain-model.md) §9 and
-> [specs/05-surfaces.md](../specs/05-surfaces.md) §2.1 — this document is the behavior/how-to layer
+> [specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md) §9 and
+> [specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §2.1 — this document is the behavior/how-to layer
 > on top of those, in the same spirit as [docs/architecture.md](architecture.md).
 
 `store-libsql` tracks its own schema version in a `schema_migrations` table (source of truth) plus
@@ -32,7 +32,7 @@ A fresh (`version == 0`) or already-at-head store opens normally — no CLI acti
 
 Schema migrations aren't the only thing that can make a store unreadable by an older binary.
 `sources.ingestor_kind` is decoded via a hard match over `IngestorKind`'s known variants
-([specs/02-domain-model.md](../specs/02-domain-model.md) §2) — an unrecognized kind is a hard error
+([specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md) §2) — an unrecognized kind is a hard error
 for the whole `list_sources`/`index` call, not just the one source carrying it.
 
 The Atom/RSS feed connector (`kind = 'feed'`,
@@ -52,7 +52,7 @@ graceful degradation so an old binary skips unknown source kinds instead of fail
 ## `db status` / `db migrate` / `db downgrade`
 
 Three CLI-only maintenance subcommands (`localdb db …`), specced in
-[specs/05-surfaces.md](../specs/05-surfaces.md) §2.1. They are the _only_ surfaces allowed to touch
+[specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §2.1. They are the _only_ surfaces allowed to touch
 a store's schema version — the HTTP daemon and MCP never migrate, they only ever surface the
 refusal-with-hint above.
 

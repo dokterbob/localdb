@@ -11,7 +11,7 @@
 > experimental as a surface: write concurrency across processes is SQLite WAL + `busy_timeout=5000`,
 > not a dedicated lock.
 >
-> For design rationale see [specs/05-surfaces.md](../specs/05-surfaces.md) §3.
+> For design rationale see [specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §3.
 
 ---
 
@@ -55,7 +55,7 @@ is: anything that can reach the bind address is as trusted as the files themselv
 is accepted — binding to a specific non-loopback address (e.g. a LAN or VPN IP) is treated as a
 deliberate trust decision and starts silently. Binding to `0.0.0.0` (all interfaces) logs a warning
 at startup, since that makes the unauthenticated daemon reachable from any network the machine is
-on. See [specs/05-surfaces.md](../specs/05-surfaces.md) §3 for the binding and trust decision.
+on. See [specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §3 for the binding and trust decision.
 
 ---
 
@@ -67,7 +67,7 @@ Alongside `/v1`, the daemon also mounts `/mcp` — the same five read-only MCP t
 client (e.g. Claude Code on another machine, over Tailscale/LAN). It inherits this daemon's
 bind-address trust decision automatically — see
 [docs/mcp.md](mcp.md#remote-http-connecting-from-another-machine) for setup and
-[specs/05-surfaces.md](../specs/05-surfaces.md) §4.2 for the transport/error-model details.
+[specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §4.2 for the transport/error-model details.
 
 ---
 
@@ -126,7 +126,7 @@ curl -s http://127.0.0.1:7700/v1/status
 | `database.largest_tables`                          | array     | Up to 5 `{name, bytes}` rows, the largest on-disk tables via SQLite's `dbstat`, descending; best-effort — empty if `dbstat` querying fails                                  |
 
 This is the same shape the embedded CLI's `localdb status --json` reports (see
-[specs/05-surfaces.md](../specs/05-surfaces.md) §2.4) — daemon-routed and embedded `status` render
+[specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §2.4) — daemon-routed and embedded `status` render
 identically.
 
 ---
@@ -272,7 +272,7 @@ curl -s http://127.0.0.1:7700/v1/documents/a86bf252232bcec2a7da314d11e4c6005918f
 is no query parameter that omits it (the CLI's `document get --text` is purely a rendering choice on
 top of the same always-fetched text, specs/05-surfaces.md §2). `metadata` is the full `Metadata`
 enum, same shape as a search citation's `metadata` field
-([specs/02-domain-model.md](../specs/02-domain-model.md) §7).
+([specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md) §7).
 
 Returns `404` with error code `resource_not_found` if no document with that id exists in scope, or
 `store_not_found` if a named `?store=` does not exist.
@@ -331,7 +331,7 @@ curl -s http://127.0.0.1:7700/v1/config
 
 `effective_stores` lists all stores registered via `localdb store add` (or `POST /v1/stores`). The
 DB is the single source of truth — there is no YAML store declaration. Config schema details are in
-[specs/03-config.md](../specs/03-config.md).
+[specs/03-config.md](https://github.com/dokterbob/localdb/blob/main/specs/03-config.md).
 
 ---
 
@@ -364,7 +364,7 @@ curl -s -X POST http://127.0.0.1:7700/v1/search \
 ```
 
 Each citation in `citations` follows the canonical Citation shape defined in
-[specs/02-domain-model.md](../specs/02-domain-model.md) §6. For a fully-populated example see the
+[specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md) §6. For a fully-populated example see the
 `localdb search --json` output in the CLI reference.
 
 ---
@@ -579,7 +579,7 @@ client that just wants display text should combine `code` and `message` itself (
 as-is.
 
 HTTP status codes follow the shared error taxonomy in
-[specs/05-surfaces.md](../specs/05-surfaces.md) §5:
+[specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §5:
 
 | Code                                                                            | HTTP status | Meaning                                                                                                                                                        |
 | ------------------------------------------------------------------------------- | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |

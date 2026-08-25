@@ -162,7 +162,7 @@ localdb search --limit 1 rank fusion
 ### JSON output
 
 Pass `--json` to get machine-readable citations. The citation shape is the canonical `localdb`
-Citation object (see [../specs/02-domain-model.md](../specs/02-domain-model.md) §6):
+Citation object (see [../specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md) §6):
 
 ```bash
 localdb search -s notes --json hybrid search
@@ -258,4 +258,4 @@ stores (1):
   overrides, per-store indexing policy.
 - **CLI reference:** [cli.md](cli.md) — all commands, flags, exit codes, and JSON shapes.
 - **MCP integration:** [mcp.md](mcp.md) — connecting localdb to AI agents via the MCP stdio server.
-- **Architecture and design:** [../specs/01-architecture.md](../specs/01-architecture.md)
+- **Architecture and design:** [../specs/01-architecture.md](https://github.com/dokterbob/localdb/blob/main/specs/01-architecture.md)

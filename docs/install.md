@@ -118,7 +118,7 @@ To fetch it ahead of time instead of on the first `index`/`search`, run
 
 For details on the embedding pipeline and alternative model options, see
 [architecture.md](architecture.md) and
-[../specs/04-search-pipeline.md](../specs/04-search-pipeline.md).
+[../specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md).
 
 ## Next step
 

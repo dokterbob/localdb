@@ -39,6 +39,9 @@ env:
 jobs:
   release-plz-release:
     name: tag release
+    # Forks do not have RELEASE_PLZ_TOKEN, so keep release automation on the
+    # canonical repository instead of failing during checkout on every push.
+    if: github.repository == 'dokterbob/localdb'
     runs-on: ubuntu-22.04
     # One release at a time; queue instead of cancel so a merge right after a
     # release PR still gets processed.
@@ -64,6 +67,9 @@ jobs:
 
   release-plz-pr:
     name: maintain release PR
+    # Forks do not have RELEASE_PLZ_TOKEN, so keep release automation on the
+    # canonical repository instead of failing during checkout on every push.
+    if: github.repository == 'dokterbob/localdb'
     runs-on: ubuntu-22.04
     concurrency:
       group: release-plz-pr
