@@ -64,6 +64,8 @@ claude mcp add localdb -- localdb mcp --config /path/to/config.yaml
 > shell-evaluated, so `$(which localdb)` will not work there. In `claude mcp add`, which is a shell
 > command, `$(which localdb)` in place of the bare `localdb` works directly.
 
+<a id="remote-http-connecting-from-another-machine"></a>
+
 ### Remote / HTTP — connecting from another machine
 
 If you run `localdb serve`, it mounts the same five MCP tools at `/mcp` alongside its `/v1` REST
