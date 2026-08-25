@@ -430,15 +430,14 @@ fn init_on_malformed_config_exits_2_without_warning() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("invalid_config"),
-        "error envelope should classify this as invalid_config; got: {stderr}"
-    );
-    assert!(
-        !String::from_utf8_lossy(&output.stdout).contains("\"status\""),
-        "no success envelope should be printed; got stdout: {}",
-        String::from_utf8_lossy(&output.stdout)
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|_| {
+        panic!("--json error envelope must be pure JSON on stdout; got: {stdout}")
+    });
+    assert_eq!(
+        v["error"].as_str().unwrap_or_default(),
+        "invalid_config",
+        "error envelope should classify this as invalid_config; got: {v}"
     );
 }
 
@@ -468,9 +467,10 @@ fn init_download_model_json_reports_ok() {
 
     // The cosmetic "Preparing the configured embedder..." progress line is
     // gated on `!ctx.json`, not on `download_model` alone — a `--json`
-    // caller's stderr must stay free of it, since anything printed there on
-    // the failure path would prefix the machine-readable error envelope
-    // (`normalize::exit_err`) with non-JSON text.
+    // caller's stderr stays free of it purely for output hygiene. Nothing
+    // downstream depends on stderr being clean (the JSON error envelope
+    // lives on stdout — see `init_download_model_json_failure_stdout_is_pure_json`
+    // below), so this is a UX choice, not a correctness one.
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !stderr.contains("Preparing the configured embedder"),
@@ -532,18 +532,16 @@ fn init_download_model_failure_exits_2_and_names_providers_block() {
 }
 
 /// Same failure as `init_download_model_failure_exits_2_and_names_providers_block`,
-/// but under `--json`: stderr must be the JSON error envelope and nothing
-/// else. `normalize::exit_err` writes that envelope to stderr, which is also
-/// where the `"Preparing the configured embedder..."` progress line would go
-/// — so any progress text that escapes the `!ctx.json` gate lands directly
-/// in front of it and a consumer parsing stderr as the documented
-/// machine-readable error object fails to decode it.
+/// but under `--json`: the JSON error envelope goes to **stdout**, not
+/// stderr (`normalize::exit_err`, issue #260) — stdout is the only channel a
+/// `--json` caller is ever guaranteed to be pure JSON, so nothing that might
+/// land on stderr (a progress line, a warning) can corrupt it.
 ///
-/// A `.contains("providers:")` check cannot catch that: a corrupting prefix
-/// and the JSON substring coexist happily in one stderr. Parsing the *whole*
-/// stderr string as a single JSON value is what pins it (issue #225).
+/// A `.contains("providers:")` check on stdout cannot tell "clean JSON" from
+/// "JSON plus a stray prefix"; parsing the *whole* stdout string as a single
+/// JSON value is what pins it.
 #[test]
-fn init_download_model_json_failure_stderr_is_pure_json() {
+fn init_download_model_json_failure_stdout_is_pure_json() {
     let dir = TempDir::new().unwrap();
     write_config_with_data_dir(
         &dir,
@@ -561,13 +559,8 @@ fn init_download_model_json_failure_stderr_is_pure_json() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.is_empty(),
-        "no success envelope should be printed; got stdout: {stdout}"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let v: serde_json::Value = serde_json::from_str(&stderr).unwrap_or_else(|_| {
-        panic!("--json error envelope must be pure JSON; got stderr: {stderr}")
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|_| {
+        panic!("--json error envelope must be pure JSON on stdout; got: {stdout}")
     });
     assert!(
         v["message"]
