@@ -231,11 +231,11 @@ the former; `paths.data` the latter). Both are created implicitly on first use (
 The default `data_dir` on macOS is `~/Library/Application Support/localdb/data`. Override with
 `paths.data` in `config.yaml` or point to a custom config with `--config`.
 
-The `models/` directory (configured via `paths.models`) is populated on first `localdb index` or
-`localdb search` when the default `local` embedder downloads `pplx-embed-context-v1-0.6b` (~706 MB
-ONNX) from HuggingFace. On Apple Silicon macOS built with `--features local-coreml`, the CoreML
-bundle is additionally fetched from `dokterbob/pplx-embed-coreml` (XET-deduped via `hf-hub` 1.0).
-Subsequent runs use the cached model.
+The `models/` directory (configured via `paths.models`) is populated on the first indexing or search
+operation (including `source add`'s auto-index) when the default `local` embedder downloads
+`pplx-embed-context-v1-0.6b` (~706 MB ONNX) from HuggingFace. On Apple Silicon macOS built with
+`--features local-coreml`, the CoreML bundle is additionally fetched from
+`dokterbob/pplx-embed-coreml` (XET-deduped via `hf-hub` 1.0). Subsequent runs use the cached model.
 
 `--features local-onnx` builds (the default on Linux; the ONNX fallback on macOS) additionally
 populate `<cache_dir>/localdb/ort/<version>/` on first use with the embedded ONNX Runtime shared
@@ -359,9 +359,8 @@ guard still prevents two concurrent jobs on the same store from racing regardles
 **Gap #2. `source add` does not validate path existence.**
 ([#14](https://github.com/dokterbob/localdb/issues/14)) **Resolved as of 2026-06-28:**
 `cli/src/lib.rs` now validates path existence in `run_source_add_async` via `normalize_path_source`.
-`localdb source add /does/not/exist --store notes` succeeds (exit 0) even when the path does not
-exist on disk. Validation is deferred to index time. The source spec validation in
-`core/src/config/` or the CLI source-add handler is the place to add an existence check.
+`localdb source add /does/not/exist --store notes` fails immediately with `invalid_request` (exit 2)
+and the source is never registered.
 
 **Gap #3. macOS default paths use a verbose bundle ID.**
 ([#15](https://github.com/dokterbob/localdb/issues/15)) **Resolved as of 2026-06-28:**

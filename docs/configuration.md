@@ -254,9 +254,9 @@ defaults:
 > **Default embedder:** `provider: local`, `model: pplx-embed-context-v1-0.6b`. `local` auto-picks a
 > backend: CoreML (ANE/GPU) on Apple Silicon macOS builds, ONNX (CPU) everywhere else — see
 > [specs/03-config.md §7](https://github.com/dokterbob/localdb/blob/main/specs/03-config.md#7-local-embedding-provider-selection-local--local-coreml--local-onnx)
-> to force one explicitly with `local-coreml`/`local-onnx`. The first `localdb index` or
-> `localdb search` downloads the model (~706 MB) from the public HuggingFace repo
-> `perplexity-ai/pplx-embed-context-v1-0.6b` — no API key required. The model is cached under
+> to force one explicitly with `local-coreml`/`local-onnx`. The first indexing or search operation
+> (including `source add`'s auto-index) downloads the model (~706 MB) from the public HuggingFace
+> repo `perplexity-ai/pplx-embed-context-v1-0.6b` — no API key required. The model is cached under
 > `paths.models` for subsequent runs. Alternative local model: `bge-small-en-v1.5` (384-dim, much
 > smaller). Hosted alternatives: `provider: perplexity` or `provider: voyage` (both require an API
 > key) or `provider: openai-compatible`.
@@ -380,7 +380,8 @@ paths:
   logs: ~/localdb/logs
 
 # --- Global indexing defaults (inherited by all stores) ---
-# The default local model is downloaded (~706 MB) on first index/search.
+# The default local model is downloaded (~706 MB) on first use (indexing, search, or
+# source add's auto-index).
 defaults:
   indexing:
     chunking:

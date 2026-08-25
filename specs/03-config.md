@@ -220,8 +220,8 @@ through the strict load path (`store add`/`remove`, `source add`/`list`/`remove`
 `localdb init` ([05-surfaces.md](05-surfaces.md) §2) remains available as an optional, explicit
 bootstrap — it runs this same scaffolding, prints every resolved path, and, with `--download-model`,
 prepares the configured embedder up front (downloading a local model rather than deferring to the
-first `index`/`search`). It is never required: every command above scaffolds implicitly on first
-use.
+first indexing or search operation, including `source add`'s auto-index). It is never required:
+every command above scaffolds implicitly on first use.
 
 On a genuine first run (the resolved config path does not exist at all), scaffolding:
 

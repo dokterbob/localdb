@@ -51,7 +51,8 @@ for the full error taxonomy that drives them.
 directories implicitly on first use, so you never have to run `init` before `store add`,
 `source add`, `index`, or `search`. Run it if you'd rather do that setup explicitly up front: it
 prints every resolved path, and `--download-model` lets you pull the embedding model ahead of time
-instead of on the first `index`/`search`.
+instead of deferring it to the first indexing or search operation (including `source add`'s
+auto-index).
 
 ```
 Optional bootstrap: write the config, create the data/models/logs directories, and print the resolved paths
@@ -76,10 +77,11 @@ creates a store named `default`, unless the database can't be opened (see below)
 
 **`--download-model`:** prepares the configured embedder immediately. For the default local provider
 this downloads the ~706 MB model (`pplx-embed-context-v1-0.6b`, from HuggingFace, no API key or
-license click-through required) right away instead of deferring it to the first `index` or `search`.
-For a hosted provider (`openai-compatible`, `perplexity`, `voyage`) it just validates that the
-client can be constructed (e.g. that an API key is present). When this flag succeeds, `init` omits
-the "downloads its embedding model on first index" note from its output, since it's no longer true.
+license click-through required) right away instead of deferring it to the first indexing or search
+operation (including `source add`'s auto-index). For a hosted provider (`openai-compatible`,
+`perplexity`, `voyage`) it just validates that the client can be constructed (e.g. that an API key
+is present). When this flag succeeds, `init` omits the "downloads its embedding model on first
+index" note from its output, since it's no longer true.
 
 **If the database can't be opened** — most commonly because it needs a schema migration — `init`
 prints a `Warning: ...` on stderr and still exits `0`. It still writes the config and creates the
@@ -422,12 +424,17 @@ This is the **one** command where omitting `--store` narrows rather than spans. 
 treats `-s` as a filter over all stores; a write can't, because "add this source to every store" is
 not what anyone means.
 
-**Note:** path existence is not validated at registration time — `source add /does/not/exist`
-succeeds (exit 0). The error surfaces at `index` time.
+**Note:** path existence is validated at registration time — `source add /does/not/exist` fails
+immediately with `invalid request: path '/does/not/exist' does not exist` (exit 2), and the source
+is never added.
 
 ```
 $ localdb source add ~/notes --store notes
 Added source 01KTVH6AY4DC84HWW7M2PP4F0X to store 'notes'
+Auto-indexing source 01KTVH6AY4DC84HWW7M2PP4F0X ...
+Indexing /home/user/notes
+  discovered 1 files
+  indexed 1 docs, 0 skipped, 0 deleted, 2 chunks
 ```
 
 ### `localdb source list`
