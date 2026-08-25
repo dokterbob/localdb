@@ -91,11 +91,11 @@ jobs:
       - name: Run coverage (all tests)
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info
       - name: Upload coverage to Qlty
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         uses: qltysh/qlty-action/coverage@v2
         with:
           oidc: true
           files: lcov.info
-          fail_ci_if_error: false
 
   coreml:
     name: CoreML backend (macOS)
