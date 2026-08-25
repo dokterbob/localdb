@@ -31,6 +31,21 @@ jobs:
         with:
           source: docs
           destination: _site
+      - name: Check links (built site)
+        # Runs only here, not in ci.yml's offline pass: this checks external
+        # links too (no --offline), and only after Jekyll has resolved the
+        # `_site/**/*.html` Liquid templating that ci.yml's source-only pass
+        # deliberately skips (docs/index.md, docs/_layouts/**). This job only
+        # runs on main-branch pushes/dispatch, so external-link flakiness never
+        # blocks a PR.
+        uses: lycheeverse/lychee-action@v2
+        with:
+          # `_site` lands at the repo root (destination: _site above, relative
+          # to the default working directory), so the default workingDirectory
+          # ('.') already covers it — no override needed.
+          args: >-
+            --include-fragments --no-progress
+            '_site/**/*.html'
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
