@@ -19,7 +19,7 @@ enriched by what the people you trust have found, with provenance at every hop. 
 that is built in from day one: content-addressed documents, per-chunk provenance, and stores as
 first-class shareable units. See [VISION.md](VISION.md).
 
-**Status: v0.1.0 released.** Hybrid search uses real dense embeddings via the default local model
+**Status:** hybrid search uses real dense embeddings via the default local model
 (`pplx-embed-context-v1-0.6b`, ONNX on CPU by default; CoreML ANE/GPU on Apple Silicon macOS
 automatically); the first indexing operation — including `add`'s auto-index — downloads ~706 MB from
 HuggingFace (no API key required). The HTTP daemon remains experimental, with no auth. See

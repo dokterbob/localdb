@@ -6,7 +6,8 @@ affected code, the available options, and a recommendation — but no code has b
 follow-up ticket or PR should resolve each item before implementing.
 
 See also [docs/architecture.md#known-gaps](architecture.md#known-gaps) for runtime-visible gaps and
-the [specs/](https://github.com/dokterbob/localdb/tree/main/specs) tree for authoritative design documents.
+the [specs/](https://github.com/dokterbob/localdb/tree/main/specs) tree for authoritative design
+documents.
 
 ---
 
