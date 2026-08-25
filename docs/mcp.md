@@ -58,7 +58,7 @@ claude mcp add localdb -- localdb mcp --config /path/to/config.yaml
 
 > **Use an absolute path to the binary.** MCP clients spawn `localdb` directly, without your shell's
 > PATH additions (`.bashrc`/`.zshrc` `export PATH=...` lines aren't sourced). If you installed with
-> the shell installer, `~/.local/bin` — its default install location — is exactly what goes missing,
+> the shell installer, `~/.cargo/bin` — its default install location — is exactly what goes missing,
 > and the client fails to launch the server with no obvious reason why. In the JSON blocks above,
 > set `command` to the absolute path that `which localdb` prints — JSON config files are not
 > shell-evaluated, so `$(which localdb)` will not work there. In `claude mcp add`, which is a shell
