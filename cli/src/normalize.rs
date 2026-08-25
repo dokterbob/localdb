@@ -58,7 +58,7 @@ pub(crate) fn format_snippet(snippet: &str, max_chars: usize) -> String {
 ///
 /// In `--json` mode the error envelope goes to **stdout**, not stderr —
 /// stdout is the only channel a `--json` caller is ever guaranteed to be
-/// pure JSON, success or failure (specs/05-surfaces.md §2.2, issue #260).
+/// pure JSON, success or failure (specs/05-surfaces.md §2, issue #260).
 /// stderr in `--json` mode carries diagnostics only (progress, warnings) and
 /// is never meant to be parsed, so nothing that lands there — including a
 /// local-model download's progress output — can corrupt a machine-readable
@@ -82,14 +82,13 @@ pub fn exit_err(err: &Error, json_mode: bool) -> ! {
 /// A multi-`--store` `--json` loop (`source add`/`add`'s local and
 /// daemon-routed branches alike) that fails partway through — after at least
 /// one earlier item already succeeded — must not silently discard the
-/// buffered results (Codex review round 2, finding 5; the fuller
-/// validate-then-persist restructuring across the multi-argument axis is
-/// tracked separately as #174). Mirrors `cmds::index::report_index_outcomes`'s
-/// existing pattern: print a `"status"`-tagged JSON document to stdout, then
-/// exit explicitly. Both this and plain `exit_err` write to stdout now;
-/// this helper exists because `results` is additional output data a caller
-/// may need to preserve, and `exit_err`'s bare `{"error", "message"}` shape
-/// has no field for it.
+/// buffered results. (The fuller validate-then-persist restructuring across
+/// the multi-argument axis is tracked separately as #174.) Mirrors
+/// `cmds::index::report_index_outcomes`'s existing pattern: print a
+/// `"status"`-tagged JSON document to stdout, then exit explicitly. Both this
+/// and plain `exit_err` write to stdout; this helper exists because `results`
+/// is additional output data a caller may need to preserve, and `exit_err`'s
+/// bare `{"error", "message"}` shape has no field for it.
 ///
 /// Only meaningful in `--json` mode: non-JSON output already prints each
 /// success as it happens, so callers should keep using `exit_err` directly
