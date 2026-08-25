@@ -257,7 +257,9 @@ library — a separate, sibling directory to `models/`, not configurable via `pa
 
 ---
 
-## Platform notes {#platform-notes}
+<a id="platform-notes"></a>
+
+## Platform notes
 
 **CoreML embedding backend (macOS / Apple Silicon).** The default `pplx-embed-context-v1-0.6b` model
 can run on Apple's ANE/GPU via a CoreML backend in `embed`, behind the opt-in `local-coreml` cargo
@@ -322,7 +324,9 @@ workflows also pin Linux builds to `ubuntu-22.04` (not `ubuntu-latest`) and veri
 
 ---
 
-## Known gaps {#known-gaps}
+<a id="known-gaps"></a>
+
+## Known gaps
 
 This section documents verified divergences between the specs and the current implementation. They
 are listed honestly so contributors know where work remains. Each item names the responsible code
@@ -556,7 +560,9 @@ needs no new surface: delete the file, and the sweep removes it normally under `
 
 ---
 
-## Deferred design decisions {#design-decisions}
+<a id="design-decisions"></a>
+
+## Deferred design decisions
 
 Several items surfaced during the v0.1.0 issue sweep require cross-cutting design decisions before
 code can be written. They are documented (with options and recommendations) in
