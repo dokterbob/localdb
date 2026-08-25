@@ -49,9 +49,9 @@ matches all at once:
   and "Where localdb is headed" below.
 - **Sensible defaults.** No init step required — `store add` to a working `search` is four commands:
   `store add`, `source add`, `index`, `search` (see the
-  [README quickstart](https://github.com/dokterbob/localdb/blob/main/README.md#60-second-quickstart),
-  which also shows an optional `status` check); the default embedding backend auto-selects CoreML on
-  Apple Silicon and falls back to ONNX elsewhere; no API key is required to start.
+  [README quickstart](https://github.com/dokterbob/localdb/blob/main/README.md#quickstart), which
+  also shows an optional `status` check); the default embedding backend auto-selects CoreML on Apple
+  Silicon and falls back to ONNX elsewhere; no API key is required to start.
 - **Agent-first, not chat-first.** The CLI and MCP server are the primary surfaces, not a bolted-on
   integration layer. This has been validated in practice against multiple agentic clients — Codex,
   Claude Code, Claude Desktop, and Hermes Agent — and across both cloud model providers (Anthropic,
@@ -141,7 +141,7 @@ retrieval primitive.
 hybrid full-text + vector search (FastEmbed embeddings over SQLite), installed without any external
 database ("just files plus a local SQLite index, no servers required"). Two divergences matter.
 First, scope and trust boundary: its MCP tool surface is read-write — an agent can create, edit,
-move, and delete notes and build a knowledge graph through it — where localdb's three MCP tools are
+move, and delete notes and build a knowledge graph through it — where localdb's five MCP tools are
 read-only. That's a deliberate tradeoff each project makes differently, not a bug in either: Basic
 Memory is a notes app that happens to be agent-editable, localdb is a retrieval layer that assumes
 something else owns writes. Second, and directly relevant to
@@ -207,8 +207,7 @@ and a vector index to maintain, which is not free.
 
 ## Where localdb is behind
 
-In the interest of the same honesty as the README's
-[What works today](https://github.com/dokterbob/localdb/blob/main/README.md#what-works-today) table:
+In the interest of the same honesty as [Known gaps](architecture.md#known-gaps):
 
 - **As of v0.1.0.** Several of the projects above (Khoj, Basic Memory, AnythingLLM, Onyx) have years
   of production use and large user bases; localdb does not yet.
