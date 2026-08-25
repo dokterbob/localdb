@@ -121,8 +121,10 @@ localdb source list --store notes
 ## Step 5 — Re-index after changes (optional)
 
 `source add` already indexed the source back in Step 4, so files are searchable immediately. Run
-`localdb index` again whenever files under a source's path change — new/changed files get picked up,
-removed files get pruned. Since nothing has changed since Step 4, running it now is a no-op:
+`localdb index` again whenever files under a source's path change — new/changed files get picked up.
+Deleted files stay searchable unless you pass `--delete`, which prunes them (off by default, like
+`rsync --delete` — see the [CLI reference](cli.md#localdb-index)). Since nothing has changed since
+Step 4, running it now is a no-op:
 
 ```bash
 localdb index --store notes
