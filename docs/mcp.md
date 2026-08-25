@@ -9,7 +9,7 @@ available, both serving the same five read-only tools:
 - **HTTP** (`/mcp`, mounted on a running `localdb serve` daemon) — for connecting a remote MCP
   client, or one running on a different machine on your network/Tailscale.
 
-For design rationale and the trust model see [../specs/05-surfaces.md](../specs/05-surfaces.md) §4.
+For design rationale and the trust model see [../specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §4.
 
 ---
 
@@ -84,7 +84,7 @@ DNS-rebinding `Host`-header check — you don't need to configure this separatel
 deliberately-chosen non-loopback bind is added to the allowlist alongside `rmcp`'s own
 `localhost`/`127.0.0.1`/`::1` defaults; a wildcard bind, `0.0.0.0`/`::`, disables the check
 entirely, since it already accepts connections from any network. See
-[specs/05-surfaces.md](../specs/05-surfaces.md) §4.2.)
+[specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §4.2.)
 
 **Known v1 limitation:** the HTTP `/mcp` route snapshots the daemon's stores once at startup — a
 store added later via `POST /v1/stores` won't appear over MCP until the daemon restarts.
@@ -177,7 +177,7 @@ canonical localdb Citation JSON shape.
 
 > **Note:** the dense component uses the configured embedder (default: `pplx-embed-context-v1-0.6b`
 > local ONNX). The model is downloaded automatically on first use (~706 MB). See
-> [../specs/04-search-pipeline.md](../specs/04-search-pipeline.md) for the pipeline details.
+> [../specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md) for the pipeline details.
 
 **Input schema** (as actually returned by `tools/list`):
 
@@ -276,7 +276,7 @@ real indexing run. `score`, `store` and `provenance.fetched_at` are illustrative
 The citation shape is identical to `localdb search --json`. There is no top-level `document_id`,
 `block_seq`, `block_kind`, or `span` — those are superseded by `resource_id`, the nested
 `block {seq, kind}`, `chunk_position {seq_in_block}`, and `location {span, window_block_seqs}`
-respectively. See [../specs/02-domain-model.md](../specs/02-domain-model.md) §6 for field
+respectively. See [../specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md) §6 for field
 definitions.
 
 ---
@@ -529,7 +529,7 @@ If the same `anchor_chunk_id` (`block_seq = 10`) were requested with `limit: 30`
 20-chunk resource, the window would clamp to the whole list: `offset: 0`, `returned: 20`,
 `anchor_index: 10`.
 
-See [specs/05-surfaces.md](../specs/05-surfaces.md) §4.1 for the full spec (issue #146).
+See [specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §4.1 for the full spec (issue #146).
 
 ---
 
@@ -659,7 +659,7 @@ same shape `GET /v1/stores/{name}/documents` returns per item (see
 ## Error model
 
 MCP failures split into exactly two tiers, by whether the request could be _routed_ to a tool at
-all. See [specs/05-surfaces.md](../specs/05-surfaces.md) §4.3 for the full rationale — this section
+all. See [specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §4.3 for the full rationale — this section
 shows what each tier actually looks like on the wire.
 
 **Tool-level** (`result.isError: true`) — everything you're likely to hit in practice: a missing or
