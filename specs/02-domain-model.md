@@ -59,27 +59,55 @@ persisted in the unified database (`localdb.db`). Source CRUD is exposed via `St
 One logical content unit produced by an ingestor. Replaces the former `Document` entity. A resource
 is: a file, a fetched page, a Notion page, a conversation thread, a transcript, a feed entry.
 
-| Field                       | Notes                                                                                                                                                |
-| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `id`                        | **Content-addressed**: `blake3(uri ‖ content_hash)` — see §3.                                                                                        |
-| `source_id`, `store_id`     | Ownership.                                                                                                                                           |
-| `ingestor_kind`             | Which ingestor produced this resource (denormalized from source for queries).                                                                        |
-| `resource_kind`             | `document` \| `conversation` \| `transcription`. Determines block ordering semantics.                                                                |
-| `uri`                       | `Uri` newtype wrapping `url::Url`. Canonical locator (absolute path as `file://`, URL, or connector-defined scheme like `notion://`, `telegram://`). |
-| `external_id`               | Arbitrary source-system ID (Notion page ID, Telegram message ID, email Message-ID). Optional.                                                        |
-| `external_etag`             | Change detection token from the source system (HTTP ETag, Notion `last_edited_time`, file mtime). Optional.                                          |
-| `content_hash`              | blake3 of ordered block canonical texts concatenated. Drives incremental re-index. Not dependent on Markdown rendering.                              |
-| `title`, `mime`, `language` | From extraction. `language` is BCP 47.                                                                                                               |
-| `date_original`             | Dublin Core date string (may be partial, e.g. `2026` or `2026-06`).                                                                                  |
-| `date_parsed`               | Best-effort ISO 8601 parse of `date_original` (sortable).                                                                                            |
-| `added_at`                  | When first indexed (our timestamp, RFC 3339).                                                                                                        |
-| `modified_at`               | When content last changed (RFC 3339).                                                                                                                |
-| `thread_id`                 | Conversation thread identifier (conversation resources only).                                                                                        |
-| `channel`                   | Channel/folder/chat name (conversation resources only).                                                                                              |
-| `participants`              | JSON array of participant names/IDs (conversation resources only).                                                                                   |
-| `metadata`                  | `Metadata` enum — see §7. Contains Dublin Core base fields plus resource-kind-specific fields.                                                       |
-| `provenance`                | See §4.                                                                                                                                              |
-| `extractor_version`         | Version string of the parser/ingestor that produced the blocks. Enables reprocessing when extraction logic improves.                                 |
+| Field                       | Notes                                                                                                                                                                                                                                                                                                                                                                     |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`                        | **Content-addressed**: `blake3(uri ‖ content_hash)` — see §3.                                                                                                                                                                                                                                                                                                             |
+| `source_id`, `store_id`     | Ownership.                                                                                                                                                                                                                                                                                                                                                                |
+| `ingestor_kind`             | Which ingestor produced this resource (denormalized from source for queries).                                                                                                                                                                                                                                                                                             |
+| `resource_kind`             | `document` \| `conversation` \| `transcription`. Determines block ordering semantics.                                                                                                                                                                                                                                                                                     |
+| `uri`                       | `Uri` newtype wrapping `url::Url`. Canonical locator (absolute path as `file://`, URL, or connector-defined scheme like `notion://`, `telegram://`).                                                                                                                                                                                                                      |
+| `external_id`               | Arbitrary source-system ID (Notion page ID, Telegram message ID, email Message-ID). Optional.                                                                                                                                                                                                                                                                             |
+| `external_etag`             | Change detection token from the source system (HTTP ETag, Notion `last_edited_time`, file mtime). Optional.                                                                                                                                                                                                                                                               |
+| `content_hash`              | blake3 of ordered block canonical texts concatenated. Drives incremental re-index. Not dependent on Markdown rendering.                                                                                                                                                                                                                                                   |
+| `title`, `mime`, `language` | From extraction. `language` is BCP 47.                                                                                                                                                                                                                                                                                                                                    |
+| `date_original`             | Dublin Core date string (may be partial, e.g. `2026` or `2026-06`). Populated from `dc:date` per source format (coverage varies — see §7); population follows the "Document date" row of the date-axes table below. Never derived from `added_at`, `modified_at`, or `index_updated_at`.                                                                                  |
+| `date_parsed`               | Best-effort ISO 8601 parse of `date_original` (sortable). Same source and population rule as `date_original`.                                                                                                                                                                                                                                                             |
+| `added_at`                  | When this resource _version_ was first indexed — our clock (`now()` at ingestion), never a source value. Because `id` is content-addressed (`blake3(uri ‖ content_hash)`, §3), a content change mints a new resource ID and therefore a fresh `added_at`; a policy-only re-index (chunking/embedding config change, content unchanged) preserves the existing `added_at`. |
+| `modified_at`               | The **source-claimed** change time: when the source system says this content last changed (file mtime, feed `updated`\|`published`, future HTTP `Last-Modified`). A claim, not our observation — never our clock, and never promoted into `date_original`/`date_parsed`.                                                                                                  |
+| `index_updated_at`          | When we last wrote this resource's stored state — full re-index or metadata-only update — our clock. Lands with schema migration v7 (§9).                                                                                                                                                                                                                                 |
+| `thread_id`                 | Conversation thread identifier (conversation resources only).                                                                                                                                                                                                                                                                                                             |
+| `channel`                   | Channel/folder/chat name (conversation resources only).                                                                                                                                                                                                                                                                                                                   |
+| `participants`              | JSON array of participant names/IDs (conversation resources only).                                                                                                                                                                                                                                                                                                        |
+| `metadata`                  | `Metadata` enum — see §7. Contains Dublin Core base fields plus resource-kind-specific fields.                                                                                                                                                                                                                                                                            |
+| `provenance`                | See §4.                                                                                                                                                                                                                                                                                                                                                                   |
+| `extractor_version`         | Version string of the parser/ingestor that produced the blocks. Enables reprocessing when extraction logic improves.                                                                                                                                                                                                                                                      |
+
+### Date axes (normative)
+
+A resource carries **four** distinct date/time signals. They answer different questions, are set by
+different code paths, and must never be conflated or substituted for one another. This table is
+normative: any code that writes one axis's field from another axis's source is a bug against this
+spec, not an acceptable implementation choice.
+
+| Axis                      | Meaning                                                                                    | Field / column                 | Set by                                                                                                                                          | Never receives                                                                                                                 |
+| ------------------------- | ------------------------------------------------------------------------------------------ | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| Document date             | The date the document is _about_, or was authored/adopted — Dublin Core.                   | `date_original`, `date_parsed` | Parsers and connector metadata enrichment, from `dc:date` only.                                                                                 | File mtime, HTTP `Last-Modified`, or any feed timestamp (`updated`, `published`).                                              |
+| Index added               | When _we_ first indexed this resource version.                                             | `added_at`                     | Our clock (`now()` at ingestion).                                                                                                               | Any source-provided value.                                                                                                     |
+| Index updated             | When _we_ last wrote this resource's stored state (full re-index or metadata-only update). | `index_updated_at`             | Our clock (`now()` at write). Bumps on every resource-row write, including a metadata-only update that leaves content and `added_at` untouched. | Any source-provided value.                                                                                                     |
+| Source-claimed changed-at | The source system's own claim about when its content last changed.                         | `modified_at`                  | The source: file mtime, feed `updated`\|`published`, future HTTP `Last-Modified`.                                                               | Never promoted into `date_original`/`date_parsed`; never read back as an index-side timestamp (`added_at`/`index_updated_at`). |
+
+Two rules follow directly from the "Never receives" column and hold across every ingestor, present
+and future:
+
+1. **No ingestor may write a source-side timestamp into `dc:date`.** File mtime, HTTP
+   `Last-Modified`, and a feed entry's `updated`/`published` are all instances of the
+   "source-claimed changed-at" axis, not the "document date" axis — none of them may populate
+   `date_original`/`date_parsed`, no matter how plausible a stand-in they seem when the source
+   supplies no explicit `dc:date`.
+2. **No parser-derived `dc:date` may be read back as an index timestamp.** `date_original` and
+   `date_parsed` never substitute for `added_at`, `index_updated_at`, or `modified_at` — a document
+   whose Dublin Core date is missing or unparsed stays missing on those fields; it is never
+   backfilled from an index-side clock or vice versa.
 
 ### Block
 
@@ -381,7 +409,7 @@ Every resource and every chunk carries:
 | -------------- | ------------------------------------------------------------------------------ |
 | `origin_store` | Store ID where it was first indexed (≠ current store after future federation). |
 | `source_ref`   | Source ID + ingestor kind.                                                     |
-| `fetched_at`   | Acquisition time (file mtime at scan / HTTP fetch time).                       |
+| `fetched_at`   | Acquisition time: the resource's `added_at` (our ingestion clock).             |
 | `content_hash` | blake3 of resource content (ordered block texts concatenated).                 |
 | `share_path`   | Reserved, empty in MVP: list of (node, store) hops for federated content.      |
 
@@ -389,6 +417,13 @@ Every resource and every chunk carries:
 `modified_at` — it is persisted as `resources.added_at`, and that is the column
 `MetadataFilter::FetchedAfter`/`FetchedBefore` filter on and every citation's
 `provenance.fetched_at` reports.
+
+**Surface exposure.** Citations expose only the "index added" axis: every citation's
+`provenance.fetched_at` (§6) and `MetadataFilter::FetchedAfter`/`FetchedBefore` report and filter on
+`added_at` — never `modified_at`, `index_updated_at`, or `date_original`/`date_parsed`. The other
+three axes (§2's "Date axes (normative)") are document-level surfaces, not citation fields:
+`date_original`, `date_parsed`, and `index_updated_at` are returned by
+`document get`/`document list` (`DocumentInfo`, specs/05-surfaces.md §2-4), not by search citations.
 
 ## 5. Conversations and non-document resources
 
