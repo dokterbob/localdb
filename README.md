@@ -1,5 +1,10 @@
 # localdb
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/images/localdb-logo-dark.png">
+  <img src="docs/assets/images/localdb-logo-light.png" alt="localdb" width="268">
+</picture>
+
 [![Maintainability](https://qlty.sh/badges/32c0fdf3-b30a-44fc-993a-a45a573b1d56/maintainability.svg)](https://qlty.sh/gh/dokterbob/projects/localdb)
 [![Code Coverage](https://qlty.sh/badges/32c0fdf3-b30a-44fc-993a-a45a573b1d56/coverage.svg)](https://qlty.sh/gh/dokterbob/projects/localdb)
 
@@ -14,284 +19,95 @@ enriched by what the people you trust have found, with provenance at every hop. 
 that is built in from day one: content-addressed documents, per-chunk provenance, and stores as
 first-class shareable units. See [VISION.md](VISION.md).
 
-**Status: v0.1.0 released.** Hybrid search uses real dense embeddings via the default local model
+**Status:** hybrid search uses real dense embeddings via the default local model
 (`pplx-embed-context-v1-0.6b`, ONNX on CPU by default; CoreML ANE/GPU on Apple Silicon macOS
-automatically); the first `localdb index` or `localdb search` downloads ~706 MB from HuggingFace (no
-API key required). The HTTP daemon reads from and writes to the same unified database as the CLI,
-and ingestion via `POST /v1/jobs` runs the real indexing pipeline through an async job queue with
-live SSE progress, cancellation, and a worker pool — it remains experimental, with no auth. See
-[What works today](#what-works-today) below.
+automatically); the first indexing or search operation — including `add`'s auto-index — downloads
+~706 MB from HuggingFace (no API key required). The HTTP daemon remains experimental, with no auth.
+See [docs/architecture.md#known-gaps](docs/architecture.md#known-gaps) for the full list of what's
+not there yet.
 
-**License:** [AGPL-3.0-or-later](LICENSE).
+---
+
+## Quickstart
+
+1. **Install** (pick one):
+
+   ```bash
+   brew install dokterbob/localdb/localdb        # Homebrew, macOS and Linux
+   curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dokterbob/localdb/releases/latest/download/localdb-installer.sh | sh
+   ```
+
+   See [docs/install.md](docs/install.md) for tarballs, building from source, and completions.
+
+2. **Add and index a folder** — scaffolds `config.yaml` and a `default` store on first use, then
+   indexes it:
+
+   ```bash
+   localdb add ~/notes
+   ```
+
+   The first indexing or search operation (including this auto-index) downloads the ~706 MB default
+   embedding model from HuggingFace; later runs reuse the cached copy.
+
+3. **Search:**
+
+   ```bash
+   localdb search "some query"
+   ```
+
+   Add `--json` for structured `Citation` objects (chunk IDs, provenance hashes, per-component
+   scores, document metadata). Scope either command to one store with `-s` — flags go before the
+   query, e.g. `localdb search -s notes "some query"` (everything after the first query word is
+   treated as query text).
+
+4. **Connect an AI assistant:**
+
+   ```bash
+   claude mcp add localdb -- $(which localdb) mcp
+   ```
+
+   Use the absolute path — MCP clients spawn the binary directly, without your shell's PATH, so a
+   bare `localdb` often fails to launch. See [docs/mcp.md](docs/mcp.md) for other clients and the
+   remote/HTTP setup.
 
 ---
 
 ## Comparison to other tools
 
-localdb is for personal knowledge search from the command line or from an AI assistant, with no
-cloud dependency, no daemon required for search, and one binary to install — no Python interpreter,
-virtualenv, or Docker Compose stack. It's agent-first rather than chat-first: the CLI and MCP server
-are the primary surfaces, validated in practice against Codex, Claude Code, Claude Desktop, and
-Hermes Agent, using both cloud (Anthropic, OpenAI, DeepSeek) and local (Gemma) model providers. It
-already indexes more than "your notes": Markdown, plain text, HTML, PDF, Office documents
-(DOCX/PPTX/XLSX/XLS/CSV), and EPUB, all extracted in-process — with connectors for Notion, email,
-chat, and transcription planned next.
-
-It is deliberately narrow — "do one thing well": a verifiable retrieval primitive (index, search,
-cite), not an all-in-one chat app or team platform. That keeps its API stable enough for other
-things to be built on top instead of bundled in — a second-brain UI, or an agent's own live
-scratchpad search. A knowledge-graph layer, MCP tools for managing sources/stores, and eventually a
-web UI are on the roadmap, alongside — much further out — federation: searching datasets shared by
-people you trust, larger than any one person could assemble alone. No surveyed competitor addresses
-that last one yet. See [docs/comparison.md](docs/comparison.md) for the full survey against eight
-adjacent projects, including exactly where localdb is behind (no GUI yet, single-node, read-only
-MCP, no knowledge graph — see its "Where localdb is behind" section).
-
-| Project                                             | Single binary, no runtime | No external services | Hybrid BM25+vector | Native MCP server | Structured citations |
-| --------------------------------------------------- | :-----------------------: | :------------------: | :----------------: | :---------------: | :------------------: |
-| **localdb**                                         |            ✅             |          ✅          |         ✅         |        ✅         |          ✅          |
-| [GPT4All](https://www.nomic.ai/gpt4all) (LocalDocs) |            ✅             |          ✅          |         ❌         |        ❌         |          ❌          |
-| [Khoj](https://khoj.dev)                            |            ❌             |          ⚠️          |         ❌         |        ❌         |          ❌          |
-| [Basic Memory](https://basicmemory.com)             |            ❌             |          ✅          |         ✅         |        ✅         |          ❌          |
-
-GPT4All is the most common comparison point (and appears effectively stalled — no commits or
-releases in 13+ months); Khoj is the most popular actively-maintained self-hosted alternative
-(Python, needs `pip`/`uv`/Docker); Basic Memory is the closest architectural peer — native MCP,
-local-first, hybrid search — but trades localdb's read-only cited-corpus model for read-write note
-editing, and is scoped to Markdown only (no PDF/Office ingestion). Full details, sources, and
-caveats (including the `⚠️` partial marks) are in [docs/comparison.md](docs/comparison.md).
-
----
+localdb is a single dependency-free binary with no external services, hybrid BM25+vector search, a
+native MCP server, and structured byte-span citations — a combination no surveyed alternative
+(GPT4All, Khoj, Basic Memory, and five others) matches in full. See
+[docs/comparison.md](docs/comparison.md) for the full survey, including where localdb is behind (no
+GUI yet, single-node, read-only MCP, no knowledge graph).
 
 ## Feature highlights
 
-- **Citeable hybrid search** — BM25 + dense vector (RRF fusion) returning structured `Citation`
-  objects: file URI, heading path, exact text snippet, byte span, content hash, per-component
-  scores, and full document metadata. Every result is verifiable.
-- **Document metadata** — `DocumentMetadata` (Dublin Core: title, creator, date, description, …)
-  extracted from frontmatter and carried on every citation, so agents can attribute sources
-  properly.
-- **Local files, URLs, and feeds** — `localdb source add ~/notes` or
-  `localdb source add https://example.com/page`; `--kind feed` for Atom/RSS with per-source refresh
-  intervals; incremental re-index skips unchanged content.
-- **Embedded-first** — `localdb search` opens the store in-process; nothing needs to be running. The
-  MCP server works the same way.
-- **MCP server** — `localdb mcp` exposes four read-only tools (`search`, `list_stores`,
-  `get_document`, `get_chunks`) to any MCP-capable AI assistant, over stdio or (via `localdb serve`)
-  HTTP — including from another machine over Tailscale/LAN. Connect once, search forever.
-- **Multiple stores** — each store is isolated. `--store <name>` (repeatable) is a _filter_:
-  omitted, `search`/`status`/`store list`/`source list`/`index`/`mcp` span every store. Only
-  `source add` (and the `add` alias) narrows by default, to the store named `default` (exit 2 if it
-  doesn't exist), because a write has to land in one named place — see
-  [docs/cli.md](docs/cli.md#global-flags). `localdb mcp --store <name>` limits what an agent can
-  reach, which is how you keep a project-bound store project-bound.
-- **Context-aware dense search** — the default embedder (`pplx-embed-context-v1-0.6b`) is a
-  late-chunking model from Perplexity AI that encodes each chunk in the context of its full
-  document, producing strong retrieval quality. Stored as binary-quantized 128-byte vectors (Hamming
-  / IVF_FLAT), keeping index size small and search fast without a GPU. On Apple Silicon macOS, the
-  binary runs the model on the Neural Engine / GPU via CoreML automatically — no `--features` flag
-  is needed. The default `local` provider auto-selects CoreML at runtime and falls back to ONNX
-  (CPU) otherwise; both produce index-interchangeable vectors. The model is a public MIT release, so
-  no API key or license click-through is needed. Alternative: any OpenAI-compatible embedding
-  endpoint, including local private models via llama.cpp or MLX (Apple Silicon, SSD-backed KV
-  cache).
-- **libsql backend**: embedded database with DiskANN vector index and FTS5 full-text search, no
-  separate server.
-- **`--json` everywhere** — machine-readable output on every command.
-- **`localdb status`** — shows indexed stores and daemon state at a glance.
-
----
-
-## Install
-
-### Homebrew (macOS and Linux)
-
-```bash
-brew install dokterbob/localdb/localdb
-```
-
-Prebuilt binaries with shell completions installed for you. To run the HTTP daemon under
-`brew services` (optional — every command also works daemonless):
-
-```bash
-brew services start localdb
-```
-
-### Shell installer
-
-```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dokterbob/localdb/releases/latest/download/localdb-installer.sh | sh
-```
-
-### From source
-
-Requires a Rust toolchain (**1.88 or later, on every platform** — the `pdf_oxide` PDF parser
-declares that floor, and it subsumes the older per-platform split of Linux 1.82 / macOS 1.85).
-Install via [rustup](https://rustup.rs/).
-
-```bash
-git clone https://github.com/dokterbob/localdb
-cd localdb
-cargo install --path localdb
-localdb --version
-```
-
-On Apple Silicon macOS, CoreML (ANE/GPU) acceleration is built in automatically — no `--features`
-flag is needed. The default `local` embedding provider selects CoreML at runtime when available and
-falls back to ONNX (CPU) otherwise; indexes built by either backend are queryable by the other.
-
-### Pre-built tarballs
-
-| Platform            | Tarball suffix              | Notes                                                |
-| ------------------- | --------------------------- | ---------------------------------------------------- |
-| macOS Apple Silicon | `aarch64-apple-darwin`      | CoreML (ANE/GPU) built in — auto-selected at runtime |
-| Linux x86_64        | `x86_64-unknown-linux-gnu`  | ONNX CPU                                             |
-| Linux arm64         | `aarch64-unknown-linux-gnu` | ONNX CPU                                             |
-
-Download and install from the [Releases](https://github.com/dokterbob/localdb/releases) page:
-
-```bash
-# Replace VERSION and PLATFORM with your values from the table above
-PLATFORM=aarch64-apple-darwin   # or x86_64-unknown-linux-gnu / aarch64-unknown-linux-gnu
-curl -L "https://github.com/dokterbob/localdb/releases/latest/download/localdb-${PLATFORM}.tar.xz" \
-  | tar -xJ -C /usr/local/bin --strip-components=1 "localdb-${PLATFORM}/localdb"
-localdb --version
-```
-
-See [docs/release-engineering.md](docs/release-engineering.md) for full pipeline details and how to
-cut a release.
-
----
-
-## 60-second quickstart
-
-```bash
-# 1. Create a store
-localdb store add notes
-
-# 2. Add sources — local directories and/or URLs
-localdb source add ~/notes --store notes
-localdb source add https://example.com/page --store notes   # optional
-
-# 3. Index
-localdb index --store notes
-
-# 4. Check what got indexed
-localdb status
-
-# 5. Search
-localdb search "how does rust handle errors" --store notes
-```
-
-Example output from step 5 (paths shown from a scratch run):
-
-```
-1. file:///private/tmp/.../notes/rust-error-handling.md > Error handling in Rust
-   Error handling in Rust
-Rust uses the Result type for recoverable errors and panic! for unrecoverable ones. The question-
-
-2. file:///private/tmp/.../notes/meeting.txt
-   Meeting 2026-06-02: decided to adopt reciprocal rank fusion for combining dense and sparse retrieval results. Aardvark c
-
-3. file:///private/tmp/.../notes/lancedb-notes.md > LanceDB notes
-   LanceDB notes
-LanceDB is an embedded vector database built on the Lance columnar format. It supports hybrid search combi
-```
-
-Add `--json` to get structured `Citation` objects with chunk IDs, document IDs, provenance hashes,
-per-component scores, and document `metadata` fields (title, creator, date, etc.):
-
-```bash
-localdb search "hybrid search" --store notes --json
-```
-
----
+Citeable hybrid search with full provenance, local files/URLs/feeds, an embedded-first design
+(nothing needs to be running), five MCP tools, multiple isolated stores, a context-aware local
+embedder with CoreML acceleration on Apple Silicon, a libsql backend (DiskANN + FTS5), and `--json`
+everywhere. See [docs/comparison.md](docs/comparison.md#what-makes-localdbs-combination-distinctive)
+for the detailed rundown.
 
 ## MCP hookup
 
-```bash
-claude mcp add localdb -- localdb mcp
-```
-
-This registers `localdb` as a local MCP server over stdio. Four read-only tools are exposed:
-`search` (hybrid search returning Citation JSON), `list_stores` (store names, document counts, chunk
-counts), `get_document` (full document text and metadata by document ID), and `get_chunks` (a
-document's chunks, paginated).
-
-Once connected, any MCP-capable AI assistant can call `search` against your indexed stores and
-return cited excerpts with source URI, heading path, and document metadata — grounded in actual
-passages from your files.
-
-Running `localdb serve` too? `localdb mcp` detects it automatically and proxies through the daemon
-instead of conflicting with it — no need to stop one to use the other. The daemon also serves the
-same tools directly over HTTP at `/mcp`, so you can point an MCP client on a different machine (e.g.
-over Tailscale) at it too.
-
-See [docs/mcp.md](docs/mcp.md) for full tool schemas, the HTTP/remote setup, and example calls.
-
----
+`localdb mcp` exposes five read-only tools (`search`, `list_stores`, `get_document`, `get_chunks`,
+`list_documents`) over stdio, or over HTTP at `/mcp` via `localdb serve` — including from another
+machine over Tailscale/LAN. See [docs/mcp.md](docs/mcp.md) for full tool schemas, transports, and
+example calls.
 
 ## Experimental HTTP daemon
 
-```bash
-localdb serve   # binds http://127.0.0.1:7700 by default
-```
-
-The daemon exposes the REST API, plus the same MCP tools over HTTP at `/mcp` (see
-[MCP hookup](#mcp-hookup) above). Ingestion via `POST /v1/jobs` runs the real indexing pipeline
-through an async job queue — a configurable worker pool, live progress over SSE at
-`GET /v1/jobs/{id}/events`, and cancellation via `DELETE /v1/jobs/{id}` (`localdb job cancel`);
-`localdb index` submits to and attaches to a running daemon automatically. The daemon reads and
-writes the same unified database as the CLI, so CLI-indexed data is visible to it. It remains
-**experimental** and unauthenticated — anything that can reach the bind address is trusted. See
-[docs/http-api.md](docs/http-api.md) for endpoint reference and known limitations.
-
----
+`localdb serve` exposes a REST API (`/v1`) plus the same MCP tools at `/mcp`, backed by the same
+unified database the CLI uses, with ingestion running through an async job queue with live SSE
+progress. It remains experimental and unauthenticated. See [docs/http-api.md](docs/http-api.md) for
+the endpoint reference and known limitations.
 
 ## Schema migrations
 
-`store-libsql` tracks its schema version explicitly (`schema_migrations` table). Opening a store
-whose schema is behind, ahead of, or predates this binary's migration framework **refuses** with an
-actionable hint (exit 2) instead of silently rebuilding — run one of:
-
-```bash
-localdb db status              # current version, pending migrations, history — never refuses
-localdb db migrate              # apply pending migrations (confirmation only for a legacy v1-v3 rebuild)
-localdb db downgrade [--to N]   # step back using stored down-SQL (always confirms)
-localdb db vacuum               # reclaim disk space freed by migrations/deletes (SQLite VACUUM)
-```
-
-An older `localdb` binary can still downgrade a store a newer binary migrated forward — every
-migration's down-SQL is stored as data in the database itself, not read from compiled code. See
+`store-libsql` tracks its schema version explicitly and refuses to open a store whose schema is
+behind, ahead, or predates the migration framework (exit 2) rather than silently rebuilding — run
+`localdb db status` / `db migrate` / `db downgrade` / `db vacuum`. See
 [docs/migrations.md](docs/migrations.md) for the full walkthrough and the migration-authoring guide.
-
----
-
-## What works today
-
-| Area                  | What is true today                                                                                                                                                                                                                                                                                           |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Search ranking        | Hybrid BM25 + dense (RRF fusion). Default embedder is `pplx-embed-context-v1-0.6b` (local ONNX, ~706 MB download on first use).                                                                                                                                                                              |
-| Embedding models      | Downloaded automatically on first `localdb index` or `localdb search` from the public HuggingFace repo `perplexity-ai/pplx-embed-context-v1-0.6b`. No API key required.                                                                                                                                      |
-| Embedding backend     | Default provider `local` runs ONNX on CPU. On Apple Silicon macOS, the macOS binary includes CoreML by default and auto-selects the ANE/GPU backend at runtime, falling back to ONNX otherwise. CoreML/ONNX indexes are interchangeable. Force a backend with `local-coreml` / `local-onnx`.                 |
-| HTTP daemon           | Experimental — no auth. Ingestion via POST /v1/jobs runs the real pipeline through an async job queue (configurable worker pool, SSE progress, cancellation); `localdb index` attaches automatically; reads and writes the unified database same as the CLI.                                                 |
-| YAML-declared stores  | Appear in `store list` but **cannot be indexed** (`localdb index` only resolves runtime stores). Use `localdb store add` + `localdb source add` instead.                                                                                                                                                     |
-| CLI while daemon runs | CLI and daemon can run concurrently. SQLite WAL and busy_timeout serialise concurrent writes.                                                                                                                                                                                                                |
-| MCP while daemon runs | `localdb mcp` now detects a running daemon and proxies to its `/mcp` route automatically, rather than conflicting with it. `--store` narrowing is honored in both modes, but since the daemon's `/mcp` is unauthenticated it is a guardrail, not containment — see [docs/mcp.md](docs/mcp.md#store-scoping). |
-| MCP over HTTP         | `/mcp` on the daemon snapshots the store list once at startup — a store added later via `/v1/stores` isn't visible over MCP until restart.                                                                                                                                                                   |
-| Job control           | `localdb job list` / `localdb job cancel <id>` manage a daemon's job queue; daemon-only (exit 5 without one).                                                                                                                                                                                                |
-| Document commands     | `localdb document list [--source ID]` / `localdb document get <id> [--text]` read indexed documents, embedded or daemon-attached.                                                                                                                                                                            |
-| Shell completions     | `localdb completions <shell>` for bash/zsh/fish/elvish/powershell — pure codegen, works before `init`, never probes the daemon.                                                                                                                                                                              |
-
-Docs sync: the old Known Gaps entries for source path validation and the macOS bundle ID are
-resolved in code and reflected in `docs/architecture.md`. `--store` scoping is now consistent across
-every subcommand rather than only `search`/`mcp` (#178, #118, #201 — it is a _filter_, so omitting
-it spans every store except on `source add`, and the commands that aren't store-scoped reject it
-instead of ignoring it), and `get_document`/`get_chunks` accept an optional `store` argument to
-disambiguate a document id that exists in more than one store (#144) — see
-[specs/05-surfaces.md §2.2](specs/05-surfaces.md#22-store-scope).
-
-Design rationale and planned behavior live in the [specs/](specs/) directory.
 
 ---
 
@@ -307,7 +123,7 @@ Design rationale and planned behavior live in the [specs/](specs/) directory.
 | [docs/cli.md](docs/cli.md)                                 | All commands and flags, exit codes, error messages                                        |
 | [docs/http-api.md](docs/http-api.md)                       | REST endpoint reference, request/response shapes, limitations                             |
 | [docs/mcp.md](docs/mcp.md)                                 | MCP tool schemas, stdio and HTTP transports, remote setup, example calls                  |
-| [docs/architecture.md](docs/architecture.md)               | Crate layout, storage, search pipeline overview                                           |
+| [docs/architecture.md](docs/architecture.md)               | Crate layout, storage, search pipeline overview, known gaps                               |
 | [docs/migrations.md](docs/migrations.md)                   | Schema migrations: user-facing `db status`/`migrate`/`downgrade`, and the authoring guide |
 | [specs/01-architecture.md](specs/01-architecture.md)       | Workspace layout, embedded-first process model, storage trait                             |
 | [specs/02-domain-model.md](specs/02-domain-model.md)       | Store, Source, Document, Block, Chunk, Citation; content-addressed IDs                    |

@@ -128,6 +128,33 @@ jobs:
       - name: Run clippy with local-coreml (deny warnings)
         run: cargo clippy -p localdb-embed --features local-coreml --all-targets -- -D warnings
 
+  link-check:
+    name: Check links (docs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check links
+        uses: lycheeverse/lychee-action@v2
+        with:
+          # `--offline` alone never checks fragment anchors — `--include-fragments`
+          # (bare, so it defaults to anchor-only) is what validates `file.md#anchor`
+          # targets, both GitHub-style heading slugs and raw `<a id="...">` HTML
+          # anchors. Both offline and deterministic, so this can gate PRs.
+          #
+          # docs/index.md and docs/_layouts/** are excluded: they contain raw
+          # Liquid `{{ ... | relative_url }}` hrefs that are only real links once
+          # Jekyll renders them, which would all be false positives here. The
+          # built-site pass in pages.yml covers those instead.
+          #
+          # Shared excludes (e.g. localhost) live in ./lychee.toml, which lychee
+          # auto-detects from the working directory — no --config flag needed.
+          args: >-
+            --offline --include-fragments --no-progress
+            --exclude-path docs/index.md
+            --exclude-path docs/_layouts
+            README.md CLAUDE.md CONTRIBUTING.md VISION.md
+            'docs/**/*.md' 'specs/**/*.md'
+
   # Demonstrate the coverage gate: this job has a dummy function with a test.
   # The function and test live in the core crate (error.rs / tests).
   # If tests are removed, coverage will drop and the coverage job will fail.

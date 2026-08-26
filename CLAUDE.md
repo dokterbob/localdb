@@ -50,7 +50,7 @@ to the short directory name, so imports in code stay unprefixed (`use extract::�
 | `fetch`        | The `UrlFetcher` impl (reqwest) plus the shared outgoing-HTTP layer (issue #207): retry via `backon` (429/408/5xx/timeout, honoring `Retry-After`) and per-host pacing via `governor` (keyed on destination host, loopback/LAN exempt). Two clients: `new()` unrestricted for operator-configured URLs, `new_public_only()` with the SSRF destination guard for URLs discovered in untrusted content (feed entry links) |
 | `ingest`       | Concrete `Ingestor` impls (`FileIngestor`, `UrlIngestor`, future connectors — Atom/RSS, Notion, Telegram, …); depends on `core` + `extract`; owns all acquisition I/O                                                                                                                                                                                                                                                   |
 | `localdb`      | Binary entry point; wires all subcommands                                                                                                                                                                                                                                                                                                                                                                               |
-| `mcp`          | `rmcp`-based MCP server, stdio (embedded or daemon-proxied) and HTTP (`/mcp`); tools: `search`, `get_document`, `get_chunks`, `list_stores`                                                                                                                                                                                                                                                                             |
+| `mcp`          | `rmcp`-based MCP server, stdio (embedded or daemon-proxied) and HTTP (`/mcp`); tools: `search`, `get_document`, `get_chunks`, `list_stores`, `list_documents`                                                                                                                                                                                                                                                           |
 | `server`       | HTTP daemon (`/v1` axum routes), background jobs, file-watch, discovery-socket lifecycle                                                                                                                                                                                                                                                                                                                                |
 | `store-libsql` | `RetrievalStore` impl: libsql (DiskANN vectors + FTS5 BM25); RRF fusion lives in `core`, not here                                                                                                                                                                                                                                                                                                                       |
 
@@ -84,11 +84,11 @@ first if it is wrong.
   auto-selects CoreML (ANE/GPU) automatically — the macOS binary enables `embed`'s `local-coreml`
   feature by default via `cli/Cargo.toml`'s `[target.'cfg(target_os = "macos")'.dependencies]`, so
   no `--features` flag is needed. It falls back to ONNX otherwise; CoreML/ONNX vectors are
-  index-interchangeable (force a backend with `local-coreml` / `local-onnx`). The first
-  `localdb index` or `localdb search` triggers a one-time ~706 MB download; no API key or license
-  click-through is required. Alternative local model: `model: bge-small-en-v1.5` (384-dim, much
-  smaller). Hosted alternatives: `provider: perplexity` with `model: pplx-embed-context-v1`
-  (requires API key), or `provider: openai-compatible`.
+  index-interchangeable (force a backend with `local-coreml` / `local-onnx`). The first indexing or
+  search operation (including `source add`'s auto-index) triggers a one-time ~706 MB download; no
+  API key or license click-through is required. Alternative local model: `model: bge-small-en-v1.5`
+  (384-dim, much smaller). Hosted alternatives: `provider: perplexity` with
+  `model: pplx-embed-context-v1` (requires API key), or `provider: openai-compatible`.
 - **ONNX Runtime is loaded dynamically, never statically linked** (issue #133): `embed`'s `ort`
   dependency uses `load-dynamic`, and `embed/build.rs` embeds Microsoft's _official_ ONNX Runtime
   build (pinned version, sha256-verified) for every `local-onnx` target — Linux x64, Linux aarch64,

@@ -9,7 +9,8 @@ available, both serving the same five read-only tools:
 - **HTTP** (`/mcp`, mounted on a running `localdb serve` daemon) — for connecting a remote MCP
   client, or one running on a different machine on your network/Tailscale.
 
-For design rationale and the trust model see [../specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §4.
+For design rationale and the trust model see
+[specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §4.
 
 ---
 
@@ -54,6 +55,16 @@ With a custom config:
 ```
 claude mcp add localdb -- localdb mcp --config /path/to/config.yaml
 ```
+
+> **Use an absolute path to the binary.** MCP clients spawn `localdb` directly, without your shell's
+> PATH additions (`.bashrc`/`.zshrc` `export PATH=...` lines aren't sourced). If you installed with
+> the shell installer, `~/.cargo/bin` — its default install location — is exactly what goes missing,
+> and the client fails to launch the server with no obvious reason why. In the JSON blocks above,
+> set `command` to the absolute path that `which localdb` prints — JSON config files are not
+> shell-evaluated, so `$(which localdb)` will not work there. In `claude mcp add`, which is a shell
+> command, `$(which localdb)` in place of the bare `localdb` works directly.
+
+<a id="remote-http-connecting-from-another-machine"></a>
 
 ### Remote / HTTP — connecting from another machine
 
@@ -177,7 +188,8 @@ canonical localdb Citation JSON shape.
 
 > **Note:** the dense component uses the configured embedder (default: `pplx-embed-context-v1-0.6b`
 > local ONNX). The model is downloaded automatically on first use (~706 MB). See
-> [../specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md) for the pipeline details.
+> [specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md)
+> for the pipeline details.
 
 **Input schema** (as actually returned by `tools/list`):
 
@@ -276,8 +288,9 @@ real indexing run. `score`, `store` and `provenance.fetched_at` are illustrative
 The citation shape is identical to `localdb search --json`. There is no top-level `document_id`,
 `block_seq`, `block_kind`, or `span` — those are superseded by `resource_id`, the nested
 `block {seq, kind}`, `chunk_position {seq_in_block}`, and `location {span, window_block_seqs}`
-respectively. See [../specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md) §6 for field
-definitions.
+respectively. See
+[specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md)
+§6 for field definitions.
 
 ---
 
@@ -529,7 +542,8 @@ If the same `anchor_chunk_id` (`block_seq = 10`) were requested with `limit: 30`
 20-chunk resource, the window would clamp to the whole list: `offset: 0`, `returned: 20`,
 `anchor_index: 10`.
 
-See [specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §4.1 for the full spec (issue #146).
+See [specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §4.1
+for the full spec (issue #146).
 
 ---
 
@@ -659,8 +673,8 @@ same shape `GET /v1/stores/{name}/documents` returns per item (see
 ## Error model
 
 MCP failures split into exactly two tiers, by whether the request could be _routed_ to a tool at
-all. See [specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §4.3 for the full rationale — this section
-shows what each tier actually looks like on the wire.
+all. See [specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md)
+§4.3 for the full rationale — this section shows what each tier actually looks like on the wire.
 
 **Tool-level** (`result.isError: true`) — everything you're likely to hit in practice: a missing or
 malformed argument, an unknown store name, a not-found lookup, an out-of-range `limit`/`offset`.

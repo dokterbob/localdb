@@ -1,10 +1,11 @@
 # localdb CLI reference
 
 `localdb` is a local-first hybrid-search document index. This page is the complete reference for its
-command-line interface (v0.1.0).
+command-line interface.
 
-For design decisions and process-model details see [specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md).
-For the HTTP daemon surface see [docs/http-api.md](http-api.md). For the MCP stdio surface see
+For design decisions and process-model details see
+[specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md). For the
+HTTP daemon surface see [docs/http-api.md](http-api.md). For the MCP stdio surface see
 [docs/mcp.md](mcp.md).
 
 ---
@@ -13,14 +14,14 @@ For the HTTP daemon surface see [docs/http-api.md](http-api.md). For the MCP std
 
 These flags are accepted by every subcommand.
 
-| Flag                 | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `--config <PATH>`    | Path to the config file. Default: the platform config dir — `~/Library/Application Support/localdb/config.yaml` on macOS, `~/.config/localdb/config.yaml` on Linux. Can also be set via the `LOCALDB_CONFIG` environment variable.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `--json`             | Emit machine-readable JSON instead of human-readable text. All JSON shapes are stable API.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| Flag                 | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--config <PATH>`    | Path to the config file. Default: the platform config dir — `~/Library/Application Support/localdb/config.yaml` on macOS, `~/.config/localdb/config.yaml` on Linux. Can also be set via the `LOCALDB_CONFIG` environment variable.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `--json`             | Emit machine-readable JSON instead of human-readable text. All JSON shapes are stable API.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `-s, --store <NAME>` | Narrow to these stores; repeatable. It is a **filter**, so omitting it means **all stores** for `search`, `status`, `store list`, `source list`, `source remove <ULID>`, `document list`, `document get`, `index` and `mcp`. Three exceptions: `source add` (and the `add` alias) defaults to the store named `default`, exit 2 if absent; `source remove <path\|url>` requires it, exit 2 without it; and `init`, `serve`, `store add`, `store remove`, `db status`/`migrate`/`downgrade`/`vacuum` **reject it outright** (exit 2) because they aren't store-scoped. An explicit name is always validated — unknown is exit 3, never silently ignored. `document get`'s omitted case can additionally be `invalid_request` (exit 2) if the id exists in more than one store — see below. See [specs/05-surfaces.md §2.2](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md#22-store-scope). |
-| `-y, --yes`          | Skip confirmation prompts for destructive operations (`db migrate` legacy rebuild, `db downgrade`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `-h, --help`         | Print help.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `-V, --version`      | Print version.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `-y, --yes`          | Skip confirmation prompts for destructive operations (`db migrate` legacy rebuild, `db downgrade`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `-h, --help`         | Print help.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `-V, --version`      | Print version.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 
 **Environment variable:** `LOCALDB_CONFIG=<path>` is equivalent to `--config <path>`.
 
@@ -29,8 +30,8 @@ These flags are accepted by every subcommand.
 ## Exit codes
 
 Exit codes are stable API. See
-[specs/05-surfaces.md §5](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md#5-shared-error-taxonomy) for the full error
-taxonomy that drives them.
+[specs/05-surfaces.md §5](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md#5-shared-error-taxonomy)
+for the full error taxonomy that drives them.
 
 | Code | Meaning                 | Example trigger                                               |
 | ---- | ----------------------- | ------------------------------------------------------------- |
@@ -50,7 +51,8 @@ taxonomy that drives them.
 directories implicitly on first use, so you never have to run `init` before `store add`,
 `source add`, `index`, or `search`. Run it if you'd rather do that setup explicitly up front: it
 prints every resolved path, and `--download-model` lets you pull the embedding model ahead of time
-instead of on the first `index`/`search`.
+instead of deferring it to the first indexing or search operation (including `source add`'s
+auto-index).
 
 ```
 Optional bootstrap: write the config, create the data/models/logs directories, and print the resolved paths
@@ -75,10 +77,11 @@ creates a store named `default`, unless the database can't be opened (see below)
 
 **`--download-model`:** prepares the configured embedder immediately. For the default local provider
 this downloads the ~706 MB model (`pplx-embed-context-v1-0.6b`, from HuggingFace, no API key or
-license click-through required) right away instead of deferring it to the first `index` or `search`.
-For a hosted provider (`openai-compatible`, `perplexity`, `voyage`) it just validates that the
-client can be constructed (e.g. that an API key is present). When this flag succeeds, `init` omits
-the "downloads its embedding model on first index" note from its output, since it's no longer true.
+license click-through required) right away instead of deferring it to the first indexing or search
+operation (including `source add`'s auto-index). For a hosted provider (`openai-compatible`,
+`perplexity`, `voyage`) it just validates that the client can be constructed (e.g. that an API key
+is present). When this flag succeeds, `init` omits the "downloads its embedding model on first
+index" note from its output, since it's no longer true.
 
 **If the database can't be opened** — most commonly because it needs a schema migration — `init`
 prints a `Warning: ...` on stderr and still exits `0`. It still writes the config and creates the
@@ -149,13 +152,24 @@ Options:
   -V, --version        Print version
 ```
 
-**Examples:**
+**Examples** (a scratch database with two stores, `books` and `notes`, each already indexed):
 
 ```
 $ localdb status
 daemon: not running (embedded mode)
-stores (1):
-  notes [libsql]
+stores (2):
+  books [libsql] 1 documents, 1 chunks
+  notes [libsql] 2 documents, 2 chunks
+
+database: /home/user/localdb/data/localdb.db
+  size: 164.0 KB (+ 0 B WAL)
+  ~54.7 KB per chunk (3 chunks total)
+  largest tables:
+    chunks_vec_idx_shadow — 32.0 KB
+    sources — 24.0 KB
+    resources — 16.0 KB
+    chunks — 16.0 KB
+    stores — 12.0 KB
 ```
 
 ```
@@ -164,13 +178,56 @@ $ localdb status --json
   "daemon": "not running (embedded mode)",
   "stores": [
     {
+      "name": "books",
+      "visibility": "private",
       "backend": "libsql",
+      "document_count": 1,
+      "chunk_count": 1
+    },
+    {
       "name": "notes",
-      "visibility": "private"
+      "visibility": "private",
+      "backend": "libsql",
+      "document_count": 2,
+      "chunk_count": 2
     }
-  ]
+  ],
+  "database": {
+    "path": "/home/user/localdb/data/localdb.db",
+    "exists": true,
+    "size_bytes": 167936,
+    "wal_size_bytes": 0,
+    "total_size_bytes": 167936,
+    "bytes_per_chunk": 55978,
+    "largest_tables": [
+      {
+        "name": "chunks_vec_idx_shadow",
+        "bytes": 32768
+      },
+      {
+        "name": "sources",
+        "bytes": 24576
+      },
+      {
+        "name": "resources",
+        "bytes": 16384
+      },
+      {
+        "name": "chunks",
+        "bytes": 16384
+      },
+      {
+        "name": "stores",
+        "bytes": 12288
+      }
+    ]
+  }
 }
 ```
+
+(path shown from a scratch run; `document_count`/`chunk_count` appear per store, and the `database`
+block reports on-disk size and a breakdown of the largest tables — useful for deciding whether
+`localdb db vacuum` is worth running.)
 
 ---
 
@@ -340,29 +397,44 @@ Arguments:
   <SOURCES>...  Source paths or URLs (one or more)
 
 Options:
-      --config <PATH>      Path to config file (default: platform data dir / localdb / config.yaml)
-      --refresh <REFRESH>  Refresh interval for URL sources (e.g. "1h", "30m", "3600")
-      --json               Emit JSON output instead of human-readable text
-  -s, --store <NAME>       Operate on these stores (repeatable); a filter, not a selector
-  -y, --yes                Skip confirmation prompts for destructive operations
-  -h, --help               Print help (see more with '--help')
-  -V, --version            Print version
+      --config <PATH>          Path to config file (default: platform data dir / localdb / config.yaml)
+      --refresh <REFRESH>      Refresh interval for URL and feed sources (e.g. "1h", "30m", "3600")
+      --json                   Emit JSON output instead of human-readable text
+      --kind <KIND>            Override source-kind classification instead of inferring it from the argument (path vs. `http(s)://` URL). `feed` treats the argument as an Atom/RSS feed URL, which fetches every entry page at index time — pass `--max-entries` to bound that [possible values: path, url, feed]
+      --max-entries <N>        Cap on feed entries considered per indexing run (feed sources only)
+  -s, --store <NAME>           Operate on these stores (repeatable); a filter, not a selector
+      --no-fetch-full-content  For feed sources, index only the feed-supplied summary instead of fetching each entry's full page content (feed sources only)
+  -y, --yes                    Skip confirmation prompts for destructive operations
+  -h, --help                   Print help (see more with '--help')
+  -V, --version                Print version
 ```
 
-Registers one or more filesystem paths (or URLs) as sources for a store. `--store` is repeatable;
-omit it and the source is added to the store named `default` (exit `2` if no such store exists) — it
-is never guessed from whatever stores happen to exist (specs/05-surfaces.md §2.2).
+Registers one or more filesystem paths, URLs, or (with `--kind feed`) Atom/RSS feed URLs as sources
+for a store. `--store` is repeatable; omit it and the source is added to the store named `default`
+(exit `2` if no such store exists) — it is never guessed from whatever stores happen to exist
+(specs/05-surfaces.md §2.2).
+
+**`--kind`:** by default the source kind is inferred from the argument (a filesystem path vs. an
+`http(s)://` URL). Pass `--kind feed` to treat the argument as an Atom/RSS feed instead of a plain
+URL source — indexing then fetches every entry's full page content by default (bound the number of
+entries considered with `--max-entries`, or index only the feed-supplied summaries with
+`--no-fetch-full-content`).
 
 This is the **one** command where omitting `--store` narrows rather than spans. Everything else
 treats `-s` as a filter over all stores; a write can't, because "add this source to every store" is
 not what anyone means.
 
-**Note:** path existence is not validated at registration time — `source add /does/not/exist`
-succeeds (exit 0). The error surfaces at `index` time.
+**Note:** path existence is validated at registration time — `source add /does/not/exist` fails
+immediately with `invalid request: path '/does/not/exist' does not exist` (exit 2), and the source
+is never added.
 
 ```
 $ localdb source add ~/notes --store notes
 Added source 01KTVH6AY4DC84HWW7M2PP4F0X to store 'notes'
+Auto-indexing source 01KTVH6AY4DC84HWW7M2PP4F0X ...
+Indexing /home/user/notes
+  discovered 1 files
+  indexed 1 docs, 0 skipped, 0 deleted, 2 chunks
 ```
 
 ### `localdb source list`
@@ -454,6 +526,62 @@ exit: 2
 
 An explicit `--store` still hard-filters a ULID removal: if the source exists but lives outside the
 named scope, this is `source_not_found` (exit `3`) rather than a silent redirect to its real store.
+
+---
+
+## `localdb add`
+
+Alias for `localdb source add` — same arguments, same options, same store-scoping rule (defaults to
+the store named `default`, exit `2` if it doesn't exist). See
+[`localdb source add`](#localdb-source-add) above for the full reference; this section only covers
+what's different.
+
+```
+Alias for `source add`: add one or more sources to a store
+
+Usage: localdb add [OPTIONS] <SOURCES>...
+
+Arguments:
+  <SOURCES>...  Source paths or URLs (one or more)
+
+Options:
+      --config <PATH>          Path to config file (default: platform data dir / localdb / config.yaml)
+      --refresh <REFRESH>      Refresh interval for URL and feed sources (e.g. "1h", "30m", "3600")
+      --json                   Emit JSON output instead of human-readable text
+      --kind <KIND>            Override source-kind classification instead of inferring it from the argument (path vs. `http(s)://` URL). `feed` treats the argument as an Atom/RSS feed URL, which fetches every entry page at index time — pass `--max-entries` to bound that [possible values: path, url, feed]
+      --max-entries <N>        Cap on feed entries considered per indexing run (feed sources only)
+  -s, --store <NAME>           Operate on these stores (repeatable); a filter, not a selector
+      --no-fetch-full-content  For feed sources, index only the feed-supplied summary instead of fetching each entry's full page content (feed sources only)
+  -y, --yes                    Skip confirmation prompts for destructive operations
+  -h, --help                   Print help (see more with '--help')
+  -V, --version                Print version
+```
+
+**On a genuinely first run** (no config file exists yet at the resolved path), `add` — like every
+command except `db status`/`migrate`/`downgrade`/`vacuum` — implicitly scaffolds the config file and
+data/models/logs directories, then also creates the `default` store, so `localdb add ~/notes` works
+immediately with nothing set up beforehand:
+
+```
+$ localdb add ~/notes
+Added source 01M0WYAT70DK1N87E6VHDJG07Y to store 'default'
+Auto-indexing source 01M0WYAT70DK1N87E6VHDJG07Y ...
+Indexing /home/user/notes
+  discovered 1 files
+  indexed 1 docs, 0 skipped, 0 deleted, 1 chunks
+```
+
+Once a config file exists, that implicit `default`-store creation no longer happens —
+`add`/`source add` then requires an explicit `default` store (or an explicit `--store <name>`), same
+as any other run:
+
+```
+$ localdb add ~/notes
+error: invalid request: no store named 'default'; pass --store <name>
+exit: 2
+```
+
+(paths and IDs shown from a scratch run)
 
 ---
 
@@ -613,11 +741,17 @@ Options:
       --source <SOURCE_ID>  Limit to a specific source (by ID)
       --json                Emit JSON output instead of human-readable text
       --strict              Exit with code 2 if any document failed extraction (never aborts mid-run)
+      --delete              Remove indexed documents that no longer exist at their source
   -s, --store <NAME>        Operate on these stores (repeatable); a filter, not a selector
   -y, --yes                 Skip confirmation prompts for destructive operations
   -h, --help                Print help (see more with '--help')
   -V, --version             Print version
 ```
+
+**`--delete`:** off by default, like `rsync --delete` — indexing never removes anything unless you
+ask. Without it, documents whose files were deleted (or whose URLs now 404) stay searchable, and the
+run reports how many could be pruned. With it, they're actually removed (`docs_deleted` in
+`--json`).
 
 Omit `--store` and every store in the database is indexed; pass `--store` (repeatable) to index only
 specific stores. Indexing more than one store prints a `[store]`-prefixed line per store plus a
@@ -631,7 +765,8 @@ the summary JSON itself).
 
 **Embeddings:** the CLI calls `embed::create_embedder` from the config policy. The default embedder
 (`pplx-embed-context-v1-0.6b`, local ONNX) is downloaded automatically on first run (~706 MB). See
-[specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md) for the pipeline.
+[specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md)
+for the pipeline.
 
 ```
 $ localdb index --store notes
@@ -683,7 +818,9 @@ Omit `--store` and every store is searched; pass `--store` (repeatable) to narro
 > treats `--limit 5` as part of the query.
 
 Runs hybrid BM25 + dense-vector search across the targeted stores and returns ranked citations. The
-Citation JSON shape is documented in [specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md) §6.
+Citation JSON shape is documented in
+[specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md)
+§6.
 
 **Ranking:** hybrid BM25 + dense (RRF fusion). With the default binary-quantized local model,
 `dense` is the normalized Hamming similarity (`1.0 - hamming_dist / nbits`); a float32 embedder
@@ -783,7 +920,8 @@ real indexing run. `score`, `store` and `provenance.fetched_at` are illustrative
 There is no top-level `document_id`, `block_seq`, `block_kind`, or `span` in the Citation shape —
 those are superseded by `resource_id`, the nested `block {seq, kind}`,
 `chunk_position {seq_in_block}`, and `location {span, window_block_seqs}` respectively. See
-[specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md) §6.
+[specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md)
+§6.
 
 ---
 
@@ -791,7 +929,8 @@ those are superseded by `resource_id`, the nested `block {seq, kind}`,
 
 Inspect or migrate the database schema. See [docs/migrations.md](migrations.md) for the full
 migration walkthrough and the migration-authoring guide, and
-[specs/05-surfaces.md §2.1](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md#21-schema-migrations) for the design.
+[specs/05-surfaces.md §2.1](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md#21-schema-migrations)
+for the design.
 
 ```
 Inspect or migrate the database schema (specs/05-surfaces.md §2.1)
@@ -802,6 +941,7 @@ Commands:
   status     Show schema version, pending migrations, and migration history
   migrate    Apply pending migrations to bring the database up to this binary's head version
   downgrade  Reverse migrations using stored down-SQL (default: one step back)
+  vacuum     Reclaim disk space freed by prior migrations/deletes by rewriting the whole database file (SQLite `VACUUM`)
   help       Print this message or the help of the given subcommand(s)
 
 Options:
@@ -817,7 +957,7 @@ Opening a store never migrates it — a version mismatch on open is refused (exi
 pointing at one of these commands. They are the only surfaces allowed to change a store's schema
 version.
 
-**None of the three subcommands are store-scoped.** They operate on the whole database file passed
+**None of the four subcommands are store-scoped.** They operate on the whole database file passed
 via `--config`/the default data dir, not a single named store, so `--store`/`-s` is **rejected
 outright** — exit `2` — rather than silently ignored (specs/05-surfaces.md §2.2):
 
@@ -827,7 +967,7 @@ error: invalid request: `db` commands operate on the whole database file; --stor
 exit: 2
 ```
 
-**All three subcommands require the daemon to be stopped.** Run against a live daemon they exit `4`
+**All four subcommands require the daemon to be stopped.** Run against a live daemon they exit `4`
 (`daemon_running`), the same as every other daemon-aware write command — the daemon never applies
 migrations itself:
 
@@ -858,11 +998,16 @@ framework entirely, is reportable state, not an error.
 
 ```
 $ localdb db status
-schema version: 4 (this binary's head: 4, baseline: 4)
+schema version: 6 (this binary's head: 6, baseline: 4)
 up to date
 history:
-  v4 baseline  applied 2026-07-01T10:00:00Z  (not downgradable: baseline schema predates the migration framework; cannot downgrade below v4)
+  v4 baseline  applied 2026-08-25T17:07:04Z  (not downgradable: baseline schema predates the migration framework; cannot downgrade below v4)
+  v5 drop_chunks_block_id_and_retag_resource_metadata  applied 2026-08-25T17:07:04Z  (not downgradable: chunks.block_id cannot be reconstructed; re-index required after downgrade)
+  v6 shrink_vector_index  applied 2026-08-25T17:07:04Z  (downgradable)
 ```
+
+(from a scratch run — all three migrations were applied at store-creation time, since a freshly
+created store is built directly at head rather than replayed step by step)
 
 With pending migrations the second line becomes ``2 pending migrations; run `localdb db migrate` ``.
 `--json` emits `current_version`, `head_version`, `baseline_version`, `pending`, `legacy`,
@@ -875,8 +1020,8 @@ reported distinctly, never as "up to date":
 
 ```
 $ localdb db status
-schema version: 0 (this binary's head: 4, baseline: 4)
-store exists but is uninitialized (no schema yet); any normal localdb command, or `localdb db migrate`, will initialize it to v4
+schema version: 0 (this binary's head: 6, baseline: 4)
+store exists but is uninitialized (no schema yet); any normal localdb command, or `localdb db migrate`, will initialize it to v6
 ```
 
 `--json` sets `"uninitialized": true` for this case. `pending` stays `0` rather than reporting
@@ -905,9 +1050,18 @@ on stderr, then a summary:
 
 ```
 $ localdb db migrate
-applied migration v5 'create_auth_tables' in 12ms
-migrated: v4 -> v5 (1 step applied)
+note: this migration rebuilds the vector index (~9x smaller) by re-reading the stored embeddings — no re-embedding, but it does one index insert per chunk and can take a long time on a large store.
+      it does NOT shrink the file: the space it frees goes to SQLite's free list, so '/home/user/localdb/data/localdb.db' (268.0 KiB) will briefly grow before `localdb db vacuum` reclaims it.
+applying 1 pending migration
+applying 1/1: shrink_vector_index
+applied migration v6 'shrink_vector_index' in 1ms
+migrated: v5 -> v6 (1 step applied)
+hint: this migration shrank the vector index but freed pages stay in the file until reclaimed — run `localdb db vacuum` to shrink it on disk
 ```
+
+(from a scratch run; a migration that also rewrites large derived data — like the v6 vector-index
+shrink above — prints a cost/space-tradeoff note before applying, and a matching hint pointing at
+`db vacuum` afterward)
 
 If nothing is pending it prints `already at head (vN)` and exits `0`. If any applied migration marks
 derived data stale (a re-embedding/re-extraction-class migration), it ends with a hint — the
@@ -924,8 +1078,13 @@ lost — so it prompts first:
 ```
 $ localdb db migrate
 This store's schema (v2) predates the migration baseline (v4); migrating it erases ALL indexed data and rebuilds from scratch. Continue? [y/N] y
-rebuilt legacy store: v2 -> v4 (all indexed data erased)
+rebuilt legacy store: v2 -> v6 (all indexed data erased)
+hint: run `localdb index` to re-index stale content
 ```
+
+(the rebuild drops and recreates the schema directly at this binary's head version — v6 here — not
+at the baseline; a legacy rebuild always marks derived data stale, so the re-index hint always
+follows it)
 
 Declining leaves the store untouched (prints `Aborted.`, exit `0`). `--yes` skips the prompt; a
 non-interactive session (or `--json`) without `--yes` exits `2`
@@ -958,42 +1117,240 @@ non-interactive rule as `migrate`):
 ```
 $ localdb db downgrade --to 5
 This reverses the store's schema to version 5, replaying stored down-SQL and discarding any data or structure introduced by later migrations. Continue? [y/N] y
-downgraded migration v6 'add_access_requests_collected_at_column' in 3ms
+downgraded migration v6 'shrink_vector_index' in 1ms
 downgraded: v6 -> v5 (1 step)
 ```
 
-An **impossible** target — already at or below the frozen baseline (v4), or a `--to` at or above the
-current version (`nothing to downgrade`) — is checked _before_ that confirmation prompt and refused
-immediately, exit `2`, store untouched. It never asks "Continue? [y/N]" first: an operation that can
-only fail doesn't need "are you sure":
+An **impossible** target is checked and refused — exit `2`, store untouched — before that
+confirmation prompt is ever shown, so a request that can only fail never asks "are you sure". Three
+cases are impossible: already at or below the frozen baseline (v4); a `--to` at or above the current
+version (`nothing to downgrade`); or a migration with no down-SQL (irreversible; its row records a
+`down_unsupported_reason` instead) somewhere on the path to the target, in which case the error
+names the blocking migration and the nearest reachable target instead:
 
 ```
-$ localdb db downgrade --to 4
-error: invalid config: nothing to downgrade: target version 4 must be below the current version 4
+$ localdb db downgrade --to 6
+error: invalid config: nothing to downgrade: target version 6 must be below the current version 6
 exit: 2
 ```
 
-If any migration on the path to a plausible target has no down-SQL (irreversible; its row records a
-`down_unsupported_reason` instead), the whole downgrade is refused — exit `2`, nothing changed —
-naming the blocking migration and the nearest reachable target. This check runs inside
-`downgrade_store` itself (after confirmation), since it depends on which rows are actually on the
-path, not just the target number:
-
 ```
 $ localdb db downgrade --to 4
-This reverses the store's schema to version 4, replaying stored down-SQL and discarding any data or structure introduced by later migrations. Continue? [y/N] y
-error: invalid config: cannot downgrade past migration 'drop_chunks_block_id' (version 7): chunks.block_id cannot be reconstructed; re-index required after downgrade. Nothing was changed. Downgrade to version 7 instead (`db downgrade --to 7`) to keep it applied and only replay the migrations above it.
+error: invalid config: cannot downgrade past migration 'drop_chunks_block_id_and_retag_resource_metadata' (version 5): chunks.block_id cannot be reconstructed; re-index required after downgrade. Nothing was changed. Downgrade to version 5 instead (`db downgrade --to 5`) to keep it applied and only replay the migrations above it.
 exit: 2
 ```
 
 A store with no migration history yet (`run 'localdb db migrate' first`) is also refused inside
 `downgrade_store`, after confirmation.
 
+### `localdb db vacuum`
+
+```
+Reclaim disk space freed by prior migrations/deletes by rewriting the whole database file (SQLite `VACUUM`)
+
+Usage: localdb db vacuum [OPTIONS]
+
+Options:
+      --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
+      --json           Emit JSON output instead of human-readable text
+  -s, --store <NAME>   Operate on these stores (repeatable); a filter, not a selector
+  -y, --yes            Skip confirmation prompts for destructive operations
+  -h, --help           Print help (see more with '--help')
+  -V, --version        Print version
+```
+
+A schema migration (e.g. v6 `shrink_vector_index`) or an ordinary bulk delete frees pages onto
+SQLite's own free list, but the file itself does not shrink until something rewrites it —
+`db vacuum` does that, via SQLite's `VACUUM`. Data-preserving (an interrupted `VACUUM` leaves the
+original file untouched), but needs roughly the current file size again in free disk space and can
+take minutes on a large store. No confirmation prompt, since it never discards data.
+
+```
+$ localdb db vacuum
+vacuuming '/home/user/localdb/data/localdb.db': this rewrites the entire database file and needs roughly its current size again in free disk space; large stores can take minutes
+vacuumed: 340.0 KiB -> 164.0 KiB (176.0 KiB reclaimed, 0.0s)
+```
+
+```
+$ localdb db vacuum --json
+{
+  "status": "ok",
+  "size_before_bytes": 167936,
+  "size_after_bytes": 167936,
+  "bytes_reclaimed": 0,
+  "duration_ms": 2
+}
+```
+
+(the warning above is always printed, even in `--json` mode, since it's progress/cost information
+rather than the command's result; path and sizes shown from a scratch run — this second `--json` run
+reclaims nothing because an earlier `vacuum` in the same session had already returned the store's
+free pages to the OS)
+
+---
+
+## `localdb job`
+
+Manage jobs on a running daemon.
+
+```
+Manage running/queued jobs on a daemon
+
+Usage: localdb job [OPTIONS] <COMMAND>
+
+Commands:
+  cancel  Request cancellation of a queued or running job
+  list    List every job on the daemon's queue, regardless of state or store
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+      --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
+      --json           Emit JSON output instead of human-readable text
+  -s, --store <NAME>   Operate on these stores (repeatable); a filter, not a selector
+  -y, --yes            Skip confirmation prompts for destructive operations
+  -h, --help           Print help (see more with '--help')
+  -V, --version        Print version
+```
+
+**Daemon-only: there is no embedded equivalent.** An embedded (non-daemon) job lives and dies within
+a single CLI invocation, so there is nothing for `job list`/`job cancel` to look up afterward. Both
+subcommands exit `5` (`daemon is unreachable`) if no daemon is running:
+
+```
+$ localdb job list
+error: daemon is unreachable
+exit: 5
+
+$ localdb job cancel some-job-id
+error: daemon is unreachable
+exit: 5
+```
+
+**Neither subcommand is store-scoped.** `--store`/`-s` is **rejected outright** — exit `2` — on
+both: `cancel` operates on a job id, which is already globally unique across every store; `list`
+spans every job on the queue regardless of which store it belongs to:
+
+```
+$ localdb job list --store notes
+error: invalid request: `job list` shows every job regardless of store; --store is not applicable
+exit: 2
+```
+
+### `localdb job list`
+
+```
+List every job on the daemon's queue, regardless of state or store
+
+Usage: localdb job list [OPTIONS]
+
+Options:
+      --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
+      --json           Emit JSON output instead of human-readable text
+  -s, --store <NAME>   Operate on these stores (repeatable); a filter, not a selector
+  -y, --yes            Skip confirmation prompts for destructive operations
+  -h, --help           Print help (see more with '--help')
+  -V, --version        Print version
+```
+
+With no jobs on the queue:
+
+```
+$ localdb job list
+No jobs.
+
+$ localdb job list --json
+[]
+```
+
+With a completed job in history (jobs are ephemeral operational records with bounded retention, not
+permanent history — see
+[specs/05-surfaces.md §3](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md#3-http-api)
+for the eviction policy):
+
+```
+$ localdb job list
+ID                          STORE  STATE  ERROR_CODE  CREATED_AT
+01M0WYCSV7HPJY5ADKQP59D8S7  notes  done   -           2026-08-25T17:09:56Z
+```
+
+```
+$ localdb job list --json
+[
+  {
+    "id": "01M0WYD5119M0MVZ6G9NZFX4JC",
+    "store_id": "notes",
+    "scope": {
+      "type": "store"
+    },
+    "state": "done",
+    "stats": {
+      "docs_seen": 3,
+      "docs_indexed": 0,
+      "docs_skipped": 3,
+      "docs_deleted": 0,
+      "docs_prunable": 0,
+      "chunks_written": 0,
+      "unsupported_format_count": 0,
+      "error_count": 0,
+      "sources_count": 2
+    },
+    "error": null,
+    "error_code": null,
+    "created_at": "2026-08-25T17:10:07Z",
+    "started_at": "2026-08-25T17:10:07Z",
+    "completed_at": "2026-08-25T17:10:08Z"
+  }
+]
+```
+
+(job ids and timestamps shown from a scratch run against a real daemon)
+
+### `localdb job cancel`
+
+```
+Request cancellation of a queued or running job
+
+Usage: localdb job cancel [OPTIONS] <ID>
+
+Arguments:
+  <ID>  Job ID
+
+Options:
+      --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
+      --json           Emit JSON output instead of human-readable text
+  -s, --store <NAME>   Operate on these stores (repeatable); a filter, not a selector
+  -y, --yes            Skip confirmation prompts for destructive operations
+  -h, --help           Print help (see more with '--help')
+  -V, --version        Print version
+```
+
+Requests cancellation of a queued or running job by id. Exit codes: `0` cancellation requested (the
+daemon accepted it, HTTP 202 — cancellation is asynchronous, so this does not mean the job has
+actually stopped yet), `3` the id doesn't match any job, `4` the job already reached a terminal
+state (`done`/`failed` — a cancelled job lands in `failed` with `error_code: "job_cancelled"`) and
+can no longer be cancelled:
+
+```
+$ localdb job cancel not-a-real-job-id
+error: job not found: not-a-real-job-id
+exit: 3
+
+$ localdb job cancel 01M0WYCSV7HPJY5ADKQP59D8S7   # already 'done'
+error: job already reached a terminal state; cannot cancel
+exit: 4
+```
+
+(job ids shown from a scratch run against a real daemon; the exit-`0`/202-accepted case requires
+cancelling a job while it's still queued or running, which needs a slower job than this reference's
+scratch fixtures produce — see
+[specs/05-surfaces.md §5](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md#5-shared-error-taxonomy)
+and `server/src/job_exec.rs` for the cancellation contract)
+
 ---
 
 ## `localdb serve`
 
-> **Experimental.** The HTTP daemon is a preview in v0.1.0. See limitations below.
+> **Experimental.** The HTTP daemon is an experimental preview. See limitations below.
 
 Start the HTTP API daemon.
 
@@ -1036,17 +1393,20 @@ exit: 4
 
 For the full HTTP API reference see [docs/http-api.md](http-api.md).
 
-### Known limitations (v0.1.0)
+### Known limitations
 
-- **`POST /v1/jobs` runs real ingestion.** ([#187](https://github.com/dokterbob/localdb/issues/187))
-  The daemon's job endpoint runs the actual ingestion pipeline through an async, single-worker job
-  queue with a per-store in-flight guard — a second submission for a store already running gets
-  `index_in_progress` (409). When a daemon is running, `localdb index` (`cli/src/job_attach.rs`)
-  submits a job and attaches to its live progress over SSE (`GET /v1/jobs/{id}/events`, falling back
-  to polling), rendering an identical summary/`--json`/`--strict` to embedded mode; `--delete` works
-  daemon-attached too. Stopping the daemon before `localdb index` is no longer necessary.
-  Daemon-side reads (`/v1/search`, `/v1/documents/{id}`, `/v1/status`) see the same data, because
-  the daemon opens the same unified database (`<data_dir>/localdb.db`) as the CLI.
+- **`POST /v1/jobs` runs real ingestion.** ([#187](https://github.com/dokterbob/localdb/issues/187),
+  [#208](https://github.com/dokterbob/localdb/issues/208)) The daemon's job endpoint runs the actual
+  ingestion pipeline through an async job queue with a configurable worker pool
+  (`server.job_workers`, default 1) and a per-store in-flight guard: jobs for _different_ stores run
+  concurrently up to the pool size, but same-store jobs are always serialized — a second submission
+  for a store already running gets `index_in_progress` (409). When a daemon is running,
+  `localdb index` (`cli/src/job_attach.rs`) submits a job and attaches to its live progress over SSE
+  (`GET /v1/jobs/{id}/events`, falling back to polling), rendering an identical
+  summary/`--json`/`--strict` to embedded mode; `--delete` works daemon-attached too. Stopping the
+  daemon before `localdb index` is no longer necessary. Daemon-side reads (`/v1/search`,
+  `/v1/documents/{id}`, `/v1/status`) see the same data, because the daemon opens the same unified
+  database (`<data_dir>/localdb.db`) as the CLI.
 - **Stale socket after kill.** If the daemon process is killed without a clean shutdown,
   `daemon.sock` is not removed. Subsequent CLI commands report `daemon: running` but searches fail
   with `exit 5` (`daemon is unreachable`). Fix by removing the stale socket file:
@@ -1096,8 +1456,8 @@ Options:
 ```
 
 Starts a JSON-RPC 2.0 MCP server on stdin/stdout. If no daemon is running it uses embedded mode; if
-one is, it proxies to that daemon's `/mcp` route. The server is fully functional in v0.1.0 and
-exposes four read-only tools: `search`, `get_document`, `get_chunks`, and `list_stores`.
+one is, it proxies to that daemon's `/mcp` route. The server exposes five read-only tools: `search`,
+`get_document`, `get_chunks`, `list_documents`, and `list_stores`.
 
 Omitting `--store` exposes every store; pass `--store` (repeatable) to limit the session to those
 stores. The limit is enforced in **both** modes, and an unknown name exits `3`:
@@ -1136,6 +1496,39 @@ The server reads newline-delimited JSON-RPC from stdin and writes responses to s
 
 ---
 
+## `localdb completions`
+
+Generate a shell completion script.
+
+```
+Generate a shell completion script on stdout
+
+Usage: localdb completions [OPTIONS] <SHELL>
+
+Arguments:
+  <SHELL>  Shell to generate completions for [possible values: bash, elvish, fish, powershell, zsh]
+
+Options:
+      --config <PATH>  Path to config file (default: platform data dir / localdb / config.yaml)
+      --json           Emit JSON output instead of human-readable text
+  -s, --store <NAME>   Operate on these stores (repeatable); a filter, not a selector
+  -y, --yes            Skip confirmation prompts for destructive operations
+  -h, --help           Print help (see more with '--help')
+  -V, --version        Print version
+```
+
+Pure codegen: it prints a completion script for the named shell to stdout and exits — no config
+load, no daemon probe, and it works before `init` (nothing needs to exist yet). Install by sourcing
+the output into your shell's completion path:
+
+```sh
+localdb completions zsh > "${fpath[1]}/_localdb"
+localdb completions bash >> ~/.bash_completion
+localdb completions fish > ~/.config/fish/completions/localdb.fish
+```
+
+---
+
 ## Typical workflow
 
 ```sh
@@ -1151,8 +1544,8 @@ localdb index --store notes
 # 4. Search
 localdb search "how does rust handle errors"
 
-# 5. Search with JSON output for scripting
-localdb search "hybrid search" --store notes --json
+# 5. Search with JSON output for scripting (flags before the query)
+localdb search --store notes --json "hybrid search"
 ```
 
 ---

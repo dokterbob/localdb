@@ -2,9 +2,10 @@
 
 > Covers the schema-migrations framework landed for issue
 > [#127](https://github.com/dokterbob/localdb/issues/127). Design rationale lives in
-> [specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md) §9 and
-> [specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §2.1 — this document is the behavior/how-to layer
-> on top of those, in the same spirit as [docs/architecture.md](architecture.md).
+> [specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md)
+> §9 and [specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md)
+> §2.1 — this document is the behavior/how-to layer on top of those, in the same spirit as
+> [docs/architecture.md](architecture.md).
 
 `store-libsql` tracks its own schema version in a `schema_migrations` table (source of truth) plus
 `PRAGMA user_version` (a cheap, kept-in-lockstep marker — never authoritative on its own). Opening a
@@ -32,8 +33,9 @@ A fresh (`version == 0`) or already-at-head store opens normally — no CLI acti
 
 Schema migrations aren't the only thing that can make a store unreadable by an older binary.
 `sources.ingestor_kind` is decoded via a hard match over `IngestorKind`'s known variants
-([specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md) §2) — an unrecognized kind is a hard error
-for the whole `list_sources`/`index` call, not just the one source carrying it.
+([specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md)
+§2) — an unrecognized kind is a hard error for the whole `list_sources`/`index` call, not just the
+one source carrying it.
 
 The Atom/RSS feed connector (`kind = 'feed'`,
 [#116](https://github.com/dokterbob/localdb/issues/116)) needed **no schema migration at all** —
@@ -51,10 +53,11 @@ graceful degradation so an old binary skips unknown source kinds instead of fail
 
 ## `db status` / `db migrate` / `db downgrade`
 
-Three CLI-only maintenance subcommands (`localdb db …`), specced in
-[specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §2.1. They are the _only_ surfaces allowed to touch
-a store's schema version — the HTTP daemon and MCP never migrate, they only ever surface the
-refusal-with-hint above.
+Four CLI-only maintenance subcommands (`localdb db status` / `migrate` / `downgrade` / `vacuum`),
+specced in
+[specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §2.1.
+They are the _only_ surfaces allowed to touch a store's schema version — the HTTP daemon and MCP
+never migrate, they only ever surface the refusal-with-hint above.
 
 ### `localdb db status`
 
@@ -128,23 +131,28 @@ downgraded: v6 -> v5 (1 step)
 
 If a migration on the path to `--to` has `down_unsupported_reason` set, the whole downgrade is
 refused up front — before touching anything — naming the blocking migration and suggesting the
-nearest reachable target:
+nearest reachable target. For example, on the current real chain (baseline v4, irreversible v5, head
+v6 — see the [CLI reference](cli.md#localdb-db-status) for the full listing), trying to downgrade
+past v5 (`drop_chunks_block_id_and_retag_resource_metadata`, which is `Down::Unsupported`) to v4:
 
 ```
-cannot downgrade past migration 'drop_chunks_block_id_and_retag_resource_metadata' (version 7):
-chunks.block_id cannot be reconstructed; re-index required after downgrade. Nothing was changed.
-Downgrade to version 7 instead (`db downgrade --to 7`) to keep it applied and only replay the
-migrations above it.
+$ localdb db downgrade --to 4
+error: invalid config: cannot downgrade past migration
+'drop_chunks_block_id_and_retag_resource_metadata' (version 5): chunks.block_id cannot be
+reconstructed; re-index required after downgrade. Nothing was changed. Downgrade to version 5
+instead (`db downgrade --to 5`) to keep it applied and only replay the migrations above it.
 ```
 
 ### Daemon must be stopped
 
-All three subcommands refuse with `daemon_running` (exit 4) while `localdb serve` is up — the same
+All four subcommands refuse with `daemon_running` (exit 4) while `localdb serve` is up — the same
 way every other daemon-aware write command does. The daemon itself never applies migrations, so
 there's nothing to route to it; the refusal exists purely to prevent a concurrent-write race against
 a running daemon's connection.
 
-### Old-binary downgrade story {#old-binary-downgrade-story}
+<a id="old-binary-downgrade-story"></a>
+
+### Old-binary downgrade story
 
 Every migration's "down" SQL is **rendered once, at apply time**, and persisted as data in the
 `schema_migrations.down_sql` column (a JSON array of statements — not a `;`-joined string, since
@@ -241,7 +249,9 @@ renumber can't silently merge.
     logic is exactly the kind of drift the checksum exists to catch — don't rely on catching it by
     inspection.
 
-### `Down::Sql` rules {#down-rules}
+<a id="down-rules"></a>
+
+### `Down::Sql` rules
 
 `Down::Sql(fn(&MigrationContext) -> Vec<String>)` is rendered **once, at apply time**, and stored as
 data (JSON array) in `schema_migrations.down_sql` — never re-derived from the compiled chain at

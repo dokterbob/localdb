@@ -15,17 +15,17 @@ months out.
 ## What makes localdb's combination distinctive
 
 localdb is a **search/retrieval primitive, not an app** — "do one thing well," in the Unix sense.
-Its surface is deliberately narrow: index, search, cite. The CLI and MCP server expose four
-read-only tools (`search`, `list_stores`, `get_document`, `get_chunks`); there is no note editor,
-chat UI, or agent-orchestration layer built into the binary. That narrowness is a design choice, not
-an omission: it keeps the retrieval API stable enough for other things to be built _on top_ of it. A
-project's or agent's own Markdown knowledge base can be pointed at with `localdb source add` and
-kept current with incremental re-index (unchanged content is skipped by content hash), so a
-second-brain UI or an agent's own scratchpad-memory layer can search current state without owning
-the indexing pipeline itself. Most of the projects surveyed below take the opposite bet: they bundle
-a chat interface, a notes editor, or an agent-orchestration layer directly into the same binary as
-the retrieval engine, which is a reasonable product choice but couples the retrieval API to that
-layer's roadmap.
+Its surface is deliberately narrow: index, search, cite. The CLI and MCP server expose five
+read-only tools (`search`, `list_stores`, `get_document`, `get_chunks`, `list_documents`); there is
+no note editor, chat UI, or agent-orchestration layer built into the binary. That narrowness is a
+design choice, not an omission: it keeps the retrieval API stable enough for other things to be
+built _on top_ of it. A project's or agent's own Markdown knowledge base can be pointed at with
+`localdb source add` and kept current with incremental re-index (unchanged content is skipped by
+content hash), so a second-brain UI or an agent's own scratchpad-memory layer can search current
+state without owning the indexing pipeline itself. Most of the projects surveyed below take the
+opposite bet: they bundle a chat interface, a notes editor, or an agent-orchestration layer directly
+into the same binary as the retrieval engine, which is a reasonable product choice but couples the
+retrieval API to that layer's roadmap.
 
 Around that core choice, several other properties combine in a way no single surveyed project
 matches all at once:
@@ -44,13 +44,14 @@ matches all at once:
   by pure-Rust or embedded libraries, no shelling out to a converter binary or a separate Tika/JVM
   process. And this is a floor, not a ceiling: the domain model already has typed slots
   (`IngestorKind::Notion`, `Telegram`, `Signal`, `HackMd`, `Email`, `Transcription`, `Feed`)
-  reserved for connectors landing next — see [specs/06-roadmap.md](https://github.com/dokterbob/localdb/blob/main/specs/06-roadmap.md) Phase 2
+  reserved for connectors landing next — see
+  [specs/06-roadmap.md](https://github.com/dokterbob/localdb/blob/main/specs/06-roadmap.md) Phase 2
   and "Where localdb is headed" below.
 - **Sensible defaults.** No init step required — `store add` to a working `search` is four commands:
   `store add`, `source add`, `index`, `search` (see the
-  [README quickstart](https://github.com/dokterbob/localdb/blob/main/README.md#60-second-quickstart), which also shows an optional `status`
-  check); the default embedding backend auto-selects CoreML on Apple Silicon and falls back to ONNX
-  elsewhere; no API key is required to start.
+  [README quickstart](https://github.com/dokterbob/localdb/blob/main/README.md#quickstart), which
+  also shows an optional `status` check); the default embedding backend auto-selects CoreML on Apple
+  Silicon and falls back to ONNX elsewhere; no API key is required to start.
 - **Agent-first, not chat-first.** The CLI and MCP server are the primary surfaces, not a bolted-on
   integration layer. This has been validated in practice against multiple agentic clients — Codex,
   Claude Code, Claude Desktop, and Hermes Agent — and across both cloud model providers (Anthropic,
@@ -102,7 +103,7 @@ _connector_ library today than localdb does (see "Where localdb is behind").
 | -------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
 | **[GPT4All](https://www.nomic.ai/gpt4all) LocalDocs** ([repo](https://github.com/nomic-ai/gpt4all))                                          | MIT                               | Compiled desktop installer (.exe/.dmg/.deb/AppImage), fully self-contained                                                                                             | Vector-only (on-device Nomic embeddings)                                    | None                                                                                                                                            | File + snippet in a Sources panel, no spans        | **Stalled** — last commit 2025-05-27 (13+ months), last release v3.10.0 (2025-02-25); open "Is GPT4all dead?" issue                 |
 | **[Khoj](https://khoj.dev)** ([repo](https://github.com/khoj-ai/khoj))                                                                       | AGPL-3.0                          | `pip install khoj` or Docker Compose; can auto-start an embedded Postgres/pgvector process (`USE_EMBEDDED_DB=true`)                                                    | Vector-only (bi-encoder + cross-encoder rerank), no BM25                    | Client-only (consumes external MCP tools in research mode); no MCP _server_ — an open issue (#1364) requests one                                | Sources panel with file + excerpt, no spans/hashes | Very active (35.4k★, last commit 2026-06-24). Hosted "Khoj Cloud" was sunset 2026-04-15; the open-source project remains maintained |
-| **[Basic Memory](https://basicmemory.com)** ([repo](https://github.com/basicmachines-co/basic-memory), [docs](https://docs.basicmemory.com)) | AGPL-3.0                          | `uv tool install basic-memory` / `uvx` (Python 3.12+); "just files plus a local SQLite index, no servers required"                                                     | Hybrid full-text + vector (FastEmbed, SQLite)                               | Native MCP server — but a large read/write tool surface (write/edit/move/delete notes, knowledge graph, canvas) vs. localdb's 3 read-only tools | Note-level retrieval, no byte-span/content-hash    | Very active (3.3k★, last push 2026-06-29, v0.22.1 released 2026-06-13)                                                              |
+| **[Basic Memory](https://basicmemory.com)** ([repo](https://github.com/basicmachines-co/basic-memory), [docs](https://docs.basicmemory.com)) | AGPL-3.0                          | `uv tool install basic-memory` / `uvx` (Python 3.12+); "just files plus a local SQLite index, no servers required"                                                     | Hybrid full-text + vector (FastEmbed, SQLite)                               | Native MCP server — but a large read/write tool surface (write/edit/move/delete notes, knowledge graph, canvas) vs. localdb's 5 read-only tools | Note-level retrieval, no byte-span/content-hash    | Very active (3.3k★, last push 2026-06-29, v0.22.1 released 2026-06-13)                                                              |
 | [AnythingLLM](https://anythingllm.com) ([repo](https://github.com/Mintplex-Labs/anything-llm))                                               | MIT                               | Desktop installer (self-contained) or Docker; underlying stack is Node.js; LanceDB embedded by default                                                                 | Vector-only; hybrid BM25 PR open/unmerged since ~June 2026                  | Client-only, explicitly no Resources/Prompts/Sampling                                                                                           | Not a stated strength                              | Very active (62.4k★, last push 2026-07-01)                                                                                          |
 | [Onyx](https://onyx.app) (formerly Danswer) ([repo](https://github.com/onyx-dot-app/onyx), [docs](https://docs.onyx.app/welcome))            | Open-core: CE MIT, EE proprietary | Multi-service stack via Docker Compose (~13 containers: Postgres, OpenSearch, Redis, MinIO, background workers, …)                                                     | Hybrid (OpenSearch-backed; replaced Vespa in v3.0.0, fully removed by v4.x) | Both client and server                                                                                                                          | Enterprise-oriented                                | Active (30.6k★, last commit 2026-07-01)                                                                                             |
 | [PrivateGPT](https://docs.privategpt.dev) (zylon-ai) ([repo](https://github.com/zylon-ai/private-gpt))                                       | Apache-2.0                        | Homebrew (macOS) or `uv tool install` (Python 3.11, pinned); Qdrant embedded locally, but needs an external OpenAI-compatible inference server (Ollama/vLLM/llama.cpp) | Vector-centric RAG                                                          | MCP _client_ connectors ("PrivateGPT 1.0" relaunch: v1.0.0 2026-06-03 after ~2 quiet years, v1.0.1 2026-06-18)                                  | Retrieval + citations as API features              | Active again (57.3k★, last commit 2026-06-29)                                                                                       |
@@ -140,7 +141,7 @@ retrieval primitive.
 hybrid full-text + vector search (FastEmbed embeddings over SQLite), installed without any external
 database ("just files plus a local SQLite index, no servers required"). Two divergences matter.
 First, scope and trust boundary: its MCP tool surface is read-write — an agent can create, edit,
-move, and delete notes and build a knowledge graph through it — where localdb's three MCP tools are
+move, and delete notes and build a knowledge graph through it — where localdb's five MCP tools are
 read-only. That's a deliberate tradeoff each project makes differently, not a bug in either: Basic
 Memory is a notes app that happens to be agent-editable, localdb is a retrieval layer that assumes
 something else owns writes. Second, and directly relevant to
@@ -206,8 +207,7 @@ and a vector index to maintain, which is not free.
 
 ## Where localdb is behind
 
-In the interest of the same honesty as the README's
-[What works today](https://github.com/dokterbob/localdb/blob/main/README.md#what-works-today) table:
+In the interest of the same honesty as [Known gaps](architecture.md#known-gaps):
 
 - **As of v0.1.0.** Several of the projects above (Khoj, Basic Memory, AnythingLLM, Onyx) have years
   of production use and large user bases; localdb does not yet.
@@ -216,20 +216,23 @@ In the interest of the same honesty as the README's
   richer content types on the roadmap but not yet shipped (see below).
 - **No GUI or chat interface.** localdb is CLI + MCP only. Anyone wanting a chat-first experience
   out of the box (GPT4All, Khoj, AnythingLLM) will find localdb requires an external agent or client
-  to talk to. A web UI is planned (Phase 3 of [specs/06-roadmap.md](https://github.com/dokterbob/localdb/blob/main/specs/06-roadmap.md)) but
+  to talk to. A web UI is planned (Phase 3 of
+  [specs/06-roadmap.md](https://github.com/dokterbob/localdb/blob/main/specs/06-roadmap.md)) but
   CLI, MCP, and agents remain the primary surfaces for the foreseeable future.
 - **Single-user, single-node.** There is no multi-tenant deployment story today, unlike Onyx.
 - **MCP is read-only today.** Mutating tools (`add_source`, `reindex`, and similar) are specified as
   the next planned addition, gated behind an explicit `localdb mcp --allow-write` opt-in flag that
-  will never be on by default (see [specs/05-surfaces.md §4](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md)) — but they
-  are not shipped yet. There is deliberately no plan for in-place _edit_ tools: an agent that needs
-  to change indexed content can re-add the source and let incremental re-index pick up the change,
-  which is a smaller, more auditable surface than exposing note-editing verbs the way Basic Memory
-  does.
+  will never be on by default (see
+  [specs/05-surfaces.md §4](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md)) —
+  but they are not shipped yet. There is deliberately no plan for in-place _edit_ tools: an agent
+  that needs to change indexed content can re-add the source and let incremental re-index pick up
+  the change, which is a smaller, more auditable surface than exposing note-editing verbs the way
+  Basic Memory does.
 - **No knowledge graph / entity layer yet.** An entities/graph layer is tracked in
-  [specs/06-roadmap.md](https://github.com/dokterbob/localdb/blob/main/specs/06-roadmap.md) ("tracked but unscheduled: entities/graph layer,
-  metadata-only entities first, graph extraction only after baseline retrieval quality is proven")
-  but is not designed or built. Basic Memory already has one.
+  [specs/06-roadmap.md](https://github.com/dokterbob/localdb/blob/main/specs/06-roadmap.md)
+  ("tracked but unscheduled: entities/graph layer, metadata-only entities first, graph extraction
+  only after baseline retrieval quality is proven") but is not designed or built. Basic Memory
+  already has one.
 - **File-watch-triggered re-indexing isn't live yet.** `POST /v1/jobs` itself runs real ingestion
   through the daemon's async job queue ([#187](https://github.com/dokterbob/localdb/issues/187)),
   and `localdb index` (embedded or daemon-attached) drives it with live progress — but nothing yet
@@ -241,10 +244,11 @@ In the interest of the same honesty as the README's
 
 ## Where localdb is headed that nobody else is
 
-Per [VISION.md](https://github.com/dokterbob/localdb/blob/main/VISION.md), the long-horizon goal is **federation**: the ability to search
-datasets far larger than any one person could assemble alone, by securely sharing direct,
-credentialed access to stores — someone's curated book collection, a Wikipedia-scale corpus, a
-friend's notes — without proxying content through intermediaries or inventing homegrown crypto.
+Per [VISION.md](https://github.com/dokterbob/localdb/blob/main/VISION.md), the long-horizon goal is
+**federation**: the ability to search datasets far larger than any one person could assemble alone,
+by securely sharing direct, credentialed access to stores — someone's curated book collection, a
+Wikipedia-scale corpus, a friend's notes — without proxying content through intermediaries or
+inventing homegrown crypto.
 
 **None of the eight projects surveyed above do this at all.** Each is scoped to a single user's (or
 single organization's) own content. This is the one dimension of this comparison with no current
@@ -255,10 +259,10 @@ Two nearer-term axes sit ahead of federation on the roadmap:
 - **Ingest all the things.** Files and URLs are indexed today; the domain model already reserves
   typed slots for what's next (`IngestorKind::Notion`, `Telegram`, `Signal`, `HackMd`, `Email`,
   `Transcription`, `Feed` — see `core/src/block.rs`), tracked as Phase 2 in
-  [specs/06-roadmap.md](https://github.com/dokterbob/localdb/blob/main/specs/06-roadmap.md). This would put localdb ahead of the content-scoped
-  competitors (GPT4All, Basic Memory) on content coverage well before federation is in scope —
-  though it's worth being honest that Onyx's connector library is already larger today (see "Where
-  localdb is behind").
+  [specs/06-roadmap.md](https://github.com/dokterbob/localdb/blob/main/specs/06-roadmap.md). This
+  would put localdb ahead of the content-scoped competitors (GPT4All, Basic Memory) on content
+  coverage well before federation is in scope — though it's worth being honest that Onyx's connector
+  library is already larger today (see "Where localdb is behind").
 - **A knowledge graph, MCP write tools, and eventually a web UI.** An entities/graph layer, MCP
   tools for managing sources and stores (not editing content — see above), and a browse/search web
   UI (Phase 3) are all directional next steps, not committed dates. CLI, MCP, and agentic clients

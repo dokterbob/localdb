@@ -11,7 +11,8 @@
 > experimental as a surface: write concurrency across processes is SQLite WAL + `busy_timeout=5000`,
 > not a dedicated lock.
 >
-> For design rationale see [specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §3.
+> For design rationale see
+> [specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §3.
 
 ---
 
@@ -55,7 +56,8 @@ is: anything that can reach the bind address is as trusted as the files themselv
 is accepted — binding to a specific non-loopback address (e.g. a LAN or VPN IP) is treated as a
 deliberate trust decision and starts silently. Binding to `0.0.0.0` (all interfaces) logs a warning
 at startup, since that makes the unauthenticated daemon reachable from any network the machine is
-on. See [specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §3 for the binding and trust decision.
+on. See [specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md)
+§3 for the binding and trust decision.
 
 ---
 
@@ -67,7 +69,8 @@ Alongside `/v1`, the daemon also mounts `/mcp` — the same five read-only MCP t
 client (e.g. Claude Code on another machine, over Tailscale/LAN). It inherits this daemon's
 bind-address trust decision automatically — see
 [docs/mcp.md](mcp.md#remote-http-connecting-from-another-machine) for setup and
-[specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §4.2 for the transport/error-model details.
+[specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §4.2 for
+the transport/error-model details.
 
 ---
 
@@ -126,8 +129,8 @@ curl -s http://127.0.0.1:7700/v1/status
 | `database.largest_tables`                          | array     | Up to 5 `{name, bytes}` rows, the largest on-disk tables via SQLite's `dbstat`, descending; best-effort — empty if `dbstat` querying fails                                  |
 
 This is the same shape the embedded CLI's `localdb status --json` reports (see
-[specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §2.4) — daemon-routed and embedded `status` render
-identically.
+[specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §2.4) —
+daemon-routed and embedded `status` render identically.
 
 ---
 
@@ -156,6 +159,38 @@ curl -s http://127.0.0.1:7700/v1/stores
 
 ---
 
+### `POST /v1/stores`
+
+Create a runtime-owned store. The DB is the single source of truth for stores — there is no YAML
+store declaration (see [`GET /v1/config`](#get-v1config)).
+
+**Request body:**
+
+| Field        | Type   | Required | Description                                         |
+| ------------ | ------ | -------- | --------------------------------------------------- |
+| `name`       | string | yes      | Store name; must be non-empty and not already exist |
+| `visibility` | string | no       | `"private"` (default) or `"shared"`                 |
+
+```
+curl -s -X POST http://127.0.0.1:7700/v1/stores \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"notes"}'
+```
+
+```json
+{
+  "name": "notes",
+  "id": "01KTVGQ62TQN8X6XN9E5FDZN67",
+  "visibility": "private",
+  "backend": "libsql"
+}
+```
+
+Returns `201` on success. `invalid_request`, 400, for an empty `name`, a `name` that already exists,
+or an unrecognized `visibility` value (see [Error responses](#error-responses)).
+
+---
+
 ### `GET /v1/stores/{name}`
 
 Fetch a single store by name.
@@ -178,6 +213,50 @@ Returns `404` with error code `store_not_found` if the store does not exist (see
 
 ---
 
+### `PATCH /v1/stores/{name}`
+
+Update a runtime-owned store. All fields are optional — only provided fields are updated. Currently
+the only mutable field is `visibility`.
+
+**Request body:**
+
+| Field        | Type   | Required | Description                               |
+| ------------ | ------ | -------- | ----------------------------------------- |
+| `visibility` | string | no       | New visibility: `"private"` or `"shared"` |
+
+```
+curl -s -X PATCH http://127.0.0.1:7700/v1/stores/notes \
+  -H 'Content-Type: application/json' \
+  -d '{"visibility":"shared"}'
+```
+
+```json
+{
+  "name": "notes",
+  "id": "01KTVGQ62TQN8X6XN9E5FDZN67",
+  "visibility": "shared",
+  "backend": "libsql"
+}
+```
+
+Returns `404` with error code `store_not_found` if the store does not exist. `invalid_request`, 400,
+for an unrecognized `visibility` value.
+
+---
+
+### `DELETE /v1/stores/{name}`
+
+Delete a store, cascading to all its sources, documents, and chunks.
+
+```
+curl -s -X DELETE http://127.0.0.1:7700/v1/stores/notes
+```
+
+Returns `204 No Content` (empty body) on success. Returns `404` with error code `store_not_found` if
+the store does not exist.
+
+---
+
 ### `GET /v1/stores/{name}/sources`
 
 List sources attached to a store. Response is paginated.
@@ -193,6 +272,56 @@ curl -s http://127.0.0.1:7700/v1/stores/notes/sources
   "total": 0
 }
 ```
+
+---
+
+### `POST /v1/stores/{name}/sources`
+
+Add a source to a store.
+
+**Request body:**
+
+| Field     | Type   | Required | Description                                                                                                                                                                          |
+| --------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `kind`    | string | yes      | `"path"`, `"url"`, or `"feed"`                                                                                                                                                       |
+| `spec`    | object | yes      | Kind-specific spec — e.g. `{"root": "..."}` for `path` (see [specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md) §2 for `url`/`feed`) |
+| `preset`  | string | no       | Chunking preset (default: `"prose"`)                                                                                                                                                 |
+| `refresh` | string | no       | Refresh interval (e.g. `"24h"`); persisted for `url`/`feed` sources; rejected with `invalid_request` (400) for any other kind                                                        |
+
+```
+curl -s -X POST http://127.0.0.1:7700/v1/stores/notes/sources \
+  -H 'Content-Type: application/json' \
+  -d '{"kind":"path","spec":{"root":"/home/user/docs"}}'
+```
+
+```json
+{
+  "id": "01KTVH6AY4DC84HWW7M2PP4F0X",
+  "store_id": "01KTVGQ62TQN8X6XN9E5FDZN67",
+  "kind": "path",
+  "spec": { "root": "/home/user/docs", "include": [], "exclude": [] },
+  "preset": "prose",
+  "refresh": null
+}
+```
+
+Returns `201` on success. `404` with error code `store_not_found` if the store does not exist.
+`invalid_request`, 400, for an unrecognized `kind` or a `spec` that fails kind-specific validation
+(e.g. a `path` source's `spec` missing `root`, or a `feed` source's `max_entries: 0`).
+
+---
+
+### `DELETE /v1/sources/{id}`
+
+Remove a source by id. Store-agnostic — the id alone identifies the source, so this route is not
+nested under `/v1/stores/{name}`.
+
+```
+curl -s -X DELETE http://127.0.0.1:7700/v1/sources/01KTVH6AY4DC84HWW7M2PP4F0X
+```
+
+Returns `204 No Content` (empty body) on success. Returns `404` with error code `source_not_found`
+if the source does not exist.
 
 ---
 
@@ -272,7 +401,8 @@ curl -s http://127.0.0.1:7700/v1/documents/a86bf252232bcec2a7da314d11e4c6005918f
 is no query parameter that omits it (the CLI's `document get --text` is purely a rendering choice on
 top of the same always-fetched text, specs/05-surfaces.md §2). `metadata` is the full `Metadata`
 enum, same shape as a search citation's `metadata` field
-([specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md) §7).
+([specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md)
+§7).
 
 Returns `404` with error code `resource_not_found` if no document with that id exists in scope, or
 `store_not_found` if a named `?store=` does not exist.
@@ -342,12 +472,12 @@ daemon and the CLI share `<data_dir>/localdb.db`.
 
 **Request body:**
 
-| Field          | Type     | Required | Description                                                   |
-| -------------- | -------- | -------- | ------------------------------------------------------------- |
-| `query`        | string   | yes      | Natural language search query                                 |
-| `store_filter` | string[] | no       | Store names to search; omit or pass `[]` to search all stores |
-| `limit`        | int      | no       | Maximum results to return (default: 10; not clamped)          |
-| `cursor`       | string   | no       | Pagination cursor from a previous response                    |
+| Field          | Type     | Required | Description                                                                          |
+| -------------- | -------- | -------- | ------------------------------------------------------------------------------------ |
+| `query`        | string   | yes      | Natural language search query                                                        |
+| `store_filter` | string[] | no       | Store names to search; omit or pass `[]` to search all stores                        |
+| `limit`        | int      | no       | Maximum results to return (default: 10; silently clamped to 100, `SEARCH_MAX_LIMIT`) |
+| `cursor`       | string   | no       | Pagination cursor from a previous response                                           |
 
 ```
 curl -s -X POST http://127.0.0.1:7700/v1/search \
@@ -364,17 +494,62 @@ curl -s -X POST http://127.0.0.1:7700/v1/search \
 ```
 
 Each citation in `citations` follows the canonical Citation shape defined in
-[specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md) §6. For a fully-populated example see the
-`localdb search --json` output in the CLI reference.
+[specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md)
+§6. For a fully-populated example see the `localdb search --json` output in the CLI reference.
+
+A `limit` above 100 is not an error — it is silently clamped to 100
+(`localdb_core::SEARCH_MAX_LIMIT`), matching the MCP `search` tool's own cap.
+
+---
+
+### `GET /v1/jobs`
+
+List every job on the daemon's queue, in any state, across every store.
+
+```
+curl -s http://127.0.0.1:7700/v1/jobs
+```
+
+```json
+[
+  {
+    "id": "01KTVM5XMA59N4WGHNZ80QX9B7",
+    "store_id": "notes",
+    "scope": { "type": "store" },
+    "state": "running",
+    "stats": {
+      "docs_seen": 0,
+      "docs_indexed": 0,
+      "docs_skipped": 0,
+      "docs_deleted": 0,
+      "docs_prunable": 0,
+      "chunks_written": 0,
+      "unsupported_format_count": 0,
+      "error_count": 0,
+      "sources_count": 0
+    },
+    "error": null,
+    "error_code": null,
+    "created_at": "2026-06-11T15:17:59Z",
+    "started_at": "2026-06-11T15:17:59Z",
+    "completed_at": null
+  }
+]
+```
+
+Returns the raw `IndexJob[]` array directly — unlike `/v1/stores` and `/v1/stores/{name}/sources`,
+there is no pagination envelope: jobs are ephemeral operational records with bounded retention (the
+registry caps how many terminal jobs it keeps, evicting the oldest first), so the response never
+grows unbounded. Order is registry iteration order, not guaranteed stable.
 
 ---
 
 ### `POST /v1/jobs`
 
 Submit an index job for a store. This runs the real ingestion pipeline (`server::job_exec::run_job`)
-through an async, single-worker job queue (issue #187) — the daemon processes the job
-asynchronously, in the background; poll `GET /v1/jobs/{id}` or stream `GET /v1/jobs/{id}/events` for
-progress.
+through an async job queue with a configurable worker pool (`server.job_workers`, default 1, issues
+#187/#208) — the daemon processes the job asynchronously, in the background; poll
+`GET /v1/jobs/{id}` or stream `GET /v1/jobs/{id}/events` for progress.
 
 **Request body:**
 
@@ -421,11 +596,11 @@ curl -s -X POST http://127.0.0.1:7700/v1/jobs \
 > `CreateJobRequest` does not set `deny_unknown_fields`.
 
 A second `POST /v1/jobs` for a store that already has a job queued or running is rejected with
-`index_in_progress`, 409 (see [Error responses](#error-responses)) — the in-flight guard is
-per-store, reserved atomically before the job is created, so two concurrent submissions for the same
-store can never both proceed. Jobs against different stores run concurrently; a single sequential
-worker processes the queue (a worker-pool size >1 is a follow-up, not a correctness issue, since the
-per-store guard already prevents same-store overlap).
+`index_in_progress`, 409 (see [Error responses](#error-responses)), regardless of worker-pool size —
+the in-flight guard is per-store, reserved atomically before the job is created, so two concurrent
+submissions for the same store can never both proceed. Jobs for different stores run concurrently,
+up to `server.job_workers` workers (default 1); same-store jobs are always serialized by the
+per-store guard.
 
 ---
 
@@ -495,6 +670,69 @@ curl -s http://127.0.0.1:7700/v1/jobs/01KTVM5XMA59N4WGHNZ80QX9B7
 
 ---
 
+### `DELETE /v1/jobs/{id}`
+
+Request cancellation of a queued or running job (issue #218).
+
+```
+curl -s -X DELETE http://127.0.0.1:7700/v1/jobs/01KTVM5XMA59N4WGHNZ80QX9B7
+```
+
+```json
+{
+  "id": "01KTVM5XMA59N4WGHNZ80QX9B7",
+  "store_id": "notes",
+  "scope": { "type": "store" },
+  "state": "running",
+  "stats": {
+    "docs_seen": 0,
+    "docs_indexed": 0,
+    "docs_skipped": 0,
+    "docs_deleted": 0,
+    "docs_prunable": 0,
+    "chunks_written": 0,
+    "unsupported_format_count": 0,
+    "error_count": 0,
+    "sources_count": 0
+  },
+  "error": null,
+  "error_code": null,
+  "created_at": "2026-06-11T15:17:59Z",
+  "started_at": "2026-06-11T15:17:59Z",
+  "completed_at": null
+}
+```
+
+Returns `202` and the job's snapshot at the moment cancellation was requested — **not** a guarantee
+it has already stopped. Poll `GET /v1/jobs/{id}` or watch `GET /v1/jobs/{id}/events` for the
+eventual terminal state. Cancellation does not add a new `state` value — it reuses the existing
+`"failed"` terminal state with `error_code: "job_cancelled"`:
+
+```json
+{
+  "id": "01KTVM5XMA59N4WGHNZ80QX9B7",
+  "store_id": "notes",
+  "scope": { "type": "store" },
+  "state": "failed",
+  "stats": { "...": "..." },
+  "error": "job was cancelled",
+  "error_code": "job_cancelled",
+  "created_at": "2026-06-11T15:17:59Z",
+  "started_at": "2026-06-11T15:17:59Z",
+  "completed_at": "2026-06-11T15:17:59Z"
+}
+```
+
+`404` with error code `job_not_found` for an unknown job id. `409` with error code
+`job_already_terminal` for a job that already reached `"done"` or `"failed"` — a cancel landing
+after normal completion (or after a real failure) must never overwrite the recorded outcome:
+
+```json
+{ "code": "job_already_terminal", "message": "job already reached a terminal state; cannot cancel" }
+```
+
+---
+
 ### `GET /v1/jobs/{id}/events`
 
 Stream a job's live progress as
@@ -544,7 +782,8 @@ the stream opens).
 ## Pagination
 
 List endpoints (`/v1/stores`, `/v1/stores/{name}/sources`, `/v1/stores/{name}/documents`) use
-cursor-based pagination.
+cursor-based pagination. `GET /v1/jobs` is a list endpoint but is _not_ paginated — see its own
+section above for why.
 
 | Query parameter | Default        | Description                                                    |
 | --------------- | -------------- | -------------------------------------------------------------- |
@@ -594,6 +833,8 @@ HTTP status codes follow the shared error taxonomy in
 | `model_missing`                                                                 | 503         | Local model not yet downloaded                                                                                                                                 |
 | `rate_limited`                                                                  | 502         | Retries against an upstream host exhausted; grouped with "upstream not currently servable" rather than 429, since it's an upstream limit, not the daemon's own |
 | `index_in_progress`                                                             | 409         | Conflicting job already running for this scope                                                                                                                 |
+| `job_already_terminal`                                                          | 409         | `DELETE /v1/jobs/{id}` requested for a job that already reached `done`/`failed` — cancellation must never overwrite a recorded outcome                         |
+| `job_cancelled`                                                                 | n/a         | Never a live response's `code` — appears only as a cancelled job's `error_code` (`GET /v1/jobs/{id}`), reconstructed via `core::Error::from_code`              |
 | `internal`                                                                      | 500         | Bug; response includes a `correlation_id` for log correlation                                                                                                  |
 
 ---

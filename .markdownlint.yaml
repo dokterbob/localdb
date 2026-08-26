@@ -18,3 +18,15 @@ MD060: false
 # is prose, not a malformed heading; genuine `#Heading` typos are far rarer
 # than issue refs here, so the rule is off.
 MD018: false
+
+# README embeds the logo via <picture>/<source>/<img> for light/dark theme
+# switching (srcset media queries), which Markdown's image syntax can't
+# express, and the docs use `<a id="..."></a>` anchor lines — the one anchor
+# form that resolves on both GitHub blob view and the kramdown-rendered Pages
+# site. Allow just those elements rather than disabling MD033 wholesale.
+MD033:
+  allowed_elements:
+    - picture
+    - source
+    - img
+    - a

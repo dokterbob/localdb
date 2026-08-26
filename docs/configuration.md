@@ -2,7 +2,8 @@
 
 localdb is configured through a single YAML file. This document covers every field, platform
 defaults, config lookup rules, and validation behaviour. For the ownership model and design
-rationale, see [specs/03-config.md](https://github.com/dokterbob/localdb/blob/main/specs/03-config.md).
+rationale, see
+[specs/03-config.md](https://github.com/dokterbob/localdb/blob/main/specs/03-config.md).
 
 ---
 
@@ -69,6 +70,7 @@ $schema: https://raw.githubusercontent.com/dokterbob/localdb/main/schema/config.
 server:
   bind: 127.0.0.1 # loopback only; set to 0.0.0.0 to listen on all interfaces
   port: 7700 # set to 0 to let the OS assign an ephemeral port
+  job_workers: 1 # daemon job-queue workers; jobs for the same store never run concurrently
 
 # --- Path overrides (optional; platform defaults apply to omitted keys) ---
 # paths:
@@ -109,8 +111,8 @@ defaults:
 
 `version: 1` is the only required field; every other key shown above is already at its default
 value, spelled out for discoverability rather than left implicit. See
-[specs/03-config.md §8](https://github.com/dokterbob/localdb/blob/main/specs/03-config.md#8-config-file-generation-and-schema) for the full
-generation and schema design.
+[specs/03-config.md §8](https://github.com/dokterbob/localdb/blob/main/specs/03-config.md#8-config-file-generation-and-schema)
+for the full generation and schema design.
 
 ---
 
@@ -162,12 +164,14 @@ Controls the HTTP daemon started by `localdb serve`.
 server:
   bind: 127.0.0.1 # interface to listen on (default: 127.0.0.1)
   port: 7700 # port (default: 7700)
+  job_workers: 1 # daemon job-queue workers (default: 1)
 ```
 
-| Field  | Default     | Notes                                             |
-| ------ | ----------- | ------------------------------------------------- |
-| `bind` | `127.0.0.1` | Set to `0.0.0.0` to listen on all interfaces      |
-| `port` | `7700`      | Set to `0` to let the OS assign an ephemeral port |
+| Field         | Default     | Notes                                                                                                                                                 |
+| ------------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bind`        | `127.0.0.1` | Set to `0.0.0.0` to listen on all interfaces                                                                                                          |
+| `port`        | `7700`      | Set to `0` to let the OS assign an ephemeral port                                                                                                     |
+| `job_workers` | `1`         | Number of parallel ingestion job workers (min `1`). Different stores run concurrently up to this many workers; same-store jobs are always serialized. |
 
 > **Experimental:** the HTTP daemon is an early preview. It opens the same unified database
 > (`<data_dir>/localdb.db`) as the CLI, so CLI-indexed data IS visible, and `POST /v1/jobs` runs
@@ -250,12 +254,12 @@ defaults:
 > **Default embedder:** `provider: local`, `model: pplx-embed-context-v1-0.6b`. `local` auto-picks a
 > backend: CoreML (ANE/GPU) on Apple Silicon macOS builds, ONNX (CPU) everywhere else — see
 > [specs/03-config.md §7](https://github.com/dokterbob/localdb/blob/main/specs/03-config.md#7-local-embedding-provider-selection-local--local-coreml--local-onnx)
-> to force one explicitly with `local-coreml`/`local-onnx`. The first `localdb index` or
-> `localdb search` downloads the model (~706 MB) from the public HuggingFace repo
-> `perplexity-ai/pplx-embed-context-v1-0.6b` — no API key required. The model is cached under
+> to force one explicitly with `local-coreml`/`local-onnx`. The first indexing or search operation
+> (including `source add`'s auto-index) downloads the model (~706 MB) from the public HuggingFace
+> repo `perplexity-ai/pplx-embed-context-v1-0.6b` — no API key required. The model is cached under
 > `paths.models` for subsequent runs. Alternative local model: `bge-small-en-v1.5` (384-dim, much
-> smaller). Hosted alternatives: `provider: perplexity` (requires API key) or
-> `provider: openai-compatible`.
+> smaller). Hosted alternatives: `provider: perplexity` or `provider: voyage` (both require an API
+> key) or `provider: openai-compatible`.
 
 ---
 
@@ -274,7 +278,7 @@ providers:
 | Field         | Description                                                        |
 | ------------- | ------------------------------------------------------------------ |
 | `name`        | Reference name used in `defaults.indexing.embedding.provider`      |
-| `kind`        | Provider type; `openai-compatible` in v1                           |
+| `kind`        | Provider type: `openai-compatible`, `perplexity`, or `voyage`      |
 | `base_url`    | Base URL of the API endpoint                                       |
 | `api_key_env` | Environment variable that holds the API key (never inline the key) |
 
@@ -290,7 +294,8 @@ Stores and sources are managed exclusively via the CLI (`localdb store add`, `lo
 or HTTP API — no store declarations in YAML are supported. The unified database
 (`<data_dir>/localdb.db`) is the single source of truth for all stores and sources.
 
-For full details, see [specs/03-config.md §3](https://github.com/dokterbob/localdb/blob/main/specs/03-config.md#3-store-and-source-management).
+For full details, see
+[specs/03-config.md §3](https://github.com/dokterbob/localdb/blob/main/specs/03-config.md#3-store-and-source-management).
 
 ---
 
@@ -302,8 +307,8 @@ include a precise location.
 **Unknown top-level key:**
 
 ```
-error: invalid config: unknown field `bogus_key`, expected one of `version`, `server`,
-`paths`, `defaults`, `providers` at line 2 column 1
+error: invalid config: unknown field `bogus_key`, expected one of `version`, `$schema`, `server`,
+`paths`, `defaults`, `providers`, `http` at line 2 column 1
 ```
 
 Unknown keys are a hard error, not a warning — they catch typos before they silently take no effect.
@@ -340,13 +345,14 @@ No such file or directory (os error 2)
 
 The HTTP daemon (`localdb serve`) is an **experimental preview** in v1. Key limitations:
 
-- **`POST /v1/jobs` runs real ingestion**, through an async, single-worker job queue with a
-  per-store in-flight guard (a second submission for a store already running gets
-  `index_in_progress`, 409). `localdb index` submits a job and attaches to its live progress
-  (`GET /v1/jobs/{id}/events`, SSE, falling back to polling) whenever a daemon is running, with
-  output identical to embedded mode; concurrent writers (CLI and daemon alike) serialise via SQLite
-  WAL + `busy_timeout=5000`. Daemon-side reads (`/v1/search`, `/v1/documents/{id}`, `/v1/status`)
-  see the same data.
+- **`POST /v1/jobs` runs real ingestion**, through an async job queue with a configurable worker
+  pool (`server.job_workers`, default 1) and a per-store in-flight guard — jobs for different stores
+  run concurrently up to `server.job_workers` workers, while same-store jobs are always serialized
+  (a second submission for a store already running gets `index_in_progress`, 409). `localdb index`
+  submits a job and attaches to its live progress (`GET /v1/jobs/{id}/events`, SSE, falling back to
+  polling) whenever a daemon is running, with output identical to embedded mode; concurrent writers
+  (CLI and daemon alike) serialise via SQLite WAL + `busy_timeout=5000`. Daemon-side reads
+  (`/v1/search`, `/v1/documents/{id}`, `/v1/status`) see the same data.
 - **Stale socket after a crash.** If the daemon process is killed (not stopped cleanly), the unix
   socket `<data_dir>/daemon.sock` is not cleaned up. Subsequent CLI commands report
   `daemon: running` and searches exit with `error: daemon is unreachable` (exit 5). Fix:
@@ -356,7 +362,7 @@ The HTTP daemon (`localdb serve`) is an **experimental preview** in v1. Key limi
 
 ## Annotated complete example
 
-The following config is a valid, verified example that localdb 0.1.0 will parse without error.
+The following config is a valid, verified example that localdb parses without error.
 
 ```yaml
 version: 1
@@ -365,6 +371,7 @@ version: 1
 server:
   bind: 127.0.0.1
   port: 7700
+  job_workers: 1
 
 # --- Data paths (all optional; platform defaults used for any omitted key) ---
 paths:
@@ -373,7 +380,8 @@ paths:
   logs: ~/localdb/logs
 
 # --- Global indexing defaults (inherited by all stores) ---
-# The default local model is downloaded (~706 MB) on first index/search.
+# The default local model is downloaded (~706 MB) on first use (indexing, search, or
+# source add's auto-index).
 defaults:
   indexing:
     chunking:
@@ -399,4 +407,5 @@ http:
     burst: 4
 ```
 
-For design decisions behind each section, see [specs/03-config.md](https://github.com/dokterbob/localdb/blob/main/specs/03-config.md).
+For design decisions behind each section, see
+[specs/03-config.md](https://github.com/dokterbob/localdb/blob/main/specs/03-config.md).
