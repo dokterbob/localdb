@@ -1544,8 +1544,8 @@ localdb index --store notes
 # 4. Search
 localdb search "how does rust handle errors"
 
-# 5. Search with JSON output for scripting
-localdb search "hybrid search" --store notes --json
+# 5. Search with JSON output for scripting (flags before the query)
+localdb search --store notes --json "hybrid search"
 ```
 
 ---

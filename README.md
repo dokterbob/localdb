@@ -56,8 +56,9 @@ not there yet.
    ```
 
    Add `--json` for structured `Citation` objects (chunk IDs, provenance hashes, per-component
-   scores, document metadata). Scope either command to one store with `-s`, e.g.
-   `localdb search "some query" -s notes`.
+   scores, document metadata). Scope either command to one store with `-s` — flags go before the
+   query, e.g. `localdb search -s notes "some query"` (everything after the first query word is
+   treated as query text).
 
 4. **Connect an AI assistant:**
 
