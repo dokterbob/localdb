@@ -1327,7 +1327,8 @@ Options:
 Requests cancellation of a queued or running job by id. Exit codes: `0` cancellation requested (the
 daemon accepted it, HTTP 202 — cancellation is asynchronous, so this does not mean the job has
 actually stopped yet), `3` the id doesn't match any job, `4` the job already reached a terminal
-state (`done`/`failed`/`cancelled`) and can no longer be cancelled:
+state (`done`/`failed` — a cancelled job lands in `failed` with `error_code: "job_cancelled"`) and
+can no longer be cancelled:
 
 ```
 $ localdb job cancel not-a-real-job-id

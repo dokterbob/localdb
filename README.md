@@ -21,10 +21,10 @@ first-class shareable units. See [VISION.md](VISION.md).
 
 **Status:** hybrid search uses real dense embeddings via the default local model
 (`pplx-embed-context-v1-0.6b`, ONNX on CPU by default; CoreML ANE/GPU on Apple Silicon macOS
-automatically); the first indexing operation — including `add`'s auto-index — downloads ~706 MB from
-HuggingFace (no API key required). The HTTP daemon remains experimental, with no auth. See
-[docs/architecture.md#known-gaps](docs/architecture.md#known-gaps) for the full list of what's not
-there yet.
+automatically); the first indexing or search operation — including `add`'s auto-index — downloads
+~706 MB from HuggingFace (no API key required). The HTTP daemon remains experimental, with no auth.
+See [docs/architecture.md#known-gaps](docs/architecture.md#known-gaps) for the full list of what's
+not there yet.
 
 ---
 
@@ -46,8 +46,8 @@ there yet.
    localdb add ~/notes
    ```
 
-   The first indexing operation (including this auto-index) downloads the ~706 MB default embedding
-   model from HuggingFace; later runs reuse the cached copy.
+   The first indexing or search operation (including this auto-index) downloads the ~706 MB default
+   embedding model from HuggingFace; later runs reuse the cached copy.
 
 3. **Search:**
 

@@ -286,7 +286,7 @@ Add a source to a store.
 | `kind`    | string | yes      | `"path"`, `"url"`, or `"feed"`                                                                                                                                                       |
 | `spec`    | object | yes      | Kind-specific spec — e.g. `{"root": "..."}` for `path` (see [specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md) §2 for `url`/`feed`) |
 | `preset`  | string | no       | Chunking preset (default: `"prose"`)                                                                                                                                                 |
-| `refresh` | string | no       | Refresh interval (e.g. `"24h"`); persisted for `url`/`feed` sources, ignored otherwise                                                                                               |
+| `refresh` | string | no       | Refresh interval (e.g. `"24h"`); persisted for `url`/`feed` sources; rejected with `invalid_request` (400) for any other kind                                                        |
 
 ```
 curl -s -X POST http://127.0.0.1:7700/v1/stores/notes/sources \
