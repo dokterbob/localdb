@@ -513,6 +513,33 @@ use `Vec<String>`; singleton elements use `Option<String>`.
 | `relation`    | `Vec<String>`    | Repeatable: related resources.                          |
 | `coverage`    | `Option<String>` | Spatial or temporal extent.                             |
 | `rights`      | `Option<String>` | Rights statement or license.                            |
+| `date_source` | `Option<String>` | Provenance of `date` — see below. Not a DCMES element.  |
+
+#### `date_source` (provenance of `date`)
+
+Every site that writes `dc:date` (`DublinCoreMetadata::date`) stamps `date_source` in the same
+statement, so a date is never persisted without a record of which extraction path produced it — a
+date without correct provenance is considered worse than no date.
+`#[serde(skip_serializing_if = "Option::is_none")]` on the field: a document with no stamped
+`date_source` (every document indexed before this field existed) serializes byte-identical to
+before, so introducing the field does not by itself change `metadata_hash` for the existing corpus
+(see `core::ids::compute_metadata_hash`).
+
+| Value                      | Set by                                                                        |
+| -------------------------- | ----------------------------------------------------------------------------- |
+| `"pdf-info"`               | PDF `/CreationDate` (Info dictionary).                                        |
+| `"xmp"`                    | PDF XMP `xmp:CreateDate` (fallback when the Info dictionary has none).        |
+| `"epub-opf"`               | EPUB OPF `dc:date`/published date.                                            |
+| `"office-core-properties"` | docx/pptx `docProps/core.xml` `dcterms:created`.                              |
+| `"html-json-ld"`           | HTML `script[type="application/ld+json"]` `datePublished`/`dateModified`.     |
+| `"html-meta"`              | HTML `<meta>` date tag (`dcterms.date`, `article:published_time`, or `date`). |
+| `"front-matter"`           | Markdown YAML front-matter `date:` key.                                       |
+| `"feed-entry"`             | Feed connector enrichment (`published`, falling back to `updated`).           |
+
+The feed-entry overwrite (`ingest::url_pipeline::build_resource`) sets `dc.date` and `date_source`
+together in the same statement: a page parser's own `date_source` (e.g. `"html-json-ld"`, when the
+fetched page itself carries JSON-LD) must never survive stamped on the feed's date — that would
+misattribute the feed's publication claim to the page's own metadata.
 
 #### Population by source format
 
@@ -529,6 +556,26 @@ the publisher of the work. And `title` has no filename or first-page fallback: a
 neither `/Title` nor XMP has no title, and inventing one would be a guess presented as data.
 
 `format` is set by the parser from the sniffed MIME type, not read from the document.
+
+Office (docx/pptx only — CSV has no `docProps` part, and `.odt` has no parser yet, #254) reads
+`docProps/core.xml`: `dc:title` (trimmed; empty or absent falls through) and `dcterms:created`
+(stored raw, untouched — `date_parsed` derivation normalizes it downstream). Title precedence is
+explicit-over-heuristic: a non-empty `dc:title` wins over anytomd's H1-derived title outright, even
+a stale placeholder like Word's default `"Document1"` — a quality-aware precedence that preferred a
+good heading instead was considered and deliberately not built.
+
+HTML reads a document date in precedence order (first hit wins): JSON-LD
+(`script[type="application/ ld+json"]`, document order — the first entry, top-level or within an
+`@graph` array, carrying `datePublished` else `dateModified`, no `@type` filtering), then
+`<meta name="dcterms.date">`, then `<meta property="article:published_time">`, then the legacy
+`<meta name="date">`. A script whose JSON fails to parse is skipped, not fatal — extraction falls
+through to the next signal.
+
+Markdown scans YAML front-matter for a top-level `date:` key (bare or quoted scalar; nested keys,
+multi-document front-matter, and folded scalars are out of scope, #195) and stores the raw value.
+
+A filename-based date/title fallback (e.g. `2024-01-05-post.md`) is deferred to a future PR — none
+of the formats above fall back to the filename today.
 
 ### Metadata enum
 

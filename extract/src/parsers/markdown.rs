@@ -38,9 +38,15 @@ impl Parser for MarkdownParser {
         };
 
         let (markdown, title) = crate::markdown::extract_markdown(text)?;
+        let (date, date_source) = match crate::markdown::extract_frontmatter_date(text) {
+            Some(date) => (Some(date), Some("front-matter".to_string())),
+            None => (None, None),
+        };
 
         let dc = DublinCoreMetadata {
             title: title.clone(),
+            date,
+            date_source,
             format: probe.sniffed_mime.map(|s| s.to_string()),
             ..DublinCoreMetadata::default()
         };

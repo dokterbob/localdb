@@ -111,6 +111,92 @@ fn extract_main_content_html(document: &Html) -> String {
     document.root_element().inner_html()
 }
 
+/// Extract a document-level date claim from HTML (issue #251), in
+/// precedence order (first hit wins):
+///
+/// 1. JSON-LD (`script[type="application/ld+json"]`, document order): the
+///    first entry — the top-level object, or each member of an `@graph`
+///    array in order — carrying `datePublished` (else `dateModified`). No
+///    `@type` filtering: deterministic and simplest. A script whose content
+///    fails to parse as JSON is skipped, not fatal — the next script (or the
+///    meta-tag fallback) still gets a chance.
+/// 2. `<meta name="dcterms.date" content="...">`
+/// 3. `<meta property="article:published_time" content="...">`
+/// 4. `<meta name="date" content="...">` (the oldest/legacy convention)
+///
+/// Returns the raw `content`/JSON-string value, trimmed — never date-parsed
+/// here (`date_original` convention; normalization happens downstream) —
+/// paired with which signal won, for `DublinCoreMetadata::date_source`.
+pub fn extract_html_date(input: &str) -> Option<(String, &'static str)> {
+    let document = Html::parse_document(input);
+
+    if let Some(date) = extract_json_ld_date(&document) {
+        return Some((date, "html-json-ld"));
+    }
+
+    for selector_str in [
+        r#"meta[name="dcterms.date"]"#,
+        r#"meta[property="article:published_time"]"#,
+        r#"meta[name="date"]"#,
+    ] {
+        if let Some(date) = extract_meta_content(&document, selector_str) {
+            return Some((date, "html-meta"));
+        }
+    }
+
+    None
+}
+
+/// `<meta ... content="...">`, trimmed; `None` if the selector matches
+/// nothing, the element has no `content` attribute, or it's empty.
+fn extract_meta_content(document: &Html, selector_str: &str) -> Option<String> {
+    let selector = Selector::parse(selector_str).ok()?;
+    let el = document.select(&selector).next()?;
+    let content = el.value().attr("content")?.trim();
+    (!content.is_empty()).then(|| content.to_string())
+}
+
+/// Scan every `script[type="application/ld+json"]` in document order for
+/// the first `datePublished`/`dateModified` claim, descending into `@graph`
+/// when the top-level object itself carries none.
+fn extract_json_ld_date(document: &Html) -> Option<String> {
+    let selector = Selector::parse(r#"script[type="application/ld+json"]"#).ok()?;
+    for el in document.select(&selector) {
+        let text: String = el.text().collect();
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue; // malformed JSON in this block — try the next script
+        };
+        if let Some(date) = json_ld_date_from_value(&value) {
+            return Some(date);
+        }
+    }
+    None
+}
+
+/// `datePublished`/`dateModified` from a top-level JSON-LD value, or (when
+/// absent there) from the first `@graph` member that carries either field.
+fn json_ld_date_from_value(value: &serde_json::Value) -> Option<String> {
+    if let Some(date) = json_ld_date_from_object(value) {
+        return Some(date);
+    }
+    value
+        .get("@graph")
+        .and_then(|g| g.as_array())
+        .and_then(|graph| graph.iter().find_map(json_ld_date_from_object))
+}
+
+/// `datePublished`, falling back to `dateModified`, from a single JSON-LD
+/// node (no `@type` filtering).
+fn json_ld_date_from_object(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("datePublished")
+        .or_else(|| value.get("dateModified"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// Extract the first H1 text from a Markdown string (for title fallback).
 fn extract_first_h1_from_markdown(markdown: &str) -> Option<String> {
     let parser = Parser::new_ext(markdown, Options::empty());

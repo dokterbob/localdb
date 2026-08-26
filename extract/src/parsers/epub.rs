@@ -114,6 +114,7 @@ fn map_metadata(epub: &Epub, probe: &Probe) -> DublinCoreMetadata {
         publisher: meta.publishers().next().map(|p| p.value().to_string()),
         contributor,
         date: meta.published().map(|d| d.date().to_string()),
+        date_source: meta.published().map(|_| "epub-opf".to_string()),
         format: probe.sniffed_mime.map(|s| s.to_string()),
         identifier: meta.identifier().map(|i| i.value().to_string()),
         language: meta.language().map(|l| l.value().to_string()),

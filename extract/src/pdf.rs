@@ -1124,19 +1124,30 @@ fn document_metadata(doc: &PdfDocument) -> DublinCoreMetadata {
                 .unwrap_or_default()
         });
 
+    // Resolve date and its provenance together so `date_source` always
+    // agrees with which branch actually won — the Info dict's /CreationDate
+    // ("pdf-info") first, XMP's xmp:CreateDate ("xmp") as fallback.
+    let (date, date_source) =
+        match info_dict_string(doc, "CreationDate").and_then(|d| parse_pdf_date(&d)) {
+            Some(d) => (Some(d), Some("pdf-info".to_string())),
+            None => match xmp
+                .as_ref()
+                .and_then(|x| x.xmp_create_date.as_deref())
+                .map(xmp_date_to_iso_date)
+            {
+                Some(d) => (Some(d), Some("xmp".to_string())),
+                None => (None, None),
+            },
+        };
+
     DublinCoreMetadata {
         title: document_title(doc),
         creator,
         subject,
         description: info_dict_string(doc, "Subject")
             .or_else(|| xmp.as_ref().and_then(|x| x.dc_description.clone())),
-        date: info_dict_string(doc, "CreationDate")
-            .and_then(|d| parse_pdf_date(&d))
-            .or_else(|| {
-                xmp.as_ref()
-                    .and_then(|x| x.xmp_create_date.as_deref())
-                    .map(xmp_date_to_iso_date)
-            }),
+        date,
+        date_source,
         language: xmp.as_ref().and_then(|x| x.dc_language.clone()),
         rights: xmp.as_ref().and_then(|x| x.dc_rights.clone()),
         ..DublinCoreMetadata::default()

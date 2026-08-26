@@ -330,7 +330,12 @@ pub(crate) fn build_resource(
         dc.creator = enrich.creator.clone();
     }
     if let Some(date) = &enrich.date {
+        // Same statement set: the feed's date overwrites both dc.date AND
+        // its provenance together, so a page parser's date_source (e.g.
+        // "html-json-ld") can never survive stamped on the feed's date — a
+        // lie about where the value actually came from.
         dc.date = Some(date.clone());
+        dc.date_source = Some("feed-entry".to_string());
     }
     if let Some(src) = &enrich.provenance_source {
         dc.source = Some(src.clone());
