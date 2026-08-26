@@ -34,6 +34,10 @@ fn make_document_chunk(
         block_kind: None,
         page: None,
         window_block_seqs: vec![],
+        date_original: None,
+        date_parsed: None,
+        external_id: None,
+        external_etag: None,
     }
 }
 
@@ -362,4 +366,74 @@ async fn find_document_with_store_id_disambiguates_cross_store_id() {
         "the unscoped lookup must still error as ambiguous; got: {:?}",
         unscoped
     );
+}
+
+/// `find_document` must read `resources.date_original`/`date_parsed` (stamped
+/// via `ChunkRecord::date_original`/`date_parsed` on upsert) and
+/// `index_updated_at` (the write-time clock stamped by every
+/// `upsert_chunks_inner` call, migration v7) back onto `DocumentInfo`. All
+/// three are `Option` — a resource with no claimed date at all still finds
+/// successfully with `date_original`/`date_parsed: None`.
+#[tokio::test]
+async fn find_document_returns_dates_and_index_updated_at() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    api.upsert_source(&make_path_source("src-1", "store-1", "/a"))
+        .await
+        .unwrap();
+
+    let handle = api.retrieval_store("store-1").await.unwrap();
+    let mut chunk = make_document_chunk("c1", "doc-1", "store-1", "src-1", "file:///a/1.md");
+    chunk.date_original = Some("2026-06-15T10:30:00Z".to_string());
+    chunk.date_parsed = Some("2026-06-15".to_string());
+    handle.upsert_chunks(vec![chunk]).await.unwrap();
+
+    let found = api
+        .find_document("doc-1", Some("store-1"))
+        .await
+        .unwrap()
+        .expect("doc-1 must be found");
+    assert_eq!(found.date_original.as_deref(), Some("2026-06-15T10:30:00Z"));
+    assert_eq!(found.date_parsed.as_deref(), Some("2026-06-15"));
+    assert!(
+        found.index_updated_at.is_some(),
+        "index_updated_at must be populated (stamped by every upsert)"
+    );
+}
+
+/// A resource with no claimed date at all (`ChunkRecord::date_original`/
+/// `date_parsed` left `None`, the default) reads back as `None`, not an
+/// error or an empty string.
+#[tokio::test]
+async fn find_document_dates_are_none_when_never_stamped() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    api.upsert_source(&make_path_source("src-1", "store-1", "/a"))
+        .await
+        .unwrap();
+
+    let handle = api.retrieval_store("store-1").await.unwrap();
+    handle
+        .upsert_chunks(vec![make_document_chunk(
+            "c1",
+            "doc-1",
+            "store-1",
+            "src-1",
+            "file:///a/1.md",
+        )])
+        .await
+        .unwrap();
+
+    let found = api
+        .find_document("doc-1", Some("store-1"))
+        .await
+        .unwrap()
+        .expect("doc-1 must be found");
+    assert_eq!(found.date_original, None);
+    assert_eq!(found.date_parsed, None);
+    assert!(found.index_updated_at.is_some());
 }

@@ -93,6 +93,10 @@ fn make_chunk(id: &str, doc_id: &str, store_id: &str, embedding: Vec<f32>) -> Ch
         block_kind: None,
         page: None,
         window_block_seqs: vec![],
+        date_original: None,
+        date_parsed: None,
+        external_id: None,
+        external_etag: None,
     }
 }
 

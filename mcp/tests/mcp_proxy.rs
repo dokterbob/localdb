@@ -130,6 +130,9 @@ fn make_document_info(id: &str, store_id: &str, uri: &str) -> DocumentInfo {
         origin_store: store_id.to_string(),
         policy_version: "v1".to_string(),
         metadata: Metadata::default(),
+        date_original: None,
+        date_parsed: None,
+        index_updated_at: None,
     }
 }
 
@@ -168,6 +171,10 @@ async fn seeded_store(store_id: &str, store_name: &str, text: &str) -> (Availabl
         block_kind: None,
         page: None,
         window_block_seqs: vec![],
+        date_original: None,
+        date_parsed: None,
+        external_id: None,
+        external_etag: None,
     };
     store.upsert_chunks(vec![record]).await.expect("seed chunk");
 

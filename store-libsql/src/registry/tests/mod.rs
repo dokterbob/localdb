@@ -443,6 +443,10 @@ async fn metadata_json_round_trips_tagged_document_kind() {
         block_kind: None,
         page: None,
         window_block_seqs: vec![],
+        date_original: None,
+        date_parsed: None,
+        external_id: None,
+        external_etag: None,
     };
 
     let handle = api.retrieval_store("store-1").await.unwrap();
@@ -522,6 +526,10 @@ async fn find_document_tolerates_invalid_metadata_json() {
         block_kind: None,
         page: None,
         window_block_seqs: vec![],
+        date_original: None,
+        date_parsed: None,
+        external_id: None,
+        external_etag: None,
     };
 
     let handle = api.retrieval_store("store-1").await.unwrap();

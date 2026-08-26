@@ -41,6 +41,9 @@ struct DocumentListItem {
     source_id: String,
     content_hash: String,
     fetched_at: String,
+    date_original: Option<String>,
+    date_parsed: Option<String>,
+    index_updated_at: Option<String>,
 }
 
 fn document_info_to_list_item(d: &DocumentInfo, store_name: &str) -> DocumentListItem {
@@ -53,6 +56,9 @@ fn document_info_to_list_item(d: &DocumentInfo, store_name: &str) -> DocumentLis
         source_id: d.source_id.clone(),
         content_hash: d.content_hash.clone(),
         fetched_at: d.fetched_at.clone(),
+        date_original: d.date_original.clone(),
+        date_parsed: d.date_parsed.clone(),
+        index_updated_at: d.index_updated_at.clone(),
     }
 }
 
@@ -102,6 +108,18 @@ fn daemon_item_to_document_list_item(
             .and_then(|v| v.as_str())
             .unwrap_or("?")
             .to_string(),
+        date_original: item
+            .get("date_original")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        date_parsed: item
+            .get("date_parsed")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        index_updated_at: item
+            .get("index_updated_at")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
     }
 }
 
@@ -179,6 +197,9 @@ impl ScopedListItem for DocumentListItem {
             "source_id": self.source_id,
             "content_hash": self.content_hash,
             "fetched_at": self.fetched_at,
+            "date_original": self.date_original,
+            "date_parsed": self.date_parsed,
+            "index_updated_at": self.index_updated_at,
         })
     }
 
@@ -235,6 +256,9 @@ struct DocumentGetResult {
     fetched_at: String,
     metadata: Metadata,
     text: String,
+    date_original: Option<String>,
+    date_parsed: Option<String>,
+    index_updated_at: Option<String>,
 }
 
 impl DocumentGetResult {
@@ -250,6 +274,9 @@ impl DocumentGetResult {
             fetched_at: info.fetched_at,
             metadata: info.metadata,
             text: detail.text.unwrap_or_default(),
+            date_original: info.date_original,
+            date_parsed: info.date_parsed,
+            index_updated_at: info.index_updated_at,
         }
     }
 }
@@ -296,6 +323,18 @@ fn document_get_result_from_daemon_json(v: &serde_json::Value) -> Result<Documen
             .and_then(|f| f.as_str())
             .unwrap_or_default()
             .to_string(),
+        date_original: v
+            .get("date_original")
+            .and_then(|f| f.as_str())
+            .map(str::to_string),
+        date_parsed: v
+            .get("date_parsed")
+            .and_then(|f| f.as_str())
+            .map(str::to_string),
+        index_updated_at: v
+            .get("index_updated_at")
+            .and_then(|f| f.as_str())
+            .map(str::to_string),
     })
 }
 
@@ -359,6 +398,9 @@ fn document_get_human_lines(doc: &DocumentGetResult, include_text: bool) -> Vec<
     lines.push(format!("source_id: {}", doc.source_id));
     lines.push(format!("content_hash: {}", doc.content_hash));
     lines.push(format!("fetched_at: {}", doc.fetched_at));
+    if let Some(date) = &doc.date_original {
+        lines.push(format!("date: {date}"));
+    }
 
     // Dublin Core fields beyond `title` (already shown above from the
     // document registry's own `title` column) — printed only when present,
@@ -428,6 +470,9 @@ fn document_get_result_json(doc: &DocumentGetResult) -> serde_json::Value {
         "fetched_at": doc.fetched_at,
         "metadata": doc.metadata,
         "text": doc.text,
+        "date_original": doc.date_original,
+        "date_parsed": doc.date_parsed,
+        "index_updated_at": doc.index_updated_at,
     })
 }
 

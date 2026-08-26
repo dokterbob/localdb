@@ -468,6 +468,8 @@ fn document_json(detail: &DocumentDetail, store_name: &str) -> Value {
         "resource_id": detail.info.id,
         "uri": detail.info.uri,
         "title": detail.info.metadata.title(),
+        "date_original": detail.info.date_original,
+        "date_parsed": detail.info.date_parsed,
         "store": {
             "id": detail.info.store_id,
             "name": store_name,
@@ -475,6 +477,7 @@ fn document_json(detail: &DocumentDetail, store_name: &str) -> Value {
         "provenance": {
             "fetched_at": detail.info.fetched_at,
             "content_hash": detail.info.content_hash,
+            "index_updated_at": detail.info.index_updated_at,
         },
         "metadata": detail.info.metadata,
         "chunk_count": detail.chunk_count.unwrap_or(0),

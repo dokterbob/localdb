@@ -119,6 +119,33 @@ pub struct ChunkRecord {
     /// only when non-empty.
     #[serde(default)]
     pub window_block_seqs: Vec<u32>,
+
+    /// The resource's own claimed date, exactly as the source expressed it
+    /// (a PDF `D:` string's date portion, an EPUB OPF `dc:date`, a feed
+    /// entry's `published`/`updated`). Write-only: persisted to
+    /// `resources.date_original` on every upsert but never read back onto a
+    /// `ChunkRecord` (not part of `CHUNK_COLS`) — nothing currently consumes
+    /// it from a chunk read. See specs/02-domain-model.md §2.
+    #[serde(default)]
+    pub date_original: Option<String>,
+
+    /// `date_original` normalized to a sortable ISO 8601 string via
+    /// `crate::dates::parse_partial_iso8601`, or `None` when `date_original`
+    /// was absent or unparseable. Write-only, same posture as
+    /// `date_original`.
+    #[serde(default)]
+    pub date_parsed: Option<String>,
+
+    /// The source's own identifier for this resource (e.g. a feed entry's
+    /// `<id>`), distinct from localdb's content-addressed `resource_id`.
+    /// Write-only, same posture as `date_original`.
+    #[serde(default)]
+    pub external_id: Option<String>,
+
+    /// The source's own change-detection token for this resource (e.g. an
+    /// HTTP `ETag`). Write-only, same posture as `date_original`.
+    #[serde(default)]
+    pub external_etag: Option<String>,
 }
 
 impl ChunkRecord {
@@ -161,6 +188,13 @@ impl ChunkRecord {
             block_kind: None,
             page: None,
             window_block_seqs: chunk.window_block_seqs.clone(),
+            // Not derivable from `Chunk`/`Provenance` — `index_resource`
+            // stamps these onto each record after construction, same as
+            // `modified_at` above.
+            date_original: None,
+            date_parsed: None,
+            external_id: None,
+            external_etag: None,
         }
     }
 }
@@ -689,6 +723,10 @@ pub mod conformance {
             block_kind: None,
             page: None,
             window_block_seqs: vec![],
+            date_original: None,
+            date_parsed: None,
+            external_id: None,
+            external_etag: None,
         }
     }
 
@@ -1265,6 +1303,10 @@ mod tests {
             block_kind: None,
             page: None,
             window_block_seqs: vec![],
+            date_original: None,
+            date_parsed: None,
+            external_id: None,
+            external_etag: None,
         }
     }
 

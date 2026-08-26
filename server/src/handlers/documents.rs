@@ -24,6 +24,9 @@ pub struct DocumentRecord {
     pub fetched_at: String,
     pub normalized_text: String,
     pub metadata: Metadata,
+    pub date_original: Option<String>,
+    pub date_parsed: Option<String>,
+    pub index_updated_at: Option<String>,
 }
 
 /// `GET /v1/documents/{id}` query params: a repeatable `?store=` scopes the
@@ -54,6 +57,9 @@ pub async fn get_document(
         fetched_at: info.fetched_at,
         normalized_text: detail.text.unwrap_or_default(),
         metadata: info.metadata,
+        date_original: info.date_original,
+        date_parsed: info.date_parsed,
+        index_updated_at: info.index_updated_at,
     }))
 }
 

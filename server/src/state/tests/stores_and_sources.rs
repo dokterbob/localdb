@@ -183,6 +183,10 @@ async fn upsert_and_search_chunks_roundtrip() {
         block_kind: None,
         page: None,
         window_block_seqs: vec![],
+        date_original: None,
+        date_parsed: None,
+        external_id: None,
+        external_etag: None,
     };
 
     let handle = state.backend().retrieval_store(&store_id).await.unwrap();

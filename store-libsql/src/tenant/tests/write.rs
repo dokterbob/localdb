@@ -37,6 +37,10 @@ fn chunk_record(fetched_at: &str, modified_at: &str) -> ChunkRecord {
         block_kind: None,
         page: None,
         window_block_seqs: vec![],
+        date_original: None,
+        date_parsed: None,
+        external_id: None,
+        external_etag: None,
     }
 }
 
@@ -62,6 +66,38 @@ async fn resource_row(
         row.get(0).unwrap(),
         row.get(1).unwrap(),
         row.get(2).unwrap(),
+    )
+}
+
+/// Read `date_original`, `date_parsed`, `external_id`, and `external_etag`
+/// straight off the `resources` row for `resource_id` — write-only
+/// `ChunkRecord` stamps (`core::store::ChunkRecord`'s doc comment) that
+/// `get_chunk`/`CHUNK_COLS` never read back, so these tests go around the
+/// `RetrievalStore` trait for assertions, same posture as `resource_row`.
+async fn resource_dates_and_external(
+    backend: &SqliteBackend,
+    resource_id: &str,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    let conn = backend.conn.reader();
+    let mut rows = conn
+        .query(
+            "SELECT date_original, date_parsed, external_id, external_etag FROM resources \
+             WHERE store_id = 'store-1' AND id = ?",
+            libsql::params![resource_id.to_string()],
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().expect("resource row must exist");
+    (
+        row.get(0).unwrap(),
+        row.get(1).unwrap(),
+        row.get(2).unwrap(),
+        row.get(3).unwrap(),
     )
 }
 
@@ -103,6 +139,10 @@ async fn get_chunk_tolerates_invalid_metadata_json() {
         block_kind: None,
         page: None,
         window_block_seqs: vec![],
+        date_original: None,
+        date_parsed: None,
+        external_id: None,
+        external_etag: None,
     };
     handle.upsert_chunks(vec![record]).await.unwrap();
 
@@ -190,6 +230,10 @@ async fn upsert_blocks_is_now_transactional() {
         block_kind: None,
         page: None,
         window_block_seqs: vec![],
+        date_original: None,
+        date_parsed: None,
+        external_id: None,
+        external_etag: None,
     };
     handle.upsert_chunks(vec![record]).await.unwrap();
 
@@ -350,5 +394,73 @@ async fn upsert_resource_added_at_survives_policy_reindex() {
     assert!(
         index_updated_at_2.is_some(),
         "index_updated_at must be populated after the reindex"
+    );
+}
+
+/// `ChunkRecord::date_original`/`date_parsed` are write-only stamps
+/// (`core::store::ChunkRecord`'s doc comment): `upsert_chunks_inner` must
+/// persist them to `resources.date_original`/`date_parsed` and refresh them
+/// on a later upsert of the same resource, the same posture as
+/// `metadata_json`. Read back via direct SQL since `get_chunk`/`CHUNK_COLS`
+/// never expose these columns.
+#[tokio::test]
+async fn upsert_resource_persists_date_original_and_date_parsed() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("localdb.db");
+    let backend = backend_with_store_and_source(&path).await;
+    let handle = backend.retrieval_store("store-1").await.unwrap();
+
+    let mut record = chunk_record("2026-07-01T00:00:00Z", "2026-07-01T00:00:00Z");
+    record.date_original = Some("2026-06-15T10:30:00Z".to_string());
+    record.date_parsed = Some("2026-06-15".to_string());
+    handle.upsert_chunks(vec![record]).await.unwrap();
+
+    let (date_original, date_parsed, _, _) = resource_dates_and_external(&backend, "doc-1").await;
+    assert_eq!(date_original.as_deref(), Some("2026-06-15T10:30:00Z"));
+    assert_eq!(date_parsed.as_deref(), Some("2026-06-15"));
+
+    // A later upsert of the same resource refreshes both columns, same as
+    // `metadata_json`.
+    let mut second = chunk_record("2026-07-01T00:00:00Z", "2026-07-01T00:00:00Z");
+    second.date_original = Some("2026-07-20".to_string());
+    second.date_parsed = Some("2026-07-20".to_string());
+    handle.upsert_chunks(vec![second]).await.unwrap();
+
+    let (date_original_2, date_parsed_2, _, _) =
+        resource_dates_and_external(&backend, "doc-1").await;
+    assert_eq!(date_original_2.as_deref(), Some("2026-07-20"));
+    assert_eq!(date_parsed_2.as_deref(), Some("2026-07-20"));
+}
+
+/// Same contract as `upsert_resource_persists_date_original_and_date_parsed`,
+/// for `external_id`/`external_etag`.
+#[tokio::test]
+async fn upsert_resource_persists_external_id_and_external_etag() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("localdb.db");
+    let backend = backend_with_store_and_source(&path).await;
+    let handle = backend.retrieval_store("store-1").await.unwrap();
+
+    let mut record = chunk_record("2026-07-01T00:00:00Z", "2026-07-01T00:00:00Z");
+    record.external_id = Some("urn:entry:1".to_string());
+    record.external_etag = Some("\"etag-1\"".to_string());
+    handle.upsert_chunks(vec![record]).await.unwrap();
+
+    let (_, _, external_id, external_etag) = resource_dates_and_external(&backend, "doc-1").await;
+    assert_eq!(external_id.as_deref(), Some("urn:entry:1"));
+    assert_eq!(external_etag.as_deref(), Some("\"etag-1\""));
+
+    let mut second = chunk_record("2026-07-01T00:00:00Z", "2026-07-01T00:00:00Z");
+    second.external_id = Some("urn:entry:1".to_string());
+    second.external_etag = Some("\"etag-2\"".to_string());
+    handle.upsert_chunks(vec![second]).await.unwrap();
+
+    let (_, _, external_id_2, external_etag_2) =
+        resource_dates_and_external(&backend, "doc-1").await;
+    assert_eq!(external_id_2.as_deref(), Some("urn:entry:1"));
+    assert_eq!(
+        external_etag_2.as_deref(),
+        Some("\"etag-2\""),
+        "external_etag must refresh on re-index, same as metadata_json"
     );
 }

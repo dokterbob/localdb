@@ -899,6 +899,16 @@ pub async fn index_resource(
         }
     }
 
+    // The resource's own claimed date, exactly as the source expressed it —
+    // computed once per resource (not redundantly per chunk). Read from
+    // `record_metadata` (post-title-backfill is fine: the Dublin Core date
+    // itself is never backfilled) rather than `resource.metadata`, so a
+    // future backfill of `dc.date` would be picked up here too.
+    let date_original = record_metadata.dublin_core().date.clone();
+    let date_parsed = date_original
+        .as_deref()
+        .and_then(crate::dates::parse_partial_iso8601);
+
     // Page lookup for paginated formats (#103): block seq → location.page,
     // copied onto each chunk record from its originating block.
     let page_by_seq: std::collections::HashMap<u32, u32> = resource
@@ -941,6 +951,10 @@ pub async fn index_resource(
         // `fetched_at`/`provenance.fetched_at` (acquisition time, stamped by
         // `from_chunk` above). See specs/02-domain-model.md §2.
         record.modified_at = resource.modified_at.clone();
+        record.date_original = date_original.clone();
+        record.date_parsed = date_parsed.clone();
+        record.external_id = resource.external_id.clone();
+        record.external_etag = resource.external_etag.clone();
         records.push(record);
     }
 
@@ -2176,6 +2190,10 @@ mod tests {
             block_kind: None,
             page: None,
             window_block_seqs: vec![],
+            date_original: None,
+            date_parsed: None,
+            external_id: None,
+            external_etag: None,
         }
     }
 

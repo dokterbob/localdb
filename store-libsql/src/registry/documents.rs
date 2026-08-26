@@ -23,7 +23,8 @@ pub(crate) async fn find_document(
         let mut rows = conn
             .query(
                 "SELECT store_id, id, source_id, ingestor_kind, uri, title, mime,
-                            content_hash, added_at, origin_store, policy_version, metadata_json
+                            content_hash, added_at, origin_store, policy_version, metadata_json,
+                            date_original, date_parsed, index_updated_at
                      FROM resources WHERE id = ? AND store_id = ?",
                 libsql::params![doc_id.to_string(), store_id.to_string()],
             )
@@ -38,7 +39,8 @@ pub(crate) async fn find_document(
     let mut rows = conn
         .query(
             "SELECT store_id, id, source_id, ingestor_kind, uri, title, mime,
-                        content_hash, added_at, origin_store, policy_version, metadata_json
+                        content_hash, added_at, origin_store, policy_version, metadata_json,
+                        date_original, date_parsed, index_updated_at
                  FROM resources WHERE id = ?",
             libsql::params![doc_id.to_string()],
         )
@@ -79,7 +81,8 @@ pub(crate) async fn list_documents(
         Some(source_id) => conn
             .query(
                 "SELECT store_id, id, source_id, ingestor_kind, uri, title, mime,
-                            content_hash, added_at, origin_store, policy_version, metadata_json
+                            content_hash, added_at, origin_store, policy_version, metadata_json,
+                            date_original, date_parsed, index_updated_at
                      FROM resources WHERE store_id = ? AND source_id = ? ORDER BY uri
                      LIMIT ? OFFSET ?",
                 libsql::params![
@@ -94,7 +97,8 @@ pub(crate) async fn list_documents(
         None => conn
             .query(
                 "SELECT store_id, id, source_id, ingestor_kind, uri, title, mime,
-                            content_hash, added_at, origin_store, policy_version, metadata_json
+                            content_hash, added_at, origin_store, policy_version, metadata_json,
+                            date_original, date_parsed, index_updated_at
                      FROM resources WHERE store_id = ? ORDER BY uri
                      LIMIT ? OFFSET ?",
                 libsql::params![store_id.to_string(), limit_param, offset_param],
@@ -167,6 +171,9 @@ fn row_to_document_info(row: &libsql::Row) -> Result<DocumentInfo, Error> {
                                                                      // `parse_metadata_json_lenient`.
     let metadata: localdb_core::metadata::Metadata =
         parse_metadata_json_lenient(&metadata_str, &id);
+    let date_original: Option<String> = row.get(12).map_err(map_libsql_err)?;
+    let date_parsed: Option<String> = row.get(13).map_err(map_libsql_err)?;
+    let index_updated_at: Option<String> = row.get(14).map_err(map_libsql_err)?;
 
     Ok(DocumentInfo {
         store_id,
@@ -181,5 +188,8 @@ fn row_to_document_info(row: &libsql::Row) -> Result<DocumentInfo, Error> {
         origin_store,
         policy_version,
         metadata,
+        date_original,
+        date_parsed,
+        index_updated_at,
     })
 }

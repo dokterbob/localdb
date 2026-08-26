@@ -68,6 +68,10 @@ async fn tool_get_document_returns_identical_json_for_fixed_document() {
             block_kind: None,
             page: None,
             window_block_seqs: vec![],
+            date_original: None,
+            date_parsed: None,
+            external_id: None,
+            external_etag: None,
         }
     };
     store
@@ -100,6 +104,8 @@ async fn tool_get_document_returns_identical_json_for_fixed_document() {
         "resource_id": doc_id,
         "uri": doc_uri,
         "title": "Guide",
+        "date_original": null,
+        "date_parsed": null,
         "store": {
             "id": store_id.to_string(),
             "name": "notes",
@@ -107,6 +113,7 @@ async fn tool_get_document_returns_identical_json_for_fixed_document() {
         "provenance": {
             "fetched_at": "2026-06-29T00:00:00Z",
             "content_hash": doc_hash,
+            "index_updated_at": null,
         },
         "metadata": metadata,
         "chunk_count": 2,
@@ -198,6 +205,10 @@ async fn tool_get_document_reconstructs_table_without_duplicated_header() {
             block_kind: co.block_kind.clone(),
             page: None,
             window_block_seqs: co.window_block_seqs.clone(),
+            date_original: None,
+            date_parsed: None,
+            external_id: None,
+            external_etag: None,
         })
         .collect();
 

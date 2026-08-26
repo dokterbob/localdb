@@ -201,5 +201,11 @@ async fn lookup_in_store(
         origin_store: first.origin_store.clone(),
         policy_version: first.policy_version.clone(),
         metadata: first.metadata.clone(),
+        date_original: first.date_original.clone(),
+        date_parsed: first.date_parsed.clone(),
+        // This double has no `resources` row to source a write-time clock
+        // from — `ChunkRecord` carries no `index_updated_at` field of its
+        // own (it's a resource-level stamp, not a chunk one).
+        index_updated_at: None,
     }))
 }

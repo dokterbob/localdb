@@ -17,6 +17,9 @@ fn test_document_info(id: &str, uri: &str, title: Option<&str>) -> DocumentInfo 
         origin_store: "store-1".to_string(),
         policy_version: "v1".to_string(),
         metadata: Metadata::default(),
+        date_original: None,
+        date_parsed: None,
+        index_updated_at: None,
     }
 }
 
@@ -70,6 +73,44 @@ fn daemon_item_to_document_list_item_tolerates_missing_optional_title() {
     });
     let item = daemon_item_to_document_list_item(&raw, "s");
     assert_eq!(item.title, None);
+    assert_eq!(item.date_original, None);
+    assert_eq!(item.date_parsed, None);
+    assert_eq!(item.index_updated_at, None);
+}
+
+#[test]
+fn daemon_item_to_document_list_item_reads_dates_when_present() {
+    let raw = json!({
+        "id": "doc-4",
+        "uri": "/tmp/dated.md",
+        "store_id": "store-1",
+        "source_id": "source-1",
+        "content_hash": "xyz",
+        "fetched_at": "2026-01-01T00:00:00Z",
+        "date_original": "2026-06-15T10:30:00Z",
+        "date_parsed": "2026-06-15",
+        "index_updated_at": "2026-08-01T00:00:00Z",
+    });
+    let item = daemon_item_to_document_list_item(&raw, "s");
+    assert_eq!(item.date_original.as_deref(), Some("2026-06-15T10:30:00Z"));
+    assert_eq!(item.date_parsed.as_deref(), Some("2026-06-15"));
+    assert_eq!(
+        item.index_updated_at.as_deref(),
+        Some("2026-08-01T00:00:00Z")
+    );
+}
+
+#[test]
+fn document_list_item_json_row_includes_dates() {
+    let mut info = test_document_info("doc-1", "/tmp/notes.md", Some("Notes"));
+    info.date_original = Some("2026-06-15T10:30:00Z".to_string());
+    info.date_parsed = Some("2026-06-15".to_string());
+    info.index_updated_at = Some("2026-08-01T00:00:00Z".to_string());
+    let item = document_info_to_list_item(&info, "mystore");
+    let v = item.json_row();
+    assert_eq!(v["date_original"], "2026-06-15T10:30:00Z");
+    assert_eq!(v["date_parsed"], "2026-06-15");
+    assert_eq!(v["index_updated_at"], "2026-08-01T00:00:00Z");
 }
 
 #[test]
@@ -225,6 +266,9 @@ fn sample_get_result(text: &str) -> DocumentGetResult {
         fetched_at: "2026-01-01T00:00:00Z".to_string(),
         metadata: sample_metadata(),
         text: text.to_string(),
+        date_original: None,
+        date_parsed: None,
+        index_updated_at: None,
     }
 }
 
@@ -265,6 +309,31 @@ fn document_get_human_lines_skips_absent_dublin_core_fields() {
 }
 
 #[test]
+fn document_get_human_lines_shows_date_line_only_when_present() {
+    let mut doc = sample_get_result("body");
+    doc.date_original = Some("2026-06-15".to_string());
+    let lines = document_get_human_lines(&doc, false);
+    assert!(lines.contains(&"date: 2026-06-15".to_string()));
+
+    let absent = sample_get_result("body");
+    let lines = document_get_human_lines(&absent, false);
+    assert!(
+        !lines.iter().any(|l| l.starts_with("date:")),
+        "no 'date:' line when date_original is absent: {lines:?}"
+    );
+}
+
+#[test]
+fn document_get_human_lines_never_shows_index_updated_at() {
+    // `index_updated_at` is --json-only per the CLI surface's own contract
+    // (scope: "index_updated_at only in --json, not human").
+    let mut doc = sample_get_result("body");
+    doc.index_updated_at = Some("2026-06-15T00:00:00Z".to_string());
+    let lines = document_get_human_lines(&doc, false);
+    assert!(!lines.iter().any(|l| l.contains("index_updated_at")));
+}
+
+#[test]
 fn document_get_result_json_always_includes_text_regardless_of_flag() {
     // `--text` only governs the human renderer; the JSON shape always
     // carries the fetched text (see `DocumentGetResult`'s doc comment).
@@ -279,6 +348,27 @@ fn document_get_result_json_always_includes_text_regardless_of_flag() {
     assert_eq!(v["fetched_at"], "2026-01-01T00:00:00Z");
     assert_eq!(v["text"], "the full body");
     assert_eq!(v["metadata"]["kind"], "document");
+}
+
+#[test]
+fn document_get_result_json_includes_dates_when_present() {
+    let mut doc = sample_get_result("body");
+    doc.date_original = Some("2026-06-15T10:30:00Z".to_string());
+    doc.date_parsed = Some("2026-06-15".to_string());
+    doc.index_updated_at = Some("2026-08-01T00:00:00Z".to_string());
+    let v = document_get_result_json(&doc);
+    assert_eq!(v["date_original"], "2026-06-15T10:30:00Z");
+    assert_eq!(v["date_parsed"], "2026-06-15");
+    assert_eq!(v["index_updated_at"], "2026-08-01T00:00:00Z");
+}
+
+#[test]
+fn document_get_result_json_dates_are_null_when_absent() {
+    let doc = sample_get_result("body");
+    let v = document_get_result_json(&doc);
+    assert!(v["date_original"].is_null());
+    assert!(v["date_parsed"].is_null());
+    assert!(v["index_updated_at"].is_null());
 }
 
 // --- document list rendering: empty-scope messaging ---
