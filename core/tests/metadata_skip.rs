@@ -172,9 +172,17 @@ impl Ingestor for ScriptedIngestor {
 /// counter the metadata-only-update tests assert on (mirrors
 /// `core::ingestion`'s own private `RecordingStore`, unusable here since
 /// it's `mod tests`-private to that file).
+///
+/// `update_resource_metadata` can be told to fail via
+/// `fail_next_metadata_update`, mirroring that same private `RecordingStore`'s
+/// `fail_next_upsert` (core/src/ingestion.rs) — armed once, consumed on the
+/// next call, and returns an error *without* touching the underlying
+/// `FakeStore`, simulating a real backend write failure (e.g. a dropped
+/// connection) rather than a logic bug.
 struct RecordingStore {
     inner: FakeStore,
     metadata_update_calls: Mutex<Vec<(String, String)>>,
+    fail_next_metadata_update: std::sync::atomic::AtomicBool,
 }
 
 impl RecordingStore {
@@ -182,11 +190,17 @@ impl RecordingStore {
         Self {
             inner: FakeStore::new(),
             metadata_update_calls: Mutex::new(Vec::new()),
+            fail_next_metadata_update: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     fn metadata_update_calls(&self) -> Vec<(String, String)> {
         self.metadata_update_calls.lock().unwrap().clone()
+    }
+
+    fn fail_next_metadata_update(&self) {
+        self.fail_next_metadata_update
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -248,6 +262,15 @@ impl RetrievalStore for RecordingStore {
             .lock()
             .unwrap()
             .push((store_id.to_string(), resource_id.to_string()));
+        if self
+            .fail_next_metadata_update
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Error::Internal {
+                message: "simulated metadata update failure".to_string(),
+                correlation_id: "recording_store_simulated_failure".to_string(),
+            });
+        }
         self.inner
             .update_resource_metadata(store_id, resource_id, record)
             .await
@@ -735,6 +758,177 @@ async fn fake_store_update_resource_metadata_errors_on_unknown_resource() {
         Error::ResourceNotFound {
             id: "does-not-exist".to_string()
         }
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 6b. metadata_update_failure_counts_error_and_continues (F2)
+// ---------------------------------------------------------------------------
+
+/// A metadata-only write failure (`RetrievalStore::update_resource_metadata`
+/// returning `Err`) must be contained to that one resource — counted as a
+/// per-resource error, like `index_resource`'s own error arm — rather than
+/// aborting the whole `run_source_ingestion` call. `doc_index` must stay
+/// untouched for the failed resource (the stale hash makes it retry the
+/// metadata write on the next run), and a later resource in the same run
+/// must still be processed.
+#[tokio::test]
+async fn metadata_update_failure_counts_error_and_continues() {
+    let store = RecordingStore::new();
+    let embedder = FakeEmbedder::new(4);
+    let store_id = "store-1";
+    let config = make_ingestion_config(store_id);
+    let source = make_source_with_preset(store_id, "prose");
+    let uri_a = "file:///docs/fails-to-update.md";
+    let uri_b = "file:///docs/new-doc.md";
+    let text_a = "Content whose metadata update will fail.";
+
+    let mut doc_index = DocumentIndex::new();
+    let first_a = make_resource(uri_a, text_a, &source.id, store_id);
+    run_once(
+        &store,
+        &embedder,
+        &config,
+        &source,
+        &mut doc_index,
+        vec![first_a],
+        DeletionPolicy::Retain,
+    )
+    .await;
+
+    let hash_before = doc_index.get(uri_a).unwrap().metadata_hash.clone();
+
+    // Second run: uri_a gets a metadata-only change (triggers
+    // update_resource_metadata, armed to fail), uri_b is a brand-new
+    // resource in the same run (proves the run continues past the failure).
+    store.fail_next_metadata_update();
+    let second_a = make_resource_full(
+        uri_a,
+        text_a,
+        &source.id,
+        store_id,
+        None,
+        None,
+        Some("urn:entry:fails"),
+        None,
+        "2026-06-10T12:00:00Z",
+    );
+    let second_b = make_resource(
+        uri_b,
+        "Brand-new content in the same run.",
+        &source.id,
+        store_id,
+    );
+    let result2 = run_once(
+        &store,
+        &embedder,
+        &config,
+        &source,
+        &mut doc_index,
+        vec![second_a, second_b],
+        DeletionPolicy::Retain,
+    )
+    .await;
+
+    assert_eq!(
+        result2.error_count, 1,
+        "the failed metadata update must count as exactly one error"
+    );
+    assert_eq!(
+        result2.docs_metadata_updated, 0,
+        "a failed metadata update must not be counted as a success"
+    );
+    assert_eq!(
+        result2.docs_indexed, 1,
+        "a later resource in the same run must still be processed"
+    );
+    assert_eq!(
+        doc_index.get(uri_a).unwrap().metadata_hash,
+        hash_before,
+        "doc_index must stay untouched for the failed resource so it retries next run"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 7b. metadata_hash_ignores_modified_at_only_changes (F1)
+// ---------------------------------------------------------------------------
+
+/// A resource whose ONLY difference from the previous run is `modified_at`
+/// (content, metadata, and external identity all identical) must take the
+/// SKIP path, not the metadata-update path. `modified_at` is excluded from
+/// `compute_metadata_hash` on purpose (see that function's doc comment):
+/// for a source with no change claim of its own it falls back to
+/// ingestion-time `now()`, which would otherwise make this exact resource
+/// re-hash differently — and trigger a pointless metadata rewrite — on
+/// every single run.
+#[tokio::test]
+async fn metadata_hash_ignores_modified_at_only_changes() {
+    let store = RecordingStore::new();
+    let embedder = FakeEmbedder::new(4);
+    let store_id = "store-1";
+    let config = make_ingestion_config(store_id);
+    let source = make_source_with_preset(store_id, "prose");
+    let uri = "file:///docs/no-claim.md";
+    let text = "Content from a source with no modification-time claim of its own.";
+
+    let mut doc_index = DocumentIndex::new();
+    let first = make_resource_full(
+        uri,
+        text,
+        &source.id,
+        store_id,
+        None,
+        None,
+        None,
+        None,
+        "2026-06-10T12:00:00Z",
+    );
+    let result1 = run_once(
+        &store,
+        &embedder,
+        &config,
+        &source,
+        &mut doc_index,
+        vec![first],
+        DeletionPolicy::Retain,
+    )
+    .await;
+    assert_eq!(result1.docs_indexed, 1);
+
+    // Same content, same metadata, same external_id/etag — only
+    // `modified_at` differs, simulating a fresh ingestion-time `now()`
+    // fallback on a second run over the same no-claim source.
+    let second = make_resource_full(
+        uri,
+        text,
+        &source.id,
+        store_id,
+        None,
+        None,
+        None,
+        None,
+        "2026-06-10T13:00:00Z",
+    );
+    let result2 = run_once(
+        &store,
+        &embedder,
+        &config,
+        &source,
+        &mut doc_index,
+        vec![second],
+        DeletionPolicy::Retain,
+    )
+    .await;
+
+    assert_eq!(
+        result2.docs_skipped, 1,
+        "modified_at-only change must take the skip path"
+    );
+    assert_eq!(result2.docs_metadata_updated, 0);
+    assert_eq!(result2.docs_indexed, 0);
+    assert!(
+        store.metadata_update_calls().is_empty(),
+        "update_resource_metadata must not be called when only modified_at changed"
     );
 }
 

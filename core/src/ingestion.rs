@@ -57,8 +57,9 @@ pub struct DocumentRecord {
     /// The policy version that was used to index this document.
     pub policy_version: String,
     /// `core::ids::compute_metadata_hash` of the persisted metadata state
-    /// (post-title-backfill `Metadata` plus `external_id`/`external_etag`/
-    /// `modified_at`) from last indexing or last metadata-only update.
+    /// (post-title-backfill `Metadata` plus `external_id`/`external_etag` —
+    /// `modified_at` is deliberately excluded, see that function's doc
+    /// comment) from last indexing or last metadata-only update.
     /// Drives the metadata-only incremental update (issue #176;
     /// specs/04-search-pipeline.md): a mismatch here, with `content_hash`
     /// and `policy_version` both unchanged, means only the resource row
@@ -744,7 +745,8 @@ struct DerivedResourceState {
     /// `dublin_core_mut().title` when the metadata itself carried none.
     metadata: Metadata,
     /// `core::ids::compute_metadata_hash` of `metadata` plus
-    /// `resource.external_id`/`external_etag`/`modified_at`.
+    /// `resource.external_id`/`external_etag` (`modified_at` is deliberately
+    /// excluded — see that function's doc comment).
     metadata_hash: String,
     /// `metadata`'s own Dublin Core `date`, exactly as the source expressed it.
     date_original: Option<String>,
@@ -781,7 +783,6 @@ fn derive_resource_state(resource: &Resource) -> DerivedResourceState {
         &metadata,
         resource.external_id.as_deref(),
         resource.external_etag.as_deref(),
-        &resource.modified_at,
     );
 
     DerivedResourceState {
@@ -1449,9 +1450,25 @@ impl IngestCallback for PipelineCallback<'_> {
                     date_original: derived.date_original,
                     date_parsed: derived.date_parsed,
                 };
-                self.store
+                // Per-resource errors never abort the run (specs/04 §2),
+                // mirroring the full-reindex error arm below: a metadata-only
+                // write failure counts as an error and processing continues.
+                // doc_index is deliberately left untouched — the stale hash
+                // makes this resource retry the metadata write on the next
+                // run, exactly like a failed full reindex retries.
+                if let Err(e) = self
+                    .store
                     .update_resource_metadata(&self.config.store_id, &resource_id, &record)
-                    .await?;
+                    .await
+                {
+                    tracing::warn!("error updating metadata for resource '{}': {}", uri, e);
+                    self.result.error_count += 1;
+                    self.emit(crate::progress::ProgressEvent::DocumentFinished {
+                        uri,
+                        outcome: crate::progress::DocOutcome::Error,
+                    });
+                    return Ok(());
+                }
                 self.doc_index.upsert(DocumentRecord {
                     uri: uri.clone(),
                     resource_id,

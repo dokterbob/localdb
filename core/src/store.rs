@@ -734,7 +734,6 @@ impl RetrievalStore for FakeStore {
                     &chunk.metadata,
                     chunk.external_id.as_deref(),
                     chunk.external_etag.as_deref(),
-                    &chunk.modified_at,
                 ),
             });
         }

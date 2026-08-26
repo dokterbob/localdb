@@ -290,15 +290,18 @@ pub(crate) async fn list_indexed_documents(
     let conn = store.conn().reader();
     // `resources.id` maps back to `DocumentRecord.resource_id`. The extra
     // columns beyond the original set (metadata_json, external_id,
-    // external_etag, modified_at) feed `compute_metadata_hash` below — see
-    // its doc comment: this must derive from exactly the same persisted
-    // state `index_resource`/`update_resource_metadata` write, or a
-    // rehydrated `DocumentIndex` would disagree with the in-process one
-    // about whether a resource's metadata changed (issue #176).
+    // external_etag) feed `compute_metadata_hash` below — see its doc
+    // comment: this must derive from exactly the same persisted state
+    // `index_resource`/`update_resource_metadata` write, or a rehydrated
+    // `DocumentIndex` would disagree with the in-process one about whether a
+    // resource's metadata changed (issue #176). `modified_at` is NOT
+    // selected here — it feeds the `resources` row but is deliberately
+    // excluded from `compute_metadata_hash` itself (see that function's doc
+    // comment for why).
     let mut rows = conn
         .query(
             "SELECT id, uri, content_hash, policy_version, source_id,
-                    metadata_json, external_id, external_etag, modified_at
+                    metadata_json, external_id, external_etag
              FROM resources WHERE store_id = ?",
             params![store.store_id().to_string()],
         )
@@ -310,7 +313,6 @@ pub(crate) async fn list_indexed_documents(
         let metadata_json: String = row.get(5).map_err(map_libsql_err)?;
         let external_id: Option<String> = row.get(6).map_err(map_libsql_err)?;
         let external_etag: Option<String> = row.get(7).map_err(map_libsql_err)?;
-        let modified_at: String = row.get(8).map_err(map_libsql_err)?;
 
         // Deliberately re-parsed here (rather than delegating to
         // `parse_metadata_json_lenient`, the precedent `rows.rs` uses for
@@ -318,12 +320,9 @@ pub(crate) async fn list_indexed_documents(
         // string instead of the lenient `Metadata::default()` fallback — see
         // that branch's comment for why.
         let metadata_hash = match serde_json::from_str::<Metadata>(&metadata_json) {
-            Ok(metadata) => compute_metadata_hash(
-                &metadata,
-                external_id.as_deref(),
-                external_etag.as_deref(),
-                &modified_at,
-            ),
+            Ok(metadata) => {
+                compute_metadata_hash(&metadata, external_id.as_deref(), external_etag.as_deref())
+            }
             Err(e) => {
                 tracing::warn!(
                     resource = resource_id.as_str(),

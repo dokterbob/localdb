@@ -94,16 +94,15 @@ pub fn chunk_id(
 /// metadata-only incremental update).
 ///
 /// Inputs are exactly the fields `store-libsql` persists on the `resources`
-/// row alongside `metadata_json` — `external_id`, `external_etag`,
-/// `modified_at` — plus `metadata` itself. Callers MUST pass post-backfill,
-/// exactly-as-persisted values: `metadata` after `core::ingestion`'s
-/// title-backfill (a resource's own `title` folds into
-/// `metadata.dublin_core_mut().title` when the metadata carries none), never
-/// the raw `resource.metadata`. Computing this before backfill at one call
-/// site and after backfill at another would make the same resource hash
-/// differently depending on which code path touched it first — exactly the
-/// bug this hash exists to avoid across index-time, metadata-update-time, and
-/// rehydration-time computations.
+/// row alongside `metadata_json` — `external_id`, `external_etag` — plus
+/// `metadata` itself. Callers MUST pass post-backfill, exactly-as-persisted
+/// values: `metadata` after `core::ingestion`'s title-backfill (a resource's
+/// own `title` folds into `metadata.dublin_core_mut().title` when the
+/// metadata carries none), never the raw `resource.metadata`. Computing this
+/// before backfill at one call site and after backfill at another would make
+/// the same resource hash differently depending on which code path touched
+/// it first — exactly the bug this hash exists to avoid across index-time,
+/// metadata-update-time, and rehydration-time computations.
 ///
 /// Deliberately excludes:
 /// - `title` as a separate parameter — it always lives inside `metadata` by
@@ -112,6 +111,16 @@ pub fn chunk_id(
 /// - `date_original`/`date_parsed` — both are derived from `metadata`'s own
 ///   Dublin Core `date` field (`core::dates::parse_partial_iso8601`), so
 ///   hashing them too would double-count that field a second time.
+/// - `modified_at` — for a source with no change claim of its own (a bare
+///   URL fetch, a dateless feed entry, an unreadable file mtime) it falls
+///   back to ingestion-time `now()` (specs/02-domain-model.md's `modified_at`
+///   row), which would make otherwise-identical content hash differently on
+///   every single run and permanently defeat the unchanged-skip path for
+///   that resource. Excluding it means a pure mtime touch with unchanged
+///   content and metadata no longer trips a metadata write — acceptable
+///   because no read surface exposes `modified_at` today; giving
+///   source-claims a nullable "no claim" representation instead of the
+///   `now()` fallback is a tracked follow-up.
 ///
 /// `metadata` must serialize deterministically for this to be stable: every
 /// `Metadata` variant is plain structs/`Vec`s/`Option`s with no `HashMap`, so
@@ -122,22 +131,35 @@ pub fn chunk_id(
 /// Fields are combined with `\x00` separators (mirroring
 /// `markdown_blocks::compute_blocks_hash`'s delimiting convention) so a
 /// shifted field boundary — e.g. `external_id="ab"` + `external_etag="c"` vs
-/// `external_id="a"` + `external_etag="bc"` — can never collide.
+/// `external_id="a"` + `external_etag="bc"` — can never collide. Each
+/// optional field is additionally tagged with a `\x01` marker when present
+/// (same convention `compute_blocks_hash` uses for its optional page
+/// suffix), so `None` and `Some("")` can never collide either — otherwise
+/// `external_id.unwrap_or("")` would hash a present-but-empty value
+/// identically to an absent one.
 pub fn compute_metadata_hash(
     metadata: &Metadata,
     external_id: Option<&str>,
     external_etag: Option<&str>,
-    modified_at: &str,
 ) -> String {
     let metadata_json = serde_json::to_string(metadata).unwrap_or_default();
     let combined = format!(
-        "{}\x00{}\x00{}\x00{}",
+        "{}\x00{}\x00{}",
         metadata_json,
-        external_id.unwrap_or(""),
-        external_etag.unwrap_or(""),
-        modified_at,
+        encode_optional_field(external_id),
+        encode_optional_field(external_etag),
     );
     content_hash(&combined)
+}
+
+/// Encode an optional hash-input field so `None` and `Some("")` produce
+/// distinct output: `Some(v)` becomes `\x01v`, `None` becomes the empty
+/// string. See [`compute_metadata_hash`]'s doc comment.
+fn encode_optional_field(value: Option<&str>) -> String {
+    match value {
+        Some(v) => format!("\x01{v}"),
+        None => String::new(),
+    }
 }
 
 #[cfg(test)]
@@ -344,15 +366,15 @@ mod tests {
     #[test]
     fn metadata_hash_is_deterministic() {
         let m = doc_metadata(Some("Title"));
-        let h1 = compute_metadata_hash(&m, Some("ext-1"), Some("etag-1"), "2026-06-10T12:00:00Z");
-        let h2 = compute_metadata_hash(&m, Some("ext-1"), Some("etag-1"), "2026-06-10T12:00:00Z");
+        let h1 = compute_metadata_hash(&m, Some("ext-1"), Some("etag-1"));
+        let h2 = compute_metadata_hash(&m, Some("ext-1"), Some("etag-1"));
         assert_eq!(h1, h2);
     }
 
     #[test]
     fn metadata_hash_is_hex_encoded_blake3() {
         let m = doc_metadata(None);
-        let h = compute_metadata_hash(&m, None, None, "2026-06-10T12:00:00Z");
+        let h = compute_metadata_hash(&m, None, None);
         assert_eq!(h.len(), 64, "expected 64-char hex string, got: {h}");
         assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
     }
@@ -361,32 +383,24 @@ mod tests {
     fn metadata_hash_changes_when_metadata_changes() {
         let a = doc_metadata(Some("A"));
         let b = doc_metadata(Some("B"));
-        let ha = compute_metadata_hash(&a, None, None, "2026-06-10T12:00:00Z");
-        let hb = compute_metadata_hash(&b, None, None, "2026-06-10T12:00:00Z");
+        let ha = compute_metadata_hash(&a, None, None);
+        let hb = compute_metadata_hash(&b, None, None);
         assert_ne!(ha, hb);
     }
 
     #[test]
     fn metadata_hash_changes_when_external_id_changes() {
         let m = doc_metadata(Some("Title"));
-        let h1 = compute_metadata_hash(&m, Some("a"), None, "2026-06-10T12:00:00Z");
-        let h2 = compute_metadata_hash(&m, Some("b"), None, "2026-06-10T12:00:00Z");
+        let h1 = compute_metadata_hash(&m, Some("a"), None);
+        let h2 = compute_metadata_hash(&m, Some("b"), None);
         assert_ne!(h1, h2);
     }
 
     #[test]
     fn metadata_hash_changes_when_external_etag_changes() {
         let m = doc_metadata(Some("Title"));
-        let h1 = compute_metadata_hash(&m, None, Some("a"), "2026-06-10T12:00:00Z");
-        let h2 = compute_metadata_hash(&m, None, Some("b"), "2026-06-10T12:00:00Z");
-        assert_ne!(h1, h2);
-    }
-
-    #[test]
-    fn metadata_hash_changes_when_modified_at_changes() {
-        let m = doc_metadata(Some("Title"));
-        let h1 = compute_metadata_hash(&m, None, None, "2026-06-10T12:00:00Z");
-        let h2 = compute_metadata_hash(&m, None, None, "2026-06-11T12:00:00Z");
+        let h1 = compute_metadata_hash(&m, None, Some("a"));
+        let h2 = compute_metadata_hash(&m, None, Some("b"));
         assert_ne!(h1, h2);
     }
 
@@ -396,9 +410,25 @@ mod tests {
         // external_id="a" + external_etag="bc" — the `\x00` separator must
         // hold the field boundary even when a naive concatenation wouldn't.
         let m = doc_metadata(None);
-        let h1 = compute_metadata_hash(&m, Some("ab"), Some("c"), "2026-06-10T12:00:00Z");
-        let h2 = compute_metadata_hash(&m, Some("a"), Some("bc"), "2026-06-10T12:00:00Z");
+        let h1 = compute_metadata_hash(&m, Some("ab"), Some("c"));
+        let h2 = compute_metadata_hash(&m, Some("a"), Some("bc"));
         assert_ne!(h1, h2);
+    }
+
+    /// F3: `external_id: None` must not hash the same as
+    /// `external_id: Some("")` — a naive `unwrap_or("")` would collide the
+    /// two. Each optional field is `\x01`-tagged when present (see the doc
+    /// comment), so an absent field and a present-but-empty one can never
+    /// produce the same combined string.
+    #[test]
+    fn metadata_hash_distinguishes_none_from_empty_external_fields() {
+        let m = doc_metadata(Some("Title"));
+        let h_none = compute_metadata_hash(&m, None, None);
+        let h_empty = compute_metadata_hash(&m, Some(""), Some(""));
+        assert_ne!(
+            h_none, h_empty,
+            "external_id/external_etag of None must hash differently from Some(\"\")"
+        );
     }
 
     /// The trap this hash exists to pin closed: a resource whose title was
@@ -412,8 +442,8 @@ mod tests {
     #[test]
     fn metadata_hash_treats_backfilled_title_as_ordinary_metadata() {
         let backfilled = doc_metadata(Some("Backfilled Title"));
-        let h1 = compute_metadata_hash(&backfilled, None, None, "2026-06-10T12:00:00Z");
-        let h2 = compute_metadata_hash(&backfilled, None, None, "2026-06-10T12:00:00Z");
+        let h1 = compute_metadata_hash(&backfilled, None, None);
+        let h2 = compute_metadata_hash(&backfilled, None, None);
         assert_eq!(
             h1, h2,
             "hashing post-backfill metadata must be deterministic"
