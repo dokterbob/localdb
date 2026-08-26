@@ -518,6 +518,14 @@ claim — no ingestion-time fallback is ever hashed or stored,
 [#283](https://github.com/dokterbob/localdb/issues/283)), so a genuine claim change on
 byte-identical content takes the metadata-only path too.
 
+One field is not covered by this fix: `Resource.mime` (the ingestor-captured Content-Type, distinct
+from the sniffed format inside `metadata_json`, which _is_ hashed) is not one of `metadata_hash`'s
+inputs and has no `ResourceRecord` column at all. A Content-Type-only change on otherwise
+byte-identical content is therefore invisible to the skip-check: `content_hash`, `policy_version`,
+and `metadata_hash` all still match, so the resource is skipped outright rather than taking the
+metadata-only-write path, and the stored (API-exposed) mime goes stale. Tracked in
+[#288](https://github.com/dokterbob/localdb/issues/288).
+
 **16. ~~`index_resource`'s zero-chunk arm still deletes on an empty replacement~~ — RESOLVED.**
 ([#185](https://github.com/dokterbob/localdb/issues/185),
 [#156](https://github.com/dokterbob/localdb/issues/156)) `index_resource` now returns
