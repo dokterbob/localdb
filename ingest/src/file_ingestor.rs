@@ -126,14 +126,15 @@ impl Ingestor for FileIngestor {
             // tokio runtime (issue #187 real ingestion) — see
             // `core::blocking::run_blocking`'s doc comment for why that's
             // `block_in_place`-on-multi-thread rather than a bare call.
-            // mtime -> fetched_at/added_at/modified_at, formatted as RFC 3339
-            // (falls back to "now" if the filesystem doesn't report a
-            // modified time); only computed once the read succeeds, matching
-            // the original sequencing.
-            let (bytes, fetched_at) = match localdb_core::run_blocking(
+            // mtime -> modified_at, formatted as RFC 3339 (falls back to
+            // "now" if the filesystem doesn't report a modified time);
+            // `added_at` is stamped separately below from the ingestion
+            // clock, not from this value — only computed once the read
+            // succeeds, matching the original sequencing.
+            let (bytes, mtime_rfc3339) = match localdb_core::run_blocking(
                 || -> Result<(Vec<u8>, String), std::io::Error> {
                     let bytes = std::fs::read(&file.path)?;
-                    let fetched_at = file
+                    let mtime_rfc3339 = file
                         .path
                         .metadata()
                         .ok()
@@ -146,7 +147,7 @@ impl Ingestor for FileIngestor {
                             format_unix_secs(secs)
                         })
                         .unwrap_or_else(now_rfc3339);
-                    Ok((bytes, fetched_at))
+                    Ok((bytes, mtime_rfc3339))
                 },
             ) {
                 Ok(v) => v,
@@ -308,8 +309,11 @@ impl Ingestor for FileIngestor {
                     dublin_core: dc,
                     ..Default::default()
                 }),
-                added_at: fetched_at.clone(),
-                modified_at: fetched_at,
+                // `added_at` is the ingestion clock — when *we* observed this
+                // file — never the file's own mtime; `modified_at` is the
+                // mtime-derived value read above.
+                added_at: now_rfc3339(),
+                modified_at: mtime_rfc3339,
                 thread_id: None,
                 channel: None,
                 participants: vec![],
@@ -980,12 +984,111 @@ mod tests {
         ingestor.ingest(&source, &mut cb).await.unwrap();
 
         assert_eq!(cb.resources.len(), 1);
-        assert_eq!(cb.resources[0].added_at, expected);
+        // `modified_at` is derived from the file's mtime; `added_at` is the
+        // ingestion clock, not the mtime — see `file_ingestor_added_at_is_now_not_mtime`
+        // and `file_ingestor_modified_at_is_mtime_derived` for that split.
         assert_eq!(cb.resources[0].modified_at, expected);
         assert!(
             expected.ends_with('Z') && expected.contains('T'),
             "expected an RFC 3339 timestamp, got: {expected}"
         );
+    }
+
+    /// `added_at` records when *we* observed the file (the ingestion clock),
+    /// never the file's own mtime (#190) — otherwise a file
+    /// with an old mtime that's only being indexed for the first time today
+    /// would misreport when it entered the store.
+    #[tokio::test]
+    async fn file_ingestor_added_at_is_now_not_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.md");
+        std::fs::write(&path, "# X\n\nY.").unwrap();
+
+        // Push mtime far into the past so `added_at` (ingestion time) and
+        // `modified_at` (mtime) can't coincide by accident.
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        let file = std::fs::File::open(&path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+
+        let before = std::time::SystemTime::now();
+        let ingestor = FileIngestor::new(Box::new(AllParser));
+        let source = source_with_root(dir.path().to_str().unwrap());
+        let mut cb = RecordingCallback::default();
+        ingestor.ingest(&source, &mut cb).await.unwrap();
+        let after = std::time::SystemTime::now();
+
+        assert_eq!(cb.resources.len(), 1);
+        let added_at = &cb.resources[0].added_at;
+
+        // RFC 3339 strings in this format are lexicographically ordered, so a
+        // plain string comparison against the bracketing wall-clock reads is
+        // enough to prove `added_at` came from "now" and not from the (far
+        // older) mtime set above.
+        let lower = crate::support::format_unix_secs(
+            before
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        );
+        let upper = crate::support::format_unix_secs(
+            after
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 1,
+        );
+        assert!(
+            added_at.as_str() >= lower.as_str() && added_at.as_str() <= upper.as_str(),
+            "added_at ({added_at}) must be the ingestion clock (between {lower} and {upper}), \
+             not the file's mtime"
+        );
+    }
+
+    /// Complement to the test above: `modified_at` still tracks the file's
+    /// mtime, unaffected by this split.
+    #[tokio::test]
+    async fn file_ingestor_modified_at_is_mtime_derived() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.md");
+        std::fs::write(&path, "# X\n\nY.").unwrap();
+
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        let file = std::fs::File::open(&path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        let expected = crate::support::format_unix_secs(1_000_000_000);
+
+        let ingestor = FileIngestor::new(Box::new(AllParser));
+        let source = source_with_root(dir.path().to_str().unwrap());
+        let mut cb = RecordingCallback::default();
+        ingestor.ingest(&source, &mut cb).await.unwrap();
+
+        assert_eq!(cb.resources.len(), 1);
+        assert_eq!(cb.resources[0].modified_at, expected);
+    }
+
+    /// For a file whose mtime is far in the past, `added_at` (ingestion time)
+    /// and `modified_at` (mtime) must diverge — pinning that the two are no
+    /// longer the same clock read for file sources.
+    #[tokio::test]
+    async fn file_ingestor_added_at_and_modified_at_differ_for_old_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.md");
+        std::fs::write(&path, "# X\n\nY.").unwrap();
+
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        let file = std::fs::File::open(&path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+
+        let ingestor = FileIngestor::new(Box::new(AllParser));
+        let source = source_with_root(dir.path().to_str().unwrap());
+        let mut cb = RecordingCallback::default();
+        ingestor.ingest(&source, &mut cb).await.unwrap();
+
+        assert_eq!(cb.resources.len(), 1);
+        assert_ne!(cb.resources[0].added_at, cb.resources[0].modified_at);
     }
 
     #[cfg(unix)]
