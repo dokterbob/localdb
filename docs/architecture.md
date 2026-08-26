@@ -456,12 +456,17 @@ extraction defect (see
   (`source remove`, which still cascades normally). Pruning truly-dead entry URLs (404/410) is a
   follow-up issue.
 
-**11. Conditional-GET state (`ETag`/`Last-Modified`) is captured but never persisted or reused, for
-both `url` and `feed` sources.** `external_etag` is captured on the `Resource` at fetch time but
-nothing writes it back for reuse on the next fetch — every `localdb index` re-fetches every URL and
-every feed entry in full, with no `If-None-Match`/`If-Modified-Since` sent. A follow-up issue covers
-persisting and round-tripping conditional-GET state together with delete-on-404/410 pruning
-(previous item).
+**11. Conditional-GET state (`ETag`) is persisted but never read back and reused, for both `url` and
+`feed` sources; `Last-Modified` is not persisted at all.** `external_etag` is captured on the
+`Resource` at fetch time and, as of the four-date-axis work, written to `resources.external_etag`
+(`store-libsql/src/tenant/write.rs`) — but every real ingestion call site
+(`ingest/src/url_pipeline.rs`, `ingest/src/feed_ingestor.rs`) still builds a fresh
+`FetchMetadata::default()` for each fetch instead of reading the persisted value back, so
+`fetch::http`'s existing `If-None-Match`/`If-Modified-Since` support (`fetch/src/lib.rs`) is never
+exercised: every `localdb index` re-fetches every URL and every feed entry in full. There is no
+`resources` column for `Last-Modified` at all. A follow-up issue covers round-tripping the persisted
+`external_etag` (and adding `Last-Modified` persistence) into `FetchMetadata` on the next fetch,
+together with delete-on-404/410 pruning (previous item).
 
 **12. A store containing a `kind = 'feed'` source cannot be opened by an older binary that predates
 the Feed ingestor.** `sources.ingestor_kind` decoding is a hard match over the known `IngestorKind`
@@ -493,21 +498,20 @@ story as `url`'s `refresh_interval_secs`: the value round-trips through config a
 scheduler reads it back to trigger a re-fetch — scheduled refresh is daemon-side work not yet built
 for either source kind.
 
-**15. Enrichment metadata changes don't persist while content is unchanged.**
-([#176](https://github.com/dokterbob/localdb/issues/176)) The pipeline's incremental skip
-(`core/src/ingestion.rs`, `on_resource`) returns on a `content_hash` + `policy_version` match before
-any store write, and metadata is never compared — so corrected feed dates/authors/external ids (and
-the feed-derived `modified_at`) never reach the store for an already-indexed document until its
-content bytes change. Fixing this needs a core skip-contract change (metadata-aware compare, or a
-metadata-only store update that skips re-embedding); see the issue for the design options.
-
-This is format-general, not feed-specific. It equally covers a PDF whose Info dictionary or XMP is
-corrected (`/Title`, `/Author`) and a Markdown file whose YAML front-matter changes: in both cases
-the extracted blocks — and therefore `content_hash` — are byte-identical, so the resource is skipped
-and the stored metadata stays stale. PDFs became a visible instance of it when PDF Dublin Core
-extraction landed, but the skip contract, not the extractor, is the cause. Note the first index
-after upgrading is unaffected: the extraction change moves every PDF's content hash anyway, so
-metadata is written then.
+**15. ~~Enrichment metadata changes don't persist while content is unchanged~~ — RESOLVED.**
+([#176](https://github.com/dokterbob/localdb/issues/176)) The skip-check (`core/src/ingestion.rs`,
+`on_resource`) now compares a third value, `metadata_hash` (`core::ids::compute_metadata_hash`, over
+the persisted `Metadata` plus `external_id`/`external_etag`), alongside `content_hash` and
+`policy_version`. A `content_hash`/`policy_version` match with a `metadata_hash` mismatch now
+triggers a metadata-only write (`RetrievalStore::update_resource_metadata`, a `ResourceRecord`
+payload) that rewrites the resource row in place — no chunks, blocks, or embeddings touched —
+instead of skipping outright, tracked via a `DocOutcome::MetadataUpdated` progress outcome and the
+`docs_metadata_updated` result counter. This is format-general, not feed-specific: it covers a PDF
+whose Info dictionary/XMP is corrected as much as a feed's own metadata. The source-claimed
+`modified_at` participates in `metadata_hash` as a nullable claim (`None` when the source makes no
+claim — no ingestion-time fallback is ever hashed or stored,
+[#283](https://github.com/dokterbob/localdb/issues/283)), so a genuine claim change on
+byte-identical content takes the metadata-only path too.
 
 **16. ~~`index_resource`'s zero-chunk arm still deletes on an empty replacement~~ — RESOLVED.**
 ([#185](https://github.com/dokterbob/localdb/issues/185),
