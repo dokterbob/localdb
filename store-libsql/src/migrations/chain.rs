@@ -113,6 +113,28 @@ fn shrink_vector_index_down(ctx: &MigrationContext) -> Vec<String> {
     }
 }
 
+/// `v7`: add `resources.index_updated_at`, backfilled from `added_at` so no
+/// row is left `NULL`.
+///
+/// Tracks when *our store* last wrote a resource's chunks — distinct from
+/// `added_at` (first-ever write, preserved across replaces) and
+/// `modified_at` (the origin's claimed content modification time). See
+/// specs/02-domain-model.md §2.
+fn add_index_updated_at_up(_ctx: &MigrationContext) -> Vec<String> {
+    vec![
+        "ALTER TABLE resources ADD COLUMN index_updated_at TEXT".to_string(),
+        "UPDATE resources SET index_updated_at = added_at WHERE index_updated_at IS NULL"
+            .to_string(),
+    ]
+}
+
+/// The v7 down-step: drop `index_updated_at` (v5 precedent for `DROP
+/// COLUMN`). Reversible: the column adds no data other stored columns don't
+/// already carry (it backfills from `added_at`).
+fn add_index_updated_at_down(_ctx: &MigrationContext) -> Vec<String> {
+    vec!["ALTER TABLE resources DROP COLUMN index_updated_at".to_string()]
+}
+
 /// The real migration registry.
 ///
 /// Consumer branches append entries starting at version `BASELINE_VERSION +
@@ -142,6 +164,15 @@ pub fn migrations() -> Vec<Migration> {
                       freed pages to the filesystem",
             up: Up::Sql(shrink_vector_index_up),
             down: Down::Sql(shrink_vector_index_down),
+            needs_reindex: false,
+        },
+        Migration {
+            version: BASELINE_VERSION + 3,
+            name: "add_index_updated_at",
+            summary: "adds resources.index_updated_at (write-time clock of the last index \
+                      write for a resource), backfilled from added_at so no row is left NULL",
+            up: Up::Sql(add_index_updated_at_up),
+            down: Down::Sql(add_index_updated_at_down),
             needs_reindex: false,
         },
     ]

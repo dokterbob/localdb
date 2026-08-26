@@ -3,10 +3,67 @@
 use localdb_core::block::{Block, BlockKind};
 use localdb_core::metadata::Metadata;
 use localdb_core::types::Span;
-use localdb_core::StoreBackend;
+use localdb_core::{ChunkRecord, StoreBackend};
 use tempfile::tempdir;
 
 use super::common::backend_with_store_and_source;
+use crate::SqliteBackend;
+
+/// A minimal, self-contained `ChunkRecord` fixture for `store-1`/`doc-1`
+/// (the store/source seeded by `backend_with_store_and_source`), with
+/// `fetched_at` and `modified_at` as explicit parameters so callers can
+/// distinguish them.
+fn chunk_record(fetched_at: &str, modified_at: &str) -> ChunkRecord {
+    ChunkRecord {
+        id: "chunk-1".to_string(),
+        resource_id: "doc-1".to_string(),
+        store_id: "store-1".to_string(),
+        text: "some chunk text".to_string(),
+        span: Span::new(0, 15),
+        heading_path: vec![],
+        embedding: vec![0.1, 0.2, 0.3, 0.4],
+        policy_version: "v1".to_string(),
+        fetched_at: fetched_at.to_string(),
+        modified_at: modified_at.to_string(),
+        content_hash: "abc123".to_string(),
+        origin_store: "store-1".to_string(),
+        source_id: "src-1".to_string(),
+        ingestor_kind: "path".to_string(),
+        mime: Some("text/markdown".to_string()),
+        uri: "file:///docs/doc.md".to_string(),
+        metadata: Metadata::default(),
+        block_seq: 0,
+        seq_in_block: 0,
+        block_kind: None,
+        page: None,
+        window_block_seqs: vec![],
+    }
+}
+
+/// Read `added_at`, `modified_at`, and `index_updated_at` straight off the
+/// `resources` row for `resource_id` — the columns `ChunkRecord`/`get_chunk`
+/// don't (fully) expose, so these tests go around the `RetrievalStore` trait
+/// for assertions.
+async fn resource_row(
+    backend: &SqliteBackend,
+    resource_id: &str,
+) -> (String, String, Option<String>) {
+    let conn = backend.conn.reader();
+    let mut rows = conn
+        .query(
+            "SELECT added_at, modified_at, index_updated_at FROM resources \
+             WHERE store_id = 'store-1' AND id = ?",
+            libsql::params![resource_id.to_string()],
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().expect("resource row must exist");
+    (
+        row.get(0).unwrap(),
+        row.get(1).unwrap(),
+        row.get(2).unwrap(),
+    )
+}
 
 /// Regression test for issue C4 on the tenant read path
 /// (`tenant::rows::row_to_chunk_record_strict`, via
@@ -33,6 +90,7 @@ async fn get_chunk_tolerates_invalid_metadata_json() {
         embedding: vec![0.1, 0.2, 0.3, 0.4],
         policy_version: "v1".to_string(),
         fetched_at: "2026-07-01T00:00:00Z".to_string(),
+        modified_at: "2026-07-01T00:00:00Z".to_string(),
         content_hash: "abc123".to_string(),
         origin_store: "store-1".to_string(),
         source_id: "src-1".to_string(),
@@ -119,6 +177,7 @@ async fn upsert_blocks_is_now_transactional() {
         embedding: vec![0.1, 0.2, 0.3, 0.4],
         policy_version: "v1".to_string(),
         fetched_at: "2026-07-01T00:00:00Z".to_string(),
+        modified_at: "2026-07-01T00:00:00Z".to_string(),
         content_hash: "abc123".to_string(),
         origin_store: "store-1".to_string(),
         source_id: "src-1".to_string(),
@@ -178,5 +237,118 @@ async fn upsert_blocks_is_now_transactional() {
         persisted.is_empty(),
         "upsert_blocks must be all-or-nothing: a mid-batch failure must leave ZERO block rows \
          persisted, got {persisted:?}"
+    );
+}
+
+/// `resources.modified_at` must come from the resource's own claimed
+/// modification time (`ChunkRecord::modified_at`), not `fetched_at`
+/// (acquisition time) — the two used to be conflated (both bound from
+/// `record.fetched_at`). See specs/02-domain-model.md §2.
+#[tokio::test]
+async fn upsert_resource_modified_at_reflects_resource_modified_at_not_fetched_at() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("localdb.db");
+    let backend = backend_with_store_and_source(&path).await;
+    let handle = backend.retrieval_store("store-1").await.unwrap();
+
+    let record = chunk_record("2026-07-01T00:00:00Z", "2020-01-01T00:00:00Z");
+    handle.upsert_chunks(vec![record]).await.unwrap();
+
+    let (added_at, modified_at, _) = resource_row(&backend, "doc-1").await;
+    assert_eq!(
+        added_at, "2026-07-01T00:00:00Z",
+        "added_at must still come from fetched_at"
+    );
+    assert_eq!(
+        modified_at, "2020-01-01T00:00:00Z",
+        "modified_at must come from the resource's own claimed modification time, \
+         not fetched_at"
+    );
+}
+
+/// `resources.index_updated_at` is a write-time clock: it must be set on
+/// first insert and must not go backwards across a later upsert of the same
+/// resource, while `added_at` is preserved by the ordinary `ON CONFLICT`
+/// path (no replace involved here).
+#[tokio::test]
+async fn upsert_resource_index_updated_at_bumps_on_conflict_update() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("localdb.db");
+    let backend = backend_with_store_and_source(&path).await;
+    let handle = backend.retrieval_store("store-1").await.unwrap();
+
+    handle
+        .upsert_chunks(vec![chunk_record(
+            "2026-07-01T00:00:00Z",
+            "2026-07-01T00:00:00Z",
+        )])
+        .await
+        .unwrap();
+    let (added_at_1, _, index_updated_at_1) = resource_row(&backend, "doc-1").await;
+    let index_updated_at_1 =
+        index_updated_at_1.expect("index_updated_at must be set on first insert");
+
+    handle
+        .upsert_chunks(vec![chunk_record(
+            "2026-07-01T00:00:00Z",
+            "2026-07-02T00:00:00Z",
+        )])
+        .await
+        .unwrap();
+    let (added_at_2, modified_at_2, index_updated_at_2) = resource_row(&backend, "doc-1").await;
+    let index_updated_at_2 =
+        index_updated_at_2.expect("index_updated_at must be set on the second upsert too");
+
+    assert_eq!(
+        added_at_1, added_at_2,
+        "added_at must be preserved by ON CONFLICT"
+    );
+    assert_eq!(modified_at_2, "2026-07-02T00:00:00Z");
+    assert!(
+        index_updated_at_2.as_str() >= index_updated_at_1.as_str(),
+        "index_updated_at must not go backwards: {index_updated_at_1} -> {index_updated_at_2}"
+    );
+}
+
+/// A policy-only re-index deletes and reinserts the SAME resource_id inside
+/// one transaction (`upsert_chunks_and_blocks` with
+/// `replaces_resource_id == Some(resource_id)`). `added_at` must survive
+/// that round trip even though the new scan carries a fresh `fetched_at` —
+/// see specs/02-domain-model.md §2's added_at row.
+#[tokio::test]
+async fn upsert_resource_added_at_survives_policy_reindex() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("localdb.db");
+    let backend = backend_with_store_and_source(&path).await;
+    let handle = backend.retrieval_store("store-1").await.unwrap();
+
+    let first = chunk_record("2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z");
+    handle
+        .upsert_chunks_and_blocks("store-1", "doc-1", vec![first], &[], None)
+        .await
+        .unwrap();
+    let (added_at_1, _, _) = resource_row(&backend, "doc-1").await;
+
+    // A fresh scan of the same resource: a different fetched_at (this run's
+    // acquisition time) and modified_at, same resource_id.
+    let second = chunk_record("2026-08-26T00:00:00Z", "2026-08-20T00:00:00Z");
+    handle
+        .upsert_chunks_and_blocks("store-1", "doc-1", vec![second], &[], Some("doc-1"))
+        .await
+        .unwrap();
+    let (added_at_2, modified_at_2, index_updated_at_2) = resource_row(&backend, "doc-1").await;
+
+    assert_eq!(
+        added_at_2, added_at_1,
+        "added_at must survive a same-resource-id policy reindex"
+    );
+    assert_ne!(
+        added_at_2, "2026-08-26T00:00:00Z",
+        "added_at must not reset to the new scan's fetched_at"
+    );
+    assert_eq!(modified_at_2, "2026-08-20T00:00:00Z");
+    assert!(
+        index_updated_at_2.is_some(),
+        "index_updated_at must be populated after the reindex"
     );
 }

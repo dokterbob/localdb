@@ -701,21 +701,25 @@ async fn migrate_store_on_real_chain_drops_block_id_and_retags_metadata() {
         .unwrap();
 
     assert_eq!(report.from_version, BASELINE_VERSION);
-    assert_eq!(report.to_version, BASELINE_VERSION + 2);
+    assert_eq!(report.to_version, BASELINE_VERSION + 3);
     assert_eq!(
         report.applied.iter().map(|s| s.version).collect::<Vec<_>>(),
-        vec![BASELINE_VERSION + 1, BASELINE_VERSION + 2],
+        vec![
+            BASELINE_VERSION + 1,
+            BASELINE_VERSION + 2,
+            BASELINE_VERSION + 3
+        ],
         "a v4 store steps through the whole compiled chain, not just v5"
     );
     assert!(!report.legacy_rebuilt);
     assert!(
         report.staleness_marked,
-        "the block_id-drop migration is needs_reindex: true (v6, the index \
-         shrink, is not — it rebuilds from chunks.embedding)"
+        "the block_id-drop migration is needs_reindex: true (v6/v7, the index \
+         shrink and the index_updated_at backfill, are not)"
     );
 
     let (_db, conn) = open_conn(&path).await;
-    assert_eq!(user_version(&conn).await, BASELINE_VERSION + 2);
+    assert_eq!(user_version(&conn).await, BASELINE_VERSION + 3);
     assert!(!column_exists(&conn, "chunks", "block_id").await);
     assert!(!index_exists(&conn, "idx_chunks_store_resource").await);
     assert!(index_exists(&conn, "idx_chunks_store_resource_pos").await);
@@ -746,4 +750,72 @@ async fn migrate_store_on_real_chain_drops_block_id_and_retags_metadata() {
     assert!(parsed["page_count"].is_null());
     assert!(parsed["word_count"].is_null());
     assert_eq!(parsed["title"], "Doc One");
+}
+
+/// v7 (`add_index_updated_at`), against the REAL compiled chain: a v4 store
+/// migrated all the way to head gets `resources.index_updated_at` backfilled
+/// from `added_at` for every pre-existing row, so no row is left `NULL`.
+#[tokio::test]
+async fn migrate_store_on_real_chain_backfills_index_updated_at_from_added_at() {
+    let (_dir, path) = temp_db_path();
+    {
+        let (_db, conn) = open_conn(&path).await;
+        create_baseline_schema(&conn, &ctx()).await.unwrap();
+        seed_v4_data(&conn).await;
+    }
+
+    let report = store_libsql::migrate_store(&path, &ctx(), false)
+        .await
+        .unwrap();
+    assert_eq!(report.to_version, BASELINE_VERSION + 3);
+
+    let (_db, conn) = open_conn(&path).await;
+    assert!(column_exists(&conn, "resources", "index_updated_at").await);
+
+    for res_id in ["res-1", "res-2"] {
+        let mut rows = conn
+            .query(
+                "SELECT added_at, index_updated_at FROM resources WHERE id = ?",
+                params![res_id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let added_at: String = row.get(0).unwrap();
+        let index_updated_at: Option<String> = row.get(1).unwrap();
+        assert_eq!(
+            index_updated_at.as_deref(),
+            Some(added_at.as_str()),
+            "{res_id}'s index_updated_at must be backfilled from added_at"
+        );
+    }
+}
+
+/// v7's down-step: downgrading a store sitting at head (v7) back to v6 drops
+/// `resources.index_updated_at` and nothing else, via the real compiled
+/// chain's stored `down_sql` — not a fixture mirror.
+#[tokio::test]
+async fn downgrade_real_chain_from_head_drops_index_updated_at() {
+    let (_dir, path) = temp_db_path();
+    {
+        let (_db, conn) = open_conn(&path).await;
+        create_baseline_schema(&conn, &ctx()).await.unwrap();
+        seed_v4_data(&conn).await;
+    }
+    store_libsql::migrate_store(&path, &ctx(), false)
+        .await
+        .unwrap();
+
+    let report = store_libsql::downgrade_store(&path, Some(BASELINE_VERSION + 2))
+        .await
+        .unwrap();
+    assert_eq!(report.to_version, BASELINE_VERSION + 2);
+
+    let (_db, conn) = open_conn(&path).await;
+    assert_eq!(user_version(&conn).await, BASELINE_VERSION + 2);
+    assert!(!column_exists(&conn, "resources", "index_updated_at").await);
+
+    // v6's own effects (chunks_vec_idx tuning) are untouched by this
+    // downgrade — only the v7 step is reverted.
+    assert_eq!(row_count(&conn, "resources").await, 2);
 }

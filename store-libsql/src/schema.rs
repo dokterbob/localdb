@@ -98,6 +98,13 @@ async fn create_sources(conn: &Connection) -> Result<(), libsql::Error> {
 }
 
 async fn create_resources(conn: &Connection) -> Result<(), libsql::Error> {
+    // `index_updated_at` is appended after `extractor_version` rather than
+    // grouped with `added_at`/`modified_at` above: it landed via schema v7's
+    // `ALTER TABLE resources ADD COLUMN`, which SQLite always appends after
+    // the last existing column definition — verified empirically, and this
+    // literal must stay byte-for-byte identical to that or the drift-guard
+    // test (`migrations::runner::drift_guard_create_schema_equals_baseline_plus_chain`)
+    // fails (write-twice rule, docs/migrations.md).
     conn.execute(
         "CREATE TABLE IF NOT EXISTS resources (
             rowid             INTEGER PRIMARY KEY,
@@ -124,7 +131,7 @@ async fn create_resources(conn: &Connection) -> Result<(), libsql::Error> {
             origin_store      TEXT NOT NULL,
             policy_version    TEXT NOT NULL,
             share_path        TEXT,
-            extractor_version TEXT NOT NULL,
+            extractor_version TEXT NOT NULL, index_updated_at TEXT,
             UNIQUE (store_id, id),
             FOREIGN KEY (store_id, source_id) REFERENCES sources(store_id, id) ON DELETE CASCADE
         )",

@@ -155,6 +155,7 @@ async fn seeded_store(store_id: &str, store_name: &str, text: &str) -> (Availabl
         embedding: vec![0.8, 0.2, 0.1, 0.5],
         policy_version: "v1".to_string(),
         fetched_at: "2026-06-10T12:00:00Z".to_string(),
+        modified_at: "2026-06-10T12:00:00Z".to_string(),
         content_hash: doc_hash,
         origin_store: store_id.to_string(),
         source_id: new_ulid(),

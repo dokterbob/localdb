@@ -80,6 +80,7 @@ fn make_chunk(id: &str, doc_id: &str, store_id: &str, embedding: Vec<f32>) -> Ch
         embedding,
         policy_version: "v1".to_string(),
         fetched_at: "2026-06-25T12:00:00Z".to_string(),
+        modified_at: "2026-06-25T12:00:00Z".to_string(),
         content_hash: "abc123".to_string(),
         origin_store: store_id.to_string(),
         source_id: format!("src-{store_id}"),
@@ -348,4 +349,25 @@ async fn indexed_resource_persists_ingestion_time_not_feed_date_in_added_at() {
         info.fetched_at, INGESTED_AT,
         "resources.added_at must hold the ingestion time, not the feed's date"
     );
+
+    // Real-backend round trip for ChunkRecord.modified_at (specs/02-domain-model.md
+    // §2): reading the chunk back through the real TenantStore must surface the
+    // resource's own claimed modified_at, distinct from fetched_at/added_at.
+    let chunks = handle.get_chunks_for_resource(&resource.id).await.unwrap();
+    assert!(!chunks.is_empty());
+    for c in &chunks {
+        assert_eq!(
+            c.fetched_at, INGESTED_AT,
+            "ChunkRecord.fetched_at must round-trip as the ingestion time"
+        );
+        assert_eq!(
+            c.modified_at, FEED_CLAIMED,
+            "ChunkRecord.modified_at must round-trip as the resource's own claimed \
+             modification time, not the ingestion time"
+        );
+        assert_ne!(
+            c.fetched_at, c.modified_at,
+            "added_at and modified_at must be independently readable, not conflated"
+        );
+    }
 }

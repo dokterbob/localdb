@@ -937,6 +937,10 @@ pub async fn index_resource(
         record.seq_in_block = chunk_out.seq_in_block;
         record.block_kind = chunk_out.block_kind.clone();
         record.page = page_by_seq.get(&chunk_out.block_seq).copied();
+        // The resource's own claimed modification time — distinct from
+        // `fetched_at`/`provenance.fetched_at` (acquisition time, stamped by
+        // `from_chunk` above). See specs/02-domain-model.md §2.
+        record.modified_at = resource.modified_at.clone();
         records.push(record);
     }
 
@@ -2159,6 +2163,7 @@ mod tests {
             embedding: vec![0.0, 0.0, 0.0, 0.0],
             policy_version: "v1".to_string(),
             fetched_at: "2026-06-22T00:00:00Z".to_string(),
+            modified_at: "2026-06-22T00:00:00Z".to_string(),
             content_hash: content_hash.to_string(),
             origin_store: store_id.to_string(),
             source_id: "src-1".to_string(),

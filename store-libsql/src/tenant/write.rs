@@ -103,6 +103,43 @@ async fn delete_document_inner(
     Ok(chunk_count as usize)
 }
 
+/// Connection-level helper: delete a document's chunks and blocks only —
+/// the `resources` row is left in place.
+///
+/// Used by `upsert_chunks_and_blocks`'s same-resource-id replace path (a
+/// policy-only re-index, where `replaces_resource_id == Some(resource_id)`):
+/// leaving the `resources` row in place means the INSERT that follows hits
+/// its `ON CONFLICT(store_id, id) DO UPDATE` instead of a fresh insert, and
+/// `added_at` — deliberately absent from that `DO UPDATE SET` list — is
+/// preserved for free. `modified_at`/`index_updated_at`/etc. still refresh
+/// normally, since they're bound from the new scan and ARE in that SET list.
+///
+/// Both `chunks` and `blocks` carry their own `ON DELETE CASCADE` FK to
+/// `resources(store_id, id)` (`schema.rs`), which is why
+/// `delete_document_inner` can get away with deleting `chunks` explicitly and
+/// letting `blocks` cascade off the `resources` row's own delete — but with
+/// `resources` staying put here, both need an explicit delete.
+async fn delete_chunks_and_blocks_inner(
+    conn: &Connection,
+    store_id: &str,
+    resource_id: &str,
+) -> Result<usize, Error> {
+    let chunk_count = conn
+        .execute(
+            "DELETE FROM chunks WHERE store_id = ? AND resource_id = ?",
+            params![store_id.to_string(), resource_id.to_string()],
+        )
+        .await
+        .map_err(map_libsql_err)?;
+    conn.execute(
+        "DELETE FROM blocks WHERE store_id = ? AND resource_id = ?",
+        params![store_id.to_string(), resource_id.to_string()],
+    )
+    .await
+    .map_err(map_libsql_err)?;
+    Ok(chunk_count as usize)
+}
+
 pub(crate) async fn delete_by_store(store: &TenantStore, store_id: &str) -> Result<usize, Error> {
     if store_id != store.store_id() {
         return tenant_violation(format!(
@@ -157,6 +194,10 @@ async fn upsert_chunks_inner(
     // Track which (store_id, resource_id) pairs we've already upserted in this
     // batch so we don't issue duplicate resource upserts.
     let mut seen_resources: HashMap<(String, String), bool> = HashMap::new();
+    // One write-time clock reading for the whole batch: every resource
+    // touched by this call was written "now", by definition of this call
+    // happening now. See specs/02-domain-model.md §2.
+    let index_updated_at = localdb_core::ingestion::now_rfc3339();
 
     for record in records {
         // `record.resource_id` maps to the `id` column on `resources`.
@@ -170,20 +211,21 @@ async fn upsert_chunks_inner(
             let title = record.metadata.title();
             conn.execute(
                 "INSERT INTO resources (store_id, id, source_id, ingestor_kind, resource_kind,
-                     uri, title, mime, content_hash, added_at, modified_at, origin_store,
-                     policy_version, metadata_json, extractor_version)
-                 VALUES (?, ?, ?, ?, 'document', ?, ?, ?, ?, ?, ?, ?, ?, ?, '1')
+                     uri, title, mime, content_hash, added_at, modified_at, index_updated_at,
+                     origin_store, policy_version, metadata_json, extractor_version)
+                 VALUES (?, ?, ?, ?, 'document', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '1')
                  ON CONFLICT(store_id, id) DO UPDATE SET
-                     source_id      = excluded.source_id,
-                     ingestor_kind  = excluded.ingestor_kind,
-                     uri            = excluded.uri,
-                     title          = excluded.title,
-                     mime           = excluded.mime,
-                     content_hash   = excluded.content_hash,
-                     modified_at    = excluded.modified_at,
-                     origin_store   = excluded.origin_store,
-                     policy_version = excluded.policy_version,
-                     metadata_json  = excluded.metadata_json",
+                     source_id        = excluded.source_id,
+                     ingestor_kind    = excluded.ingestor_kind,
+                     uri              = excluded.uri,
+                     title            = excluded.title,
+                     mime             = excluded.mime,
+                     content_hash     = excluded.content_hash,
+                     modified_at      = excluded.modified_at,
+                     index_updated_at = excluded.index_updated_at,
+                     origin_store     = excluded.origin_store,
+                     policy_version   = excluded.policy_version,
+                     metadata_json    = excluded.metadata_json",
                 params![
                     record.store_id.as_str(),
                     record.resource_id.as_str(), // id column
@@ -194,7 +236,8 @@ async fn upsert_chunks_inner(
                     record.mime.as_deref(),
                     record.content_hash.as_str(),
                     record.fetched_at.as_str(), // added_at column
-                    record.fetched_at.as_str(), // modified_at column
+                    record.modified_at.as_str(),
+                    index_updated_at.as_str(),
                     record.origin_store.as_str(),
                     record.policy_version.as_str(),
                     metadata_json.as_str(),
@@ -281,16 +324,23 @@ async fn upsert_chunks_inner(
 /// transactions), this wraps both writes in one `write_tx` so the resource
 /// can never appear indexed (chunks present) but un-blocked.
 ///
-/// When `replaces_resource_id` is `Some(old_id)`, the old document's chunks,
-/// blocks, and resource row are deleted **inside this same transaction**,
-/// before the new records are inserted (issue #79). This closes the residual
-/// same-run window from the A6 design decision (`docs/design-decisions.md`):
+/// When `replaces_resource_id` is `Some(old_id)`, the old document's chunks
+/// and blocks are deleted **inside this same transaction**, before the new
+/// records are inserted (issue #79). This closes the residual same-run
+/// window from the A6 design decision (`docs/design-decisions.md`):
 /// previously the replace delete ran in its own transaction, so a write
 /// failure in the upsert that followed left the old chunks gone for the rest
 /// of the run. Folding the delete into this transaction means a failure
-/// anywhere below (including the delete-then-reinsert of the very same
-/// `resource_id`, for a policy-only re-index) rolls back everything and
-/// leaves the old resource intact and searchable.
+/// anywhere below rolls back everything and leaves the old resource intact
+/// and searchable.
+///
+/// Whether the old `resources` row itself is deleted depends on whether
+/// `old_id` names the *same* resource being written here (a policy-only
+/// re-index — chunk boundaries can change under a new chunking policy even
+/// though the content and its identity haven't) or a genuinely different one
+/// (content changed enough to mint a new content-addressed ID): see
+/// `delete_chunks_and_blocks_inner`'s doc comment for why the same-ID case
+/// keeps the row in place.
 pub(crate) async fn upsert_chunks_and_blocks(
     store: &TenantStore,
     resource_id: &str,
@@ -320,7 +370,11 @@ pub(crate) async fn upsert_chunks_and_blocks(
     // this function's own scope, no `'static` bound or boxing required.
     let result: Result<usize, localdb_core::Error> = async {
         if let Some(old_id) = replaces_resource_id {
-            delete_document_inner(&tx, store.store_id(), old_id).await?;
+            if old_id == resource_id {
+                delete_chunks_and_blocks_inner(&tx, store.store_id(), old_id).await?;
+            } else {
+                delete_document_inner(&tx, store.store_id(), old_id).await?;
+            }
         }
         upsert_chunks_inner(&tx, &records, store.encoding()).await?;
         upsert_blocks_inner(&tx, store.store_id(), resource_id, blocks).await?;
