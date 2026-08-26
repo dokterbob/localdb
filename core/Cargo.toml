@@ -36,6 +36,14 @@ http = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }
 tempfile = "3"
 localdb-extract = { path = "../extract" }
+# Self dev-dependency, `test-support` feature only: `core/tests/*.rs`
+# integration tests link against this crate as an ordinary dependency (no
+# `cfg(test)`), so `FakeStore` — gated `cfg(any(test, feature =
+# "test-support"))` because it's also used by other crates' integration
+# tests (`ingest`, which already depends on this same feature) — needs the
+# feature turned on explicitly here too. Mirrors `ingest/Cargo.toml`'s
+# `localdb-core = { path = "../core", features = ["test-support"] }`.
+localdb-core = { path = ".", features = ["test-support"] }
 # default-features off: the default `resolve-http` feature drags reqwest 0.13
 # into the test build graph with `rustls-no-provider`, which breaks rmcp's
 # daemon-proxy client under `cargo test` (rustls provider ambiguity; CI-only

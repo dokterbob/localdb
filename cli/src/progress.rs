@@ -643,6 +643,7 @@ mod tests {
                 chunks_written: 6,
                 unsupported_format_count: 0,
                 docs_prunable: 0,
+                docs_metadata_updated: 0,
                 error_count: 0,
             },
         });
@@ -686,6 +687,7 @@ mod tests {
                 chunks_written: 6,
                 unsupported_format_count: 0,
                 docs_prunable: 0,
+                docs_metadata_updated: 0,
                 error_count: 0,
             },
         });
@@ -735,6 +737,7 @@ mod tests {
                 chunks_written: 12,
                 unsupported_format_count: 0,
                 docs_prunable: 0,
+                docs_metadata_updated: 0,
                 error_count: 0,
             },
         });

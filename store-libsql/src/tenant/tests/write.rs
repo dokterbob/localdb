@@ -1,9 +1,9 @@
 //! `tenant::write` tests.
 
 use localdb_core::block::{Block, BlockKind};
-use localdb_core::metadata::Metadata;
+use localdb_core::metadata::{DocumentMetadata, DublinCoreMetadata, Metadata};
 use localdb_core::types::Span;
-use localdb_core::{ChunkRecord, StoreBackend};
+use localdb_core::{ChunkRecord, Error, ResourceRecord, StoreBackend};
 use tempfile::tempdir;
 
 use super::common::backend_with_store_and_source;
@@ -462,5 +462,171 @@ async fn upsert_resource_persists_external_id_and_external_etag() {
         external_etag_2.as_deref(),
         Some("\"etag-2\""),
         "external_etag must refresh on re-index, same as metadata_json"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// update_resource_metadata (issue #176: metadata-only incremental update)
+// ---------------------------------------------------------------------------
+
+/// The whole point of `update_resource_metadata`: it may rewrite the
+/// `resources` row's metadata columns, but chunks, embeddings, and the FTS
+/// index must be byte-for-byte untouched — content/policy are unchanged, so
+/// nothing about search results should shift. See
+/// specs/04-search-pipeline.md (metadata-only update semantics).
+#[tokio::test]
+async fn metadata_only_update_does_not_touch_chunks_embeddings_or_fts() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("localdb.db");
+    let backend = backend_with_store_and_source(&path).await;
+    let handle = backend.retrieval_store("store-1").await.unwrap();
+
+    handle
+        .upsert_chunks(vec![chunk_record(
+            "2026-07-01T00:00:00Z",
+            "2026-07-01T00:00:00Z",
+        )])
+        .await
+        .unwrap();
+
+    let before = handle
+        .get_chunk("chunk-1")
+        .await
+        .unwrap()
+        .expect("chunk must exist before the update");
+    let bm25_before = handle.bm25_search("chunk text", 10, &[]).await.unwrap();
+    assert_eq!(
+        bm25_before.len(),
+        1,
+        "FTS must find the chunk before the update"
+    );
+
+    let new_metadata = Metadata::Document(DocumentMetadata {
+        dublin_core: DublinCoreMetadata {
+            title: Some("New Title".to_string()),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let update = ResourceRecord {
+        metadata: new_metadata.clone(),
+        external_id: Some("urn:entry:9".to_string()),
+        external_etag: Some("\"etag-9\"".to_string()),
+        modified_at: "2026-08-01T00:00:00Z".to_string(),
+        date_original: Some("2026-07-30".to_string()),
+        date_parsed: Some("2026-07-30".to_string()),
+    };
+    handle
+        .update_resource_metadata("store-1", "doc-1", &update)
+        .await
+        .unwrap();
+
+    let after = handle
+        .get_chunk("chunk-1")
+        .await
+        .unwrap()
+        .expect("chunk must still exist after the update");
+    assert_eq!(
+        before.embedding, after.embedding,
+        "embedding bytes must be untouched by a metadata-only update"
+    );
+    assert_eq!(before.text, after.text);
+    assert_eq!(before.span, after.span);
+    assert_eq!(before.block_seq, after.block_seq);
+    assert_eq!(before.heading_path, after.heading_path);
+    // `get_chunk` reads metadata via the resources join, so it DOES reflect
+    // the update — this is the row the update was meant to change.
+    assert_eq!(after.metadata, new_metadata);
+    assert_eq!(after.modified_at, "2026-08-01T00:00:00Z");
+
+    let bm25_after = handle.bm25_search("chunk text", 10, &[]).await.unwrap();
+    assert_eq!(
+        bm25_after.len(),
+        1,
+        "FTS row must still be present after the metadata-only update"
+    );
+    assert_eq!(bm25_after[0].chunk.id, bm25_before[0].chunk.id);
+
+    let stats = handle.stats().await.unwrap();
+    assert_eq!(stats.chunk_count, 1, "no chunk rows added or removed");
+
+    let (date_original, date_parsed, external_id, external_etag) =
+        resource_dates_and_external(&backend, "doc-1").await;
+    assert_eq!(date_original.as_deref(), Some("2026-07-30"));
+    assert_eq!(date_parsed.as_deref(), Some("2026-07-30"));
+    assert_eq!(external_id.as_deref(), Some("urn:entry:9"));
+    assert_eq!(external_etag.as_deref(), Some("\"etag-9\""));
+}
+
+/// `index_updated_at` must still bump on a metadata-only update — the row
+/// really was rewritten, even though no chunk changed.
+#[tokio::test]
+async fn metadata_only_update_bumps_index_updated_at() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("localdb.db");
+    let backend = backend_with_store_and_source(&path).await;
+    let handle = backend.retrieval_store("store-1").await.unwrap();
+
+    handle
+        .upsert_chunks(vec![chunk_record(
+            "2026-07-01T00:00:00Z",
+            "2026-07-01T00:00:00Z",
+        )])
+        .await
+        .unwrap();
+    let (_, _, index_updated_at_1) = resource_row(&backend, "doc-1").await;
+    let index_updated_at_1 = index_updated_at_1.expect("set on first insert");
+
+    let update = ResourceRecord {
+        metadata: Metadata::default(),
+        external_id: None,
+        external_etag: None,
+        modified_at: "2026-07-01T00:00:00Z".to_string(),
+        date_original: None,
+        date_parsed: None,
+    };
+    handle
+        .update_resource_metadata("store-1", "doc-1", &update)
+        .await
+        .unwrap();
+    let (_, _, index_updated_at_2) = resource_row(&backend, "doc-1").await;
+    let index_updated_at_2 = index_updated_at_2.expect("set after metadata-only update");
+
+    assert!(
+        index_updated_at_2.as_str() >= index_updated_at_1.as_str(),
+        "index_updated_at must not go backwards: {index_updated_at_1} -> {index_updated_at_2}"
+    );
+}
+
+/// Zero-rows semantics: a concurrent delete between the skip-check and the
+/// update means no row matches `(store_id, resource_id)` — this must be a
+/// reported error, never a silent no-op success (see
+/// `RetrievalStore::update_resource_metadata`'s doc comment on why: a
+/// silent `Ok(())` would leave the caller's `DocumentIndex` pointing at a
+/// resource_id the store has no row for at all).
+#[tokio::test]
+async fn update_resource_metadata_errors_when_no_row_matches() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("localdb.db");
+    let backend = backend_with_store_and_source(&path).await;
+    let handle = backend.retrieval_store("store-1").await.unwrap();
+
+    let update = ResourceRecord {
+        metadata: Metadata::default(),
+        external_id: None,
+        external_etag: None,
+        modified_at: "2026-08-01T00:00:00Z".to_string(),
+        date_original: None,
+        date_parsed: None,
+    };
+    let err = handle
+        .update_resource_metadata("store-1", "does-not-exist", &update)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        Error::ResourceNotFound {
+            id: "does-not-exist".to_string()
+        }
     );
 }

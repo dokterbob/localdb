@@ -340,7 +340,7 @@ async fn indexed_resource_persists_ingestion_time_not_feed_date_in_added_at() {
         .await
         .unwrap();
     assert!(
-        matches!(outcome, IndexOutcome::Written(n) if n > 0),
+        matches!(outcome, IndexOutcome::Written(n, _) if n > 0),
         "the resource must produce at least one chunk, got {outcome:?}"
     );
 
