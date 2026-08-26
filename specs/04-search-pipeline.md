@@ -51,14 +51,16 @@ Resources also carry:
 The skip-check compares three values, not one: `content_hash`, `policy_version`, and `metadata_hash`
 — a hash (`core::ids::compute_metadata_hash`) of a resource's _persisted_ metadata state:
 post-title-backfill `Metadata` (a resource's own `title` folds into
-`Metadata.dublin_core_mut().title` when the extracted metadata carries none) plus `external_id` and
-`external_etag`. All three writers of this hash — indexing, a metadata-only update, and rehydrating
-`DocumentIndex` from `RetrievalStore::list_indexed_documents` after a process restart — derive it
-from that same already-persisted state, never from a resource's raw, pre-backfill fields, so the
-hash means the same thing regardless of which of the three computed it. `modified_at` is
-deliberately excluded: for a source with no change claim of its own it falls back to ingestion-time
-`now()`, which would make otherwise-identical content hash differently on every run and permanently
-defeat this skip-check.
+`Metadata.dublin_core_mut().title` when the extracted metadata carries none) plus `external_id`,
+`external_etag`, and `modified_at`. All three writers of this hash — indexing, a metadata-only
+update, and rehydrating `DocumentIndex` from `RetrievalStore::list_indexed_documents` after a
+process restart — derive it from that same already-persisted state, never from a resource's raw,
+pre-backfill fields, so the hash means the same thing regardless of which of the three computed it.
+`modified_at` is `Option<String>` ([02-domain-model.md](02-domain-model.md)'s `modified_at` row):
+`None` when the source makes no change claim of its own, never our clock. A no-claim source hashes a
+stable `None` on every run, so it never trips this skip-check on its own — only a genuine change to
+the source's claim does, which correctly routes through the metadata-only-update outcome below, same
+as any other metadata field.
 
 Three outcomes follow from comparing incoming vs. stored state (issue #176):
 

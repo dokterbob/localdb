@@ -374,6 +374,13 @@ async fn empty_feed_single_doc_mode_emits_one_title_only_resource() {
     assert_eq!(result.resources_produced, 1);
     assert_eq!(result.errors, 0);
     assert_eq!(cb.resources[0].title.as_deref(), Some("Test Feed"));
+    // No `feed.updated` and no entries at all: single-document mode's
+    // `modified_at_override` chain bottoms out at `None` — no claim, never
+    // an ingestion-time `now()` stand-in (#283).
+    assert_eq!(
+        cb.resources[0].modified_at, None,
+        "a feed with no updated timestamp and no entries makes no modification-time claim"
+    );
 }
 
 /// Codex review finding F6: the `feed_rs` parse (`catch_panic(...)` around
@@ -1959,19 +1966,27 @@ async fn modified_at_prefers_updated_while_dc_date_prefers_published() {
     let res = &cb.resources[0];
     // modified_at = updated.or(published) (modification semantics);
     // dc.date = published.or(updated) (creation/publication semantics).
-    assert_eq!(res.modified_at, "2026-01-05T00:00:00+00:00");
+    assert_eq!(
+        res.modified_at.as_deref(),
+        Some("2026-01-05T00:00:00+00:00")
+    );
     assert_eq!(
         res.metadata.dublin_core().date.as_deref(),
         Some("2026-01-04T00:00:00+00:00")
     );
     assert_ne!(
-        res.added_at, res.modified_at,
+        Some(res.added_at.as_str()),
+        res.modified_at.as_deref(),
         "added_at records when our store saw the entry, not the feed's date"
     );
 }
 
+/// A feed entry with no `updated`/`published` of its own makes no
+/// modification-time claim at all: `modified_at` is `None`, never a
+/// same-as-`added_at` `now()` stand-in (#283). `added_at` is still stamped
+/// with the ingestion clock regardless.
 #[tokio::test]
-async fn no_entry_dates_added_at_equals_modified_at() {
+async fn no_entry_dates_yields_modified_at_none() {
     let items =
         r#"<item><title>No Dates</title><guid>e1</guid><description>Body</description></item>"#;
     let feed_xml = rss2_feed("", items);
@@ -1986,7 +2001,14 @@ async fn no_entry_dates_added_at_equals_modified_at() {
     ingestor.ingest(&source, &mut cb).await.unwrap();
 
     let res = &cb.resources[0];
-    assert_eq!(res.added_at, res.modified_at);
+    assert_eq!(
+        res.modified_at, None,
+        "a dateless entry makes no modification-time claim"
+    );
+    assert!(
+        !res.added_at.is_empty(),
+        "added_at must still be stamped from the ingestion clock"
+    );
 }
 
 #[tokio::test]
@@ -2006,7 +2028,10 @@ async fn single_doc_modified_at_from_feed_updated() {
     ingestor.ingest(&source, &mut cb).await.unwrap();
 
     assert_eq!(cb.resources.len(), 1);
-    assert_eq!(cb.resources[0].modified_at, "2026-01-01T00:00:00+00:00");
+    assert_eq!(
+        cb.resources[0].modified_at.as_deref(),
+        Some("2026-01-01T00:00:00+00:00")
+    );
 }
 
 // ---------------------------------------------------------------------------

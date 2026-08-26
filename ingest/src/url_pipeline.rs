@@ -87,9 +87,10 @@ pub(crate) enum UrlOutcome {
 /// `Default` reproduces `UrlIngestor`'s pre-refactor behavior exactly: no
 /// external id, no title fallback (the page's own title or Dublin Core title
 /// wins or the field stays `None`), no injected creator/date/provenance,
-/// `added_at == modified_at` (no `modified_at_override`), and
-/// `external_etag` always `None` (a bare `UrlIngestor` never threads
-/// conditional-fetch state through `Resource`).
+/// `modified_at: None` (a bare `UrlIngestor` makes no claim about
+/// modification time — no `modified_at_override`), and `external_etag`
+/// always `None` (a bare `UrlIngestor` never threads conditional-fetch state
+/// through `Resource`).
 #[derive(Default)]
 pub(crate) struct ResourceEnrichment {
     /// Arbitrary source-system ID (e.g. a feed entry's `<id>`/`<guid>`).
@@ -107,10 +108,11 @@ pub(crate) struct ResourceEnrichment {
     pub date: Option<String>,
     /// Value (RFC 3339) for `Resource.modified_at` when the source system
     /// carries its own modification timestamp (e.g. a feed entry's
-    /// `updated`). `None` keeps the pre-enrichment behavior: `added_at` and
-    /// `modified_at` are the same `now_rfc3339()` call. `added_at` is always
-    /// ingestion-time `now()` regardless — it records when *our store* first
-    /// saw the resource, not when the source last changed it.
+    /// `updated`). Passed straight through as the source's claim; `None`
+    /// means the source makes no such claim (`Resource.modified_at` stays
+    /// `None`, not "now"). `added_at` is always ingestion-time `now()`
+    /// regardless — it records when *our store* first saw the resource, not
+    /// when the source last changed it.
     pub modified_at_override: Option<String>,
     /// Provenance source (e.g. the owning feed's URL) to stamp into
     /// `DublinCoreMetadata::source` when present.
@@ -357,8 +359,8 @@ pub(crate) fn build_resource(
             dublin_core: dc,
             ..Default::default()
         }),
-        added_at: now.clone(),
-        modified_at: enrich.modified_at_override.clone().unwrap_or(now),
+        added_at: now,
+        modified_at: enrich.modified_at_override.clone(),
         thread_id: None,
         channel: None,
         participants: vec![],

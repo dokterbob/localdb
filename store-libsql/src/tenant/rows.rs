@@ -44,7 +44,7 @@ pub(crate) fn row_to_chunk_record_strict(row: &libsql::Row) -> Result<ChunkRecor
     let mime: Option<String> = row.get(10).map_err(map_libsql_err)?;
     let policy_version: String = row.get(11).map_err(map_libsql_err)?;
     let added_at: String = row.get(12).map_err(map_libsql_err)?; // → fetched_at
-    let modified_at: String = row.get(13).map_err(map_libsql_err)?;
+    let modified_at: Option<String> = row.get(13).map_err(map_libsql_err)?;
     let content_hash: String = row.get(14).map_err(map_libsql_err)?;
     let origin_store: String = row.get(15).map_err(map_libsql_err)?;
     let metadata_str: String = row.get(16).map_err(map_libsql_err)?;

@@ -126,13 +126,14 @@ impl Ingestor for FileIngestor {
             // tokio runtime (issue #187 real ingestion) — see
             // `core::blocking::run_blocking`'s doc comment for why that's
             // `block_in_place`-on-multi-thread rather than a bare call.
-            // mtime -> modified_at, formatted as RFC 3339 (falls back to
-            // "now" if the filesystem doesn't report a modified time);
-            // `added_at` is stamped separately below from the ingestion
-            // clock, not from this value — only computed once the read
-            // succeeds, matching the original sequencing.
+            // mtime -> modified_at, formatted as RFC 3339; `None` when the
+            // filesystem doesn't report a modified time (no claim, not "now"
+            // — see `Resource::modified_at`'s doc comment). `added_at` is
+            // stamped separately below from the ingestion clock, not from
+            // this value — only computed once the read succeeds, matching
+            // the original sequencing.
             let (bytes, mtime_rfc3339) = match localdb_core::run_blocking(
-                || -> Result<(Vec<u8>, String), std::io::Error> {
+                || -> Result<(Vec<u8>, Option<String>), std::io::Error> {
                     let bytes = std::fs::read(&file.path)?;
                     let mtime_rfc3339 = file
                         .path
@@ -145,8 +146,7 @@ impl Ingestor for FileIngestor {
                                 .unwrap_or_default()
                                 .as_secs();
                             format_unix_secs(secs)
-                        })
-                        .unwrap_or_else(now_rfc3339);
+                        });
                     Ok((bytes, mtime_rfc3339))
                 },
             ) {

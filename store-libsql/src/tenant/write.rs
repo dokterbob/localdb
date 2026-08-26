@@ -233,7 +233,7 @@ async fn update_resource_metadata_inner(
                 title,
                 record.external_id.as_deref(),
                 record.external_etag.as_deref(),
-                record.modified_at.as_str(),
+                record.modified_at.as_deref(),
                 record.date_original.as_deref(),
                 record.date_parsed.as_deref(),
                 index_updated_at.as_str(),
@@ -321,7 +321,7 @@ async fn upsert_chunks_inner(
                     record.mime.as_deref(),
                     record.content_hash.as_str(),
                     record.fetched_at.as_str(), // added_at column
-                    record.modified_at.as_str(),
+                    record.modified_at.as_deref(),
                     index_updated_at.as_str(),
                     record.origin_store.as_str(),
                     record.policy_version.as_str(),

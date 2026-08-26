@@ -158,7 +158,7 @@ async fn get_document_reconstructs_table_without_duplicated_header() {
             embedding: vec![0.0; 128],
             policy_version: "policy-v1".to_string(),
             fetched_at: "2026-06-29T00:00:00Z".to_string(),
-            modified_at: "2026-06-29T00:00:00Z".to_string(),
+            modified_at: Some("2026-06-29T00:00:00Z".to_string()),
             content_hash: doc_hash.clone(),
             origin_store: store_id.clone(),
             source_id: source.id.clone(),

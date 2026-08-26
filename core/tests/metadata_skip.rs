@@ -71,7 +71,7 @@ fn make_resource_full(
     metadata_title: Option<&str>,
     external_id: Option<&str>,
     external_etag: Option<&str>,
-    modified_at: &str,
+    modified_at: Option<&str>,
 ) -> Resource {
     let hash = content_hash(text);
     let id = resource_id(uri, &hash);
@@ -95,7 +95,7 @@ fn make_resource_full(
             ..Default::default()
         }),
         added_at: "2026-06-10T12:00:00Z".to_string(),
-        modified_at: modified_at.to_string(),
+        modified_at: modified_at.map(str::to_string),
         thread_id: None,
         channel: None,
         participants: vec![],
@@ -124,7 +124,7 @@ fn make_resource(uri: &str, text: &str, source_id: &str, store_id: &str) -> Reso
         None,
         None,
         None,
-        "2026-06-10T12:00:00Z",
+        Some("2026-06-10T12:00:00Z"),
     )
 }
 
@@ -361,7 +361,7 @@ async fn on_resource_metadata_only_change_writes_no_chunks() {
         None,
         Some("urn:entry:1"),
         None,
-        "2026-06-10T12:00:00Z",
+        Some("2026-06-10T12:00:00Z"),
     );
     let result2 = run_once(
         &store,
@@ -558,7 +558,7 @@ async fn list_indexed_documents_metadata_hash_matches_index_resource_stamped_has
         None,
         Some("urn:entry:42"),
         Some("\"etag-42\""),
-        "2026-06-15T00:00:00Z",
+        Some("2026-06-15T00:00:00Z"),
     );
 
     let deps = IndexResourceDeps {
@@ -636,7 +636,7 @@ async fn rehydrated_index_detects_metadata_only_change_across_restart() {
         None,
         None,
         Some("\"etag-new\""),
-        "2026-06-10T12:00:00Z",
+        Some("2026-06-10T12:00:00Z"),
     );
     let ingestor2 = ScriptedIngestor::new(vec![second]);
     let deps2 = SourceIngestionDeps {
@@ -700,7 +700,7 @@ async fn metadata_updated_uri_survives_delete_sweep() {
         None,
         Some("urn:entry:survivor"),
         None,
-        "2026-06-10T12:00:00Z",
+        Some("2026-06-10T12:00:00Z"),
     );
     let result2 = run_once(
         &store,
@@ -745,7 +745,7 @@ async fn fake_store_update_resource_metadata_errors_on_unknown_resource() {
         metadata: Metadata::default(),
         external_id: None,
         external_etag: None,
-        modified_at: "2026-06-10T12:00:00Z".to_string(),
+        modified_at: Some("2026-06-10T12:00:00Z".to_string()),
         date_original: None,
         date_parsed: None,
     };
@@ -811,7 +811,7 @@ async fn metadata_update_failure_counts_error_and_continues() {
         None,
         Some("urn:entry:fails"),
         None,
-        "2026-06-10T12:00:00Z",
+        Some("2026-06-10T12:00:00Z"),
     );
     let second_b = make_resource(
         uri_b,
@@ -850,26 +850,29 @@ async fn metadata_update_failure_counts_error_and_continues() {
 }
 
 // ---------------------------------------------------------------------------
-// 7b. metadata_hash_ignores_modified_at_only_changes (F1)
+// 7b. metadata_claim_change_triggers_metadata_only_update (#283; was F1's
+//     metadata_hash_ignores_modified_at_only_changes)
 // ---------------------------------------------------------------------------
 
 /// A resource whose ONLY difference from the previous run is `modified_at`
-/// (content, metadata, and external identity all identical) must take the
-/// SKIP path, not the metadata-update path. `modified_at` is excluded from
-/// `compute_metadata_hash` on purpose (see that function's doc comment):
-/// for a source with no change claim of its own it falls back to
-/// ingestion-time `now()`, which would otherwise make this exact resource
-/// re-hash differently — and trigger a pointless metadata rewrite — on
-/// every single run.
+/// (content, metadata, and external identity all identical) now takes the
+/// metadata-only-update path, not the skip path: `modified_at` is included
+/// in `compute_metadata_hash` (#283), and a genuine claim change IS a
+/// metadata change — one that should reach `resources.modified_at` — not
+/// something to silently ignore. This was previously excluded (F1) because
+/// a no-claim source's `modified_at` used to fall back to ingestion-time
+/// `now()`, churning the hash on every run; that fallback is gone now that
+/// `modified_at` is `Option<String>` and `None` hashes stably. See
+/// `core::ids::compute_metadata_hash`'s doc comment.
 #[tokio::test]
-async fn metadata_hash_ignores_modified_at_only_changes() {
+async fn metadata_claim_change_triggers_metadata_only_update() {
     let store = RecordingStore::new();
     let embedder = FakeEmbedder::new(4);
     let store_id = "store-1";
     let config = make_ingestion_config(store_id);
     let source = make_source_with_preset(store_id, "prose");
-    let uri = "file:///docs/no-claim.md";
-    let text = "Content from a source with no modification-time claim of its own.";
+    let uri = "file:///docs/claim-change.md";
+    let text = "Content whose source now claims a different modification time.";
 
     let mut doc_index = DocumentIndex::new();
     let first = make_resource_full(
@@ -881,7 +884,7 @@ async fn metadata_hash_ignores_modified_at_only_changes() {
         None,
         None,
         None,
-        "2026-06-10T12:00:00Z",
+        Some("2026-06-10T12:00:00Z"),
     );
     let result1 = run_once(
         &store,
@@ -895,9 +898,11 @@ async fn metadata_hash_ignores_modified_at_only_changes() {
     .await;
     assert_eq!(result1.docs_indexed, 1);
 
-    // Same content, same metadata, same external_id/etag — only
-    // `modified_at` differs, simulating a fresh ingestion-time `now()`
-    // fallback on a second run over the same no-claim source.
+    let resource_id_str = doc_index.get(uri).unwrap().resource_id.clone();
+    let chunk_count_before = store.stats().await.unwrap().chunk_count;
+
+    // Same content, same metadata, same external_id/etag — only the
+    // source's claimed `modified_at` differs.
     let second = make_resource_full(
         uri,
         text,
@@ -907,7 +912,72 @@ async fn metadata_hash_ignores_modified_at_only_changes() {
         None,
         None,
         None,
-        "2026-06-10T13:00:00Z",
+        Some("2026-06-10T13:00:00Z"),
+    );
+    let result2 = run_once(
+        &store,
+        &embedder,
+        &config,
+        &source,
+        &mut doc_index,
+        vec![second],
+        DeletionPolicy::Retain,
+    )
+    .await;
+
+    assert_eq!(
+        result2.docs_metadata_updated, 1,
+        "a modified_at claim change must take the metadata-only-update path"
+    );
+    assert_eq!(result2.docs_skipped, 0);
+    assert_eq!(result2.docs_indexed, 0, "no full reindex, no chunk writes");
+    assert_eq!(
+        store.stats().await.unwrap().chunk_count,
+        chunk_count_before,
+        "a claim-only change must write zero chunks"
+    );
+    assert_eq!(
+        store.metadata_update_calls(),
+        vec![(store_id.to_string(), resource_id_str)],
+        "update_resource_metadata must be called exactly once"
+    );
+}
+
+/// Companion to the test above, pinning the F1 bug dead in the other
+/// direction: a no-claim source (`modified_at: None` on every run) must
+/// still take the plain SKIP path on a repeat run with unchanged content —
+/// no per-run churn, no metadata rewrite, because `None` hashes identically
+/// every time (unlike the old `now()` fallback this replaces).
+#[tokio::test]
+async fn no_claim_repeat_run_still_skips() {
+    let store = RecordingStore::new();
+    let embedder = FakeEmbedder::new(4);
+    let store_id = "store-1";
+    let config = make_ingestion_config(store_id);
+    let source = make_source_with_preset(store_id, "prose");
+    let uri = "file:///docs/no-claim.md";
+    let text = "Content from a source with no modification-time claim of its own.";
+
+    let mut doc_index = DocumentIndex::new();
+    let first = make_resource_full(
+        uri, text, &source.id, store_id, None, None, None, None, None,
+    );
+    let result1 = run_once(
+        &store,
+        &embedder,
+        &config,
+        &source,
+        &mut doc_index,
+        vec![first],
+        DeletionPolicy::Retain,
+    )
+    .await;
+    assert_eq!(result1.docs_indexed, 1);
+
+    // Same content, same metadata, same external_id/etag, still no claim —
+    // simulating a second run over the same no-claim source.
+    let second = make_resource_full(
+        uri, text, &source.id, store_id, None, None, None, None, None,
     );
     let result2 = run_once(
         &store,
@@ -922,13 +992,13 @@ async fn metadata_hash_ignores_modified_at_only_changes() {
 
     assert_eq!(
         result2.docs_skipped, 1,
-        "modified_at-only change must take the skip path"
+        "a repeat no-claim run must take the skip path — None must not churn"
     );
     assert_eq!(result2.docs_metadata_updated, 0);
     assert_eq!(result2.docs_indexed, 0);
     assert!(
         store.metadata_update_calls().is_empty(),
-        "update_resource_metadata must not be called when only modified_at changed"
+        "update_resource_metadata must not be called when the resource is genuinely unchanged"
     );
 }
 
@@ -979,7 +1049,7 @@ async fn metadata_only_update_emits_metadata_updated_progress_event() {
         None,
         Some("urn:entry:progress"),
         None,
-        "2026-06-10T12:00:00Z",
+        Some("2026-06-10T12:00:00Z"),
     );
     let ingestor2 = ScriptedIngestor::new(vec![second]);
     let deps2 = SourceIngestionDeps {

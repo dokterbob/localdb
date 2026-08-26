@@ -672,8 +672,10 @@ mod tests {
     /// Full-struct `Resource` equality, pinning the `process_url` refactor
     /// (issue #116, `url_pipeline` extraction) as behavior-preserving: every
     /// field must match the exact `Resource` `UrlIngestor` produced before
-    /// the extraction, including `external_id: None`, `external_etag: None`,
-    /// and `added_at == modified_at` (both the same `now_rfc3339()` call).
+    /// the extraction, including `external_id: None`, `external_etag: None`.
+    /// `modified_at: None` (#283): a bare `UrlIngestor` makes no
+    /// modification-time claim of its own — it no longer stands in a second
+    /// `now_rfc3339()` call for it.
     #[tokio::test]
     async fn resource_full_struct_equality_pins_pre_refactor_shape() {
         use localdb_core::block::{Resource, ResourceKind};
@@ -725,7 +727,7 @@ mod tests {
                 ..Default::default()
             }),
             added_at: localdb_core::ingestion::now_rfc3339(),
-            modified_at: localdb_core::ingestion::now_rfc3339(),
+            modified_at: None,
             thread_id: None,
             channel: None,
             participants: vec![],
@@ -737,10 +739,6 @@ mod tests {
         };
 
         assert_eq!(cb.resources[0], expected);
-        assert_eq!(
-            cb.resources[0].added_at, cb.resources[0].modified_at,
-            "added_at and modified_at must be the same now_rfc3339() string"
-        );
     }
 
     /// `url` sources are NOT exempt from the delete-sweep, so `Blocked` must

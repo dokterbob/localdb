@@ -352,7 +352,8 @@ impl Ingestor for FeedIngestor {
             // `modified_at` comes from the feed when it says anything:
             // `feed.updated`, else the newest entry's date (entries are
             // already sorted DESC on published.or(updated), so that's the
-            // first entry's sort key), else ingestion-time now().
+            // first entry's sort key), else `None` — no claim, never
+            // ingestion-time now() (#283).
             let modified_at_override = feed
                 .updated
                 .or_else(|| entries.first().and_then(|e| e.published.or(e.updated)))

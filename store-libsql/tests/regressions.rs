@@ -80,7 +80,7 @@ fn make_chunk(id: &str, doc_id: &str, store_id: &str, embedding: Vec<f32>) -> Ch
         embedding,
         policy_version: "v1".to_string(),
         fetched_at: "2026-06-25T12:00:00Z".to_string(),
-        modified_at: "2026-06-25T12:00:00Z".to_string(),
+        modified_at: Some("2026-06-25T12:00:00Z".to_string()),
         content_hash: "abc123".to_string(),
         origin_store: store_id.to_string(),
         source_id: format!("src-{store_id}"),
@@ -308,7 +308,7 @@ async fn indexed_resource_persists_ingestion_time_not_feed_date_in_added_at() {
         metadata: Metadata::default(),
         // The feed connector's shape: acquisition is now, the feed claims 2020.
         added_at: INGESTED_AT.to_string(),
-        modified_at: FEED_CLAIMED.to_string(),
+        modified_at: Some(FEED_CLAIMED.to_string()),
         thread_id: None,
         channel: None,
         participants: vec![],
@@ -365,12 +365,14 @@ async fn indexed_resource_persists_ingestion_time_not_feed_date_in_added_at() {
             "ChunkRecord.fetched_at must round-trip as the ingestion time"
         );
         assert_eq!(
-            c.modified_at, FEED_CLAIMED,
+            c.modified_at.as_deref(),
+            Some(FEED_CLAIMED),
             "ChunkRecord.modified_at must round-trip as the resource's own claimed \
              modification time, not the ingestion time"
         );
         assert_ne!(
-            c.fetched_at, c.modified_at,
+            Some(c.fetched_at.as_str()),
+            c.modified_at.as_deref(),
             "added_at and modified_at must be independently readable, not conflated"
         );
     }
