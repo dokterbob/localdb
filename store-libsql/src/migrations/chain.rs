@@ -113,26 +113,48 @@ fn shrink_vector_index_down(ctx: &MigrationContext) -> Vec<String> {
     }
 }
 
-/// `v7`: add `resources.index_updated_at`, backfilled from `added_at` so no
-/// row is left `NULL`.
+/// `v7`: relax `resources.modified_at`'s `NOT NULL` constraint (not every
+/// ingestor kind can supply one) and add `resources.index_updated_at`,
+/// backfilled from `added_at` so no row is left `NULL`.
 ///
-/// Tracks when *our store* last wrote a resource's chunks — distinct from
-/// `added_at` (first-ever write, preserved across replaces) and
-/// `modified_at` (the origin's claimed content modification time). See
-/// specs/02-domain-model.md §2.
-fn add_index_updated_at_up(_ctx: &MigrationContext) -> Vec<String> {
+/// `index_updated_at` tracks when *our store* last wrote a resource's
+/// chunks — distinct from `added_at` (first-ever write, preserved across
+/// replaces) and `modified_at` (the origin's claimed content modification
+/// time). See specs/02-domain-model.md §2.
+///
+/// The `modified_at` relaxation can't use a plain `ALTER TABLE ... DROP
+/// COLUMN` + `ADD COLUMN` (SQLite has no `ALTER COLUMN`) and can't rebuild
+/// `resources` via `DROP TABLE` + recreate either: `chunks` and `blocks` both
+/// carry `FOREIGN KEY ... REFERENCES resources` (`schema::create_chunks`,
+/// `schema::create_blocks`), and `PRAGMA foreign_keys` can't be toggled
+/// mid-transaction (`runner::apply_one` runs every migration inside one), so
+/// dropping `resources` here would be either refused by FK enforcement or —
+/// if enforcement were ever off — leave `chunks`/`blocks` referencing nothing.
+/// Instead this is a column-level dance:
+///
+/// 1. Add a nullable `modified_at_new` column.
+/// 2. Copy every row's `modified_at` into it.
+/// 3. Drop the original (`NOT NULL`) `modified_at` column.
+/// 4. Rename `modified_at_new` back to `modified_at`.
+///
+/// `ALTER TABLE ... ADD COLUMN` always appends after the last existing column
+/// definition (and before any table-level constraints) — verified empirically
+/// against a real database — so running this dance before the
+/// `index_updated_at` add is what makes the final column order deterministic:
+/// `modified_at` (relaxed, now nullable) lands immediately after
+/// `extractor_version`, and `index_updated_at` lands after that. See
+/// `schema::create_resources`'s comment for the resulting literal (the
+/// write-twice fold-in).
+fn relax_modified_at_and_add_index_updated_at_up(_ctx: &MigrationContext) -> Vec<String> {
     vec![
+        "ALTER TABLE resources ADD COLUMN modified_at_new TEXT".to_string(),
+        "UPDATE resources SET modified_at_new = modified_at".to_string(),
+        "ALTER TABLE resources DROP COLUMN modified_at".to_string(),
+        "ALTER TABLE resources RENAME COLUMN modified_at_new TO modified_at".to_string(),
         "ALTER TABLE resources ADD COLUMN index_updated_at TEXT".to_string(),
         "UPDATE resources SET index_updated_at = added_at WHERE index_updated_at IS NULL"
             .to_string(),
     ]
-}
-
-/// The v7 down-step: drop `index_updated_at` (v5 precedent for `DROP
-/// COLUMN`). Reversible: the column adds no data other stored columns don't
-/// already carry (it backfills from `added_at`).
-fn add_index_updated_at_down(_ctx: &MigrationContext) -> Vec<String> {
-    vec!["ALTER TABLE resources DROP COLUMN index_updated_at".to_string()]
 }
 
 /// The real migration registry.
@@ -168,11 +190,19 @@ pub fn migrations() -> Vec<Migration> {
         },
         Migration {
             version: BASELINE_VERSION + 3,
-            name: "add_index_updated_at",
-            summary: "adds resources.index_updated_at (write-time clock of the last index \
-                      write for a resource), backfilled from added_at so no row is left NULL",
-            up: Up::Sql(add_index_updated_at_up),
-            down: Down::Sql(add_index_updated_at_down),
+            name: "relax_modified_at_and_add_index_updated_at",
+            summary: "relaxes resources.modified_at's NOT NULL constraint (via an add/copy/drop/ \
+                      rename column dance, since chunks/blocks foreign keys to resources make a \
+                      table rebuild unsafe here) and adds resources.index_updated_at (write-time \
+                      clock of the last index write for a resource), backfilled from added_at so \
+                      no row is left NULL",
+            up: Up::Sql(relax_modified_at_and_add_index_updated_at_up),
+            down: Down::Unsupported(
+                "resources.modified_at's NOT NULL constraint and original column position \
+                 cannot be restored by ALTER TABLE alone (SQLite can only append columns); \
+                 downgrading would require rebuilding the resources table, which \
+                 chunks/blocks' foreign keys to it make unsafe inside a migration transaction",
+            ),
             needs_reindex: false,
         },
     ]

@@ -791,11 +791,19 @@ async fn migrate_store_on_real_chain_backfills_index_updated_at_from_added_at() 
     }
 }
 
-/// v7's down-step: downgrading a store sitting at head (v7) back to v6 drops
-/// `resources.index_updated_at` and nothing else, via the real compiled
-/// chain's stored `down_sql` — not a fixture mirror.
+/// v7's down-step: `relax_modified_at_and_add_index_updated_at` is
+/// `Down::Unsupported` (see `chain.rs`) — the `modified_at` relaxation can't
+/// be undone by `ALTER TABLE` alone (SQLite can only append columns, so the
+/// original `NOT NULL` constraint and mid-table position are unrecoverable),
+/// and a `resources` table rebuild is unsafe inside a migration transaction
+/// (`chunks`/`blocks` FK to it, `PRAGMA foreign_keys` can't toggle
+/// mid-transaction). Downgrading a store sitting at head (v7) past it must
+/// therefore be refused up front, naming the migration/version/reason and
+/// leaving the store completely untouched — the same contract v5's
+/// `Unsupported` step already gets, exercised here against the REAL compiled
+/// chain rather than the fixture mirror.
 #[tokio::test]
-async fn downgrade_real_chain_from_head_drops_index_updated_at() {
+async fn downgrade_real_chain_from_head_is_refused_by_relax_modified_at_step() {
     let (_dir, path) = temp_db_path();
     {
         let (_db, conn) = open_conn(&path).await;
@@ -806,16 +814,144 @@ async fn downgrade_real_chain_from_head_drops_index_updated_at() {
         .await
         .unwrap();
 
-    let report = store_libsql::downgrade_store(&path, Some(BASELINE_VERSION + 2))
+    let before = dump_db(&path).await;
+    let result = store_libsql::downgrade_store(&path, Some(BASELINE_VERSION + 2)).await;
+    let after = dump_db(&path).await;
+
+    match result {
+        Err(Error::InvalidConfig { message }) => {
+            assert!(
+                message.contains("relax_modified_at_and_add_index_updated_at"),
+                "should name the blocking migration: {message}"
+            );
+            assert!(
+                message.contains(&(BASELINE_VERSION + 3).to_string()),
+                "should name the blocking version (7): {message}"
+            );
+            assert!(
+                message.contains("cannot be restored by ALTER TABLE alone"),
+                "should include the stored reason: {message}"
+            );
+            assert!(
+                message.contains("--to 7"),
+                "should suggest downgrading to v7's own version to keep it applied: {message}"
+            );
+        }
+        other => panic!("expected InvalidConfig, got {other:?}"),
+    }
+
+    assert_eq!(
+        before, after,
+        "a refused downgrade must not mutate the store at all"
+    );
+}
+
+/// v7's `modified_at` relaxation: a v4 store migrated all the way to head
+/// (a) keeps every pre-existing resource's `modified_at` value intact
+/// through the add/copy/drop/rename dance, (b) genuinely accepts a `NULL`
+/// `modified_at` on new inserts (the whole point of the migration), (c)
+/// produces exactly the column shape `schema::create_resources` documents —
+/// `modified_at TEXT` with no `NOT NULL` — in `sqlite_master`, and (d) never
+/// cascades through `chunks`/`blocks`' foreign keys to `resources`: both
+/// tables' pre-migration rows survive untouched, pinning the no-table-rebuild
+/// property the migration's doc comment claims.
+#[tokio::test]
+async fn migrate_v7_relaxes_modified_at_not_null() {
+    let (_dir, path) = temp_db_path();
+    {
+        let (_db, conn) = open_conn(&path).await;
+        create_baseline_schema(&conn, &ctx()).await.unwrap();
+        seed_v4_data(&conn).await;
+    }
+
+    let report = store_libsql::migrate_store(&path, &ctx(), false)
         .await
         .unwrap();
-    assert_eq!(report.to_version, BASELINE_VERSION + 2);
+    assert_eq!(report.to_version, BASELINE_VERSION + 3);
 
     let (_db, conn) = open_conn(&path).await;
-    assert_eq!(user_version(&conn).await, BASELINE_VERSION + 2);
-    assert!(!column_exists(&conn, "resources", "index_updated_at").await);
 
-    // v6's own effects (chunks_vec_idx tuning) are untouched by this
-    // downgrade — only the v7 step is reverted.
-    assert_eq!(row_count(&conn, "resources").await, 2);
+    // (a) the seeded rows' modified_at values survived the dance.
+    for res_id in ["res-1", "res-2"] {
+        let mut rows = conn
+            .query(
+                "SELECT modified_at FROM resources WHERE id = ?",
+                params![res_id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let modified_at: Option<String> = row.get(0).unwrap();
+        assert_eq!(
+            modified_at.as_deref(),
+            Some("2024-01-01T00:00:00Z"),
+            "{res_id}'s modified_at must survive the add/copy/drop/rename dance"
+        );
+    }
+
+    // (b) INSERT with a NULL modified_at now succeeds.
+    conn.execute(
+        "INSERT INTO resources \
+         (store_id, id, source_id, ingestor_kind, resource_kind, uri, \
+          content_hash, added_at, modified_at, origin_store, policy_version, \
+          metadata_json, extractor_version) \
+         VALUES ('store-1', 'res-null-modified', 'src-1', 'path', 'file', \
+                 'file:///doc-null.md', 'hash-null', '2024-01-01T00:00:00Z', NULL, \
+                 'store-1', '1', '{}', '1')",
+        (),
+    )
+    .await
+    .expect("modified_at must now be nullable");
+
+    // (c) sqlite_master for resources: `modified_at TEXT` with no NOT NULL.
+    let mut rows = conn
+        .query(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'resources'",
+            (),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    let sql: String = row.get(0).unwrap();
+    assert!(
+        sql.contains("modified_at TEXT,") || sql.contains("modified_at TEXT\n"),
+        "resources.modified_at must be a bare nullable TEXT column: {sql}"
+    );
+    assert!(
+        !sql.contains("modified_at TEXT NOT NULL"),
+        "resources.modified_at must no longer be NOT NULL: {sql}"
+    );
+
+    // (d) chunks/blocks pre-migration rows are untouched — no cascade through
+    // resources' FK-referenced children.
+    assert_eq!(row_count(&conn, "blocks").await, 4);
+    assert_eq!(row_count(&conn, "chunks").await, 4);
+    let mut rows = conn
+        .query(
+            "SELECT resource_id FROM blocks WHERE store_id = 'store-1' ORDER BY seq",
+            (),
+        )
+        .await
+        .unwrap();
+    let row = rows
+        .next()
+        .await
+        .unwrap()
+        .expect("store-1's blocks must survive");
+    let resource_id: String = row.get(0).unwrap();
+    assert_eq!(resource_id, "res-1");
+    let mut rows = conn
+        .query(
+            "SELECT store_id, resource_id, text FROM chunks WHERE id = 'chunk-1'",
+            (),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().expect("chunk-1 must survive");
+    let store_id: String = row.get(0).unwrap();
+    let resource_id: String = row.get(1).unwrap();
+    let text: String = row.get(2).unwrap();
+    assert_eq!(store_id, "store-1");
+    assert_eq!(resource_id, "res-1");
+    assert_eq!(text, "chunk text 1");
 }
