@@ -51,7 +51,7 @@ pub use embedder::{
     DocumentChunks, EmbeddedDocument, Embedder, FakeEmbedder, TokenCounter, VectorEncoding,
 };
 pub use error::Error;
-pub use ids::{chunk_id, content_hash, new_ulid, resource_id};
+pub use ids::{chunk_id, compute_metadata_hash, content_hash, new_ulid, resource_id};
 pub use ingestion::{
     complete_index_job, create_index_job, enumerate_path_source, fail_index_job,
     fail_index_job_with_error, index_resource, is_store_stale, run_source_ingestion,
@@ -75,7 +75,9 @@ pub use snippet::truncate_snippet;
 pub use source::source_row_to_source;
 #[cfg(any(test, feature = "test-support"))]
 pub use store::FakeStore;
-pub use store::{ChunkRecord, MetadataFilter, RetrievalStore, SearchResult, StoreStats};
+pub use store::{
+    ChunkRecord, MetadataFilter, ResourceRecord, RetrievalStore, SearchResult, StoreStats,
+};
 pub use types::{
     validate_dc_meta_key, validate_msg_meta_key, AclEntry, BackendConfig, Chunk, ChunkingConfig,
     Document, EmbeddingConfig, FederationHop, IndexJob, IndexJobScope, IndexJobState,

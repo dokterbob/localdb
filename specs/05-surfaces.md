@@ -832,6 +832,18 @@ counted as prunable — `--delete` would not remove them either.
 
 Both counters appear in `--json` output as `docs_deleted` and `docs_prunable`.
 
+### `localdb index` — metadata-only updates
+
+A document whose content and policy are unchanged but whose metadata (Dublin Core fields,
+`external_id`/`external_etag`/`modified_at`) differs from what's stored gets its resource row
+rewritten in place — no chunk/embedding write (issue #176; see
+[04-search-pipeline.md](04-search-pipeline.md) §1's "Metadata-only update"). Counted separately from
+`docs_indexed` and `docs_skipped` as `docs_metadata_updated`, present in `--json` output
+unconditionally (default 0, same posture as `docs_deleted`/`docs_prunable`) and folded into the
+human-readable summary line as `, N metadata updated` only when non-zero — the same
+append-only-when-nonzero convention `docs_deleted`/`docs_prunable` already follow, so a run with
+none reads exactly as it always has.
+
 `--delete` works identically against a running daemon (maintainer decision D6, issue #187):
 `POST /v1/jobs` carries a `deletion_policy` field (`"retain"` default, `"delete"` for `--delete`;
 §3), so the CLI sends the real policy and the daemon's job engine honors it exactly as the embedded

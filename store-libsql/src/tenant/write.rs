@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use libsql::{params, Connection};
-use localdb_core::{ChunkRecord, Error, VectorEncoding};
+use localdb_core::{ChunkRecord, Error, ResourceRecord, VectorEncoding};
 
 use super::TenantStore;
 use crate::connection::{map_libsql_err, WriteTx};
@@ -174,6 +174,86 @@ fn tenant_violation<T>(message: String) -> Result<T, Error> {
         message,
         correlation_id: "store_handle_tenant_violation".to_string(),
     })
+}
+
+/// Rewrite an existing resource row's metadata in place (issue #176's
+/// metadata-only incremental update) — no chunks/blocks/embeddings touched.
+///
+/// Own `write_tx`, mirroring `delete_by_resource`/`upsert_blocks` above
+/// rather than `upsert_chunks_and_blocks`'s inline-`async` composition: this
+/// is a single-statement write with nothing else to compose it with.
+pub(crate) async fn update_resource_metadata(
+    store: &TenantStore,
+    store_id: &str,
+    resource_id: &str,
+    record: &ResourceRecord,
+) -> Result<(), Error> {
+    if store_id != store.store_id() {
+        return tenant_violation(format!(
+            "update_resource_metadata requested store_id '{store_id}' but handle owns store_id \
+             '{handle}'",
+            handle = store.store_id()
+        ));
+    }
+    let tx = store.conn().write_tx().await?;
+    let result = update_resource_metadata_inner(&tx, store_id, resource_id, record).await;
+    finish_write_tx(tx, result).await
+}
+
+async fn update_resource_metadata_inner(
+    conn: &Connection,
+    store_id: &str,
+    resource_id: &str,
+    record: &ResourceRecord,
+) -> Result<(), Error> {
+    let metadata_json = serde_json::to_string(&record.metadata).map_err(|e| Error::Internal {
+        message: format!("update_resource_metadata metadata serialize: {e}"),
+        correlation_id: "store_handle_update_metadata".to_string(),
+    })?;
+    let title = record.metadata.title();
+    // One write-time clock reading for this write, mirroring
+    // `upsert_chunks_inner`'s single `now_rfc3339()` call per batch — see
+    // `ResourceRecord`'s doc comment for why `index_updated_at` isn't a
+    // caller-supplied field.
+    let index_updated_at = localdb_core::ingestion::now_rfc3339();
+    let rows_affected = conn
+        .execute(
+            "UPDATE resources SET
+                 metadata_json    = ?,
+                 title            = ?,
+                 external_id      = ?,
+                 external_etag    = ?,
+                 modified_at      = ?,
+                 date_original    = ?,
+                 date_parsed      = ?,
+                 index_updated_at = ?
+             WHERE store_id = ? AND id = ?",
+            params![
+                metadata_json.as_str(),
+                title,
+                record.external_id.as_deref(),
+                record.external_etag.as_deref(),
+                record.modified_at.as_str(),
+                record.date_original.as_deref(),
+                record.date_parsed.as_deref(),
+                index_updated_at.as_str(),
+                store_id.to_string(),
+                resource_id.to_string(),
+            ],
+        )
+        .await
+        .map_err(map_libsql_err)?;
+    if rows_affected == 0 {
+        // The row vanished — a concurrent delete raced this update. Report
+        // it rather than silently succeeding: the caller's `DocumentIndex`
+        // entry would otherwise be stamped with a metadata_hash for a
+        // resource_id the store no longer has any row for, which the next
+        // run's skip-check would compare against a phantom.
+        return Err(Error::ResourceNotFound {
+            id: resource_id.to_string(),
+        });
+    }
+    Ok(())
 }
 
 pub(crate) async fn upsert_blocks(

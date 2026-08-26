@@ -1,6 +1,9 @@
 use libsql::params;
 use localdb_core::ingestion::DocumentRecord;
-use localdb_core::{ChunkRecord, Error, MetadataFilter, SearchResult, StoreStats, VectorEncoding};
+use localdb_core::{
+    compute_metadata_hash, content_hash, ChunkRecord, Error, Metadata, MetadataFilter,
+    SearchResult, StoreStats, VectorEncoding,
+};
 
 use super::rows::{row_to_block, row_to_chunk_record_strict};
 use super::sql::{build_filter_clauses, escape_fts5_query};
@@ -285,10 +288,17 @@ pub(crate) async fn list_indexed_documents(
     store: &TenantStore,
 ) -> Result<Vec<DocumentRecord>, Error> {
     let conn = store.conn().reader();
-    // `resources.id` maps back to `DocumentRecord.resource_id`.
+    // `resources.id` maps back to `DocumentRecord.resource_id`. The extra
+    // columns beyond the original set (metadata_json, external_id,
+    // external_etag, modified_at) feed `compute_metadata_hash` below — see
+    // its doc comment: this must derive from exactly the same persisted
+    // state `index_resource`/`update_resource_metadata` write, or a
+    // rehydrated `DocumentIndex` would disagree with the in-process one
+    // about whether a resource's metadata changed (issue #176).
     let mut rows = conn
         .query(
-            "SELECT id, uri, content_hash, policy_version, source_id
+            "SELECT id, uri, content_hash, policy_version, source_id,
+                    metadata_json, external_id, external_etag, modified_at
              FROM resources WHERE store_id = ?",
             params![store.store_id().to_string()],
         )
@@ -296,12 +306,54 @@ pub(crate) async fn list_indexed_documents(
         .map_err(map_libsql_err)?;
     let mut out = Vec::new();
     while let Some(row) = rows.next().await.map_err(map_libsql_err)? {
+        let resource_id: String = row.get(0).map_err(map_libsql_err)?;
+        let metadata_json: String = row.get(5).map_err(map_libsql_err)?;
+        let external_id: Option<String> = row.get(6).map_err(map_libsql_err)?;
+        let external_etag: Option<String> = row.get(7).map_err(map_libsql_err)?;
+        let modified_at: String = row.get(8).map_err(map_libsql_err)?;
+
+        // Deliberately re-parsed here (rather than delegating to
+        // `parse_metadata_json_lenient`, the precedent `rows.rs` uses for
+        // chunk reads) so the corrupt-row branch below can hash the raw
+        // string instead of the lenient `Metadata::default()` fallback — see
+        // that branch's comment for why.
+        let metadata_hash = match serde_json::from_str::<Metadata>(&metadata_json) {
+            Ok(metadata) => compute_metadata_hash(
+                &metadata,
+                external_id.as_deref(),
+                external_etag.as_deref(),
+                &modified_at,
+            ),
+            Err(e) => {
+                tracing::warn!(
+                    resource = resource_id.as_str(),
+                    error = %e,
+                    "failed to parse resources.metadata_json while rehydrating the \
+                     incremental-skip index; hashing the raw column instead of a \
+                     default-metadata fallback so this row can never spuriously \
+                     match a legitimately computed metadata_hash"
+                );
+                // Hashing `Metadata::default()` here would produce a real,
+                // structurally valid metadata_hash indistinguishable from a
+                // legitimate all-default resource — silently matching on the
+                // next run and masking the corruption forever. Hashing the
+                // raw (undecodable) string, tagged so it can never collide
+                // with `compute_metadata_hash`'s own `\x00`-delimited
+                // metadata_json-first format, instead deterministically
+                // forces the next comparison to mismatch: a fresh write from
+                // `update_resource_metadata`/`index_resource` self-heals the
+                // row instead of the corruption hiding behind a false match.
+                content_hash(&format!("\x00corrupt-metadata-json\x00{metadata_json}"))
+            }
+        };
+
         out.push(DocumentRecord {
-            resource_id: row.get(0).map_err(map_libsql_err)?,
+            resource_id,
             uri: row.get(1).map_err(map_libsql_err)?,
             content_hash: row.get(2).map_err(map_libsql_err)?,
             policy_version: row.get(3).map_err(map_libsql_err)?,
             source_id: row.get(4).map_err(map_libsql_err)?,
+            metadata_hash,
         });
     }
     Ok(out)

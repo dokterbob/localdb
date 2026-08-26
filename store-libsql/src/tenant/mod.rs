@@ -3,7 +3,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use localdb_core::ingestion::DocumentRecord;
 use localdb_core::{
-    ChunkRecord, Error, MetadataFilter, RetrievalStore, SearchResult, StoreStats, VectorEncoding,
+    ChunkRecord, Error, MetadataFilter, ResourceRecord, RetrievalStore, SearchResult, StoreStats,
+    VectorEncoding,
 };
 
 use crate::connection::LibsqlDb;
@@ -101,6 +102,15 @@ impl RetrievalStore for TenantStore {
 
     async fn list_indexed_documents(&self) -> Result<Vec<DocumentRecord>, Error> {
         read::list_indexed_documents(self).await
+    }
+
+    async fn update_resource_metadata(
+        &self,
+        store_id: &str,
+        resource_id: &str,
+        record: &ResourceRecord,
+    ) -> Result<(), Error> {
+        write::update_resource_metadata(self, store_id, resource_id, record).await
     }
 
     async fn upsert_blocks(

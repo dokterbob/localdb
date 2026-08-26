@@ -38,10 +38,17 @@ pub enum ProgressEvent {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum DocOutcome {
-    Indexed { chunks: usize },
+    Indexed {
+        chunks: usize,
+    },
     Skipped,
     Unsupported,
     Error,
+    /// Content and policy were unchanged, but persisted metadata (Dublin
+    /// Core fields, `external_id`/`external_etag`/`modified_at`) differed
+    /// from what's stored — the resource row was rewritten in place, no
+    /// chunks/embeddings touched (issue #176; specs/04-search-pipeline.md).
+    MetadataUpdated,
 }
 
 /// A cheaply-cloneable progress callback, `Send + Sync` for future parallel use.

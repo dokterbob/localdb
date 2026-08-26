@@ -25,6 +25,7 @@ use crate::embedder::{DocumentChunks, Embedder};
 use crate::error::Error;
 use crate::ids::new_ulid;
 use crate::ingestor::{Enumeration, IngestCallback, IngestSource, Ingestor, SkipReason};
+use crate::metadata::Metadata;
 use crate::store::{ChunkRecord, RetrievalStore};
 use crate::types::{
     Chunk, IndexJob, IndexJobScope, IndexJobState, IndexJobStats, Provenance, Source, SourceRef,
@@ -55,6 +56,16 @@ pub struct DocumentRecord {
     pub content_hash: String,
     /// The policy version that was used to index this document.
     pub policy_version: String,
+    /// `core::ids::compute_metadata_hash` of the persisted metadata state
+    /// (post-title-backfill `Metadata` plus `external_id`/`external_etag`/
+    /// `modified_at`) from last indexing or last metadata-only update.
+    /// Drives the metadata-only incremental update (issue #176;
+    /// specs/04-search-pipeline.md): a mismatch here, with `content_hash`
+    /// and `policy_version` both unchanged, means only the resource row
+    /// needs rewriting, not chunks/embeddings. Kept as a plain field (not an
+    /// extension point) so a future addition (e.g. #269's
+    /// `extractor_version`) is a small struct change, not a redesign.
+    pub metadata_hash: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -171,6 +182,13 @@ pub struct IngestionResult {
     /// Surfaced so a default (retaining) run can tell the user what `--delete`
     /// would remove, instead of silently accumulating stale documents.
     pub docs_prunable: u64,
+    /// Documents whose content and policy were unchanged but whose metadata
+    /// differed from what's persisted — the resource row was rewritten in
+    /// place, no chunks/embeddings touched (issue #176). A strict subset of
+    /// what would otherwise be counted in `docs_skipped`: a metadata-only
+    /// update is not a content skip, but it is also not a full `docs_indexed`
+    /// re-index, so it gets its own counter rather than overloading either.
+    pub docs_metadata_updated: u64,
 }
 
 /// Whether an ingestion run may remove documents from the store.
@@ -713,6 +731,67 @@ pub struct IndexResourceDeps<'a> {
     pub config: &'a IngestionConfig,
 }
 
+/// A resource's post-backfill metadata state, plus its derived
+/// `metadata_hash` and Dublin Core dates — the single source of truth for
+/// both what [`index_resource`] persists and what [`PipelineCallback::on_resource`]
+/// compares against, so a resource's title-backfill decision is never made
+/// twice with room for the two sites to disagree (issue #176's whole premise:
+/// the metadata_hash is comparable across index-time, metadata-update-time,
+/// and rehydration-time only if every writer derives it from the *persisted*
+/// state via this one function). See specs/04-search-pipeline.md.
+struct DerivedResourceState {
+    /// `resource.metadata`, with `resource.title` folded into
+    /// `dublin_core_mut().title` when the metadata itself carried none.
+    metadata: Metadata,
+    /// `core::ids::compute_metadata_hash` of `metadata` plus
+    /// `resource.external_id`/`external_etag`/`modified_at`.
+    metadata_hash: String,
+    /// `metadata`'s own Dublin Core `date`, exactly as the source expressed it.
+    date_original: Option<String>,
+    /// `date_original` normalized via `crate::dates::parse_partial_iso8601`.
+    date_parsed: Option<String>,
+}
+
+/// Compute [`DerivedResourceState`] for `resource`. Pure function of
+/// `resource` alone — safe to call more than once for the same resource (as
+/// [`PipelineCallback::on_resource`] and [`index_resource`] both do, on
+/// different branches) since `Metadata` carries no maps and therefore
+/// serializes deterministically (see `compute_metadata_hash`'s doc comment).
+fn derive_resource_state(resource: &Resource) -> DerivedResourceState {
+    // Title propagation: resource.title backfills the metadata's Dublin Core
+    // title when the resource's own metadata doesn't already carry one.
+    let mut metadata = resource.metadata.clone();
+    if metadata.dublin_core().title.is_none() {
+        if let Some(title) = &resource.title {
+            metadata.dublin_core_mut().title = Some(title.clone());
+        }
+    }
+
+    // The resource's own claimed date, exactly as the source expressed it —
+    // computed once per resource (not redundantly per chunk). Read from
+    // `metadata` (post-title-backfill is fine: the Dublin Core date itself
+    // is never backfilled) rather than `resource.metadata`, so a future
+    // backfill of `dc.date` would be picked up here too.
+    let date_original = metadata.dublin_core().date.clone();
+    let date_parsed = date_original
+        .as_deref()
+        .and_then(crate::dates::parse_partial_iso8601);
+
+    let metadata_hash = crate::ids::compute_metadata_hash(
+        &metadata,
+        resource.external_id.as_deref(),
+        resource.external_etag.as_deref(),
+        &resource.modified_at,
+    );
+
+    DerivedResourceState {
+        metadata,
+        metadata_hash,
+        date_original,
+        date_parsed,
+    }
+}
+
 /// Compute the effective `ChunkerConfig` for one resource (issue #60; see
 /// specs/04-search-pipeline.md §3 "Source preset override").
 ///
@@ -772,8 +851,9 @@ fn filename_hint_from_uri(uri: &crate::uri::Uri) -> Option<String> {
 /// `PipelineCallback` below) — this function always (re)indexes; `resource`'s
 /// blocks, metadata, and `content_hash` must already be final.
 ///
-/// Returns [`IndexOutcome::Written`] with the number of chunks written, or
-/// [`IndexOutcome::Empty`] if the resource produced no chunks at all.
+/// Returns [`IndexOutcome::Written`] with the number of chunks written and
+/// the persisted metadata_hash, or [`IndexOutcome::Empty`] if the resource
+/// produced no chunks at all.
 pub async fn index_resource(
     resource: &Resource,
     source: &Source,
@@ -890,24 +970,15 @@ pub async fn index_resource(
         share_path: vec![],
     };
 
-    // Title propagation: resource.title backfills the metadata's Dublin Core
-    // title when the resource's own metadata doesn't already carry one.
-    let mut record_metadata = resource.metadata.clone();
-    if record_metadata.dublin_core().title.is_none() {
-        if let Some(title) = &resource.title {
-            record_metadata.dublin_core_mut().title = Some(title.clone());
-        }
-    }
-
-    // The resource's own claimed date, exactly as the source expressed it —
-    // computed once per resource (not redundantly per chunk). Read from
-    // `record_metadata` (post-title-backfill is fine: the Dublin Core date
-    // itself is never backfilled) rather than `resource.metadata`, so a
-    // future backfill of `dc.date` would be picked up here too.
-    let date_original = record_metadata.dublin_core().date.clone();
-    let date_parsed = date_original
-        .as_deref()
-        .and_then(crate::dates::parse_partial_iso8601);
+    // Post-backfill metadata, its persisted-state hash, and derived dates —
+    // computed via the one function `on_resource`'s skip-check and
+    // metadata-only-update path also call, so the two never disagree about
+    // what a resource's persisted state is (issue #176). See
+    // `DerivedResourceState`'s doc comment.
+    let derived = derive_resource_state(resource);
+    let record_metadata = derived.metadata;
+    let date_original = derived.date_original;
+    let date_parsed = derived.date_parsed;
 
     // Page lookup for paginated formats (#103): block seq → location.page,
     // copied onto each chunk record from its originating block.
@@ -969,7 +1040,7 @@ pub async fn index_resource(
         )
         .await?;
 
-    Ok(IndexOutcome::Written(written))
+    Ok(IndexOutcome::Written(written, derived.metadata_hash))
 }
 
 /// What [`index_resource`] did with a resource.
@@ -980,10 +1051,14 @@ pub async fn index_resource(
 /// `docs_indexed`, upserting its hash into the `DocumentIndex` — is what
 /// turned "this file extracted to nothing" into "this file's indexed content
 /// is gone."
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IndexOutcome {
-    /// The resource was chunked, embedded, and written: this many chunks.
-    Written(usize),
+    /// The resource was chunked, embedded, and written: chunk count, plus
+    /// the `metadata_hash` this write persisted (issue #176) — threaded out
+    /// rather than recomputed at the call site, so the value the caller
+    /// stamps into its `DocumentIndex` is guaranteed to be exactly what this
+    /// call persisted, not a second, separately-computed guess at it.
+    Written(usize, String),
     /// The resource produced no chunks. Nothing was written, and — the
     /// invariant this type exists to carry — nothing was deleted either.
     Empty,
@@ -1339,17 +1414,56 @@ impl IngestCallback for PipelineCallback<'_> {
         self.result.docs_seen += 1;
         self.start_document(&uri);
 
-        // Skip-check: unchanged content_hash + same policy_version → skip.
-        // Ingestors may ALSO skip earlier via `on_skipped`; both paths mark
-        // the URI seen so the delete-sweep leaves it alone.
+        // Skip-check: unchanged content_hash + same policy_version → either
+        // an unchanged-metadata skip or a metadata-only update, decided by
+        // `metadata_hash` (issue #176). Ingestors may ALSO skip earlier via
+        // `on_skipped`; every path here marks the URI seen so the
+        // delete-sweep leaves it alone.
         if let Some(existing) = self.doc_index.get(&uri) {
             if existing.content_hash == resource.content_hash
                 && existing.policy_version == self.config.policy_version
             {
-                self.result.docs_skipped += 1;
+                // Computed once here — the sole use of `derive_resource_state`
+                // on this branch, since neither arm below calls
+                // `index_resource` (which would otherwise duplicate it).
+                let derived = derive_resource_state(&resource);
+
+                if existing.metadata_hash == derived.metadata_hash {
+                    self.result.docs_skipped += 1;
+                    self.emit(crate::progress::ProgressEvent::DocumentFinished {
+                        uri,
+                        outcome: crate::progress::DocOutcome::Skipped,
+                    });
+                    return Ok(());
+                }
+
+                // Content and policy are unchanged, but persisted metadata
+                // differs: rewrite the resource row in place, no
+                // chunks/blocks/embeddings touched.
+                let resource_id = existing.resource_id.clone();
+                let record = crate::store::ResourceRecord {
+                    metadata: derived.metadata,
+                    external_id: resource.external_id.clone(),
+                    external_etag: resource.external_etag.clone(),
+                    modified_at: resource.modified_at.clone(),
+                    date_original: derived.date_original,
+                    date_parsed: derived.date_parsed,
+                };
+                self.store
+                    .update_resource_metadata(&self.config.store_id, &resource_id, &record)
+                    .await?;
+                self.doc_index.upsert(DocumentRecord {
+                    uri: uri.clone(),
+                    resource_id,
+                    source_id: existing.source_id.clone(),
+                    content_hash: existing.content_hash.clone(),
+                    policy_version: existing.policy_version.clone(),
+                    metadata_hash: derived.metadata_hash,
+                });
+                self.result.docs_metadata_updated += 1;
                 self.emit(crate::progress::ProgressEvent::DocumentFinished {
                     uri,
-                    outcome: crate::progress::DocOutcome::Skipped,
+                    outcome: crate::progress::DocOutcome::MetadataUpdated,
                 });
                 return Ok(());
             }
@@ -1382,7 +1496,7 @@ impl IngestCallback for PipelineCallback<'_> {
                     outcome: crate::progress::DocOutcome::Skipped,
                 });
             }
-            Ok(IndexOutcome::Written(chunks_written)) => {
+            Ok(IndexOutcome::Written(chunks_written, metadata_hash)) => {
                 self.result.docs_indexed += 1;
                 self.result.chunks_written += chunks_written as u64;
                 self.doc_index.upsert(DocumentRecord {
@@ -1391,6 +1505,7 @@ impl IngestCallback for PipelineCallback<'_> {
                     source_id: resource.source_id.clone(),
                     content_hash: resource.content_hash.clone(),
                     policy_version: self.config.policy_version.clone(),
+                    metadata_hash,
                 });
                 self.emit(crate::progress::ProgressEvent::DocumentFinished {
                     uri,
@@ -1531,6 +1646,7 @@ mod tests {
             source_id: "src-1".to_string(),
             content_hash: "hash-1".to_string(),
             policy_version: "v1".to_string(),
+            metadata_hash: "mhash-1".to_string(),
         };
         idx.upsert(rec.clone());
         let found = idx.get("file:///test.md").unwrap();
@@ -1546,6 +1662,7 @@ mod tests {
             source_id: "src-1".to_string(),
             content_hash: "hash-1".to_string(),
             policy_version: "v1".to_string(),
+            metadata_hash: "mhash-1".to_string(),
         };
         idx.upsert(rec);
         let removed = idx.remove("file:///test.md");
@@ -2300,9 +2417,17 @@ mod tests {
                 embedder,
                 config,
             };
-            index_resource(&resource, source, None, &deps)
+            let outcome = index_resource(&resource, source, None, &deps)
                 .await
                 .expect("seed index must succeed");
+            // Reuse the hash `index_resource` actually persisted rather than
+            // recomputing it here — the same "thread it out, don't
+            // duplicate" reasoning as `PipelineCallback::on_resource`'s
+            // `Written` arm.
+            let metadata_hash = match outcome {
+                IndexOutcome::Written(_, hash) => hash,
+                IndexOutcome::Empty => panic!("seed_indexed: resource must not chunk to empty"),
+            };
             // The doc_index key must be the NORMALIZED uri, exactly as
             // `list_indexed_documents` rehydrates it — a raw spelling here
             // diverges from the pipeline's seen-set whenever the path needs
@@ -2314,6 +2439,7 @@ mod tests {
                 source_id: source.id.clone(),
                 content_hash: resource.content_hash.clone(),
                 policy_version: config.policy_version.clone(),
+                metadata_hash,
             }
         }
 
@@ -4573,6 +4699,17 @@ mod tests {
                 self.inner.list_indexed_documents().await
             }
 
+            async fn update_resource_metadata(
+                &self,
+                store_id: &str,
+                resource_id: &str,
+                record: &crate::store::ResourceRecord,
+            ) -> Result<(), Error> {
+                self.inner
+                    .update_resource_metadata(store_id, resource_id, record)
+                    .await
+            }
+
             async fn upsert_chunks_and_blocks(
                 &self,
                 store_id: &str,
@@ -5015,7 +5152,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(
-                matches!(written, IndexOutcome::Written(n) if n >= 3),
+                matches!(written, IndexOutcome::Written(n, _) if n >= 3),
                 "expected at least one chunk per block, got {written:?}"
             );
 

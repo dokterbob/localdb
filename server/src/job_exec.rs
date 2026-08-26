@@ -299,6 +299,7 @@ pub async fn run_job(
                 stats.docs_skipped += r.docs_skipped;
                 stats.docs_deleted += r.docs_deleted;
                 stats.docs_prunable += r.docs_prunable;
+                stats.docs_metadata_updated += r.docs_metadata_updated;
                 stats.chunks_written += r.chunks_written;
                 stats.unsupported_format_count += r.unsupported_format_count;
                 stats.error_count += r.error_count;

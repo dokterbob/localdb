@@ -39,6 +39,9 @@ pub(crate) struct IndexSummary {
     prunable: u64,
     /// Documents actually removed (only ever non-zero with `--delete`).
     deleted: u64,
+    /// Documents whose content and policy were unchanged but whose metadata
+    /// was rewritten in place (issue #176) — no chunks/embeddings touched.
+    metadata_updated: u64,
 }
 
 impl IndexSummary {
@@ -54,6 +57,7 @@ impl IndexSummary {
         self.unsupported += other.unsupported;
         self.prunable += other.prunable;
         self.deleted += other.deleted;
+        self.metadata_updated += other.metadata_updated;
     }
 
     /// Build an `IndexSummary` from a completed job's `IndexJobStats`
@@ -76,6 +80,7 @@ impl IndexSummary {
             unsupported: stats.unsupported_format_count,
             prunable: stats.docs_prunable,
             deleted: stats.docs_deleted,
+            metadata_updated: stats.docs_metadata_updated,
         }
     }
 }
@@ -461,6 +466,9 @@ fn format_summary_body(summary: &IndexSummary) -> String {
             summary.prunable
         ));
     }
+    if summary.metadata_updated > 0 {
+        body.push_str(&format!(", {} metadata updated", summary.metadata_updated));
+    }
     body
 }
 
@@ -511,6 +519,7 @@ fn summary_fields_json(summary: &IndexSummary, strict: bool) -> serde_json::Valu
         "errors": summary.errors,
         "docs_deleted": summary.deleted,
         "docs_prunable": summary.prunable,
+        "docs_metadata_updated": summary.metadata_updated,
     })
 }
 
@@ -613,6 +622,7 @@ mod tests {
             unsupported,
             prunable: 0,
             deleted: 0,
+            metadata_updated: 0,
         }
     }
 
@@ -714,7 +724,44 @@ mod tests {
         );
     }
 
+    /// `metadata_updated` follows the same conditional-append precedent as
+    /// `deleted`/`prunable` above: it only appears in the sentence when
+    /// non-zero, so the base (zero) case stays byte-identical to the pinned
+    /// legacy format — see the three tests above, none of which mention
+    /// "metadata updated" and none of which needed to change for this field
+    /// to exist.
+    #[test]
+    fn render_index_text_appends_metadata_updated_when_nonzero() {
+        let mut summary = with_sources(3, 1, 6, 0, 0);
+        summary.metadata_updated = 2;
+        let outcomes = vec![outcome("books", summary)];
+        assert_eq!(
+            render_index_text(&outcomes),
+            "Index complete: 3 indexed, 1 skipped, 6 chunks written, 0 unsupported, 0 errors, \
+             2 metadata updated"
+        );
+    }
+
     // -- render_index_json --------------------------------------------------
+
+    #[test]
+    fn render_index_json_includes_metadata_updated_field() {
+        let mut summary = with_sources(3, 1, 6, 0, 0);
+        summary.metadata_updated = 2;
+        let outcomes = vec![outcome("books", summary)];
+        let v = render_index_json(&outcomes, false);
+        assert_eq!(v["docs_metadata_updated"], json!(2));
+    }
+
+    #[test]
+    fn total_summary_sums_metadata_updated_across_stores() {
+        let mut a = with_sources(3, 1, 6, 0, 0);
+        a.metadata_updated = 1;
+        let mut b = with_sources(1, 0, 2, 1, 2);
+        b.metadata_updated = 4;
+        let outcomes = vec![outcome("a", a), outcome("b", b)];
+        assert_eq!(total_summary(&outcomes).metadata_updated, 5);
+    }
 
     #[test]
     fn render_index_json_single_store_matches_legacy_flat_shape() {
@@ -733,6 +780,7 @@ mod tests {
                 // has to be able to tell consumers what pruning would remove.
                 "docs_deleted": 0,
                 "docs_prunable": 0,
+                "docs_metadata_updated": 0,
             })
         );
         assert!(
@@ -797,6 +845,7 @@ mod tests {
                         "errors": 0,
                         "docs_deleted": 0,
                         "docs_prunable": 0,
+                        "docs_metadata_updated": 0,
                     },
                     {
                         "store": "notes",
@@ -808,6 +857,7 @@ mod tests {
                         "errors": 1,
                         "docs_deleted": 0,
                         "docs_prunable": 0,
+                        "docs_metadata_updated": 0,
                     },
                 ],
                 "total": {
@@ -819,6 +869,7 @@ mod tests {
                     "errors": 1,
                     "docs_deleted": 0,
                     "docs_prunable": 0,
+                    "docs_metadata_updated": 0,
                 },
             })
         );

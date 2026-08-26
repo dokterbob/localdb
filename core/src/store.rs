@@ -200,6 +200,49 @@ impl ChunkRecord {
 }
 
 // ---------------------------------------------------------------------------
+// ResourceRecord — metadata-only update payload
+// ---------------------------------------------------------------------------
+
+/// The fields a metadata-only update (issue #176) writes to an existing
+/// resource row, without touching its chunks, blocks, or embeddings.
+///
+/// `store_id`/`resource_id` are passed as `update_resource_metadata`
+/// parameters rather than struct fields, matching the trait's other
+/// per-call methods (`delete_by_resource`, `get_chunks_for_resource`, ...).
+/// `title` is deliberately omitted: it is always derived from
+/// `metadata.title()` (Dublin Core), the same convention
+/// `upsert_chunks_inner` follows for the full-write path — a separate
+/// `title` field here would let the two disagree. `index_updated_at` is
+/// likewise omitted: the store stamps it itself with its own write-time
+/// clock reading, mirroring `upsert_chunks_inner`'s single
+/// `now_rfc3339()` call for a batch.
+///
+/// Named ahead of the broader per-resource CRUD surface issue #189 previews
+/// (extractor_version, etc.) — kept to plain fields deliberately so a future
+/// field there is a small addition, not a redesign.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResourceRecord {
+    /// Resource metadata, tagged by resource kind — already post-backfill
+    /// (see `core::ids::compute_metadata_hash`'s doc comment): the caller
+    /// must have already folded `resource.title` into
+    /// `metadata.dublin_core_mut().title` when the metadata itself carried
+    /// none, exactly as `index_resource` does for the full-write path.
+    pub metadata: Metadata,
+    /// The source's own identifier for this resource. See `ChunkRecord::external_id`.
+    pub external_id: Option<String>,
+    /// The source's own change-detection token. See `ChunkRecord::external_etag`.
+    pub external_etag: Option<String>,
+    /// The resource's own claimed modification time (RFC 3339).
+    pub modified_at: String,
+    /// The resource's own claimed date, exactly as the source expressed it.
+    /// See `ChunkRecord::date_original`.
+    pub date_original: Option<String>,
+    /// `date_original` normalized via `crate::dates::parse_partial_iso8601`.
+    /// See `ChunkRecord::date_parsed`.
+    pub date_parsed: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // SearchResult
 // ---------------------------------------------------------------------------
 
@@ -377,6 +420,32 @@ pub trait RetrievalStore: Send + Sync + 'static {
     /// One record per distinct URI (first chunk wins). Implementations must NOT
     /// return the embedding column to avoid loading vectors for the entire store.
     async fn list_indexed_documents(&self) -> Result<Vec<DocumentRecord>, Error>;
+
+    /// Update an existing resource's metadata in place, without touching its
+    /// chunks, blocks, or embeddings (issue #176's metadata-only incremental
+    /// update — specs/04-search-pipeline.md).
+    ///
+    /// Callers reach this only when `content_hash`/`policy_version` are
+    /// unchanged but `core::ids::compute_metadata_hash` differs — a full
+    /// reindex (`upsert_chunks_and_blocks`) is the path for everything else.
+    /// No default implementation: unlike `upsert_blocks`/
+    /// `get_blocks_for_resource`'s no-op defaults (which are legitimately
+    /// optional for early/legacy stores), a store that silently accepted
+    /// this call and did nothing would report success while the metadata
+    /// staleness it was asked to fix persists forever — every implementor
+    /// must have an opinion.
+    ///
+    /// Returns `Err(Error::ResourceNotFound)` if no row matches
+    /// `(store_id, resource_id)` — e.g. a concurrent delete raced this
+    /// update. Never silently succeeds on zero rows affected: the caller's
+    /// `DocumentIndex` entry would otherwise be stamped with a metadata_hash
+    /// for a resource_id the store no longer has any row for.
+    async fn update_resource_metadata(
+        &self,
+        store_id: &str,
+        resource_id: &str,
+        record: &ResourceRecord,
+    ) -> Result<(), Error>;
 
     /// Upsert a set of blocks for a document.
     ///
@@ -656,9 +725,54 @@ impl RetrievalStore for FakeStore {
                 source_id: chunk.source_id.clone(),
                 content_hash: chunk.content_hash.clone(),
                 policy_version: chunk.policy_version.clone(),
+                // Rehydrated the same way `TenantStore::list_indexed_documents`
+                // does: from this chunk's own already-persisted (denormalized)
+                // metadata state, not recomputed from some other source of
+                // truth — `FakeStore` has no separate `resources` table, so
+                // each chunk's fields already *are* that state.
+                metadata_hash: crate::ids::compute_metadata_hash(
+                    &chunk.metadata,
+                    chunk.external_id.as_deref(),
+                    chunk.external_etag.as_deref(),
+                    &chunk.modified_at,
+                ),
             });
         }
         Ok(seen.into_values().collect())
+    }
+
+    async fn update_resource_metadata(
+        &self,
+        store_id: &str,
+        resource_id: &str,
+        record: &ResourceRecord,
+    ) -> Result<(), Error> {
+        let mut chunks = self.chunks.write().await;
+        let mut touched = false;
+        for chunk in chunks
+            .iter_mut()
+            .filter(|c| c.store_id == store_id && c.resource_id == resource_id)
+        {
+            // Mirror the real backend's denormalization: every chunk row for
+            // this resource carries its own copy of these fields, so a
+            // metadata-only update must touch all of them, exactly as
+            // `update_resource_metadata`'s single-row `UPDATE resources ...`
+            // does for the real (non-denormalized) `TenantStore`.
+            chunk.metadata = record.metadata.clone();
+            chunk.external_id = record.external_id.clone();
+            chunk.external_etag = record.external_etag.clone();
+            chunk.modified_at = record.modified_at.clone();
+            chunk.date_original = record.date_original.clone();
+            chunk.date_parsed = record.date_parsed.clone();
+            touched = true;
+        }
+        if touched {
+            Ok(())
+        } else {
+            Err(Error::ResourceNotFound {
+                id: resource_id.to_string(),
+            })
+        }
     }
 
     async fn upsert_blocks(

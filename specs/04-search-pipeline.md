@@ -46,6 +46,33 @@ Resources also carry:
   of resources whose content has not changed but whose block representation may improve (without a
   full policy-version reindex).
 
+### Metadata-only update
+
+The skip-check compares three values, not one: `content_hash`, `policy_version`, and `metadata_hash`
+— a hash (`core::ids::compute_metadata_hash`) of a resource's _persisted_ metadata state:
+post-title-backfill `Metadata` (a resource's own `title` folds into
+`Metadata.dublin_core_mut().title` when the extracted metadata carries none) plus `external_id`,
+`external_etag`, and `modified_at`. All three writers of this hash — indexing, a metadata-only
+update, and rehydrating `DocumentIndex` from `RetrievalStore::list_indexed_documents` after a
+process restart — derive it from that same already-persisted state, never from a resource's raw,
+pre-backfill fields, so the hash means the same thing regardless of which of the three computed it.
+
+Three outcomes follow from comparing incoming vs. stored state (issue #176):
+
+- **`content_hash`/`policy_version` differ** → full reindex, as above: chunks, blocks, and
+  embeddings are replaced.
+- **All three match** → skip. No writes at all.
+- **`content_hash`/`policy_version` match but `metadata_hash` differs** → metadata-only update:
+  `RetrievalStore::update_resource_metadata` rewrites the resource row's metadata columns
+  (`metadata_json`, `title`, `external_id`, `external_etag`, `modified_at`, `date_original`,
+  `date_parsed`) in place. No chunk, block, or embedding write. `resources.index_updated_at` bumps
+  (the store's own write-time clock, same as a full write); `resources.added_at` is untouched — the
+  document wasn't re-acquired, just re-described. Counted separately from both `docs_indexed` and
+  `docs_skipped`, in `IngestionResult.docs_metadata_updated` / `IndexJobStats.docs_metadata_updated`
+  / the CLI summary's `docs_metadata_updated`, and reported per-document as
+  `DocOutcome::MetadataUpdated`. The URI is marked `seen` exactly like an ordinary skip or a full
+  reindex, so it is not eligible for the delete-sweep in the same run.
+
 ### Deletes
 
 Deletes are data-modifying: ≥ 90% coverage gate ([01-architecture.md](01-architecture.md) §7).

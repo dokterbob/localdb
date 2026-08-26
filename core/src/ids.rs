@@ -10,6 +10,8 @@
 
 use ulid::Ulid;
 
+use crate::metadata::Metadata;
+
 /// A ULID as a string, used for fiat-identity entities (Store, Source, IndexJob).
 ///
 /// The string representation is the canonical form; it is stable, sortable by time,
@@ -88,9 +90,60 @@ pub fn chunk_id(
     hasher.finalize().to_hex().to_string()
 }
 
+/// Derive a hash over a resource's persisted metadata state (specs/04-search-pipeline.md,
+/// metadata-only incremental update).
+///
+/// Inputs are exactly the fields `store-libsql` persists on the `resources`
+/// row alongside `metadata_json` — `external_id`, `external_etag`,
+/// `modified_at` — plus `metadata` itself. Callers MUST pass post-backfill,
+/// exactly-as-persisted values: `metadata` after `core::ingestion`'s
+/// title-backfill (a resource's own `title` folds into
+/// `metadata.dublin_core_mut().title` when the metadata carries none), never
+/// the raw `resource.metadata`. Computing this before backfill at one call
+/// site and after backfill at another would make the same resource hash
+/// differently depending on which code path touched it first — exactly the
+/// bug this hash exists to avoid across index-time, metadata-update-time, and
+/// rehydration-time computations.
+///
+/// Deliberately excludes:
+/// - `title` as a separate parameter — it always lives inside `metadata` by
+///   the time this is called (see above), so a separate parameter would
+///   double-count it.
+/// - `date_original`/`date_parsed` — both are derived from `metadata`'s own
+///   Dublin Core `date` field (`core::dates::parse_partial_iso8601`), so
+///   hashing them too would double-count that field a second time.
+///
+/// `metadata` must serialize deterministically for this to be stable: every
+/// `Metadata` variant is plain structs/`Vec`s/`Option`s with no `HashMap`, so
+/// `serde_json::to_string` produces the same bytes for equal values on every
+/// call — a `HashMap`-valued field would risk nondeterministic key ordering
+/// and make this hash spuriously flap between runs with no real change.
+///
+/// Fields are combined with `\x00` separators (mirroring
+/// `markdown_blocks::compute_blocks_hash`'s delimiting convention) so a
+/// shifted field boundary — e.g. `external_id="ab"` + `external_etag="c"` vs
+/// `external_id="a"` + `external_etag="bc"` — can never collide.
+pub fn compute_metadata_hash(
+    metadata: &Metadata,
+    external_id: Option<&str>,
+    external_etag: Option<&str>,
+    modified_at: &str,
+) -> String {
+    let metadata_json = serde_json::to_string(metadata).unwrap_or_default();
+    let combined = format!(
+        "{}\x00{}\x00{}\x00{}",
+        metadata_json,
+        external_id.unwrap_or(""),
+        external_etag.unwrap_or(""),
+        modified_at,
+    );
+    content_hash(&combined)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata::{DocumentMetadata, DublinCoreMetadata};
 
     // --- Failing tests first (TDD) ---
 
@@ -274,5 +327,96 @@ mod tests {
         let id_run1 = chunk_id(&doc_id, 0, chunk_text, 0);
         let id_run2 = chunk_id(&doc_id, 0, chunk_text, 0);
         assert_eq!(id_run1, id_run2, "chunk ID must be stable across re-runs");
+    }
+
+    // --- compute_metadata_hash ---
+
+    fn doc_metadata(title: Option<&str>) -> Metadata {
+        Metadata::Document(DocumentMetadata {
+            dublin_core: DublinCoreMetadata {
+                title: title.map(str::to_string),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn metadata_hash_is_deterministic() {
+        let m = doc_metadata(Some("Title"));
+        let h1 = compute_metadata_hash(&m, Some("ext-1"), Some("etag-1"), "2026-06-10T12:00:00Z");
+        let h2 = compute_metadata_hash(&m, Some("ext-1"), Some("etag-1"), "2026-06-10T12:00:00Z");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn metadata_hash_is_hex_encoded_blake3() {
+        let m = doc_metadata(None);
+        let h = compute_metadata_hash(&m, None, None, "2026-06-10T12:00:00Z");
+        assert_eq!(h.len(), 64, "expected 64-char hex string, got: {h}");
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn metadata_hash_changes_when_metadata_changes() {
+        let a = doc_metadata(Some("A"));
+        let b = doc_metadata(Some("B"));
+        let ha = compute_metadata_hash(&a, None, None, "2026-06-10T12:00:00Z");
+        let hb = compute_metadata_hash(&b, None, None, "2026-06-10T12:00:00Z");
+        assert_ne!(ha, hb);
+    }
+
+    #[test]
+    fn metadata_hash_changes_when_external_id_changes() {
+        let m = doc_metadata(Some("Title"));
+        let h1 = compute_metadata_hash(&m, Some("a"), None, "2026-06-10T12:00:00Z");
+        let h2 = compute_metadata_hash(&m, Some("b"), None, "2026-06-10T12:00:00Z");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn metadata_hash_changes_when_external_etag_changes() {
+        let m = doc_metadata(Some("Title"));
+        let h1 = compute_metadata_hash(&m, None, Some("a"), "2026-06-10T12:00:00Z");
+        let h2 = compute_metadata_hash(&m, None, Some("b"), "2026-06-10T12:00:00Z");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn metadata_hash_changes_when_modified_at_changes() {
+        let m = doc_metadata(Some("Title"));
+        let h1 = compute_metadata_hash(&m, None, None, "2026-06-10T12:00:00Z");
+        let h2 = compute_metadata_hash(&m, None, None, "2026-06-11T12:00:00Z");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn metadata_hash_field_boundary_is_unambiguous() {
+        // external_id="ab" + external_etag="c" must not collide with
+        // external_id="a" + external_etag="bc" — the `\x00` separator must
+        // hold the field boundary even when a naive concatenation wouldn't.
+        let m = doc_metadata(None);
+        let h1 = compute_metadata_hash(&m, Some("ab"), Some("c"), "2026-06-10T12:00:00Z");
+        let h2 = compute_metadata_hash(&m, Some("a"), Some("bc"), "2026-06-10T12:00:00Z");
+        assert_ne!(h1, h2);
+    }
+
+    /// The trap this hash exists to pin closed: a resource whose title was
+    /// BACKFILLED (`resource.title` carries it, `resource.metadata`'s Dublin
+    /// Core title does not) must hash identically whether the caller passes
+    /// the pre-backfill or the already-backfilled `Metadata` — as long as
+    /// both actually contain the title. This test documents the contract at
+    /// the unit level; `core/tests/metadata_skip.rs`
+    /// (`list_indexed_documents_metadata_hash_matches_index_resource_stamped_hash`)
+    /// pins it end-to-end across index-time and rehydration-time.
+    #[test]
+    fn metadata_hash_treats_backfilled_title_as_ordinary_metadata() {
+        let backfilled = doc_metadata(Some("Backfilled Title"));
+        let h1 = compute_metadata_hash(&backfilled, None, None, "2026-06-10T12:00:00Z");
+        let h2 = compute_metadata_hash(&backfilled, None, None, "2026-06-10T12:00:00Z");
+        assert_eq!(
+            h1, h2,
+            "hashing post-backfill metadata must be deterministic"
+        );
     }
 }

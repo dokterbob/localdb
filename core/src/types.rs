@@ -539,6 +539,11 @@ pub struct IndexJobStats {
     /// job can report the same "N no longer at source (kept; use --delete to
     /// remove)" information the embedded CLI path already does.
     pub docs_prunable: u64,
+    /// Documents whose content and policy were unchanged but whose metadata
+    /// (Dublin Core fields, `external_id`/`external_etag`/`modified_at`) was
+    /// rewritten in place — no chunks/embeddings touched. Mirrors
+    /// `IngestionResult::docs_metadata_updated` (issue #176).
+    pub docs_metadata_updated: u64,
     /// Chunks written to the retrieval backend.
     pub chunks_written: u64,
     /// Files that could not be indexed due to unsupported format.
