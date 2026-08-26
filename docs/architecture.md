@@ -460,18 +460,21 @@ extraction defect (see
 then it's never read back and reused; `Last-Modified` is not persisted at all.** `capture_etag` on
 `ResourceEnrichment` defaults to `false` (`ingest/src/url_pipeline.rs:120-123`), and every ordinary
 `url` source uses that default (`ingest/src/url_ingestor.rs:94`), so `Resource.external_etag` is
-always `None` there. The feed root fetch discards the response's `etag` outright and never becomes a
-`Resource` to begin with (`ingest/src/feed_ingestor.rs:138-141`). Only feed entry links set
-`capture_etag: true` (`ingest/src/feed_ingestor.rs:503-514`), so a successful entry fetch captures
-`external_etag` and writes it to `resources.external_etag` (`store-libsql/src/tenant/write.rs`) —
-but every real ingestion call site (`ingest/src/url_pipeline.rs`, `ingest/src/feed_ingestor.rs`)
-still builds a fresh `FetchMetadata::default()` for each fetch instead of reading that persisted
-value back, so `fetch::http`'s existing `If-None-Match`/`If-Modified-Since` support
-(`fetch/src/lib.rs`) is never exercised: every `localdb index` re-fetches every URL and every feed
-entry in full. There is no `resources` column for `Last-Modified` at all. A follow-up issue covers
-adding `ETag` capture for `url` sources and the feed-root fetch, round-tripping the persisted
-`external_etag` (and adding `Last-Modified` persistence) into `FetchMetadata` on the next fetch,
-together with delete-on-404/410 pruning (previous item).
+always `None` there. The feed root fetch discards the response's `etag` outright
+(`ingest/src/feed_ingestor.rs:138-141`). In the default discovery mode (`fetch_full_content: true`)
+the feed root never becomes a `Resource`; in single-document mode (`fetch_full_content: false`) it
+does become one, but `build_resource` still hardcodes `external_etag` to `None`
+(`ingest/src/url_pipeline.rs:346-354`). Only feed entry links set `capture_etag: true`
+(`ingest/src/feed_ingestor.rs:503-514`), so a successful entry fetch captures `external_etag` and
+writes it to `resources.external_etag` (`store-libsql/src/tenant/write.rs`) — but every real
+ingestion call site (`ingest/src/url_pipeline.rs`, `ingest/src/feed_ingestor.rs`) still builds a
+fresh `FetchMetadata::default()` for each fetch instead of reading that persisted value back, so
+`fetch::http`'s existing `If-None-Match`/`If-Modified-Since` support (`fetch/src/lib.rs`) is never
+exercised: every `localdb index` re-fetches every URL and every feed entry in full. There is no
+`resources` column for `Last-Modified` at all. A follow-up issue covers adding `ETag` capture for
+`url` sources and the feed-root fetch (and threading it into `build_resource` for single-document
+mode), round-tripping the persisted `external_etag` (and adding `Last-Modified` persistence) into
+`FetchMetadata` on the next fetch, together with delete-on-404/410 pruning (previous item).
 
 **12. A store containing a `kind = 'feed'` source cannot be opened by an older binary that predates
 the Feed ingestor.** `sources.ingestor_kind` decoding is a hard match over the known `IngestorKind`
