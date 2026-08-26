@@ -81,6 +81,50 @@ fn html_no_date_signal_leaves_date_none() {
 }
 
 #[test]
+fn html_json_ld_top_level_array_descends_into_elements() {
+    let html = r#"<html><head>
+        <script type="application/ld+json">
+        [
+          {"@type": "Article", "datePublished": "2021-03-15"}
+        ]
+        </script>
+    </head><body><p>Content</p></body></html>"#;
+
+    let (date, source) = extract_html_date(html).expect("expected a date");
+    assert_eq!(date, "2021-03-15");
+    assert_eq!(source, "html-json-ld");
+}
+
+#[test]
+fn html_json_ld_top_level_array_finds_non_first_match() {
+    let html = r#"<html><head>
+        <script type="application/ld+json">
+        [
+          {"@type": "WebSite", "name": "Example"},
+          {"@type": "BreadcrumbList"},
+          {"@type": "Article", "datePublished": "2020-09-10"}
+        ]
+        </script>
+    </head><body><p>Content</p></body></html>"#;
+
+    let (date, source) = extract_html_date(html).expect("expected a date");
+    assert_eq!(date, "2020-09-10");
+    assert_eq!(source, "html-json-ld");
+}
+
+#[test]
+fn html_meta_date_second_tag_used_when_first_empty() {
+    let html = r#"<html><head>
+        <meta name="dcterms.date" content="">
+        <meta name="dcterms.date" content="2024-02-20">
+    </head><body><p>Content</p></body></html>"#;
+
+    let (date, source) = extract_html_date(html).expect("expected a date");
+    assert_eq!(date, "2024-02-20");
+    assert_eq!(source, "html-meta");
+}
+
+#[test]
 fn malformed_json_ld_skips_to_meta() {
     // Trailing commas after the author name and after the author object —
     // a realistic CMS templating bug. `serde_json` fails to parse it; the

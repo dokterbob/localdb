@@ -3484,6 +3484,7 @@ name = "localdb-extract"
 version = "0.1.0"
 dependencies = [
  "anytomd",
+ "encoding_rs",
  "infer",
  "localdb-core",
  "mime_guess",

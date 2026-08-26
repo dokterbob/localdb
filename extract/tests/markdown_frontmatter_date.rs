@@ -53,3 +53,33 @@ fn markdown_no_frontmatter_leaves_date_none() {
     assert_eq!(doc.metadata.date, None);
     assert_eq!(doc.metadata.date_source, None);
 }
+
+#[test]
+fn markdown_frontmatter_date_bare_value_strips_trailing_comment() {
+    // A '#' preceded by whitespace on a bare scalar starts a comment.
+    let md = b"---\ndate: 2020-11-05 # published\n---\n\n# Heading\n\nBody.\n";
+    let probe = Probe::new(md, Some("post.md"), None);
+    let doc = MarkdownParser.parse(&probe).unwrap().unwrap();
+    assert_eq!(doc.metadata.date.as_deref(), Some("2020-11-05"));
+}
+
+#[test]
+fn markdown_frontmatter_date_quoted_value_strips_trailing_comment() {
+    // Everything after the closing quote, including a '#' comment, is discarded.
+    let md = b"---\ndate: \"2020-11-05\" # published\n---\n\n# Heading\n\nBody.\n";
+    let probe = Probe::new(md, Some("post.md"), None);
+    let doc = MarkdownParser.parse(&probe).unwrap().unwrap();
+    assert_eq!(doc.metadata.date.as_deref(), Some("2020-11-05"));
+}
+
+#[test]
+fn markdown_frontmatter_date_quoted_value_preserves_hash_inside_quotes() {
+    // A '#' inside the quotes is literal content, not a comment marker.
+    let md = b"---\ndate: \"2020-11-05#not-a-comment\"\n---\n\n# Heading\n\nBody.\n";
+    let probe = Probe::new(md, Some("post.md"), None);
+    let doc = MarkdownParser.parse(&probe).unwrap().unwrap();
+    assert_eq!(
+        doc.metadata.date.as_deref(),
+        Some("2020-11-05#not-a-comment")
+    );
+}

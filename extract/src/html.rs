@@ -147,13 +147,16 @@ pub fn extract_html_date(input: &str) -> Option<(String, &'static str)> {
     None
 }
 
-/// `<meta ... content="...">`, trimmed; `None` if the selector matches
-/// nothing, the element has no `content` attribute, or it's empty.
+/// `<meta ... content="...">`, trimmed; scans every element matching
+/// `selector_str` in document order and returns the first one with a
+/// non-empty `content` attribute. `None` if the selector matches nothing, or
+/// every match has no `content` attribute or an empty one.
 fn extract_meta_content(document: &Html, selector_str: &str) -> Option<String> {
     let selector = Selector::parse(selector_str).ok()?;
-    let el = document.select(&selector).next()?;
-    let content = el.value().attr("content")?.trim();
-    (!content.is_empty()).then(|| content.to_string())
+    document.select(&selector).find_map(|el| {
+        let content = el.value().attr("content")?.trim();
+        (!content.is_empty()).then(|| content.to_string())
+    })
 }
 
 /// Scan every `script[type="application/ld+json"]` in document order for
@@ -174,15 +177,27 @@ fn extract_json_ld_date(document: &Html) -> Option<String> {
 }
 
 /// `datePublished`/`dateModified` from a top-level JSON-LD value, or (when
-/// absent there) from the first `@graph` member that carries either field.
+/// absent there) from the first member of a top-level array or `@graph`
+/// array that carries either field.
 fn json_ld_date_from_value(value: &serde_json::Value) -> Option<String> {
     if let Some(date) = json_ld_date_from_object(value) {
         return Some(date);
     }
+    if let Some(arr) = value.as_array() {
+        if let Some(date) = find_date_in_array(arr) {
+            return Some(date);
+        }
+    }
     value
         .get("@graph")
         .and_then(|g| g.as_array())
-        .and_then(|graph| graph.iter().find_map(json_ld_date_from_object))
+        .and_then(|graph| find_date_in_array(graph))
+}
+
+/// First element in `arr` (document order) carrying a `datePublished`/
+/// `dateModified` claim. Shared by top-level JSON-LD arrays and `@graph`.
+fn find_date_in_array(arr: &[serde_json::Value]) -> Option<String> {
+    arr.iter().find_map(json_ld_date_from_object)
 }
 
 /// `datePublished`, falling back to `dateModified`, from a single JSON-LD

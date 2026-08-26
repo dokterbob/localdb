@@ -28,7 +28,8 @@ pub fn extract_markdown(input: &str) -> Result<(String, Option<String>), Error> 
 /// tolerance, not a general YAML parser): only a line starting with
 /// literal `date:` (no leading whitespace — nested keys are out of scope,
 /// #195), remainder trimmed, one pair of matching `'…'`/`"…"` quotes
-/// stripped if present. Both `date: 2020-11-05` (bare) and
+/// stripped if present, and a trailing `#` comment stripped from an
+/// unquoted scalar. Both `date: 2020-11-05` (bare) and
 /// `date: "2020-11-05"` (quoted) — both present in the wild — normalize to
 /// the same raw string. Multi-doc front matter and folded scalars are out
 /// of scope (#195). Returns the raw claim as-is (`date_original`
@@ -45,22 +46,39 @@ pub(crate) fn extract_frontmatter_date(input: &str) -> Option<String> {
         if value.is_empty() {
             continue;
         }
-        let unquoted = strip_matching_quotes(value);
-        if !unquoted.is_empty() {
-            return Some(unquoted.to_string());
+        let resolved = resolve_scalar(value);
+        if !resolved.is_empty() {
+            return Some(resolved.to_string());
         }
     }
     None
 }
 
-/// Strip one pair of matching leading/trailing `'` or `"` quotes, if present.
-fn strip_matching_quotes(value: &str) -> &str {
+/// Resolve a YAML front-matter scalar: for a quoted value, find the matching
+/// closing quote and return what's between the quotes — anything after the
+/// closing quote (including a `#` comment) is discarded. For an unquoted
+/// value (or a quoted value with no closing quote), fall back to
+/// [`strip_trailing_comment`]. The closing quote must be resolved before any
+/// comment-scanning, or a `#` inside quotes would be mistaken for a comment.
+fn resolve_scalar(value: &str) -> &str {
     let bytes = value.as_bytes();
-    if bytes.len() >= 2 {
-        let first = bytes[0];
-        let last = bytes[bytes.len() - 1];
-        if (first == b'\'' || first == b'"') && first == last {
-            return &value[1..value.len() - 1];
+    if let Some(&first) = bytes.first() {
+        if first == b'\'' || first == b'"' {
+            if let Some(rel_end) = value[1..].find(first as char) {
+                return &value[1..1 + rel_end];
+            }
+        }
+    }
+    strip_trailing_comment(value)
+}
+
+/// Strip a trailing `#` comment from an unquoted scalar: a `#` at index 0 or
+/// preceded by ASCII whitespace starts a comment.
+fn strip_trailing_comment(value: &str) -> &str {
+    let bytes = value.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'#' && (i == 0 || bytes[i - 1].is_ascii_whitespace()) {
+            return value[..i].trim_end();
         }
     }
     value

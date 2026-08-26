@@ -38,7 +38,7 @@ pub(crate) struct OfficeCoreProperties {
 pub(crate) fn read_core_properties(bytes: &[u8]) -> Option<OfficeCoreProperties> {
     let cursor = Cursor::new(bytes);
     let mut archive = zip::ZipArchive::new(cursor).ok()?;
-    let mut xml = String::new();
+    let mut raw = Vec::new();
     // Cap the decompressed read: a legitimate core.xml is a few KB, and this
     // reads untrusted content — an over-cap part is truncated and then fails
     // XML parsing below, landing in the same fail-closed `None` path.
@@ -46,8 +46,12 @@ pub(crate) fn read_core_properties(bytes: &[u8]) -> Option<OfficeCoreProperties>
         .by_name("docProps/core.xml")
         .ok()?
         .take(1 << 20)
-        .read_to_string(&mut xml)
+        .read_to_end(&mut raw)
         .ok()?;
+    // Some OOXML producers write core.xml as UTF-16. `UTF_8.decode` BOM-sniffs
+    // UTF-8/UTF-16LE/UTF-16BE per WHATWG, strips the BOM, and never errors —
+    // a part with no BOM is decoded as UTF-8, matching the previous behavior.
+    let (xml, _, _) = encoding_rs::UTF_8.decode(&raw);
     parse_core_properties(&xml)
 }
 
@@ -86,16 +90,19 @@ fn parse_core_properties(xml: &str) -> Option<OfficeCoreProperties> {
             // corresponding field is simply never assigned, staying `None`.
             Ok(Event::Empty(_)) => {}
             Ok(Event::Text(t)) => {
-                if let Some(field) = &current {
+                if current.is_some() {
                     let decoded = t.decode().ok()?;
                     let text = quick_xml::escape::unescape(&decoded).ok()?.into_owned();
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() {
-                        match field {
-                            Field::Title => props.title = Some(trimmed.to_string()),
-                            Field::Created => props.created = Some(trimmed.to_string()),
-                        }
-                    }
+                    assign_field(&current, &text, &mut props);
+                }
+            }
+            // CDATA content is already literal — unlike `Event::Text`, it must
+            // NOT be run through entity-unescape, or a literal '&' would be
+            // corrupted (or error out as a malformed entity reference).
+            Ok(Event::CData(t)) => {
+                if current.is_some() {
+                    let text = std::str::from_utf8(t.as_ref()).ok()?;
+                    assign_field(&current, text, &mut props);
                 }
             }
             Ok(Event::End(_)) => current = None,
@@ -105,6 +112,21 @@ fn parse_core_properties(xml: &str) -> Option<OfficeCoreProperties> {
     }
 
     Some(props)
+}
+
+/// Assign already-decoded `text` to whichever field `current` names, if any,
+/// once trimmed non-empty. Shared tail for the `Text` and `CData` arms, which
+/// differ only in how they turn their raw event bytes into `text`.
+fn assign_field(current: &Option<Field>, text: &str, props: &mut OfficeCoreProperties) {
+    if let Some(field) = current {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            match field {
+                Field::Title => props.title = Some(trimmed.to_string()),
+                Field::Created => props.created = Some(trimmed.to_string()),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -211,5 +233,95 @@ mod tests {
         let props = read_core_properties(&bytes).unwrap();
         assert_eq!(props.title.as_deref(), Some("Q3 Board Report"));
         assert_eq!(props.created.as_deref(), Some("2019-03-04T00:00:00Z"));
+    }
+
+    /// Byte-taking variant of `make_ooxml_zip`, for parts whose bytes are not
+    /// valid UTF-8 (e.g. UTF-16 `core.xml`).
+    fn make_ooxml_zip_bytes(core_xml: Option<&[u8]>) -> Vec<u8> {
+        use zip::write::SimpleFileOptions;
+        use zip::ZipWriter;
+
+        let buf = Cursor::new(Vec::new());
+        let mut zip = ZipWriter::new(buf);
+        let opts = SimpleFileOptions::default();
+
+        zip.start_file("[Content_Types].xml", opts).unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><Types/>"#).unwrap();
+
+        if let Some(core_xml) = core_xml {
+            zip.start_file("docProps/core.xml", opts).unwrap();
+            zip.write_all(core_xml).unwrap();
+        }
+
+        zip.finish().unwrap().into_inner()
+    }
+
+    fn utf16le_bytes_with_bom(s: &str) -> Vec<u8> {
+        let mut out = vec![0xFFu8, 0xFEu8];
+        for unit in s.encode_utf16() {
+            out.extend_from_slice(&unit.to_le_bytes());
+        }
+        out
+    }
+
+    fn utf16be_bytes_with_bom(s: &str) -> Vec<u8> {
+        let mut out = vec![0xFEu8, 0xFFu8];
+        for unit in s.encode_utf16() {
+            out.extend_from_slice(&unit.to_be_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn core_xml_utf16le_bom_is_decoded() {
+        let bytes = make_ooxml_zip_bytes(Some(&utf16le_bytes_with_bom(CORE_XML_FULL)));
+        let props = read_core_properties(&bytes).unwrap();
+        assert_eq!(props.title.as_deref(), Some("Q3 Board Report"));
+        assert_eq!(props.created.as_deref(), Some("2019-03-04T00:00:00Z"));
+    }
+
+    #[test]
+    fn core_xml_utf16be_bom_is_decoded() {
+        let bytes = make_ooxml_zip_bytes(Some(&utf16be_bytes_with_bom(CORE_XML_FULL)));
+        let props = read_core_properties(&bytes).unwrap();
+        assert_eq!(props.title.as_deref(), Some("Q3 Board Report"));
+        assert_eq!(props.created.as_deref(), Some("2019-03-04T00:00:00Z"));
+    }
+
+    #[test]
+    fn cdata_title_extracted() {
+        let xml = r#"<?xml version="1.0"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
+    xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/">
+  <dc:title><![CDATA[Q3 Board Report]]></dc:title>
+</cp:coreProperties>"#;
+        let props = parse_core_properties(xml).unwrap();
+        assert_eq!(props.title.as_deref(), Some("Q3 Board Report"));
+    }
+
+    #[test]
+    fn cdata_created_extracted() {
+        let xml = r#"<?xml version="1.0"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
+    xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/">
+  <dcterms:created><![CDATA[2019-03-04T00:00:00Z]]></dcterms:created>
+</cp:coreProperties>"#;
+        let props = parse_core_properties(xml).unwrap();
+        assert_eq!(props.created.as_deref(), Some("2019-03-04T00:00:00Z"));
+    }
+
+    #[test]
+    fn cdata_ampersand_not_double_unescaped() {
+        // A literal '&' inside CDATA must survive as-is: CDATA is not an
+        // escaped context, so re-running entity-unescape on it would either
+        // corrupt the literal '&' or error out on "& Q2" as a malformed
+        // entity reference.
+        let xml = r#"<?xml version="1.0"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
+    xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/">
+  <dc:title><![CDATA[Q1 & Q2 Report]]></dc:title>
+</cp:coreProperties>"#;
+        let props = parse_core_properties(xml).unwrap();
+        assert_eq!(props.title.as_deref(), Some("Q1 & Q2 Report"));
     }
 }

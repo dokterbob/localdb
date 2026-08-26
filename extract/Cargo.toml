@@ -39,6 +39,11 @@ mime_guess = "2"
 # EPUB parsing — read-only, so default features (write/threadsafe/prelude) are off.
 rbook = { version = "0.7", default-features = false }
 
+# BOM-sniffing UTF-8/UTF-16LE/UTF-16BE decode for docProps/core.xml (issue
+# #251): some producers write it as UTF-16. Already transitive at 0.8.35 via
+# pdf_oxide/anytomd; the bare "0.8" range is compatible with that pin.
+encoding_rs = "0.8"
+
 # Office (docx/pptx) docProps/core.xml extraction (issue #251). Exact-pinned
 # to rbook's already-compiled 0.40.1 so only ONE quick-xml major ships in the
 # binary — a bare "0.40" would let cargo pick a different 0.40.x that still
