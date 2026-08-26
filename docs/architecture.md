@@ -501,10 +501,13 @@ connector (it already applied to two `url` sources, or a `path`/`url` collision,
 is not fixed by this work; the feed connector's discovery mode just makes the collision more likely
 in practice, since feeds routinely link to pages users have also added directly.
 
-**14. Feed `refresh` is accepted, persisted, and validated but does not do anything yet.** Same
-story as `url`'s `refresh_interval_secs`: the value round-trips through config and the API but no
-scheduler reads it back to trigger a re-fetch — scheduled refresh is daemon-side work not yet built
-for either source kind.
+**14. Feed `refresh` is accepted, persisted, and validated but does not do anything yet.** Unlike
+`url` sources — whose `refresh_interval_secs` the daemon's `UrlRefreshScheduler`
+(`server/src/scheduler.rs`) reads back and acts on, submitting real refresh jobs through the job
+queue — feed sources are never registered with the scheduler (`server/src/daemon.rs` registers
+`SourceKind::Url` only, and `server/src/state.rs` documents the exclusion), so a feed's `refresh`
+value round-trips through config and the API without triggering anything. Extending scheduler
+registration to feed sources is part of [#171](https://github.com/dokterbob/localdb/issues/171).
 
 **15. ~~Enrichment metadata changes don't persist while content is unchanged~~ — RESOLVED.**
 ([#176](https://github.com/dokterbob/localdb/issues/176)) The skip-check (`core/src/ingestion.rs`,
