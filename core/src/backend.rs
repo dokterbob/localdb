@@ -92,6 +92,23 @@ pub struct DocumentInfo {
     pub origin_store: String,
     pub policy_version: String,
     pub metadata: Metadata,
+
+    /// The resource's own claimed date, exactly as the source expressed it
+    /// (`resources.date_original`). `None` when the source carried no date
+    /// (or, for daemon-attached reads against a pre-v7 database, on a row
+    /// written before this column existed).
+    pub date_original: Option<String>,
+
+    /// `date_original` normalized to a sortable ISO 8601 string
+    /// (`resources.date_parsed`, via `crate::dates::parse_partial_iso8601`).
+    /// `None` when `date_original` was absent or unparseable.
+    pub date_parsed: Option<String>,
+
+    /// Write-time clock of this resource's last index (`resources.
+    /// index_updated_at`, migration v7). `Option` because a daemon may open
+    /// a pre-v7 database before `localdb db migrate` has run — `open` never
+    /// migrates on any surface (docs/migrations.md).
+    pub index_updated_at: Option<String>,
 }
 
 #[async_trait]

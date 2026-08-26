@@ -10,6 +10,7 @@ pub mod blocking;
 pub mod chunker;
 pub mod citation;
 pub mod config;
+pub mod dates;
 pub mod diagnostics;
 pub mod documents;
 pub mod embedder;

@@ -524,10 +524,12 @@ fn store_record_json(name: &str) -> String {
 
 /// A `DocumentInfo`-shaped (`core/src/backend.rs`) JSON object, for stubbing
 /// `GET /v1/stores/{{name}}/documents` items. `daemon_item_to_document_list_item`
-/// (`cli/src/cmds/document.rs`) only reads `id`/`uri`/`title`/`store_id`/
-/// `source_id`/`content_hash`/`fetched_at` from each item, so the remaining
-/// `DocumentInfo` fields (`ingestor_kind`, `mime`, `origin_store`,
-/// `policy_version`, `metadata`) are omitted here.
+/// (`cli/src/cmds/document.rs`) reads `id`/`uri`/`title`/`store_id`/
+/// `source_id`/`content_hash`/`fetched_at`/`date_original`/`date_parsed`/
+/// `index_updated_at` from each item, so the remaining `DocumentInfo` fields
+/// (`ingestor_kind`, `mime`, `origin_store`, `policy_version`, `metadata`)
+/// are omitted here.
+#[allow(clippy::too_many_arguments)]
 fn daemon_document_list_item_json(
     id: &str,
     uri: &str,
@@ -536,13 +538,20 @@ fn daemon_document_list_item_json(
     source_id: &str,
     content_hash: &str,
     fetched_at: &str,
+    date_original: Option<&str>,
+    date_parsed: Option<&str>,
+    index_updated_at: Option<&str>,
 ) -> String {
-    let title_json = match title {
-        Some(t) => format!("\"{t}\""),
+    let opt_json = |v: Option<&str>| match v {
+        Some(s) => format!("\"{s}\""),
         None => "null".to_string(),
     };
+    let title_json = opt_json(title);
+    let date_original_json = opt_json(date_original);
+    let date_parsed_json = opt_json(date_parsed);
+    let index_updated_at_json = opt_json(index_updated_at);
     format!(
-        r#"{{"id":"{id}","uri":"{uri}","title":{title_json},"store_id":"{store_id}","source_id":"{source_id}","content_hash":"{content_hash}","fetched_at":"{fetched_at}"}}"#
+        r#"{{"id":"{id}","uri":"{uri}","title":{title_json},"store_id":"{store_id}","source_id":"{source_id}","content_hash":"{content_hash}","fetched_at":"{fetched_at}","date_original":{date_original_json},"date_parsed":{date_parsed_json},"index_updated_at":{index_updated_at_json}}}"#
     )
 }
 
@@ -600,6 +609,9 @@ fn document_list_daemon_routes_and_matches_embedded_shape() {
         d["source_id"].as_str().unwrap(),
         d["content_hash"].as_str().unwrap(),
         d["fetched_at"].as_str().unwrap(),
+        d["date_original"].as_str(),
+        d["date_parsed"].as_str(),
+        d["index_updated_at"].as_str(),
     );
 
     let daemon_dir = TempDir::new().unwrap();
@@ -676,6 +688,9 @@ fn document_list_daemon_source_filter_and_pagination_walks_to_page_2() {
         "src-1",
         "hash-a",
         "2026-01-01T00:00:00Z",
+        None,
+        None,
+        None,
     );
     let page2_item = daemon_document_list_item_json(
         "doc-b",
@@ -685,6 +700,9 @@ fn document_list_daemon_source_filter_and_pagination_walks_to_page_2() {
         "src-1",
         "hash-b",
         "2026-01-02T00:00:00Z",
+        None,
+        None,
+        None,
     );
     let page1_body = paginated_list_page(&[page1_item], Some("1"), 2);
     let page2_body = paginated_list_page(&[page2_item], None, 2);

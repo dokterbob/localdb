@@ -200,6 +200,10 @@ pub(crate) async fn seed_chunk_with_source(
         block_kind: None,
         page: None,
         window_block_seqs: vec![],
+        date_original: None,
+        date_parsed: None,
+        external_id: None,
+        external_etag: None,
     };
     state
         .backend()
@@ -269,6 +273,10 @@ pub(crate) async fn seed_many_chunks(state: &AppState, count: usize) -> Vec<Stri
             block_kind: None,
             page: None,
             window_block_seqs: vec![],
+            date_original: None,
+            date_parsed: None,
+            external_id: None,
+            external_etag: None,
         });
         ids.push(chunk_id);
     }

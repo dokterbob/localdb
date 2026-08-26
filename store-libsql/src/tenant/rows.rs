@@ -134,6 +134,12 @@ pub(crate) fn row_to_chunk_record_strict(row: &libsql::Row) -> Result<ChunkRecor
         block_kind,
         page,
         window_block_seqs,
+        // Write-only stamps (core::store::ChunkRecord doc comment) — not
+        // part of `CHUNK_COLS`, so a chunk read never carries them.
+        date_original: None,
+        date_parsed: None,
+        external_id: None,
+        external_etag: None,
     })
 }
 

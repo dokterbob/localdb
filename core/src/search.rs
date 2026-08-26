@@ -540,6 +540,10 @@ mod tests {
             block_kind: None,
             page: None,
             window_block_seqs: vec![],
+            date_original: None,
+            date_parsed: None,
+            external_id: None,
+            external_etag: None,
         }
     }
 

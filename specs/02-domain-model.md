@@ -427,9 +427,6 @@ Every resource and every chunk carries:
 three axes (§2's "Date axes (normative)") are document-level surfaces, not citation fields:
 `date_original`, `date_parsed`, and `index_updated_at` are returned by
 `document get`/`document list` (`DocumentInfo`, specs/05-surfaces.md §2-4), not by search citations.
-Like `index_updated_at` itself, this document-level exposure lands with a later PR in the
-migration-v7 wave (§9); until then `DocumentInfo` carries only `fetched_at` (= `added_at`) alongside
-the metadata blob.
 
 ## 5. Conversations and non-document resources
 

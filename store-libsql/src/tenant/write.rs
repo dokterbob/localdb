@@ -212,8 +212,9 @@ async fn upsert_chunks_inner(
             conn.execute(
                 "INSERT INTO resources (store_id, id, source_id, ingestor_kind, resource_kind,
                      uri, title, mime, content_hash, added_at, modified_at, index_updated_at,
-                     origin_store, policy_version, metadata_json, extractor_version)
-                 VALUES (?, ?, ?, ?, 'document', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '1')
+                     origin_store, policy_version, metadata_json, extractor_version,
+                     date_original, date_parsed, external_id, external_etag)
+                 VALUES (?, ?, ?, ?, 'document', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '1', ?, ?, ?, ?)
                  ON CONFLICT(store_id, id) DO UPDATE SET
                      source_id        = excluded.source_id,
                      ingestor_kind    = excluded.ingestor_kind,
@@ -225,7 +226,11 @@ async fn upsert_chunks_inner(
                      index_updated_at = excluded.index_updated_at,
                      origin_store     = excluded.origin_store,
                      policy_version   = excluded.policy_version,
-                     metadata_json    = excluded.metadata_json",
+                     metadata_json    = excluded.metadata_json,
+                     date_original    = excluded.date_original,
+                     date_parsed      = excluded.date_parsed,
+                     external_id      = excluded.external_id,
+                     external_etag    = excluded.external_etag",
                 params![
                     record.store_id.as_str(),
                     record.resource_id.as_str(), // id column
@@ -241,6 +246,10 @@ async fn upsert_chunks_inner(
                     record.origin_store.as_str(),
                     record.policy_version.as_str(),
                     metadata_json.as_str(),
+                    record.date_original.as_deref(),
+                    record.date_parsed.as_deref(),
+                    record.external_id.as_deref(),
+                    record.external_etag.as_deref(),
                 ],
             )
             .await

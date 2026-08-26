@@ -324,6 +324,10 @@ async fn make_handler_with_sequential_chunks(count: u32) -> (McpHandler, String,
             block_kind: Some("text".to_string()),
             page: None,
             window_block_seqs: vec![],
+            date_original: None,
+            date_parsed: None,
+            external_id: None,
+            external_etag: None,
         });
     }
     store.upsert_chunks(chunks).await.expect("seed chunks");

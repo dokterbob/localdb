@@ -143,6 +143,10 @@ pub(crate) async fn make_handler_with_seeded_store() -> (McpHandler, String, Str
         // citation.block.page with no surface-crate code change.
         page: Some(4),
         window_block_seqs: vec![],
+        date_original: None,
+        date_parsed: None,
+        external_id: None,
+        external_etag: None,
     };
 
     store.upsert_chunks(vec![record]).await.expect("seed chunk");
@@ -204,6 +208,10 @@ pub(crate) async fn make_handler_with_multichunk_doc() -> (McpHandler, String) {
             block_kind: Some("text".to_string()),
             page: None,
             window_block_seqs: vec![],
+            date_original: None,
+            date_parsed: None,
+            external_id: None,
+            external_etag: None,
         }
     };
 
@@ -267,6 +275,10 @@ pub(crate) async fn make_handler_with_tied_chunks(reversed: bool) -> (McpHandler
             block_kind: Some("text".to_string()),
             page: None,
             window_block_seqs: vec![],
+            date_original: None,
+            date_parsed: None,
+            external_id: None,
+            external_etag: None,
         }
     };
 
@@ -330,6 +342,10 @@ pub(crate) async fn make_handler_with_sequential_chunks(
             block_kind: Some("text".to_string()),
             page: None,
             window_block_seqs: vec![],
+            date_original: None,
+            date_parsed: None,
+            external_id: None,
+            external_etag: None,
         });
     }
     store.upsert_chunks(chunks).await.expect("seed chunks");
@@ -382,6 +398,10 @@ pub(crate) async fn make_handler_with_block_seq_gaps() -> (McpHandler, String) {
             block_kind: Some("text".to_string()),
             page: None,
             window_block_seqs: vec![],
+            date_original: None,
+            date_parsed: None,
+            external_id: None,
+            external_etag: None,
         }
     };
 

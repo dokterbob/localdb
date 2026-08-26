@@ -151,6 +151,10 @@ collector, which keeps runtime performance predictable and fast.";
         block_kind: None,
         page: None,
         window_block_seqs: vec![],
+        date_original: None,
+        date_parsed: None,
+        external_id: None,
+        external_etag: None,
     };
     store.upsert_chunks(vec![record]).await.unwrap();
 
@@ -300,6 +304,10 @@ async fn test_search_limit_respected() {
             block_kind: None,
             page: None,
             window_block_seqs: vec![],
+            date_original: None,
+            date_parsed: None,
+            external_id: None,
+            external_etag: None,
         });
     }
     store.upsert_chunks(records).await.unwrap();

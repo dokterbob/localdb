@@ -177,6 +177,9 @@ fn make_document_info(id: &str, store_id: &str, uri: &str) -> DocumentInfo {
         origin_store: store_id.to_string(),
         policy_version: "v1".to_string(),
         metadata: Metadata::default(),
+        date_original: None,
+        date_parsed: None,
+        index_updated_at: None,
     }
 }
 
@@ -204,6 +207,10 @@ fn make_chunk(id: &str, resource_id: &str, store_id: &str, text: &str) -> ChunkR
         block_kind: None,
         page: None,
         window_block_seqs: vec![],
+        date_original: None,
+        date_parsed: None,
+        external_id: None,
+        external_etag: None,
     }
 }
 
