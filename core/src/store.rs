@@ -56,6 +56,13 @@ pub struct ChunkRecord {
     /// Acquisition time (RFC 3339 string). Used for metadata filters.
     pub fetched_at: String,
 
+    /// The resource's claimed content modification time (RFC 3339 string) —
+    /// the origin's own notion of "last changed" (e.g. a feed entry's
+    /// `<updated>`), distinct from `fetched_at` (when *our store* acquired
+    /// it). Written to `resources.modified_at`. See specs/02-domain-model.md
+    /// §2.
+    pub modified_at: String,
+
     /// blake3 content hash of normalized text (hex string).
     pub content_hash: String,
 
@@ -133,6 +140,15 @@ impl ChunkRecord {
             embedding,
             policy_version: chunk.policy_version.clone(),
             fetched_at: chunk.provenance.fetched_at.clone(),
+            // `Chunk`/`Provenance` carry no modified_at of their own (see
+            // `Provenance`'s doc comment — acquisition time only); default to
+            // `fetched_at` here so callers that never touch this field (most
+            // fixtures, and any future caller of `from_chunk` that only cares
+            // about acquisition time) keep the pre-existing behavior of
+            // `added_at`/`modified_at` starting out equal. `index_resource`
+            // overrides this with the real `resource.modified_at` right after
+            // constructing the record.
+            modified_at: chunk.provenance.fetched_at.clone(),
             content_hash: chunk.provenance.content_hash.clone(),
             origin_store: chunk.provenance.origin_store.clone(),
             source_id: chunk.provenance.source_ref.id.clone(),
@@ -660,6 +676,7 @@ pub mod conformance {
             embedding,
             policy_version: "v1".to_string(),
             fetched_at: "2026-06-10T12:00:00Z".to_string(),
+            modified_at: "2026-06-10T12:00:00Z".to_string(),
             content_hash: "abc123".to_string(),
             origin_store: store_id.to_string(),
             source_id: "src-1".to_string(),
@@ -1235,6 +1252,7 @@ mod tests {
             embedding,
             policy_version: "v1".to_string(),
             fetched_at: "2026-06-10T12:00:00Z".to_string(),
+            modified_at: "2026-06-10T12:00:00Z".to_string(),
             content_hash: "abc123".to_string(),
             origin_store: "test-store".to_string(),
             source_id: "src-1".to_string(),
