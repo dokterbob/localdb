@@ -83,7 +83,7 @@ fn make_record(store_id: &str, source_id: &str, idx: usize) -> ChunkRecord {
         embedding: vec![0.1, 0.2, 0.3, 0.4],
         policy_version: "v1".to_string(),
         fetched_at: "2026-06-25T12:00:00Z".to_string(),
-        modified_at: "2026-06-25T12:00:00Z".to_string(),
+        modified_at: Some("2026-06-25T12:00:00Z".to_string()),
         content_hash: format!("hash-{store_id}"),
         origin_store: store_id.to_string(),
         source_id: source_id.to_string(),

@@ -21,7 +21,7 @@ fn make_document_chunk(
         embedding: vec![0.1, 0.2, 0.3, 0.4],
         policy_version: "v1".to_string(),
         fetched_at: "2026-07-01T00:00:00Z".to_string(),
-        modified_at: "2026-07-01T00:00:00Z".to_string(),
+        modified_at: Some("2026-07-01T00:00:00Z".to_string()),
         content_hash: "abc123".to_string(),
         origin_store: store_id.to_string(),
         source_id: source_id.to_string(),

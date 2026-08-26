@@ -122,7 +122,7 @@ async fn watcher_file_change_triggers_reindex_visible_in_search() {
         embedding,
         policy_version: "v1".to_string(),
         fetched_at: "2026-06-10T12:00:00Z".to_string(),
-        modified_at: "2026-06-10T12:00:00Z".to_string(),
+        modified_at: Some("2026-06-10T12:00:00Z".to_string()),
         content_hash: "watcher-hash-1".to_string(),
         origin_store: store_id.clone(),
         source_id: source.id,

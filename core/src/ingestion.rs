@@ -57,9 +57,9 @@ pub struct DocumentRecord {
     /// The policy version that was used to index this document.
     pub policy_version: String,
     /// `core::ids::compute_metadata_hash` of the persisted metadata state
-    /// (post-title-backfill `Metadata` plus `external_id`/`external_etag` —
-    /// `modified_at` is deliberately excluded, see that function's doc
-    /// comment) from last indexing or last metadata-only update.
+    /// (post-title-backfill `Metadata` plus
+    /// `external_id`/`external_etag`/`modified_at`) from last indexing or
+    /// last metadata-only update.
     /// Drives the metadata-only incremental update (issue #176;
     /// specs/04-search-pipeline.md): a mismatch here, with `content_hash`
     /// and `policy_version` both unchanged, means only the resource row
@@ -745,13 +745,17 @@ struct DerivedResourceState {
     /// `dublin_core_mut().title` when the metadata itself carried none.
     metadata: Metadata,
     /// `core::ids::compute_metadata_hash` of `metadata` plus
-    /// `resource.external_id`/`external_etag` (`modified_at` is deliberately
-    /// excluded — see that function's doc comment).
+    /// `resource.external_id`/`external_etag`/`modified_at`.
     metadata_hash: String,
     /// `metadata`'s own Dublin Core `date`, exactly as the source expressed it.
     date_original: Option<String>,
     /// `date_original` normalized via `crate::dates::parse_partial_iso8601`.
     date_parsed: Option<String>,
+    /// `resource.modified_at`, unchanged — carried here so the value fed to
+    /// `compute_metadata_hash` above is exactly the value later stamped onto
+    /// the persisted `ChunkRecord`/`ResourceRecord`, never two separately
+    /// read copies.
+    modified_at: Option<String>,
 }
 
 /// Compute [`DerivedResourceState`] for `resource`. Pure function of
@@ -779,10 +783,13 @@ fn derive_resource_state(resource: &Resource) -> DerivedResourceState {
         .as_deref()
         .and_then(crate::dates::parse_partial_iso8601);
 
+    let modified_at = resource.modified_at.clone();
+
     let metadata_hash = crate::ids::compute_metadata_hash(
         &metadata,
         resource.external_id.as_deref(),
         resource.external_etag.as_deref(),
+        modified_at.as_deref(),
     );
 
     DerivedResourceState {
@@ -790,6 +797,7 @@ fn derive_resource_state(resource: &Resource) -> DerivedResourceState {
         metadata_hash,
         date_original,
         date_parsed,
+        modified_at,
     }
 }
 
@@ -980,6 +988,7 @@ pub async fn index_resource(
     let record_metadata = derived.metadata;
     let date_original = derived.date_original;
     let date_parsed = derived.date_parsed;
+    let modified_at = derived.modified_at;
 
     // Page lookup for paginated formats (#103): block seq → location.page,
     // copied onto each chunk record from its originating block.
@@ -1021,8 +1030,11 @@ pub async fn index_resource(
         record.page = page_by_seq.get(&chunk_out.block_seq).copied();
         // The resource's own claimed modification time — distinct from
         // `fetched_at`/`provenance.fetched_at` (acquisition time, stamped by
-        // `from_chunk` above). See specs/02-domain-model.md §2.
-        record.modified_at = resource.modified_at.clone();
+        // `from_chunk` above). Normalized (`Some("")` → `None`) via
+        // `derive_resource_state`, so this always matches what
+        // `derived.metadata_hash` was computed over. See
+        // specs/02-domain-model.md §2.
+        record.modified_at = modified_at.clone();
         record.date_original = date_original.clone();
         record.date_parsed = date_parsed.clone();
         record.external_id = resource.external_id.clone();
@@ -1446,7 +1458,7 @@ impl IngestCallback for PipelineCallback<'_> {
                     metadata: derived.metadata,
                     external_id: resource.external_id.clone(),
                     external_etag: resource.external_etag.clone(),
-                    modified_at: resource.modified_at.clone(),
+                    modified_at: derived.modified_at,
                     date_original: derived.date_original,
                     date_parsed: derived.date_parsed,
                 };
@@ -2311,7 +2323,7 @@ mod tests {
             embedding: vec![0.0, 0.0, 0.0, 0.0],
             policy_version: "v1".to_string(),
             fetched_at: "2026-06-22T00:00:00Z".to_string(),
-            modified_at: "2026-06-22T00:00:00Z".to_string(),
+            modified_at: Some("2026-06-22T00:00:00Z".to_string()),
             content_hash: content_hash.to_string(),
             origin_store: store_id.to_string(),
             source_id: "src-1".to_string(),
@@ -2405,7 +2417,7 @@ mod tests {
                 mime: Some("text/markdown".to_string()),
                 metadata: Metadata::Document(DocumentMetadata::default()),
                 added_at: "2026-06-10T12:00:00Z".to_string(),
-                modified_at: "2026-06-10T12:00:00Z".to_string(),
+                modified_at: Some("2026-06-10T12:00:00Z".to_string()),
                 thread_id: None,
                 channel: None,
                 participants: vec![],
@@ -5232,7 +5244,7 @@ mod tests {
                 store_id,
             );
             resource.added_at = INGESTED_AT.to_string();
-            resource.modified_at = FEED_CLAIMED.to_string();
+            resource.modified_at = Some(FEED_CLAIMED.to_string());
 
             let deps = IndexResourceDeps {
                 store: &store,

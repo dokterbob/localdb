@@ -633,7 +633,7 @@ async fn mtime_is_formatted_as_rfc3339() {
     // `modified_at` is derived from the file's mtime; `added_at` is the
     // ingestion clock, not the mtime — see `file_ingestor_added_at_is_now_not_mtime`
     // and `file_ingestor_modified_at_is_mtime_derived` for that split.
-    assert_eq!(cb.resources[0].modified_at, expected);
+    assert_eq!(cb.resources[0].modified_at, Some(expected.clone()));
     assert!(
         expected.ends_with('Z') && expected.contains('T'),
         "expected an RFC 3339 timestamp, got: {expected}"
@@ -711,7 +711,7 @@ async fn file_ingestor_modified_at_is_mtime_derived() {
     ingestor.ingest(&source, &mut cb).await.unwrap();
 
     assert_eq!(cb.resources.len(), 1);
-    assert_eq!(cb.resources[0].modified_at, expected);
+    assert_eq!(cb.resources[0].modified_at, Some(expected));
 }
 
 /// For a file whose mtime is far in the past, `added_at` (ingestion time)
@@ -734,7 +734,10 @@ async fn file_ingestor_added_at_and_modified_at_differ_for_old_mtime() {
     ingestor.ingest(&source, &mut cb).await.unwrap();
 
     assert_eq!(cb.resources.len(), 1);
-    assert_ne!(cb.resources[0].added_at, cb.resources[0].modified_at);
+    assert_ne!(
+        Some(cb.resources[0].added_at.clone()),
+        cb.resources[0].modified_at
+    );
 }
 
 #[cfg(unix)]

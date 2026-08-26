@@ -104,6 +104,9 @@ pub fn chunk_id(
 /// it first — exactly the bug this hash exists to avoid across index-time,
 /// metadata-update-time, and rehydration-time computations.
 ///
+/// `modified_at` IS included, as the source's claim (`Option<&str>`, not the
+/// `now()` fallback this hash used to have to defend against — see below).
+///
 /// Deliberately excludes:
 /// - `title` as a separate parameter — it always lives inside `metadata` by
 ///   the time this is called (see above), so a separate parameter would
@@ -111,16 +114,16 @@ pub fn chunk_id(
 /// - `date_original`/`date_parsed` — both are derived from `metadata`'s own
 ///   Dublin Core `date` field (`core::dates::parse_partial_iso8601`), so
 ///   hashing them too would double-count that field a second time.
-/// - `modified_at` — for a source with no change claim of its own (a bare
-///   URL fetch, a dateless feed entry, an unreadable file mtime) it falls
-///   back to ingestion-time `now()` (specs/02-domain-model.md's `modified_at`
-///   row), which would make otherwise-identical content hash differently on
-///   every single run and permanently defeat the unchanged-skip path for
-///   that resource. Excluding it means a pure mtime touch with unchanged
-///   content and metadata no longer trips a metadata write — acceptable
-///   because no read surface exposes `modified_at` today; giving
-///   source-claims a nullable "no claim" representation instead of the
-///   `now()` fallback is a tracked follow-up.
+///
+/// `modified_at` used to be excluded here: for a source with no change claim
+/// of its own it used to fall back to ingestion-time `now()`, which would
+/// make otherwise-identical content hash differently on every single run and
+/// permanently defeat the unchanged-skip path. Now that `Resource::modified_at`
+/// (and every field it flows through, down to the nullable
+/// `resources.modified_at` column) is `Option<String>` — `None` when the
+/// source makes no claim, never `now()` — that churn source is gone: a
+/// no-claim source hashes a stable `None` on every run, so it's safe (and
+/// correct — a genuine claim change IS a metadata change) to include it.
 ///
 /// `metadata` must serialize deterministically for this to be stable: every
 /// `Metadata` variant is plain structs/`Vec`s/`Option`s with no `HashMap`, so
@@ -141,13 +144,15 @@ pub fn compute_metadata_hash(
     metadata: &Metadata,
     external_id: Option<&str>,
     external_etag: Option<&str>,
+    modified_at: Option<&str>,
 ) -> String {
     let metadata_json = serde_json::to_string(metadata).unwrap_or_default();
     let combined = format!(
-        "{}\x00{}\x00{}",
+        "{}\x00{}\x00{}\x00{}",
         metadata_json,
         encode_optional_field(external_id),
         encode_optional_field(external_etag),
+        encode_optional_field(modified_at),
     );
     content_hash(&combined)
 }
@@ -366,15 +371,15 @@ mod tests {
     #[test]
     fn metadata_hash_is_deterministic() {
         let m = doc_metadata(Some("Title"));
-        let h1 = compute_metadata_hash(&m, Some("ext-1"), Some("etag-1"));
-        let h2 = compute_metadata_hash(&m, Some("ext-1"), Some("etag-1"));
+        let h1 = compute_metadata_hash(&m, Some("ext-1"), Some("etag-1"), None);
+        let h2 = compute_metadata_hash(&m, Some("ext-1"), Some("etag-1"), None);
         assert_eq!(h1, h2);
     }
 
     #[test]
     fn metadata_hash_is_hex_encoded_blake3() {
         let m = doc_metadata(None);
-        let h = compute_metadata_hash(&m, None, None);
+        let h = compute_metadata_hash(&m, None, None, None);
         assert_eq!(h.len(), 64, "expected 64-char hex string, got: {h}");
         assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
     }
@@ -383,24 +388,24 @@ mod tests {
     fn metadata_hash_changes_when_metadata_changes() {
         let a = doc_metadata(Some("A"));
         let b = doc_metadata(Some("B"));
-        let ha = compute_metadata_hash(&a, None, None);
-        let hb = compute_metadata_hash(&b, None, None);
+        let ha = compute_metadata_hash(&a, None, None, None);
+        let hb = compute_metadata_hash(&b, None, None, None);
         assert_ne!(ha, hb);
     }
 
     #[test]
     fn metadata_hash_changes_when_external_id_changes() {
         let m = doc_metadata(Some("Title"));
-        let h1 = compute_metadata_hash(&m, Some("a"), None);
-        let h2 = compute_metadata_hash(&m, Some("b"), None);
+        let h1 = compute_metadata_hash(&m, Some("a"), None, None);
+        let h2 = compute_metadata_hash(&m, Some("b"), None, None);
         assert_ne!(h1, h2);
     }
 
     #[test]
     fn metadata_hash_changes_when_external_etag_changes() {
         let m = doc_metadata(Some("Title"));
-        let h1 = compute_metadata_hash(&m, None, Some("a"));
-        let h2 = compute_metadata_hash(&m, None, Some("b"));
+        let h1 = compute_metadata_hash(&m, None, Some("a"), None);
+        let h2 = compute_metadata_hash(&m, None, Some("b"), None);
         assert_ne!(h1, h2);
     }
 
@@ -410,8 +415,8 @@ mod tests {
         // external_id="a" + external_etag="bc" — the `\x00` separator must
         // hold the field boundary even when a naive concatenation wouldn't.
         let m = doc_metadata(None);
-        let h1 = compute_metadata_hash(&m, Some("ab"), Some("c"));
-        let h2 = compute_metadata_hash(&m, Some("a"), Some("bc"));
+        let h1 = compute_metadata_hash(&m, Some("ab"), Some("c"), None);
+        let h2 = compute_metadata_hash(&m, Some("a"), Some("bc"), None);
         assert_ne!(h1, h2);
     }
 
@@ -423,8 +428,8 @@ mod tests {
     #[test]
     fn metadata_hash_distinguishes_none_from_empty_external_fields() {
         let m = doc_metadata(Some("Title"));
-        let h_none = compute_metadata_hash(&m, None, None);
-        let h_empty = compute_metadata_hash(&m, Some(""), Some(""));
+        let h_none = compute_metadata_hash(&m, None, None, None);
+        let h_empty = compute_metadata_hash(&m, Some(""), Some(""), None);
         assert_ne!(
             h_none, h_empty,
             "external_id/external_etag of None must hash differently from Some(\"\")"
@@ -442,11 +447,52 @@ mod tests {
     #[test]
     fn metadata_hash_treats_backfilled_title_as_ordinary_metadata() {
         let backfilled = doc_metadata(Some("Backfilled Title"));
-        let h1 = compute_metadata_hash(&backfilled, None, None);
-        let h2 = compute_metadata_hash(&backfilled, None, None);
+        let h1 = compute_metadata_hash(&backfilled, None, None, None);
+        let h2 = compute_metadata_hash(&backfilled, None, None, None);
         assert_eq!(
             h1, h2,
             "hashing post-backfill metadata must be deterministic"
+        );
+    }
+
+    /// The re-inclusion this whole change is about (#283): a genuine claim
+    /// change must move the hash.
+    #[test]
+    fn metadata_hash_changes_when_modified_at_changes() {
+        let m = doc_metadata(Some("Title"));
+        let h_none = compute_metadata_hash(&m, None, None, None);
+        let h_claim = compute_metadata_hash(&m, None, None, Some("2020-01-01T00:00:00Z"));
+        assert_ne!(
+            h_none, h_claim,
+            "a source claim must hash differently from no claim"
+        );
+    }
+
+    /// No-claim sources must hash a stable `None` on every run — the F1 bug
+    /// this design fixes: hashing `now()` instead would churn on every run
+    /// even with unchanged content and metadata.
+    #[test]
+    fn metadata_hash_none_modified_at_is_stable_across_calls() {
+        let m = doc_metadata(Some("Title"));
+        let h1 = compute_metadata_hash(&m, None, None, None);
+        let h2 = compute_metadata_hash(&m, None, None, None);
+        assert_eq!(h1, h2, "None modified_at must hash identically every run");
+    }
+
+    /// `modified_at: None` must not hash the same as `modified_at: Some("")`
+    /// — same F3 collision guard as `external_id`/`external_etag` above. In
+    /// practice a real claim is always a non-empty RFC 3339 string and the
+    /// nullable `resources.modified_at` column round-trips `None` as SQL
+    /// NULL, so the two can't collide upstream either — this pins the
+    /// encoding property at the hash-function level regardless.
+    #[test]
+    fn metadata_hash_distinguishes_none_from_empty_modified_at() {
+        let m = doc_metadata(Some("Title"));
+        let h_none = compute_metadata_hash(&m, None, None, None);
+        let h_empty = compute_metadata_hash(&m, None, None, Some(""));
+        assert_ne!(
+            h_none, h_empty,
+            "modified_at of None must hash differently from Some(\"\")"
         );
     }
 }

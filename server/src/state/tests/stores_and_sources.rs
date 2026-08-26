@@ -170,7 +170,7 @@ async fn upsert_and_search_chunks_roundtrip() {
         embedding: vec![1.0; 128],
         policy_version: "v1".to_string(),
         fetched_at: "2026-06-10T12:00:00Z".to_string(),
-        modified_at: "2026-06-10T12:00:00Z".to_string(),
+        modified_at: Some("2026-06-10T12:00:00Z".to_string()),
         content_hash: "abc".to_string(),
         origin_store: store_id.clone(),
         source_id: source.id,

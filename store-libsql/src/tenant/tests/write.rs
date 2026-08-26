@@ -12,8 +12,9 @@ use crate::SqliteBackend;
 /// A minimal, self-contained `ChunkRecord` fixture for `store-1`/`doc-1`
 /// (the store/source seeded by `backend_with_store_and_source`), with
 /// `fetched_at` and `modified_at` as explicit parameters so callers can
-/// distinguish them.
-fn chunk_record(fetched_at: &str, modified_at: &str) -> ChunkRecord {
+/// distinguish them. `modified_at: None` writes a genuine no-claim resource
+/// (#283).
+fn chunk_record(fetched_at: &str, modified_at: Option<&str>) -> ChunkRecord {
     ChunkRecord {
         id: "chunk-1".to_string(),
         resource_id: "doc-1".to_string(),
@@ -24,7 +25,7 @@ fn chunk_record(fetched_at: &str, modified_at: &str) -> ChunkRecord {
         embedding: vec![0.1, 0.2, 0.3, 0.4],
         policy_version: "v1".to_string(),
         fetched_at: fetched_at.to_string(),
-        modified_at: modified_at.to_string(),
+        modified_at: modified_at.map(str::to_string),
         content_hash: "abc123".to_string(),
         origin_store: "store-1".to_string(),
         source_id: "src-1".to_string(),
@@ -51,7 +52,7 @@ fn chunk_record(fetched_at: &str, modified_at: &str) -> ChunkRecord {
 async fn resource_row(
     backend: &SqliteBackend,
     resource_id: &str,
-) -> (String, String, Option<String>) {
+) -> (String, Option<String>, Option<String>) {
     let conn = backend.conn.reader();
     let mut rows = conn
         .query(
@@ -126,7 +127,7 @@ async fn get_chunk_tolerates_invalid_metadata_json() {
         embedding: vec![0.1, 0.2, 0.3, 0.4],
         policy_version: "v1".to_string(),
         fetched_at: "2026-07-01T00:00:00Z".to_string(),
-        modified_at: "2026-07-01T00:00:00Z".to_string(),
+        modified_at: Some("2026-07-01T00:00:00Z".to_string()),
         content_hash: "abc123".to_string(),
         origin_store: "store-1".to_string(),
         source_id: "src-1".to_string(),
@@ -217,7 +218,7 @@ async fn upsert_blocks_is_now_transactional() {
         embedding: vec![0.1, 0.2, 0.3, 0.4],
         policy_version: "v1".to_string(),
         fetched_at: "2026-07-01T00:00:00Z".to_string(),
-        modified_at: "2026-07-01T00:00:00Z".to_string(),
+        modified_at: Some("2026-07-01T00:00:00Z".to_string()),
         content_hash: "abc123".to_string(),
         origin_store: "store-1".to_string(),
         source_id: "src-1".to_string(),
@@ -295,7 +296,7 @@ async fn upsert_resource_modified_at_reflects_resource_modified_at_not_fetched_a
     let backend = backend_with_store_and_source(&path).await;
     let handle = backend.retrieval_store("store-1").await.unwrap();
 
-    let record = chunk_record("2026-07-01T00:00:00Z", "2020-01-01T00:00:00Z");
+    let record = chunk_record("2026-07-01T00:00:00Z", Some("2020-01-01T00:00:00Z"));
     handle.upsert_chunks(vec![record]).await.unwrap();
 
     let (added_at, modified_at, _) = resource_row(&backend, "doc-1").await;
@@ -304,9 +305,49 @@ async fn upsert_resource_modified_at_reflects_resource_modified_at_not_fetched_a
         "added_at must still come from fetched_at"
     );
     assert_eq!(
-        modified_at, "2020-01-01T00:00:00Z",
+        modified_at,
+        Some("2020-01-01T00:00:00Z".to_string()),
         "modified_at must come from the resource's own claimed modification time, \
          not fetched_at"
+    );
+}
+
+/// #283: `modified_at: None` (no claim) must round-trip through the real
+/// backend as SQL NULL — never a placeholder string — and rehydration via
+/// `list_indexed_documents` must derive the same `metadata_hash` as
+/// `compute_metadata_hash` computes directly for the same no-claim resource.
+///
+/// BLOCKED on the nullable `resources.modified_at` column (migration v7)
+/// landing on the base branch (`ticket/t250-write-path`): on this branch the
+/// column is still `NOT NULL`, so binding `None` here trips a real SQL
+/// constraint and `upsert_chunks` returns `Err` instead of `Ok(())` — this
+/// test is written-but-red until this branch rebases onto that migration.
+#[tokio::test]
+async fn modified_at_none_round_trips_as_null() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("localdb.db");
+    let backend = backend_with_store_and_source(&path).await;
+    let handle = backend.retrieval_store("store-1").await.unwrap();
+
+    let record = chunk_record("2026-07-01T00:00:00Z", None);
+    handle.upsert_chunks(vec![record]).await.unwrap();
+
+    let (_, modified_at, _) = resource_row(&backend, "doc-1").await;
+    assert_eq!(
+        modified_at, None,
+        "a no-claim resource must persist modified_at as NULL, not a placeholder string"
+    );
+
+    let rehydrated = handle.list_indexed_documents().await.unwrap();
+    let doc = rehydrated
+        .into_iter()
+        .find(|d| d.resource_id == "doc-1")
+        .expect("doc-1 must be rehydrated");
+    let expected_hash =
+        localdb_core::ids::compute_metadata_hash(&Metadata::default(), None, None, None);
+    assert_eq!(
+        doc.metadata_hash, expected_hash,
+        "rehydrated hash for a no-claim resource must match the stamp-time hash"
     );
 }
 
@@ -324,7 +365,7 @@ async fn upsert_resource_index_updated_at_bumps_on_conflict_update() {
     handle
         .upsert_chunks(vec![chunk_record(
             "2026-07-01T00:00:00Z",
-            "2026-07-01T00:00:00Z",
+            Some("2026-07-01T00:00:00Z"),
         )])
         .await
         .unwrap();
@@ -335,7 +376,7 @@ async fn upsert_resource_index_updated_at_bumps_on_conflict_update() {
     handle
         .upsert_chunks(vec![chunk_record(
             "2026-07-01T00:00:00Z",
-            "2026-07-02T00:00:00Z",
+            Some("2026-07-02T00:00:00Z"),
         )])
         .await
         .unwrap();
@@ -347,7 +388,7 @@ async fn upsert_resource_index_updated_at_bumps_on_conflict_update() {
         added_at_1, added_at_2,
         "added_at must be preserved by ON CONFLICT"
     );
-    assert_eq!(modified_at_2, "2026-07-02T00:00:00Z");
+    assert_eq!(modified_at_2, Some("2026-07-02T00:00:00Z".to_string()));
     assert!(
         index_updated_at_2.as_str() >= index_updated_at_1.as_str(),
         "index_updated_at must not go backwards: {index_updated_at_1} -> {index_updated_at_2}"
@@ -366,7 +407,7 @@ async fn upsert_resource_added_at_survives_policy_reindex() {
     let backend = backend_with_store_and_source(&path).await;
     let handle = backend.retrieval_store("store-1").await.unwrap();
 
-    let first = chunk_record("2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z");
+    let first = chunk_record("2020-01-01T00:00:00Z", Some("2020-01-01T00:00:00Z"));
     handle
         .upsert_chunks_and_blocks("store-1", "doc-1", vec![first], &[], None)
         .await
@@ -375,7 +416,7 @@ async fn upsert_resource_added_at_survives_policy_reindex() {
 
     // A fresh scan of the same resource: a different fetched_at (this run's
     // acquisition time) and modified_at, same resource_id.
-    let second = chunk_record("2026-08-26T00:00:00Z", "2026-08-20T00:00:00Z");
+    let second = chunk_record("2026-08-26T00:00:00Z", Some("2026-08-20T00:00:00Z"));
     handle
         .upsert_chunks_and_blocks("store-1", "doc-1", vec![second], &[], Some("doc-1"))
         .await
@@ -390,7 +431,7 @@ async fn upsert_resource_added_at_survives_policy_reindex() {
         added_at_2, "2026-08-26T00:00:00Z",
         "added_at must not reset to the new scan's fetched_at"
     );
-    assert_eq!(modified_at_2, "2026-08-20T00:00:00Z");
+    assert_eq!(modified_at_2, Some("2026-08-20T00:00:00Z".to_string()));
     assert!(
         index_updated_at_2.is_some(),
         "index_updated_at must be populated after the reindex"
@@ -410,7 +451,7 @@ async fn upsert_resource_persists_date_original_and_date_parsed() {
     let backend = backend_with_store_and_source(&path).await;
     let handle = backend.retrieval_store("store-1").await.unwrap();
 
-    let mut record = chunk_record("2026-07-01T00:00:00Z", "2026-07-01T00:00:00Z");
+    let mut record = chunk_record("2026-07-01T00:00:00Z", Some("2026-07-01T00:00:00Z"));
     record.date_original = Some("2026-06-15T10:30:00Z".to_string());
     record.date_parsed = Some("2026-06-15".to_string());
     handle.upsert_chunks(vec![record]).await.unwrap();
@@ -421,7 +462,7 @@ async fn upsert_resource_persists_date_original_and_date_parsed() {
 
     // A later upsert of the same resource refreshes both columns, same as
     // `metadata_json`.
-    let mut second = chunk_record("2026-07-01T00:00:00Z", "2026-07-01T00:00:00Z");
+    let mut second = chunk_record("2026-07-01T00:00:00Z", Some("2026-07-01T00:00:00Z"));
     second.date_original = Some("2026-07-20".to_string());
     second.date_parsed = Some("2026-07-20".to_string());
     handle.upsert_chunks(vec![second]).await.unwrap();
@@ -441,7 +482,7 @@ async fn upsert_resource_persists_external_id_and_external_etag() {
     let backend = backend_with_store_and_source(&path).await;
     let handle = backend.retrieval_store("store-1").await.unwrap();
 
-    let mut record = chunk_record("2026-07-01T00:00:00Z", "2026-07-01T00:00:00Z");
+    let mut record = chunk_record("2026-07-01T00:00:00Z", Some("2026-07-01T00:00:00Z"));
     record.external_id = Some("urn:entry:1".to_string());
     record.external_etag = Some("\"etag-1\"".to_string());
     handle.upsert_chunks(vec![record]).await.unwrap();
@@ -450,7 +491,7 @@ async fn upsert_resource_persists_external_id_and_external_etag() {
     assert_eq!(external_id.as_deref(), Some("urn:entry:1"));
     assert_eq!(external_etag.as_deref(), Some("\"etag-1\""));
 
-    let mut second = chunk_record("2026-07-01T00:00:00Z", "2026-07-01T00:00:00Z");
+    let mut second = chunk_record("2026-07-01T00:00:00Z", Some("2026-07-01T00:00:00Z"));
     second.external_id = Some("urn:entry:1".to_string());
     second.external_etag = Some("\"etag-2\"".to_string());
     handle.upsert_chunks(vec![second]).await.unwrap();
@@ -484,7 +525,7 @@ async fn metadata_only_update_does_not_touch_chunks_embeddings_or_fts() {
     handle
         .upsert_chunks(vec![chunk_record(
             "2026-07-01T00:00:00Z",
-            "2026-07-01T00:00:00Z",
+            Some("2026-07-01T00:00:00Z"),
         )])
         .await
         .unwrap();
@@ -512,7 +553,7 @@ async fn metadata_only_update_does_not_touch_chunks_embeddings_or_fts() {
         metadata: new_metadata.clone(),
         external_id: Some("urn:entry:9".to_string()),
         external_etag: Some("\"etag-9\"".to_string()),
-        modified_at: "2026-08-01T00:00:00Z".to_string(),
+        modified_at: Some("2026-08-01T00:00:00Z".to_string()),
         date_original: Some("2026-07-30".to_string()),
         date_parsed: Some("2026-07-30".to_string()),
     };
@@ -537,7 +578,7 @@ async fn metadata_only_update_does_not_touch_chunks_embeddings_or_fts() {
     // `get_chunk` reads metadata via the resources join, so it DOES reflect
     // the update — this is the row the update was meant to change.
     assert_eq!(after.metadata, new_metadata);
-    assert_eq!(after.modified_at, "2026-08-01T00:00:00Z");
+    assert_eq!(after.modified_at, Some("2026-08-01T00:00:00Z".to_string()));
 
     let bm25_after = handle.bm25_search("chunk text", 10, &[]).await.unwrap();
     assert_eq!(
@@ -570,7 +611,7 @@ async fn metadata_only_update_bumps_index_updated_at() {
     handle
         .upsert_chunks(vec![chunk_record(
             "2026-07-01T00:00:00Z",
-            "2026-07-01T00:00:00Z",
+            Some("2026-07-01T00:00:00Z"),
         )])
         .await
         .unwrap();
@@ -581,7 +622,7 @@ async fn metadata_only_update_bumps_index_updated_at() {
         metadata: Metadata::default(),
         external_id: None,
         external_etag: None,
-        modified_at: "2026-07-01T00:00:00Z".to_string(),
+        modified_at: Some("2026-07-01T00:00:00Z".to_string()),
         date_original: None,
         date_parsed: None,
     };
@@ -615,7 +656,7 @@ async fn update_resource_metadata_errors_when_no_row_matches() {
         metadata: Metadata::default(),
         external_id: None,
         external_etag: None,
-        modified_at: "2026-08-01T00:00:00Z".to_string(),
+        modified_at: Some("2026-08-01T00:00:00Z".to_string()),
         date_original: None,
         date_parsed: None,
     };
