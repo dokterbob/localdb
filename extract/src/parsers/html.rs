@@ -42,9 +42,15 @@ impl Parser for HtmlParser {
         };
 
         let (markdown, title) = crate::html::extract_html(text)?;
+        let (date, date_source) = match crate::html::extract_html_date(text) {
+            Some((date, source)) => (Some(date), Some(source.to_string())),
+            None => (None, None),
+        };
 
         let dc = DublinCoreMetadata {
             title: title.clone(),
+            date,
+            date_source,
             format: probe.sniffed_mime.map(|s| s.to_string()),
             ..DublinCoreMetadata::default()
         };

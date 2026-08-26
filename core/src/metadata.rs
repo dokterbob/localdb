@@ -16,6 +16,17 @@ pub struct DublinCoreMetadata {
     #[serde(default)]
     pub contributor: Vec<String>,
     pub date: Option<String>,
+    /// Provenance of `date`: which extraction site stamped it (e.g.
+    /// `"pdf-info"`, `"xmp"`, `"epub-opf"`, `"feed-entry"`,
+    /// `"office-core-properties"`, `"html-json-ld"`, `"html-meta"`,
+    /// `"front-matter"`). `#[serde(skip_serializing_if)]` so documents
+    /// without a stamped date_source (i.e. every document indexed before
+    /// this field existed) keep serializing byte-identical to before — a
+    /// missing skip attribute here would change `metadata_hash` for the
+    /// whole corpus on the first post-upgrade index run. See
+    /// specs/02-domain-model.md §7.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date_source: Option<String>,
     pub r#type: Option<String>,
     pub format: Option<String>,
     pub identifier: Option<String>,
@@ -256,5 +267,41 @@ mod tests {
         assert!(dc.subject.is_empty());
         assert!(dc.contributor.is_empty());
         assert!(dc.relation.is_empty());
+    }
+
+    /// Pin: a `DublinCoreMetadata` with `date_source: None` must serialize to
+    /// the exact same JSON as it did before `date_source` existed — no
+    /// `"date_source"` key at all, and no shift in any other field's
+    /// position. Without `skip_serializing_if` on the new field, every
+    /// existing document's `metadata_hash` (which hashes this JSON, see
+    /// `core::ids::compute_metadata_hash`) would change on the first
+    /// post-upgrade index run, forcing a full-corpus reindex.
+    #[test]
+    fn date_source_none_serializes_identically_to_before_the_field_existed() {
+        let dc = DublinCoreMetadata {
+            title: Some("Pre-upgrade Doc".to_string()),
+            creator: vec!["Alice".to_string()],
+            date: Some("2020-01-01".to_string()),
+            language: Some("en".to_string()),
+            date_source: None,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&dc).unwrap();
+        assert!(
+            !json.contains("date_source"),
+            "date_source: None must not appear in the serialized JSON at all: {json}"
+        );
+
+        // The pre-existing field order/shape, hand-pinned as an exact string
+        // (not a Value comparison, which would ignore key order): reordering
+        // fields, or making the new field always-present, would change this
+        // and, with it, every pre-upgrade document's metadata_hash.
+        let expected = concat!(
+            r#"{"title":"Pre-upgrade Doc","creator":["Alice"],"subject":[],"#,
+            r#""description":null,"publisher":null,"contributor":[],"#,
+            r#""date":"2020-01-01","type":null,"format":null,"identifier":null,"#,
+            r#""source":null,"language":"en","relation":[],"coverage":null,"rights":null}"#,
+        );
+        assert_eq!(json, expected);
     }
 }

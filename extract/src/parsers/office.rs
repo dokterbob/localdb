@@ -9,6 +9,8 @@ use localdb_core::metadata::DublinCoreMetadata;
 use localdb_core::parser::{ParsedDocument, Parser, Probe};
 use localdb_core::Error;
 
+use super::office_metadata::read_core_properties;
+
 /// Handles office document formats via `anytomd`.
 ///
 /// Supported extensions: `.docx`, `.pptx`, `.csv`.
@@ -39,9 +41,36 @@ impl Parser for OfficeParser {
             }
         })?;
 
-        let title = result.title.clone();
+        // docProps/core.xml only exists for docx/pptx (both OOXML zip
+        // packages); csv is plain text and has no such part — skip the
+        // zip-open attempt for it entirely.
+        let core_props = if ext == "csv" {
+            None
+        } else {
+            read_core_properties(probe.bytes())
+        };
+
+        // Title precedence is explicit-over-heuristic: core.xml's dc:title,
+        // trimmed and non-empty, wins over anytomd's derived title outright
+        // — even for a stale placeholder like Word's default "Document1"
+        // (a *quality-aware* precedence would prefer a good heading instead,
+        // but that tradeoff is deliberately not made here; see
+        // extract/tests/metadata_extraction.rs's docx-junk-title case).
+        // Empty/whitespace dc:title (`<dc:title/>`) is already normalized to
+        // `None` by `office_metadata::parse_core_properties`, so it falls
+        // through to anytomd's title with no special-casing needed here.
+        let core_title = core_props.as_ref().and_then(|p| p.title.clone());
+        let title = core_title.or_else(|| result.title.clone());
+
+        let (date, date_source) = match core_props.and_then(|p| p.created) {
+            Some(created) => (Some(created), Some("office-core-properties".to_string())),
+            None => (None, None),
+        };
+
         let dc = DublinCoreMetadata {
             title: title.clone(),
+            date,
+            date_source,
             format: probe.sniffed_mime.map(|s| s.to_string()),
             ..DublinCoreMetadata::default()
         };

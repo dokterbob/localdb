@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Broken JSON-LD Must Not Crash</title>
+<meta property="article:published_time" content="2019-11-11T00:00:00Z">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "Article",
+  "headline": "Broken JSON-LD Must Not Crash",
+  "datePublished": "2020-01-01T00:00:00Z",
+  "author": {
+    "@type": "Person",
+    "name": "Trailing Comma Strikes Again",
+  },
+}
+</script>
+</head>
+<body>
+<article>
+<h1>Broken JSON-LD Must Not Crash</h1>
+<p>The <code>ld+json</code> block above has trailing commas after the
+author name and after the author object, which is invalid JSON (real-world
+CMS templating bugs produce exactly this). A valid
+<code>article:published_time</code> meta tag (2019-11-11) is also present
+as a fallback. This probes that a JSON parse failure is caught and does not
+crash extraction, and that the extractor still falls back to the meta tag
+instead of losing the date entirely.</p>
+</article>
+</body>
+</html>

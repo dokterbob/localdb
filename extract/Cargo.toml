@@ -21,6 +21,8 @@ pulldown-cmark = "0.13"
 
 # HTML parsing
 scraper = "0.27"
+# JSON-LD (script[type="application/ld+json"]) date extraction (issue #251).
+serde_json = { workspace = true }
 
 # PDF text extraction and Markdown conversion.
 # Exact-pinned: 0.3.x is pre-1.0 with rapid API churn; bump deliberately, with
@@ -37,10 +39,21 @@ mime_guess = "2"
 # EPUB parsing — read-only, so default features (write/threadsafe/prelude) are off.
 rbook = { version = "0.7", default-features = false }
 
-tracing = { workspace = true }
+# BOM-sniffing UTF-8/UTF-16LE/UTF-16BE decode for docProps/core.xml (issue
+# #251): some producers write it as UTF-16. Already transitive at 0.8.35 via
+# pdf_oxide/anytomd; the bare "0.8" range is compatible with that pin.
+encoding_rs = "0.8"
 
-[dev-dependencies]
-# Used in tests to build synthetic EPUBs (already in the lockfile via rbook).
-zip = { version = "2", default-features = false, features = ["deflate"] }
-# Corpus test (tests/corpus.rs) reads expectation JSON files.
-serde_json = { workspace = true }
+# Office (docx/pptx) docProps/core.xml extraction (issue #251). Exact-pinned
+# to rbook's already-compiled 0.40.1 so only ONE quick-xml major ships in the
+# binary — a bare "0.40" would let cargo pick a different 0.40.x that still
+# happens to satisfy rbook's own requirement, but pinning removes the
+# ambiguity outright.
+quick-xml = "=0.40.1"
+# docx/pptx are zip containers; promoted from a test-only dev-dependency
+# (issue #251) to open docProps/core.xml at extraction time. Pinned to major
+# 8 to match rbook's transitive zip 8.6.0 — the 2.x pin previously used only
+# in tests would otherwise compile two zip majors into the binary.
+zip = { version = "8", default-features = false, features = ["deflate"] }
+
+tracing = { workspace = true }

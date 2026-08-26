@@ -4,6 +4,7 @@ pub mod epub;
 pub mod html;
 pub mod markdown;
 pub mod office;
+mod office_metadata;
 pub mod pdf;
 pub mod plaintext;
 

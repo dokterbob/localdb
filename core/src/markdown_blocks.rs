@@ -551,7 +551,11 @@ pub fn compute_blocks_hash(blocks: &[Block]) -> String {
 /// delimiters and `rest` is everything after the closing `---\n` (or `---`
 /// at end-of-file).  Returns `(None, markdown)` if no front-matter is
 /// present.
-fn extract_frontmatter(markdown: &str) -> (Option<String>, &str) {
+///
+/// `pub` so `extract::markdown` can do a second, independent read of the
+/// front-matter body to scan for a `date:` key (issue #251) — this function
+/// only carves the block out; it does not change what block-carving does.
+pub fn extract_frontmatter(markdown: &str) -> (Option<String>, &str) {
     // Determine the opening delimiter length (LF or CRLF).
     let open_len = if markdown.starts_with("---\r\n") {
         5
