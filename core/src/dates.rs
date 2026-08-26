@@ -57,25 +57,19 @@ pub fn parse_partial_iso8601(raw: &str) -> Option<String> {
     }
 
     // ---- -MM ----
-    if bytes.len() < 7 || bytes[4] != b'-' || !bytes[5..7].iter().all(u8::is_ascii_digit) {
+    if bytes.len() < 7 || bytes[4] != b'-' {
         return None;
     }
-    let month: u32 = s[5..7].parse().ok()?;
-    if !(1..=12).contains(&month) {
-        return None;
-    }
+    let month = digits_in_range(&s[5..7], 1, 12)?;
     if bytes.len() == 7 {
         return Some(format!("{year}-{month:02}"));
     }
 
     // ---- -DD ----
-    if bytes.len() < 10 || bytes[7] != b'-' || !bytes[8..10].iter().all(u8::is_ascii_digit) {
+    if bytes.len() < 10 || bytes[7] != b'-' {
         return None;
     }
-    let day: u32 = s[8..10].parse().ok()?;
-    if !(1..=31).contains(&day) {
-        return None;
-    }
+    let day = digits_in_range(&s[8..10], 1, 31)?;
     let date_str = format!("{year}-{month:02}-{day:02}");
     if bytes.len() == 10 {
         return Some(date_str);
@@ -92,6 +86,18 @@ pub fn parse_partial_iso8601(raw: &str) -> Option<String> {
     }
 }
 
+/// Parse a fixed-width numeric component: fails closed (`None`) unless every
+/// byte of `s` is an ASCII digit, the parsed value fits `u32`, and it falls
+/// within `[lo, hi]` inclusive. Shared by every date/time/offset component
+/// below — each is the same "all-digits, then parse, then range-check" shape.
+fn digits_in_range(s: &str, lo: u32, hi: u32) -> Option<u32> {
+    if !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let value: u32 = s.parse().ok()?;
+    (lo..=hi).contains(&value).then_some(value)
+}
+
 /// Validate (without extracting) the `HH:MM:SS[.fraction](Z|±HH:MM)` tail of
 /// a full RFC 3339 datetime. Discarded on success — `date_parsed` only ever
 /// keeps the date prefix — but validated so trailing garbage still fails the
@@ -101,26 +107,14 @@ fn validate_time_and_offset(rest: &str) -> bool {
     if bytes.len() < 8 {
         return false;
     }
-    if !bytes[0..2].iter().all(u8::is_ascii_digit) || bytes[2] != b':' {
+    if bytes[2] != b':' || bytes[5] != b':' {
         return false;
     }
-    if !bytes[3..5].iter().all(u8::is_ascii_digit) || bytes[5] != b':' {
-        return false;
-    }
-    if !bytes[6..8].iter().all(u8::is_ascii_digit) {
-        return false;
-    }
-    let Ok(hour) = rest[0..2].parse::<u32>() else {
-        return false;
-    };
-    let Ok(minute) = rest[3..5].parse::<u32>() else {
-        return false;
-    };
     // 60 tolerates a leap second; RFC 3339 permits it.
-    let Ok(second) = rest[6..8].parse::<u32>() else {
-        return false;
-    };
-    if hour > 23 || minute > 59 || second > 60 {
+    if digits_in_range(&rest[0..2], 0, 23).is_none()
+        || digits_in_range(&rest[3..5], 0, 59).is_none()
+        || digits_in_range(&rest[6..8], 0, 60).is_none()
+    {
         return false;
     }
 
@@ -139,25 +133,22 @@ fn validate_time_and_offset(rest: &str) -> bool {
         return false; // no offset at all — not a complete RFC 3339 datetime
     }
 
+    validate_offset(rest, idx)
+}
+
+/// Validate the offset suffix (`Z`/`z`, or `±HH:MM`) of a full RFC 3339
+/// datetime, starting at byte index `idx` of `rest`.
+fn validate_offset(rest: &str, idx: usize) -> bool {
+    let bytes = rest.as_bytes();
     match bytes[idx] {
         b'Z' | b'z' => idx + 1 == bytes.len(),
         b'+' | b'-' => {
             let off = &rest[idx + 1..];
-            let ob = off.as_bytes();
-            if ob.len() != 5
-                || !ob[0..2].iter().all(u8::is_ascii_digit)
-                || ob[2] != b':'
-                || !ob[3..5].iter().all(u8::is_ascii_digit)
-            {
+            if off.len() != 5 || off.as_bytes()[2] != b':' {
                 return false;
             }
-            let Ok(off_hour) = off[0..2].parse::<u32>() else {
-                return false;
-            };
-            let Ok(off_minute) = off[3..5].parse::<u32>() else {
-                return false;
-            };
-            off_hour <= 23 && off_minute <= 59
+            digits_in_range(&off[0..2], 0, 23).is_some()
+                && digits_in_range(&off[3..5], 0, 59).is_some()
         }
         _ => false,
     }
