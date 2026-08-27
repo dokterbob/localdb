@@ -134,7 +134,6 @@ behind, ahead, or predates the migration framework (exit 2) rather than silently
 | [VISION.md](VISION.md)                                     | Long-horizon direction: peer-to-peer store sharing                                        |
 | [skills/localdb/SKILL.md](skills/localdb/SKILL.md)         | Agent skill definition for localdb-aware AI assistants                                    |
 | [CONTRIBUTING.md](CONTRIBUTING.md)                         | Development setup, test gates, contribution guidelines                                    |
-| [docs/design-decisions.md](docs/design-decisions.md)       | Open design questions with options and recommendations                                    |
 
 ---
 

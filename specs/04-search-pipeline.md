@@ -179,7 +179,8 @@ reproduction of the printed page:
 
 Geometric stripping of running headers in _untagged_ PDFs is **not** enabled: the upstream
 implementation matches glyph-run spans rather than lines and deletes body text from multi-column
-documents. See `docs/followups-pdf-oxide-swap.md`.
+documents. Reported upstream as
+[pdf_oxide#1022](https://github.com/yfedoseev/pdf_oxide/issues/1022).
 
 **Out of scope (explicit):** OCR / scanned PDFs and images. EPUB is the only ebook format supported;
 **MOBI/AZW/AZW3** (PalmDOC/KF8 compression, frequent DRM — realistically need a Calibre shell-out)

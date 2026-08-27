@@ -74,7 +74,6 @@ title: localdb docs
     <a href="{{ '/http-api.html' | relative_url }}">HTTP API</a>
     <a href="{{ '/migrations.html' | relative_url }}">Migrations</a>
     <a href="{{ '/comparison.html' | relative_url }}">Comparison</a>
-    <a href="{{ '/design-decisions.html' | relative_url }}">Design decisions</a>
     <a href="{{ '/release-engineering.html' | relative_url }}">Release engineering</a>
   </div>
 </section>

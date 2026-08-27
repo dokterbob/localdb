@@ -172,7 +172,7 @@ fn retrieval_conversion_options() -> ConversionOptions {
         //     → "As representatives  consortium that produces the  apparent evidence"
         // Silent mid-sentence word loss is far worse than an indexed running
         // header, so we take the artifact-tag path only until this is fixed
-        // upstream. See docs/followups-pdf-oxide-swap.md.
+        // upstream. Reported upstream as pdf_oxide#1022.
         //
         // ﬁ/ﬂ/ﬀ/ﬃ/ﬄ (U+FB00–U+FB06) → fi/fl/ff/ffi/ffl, so BM25 tokenization
         // and the embedder see real words. pdf_oxide defaults this off to
