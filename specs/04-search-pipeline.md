@@ -177,6 +177,13 @@ reproduction of the printed page:
   `heading_path` breadcrumb for every following chunk), and a bare fence whose content reads as
   prose is un-fenced. Both guards are biased hard against false positives.
 
+Unmappable glyphs never reach the index as mojibake. A Type0/Identity-H font carrying no
+`/ToUnicode` CMap and no embedded font program gives the extractor no way to recover characters, so
+extraction either fails outright or returns text containing no U+FFFD replacement characters — it
+never emits the replacement-character soup that leaves a document looking indexed while being
+unsearchable. `extract/tests/fixtures/malformed/cid_no_tounicode.pdf` pins the single-document case,
+and the corpus test forbids U+FFFD across every fixture.
+
 Geometric stripping of running headers in _untagged_ PDFs is **not** enabled: the upstream
 implementation matches glyph-run spans rather than lines and deletes body text from multi-column
 documents. Reported upstream as
