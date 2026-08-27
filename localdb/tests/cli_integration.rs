@@ -2514,26 +2514,41 @@ fn two_concurrent_store_list_calls_both_succeed() {
     let config_path = dir.path().join("config.yaml");
     let binary = env!("CARGO_BIN_EXE_localdb");
 
-    let mut child1 = std::process::Command::new(binary)
+    let child1 = std::process::Command::new(binary)
         .env("LOCALDB_CONFIG", &config_path)
         .args(["store", "list"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn child1");
-    let mut child2 = std::process::Command::new(binary)
+    let child2 = std::process::Command::new(binary)
         .env("LOCALDB_CONFIG", &config_path)
         .args(["store", "list"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn child2");
 
-    let s1 = child1.wait().expect("wait child1");
-    let s2 = child2.wait().expect("wait child2");
+    // Both children are spawned above before either is waited on, so they
+    // still run concurrently; `wait_with_output` consumes each child but
+    // that's fine now that both are already running.
+    let o1 = child1.wait_with_output().expect("wait child1");
+    let o2 = child2.wait_with_output().expect("wait child2");
 
-    assert!(s1.success(), "first store list failed: {:?}", s1.code());
-    assert!(s2.success(), "second store list failed: {:?}", s2.code());
+    assert!(
+        o1.status.success(),
+        "first store list failed: exit={:?} stdout={} stderr={}",
+        o1.status.code(),
+        String::from_utf8_lossy(&o1.stdout),
+        String::from_utf8_lossy(&o1.stderr),
+    );
+    assert!(
+        o2.status.success(),
+        "second store list failed: exit={:?} stdout={} stderr={}",
+        o2.status.code(),
+        String::from_utf8_lossy(&o2.stdout),
+        String::from_utf8_lossy(&o2.stderr),
+    );
 }
 
 /// With a minimal valid config (version: 1 + temp data dir, no `stores:` key, no embedder
