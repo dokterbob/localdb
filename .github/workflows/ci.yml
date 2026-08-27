@@ -19,8 +19,42 @@ env:
 # in the log rather than folded into the first cargo command.
 
 jobs:
+  # Detects whether a pull request touches anything besides docs/specs/markdown.
+  # `code` is true iff at least one changed file falls outside that set — the
+  # gated cargo jobs below skip when it's false, and a skipped required job
+  # reports "skipped" to branch protection, which counts as passing. This only
+  # narrows `pull_request` runs: push events (main, ticket/**) always run
+  # every job, gated or not, since `github.event_name != 'pull_request'` short-
+  # circuits the `if:` on push before `needs.changes.outputs.code` is read.
+  # The docs-ish path list below is conceptually the mirror image of
+  # pages.yml's `paths:` trigger (docs/specs/markdown vs. docs-only) — no
+  # shared source, keep the two in sync by hand.
+  changes:
+    name: Detect changed files
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Filter changed paths
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          predicate-quantifier: every
+          filters: |
+            code:
+              - '!docs/**'
+              - '!specs/**'
+              - '!**/*.md'
+              - '!lychee.toml'
+
   fmt:
     name: Formatting
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,6 +65,8 @@ jobs:
 
   clippy:
     name: Clippy
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -62,6 +98,8 @@ jobs:
 
   test:
     name: Tests
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -99,6 +137,8 @@ jobs:
 
   coreml:
     name: CoreML backend (macOS)
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -160,6 +200,8 @@ jobs:
   # If tests are removed, coverage will drop and the coverage job will fail.
   build-all-platforms:
     name: Cross-compile check (${{ matrix.target }})
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
