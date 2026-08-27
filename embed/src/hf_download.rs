@@ -26,11 +26,13 @@
 use std::{
     io::Write,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use futures_util::StreamExt;
 use tracing::info;
 
+use crate::blocking_retry::retry_blocking;
 use crate::error::EmbedError;
 
 // ---------------------------------------------------------------------------
@@ -171,32 +173,19 @@ pub(crate) async fn ensure_files(
 // Blocking shim
 // ---------------------------------------------------------------------------
 
-/// Synchronously download model files, bridging from sync callers into async.
-///
-/// Checks `sentinel_relpath` (e.g. `"onnx/model_quantized.onnx"`) before
-/// spinning up a runtime; returns immediately if the sentinel already exists.
-///
-/// Handles three runtime contexts:
+/// One attempt at downloading every required/optional file in `spec` into
+/// `model_dir`, bridging from a sync caller into async. Handles three runtime
+/// contexts:
 ///
 /// 1. **Multi-thread tokio**: `block_in_place` to avoid blocking the worker.
 /// 2. **Current-thread tokio**: spawns a dedicated thread with its own runtime
 ///    to avoid nesting `block_on` calls.
 /// 3. **No runtime**: builds a fresh current-thread runtime inline.
-pub(crate) fn download_blocking(
+fn download_attempt(
     model_dir: &Path,
-    sentinel_relpath: &str,
     spec: &'static HfSpec,
     show_progress: bool,
 ) -> Result<(), EmbedError> {
-    // Split on '/' so this works cross-platform (avoid Path::join on a literal
-    // that already contains the separator).
-    let sentinel = sentinel_relpath
-        .split('/')
-        .fold(model_dir.to_path_buf(), |acc, part| acc.join(part));
-    if sentinel.exists() {
-        return Ok(());
-    }
-
     // Capture model_dir as owned for the move closures below.
     let model_dir_owned: PathBuf = model_dir.to_path_buf();
 
@@ -224,6 +213,38 @@ pub(crate) fn download_blocking(
             .map_err(|e| EmbedError::Internal(format!("create tokio runtime: {e}")))?
             .block_on(ensure_files(600, spec, model_dir, show_progress)),
     }
+}
+
+/// Synchronously download model files, bridging from sync callers into async.
+///
+/// Checks `sentinel_relpath` (e.g. `"onnx/model_quantized.onnx"`) before
+/// spinning up a runtime; returns immediately if the sentinel already exists.
+///
+/// Retries the whole attempt a few times with a short pause on failure:
+/// `download_file` skips any file that already landed on disk, so a retry
+/// after a transient failure (a dropped connection partway through a
+/// multi-hundred-MB model) only re-fetches the file that failed rather than
+/// starting over.
+pub(crate) fn download_blocking(
+    model_dir: &Path,
+    sentinel_relpath: &str,
+    spec: &'static HfSpec,
+    show_progress: bool,
+) -> Result<(), EmbedError> {
+    // Split on '/' so this works cross-platform (avoid Path::join on a literal
+    // that already contains the separator).
+    let sentinel = sentinel_relpath
+        .split('/')
+        .fold(model_dir.to_path_buf(), |acc, part| acc.join(part));
+    if sentinel.exists() {
+        return Ok(());
+    }
+
+    retry_blocking(
+        3,
+        |attempt| Duration::from_secs(if attempt == 0 { 1 } else { 2 }),
+        || download_attempt(model_dir, spec, show_progress),
+    )
 }
 
 // ---------------------------------------------------------------------------

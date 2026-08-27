@@ -47,6 +47,9 @@ pub mod retry;
 pub mod voyage;
 
 #[cfg(feature = "local-onnx")]
+mod blocking_retry;
+
+#[cfg(feature = "local-onnx")]
 pub mod hf_download;
 
 #[cfg(feature = "local-onnx")]
