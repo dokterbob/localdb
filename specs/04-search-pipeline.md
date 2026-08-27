@@ -459,6 +459,15 @@ Silicon, 16 GB): index a ~2 000-file / ~100 MB mixed corpus. **Gate:** sustained
 end-to-end and first-index ≤ 30 min; if missed, the bge-small-class preset becomes the default and
 the 0.6b model the opt-in quality preset. Either outcome is config, not architecture.
 
+### Real-corpus reference point
+
+The gate above is a synthetic target. For a sense of what a real store looks like, an actual
+PDF-heavy mixed corpus of **1 063 documents indexes to roughly 642 000 chunks** — on the order of
+600 chunks per document. That ratio, not the document count, is what sets the cost of a full
+reindex: anything that changes `policy_version` re-embeds every one of those chunks, so on a store
+this size a policy or chunking-algorithm bump is a substantial one-time operation to be scheduled
+rather than triggered casually.
+
 ### Policy versioning
 
 `policy_version = hash(canonical serialization of the store's effective {chunking, embedding, parsers})`.
