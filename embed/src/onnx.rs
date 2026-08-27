@@ -28,12 +28,14 @@
 
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use localdb_core::{DocumentChunks, EmbeddedDocument, Embedder, Error as CoreError};
 use tracing::info;
 
+use crate::blocking_retry::retry_blocking;
 use crate::error::EmbedError;
 
 /// Model choice for the fastembed-backed local ONNX embedder.
@@ -106,16 +108,24 @@ impl OnnxEmbedder {
             "loading ONNX embedding model"
         );
 
-        let fastembed_model = model_choice.to_fastembed_model();
-
-        let mut opts = TextInitOptions::new(fastembed_model)
-            .with_show_download_progress(show_download_progress);
-
-        if let Some(dir) = cache_dir {
-            opts = opts.with_cache_dir(dir);
-        }
-
-        let model = TextEmbedding::try_new(opts).map_err(|e| {
+        // First-run model loading downloads the model from HuggingFace; a single
+        // dropped connection mid-download would otherwise fail the whole
+        // operation. Retry a few times with a short pause rather than fail on
+        // the first transient hiccup — `TextInitOptions` isn't `Clone`, so each
+        // attempt rebuilds it from the captured (`Copy`/cheaply-cloned) inputs.
+        let model = retry_blocking(
+            3,
+            |attempt| Duration::from_secs(if attempt == 0 { 1 } else { 2 }),
+            || {
+                let mut opts = TextInitOptions::new(model_choice.to_fastembed_model())
+                    .with_show_download_progress(show_download_progress);
+                if let Some(dir) = cache_dir.clone() {
+                    opts = opts.with_cache_dir(dir);
+                }
+                TextEmbedding::try_new(opts)
+            },
+        )
+        .map_err(|e| {
             EmbedError::ModelMissing(format!(
                 "failed to load ONNX model '{}': {e}. \
                  Run `localdb init --download-model` to download models, or ensure the model cache is populated.",
@@ -206,31 +216,50 @@ impl Embedder for OnnxEmbedder {
 mod tests {
     use super::*;
     use localdb_core::{DocumentChunks, Embedder};
-    use tempfile::TempDir;
+    use std::path::Path;
 
-    /// Helper: create an ONNX embedder with a temp cache dir.
-    ///
-    /// Downloads the model if not already cached.
-    fn make_embedder() -> (TempDir, OnnxEmbedder) {
-        let dir = TempDir::new().unwrap();
-        let embedder = OnnxEmbedder::new(
+    /// Cache dir shared by every test in this module, under the crate's own
+    /// `target/` directory rather than a fresh temp dir per test. All of these
+    /// tests load the same `bge-small-en-v1.5` model, so a shared, persistent
+    /// location means the model is downloaded from HuggingFace at most once per
+    /// machine instead of once per test — and, being under `target/`, it rides
+    /// along with any cache already keyed on that directory.
+    fn shared_test_cache_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/onnx-test-model-cache")
+    }
+
+    /// Serializes embedder construction across this module's tests. With a
+    /// cold shared cache, multiple tests would otherwise race to download the
+    /// same model files into the same directory at once; the fastembed/hf-hub
+    /// cache locking underneath does not handle that gracefully (see
+    /// `pplx_context_coreml.rs`'s note on the same failure mode with a
+    /// different model). Poison is treated as a non-issue: a panic inside one
+    /// test while holding the lock should not fail unrelated tests.
+    static MODEL_LOAD_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Helper: create an ONNX embedder backed by the shared on-disk test model
+    /// cache, downloading the model only if it isn't already cached there.
+    fn make_embedder() -> OnnxEmbedder {
+        let _guard = MODEL_LOAD_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        OnnxEmbedder::new(
             ModelChoice::BgeSmallEnV15,
-            Some(dir.path().to_path_buf()),
+            Some(shared_test_cache_dir()),
             false,
         )
-        .expect("ONNX embedder should load BGE Small model");
-        (dir, embedder)
+        .expect("ONNX embedder should load BGE Small model")
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn onnx_embedder_returns_correct_dim() {
-        let (_dir, embedder) = make_embedder();
+        let embedder = make_embedder();
         assert_eq!(embedder.embedding_dim(), 384, "BGE Small EN has 384 dims");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn onnx_embedder_returns_correct_shape() {
-        let (_dir, embedder) = make_embedder();
+        let embedder = make_embedder();
 
         let docs = vec![DocumentChunks {
             document_context: "Test document about Rust programming".to_string(),
@@ -249,7 +278,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn onnx_embedder_is_deterministic() {
-        let (_dir, embedder) = make_embedder();
+        let embedder = make_embedder();
 
         let docs = vec![DocumentChunks {
             document_context: "ctx".to_string(),
@@ -264,7 +293,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn onnx_embedder_distinct_texts_produce_distinct_vectors() {
-        let (_dir, embedder) = make_embedder();
+        let embedder = make_embedder();
 
         let docs = vec![DocumentChunks {
             document_context: "ctx".to_string(),
@@ -283,7 +312,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn onnx_embedder_similar_texts_are_closer() {
-        let (_dir, embedder) = make_embedder();
+        let embedder = make_embedder();
 
         let docs = vec![DocumentChunks {
             document_context: "ctx".to_string(),
@@ -321,14 +350,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn onnx_embedder_empty_docs() {
-        let (_dir, embedder) = make_embedder();
+        let embedder = make_embedder();
         let result = embedder.embed_documents(vec![]).await.unwrap();
         assert!(result.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn onnx_embedder_multi_doc() {
-        let (_dir, embedder) = make_embedder();
+        let embedder = make_embedder();
 
         let docs = vec![
             DocumentChunks {
