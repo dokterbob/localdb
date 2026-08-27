@@ -110,7 +110,10 @@ jobs:
   test:
     name: Tests
     needs: changes
-    if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' || needs.changes.outputs.test_inputs == 'true'
+    if: >-
+      github.event_name != 'pull_request' ||
+      needs.changes.outputs.code == 'true' ||
+      needs.changes.outputs.test_inputs == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
