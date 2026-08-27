@@ -37,6 +37,7 @@ jobs:
       pull-requests: read
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      test_inputs: ${{ steps.filter.outputs.test_inputs }}
     steps:
       - uses: actions/checkout@v4
       - name: Filter changed paths
@@ -44,12 +45,22 @@ jobs:
         uses: dorny/paths-filter@v3
         with:
           predicate-quantifier: every
+          # `code`: true when any changed file lies outside the docs-ish set.
+          # Only root-level `*.md` is excluded — markdown elsewhere (e.g.
+          # `extract/tests/fixtures/*.md`) is baked into test binaries via
+          # `include_bytes!` and must count as code.
+          # `test_inputs`: spec files that tests read at runtime
+          # (mcp/tests/spec_conformance.rs reads specs/05-surfaces.md), so a
+          # change to them must still run the Tests job even though `specs/**`
+          # is otherwise docs-only.
           filters: |
             code:
               - '!docs/**'
               - '!specs/**'
-              - '!**/*.md'
+              - '!*.md'
               - '!lychee.toml'
+            test_inputs:
+              - 'specs/05-surfaces.md'
 
   fmt:
     name: Formatting
@@ -99,7 +110,7 @@ jobs:
   test:
     name: Tests
     needs: changes
-    if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
+    if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' || needs.changes.outputs.test_inputs == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
