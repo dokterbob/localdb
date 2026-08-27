@@ -449,15 +449,21 @@ extraction defect (see
   multi-column layout the first line of every column falls in that band and any short fragment
   recurring there is deleted from the body text — measured at −2.2% of characters on a two-column
   corpus fixture. Reported upstream as
-  [pdf_oxide#1022](https://github.com/yfedoseev/pdf_oxide/issues/1022). **10. Feed sources are
-  exempt from the delete-sweep — there is no entry pruning.** A feed exposes only its most recent
-  entries, so an entry falling out of the feed does not mean it was deleted upstream: treating it as
-  a delete would wipe most of a feed's indexed history on a normal fetch, and a feed `304` (or a
-  transient empty parse) would zero out every entry in one sweep. The ingestion pipeline's
-  delete-sweep therefore skips `ingestor_kind = feed` sources entirely — entries once indexed stay
-  indexed indefinitely, even after they scroll off the feed, until the whole source is removed
-  (`source remove`, which still cascades normally). Pruning truly-dead entry URLs (404/410) is a
-  follow-up issue.
+  [pdf_oxide#1022](https://github.com/yfedoseev/pdf_oxide/issues/1022).
+- **Over-tagged artifacts are dropped silently.** Dropping `/Artifact`-tagged spans is the one
+  setting under which a correctly parsed span is discarded on purpose, so a producer that tags body
+  content as an artifact loses it with no warning. No corpus fixture covers that case. The trade is
+  deliberate: it needs a broken producer, whereas indexing running headers and page-number folios as
+  content happened on every well-formed tagged PDF.
+
+**10. Feed sources are exempt from the delete-sweep — there is no entry pruning.** A feed exposes
+only its most recent entries, so an entry falling out of the feed does not mean it was deleted
+upstream: treating it as a delete would wipe most of a feed's indexed history on a normal fetch, and
+a feed `304` (or a transient empty parse) would zero out every entry in one sweep. The ingestion
+pipeline's delete-sweep therefore skips `ingestor_kind = feed` sources entirely — entries once
+indexed stay indexed indefinitely, even after they scroll off the feed, until the whole source is
+removed (`source remove`, which still cascades normally). Pruning truly-dead entry URLs (404/410) is
+a follow-up issue.
 
 **11. Conditional-GET state (`ETag`) is captured only when a feed entry link is fetched, and even
 then it's never read back and reused; `Last-Modified` is not persisted at all.** `capture_etag` on

@@ -155,6 +155,15 @@ fn retrieval_conversion_options() -> ConversionOptions {
         // numbers, watermarks. Spec-correct per ISO 32000-1 §14.8.2.2.1 —
         // pdf_oxide only defaults this on for backward compatibility. Handles
         // *tagged* PDFs, where the producer marked the furniture for us.
+        //
+        // Accepted risk: this is the one setting under which a correctly
+        // parsed span is dropped on purpose, so a producer that *over-tags*
+        // body content as `/Artifact` — a real-world tagging bug — loses that
+        // content silently. No corpus fixture exercises an over-tagged PDF;
+        // add one if such a document turns up. The trade is deliberate: the
+        // failure needs a broken producer, whereas indexing running headers
+        // and page-number folios as content happened on every well-formed
+        // tagged PDF.
         include_artifacts: false,
         // NOT enabled: `strip_running_headers_footers: true`.
         //
