@@ -6,6 +6,11 @@ on:
     paths:
       - "docs/**"
       - ".github/workflows/pages.yml"
+  pull_request:
+    paths:
+      - "docs/**"
+      - ".github/workflows/pages.yml"
+      - "lychee.toml"
   workflow_dispatch:
 
 permissions:
@@ -14,7 +19,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: pages
+  group: pages-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -25,35 +30,52 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Configure Pages
+        id: pages
         uses: actions/configure-pages@v5
       - name: Build with Jekyll
         uses: actions/jekyll-build-pages@v1
         with:
           source: docs
           destination: _site
+      - name: Stage site under its base path
+        # Jekyll writes to `_site` at the repo root, but the pages served
+        # under `configure-pages`' `base_path` (e.g. `/localdb`) contain
+        # root-relative links like `/localdb/architecture.html` — lychee can
+        # only resolve a root-relative link against a `--root-dir`, and that
+        # root-dir has to actually contain the `base_path` prefix on disk for
+        # the resolved path to exist. Moving `_site` under
+        # `site-root<base_path>` makes `site-root` that root-dir.
+        run: |
+          target="site-root${{ steps.pages.outputs.base_path }}"
+          mkdir -p "$(dirname "$target")"
+          mv _site "$target"
       - name: Check links (built site)
-        # Runs only here, not in ci.yml's offline pass: this checks external
-        # links too (no --offline), and only after Jekyll has resolved the
-        # `_site/**/*.html` Liquid templating that ci.yml's source-only pass
-        # deliberately skips (docs/index.md, docs/_layouts/**). This job only
-        # runs on main-branch pushes/dispatch, so external-link flakiness never
-        # blocks a PR.
+        # Runs here, not in ci.yml's offline `link-check` job: this checks
+        # after Jekyll has resolved the Liquid templating that ci.yml's
+        # source-only pass deliberately skips (docs/index.md,
+        # docs/_layouts/**), and it resolves root-relative links via
+        # `--root-dir` against the staged `site-root` tree (see previous
+        # step). On `push`/`workflow_dispatch` it also checks external links
+        # (no `--offline`); on `pull_request` it stays offline so a
+        # rate-limited external site never blocks a PR — root-relative
+        # resolution is exercised either way.
         uses: lycheeverse/lychee-action@v2
         with:
-          # `_site` lands at the repo root (destination: _site above, relative
-          # to the default working directory), so the default workingDirectory
-          # ('.') already covers it — no override needed.
           args: >-
+            ${{ github.event_name == 'pull_request' && '--offline' || '' }}
             --include-fragments --no-progress
-            '_site/**/*.html'
+            --root-dir "${{ github.workspace }}/site-root"
+            'site-root/**/*.html'
       - name: Upload artifact
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         uses: actions/upload-pages-artifact@v3
         with:
-          path: _site
+          path: site-root${{ steps.pages.outputs.base_path }}
 
   deploy:
     name: Deploy docs
     needs: build
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
