@@ -415,13 +415,11 @@ async fn upsert_chunks_inner(
 ///
 /// When `replaces_resource_id` is `Some(old_id)`, the old document's chunks
 /// and blocks are deleted **inside this same transaction**, before the new
-/// records are inserted (issue #79). This closes the residual same-run
-/// window from the A6 design decision (`docs/design-decisions.md`):
-/// previously the replace delete ran in its own transaction, so a write
-/// failure in the upsert that followed left the old chunks gone for the rest
-/// of the run. Folding the delete into this transaction means a failure
-/// anywhere below rolls back everything and leaves the old resource intact
-/// and searchable.
+/// records are inserted. A replace delete in its own separate transaction
+/// would leave the old chunks gone for the rest of the run if the upsert
+/// that followed then failed. Folding the delete into this transaction
+/// means a failure anywhere below rolls back everything and leaves the old
+/// resource intact and searchable.
 ///
 /// Whether the old `resources` row itself is deleted depends on whether
 /// `old_id` names the *same* resource being written here (a policy-only

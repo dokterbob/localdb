@@ -444,17 +444,26 @@ extraction defect (see
   concatenation is also a word (`a bout`/`about`, `in to`/`into`, `any one`/`anyone`), and
   misjoining those silently changes meaning. Tracked separately.
 - **Untagged running headers survive.** Artifact-tagged furniture is dropped, but a PDF that does
-  not tag its running heads keeps them. The upstream geometric stripper is unsafe (it deletes body
-  text from multi-column documents) — see
-  [docs/followups-pdf-oxide-swap.md](followups-pdf-oxide-swap.md) §2a. **10. Feed sources are exempt
-  from the delete-sweep — there is no entry pruning.** A feed exposes only its most recent entries,
-  so an entry falling out of the feed does not mean it was deleted upstream: treating it as a delete
-  would wipe most of a feed's indexed history on a normal fetch, and a feed `304` (or a transient
-  empty parse) would zero out every entry in one sweep. The ingestion pipeline's delete-sweep
-  therefore skips `ingestor_kind = feed` sources entirely — entries once indexed stay indexed
-  indefinitely, even after they scroll off the feed, until the whole source is removed
-  (`source remove`, which still cascades normally). Pruning truly-dead entry URLs (404/410) is a
-  follow-up issue.
+  not tag its running heads keeps them. The upstream geometric stripper is unsafe: it matches
+  glyph-run spans against the top/bottom 15% of the page rather than assembled lines, so in a
+  multi-column layout the first line of every column falls in that band and any short fragment
+  recurring there is deleted from the body text — measured at −2.2% of characters on a two-column
+  corpus fixture. Reported upstream as
+  [pdf_oxide#1022](https://github.com/yfedoseev/pdf_oxide/issues/1022).
+- **Over-tagged artifacts are dropped silently.** Dropping `/Artifact`-tagged spans is the one
+  setting under which a correctly parsed span is discarded on purpose, so a producer that tags body
+  content as an artifact loses it with no warning. No corpus fixture covers that case. The trade is
+  deliberate: it needs a broken producer, whereas indexing running headers and page-number folios as
+  content happened on every well-formed tagged PDF.
+
+**10. Feed sources are exempt from the delete-sweep — there is no entry pruning.** A feed exposes
+only its most recent entries, so an entry falling out of the feed does not mean it was deleted
+upstream: treating it as a delete would wipe most of a feed's indexed history on a normal fetch, and
+a feed `304` (or a transient empty parse) would zero out every entry in one sweep. The ingestion
+pipeline's delete-sweep therefore skips `ingestor_kind = feed` sources entirely — entries once
+indexed stay indexed indefinitely, even after they scroll off the feed, until the whole source is
+removed (`source remove`, which still cascades normally). Pruning truly-dead entry URLs (404/410) is
+a follow-up issue.
 
 **11. Conditional-GET state (`ETag`) is captured only when a feed entry link is fetched, and even
 then it's never read back and reused; `Last-Modified` is not persisted at all.** `capture_etag` on
@@ -587,14 +596,15 @@ needs no new surface: delete the file, and the sweep removes it normally under `
 
 ## Deferred design decisions
 
-Several items surfaced during the v0.1.0 issue sweep require cross-cutting design decisions before
-code can be written. They are documented (with options and recommendations) in
-[docs/design-decisions.md](design-decisions.md):
+Several items surfaced during the v0.1.0 issue sweep need a cross-cutting decision before code can
+be written. Each is tracked as an issue carrying the problem statement, the options, and a
+recommendation:
 
-- **A7**: `policy_version` does not hash resolved per-source chunking parameters.
-- **A8 / B4**: Pagination offset computed but never applied; `total_candidates` is pre-dedup.
-- **B2**: Cross-store deduplication semantics (collapse vs. distinct citations).
-- **B3**: Rerank seam re-attaches store metadata by index position (safe today, unsafe with real
-  reranker).
-- **E1**: Structured MCP tool results (spec-decided, implementation deferred to v0.2.0).
-- **A9-charset**: Allowed character set for store names beyond traversal-safety.
+- **[#47](https://github.com/dokterbob/localdb/issues/47)**: `policy_version` does not hash resolved
+  per-source chunking parameters.
+- **[#95](https://github.com/dokterbob/localdb/issues/95)**: cross-store deduplication semantics —
+  collapse citations sharing a content hash, or keep them distinct.
+- **[#267](https://github.com/dokterbob/localdb/issues/267)**: structured MCP tool results. The spec
+  already decided this; the implementation is what is deferred.
+- **[#268](https://github.com/dokterbob/localdb/issues/268)**: allowed character set for store names
+  beyond traversal-safety.

@@ -177,9 +177,17 @@ reproduction of the printed page:
   `heading_path` breadcrumb for every following chunk), and a bare fence whose content reads as
   prose is un-fenced. Both guards are biased hard against false positives.
 
+Unmappable glyphs never reach the index as mojibake. A Type0/Identity-H font carrying no
+`/ToUnicode` CMap and no embedded font program gives the extractor no way to recover characters, so
+extraction either fails outright or returns text containing no U+FFFD replacement characters — it
+never emits the replacement-character soup that leaves a document looking indexed while being
+unsearchable. `extract/tests/fixtures/malformed/cid_no_tounicode.pdf` pins the single-document case,
+and the corpus test forbids U+FFFD across every fixture.
+
 Geometric stripping of running headers in _untagged_ PDFs is **not** enabled: the upstream
 implementation matches glyph-run spans rather than lines and deletes body text from multi-column
-documents. See `docs/followups-pdf-oxide-swap.md`.
+documents. Reported upstream as
+[pdf_oxide#1022](https://github.com/yfedoseev/pdf_oxide/issues/1022).
 
 **Out of scope (explicit):** OCR / scanned PDFs and images. EPUB is the only ebook format supported;
 **MOBI/AZW/AZW3** (PalmDOC/KF8 compression, frequent DRM — realistically need a Calibre shell-out)
@@ -450,6 +458,15 @@ Before `pplx-embed-context-v1-0.6b` is confirmed as default, measure on a mid-ra
 Silicon, 16 GB): index a ~2 000-file / ~100 MB mixed corpus. **Gate:** sustained ≥ 15 chunks/s
 end-to-end and first-index ≤ 30 min; if missed, the bge-small-class preset becomes the default and
 the 0.6b model the opt-in quality preset. Either outcome is config, not architecture.
+
+### Real-corpus reference point
+
+The gate above is a synthetic target. For a sense of what a real store looks like, an actual
+PDF-heavy mixed corpus of **1 063 documents indexes to roughly 642 000 chunks** — on the order of
+600 chunks per document. That ratio, not the document count, is what sets the cost of a full
+reindex: anything that changes `policy_version` re-embeds every one of those chunks, so on a store
+this size a policy or chunking-algorithm bump is a substantial one-time operation to be scheduled
+rather than triggered casually.
 
 ### Policy versioning
 
