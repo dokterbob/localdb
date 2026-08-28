@@ -3421,6 +3421,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "blake3",
+ "chrono",
  "directories",
  "dirs 6.0.0",
  "globset",
@@ -3518,6 +3519,7 @@ name = "localdb-ingest"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "feed-rs",
  "localdb-core",
  "localdb-extract",

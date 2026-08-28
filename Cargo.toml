@@ -75,6 +75,11 @@ percent-encoding = "2"
 # Hashing for policy_version
 hex = "0.4"
 
+# Date/time: canonical RFC 3339 timestamp formatting/parsing (issue #247).
+# Already resolved transitively (feed-rs/rmcp/schemars all depend on it), so
+# promoting it to a direct dependency adds no new compiled crate to the graph.
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+
 # Progress bars and spinners
 indicatif = "0.17"
 

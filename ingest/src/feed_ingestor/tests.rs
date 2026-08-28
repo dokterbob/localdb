@@ -802,7 +802,7 @@ async fn discovery_mode_fetches_entry_pages_and_enriches_fully() {
     );
     assert_eq!(
         res.metadata.dublin_core().date.as_deref(),
-        Some("2026-01-04T00:00:00+00:00")
+        Some("2026-01-04T00:00:00Z")
     );
 }
 
@@ -1966,13 +1966,10 @@ async fn modified_at_prefers_updated_while_dc_date_prefers_published() {
     let res = &cb.resources[0];
     // modified_at = updated.or(published) (modification semantics);
     // dc.date = published.or(updated) (creation/publication semantics).
-    assert_eq!(
-        res.modified_at.as_deref(),
-        Some("2026-01-05T00:00:00+00:00")
-    );
+    assert_eq!(res.modified_at.as_deref(), Some("2026-01-05T00:00:00Z"));
     assert_eq!(
         res.metadata.dublin_core().date.as_deref(),
-        Some("2026-01-04T00:00:00+00:00")
+        Some("2026-01-04T00:00:00Z")
     );
     assert_ne!(
         Some(res.added_at.as_str()),
@@ -2030,7 +2027,7 @@ async fn single_doc_modified_at_from_feed_updated() {
     assert_eq!(cb.resources.len(), 1);
     assert_eq!(
         cb.resources[0].modified_at.as_deref(),
-        Some("2026-01-01T00:00:00+00:00")
+        Some("2026-01-01T00:00:00Z")
     );
 }
 
