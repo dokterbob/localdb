@@ -197,9 +197,9 @@ pub enum Command {
 
     /// Hybrid search with citations.
     Search {
-        /// Natural language query (no quotes needed; everything after the
-        /// options is treated as the query).
-        #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+        /// Natural language query; may be given unquoted as multiple words.
+        /// A query word starting with `-` must be protected with `--`.
+        #[arg(required = true, num_args = 1..)]
         query: Vec<String>,
 
         /// Maximum number of results to return (must be >= 1).
@@ -835,7 +835,7 @@ mod tests {
 
     /// Unquoted multi-word query is joined into a single string.
     #[test]
-    fn search_query_trailing_var_arg() {
+    fn search_query_accepts_unquoted_multiple_words() {
         let cli = Cli::try_parse_from(["localdb", "search", "machine", "learning"]).unwrap();
         if let Command::Search {
             query,
@@ -846,6 +846,49 @@ mod tests {
             assert_eq!(query.join(" "), "machine learning");
             assert_eq!(limit, 3);
             assert_eq!(content_length, 1000);
+        } else {
+            panic!("expected Search command");
+        }
+    }
+
+    /// A flag typed *after* the query words must still be parsed as a flag,
+    /// not silently absorbed into the query (issue #224). Before the fix,
+    /// `trailing_var_arg = true` made `--limit 5` here part of the query
+    /// text instead of setting `limit`.
+    #[test]
+    fn search_flags_after_query_words_still_parse() {
+        let cli =
+            Cli::try_parse_from(["localdb", "search", "rank", "fusion", "--limit", "5"]).unwrap();
+        if let Command::Search { query, limit, .. } = cli.command {
+            assert_eq!(query.join(" "), "rank fusion");
+            assert_eq!(limit, 5);
+        } else {
+            panic!("expected Search command");
+        }
+    }
+
+    /// `--limit` before the query words still works (regression guard).
+    #[test]
+    fn search_flags_before_query_words_still_parse() {
+        let cli =
+            Cli::try_parse_from(["localdb", "search", "--limit", "5", "rank", "fusion"]).unwrap();
+        if let Command::Search { query, limit, .. } = cli.command {
+            assert_eq!(query.join(" "), "rank fusion");
+            assert_eq!(limit, 5);
+        } else {
+            panic!("expected Search command");
+        }
+    }
+
+    /// `--` forces everything after it to be literal query text, including
+    /// tokens that look like flags — the escape hatch for a query word that
+    /// legitimately starts with `-`.
+    #[test]
+    fn search_double_dash_escapes_flag_like_query_words() {
+        let cli = Cli::try_parse_from(["localdb", "search", "--", "--limit", "5"]).unwrap();
+        if let Command::Search { query, limit, .. } = cli.command {
+            assert_eq!(query, vec!["--limit".to_string(), "5".to_string()]);
+            assert_eq!(limit, 3);
         } else {
             panic!("expected Search command");
         }
