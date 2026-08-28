@@ -142,10 +142,10 @@ partial for different reasons:
   partial regardless of what the axis stores. Without widening, an inclusive `added_before: "2026"`
   would exclude every resource added during 2026 — `"2026-06-10T12:00:00Z" <= "2026"` is false.
 - **The stored value is widened only on the `document` axis**, the only one whose column can hold a
-  partial value (`date_parsed` is normalized to a bare `"YYYY"`, `"YYYY-MM"`, or full
-  `"YYYY-MM-DD"` — see `core::dates::parse_partial_iso8601`). `added`, `updated` and `modified`
-  always hold full-width RFC 3339 per the canonical form above, so widening them would be a no-op
-  and is skipped.
+  partial value (`date_parsed` is normalized to a bare `"YYYY"`, `"YYYY-MM"`, or full `"YYYY-MM-DD"`
+  — see `core::dates::parse_partial_iso8601`). `added`, `updated` and `modified` always hold
+  full-width RFC 3339 per the canonical form above, so widening them would be a no-op and is
+  skipped.
 
 `DateAfter` needs no widening in either operand: a short prefix already sorts below any longer bound
 it cannot confirm, which is the correct conservative reading.
