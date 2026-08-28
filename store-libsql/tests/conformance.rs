@@ -162,6 +162,13 @@ async fn metadata_filter_uri_prefix() {
 }
 
 #[tokio::test]
+async fn metadata_filter_values_are_bound_not_interpolated() {
+    let (_dir, db) = setup().await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+    conformance::test_metadata_filter_values_are_bound_not_interpolated(handle.as_ref()).await;
+}
+
+#[tokio::test]
 async fn get_chunk() {
     let (_dir, db) = setup().await;
     let handle = db.retrieval_store("store-1").await.unwrap();

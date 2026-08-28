@@ -520,6 +520,9 @@ interpolation (needs per-model calibration); backend-native fusion (backend-depe
   `chunk_id` ascending. Metadata filters (mime, path prefix, fetched_at range) are pushed down to
   the backend where supported.
 
+  Filter values are always passed as bound SQL parameters, never interpolated into query text; a
+  literal `%` or `_` in a URI-prefix filter is treated as a SQL `LIKE` wildcard.
+
   **Known limitation — cross-store score comparability.** Pooling ranks each leg by its raw backend
   score, which assumes every store queried together reports that leg's scores on the same scale. Two
   ways that assumption is imperfect:
