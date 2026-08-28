@@ -77,6 +77,19 @@ first if it is wrong.
   spec change.
 - **Async**: the project's async model is documented in `specs/01-architecture.md §6` — follow it
   for all new async code.
+- **No issue references in code comments.** An issue closes and the comment becomes a pointer to
+  state the reader cannot see — noise that accumulates. Put the reasoning in the comment itself:
+  what the code does and why it has to, not where that was argued. Commit messages, PR descriptions
+  and `specs/` are the durable homes for provenance, and git already dates them. The same goes for
+  any other transient state — "currently", "for now", a transitive dependency fact that holds only
+  until the graph shifts. The tree still carries a few hundred of these from earlier work; do not
+  add more, and clear them from comments you are already rewriting.
+- **Tests live in a sibling `tests.rs`, not inline.** A module declares a bodyless `mod tests;` and
+  its tests live in `<module>/tests.rs`, so source files stay reviewable — roughly 1000 lines is the
+  ceiling. Apply this whenever you significantly touch a module that still has inline tests: extract
+  as part of that change rather than adding to the pile. If the extraction would dwarf the change it
+  rides along with (a few hundred lines of test relocation inside a ten-line fix), file it instead
+  and say so in the PR — a pure move belongs in a diff a reviewer can treat as pure.
 - **CLI uses real embeddings via config policy**: `cli` calls `embed::create_embedder` from the
   config; `FakeEmbedder` is only used in unit tests. The default embedder is `provider: local`
   (auto), `model: pplx-embed-context-v1-0.6b` — a context-aware late-chunking model (MIT-licensed,
