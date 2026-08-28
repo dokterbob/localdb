@@ -279,7 +279,7 @@ pub fn parse_date_or_datetime(raw: &str) -> Option<String> {
 
 /// Widen a date/datetime bound to the latest instant consistent with its own
 /// precision, for use as the upper bound of a `DateAxis::Document`
-/// `MetadataFilter::DateBefore` comparison (issue #247).
+/// `MetadataFilter::DateBefore` comparison.
 ///
 /// In fixed-width ISO 8601 a proper prefix always sorts *less than* the
 /// string it prefixes (`"2026-06-10" < "2026-06-10T09:00:00Z"`), which makes
