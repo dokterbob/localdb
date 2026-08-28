@@ -1711,8 +1711,8 @@ pub mod conformance {
         }
     }
 
-    /// Regression test for the `DateBefore{Document}` widening rule (issue
-    /// #247): a chunk with a bare-year `date_parsed = "2024"` must be
+    /// Regression test for the `DateBefore{Document}` widening rule: a chunk
+    /// with a bare-year `date_parsed = "2024"` must be
     /// EXCLUDED by `DateBefore{Document, "2024-06-01"}` (its widened latest
     /// instant, December 31st, is later than the bound's widened latest
     /// instant, June 1st), INCLUDED by `DateBefore{Document, "2024-12-31"}`

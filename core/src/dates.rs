@@ -7,7 +7,7 @@
 //! ISO 8601 string.
 //!
 //! The `YYYY`, `YYYY-MM`, and `YYYY-MM-DD` shapes stay hand-rolled digit
-//! parsing (issue #247): they deliberately accept calendar-invalid values
+//! parsing: they deliberately accept calendar-invalid values
 //! like day 31 in a 30-day month (see "Why the date arms stay hand-rolled"
 //! below), which `chrono::NaiveDate` would reject. The full-datetime shape's
 //! time-and-offset tail delegates to `chrono::DateTime::parse_from_rfc3339`
@@ -156,7 +156,7 @@ fn digits_in_range(bytes: &[u8], lo: u32, hi: u32) -> Option<u32> {
 /// whole parse rather than silently truncating it away.
 ///
 /// Delegates to `chrono::DateTime::parse_from_rfc3339` rather than
-/// hand-rolling this grammar a second time (issue #247). `rest` is spliced
+/// hand-rolling this grammar a second time. `rest` is spliced
 /// onto the fixed, always-calendar-valid prefix `"2000-01-01T"` before
 /// handing it to chrono: this function must validate *only* the tail's
 /// grammar, never the (possibly calendar-invalid, and deliberately
@@ -279,7 +279,7 @@ pub fn parse_date_or_datetime(raw: &str) -> Option<String> {
 
 /// Widen a date/datetime bound to the latest instant consistent with its own
 /// precision, for use as the upper bound of a `DateAxis::Document`
-/// `MetadataFilter::DateBefore` comparison (issue #247).
+/// `MetadataFilter::DateBefore` comparison.
 ///
 /// In fixed-width ISO 8601 a proper prefix always sorts *less than* the
 /// string it prefixes (`"2026-06-10" < "2026-06-10T09:00:00Z"`), which makes

@@ -75,9 +75,9 @@ percent-encoding = "2"
 # Hashing for policy_version
 hex = "0.4"
 
-# Date/time: canonical RFC 3339 timestamp formatting/parsing (issue #247).
-# Already resolved transitively (feed-rs/rmcp/schemars all depend on it), so
-# promoting it to a direct dependency adds no new compiled crate to the graph.
+# Date/time: canonical RFC 3339 timestamp formatting and parsing. Every stored
+# timestamp is produced here, so the formatter is a shared dependency rather
+# than each crate reaching for its own.
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 
 # Relative-duration search filter values, e.g. `--modified-after 7d` (issue

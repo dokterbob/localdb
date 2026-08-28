@@ -360,7 +360,7 @@ impl Ingestor for FeedIngestor {
             // which sorts *before* every ingestion-clock `…Z` timestamp
             // bytewise ('+' 0x2B < 'Z' 0x5A) — a real correctness bug for a
             // field a later PR makes filterable and lexicographically
-            // compared (issue #247).
+            // compared.
             let modified_at_override = feed
                 .updated
                 .or_else(|| entries.first().and_then(|e| e.published.or(e.updated)))
@@ -512,7 +512,7 @@ async fn process_discovery_entry(
         title_fallback: entry.title.as_ref().map(|t| t.content.clone()),
         creator: effective_authors(entry, feed_authors),
         // `.to_rfc3339_opts(SecondsFormat::Secs, true)`, not the default
-        // `to_rfc3339()` (`Z` not `+00:00` — issue #247). Cosmetic
+        // `to_rfc3339()` (`Z` not `+00:00`). Cosmetic
         // consistency only for `date`/`dc:date`: `date_original` is never
         // lexicographically compared, and `parse_partial_iso8601` discards
         // the offset before deriving `date_parsed`.
