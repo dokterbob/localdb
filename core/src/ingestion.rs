@@ -672,18 +672,25 @@ pub fn format_secs_rfc3339(secs: u64) -> String {
     // is far worse than the out-of-range fallback below — it is a plausible
     // value that silently sorts before every real row. Fail the conversion
     // instead, and let both out-of-range paths share one fallback.
-    let dt = i64::try_from(secs)
+    let formatted = i64::try_from(secs)
         .ok()
-        .and_then(|secs| DateTime::<Utc>::from_timestamp(secs, 0));
-    match dt {
-        Some(dt) => dt.to_rfc3339_opts(SecondsFormat::Secs, true),
+        .and_then(|secs| DateTime::<Utc>::from_timestamp(secs, 0))
+        .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Secs, true))
+        // Chrono represents years well past 9999 and renders them with a
+        // sign prefix (`+10000-01-01T00:00:00Z`), which is not canonical
+        // form — and `+` sorts below every digit, so such a value would
+        // order before every real row instead of after them. Both
+        // out-of-range paths converge on the fallback below.
+        .filter(|s| crate::dates::is_canonical_timestamp(s));
+
+    match formatted {
+        Some(s) => s,
         // Reachable only for an input no real Unix timestamp carries: above
-        // `i64::MAX`, or beyond chrono's representable range (roughly
-        // ±262,000 years around 1970). This function is documented as
-        // infallible, so rather than introduce a `Result` no caller has a
-        // recovery path for, fall back to the epoch: deterministic, never
-        // panics, and still canonical-form so it sorts against every other
-        // stored value.
+        // `i64::MAX`, beyond chrono's representable range, or past year
+        // 9999. This function is documented as infallible, so rather than
+        // introduce a `Result` no caller has a recovery path for, fall back
+        // to the epoch: deterministic, never panics, and canonical-form so
+        // it still sorts against every other stored value.
         None => "1970-01-01T00:00:00Z".to_string(),
     }
 }
@@ -725,16 +732,7 @@ mod canonical_form_tests {
 
     /// `^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$`, checked by hand (no regex
     /// dependency in this crate) rather than as a literal pattern.
-    fn matches_canonical_shape(s: &str) -> bool {
-        // One char class per position, so the pattern reads like the shape it
-        // describes: `D` = ASCII digit, anything else = that literal byte.
-        const PATTERN: &[u8] = b"DDDD-DD-DDTDD:DD:DDZ";
-        s.len() == PATTERN.len()
-            && s.bytes().zip(PATTERN).all(|(got, want)| match want {
-                b'D' => got.is_ascii_digit(),
-                literal => got == *literal,
-            })
-    }
+    use crate::dates::is_canonical_timestamp as matches_canonical_shape;
 
     /// `now_rfc3339`'s real-clock branch is stubbed to a fixed literal under
     /// `cfg(test)` and never touches the formatter, so this exercises the
@@ -757,6 +755,31 @@ mod canonical_form_tests {
     #[test]
     fn format_secs_rfc3339_has_no_fractional_second_component() {
         assert!(!format_secs_rfc3339(1_783_524_645).contains('.'));
+    }
+
+    /// Whatever the input, the output is always canonical form. Chrono
+    /// happily represents years past 9999 and renders them with a sign
+    /// prefix (`+10000-01-01T00:00:00Z`), which sorts below every real row
+    /// because `+` is 0x2B — so those must reach the fallback too, not just
+    /// values chrono cannot represent at all.
+    #[test]
+    fn every_timestamp_formats_to_canonical_form_or_falls_back() {
+        for secs in [
+            0,
+            1_781_092_800,
+            253_402_300_800,     // 10000-01-01, representable but not RFC 3339
+            1_000_000_000_000,   // ~year 33658
+            8_210_298_412_800,   // past chrono's range
+            i64::MAX as u64 + 1, // past i64
+            u64::MAX,
+        ] {
+            let formatted = format_secs_rfc3339(secs);
+            assert!(
+                matches_canonical_shape(&formatted),
+                "{secs} produced non-canonical {formatted:?}; a `+`/`-` year prefix \
+                 sorts below every digit and would misorder against every stored row"
+            );
+        }
     }
 
     /// A `u64` above `i64::MAX` must reach the out-of-range fallback, never

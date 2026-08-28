@@ -115,7 +115,7 @@ fn partial_date_prefix_len(s: &str) -> Option<usize> {
     if bytes.len() < 7 || bytes[4] != b'-' {
         return None;
     }
-    digits_in_range(&s[5..7], 1, 12)?;
+    digits_in_range(&bytes[5..7], 1, 12)?;
     if bytes.len() == 7 {
         return Some(7);
     }
@@ -124,19 +124,29 @@ fn partial_date_prefix_len(s: &str) -> Option<usize> {
     if bytes.len() < 10 || bytes[7] != b'-' {
         return None;
     }
-    digits_in_range(&s[8..10], 1, 31)?;
+    digits_in_range(&bytes[8..10], 1, 31)?;
     Some(10)
 }
 
 /// Parse a fixed-width numeric component: fails closed (`None`) unless every
-/// byte of `s` is an ASCII digit, the parsed value fits `u32`, and it falls
-/// within `[lo, hi]` inclusive. Shared by every date/time/offset component
-/// below — each is the same "all-digits, then parse, then range-check" shape.
-fn digits_in_range(s: &str, lo: u32, hi: u32) -> Option<u32> {
-    if !s.bytes().all(|b| b.is_ascii_digit()) {
+/// byte is an ASCII digit, the parsed value fits `u32`, and it falls within
+/// `[lo, hi]` inclusive. Shared by every date/time/offset component below —
+/// each is the same "all-digits, then parse, then range-check" shape.
+///
+/// Takes bytes, not `&str`, deliberately. Every component here sits at a
+/// fixed byte offset, and slicing a `&str` at one of those offsets panics
+/// when the input happens to carry a multi-byte character across it
+/// (`"2026-0é"` splits `é` at byte 6). Input reaches this module straight
+/// from document metadata and from user-supplied filter bounds, so that has
+/// to fail closed like any other malformed value, not abort the process.
+/// Byte slicing cannot split a code point, and a non-ASCII byte is not an
+/// ASCII digit, so such input falls out as `None` on the first check.
+fn digits_in_range(bytes: &[u8], lo: u32, hi: u32) -> Option<u32> {
+    if !bytes.iter().all(u8::is_ascii_digit) {
         return None;
     }
-    let value: u32 = s.parse().ok()?;
+    // Every byte is an ASCII digit, so this is valid UTF-8 by construction.
+    let value: u32 = std::str::from_utf8(bytes).ok()?.parse().ok()?;
     (lo..=hi).contains(&value).then_some(value)
 }
 
@@ -173,6 +183,28 @@ fn digits_in_range(s: &str, lo: u32, hi: u32) -> Option<u32> {
 fn validate_full_datetime_tail(rest: &str) -> bool {
     let probe = format!("2000-01-01T{rest}");
     chrono::DateTime::parse_from_rfc3339(&probe).is_ok()
+}
+
+/// Does `s` match the canonical stored-timestamp form
+/// `YYYY-MM-DDTHH:MM:SSZ` (specs/02-domain-model.md §2)?
+///
+/// Every stored timestamp and every value compared against one must be in
+/// exactly this shape, because the comparisons are plain lexicographic string
+/// comparisons. Anything else silently misorders rather than failing: chrono
+/// renders a year outside `0000..=9999` with a sign prefix
+/// (`+10000-01-01T00:00:00Z`, `-189627-03-09T13:49:29Z`), and both `+` (0x2B)
+/// and `-` (0x2D) sort below every ASCII digit — so such a value compares as
+/// an extreme against every real row rather than as the date it names.
+///
+/// One char class per position, so the pattern reads like the shape it
+/// checks: `D` is an ASCII digit, anything else is that literal byte.
+pub fn is_canonical_timestamp(s: &str) -> bool {
+    const PATTERN: &[u8] = b"DDDD-DD-DDTDD:DD:DDZ";
+    s.len() == PATTERN.len()
+        && s.bytes().zip(PATTERN).all(|(got, want)| match want {
+            b'D' => got.is_ascii_digit(),
+            literal => got == *literal,
+        })
 }
 
 /// Normalize a partial-or-full ISO 8601 date/datetime string for use as a
