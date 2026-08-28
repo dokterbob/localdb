@@ -717,7 +717,7 @@ mod format_secs_rfc3339_tests {
 }
 
 // ---------------------------------------------------------------------------
-// Canonical-form contract tests (issue #247) — additional to (not a
+// Canonical-form contract tests — additional to (not a
 // substitute for) the golden `format_secs_rfc3339_tests` exact-value
 // assertions above, which are the strongest evidence the chrono
 // implementation is behaviorally identical to the hand-rolled arithmetic it

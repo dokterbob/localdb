@@ -3,10 +3,10 @@
 //! These serve the concrete ingestors (mime detection from paths,
 //! panic-tolerant parsing). They deliberately live here rather than as
 //! `pub` items in `core`: core stays free of acquisition concerns, and this
-//! crate is the one true implementation since #117 removed the legacy
-//! pipeline's copies. RFC 3339 timestamp formatting is the one exception —
+//! crate is the one true implementation. RFC 3339 timestamp formatting is the
+//! one exception —
 //! `localdb_core::ingestion::format_secs_rfc3339` is `pub` precisely so this
-//! crate doesn't need its own copy (issue #247 dedup).
+//! crate doesn't need its own copy.
 
 use std::path::Path;
 
@@ -70,7 +70,7 @@ pub(crate) fn detect_mime(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod format_unix_secs_tests {
     // `ingest` no longer carries its own Gregorian-arithmetic copy (issue
-    // #247 dedup) — callers use `localdb_core::ingestion::format_secs_rfc3339`
+    // callers use `localdb_core::ingestion::format_secs_rfc3339`
     // directly. `epoch_zero_is_1970_01_01`, `leap_day_2024_02_29_is_...`, and
     // `year_end_boundary_rolls_over_correctly` exactly duplicated core's own
     // golden tests (`core::ingestion::format_secs_rfc3339_tests`) and are not
