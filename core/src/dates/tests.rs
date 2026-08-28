@@ -187,6 +187,28 @@ fn full_datetime_with_calendar_invalid_date_is_rejected() {
     assert_eq!(parse_date_or_datetime("2026-11-31T10:00:00Z"), None);
 }
 
+/// A four-digit year can leave the representable range purely by shifting to
+/// UTC: `9999-12-31T23:30:00-01:00` lands in year 10000, and
+/// `0000-01-01T00:30:00+01:00` in year -1. Chrono renders both with a sign
+/// prefix, and `+` (0x2B) and `-` (0x2D) both sort below every ASCII digit —
+/// so such a bound would compare as an extreme against every stored row
+/// instead of as the date it names. Fail closed rather than return it.
+#[test]
+fn datetime_normalizing_outside_four_digit_years_is_rejected() {
+    assert_eq!(parse_date_or_datetime("9999-12-31T23:30:00-01:00"), None);
+    assert_eq!(parse_date_or_datetime("0000-01-01T00:30:00+01:00"), None);
+
+    // The same instants that stay inside the range still normalize.
+    assert_eq!(
+        parse_date_or_datetime("9999-12-31T23:59:59Z"),
+        Some("9999-12-31T23:59:59Z".to_string())
+    );
+    assert_eq!(
+        parse_date_or_datetime("9999-12-31T23:30:00+01:00"),
+        Some("9999-12-31T22:30:00Z".to_string())
+    );
+}
+
 #[test]
 fn rejects_datetime_missing_offset() {
     assert_eq!(parse_date_or_datetime("2026-06-15T10:30:00"), None);
