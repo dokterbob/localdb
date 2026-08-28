@@ -51,7 +51,23 @@ pub struct StatusResponse {
     /// instead of only reporting a bare `store_count`.
     pub stores: Vec<StoreStatusRecord>,
     pub database: DatabaseStatus,
+    /// Optional capabilities this daemon supports, so a newer client can tell
+    /// whether an older running daemon will honour a request before sending
+    /// it (issue #247). `SearchRequest` does not reject unknown fields, so a
+    /// daemon predating a feature silently ignores its parameters and answers
+    /// as though they were never sent — for search filters that means
+    /// returning unfiltered results to a caller who asked for a narrow scope.
+    ///
+    /// Grow this list when adding a request parameter whose absence changes
+    /// the answer rather than merely omitting detail. A client must treat an
+    /// absent or unknown name as "unsupported": daemons older than this field
+    /// omit it entirely.
+    pub features: Vec<String>,
 }
+
+/// Capability advertised by [`StatusResponse::features`] when `POST
+/// /v1/search` honours [`localdb_core::SearchFilters`].
+pub const FEATURE_SEARCH_FILTERS: &str = "search_filters";
 
 /// `GET /status` query params: a repeatable `?store=` scopes the response to
 /// specific stores, mirroring CLI `--store` (issue #187 review, finding F7).
@@ -132,6 +148,7 @@ pub async fn get_status(
         source_count,
         job_count: jobs.len(),
         stores,
+        features: vec![FEATURE_SEARCH_FILTERS.to_string()],
         database: DatabaseStatus {
             path: db_path.display().to_string(),
             exists: db_size.main_bytes.is_some(),

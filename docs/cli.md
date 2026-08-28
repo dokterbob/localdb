@@ -833,21 +833,23 @@ or a relative duration (`7d`, `30m`, `2w`) — a duration always resolves to **n
 duration**, for either bound: `--modified-after 7d` means "modified within the last 7 days",
 `--modified-before 7d` means "modified more than 7 days ago", never `now + duration`. In the
 duration grammar `M` means months and `m` means minutes — both parse successfully, so a mistaken
-capital silently produces a bound about 60 times further out. A malformed value exits 2.
+capital silently produces a bound roughly 44,000 times further out. A malformed value exits 2.
 
-| Flag                                   | Bounds                                                       | NULL rule                                                                             |
-| -------------------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------------------------------- |
-| `--path <PREFIX>`                      | URI starts with `PREFIX`                                     | n/a — literal match                                                                   |
-| `--mime <TYPE>`                        | MIME type equals `TYPE`                                      | n/a — literal match                                                                   |
-| `--added-after`/`--added-before`       | when the resource was first indexed                          | a resource with no value on this axis is **excluded**, regardless of the bound        |
-| `--updated-after`/`--updated-before`   | when the store last wrote the resource's stored state        | a resource with no value on this axis is **excluded**, regardless of the bound        |
-| `--modified-after`/`--modified-before` | the source's own claim of when the resource was last changed | a resource with no claimed modification time is **excluded**, regardless of the bound |
-| `--document-after`/`--document-before` | the document's own claimed date (Dublin Core `dc:date`)      | a resource with no claimed document date is **excluded**, regardless of the bound     |
+| Flag                                   | Bounds                                                           | NULL rule                                                                             |
+| -------------------------------------- | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| `--path <PREFIX>`                      | URI starts with `PREFIX` (SQL `LIKE`: `%` and `_` are wildcards) | n/a — no date parsing                                                                 |
+| `--mime <TYPE>`                        | MIME type equals `TYPE` (exact string)                           | n/a — no date parsing                                                                 |
+| `--added-after`/`--added-before`       | when the resource was first indexed                              | a resource with no value on this axis is **excluded**, regardless of the bound        |
+| `--updated-after`/`--updated-before`   | when the store last wrote the resource's stored state            | a resource with no value on this axis is **excluded**, regardless of the bound        |
+| `--modified-after`/`--modified-before` | the source's own claim of when the resource was last changed     | a resource with no claimed modification time is **excluded**, regardless of the bound |
+| `--document-after`/`--document-before` | the document's own claimed date (Dublin Core `dc:date`)          | a resource with no claimed document date is **excluded**, regardless of the bound     |
 
-`--document-*` coverage caveat: the document date is populated today only for HTML (JSON-LD +
-`meta[dcterms.date\|date]`), Markdown front matter, and Office (`dcterms:created`) documents — PDF
-and feed coverage is issue #251, so `--document-after`/`--document-before` currently exclude every
-PDF in a corpus, not just PDFs genuinely outside the bound.
+`--document-*` coverage: a resource has a document date only when its source carried one — HTML
+(JSON-LD or a `meta[dcterms.date\|date]`), Markdown front matter, Office (`dcterms:created`), PDF
+(`/CreationDate`, or XMP `xmp:CreateDate` as a fallback), and feed entries (`published`, falling
+back to `updated`). Plain text carries none, and any format's metadata may simply omit it. Combined
+with the NULL rule above, a corpus whose documents mostly lack the field will narrow sharply under
+`--document-*`.
 
 Multiple filters, of any kind and in any combination, always AND together — there is no OR.
 
@@ -904,10 +906,9 @@ $ localdb search --modified-after 30d hybrid search
 `meeting.txt` from the earlier examples is missing here for two possible reasons that look identical
 from the output alone: it was modified more than 30 days ago, or its source never claims a
 `modified_at` at all — the NULL rule excludes a resource with no value on the filtered axis
-regardless of the bound. The same caveat applies to `--document-after`/`--document-before`: today
-that date is populated only for HTML, Markdown front matter, and Office documents, so a PDF-only
-corpus filtered on `--document-after` returns nothing, not because every PDF fails the bound but
-because none of them have a document date yet (issue #251).
+regardless of the bound. The same ambiguity applies to `--document-after`/`--document-before`: a
+resource carries a document date only if its source supplied one, so an empty result may mean the
+documents fell outside the bound or that they never declared a date at all.
 
 JSON output (full citation shape):
 

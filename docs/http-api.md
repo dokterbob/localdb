@@ -93,6 +93,7 @@ curl -s http://127.0.0.1:7700/v1/status
   "store_count": 1,
   "source_count": 0,
   "job_count": 0,
+  "features": ["search_filters"],
   "stores": [
     {
       "name": "notes",
@@ -114,19 +115,20 @@ curl -s http://127.0.0.1:7700/v1/status
 }
 ```
 
-| Field                                              | Type      | Description                                                                                                                                                                 |
-| -------------------------------------------------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `daemon`                                           | bool      | Always `true` when the daemon is responding                                                                                                                                 |
-| `store_count`                                      | int       | Number of stores known to this daemon instance                                                                                                                              |
-| `source_count`                                     | int       | Total sources across all stores                                                                                                                                             |
-| `job_count`                                        | int       | Number of jobs ever created in this daemon session                                                                                                                          |
-| `stores[].document_count` / `stores[].chunk_count` | int\|null | Per-store `RetrievalStore::stats()` figures; `null` if that store's stats call itself failed (a corrupt or mid-migration store must not blank out the report on the others) |
-| `database.path`                                    | string    | Path to the shared `localdb.db` file — one physical file backs every store, so this is reported once, not per-store                                                         |
-| `database.exists`                                  | bool      | Whether the file exists yet (`false` before the first `store add`/`index`)                                                                                                  |
-| `database.size_bytes` / `database.wal_size_bytes`  | int\|null | Bytes in the main file / `-wal` sidecar; `null` if a stat fails                                                                                                             |
-| `database.total_size_bytes`                        | int       | `size_bytes + wal_size_bytes` (missing components treated as 0) — what the disk actually has allocated right now                                                            |
-| `database.bytes_per_chunk`                         | int\|null | `total_size_bytes` divided by the sum of every store's `chunk_count`; `null` with no chunks                                                                                 |
-| `database.largest_tables`                          | array     | Up to 5 `{name, bytes}` rows, the largest on-disk tables via SQLite's `dbstat`, descending; best-effort — empty if `dbstat` querying fails                                  |
+| Field                                              | Type      | Description                                                                                                                                                                                                                                                           |
+| -------------------------------------------------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `daemon`                                           | bool      | Always `true` when the daemon is responding                                                                                                                                                                                                                           |
+| `store_count`                                      | int       | Number of stores known to this daemon instance                                                                                                                                                                                                                        |
+| `source_count`                                     | int       | Total sources across all stores                                                                                                                                                                                                                                       |
+| `job_count`                                        | int       | Number of jobs ever created in this daemon session                                                                                                                                                                                                                    |
+| `stores[].document_count` / `stores[].chunk_count` | int\|null | Per-store `RetrievalStore::stats()` figures; `null` if that store's stats call itself failed (a corrupt or mid-migration store must not blank out the report on the others)                                                                                           |
+| `database.path`                                    | string    | Path to the shared `localdb.db` file — one physical file backs every store, so this is reported once, not per-store                                                                                                                                                   |
+| `database.exists`                                  | bool      | Whether the file exists yet (`false` before the first `store add`/`index`)                                                                                                                                                                                            |
+| `database.size_bytes` / `database.wal_size_bytes`  | int\|null | Bytes in the main file / `-wal` sidecar; `null` if a stat fails                                                                                                                                                                                                       |
+| `features`                                         | string[]  | Capabilities this daemon supports, so a newer client can tell whether an older running daemon will honour a request before sending it. Currently `["search_filters"]`. Treat an absent or unknown name as unsupported — daemons predating this field omit it entirely |
+| `database.total_size_bytes`                        | int       | `size_bytes + wal_size_bytes` (missing components treated as 0) — what the disk actually has allocated right now                                                                                                                                                      |
+| `database.bytes_per_chunk`                         | int\|null | `total_size_bytes` divided by the sum of every store's `chunk_count`; `null` with no chunks                                                                                                                                                                           |
+| `database.largest_tables`                          | array     | Up to 5 `{name, bytes}` rows, the largest on-disk tables via SQLite's `dbstat`, descending; best-effort — empty if `dbstat` querying fails                                                                                                                            |
 
 This is the same shape the embedded CLI's `localdb status --json` reports (see
 [specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) §2.4) —
@@ -472,27 +474,27 @@ daemon and the CLI share `<data_dir>/localdb.db`.
 
 **Request body:**
 
-| Field                              | Type     | Required | Description                                                                          |
-| ---------------------------------- | -------- | -------- | ------------------------------------------------------------------------------------ |
-| `query`                            | string   | yes      | Natural language search query                                                        |
-| `store_filter`                     | string[] | no       | Store names to search; omit or pass `[]` to search all stores                        |
-| `limit`                            | int      | no       | Maximum results to return (default: 10; silently clamped to 100, `SEARCH_MAX_LIMIT`) |
-| `cursor`                           | string   | no       | Pagination cursor from a previous response                                           |
-| `path`                             | string   | no       | Restrict to resources whose URI starts with this prefix. Matched literally.          |
-| `mime`                             | string   | no       | Restrict to resources with this exact MIME type. Matched literally.                  |
-| `added_after`/`added_before`       | string   | no       | Bound on when the resource was first indexed                                         |
-| `updated_after`/`updated_before`   | string   | no       | Bound on when the store last wrote the resource's stored state                       |
-| `modified_after`/`modified_before` | string   | no       | Bound on the source's own claimed last-modified time                                 |
-| `document_after`/`document_before` | string   | no       | Bound on the document's own claimed date (Dublin Core `dc:date`)                     |
+| Field                              | Type     | Required | Description                                                                                                                   |
+| ---------------------------------- | -------- | -------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `query`                            | string   | yes      | Natural language search query                                                                                                 |
+| `store_filter`                     | string[] | no       | Store names to search; omit or pass `[]` to search all stores                                                                 |
+| `limit`                            | int      | no       | Maximum results to return (default: 10; silently clamped to 100, `SEARCH_MAX_LIMIT`)                                          |
+| `cursor`                           | string   | no       | Pagination cursor from a previous response                                                                                    |
+| `path`                             | string   | no       | Restrict to resources whose URI starts with this prefix. Matched with SQL `LIKE`, so a literal `%` or `_` acts as a wildcard. |
+| `mime`                             | string   | no       | Restrict to resources with this exact MIME type, compared as an exact string.                                                 |
+| `added_after`/`added_before`       | string   | no       | Bound on when the resource was first indexed                                                                                  |
+| `updated_after`/`updated_before`   | string   | no       | Bound on when the store last wrote the resource's stored state                                                                |
+| `modified_after`/`modified_before` | string   | no       | Bound on the source's own claimed last-modified time                                                                          |
+| `document_after`/`document_before` | string   | no       | Bound on the document's own claimed date (Dublin Core `dc:date`)                                                              |
 
 Each date field accepts a full RFC 3339 datetime, a partial date (`YYYY`, `YYYY-MM`, `YYYY-MM-DD`),
 or a relative duration (`7d`, `30m`, `2w`) — a duration always resolves to **now minus the
 duration**, for either bound (`modified_after: "7d"` means "modified within the last 7 days";
 `modified_before: "7d"` means "modified more than 7 days ago"). A resource with no value on a
-filtered axis is excluded regardless of the bound (the NULL rule); `document_after`/
-`document_before` currently exclude every PDF and feed entry, since that date is populated today
-only for HTML, Markdown front matter, and Office documents (issue #251). A malformed filter value is
-`invalid_request`, HTTP 400. Multiple filters, of any kind, always AND together.
+filtered axis is excluded regardless of the bound (the NULL rule), and a resource carries a document
+date only when its source supplied one — HTML, Markdown front matter, Office, PDF (`/CreationDate`
+or XMP), and feed entries all can, plain text cannot. A malformed filter value is `invalid_request`,
+HTTP 400. Multiple filters, of any kind, always AND together.
 
 ```
 curl -s -X POST http://127.0.0.1:7700/v1/search \

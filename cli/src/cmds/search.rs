@@ -54,6 +54,37 @@ pub(crate) struct SearchCmd<'a> {
     pub(crate) filters: SearchFilters,
 }
 
+/// Fail unless the daemon at `base_url` advertises search-filter support.
+///
+/// Absence is treated as unsupported, which is the only safe reading: a
+/// daemon older than the `features` field omits it entirely, and one older
+/// than search filters would silently drop them and answer unfiltered.
+/// Exits 5 (unavailable) — the daemon is running and healthy, it just cannot
+/// do what was asked — and names the fix, since restarting it resolves this
+/// permanently.
+async fn require_daemon_search_filter_support(base_url: &str) -> Result<(), Error> {
+    let url = format!("{base_url}/v1/status");
+    let status = daemon_request_async(reqwest::Method::GET, &url, None).await?;
+    let supported = status
+        .get("features")
+        .and_then(|f| f.as_array())
+        .is_some_and(|features| {
+            features
+                .iter()
+                .any(|f| f.as_str() == Some("search_filters"))
+        });
+
+    if supported {
+        return Ok(());
+    }
+    Err(Error::DaemonCapabilityUnavailable {
+        message: "the running daemon predates search filters and would ignore them, \
+                  returning unfiltered results; restart it (`localdb serve`) to use \
+                  --path/--mime/date filters, or stop it to search in embedded mode"
+            .to_string(),
+    })
+}
+
 impl DaemonAwareCommand for SearchCmd<'_> {
     type Outcome = Vec<Citation>;
 
@@ -63,6 +94,21 @@ impl DaemonAwareCommand for SearchCmd<'_> {
     const SCOPE_POLICY: StoreScopePolicy = StoreScopePolicy::AllStoresAllowEmpty;
 
     async fn run_daemon(&self, ctx: &CliContext, base_url: &str) -> Result<Self::Outcome, Error> {
+        // A daemon predating search filters ignores the new request fields
+        // rather than rejecting them — `SearchRequest` has no
+        // `deny_unknown_fields` — and answers as though no filter had been
+        // asked for. That is the worst possible failure for a scoping
+        // request: the caller gets a full, unfiltered result set that looks
+        // like a correctly narrowed one. A long-lived daemon outliving a
+        // binary upgrade makes this reachable in normal use.
+        //
+        // So when filters are actually set, confirm the daemon advertises
+        // support before sending them. Only paid for when filtering; an
+        // unfiltered search still goes straight to the POST below.
+        if self.filters.is_any_set() {
+            require_daemon_search_filter_support(base_url).await?;
+        }
+
         let url = format!("{base_url}/v1/search");
         // Serialize the shared `SearchRequest` struct rather than hand-building
         // a `serde_json::json!` body (issue #247): field names between this

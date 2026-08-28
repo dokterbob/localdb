@@ -275,7 +275,8 @@ pub enum Command {
 #[derive(Debug, Args)]
 pub struct SearchFilterArgs {
     /// Restrict to resources whose URI starts with this prefix (e.g. "file:///docs/").
-    /// Matched literally — no date or duration parsing.
+    /// No date or duration parsing is applied. Matched with SQL LIKE, so a literal
+    /// `%` or `_` in the prefix acts as a wildcard.
     #[arg(long)]
     path: Option<String>,
 
@@ -289,7 +290,7 @@ pub struct SearchFilterArgs {
     /// relative duration such as "7d" or "30m", which always resolves to now minus the
     /// duration regardless of which bound it fills. Note: "M" means months and "m" means
     /// minutes in the duration grammar — both parse successfully, so a mistaken capital
-    /// silently produces a bound about 60 times further out. NULL rule: a resource with
+    /// silently produces a bound roughly 44,000 times further out. NULL rule: a resource with
     /// no value on this axis is excluded, regardless of the bound.
     #[arg(long)]
     added_after: Option<String>,
@@ -326,19 +327,21 @@ pub struct SearchFilterArgs {
 
     /// Lower bound (inclusive) on the document date — the document's own claimed date
     /// (Dublin Core dc:date). Same value grammar as --added-after. NULL rule: a resource
-    /// with no claimed document date is excluded, regardless of the bound. Coverage:
-    /// this date is populated today only for HTML, Markdown front matter, and Office
-    /// documents — PDFs and feed entries have none yet (issue #251), so this currently
-    /// excludes every PDF in a corpus.
+    /// with no claimed document date is excluded, regardless of the bound. Coverage: a
+    /// resource has one only when its source carried one — HTML (JSON-LD or a
+    /// dcterms.date/date meta), Markdown front matter, Office (dcterms:created), PDF
+    /// (/CreationDate or XMP xmp:CreateDate), and feed entries (published/updated).
+    /// Plain text carries none, and any format's metadata may simply omit it.
     #[arg(long)]
     document_after: Option<String>,
 
     /// Upper bound (inclusive) on the document date — the document's own claimed date
     /// (Dublin Core dc:date). Same value grammar as --added-after. NULL rule: a resource
-    /// with no claimed document date is excluded, regardless of the bound. Coverage:
-    /// this date is populated today only for HTML, Markdown front matter, and Office
-    /// documents — PDFs and feed entries have none yet (issue #251), so this currently
-    /// excludes every PDF in a corpus.
+    /// with no claimed document date is excluded, regardless of the bound. Coverage: a
+    /// resource has one only when its source carried one — HTML (JSON-LD or a
+    /// dcterms.date/date meta), Markdown front matter, Office (dcterms:created), PDF
+    /// (/CreationDate or XMP xmp:CreateDate), and feed entries (published/updated).
+    /// Plain text carries none, and any format's metadata may simply omit it.
     #[arg(long)]
     document_before: Option<String>,
 }

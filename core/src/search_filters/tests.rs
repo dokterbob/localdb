@@ -110,6 +110,55 @@ fn duration_that_underflows_the_representable_range_is_invalid_request() {
     }
 }
 
+/// Stored timestamps have second precision, so a sub-second bound must round
+/// to a whole second — and the two directions round opposite ways. Truncating
+/// a lower bound downward would admit the second below it: `14:30:00.9Z`
+/// truncated to `14:30:00Z` matches a resource stored at exactly `14:30:00Z`,
+/// which precedes what the caller asked for. An upper bound truncates
+/// correctly for the same reason in reverse.
+#[test]
+fn subsecond_bounds_round_outward_from_the_requested_instant() {
+    let lower = SearchFilters {
+        added_after: Some("2026-06-10T14:30:00.9Z".to_string()),
+        ..filters()
+    };
+    assert_eq!(
+        lower.into_metadata_filters().unwrap(),
+        vec![MetadataFilter::DateAfter {
+            axis: DateAxis::Added,
+            value: "2026-06-10T14:30:01Z".to_string(),
+        }],
+        "a fractional lower bound must round UP, or it admits the second below it"
+    );
+
+    let upper = SearchFilters {
+        added_before: Some("2026-06-10T14:30:00.9Z".to_string()),
+        ..filters()
+    };
+    assert_eq!(
+        upper.into_metadata_filters().unwrap(),
+        vec![MetadataFilter::DateBefore {
+            axis: DateAxis::Added,
+            value: "2026-06-10T14:30:00Z".to_string(),
+        }],
+        "a fractional upper bound truncates, which is already correct"
+    );
+
+    // An exactly-zero fraction is not a sub-second value; it must not shift.
+    let zero_frac = SearchFilters {
+        added_after: Some("2026-06-10T14:30:00.000Z".to_string()),
+        ..filters()
+    };
+    assert_eq!(
+        zero_frac.into_metadata_filters().unwrap(),
+        vec![MetadataFilter::DateAfter {
+            axis: DateAxis::Added,
+            value: "2026-06-10T14:30:00Z".to_string(),
+        }],
+        "a zero fraction names a whole second and must not be rounded up"
+    );
+}
+
 #[test]
 fn relative_duration_resolves_to_now_minus_duration() {
     let before = chrono::Utc::now();

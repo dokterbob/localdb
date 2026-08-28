@@ -80,7 +80,12 @@ pub fn http_status_for(err: &CoreError) -> StatusCode {
 
         CoreError::InvalidRequest { .. } => StatusCode::BAD_REQUEST,
 
-        CoreError::ModelMissing { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        // Raised client-side by the CLI about the daemon it is talking to,
+        // never by the daemon about itself; mapped for exhaustiveness, and
+        // 503 is the honest reading either way.
+        CoreError::ModelMissing { .. } | CoreError::DaemonCapabilityUnavailable { .. } => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
 
         CoreError::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
     }

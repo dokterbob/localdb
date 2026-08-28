@@ -199,7 +199,7 @@ canonical localdb Citation JSON shape.
   "properties": {
     "added_after": {
       "default": null,
-      "description": "Lower bound (inclusive) on the added date — when this resource was first indexed. Accepts a full RFC 3339 datetime, a partial date (YYYY, YYYY-MM, YYYY-MM-DD), or a relative duration such as \"7d\" or \"30m\", which always resolves to now minus the duration regardless of which bound it fills. Note: \"M\" means months and \"m\" means minutes in the duration grammar — both parse successfully, so a mistaken capital silently produces a bound about 60 times further out. NULL rule: a resource with no value on this axis is excluded, regardless of the bound.",
+      "description": "Lower bound (inclusive) on the added date — when this resource was first indexed. Accepts a full RFC 3339 datetime, a partial date (YYYY, YYYY-MM, YYYY-MM-DD), or a relative duration such as \"7d\" or \"30m\", which always resolves to now minus the duration regardless of which bound it fills. Note: \"M\" means months and \"m\" means minutes in the duration grammar — both parse successfully, so a mistaken capital silently produces a bound roughly 44,000 times further out. NULL rule: a resource with no value on this axis is excluded, regardless of the bound.",
       "type": ["string", "null"]
     },
     "added_before": {
@@ -216,12 +216,12 @@ canonical localdb Citation JSON shape.
     },
     "document_after": {
       "default": null,
-      "description": "Lower bound (inclusive) on the document date — the document's own claimed date (Dublin Core dc:date). Same value grammar as added_after. NULL rule: a resource with no claimed document date is excluded, regardless of the bound. Coverage: this date is populated today only for HTML, Markdown front matter, and Office documents — PDFs and feed entries have none yet (issue #251), so this currently excludes every PDF in a corpus.",
+      "description": "Lower bound (inclusive) on the document date — the document's own claimed date (Dublin Core dc:date). Same value grammar as added_after. NULL rule: a resource with no claimed document date is excluded, regardless of the bound. Coverage: a resource has one only when its source carried one — HTML (JSON-LD or a `dcterms.date`/`date` meta), Markdown front matter, Office (`dcterms:created`), PDF (`/CreationDate` or XMP `xmp:CreateDate`), and feed entries (`published`/`updated`). Plain text carries none, and any format's metadata may simply omit it.",
       "type": ["string", "null"]
     },
     "document_before": {
       "default": null,
-      "description": "Upper bound (inclusive) on the document date — the document's own claimed date (Dublin Core dc:date). Same value grammar as added_after. NULL rule: a resource with no claimed document date is excluded, regardless of the bound. Coverage: this date is populated today only for HTML, Markdown front matter, and Office documents — PDFs and feed entries have none yet (issue #251), so this currently excludes every PDF in a corpus.",
+      "description": "Upper bound (inclusive) on the document date — the document's own claimed date (Dublin Core dc:date). Same value grammar as added_after. NULL rule: a resource with no claimed document date is excluded, regardless of the bound. Coverage: a resource has one only when its source carried one — HTML (JSON-LD or a `dcterms.date`/`date` meta), Markdown front matter, Office (`dcterms:created`), PDF (`/CreationDate` or XMP `xmp:CreateDate`), and feed entries (`published`/`updated`). Plain text carries none, and any format's metadata may simply omit it.",
       "type": ["string", "null"]
     },
     "limit": {
@@ -234,7 +234,7 @@ canonical localdb Citation JSON shape.
     },
     "mime": {
       "default": null,
-      "description": "Restrict to resources with this exact MIME type (e.g. \"text/markdown\"). Matched literally — no date or duration parsing.",
+      "description": "Restrict to resources with this exact MIME type (e.g. \"text/markdown\"). Matched as an exact string: no date or duration parsing is applied.",
       "type": ["string", "null"]
     },
     "modified_after": {
@@ -249,7 +249,7 @@ canonical localdb Citation JSON shape.
     },
     "path": {
       "default": null,
-      "description": "Restrict to resources whose URI starts with this prefix (e.g. \"file:///docs/\"). Matched literally — no date or duration parsing.",
+      "description": "Restrict to resources whose URI starts with this prefix (e.g. \"file:///docs/\"). Not a date: no date or duration parsing is applied. Matched with SQL LIKE, so a literal `%` or `_` in the prefix acts as a wildcard.",
       "type": ["string", "null"]
     },
     "query": {
@@ -310,8 +310,9 @@ canonical localdb Citation JSON shape.
 
 A resource with no claimed `modified_at` at all is excluded by this filter regardless of the bound
 (the NULL rule) — it is indistinguishable in the response from one that was simply modified too long
-ago. The same applies to `document_after`/`document_before`, which today only match HTML, Markdown
-front matter, and Office documents (PDF and feed coverage is issue #251).
+ago. The same applies to `document_after`/`document_before`: a resource carries a document date only
+when its source supplied one — HTML, Markdown front matter, Office, PDF (`/CreationDate` or XMP),
+and feed entries all can, plain text cannot.
 
 **Example result.** The single `text` content block carries the pretty-printed JSON, then a
 `\n\n---\n` separator, then a human-readable rendering of the same citations (`search` is the only

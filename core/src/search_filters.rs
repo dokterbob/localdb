@@ -56,20 +56,24 @@ mod tests;
 /// …) use, so there is exactly one vocabulary across all three surfaces.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SearchFilters {
-    /// URI-prefix filter. Matched literally, with no date/duration parsing —
-    /// see this module's doc comment.
+    /// URI-prefix filter. No date/duration parsing — see this module's doc
+    /// comment. Pushed down as a SQL `LIKE` prefix match, so a literal `%` or
+    /// `_` in the value is a wildcard (specs/04-search-pipeline.md §5).
     #[serde(default)]
     #[schemars(
         description = "Restrict to resources whose URI starts with this prefix (e.g. \
-        \"file:///docs/\"). Matched literally — no date or duration parsing."
+        \"file:///docs/\"). Not a date: no date or duration parsing is applied. \
+        Matched with SQL LIKE, so a literal `%` or `_` in the prefix acts as a \
+        wildcard."
     )]
     pub path: Option<String>,
 
-    /// Exact MIME-type filter. Matched literally, with no date/duration
+    /// Exact MIME-type filter, compared as a whole string. No date/duration
     /// parsing — see this module's doc comment.
     #[serde(default)]
     #[schemars(description = "Restrict to resources with this exact MIME type (e.g. \
-        \"text/markdown\"). Matched literally — no date or duration parsing.")]
+        \"text/markdown\"). Matched as an exact string: no date or duration parsing \
+        is applied.")]
     pub mime: Option<String>,
 
     /// Inclusive lower bound on [`DateAxis::Added`].
@@ -80,7 +84,7 @@ pub struct SearchFilters {
         YYYY-MM-DD), or a relative duration such as \"7d\" or \"30m\", which always resolves \
         to now minus the duration regardless of which bound it fills. Note: \"M\" means \
         months and \"m\" means minutes in the duration grammar — both parse successfully, so \
-        a mistaken capital silently produces a bound about 60 times further out. NULL rule: a \
+        a mistaken capital silently produces a bound roughly 44,000 times further out. NULL rule: a \
         resource with no value on this axis is excluded, regardless of the bound."
     )]
     pub added_after: Option<String>,
@@ -135,9 +139,11 @@ pub struct SearchFilters {
         description = "Lower bound (inclusive) on the document date — the document's \
         own claimed date (Dublin Core dc:date). Same value grammar as added_after. NULL \
         rule: a resource with no claimed document date is excluded, regardless of the bound. \
-        Coverage: this date is populated today only for HTML, Markdown front matter, and \
-        Office documents — PDFs and feed entries have none yet (issue #251), so this \
-        currently excludes every PDF in a corpus."
+        Coverage: a resource has one only when its source carried one — HTML \
+        (JSON-LD or a `dcterms.date`/`date` meta), Markdown front matter, Office \
+        (`dcterms:created`), PDF (`/CreationDate` or XMP `xmp:CreateDate`), and feed \
+        entries (`published`/`updated`). Plain text carries none, and any format's \
+        metadata may simply omit it."
     )]
     pub document_after: Option<String>,
     /// Inclusive upper bound on [`DateAxis::Document`].
@@ -146,9 +152,11 @@ pub struct SearchFilters {
         description = "Upper bound (inclusive) on the document date — the document's \
         own claimed date (Dublin Core dc:date). Same value grammar as added_after. NULL \
         rule: a resource with no claimed document date is excluded, regardless of the bound. \
-        Coverage: this date is populated today only for HTML, Markdown front matter, and \
-        Office documents — PDFs and feed entries have none yet (issue #251), so this \
-        currently excludes every PDF in a corpus."
+        Coverage: a resource has one only when its source carried one — HTML \
+        (JSON-LD or a `dcterms.date`/`date` meta), Markdown front matter, Office \
+        (`dcterms:created`), PDF (`/CreationDate` or XMP `xmp:CreateDate`), and feed \
+        entries (`published`/`updated`). Plain text carries none, and any format's \
+        metadata may simply omit it."
     )]
     pub document_before: Option<String>,
 }
@@ -162,6 +170,42 @@ impl SearchFilters {
     /// `Error::InvalidRequest` naming the offending field, for any date field
     /// whose value matches none of the three accepted forms (see this
     /// module's doc comment).
+    /// Is any filter field set?
+    ///
+    /// Lets a caller skip work that only matters when filtering — notably the
+    /// CLI's daemon-capability probe, which should not cost an extra request
+    /// on every unfiltered search.
+    pub fn is_any_set(&self) -> bool {
+        let Self {
+            path,
+            mime,
+            added_after,
+            added_before,
+            updated_after,
+            updated_before,
+            modified_after,
+            modified_before,
+            document_after,
+            document_before,
+        } = self;
+        // Destructured rather than field-by-field so adding a field without
+        // updating this is a compile error, not a silently-missed case.
+        [
+            path,
+            mime,
+            added_after,
+            added_before,
+            updated_after,
+            updated_before,
+            modified_after,
+            modified_before,
+            document_after,
+            document_before,
+        ]
+        .iter()
+        .any(|f| f.is_some())
+    }
+
     pub fn into_metadata_filters(self) -> Result<Vec<MetadataFilter>, Error> {
         let mut filters = Vec::new();
 
@@ -206,7 +250,7 @@ impl SearchFilters {
 
         for (axis, after_field, after, before_field, before) in axes {
             if let Some(raw) = after {
-                let value = parse_filter_date_value(after_field, &raw)?;
+                let value = parse_filter_date_value(after_field, &raw, Bound::Lower)?;
                 filters.push(MetadataFilter::DateAfter { axis, value });
             }
             if let Some(raw) = before {
@@ -220,7 +264,7 @@ impl SearchFilters {
                 // widens the bound and mirrors it with a `CASE` over the
                 // column. Widening here as well would give one rule two
                 // owners that must stay in lockstep for no gain.
-                let value = parse_filter_date_value(before_field, &raw)?;
+                let value = parse_filter_date_value(before_field, &raw, Bound::Upper)?;
                 filters.push(MetadataFilter::DateBefore { axis, value });
             }
         }
@@ -232,8 +276,53 @@ impl SearchFilters {
 /// Parse one date-filter value into a canonical bound string, trying the
 /// date grammar before the duration grammar (see this module's doc comment
 /// for why no disambiguation heuristic is needed).
-fn parse_filter_date_value(field: &str, raw: &str) -> Result<String, Error> {
+/// If `raw` is a full RFC 3339 datetime carrying a non-zero sub-second
+/// component, return it rounded **up** to the next whole second in canonical
+/// form. Returns `None` for anything else — a partial date, a datetime with
+/// no fraction (or a zero one), or a value chrono cannot parse — leaving the
+/// caller's existing result untouched.
+fn ceil_to_next_second(raw: &str) -> Option<String> {
+    let parsed = chrono::DateTime::parse_from_rfc3339(raw.trim()).ok()?;
+    let utc = parsed.with_timezone(&chrono::Utc);
+    if utc.timestamp_subsec_nanos() == 0 {
+        return None;
+    }
+    let ceiled = utc.checked_add_signed(chrono::Duration::seconds(1))?;
+    let formatted = ceiled.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    is_canonical_timestamp(&formatted).then_some(formatted)
+}
+
+/// Which end of a range a value bounds. Only matters for one thing — how a
+/// sub-second component is rounded — but it matters in opposite directions,
+/// so the two cannot share a single rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bound {
+    /// Inclusive lower bound (`DateAfter`).
+    Lower,
+    /// Inclusive upper bound (`DateBefore`).
+    Upper,
+}
+
+fn parse_filter_date_value(field: &str, raw: &str, bound: Bound) -> Result<String, Error> {
     if let Some(value) = parse_date_or_datetime(raw) {
+        // Stored timestamps have second precision, and canonical form has no
+        // fractional part, so a sub-second input has to be rounded to a whole
+        // second. Truncating — which is what rendering at second precision
+        // does — is right for an upper bound and wrong for a lower one:
+        //
+        //   added_after: "…14:30:00.9Z"  truncated to "…14:30:00Z" would admit
+        //   a resource stored at exactly "…14:30:00Z", which precedes the
+        //   bound the caller actually asked for.
+        //
+        // So a lower bound rounds up to the next whole second instead. Any
+        // stored second-precision value at or after that is genuinely at or
+        // after the requested instant. An upper bound keeps the truncation,
+        // which is already correct for the same reason in reverse.
+        if bound == Bound::Lower {
+            if let Some(ceiled) = ceil_to_next_second(raw) {
+                return Ok(ceiled);
+            }
+        }
         return Ok(value);
     }
 
