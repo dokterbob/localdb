@@ -177,6 +177,46 @@ fn search_requires_query() {
     cmd().arg("search").assert().failure();
 }
 
+/// A typo'd flag typed after the query words must be a hard parse error
+/// (exit 2), not silently absorbed into the query text (issue #224). clap
+/// suggests the flag it thinks was meant.
+#[test]
+fn search_typo_flag_after_query_exits_2_with_suggestion() {
+    cmd()
+        .args(["search", "rank", "fusion", "--limt", "5"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--limit"));
+}
+
+/// An unrecognized flag-shaped token anywhere in `search`'s arguments is a
+/// parse error (exit 2). Before this fix, `trailing_var_arg` made anything
+/// after the first query word part of the query, so `--foo-bar` here would
+/// have been silently swallowed as literal query text instead of rejected.
+#[test]
+fn search_unknown_flag_exits_2() {
+    cmd().args(["search", "find", "--foo-bar"]).assert().code(2);
+}
+
+/// Pre-existing, unrelated-to-#224 gap: clap parse errors happen inside
+/// `Cli::parse()`, before the `CliContext` that carries `--json` exists, so
+/// even with `--json` passed, a parse error is reported as plain text, not
+/// a JSON error envelope — identical to every other clap parse error in
+/// this CLI (e.g. `unknown_subcommand_fails`, `search_requires_query`).
+#[test]
+fn search_typo_flag_with_json_flag_still_reports_plain_text() {
+    let assert = cmd()
+        .args(["--json", "search", "rank", "fusion", "--limt", "5"])
+        .assert()
+        .code(2);
+    let output = assert.get_output();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&stderr).is_err(),
+        "clap parse-error stderr must not parse as JSON; got: {stderr}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // internal print-schema (hidden)
 // ---------------------------------------------------------------------------
