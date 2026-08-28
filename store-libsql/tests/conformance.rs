@@ -183,6 +183,13 @@ async fn date_filter_null_axis_value_excluded() {
 }
 
 #[tokio::test]
+async fn date_filter_partial_bound_on_timestamp_axis() {
+    let (_dir, db) = setup().await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+    conformance::test_date_filter_partial_bound_on_timestamp_axis(handle.as_ref()).await;
+}
+
+#[tokio::test]
 async fn date_filter_document_axis_partial_precision_widening() {
     let (_dir, db) = setup().await;
     let handle = db.retrieval_store("store-1").await.unwrap();

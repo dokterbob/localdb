@@ -528,10 +528,12 @@ interpolation (needs per-model calibration); backend-native fusion (backend-depe
   §2's "Date axes (normative)") — and both bounds are inclusive (`>=`/`<=`). Multiple filters, of
   any kind and in any combination, always AND together; there is no OR. A `None`/`NULL` axis value
   on a given chunk fails every bound, in both directions — a document with no claimed `modified_at`
-  never matches a `modified`-axis filter regardless of the bound supplied. Because `document`-axis
-  values (`date_parsed`) can be partial-precision, a `document`-axis `DateBefore` bound is widened
-  to the latest instant its own precision allows before comparing; the other three axes are always
-  full-width RFC 3339 and need no widening.
+  never matches a `modified`-axis filter regardless of the bound supplied. A `DateBefore` bound is
+  widened to the latest instant its own precision allows before comparing, on **every** axis, so
+  that `added_before: "2026"` includes all of 2026 rather than excluding it; the stored value is
+  widened too on the `document` axis alone, the only one whose column can hold a partial-precision
+  value. See [02-domain-model.md](02-domain-model.md) §2's "Date axes (normative)" for the full
+  rule.
 
   **Known limitation — cross-store score comparability.** Pooling ranks each leg by its raw backend
   score, which assumes every store queried together reports that leg's scores on the same scale. Two

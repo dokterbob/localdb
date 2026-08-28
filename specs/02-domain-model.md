@@ -133,16 +133,26 @@ SQL-pushdown-only: it filters correctly against the real backend, but has no Rus
 a `ChunkRecord`, because the store always stamps `index_updated_at` with its own write-time clock
 rather than accepting a caller-supplied value (see the "Index updated" row above).
 
-Because `date_parsed` alone can be partial-precision (a bare `"YYYY"`, `"YYYY-MM"`, or full
-`"YYYY-MM-DD"` — see `core::dates::parse_partial_iso8601`), `DateBefore{axis: document, ...}` widens
-both the stored value and the bound to the latest instant consistent with their own precision
-(`core::dates::widen_date_upper_bound`) before comparing: a short prefix always sorts less than a
-longer string it prefixes, so without widening, `--document-before 2026-06-10` would wrongly exclude
-every timestamp later that same day. `DateAfter` needs no such widening — a short prefix already,
-correctly, sorts below any longer bound it cannot confirm. The widening is calendar-unaware
-(`"YYYY-MM"` always widens to day 31, regardless of the real month length) and scoped to the
-`document` axis only — `added`, `updated`, and `modified` are always full-width RFC 3339, per the
-canonical form above.
+`DateBefore` widens to the latest instant consistent with a value's own precision
+(`core::dates::widen_date_upper_bound`) before comparing, because a short prefix always sorts less
+than a longer string it prefixes. The two operands widen under different rules, since they become
+partial for different reasons:
+
+- **The bound is always widened, on every axis.** It is whatever the caller supplied, so it can be
+  partial regardless of what the axis stores. Without widening, an inclusive `added_before: "2026"`
+  would exclude every resource added during 2026 — `"2026-06-10T12:00:00Z" <= "2026"` is false.
+- **The stored value is widened only on the `document` axis**, the only one whose column can hold a
+  partial value (`date_parsed` is normalized to a bare `"YYYY"`, `"YYYY-MM"`, or full
+  `"YYYY-MM-DD"` — see `core::dates::parse_partial_iso8601`). `added`, `updated` and `modified`
+  always hold full-width RFC 3339 per the canonical form above, so widening them would be a no-op
+  and is skipped.
+
+`DateAfter` needs no widening in either operand: a short prefix already sorts below any longer bound
+it cannot confirm, which is the correct conservative reading.
+
+The widening is calendar-unaware — `"YYYY-MM"` always widens to day 31 regardless of the real month
+length, because `"31"` string-compares at or above any real day-of-month and SQLite cannot run
+per-row calendar arithmetic without a registered custom function.
 
 ### Block
 

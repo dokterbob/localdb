@@ -401,20 +401,30 @@ impl MetadataFilter {
                 axis.value_of(record).is_some_and(|v| v >= value.as_str())
             }
             MetadataFilter::DateBefore { axis, value } => axis.value_of(record).is_some_and(|v| {
-                // `Document` is the only axis whose stored value can be
-                // partial-width (`date_parsed` is normalized to exactly 4,
-                // 7, or 10 chars by `crate::dates::parse_partial_iso8601`);
-                // `Added`/`Updated`/`Modified` are always full RFC 3339. Both
-                // operands are widened for `Document` — the stored value
-                // (mirroring the SQL-side `CASE` over the column in
-                // `store-libsql/src/tenant/sql.rs`) and the bound (mirroring
-                // that same function's pre-widened `?` binding) — so this
-                // arm MUST stay in lockstep with both.
-                if matches!(axis, DateAxis::Document) {
-                    crate::dates::widen_date_upper_bound(v)
-                        <= crate::dates::widen_date_upper_bound(value)
-                } else {
-                    v <= value.as_str()
+                // The two operands widen under DIFFERENT rules, because they
+                // become partial-width for different reasons:
+                //
+                // - The BOUND is whatever a caller supplied, so it can be
+                //   partial on ANY axis. It is always widened. Without this,
+                //   an inclusive `added_before: "2026"` excludes every
+                //   resource added during 2026: a longer string sorts after
+                //   its own prefix, so `"2026-06-10T12:00:00Z" <= "2026"` is
+                //   false.
+                // - The STORED value is only partial-width on `Document`
+                //   (`date_parsed` is normalized to exactly 4, 7, or 10 chars
+                //   by `crate::dates::parse_partial_iso8601`);
+                //   `Added`/`Updated`/`Modified` are always full RFC 3339.
+                //   Widening those would be a no-op, so it is skipped —
+                //   matching the SQL side, which pays for a `CASE` over the
+                //   column only on `Document`.
+                //
+                // This arm MUST stay in lockstep with `build_filter_clauses`
+                // in `store-libsql/src/tenant/sql.rs`, which mirrors exactly
+                // this split.
+                let bound = crate::dates::widen_date_upper_bound(value);
+                match axis {
+                    DateAxis::Document => crate::dates::widen_date_upper_bound(v) <= bound,
+                    _ => v <= bound.as_str(),
                 }
             }),
             MetadataFilter::SourceId(id) => &record.source_id == id,
@@ -1691,6 +1701,58 @@ pub mod conformance {
     /// `DateAfter{Document, "2023-12-31"}` (`DateAfter` needs no widening —
     /// see `core::dates::widen_date_upper_bound`'s doc comment — and `"2024"`
     /// already sorts after `"2023-12-31"` as a plain string).
+    /// Test: a partial `DateBefore` bound on a full-timestamp axis must
+    /// include the whole period it names, not exclude it.
+    ///
+    /// The bound is caller-supplied, so it can be partial on any axis, while
+    /// `added_at` always holds a full RFC 3339 timestamp. Comparing the two
+    /// raw would exclude everything: a longer string sorts after its own
+    /// prefix, so `"2026-06-10T12:00:00Z" <= "2026"` is false. Widening the
+    /// bound to the latest instant its precision allows is what makes an
+    /// inclusive upper bound actually inclusive.
+    pub async fn test_date_filter_partial_bound_on_timestamp_axis(store: &dyn RetrievalStore) {
+        let mut record = make_record(
+            "chunk-added-2026",
+            "doc-added-2026",
+            "store-1",
+            "added mid 2026",
+            vec![1.0, 0.0],
+        );
+        record.fetched_at = "2026-06-10T12:00:00Z".to_string();
+        store.upsert_chunks(vec![record]).await.unwrap();
+
+        // Every bound below names a period that CONTAINS the stored instant,
+        // so each must match. Before the bound was widened, all three
+        // returned nothing.
+        for bound in ["2026", "2026-06", "2026-06-10"] {
+            let filters = vec![MetadataFilter::DateBefore {
+                axis: DateAxis::Added,
+                value: bound.to_string(),
+            }];
+            let results = store.dense_search(&[1.0, 0.0], 10, &filters).await.unwrap();
+            assert_eq!(
+                results.len(),
+                1,
+                "DateBefore{{Added, {bound:?}}} must include a resource added \
+                 2026-06-10T12:00:00Z — the bound names a period containing it"
+            );
+        }
+
+        // A bound naming an earlier period must still exclude it, so the
+        // widening cannot be over-broad.
+        for bound in ["2025", "2026-05", "2026-06-09"] {
+            let filters = vec![MetadataFilter::DateBefore {
+                axis: DateAxis::Added,
+                value: bound.to_string(),
+            }];
+            let results = store.dense_search(&[1.0, 0.0], 10, &filters).await.unwrap();
+            assert!(
+                results.is_empty(),
+                "DateBefore{{Added, {bound:?}}} must exclude a resource added later"
+            );
+        }
+    }
+
     pub async fn test_date_filter_document_axis_partial_precision_widening(
         store: &dyn RetrievalStore,
     ) {
@@ -1945,6 +2007,12 @@ mod tests {
     async fn fake_store_date_filter_null_axis_value_excluded() {
         let store = FakeStore::new();
         test_date_filter_null_axis_value_excluded(&store).await;
+    }
+
+    #[tokio::test]
+    async fn fake_store_date_filter_partial_bound_on_timestamp_axis() {
+        let store = FakeStore::new();
+        test_date_filter_partial_bound_on_timestamp_axis(&store).await;
     }
 
     #[tokio::test]
