@@ -3,6 +3,7 @@
 //! widening rule, and the error cases.
 
 use super::SearchFilters;
+use crate::error::Error;
 use crate::store::{ChunkRecord, DateAxis, MetadataFilter};
 use crate::types::Span;
 
@@ -81,6 +82,31 @@ fn partial_dates_pass_through_unchanged_for_after_bound() {
             }],
             "partial date {raw:?} should pass through unchanged on the after bound"
         );
+    }
+}
+
+/// A duration can parse cleanly and still carry `now` outside
+/// `DateTime<Utc>`'s representable range. That must be an `invalid_request`,
+/// not a panic — these values arrive unfiltered from the HTTP and MCP
+/// surfaces, where a panic would take down the request rather than answer
+/// it.
+#[test]
+fn duration_that_underflows_the_representable_range_is_invalid_request() {
+    for huge in ["1000000years", "500000years", "9999999weeks"] {
+        let f = SearchFilters {
+            added_after: Some(huge.to_string()),
+            ..filters()
+        };
+        match f.into_metadata_filters() {
+            Err(Error::InvalidRequest { message }) => {
+                assert!(
+                    message.contains("added_after"),
+                    "error must name the offending field, got: {message}"
+                );
+            }
+            Err(other) => panic!("{huge:?} must be InvalidRequest, got {other:?}"),
+            Ok(v) => panic!("{huge:?} must be rejected, got {v:?}"),
+        }
     }
 }
 

@@ -238,6 +238,32 @@ fn search_bad_date_filter_exits_2() {
     );
 }
 
+/// A malformed filter must exit 2 even against a database with no stores at
+/// all. Argument validity is a property of the invocation, not of database
+/// state: when the conversion ran after the empty-store early return, this
+/// exact command reported "no results" and exit 0, disagreeing with both the
+/// daemon-routed form and the same command against a populated database.
+#[test]
+fn search_bad_date_filter_exits_2_on_a_storeless_database() {
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+
+    let output = cmd_with_dir(&dir)
+        .args(["search", "--added-after", "not-a-date", "hello"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "a malformed filter must be rejected before store resolution; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("added_after"),
+        "the error must name the offending field"
+    );
+}
+
 /// `--mime` never runs through date/duration parsing: `"7d"` would be a
 /// valid duration for a date flag, but here it is only ever a literal MIME
 /// string. No real document has that MIME type, so the request must still

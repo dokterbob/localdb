@@ -99,6 +99,16 @@ impl DaemonAwareCommand for SearchCmd<'_> {
         use localdb_core::clamp_search_limit;
         use localdb_core::search::{QueryRequest, SearchOrchestrator, StoreHandle};
 
+        // Validate the filters first, before the empty-store return and
+        // before the embedder is built. Argument validity is a property of
+        // the invocation, not of database or daemon state, so a malformed
+        // `--added-after not-a-date` must exit 2 identically whether the
+        // database is empty, populated, or fronted by a daemon. Doing it
+        // later meant a storeless database reported "no results" and exit 0,
+        // and a populated one could fail on provider configuration — or
+        // trigger a model download — before ever mentioning the bad value.
+        let filters = self.filters.clone().into_metadata_filters()?;
+
         // specs/05-surfaces.md §2.2, via the one shared resolver every other
         // `-s`-accepting command uses. `AllStoresAllowEmpty` is what makes a
         // fresh, storeless database return no results and exit 0 rather than
@@ -139,7 +149,7 @@ impl DaemonAwareCommand for SearchCmd<'_> {
             query: self.query.to_string(),
             leg_k: None,
             top_n: Some(clamp_search_limit(self.limit)),
-            filters: self.filters.clone().into_metadata_filters()?,
+            filters,
         };
 
         SearchOrchestrator::query(&store_handles, embedder.as_ref(), &request)

@@ -174,6 +174,29 @@ async fn search_bad_filter_value_returns_invalid_request() {
     );
 }
 
+/// The same malformed value must be rejected when the session exposes no
+/// stores at all. Argument validity does not depend on store availability:
+/// behind the empty-store early return, this was reported as a successful
+/// empty search, so an agent got `{"citations": []}` for a request that was
+/// never valid.
+#[tokio::test]
+async fn search_bad_filter_value_returns_invalid_request_with_no_stores() {
+    let embedder = FakeEmbedder::new(128);
+
+    let mut args = search_args("hello");
+    args.filters.added_after = Some("not-a-date".to_string());
+    let result = tool_search(&[], &embedder, args).await;
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a malformed filter must not be reported as a successful empty search"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text_of(&result)).expect("error body is JSON");
+    assert_eq!(parsed["error"]["code"].as_str().unwrap(), "invalid_request");
+}
+
 // -----------------------------------------------------------------------
 // E2 — typed error shape
 // -----------------------------------------------------------------------

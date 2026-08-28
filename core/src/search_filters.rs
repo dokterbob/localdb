@@ -232,6 +232,19 @@ impl SearchFilters {
 /// Parse one date-filter value into a canonical bound string, trying the
 /// date grammar before the duration grammar (see this module's doc comment
 /// for why no disambiguation heuristic is needed).
+/// Does `s` match the canonical stored-timestamp form
+/// `YYYY-MM-DDTHH:MM:SSZ` (specs/02-domain-model.md)? One char class per
+/// position, so the pattern reads like the shape it checks: `D` is an ASCII
+/// digit, anything else is that literal byte.
+fn is_canonical_timestamp(s: &str) -> bool {
+    const PATTERN: &[u8] = b"DDDD-DD-DDTDD:DD:DDZ";
+    s.len() == PATTERN.len()
+        && s.bytes().zip(PATTERN).all(|(got, want)| match want {
+            b'D' => got.is_ascii_digit(),
+            literal => got == *literal,
+        })
+}
+
 fn parse_filter_date_value(field: &str, raw: &str) -> Result<String, Error> {
     if let Some(value) = parse_date_or_datetime(raw) {
         return Ok(value);
@@ -246,8 +259,35 @@ fn parse_filter_date_value(field: &str, raw: &str) -> Result<String, Error> {
         // bound direction. `--modified-after 7d` -> "within the last 7
         // days"; `--modified-before 7d` -> "more than 7 days ago". Never
         // `now + duration`.
-        let bound = chrono::Utc::now() - duration;
-        return Ok(bound.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+        //
+        // `checked_sub_signed`, not `-`: a duration can be syntactically
+        // valid and fit both `std::time::Duration` and `chrono::Duration`
+        // while still carrying `now` outside `DateTime<Utc>`'s representable
+        // range (a span on the order of a million years does it). Plain
+        // subtraction panics there, and these values arrive unfiltered from
+        // the HTTP and MCP surfaces, so it has to be an `invalid_request`
+        // like any other unusable bound.
+        let bound = chrono::Utc::now()
+            .checked_sub_signed(duration)
+            .ok_or_else(|| Error::InvalidRequest {
+                message: format!("{field}: duration out of range: {raw:?}"),
+            })?;
+        let bound = bound.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+        // The result must land in the canonical `YYYY-MM-DDTHH:MM:SSZ` form
+        // (specs/02-domain-model.md), because bounds are compared
+        // lexicographically against stored values in exactly that form. A
+        // duration large enough to reach a year outside `0000..=9999` still
+        // subtracts successfully, but chrono then renders a signed,
+        // wider-than-four-digit year — and `-` sorts below every digit, so
+        // such a bound would compare as an extreme against every row rather
+        // than as the date it names. Reject it as unusable instead.
+        if !is_canonical_timestamp(&bound) {
+            return Err(Error::InvalidRequest {
+                message: format!("{field}: duration out of range: {raw:?}"),
+            });
+        }
+        return Ok(bound);
     }
 
     Err(Error::InvalidRequest {
