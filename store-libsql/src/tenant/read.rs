@@ -54,11 +54,11 @@ pub(crate) async fn dense_search(
     filters: &[MetadataFilter],
 ) -> Result<Vec<SearchResult>, Error> {
     let conn = store.conn().reader();
-    let filter_clauses = build_filter_clauses(filters);
+    let (filter_clauses, filter_values) = build_filter_clauses(filters);
     let encoding = store.encoding();
     let dim = store.embedding_dim();
     // Always start with an overfetch multiplier: the tenant predicate
-    // (WHERE c.store_id = '...') acts as a post-ANN filter even when the
+    // (WHERE c.store_id = ?) acts as a post-ANN filter even when the
     // caller supplies no MetadataFilters.
     let mut fetch_k = limit * 3;
     let max_fetch = limit * 20;
@@ -67,24 +67,34 @@ pub(crate) async fn dense_search(
     let mut ann_saturated = false;
     loop {
         let qvec_sql = vectors::query_vector_sql(query_vector, encoding);
-        let escaped_store_id = store.store_id().replace('\'', "''");
         // TODO(#104): libsql has no partial vector indexes or ANN-level
         // predicate pushdown, so we always overfetch at the global index and
         // post-filter by store_id.  True per-store ANN partitioning would
         // require per-store chunk tables — see the tracking issue.
         // An exact-scan fallback below handles saturation by other tenants.
+        //
+        // `qvec_sql`, `fetch_k`, and `limit` stay interpolated (issue #255):
+        // `qvec_sql` is a `vector32(...)`/`vector1bit(...)` SQL function-call
+        // literal built from internally-computed `f32` values — it is not
+        // attacker-reachable and not bindable in the `vector_top_k` argument
+        // position; `fetch_k`/`limit` are Rust-computed `usize`.
         let sql = format!(
             "SELECT {CHUNK_COLS},
                     vector_distance_cos(c.embedding, {qvec_sql}) AS distance
              FROM vector_top_k('chunks_vec_idx', {qvec_sql}, {fetch_k}) AS v
              JOIN chunks c ON c.rowid = v.id
              JOIN resources r ON r.store_id = c.store_id AND r.id = c.resource_id
-             WHERE c.store_id = '{escaped_store_id}'
+             WHERE c.store_id = ?
              {filter_clauses}
              ORDER BY distance ASC
              LIMIT {limit}"
         );
-        let mut rows = conn.query(&sql, ()).await.map_err(map_libsql_err)?;
+        // `filter_values` is reused across this fetch_k-doubling loop and the
+        // exact-scan fallback below, so it is cloned at each query call —
+        // `IntoParams::into_params` takes `self` by value.
+        let mut params = vec![store.store_id().to_string()];
+        params.extend(filter_values.clone());
+        let mut rows = conn.query(&sql, params).await.map_err(map_libsql_err)?;
         results.clear();
         while let Some(row) = rows.next().await.map_err(map_libsql_err)? {
             let chunk = row_to_chunk_record_strict(&row)?;
@@ -112,18 +122,19 @@ pub(crate) async fn dense_search(
     // long-term fix (tracking issue).
     if ann_saturated && results.len() < limit {
         let qvec_sql = vectors::query_vector_sql(query_vector, encoding);
-        let escaped_store_id = store.store_id().replace('\'', "''");
         let sql = format!(
             "SELECT {CHUNK_COLS},
                     vector_distance_cos(c.embedding, {qvec_sql}) AS distance
              FROM chunks c
              JOIN resources r ON r.store_id = c.store_id AND r.id = c.resource_id
-             WHERE c.store_id = '{escaped_store_id}'
+             WHERE c.store_id = ?
              {filter_clauses}
              ORDER BY distance ASC
              LIMIT {limit}"
         );
-        let mut rows = conn.query(&sql, ()).await.map_err(map_libsql_err)?;
+        let mut params = vec![store.store_id().to_string()];
+        params.extend(filter_values.clone());
+        let mut rows = conn.query(&sql, params).await.map_err(map_libsql_err)?;
         results.clear();
         while let Some(row) = rows.next().await.map_err(map_libsql_err)? {
             let chunk = row_to_chunk_record_strict(&row)?;
@@ -149,8 +160,7 @@ pub(crate) async fn bm25_search(
     }
     let conn = store.conn().reader();
     let escaped_query = escape_fts5_query(query_text);
-    let filter_clauses = build_filter_clauses(filters);
-    let escaped_store_id = store.store_id().replace('\'', "''");
+    let (filter_clauses, filter_values) = build_filter_clauses(filters);
     let sql = format!(
         "SELECT {CHUNK_COLS},
                 bm25(chunks_fts) AS score
@@ -158,15 +168,17 @@ pub(crate) async fn bm25_search(
          JOIN chunks c ON c.rowid = f.rowid
          JOIN resources r ON r.store_id = c.store_id AND r.id = c.resource_id
          WHERE chunks_fts MATCH ?
-         AND c.store_id = '{escaped_store_id}'
+         AND c.store_id = ?
          {filter_clauses}
          ORDER BY score ASC
          LIMIT {limit}"
     );
-    let mut rows = conn
-        .query(&sql, params![escaped_query])
-        .await
-        .map_err(map_libsql_err)?;
+    // `MATCH ?` is bound first, so it must stay the first positional param;
+    // store_id and filter values follow in the order their `?` placeholders
+    // appear in the SQL text above (issue #255).
+    let mut params = vec![escaped_query, store.store_id().to_string()];
+    params.extend(filter_values);
+    let mut rows = conn.query(&sql, params).await.map_err(map_libsql_err)?;
     let mut results = Vec::new();
     while let Some(row) = rows.next().await.map_err(map_libsql_err)? {
         let chunk = row_to_chunk_record_strict(&row)?;
