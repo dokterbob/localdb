@@ -123,7 +123,7 @@ fn feed_rfc3339_shape() {
 }
 
 // ---------------------------------------------------------------------------
-// parse_date_or_datetime (issue #247) — search-filter date bound primitive.
+// parse_date_or_datetime — search-filter date bound primitive.
 // Not wired to any caller yet; a later PR wires it through CLI date-filter
 // flags. Partial dates pass through unchanged (asymmetric filter-bound
 // comparison needs that); a full datetime normalizes to canonical UTC.
