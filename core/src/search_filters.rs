@@ -34,7 +34,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::dates::parse_date_or_datetime;
+use crate::dates::{is_canonical_timestamp, parse_date_or_datetime};
 use crate::error::Error;
 use crate::store::{DateAxis, MetadataFilter};
 
@@ -232,19 +232,6 @@ impl SearchFilters {
 /// Parse one date-filter value into a canonical bound string, trying the
 /// date grammar before the duration grammar (see this module's doc comment
 /// for why no disambiguation heuristic is needed).
-/// Does `s` match the canonical stored-timestamp form
-/// `YYYY-MM-DDTHH:MM:SSZ` (specs/02-domain-model.md)? One char class per
-/// position, so the pattern reads like the shape it checks: `D` is an ASCII
-/// digit, anything else is that literal byte.
-fn is_canonical_timestamp(s: &str) -> bool {
-    const PATTERN: &[u8] = b"DDDD-DD-DDTDD:DD:DDZ";
-    s.len() == PATTERN.len()
-        && s.bytes().zip(PATTERN).all(|(got, want)| match want {
-            b'D' => got.is_ascii_digit(),
-            literal => got == *literal,
-        })
-}
-
 fn parse_filter_date_value(field: &str, raw: &str) -> Result<String, Error> {
     if let Some(value) = parse_date_or_datetime(raw) {
         return Ok(value);

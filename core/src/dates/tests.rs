@@ -1,4 +1,6 @@
-use super::{parse_date_or_datetime, parse_partial_iso8601, widen_date_upper_bound};
+use super::{
+    is_canonical_timestamp, parse_date_or_datetime, parse_partial_iso8601, widen_date_upper_bound,
+};
 
 #[test]
 fn bare_year() {
@@ -269,4 +271,65 @@ fn cross_width_after_before_asymmetry() {
         "a bare year widened to Dec 31 must sort at-or-before a Dec 31 bound widened to the \
          same day"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Multi-byte input must fail closed, not panic
+// ---------------------------------------------------------------------------
+
+/// Every date component sits at a fixed byte offset, so a multi-byte
+/// character straddling one of those offsets used to split a code point and
+/// abort the process. Both entry points reach the same walk, and both are fed
+/// untrusted input: `parse_partial_iso8601` from document metadata (an HTML
+/// `dcterms.date` meta tag, Markdown front matter), and
+/// `parse_date_or_datetime` from user-supplied filter bounds. Malformed input
+/// has to fail closed like any other, so indexing a hostile document cannot
+/// take the indexer down.
+#[test]
+fn multibyte_input_across_a_component_boundary_fails_closed() {
+    for raw in [
+        "2026-0é",    // é splits at byte 6, inside the month slice
+        "2026-06-0é", // é splits at byte 9, inside the day slice
+        "2026-0é-01",
+        "20é6",
+        "2026-06-10T1é:00:00Z", // multi-byte in the datetime tail
+        "２０２６",             // full-width digits: not ASCII, must not parse
+        "2026-06-10\u{0}",
+    ] {
+        assert_eq!(
+            parse_partial_iso8601(raw),
+            None,
+            "parse_partial_iso8601({raw:?}) must return None, not panic"
+        );
+        assert_eq!(
+            parse_date_or_datetime(raw),
+            None,
+            "parse_date_or_datetime({raw:?}) must return None, not panic"
+        );
+    }
+}
+
+/// The canonical form is exactly `YYYY-MM-DDTHH:MM:SSZ` — a sign-prefixed
+/// year is not canonical, which is what keeps a far-future or pre-epoch
+/// instant from sorting as an extreme against every real row.
+#[test]
+fn is_canonical_timestamp_accepts_only_the_stored_form() {
+    assert!(is_canonical_timestamp("2026-06-10T12:00:00Z"));
+    assert!(is_canonical_timestamp("1970-01-01T00:00:00Z"));
+
+    for bad in [
+        "+10000-01-01T00:00:00Z",
+        "-189627-03-09T13:49:29Z",
+        "2026-06-10T12:00:00+00:00",
+        "2026-06-10T12:00:00.123Z",
+        "2026-06-10T12:00:00",
+        "2026-06-10",
+        "",
+        "20X6-06-10T12:00:00Z",
+    ] {
+        assert!(
+            !is_canonical_timestamp(bad),
+            "{bad:?} must not be canonical"
+        );
+    }
 }
