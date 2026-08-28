@@ -34,7 +34,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::dates::{parse_date_or_datetime, widen_date_upper_bound};
+use crate::dates::parse_date_or_datetime;
 use crate::error::Error;
 use crate::store::{DateAxis, MetadataFilter};
 
@@ -210,22 +210,17 @@ impl SearchFilters {
                 filters.push(MetadataFilter::DateAfter { axis, value });
             }
             if let Some(raw) = before {
+                // Every axis's bound is carried through exactly as parsed —
+                // no upper-bound widening happens here. Widening the
+                // `document` axis is the store layer's job, because it has
+                // to apply to every `MetadataFilter`, however constructed,
+                // not only to those built from a `SearchFilters`. Both
+                // backends already do it: `MetadataFilter::matches` widens
+                // both operands, and `store-libsql`'s `build_filter_clauses`
+                // widens the bound and mirrors it with a `CASE` over the
+                // column. Widening here as well would give one rule two
+                // owners that must stay in lockstep for no gain.
                 let value = parse_filter_date_value(before_field, &raw)?;
-                // Ordering rule (issue #247): widen ONLY the `document` axis
-                // before-bound, here — `added`/`updated`/`modified` stay
-                // byte-identical to what `parse_filter_date_value` returned.
-                // `document`'s stored value (`date_parsed`) can be
-                // partial-width, so its `<=` bound must be widened to the
-                // latest instant its own precision allows (see
-                // `widen_date_upper_bound`'s doc comment); the other three
-                // axes are always full-width RFC 3339 and widening them
-                // would be a no-op at best and a silent behavior change at
-                // worst if that ever stopped being true.
-                let value = if matches!(axis, DateAxis::Document) {
-                    widen_date_upper_bound(&value)
-                } else {
-                    value
-                };
                 filters.push(MetadataFilter::DateBefore { axis, value });
             }
         }

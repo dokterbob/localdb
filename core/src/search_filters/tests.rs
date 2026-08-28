@@ -175,11 +175,21 @@ fn modified_before_7d_excludes_yesterday_and_includes_8_days_ago() {
 }
 
 // ---------------------------------------------------------------------------
-// Widening ordering rule: document-axis before-bound ONLY.
+// Widening ownership: no axis's bound is widened here.
 // ---------------------------------------------------------------------------
 
+/// Upper-bound widening for the `document` axis belongs to the store layer,
+/// which applies it to every `MetadataFilter` however constructed —
+/// `MetadataFilter::matches` widens both operands, and `store-libsql`'s
+/// `build_filter_clauses` widens the bound and mirrors it with a `CASE` over
+/// the column. This conversion therefore carries every bound through exactly
+/// as parsed, so the filter reflects what the caller actually asked for.
+///
+/// Pinned because widening here as well would be invisible — it is
+/// idempotent, so the duplication would pass every behavioral test while
+/// giving one rule two owners that must stay in lockstep.
 #[test]
-fn only_document_axis_before_bound_is_widened() {
+fn no_axis_before_bound_is_widened_at_the_conversion_boundary() {
     let f = SearchFilters {
         added_before: Some("2026".to_string()),
         updated_before: Some("2026".to_string()),
@@ -216,8 +226,8 @@ fn only_document_axis_before_bound_is_widened() {
     );
     assert_eq!(
         value_for(DateAxis::Document),
-        "2026-12-31T23:59:59Z",
-        "document must be widened to the latest instant its precision allows"
+        "2026",
+        "document must not be widened here either — the store layer owns widening"
     );
 }
 
