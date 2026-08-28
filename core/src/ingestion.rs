@@ -666,17 +666,24 @@ pub fn now_rfc3339() -> String {
 /// `+00:00`, matching every other stored timestamp in the system so plain
 /// string comparison stays correct.
 pub fn format_secs_rfc3339(secs: u64) -> String {
-    match DateTime::<Utc>::from_timestamp(secs as i64, 0) {
+    // `i64::try_from`, never `as i64`: a wrapping cast turns a `u64` above
+    // `i64::MAX` into a *negative* timestamp, which chrono formats happily as
+    // a pre-epoch instant (`u64::MAX` becomes `1969-12-31T23:59:59Z`). That
+    // is far worse than the out-of-range fallback below — it is a plausible
+    // value that silently sorts before every real row. Fail the conversion
+    // instead, and let both out-of-range paths share one fallback.
+    let dt = i64::try_from(secs)
+        .ok()
+        .and_then(|secs| DateTime::<Utc>::from_timestamp(secs, 0));
+    match dt {
         Some(dt) => dt.to_rfc3339_opts(SecondsFormat::Secs, true),
-        // `secs as i64` combined with chrono's own representable range
-        // (roughly ±262,000 years around 1970) can only be exceeded by an
-        // input no real Unix timestamp will ever carry. This function is
-        // documented as infallible (unlike the hand-rolled arithmetic it
-        // replaces, which genuinely could not fail), so rather than
-        // introduce a `Result` no caller has a recovery path for, fall back
-        // to the fixed Unix epoch literal: deterministic, never panics, and
-        // still a valid canonical-form timestamp that sorts correctly
-        // against every other stored value.
+        // Reachable only for an input no real Unix timestamp carries: above
+        // `i64::MAX`, or beyond chrono's representable range (roughly
+        // ±262,000 years around 1970). This function is documented as
+        // infallible, so rather than introduce a `Result` no caller has a
+        // recovery path for, fall back to the epoch: deterministic, never
+        // panics, and still canonical-form so it sorts against every other
+        // stored value.
         None => "1970-01-01T00:00:00Z".to_string(),
     }
 }
@@ -719,20 +726,14 @@ mod canonical_form_tests {
     /// `^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$`, checked by hand (no regex
     /// dependency in this crate) rather than as a literal pattern.
     fn matches_canonical_shape(s: &str) -> bool {
-        let b = s.as_bytes();
-        b.len() == 20
-            && b[..4].iter().all(u8::is_ascii_digit)
-            && b[4] == b'-'
-            && b[5..7].iter().all(u8::is_ascii_digit)
-            && b[7] == b'-'
-            && b[8..10].iter().all(u8::is_ascii_digit)
-            && b[10] == b'T'
-            && b[11..13].iter().all(u8::is_ascii_digit)
-            && b[13] == b':'
-            && b[14..16].iter().all(u8::is_ascii_digit)
-            && b[16] == b':'
-            && b[17..19].iter().all(u8::is_ascii_digit)
-            && b[19] == b'Z'
+        // One char class per position, so the pattern reads like the shape it
+        // describes: `D` = ASCII digit, anything else = that literal byte.
+        const PATTERN: &[u8] = b"DDDD-DD-DDTDD:DD:DDZ";
+        s.len() == PATTERN.len()
+            && s.bytes().zip(PATTERN).all(|(got, want)| match want {
+                b'D' => got.is_ascii_digit(),
+                literal => got == *literal,
+            })
     }
 
     /// `now_rfc3339`'s real-clock branch is stubbed to a fixed literal under
@@ -756,6 +757,25 @@ mod canonical_form_tests {
     #[test]
     fn format_secs_rfc3339_has_no_fractional_second_component() {
         assert!(!format_secs_rfc3339(1_783_524_645).contains('.'));
+    }
+
+    /// A `u64` above `i64::MAX` must reach the out-of-range fallback, never
+    /// wrap into a negative timestamp. A wrapping `as i64` cast turns
+    /// `u64::MAX` into `-1`, which chrono formats as `1969-12-31T23:59:59Z`
+    /// — a plausible-looking value that would sort before every real row.
+    #[test]
+    fn timestamps_above_i64_max_fall_back_instead_of_wrapping_to_pre_epoch() {
+        for secs in [u64::MAX, i64::MAX as u64 + 1] {
+            let formatted = format_secs_rfc3339(secs);
+            assert_eq!(
+                formatted, "1970-01-01T00:00:00Z",
+                "{secs} must hit the epoch fallback, not wrap"
+            );
+            assert!(
+                !formatted.starts_with("1969"),
+                "{secs} wrapped into a pre-epoch instant: {formatted}"
+            );
+        }
     }
 
     /// The test that actually matters: a hand-written legacy-form literal
