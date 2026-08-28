@@ -54,6 +54,17 @@ malformed invocation (unknown subcommand, missing argument, bad enum value) prin
 to stderr with empty stdout and exit 2, and `--help` / `--version` print human-readable text to
 stdout with exit 0.
 
+**`search` query argument parsing (issue #224).** `search` accepts its query as one or more
+positional words, which may be given unquoted (`localdb search rank fusion`, not
+`localdb search "rank fusion"`). Option flags (`--limit`, `--content-length`, `--store`/`-s`,
+`--json`, …) may be interleaved before or after the query words — both
+`localdb search --limit 5 rank fusion` and `localdb search rank fusion --limit 5` parse identically.
+A token that looks like a flag but is not one clap recognizes is a usage error, exit 2, per the
+argument-parsing outcome above — it is never silently absorbed into the query text. `--` forces
+every token after it to be treated as literal query text, including tokens that would otherwise look
+like flags; this is the escape hatch for a query word that legitimately begins with `-` (e.g.
+`localdb search -- -5 degrees`).
+
 ### 2.1 Schema migrations
 
 All schema-version mismatches on open — on every surface, CLI, HTTP daemon, and MCP alike — map to

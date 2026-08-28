@@ -788,7 +788,8 @@ Hybrid search with citations
 Usage: localdb search [OPTIONS] <QUERY>...
 
 Arguments:
-  <QUERY>...  Natural language query (no quotes needed; everything after the options is treated as the query)
+  <QUERY>...  Natural language query; may be given unquoted as multiple words. A query word
+              starting with `-` must be protected with `--`
 
 Options:
       --config <PATH>
@@ -812,10 +813,16 @@ Options:
 Omit `--store` and every store is searched; pass `--store` (repeatable) to narrow to specific stores
 (specs/05-surfaces.md §2.2) — unchanged behavior, listed here for completeness.
 
-> **Options-first:** flags (`--limit`, `--content-length`, `--store`, `-s`, `--json`) must appear
-> **before** the query words. Anything after the first query word is captured verbatim as query text
-> — so `localdb search --limit 5 rank fusion` works, but `localdb search rank fusion --limit 5`
-> treats `--limit 5` as part of the query.
+> **Flag placement:** flags (`--limit`, `--content-length`, `--store`, `-s`, `--json`) may appear
+> either before or after the query words — `localdb search --limit 5 rank fusion` and
+> `localdb search rank fusion --limit 5` both work. A token that looks like a flag but isn't a
+> recognized one is a parse error (exit 2), not text silently folded into the query. A query word
+> that legitimately begins with `-` must be protected with `--`, e.g.
+> `localdb search -- -5 degrees`.
+>
+> This applies to `search` specifically; parse errors are always reported as plain text on stderr,
+> even when `--json` is passed, since the failure happens before the flag that would select JSON
+> output takes effect.
 
 Runs hybrid BM25 + dense-vector search across the targeted stores and returns ranked citations. The
 Citation JSON shape is documented in

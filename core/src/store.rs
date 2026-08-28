@@ -1133,6 +1133,97 @@ pub mod conformance {
         assert_eq!(results[0].chunk.id, "chunk-1");
     }
 
+    /// Test: metadata filter values are bound as SQL parameters, never
+    /// interpolated into query text (issue #255). Table-driven over four
+    /// adversarial payloads: a bare single quote (the exact character the
+    /// old `'`-doubling escaping handled — direct regression signal), a SQL
+    /// line-comment payload, the documented `LIKE`-wildcard character for
+    /// `UriPrefix` (specs/04-search-pipeline.md §5), and a non-ASCII
+    /// multi-byte string. Each value is embedded in a real resource's
+    /// `mime`/`uri` and must be matched (or not) as literal data — the
+    /// query must never error, which is the failure mode a reintroduced
+    /// interpolation bug would produce.
+    pub async fn test_metadata_filter_values_are_bound_not_interpolated(
+        store: &dyn RetrievalStore,
+    ) {
+        let adversarial_values = ["'", "--", "%", "café-日本"];
+
+        for (i, value) in adversarial_values.iter().enumerate() {
+            let chunk_id = format!("chunk-adv-{i}");
+            let resource_id = format!("doc-adv-{i}");
+            let mut matching = make_record(
+                &chunk_id,
+                &resource_id,
+                "store-1",
+                "adversarial payload content",
+                vec![1.0, 0.0],
+            );
+            matching.mime = Some(value.to_string());
+            matching.uri = format!("file:///adv/{value}/doc.md");
+
+            let other_chunk_id = format!("chunk-adv-other-{i}");
+            let other_resource_id = format!("doc-adv-other-{i}");
+            let mut other = make_record(
+                &other_chunk_id,
+                &other_resource_id,
+                "store-1",
+                "unrelated content",
+                vec![0.0, 1.0],
+            );
+            other.mime = Some("text/plain".to_string());
+            other.uri = "file:///unrelated/doc.md".to_string();
+
+            store
+                .upsert_chunks(vec![matching, other])
+                .await
+                .unwrap_or_else(|e| panic!("upsert must not error on {value:?}: {e}"));
+
+            // Mime equality filter: exact match on the adversarial value itself.
+            let mime_filter = vec![MetadataFilter::Mime(value.to_string())];
+            let dense = store
+                .dense_search(&[1.0, 0.0], 10, &mime_filter)
+                .await
+                .unwrap_or_else(|e| panic!("dense_search must not error on Mime {value:?}: {e}"));
+            assert_eq!(
+                dense.len(),
+                1,
+                "Mime filter {value:?} should match exactly the tagged chunk, got {dense:?}"
+            );
+            assert_eq!(dense[0].chunk.id, chunk_id);
+
+            let bm25 = store
+                .bm25_search("adversarial payload content", 10, &mime_filter)
+                .await
+                .unwrap_or_else(|e| panic!("bm25_search must not error on Mime {value:?}: {e}"));
+            assert_eq!(
+                bm25.len(),
+                1,
+                "BM25 with Mime filter {value:?} should match exactly the tagged chunk"
+            );
+            assert_eq!(bm25[0].chunk.id, chunk_id);
+
+            // UriPrefix filter: the adversarial value sits inside the bound
+            // prefix value itself. `%` is the one value expected to behave as
+            // a LIKE wildcard here (documented, not a bug); every value must
+            // still avoid a SQL error and must still match its own tagged
+            // chunk.
+            let uri_prefix_filter = vec![MetadataFilter::UriPrefix(format!("file:///adv/{value}"))];
+            let uri_results = store
+                .dense_search(&[1.0, 0.0], 10, &uri_prefix_filter)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("dense_search must not error on UriPrefix {value:?}: {e}")
+                });
+            assert!(
+                uri_results.iter().any(|r| r.chunk.id == chunk_id),
+                "UriPrefix filter embedding {value:?} should still match its own tagged chunk"
+            );
+
+            store.delete_by_resource(&resource_id).await.unwrap();
+            store.delete_by_resource(&other_resource_id).await.unwrap();
+        }
+    }
+
     /// Test: get_chunk by ID.
     pub async fn test_get_chunk(store: &dyn RetrievalStore) {
         let record = make_record("chunk-1", "doc-1", "store-1", "Hello", vec![1.0, 0.0]);
