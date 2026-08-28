@@ -104,7 +104,7 @@ fn resolve_search_limit_negative_falls_back_to_default() {
 }
 
 // -----------------------------------------------------------------------
-// Metadata filters (issue #247) — per-field parsing is unit-tested once in
+// Metadata filters — per-field parsing is unit-tested once in
 // `localdb_core::search_filters::tests`; these two prove the wiring: a
 // filter narrows results, and a malformed value is a tool-level
 // `invalid_request` error, not a panic or a silently-empty result.

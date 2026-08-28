@@ -111,7 +111,7 @@ impl DaemonAwareCommand for SearchCmd<'_> {
 
         let url = format!("{base_url}/v1/search");
         // Serialize the shared `SearchRequest` struct rather than hand-building
-        // a `serde_json::json!` body (issue #247): field names between this
+        // a `serde_json::json!` body: field names between this
         // CLI-daemon path and `POST /v1/search`'s own `Deserialize` impl can
         // then never drift apart. Filter values are sent raw (unparsed) —
         // the daemon runs the exact same `SearchFilters::into_metadata_filters`

@@ -79,7 +79,7 @@ async fn test_no_mutating_tools_accessible() {
     }
 }
 
-/// The new filter properties (issue #247) must appear in the generated
+/// The new filter properties must appear in the generated
 /// `search` tool schema, each with its own description — the only guard
 /// between `docs/mcp.md`'s hand-copied schema snippet and silent drift.
 #[tokio::test]

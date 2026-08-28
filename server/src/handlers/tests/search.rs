@@ -311,7 +311,7 @@ async fn search_pagination_walk_to_exhaustion_covers_all_results_without_duplica
 }
 
 // ---------------------------------------------------------------------------
-// Metadata filters (issue #247) — `SearchFilters` flattened into
+// Metadata filters — `SearchFilters` flattened into
 // `SearchRequest`. Per-field parsing is unit-tested once in
 // `localdb_core::search_filters::tests`; these two prove the wiring: a
 // filter narrows results, and a malformed date bound is a 400.

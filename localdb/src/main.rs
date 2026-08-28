@@ -262,7 +262,7 @@ pub enum Command {
     Internal(InternalCommand),
 }
 
-/// `search`'s ten metadata-filter flags (issue #247), flattened into
+/// `search`'s ten metadata-filter flags, flattened into
 /// `Command::Search` via `#[command(flatten)] filters: Box<SearchFilterArgs>`
 /// — boxed so this large, all-`Option<String>` group doesn't make `Search`
 /// dominate `Command`'s overall enum size. Field names are hand-written

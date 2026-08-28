@@ -11,7 +11,7 @@ use crate::state::AppState;
 
 /// `POST /v1/search` request body, and — serialized rather than
 /// `serde_json::json!`-hand-built — the CLI's daemon-attached POST body too
-/// (`cli::cmds::search::SearchCmd::run_daemon`, issue #247): one shared type
+/// (`cli::cmds::search::SearchCmd::run_daemon`): one shared type
 /// deserialized/serialized on both ends means the two can never drift apart
 /// on field names the way a hand-built `json!` body could.
 #[derive(Debug, Serialize, Deserialize)]
@@ -58,7 +58,7 @@ impl SearchService {
         }
 
         // Validate/convert filters up front — a malformed date bound is a
-        // 400, not a 500 or a silently-empty result set (issue #247).
+        // 400, not a 500 or a silently-empty result set.
         let metadata_filters = req.filters.into_metadata_filters().map_err(ApiError)?;
 
         let offset = parse_cursor(req.cursor.as_deref())?;

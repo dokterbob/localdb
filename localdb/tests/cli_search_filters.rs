@@ -1,5 +1,5 @@
-//! Integration tests for `localdb search`'s ten metadata-filter flags
-//! (issue #247): `--path`, `--mime`, and `--{axis}-after`/`--{axis}-before`
+//! Integration tests for `localdb search`'s ten metadata-filter flags:
+//! `--path`, `--mime`, and `--{axis}-after`/`--{axis}-before`
 //! for each of the four `DateAxis` values (`added`, `updated`, `modified`,
 //! `document`).
 //!
@@ -306,7 +306,7 @@ fn search_subcommand_help_lists_all_filter_flags() {
         .stdout(predicate::str::contains("--document-before"));
 }
 
-/// Consistency guard (issue #247): the clap `--help` output for `localdb
+/// Consistency guard: the clap `--help` output for `localdb
 /// search` and the MCP `search` tool schema must both describe each
 /// `DateAxis` using its `describe()` text verbatim. This is the entire
 /// justification for hand-writing the flag/schema description text in
@@ -349,7 +349,7 @@ fn date_axis_describe_text_matches_cli_help_and_mcp_schema() {
     }
 }
 
-/// Parity (issue #247): the same filter value must produce the same
+/// Parity: the same filter value must produce the same
 /// citations whether `search` runs embedded or daemon-attached. The
 /// mechanism is a single shared `SearchFilters` struct serialized into the
 /// daemon POST body, so per-flag parity would be redundant — one

@@ -53,7 +53,7 @@ pub struct StatusResponse {
     pub database: DatabaseStatus,
     /// Optional capabilities this daemon supports, so a newer client can tell
     /// whether an older running daemon will honour a request before sending
-    /// it (issue #247). `SearchRequest` does not reject unknown fields, so a
+    /// it. `SearchRequest` does not reject unknown fields, so a
     /// daemon predating a feature silently ignores its parameters and answers
     /// as though they were never sent — for search filters that means
     /// returning unfiltered results to a caller who asked for a narrow scope.

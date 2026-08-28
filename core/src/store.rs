@@ -339,7 +339,7 @@ impl DateAxis {
     }
 
     /// One-line human description of this axis, shared verbatim by every
-    /// surface's `--help`/schema text (issue #247). `#[arg(long = ...)]` and
+    /// surface's `--help`/schema text. `#[arg(long = ...)]` and
     /// `#[schemars(description = ...)]` are derive-macro attributes parsed as
     /// literal tokens at macro-expansion time — a runtime `&'static str`
     /// cannot appear inside them — so the CLI flag help (`localdb/src/main.rs`)

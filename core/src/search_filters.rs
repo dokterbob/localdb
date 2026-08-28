@@ -1,5 +1,5 @@
 //! `SearchFilters` — the single arg → `Vec<MetadataFilter>` conversion point
-//! shared verbatim by the CLI, HTTP, and MCP surfaces (issue #247).
+//! shared verbatim by the CLI, HTTP, and MCP surfaces.
 //!
 //! specs/01-architecture.md §1 forbids domain logic in surface crates, so the
 //! translation from raw string flags/fields to [`MetadataFilter`] lives here
@@ -41,7 +41,7 @@ use crate::store::{DateAxis, MetadataFilter};
 #[cfg(test)]
 mod tests;
 
-/// User/agent-supplied search-scoping filters (issue #247), shared verbatim
+/// User/agent-supplied search-scoping filters, shared verbatim
 /// by the CLI (`localdb search`), HTTP (`POST /v1/search`), and MCP
 /// (`search` tool) surfaces.
 ///
@@ -330,7 +330,7 @@ fn parse_filter_date_value(field: &str, raw: &str, bound: Bound) -> Result<Strin
         let duration = chrono::Duration::from_std(duration).map_err(|_| Error::InvalidRequest {
             message: format!("{field}: duration out of range: {raw:?}"),
         })?;
-        // Sign convention (issue #247, deliberately specified): a duration
+        // Sign convention (deliberately specified): a duration
         // ALWAYS resolves to `now - duration`, used identically for either
         // bound direction. `--modified-after 7d` -> "within the last 7
         // days"; `--modified-before 7d` -> "more than 7 days ago". Never
