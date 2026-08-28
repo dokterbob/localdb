@@ -3580,6 +3580,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "blake3",
+ "chrono",
  "libsql",
  "localdb-core",
  "serde",

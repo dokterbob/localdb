@@ -517,11 +517,21 @@ interpolation (needs per-model calibration); backend-native fusion (backend-depe
   ([02-domain-model.md](02-domain-model.md) §2), so the same document indexed into two stores yields
   the same chunk_id in both — a `chunk_id`-only key would silently merge two stores' distinct hits.
   Ties are broken deterministically: `fused_score` descending, then `store_id` ascending, then
-  `chunk_id` ascending. Metadata filters (mime, path prefix, fetched_at range) are pushed down to
-  the backend where supported.
+  `chunk_id` ascending. Metadata filters (mime, path prefix, date-axis range) are pushed down to the
+  backend where supported.
 
   Filter values are always passed as bound SQL parameters, never interpolated into query text; a
   literal `%` or `_` in a URI-prefix filter is treated as a SQL `LIKE` wildcard.
+
+  A date-range filter (`MetadataFilter::DateAfter`/`DateBefore`) names one of the four `DateAxis`
+  values — `added`, `updated`, `modified`, `document` (see [02-domain-model.md](02-domain-model.md)
+  §2's "Date axes (normative)") — and both bounds are inclusive (`>=`/`<=`). Multiple filters, of
+  any kind and in any combination, always AND together; there is no OR. A `None`/`NULL` axis value
+  on a given chunk fails every bound, in both directions — a document with no claimed `modified_at`
+  never matches a `modified`-axis filter regardless of the bound supplied. Because `document`-axis
+  values (`date_parsed`) can be partial-precision, a `document`-axis `DateBefore` bound is widened
+  to the latest instant its own precision allows before comparing; the other three axes are always
+  full-width RFC 3339 and need no widening.
 
   **Known limitation — cross-store score comparability.** Pooling ranks each leg by its raw backend
   score, which assumes every store queried together reports that leg's scores on the same scale. Two

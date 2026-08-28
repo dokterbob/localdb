@@ -1066,8 +1066,8 @@ pub async fn index_resource(
         // `added_at`, never `modified_at` (which for a feed entry is the
         // feed's own claim about the content's age). The libsql backend binds
         // this to `resources.added_at`, the column `MetadataFilter::
-        // FetchedAfter`/`FetchedBefore` filter on and every citation reports.
-        // See specs/02-domain-model.md §4.
+        // DateAfter`/`DateBefore` (`DateAxis::Added`) filter on and every
+        // citation reports. See specs/02-domain-model.md §4.
         fetched_at: resource.added_at.clone(),
         content_hash: resource.content_hash.clone(),
         share_path: vec![],
@@ -5310,8 +5310,8 @@ mod tests {
 
         /// `Provenance.fetched_at` is defined as *acquisition* time, and the
         /// libsql backend binds it to `resources.added_at` — the column
-        /// `MetadataFilter::FetchedAfter`/`FetchedBefore` filter on and that
-        /// every citation reports. `index_resource` used to read
+        /// `MetadataFilter::DateAfter`/`DateBefore` (`DateAxis::Added`) filter
+        /// on and that every citation reports. `index_resource` used to read
         /// `resource.modified_at`, so a 2020 feed entry ingested today claimed
         /// a 2020 acquisition time and fell outside a "fetched since last
         /// week" filter. Only the feed connector makes the two fields differ

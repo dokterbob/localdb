@@ -254,8 +254,9 @@ async fn dense_search_exact_fallback_when_ann_cap_saturated() {
 ///
 /// **Observable failure**: `find_document` maps `resources.added_at` →
 /// `DocumentInfo.fetched_at`, so every citation reported a 2020 acquisition
-/// time, and `MetadataFilter::FetchedAfter` (which filters on `r.added_at`)
-/// excluded the entry from any "fetched since last week" query.
+/// time, and `MetadataFilter::DateAfter` with `DateAxis::Added` (which
+/// filters on `r.added_at`) excluded the entry from any "fetched since last
+/// week" query.
 ///
 /// **Why the fix is correct**: `Provenance.fetched_at` is defined as
 /// acquisition time (specs/02-domain-model.md §4), and `added_at` is spec'd as

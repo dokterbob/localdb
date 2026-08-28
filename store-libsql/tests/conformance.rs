@@ -2,7 +2,7 @@ use tempfile::tempdir;
 
 use localdb_core::block::{Block, BlockKind, BlockLocation};
 use localdb_core::store::conformance;
-use localdb_core::store::{ChunkRecord, MetadataFilter};
+use localdb_core::store::{ChunkRecord, DateAxis, MetadataFilter};
 use localdb_core::types::{SourceKind, Span, StoreVisibility};
 use localdb_core::{Error, SourceRow, StoreBackend, StoreBackendConfig, StoreRow, VectorEncoding};
 use store_libsql::SqliteBackend;
@@ -166,6 +166,109 @@ async fn metadata_filter_values_are_bound_not_interpolated() {
     let (_dir, db) = setup().await;
     let handle = db.retrieval_store("store-1").await.unwrap();
     conformance::test_metadata_filter_values_are_bound_not_interpolated(handle.as_ref()).await;
+}
+
+#[tokio::test]
+async fn metadata_filter_and_combination() {
+    let (_dir, db) = setup().await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+    conformance::test_metadata_filter_and_combination(handle.as_ref()).await;
+}
+
+#[tokio::test]
+async fn date_filter_null_axis_value_excluded() {
+    let (_dir, db) = setup().await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+    conformance::test_date_filter_null_axis_value_excluded(handle.as_ref()).await;
+}
+
+#[tokio::test]
+async fn date_filter_document_axis_partial_precision_widening() {
+    let (_dir, db) = setup().await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+    conformance::test_date_filter_document_axis_partial_precision_widening(handle.as_ref()).await;
+}
+
+#[tokio::test]
+async fn date_filter_per_axis_round_trip() {
+    let (_dir, db) = setup().await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+    conformance::test_date_filter_per_axis_round_trip(handle.as_ref()).await;
+}
+
+/// `DateAxis::Updated` (`resources.index_updated_at`) is the one axis no
+/// caller-supplied literal ever reaches — the store always stamps its own
+/// write-time clock (`upsert_chunks_inner`'s single `now_rfc3339()` call per
+/// batch). This test is real-backend-only (not part of
+/// `core::store::conformance`): it needs the store's own wall-clock write
+/// time, which `FakeStore` never populates for this axis at all (`DateAxis::
+/// value_of` always returns `None` for `Updated`), so a shared conformance
+/// function would trivially fail against `FakeStore` regardless of bound
+/// direction.
+#[tokio::test]
+async fn date_filter_updated_axis_now_relative() {
+    let (_dir, db) = setup().await;
+    let handle = db.retrieval_store("store-1").await.unwrap();
+
+    let before_write = localdb_core::ingestion::now_rfc3339();
+    handle
+        .upsert_chunks(vec![make_record(
+            "chunk-updated-now",
+            "doc-updated-now",
+            "store-1",
+            vec![1.0, 0.0],
+        )])
+        .await
+        .unwrap();
+
+    // A bound comfortably in the past: the just-written row's
+    // `index_updated_at` (stamped `now()` by the store during the upsert
+    // above) must be at-or-after it.
+    let one_hour_ago = shift_rfc3339_hours(&before_write, -1);
+    let after_filter = vec![MetadataFilter::DateAfter {
+        axis: DateAxis::Updated,
+        value: one_hour_ago.clone(),
+    }];
+    let after_results = handle
+        .dense_search(&[1.0, 0.0], 10, &after_filter)
+        .await
+        .unwrap();
+    assert!(
+        after_results
+            .iter()
+            .any(|r| r.chunk.id == "chunk-updated-now"),
+        "a row just written must match DateAfter(Updated, now - 1h), got {after_results:?}"
+    );
+
+    // The same bound used as an upper bound must exclude it — the row's
+    // `index_updated_at` is after (not before) an hour ago.
+    let before_filter = vec![MetadataFilter::DateBefore {
+        axis: DateAxis::Updated,
+        value: one_hour_ago,
+    }];
+    let before_results = handle
+        .dense_search(&[1.0, 0.0], 10, &before_filter)
+        .await
+        .unwrap();
+    assert!(
+        before_results
+            .iter()
+            .all(|r| r.chunk.id != "chunk-updated-now"),
+        "a row just written must NOT match DateBefore(Updated, now - 1h), got {before_results:?}"
+    );
+}
+
+/// Shift an RFC 3339 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`) by a whole number
+/// of hours, staying in the same canonical form. Local test helper — not
+/// `core::dates` material, since it only ever needs to move a known-canonical
+/// timestamp, never parse an arbitrary one.
+fn shift_rfc3339_hours(ts: &str, hours: i64) -> String {
+    use chrono::{DateTime, Utc};
+    let parsed: DateTime<Utc> = ts
+        .parse()
+        .expect("test-supplied timestamp must be RFC 3339");
+    let shifted = parsed + chrono::Duration::hours(hours);
+    shifted.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 #[tokio::test]

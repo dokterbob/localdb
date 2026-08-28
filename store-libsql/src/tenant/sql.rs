@@ -1,4 +1,5 @@
-use localdb_core::MetadataFilter;
+use localdb_core::dates::widen_date_upper_bound;
+use localdb_core::{DateAxis, MetadataFilter};
 
 pub(crate) fn escape_fts5_query(input: &str) -> String {
     input
@@ -40,11 +41,50 @@ pub(crate) fn build_filter_clauses(filters: &[MetadataFilter]) -> (String, Vec<S
                 clauses.push_str(" AND r.uri LIKE ?");
                 values.push(format!("{v}%"));
             }
-            MetadataFilter::FetchedAfter(v) => {
-                push_filter(&mut clauses, &mut values, "r.added_at >=", v)
+            MetadataFilter::DateAfter { axis, value } => {
+                // `DateAfter` needs no widening: in fixed-width ISO 8601 a
+                // proper prefix always sorts less than the string it
+                // prefixes, so plain `>=` is already correct for every
+                // combination of short/long stored value against
+                // short/long bound. See `core::dates::widen_date_upper_bound`'s
+                // doc comment for the full argument.
+                let column_op = format!("r.{} >=", axis.column());
+                push_filter(&mut clauses, &mut values, &column_op, value)
             }
-            MetadataFilter::FetchedBefore(v) => {
-                push_filter(&mut clauses, &mut values, "r.added_at <=", v)
+            MetadataFilter::DateBefore { axis, value } => {
+                // `Document` is the only axis whose stored value can be
+                // partial-width (`date_parsed`, normalized by
+                // `core::dates::parse_partial_iso8601` to exactly 4, 7, or 10
+                // chars); `Added`/`Updated`/`Modified` are always full RFC
+                // 3339. Widen both operands for `Document` only: the bound
+                // here in Rust, and the stored column via this `CASE`, which
+                // MUST stay in lockstep with
+                // `core::dates::widen_date_upper_bound` — same lengths (4 /
+                // 7 / 10), same widened suffixes. `length(NULL)` is `NULL`
+                // in SQLite, so no `WHEN` arm matches for a NULL column and
+                // the `CASE` falls through to `ELSE col` (still `NULL`),
+                // preserving the "NULL fails every bound" property the
+                // comparison relies on.
+                if matches!(axis, DateAxis::Document) {
+                    let column = axis.column();
+                    let column_op = format!(
+                        "CASE length(r.{column})
+                             WHEN 4 THEN r.{column} || '-12-31T23:59:59Z'
+                             WHEN 7 THEN r.{column} || '-31T23:59:59Z'
+                             WHEN 10 THEN r.{column} || 'T23:59:59Z'
+                             ELSE r.{column}
+                         END <="
+                    );
+                    push_filter(
+                        &mut clauses,
+                        &mut values,
+                        &column_op,
+                        &widen_date_upper_bound(value),
+                    )
+                } else {
+                    let column_op = format!("r.{} <=", axis.column());
+                    push_filter(&mut clauses, &mut values, &column_op, value)
+                }
             }
             MetadataFilter::SourceId(v) => {
                 push_filter(&mut clauses, &mut values, "r.source_id =", v)
