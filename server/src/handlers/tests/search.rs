@@ -9,8 +9,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::common::{
-    json_body, make_app, make_state_with_fake_config, seed_many_chunks, seed_store_a_chunk,
-    SeedChunkInput,
+    json_body, make_app, make_state_with_fake_config, seed_chunk_with_source, seed_many_chunks,
+    seed_store_a_chunk, SeedChunkInput,
 };
 
 fn citation_ids(body: &serde_json::Value) -> Vec<String> {
@@ -308,4 +308,101 @@ async fn search_pagination_walk_to_exhaustion_covers_all_results_without_duplica
         all_set, seeded_set,
         "walking the cursor to exhaustion should yield exactly the seeded chunk ids"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Metadata filters (issue #247) — `SearchFilters` flattened into
+// `SearchRequest`. Per-field parsing is unit-tested once in
+// `localdb_core::search_filters::tests`; these two prove the wiring: a
+// filter narrows results, and a malformed date bound is a 400.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn search_path_filter_narrows_to_matching_uri_prefix() {
+    let (_dir, state) = make_state_with_fake_config().await;
+    state.add_store("store-A", "private").await.unwrap();
+    let source = state
+        .add_source("store-A", "path", json!({"root": "/tmp"}), "prose", None)
+        .await
+        .unwrap();
+    seed_chunk_with_source(
+        &state,
+        &source.store_id,
+        &source.id,
+        SeedChunkInput {
+            chunk_id: "chunk-keep",
+            doc_id: "doc-keep",
+            text: "hello world rust programming",
+            uri: "file:///keep/a.md",
+            metadata: localdb_core::metadata::Metadata::default(),
+        },
+    )
+    .await;
+    seed_chunk_with_source(
+        &state,
+        &source.store_id,
+        &source.id,
+        SeedChunkInput {
+            chunk_id: "chunk-skip",
+            doc_id: "doc-skip",
+            text: "hello world rust programming",
+            uri: "file:///skip/b.md",
+            metadata: localdb_core::metadata::Metadata::default(),
+        },
+    )
+    .await;
+
+    let app = crate::daemon::build_router(
+        state,
+        vec![],
+        std::sync::Arc::new(localdb_core::FakeEmbedder::new(1)),
+        vec![],
+    );
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"query": "hello world rust programming", "path": "file:///keep/"})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp.into_body()).await;
+    let citations = body["citations"].as_array().unwrap();
+    assert!(
+        !citations.is_empty(),
+        "expected at least one match: {body:?}"
+    );
+    for citation in citations {
+        let uri = citation["uri"].as_str().unwrap();
+        assert!(
+            uri.starts_with("file:///keep/"),
+            "path filter should only return file:///keep/* citations, got uri {uri}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn search_malformed_date_filter_returns_400() {
+    let (_dir, app) = make_app().await;
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"query": "hello world", "added_after": "not-a-date"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }

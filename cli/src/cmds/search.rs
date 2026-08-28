@@ -1,6 +1,7 @@
 use localdb_core::citation::Citation;
-use localdb_core::{config::loader::ConfigLoader, Error};
+use localdb_core::{config::loader::ConfigLoader, Error, SearchFilters};
 use serde_json::json;
+use server::search_service::SearchRequest;
 
 use crate::{
     app_db::{load_config_lenient, open_app_db_lenient_or_exit},
@@ -10,8 +11,14 @@ use crate::{
     normalize::{exit_err, format_snippet, print_json, validate_store_name},
 };
 
-/// `localdb search <query> [--limit N] [--content-length N]`
-pub fn run_search(ctx: &CliContext, query: &str, limit: usize, content_length: usize) {
+/// `localdb search <query> [--limit N] [--content-length N] [filters...]`
+pub fn run_search(
+    ctx: &CliContext,
+    query: &str,
+    limit: usize,
+    content_length: usize,
+    filters: SearchFilters,
+) {
     // F9: Reject --limit 0.
     if limit == 0 {
         exit_err(
@@ -30,7 +37,7 @@ pub fn run_search(ctx: &CliContext, query: &str, limit: usize, content_length: u
     }
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    rt.block_on(run_search_async(ctx, query, limit, content_length));
+    rt.block_on(run_search_async(ctx, query, limit, content_length, filters));
 }
 
 /// `search`'s table entry (issue #187 stage 5). `Outcome` is `Vec<Citation>`
@@ -44,6 +51,7 @@ pub fn run_search(ctx: &CliContext, query: &str, limit: usize, content_length: u
 pub(crate) struct SearchCmd<'a> {
     pub(crate) query: &'a str,
     pub(crate) limit: usize,
+    pub(crate) filters: SearchFilters,
 }
 
 impl DaemonAwareCommand for SearchCmd<'_> {
@@ -56,18 +64,24 @@ impl DaemonAwareCommand for SearchCmd<'_> {
 
     async fn run_daemon(&self, ctx: &CliContext, base_url: &str) -> Result<Self::Outcome, Error> {
         let url = format!("{base_url}/v1/search");
-        let mut body = json!({
-            "query": self.query,
-            "limit": self.limit,
-        });
-        if !ctx.stores.is_empty() {
-            body["store_filter"] = serde_json::Value::Array(
-                ctx.stores
-                    .iter()
-                    .map(|s| serde_json::Value::String(s.clone()))
-                    .collect(),
-            );
-        }
+        // Serialize the shared `SearchRequest` struct rather than hand-building
+        // a `serde_json::json!` body (issue #247): field names between this
+        // CLI-daemon path and `POST /v1/search`'s own `Deserialize` impl can
+        // then never drift apart. Filter values are sent raw (unparsed) —
+        // the daemon runs the exact same `SearchFilters::into_metadata_filters`
+        // validation embedded mode runs, so a malformed date bound surfaces
+        // as the same `invalid_request` / exit 2 either way.
+        let request = SearchRequest {
+            query: self.query.to_string(),
+            store_filter: ctx.stores.clone(),
+            limit: self.limit,
+            cursor: None,
+            filters: self.filters.clone(),
+        };
+        let body = serde_json::to_value(&request).map_err(|e| Error::Internal {
+            message: format!("cannot serialize search request: {e}"),
+            correlation_id: "daemon_search_request_shape".to_string(),
+        })?;
         let value = daemon_request_async(reqwest::Method::POST, &url, Some(body)).await?;
         let citations_json = value.get("citations").cloned().unwrap_or(json!([]));
         serde_json::from_value(citations_json).map_err(|e| Error::Internal {
@@ -125,7 +139,7 @@ impl DaemonAwareCommand for SearchCmd<'_> {
             query: self.query.to_string(),
             leg_k: None,
             top_n: Some(clamp_search_limit(self.limit)),
-            filters: vec![],
+            filters: self.filters.clone().into_metadata_filters()?,
         };
 
         SearchOrchestrator::query(&store_handles, embedder.as_ref(), &request)
@@ -181,12 +195,20 @@ pub(crate) async fn run_search_async(
     query: &str,
     limit: usize,
     content_length: usize,
+    filters: SearchFilters,
 ) {
     // F1-cli: use lenient loader so search works even with malformed config.
     let config_loader = load_config_lenient(ctx).await;
-    let citations = dispatch(&SearchCmd { query, limit }, ctx, &config_loader, || {
-        open_app_db_lenient_or_exit(ctx, &config_loader)
-    })
+    let citations = dispatch(
+        &SearchCmd {
+            query,
+            limit,
+            filters,
+        },
+        ctx,
+        &config_loader,
+        || open_app_db_lenient_or_exit(ctx, &config_loader),
+    )
     .await;
     render_search_output(&citations, query, content_length, ctx.json);
 }

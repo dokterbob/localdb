@@ -80,6 +80,12 @@ hex = "0.4"
 # promoting it to a direct dependency adds no new compiled crate to the graph.
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 
+# Relative-duration search filter values, e.g. `--modified-after 7d` (issue
+# #247). NOT zero-cost on Linux: its only existing lockfile dependent reaches
+# it through `embed`'s macOS-gated `local-coreml` feature, so on the two
+# Linux release targets this is one genuinely new (small) compiled crate.
+humantime = "2"
+
 # Progress bars and spinners
 indicatif = "0.17"
 

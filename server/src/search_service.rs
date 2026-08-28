@@ -1,15 +1,20 @@
 use serde::{Deserialize, Serialize};
 
 use localdb_core::{
-    clamp_search_limit, Citation, Error as CoreError, QueryRequest, SearchOrchestrator,
-    StoreHandle as CoreStoreHandle,
+    clamp_search_limit, Citation, Error as CoreError, QueryRequest, SearchFilters,
+    SearchOrchestrator, StoreHandle as CoreStoreHandle,
 };
 
 use crate::error::ApiError;
 use crate::handlers::parse_cursor;
 use crate::state::AppState;
 
-#[derive(Debug, Deserialize)]
+/// `POST /v1/search` request body, and — serialized rather than
+/// `serde_json::json!`-hand-built — the CLI's daemon-attached POST body too
+/// (`cli::cmds::search::SearchCmd::run_daemon`, issue #247): one shared type
+/// deserialized/serialized on both ends means the two can never drift apart
+/// on field names the way a hand-built `json!` body could.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SearchRequest {
     pub query: String,
     #[serde(default)]
@@ -18,6 +23,11 @@ pub struct SearchRequest {
     pub limit: usize,
     #[serde(default)]
     pub cursor: Option<String>,
+    /// Search-scoping filters (path, mime, date-axis bounds) — flattened so
+    /// their fields (`path`, `mime`, `added_after`, …) sit at the top level
+    /// of the request body rather than nested under a `filters` key.
+    #[serde(flatten)]
+    pub filters: SearchFilters,
 }
 
 fn default_search_limit() -> usize {
@@ -46,6 +56,10 @@ impl SearchService {
                 message: "query cannot be empty".to_string(),
             }));
         }
+
+        // Validate/convert filters up front — a malformed date bound is a
+        // 400, not a 500 or a silently-empty result set (issue #247).
+        let metadata_filters = req.filters.into_metadata_filters().map_err(ApiError)?;
 
         let offset = parse_cursor(req.cursor.as_deref())?;
         let limit = clamp_search_limit(req.limit);
@@ -112,7 +126,7 @@ impl SearchService {
             query: req.query.clone(),
             leg_k: None,
             top_n: Some(page_end),
-            filters: vec![],
+            filters: metadata_filters,
         };
 
         let response = SearchOrchestrator::query(&store_handles, embedder.as_ref(), &query_request)

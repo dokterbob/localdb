@@ -21,6 +21,8 @@
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+use localdb_core::SearchFilters;
+
 /// Arguments for the `search` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchArgs {
@@ -54,6 +56,14 @@ pub struct SearchArgs {
         range(min = 1)
     )]
     pub content_length: Option<i64>,
+
+    /// Search-scoping filters (path, mime, date-axis bounds) — flattened so
+    /// their fields (`path`, `mime`, `added_after`, …) sit at the top level
+    /// of the tool's arguments rather than nested under a `filters` key.
+    /// Validated once, in `SearchFilters::into_metadata_filters`
+    /// (`tools::tool_search`), not re-validated per surface.
+    #[serde(flatten)]
+    pub filters: SearchFilters,
 }
 
 /// Arguments for the `get_document` tool.

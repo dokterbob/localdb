@@ -535,6 +535,24 @@ interpolation (needs per-model calibration); backend-native fusion (backend-depe
   value. See [02-domain-model.md](02-domain-model.md) §2's "Date axes (normative)" for the full
   rule.
 
+  **Surface wiring (`core::search_filters::SearchFilters`).** The CLI (`localdb search`), HTTP
+  (`POST /v1/search`), and MCP (`search` tool) surfaces all build `MetadataFilter`s through one
+  shared type, `SearchFilters::into_metadata_filters`, rather than each hand-rolling its own
+  translation (specs/01-architecture.md §1: no domain logic in surface crates). It carries `path` (→
+  `UriPrefix`), `mime` (→ `Mime`), and eight `Option<String>` date fields — `{axis}_after` /
+  `{axis}_before` for each of the four `DateAxis` values — all single-valued, never a list, so a
+  repeated flag is a usage error rather than silently matching nothing. `path` and `mime` are
+  matched as literal strings with no date/duration parsing at all.
+
+  Each date field accepts one of three forms, tried in this order: a full RFC 3339 datetime
+  (normalized to canonical UTC), a partial date (`YYYY`, `YYYY-MM`, `YYYY-MM-DD`, passed through
+  unchanged — load-bearing for the `document`-axis widening above), or a relative duration (e.g.
+  `7d`, `30m`, `2w`). A duration always resolves to `now − duration`, identically for either bound
+  direction: `--modified-after 7d` means "modified within the last 7 days", and
+  `--modified-before 7d` means "modified more than 7 days ago" — never `now + duration`. A value
+  matching none of the three forms is `invalid_request` (exit 2 / HTTP 400 / MCP tool error), naming
+  the offending field.
+
   **Known limitation — cross-store score comparability.** Pooling ranks each leg by its raw backend
   score, which assumes every store queried together reports that leg's scores on the same scale. Two
   ways that assumption is imperfect:

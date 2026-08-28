@@ -78,3 +78,49 @@ async fn test_no_mutating_tools_accessible() {
         );
     }
 }
+
+/// The new filter properties (issue #247) must appear in the generated
+/// `search` tool schema, each with its own description — the only guard
+/// between `docs/mcp.md`'s hand-copied schema snippet and silent drift.
+#[tokio::test]
+async fn test_search_schema_includes_filter_properties_with_descriptions() {
+    let client = client_for(make_handler_with_one_store()).await;
+    let result = client.list_tools(None).await.expect("list_tools succeeds");
+
+    let search_tool = result
+        .tools
+        .iter()
+        .find(|t| t.name.as_ref() == "search")
+        .expect("search tool must be present");
+
+    let properties = search_tool
+        .input_schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .expect("search tool inputSchema must have an object 'properties'");
+
+    for field in [
+        "path",
+        "mime",
+        "added_after",
+        "added_before",
+        "updated_after",
+        "updated_before",
+        "modified_after",
+        "modified_before",
+        "document_after",
+        "document_before",
+    ] {
+        let prop = properties
+            .get(field)
+            .unwrap_or_else(|| panic!("search tool schema is missing filter property '{field}'"));
+        let description = prop
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("filter property '{field}' must have a description"));
+        assert!(
+            !description.is_empty(),
+            "filter property '{field}' description must not be empty"
+        );
+    }
+}

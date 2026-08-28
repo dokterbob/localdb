@@ -43,6 +43,7 @@ pub use cmds::status::run_status;
 pub use cmds::store::{run_store_add, run_store_list, run_store_remove};
 pub use cmds::surface::{run_mcp, run_serve};
 pub use daemon_client::{probe_daemon, CliContext, DaemonState};
+pub use localdb_core::SearchFilters;
 pub use normalize::{
     classify_source, confirm_destructive, exit_err, source_row_to_core_source, validate_store_name,
 };

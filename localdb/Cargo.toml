@@ -29,3 +29,11 @@ tempfile = { workspace = true }
 serde_json = { workspace = true }
 libsql = { workspace = true }
 localdb-core = { path = "../core" }
+# In-process MCP tool-schema generation for the `DateAxis::describe()`
+# consistency test (issue #247) — asserts the clap `--help` text and the MCP
+# `search` tool schema both contain each axis's `describe()` text.
+localdb-mcp = { path = "../mcp" }
+schemars = { workspace = true }
+# RFC 3339 cutoff timestamps for the added/updated-axis filter fixtures in
+# cli_search_filters.rs. Already a workspace dependency; no new crate.
+chrono = { workspace = true }

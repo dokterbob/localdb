@@ -287,11 +287,15 @@ pub async fn tool_search(
     if store_handles.is_empty() {
         return success_json(&serde_json::json!({ "citations": [] }));
     }
+    let metadata_filters = match args.filters.into_metadata_filters() {
+        Ok(f) => f,
+        Err(e) => return typed_error(e.code(), e.to_string()),
+    };
     let request = QueryRequest {
         query: args.query.clone(),
         leg_k: None,
         top_n: Some(limit),
-        filters: vec![],
+        filters: metadata_filters,
     };
     let response = match SearchOrchestrator::query(&store_handles, embedder, &request).await {
         Ok(r) => r,

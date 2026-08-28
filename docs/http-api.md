@@ -472,17 +472,32 @@ daemon and the CLI share `<data_dir>/localdb.db`.
 
 **Request body:**
 
-| Field          | Type     | Required | Description                                                                          |
-| -------------- | -------- | -------- | ------------------------------------------------------------------------------------ |
-| `query`        | string   | yes      | Natural language search query                                                        |
-| `store_filter` | string[] | no       | Store names to search; omit or pass `[]` to search all stores                        |
-| `limit`        | int      | no       | Maximum results to return (default: 10; silently clamped to 100, `SEARCH_MAX_LIMIT`) |
-| `cursor`       | string   | no       | Pagination cursor from a previous response                                           |
+| Field                              | Type     | Required | Description                                                                          |
+| ---------------------------------- | -------- | -------- | ------------------------------------------------------------------------------------ |
+| `query`                            | string   | yes      | Natural language search query                                                        |
+| `store_filter`                     | string[] | no       | Store names to search; omit or pass `[]` to search all stores                        |
+| `limit`                            | int      | no       | Maximum results to return (default: 10; silently clamped to 100, `SEARCH_MAX_LIMIT`) |
+| `cursor`                           | string   | no       | Pagination cursor from a previous response                                           |
+| `path`                             | string   | no       | Restrict to resources whose URI starts with this prefix. Matched literally.          |
+| `mime`                             | string   | no       | Restrict to resources with this exact MIME type. Matched literally.                  |
+| `added_after`/`added_before`       | string   | no       | Bound on when the resource was first indexed                                         |
+| `updated_after`/`updated_before`   | string   | no       | Bound on when the store last wrote the resource's stored state                       |
+| `modified_after`/`modified_before` | string   | no       | Bound on the source's own claimed last-modified time                                 |
+| `document_after`/`document_before` | string   | no       | Bound on the document's own claimed date (Dublin Core `dc:date`)                     |
+
+Each date field accepts a full RFC 3339 datetime, a partial date (`YYYY`, `YYYY-MM`, `YYYY-MM-DD`),
+or a relative duration (`7d`, `30m`, `2w`) — a duration always resolves to **now minus the
+duration**, for either bound (`modified_after: "7d"` means "modified within the last 7 days";
+`modified_before: "7d"` means "modified more than 7 days ago"). A resource with no value on a
+filtered axis is excluded regardless of the bound (the NULL rule); `document_after`/
+`document_before` currently exclude every PDF and feed entry, since that date is populated today
+only for HTML, Markdown front matter, and Office documents (issue #251). A malformed filter value is
+`invalid_request`, HTTP 400. Multiple filters, of any kind, always AND together.
 
 ```
 curl -s -X POST http://127.0.0.1:7700/v1/search \
   -H 'Content-Type: application/json' \
-  -d '{"query":"hybrid search","limit":1}'
+  -d '{"query":"hybrid search","limit":1,"modified_after":"30d"}'
 ```
 
 ```json

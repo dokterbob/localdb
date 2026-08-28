@@ -338,6 +338,25 @@ impl DateAxis {
         }
     }
 
+    /// One-line human description of this axis, shared verbatim by every
+    /// surface's `--help`/schema text (issue #247). `#[arg(long = ...)]` and
+    /// `#[schemars(description = ...)]` are derive-macro attributes parsed as
+    /// literal tokens at macro-expansion time — a runtime `&'static str`
+    /// cannot appear inside them — so the CLI flag help (`localdb/src/main.rs`)
+    /// and the MCP tool schema (`SearchFilters` field docs) each hand-write
+    /// their own copy of this text rather than calling this function
+    /// directly. This function exists so a single consistency test can
+    /// assert those hand-written copies actually contain it, rather than
+    /// trusting 24 independently-edited literals to stay in sync.
+    pub fn describe(&self) -> &'static str {
+        match self {
+            DateAxis::Added => "when this resource was first indexed",
+            DateAxis::Updated => "when the store last wrote this resource's stored state",
+            DateAxis::Modified => "the source's own claim of when this resource was last changed",
+            DateAxis::Document => "the document's own claimed date (Dublin Core dc:date)",
+        }
+    }
+
     /// The Rust-side value for this axis on a `ChunkRecord`. Backs the
     /// in-process (`FakeStore`/test-support) matching path in
     /// [`MetadataFilter::matches`] only — the real (libsql) backend filters

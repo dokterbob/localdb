@@ -804,6 +804,18 @@ Options:
           Operate on these stores (repeatable); a filter, not a selector
   -y, --yes
           Skip confirmation prompts for destructive operations
+      --path <PATH>
+          Restrict to resources whose URI starts with this prefix
+      --mime <MIME>
+          Restrict to resources with this exact MIME type
+      --added-after / --added-before <VALUE>
+          Bound on when a resource was first indexed
+      --updated-after / --updated-before <VALUE>
+          Bound on when the store last wrote a resource's stored state
+      --modified-after / --modified-before <VALUE>
+          Bound on the source's own claimed last-modified time
+      --document-after / --document-before <VALUE>
+          Bound on a document's own claimed date (Dublin Core dc:date)
   -h, --help
           Print help (see more with '--help')
   -V, --version
@@ -812,6 +824,32 @@ Options:
 
 Omit `--store` and every store is searched; pass `--store` (repeatable) to narrow to specific stores
 (specs/05-surfaces.md §2.2) — unchanged behavior, listed here for completeness.
+
+### Filter options
+
+`--path` and `--mime` match a literal string, with no date/duration parsing. Each of the eight
+date-bound flags accepts a full RFC 3339 datetime, a partial date (`YYYY`, `YYYY-MM`, `YYYY-MM-DD`),
+or a relative duration (`7d`, `30m`, `2w`) — a duration always resolves to **now minus the
+duration**, for either bound: `--modified-after 7d` means "modified within the last 7 days",
+`--modified-before 7d` means "modified more than 7 days ago", never `now + duration`. In the
+duration grammar `M` means months and `m` means minutes — both parse successfully, so a mistaken
+capital silently produces a bound about 60 times further out. A malformed value exits 2.
+
+| Flag                                   | Bounds                                                       | NULL rule                                                                             |
+| -------------------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------------------------------- |
+| `--path <PREFIX>`                      | URI starts with `PREFIX`                                     | n/a — literal match                                                                   |
+| `--mime <TYPE>`                        | MIME type equals `TYPE`                                      | n/a — literal match                                                                   |
+| `--added-after`/`--added-before`       | when the resource was first indexed                          | a resource with no value on this axis is **excluded**, regardless of the bound        |
+| `--updated-after`/`--updated-before`   | when the store last wrote the resource's stored state        | a resource with no value on this axis is **excluded**, regardless of the bound        |
+| `--modified-after`/`--modified-before` | the source's own claim of when the resource was last changed | a resource with no claimed modification time is **excluded**, regardless of the bound |
+| `--document-after`/`--document-before` | the document's own claimed date (Dublin Core `dc:date`)      | a resource with no claimed document date is **excluded**, regardless of the bound     |
+
+`--document-*` coverage caveat: the document date is populated today only for HTML (JSON-LD +
+`meta[dcterms.date\|date]`), Markdown front matter, and Office (`dcterms:created`) documents — PDF
+and feed coverage is issue #251, so `--document-after`/`--document-before` currently exclude every
+PDF in a corpus, not just PDFs genuinely outside the bound.
+
+Multiple filters, of any kind and in any combination, always AND together — there is no OR.
 
 > **Flag placement:** flags (`--limit`, `--content-length`, `--store`, `-s`, `--json`) may appear
 > either before or after the query words — `localdb search --limit 5 rank fusion` and
@@ -853,6 +891,23 @@ $ localdb search --limit 1 rank fusion
    Meeting 2026-06-02: decided to adopt reciprocal rank fusion for combining dense and sparse retrieval results. Aardvark connectors are deferred to the next milestone.
 
 ```
+
+Filtered example — only notes modified in the last 30 days:
+
+```
+$ localdb search --modified-after 30d hybrid search
+1. file:///home/user/notes/lancedb-notes.md > LanceDB notes
+   LanceDB is an embedded vector database built on the Lance columnar format. It supports hybrid search combining vector similarity with BM25 full-text scoring.
+
+```
+
+`meeting.txt` from the earlier examples is missing here for two possible reasons that look identical
+from the output alone: it was modified more than 30 days ago, or its source never claims a
+`modified_at` at all — the NULL rule excludes a resource with no value on the filtered axis
+regardless of the bound. The same caveat applies to `--document-after`/`--document-before`: today
+that date is populated only for HTML, Markdown front matter, and Office documents, so a PDF-only
+corpus filtered on `--document-after` returns nothing, not because every PDF fails the bound but
+because none of them have a document date yet (issue #251).
 
 JSON output (full citation shape):
 
