@@ -263,11 +263,18 @@ pub fn parse_date_or_datetime(raw: &str) -> Option<String> {
         return None;
     }
     let parsed = chrono::DateTime::parse_from_rfc3339(s).ok()?;
-    Some(
-        parsed
-            .with_timezone(&chrono::Utc)
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-    )
+    let normalized = parsed
+        .with_timezone(&chrono::Utc)
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    // Shifting to UTC can carry a four-digit year across its own boundary —
+    // `9999-12-31T23:30:00-01:00` becomes year 10000, `0000-01-01T00:30:00+01:00`
+    // becomes year -1 — and chrono renders those with a sign prefix
+    // (`+10000-…`, `-0001-…`). Both sort below every ordinary timestamp, so
+    // returning one would hand back a bound that silently matches the wrong
+    // rows rather than the date it names. Fail closed instead, like every
+    // other value this function cannot represent.
+    is_canonical_timestamp(&normalized).then_some(normalized)
 }
 
 /// Widen a date/datetime bound to the latest instant consistent with its own
