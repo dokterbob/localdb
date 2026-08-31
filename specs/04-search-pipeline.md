@@ -328,10 +328,10 @@ entry's own origin says it is gone ("Did not observe" above).
   consult, bounded by the delete rule rather than by the candidate rule ("Candidates" above).
 
 **Log level.** Both guards suppress the presumed-gone sweep at `warn` for path/url sources — see
-"Deletes" above. For the feed liveness sweep specifically, only the incomplete-enumeration guard
-stays at `warn`; the zero-seen backstop logs at `debug`, since for a feed under `--delete` its
-overwhelmingly common cause is the routine feed-document 304 described above, and warning on every
-steady-state run trains operators to ignore the level.
+"Deletes" above. The feed liveness sweep warns only when the one guard it does inherit fires
+(incomplete enumeration). A zero-seen run logs nothing of its own here, because nothing is
+suppressed: the sweep simply runs, and reports what it probed through
+`feed_entries_liveness_checked` like any other run.
 
 **Ordering:** the sweep runs **after** the source's ordinary ingestion pass completes, so the
 seen-set it partitions against is final and no entry a run observed is ever probed on the run that

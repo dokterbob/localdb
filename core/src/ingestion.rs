@@ -1331,13 +1331,17 @@ pub struct SourceIngestionDeps<'a> {
 /// suppressed this run — guard 1 or guard 2, documented at the
 /// `suppressed_because` computation in `run_source_ingestion` below.
 ///
-/// The two guards are logged at the same level for path/url sources: either
-/// one means a run that should have produced full evidence didn't, which is
-/// anomalous regardless of which guard caught it. For a feed source under
-/// `--delete`, only `IncompleteEnumeration` keeps that meaning — the
-/// zero-seen backstop is the routine steady state there (the feed
-/// document's own 304 short-circuit fires zero entry callbacks), so the
-/// feed branch logs it at a lower level. See the two log call sites below.
+/// Both guards suppress the presumed-gone sweep for path/url sources, and
+/// both are logged at `warn!` there: either one means a run that should have
+/// produced full evidence didn't, which is anomalous regardless of which
+/// guard caught it.
+///
+/// The feed liveness sweep inherits only `IncompleteEnumeration`. The
+/// zero-seen backstop is the routine steady state for a feed — the feed
+/// document's own 304 short-circuit fires zero entry callbacks — and, more
+/// importantly, absence there only decides who gets *probed*; the delete
+/// still needs a confirmed 404/410. See the feed branch in
+/// `run_source_ingestion` and specs/04-search-pipeline.md §1 "Guards".
 enum SweepSuppression {
     /// Guard 1 — the ingestor itself reported it could not observe the
     /// source. Always anomalous.
@@ -1659,65 +1663,67 @@ pub async fn run_source_ingestion(
         // this mechanism — there is no free preview signal for it the way
         // `docs_prunable` is one for the presumed-gone sweep, since the only
         // way to learn anything here is a network request per candidate.
-        match &suppressed_because {
+        // The liveness sweep inherits *one* of the two guards, not both
+        // (specs/04-search-pipeline.md §1 "Guards"). The two sweeps read the
+        // same seen-set for different purposes: the presumed-gone sweep
+        // deletes on absence, so an untrustworthy seen-set is an
+        // untrustworthy delete signal, while here absence only decides who
+        // gets probed and the delete needs a confirmed 404/410 from the
+        // origin.
+        if let Some(reason @ SweepSuppression::IncompleteEnumeration(_)) = &suppressed_because {
             // Guard 1 stays anomalous for a feed exactly as it is for
             // path/url sources: the ingestor itself failed to observe the
-            // source, which is never routine.
-            Some(reason @ SweepSuppression::IncompleteEnumeration(_)) => {
-                tracing::warn!(
-                    source_id = %source.id,
-                    location = %source_location(source),
-                    "skipping feed liveness sweep for source at '{}': {}. This is \
-                     the same signal that suppresses the presumed-gone sweep for \
-                     path/url sources above; for a feed source it is most often \
-                     the feed document's own 304 short-circuit — an unchanged \
-                     feed document means an unchanged window, so nothing could \
-                     have aged out of it since the last run.",
-                    source_location(source),
-                    reason.reason(),
-                );
-            }
-            // Guard 2's zero-seen backstop is the routine steady state for a
-            // feed under `--delete`: the overwhelmingly common cause is the
-            // feed document's own 304, which is exactly what conditional GET
-            // exists to produce and fires zero entry callbacks. Warning on
-            // every routine run trains operators to ignore the level
-            // entirely, so this stays at `debug!`; only guard 1 above still
-            // warns.
-            Some(reason @ SweepSuppression::ZeroSeen) => {
-                tracing::debug!(
-                    source_id = %source.id,
-                    location = %source_location(source),
-                    "skipping feed liveness sweep for source at '{}': {}. This is \
-                     the same signal that suppresses the presumed-gone sweep for \
-                     path/url sources above; for a feed source it is most often \
-                     the feed document's own 304 short-circuit — an unchanged \
-                     feed document means an unchanged window, so nothing could \
-                     have aged out of it since the last run.",
-                    source_location(source),
-                    reason.reason(),
-                );
-            }
-            None => {
-                let refresh_interval_secs = match &source.spec {
-                    SourceSpec::Feed {
-                        refresh_interval_secs,
-                        ..
-                    } => *refresh_interval_secs,
-                    _ => None,
-                };
-                run_feed_liveness_sweep(
-                    &source.id,
-                    &source.store_id,
+            // source, so it knows nothing about which entries the window
+            // holds. Every previously indexed URI would look aged out and the
+            // source's whole document set would queue for probing, 25 per
+            // run, off a signal already known to be broken.
+            tracing::warn!(
+                source_id = %source.id,
+                location = %source_location(source),
+                "skipping feed liveness sweep for source at '{}': {}. This is \
+                 the same signal that suppresses the presumed-gone sweep for \
+                 path/url sources above: a run that could not read the feed's \
+                 window cannot tell an aged-out entry from one it simply never \
+                 saw.",
+                source_location(source),
+                reason.reason(),
+            );
+        } else {
+            // Guard 2 — the zero-seen backstop — deliberately does NOT
+            // suppress this sweep, even though it is the routine steady state
+            // for a feed under `--delete`: the feed document's own 304 fires
+            // zero entry callbacks, so `seen` is empty on every quiet run.
+            // Suppressing here starved the mechanism in precisely the case it
+            // exists for — a feed goes quiet, every subsequent run 304s, and
+            // the aged-out backlog is never probed again, this sweep being the
+            // only thing that could ever shrink it.
+            //
+            // Running is safe because both bounds that make the sweep safe at
+            // all are independent of the seen-set: it deletes only on a
+            // confirmed 404/410, and it probes at most 25 candidates per run
+            // per source, none more often than the recheck floor allows. An
+            // empty seen-set subtracts nothing from the candidate list, which
+            // is the right answer for a 304'd run — the window is unchanged,
+            // so nothing aged out *during* this run, and every candidate the
+            // query returns had already aged out before it began.
+            let refresh_interval_secs = match &source.spec {
+                SourceSpec::Feed {
                     refresh_interval_secs,
-                    &seen,
-                    doc_index,
-                    store,
-                    fetcher,
-                    &mut result,
-                )
-                .await?;
-            }
+                    ..
+                } => *refresh_interval_secs,
+                _ => None,
+            };
+            run_feed_liveness_sweep(
+                &source.id,
+                &source.store_id,
+                refresh_interval_secs,
+                &seen,
+                doc_index,
+                store,
+                fetcher,
+                &mut result,
+            )
+            .await?;
         }
     }
 
@@ -1784,11 +1790,15 @@ const FEED_LIVENESS_OVERFETCH_CAP: usize = 500;
 /// an entry merely scrolling off the window is still never, on its own, a
 /// deletion signal; only a confirmed 404/410 on its own link is.
 ///
-/// Callers must apply the same guards the presumed-gone sweep above applies
-/// — an `Enumeration::Incomplete` run and a zero-seen run must not reach
-/// this function at all — see the call site in `run_source_ingestion`. This
-/// function performs no guard check of its own; it probes whatever
-/// [`RetrievalStore::list_stale_feed_resources`] returns.
+/// Callers must suppress this on an `Enumeration::Incomplete` run — a run
+/// that could not read the feed's window cannot tell an aged-out entry from
+/// one it never saw. A *zero-seen* run, by contrast, must still reach this
+/// function: that is the routine feed-304 case, and suppressing it starves
+/// the sweep exactly when a feed goes quiet (specs/04-search-pipeline.md §1
+/// "Guards"). See the call site in `run_source_ingestion`. This function
+/// performs no guard check of its own; it probes whatever
+/// [`RetrievalStore::list_stale_feed_resources`] returns, minus `seen`, up to
+/// [`FEED_LIVENESS_BATCH_LIMIT`].
 #[allow(clippy::too_many_arguments)]
 async fn run_feed_liveness_sweep(
     source_id: &str,
@@ -8188,12 +8198,18 @@ mod tests {
             }
 
             /// The steady-state feed-304 case: zero entry callbacks fire, so
-            /// `seen` is empty — the same condition that suppresses the
-            /// presumed-gone sweep for path/url sources also suppresses the
-            /// liveness sweep here, and for the same reason
-            /// (specs/02-domain-model.md, "Conditional GET and pruning").
+            /// `seen` is empty. That suppresses the presumed-gone sweep for
+            /// path/url sources, and deliberately does *not* suppress this
+            /// one (specs/04-search-pipeline.md §1 "Guards").
+            ///
+            /// Suppressing here starved the mechanism in exactly the case it
+            /// exists for: once a feed goes quiet its document stops changing,
+            /// every run 304s, and the aged-out backlog is never probed again
+            /// — this sweep being the only thing that could shrink it. Absence
+            /// here only decides who gets probed; the delete still needs a
+            /// confirmed 404/410.
             #[tokio::test]
-            async fn zero_seen_guard_suppresses_the_sweep_on_a_feed_304() {
+            async fn zero_seen_on_a_feed_304_still_runs_the_sweep() {
                 let source = make_feed_source("store-1");
                 let config = make_ingestion_config("store-1");
                 let store = LivenessStore::new(vec![row(
@@ -8218,35 +8234,57 @@ mod tests {
                     deletion: DeletionPolicy::Prune,
                     document_validators: FetchMetadata::default(),
                     stored_inputs_digest: None,
-                    fetcher: &UnreachableFetcher,
+                    fetcher: &ScriptedFetcher::new(ScriptedFetchOutcome::Gone),
                 };
-                run_source_ingestion(&source, &ingestor, deps)
+                let result = run_source_ingestion(&source, &ingestor, deps)
                     .await
                     .unwrap();
 
                 assert_eq!(
                     store.list_call_count(),
-                    0,
-                    "a zero-seen run must suppress the liveness sweep"
+                    1,
+                    "an empty seen-set must not stop the sweep from querying for candidates"
+                );
+                assert_eq!(
+                    result.feed_entries_liveness_checked, 1,
+                    "the aged-out candidate must actually be probed"
+                );
+                assert_eq!(
+                    *store.delete_calls.lock().await,
+                    vec!["r1".to_string()],
+                    "and a confirmed 410 must still delete — the seen-set was never what \
+                     licensed the delete"
                 );
             }
 
-            /// The routine case: a feed under `--delete` whose document
-            /// answered 304 must not warn on every run — that trains
-            /// operators to ignore the level. It still logs, just at
-            /// `debug!`, and never at `warn!` for this cause.
+            /// The empty seen-set subtracts nothing, which is the right answer
+            /// for a 304'd run: the window is unchanged, so nothing aged out
+            /// *during* the run and every candidate the query returns had
+            /// already aged out before it began. The batch cap is what bounds
+            /// the work, not the seen-set.
             #[tokio::test]
-            async fn zero_seen_guard_on_a_feed_logs_at_debug_not_warn() {
+            async fn zero_seen_on_a_feed_304_is_still_bounded_by_the_batch_cap() {
                 let source = make_feed_source("store-1");
                 let config = make_ingestion_config("store-1");
-                let store = LivenessStore::new(vec![row(
-                    "r1",
-                    "https://a.example.com/",
-                    Some(&old_timestamp()),
-                )]);
+                let rows: Vec<LivenessRow> = (0..40)
+                    .map(|i| {
+                        row(
+                            &format!("r{i}"),
+                            &format!("https://a.example.com/{i}"),
+                            Some(&old_timestamp()),
+                        )
+                    })
+                    .collect();
+                let store = LivenessStore::new(rows);
                 let embedder = FakeEmbedder::new(4);
                 let mut doc_index = DocumentIndex::new();
-                seed_doc_index_owned_by(&mut doc_index, &source.id, "https://a.example.com/");
+                for i in 0..40 {
+                    seed_doc_index_owned_by(
+                        &mut doc_index,
+                        &source.id,
+                        &format!("https://a.example.com/{i}"),
+                    );
+                }
 
                 let ingestor = FakeIngestor::new(vec![]);
                 let deps = SourceIngestionDeps {
@@ -8258,18 +8296,15 @@ mod tests {
                     deletion: DeletionPolicy::Prune,
                     document_validators: FetchMetadata::default(),
                     stored_inputs_digest: None,
-                    fetcher: &UnreachableFetcher,
+                    fetcher: &ScriptedFetcher::new(ScriptedFetchOutcome::NotModified),
                 };
+                let result = run_source_ingestion(&source, &ingestor, deps)
+                    .await
+                    .unwrap();
 
-                let (result, captured) = run_capturing_logs(&source, &ingestor, deps).await;
-                result.unwrap();
-                assert!(
-                    captured.contains("DEBUG") && captured.contains("skipping feed liveness sweep"),
-                    "the routine feed-304 zero-seen backstop must log at DEBUG; captured: {captured}"
-                );
-                assert!(
-                    !captured.contains("WARN"),
-                    "must not also warn for the same routine suppression; captured: {captured}"
+                assert_eq!(
+                    result.feed_entries_liveness_checked, FEED_LIVENESS_BATCH_LIMIT as u64,
+                    "a zero-seen run probes at most one batch, same as any other run"
                 );
             }
 
