@@ -42,6 +42,10 @@ pub(crate) struct IndexSummary {
     /// Documents whose content and policy were unchanged but whose metadata
     /// was rewritten in place (issue #176) — no chunks/embeddings touched.
     metadata_updated: u64,
+    /// Feed-discovered resources the liveness sweep probed this run
+    /// (specs/04-search-pipeline.md §1 "Aged-out feed entries: the liveness
+    /// sweep"). Always 0 outside a `--delete` run against a feed source.
+    feed_liveness_checked: u64,
 }
 
 impl IndexSummary {
@@ -58,6 +62,7 @@ impl IndexSummary {
         self.prunable += other.prunable;
         self.deleted += other.deleted;
         self.metadata_updated += other.metadata_updated;
+        self.feed_liveness_checked += other.feed_liveness_checked;
     }
 
     /// Build an `IndexSummary` from a completed job's `IndexJobStats`
@@ -81,6 +86,7 @@ impl IndexSummary {
             prunable: stats.docs_prunable,
             deleted: stats.docs_deleted,
             metadata_updated: stats.docs_metadata_updated,
+            feed_liveness_checked: stats.feed_entries_liveness_checked,
         }
     }
 }
@@ -469,6 +475,12 @@ fn format_summary_body(summary: &IndexSummary) -> String {
     if summary.metadata_updated > 0 {
         body.push_str(&format!(", {} metadata updated", summary.metadata_updated));
     }
+    if summary.feed_liveness_checked > 0 {
+        body.push_str(&format!(
+            ", {} feed entries checked for liveness",
+            summary.feed_liveness_checked
+        ));
+    }
     body
 }
 
@@ -520,6 +532,7 @@ fn summary_fields_json(summary: &IndexSummary, strict: bool) -> serde_json::Valu
         "docs_deleted": summary.deleted,
         "docs_prunable": summary.prunable,
         "docs_metadata_updated": summary.metadata_updated,
+        "feed_entries_liveness_checked": summary.feed_liveness_checked,
     })
 }
 
@@ -623,6 +636,7 @@ mod tests {
             prunable: 0,
             deleted: 0,
             metadata_updated: 0,
+            feed_liveness_checked: 0,
         }
     }
 
@@ -764,6 +778,37 @@ mod tests {
     }
 
     #[test]
+    fn render_index_text_appends_feed_liveness_checked_when_nonzero() {
+        let mut summary = with_sources(3, 1, 6, 0, 0);
+        summary.feed_liveness_checked = 5;
+        let outcomes = vec![outcome("books", summary)];
+        assert_eq!(
+            render_index_text(&outcomes),
+            "Index complete: 3 indexed, 1 skipped, 6 chunks written, 0 unsupported, 0 errors, \
+             5 feed entries checked for liveness"
+        );
+    }
+
+    #[test]
+    fn render_index_json_includes_feed_entries_liveness_checked_field() {
+        let mut summary = with_sources(3, 1, 6, 0, 0);
+        summary.feed_liveness_checked = 5;
+        let outcomes = vec![outcome("books", summary)];
+        let v = render_index_json(&outcomes, false);
+        assert_eq!(v["feed_entries_liveness_checked"], json!(5));
+    }
+
+    #[test]
+    fn total_summary_sums_feed_liveness_checked_across_stores() {
+        let mut a = with_sources(3, 1, 6, 0, 0);
+        a.feed_liveness_checked = 1;
+        let mut b = with_sources(1, 0, 2, 1, 2);
+        b.feed_liveness_checked = 4;
+        let outcomes = vec![outcome("a", a), outcome("b", b)];
+        assert_eq!(total_summary(&outcomes).feed_liveness_checked, 5);
+    }
+
+    #[test]
     fn render_index_json_single_store_matches_legacy_flat_shape() {
         let outcomes = vec![outcome("books", with_sources(3, 1, 6, 0, 0))];
         let v = render_index_json(&outcomes, false);
@@ -781,6 +826,7 @@ mod tests {
                 "docs_deleted": 0,
                 "docs_prunable": 0,
                 "docs_metadata_updated": 0,
+                "feed_entries_liveness_checked": 0,
             })
         );
         assert!(
@@ -846,6 +892,7 @@ mod tests {
                         "docs_deleted": 0,
                         "docs_prunable": 0,
                         "docs_metadata_updated": 0,
+                        "feed_entries_liveness_checked": 0,
                     },
                     {
                         "store": "notes",
@@ -858,6 +905,7 @@ mod tests {
                         "docs_deleted": 0,
                         "docs_prunable": 0,
                         "docs_metadata_updated": 0,
+                        "feed_entries_liveness_checked": 0,
                     },
                 ],
                 "total": {
@@ -870,6 +918,7 @@ mod tests {
                     "docs_deleted": 0,
                     "docs_prunable": 0,
                     "docs_metadata_updated": 0,
+                    "feed_entries_liveness_checked": 0,
                 },
             })
         );
