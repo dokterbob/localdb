@@ -127,6 +127,12 @@ impl Default for Metadata {
 /// knows the author of an entry better than the linked page's markup does;
 /// it does not know the page's title better than the page does.
 ///
+/// `date` goes one step further and can be *withdrawn*: an entry that loses
+/// its `<pubDate>` retracts the date this connector wrote on an earlier run,
+/// scoped by [`Self::date_source`] so an extraction-derived date is never
+/// touched. `creator` has no such stamp and so cannot be retracted — see
+/// [`Self::apply_to`].
+///
 /// It exists as a `core` type rather than an ingestor-private one so the
 /// same merge runs on both sides of a conditional GET: at index time an
 /// ingestor applies it to freshly parsed metadata, and on a 304 —
@@ -143,9 +149,18 @@ pub struct MetadataEnrichment {
     /// Date claim (RFC 3339 or a Dublin Core partial), replacing the
     /// extracted `date`.
     pub date: Option<String>,
-    /// Provenance stamp for `date`, written in the same breath as `date` so
-    /// an extraction's own `date_source` can never survive attached to a
-    /// value it did not produce.
+    /// Provenance stamp for dates this connector supplies (`"feed-entry"`).
+    ///
+    /// Written in the same breath as `date` so an extraction's own
+    /// `date_source` can never survive attached to a value it did not
+    /// produce — and set even when `date` is `None`, which is what lets
+    /// [`Self::apply_to`] tell a date this connector stamped on an earlier
+    /// run (and is now retracting) from one the extraction produced. A
+    /// connector with no dates of its own leaves it `None` and retracts
+    /// nothing.
+    ///
+    /// Deliberately not part of [`Self::is_empty`]: a stamp with nothing
+    /// stamped under it is not a claim.
     pub date_source: Option<String>,
     /// Value for `DublinCoreMetadata::source` — the connector the resource
     /// was reached through (e.g. the owning feed's URL).
@@ -179,6 +194,24 @@ impl MetadataEnrichment {
         if let Some(date) = &self.date {
             dc.date = Some(date.clone());
             dc.date_source = self.date_source.clone();
+        } else if self.date_source.is_some() && dc.date_source == self.date_source {
+            // The connector stamped this date on an earlier run and is no
+            // longer claiming one — a feed entry whose `<pubDate>` was
+            // removed. Retracting it is what "a pure function of
+            // `(self, dc)`" above requires: without this branch the stored
+            // date is whatever the connector last said, with no way to
+            // withdraw it short of a full reindex.
+            //
+            // Scoped by provenance, and only to *this* connector's own
+            // stamp: a date the extraction produced carries a different
+            // `date_source` (`"pdf-info"`, `"html-json-ld"`, ...) and was
+            // never this enrichment's to claim, so it is never this
+            // enrichment's to retract. An unstamped legacy date
+            // (`date_source: None`) is likewise left alone unless this
+            // enrichment itself stamps nothing, which no date-carrying
+            // connector does.
+            dc.date = None;
+            dc.date_source = None;
         }
         if let Some(source) = &self.provenance_source {
             dc.source = Some(source.clone());
@@ -463,12 +496,94 @@ mod tests {
     fn enrichment_is_empty_ignores_date_source() {
         assert!(MetadataEnrichment::default().is_empty());
         assert!(!feed_enrichment().is_empty());
-        // date_source alone is meaningless — it is provenance for a `date`
-        // that isn't there, and applying it would change nothing.
+        // A stamp with nothing stamped under it is not a claim: the
+        // connector is saying "I own dates labelled this way", not "here is
+        // a date". `is_empty` reports on claims, so it stays false-free here
+        // even though such an enrichment is not a total no-op — it still
+        // retracts a date this same connector previously stamped, which the
+        // retraction tests below cover.
         assert!(MetadataEnrichment {
             date_source: Some("feed-entry".to_string()),
             ..Default::default()
         }
         .is_empty());
+    }
+
+    /// A feed that drops an entry's `<pubDate>` must be able to take the date
+    /// back. Without this the stored date is whatever the feed last said,
+    /// with no way to withdraw it short of a full reindex — and behind a 304
+    /// there is no reindex coming.
+    #[test]
+    fn enrichment_retracts_a_date_it_previously_stamped() {
+        let mut dc = DublinCoreMetadata::default();
+        feed_enrichment().apply_to(&mut dc);
+        assert_eq!(dc.date.as_deref(), Some("2026-02-09T00:00:00Z"));
+
+        // The next run: same feed, same entry, no date on it any more.
+        let dateless = MetadataEnrichment {
+            date: None,
+            ..feed_enrichment()
+        };
+        dateless.apply_to(&mut dc);
+        assert_eq!(dc.date, None, "the feed withdrew its claim");
+        assert_eq!(
+            dc.date_source, None,
+            "the provenance stamp goes with the value it described"
+        );
+        // Everything else the enrichment still claims is untouched.
+        assert_eq!(dc.creator, vec!["Jane Doe".to_string()]);
+    }
+
+    /// The retraction is scoped by provenance. A date the *extraction*
+    /// produced was never the connector's to claim, so it is never the
+    /// connector's to retract — an entry losing its `<pubDate>` must not
+    /// wipe a publication date the linked page's own markup supplied.
+    #[test]
+    fn enrichment_never_retracts_a_date_it_did_not_stamp() {
+        let extracted = DublinCoreMetadata {
+            date: Some("1999-01-01".to_string()),
+            date_source: Some("html-json-ld".to_string()),
+            ..Default::default()
+        };
+        let mut dc = extracted.clone();
+        MetadataEnrichment {
+            date: None,
+            ..feed_enrichment()
+        }
+        .apply_to(&mut dc);
+        assert_eq!(dc.date, extracted.date);
+        assert_eq!(dc.date_source, extracted.date_source);
+
+        // Nor does a connector that stamps nothing retract an unstamped
+        // legacy date — a document indexed before `date_source` existed.
+        let legacy = DublinCoreMetadata {
+            date: Some("2001-05-05".to_string()),
+            date_source: None,
+            ..Default::default()
+        };
+        let mut dc = legacy.clone();
+        MetadataEnrichment {
+            title_fallback: Some("Feed's title".to_string()),
+            ..Default::default()
+        }
+        .apply_to(&mut dc);
+        assert_eq!(dc.date, legacy.date);
+    }
+
+    /// Retraction must not break the idempotence the 304 path relies on:
+    /// applying a dateless enrichment twice has to land on the same state,
+    /// or every 304 would look like a change and rewrite the row forever.
+    #[test]
+    fn retraction_is_idempotent() {
+        let mut dc = DublinCoreMetadata::default();
+        feed_enrichment().apply_to(&mut dc);
+        let dateless = MetadataEnrichment {
+            date: None,
+            ..feed_enrichment()
+        };
+        dateless.apply_to(&mut dc);
+        let once = dc.clone();
+        dateless.apply_to(&mut dc);
+        assert_eq!(once, dc);
     }
 }

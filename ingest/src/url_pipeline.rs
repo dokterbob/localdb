@@ -48,7 +48,9 @@ use localdb_core::block::{IngestorKind, Resource, ResourceKind};
 use localdb_core::error::Error;
 use localdb_core::ids::resource_id;
 use localdb_core::ingestion::{now_rfc3339, FetchMetadata, FetchResult, UrlFetcher};
-use localdb_core::ingestor::{IngestCallback, IngestResult, IngestSource, SkipReason};
+use localdb_core::ingestor::{
+    IngestCallback, IngestResult, IngestSource, MetadataWriteOutcome, SkipReason,
+};
 use localdb_core::markdown_blocks::{compute_blocks_hash, markdown_to_blocks};
 use localdb_core::metadata::{DocumentMetadata, DublinCoreMetadata, Metadata, MetadataEnrichment};
 use localdb_core::parser::{Parser, Probe};
@@ -117,6 +119,15 @@ pub(crate) struct ResourceEnrichment {
     /// Provenance source (e.g. the owning feed's URL) to stamp into
     /// `DublinCoreMetadata::source` when present.
     pub provenance_source: Option<String>,
+    /// Provenance label for dates this connector supplies (`"feed-entry"`).
+    ///
+    /// Set by every connector that can supply a `date` at all, including on
+    /// a resource it currently has no date for: that is what lets the 304
+    /// seam retract a date the connector has stopped claiming without ever
+    /// touching one the page's own markup produced. See
+    /// `MetadataEnrichment::date_source`. `None` for a plain `UrlIngestor`,
+    /// which never supplies dates.
+    pub date_source: Option<String>,
     /// Whether to carry the fetch response's `ETag`/`Last-Modified` into
     /// `Resource.external_etag`/`Resource.external_last_modified`. Gates
     /// both fields together — a resource either participates in conditional
@@ -130,16 +141,18 @@ impl ResourceEnrichment {
     /// The subset of this enrichment that lands inside `Metadata`, as the
     /// `core` type both the index-time merge and the 304 seam speak.
     ///
-    /// `date_source` is stamped in the same breath as `date` so a page
-    /// parser's own provenance (e.g. `"html-json-ld"`) can never survive
-    /// attached to the connector's date — a lie about where the value came
-    /// from.
+    /// `date_source` rides along whether or not `date` is present. When it
+    /// is, the stamp keeps a page parser's own provenance (e.g.
+    /// `"html-json-ld"`) from surviving attached to the connector's date — a
+    /// lie about where the value came from. When it isn't, the stamp is how
+    /// the 304 seam recognizes a date this connector previously supplied and
+    /// has now withdrawn.
     pub(crate) fn metadata_enrichment(&self) -> MetadataEnrichment {
         MetadataEnrichment {
             title_fallback: self.title_fallback.clone(),
             creator: self.creator.clone(),
             date: self.date.clone(),
-            date_source: self.date.as_ref().map(|_| "feed-entry".to_string()),
+            date_source: self.date_source.clone(),
             provenance_source: self.provenance_source.clone(),
         }
     }
@@ -220,8 +233,9 @@ pub(crate) async fn process_url(
             // comment. Both `None` is the common case (a bare 304) and means
             // "keep what's stored," which is exactly what skipping this call
             // does.
+            let mut written = MetadataWriteOutcome::Unchanged;
             if etag.is_some() || last_modified.is_some() {
-                callback
+                written = callback
                     .on_validators_refreshed(
                         uri,
                         &FetchMetadata {
@@ -240,17 +254,43 @@ pub(crate) async fn process_url(
             // after `on_validators_refreshed` so the metadata hash is
             // recomputed against the etag that call may have just rotated.
             if enrich.supplies_metadata() {
-                callback
-                    .on_metadata_refreshed(
-                        uri,
-                        &enrich.metadata_enrichment(),
-                        enrich.external_id.as_deref(),
-                        enrich.modified_at_override.as_deref(),
-                    )
-                    .await;
+                written = written.merge(
+                    callback
+                        .on_metadata_refreshed(
+                            uri,
+                            &enrich.metadata_enrichment(),
+                            enrich.external_id.as_deref(),
+                            enrich.modified_at_override.as_deref(),
+                        )
+                        .await,
+                );
             }
-            callback.on_skipped(uri, SkipReason::Unchanged).await;
-            result.resources_skipped += 1;
+            // Reported once, whatever the two hooks did — `on_skipped` is
+            // what marks the URI seen for the delete-sweep and what emits its
+            // single `DocumentFinished`, so calling it per hook would
+            // double-count the URI in both.
+            match written {
+                MetadataWriteOutcome::Unchanged => {
+                    callback.on_skipped(uri, SkipReason::Unchanged).await;
+                    result.resources_skipped += 1;
+                }
+                MetadataWriteOutcome::Written => {
+                    // Not a skip: a row was rewritten. Counting it in both
+                    // `docs_skipped` and `docs_metadata_updated` would break
+                    // the partition of `docs_seen`
+                    // (specs/04-search-pipeline.md), and counting it as a
+                    // skip alone hides the write entirely.
+                    callback.on_skipped(uri, SkipReason::MetadataUpdated).await;
+                }
+                MetadataWriteOutcome::Failed(msg) => {
+                    // A failed metadata write is an error, not a clean skip.
+                    // `result.errors` must move with it: `run_source_ingestion`
+                    // asserts an ingestor's own error count matches the number
+                    // of `SkipReason::Error` skips it reported.
+                    callback.on_skipped(uri, SkipReason::Error(msg)).await;
+                    result.errors += 1;
+                }
+            }
             return Ok(UrlOutcome::Unchanged);
         }
         FetchResult::Gone => {

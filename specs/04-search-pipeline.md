@@ -72,13 +72,47 @@ Resources also carry:
   entry's `modified_at` is therefore a write; a 304 that brings nothing new across metadata,
   `modified_at` and `external_id` alike is not.
 
+  A connector's `date` can also be **withdrawn**, not only overwritten: an entry that drops its
+  `<pubDate>` retracts the date it previously supplied. The retraction is scoped by the
+  `date_source` provenance stamp (`"feed-entry"`), so only a date this same connector wrote is ever
+  taken back and an extraction-derived date is never touched. `creator` carries no such stamp and
+  therefore cannot be retracted — a feed that stops naming an author keeps the last one it gave,
+  since nothing distinguishes it from an author the page's own markup supplied. Giving `creator` its
+  own provenance field would close that half.
+
+  > **How a writing 304 is reported (normative).** Both refresh hooks may write, so what the run
+  > reports is the _merged_ outcome of the two, reported exactly once for the URI: nothing written →
+  > a plain skip (`docs_skipped`); either hook wrote → `docs_metadata_updated`, the same counter and
+  > the same `DocOutcome::MetadataUpdated` an ordinary metadata-only update produces; either hook's
+  > write failed → an error (`error_count`), never a clean skip. A URI is never counted in two
+  > outcome buckets — those counters partition `docs_seen` — and it is marked `seen` on every
+  > branch, so a 304 whose metadata write failed still survives the delete-sweep: a failed write is
+  > not evidence the resource is gone.
+
   RFC 9111 requires storing whichever validators a 304 response itself carries, so a 304 bearing a
-  refreshed `ETag`/`Last-Modified` still updates the stored columns. No re-chunk follows — the
-  content is unchanged by definition — but `metadata_hash` **is** recomputed and rewritten alongside
-  them, because `external_etag` is one of `compute_metadata_hash`'s own inputs ("Metadata-only
-  update" below). Leaving it stale would desync the in-memory `DocumentIndex` from what a
-  rehydration of that same row computes, and the next run would then read a `metadata_hash` mismatch
-  on a resource nothing had changed about and take the metadata-only-update branch for no reason.
+  refreshed `ETag`/`Last-Modified` still updates the stored columns — but only when the pair
+  actually moved. A compliant origin repeats the validator it already issued on every 304 for
+  unchanged content, which is the common case, and rewriting the row for it would bump the publicly
+  visible `index_updated_at` on a run that changed nothing. The comparison is on the **validator
+  pair itself**, deliberately not on `metadata_hash`: `external_last_modified` is not one of that
+  hash's inputs, so a 304 rotating only `Last-Modified` yields an identical hash while still needing
+  to be persisted.
+
+  When the pair did move, `metadata_hash` **is** recomputed and rewritten alongside it, because
+  `external_etag` is one of `compute_metadata_hash`'s own inputs ("Metadata-only update" below).
+  Leaving it stale would desync the in-memory `DocumentIndex` from what a rehydration of that same
+  row computes, and the next run would then read a `metadata_hash` mismatch on a resource nothing
+  had changed about and take the metadata-only-update branch for no reason. No re-chunk follows
+  either way — the content is unchanged by definition.
+
+  > **Rebuilding the row (normative).** `update_resource_metadata` rewrites _every_ metadata column,
+  > so a caller changing one field must read the row's current state for all the others first, via
+  > `RetrievalStore::get_resource_record`. A chunk read is not a substitute and must not be used:
+  > `external_id`, `date_original` and `date_parsed` are write-only on `ChunkRecord` by design, so a
+  > record rebuilt from a chunk carries `None` for each and writes `NULL` over three live columns on
+  > every refresh. Widening the chunk projection is the wrong repair — it also backs
+  > `dense_search`/`bm25_search`, so every search row would carry and parse fields no search
+  > consumer reads.
 
   > **Suppression rule (normative).** Conditional headers are sent **only** when the stored
   > resource's `policy_version` equals the run's. A 304 returns no bytes, so a resource that would

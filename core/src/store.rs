@@ -576,6 +576,32 @@ pub trait RetrievalStore: Send + Sync + 'static {
         record: &ResourceRecord,
     ) -> Result<(), Error>;
 
+    /// Single-row read of a resource's persisted metadata state — the read
+    /// counterpart to [`Self::update_resource_metadata`], returning exactly
+    /// the record that method writes.
+    ///
+    /// This exists because [`Self::get_chunks_for_resource`] cannot stand in
+    /// for it. A caller rebuilding a `ResourceRecord` in order to rewrite one
+    /// field needs the row's current value for every *other* field, and three
+    /// of them — `external_id`, `date_original`, `date_parsed` — are
+    /// write-only on `ChunkRecord` by design (see their doc comments): a
+    /// chunk read reports `None` for each regardless of what the row holds.
+    /// Building a record from a chunk and writing it back therefore nulls
+    /// those columns. Widening the chunk projection is not the fix — it also
+    /// backs `dense_search`/`bm25_search`, so every search result would carry
+    /// and parse fields nothing reads.
+    ///
+    /// Returns `Ok(None)` when no row matches `(store_id, resource_id)` — a
+    /// concurrent delete, or a resource this store never held. No default
+    /// implementation, for the same reason `update_resource_metadata` has
+    /// none: a store answering `None` unconditionally would silently turn
+    /// every caller into a no-op.
+    async fn get_resource_record(
+        &self,
+        store_id: &str,
+        resource_id: &str,
+    ) -> Result<Option<ResourceRecord>, Error>;
+
     /// Upsert a set of blocks for a document.
     ///
     /// The resource row identified by `resource_id` must already exist (written
@@ -941,6 +967,37 @@ impl RetrievalStore for FakeStore {
                 id: resource_id.to_string(),
             })
         }
+    }
+
+    async fn get_resource_record(
+        &self,
+        store_id: &str,
+        resource_id: &str,
+    ) -> Result<Option<ResourceRecord>, Error> {
+        let chunks = self.chunks.read().await;
+        // `FakeStore` has no separate `resources` table: it denormalizes
+        // every resource-level field onto each chunk row, so the first
+        // matching chunk *is* the resource's persisted state. That is also
+        // why this double cannot reproduce the projection bug the real
+        // backend has — see `RetrievalStore::get_resource_record`.
+        let Some(chunk) = chunks
+            .iter()
+            .find(|c| c.store_id == store_id && c.resource_id == resource_id)
+        else {
+            return Ok(None);
+        };
+        Ok(Some(ResourceRecord {
+            metadata: chunk.metadata.clone(),
+            external_id: chunk.external_id.clone(),
+            external_etag: chunk.external_etag.clone(),
+            // `ChunkRecord` carries no `external_last_modified` (same
+            // limitation `list_indexed_documents` above records) — `FakeStore`
+            // has nowhere to keep it.
+            external_last_modified: None,
+            modified_at: chunk.modified_at.clone(),
+            date_original: chunk.date_original.clone(),
+            date_parsed: chunk.date_parsed.clone(),
+        }))
     }
 
     async fn upsert_blocks(

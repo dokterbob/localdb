@@ -838,3 +838,108 @@ async fn update_resource_metadata_errors_when_no_row_matches() {
         }
     );
 }
+
+// ---------------------------------------------------------------------------
+// get_resource_record (the read counterpart to update_resource_metadata)
+// ---------------------------------------------------------------------------
+
+/// The whole reason `get_resource_record` exists, pinned end to end.
+///
+/// A caller that rewrites one field of a resource row must read every other
+/// field back first, because `update_resource_metadata` rewrites all of them.
+/// The obvious read — `get_chunks_for_resource` — cannot serve: `CHUNK_COLS`
+/// omits `external_id`, `date_original` and `date_parsed` (write-only on
+/// `ChunkRecord` by design), so a record rebuilt from a chunk carries `None`
+/// for each and writes `NULL` over three real columns.
+///
+/// This drives the exact sequence `PipelineCallback::on_validators_refreshed`
+/// performs on a 304 — read, rotate the ETag, write back — and asserts the
+/// three columns survive. It has to live here rather than in `core`: the
+/// `FakeStore` double denormalizes every `ResourceRecord` field onto its
+/// chunks, so a chunk read there faithfully returns all three and the bug is
+/// invisible.
+#[tokio::test]
+async fn validator_rotation_through_get_resource_record_preserves_the_columns_chunks_drop() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("localdb.db");
+    let backend = backend_with_store_and_source(&path).await;
+    let handle = backend.retrieval_store("store-1").await.unwrap();
+
+    let mut seed = chunk_record("2026-07-01T00:00:00Z", Some("2026-07-01T00:00:00Z"));
+    seed.external_id = Some("urn:entry:42".to_string());
+    seed.external_etag = Some("\"v1\"".to_string());
+    seed.date_original = Some("2026-06-15T10:30:00Z".to_string());
+    seed.date_parsed = Some("2026-06-15".to_string());
+    handle.upsert_chunks(vec![seed]).await.unwrap();
+
+    // The projection gap this seam routes around: the chunk read reports
+    // `None` for all three despite the row holding real values.
+    let chunks = handle.get_chunks_for_resource("doc-1").await.unwrap();
+    let chunk = chunks.first().expect("the seeded chunk must be readable");
+    assert_eq!(chunk.external_id, None);
+    assert_eq!(chunk.date_original, None);
+    assert_eq!(chunk.date_parsed, None);
+
+    let persisted = handle
+        .get_resource_record("store-1", "doc-1")
+        .await
+        .unwrap()
+        .expect("the seeded resource row must be readable");
+    assert_eq!(persisted.external_id.as_deref(), Some("urn:entry:42"));
+    assert_eq!(persisted.external_etag.as_deref(), Some("\"v1\""));
+    assert_eq!(
+        persisted.date_original.as_deref(),
+        Some("2026-06-15T10:30:00Z")
+    );
+    assert_eq!(persisted.date_parsed.as_deref(), Some("2026-06-15"));
+
+    // The hook's write: rotate the ETag, carry everything else through.
+    let rotated = ResourceRecord {
+        external_etag: Some("\"v2\"".to_string()),
+        ..persisted
+    };
+    handle
+        .update_resource_metadata("store-1", "doc-1", &rotated)
+        .await
+        .unwrap();
+
+    let (date_original, date_parsed, external_id, external_etag) =
+        resource_dates_and_external(&backend, "doc-1").await;
+    assert_eq!(
+        external_etag.as_deref(),
+        Some("\"v2\""),
+        "the rotated validator must land"
+    );
+    assert_eq!(
+        external_id.as_deref(),
+        Some("urn:entry:42"),
+        "a validator refresh must not null external_id"
+    );
+    assert_eq!(
+        date_original.as_deref(),
+        Some("2026-06-15T10:30:00Z"),
+        "a validator refresh must not null date_original"
+    );
+    assert_eq!(
+        date_parsed.as_deref(),
+        Some("2026-06-15"),
+        "a validator refresh must not null date_parsed"
+    );
+}
+
+/// `Ok(None)`, not an error, for a resource this store has no row for — a
+/// concurrent delete racing a refresh is ordinary, and the callers treat it
+/// the same way they treat a `DocumentIndex` miss.
+#[tokio::test]
+async fn get_resource_record_returns_none_for_an_unknown_resource() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("localdb.db");
+    let backend = backend_with_store_and_source(&path).await;
+    let handle = backend.retrieval_store("store-1").await.unwrap();
+
+    assert!(handle
+        .get_resource_record("store-1", "does-not-exist")
+        .await
+        .unwrap()
+        .is_none());
+}

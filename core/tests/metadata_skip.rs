@@ -277,6 +277,14 @@ impl RetrievalStore for RecordingStore {
             .await
     }
 
+    async fn get_resource_record(
+        &self,
+        store_id: &str,
+        resource_id: &str,
+    ) -> Result<Option<ResourceRecord>, Error> {
+        self.inner.get_resource_record(store_id, resource_id).await
+    }
+
     async fn upsert_blocks(
         &self,
         store_id: &str,

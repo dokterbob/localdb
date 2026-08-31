@@ -113,6 +113,14 @@ impl RetrievalStore for TenantStore {
         write::update_resource_metadata(self, store_id, resource_id, record).await
     }
 
+    async fn get_resource_record(
+        &self,
+        store_id: &str,
+        resource_id: &str,
+    ) -> Result<Option<ResourceRecord>, Error> {
+        read::get_resource_record(self, store_id, resource_id).await
+    }
+
     async fn upsert_blocks(
         &self,
         _store_id: &str,

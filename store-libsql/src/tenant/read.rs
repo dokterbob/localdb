@@ -2,13 +2,13 @@ use libsql::params;
 use localdb_core::ingestion::DocumentRecord;
 use localdb_core::{
     compute_metadata_hash, content_hash, ChunkRecord, Error, Metadata, MetadataFilter,
-    SearchResult, StoreStats, VectorEncoding,
+    ResourceRecord, SearchResult, StoreStats, VectorEncoding,
 };
 
 use super::rows::{row_to_block, row_to_chunk_record_strict};
 use super::sql::{build_filter_clauses, escape_fts5_query};
 use super::TenantStore;
-use crate::connection::map_libsql_err;
+use crate::connection::{map_libsql_err, parse_metadata_json_lenient};
 use crate::vectors;
 
 // Column projection shared across all chunk queries.
@@ -294,6 +294,50 @@ pub(crate) async fn get_blocks_for_resource(
         out.push(row_to_block(&row)?);
     }
     Ok(out)
+}
+
+/// Read one resource row's persisted metadata state, in exactly the shape
+/// `update_resource_metadata` writes it back.
+///
+/// Deliberately its own projection rather than a reuse of `CHUNK_COLS`: that
+/// projection omits `external_id`/`date_original`/`date_parsed` (write-only
+/// on `ChunkRecord`) and also backs `dense_search`/`bm25_search`, so widening
+/// it to serve this one caller would make every search row carry and parse
+/// three fields no search consumer reads. See
+/// `RetrievalStore::get_resource_record`.
+pub(crate) async fn get_resource_record(
+    store: &TenantStore,
+    store_id: &str,
+    resource_id: &str,
+) -> Result<Option<ResourceRecord>, Error> {
+    let conn = store.conn().reader();
+    let mut rows = conn
+        .query(
+            "SELECT metadata_json, external_id, external_etag, external_last_modified,
+                    modified_at, date_original, date_parsed
+             FROM resources WHERE store_id = ? AND id = ?",
+            params![store_id.to_string(), resource_id.to_string()],
+        )
+        .await
+        .map_err(map_libsql_err)?;
+    let Some(row) = rows.next().await.map_err(map_libsql_err)? else {
+        return Ok(None);
+    };
+    let metadata_json: String = row.get(0).map_err(map_libsql_err)?;
+    Ok(Some(ResourceRecord {
+        // Lenient, matching the chunk-read precedent in `rows.rs`: a row whose
+        // metadata JSON no longer decodes still has real validators and dates
+        // worth preserving, and refusing the read would strand the caller's
+        // write forever. `list_indexed_documents` above is the one place that
+        // must *not* be lenient, because its output feeds a hash comparison.
+        metadata: parse_metadata_json_lenient(&metadata_json, resource_id),
+        external_id: row.get(1).map_err(map_libsql_err)?,
+        external_etag: row.get(2).map_err(map_libsql_err)?,
+        external_last_modified: row.get(3).map_err(map_libsql_err)?,
+        modified_at: row.get(4).map_err(map_libsql_err)?,
+        date_original: row.get(5).map_err(map_libsql_err)?,
+        date_parsed: row.get(6).map_err(map_libsql_err)?,
+    }))
 }
 
 pub(crate) async fn list_indexed_documents(
