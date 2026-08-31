@@ -213,7 +213,13 @@ mod tests {
             bytes: Vec<u8>,
             content_type: Option<String>,
         },
-        NotModified,
+        /// A bare `NotModified` (both fields `None`) is the common case — a
+        /// 304 that carried no validators of its own. Non-`None` fields
+        /// script a 304 that rotated its `ETag`/`Last-Modified`.
+        NotModified {
+            etag: Option<String>,
+            last_modified: Option<String>,
+        },
         Gone,
         FetchError,
         /// The fetcher's destination policy refused the URL.
@@ -257,7 +263,13 @@ mod tests {
                     // `FetchResult::Downloaded`'s doc comment.
                     final_url: None,
                 }),
-                Some(ScriptedOutcome::NotModified) => Ok(FetchResult::NotModified),
+                Some(ScriptedOutcome::NotModified {
+                    etag,
+                    last_modified,
+                }) => Ok(FetchResult::NotModified {
+                    etag: etag.clone(),
+                    last_modified: last_modified.clone(),
+                }),
                 Some(ScriptedOutcome::Gone) => Ok(FetchResult::Gone),
                 Some(ScriptedOutcome::Blocked) => Ok(FetchResult::Blocked),
                 Some(ScriptedOutcome::FetchError) | None => Err(Error::Internal {
@@ -409,7 +421,10 @@ mod tests {
         let mut script = HashMap::new();
         script.insert(
             "https://example.com/same".to_string(),
-            ScriptedOutcome::NotModified,
+            ScriptedOutcome::NotModified {
+                etag: None,
+                last_modified: None,
+            },
         );
 
         let ingestor =

@@ -539,7 +539,23 @@ pub enum FetchResult {
         final_url: Option<String>,
     },
     /// Server returned 304 Not Modified (conditional GET).
-    NotModified,
+    ///
+    /// Carries whichever validators the 304 response *itself* carried, raw
+    /// and unmodified. RFC 9111 requires a cache to store these: an origin
+    /// MAY rotate its `ETag` or `Last-Modified` on a 304 even though the
+    /// body is unchanged, and dropping the new value means the next
+    /// conditional request replays a stale validator and needlessly gets a
+    /// full 200 body back.
+    ///
+    /// Both fields being `None` is the common case — a bare 304 — and means
+    /// "keep whatever validator is already stored", never "clear the stored
+    /// validator". That distinction is the whole point of `Option` here: a
+    /// caller must not read `None` as an instruction to blank out a
+    /// previously stored value.
+    NotModified {
+        etag: Option<String>,
+        last_modified: Option<String>,
+    },
     /// Document gone (404/410 after retry). Should trigger deletion.
     Gone,
     /// The fetcher refused to connect because the destination violates its

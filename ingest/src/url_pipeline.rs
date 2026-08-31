@@ -178,7 +178,10 @@ pub(crate) async fn process_url(
             etag,
             ..
         } => (bytes, content_type, etag),
-        FetchResult::NotModified => {
+        FetchResult::NotModified {
+            etag: _,
+            last_modified: _,
+        } => {
             callback.on_skipped(uri, SkipReason::Unchanged).await;
             result.resources_skipped += 1;
             return Ok(UrlOutcome::Unchanged);
