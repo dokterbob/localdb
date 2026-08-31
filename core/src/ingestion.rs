@@ -174,7 +174,18 @@ pub struct IngestionConfig {
 /// `Serialize`/`Deserialize` are derived because this type is embedded in
 /// [`crate::progress::ProgressEvent::SourceFinished`], which crosses the
 /// SSE wire boundary (issue #83).
+///
+/// `#[serde(default)]` at the **struct** level, matching
+/// [`crate::types::IndexJobStats`], and for the same reason: this crosses a
+/// version boundary. `localdb index` attaches to a running daemon's SSE
+/// stream, and the two are not upgraded in lockstep — a newer CLI reading an
+/// older daemon's `SourceFinished` frame would otherwise fail the whole
+/// deserialize on the first field the daemon does not know about, dropping a
+/// frame the user is watching rather than reading it with zeros for the
+/// fields that are missing. Struct-level, not per-field, so every counter
+/// added later inherits it without anyone having to remember.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct IngestionResult {
     /// Total documents seen in the scan.
     pub docs_seen: u64,
@@ -2254,6 +2265,63 @@ mod tests {
         let removed = idx.remove("file:///test.md");
         assert!(removed.is_some());
         assert!(idx.is_empty());
+    }
+
+    // ---------------------------------------------------------------------------
+    // IngestionResult wire compatibility
+    // ---------------------------------------------------------------------------
+
+    /// This type crosses a version boundary: `localdb index` attaches to a
+    /// running daemon's SSE stream, and the two are not upgraded together.
+    /// Without struct-level `#[serde(default)]` a newer CLI reading an older
+    /// daemon's `SourceFinished` frame fails the whole deserialize on the
+    /// first field the daemon never sent, dropping a frame the user is
+    /// watching.
+    ///
+    /// Asserted by deserializing an *empty* object, not by round-tripping a
+    /// populated one — a round trip passes with or without the attribute,
+    /// since it never omits a field.
+    #[test]
+    fn ingestion_result_deserializes_from_an_empty_object() {
+        let from_nothing: IngestionResult =
+            serde_json::from_str("{}").expect("every field must be optional on the wire");
+        let expected = IngestionResult::default();
+        assert_eq!(from_nothing.docs_seen, expected.docs_seen);
+        assert_eq!(from_nothing.docs_indexed, expected.docs_indexed);
+        assert_eq!(from_nothing.docs_skipped, expected.docs_skipped);
+        assert_eq!(from_nothing.docs_deleted, expected.docs_deleted);
+        assert_eq!(from_nothing.docs_prunable, expected.docs_prunable);
+        assert_eq!(
+            from_nothing.docs_metadata_updated,
+            expected.docs_metadata_updated
+        );
+        assert_eq!(from_nothing.chunks_written, expected.chunks_written);
+        assert_eq!(
+            from_nothing.unsupported_format_count,
+            expected.unsupported_format_count
+        );
+        assert_eq!(from_nothing.error_count, expected.error_count);
+        assert_eq!(
+            from_nothing.document_validators,
+            expected.document_validators
+        );
+        assert_eq!(
+            from_nothing.document_inputs_digest,
+            expected.document_inputs_digest
+        );
+    }
+
+    /// The other direction, which is the one that actually bites in
+    /// production: an *older* consumer must not choke on a field it has
+    /// never heard of. Serde ignores unknown keys by default, and nothing
+    /// on this type opts into `deny_unknown_fields` — pinned here so a
+    /// future contributor adding it has to argue with a failing test.
+    #[test]
+    fn ingestion_result_ignores_fields_it_does_not_know() {
+        let from_future: IngestionResult =
+            serde_json::from_str(r#"{"docs_seen":3,"docs_teleported":9}"#)
+                .expect("an unknown counter must not fail the frame");
+        assert_eq!(from_future.docs_seen, 3);
     }
 
     // ---------------------------------------------------------------------------

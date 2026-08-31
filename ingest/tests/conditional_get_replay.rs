@@ -586,6 +586,8 @@ async fn a_304_that_writes_reports_a_metadata_update_not_a_skip() {
             config: &config,
             progress: None,
             deletion: DeletionPolicy::Retain,
+            document_validators: FetchMetadata::default(),
+            stored_inputs_digest: None,
         },
     )
     .await
@@ -608,6 +610,8 @@ async fn a_304_that_writes_reports_a_metadata_update_not_a_skip() {
             config: &config,
             progress: None,
             deletion: DeletionPolicy::Retain,
+            document_validators: FetchMetadata::default(),
+            stored_inputs_digest: None,
         },
     )
     .await
@@ -668,6 +672,8 @@ async fn a_304_whose_metadata_write_fails_reports_an_error_not_a_skip() {
             config: &config,
             progress: None,
             deletion: DeletionPolicy::Retain,
+            document_validators: FetchMetadata::default(),
+            stored_inputs_digest: None,
         },
     )
     .await
@@ -688,6 +694,8 @@ async fn a_304_whose_metadata_write_fails_reports_an_error_not_a_skip() {
             config: &config,
             progress: None,
             deletion: DeletionPolicy::Retain,
+            document_validators: FetchMetadata::default(),
+            stored_inputs_digest: None,
         },
     )
     .await
@@ -807,6 +815,8 @@ async fn a_moved_last_modified_on_an_unchanged_200_is_persisted_and_replayed() {
                     config: &config,
                     progress: None,
                     deletion: DeletionPolicy::Retain,
+                    document_validators: FetchMetadata::default(),
+                    stored_inputs_digest: None,
                 },
             )
             .await
