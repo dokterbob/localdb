@@ -50,7 +50,7 @@ use localdb_core::ids::resource_id;
 use localdb_core::ingestion::{now_rfc3339, FetchMetadata, FetchResult, UrlFetcher};
 use localdb_core::ingestor::{IngestCallback, IngestResult, IngestSource, SkipReason};
 use localdb_core::markdown_blocks::{compute_blocks_hash, markdown_to_blocks};
-use localdb_core::metadata::{DocumentMetadata, DublinCoreMetadata, Metadata};
+use localdb_core::metadata::{DocumentMetadata, DublinCoreMetadata, Metadata, MetadataEnrichment};
 use localdb_core::parser::{Parser, Probe};
 use localdb_core::uri::Uri;
 
@@ -126,6 +126,37 @@ pub(crate) struct ResourceEnrichment {
     pub capture_conditional_get: bool,
 }
 
+impl ResourceEnrichment {
+    /// The subset of this enrichment that lands inside `Metadata`, as the
+    /// `core` type both the index-time merge and the 304 seam speak.
+    ///
+    /// `date_source` is stamped in the same breath as `date` so a page
+    /// parser's own provenance (e.g. `"html-json-ld"`) can never survive
+    /// attached to the connector's date — a lie about where the value came
+    /// from.
+    pub(crate) fn metadata_enrichment(&self) -> MetadataEnrichment {
+        MetadataEnrichment {
+            title_fallback: self.title_fallback.clone(),
+            creator: self.creator.clone(),
+            date: self.date.clone(),
+            date_source: self.date.as_ref().map(|_| "feed-entry".to_string()),
+            provenance_source: self.provenance_source.clone(),
+        }
+    }
+
+    /// Whether the connector supplies any metadata of its own for this
+    /// resource, beyond what fetching and parsing it produces.
+    ///
+    /// Gates the 304 metadata seam: a plain `UrlIngestor` knows nothing
+    /// about its URLs that the pages themselves don't say, so firing the
+    /// seam for it would buy a store read per 304 and change nothing.
+    fn supplies_metadata(&self) -> bool {
+        self.external_id.is_some()
+            || self.modified_at_override.is_some()
+            || !self.metadata_enrichment().is_empty()
+    }
+}
+
 /// Fetch, sniff, parse, and enrich a single locator into a `Resource`,
 /// reporting through `callback`/`result` per the module-level contract.
 ///
@@ -197,6 +228,24 @@ pub(crate) async fn process_url(
                             etag,
                             last_modified,
                         },
+                    )
+                    .await;
+            }
+            // A 304 proves the *body* is unchanged; it says nothing about
+            // the connector's own description of the resource, which is
+            // re-supplied on every run. Without this the entry loop would be
+            // the only thing that ever refreshed feed-supplied metadata, and
+            // an unchanged page would pin an entry's stored author and date
+            // to whatever the feed said the day it was first indexed. Runs
+            // after `on_validators_refreshed` so the metadata hash is
+            // recomputed against the etag that call may have just rotated.
+            if enrich.supplies_metadata() {
+                callback
+                    .on_metadata_refreshed(
+                        uri,
+                        &enrich.metadata_enrichment(),
+                        enrich.external_id.as_deref(),
+                        enrich.modified_at_override.as_deref(),
                     )
                     .await;
             }
@@ -344,29 +393,18 @@ pub(crate) fn build_resource(
 
     // Title merge: dc.title.or(parsed_title), THEN the enrichment's
     // title_fallback applies only if that merge still yields None.
+    // Title merge: the parser's Dublin Core title wins, then its fallback
+    // `ParsedDocument::title`, and only then does the enrichment get to fill
+    // the gap — which `MetadataEnrichment::apply_to` does, along with the
+    // overwrite-class fields. Same merge the 304 seam runs against persisted
+    // metadata (`IngestCallback::on_metadata_refreshed`), so the two paths
+    // cannot drift.
     let mut dc = parsed_metadata;
     if dc.title.is_none() {
         dc.title = parsed_title;
     }
-    if dc.title.is_none() {
-        dc.title = enrich.title_fallback.clone();
-    }
+    enrich.metadata_enrichment().apply_to(&mut dc);
     let title = dc.title.clone();
-
-    if !enrich.creator.is_empty() {
-        dc.creator = enrich.creator.clone();
-    }
-    if let Some(date) = &enrich.date {
-        // Same statement set: the feed's date overwrites both dc.date AND
-        // its provenance together, so a page parser's date_source (e.g.
-        // "html-json-ld") can never survive stamped on the feed's date — a
-        // lie about where the value actually came from.
-        dc.date = Some(date.clone());
-        dc.date_source = Some("feed-entry".to_string());
-    }
-    if let Some(src) = &enrich.provenance_source {
-        dc.source = Some(src.clone());
-    }
 
     Resource {
         id: res_id,

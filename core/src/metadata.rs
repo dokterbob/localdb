@@ -116,6 +116,76 @@ impl Default for Metadata {
     }
 }
 
+/// What a connector knows about a resource independently of the resource's
+/// own content — a feed entry's title, authors, publication date, and the
+/// feed that carried it.
+///
+/// Kept apart from [`DublinCoreMetadata`] because the two merge
+/// asymmetrically, and that asymmetry is the whole point: `title_fallback`
+/// only fills a gap the extraction left, while `creator`, `date` and
+/// `provenance_source` overwrite whatever the extraction produced. A feed
+/// knows the author of an entry better than the linked page's markup does;
+/// it does not know the page's title better than the page does.
+///
+/// It exists as a `core` type rather than an ingestor-private one so the
+/// same merge runs on both sides of a conditional GET: at index time an
+/// ingestor applies it to freshly parsed metadata, and on a 304 —
+/// [`crate::ingestor::IngestCallback::on_metadata_refreshed`] — the pipeline
+/// applies it to the persisted metadata, since a 304 returns no body to
+/// re-parse.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetadataEnrichment {
+    /// Title to use only when the merged metadata still carries none.
+    pub title_fallback: Option<String>,
+    /// Author name(s), replacing whatever the extraction found when
+    /// non-empty.
+    pub creator: Vec<String>,
+    /// Date claim (RFC 3339 or a Dublin Core partial), replacing the
+    /// extracted `date`.
+    pub date: Option<String>,
+    /// Provenance stamp for `date`, written in the same breath as `date` so
+    /// an extraction's own `date_source` can never survive attached to a
+    /// value it did not produce.
+    pub date_source: Option<String>,
+    /// Value for `DublinCoreMetadata::source` — the connector the resource
+    /// was reached through (e.g. the owning feed's URL).
+    pub provenance_source: Option<String>,
+}
+
+impl MetadataEnrichment {
+    /// Whether this enrichment carries anything at all. A connector with no
+    /// out-of-band knowledge of its resources (a plain URL fetch) produces
+    /// an empty one, and applying it is a guaranteed no-op.
+    pub fn is_empty(&self) -> bool {
+        self.title_fallback.is_none()
+            && self.creator.is_empty()
+            && self.date.is_none()
+            && self.provenance_source.is_none()
+    }
+
+    /// Layer this enrichment onto `dc` in place.
+    ///
+    /// Idempotent, and a pure function of `(self, dc)` — applying it to
+    /// already-enriched metadata reproduces that same metadata, which is
+    /// what lets the 304 path apply it to persisted state and compare the
+    /// result for equality rather than writing blindly.
+    pub fn apply_to(&self, dc: &mut DublinCoreMetadata) {
+        if dc.title.is_none() {
+            dc.title = self.title_fallback.clone();
+        }
+        if !self.creator.is_empty() {
+            dc.creator = self.creator.clone();
+        }
+        if let Some(date) = &self.date {
+            dc.date = Some(date.clone());
+            dc.date_source = self.date_source.clone();
+        }
+        if let Some(source) = &self.provenance_source {
+            dc.source = Some(source.clone());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,5 +373,102 @@ mod tests {
             r#""source":null,"language":"en","relation":[],"coverage":null,"rights":null}"#,
         );
         assert_eq!(json, expected);
+    }
+
+    // ------------------------------------------------------------------
+    // MetadataEnrichment
+    // ------------------------------------------------------------------
+
+    fn feed_enrichment() -> MetadataEnrichment {
+        MetadataEnrichment {
+            title_fallback: Some("Feed's title".to_string()),
+            creator: vec!["Jane Doe".to_string()],
+            date: Some("2026-02-09T00:00:00Z".to_string()),
+            date_source: Some("feed-entry".to_string()),
+            provenance_source: Some("https://feed.example.com/feed.xml".to_string()),
+        }
+    }
+
+    #[test]
+    fn enrichment_title_only_fills_a_gap() {
+        let mut dc = DublinCoreMetadata {
+            title: Some("The page's own title".to_string()),
+            ..Default::default()
+        };
+        feed_enrichment().apply_to(&mut dc);
+        assert_eq!(
+            dc.title.as_deref(),
+            Some("The page's own title"),
+            "a connector never knows a page's title better than the page does"
+        );
+
+        let mut dc = DublinCoreMetadata::default();
+        feed_enrichment().apply_to(&mut dc);
+        assert_eq!(dc.title.as_deref(), Some("Feed's title"));
+    }
+
+    #[test]
+    fn enrichment_overwrites_creator_date_and_source() {
+        let mut dc = DublinCoreMetadata {
+            creator: vec!["Extracted Author".to_string()],
+            date: Some("1999-01-01".to_string()),
+            date_source: Some("html-json-ld".to_string()),
+            source: Some("https://elsewhere.example".to_string()),
+            ..Default::default()
+        };
+        feed_enrichment().apply_to(&mut dc);
+        assert_eq!(dc.creator, vec!["Jane Doe".to_string()]);
+        assert_eq!(dc.date.as_deref(), Some("2026-02-09T00:00:00Z"));
+        assert_eq!(
+            dc.date_source.as_deref(),
+            Some("feed-entry"),
+            "date and its provenance move together, or the stamp becomes a lie \
+             about where the value came from"
+        );
+        assert_eq!(
+            dc.source.as_deref(),
+            Some("https://feed.example.com/feed.xml")
+        );
+    }
+
+    #[test]
+    fn enrichment_leaves_absent_claims_alone() {
+        let original = DublinCoreMetadata {
+            title: Some("T".to_string()),
+            creator: vec!["Extracted Author".to_string()],
+            date: Some("1999-01-01".to_string()),
+            date_source: Some("html-json-ld".to_string()),
+            source: Some("https://elsewhere.example".to_string()),
+            description: Some("A description the connector knows nothing about".to_string()),
+            ..Default::default()
+        };
+        let mut dc = original.clone();
+        MetadataEnrichment::default().apply_to(&mut dc);
+        assert_eq!(dc, original, "an empty enrichment must be a total no-op");
+    }
+
+    #[test]
+    fn enrichment_is_idempotent() {
+        // The 304 path applies this to already-enriched persisted state and
+        // compares the result for equality; a non-idempotent merge would
+        // make every 304 look like a change and rewrite the row forever.
+        let mut once = DublinCoreMetadata::default();
+        feed_enrichment().apply_to(&mut once);
+        let mut twice = once.clone();
+        feed_enrichment().apply_to(&mut twice);
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn enrichment_is_empty_ignores_date_source() {
+        assert!(MetadataEnrichment::default().is_empty());
+        assert!(!feed_enrichment().is_empty());
+        // date_source alone is meaningless — it is provenance for a `date`
+        // that isn't there, and applying it would change nothing.
+        assert!(MetadataEnrichment {
+            date_source: Some("feed-entry".to_string()),
+            ..Default::default()
+        }
+        .is_empty());
     }
 }

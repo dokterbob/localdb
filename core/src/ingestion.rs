@@ -1912,6 +1912,117 @@ impl IngestCallback for PipelineCallback<'_> {
             ..existing
         });
     }
+
+    /// A 304 carries no body, so the connector's own metadata for the
+    /// resource — which it re-supplies on every run, independently of the
+    /// fetch — is the only thing that can have changed. Layer it back onto
+    /// the persisted state and write only if the result actually differs.
+    ///
+    /// The comparison is the point, not an optimization: an unchanged feed
+    /// entry is the overwhelmingly common case, and a blind write would turn
+    /// every 304 into a resource-row rewrite, bumping `index_updated_at`
+    /// (publicly visible as `DocumentInfo.index_updated_at`) on a run that
+    /// changed nothing. So this recomputes `metadata_hash` from the merged
+    /// state and returns early when it matches what is already cached —
+    /// exactly the equality the skip-check in `on_resource` performs, on the
+    /// same derivation, for the same reason.
+    ///
+    /// The merge runs against the *persisted* metadata rather than a fresh
+    /// parse, because there is no fresh parse to run. One consequence
+    /// follows from `MetadataEnrichment`'s title rule and is intended: a
+    /// connector title only fills a gap, so a feed that renames an entry
+    /// whose linked page supplied its own title changes nothing here — which
+    /// is what a full re-fetch would conclude too, since the page's title
+    /// would win again. Where the two paths do differ is the rarer case of a
+    /// page with no title of its own: the persisted title is then the
+    /// connector's previous one, no longer a gap, so a renamed entry keeps
+    /// the old title until its content changes. Erring toward keeping
+    /// extracted state is the safe direction; the overwrite-class fields
+    /// (`creator`, `date`, provenance, `external_id`, `modified_at`), where
+    /// staleness actually costs something, update unconditionally.
+    async fn on_metadata_refreshed(
+        &mut self,
+        uri: &Uri,
+        enrichment: &crate::metadata::MetadataEnrichment,
+        external_id: Option<&str>,
+        modified_at: Option<&str>,
+    ) {
+        let uri_str = uri.as_str().to_string();
+        let Some(existing) = self.doc_index.get(&uri_str).cloned() else {
+            // Nothing indexed for this URI under the current doc_index —
+            // same race `on_validators_refreshed` tolerates.
+            return;
+        };
+
+        let resource_id = existing.resource_id.clone();
+        let chunks = match self.store.get_chunks_for_resource(&resource_id).await {
+            Ok(chunks) => chunks,
+            Err(e) => {
+                tracing::warn!(
+                    "error reading resource '{}' to refresh source-supplied metadata: {}",
+                    uri_str,
+                    e
+                );
+                return;
+            }
+        };
+        let Some(chunk) = chunks.first() else {
+            return;
+        };
+
+        let mut metadata = chunk.metadata.clone();
+        enrichment.apply_to(metadata.dublin_core_mut());
+        // `date_original`/`date_parsed` are projections of the merged
+        // `dc.date`, re-derived here rather than carried over from the chunk
+        // — the enrichment may have just replaced that date, and the two
+        // columns are what the `document` date axis filters on.
+        let date_original = metadata.dublin_core().date.clone();
+        let date_parsed = date_original
+            .as_deref()
+            .and_then(crate::dates::parse_partial_iso8601);
+        let external_id = external_id.map(str::to_string);
+        let modified_at = modified_at.map(str::to_string);
+
+        let metadata_hash = crate::ids::compute_metadata_hash(
+            &metadata,
+            external_id.as_deref(),
+            existing.external_etag.as_deref(),
+            modified_at.as_deref(),
+        );
+        if metadata_hash == existing.metadata_hash {
+            return;
+        }
+
+        let record = crate::store::ResourceRecord {
+            metadata,
+            external_id,
+            external_etag: existing.external_etag.clone(),
+            external_last_modified: existing.external_last_modified.clone(),
+            modified_at,
+            date_original,
+            date_parsed,
+        };
+
+        if let Err(e) = self
+            .store
+            .update_resource_metadata(&self.config.store_id, &resource_id, &record)
+            .await
+        {
+            // Left out of `doc_index`, like every other failed write here, so
+            // the stale hash makes the next run retry.
+            tracing::warn!(
+                "error persisting refreshed source-supplied metadata for '{}': {}",
+                uri_str,
+                e
+            );
+            return;
+        }
+
+        self.doc_index.upsert(DocumentRecord {
+            metadata_hash,
+            ..existing
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------

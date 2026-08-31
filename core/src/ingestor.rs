@@ -186,6 +186,42 @@ pub trait IngestCallback: Send {
         _meta: &crate::ingestion::FetchMetadata,
     ) {
     }
+
+    /// Called when a connector re-supplies its own description of an
+    /// already-indexed resource whose *body* did not change — a feed entry
+    /// whose link answered 304 while the feed's own metadata for it moved
+    /// on.
+    ///
+    /// Without this, a 304 would freeze connector-supplied metadata forever:
+    /// the response carries no body, so there is nothing to re-parse and
+    /// nothing to route through `on_resource`, and a feed that corrects an
+    /// entry's author or publication date would never see the correction
+    /// land. `enrichment` is the connector's claim; the implementor layers
+    /// it onto the resource's *persisted* metadata via
+    /// [`crate::metadata::MetadataEnrichment::apply_to`], which is the same
+    /// merge the ingestor applies to freshly parsed metadata at index time —
+    /// so the two paths cannot drift into disagreeing about what a feed's
+    /// metadata means.
+    ///
+    /// `external_id` and `modified_at` are the connector's claims too, and
+    /// are passed separately because they live on the `Resource` rather than
+    /// inside `Metadata`. Both are authoritative: `None` means the connector
+    /// makes no claim, exactly as it would at index time, not "leave the
+    /// stored value alone."
+    ///
+    /// Deliberately separate from [`Self::on_validators_refreshed`] rather
+    /// than folded into a wider signature: a plain URL fetch has no
+    /// connector metadata at all and would otherwise pass empty claims on
+    /// every 304 forever. The default no-op matches every other optional
+    /// signal on this trait.
+    async fn on_metadata_refreshed(
+        &mut self,
+        _uri: &Uri,
+        _enrichment: &crate::metadata::MetadataEnrichment,
+        _external_id: Option<&str>,
+        _modified_at: Option<&str>,
+    ) {
+    }
 }
 
 /// Source information passed to an ingestor.
