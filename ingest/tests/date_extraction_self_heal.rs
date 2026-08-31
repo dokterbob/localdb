@@ -22,7 +22,7 @@ use localdb_core::block::{IngestorKind, Resource};
 use localdb_core::embedder::FakeEmbedder;
 use localdb_core::ingestion::{
     run_source_ingestion, DeletionPolicy, DocumentIndex, DocumentRecord, FetchMetadata,
-    IngestionConfig, SourceIngestionDeps,
+    IngestionConfig, SourceIngestionDeps, UnreachableFetcher,
 };
 use localdb_core::ingestor::{IngestCallback, IngestResult, IngestSource, Ingestor, SkipReason};
 use localdb_core::store::FakeStore;
@@ -295,6 +295,7 @@ async fn reindex_with_new_date_extraction_self_heals_as_metadata_only_update() {
         deletion: DeletionPolicy::Retain,
         document_validators: FetchMetadata::default(),
         stored_inputs_digest: None,
+        fetcher: &UnreachableFetcher,
     };
     let result1 = run_source_ingestion(&source, &ingestor1, deps1)
         .await
@@ -322,6 +323,7 @@ async fn reindex_with_new_date_extraction_self_heals_as_metadata_only_update() {
         deletion: DeletionPolicy::Retain,
         document_validators: FetchMetadata::default(),
         stored_inputs_digest: None,
+        fetcher: &UnreachableFetcher,
     };
     let result2 = run_source_ingestion(&source, &ingestor2, deps2)
         .await

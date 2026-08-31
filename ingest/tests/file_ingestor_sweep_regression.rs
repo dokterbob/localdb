@@ -69,7 +69,7 @@ use localdb_core::embedder::FakeEmbedder;
 use localdb_core::ids::new_ulid;
 use localdb_core::ingestion::{
     run_source_ingestion, DeletionPolicy, DocumentIndex, DocumentRecord, FetchMetadata,
-    IngestionConfig, SourceIngestionDeps,
+    IngestionConfig, SourceIngestionDeps, UnreachableFetcher,
 };
 use localdb_core::store::FakeStore;
 use localdb_core::types::{Source, SourceKind, SourceSpec};
@@ -134,6 +134,7 @@ async fn transient_read_error_on_space_named_file_does_not_delete_it() {
             deletion: DeletionPolicy::Prune,
             document_validators: FetchMetadata::default(),
             stored_inputs_digest: None,
+            fetcher: &UnreachableFetcher,
         };
         let result = run_source_ingestion(&source, &ingestor, deps)
             .await
@@ -197,6 +198,7 @@ async fn transient_read_error_on_space_named_file_does_not_delete_it() {
             deletion: DeletionPolicy::Prune,
             document_validators: FetchMetadata::default(),
             stored_inputs_digest: None,
+            fetcher: &UnreachableFetcher,
         };
         run_source_ingestion(&source, &ingestor, deps).await
     };
@@ -268,6 +270,7 @@ async fn index_mutate_reindex(
             deletion: DeletionPolicy::Prune,
             document_validators: FetchMetadata::default(),
             stored_inputs_digest: None,
+            fetcher: &UnreachableFetcher,
         };
         let first = run_source_ingestion(&source, &ingestor, deps)
             .await
@@ -294,6 +297,7 @@ async fn index_mutate_reindex(
         deletion: DeletionPolicy::Prune,
         document_validators: FetchMetadata::default(),
         stored_inputs_digest: None,
+        fetcher: &UnreachableFetcher,
     };
     let second = run_source_ingestion(&source, &ingestor, deps)
         .await

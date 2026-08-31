@@ -20,6 +20,7 @@ use localdb_core::ids::{content_hash, new_ulid, resource_id};
 use localdb_core::ingestion::{
     index_resource, run_source_ingestion, DeletionPolicy, DocumentIndex, DocumentRecord,
     FetchMetadata, IndexOutcome, IndexResourceDeps, IngestionConfig, SourceIngestionDeps,
+    UnreachableFetcher,
 };
 use localdb_core::ingestor::{IngestCallback, IngestResult, IngestSource, Ingestor};
 use localdb_core::metadata::{DocumentMetadata, DublinCoreMetadata, Metadata};
@@ -324,6 +325,7 @@ async fn run_once(
         deletion,
         document_validators: FetchMetadata::default(),
         stored_inputs_digest: None,
+        fetcher: &UnreachableFetcher,
     };
     run_source_ingestion(source, &ingestor, deps).await.unwrap()
 }
@@ -627,6 +629,7 @@ async fn rehydrated_index_detects_metadata_only_change_across_restart() {
         deletion: DeletionPolicy::Retain,
         document_validators: FetchMetadata::default(),
         stored_inputs_digest: None,
+        fetcher: &UnreachableFetcher,
     };
     let result1 = run_source_ingestion(&source, &ingestor1, deps1)
         .await
@@ -662,6 +665,7 @@ async fn rehydrated_index_detects_metadata_only_change_across_restart() {
         deletion: DeletionPolicy::Retain,
         document_validators: FetchMetadata::default(),
         stored_inputs_digest: None,
+        fetcher: &UnreachableFetcher,
     };
     let result2 = run_source_ingestion(&source, &ingestor2, deps2)
         .await
@@ -1049,6 +1053,7 @@ async fn metadata_only_update_emits_metadata_updated_progress_event() {
         deletion: DeletionPolicy::Retain,
         document_validators: FetchMetadata::default(),
         stored_inputs_digest: None,
+        fetcher: &UnreachableFetcher,
     };
     run_source_ingestion(&source, &ingestor1, deps1)
         .await
@@ -1080,6 +1085,7 @@ async fn metadata_only_update_emits_metadata_updated_progress_event() {
         deletion: DeletionPolicy::Retain,
         document_validators: FetchMetadata::default(),
         stored_inputs_digest: None,
+        fetcher: &UnreachableFetcher,
     };
     run_source_ingestion(&source, &ingestor2, deps2)
         .await

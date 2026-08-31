@@ -19,7 +19,7 @@ use localdb_core::embedder::FakeEmbedder;
 use localdb_core::error::Error;
 use localdb_core::ingestion::{
     run_source_ingestion, DeletionPolicy, DocumentIndex, FetchMetadata, FetchResult,
-    IngestionConfig, SourceIngestionDeps, UrlFetcher,
+    IngestionConfig, SourceIngestionDeps, UnreachableFetcher, UrlFetcher,
 };
 use localdb_core::parser::{ParsedDocument, Parser, Probe};
 use localdb_core::store::FakeStore;
@@ -154,6 +154,7 @@ async fn url_source_replays_stored_validators_on_second_run() {
             deletion: DeletionPolicy::Retain,
             document_validators: FetchMetadata::default(),
             stored_inputs_digest: None,
+            fetcher: &UnreachableFetcher,
         },
     )
     .await
@@ -171,6 +172,7 @@ async fn url_source_replays_stored_validators_on_second_run() {
             deletion: DeletionPolicy::Retain,
             document_validators: FetchMetadata::default(),
             stored_inputs_digest: None,
+            fetcher: &UnreachableFetcher,
         },
     )
     .await
@@ -250,6 +252,7 @@ async fn feed_entry_link_replays_stored_validators_on_second_run() {
             deletion: DeletionPolicy::Retain,
             document_validators: FetchMetadata::default(),
             stored_inputs_digest: None,
+            fetcher: &UnreachableFetcher,
         },
     )
     .await
@@ -267,6 +270,7 @@ async fn feed_entry_link_replays_stored_validators_on_second_run() {
             deletion: DeletionPolicy::Retain,
             document_validators: FetchMetadata::default(),
             stored_inputs_digest: None,
+            fetcher: &UnreachableFetcher,
         },
     )
     .await
@@ -584,6 +588,7 @@ async fn a_304_that_writes_reports_a_metadata_update_not_a_skip() {
             store: &store,
             embedder: &embedder,
             config: &config,
+            fetcher: &UnreachableFetcher,
             progress: None,
             deletion: DeletionPolicy::Retain,
             document_validators: FetchMetadata::default(),
@@ -608,6 +613,7 @@ async fn a_304_that_writes_reports_a_metadata_update_not_a_skip() {
             store: &store,
             embedder: &embedder,
             config: &config,
+            fetcher: &UnreachableFetcher,
             progress: None,
             deletion: DeletionPolicy::Retain,
             document_validators: FetchMetadata::default(),
@@ -670,6 +676,7 @@ async fn a_304_whose_metadata_write_fails_reports_an_error_not_a_skip() {
             store: &store,
             embedder: &embedder,
             config: &config,
+            fetcher: &UnreachableFetcher,
             progress: None,
             deletion: DeletionPolicy::Retain,
             document_validators: FetchMetadata::default(),
@@ -692,6 +699,7 @@ async fn a_304_whose_metadata_write_fails_reports_an_error_not_a_skip() {
             store: &store,
             embedder: &embedder,
             config: &config,
+            fetcher: &UnreachableFetcher,
             progress: None,
             deletion: DeletionPolicy::Retain,
             document_validators: FetchMetadata::default(),
@@ -817,6 +825,7 @@ async fn a_moved_last_modified_on_an_unchanged_200_is_persisted_and_replayed() {
                     deletion: DeletionPolicy::Retain,
                     document_validators: FetchMetadata::default(),
                     stored_inputs_digest: None,
+                    fetcher: &UnreachableFetcher,
                 },
             )
             .await

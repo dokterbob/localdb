@@ -20,7 +20,7 @@ use localdb_core::error::Error;
 use localdb_core::ids::compute_metadata_hash;
 use localdb_core::ingestion::{
     run_source_ingestion, DeletionPolicy, DocumentIndex, FetchMetadata, FetchResult,
-    IngestionConfig, SourceIngestionDeps, UrlFetcher,
+    IngestionConfig, SourceIngestionDeps, UnreachableFetcher, UrlFetcher,
 };
 use localdb_core::metadata::DublinCoreMetadata;
 use localdb_core::parser::{ParsedDocument, Parser, Probe};
@@ -231,6 +231,8 @@ async fn run_two_feeds(first_feed: Vec<u8>, second_feed: Vec<u8>) -> (FakeStore,
                 deletion: DeletionPolicy::Retain,
                 document_validators: FetchMetadata::default(),
                 stored_inputs_digest: None,
+                // Retaining run: the liveness sweep never fires.
+                fetcher: &UnreachableFetcher,
             },
         )
         .await

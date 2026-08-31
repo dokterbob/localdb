@@ -29,7 +29,7 @@ use crate::ingestor::{
     Enumeration, IngestCallback, IngestSource, Ingestor, MetadataWriteOutcome, SkipReason,
 };
 use crate::metadata::Metadata;
-use crate::store::{ChunkRecord, RetrievalStore};
+use crate::store::{ChunkRecord, RetrievalStore, StaleFeedResource};
 use crate::types::{
     Chunk, IndexJob, IndexJobScope, IndexJobState, IndexJobStats, Provenance, Source, SourceRef,
     SourceSpec,
@@ -216,6 +216,19 @@ pub struct IngestionResult {
     /// update is not a content skip, but it is also not a full `docs_indexed`
     /// re-index, so it gets its own counter rather than overloading either.
     pub docs_metadata_updated: u64,
+    /// Number of feed-discovered resources the liveness sweep probed this
+    /// run — every candidate a fetch was actually attempted for, regardless
+    /// of outcome (`Gone`, `NotModified`, `Downloaded`, `Blocked`, or a
+    /// transport error all count; a candidate skipped because this run's
+    /// own ingestion pass already observed it does not). Confirmed-gone
+    /// prunes the sweep performs fold into `docs_deleted` above rather than
+    /// a separate counter, so this is the only place the sweep's own probe
+    /// work is visible — including on a run that deleted nothing. Always 0
+    /// for a non-feed source and for any run under
+    /// [`DeletionPolicy::Retain`] — see
+    /// specs/04-search-pipeline.md §1 "Aged-out feed entries: the liveness
+    /// sweep".
+    pub feed_entries_liveness_checked: u64,
     /// Refreshed validators for a feed source's own top-level document, to
     /// persist onto `sources.feed_etag`/`feed_last_modified` — threaded
     /// straight from [`crate::ingestor::IngestResult::document_validators`].
@@ -628,6 +641,26 @@ pub trait UrlFetcher: Send + Sync {
     /// Fetch a URL, optionally providing previous ETag/Last-Modified for
     /// conditional GET.
     async fn fetch(&self, url: &str, metadata: &FetchMetadata) -> Result<FetchResult, Error>;
+}
+
+/// A [`UrlFetcher`] that panics if ever called.
+///
+/// [`SourceIngestionDeps::fetcher`] is only ever dereferenced by the feed
+/// liveness sweep, and only when [`RetrievalStore::list_stale_feed_resources`]
+/// returns a non-empty candidate list. Every store used in tests unrelated
+/// to that sweep (`FakeStore` included) inherits the trait's no-op default,
+/// which always returns an empty list — so this fetcher is a safe filler for
+/// every such test's `SourceIngestionDeps` literal, and doubles as an
+/// assertion that the sweep really did stay inert for them.
+#[cfg(any(test, feature = "test-support"))]
+pub struct UnreachableFetcher;
+
+#[cfg(any(test, feature = "test-support"))]
+#[async_trait::async_trait]
+impl UrlFetcher for UnreachableFetcher {
+    async fn fetch(&self, url: &str, _metadata: &FetchMetadata) -> Result<FetchResult, Error> {
+        panic!("UnreachableFetcher::fetch called for '{url}' — the feed liveness sweep should not have run in this test");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1282,6 +1315,16 @@ pub struct SourceIngestionDeps<'a> {
     /// `None` means "inputs unknown" — a row predating the column — and is
     /// treated as a mismatch. Meaningless for any non-feed source.
     pub stored_inputs_digest: Option<String>,
+    /// HTTP client for the feed liveness sweep's own probe of an aged-out
+    /// feed entry's link. **Must be the public-destination-only fetcher**
+    /// (`fetch::HttpUrlFetcher::new_public_only`) — an entry link is
+    /// third-party content chosen by a feed author, not an
+    /// operator-configured URL, so it crosses the same trust boundary
+    /// `ingest::FeedIngestor::new`'s doc comment describes for its own
+    /// `entry_fetcher`. Passing the unrestricted client here is an SSRF
+    /// regression. Unused for non-[`SourceSpec::Feed`] sources and for any
+    /// run under [`DeletionPolicy::Retain`].
+    pub fetcher: &'a dyn UrlFetcher,
 }
 
 /// Run the unified ingestion pipeline for one source, driven by a caller-supplied
@@ -1326,6 +1369,7 @@ pub async fn run_source_ingestion(
         deletion,
         document_validators,
         stored_inputs_digest,
+        fetcher,
     } = deps;
 
     // The origin's validator speaks for the origin's bytes. It cannot speak
@@ -1481,50 +1525,68 @@ pub async fn run_source_ingestion(
     // sweep delete the *entire* source on every unchanged poll. Path and
     // url sources have no such windowing — their ingestor enumerates the
     // full current state every run — so absence there really does mean
-    // deletion and the sweep must still run for them.
+    // deletion and the sweep must still run for them. This exemption is
+    // unchanged by the feed liveness sweep below: that sweep only ever
+    // deletes on a positively confirmed 404/410, never on absence alone, so
+    // it belongs to a different bucket entirely (the same one the `on_gone`
+    // loop above does) and doesn't need this guard reasoning to justify it.
+    //
+    // Ownership + guard evaluation below is shared by this sweep (path/url
+    // sources) and the feed liveness sweep further down (feed sources):
+    // both infer something from "this run observed none of the URIs this
+    // source owns," so both need the same two guards computed from the same
+    // owned/seen sets. Computed unconditionally rather than only inside the
+    // `!Feed` branch — feed sources need it just as much; see the liveness
+    // sweep's own guard handling below, in particular how it reconciles
+    // guard 2 with the feed document's own 304 short-circuit.
+    let owned_uris: Vec<String> = doc_index
+        .uris()
+        .into_iter()
+        .filter(|uri| {
+            doc_index
+                .get(uri)
+                .is_some_and(|record| record.source_id == source.id)
+        })
+        .collect();
+    let any_owned_uri_seen = owned_uris.iter().any(|uri| seen.contains(uri));
+
+    // Two further suppressions, both from issue #156, both stating the rule
+    // the feed exemption above states for feeds: the sweep infers deletion
+    // (or, for the liveness sweep, "eligible to probe") from absence, so it
+    // may only run when the absence is *informative*.
+    let suppressed_because = match &ingest_result.enumeration {
+        // Guard 1 — enumeration completeness. The ingestor itself reported
+        // that it could not observe the source (an unmounted volume, an
+        // unreachable root, an API that failed part-way). Its silence
+        // about a URI says nothing about whether that URI still exists.
+        // This is the guard that fires for the reported incident:
+        // `/Volumes/Archive` unmounted, `FileIngestor` enumerated zero
+        // files, and the sweep deleted every document the source owned.
+        Enumeration::Incomplete { reason } => Some(reason.clone()),
+        // Guard 2 — zero-seen backstop, source-shape-agnostic. Even with a
+        // *complete* enumeration claimed, a source that previously owned
+        // documents and observed none of them this run is far more likely
+        // to be a broken connector than a source whose entire contents
+        // vanished at once. This does not subsume guard 1: a connector
+        // that enumerates 3 of 500 items before failing has a non-empty
+        // `seen` set, so only guard 1 protects the other 497. For a feed
+        // source specifically, this is also what reconciles the liveness
+        // sweep with the feed document's own 304 short-circuit: a 304 fires
+        // zero entry callbacks, so `seen` is empty and this guard fires —
+        // correctly, since an unchanged feed document means an unchanged
+        // window and nothing can have aged out since the last run.
+        //
+        // Deliberate trade-off: a source whose files really were all
+        // deleted or renamed in one run keeps its stale documents until
+        // the source is re-created. The warning below says so.
+        Enumeration::Complete if !owned_uris.is_empty() && !any_owned_uri_seen => {
+            Some("this run observed none of the documents this source owns".to_string())
+        }
+        Enumeration::Complete => None,
+    };
+
     if !matches!(source.spec, SourceSpec::Feed { .. }) {
-        // Two further suppressions, both from issue #156, both stating for
-        // path/url sources the rule the feed exemption above states for feeds:
-        // the sweep infers deletion from absence, so it may only run when the
-        // absence is *informative*.
-        let owned_uris: Vec<String> = doc_index
-            .uris()
-            .into_iter()
-            .filter(|uri| {
-                doc_index
-                    .get(uri)
-                    .is_some_and(|record| record.source_id == source.id)
-            })
-            .collect();
-        let any_owned_uri_seen = owned_uris.iter().any(|uri| seen.contains(uri));
-
-        let suppressed_because = match &ingest_result.enumeration {
-            // Guard 1 — enumeration completeness. The ingestor itself reported
-            // that it could not observe the source (an unmounted volume, an
-            // unreachable root, an API that failed part-way). Its silence
-            // about a URI says nothing about whether that URI still exists.
-            // This is the guard that fires for the reported incident:
-            // `/Volumes/Archive` unmounted, `FileIngestor` enumerated zero
-            // files, and the sweep deleted every document the source owned.
-            Enumeration::Incomplete { reason } => Some(reason.clone()),
-            // Guard 2 — zero-seen backstop, source-shape-agnostic. Even with a
-            // *complete* enumeration claimed, a source that previously owned
-            // documents and observed none of them this run is far more likely
-            // to be a broken connector than a source whose entire contents
-            // vanished at once. This does not subsume guard 1: a connector
-            // that enumerates 3 of 500 items before failing has a non-empty
-            // `seen` set, so only guard 1 protects the other 497.
-            //
-            // Deliberate trade-off: a source whose files really were all
-            // deleted or renamed in one run keeps its stale documents until
-            // the source is re-created. The warning below says so.
-            Enumeration::Complete if !owned_uris.is_empty() && !any_owned_uri_seen => {
-                Some("this run observed none of the documents this source owns".to_string())
-            }
-            Enumeration::Complete => None,
-        };
-
-        if let Some(reason) = suppressed_because {
+        if let Some(reason) = &suppressed_because {
             tracing::warn!(
                 source_id = %source.id,
                 location = %source_location(source),
@@ -1554,6 +1616,47 @@ pub async fn run_source_ingestion(
                     }
                 }
             }
+        }
+    } else if deletion == DeletionPolicy::Prune {
+        // The feed liveness sweep (specs/04-search-pipeline.md §1 "Aged-out
+        // feed entries: the liveness sweep"). Gated on `Prune` here, not
+        // inside `run_feed_liveness_sweep` itself: a retaining run performs
+        // zero liveness fetches and reports nothing pruned or prunable for
+        // this mechanism — there is no free preview signal for it the way
+        // `docs_prunable` is one for the presumed-gone sweep, since the only
+        // way to learn anything here is a network request per candidate.
+        if let Some(reason) = &suppressed_because {
+            tracing::warn!(
+                source_id = %source.id,
+                location = %source_location(source),
+                "skipping feed liveness sweep for source at '{}': {}. This is \
+                 the same signal that suppresses the presumed-gone sweep for \
+                 path/url sources above; for a feed source it is most often \
+                 the feed document's own 304 short-circuit — an unchanged \
+                 feed document means an unchanged window, so nothing could \
+                 have aged out of it since the last run.",
+                source_location(source),
+                reason,
+            );
+        } else {
+            let refresh_interval_secs = match &source.spec {
+                SourceSpec::Feed {
+                    refresh_interval_secs,
+                    ..
+                } => *refresh_interval_secs,
+                _ => None,
+            };
+            run_feed_liveness_sweep(
+                &source.id,
+                &source.store_id,
+                refresh_interval_secs,
+                &seen,
+                doc_index,
+                store,
+                fetcher,
+                &mut result,
+            )
+            .await?;
         }
     }
 
@@ -1585,6 +1688,166 @@ fn feed_inputs_digest(source: &Source, config: &IngestionConfig) -> Option<Strin
         )),
         _ => None,
     }
+}
+
+/// Batch cap for the feed liveness sweep: at most this many aged-out feed
+/// entries are probed per source per run. See
+/// specs/04-search-pipeline.md §1 "Aged-out feed entries: the liveness
+/// sweep".
+const FEED_LIVENESS_BATCH_LIMIT: usize = 25;
+
+/// Recheck floor for the feed liveness sweep, in seconds: a candidate is
+/// never re-probed more often than this, however long it has been aged out.
+/// A feed source's own `refresh_interval_secs` raises the effective floor
+/// when configured above this; the common unconfigured case uses this bare
+/// value.
+const FEED_LIVENESS_MIN_RECHECK_SECS: i64 = 24 * 60 * 60;
+
+/// The feed liveness sweep (specs/04-search-pipeline.md §1 "Aged-out feed
+/// entries: the liveness sweep"). For a `SourceSpec::Feed` source, probes a
+/// bounded batch of feed-discovered resources this run did not observe —
+/// entries aged out of the feed's window — against their stored link, and
+/// deletes only the ones a probe *positively confirms* gone (404/410).
+///
+/// This sits in the confirmed-gone bucket alongside `IngestCallback::on_gone`
+/// above, not the presumed-gone one: it never deletes on absence alone, only
+/// on the origin's own answer. That is what lets it coexist with the feed
+/// exemption from the presumed-gone sweep above without contradicting it —
+/// an entry merely scrolling off the window is still never, on its own, a
+/// deletion signal; only a confirmed 404/410 on its own link is.
+///
+/// Callers must apply the same guards the presumed-gone sweep above applies
+/// — an `Enumeration::Incomplete` run and a zero-seen run must not reach
+/// this function at all — see the call site in `run_source_ingestion`. This
+/// function performs no guard check of its own; it probes whatever
+/// [`RetrievalStore::list_stale_feed_resources`] returns.
+#[allow(clippy::too_many_arguments)]
+async fn run_feed_liveness_sweep(
+    source_id: &str,
+    store_id: &str,
+    refresh_interval_secs: Option<u64>,
+    seen: &std::collections::HashSet<String>,
+    doc_index: &mut DocumentIndex,
+    store: &dyn RetrievalStore,
+    fetcher: &dyn UrlFetcher,
+    result: &mut IngestionResult,
+) -> Result<(), Error> {
+    let floor_secs = refresh_interval_secs
+        .unwrap_or(0)
+        .max(FEED_LIVENESS_MIN_RECHECK_SECS as u64);
+    let checked_before = (Utc::now() - chrono::Duration::seconds(floor_secs as i64))
+        .to_rfc3339_opts(SecondsFormat::Secs, true);
+
+    let candidates: Vec<StaleFeedResource> = store
+        .list_stale_feed_resources(
+            store_id,
+            source_id,
+            &checked_before,
+            FEED_LIVENESS_BATCH_LIMIT,
+        )
+        .await?;
+
+    for candidate in candidates {
+        // Still inside the feed's window — this run's own ingestion pass
+        // already observed it, so it hasn't aged out at all. Reachable when
+        // a currently-live entry's `last_checked_at` happens to be unset or
+        // stale (it has simply never been probed before, or was probed long
+        // ago while still current); probing it here would be redundant with
+        // the ordinary ingestion pass that already just ran for it.
+        if seen.contains(&candidate.uri) {
+            continue;
+        }
+
+        let metadata = FetchMetadata {
+            etag: candidate.external_etag.clone(),
+            last_modified: candidate.external_last_modified.clone(),
+        };
+
+        // Counted for every candidate an attempt is made for, regardless of
+        // outcome — see `IngestionResult::feed_entries_liveness_checked`'s
+        // doc comment.
+        result.feed_entries_liveness_checked += 1;
+
+        let fetch_result = match fetcher.fetch(&candidate.uri, &metadata).await {
+            Ok(r) => r,
+            Err(e) => {
+                // A transport error is evidence of nothing — leave the
+                // resource and its `last_checked_at` untouched so it's
+                // eligible again next run, exactly like `Blocked` below.
+                tracing::debug!(
+                    uri = %candidate.uri,
+                    error = %e,
+                    "feed liveness sweep: fetch error, leaving resource untouched"
+                );
+                continue;
+            }
+        };
+
+        match fetch_result {
+            FetchResult::Gone => {
+                doc_index.remove(&candidate.uri);
+                let deleted = store.delete_by_resource(&candidate.resource_id).await?;
+                if deleted > 0 {
+                    result.docs_deleted += 1;
+                }
+            }
+            FetchResult::NotModified {
+                etag,
+                last_modified,
+            } => {
+                // A bare 304 means unchanged; fold any rotated validator
+                // over what was already stored rather than reporting a
+                // partial value that would read as "clear it" — mirrors the
+                // feed document's own 304 handling
+                // (`ingest::FeedIngestor::ingest`). Still there, so not a
+                // delete.
+                let etag = etag.or(candidate.external_etag);
+                let last_modified = last_modified.or(candidate.external_last_modified);
+                store
+                    .touch_resource_liveness(
+                        store_id,
+                        &candidate.resource_id,
+                        etag.as_deref(),
+                        last_modified.as_deref(),
+                    )
+                    .await?;
+            }
+            FetchResult::Downloaded {
+                etag,
+                last_modified,
+                ..
+            } => {
+                // Deliberately not re-indexed: an aged-out entry's
+                // feed-sourced metadata (title, author, per-entry date) is
+                // long gone, and re-indexing from the bare page alone would
+                // silently degrade the stored resource rather than improve
+                // it. Only the validators and the throttle clock move,
+                // replacing what was stored wholesale — even with both
+                // `None` — exactly like a fresh 200 does everywhere else in
+                // this pipeline (a 200 is a full fresh representation, so
+                // silence about a validator means the origin stopped
+                // offering it, not "unchanged").
+                store
+                    .touch_resource_liveness(
+                        store_id,
+                        &candidate.resource_id,
+                        etag.as_deref(),
+                        last_modified.as_deref(),
+                    )
+                    .await?;
+            }
+            FetchResult::Blocked => {
+                // Neither evidence of anything, like a transport error —
+                // leave it untouched. In production `fetcher` here is
+                // already the public-only client (see
+                // `SourceIngestionDeps::fetcher`), so this should be
+                // unreachable, but `FetchResult` is matched exhaustively
+                // regardless.
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Human-readable "location" string for `ProgressEvent::SourceStarted`.
@@ -3304,6 +3567,7 @@ mod tests {
                 deletion: DeletionPolicy::Prune,
                 document_validators: FetchMetadata::default(),
                 stored_inputs_digest: None,
+                fetcher: &UnreachableFetcher,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -3358,6 +3622,7 @@ mod tests {
                 deletion: DeletionPolicy::Prune,
                 document_validators: FetchMetadata::default(),
                 stored_inputs_digest: None,
+                fetcher: &UnreachableFetcher,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -3447,6 +3712,7 @@ mod tests {
                 deletion: DeletionPolicy::Prune,
                 document_validators: FetchMetadata::default(),
                 stored_inputs_digest: None,
+                fetcher: &UnreachableFetcher,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -3542,6 +3808,7 @@ mod tests {
                 deletion: DeletionPolicy::Prune,
                 document_validators: FetchMetadata::default(),
                 stored_inputs_digest: None,
+                fetcher: &UnreachableFetcher,
             };
             run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -3624,6 +3891,7 @@ mod tests {
                 deletion: DeletionPolicy::Prune,
                 document_validators: FetchMetadata::default(),
                 stored_inputs_digest: None,
+                fetcher: &UnreachableFetcher,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -3677,6 +3945,7 @@ mod tests {
                 deletion: DeletionPolicy::Prune,
                 document_validators: FetchMetadata::default(),
                 stored_inputs_digest: None,
+                fetcher: &UnreachableFetcher,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -3743,6 +4012,7 @@ mod tests {
                 deletion: DeletionPolicy::Prune,
                 document_validators: FetchMetadata::default(),
                 stored_inputs_digest: None,
+                fetcher: &UnreachableFetcher,
             };
             let result1 = run_source_ingestion(&source, &ingestor1, deps1)
                 .await
@@ -3779,6 +4049,7 @@ mod tests {
                 deletion: DeletionPolicy::Prune,
                 document_validators: FetchMetadata::default(),
                 stored_inputs_digest: None,
+                fetcher: &UnreachableFetcher,
             };
             let result2 = run_source_ingestion(&source, &ingestor2, deps2)
                 .await
@@ -3842,6 +4113,7 @@ mod tests {
                 deletion: DeletionPolicy::Prune,
                 document_validators: FetchMetadata::default(),
                 stored_inputs_digest: None,
+                fetcher: &UnreachableFetcher,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -3918,6 +4190,7 @@ mod tests {
                 deletion: DeletionPolicy::Prune,
                 document_validators: FetchMetadata::default(),
                 stored_inputs_digest: None,
+                fetcher: &UnreachableFetcher,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -3983,6 +4256,7 @@ mod tests {
                 deletion: DeletionPolicy::Prune,
                 document_validators: FetchMetadata::default(),
                 stored_inputs_digest: None,
+                fetcher: &UnreachableFetcher,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -4055,6 +4329,7 @@ mod tests {
                 deletion: DeletionPolicy::Prune,
                 document_validators: FetchMetadata::default(),
                 stored_inputs_digest: None,
+                fetcher: &UnreachableFetcher,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -4114,6 +4389,7 @@ mod tests {
                 deletion: DeletionPolicy::Prune,
                 document_validators: FetchMetadata::default(),
                 stored_inputs_digest: None,
+                fetcher: &UnreachableFetcher,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -4168,6 +4444,7 @@ mod tests {
                 deletion: DeletionPolicy::Retain,
                 document_validators: FetchMetadata::default(),
                 stored_inputs_digest: None,
+                fetcher: &UnreachableFetcher,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -4231,6 +4508,7 @@ mod tests {
                 deletion: DeletionPolicy::Retain,
                 document_validators: FetchMetadata::default(),
                 stored_inputs_digest: None,
+                fetcher: &UnreachableFetcher,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -4283,6 +4561,7 @@ mod tests {
                 deletion: DeletionPolicy::Retain,
                 document_validators: FetchMetadata::default(),
                 stored_inputs_digest: None,
+                fetcher: &UnreachableFetcher,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -4333,6 +4612,7 @@ mod tests {
                 deletion: DeletionPolicy::Prune,
                 document_validators: FetchMetadata::default(),
                 stored_inputs_digest: None,
+                fetcher: &UnreachableFetcher,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -4459,6 +4739,7 @@ mod tests {
                 deletion: DeletionPolicy::Prune,
                 document_validators: FetchMetadata::default(),
                 stored_inputs_digest: None,
+                fetcher: &UnreachableFetcher,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -4583,6 +4864,7 @@ mod tests {
                 deletion: DeletionPolicy::Prune,
                 document_validators: FetchMetadata::default(),
                 stored_inputs_digest: None,
+                fetcher: &UnreachableFetcher,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -4697,6 +4979,7 @@ mod tests {
                 deletion: DeletionPolicy::Prune,
                 document_validators: FetchMetadata::default(),
                 stored_inputs_digest: None,
+                fetcher: &UnreachableFetcher,
             };
             let result = run_source_ingestion(&source_a, &ingestor, deps)
                 .await
@@ -4817,6 +5100,7 @@ mod tests {
                 deletion: DeletionPolicy::Prune,
                 document_validators: FetchMetadata::default(),
                 stored_inputs_digest: None,
+                fetcher: &UnreachableFetcher,
             };
             let result = run_source_ingestion(&source_a, &ingestor, deps)
                 .await
@@ -4876,6 +5160,7 @@ mod tests {
                 deletion: DeletionPolicy::Prune,
                 document_validators: FetchMetadata::default(),
                 stored_inputs_digest: None,
+                fetcher: &UnreachableFetcher,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -4942,6 +5227,7 @@ mod tests {
                 deletion: DeletionPolicy::Prune,
                 document_validators: FetchMetadata::default(),
                 stored_inputs_digest: None,
+                fetcher: &UnreachableFetcher,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -5042,6 +5328,7 @@ mod tests {
                 deletion: DeletionPolicy::Prune,
                 document_validators: FetchMetadata::default(),
                 stored_inputs_digest: None,
+                fetcher: &UnreachableFetcher,
             };
             let feed_result = run_source_ingestion(&feed_source, &feed_ingestor, deps)
                 .await
@@ -5074,6 +5361,7 @@ mod tests {
                 deletion: DeletionPolicy::Prune,
                 document_validators: FetchMetadata::default(),
                 stored_inputs_digest: None,
+                fetcher: &UnreachableFetcher,
             };
             let url_result = run_source_ingestion(&url_source, &url_ingestor, deps)
                 .await
@@ -5193,6 +5481,7 @@ mod tests {
                 deletion: DeletionPolicy::Prune,
                 document_validators: FetchMetadata::default(),
                 stored_inputs_digest: None,
+                fetcher: &UnreachableFetcher,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -5258,6 +5547,7 @@ mod tests {
                 deletion: DeletionPolicy::Prune,
                 document_validators: FetchMetadata::default(),
                 stored_inputs_digest: None,
+                fetcher: &UnreachableFetcher,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -6462,6 +6752,756 @@ mod tests {
                 "a correctly-synced metadata_hash must not churn a metadata-only \
                  update on the very next unchanged fetch"
             );
+        }
+
+        // -----------------------------------------------------------------
+        // Feed liveness sweep (specs/04-search-pipeline.md §1 "Aged-out
+        // feed entries: the liveness sweep")
+        // -----------------------------------------------------------------
+        mod feed_liveness_sweep {
+            use super::*;
+            use crate::store::{MetadataFilter, ResourceRecord, SearchResult, StoreStats};
+
+            #[derive(Debug, Clone)]
+            struct LivenessRow {
+                resource_id: String,
+                uri: String,
+                external_etag: Option<String>,
+                external_last_modified: Option<String>,
+                last_checked_at: Option<String>,
+            }
+
+            fn row(resource_id: &str, uri: &str, last_checked_at: Option<&str>) -> LivenessRow {
+                LivenessRow {
+                    resource_id: resource_id.to_string(),
+                    uri: uri.to_string(),
+                    external_etag: None,
+                    external_last_modified: None,
+                    last_checked_at: last_checked_at.map(str::to_string),
+                }
+            }
+
+            /// A minimal `RetrievalStore` double for the liveness sweep: an
+            /// in-memory candidate table plus call recorders, so tests can
+            /// assert both the sweep's *decisions* (delete vs. touch vs.
+            /// leave alone) and its *restraint* (never queries the store at
+            /// all when a guard suppresses it, never fetches a candidate the
+            /// recheck floor or `seen` rules out).
+            /// `(resource_id, etag, last_modified)` recorded per
+            /// `touch_resource_liveness` call.
+            type TouchCall = (String, Option<String>, Option<String>);
+
+            struct LivenessStore {
+                rows: tokio::sync::Mutex<Vec<LivenessRow>>,
+                delete_calls: tokio::sync::Mutex<Vec<String>>,
+                touch_calls: tokio::sync::Mutex<Vec<TouchCall>>,
+                list_calls: std::sync::atomic::AtomicUsize,
+            }
+
+            impl LivenessStore {
+                fn new(rows: Vec<LivenessRow>) -> Self {
+                    Self {
+                        rows: tokio::sync::Mutex::new(rows),
+                        delete_calls: tokio::sync::Mutex::new(Vec::new()),
+                        touch_calls: tokio::sync::Mutex::new(Vec::new()),
+                        list_calls: std::sync::atomic::AtomicUsize::new(0),
+                    }
+                }
+
+                fn list_call_count(&self) -> usize {
+                    self.list_calls.load(std::sync::atomic::Ordering::SeqCst)
+                }
+            }
+
+            #[async_trait::async_trait]
+            impl RetrievalStore for LivenessStore {
+                async fn upsert_chunks(&self, _records: Vec<ChunkRecord>) -> Result<usize, Error> {
+                    Ok(0)
+                }
+
+                async fn delete_by_resource(&self, resource_id: &str) -> Result<usize, Error> {
+                    self.delete_calls.lock().await.push(resource_id.to_string());
+                    let mut rows = self.rows.lock().await;
+                    let before = rows.len();
+                    rows.retain(|r| r.resource_id != resource_id);
+                    Ok(before - rows.len())
+                }
+
+                async fn delete_by_store(&self, _store_id: &str) -> Result<usize, Error> {
+                    Ok(0)
+                }
+
+                async fn dense_search(
+                    &self,
+                    _query_vector: &[f32],
+                    _limit: usize,
+                    _filters: &[MetadataFilter],
+                ) -> Result<Vec<SearchResult>, Error> {
+                    Ok(Vec::new())
+                }
+
+                async fn bm25_search(
+                    &self,
+                    _query_text: &str,
+                    _limit: usize,
+                    _filters: &[MetadataFilter],
+                ) -> Result<Vec<SearchResult>, Error> {
+                    Ok(Vec::new())
+                }
+
+                async fn stats(&self) -> Result<StoreStats, Error> {
+                    Ok(StoreStats {
+                        chunk_count: 0,
+                        document_count: 0,
+                    })
+                }
+
+                async fn get_chunk(&self, _chunk_id: &str) -> Result<Option<ChunkRecord>, Error> {
+                    Ok(None)
+                }
+
+                async fn get_chunks_for_resource(
+                    &self,
+                    _resource_id: &str,
+                ) -> Result<Vec<ChunkRecord>, Error> {
+                    Ok(Vec::new())
+                }
+
+                async fn list_indexed_documents(&self) -> Result<Vec<DocumentRecord>, Error> {
+                    Ok(Vec::new())
+                }
+
+                async fn update_resource_metadata(
+                    &self,
+                    _store_id: &str,
+                    _resource_id: &str,
+                    _record: &ResourceRecord,
+                ) -> Result<(), Error> {
+                    unimplemented!("not exercised by the liveness sweep")
+                }
+
+                async fn get_resource_record(
+                    &self,
+                    _store_id: &str,
+                    _resource_id: &str,
+                ) -> Result<Option<ResourceRecord>, Error> {
+                    unimplemented!("not exercised by the liveness sweep")
+                }
+
+                async fn list_stale_feed_resources(
+                    &self,
+                    _store_id: &str,
+                    _source_id: &str,
+                    checked_before: &str,
+                    limit: usize,
+                ) -> Result<Vec<StaleFeedResource>, Error> {
+                    self.list_calls
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let rows = self.rows.lock().await;
+                    let mut candidates: Vec<&LivenessRow> = rows
+                        .iter()
+                        .filter(|r| {
+                            r.last_checked_at
+                                .as_deref()
+                                .is_none_or(|checked| checked < checked_before)
+                        })
+                        .collect();
+                    // `None` sorts before `Some`, matching SQLite's plain
+                    // `ORDER BY last_checked_at ASC` (NULL first) — see
+                    // `store-libsql`'s `list_stale_feed_resources` for the
+                    // real query this mirrors.
+                    candidates.sort_by(|a, b| a.last_checked_at.cmp(&b.last_checked_at));
+                    Ok(candidates
+                        .into_iter()
+                        .take(limit)
+                        .map(|r| StaleFeedResource {
+                            resource_id: r.resource_id.clone(),
+                            uri: r.uri.clone(),
+                            external_etag: r.external_etag.clone(),
+                            external_last_modified: r.external_last_modified.clone(),
+                        })
+                        .collect())
+                }
+
+                async fn touch_resource_liveness(
+                    &self,
+                    _store_id: &str,
+                    resource_id: &str,
+                    etag: Option<&str>,
+                    last_modified: Option<&str>,
+                ) -> Result<(), Error> {
+                    self.touch_calls.lock().await.push((
+                        resource_id.to_string(),
+                        etag.map(str::to_string),
+                        last_modified.map(str::to_string),
+                    ));
+                    let mut rows = self.rows.lock().await;
+                    if let Some(r) = rows.iter_mut().find(|r| r.resource_id == resource_id) {
+                        r.external_etag = etag.map(str::to_string);
+                        r.external_last_modified = last_modified.map(str::to_string);
+                        r.last_checked_at =
+                            Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true));
+                    }
+                    Ok(())
+                }
+            }
+
+            #[derive(Clone, Copy)]
+            enum ScriptedFetchOutcome {
+                Gone,
+                NotModified,
+                Downloaded,
+                Blocked,
+                TransportError,
+            }
+
+            /// Records every URL fetched, in call order — the recheck-floor
+            /// and batch-cap tests below assert directly on `calls`.
+            struct ScriptedFetcher {
+                default_outcome: ScriptedFetchOutcome,
+                calls: tokio::sync::Mutex<Vec<String>>,
+            }
+
+            impl ScriptedFetcher {
+                fn new(default_outcome: ScriptedFetchOutcome) -> Self {
+                    Self {
+                        default_outcome,
+                        calls: tokio::sync::Mutex::new(Vec::new()),
+                    }
+                }
+            }
+
+            #[async_trait::async_trait]
+            impl UrlFetcher for ScriptedFetcher {
+                async fn fetch(
+                    &self,
+                    url: &str,
+                    _metadata: &FetchMetadata,
+                ) -> Result<FetchResult, Error> {
+                    self.calls.lock().await.push(url.to_string());
+                    match self.default_outcome {
+                        ScriptedFetchOutcome::Gone => Ok(FetchResult::Gone),
+                        ScriptedFetchOutcome::NotModified => Ok(FetchResult::NotModified {
+                            etag: None,
+                            last_modified: None,
+                        }),
+                        ScriptedFetchOutcome::Downloaded => Ok(FetchResult::Downloaded {
+                            bytes: Vec::new(),
+                            content_type: None,
+                            etag: Some("\"fresh\"".to_string()),
+                            last_modified: None,
+                            final_url: None,
+                        }),
+                        ScriptedFetchOutcome::Blocked => Ok(FetchResult::Blocked),
+                        ScriptedFetchOutcome::TransportError => Err(Error::Internal {
+                            message: "simulated transport error".to_string(),
+                            correlation_id: "liveness_sweep_test_fetch_error".to_string(),
+                        }),
+                    }
+                }
+            }
+
+            fn old_timestamp() -> String {
+                "2020-01-01T00:00:00Z".to_string()
+            }
+
+            // -------------------------------------------------------------
+            // Per-candidate outcomes
+            // -------------------------------------------------------------
+
+            #[tokio::test]
+            async fn gone_candidate_is_deleted_and_counted() {
+                let store = LivenessStore::new(vec![row(
+                    "r1",
+                    "https://a.example.com/",
+                    Some(&old_timestamp()),
+                )]);
+                let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::Gone);
+                let mut doc_index = DocumentIndex::new();
+                let seen = std::collections::HashSet::new();
+                let mut result = IngestionResult::default();
+
+                run_feed_liveness_sweep(
+                    "src-1",
+                    "store-1",
+                    None,
+                    &seen,
+                    &mut doc_index,
+                    &store,
+                    &fetcher,
+                    &mut result,
+                )
+                .await
+                .unwrap();
+
+                assert_eq!(result.docs_deleted, 1);
+                assert_eq!(result.feed_entries_liveness_checked, 1);
+                assert_eq!(*store.delete_calls.lock().await, vec!["r1".to_string()]);
+                assert!(store.touch_calls.lock().await.is_empty());
+            }
+
+            #[tokio::test]
+            async fn not_modified_candidate_is_touched_not_deleted() {
+                let store = LivenessStore::new(vec![row(
+                    "r1",
+                    "https://a.example.com/",
+                    Some(&old_timestamp()),
+                )]);
+                let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::NotModified);
+                let mut doc_index = DocumentIndex::new();
+                let seen = std::collections::HashSet::new();
+                let mut result = IngestionResult::default();
+
+                run_feed_liveness_sweep(
+                    "src-1",
+                    "store-1",
+                    None,
+                    &seen,
+                    &mut doc_index,
+                    &store,
+                    &fetcher,
+                    &mut result,
+                )
+                .await
+                .unwrap();
+
+                assert_eq!(result.docs_deleted, 0);
+                assert_eq!(result.feed_entries_liveness_checked, 1);
+                assert!(store.delete_calls.lock().await.is_empty());
+                assert_eq!(store.touch_calls.lock().await.len(), 1);
+            }
+
+            /// A 200 is touched (validators + `last_checked_at` refreshed),
+            /// never deleted, and — the point of this test — never
+            /// re-indexed: nothing in this test's `LivenessStore` exposes an
+            /// `upsert_chunks`/`upsert_chunks_and_blocks` write path that
+            /// records a call, so a passing assertion on `touch_calls` alone
+            /// (no other store method touched) already proves no re-index
+            /// happened.
+            #[tokio::test]
+            async fn downloaded_candidate_is_touched_not_deleted_and_not_reindexed() {
+                let store = LivenessStore::new(vec![row(
+                    "r1",
+                    "https://a.example.com/",
+                    Some(&old_timestamp()),
+                )]);
+                let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::Downloaded);
+                let mut doc_index = DocumentIndex::new();
+                let seen = std::collections::HashSet::new();
+                let mut result = IngestionResult::default();
+
+                run_feed_liveness_sweep(
+                    "src-1",
+                    "store-1",
+                    None,
+                    &seen,
+                    &mut doc_index,
+                    &store,
+                    &fetcher,
+                    &mut result,
+                )
+                .await
+                .unwrap();
+
+                assert_eq!(result.docs_deleted, 0);
+                assert!(store.delete_calls.lock().await.is_empty());
+                let touches = store.touch_calls.lock().await;
+                assert_eq!(touches.len(), 1);
+                assert_eq!(touches[0].0, "r1");
+                assert_eq!(touches[0].1.as_deref(), Some("\"fresh\""));
+            }
+
+            #[tokio::test]
+            async fn blocked_candidate_is_left_completely_untouched() {
+                let store = LivenessStore::new(vec![row(
+                    "r1",
+                    "https://a.example.com/",
+                    Some(&old_timestamp()),
+                )]);
+                let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::Blocked);
+                let mut doc_index = DocumentIndex::new();
+                let seen = std::collections::HashSet::new();
+                let mut result = IngestionResult::default();
+
+                run_feed_liveness_sweep(
+                    "src-1",
+                    "store-1",
+                    None,
+                    &seen,
+                    &mut doc_index,
+                    &store,
+                    &fetcher,
+                    &mut result,
+                )
+                .await
+                .unwrap();
+
+                assert_eq!(result.docs_deleted, 0);
+                assert_eq!(
+                    result.feed_entries_liveness_checked, 1,
+                    "still counted as probed even though nothing moved"
+                );
+                assert!(store.delete_calls.lock().await.is_empty());
+                assert!(store.touch_calls.lock().await.is_empty());
+            }
+
+            #[tokio::test]
+            async fn transport_error_leaves_the_resource_untouched() {
+                let store = LivenessStore::new(vec![row(
+                    "r1",
+                    "https://a.example.com/",
+                    Some(&old_timestamp()),
+                )]);
+                let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::TransportError);
+                let mut doc_index = DocumentIndex::new();
+                let seen = std::collections::HashSet::new();
+                let mut result = IngestionResult::default();
+
+                run_feed_liveness_sweep(
+                    "src-1",
+                    "store-1",
+                    None,
+                    &seen,
+                    &mut doc_index,
+                    &store,
+                    &fetcher,
+                    &mut result,
+                )
+                .await
+                .unwrap();
+
+                assert_eq!(result.docs_deleted, 0);
+                assert_eq!(result.feed_entries_liveness_checked, 1);
+                assert!(store.delete_calls.lock().await.is_empty());
+                assert!(store.touch_calls.lock().await.is_empty());
+            }
+
+            // -------------------------------------------------------------
+            // Throttle: recheck floor and `seen`
+            // -------------------------------------------------------------
+
+            #[tokio::test]
+            async fn candidate_newer_than_the_recheck_floor_is_never_fetched() {
+                // Checked a minute ago — well inside the bare 24h floor
+                // (`refresh_interval_secs: None`).
+                let recent = (Utc::now() - chrono::Duration::seconds(60))
+                    .to_rfc3339_opts(SecondsFormat::Secs, true);
+                let store =
+                    LivenessStore::new(vec![row("r1", "https://a.example.com/", Some(&recent))]);
+                let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::Gone);
+                let mut doc_index = DocumentIndex::new();
+                let seen = std::collections::HashSet::new();
+                let mut result = IngestionResult::default();
+
+                run_feed_liveness_sweep(
+                    "src-1",
+                    "store-1",
+                    None,
+                    &seen,
+                    &mut doc_index,
+                    &store,
+                    &fetcher,
+                    &mut result,
+                )
+                .await
+                .unwrap();
+
+                assert!(
+                    fetcher.calls.lock().await.is_empty(),
+                    "a resource checked well inside the recheck floor must never be fetched"
+                );
+                assert_eq!(result.feed_entries_liveness_checked, 0);
+            }
+
+            /// A configured `refresh_interval_secs` above the bare 24h floor
+            /// raises the effective floor — a resource checked 25h ago (past
+            /// the bare floor, but not past a configured 30-day one) must
+            /// still not be fetched.
+            #[tokio::test]
+            async fn configured_refresh_interval_raises_the_recheck_floor_above_24h() {
+                let twenty_five_hours_ago = (Utc::now() - chrono::Duration::hours(25))
+                    .to_rfc3339_opts(SecondsFormat::Secs, true);
+                let store = LivenessStore::new(vec![row(
+                    "r1",
+                    "https://a.example.com/",
+                    Some(&twenty_five_hours_ago),
+                )]);
+                let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::Gone);
+                let mut doc_index = DocumentIndex::new();
+                let seen = std::collections::HashSet::new();
+                let mut result = IngestionResult::default();
+
+                run_feed_liveness_sweep(
+                    "src-1",
+                    "store-1",
+                    Some(30 * 24 * 60 * 60), // 30 days
+                    &seen,
+                    &mut doc_index,
+                    &store,
+                    &fetcher,
+                    &mut result,
+                )
+                .await
+                .unwrap();
+
+                assert!(
+                    fetcher.calls.lock().await.is_empty(),
+                    "a 30-day configured refresh interval must raise the floor above the bare 24h default"
+                );
+            }
+
+            #[tokio::test]
+            async fn a_candidate_still_in_this_runs_seen_set_is_never_fetched() {
+                let store = LivenessStore::new(vec![row(
+                    "r1",
+                    "https://a.example.com/",
+                    Some(&old_timestamp()),
+                )]);
+                let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::Gone);
+                let mut doc_index = DocumentIndex::new();
+                let mut seen = std::collections::HashSet::new();
+                seen.insert("https://a.example.com/".to_string());
+                let mut result = IngestionResult::default();
+
+                run_feed_liveness_sweep(
+                    "src-1",
+                    "store-1",
+                    None,
+                    &seen,
+                    &mut doc_index,
+                    &store,
+                    &fetcher,
+                    &mut result,
+                )
+                .await
+                .unwrap();
+
+                assert!(
+                    fetcher.calls.lock().await.is_empty(),
+                    "a candidate this run's own ingestion pass already observed must not be probed"
+                );
+                assert_eq!(result.feed_entries_liveness_checked, 0);
+            }
+
+            // -------------------------------------------------------------
+            // Batch cap
+            // -------------------------------------------------------------
+
+            #[tokio::test]
+            async fn over_cap_batch_processes_only_the_cap_oldest_first() {
+                let mut rows = Vec::new();
+                let mut expected_order = Vec::new();
+                for i in 0..(FEED_LIVENESS_BATCH_LIMIT + 5) {
+                    let resource_id = format!("r{i:03}");
+                    let uri = format!("https://{i:03}.example.com/");
+                    // Strictly increasing timestamps -> strictly oldest-first
+                    // order is unambiguous.
+                    let checked_at = format!("2020-01-{:02}T00:00:00Z", (i % 28) + 1);
+                    rows.push(row(&resource_id, &uri, Some(&checked_at)));
+                    expected_order.push((checked_at, uri));
+                }
+                expected_order.sort();
+                let expected_uris: Vec<String> = expected_order
+                    .into_iter()
+                    .take(FEED_LIVENESS_BATCH_LIMIT)
+                    .map(|(_, uri)| uri)
+                    .collect();
+
+                let store = LivenessStore::new(rows);
+                let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::NotModified);
+                let mut doc_index = DocumentIndex::new();
+                let seen = std::collections::HashSet::new();
+                let mut result = IngestionResult::default();
+
+                run_feed_liveness_sweep(
+                    "src-1",
+                    "store-1",
+                    None,
+                    &seen,
+                    &mut doc_index,
+                    &store,
+                    &fetcher,
+                    &mut result,
+                )
+                .await
+                .unwrap();
+
+                let calls = fetcher.calls.lock().await.clone();
+                assert_eq!(calls.len(), FEED_LIVENESS_BATCH_LIMIT);
+                assert_eq!(
+                    calls, expected_uris,
+                    "the batch cap must keep exactly the oldest N candidates, in oldest-first order"
+                );
+                assert_eq!(
+                    result.feed_entries_liveness_checked as usize,
+                    FEED_LIVENESS_BATCH_LIMIT
+                );
+            }
+
+            // -------------------------------------------------------------
+            // Guards (run through the full `run_source_ingestion`, since
+            // both guards live there, not inside `run_feed_liveness_sweep`
+            // itself)
+            // -------------------------------------------------------------
+
+            fn make_feed_source(store_id: &str) -> Source {
+                Source {
+                    id: new_ulid(),
+                    store_id: store_id.to_string(),
+                    kind: SourceKind::Feed,
+                    spec: SourceSpec::Feed {
+                        url: "https://feed.example.com/feed.xml".to_string(),
+                        max_entries: None,
+                        fetch_full_content: true,
+                        refresh_interval_secs: None,
+                    },
+                    source_preset: "prose".to_string(),
+                }
+            }
+
+            fn seed_doc_index_owned_by(doc_index: &mut DocumentIndex, source_id: &str, uri: &str) {
+                doc_index.upsert(DocumentRecord {
+                    uri: uri.to_string(),
+                    resource_id: format!("{uri}-resource"),
+                    source_id: source_id.to_string(),
+                    content_hash: "hash".to_string(),
+                    policy_version: "policy-v1".to_string(),
+                    metadata_hash: "mhash".to_string(),
+                    external_etag: None,
+                    external_last_modified: None,
+                });
+            }
+
+            /// The most important test in this module alongside the next
+            /// one: an ingestor that could not observe its source must
+            /// suppress the liveness sweep before it ever queries the store
+            /// — an `UnreachableFetcher` alone would not distinguish "the
+            /// sweep ran and found nothing" from "the sweep never ran",
+            /// which is exactly what `LivenessStore::list_call_count`
+            /// exists to tell apart.
+            #[tokio::test]
+            async fn incomplete_enumeration_guard_suppresses_the_sweep() {
+                let source = make_feed_source("store-1");
+                let config = make_ingestion_config("store-1");
+                let store = LivenessStore::new(vec![row(
+                    "r1",
+                    "https://a.example.com/",
+                    Some(&old_timestamp()),
+                )]);
+                let embedder = FakeEmbedder::new(4);
+                let mut doc_index = DocumentIndex::new();
+                seed_doc_index_owned_by(&mut doc_index, &source.id, "https://a.example.com/");
+
+                let ingestor = FakeIngestor::incomplete("feed unreachable");
+                let deps = SourceIngestionDeps {
+                    doc_index: &mut doc_index,
+                    store: &store,
+                    embedder: &embedder,
+                    config: &config,
+                    progress: None,
+                    deletion: DeletionPolicy::Prune,
+                    document_validators: FetchMetadata::default(),
+                    stored_inputs_digest: None,
+                    fetcher: &UnreachableFetcher,
+                };
+                run_source_ingestion(&source, &ingestor, deps)
+                    .await
+                    .unwrap();
+
+                assert_eq!(
+                    store.list_call_count(),
+                    0,
+                    "Enumeration::Incomplete must suppress the liveness sweep before it \
+                     ever queries the store"
+                );
+            }
+
+            /// The steady-state feed-304 case: zero entry callbacks fire, so
+            /// `seen` is empty — the same condition that suppresses the
+            /// presumed-gone sweep for path/url sources also suppresses the
+            /// liveness sweep here, and for the same reason
+            /// (specs/02-domain-model.md, "Conditional GET and pruning").
+            #[tokio::test]
+            async fn zero_seen_guard_suppresses_the_sweep_on_a_feed_304() {
+                let source = make_feed_source("store-1");
+                let config = make_ingestion_config("store-1");
+                let store = LivenessStore::new(vec![row(
+                    "r1",
+                    "https://a.example.com/",
+                    Some(&old_timestamp()),
+                )]);
+                let embedder = FakeEmbedder::new(4);
+                let mut doc_index = DocumentIndex::new();
+                seed_doc_index_owned_by(&mut doc_index, &source.id, "https://a.example.com/");
+
+                // Complete enumeration (the default), but zero callbacks —
+                // an empty script, mirroring what `FeedIngestor` does on a
+                // bare feed-document 304.
+                let ingestor = FakeIngestor::new(vec![]);
+                let deps = SourceIngestionDeps {
+                    doc_index: &mut doc_index,
+                    store: &store,
+                    embedder: &embedder,
+                    config: &config,
+                    progress: None,
+                    deletion: DeletionPolicy::Prune,
+                    document_validators: FetchMetadata::default(),
+                    stored_inputs_digest: None,
+                    fetcher: &UnreachableFetcher,
+                };
+                run_source_ingestion(&source, &ingestor, deps)
+                    .await
+                    .unwrap();
+
+                assert_eq!(
+                    store.list_call_count(),
+                    0,
+                    "a zero-seen run must suppress the liveness sweep"
+                );
+            }
+
+            #[tokio::test]
+            async fn deletion_retain_performs_zero_liveness_fetches() {
+                let source = make_feed_source("store-1");
+                let config = make_ingestion_config("store-1");
+                let store = LivenessStore::new(vec![row(
+                    "r1",
+                    "https://a.example.com/",
+                    Some(&old_timestamp()),
+                )]);
+                let embedder = FakeEmbedder::new(4);
+                let mut doc_index = DocumentIndex::new();
+                seed_doc_index_owned_by(&mut doc_index, &source.id, "https://a.example.com/");
+
+                // Both guards pass this time (this run observes the owned
+                // URI via a Skipped callback) — proving `Retain` alone, not
+                // a guard, is what keeps this at zero fetches.
+                let ingestor = FakeIngestor::new(vec![ScriptStep::Skipped(
+                    "https://a.example.com/".to_string(),
+                    SkipReason::Unchanged,
+                )]);
+                let deps = SourceIngestionDeps {
+                    doc_index: &mut doc_index,
+                    store: &store,
+                    embedder: &embedder,
+                    config: &config,
+                    progress: None,
+                    deletion: DeletionPolicy::Retain,
+                    document_validators: FetchMetadata::default(),
+                    stored_inputs_digest: None,
+                    fetcher: &UnreachableFetcher,
+                };
+                run_source_ingestion(&source, &ingestor, deps)
+                    .await
+                    .unwrap();
+
+                assert_eq!(
+                    store.list_call_count(),
+                    0,
+                    "DeletionPolicy::Retain must never reach the liveness sweep at all — \
+                     there is no free preview signal for this mechanism"
+                );
+            }
         }
     }
 }
