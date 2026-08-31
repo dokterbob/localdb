@@ -157,6 +157,62 @@ fn relax_modified_at_and_add_index_updated_at_up(_ctx: &MigrationContext) -> Vec
     ]
 }
 
+/// `v8`: add the five conditional-GET/liveness columns
+/// (`specs/02-domain-model.md` §"Resource", "Conditional GET and pruning";
+/// `specs/04-search-pipeline.md` "Incremental re-index", "Deletes").
+///
+/// `resources.external_last_modified` is the raw HTTP `Last-Modified`
+/// validator, stored verbatim and replayed byte-exact in `If-Modified-Since`
+/// — distinct from the `modified_at` date axis (a parsed, source-claimed
+/// change time) even once a future `Last-Modified` source lands there.
+/// `resources.last_checked_at` is the liveness sweep's own throttle clock —
+/// deliberately a separate column from `index_updated_at`, which normatively
+/// means "we last wrote this resource's stored state" and is exposed via
+/// `DocumentInfo.index_updated_at`; a liveness probe writes nothing, so
+/// reusing that column would misreport a merely-pinged resource as
+/// re-written. `sources.feed_etag`/`sources.feed_last_modified` are the feed
+/// document's own validators, kept on the `sources` row because in
+/// discovery mode the feed document itself never becomes a `Resource`.
+/// `sources.feed_inputs_digest` guards those two: it records the local
+/// inputs — indexing policy, `fetch_full_content`, `max_entries` — that
+/// produced the last feed run, so a run whose inputs have moved refuses to
+/// replay the validators and refetches unconditionally. An origin's
+/// validator only ever speaks for the origin's own bytes, and a 304 that
+/// skips the entry loop would otherwise strand every entry on the old
+/// inputs indefinitely.
+///
+/// **Weight class 1** (fast DDL): five plain `ALTER TABLE ... ADD COLUMN`
+/// statements, each nullable with no default — no rewrite, no index rebuild,
+/// hence `needs_reindex: false`. All five are pure cache state: losing them
+/// costs a re-fetch, never a re-index, which is why no row is backfilled and
+/// `NULL` is a valid steady state for every one of them. For the digest
+/// specifically, `NULL` reads as "inputs unknown", which is a mismatch
+/// against any current digest, so an upgraded store refetches its feeds once
+/// rather than trusting a validator captured before the guard existed.
+fn add_conditional_get_validators_up(_ctx: &MigrationContext) -> Vec<String> {
+    vec![
+        "ALTER TABLE resources ADD COLUMN external_last_modified TEXT".to_string(),
+        "ALTER TABLE resources ADD COLUMN last_checked_at TEXT".to_string(),
+        "ALTER TABLE sources ADD COLUMN feed_etag TEXT".to_string(),
+        "ALTER TABLE sources ADD COLUMN feed_last_modified TEXT".to_string(),
+        "ALTER TABLE sources ADD COLUMN feed_inputs_digest TEXT".to_string(),
+    ]
+}
+
+/// The v8 down-step: drop all five columns. Reversible with a plain `ALTER
+/// TABLE ... DROP COLUMN` — unlike `BASELINE_VERSION + 3`, none of these
+/// columns carries a constraint or an original position to restore, so no
+/// table rebuild is needed in either direction.
+fn add_conditional_get_validators_down(_ctx: &MigrationContext) -> Vec<String> {
+    vec![
+        "ALTER TABLE resources DROP COLUMN external_last_modified".to_string(),
+        "ALTER TABLE resources DROP COLUMN last_checked_at".to_string(),
+        "ALTER TABLE sources DROP COLUMN feed_etag".to_string(),
+        "ALTER TABLE sources DROP COLUMN feed_last_modified".to_string(),
+        "ALTER TABLE sources DROP COLUMN feed_inputs_digest".to_string(),
+    ]
+}
+
 /// The real migration registry.
 ///
 /// Consumer branches append entries starting at version `BASELINE_VERSION +
@@ -203,6 +259,24 @@ pub fn migrations() -> Vec<Migration> {
                  downgrading would require rebuilding the resources table, which \
                  chunks/blocks' foreign keys to it make unsafe inside a migration transaction",
             ),
+            needs_reindex: false,
+        },
+        Migration {
+            version: BASELINE_VERSION + 4,
+            name: "add_conditional_get_validators",
+            summary: "adds resources.external_last_modified (raw HTTP Last-Modified \
+                      conditional-GET validator, replayed byte-exact in If-Modified-Since) and \
+                      resources.last_checked_at (the liveness sweep's throttle clock, distinct \
+                      from index_updated_at because a probe writes nothing), plus \
+                      sources.feed_etag and sources.feed_last_modified (the feed document's own \
+                      validators, kept on sources since a feed document never becomes a \
+                      Resource in discovery mode) and sources.feed_inputs_digest (the local \
+                      inputs behind the last feed run, so a policy change stops those \
+                      validators being replayed); all five nullable, no default. Downgrading \
+                      past this migration discards any accumulated validators, costing one full \
+                      re-fetch of every URL and feed entry on the next upgrade",
+            up: Up::Sql(add_conditional_get_validators_up),
+            down: Down::Sql(add_conditional_get_validators_down),
             needs_reindex: false,
         },
     ]
@@ -329,5 +403,13 @@ mod tests {
     #[test]
     fn head_version_current_matches_head_version_of_real_migrations() {
         assert_eq!(head_version_current(), head_version(&migrations()));
+    }
+
+    #[test]
+    fn head_version_current_is_eight() {
+        // Pins the concrete number so a chain edit that silently drops or
+        // duplicates an entry fails here, not just via the relative
+        // assertions above.
+        assert_eq!(head_version_current(), 8);
     }
 }

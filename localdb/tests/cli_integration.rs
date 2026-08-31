@@ -2898,9 +2898,10 @@ fn db_status_on_fresh_healthy_store_reports_current_equals_head() {
     let head = v["head_version"].as_i64().unwrap();
     assert_eq!(current, head, "fresh store should be exactly at head");
     assert_eq!(
-        current, 7,
-        "current head is v7 (baseline v4 + the block_id-drop migration + the \
-         DiskANN index shrink + the index_updated_at backfill)"
+        current, 8,
+        "current head is v8 (baseline v4 + the block_id-drop migration + the \
+         DiskANN index shrink + the index_updated_at backfill + the conditional-GET \
+         validator columns)"
     );
     assert_eq!(v["pending"].as_i64().unwrap(), 0);
     assert!(!v["legacy"].as_bool().unwrap());

@@ -50,6 +50,16 @@ async fn create_stores(conn: &Connection) -> Result<(), libsql::Error> {
 }
 
 async fn create_sources(conn: &Connection) -> Result<(), libsql::Error> {
+    // `feed_etag`, `feed_last_modified` and `feed_inputs_digest` are
+    // appended after `config_json`
+    // (and before the CHECK/UNIQUE table-level constraints) rather than
+    // grouped with the source's own columns above: schema v8 adds them via
+    // plain `ALTER TABLE sources ADD COLUMN`, which SQLite always appends
+    // after the last existing column definition and before any table-level
+    // constraints. This literal must stay byte-for-byte identical to that or
+    // the drift-guard test
+    // (`migrations::runner::drift_guard_create_schema_equals_baseline_plus_chain`)
+    // fails (write-twice rule, docs/migrations.md).
     conn.execute(
         "CREATE TABLE IF NOT EXISTS sources (
             id          TEXT PRIMARY KEY NOT NULL,
@@ -62,7 +72,7 @@ async fn create_sources(conn: &Connection) -> Result<(), libsql::Error> {
             preset      TEXT NOT NULL DEFAULT 'prose',
             refresh     TEXT,
             created_at  TEXT NOT NULL,
-            config_json TEXT,
+            config_json TEXT, feed_etag TEXT, feed_last_modified TEXT, feed_inputs_digest TEXT,
             CHECK (
                 (kind = 'path' AND root IS NOT NULL)
                 OR (kind = 'url'  AND url  IS NOT NULL)
@@ -109,8 +119,11 @@ async fn create_resources(conn: &Connection) -> Result<(), libsql::Error> {
     // COLUMN` on top of that. SQLite always appends `ADD COLUMN` after the
     // last existing column definition, so both end up here, in application
     // order, in place of `modified_at`'s original position — verified
-    // empirically, and this literal must stay byte-for-byte identical to that
-    // or the drift-guard test
+    // empirically. `external_last_modified` and `last_checked_at` (schema v8)
+    // are two further plain `ALTER TABLE ... ADD COLUMN`s on top of that, so
+    // they land last, in the order their migration statements run. This
+    // literal must stay byte-for-byte identical to the result or the
+    // drift-guard test
     // (`migrations::runner::drift_guard_create_schema_equals_baseline_plus_chain`)
     // fails (write-twice rule, docs/migrations.md).
     conn.execute(
@@ -138,7 +151,7 @@ async fn create_resources(conn: &Connection) -> Result<(), libsql::Error> {
             origin_store      TEXT NOT NULL,
             policy_version    TEXT NOT NULL,
             share_path        TEXT,
-            extractor_version TEXT NOT NULL, modified_at TEXT, index_updated_at TEXT,
+            extractor_version TEXT NOT NULL, modified_at TEXT, index_updated_at TEXT, external_last_modified TEXT, last_checked_at TEXT,
             UNIQUE (store_id, id),
             FOREIGN KEY (store_id, source_id) REFERENCES sources(store_id, id) ON DELETE CASCADE
         )",
