@@ -58,8 +58,8 @@ pub(crate) async fn upsert_chunks(
     let tx = store.conn().write_tx().await?;
     // The plain (non-`_and_blocks`) path carries no `Resource`, so it has no
     // `external_last_modified` value to give — see `upsert_chunks_inner`'s
-    // `ON CONFLICT` comment for why `None` here can never clobber a value
-    // `upsert_chunks_and_blocks` already stored for the same resource_id.
+    // `ON CONFLICT` comment: `None` here nulls the column out if this call
+    // happens to hit an existing resource_id, same as every sibling column.
     let result = upsert_chunks_inner(&tx, &records, store.encoding(), None)
         .await
         .map(|()| count);
@@ -318,20 +318,30 @@ async fn upsert_chunks_inner(
                      date_original    = excluded.date_original,
                      date_parsed      = excluded.date_parsed,
                      external_id      = excluded.external_id,
-                     external_etag    = excluded.external_etag",
-                // `external_last_modified` is deliberately absent from the
-                // `ON CONFLICT` SET list above: unlike `external_etag`
-                // (denormalized onto every `ChunkRecord`, so a plain
-                // `upsert_chunks` call always carries the right value), it
-                // arrives only via this function's own parameter, which the
-                // plain (non-`_and_blocks`) `upsert_chunks` caller below
-                // always passes `None` for. Including it in `ON CONFLICT`
-                // would let that caller silently null out a validator
-                // `upsert_chunks_and_blocks` previously stored for a
-                // resource_id it happens to touch again. The `_and_blocks`
-                // replace path never hits this conflict branch anyway — it
-                // deletes the old row before inserting — so restricting the
-                // column to the plain `INSERT` values loses nothing there.
+                     external_etag    = excluded.external_etag,
+                     external_last_modified = excluded.external_last_modified",
+                // `external_last_modified` IS included in `ON CONFLICT`,
+                // same as every other column here: a same-resource-id
+                // replace (a policy-only reindex — see
+                // `delete_chunks_and_blocks_inner`'s doc comment for why
+                // that case keeps the `resources` row in place rather than
+                // deleting it first) hits this conflict branch, not a fresh
+                // `INSERT`, and must still land the freshly-fetched
+                // validator `upsert_chunks_and_blocks` was just given.
+                //
+                // The cost: the plain (non-`_and_blocks`) `upsert_chunks`
+                // below has no per-call value for this column (it isn't a
+                // `ChunkRecord` field — see this function's trailing
+                // parameter and `RetrievalStore::upsert_chunks_and_blocks`'s
+                // doc comment) and always passes `None`, so a bare
+                // `upsert_chunks` call that happens to hit an existing
+                // resource_id nulls this column out — exactly the same
+                // contract `external_etag`/`modified_at`/the date columns
+                // above already have for that same caller (each is fully
+                // overwritten by whatever the `ChunkRecord` says, with no
+                // "leave unchanged" option). `upsert_chunks` is not used by
+                // any production ingestion path today; only
+                // `upsert_chunks_and_blocks` is.
                 params![
                     record.store_id.as_str(),
                     record.resource_id.as_str(), // id column

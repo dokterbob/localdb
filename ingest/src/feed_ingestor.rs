@@ -375,7 +375,7 @@ impl Ingestor for FeedIngestor {
                 date: None,
                 modified_at_override,
                 provenance_source: Some(feed_url.clone()),
-                capture_etag: false,
+                capture_conditional_get: false,
             };
             let resource = build_resource(
                 source,
@@ -534,7 +534,7 @@ async fn process_discovery_entry(
             .or(entry.published)
             .map(|d| d.to_rfc3339_opts(SecondsFormat::Secs, true)),
         provenance_source: Some(feed_url.to_string()),
-        capture_etag: true,
+        capture_conditional_get: true,
     };
 
     let needs_fallback = if fetchable {

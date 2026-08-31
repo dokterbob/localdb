@@ -84,13 +84,13 @@ pub(crate) enum UrlOutcome {
 /// Extra metadata a caller can thread into the `Resource` built by
 /// [`process_url`], beyond what a bare URL fetch/parse produces.
 ///
-/// `Default` reproduces `UrlIngestor`'s pre-refactor behavior exactly: no
-/// external id, no title fallback (the page's own title or Dublin Core title
-/// wins or the field stays `None`), no injected creator/date/provenance,
-/// `modified_at: None` (a bare `UrlIngestor` makes no claim about
-/// modification time — no `modified_at_override`), and `external_etag`
-/// always `None` (a bare `UrlIngestor` never threads conditional-fetch state
-/// through `Resource`).
+/// `Default` reproduces `UrlIngestor`'s pre-refactor behavior for every field
+/// except `capture_conditional_get`: no external id, no title fallback (the
+/// page's own title or Dublin Core title wins or the field stays `None`), no
+/// injected creator/date/provenance, `modified_at: None` (a bare
+/// `UrlIngestor` makes no claim about modification time — no
+/// `modified_at_override`). `UrlIngestor` opts `capture_conditional_get` in
+/// explicitly (see its `ingest` method) rather than relying on `Default`.
 #[derive(Default)]
 pub(crate) struct ResourceEnrichment {
     /// Arbitrary source-system ID (e.g. a feed entry's `<id>`/`<guid>`).
@@ -117,10 +117,13 @@ pub(crate) struct ResourceEnrichment {
     /// Provenance source (e.g. the owning feed's URL) to stamp into
     /// `DublinCoreMetadata::source` when present.
     pub provenance_source: Option<String>,
-    /// Whether to carry the fetch response's ETag into
-    /// `Resource.external_etag`. `false` reproduces `UrlIngestor`'s current
-    /// behavior of always leaving it `None`.
-    pub capture_etag: bool,
+    /// Whether to carry the fetch response's `ETag`/`Last-Modified` into
+    /// `Resource.external_etag`/`Resource.external_last_modified`. Gates
+    /// both fields together — a resource either participates in conditional
+    /// GET or it doesn't, there's no partial state. `false` means a source
+    /// that either has no meaningful HTTP validators (a file) or has chosen
+    /// not to capture them.
+    pub capture_conditional_get: bool,
 }
 
 /// Fetch, sniff, parse, and enrich a single locator into a `Resource`,
@@ -145,10 +148,7 @@ pub(crate) async fn process_url(
     callback: &mut dyn IngestCallback,
     result: &mut IngestResult,
 ) -> Result<UrlOutcome, Error> {
-    let fetch_meta = FetchMetadata::default();
-    // Note: conditional-GET metadata is always the default here (no
-    // previously-stored ETag/Last-Modified is threaded in) — a known gap,
-    // marked with a `TODO` in `core::ingestion`.
+    let fetch_meta = callback.lookup_fetch_metadata(uri).await;
     let fetch_result = match fetcher.fetch(locator, &fetch_meta).await {
         Ok(r) => r,
         Err(e) => {
@@ -171,17 +171,35 @@ pub(crate) async fn process_url(
         }
     };
 
-    let (bytes, content_type, etag) = match fetch_result {
+    let (bytes, content_type, etag, last_modified) = match fetch_result {
         FetchResult::Downloaded {
             bytes,
             content_type,
             etag,
+            last_modified,
             ..
-        } => (bytes, content_type, etag),
+        } => (bytes, content_type, etag, last_modified),
         FetchResult::NotModified {
-            etag: _,
-            last_modified: _,
+            etag,
+            last_modified,
         } => {
+            // RFC 9111 requires storing whichever validator(s) the 304
+            // itself carried, even though the body (and therefore the
+            // resource) is unchanged — see `FetchResult::NotModified`'s doc
+            // comment. Both `None` is the common case (a bare 304) and means
+            // "keep what's stored," which is exactly what skipping this call
+            // does.
+            if etag.is_some() || last_modified.is_some() {
+                callback
+                    .on_validators_refreshed(
+                        uri,
+                        &FetchMetadata {
+                            etag,
+                            last_modified,
+                        },
+                    )
+                    .await;
+            }
             callback.on_skipped(uri, SkipReason::Unchanged).await;
             result.resources_skipped += 1;
             return Ok(UrlOutcome::Unchanged);
@@ -286,7 +304,10 @@ pub(crate) async fn process_url(
         content_type,
         enrich,
     );
-    resource.external_etag = if enrich.capture_etag { etag } else { None };
+    if enrich.capture_conditional_get {
+        resource.external_etag = etag;
+        resource.external_last_modified = last_modified;
+    }
 
     callback.on_resource(resource).await?;
     result.resources_produced += 1;
@@ -300,9 +321,10 @@ pub(crate) async fn process_url(
 /// `content`/`summary`) produces byte-for-byte the same `Resource` shape as
 /// the fetched-page path, rather than a hand-rolled duplicate.
 ///
-/// `external_etag` is always `None` on the returned `Resource` — only
-/// `process_url` has a fetch response to pull an ETag from; it patches the
-/// field in afterward when `enrich.capture_etag` is set.
+/// `external_etag`/`external_last_modified` are always `None` on the
+/// returned `Resource` — only `process_url` has a fetch response to pull
+/// validators from; it patches both fields in afterward when
+/// `enrich.capture_conditional_get` is set.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_resource(
     source: &IngestSource,

@@ -150,6 +150,42 @@ pub trait IngestCallback: Send {
     /// ingestor that merely fails to observe a locator must NOT call this;
     /// staying silent and letting the guarded sweep decide is correct there.
     async fn on_gone(&mut self, _uri: &Uri) {}
+
+    /// Look up conditional-GET validators stored from a previous successful
+    /// fetch of `uri`, to replay as `If-None-Match`/`If-Modified-Since` on
+    /// this fetch (`url` sources and feed entry links — see
+    /// `specs/04-search-pipeline.md` §1). The default empty `FetchMetadata`
+    /// means "no previous validators known," matching this trait's other
+    /// default-no-op methods so ingestors and test callbacks that don't need
+    /// replay can ignore it.
+    ///
+    /// `&mut self`, matching every other method on this trait, even though
+    /// this one is a pure lookup with nothing to record. A plain `&self`
+    /// looks like the better fit, and compiles standalone, but not through
+    /// `#[async_trait]`: a `&self` method desugars to a boxed future that
+    /// must be `Send`, which requires `&Self: Send`, which requires
+    /// `Self: Sync` — a bound this trait doesn't otherwise carry (its
+    /// `&mut self` methods only need `Self: Send`) and that every
+    /// implementor holding a `&mut DocumentIndex`-style field would have to
+    /// start satisfying too. `&mut self` avoids widening the trait's bounds
+    /// for one method's convenience; callers already hold
+    /// `&mut dyn IngestCallback`, so this costs them nothing.
+    async fn lookup_fetch_metadata(&mut self, _uri: &Uri) -> crate::ingestion::FetchMetadata {
+        crate::ingestion::FetchMetadata::default()
+    }
+
+    /// Called when a 304 Not Modified response itself carried a refreshed
+    /// validator (RFC 9111 requires storing one even though the body is
+    /// unchanged — see `FetchResult::NotModified`'s doc comment). `meta`
+    /// mirrors that variant's contract exactly: `None` in either field means
+    /// "unchanged, leave the stored value alone," never "clear it." The
+    /// default no-op matches every other optional signal on this trait.
+    async fn on_validators_refreshed(
+        &mut self,
+        _uri: &Uri,
+        _meta: &crate::ingestion::FetchMetadata,
+    ) {
+    }
 }
 
 /// Source information passed to an ingestor.
@@ -272,5 +308,25 @@ mod tests {
         // #156: an ingestor that says nothing about enumeration completeness
         // is claiming a complete view — the sweep-licensing default.
         assert_eq!(result.enumeration, Enumeration::Complete);
+    }
+
+    /// A callback that overrides nothing but `on_resource` (the only
+    /// non-defaulted method) must still get an empty `FetchMetadata` back
+    /// from `lookup_fetch_metadata` — the conditional-GET replay seam is
+    /// opt-in, like every other hook on this trait.
+    #[tokio::test]
+    async fn lookup_fetch_metadata_default_is_empty() {
+        struct NoopCallback;
+        #[async_trait::async_trait]
+        impl IngestCallback for NoopCallback {
+            async fn on_resource(&mut self, _resource: Resource) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+        let mut cb = NoopCallback;
+        let uri = Uri::parse("https://example.com/doc").unwrap();
+        let meta = cb.lookup_fetch_metadata(&uri).await;
+        assert_eq!(meta.etag, None);
+        assert_eq!(meta.last_modified, None);
     }
 }

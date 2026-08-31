@@ -102,6 +102,26 @@ async fn resource_dates_and_external(
     )
 }
 
+/// Read `external_last_modified` straight off the `resources` row —
+/// deliberately not a `ChunkRecord`/`get_chunk` column (see
+/// `RetrievalStore::upsert_chunks_and_blocks`'s doc comment), so this goes
+/// around the trait for assertions, same posture as `resource_dates_and_external`.
+async fn resource_external_last_modified(
+    backend: &SqliteBackend,
+    resource_id: &str,
+) -> Option<String> {
+    let conn = backend.conn.reader();
+    let mut rows = conn
+        .query(
+            "SELECT external_last_modified FROM resources WHERE store_id = 'store-1' AND id = ?",
+            libsql::params![resource_id.to_string()],
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().expect("resource row must exist");
+    row.get(0).unwrap()
+}
+
 /// Regression test for issue C4 on the tenant read path
 /// (`tenant::rows::row_to_chunk_record_strict`, via
 /// `connection::parse_metadata_json_lenient`): a resource row with
@@ -506,6 +526,118 @@ async fn upsert_resource_persists_external_id_and_external_etag() {
     );
 }
 
+/// `upsert_chunks_and_blocks`'s trailing `external_last_modified` parameter
+/// (not a `ChunkRecord` field — see its doc comment) lands on the `resources`
+/// row on a plain insert (`replaces_resource_id: None`).
+#[tokio::test]
+async fn upsert_chunks_and_blocks_persists_external_last_modified() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("localdb.db");
+    let backend = backend_with_store_and_source(&path).await;
+    let handle = backend.retrieval_store("store-1").await.unwrap();
+
+    let record = chunk_record("2026-07-01T00:00:00Z", None);
+    handle
+        .upsert_chunks_and_blocks(
+            "store-1",
+            "doc-1",
+            vec![record],
+            &[],
+            None,
+            Some("Wed, 21 Oct 2015 07:28:00 GMT"),
+        )
+        .await
+        .unwrap();
+
+    let stored = resource_external_last_modified(&backend, "doc-1").await;
+    assert_eq!(stored.as_deref(), Some("Wed, 21 Oct 2015 07:28:00 GMT"));
+}
+
+/// A content-changed replace (`replaces_resource_id: Some(old_id)`) deletes
+/// the old row before inserting the new one, so it always lands on the plain
+/// `INSERT` values — including a rotated `external_last_modified` — rather
+/// than the `ON CONFLICT` branch (which deliberately omits this column; see
+/// `upsert_chunks_inner`'s doc comment).
+#[tokio::test]
+async fn upsert_chunks_and_blocks_replace_updates_external_last_modified() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("localdb.db");
+    let backend = backend_with_store_and_source(&path).await;
+    let handle = backend.retrieval_store("store-1").await.unwrap();
+
+    let first = chunk_record("2026-07-01T00:00:00Z", None);
+    handle
+        .upsert_chunks_and_blocks(
+            "store-1",
+            "doc-1",
+            vec![first],
+            &[],
+            None,
+            Some("Wed, 21 Oct 2015 07:28:00 GMT"),
+        )
+        .await
+        .unwrap();
+
+    let mut second = chunk_record("2026-08-01T00:00:00Z", None);
+    second.text = "different chunk text entirely".to_string();
+    handle
+        .upsert_chunks_and_blocks(
+            "store-1",
+            "doc-1",
+            vec![second],
+            &[],
+            Some("doc-1"),
+            Some("Thu, 22 Oct 2015 07:28:00 GMT"),
+        )
+        .await
+        .unwrap();
+
+    let stored = resource_external_last_modified(&backend, "doc-1").await;
+    assert_eq!(stored.as_deref(), Some("Thu, 22 Oct 2015 07:28:00 GMT"));
+}
+
+/// `upsert_chunks_inner`'s `ON CONFLICT` deliberately includes
+/// `external_last_modified` (see its doc comment) so a same-resource-id
+/// replace via `upsert_chunks_and_blocks` (the policy-only-reindex case)
+/// lands a freshly-fetched validator. The flip side, pinned here: the plain
+/// (non-`_and_blocks`) `upsert_chunks` path has no per-call value for this
+/// column and always passes `None`, so it nulls the column out if it
+/// happens to hit an existing resource_id — the same contract
+/// `external_etag`/`modified_at`/the date columns already have for that
+/// same caller, not a special case for this one column.
+#[tokio::test]
+async fn plain_upsert_chunks_nulls_external_last_modified_like_its_sibling_columns() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("localdb.db");
+    let backend = backend_with_store_and_source(&path).await;
+    let handle = backend.retrieval_store("store-1").await.unwrap();
+
+    let first = chunk_record("2026-07-01T00:00:00Z", None);
+    handle
+        .upsert_chunks_and_blocks(
+            "store-1",
+            "doc-1",
+            vec![first],
+            &[],
+            None,
+            Some("Wed, 21 Oct 2015 07:28:00 GMT"),
+        )
+        .await
+        .unwrap();
+
+    // A plain `upsert_chunks` call for the SAME resource_id — the `ON
+    // CONFLICT` branch.
+    let second = chunk_record("2026-07-01T00:00:00Z", None);
+    handle.upsert_chunks(vec![second]).await.unwrap();
+
+    let stored = resource_external_last_modified(&backend, "doc-1").await;
+    assert_eq!(
+        stored, None,
+        "a plain upsert_chunks call has no value for this column and \
+         overwrites it with NULL, exactly like every sibling column"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // update_resource_metadata (issue #176: metadata-only incremental update)
 // ---------------------------------------------------------------------------
@@ -598,6 +730,38 @@ async fn metadata_only_update_does_not_touch_chunks_embeddings_or_fts() {
     assert_eq!(date_parsed.as_deref(), Some("2026-07-30"));
     assert_eq!(external_id.as_deref(), Some("urn:entry:9"));
     assert_eq!(external_etag.as_deref(), Some("\"etag-9\""));
+}
+
+/// `update_resource_metadata`'s `ResourceRecord.external_last_modified`
+/// lands on the `resources` row, same write path as `external_etag` above.
+#[tokio::test]
+async fn update_resource_metadata_persists_external_last_modified() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("localdb.db");
+    let backend = backend_with_store_and_source(&path).await;
+    let handle = backend.retrieval_store("store-1").await.unwrap();
+
+    handle
+        .upsert_chunks(vec![chunk_record("2026-07-01T00:00:00Z", None)])
+        .await
+        .unwrap();
+
+    let update = ResourceRecord {
+        metadata: Metadata::default(),
+        external_id: None,
+        external_etag: Some("\"etag-9\"".to_string()),
+        external_last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string()),
+        modified_at: None,
+        date_original: None,
+        date_parsed: None,
+    };
+    handle
+        .update_resource_metadata("store-1", "doc-1", &update)
+        .await
+        .unwrap();
+
+    let stored = resource_external_last_modified(&backend, "doc-1").await;
+    assert_eq!(stored.as_deref(), Some("Wed, 21 Oct 2015 07:28:00 GMT"));
 }
 
 /// `index_updated_at` must still bump on a metadata-only update — the row
