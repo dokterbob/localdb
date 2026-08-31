@@ -5621,13 +5621,14 @@ mod tests {
             );
         }
 
-        /// H1 regression — must never regress: a mismatched `policy_version`
-        /// never replays a stored validator. A 304 returns no bytes, so a
+        /// The suppression rule, and the one behavior in this seam that must
+        /// never regress: a mismatched `policy_version` never replays a
+        /// stored validator. A 304 returns no bytes, so a
         /// resource that needs re-chunking under a changed policy could
         /// never be re-chunked if it were allowed to answer 304 — silently
         /// freezing the document at the old policy forever.
         #[tokio::test]
-        async fn lookup_fetch_metadata_h1_mismatched_policy_version_returns_empty() {
+        async fn lookup_fetch_metadata_returns_empty_when_policy_version_differs() {
             let store_id = "store-1";
             let source = make_source_with_preset(store_id, "prose");
             let mut config = make_ingestion_config(store_id);
@@ -5806,6 +5807,81 @@ mod tests {
             );
             let cached = callback.doc_index.get(uri_str).unwrap();
             assert_eq!(cached.external_etag.as_deref(), Some("v1"));
+        }
+
+        /// A 304 may rotate one validator and say nothing about the other.
+        /// RFC 9111 makes silence mean "unchanged", so the field the response
+        /// omitted must survive — dropping it would disable half of
+        /// conditional GET for that resource on every subsequent run.
+        ///
+        /// This asserts against the `ResourceRecord` actually handed to the
+        /// store rather than against read-back chunk state, because
+        /// `external_last_modified` is deliberately not a denormalized
+        /// `ChunkRecord` field and so has no per-chunk copy to read back.
+        #[tokio::test]
+        async fn on_validators_refreshed_preserves_the_validator_a_304_omitted() {
+            let store_id = "store-1";
+            let source = make_source_with_preset(store_id, "prose");
+            let config = make_ingestion_config(store_id);
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let uri_str = "https://example.com/partial";
+            let text = "Content whose validators rotate one at a time.";
+
+            let mut doc_index = DocumentIndex::new();
+            let mut seeded =
+                seed_indexed_with_etag(&store, &embedder, &config, &source, uri_str, text, "v1")
+                    .await;
+            seeded.external_last_modified = Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string());
+            doc_index.upsert(seeded);
+
+            let mut callback =
+                make_pipeline_callback(&source, &mut doc_index, &store, &embedder, &config);
+            let uri = Uri::parse(uri_str).unwrap();
+
+            // A 304 rotating only the ETag must leave Last-Modified alone.
+            callback
+                .on_validators_refreshed(
+                    &uri,
+                    &FetchMetadata {
+                        etag: Some("v2".to_string()),
+                        last_modified: None,
+                    },
+                )
+                .await;
+
+            let updates = store.metadata_updates().await;
+            let (_, record) = updates.last().expect("the refresh must reach the store");
+            assert_eq!(record.external_etag.as_deref(), Some("v2"));
+            assert_eq!(
+                record.external_last_modified.as_deref(),
+                Some("Wed, 21 Oct 2015 07:28:00 GMT"),
+                "a 304 that omitted Last-Modified must not clear the stored one"
+            );
+
+            // And the mirror image: rotating only Last-Modified must leave
+            // the ETag alone.
+            callback
+                .on_validators_refreshed(
+                    &uri,
+                    &FetchMetadata {
+                        etag: None,
+                        last_modified: Some("Thu, 22 Oct 2015 07:28:00 GMT".to_string()),
+                    },
+                )
+                .await;
+
+            let updates = store.metadata_updates().await;
+            let (_, record) = updates.last().expect("the refresh must reach the store");
+            assert_eq!(
+                record.external_etag.as_deref(),
+                Some("v2"),
+                "a 304 that omitted ETag must not clear the stored one"
+            );
+            assert_eq!(
+                record.external_last_modified.as_deref(),
+                Some("Thu, 22 Oct 2015 07:28:00 GMT")
+            );
         }
 
         /// The metadata_hash trap, pinned: `external_etag` IS an input to

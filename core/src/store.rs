@@ -681,6 +681,18 @@ pub struct FakeStore {
     /// `store_id`-agnostic lookup below — `FakeStore` is used single-store-at-
     /// a-time in tests, so `store_id` is accepted but not partitioned on).
     blocks: tokio::sync::RwLock<HashMap<String, Vec<crate::block::Block>>>,
+    /// Every `ResourceRecord` handed to `update_resource_metadata`, in call
+    /// order, paired with its `resource_id`.
+    ///
+    /// `FakeStore` otherwise models a resource's persisted state as the
+    /// denormalized fields on its `ChunkRecord`s, which is faithful for every
+    /// column `ChunkRecord` carries — but `external_last_modified` is
+    /// deliberately not one of them (it is routed through `ResourceRecord`
+    /// instead of becoming another per-chunk denormalized copy). Without this
+    /// log, a caller's choice of `external_last_modified` would be invisible
+    /// to any test using this store, so the preserve-vs-overwrite behavior on
+    /// a partially-populated update could not be pinned at all.
+    metadata_updates: tokio::sync::RwLock<Vec<(String, ResourceRecord)>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -690,7 +702,14 @@ impl FakeStore {
         Self {
             chunks: tokio::sync::RwLock::new(Vec::new()),
             blocks: tokio::sync::RwLock::new(HashMap::new()),
+            metadata_updates: tokio::sync::RwLock::new(Vec::new()),
         }
+    }
+
+    /// The `ResourceRecord`s passed to `update_resource_metadata`, in call
+    /// order. See the field's own comment for why this log exists.
+    pub async fn metadata_updates(&self) -> Vec<(String, ResourceRecord)> {
+        self.metadata_updates.read().await.clone()
     }
 }
 
@@ -892,6 +911,10 @@ impl RetrievalStore for FakeStore {
         resource_id: &str,
         record: &ResourceRecord,
     ) -> Result<(), Error> {
+        self.metadata_updates
+            .write()
+            .await
+            .push((resource_id.to_string(), record.clone()));
         let mut chunks = self.chunks.write().await;
         let mut touched = false;
         for chunk in chunks
