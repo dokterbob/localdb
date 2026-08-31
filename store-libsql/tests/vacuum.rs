@@ -117,6 +117,7 @@ async fn vacuum_shrinks_store_file_after_bulk_delete_and_search_still_works() {
                 config_json: None,
                 feed_etag: None,
                 feed_last_modified: None,
+                feed_inputs_digest: None,
             })
             .await
             .unwrap();

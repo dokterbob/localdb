@@ -641,6 +641,7 @@ impl AppState {
             // hop ever writes these columns, against an existing row.
             feed_etag: None,
             feed_last_modified: None,
+            feed_inputs_digest: None,
         };
         self.inner.backend.upsert_source(&source_row).await?;
 

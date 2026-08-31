@@ -229,6 +229,8 @@ async fn run_two_feeds(first_feed: Vec<u8>, second_feed: Vec<u8>) -> (FakeStore,
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Retain,
+                document_validators: FetchMetadata::default(),
+                stored_inputs_digest: None,
             },
         )
         .await

@@ -47,6 +47,7 @@ fn make_path_source(id: &str, store_id: &str, root: &str) -> SourceRow {
         config_json: None,
         feed_etag: None,
         feed_last_modified: None,
+        feed_inputs_digest: None,
     }
 }
 
@@ -65,6 +66,7 @@ fn make_url_source(id: &str, store_id: &str, url: &str) -> SourceRow {
         config_json: None,
         feed_etag: None,
         feed_last_modified: None,
+        feed_inputs_digest: None,
     }
 }
 
@@ -83,6 +85,7 @@ fn make_feed_source(id: &str, store_id: &str, url: &str, config_json: Option<&st
         config_json: config_json.map(|s| s.to_string()),
         feed_etag: None,
         feed_last_modified: None,
+        feed_inputs_digest: None,
     }
 }
 
@@ -736,6 +739,7 @@ async fn feed_source_round_trips_feed_etag_and_feed_last_modified() {
     let mut s = make_feed_source("src-1", "store-1", "https://example.com/feed.xml", None);
     s.feed_etag = Some("\"abc\"".to_string());
     s.feed_last_modified = Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string());
+    s.feed_inputs_digest = Some("digest-abc".to_string());
     api.upsert_source(&s).await.unwrap();
 
     let got = api.get_source("src-1").await.unwrap().unwrap();
@@ -744,6 +748,7 @@ async fn feed_source_round_trips_feed_etag_and_feed_last_modified() {
         got.feed_last_modified.as_deref(),
         Some("Wed, 21 Oct 2015 07:28:00 GMT")
     );
+    assert_eq!(got.feed_inputs_digest.as_deref(), Some("digest-abc"));
 }
 
 #[tokio::test]
@@ -757,11 +762,13 @@ async fn feed_source_with_null_feed_validators_round_trips() {
     let s = make_feed_source("src-1", "store-1", "https://example.com/feed.xml", None);
     assert_eq!(s.feed_etag, None);
     assert_eq!(s.feed_last_modified, None);
+    assert_eq!(s.feed_inputs_digest, None);
     api.upsert_source(&s).await.unwrap();
 
     let got = api.get_source("src-1").await.unwrap().unwrap();
     assert_eq!(got.feed_etag, None);
     assert_eq!(got.feed_last_modified, None);
+    assert_eq!(got.feed_inputs_digest, None);
 }
 
 /// The positive case the `job_exec` validator-refresh persistence hop
@@ -807,6 +814,7 @@ async fn upsert_source_same_id_changed_url_nulls_feed_validators() {
     let mut s = make_feed_source("src-1", "store-1", "https://example.com/old-feed.xml", None);
     s.feed_etag = Some("\"stale\"".to_string());
     s.feed_last_modified = Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string());
+    s.feed_inputs_digest = Some("digest-stale".to_string());
     api.upsert_source(&s).await.unwrap();
 
     // Edit the url in place and re-upsert with the same id — carrying the
@@ -823,6 +831,10 @@ async fn upsert_source_same_id_changed_url_nulls_feed_validators() {
     assert_eq!(
         got.feed_last_modified, None,
         "a changed url must null feed_last_modified even if the caller passed a value"
+    );
+    assert_eq!(
+        got.feed_inputs_digest, None,
+        "the digest describes validators that no longer exist, so it goes with them"
     );
 }
 
@@ -847,6 +859,108 @@ async fn upsert_source_same_id_both_urls_null_preserves_feed_columns() {
     let got = api.get_source("src-1").await.unwrap().unwrap();
     assert_eq!(got.url, None);
     assert_eq!(got.feed_etag.as_deref(), Some("\"irrelevant-but-present\""));
+}
+
+// ---------------------------------------------------------------------------
+// update_source_feed_cache
+// ---------------------------------------------------------------------------
+
+/// The race this method exists for: an index job persists cache state from a
+/// `SourceRow` it snapshotted at the start of the run, and a `source delete`
+/// can land in between. `upsert_source` would re-insert the row and silently
+/// undo a deletion the scheduler has already acted on; an update-only write
+/// reports the miss instead.
+#[tokio::test]
+async fn update_source_feed_cache_on_a_missing_id_reports_no_row() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+
+    let updated = api
+        .update_source_feed_cache("src-gone", Some("\"v1\""), None, Some("digest-1"))
+        .await
+        .unwrap();
+    assert!(!updated, "no row matched, and none may be created");
+    assert!(
+        api.get_source("src-gone").await.unwrap().is_none(),
+        "an update-only write must never resurrect a deleted source"
+    );
+}
+
+/// Everything outside the three cache columns must survive untouched — the
+/// caller passes only an id and the cache values, so any other column that
+/// moved would mean the write is reaching further than it claims.
+#[tokio::test]
+async fn update_source_feed_cache_touches_only_the_three_cache_columns() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    let before = make_feed_source(
+        "src-1",
+        "store-1",
+        "https://example.com/feed.xml",
+        Some(r#"{"max_entries":10,"fetch_full_content":true}"#),
+    );
+    api.upsert_source(&before).await.unwrap();
+
+    let updated = api
+        .update_source_feed_cache(
+            "src-1",
+            Some("\"v2\""),
+            Some("Thu, 22 Oct 2015 07:28:00 GMT"),
+            Some("digest-2"),
+        )
+        .await
+        .unwrap();
+    assert!(updated);
+
+    let after = api.get_source("src-1").await.unwrap().unwrap();
+    assert_eq!(after.feed_etag.as_deref(), Some("\"v2\""));
+    assert_eq!(
+        after.feed_last_modified.as_deref(),
+        Some("Thu, 22 Oct 2015 07:28:00 GMT")
+    );
+    assert_eq!(after.feed_inputs_digest.as_deref(), Some("digest-2"));
+
+    // Compare the whole row against the original with only the three cache
+    // columns overwritten: a field-by-field list would silently stop
+    // covering any column added later.
+    assert_eq!(
+        after,
+        SourceRow {
+            feed_etag: after.feed_etag.clone(),
+            feed_last_modified: after.feed_last_modified.clone(),
+            feed_inputs_digest: after.feed_inputs_digest.clone(),
+            ..before
+        }
+    );
+}
+
+/// `None` means `NULL`, not "leave alone": a 200 that carries no `ETag` is
+/// the origin withdrawing one, and the stored column has to follow.
+#[tokio::test]
+async fn update_source_feed_cache_clears_columns_to_null() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    let mut s = make_feed_source("src-1", "store-1", "https://example.com/feed.xml", None);
+    s.feed_etag = Some("\"v1\"".to_string());
+    s.feed_last_modified = Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string());
+    s.feed_inputs_digest = Some("digest-1".to_string());
+    api.upsert_source(&s).await.unwrap();
+
+    assert!(api
+        .update_source_feed_cache("src-1", None, None, None)
+        .await
+        .unwrap());
+
+    let after = api.get_source("src-1").await.unwrap().unwrap();
+    assert_eq!(after.feed_etag, None);
+    assert_eq!(after.feed_last_modified, None);
+    assert_eq!(after.feed_inputs_digest, None);
 }
 
 mod documents;

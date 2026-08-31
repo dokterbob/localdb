@@ -79,6 +79,7 @@ pub(super) fn row_to_source(row: &libsql::Row) -> Result<SourceRow, Error> {
     let config_json: Option<String> = row.get(10).map_err(map_libsql_err)?;
     let feed_etag: Option<String> = row.get(11).map_err(map_libsql_err)?;
     let feed_last_modified: Option<String> = row.get(12).map_err(map_libsql_err)?;
+    let feed_inputs_digest: Option<String> = row.get(13).map_err(map_libsql_err)?;
     let include: Vec<String> =
         serde_json::from_str(&include_json).map_err(|e| Error::Internal {
             message: format!("invalid source.include JSON: {e}"),
@@ -103,5 +104,6 @@ pub(super) fn row_to_source(row: &libsql::Row) -> Result<SourceRow, Error> {
         config_json,
         feed_etag,
         feed_last_modified,
+        feed_inputs_digest,
     })
 }

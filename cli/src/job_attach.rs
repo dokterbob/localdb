@@ -837,6 +837,7 @@ mod tests {
                 config_json: None,
                 feed_etag: None,
                 feed_last_modified: None,
+                feed_inputs_digest: None,
             })
             .await
             .unwrap();

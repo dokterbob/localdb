@@ -79,6 +79,23 @@ pub struct SourceRow {
     /// [`Self::feed_etag`]. Same population rule, same null-on-URL-change
     /// requirement.
     pub feed_last_modified: Option<String>,
+    /// `crate::ids::compute_feed_inputs_digest` of the local inputs in force
+    /// when the two validators above were stored.
+    ///
+    /// The validators speak for the origin's bytes; this speaks for our own
+    /// side of the pipeline. A run whose inputs no longer match refuses to
+    /// replay them and refetches unconditionally, because an origin has no
+    /// way to signal that *our* indexing policy changed. `None` means
+    /// "inputs unknown" — every row predating this column — and mismatches
+    /// any current digest, so such a row refetches once rather than trusting
+    /// a validator captured before the guard existed.
+    ///
+    /// Written in the same hop as the validators, never separately: the pair
+    /// is one fact ("these validators were captured under these inputs"), and
+    /// recording new inputs against validators captured under the old ones
+    /// would mark the cache trustworthy for a reprocessing that never
+    /// happened.
+    pub feed_inputs_digest: Option<String>,
 }
 
 /// One row of `StoreBackend::largest_tables`: an on-disk table's name and its
@@ -148,6 +165,31 @@ pub trait StoreBackend: Send + Sync + 'static {
         value: &str,
         store_id: &str,
     ) -> Result<Option<SourceRow>, Error>;
+
+    /// Rewrite just a feed source's transport cache columns —
+    /// `feed_etag`, `feed_last_modified`, `feed_inputs_digest` — leaving
+    /// every other column of the row alone. Returns whether a row was
+    /// actually updated.
+    ///
+    /// Update-only, deliberately, where [`Self::upsert_source`] would do:
+    /// this runs at the end of an index job, from a `SourceRow` snapshot
+    /// taken when the job started. A `source delete` landing in between
+    /// would make an upsert **re-insert** the row — silently undoing a
+    /// deletion the scheduler has already acted on. `Ok(false)` is that
+    /// race, reported rather than papered over; it is not an error, and the
+    /// job that sees it has nothing left to do. `upsert_source` keeps its
+    /// insert-or-update semantics for the callers that legitimately need
+    /// them.
+    ///
+    /// The three columns move together because they are one fact — see
+    /// [`SourceRow::feed_inputs_digest`].
+    async fn update_source_feed_cache(
+        &self,
+        id: &str,
+        feed_etag: Option<&str>,
+        feed_last_modified: Option<&str>,
+        feed_inputs_digest: Option<&str>,
+    ) -> Result<bool, Error>;
 
     /// Look up a single document by id.
     ///

@@ -87,6 +87,16 @@ impl StoreBackend for FakeBackend {
         unimplemented!("not exercised by the document read model")
     }
 
+    async fn update_source_feed_cache(
+        &self,
+        _id: &str,
+        _feed_etag: Option<&str>,
+        _feed_last_modified: Option<&str>,
+        _feed_inputs_digest: Option<&str>,
+    ) -> Result<bool, Error> {
+        unimplemented!("not exercised by the document read model")
+    }
+
     async fn find_document(
         &self,
         doc_id: &str,

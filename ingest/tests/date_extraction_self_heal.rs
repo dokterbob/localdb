@@ -294,6 +294,7 @@ async fn reindex_with_new_date_extraction_self_heals_as_metadata_only_update() {
         progress: None,
         deletion: DeletionPolicy::Retain,
         document_validators: FetchMetadata::default(),
+        stored_inputs_digest: None,
     };
     let result1 = run_source_ingestion(&source, &ingestor1, deps1)
         .await
@@ -320,6 +321,7 @@ async fn reindex_with_new_date_extraction_self_heals_as_metadata_only_update() {
         progress: None,
         deletion: DeletionPolicy::Retain,
         document_validators: FetchMetadata::default(),
+        stored_inputs_digest: None,
     };
     let result2 = run_source_ingestion(&source, &ingestor2, deps2)
         .await

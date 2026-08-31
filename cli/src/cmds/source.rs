@@ -379,6 +379,7 @@ impl DaemonAwareCommand for SourceAddCmd<'_> {
                     config_json: parsed.config_json.clone(),
                     feed_etag: None,
                     feed_last_modified: None,
+                    feed_inputs_digest: None,
                 }
             } else {
                 SourceRow {
@@ -412,6 +413,7 @@ impl DaemonAwareCommand for SourceAddCmd<'_> {
                     config_json: None,
                     feed_etag: None,
                     feed_last_modified: None,
+                    feed_inputs_digest: None,
                 }
             };
 
@@ -1054,6 +1056,7 @@ mod tests {
             config_json: None,
             feed_etag: None,
             feed_last_modified: None,
+            feed_inputs_digest: None,
         }
     }
 
@@ -1107,6 +1110,7 @@ mod tests {
             config_json: config_json.map(str::to_string),
             feed_etag: None,
             feed_last_modified: None,
+            feed_inputs_digest: None,
         }
     }
 
@@ -1125,6 +1129,7 @@ mod tests {
             config_json: None,
             feed_etag: None,
             feed_last_modified: None,
+            feed_inputs_digest: None,
         }
     }
 
@@ -1143,6 +1148,7 @@ mod tests {
             config_json: None,
             feed_etag: None,
             feed_last_modified: None,
+            feed_inputs_digest: None,
         }
     }
 

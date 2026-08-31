@@ -130,6 +130,7 @@ fn row(kind: SourceKind) -> crate::backend::SourceRow {
         config_json: None,
         feed_etag: None,
         feed_last_modified: None,
+        feed_inputs_digest: None,
     }
 }
 

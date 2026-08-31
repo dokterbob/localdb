@@ -276,6 +276,7 @@ mod tests {
             config_json: None,
             feed_etag: None,
             feed_last_modified: None,
+            feed_inputs_digest: None,
         };
         let core = source_row_to_core_source(&src);
         assert_eq!(core.id, "src-1");
@@ -305,6 +306,7 @@ mod tests {
             config_json: None,
             feed_etag: None,
             feed_last_modified: None,
+            feed_inputs_digest: None,
         };
         let core = source_row_to_core_source(&src);
         match &core.spec {
@@ -330,6 +332,7 @@ mod tests {
             config_json: None,
             feed_etag: None,
             feed_last_modified: None,
+            feed_inputs_digest: None,
         };
         let core = source_row_to_core_source(&src);
         match &core.spec {
@@ -361,6 +364,7 @@ mod tests {
             config_json: None,
             feed_etag: None,
             feed_last_modified: None,
+            feed_inputs_digest: None,
         };
         let core = source_row_to_core_source(&src);
         match &core.spec {
@@ -389,6 +393,7 @@ mod tests {
             config_json: Some(r#"{"max_entries":25,"fetch_full_content":false}"#.into()),
             feed_etag: None,
             feed_last_modified: None,
+            feed_inputs_digest: None,
         };
         let core = source_row_to_core_source(&src);
         assert_eq!(core.kind, SourceKind::Feed);
@@ -425,6 +430,7 @@ mod tests {
             config_json: None,
             feed_etag: None,
             feed_last_modified: None,
+            feed_inputs_digest: None,
         };
         let core = source_row_to_core_source(&src);
         match &core.spec {
@@ -459,6 +465,7 @@ mod tests {
             config_json: Some("{not valid json".into()),
             feed_etag: None,
             feed_last_modified: None,
+            feed_inputs_digest: None,
         };
         let core = source_row_to_core_source(&src);
         match &core.spec {

@@ -646,6 +646,7 @@ mod tests {
                 docs_metadata_updated: 0,
                 error_count: 0,
                 document_validators: None,
+                document_inputs_digest: None,
             },
         });
 
@@ -691,6 +692,7 @@ mod tests {
                 docs_metadata_updated: 0,
                 error_count: 0,
                 document_validators: None,
+                document_inputs_digest: None,
             },
         });
 
@@ -742,6 +744,7 @@ mod tests {
                 docs_metadata_updated: 0,
                 error_count: 0,
                 document_validators: None,
+                document_inputs_digest: None,
             },
         });
 

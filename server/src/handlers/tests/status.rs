@@ -97,6 +97,17 @@ impl StoreBackend for TrackingBackend {
     ) -> Result<Option<SourceRow>, Error> {
         self.inner.find_source_by_root_or_url(value, store_id).await
     }
+    async fn update_source_feed_cache(
+        &self,
+        id: &str,
+        feed_etag: Option<&str>,
+        feed_last_modified: Option<&str>,
+        feed_inputs_digest: Option<&str>,
+    ) -> Result<bool, Error> {
+        self.inner
+            .update_source_feed_cache(id, feed_etag, feed_last_modified, feed_inputs_digest)
+            .await
+    }
     async fn find_document(
         &self,
         doc_id: &str,
