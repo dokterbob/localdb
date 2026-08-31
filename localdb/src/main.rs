@@ -5,7 +5,7 @@
 //!
 //! See specs/05-surfaces.md §2 for the full subcommand table.
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use cli::CliContext;
 
 /// Build-stamp version strings, from the vergen-gitcl env vars emitted by
@@ -209,6 +209,13 @@ pub enum Command {
         /// Max characters of snippet text shown per result in human-readable output.
         #[arg(long, default_value = "1000", value_parser = clap::value_parser!(usize))]
         content_length: usize,
+
+        /// The ten metadata-filter flags, boxed and flattened: `Command` is a clap-derived
+        /// enum, so an unboxed 10-`Option<String>`-field variant here would make `Search`
+        /// dominate every other variant's size (clippy `large_enum_variant`) — boxing keeps
+        /// the common no-filters path just as cheap as any other subcommand.
+        #[command(flatten)]
+        filters: Box<SearchFilterArgs>,
     },
 
     /// Alias for `source add`: add one or more sources to a store.
@@ -253,6 +260,90 @@ pub enum Command {
     /// build/release tooling only.
     #[command(subcommand, hide = true)]
     Internal(InternalCommand),
+}
+
+/// `search`'s ten metadata-filter flags, flattened into
+/// `Command::Search` via `#[command(flatten)] filters: Box<SearchFilterArgs>`
+/// — boxed so this large, all-`Option<String>` group doesn't make `Search`
+/// dominate `Command`'s overall enum size. Field names are hand-written
+/// literals (not derived from `DateAxis` at runtime — `#[arg(long = ...)]`
+/// only accepts a `syn::LitStr`), so they, `core::SearchFilters`'s own field
+/// docs, and the MCP tool schema description text must be kept in sync by
+/// hand; `localdb/tests/cli_search_filters.rs`'s
+/// `date_axis_describe_text_matches_cli_help_and_mcp_schema` is the
+/// consistency guard.
+#[derive(Debug, Args)]
+pub struct SearchFilterArgs {
+    /// Restrict to resources whose URI starts with this prefix (e.g. "file:///docs/").
+    /// No date or duration parsing is applied. Matched with SQL LIKE, so a literal
+    /// `%` or `_` in the prefix acts as a wildcard.
+    #[arg(long)]
+    path: Option<String>,
+
+    /// Restrict to resources with this exact MIME type (e.g. "text/markdown"). Matched
+    /// literally — no date or duration parsing.
+    #[arg(long)]
+    mime: Option<String>,
+
+    /// Lower bound (inclusive) on the added date — when this resource was first indexed.
+    /// Accepts a full RFC 3339 datetime, a partial date (YYYY, YYYY-MM, YYYY-MM-DD), or a
+    /// relative duration such as "7d" or "30m", which always resolves to now minus the
+    /// duration regardless of which bound it fills. Note: "M" means months and "m" means
+    /// minutes in the duration grammar — both parse successfully, so a mistaken capital
+    /// silently produces a bound roughly 44,000 times further out. NULL rule: a resource with
+    /// no value on this axis is excluded, regardless of the bound.
+    #[arg(long)]
+    added_after: Option<String>,
+
+    /// Upper bound (inclusive) on the added date — when this resource was first indexed.
+    /// Same value grammar as --added-after. NULL rule: a resource with no value on this
+    /// axis is excluded, regardless of the bound.
+    #[arg(long)]
+    added_before: Option<String>,
+
+    /// Lower bound (inclusive) on the updated date — when the store last wrote this
+    /// resource's stored state. Same value grammar as --added-after. NULL rule: a
+    /// resource with no value on this axis is excluded, regardless of the bound.
+    #[arg(long)]
+    updated_after: Option<String>,
+
+    /// Upper bound (inclusive) on the updated date — when the store last wrote this
+    /// resource's stored state. Same value grammar as --added-after. NULL rule: a
+    /// resource with no value on this axis is excluded, regardless of the bound.
+    #[arg(long)]
+    updated_before: Option<String>,
+
+    /// Lower bound (inclusive) on the modified date — the source's own claim of when
+    /// this resource was last changed. Same value grammar as --added-after. NULL rule: a
+    /// resource with no claimed modification time is excluded, regardless of the bound.
+    #[arg(long)]
+    modified_after: Option<String>,
+
+    /// Upper bound (inclusive) on the modified date — the source's own claim of when
+    /// this resource was last changed. Same value grammar as --added-after. NULL rule: a
+    /// resource with no claimed modification time is excluded, regardless of the bound.
+    #[arg(long)]
+    modified_before: Option<String>,
+
+    /// Lower bound (inclusive) on the document date — the document's own claimed date
+    /// (Dublin Core dc:date). Same value grammar as --added-after. NULL rule: a resource
+    /// with no claimed document date is excluded, regardless of the bound. Coverage: a
+    /// resource has one only when its source carried one — HTML (JSON-LD or a
+    /// dcterms.date/date meta), Markdown front matter, Office (dcterms:created), PDF
+    /// (/CreationDate or XMP xmp:CreateDate), and feed entries (published/updated).
+    /// Plain text carries none, and any format's metadata may simply omit it.
+    #[arg(long)]
+    document_after: Option<String>,
+
+    /// Upper bound (inclusive) on the document date — the document's own claimed date
+    /// (Dublin Core dc:date). Same value grammar as --added-after. NULL rule: a resource
+    /// with no claimed document date is excluded, regardless of the bound. Coverage: a
+    /// resource has one only when its source carried one — HTML (JSON-LD or a
+    /// dcterms.date/date meta), Markdown front matter, Office (dcterms:created), PDF
+    /// (/CreationDate or XMP xmp:CreateDate), and feed entries (published/updated).
+    /// Plain text carries none, and any format's metadata may simply omit it.
+    #[arg(long)]
+    document_before: Option<String>,
 }
 
 /// Hidden `internal` subcommands (build/release tooling, not user-facing).
@@ -572,7 +663,22 @@ fn main() {
             query,
             limit,
             content_length,
-        } => cli::run_search(&ctx, &query.join(" "), *limit, *content_length),
+            filters,
+        } => {
+            let filters = cli::SearchFilters {
+                path: filters.path.clone(),
+                mime: filters.mime.clone(),
+                added_after: filters.added_after.clone(),
+                added_before: filters.added_before.clone(),
+                updated_after: filters.updated_after.clone(),
+                updated_before: filters.updated_before.clone(),
+                modified_after: filters.modified_after.clone(),
+                modified_before: filters.modified_before.clone(),
+                document_after: filters.document_after.clone(),
+                document_before: filters.document_before.clone(),
+            };
+            cli::run_search(&ctx, &query.join(" "), *limit, *content_length, filters)
+        }
         Command::Add {
             sources,
             refresh,
@@ -841,6 +947,7 @@ mod tests {
             query,
             limit,
             content_length,
+            ..
         } = cli.command
         {
             assert_eq!(query.join(" "), "machine learning");

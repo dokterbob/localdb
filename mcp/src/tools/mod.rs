@@ -279,6 +279,15 @@ pub async fn tool_search(
     if limit == 0 {
         return typed_error("invalid_request", "limit must be at least 1");
     }
+    // Validate the filters before the store lookup, alongside the other
+    // argument checks above. Argument validity is a property of the call,
+    // not of which stores this session happens to expose — behind the
+    // empty-store return, a malformed `added_after` was reported as a
+    // successful empty search rather than `invalid_request`.
+    let metadata_filters = match args.filters.into_metadata_filters() {
+        Ok(f) => f,
+        Err(e) => return typed_error(e.code(), e.to_string()),
+    };
     let store_names = args.stores.unwrap_or_default();
     let store_handles = match select_mcp_stores(stores, &store_names) {
         Ok(handles) => handles,
@@ -291,7 +300,7 @@ pub async fn tool_search(
         query: args.query.clone(),
         leg_k: None,
         top_n: Some(limit),
-        filters: vec![],
+        filters: metadata_filters,
     };
     let response = match SearchOrchestrator::query(&store_handles, embedder, &request).await {
         Ok(r) => r,

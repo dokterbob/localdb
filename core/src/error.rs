@@ -85,6 +85,16 @@ pub enum Error {
     #[error("model missing: {message}")]
     ModelMissing { message: String },
 
+    /// The running daemon is healthy but predates a capability the request
+    /// needs, and would silently answer as though the request had not asked
+    /// for it (`SearchRequest` ignores unknown fields). Distinct from
+    /// [`Error::DaemonUnreachable`]: the daemon answers, it just answers
+    /// wrongly. Message includes the fix (restart the daemon).
+    ///
+    /// CLI exit code: 5
+    #[error("daemon capability unavailable: {message}")]
+    DaemonCapabilityUnavailable { message: String },
+
     /// A conflicting index job is already running for this scope.
     ///
     /// CLI exit code: 4
@@ -144,6 +154,7 @@ impl Error {
             Error::UnsupportedFormat { .. } => "unsupported_format",
             Error::ExtractionFailed { .. } => "extraction_failed",
             Error::ProviderUnavailable { .. } => "provider_unavailable",
+            Error::DaemonCapabilityUnavailable { .. } => "daemon_capability_unavailable",
             Error::ModelMissing { .. } => "model_missing",
             Error::IndexInProgress => "index_in_progress",
             Error::JobCancelled => "job_cancelled",
@@ -191,6 +202,7 @@ impl Error {
             "job_cancelled" => Error::JobCancelled,
             "job_already_terminal" => Error::JobAlreadyTerminal,
             "provider_unavailable" => Error::ProviderUnavailable { message },
+            "daemon_capability_unavailable" => Error::DaemonCapabilityUnavailable { message },
             "model_missing" => Error::ModelMissing { message },
             "rate_limited" => Error::RateLimited { message },
             _ => return None,
@@ -228,6 +240,7 @@ impl Error {
             Error::InvalidConfig { message }
             | Error::InvalidRequest { message }
             | Error::ProviderUnavailable { message }
+            | Error::DaemonCapabilityUnavailable { message }
             | Error::ModelMissing { message }
             | Error::RateLimited { message } => Some(message),
             Error::RuntimeStateLocked
@@ -257,6 +270,7 @@ impl Error {
             | Error::JobCancelled
             | Error::JobAlreadyTerminal => 4,
             Error::DaemonUnreachable
+            | Error::DaemonCapabilityUnavailable { .. }
             | Error::ProviderUnavailable { .. }
             | Error::ModelMissing { .. }
             | Error::RateLimited { .. } => 5,

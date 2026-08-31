@@ -32,6 +32,7 @@ pulldown-cmark = "0.13"
 globset = "0.4"
 schemars = { workspace = true }
 http = { workspace = true }
+humantime = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }

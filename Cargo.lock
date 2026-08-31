@@ -3378,11 +3378,14 @@ name = "localdb"
 version = "0.1.0"
 dependencies = [
  "assert_cmd",
+ "chrono",
  "clap",
  "libsql",
  "localdb-cli",
  "localdb-core",
+ "localdb-mcp",
  "predicates",
+ "schemars",
  "serde_json",
  "tempfile",
  "tokio",
@@ -3427,6 +3430,7 @@ dependencies = [
  "globset",
  "hex",
  "http 1.4.2",
+ "humantime",
  "jsonschema",
  "localdb-core",
  "localdb-extract",

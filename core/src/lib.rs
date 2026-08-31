@@ -24,6 +24,7 @@ pub mod metadata;
 pub mod parser;
 pub mod progress;
 pub mod search;
+pub mod search_filters;
 pub mod snippet;
 pub mod source;
 pub mod store;
@@ -71,6 +72,7 @@ pub use search::{
     clamp_search_limit, rerank_noop, rrf_fuse_global, rrf_score, shape_citation, FusedChunkEntry,
     QueryRequest, QueryResponse, SearchOrchestrator, StoreHandle, SEARCH_MAX_LIMIT,
 };
+pub use search_filters::SearchFilters;
 pub use snippet::truncate_snippet;
 pub use source::source_row_to_source;
 #[cfg(any(test, feature = "test-support"))]

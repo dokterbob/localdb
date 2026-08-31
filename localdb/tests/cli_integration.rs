@@ -2121,6 +2121,103 @@ fn search_routes_to_daemon_when_running() {
     );
 }
 
+/// A daemon that does not advertise search-filter support must make a
+/// filtered search fail loudly, not answer it unfiltered.
+///
+/// `SearchRequest` ignores unknown fields, so a daemon predating search
+/// filters drops them and returns a full result set that is indistinguishable
+/// from a correctly narrowed one — the worst outcome for a scoping request.
+/// The mock here answers `/v1/status` without a `features` list, exactly as an
+/// older daemon would.
+#[test]
+fn filtered_search_refuses_a_daemon_that_does_not_advertise_filter_support() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    let dir = TempDir::new().unwrap();
+    write_default_config(&dir);
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let (listener, port) = start_mock_daemon();
+    let received_paths: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let paths_clone = received_paths.clone();
+
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).is_ok() {
+                paths_clone
+                    .lock()
+                    .unwrap()
+                    .push(request_line.trim().to_string());
+            }
+            loop {
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            // An old daemon's status carries no `features` key at all. If the
+            // CLI were to POST anyway, this would answer with results.
+            let body_resp = if request_line.contains("/v1/status") {
+                r#"{"daemon":true,"store_count":1,"source_count":0,"job_count":0,"stores":[],"database":{}}"#
+            } else {
+                r#"{"citations":[{"chunk_id":"c1","uri":"file:///unfiltered.md"}]}"#
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body_resp.len(),
+                body_resp
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    std::fs::write(
+        data_dir.join("daemon.sock"),
+        format!("http://127.0.0.1:{}", port),
+    )
+    .unwrap();
+
+    let output = cmd_with_dir(&dir)
+        .env("LOCALDB_DAEMON_URL", format!("http://127.0.0.1:{}", port))
+        .args(["search", "--mime", "text/markdown", "hello world"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code().unwrap(),
+        5,
+        "a filtered search against a filter-unaware daemon must exit 5, not return \
+         unfiltered results; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("restart"),
+        "the error must name the fix; got: {stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("unfiltered.md"),
+        "the unfiltered result set must never reach the user"
+    );
+
+    let paths = received_paths.lock().unwrap();
+    assert!(
+        paths.iter().any(|p| p.contains("/v1/status")),
+        "the CLI must probe capabilities before sending filters; received: {paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|p| p.contains("/v1/search")),
+        "the CLI must not POST filters to a daemon that would ignore them; received: {paths:?}"
+    );
+}
+
 /// Daemon-routing: `source add` routes to daemon without panicking.
 ///
 /// Regression test for issue #53: `source add` used the sync `daemon_request`

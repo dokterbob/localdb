@@ -1,6 +1,7 @@
 use localdb_core::citation::Citation;
-use localdb_core::{config::loader::ConfigLoader, Error};
+use localdb_core::{config::loader::ConfigLoader, Error, SearchFilters};
 use serde_json::json;
+use server::search_service::SearchRequest;
 
 use crate::{
     app_db::{load_config_lenient, open_app_db_lenient_or_exit},
@@ -10,8 +11,14 @@ use crate::{
     normalize::{exit_err, format_snippet, print_json, validate_store_name},
 };
 
-/// `localdb search <query> [--limit N] [--content-length N]`
-pub fn run_search(ctx: &CliContext, query: &str, limit: usize, content_length: usize) {
+/// `localdb search <query> [--limit N] [--content-length N] [filters...]`
+pub fn run_search(
+    ctx: &CliContext,
+    query: &str,
+    limit: usize,
+    content_length: usize,
+    filters: SearchFilters,
+) {
     // F9: Reject --limit 0.
     if limit == 0 {
         exit_err(
@@ -30,7 +37,7 @@ pub fn run_search(ctx: &CliContext, query: &str, limit: usize, content_length: u
     }
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    rt.block_on(run_search_async(ctx, query, limit, content_length));
+    rt.block_on(run_search_async(ctx, query, limit, content_length, filters));
 }
 
 /// `search`'s table entry (issue #187 stage 5). `Outcome` is `Vec<Citation>`
@@ -44,6 +51,38 @@ pub fn run_search(ctx: &CliContext, query: &str, limit: usize, content_length: u
 pub(crate) struct SearchCmd<'a> {
     pub(crate) query: &'a str,
     pub(crate) limit: usize,
+    pub(crate) filters: SearchFilters,
+}
+
+/// Fail unless the daemon at `base_url` advertises search-filter support.
+///
+/// Absence is treated as unsupported, which is the only safe reading: a
+/// daemon older than the `features` field omits it entirely, and one older
+/// than search filters would silently drop them and answer unfiltered.
+/// Exits 5 (unavailable) — the daemon is running and healthy, it just cannot
+/// do what was asked — and names the fix, since restarting it resolves this
+/// permanently.
+async fn require_daemon_search_filter_support(base_url: &str) -> Result<(), Error> {
+    let url = format!("{base_url}/v1/status");
+    let status = daemon_request_async(reqwest::Method::GET, &url, None).await?;
+    let supported = status
+        .get("features")
+        .and_then(|f| f.as_array())
+        .is_some_and(|features| {
+            features
+                .iter()
+                .any(|f| f.as_str() == Some("search_filters"))
+        });
+
+    if supported {
+        return Ok(());
+    }
+    Err(Error::DaemonCapabilityUnavailable {
+        message: "the running daemon predates search filters and would ignore them, \
+                  returning unfiltered results; restart it (`localdb serve`) to use \
+                  --path/--mime/date filters, or stop it to search in embedded mode"
+            .to_string(),
+    })
 }
 
 impl DaemonAwareCommand for SearchCmd<'_> {
@@ -55,19 +94,40 @@ impl DaemonAwareCommand for SearchCmd<'_> {
     const SCOPE_POLICY: StoreScopePolicy = StoreScopePolicy::AllStoresAllowEmpty;
 
     async fn run_daemon(&self, ctx: &CliContext, base_url: &str) -> Result<Self::Outcome, Error> {
-        let url = format!("{base_url}/v1/search");
-        let mut body = json!({
-            "query": self.query,
-            "limit": self.limit,
-        });
-        if !ctx.stores.is_empty() {
-            body["store_filter"] = serde_json::Value::Array(
-                ctx.stores
-                    .iter()
-                    .map(|s| serde_json::Value::String(s.clone()))
-                    .collect(),
-            );
+        // A daemon predating search filters ignores the new request fields
+        // rather than rejecting them — `SearchRequest` has no
+        // `deny_unknown_fields` — and answers as though no filter had been
+        // asked for. That is the worst possible failure for a scoping
+        // request: the caller gets a full, unfiltered result set that looks
+        // like a correctly narrowed one. A long-lived daemon outliving a
+        // binary upgrade makes this reachable in normal use.
+        //
+        // So when filters are actually set, confirm the daemon advertises
+        // support before sending them. Only paid for when filtering; an
+        // unfiltered search still goes straight to the POST below.
+        if self.filters.is_any_set() {
+            require_daemon_search_filter_support(base_url).await?;
         }
+
+        let url = format!("{base_url}/v1/search");
+        // Serialize the shared `SearchRequest` struct rather than hand-building
+        // a `serde_json::json!` body: field names between this
+        // CLI-daemon path and `POST /v1/search`'s own `Deserialize` impl can
+        // then never drift apart. Filter values are sent raw (unparsed) —
+        // the daemon runs the exact same `SearchFilters::into_metadata_filters`
+        // validation embedded mode runs, so a malformed date bound surfaces
+        // as the same `invalid_request` / exit 2 either way.
+        let request = SearchRequest {
+            query: self.query.to_string(),
+            store_filter: ctx.stores.clone(),
+            limit: self.limit,
+            cursor: None,
+            filters: self.filters.clone(),
+        };
+        let body = serde_json::to_value(&request).map_err(|e| Error::Internal {
+            message: format!("cannot serialize search request: {e}"),
+            correlation_id: "daemon_search_request_shape".to_string(),
+        })?;
         let value = daemon_request_async(reqwest::Method::POST, &url, Some(body)).await?;
         let citations_json = value.get("citations").cloned().unwrap_or(json!([]));
         serde_json::from_value(citations_json).map_err(|e| Error::Internal {
@@ -84,6 +144,16 @@ impl DaemonAwareCommand for SearchCmd<'_> {
     ) -> Result<Self::Outcome, Error> {
         use localdb_core::clamp_search_limit;
         use localdb_core::search::{QueryRequest, SearchOrchestrator, StoreHandle};
+
+        // Validate the filters first, before the empty-store return and
+        // before the embedder is built. Argument validity is a property of
+        // the invocation, not of database or daemon state, so a malformed
+        // `--added-after not-a-date` must exit 2 identically whether the
+        // database is empty, populated, or fronted by a daemon. Doing it
+        // later meant a storeless database reported "no results" and exit 0,
+        // and a populated one could fail on provider configuration — or
+        // trigger a model download — before ever mentioning the bad value.
+        let filters = self.filters.clone().into_metadata_filters()?;
 
         // specs/05-surfaces.md §2.2, via the one shared resolver every other
         // `-s`-accepting command uses. `AllStoresAllowEmpty` is what makes a
@@ -125,7 +195,7 @@ impl DaemonAwareCommand for SearchCmd<'_> {
             query: self.query.to_string(),
             leg_k: None,
             top_n: Some(clamp_search_limit(self.limit)),
-            filters: vec![],
+            filters,
         };
 
         SearchOrchestrator::query(&store_handles, embedder.as_ref(), &request)
@@ -181,12 +251,20 @@ pub(crate) async fn run_search_async(
     query: &str,
     limit: usize,
     content_length: usize,
+    filters: SearchFilters,
 ) {
     // F1-cli: use lenient loader so search works even with malformed config.
     let config_loader = load_config_lenient(ctx).await;
-    let citations = dispatch(&SearchCmd { query, limit }, ctx, &config_loader, || {
-        open_app_db_lenient_or_exit(ctx, &config_loader)
-    })
+    let citations = dispatch(
+        &SearchCmd {
+            query,
+            limit,
+            filters,
+        },
+        ctx,
+        &config_loader,
+        || open_app_db_lenient_or_exit(ctx, &config_loader),
+    )
     .await;
     render_search_output(&citations, query, content_length, ctx.json);
 }

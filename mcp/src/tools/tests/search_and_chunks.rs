@@ -6,7 +6,8 @@
 use rmcp::model::CallToolResult;
 
 use localdb_core::embedder::FakeEmbedder;
-use localdb_core::store::FakeStore;
+use localdb_core::store::{FakeStore, RetrievalStore};
+use localdb_core::SearchFilters;
 
 use crate::args::{GetChunksArgs, SearchArgs};
 use crate::tools::{
@@ -15,7 +16,7 @@ use crate::tools::{
     SEARCH_DEFAULT_LIMIT,
 };
 
-use super::common::{duplicate_doc_stores, make_descriptor, text_of};
+use super::common::{duplicate_doc_stores, make_chunk, make_descriptor, text_of};
 
 // -----------------------------------------------------------------------
 // Helpers
@@ -27,6 +28,7 @@ fn search_args(query: &str) -> SearchArgs {
         stores: None,
         limit: None,
         content_length: None,
+        filters: SearchFilters::default(),
     }
 }
 
@@ -99,6 +101,100 @@ fn resolve_search_limit_negative_falls_back_to_default() {
     // Mirrors the old raw-JSON `Value::as_u64()` parse, which failed on
     // negative numbers and silently defaulted.
     assert_eq!(resolve_search_limit(Some(-5)), SEARCH_DEFAULT_LIMIT);
+}
+
+// -----------------------------------------------------------------------
+// Metadata filters — per-field parsing is unit-tested once in
+// `localdb_core::search_filters::tests`; these two prove the wiring: a
+// filter narrows results, and a malformed value is a tool-level
+// `invalid_request` error, not a panic or a silently-empty result.
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn search_path_filter_narrows_results() {
+    let store = FakeStore::new();
+    let keep = make_chunk(
+        "chunk-keep",
+        "keep-doc",
+        "store-1",
+        "hello world rust programming",
+    );
+    let skip = make_chunk(
+        "chunk-skip",
+        "skip-doc",
+        "store-1",
+        "hello world rust programming",
+    );
+    store.upsert_chunks(vec![keep, skip]).await.unwrap();
+    let av = AvailableStore::new(make_descriptor("store-1", "mystore"), Box::new(store));
+    let embedder = FakeEmbedder::new(128);
+
+    let mut args = search_args("hello world rust programming");
+    args.filters.path = Some("file:///docs/keep".to_string());
+    let result = tool_search(&[av], &embedder, args).await;
+    assert_ne!(result.is_error, Some(true), "unexpected error: {result:?}");
+
+    let text = text_of(&result);
+    let parsed: serde_json::Value = serde_json::from_str(
+        text.split("\n\n---\n")
+            .next()
+            .expect("text rendering has a JSON prefix"),
+    )
+    .expect("JSON prefix parses");
+    let citations = parsed["citations"].as_array().expect("citations array");
+    assert!(
+        !citations.is_empty(),
+        "expected at least one match: {parsed:?}"
+    );
+    for citation in citations {
+        let uri = citation["uri"].as_str().unwrap();
+        assert!(
+            uri.starts_with("file:///docs/keep"),
+            "path filter should only return matching citations, got uri {uri}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn search_bad_filter_value_returns_invalid_request() {
+    let store = FakeStore::new();
+    let av = AvailableStore::new(make_descriptor("store-1", "mystore"), Box::new(store));
+    let embedder = FakeEmbedder::new(128);
+
+    let mut args = search_args("hello");
+    args.filters.added_after = Some("not-a-date".to_string());
+    let result = tool_search(&[av], &embedder, args).await;
+    assert_eq!(result.is_error, Some(true));
+    let text = text_of(&result);
+    let parsed: serde_json::Value = serde_json::from_str(&text).expect("error body is JSON");
+    assert_eq!(
+        parsed["error"]["code"].as_str().unwrap(),
+        "invalid_request",
+        "error code should be invalid_request"
+    );
+}
+
+/// The same malformed value must be rejected when the session exposes no
+/// stores at all. Argument validity does not depend on store availability:
+/// behind the empty-store early return, this was reported as a successful
+/// empty search, so an agent got `{"citations": []}` for a request that was
+/// never valid.
+#[tokio::test]
+async fn search_bad_filter_value_returns_invalid_request_with_no_stores() {
+    let embedder = FakeEmbedder::new(128);
+
+    let mut args = search_args("hello");
+    args.filters.added_after = Some("not-a-date".to_string());
+    let result = tool_search(&[], &embedder, args).await;
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a malformed filter must not be reported as a successful empty search"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text_of(&result)).expect("error body is JSON");
+    assert_eq!(parsed["error"]["code"].as_str().unwrap(), "invalid_request");
 }
 
 // -----------------------------------------------------------------------
