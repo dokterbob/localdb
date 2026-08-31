@@ -3357,17 +3357,25 @@ mod tests {
         // actual emitted level, not just on behavior)
         // -----------------------------------------------------------------
 
-        /// A minimal `MakeWriter` capturing formatted log lines into a
-        /// shared buffer, installed via `tracing::subscriber::set_default`
-        /// — scoped to the current task rather than
-        /// `set_global_default`, mirroring
-        /// `server::daemon::tests::rejected_logging`'s same pattern.
-        #[derive(Clone, Default)]
-        struct LogBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        std::thread_local! {
+            /// Per-thread capture buffer written by `ThreadLocalCapture`
+            /// below. Safe as thread-local rather than shared state because
+            /// `#[tokio::test]` (`rt`, no `rt-multi-thread`) keeps an entire
+            /// test on the one OS thread that started it — see
+            /// `run_capturing_logs`'s doc comment for why this is thread-local
+            /// rather than a fresh swapped-in subscriber per test.
+            static LOG_CAPTURE_BUF: std::cell::RefCell<Vec<u8>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
 
-        impl std::io::Write for LogBuf {
+        /// A `MakeWriter` that always writes to the *current* thread's
+        /// `LOG_CAPTURE_BUF`, regardless of which test installed the
+        /// subscriber that owns it.
+        struct ThreadLocalCapture;
+
+        impl std::io::Write for ThreadLocalCapture {
             fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
+                LOG_CAPTURE_BUF.with(|b| b.borrow_mut().extend_from_slice(buf));
                 Ok(buf.len())
             }
             fn flush(&mut self) -> std::io::Result<()> {
@@ -3375,28 +3383,52 @@ mod tests {
             }
         }
 
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ThreadLocalCapture {
             type Writer = Self;
             fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
+                ThreadLocalCapture
             }
         }
 
-        /// Installs a thread-local subscriber capturing every line at
-        /// `DEBUG` and above; drop the returned guard when done observing.
-        fn capture_logs() -> (LogBuf, tracing::subscriber::DefaultGuard) {
-            let buf = LogBuf::default();
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(buf.clone())
-                .with_ansi(false)
-                .with_max_level(tracing::Level::DEBUG)
-                .finish();
-            let guard = tracing::subscriber::set_default(subscriber);
-            (buf, guard)
+        static INIT_LOG_CAPTURE: std::sync::Once = std::sync::Once::new();
+
+        /// Installs one `DEBUG`-level subscriber for the whole test binary,
+        /// the first time any test needs to capture logs — deliberately
+        /// global (`set_global_default`), never per-test
+        /// (`tracing::subscriber::set_default`). `tracing`'s
+        /// callsite-interest cache is process-wide, not per-subscriber
+        /// (`tracing_core::callsite`): repeatedly registering and dropping a
+        /// scoped `Dispatch` per test, under `cargo test`'s default
+        /// parallelism, raced that cache badly enough to make `debug!` lines
+        /// flakily vanish even with a per-test serialization lock around the
+        /// swap — verified reproducible both without a lock and with one.
+        /// Installing exactly one `Dispatch` for the process's entire
+        /// lifetime removes the register/drop churn that caused it; per-test
+        /// isolation instead comes from `LOG_CAPTURE_BUF` above.
+        fn ensure_log_capture_installed() {
+            INIT_LOG_CAPTURE.call_once(|| {
+                let subscriber = tracing_subscriber::fmt()
+                    .with_writer(ThreadLocalCapture)
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::DEBUG)
+                    .finish();
+                tracing::subscriber::set_global_default(subscriber)
+                    .expect("installed at most once via std::sync::Once");
+            });
         }
 
-        fn captured_text(buf: &LogBuf) -> String {
-            String::from_utf8(buf.0.lock().unwrap().clone()).unwrap()
+        /// Runs `run_source_ingestion`, returning its result alongside every
+        /// line the run logged at `DEBUG` or above.
+        async fn run_capturing_logs(
+            source: &Source,
+            ingestor: &dyn Ingestor,
+            deps: SourceIngestionDeps<'_>,
+        ) -> (Result<IngestionResult, Error>, String) {
+            ensure_log_capture_installed();
+            LOG_CAPTURE_BUF.with(|b| b.borrow_mut().clear());
+            let result = run_source_ingestion(source, ingestor, deps).await;
+            let captured = LOG_CAPTURE_BUF.with(|b| String::from_utf8(b.borrow().clone()).unwrap());
+            (result, captured)
         }
 
         // -----------------------------------------------------------------
@@ -4539,16 +4571,12 @@ mod tests {
                 progress: None,
                 deletion: DeletionPolicy::Prune,
                 document_validators: FetchMetadata::default(),
+                stored_inputs_digest: None,
                 fetcher: &UnreachableFetcher,
             };
 
-            let (buf, guard) = capture_logs();
-            run_source_ingestion(&source, &ingestor, deps)
-                .await
-                .unwrap();
-            drop(guard);
-
-            let captured = captured_text(&buf);
+            let (result, captured) = run_capturing_logs(&source, &ingestor, deps).await;
+            result.unwrap();
             assert!(
                 captured.contains("WARN") && captured.contains("skipping delete-sweep"),
                 "the path/url zero-seen backstop must still log at WARN, unchanged by \
@@ -7971,16 +7999,12 @@ mod tests {
                     progress: None,
                     deletion: DeletionPolicy::Prune,
                     document_validators: FetchMetadata::default(),
+                    stored_inputs_digest: None,
                     fetcher: &UnreachableFetcher,
                 };
 
-                let (buf, guard) = capture_logs();
-                run_source_ingestion(&source, &ingestor, deps)
-                    .await
-                    .unwrap();
-                drop(guard);
-
-                let captured = captured_text(&buf);
+                let (result, captured) = run_capturing_logs(&source, &ingestor, deps).await;
+                result.unwrap();
                 assert!(
                     captured.contains("DEBUG") && captured.contains("skipping feed liveness sweep"),
                     "the routine feed-304 zero-seen backstop must log at DEBUG; captured: {captured}"
@@ -8016,16 +8040,12 @@ mod tests {
                     progress: None,
                     deletion: DeletionPolicy::Prune,
                     document_validators: FetchMetadata::default(),
+                    stored_inputs_digest: None,
                     fetcher: &UnreachableFetcher,
                 };
 
-                let (buf, guard) = capture_logs();
-                run_source_ingestion(&source, &ingestor, deps)
-                    .await
-                    .unwrap();
-                drop(guard);
-
-                let captured = captured_text(&buf);
+                let (result, captured) = run_capturing_logs(&source, &ingestor, deps).await;
+                result.unwrap();
                 assert!(
                     captured.contains("WARN") && captured.contains("skipping feed liveness sweep"),
                     "an incomplete enumeration is genuinely anomalous and must still warn; \
