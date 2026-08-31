@@ -609,11 +609,11 @@ async fn mtime_is_formatted_as_rfc3339() {
     let path = dir.path().join("doc.md");
     std::fs::write(&path, "# X\n\nY.").unwrap();
 
-    // `format_unix_secs` no longer has a cfg(test) fixed-string shortcut
-    // (its real formatting logic is exercised directly by
-    // `support::format_unix_secs_tests`), so compute the expected value
-    // from the file's actual mtime via the same crate-local helper the
-    // production code path uses, rather than asserting a hardcoded
+    // `format_secs_rfc3339` has no cfg(test) fixed-string shortcut (its real
+    // formatting logic is exercised directly by
+    // `core::ingestion::format_secs_rfc3339_tests`), so compute the expected
+    // value from the file's actual mtime via the same shared `core` helper
+    // the production code path uses, rather than asserting a hardcoded
     // string that would be flaky against the real filesystem clock.
     let expected_secs = std::fs::metadata(&path)
         .unwrap()
@@ -622,7 +622,7 @@ async fn mtime_is_formatted_as_rfc3339() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let expected = crate::support::format_unix_secs(expected_secs);
+    let expected = localdb_core::ingestion::format_secs_rfc3339(expected_secs);
 
     let ingestor = FileIngestor::new(Box::new(AllParser));
     let source = source_with_root(dir.path().to_str().unwrap());
@@ -671,13 +671,13 @@ async fn file_ingestor_added_at_is_now_not_mtime() {
     // plain string comparison against the bracketing wall-clock reads is
     // enough to prove `added_at` came from "now" and not from the (far
     // older) mtime set above.
-    let lower = crate::support::format_unix_secs(
+    let lower = localdb_core::ingestion::format_secs_rfc3339(
         before
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs(),
     );
-    let upper = crate::support::format_unix_secs(
+    let upper = localdb_core::ingestion::format_secs_rfc3339(
         after
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -703,7 +703,7 @@ async fn file_ingestor_modified_at_is_mtime_derived() {
     let file = std::fs::File::open(&path).unwrap();
     file.set_times(std::fs::FileTimes::new().set_modified(old))
         .unwrap();
-    let expected = crate::support::format_unix_secs(1_000_000_000);
+    let expected = localdb_core::ingestion::format_secs_rfc3339(1_000_000_000);
 
     let ingestor = FileIngestor::new(Box::new(AllParser));
     let source = source_with_root(dir.path().to_str().unwrap());

@@ -17,6 +17,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use chrono::{DateTime, SecondsFormat, Utc};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 
 use crate::block::Resource;
@@ -645,11 +646,7 @@ pub fn fail_index_job_with_error(job: &mut IndexJob, error: &Error) {
 pub fn now_rfc3339() -> String {
     #[cfg(not(test))]
     {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let duration = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
-        format_secs_rfc3339(duration.as_secs())
+        Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
     }
     #[cfg(test)]
     {
@@ -657,35 +654,45 @@ pub fn now_rfc3339() -> String {
     }
 }
 
-/// Format a Unix timestamp as RFC 3339 (UTC, no sub-second precision),
-/// without requiring chrono. Public so callers that need an RFC 3339 string
-/// for an instant *other* than now — e.g. `server`'s terminal-job eviction
-/// cutoff (now minus a retention grace) — can
-/// produce one that compares correctly against [`now_rfc3339`] output.
+/// Format a Unix timestamp as RFC 3339 (UTC, no sub-second precision).
+/// Public so callers that need an RFC 3339 string for an instant *other*
+/// than now — e.g. `server`'s terminal-job eviction cutoff (now minus a
+/// retention grace) — can produce one that compares correctly against
+/// [`now_rfc3339`] output.
+///
+/// The canonical form contract (specs/02-domain-model.md): always
+/// `YYYY-MM-DDTHH:MM:SSZ` — `SecondsFormat::Secs` forbids fractional
+/// seconds and the trailing `true` forces a literal `Z` rather than
+/// `+00:00`, matching every other stored timestamp in the system so plain
+/// string comparison stays correct.
 pub fn format_secs_rfc3339(secs: u64) -> String {
-    let (y, mo, d, h, mi, s) = secs_to_ymd_hms(secs);
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, mi, s)
-}
+    // `i64::try_from`, never `as i64`: a wrapping cast turns a `u64` above
+    // `i64::MAX` into a *negative* timestamp, which chrono formats happily as
+    // a pre-epoch instant (`u64::MAX` becomes `1969-12-31T23:59:59Z`). That
+    // is far worse than the out-of-range fallback below — it is a plausible
+    // value that silently sorts before every real row. Fail the conversion
+    // instead, and let both out-of-range paths share one fallback.
+    let formatted = i64::try_from(secs)
+        .ok()
+        .and_then(|secs| DateTime::<Utc>::from_timestamp(secs, 0))
+        .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Secs, true))
+        // Chrono represents years well past 9999 and renders them with a
+        // sign prefix (`+10000-01-01T00:00:00Z`), which is not canonical
+        // form — and `+` sorts below every digit, so such a value would
+        // order before every real row instead of after them. Both
+        // out-of-range paths converge on the fallback below.
+        .filter(|s| crate::dates::is_canonical_timestamp(s));
 
-fn secs_to_ymd_hms(secs: u64) -> (u64, u64, u64, u64, u64, u64) {
-    let s = secs % 60;
-    let m = (secs / 60) % 60;
-    let h = (secs / 3600) % 24;
-    let days = secs / 86400;
-
-    // Gregorian calendar calculation
-    let z = days + 719468;
-    let era = z / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y_adj = if mo <= 2 { y + 1 } else { y };
-
-    (y_adj, mo, d, h, m, s)
+    match formatted {
+        Some(s) => s,
+        // Reachable only for an input no real Unix timestamp carries: above
+        // `i64::MAX`, beyond chrono's representable range, or past year
+        // 9999. This function is documented as infallible, so rather than
+        // introduce a `Result` no caller has a recovery path for, fall back
+        // to the epoch: deterministic, never panics, and canonical-form so
+        // it still sorts against every other stored value.
+        None => "1970-01-01T00:00:00Z".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -706,6 +713,116 @@ mod format_secs_rfc3339_tests {
     fn year_end_boundary_rolls_over_correctly() {
         assert_eq!(format_secs_rfc3339(1_704_067_199), "2023-12-31T23:59:59Z");
         assert_eq!(format_secs_rfc3339(1_704_067_200), "2024-01-01T00:00:00Z");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Canonical-form contract tests — additional to (not a
+// substitute for) the golden `format_secs_rfc3339_tests` exact-value
+// assertions above, which are the strongest evidence the chrono
+// implementation is behaviorally identical to the hand-rolled arithmetic it
+// replaced. These instead guard the *shape* of the contract:
+// specs/02-domain-model.md's canonical timestamp form is `YYYY-MM-DDTHH:MM:SSZ`
+// — no fractional seconds, `Z` never `+00:00` — and old (hand-rolled-era)
+// and new (chrono-era) stored rows must still sort correctly against each
+// other by plain string comparison.
+#[cfg(test)]
+mod canonical_form_tests {
+    use super::format_secs_rfc3339;
+
+    /// `^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$`, checked by hand (no regex
+    /// dependency in this crate) rather than as a literal pattern.
+    use crate::dates::is_canonical_timestamp as matches_canonical_shape;
+
+    /// `now_rfc3339`'s real-clock branch is stubbed to a fixed literal under
+    /// `cfg(test)` and never touches the formatter, so this exercises the
+    /// real formatter it delegates to instead — the same function
+    /// `now_rfc3339`'s non-test branch calls — to prove a freshly produced
+    /// value matches the canonical shape.
+    #[test]
+    fn format_secs_rfc3339_matches_canonical_shape() {
+        assert!(
+            matches_canonical_shape(&format_secs_rfc3339(1_783_524_645)),
+            "expected canonical YYYY-MM-DDTHH:MM:SSZ shape, got: {}",
+            format_secs_rfc3339(1_783_524_645)
+        );
+    }
+
+    /// Guards specifically against a one-word `SecondsFormat::Secs` ->
+    /// `SecondsFormat::AutoSi` typo, which would silently reintroduce
+    /// variable-precision output and break every stored-value comparison
+    /// that assumes a fixed-width timestamp.
+    #[test]
+    fn format_secs_rfc3339_has_no_fractional_second_component() {
+        assert!(!format_secs_rfc3339(1_783_524_645).contains('.'));
+    }
+
+    /// Whatever the input, the output is always canonical form. Chrono
+    /// happily represents years past 9999 and renders them with a sign
+    /// prefix (`+10000-01-01T00:00:00Z`), which sorts below every real row
+    /// because `+` is 0x2B — so those must reach the fallback too, not just
+    /// values chrono cannot represent at all.
+    #[test]
+    fn every_timestamp_formats_to_canonical_form_or_falls_back() {
+        for secs in [
+            0,
+            1_781_092_800,
+            253_402_300_800,     // 10000-01-01, representable but not RFC 3339
+            1_000_000_000_000,   // ~year 33658
+            8_210_298_412_800,   // past chrono's range
+            i64::MAX as u64 + 1, // past i64
+            u64::MAX,
+        ] {
+            let formatted = format_secs_rfc3339(secs);
+            assert!(
+                matches_canonical_shape(&formatted),
+                "{secs} produced non-canonical {formatted:?}; a `+`/`-` year prefix \
+                 sorts below every digit and would misorder against every stored row"
+            );
+        }
+    }
+
+    /// A `u64` above `i64::MAX` must reach the out-of-range fallback, never
+    /// wrap into a negative timestamp. A wrapping `as i64` cast turns
+    /// `u64::MAX` into `-1`, which chrono formats as `1969-12-31T23:59:59Z`
+    /// — a plausible-looking value that would sort before every real row.
+    #[test]
+    fn timestamps_above_i64_max_fall_back_instead_of_wrapping_to_pre_epoch() {
+        for secs in [u64::MAX, i64::MAX as u64 + 1] {
+            let formatted = format_secs_rfc3339(secs);
+            assert_eq!(
+                formatted, "1970-01-01T00:00:00Z",
+                "{secs} must hit the epoch fallback, not wrap"
+            );
+            assert!(
+                !formatted.starts_with("1969"),
+                "{secs} wrapped into a pre-epoch instant: {formatted}"
+            );
+        }
+    }
+
+    /// The test that actually matters: a hand-written legacy-form literal
+    /// (the exact shape hand-rolled `secs_to_ymd_hms` used to produce) and a
+    /// freshly chrono-produced value for the same instant — plus values one
+    /// second either side — must still order correctly under plain Rust
+    /// string comparison. This is what proves old rows (written before this
+    /// migration) and new rows (written after) sort together correctly; a
+    /// shape check alone does not.
+    #[test]
+    fn legacy_literal_and_chrono_produced_value_interleave_correctly() {
+        // 2026-06-10T12:00:00Z, the same instant `now_rfc3339`'s cfg(test)
+        // branch returns as a literal.
+        const AT_SECS: u64 = 1_781_092_800;
+        let legacy_literal = "2026-06-10T12:00:00Z".to_string();
+        let chrono_produced = format_secs_rfc3339(AT_SECS);
+        let one_second_before = format_secs_rfc3339(AT_SECS - 1);
+        let one_second_after = format_secs_rfc3339(AT_SECS + 1);
+
+        assert_eq!(legacy_literal, chrono_produced);
+        assert!(one_second_before < legacy_literal);
+        assert!(one_second_before < chrono_produced);
+        assert!(legacy_literal < one_second_after);
+        assert!(chrono_produced < one_second_after);
     }
 }
 

@@ -24,6 +24,7 @@ async-trait = { workspace = true }
 directories = { workspace = true }
 dirs = { workspace = true }
 hex = { workspace = true }
+chrono = { workspace = true }
 url = { workspace = true }
 percent-encoding = { workspace = true }
 text-splitter = { version = "0.31", features = ["markdown"] }

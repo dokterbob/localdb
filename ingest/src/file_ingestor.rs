@@ -9,7 +9,9 @@ use extract::sniff_mime;
 use localdb_core::block::{IngestorKind, Resource, ResourceKind};
 use localdb_core::error::Error;
 use localdb_core::ids::resource_id;
-use localdb_core::ingestion::{enumerate_path_source, now_rfc3339, PathEnumeration};
+use localdb_core::ingestion::{
+    enumerate_path_source, format_secs_rfc3339, now_rfc3339, PathEnumeration,
+};
 use localdb_core::ingestor::{
     Enumeration, IngestCallback, IngestResult, IngestSource, Ingestor, SkipReason,
 };
@@ -17,7 +19,7 @@ use localdb_core::markdown_blocks::{compute_blocks_hash, markdown_to_blocks_with
 use localdb_core::metadata::{DocumentMetadata, Metadata};
 use localdb_core::parser::{Parser, Probe};
 
-use crate::support::{catch_panic, detect_mime, format_unix_secs};
+use crate::support::{catch_panic, detect_mime};
 
 /// File-system ingestor.
 ///
@@ -145,7 +147,7 @@ impl Ingestor for FileIngestor {
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_secs();
-                            format_unix_secs(secs)
+                            format_secs_rfc3339(secs)
                         });
                     Ok((bytes, mtime_rfc3339))
                 },

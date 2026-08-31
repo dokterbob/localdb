@@ -13,6 +13,7 @@
 //! `String::from_utf8` first (verified against `feed-rs` 2.4.0 source: the
 //! XML reader is configured with `quick_xml`'s `encoding` support).
 
+use chrono::SecondsFormat;
 use extract::html::extract_html;
 use extract::plaintext::extract_plaintext;
 use feed_rs::model::{Entry, Feed};
@@ -354,10 +355,16 @@ impl Ingestor for FeedIngestor {
             // already sorted DESC on published.or(updated), so that's the
             // first entry's sort key), else `None` — no claim, never
             // ingestion-time now() (#283).
+            // `.to_rfc3339_opts(SecondsFormat::Secs, true)`, not the default
+            // `to_rfc3339()`: the default renders a numeric `+00:00` offset,
+            // which sorts *before* every ingestion-clock `…Z` timestamp
+            // bytewise ('+' 0x2B < 'Z' 0x5A) — a real correctness bug for a
+            // field a later PR makes filterable and lexicographically
+            // compared.
             let modified_at_override = feed
                 .updated
                 .or_else(|| entries.first().and_then(|e| e.published.or(e.updated)))
-                .map(|d| d.to_rfc3339());
+                .map(|d| d.to_rfc3339_opts(SecondsFormat::Secs, true));
             let enrichment = ResourceEnrichment {
                 external_id: None,
                 title_fallback: Some(feed_title_text),
@@ -504,11 +511,25 @@ async fn process_discovery_entry(
         external_id: Some(entry.id.clone()),
         title_fallback: entry.title.as_ref().map(|t| t.content.clone()),
         creator: effective_authors(entry, feed_authors),
-        date: entry.published.or(entry.updated).map(|d| d.to_rfc3339()),
+        // `.to_rfc3339_opts(SecondsFormat::Secs, true)`, not the default
+        // `to_rfc3339()` (`Z` not `+00:00`). Cosmetic
+        // consistency only for `date`/`dc:date`: `date_original` is never
+        // lexicographically compared, and `parse_partial_iso8601` discards
+        // the offset before deriving `date_parsed`.
+        date: entry
+            .published
+            .or(entry.updated)
+            .map(|d| d.to_rfc3339_opts(SecondsFormat::Secs, true)),
         // The feed's own modification claim, preferring `updated` (that's
         // what it means) over `published`; `dc.date` above keeps the
-        // opposite preference (creation/publication semantics).
-        modified_at_override: entry.updated.or(entry.published).map(|d| d.to_rfc3339()),
+        // opposite preference (creation/publication semantics). Unlike
+        // `date` above, this one IS a correctness fix: a later PR makes
+        // `modified_at` filterable and lexicographically compared, and the
+        // default `+00:00` form sorts incorrectly against `…Z` timestamps.
+        modified_at_override: entry
+            .updated
+            .or(entry.published)
+            .map(|d| d.to_rfc3339_opts(SecondsFormat::Secs, true)),
         provenance_source: Some(feed_url.to_string()),
         capture_etag: true,
     };

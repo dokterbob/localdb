@@ -89,6 +89,14 @@ different code paths, and must never be conflated or substituted for one another
 normative: any code that writes one axis's field from another axis's source is a bug against this
 spec, not an acceptable implementation choice.
 
+**Canonical timestamp form (normative).** Every stored timestamp on the "our clock" axes
+(`added_at`, `index_updated_at`, and any `modified_at`/`date_original` value an ingestor derives
+from its own RFC 3339 formatting rather than passing a source string through unchanged) is exactly
+`YYYY-MM-DDTHH:MM:SSZ` — no fractional seconds, and a literal `Z`, never a numeric `+00:00` offset.
+These strings are compared lexicographically, both in Rust and in SQL, so the exact form is a
+data-compatibility contract: a stray fractional component or a `+00:00` suffix breaks sort order
+against every other stored row.
+
 | Axis                      | Meaning                                                                                    | Field / column                 | Set by                                                                                                                                                                                                   | Never receives                                                                                                                 |
 | ------------------------- | ------------------------------------------------------------------------------------------ | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
 | Document date             | The date the document is _about_, or was authored/adopted — Dublin Core.                   | `date_original`, `date_parsed` | Parsers and connector metadata enrichment carrying an explicit authorship/publication claim — embedded `dc:date`, or a feed entry's `published` (falling back to `updated`) per the feed contract below. | File mtime, HTTP `Last-Modified`, or any other change-detection timestamp that carries no authorship/publication claim.        |
@@ -231,6 +239,9 @@ newest entry's date, else absent (`None`) — never `now()`. Creation/publicatio
 preference order from `modified_at`, matching each field's semantics. Like all enrichment, an
 already-indexed entry whose content hash is unchanged does not retroactively pick these up (the
 pipeline's incremental-skip runs before any store write).
+
+Both `modified_at` and `dublin_core.date` are formatted in the canonical `…Z` form described above,
+not the numeric `+00:00` offset `chrono`'s default `DateTime::to_rfc3339()` would otherwise emit.
 
 **Fallback and error handling:**
 
