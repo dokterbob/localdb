@@ -424,6 +424,15 @@ and that document is not re-extracted. Threading a real per-parser `extractor_ve
 skip-check would close that last axis and is a deferred follow-up (cross-ref
 [#47](https://github.com/dokterbob/localdb/issues/47)).
 
+Conditional GET widens what this gap costs for URL-backed resources, beyond the byte-identical case
+above.
+[specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md)
+§1 spells it out: an unchanged origin answers 304 before any parser touches the bytes, so a parser
+improvement cannot reach an already-indexed URL resource at all — not merely the ones whose output
+would have been identical. The conditional-header suppression rule there names `extractor_version`
+as its designated join point for exactly this reason; until the field carries a real value, only a
+`policy_version` bump reaches those resources.
+
 **9. Residual PDF-extraction gaps.** `extract/src/pdf.rs` repairs several classes of upstream
 extraction defect (see
 [specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md)

@@ -357,21 +357,35 @@ and a changed feed URL is a new origin.
 > point: any future local input that can change a feed run's output without changing the feed XML
 > joins this digest.
 >
-> The digest is rewritten on **every** feed run, including one that errored or was blocked, so a
-> policy change is captured even when no fetch succeeded. A row whose digest is `NULL` — every row
-> predating the column — counts as a mismatch, so the first run after an upgrade fetches
+> The digest is written **with** the validators, in the same update, and only when a fetch actually
+> produced them. A run that errored, was blocked, or never fetched the document leaves both columns
+> exactly as it found them. Writing the digest on its own would create the failure it exists to
+> prevent: it would declare the _stored_ validators — still the ones captured under the old inputs —
+> trustworthy under the new ones, and the next run would replay them, take the 304, and skip the
+> very entry loop the input change was supposed to force. Leaving the pair untouched keeps the
+> mismatch standing until a run under the new inputs actually succeeds. A row whose digest is `NULL`
+> — every row predating the column — counts as a mismatch, so the first run after an upgrade fetches
 > unconditionally: a validator captured before this gate existed carries no evidence about which
 > inputs produced it.
-
-The 304 short-circuit on the feed document itself is a deliberate, accepted trade-off, not a
-mitigated one. When the feed document returns 304, the entry loop does not run at all, so zero entry
-callbacks fire that run — drift on an already-indexed entry's own _page_ goes unnoticed for as long
-as the feed XML itself is unchanged. This is accepted because it rests on the same contract
-conditional GET relies on everywhere else in the system: a compliant origin changes its validator
-whenever any part of the representation changes (RFC 9110 §8.8.1). No cache-busting forced refresh
-is provided. A 304'd run also enumerates no entries at all, which is precisely why the liveness
-sweep's zero-seen guard suppresses it on such a run — see
-[04-search-pipeline.md](04-search-pipeline.md) §1 "Aged-out feed entries: the liveness sweep".
+>
+> **Partial entry passes withhold the validators too (normative).** The same pairing rule extends
+> past the fetch to the run as a whole: fresh feed-document validators are persisted only by a run
+> that finished with **zero** errors. An entry that failed transiently — its link timed out, its
+> index write failed — is not reflected in the store, but the feed XML that lists it is unchanged,
+> so storing that XML's validators would let the next run 304 and never retry the entry. The entry
+> would stay stranded until the feed document itself changed, which for an aging entry can be
+> indefinitely. The cost is disclosed rather than mitigated: while any entry keeps failing, every
+> run refetches the feed document in full. That is the cheap half of the work — the expensive half,
+> re-fetching and re-indexing unchanged entries, is still avoided by their own resource-level
+> validators. The 304 short-circuit on the feed document itself is a deliberate, accepted trade-off,
+> not a mitigated one. When the feed document returns 304, the entry loop does not run at all, so
+> zero entry callbacks fire that run — drift on an already-indexed entry's own _page_ goes unnoticed
+> for as long as the feed XML itself is unchanged. This is accepted because it rests on the same
+> contract conditional GET relies on everywhere else in the system: a compliant origin changes its
+> validator whenever any part of the representation changes (RFC 9110 §8.8.1). No cache-busting
+> forced refresh is provided. What a 304'd run's empty seen-set means for the liveness sweep is
+> settled in one place, next to the guard's normative definition:
+> [04-search-pipeline.md](04-search-pipeline.md) §1 "Aged-out feed entries: the liveness sweep".
 
 While an entry is still _inside_ the feed's window, a `Gone` (404/410) result on its link keeps
 falling back to the feed's own embedded content exactly as today — the feed is still vouching for

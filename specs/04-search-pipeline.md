@@ -76,14 +76,31 @@ Resources also carry:
 
   Validators are keyed to the **configured** URI, never to a redirect target — consistent with the
   feed connector's pinned-identity rule ([02-domain-model.md](02-domain-model.md), "Feed
-  connector"). The cost is a missed cache hit when a redirect target's own validator would otherwise
-  have matched; that is a lost optimization, not an incorrectness, since the configured URI is
-  refetched in full.
+  connector"). Usually the cost is only a missed cache hit: the redirect target's own validator
+  would have matched, and instead the configured URI is refetched in full. It is not purely an
+  optimization, though. A validator is scoped to the resource that issued it, and this key replays
+  one issued by whatever the configured URI resolved to on the last run against whatever it resolves
+  to now. If the redirect target changes and the new target happens to answer with the same opaque
+  `ETag` value, the origin returns 304 about a representation our stored bytes never came from, and
+  the change stays invisible until one side's validator moves. That window is accepted as remote
+  rather than closed — a collision needs two distinct targets behind one URI to pick the same
+  validator string — but it is a staleness risk, not merely a lost cache hit.
 
 - **`extractor_version`:** a version stamp on the parser/block-conversion logic. When parser or
-  `markdown_to_blocks()` logic improves, bumping `extractor_version` enables selective reprocessing
-  of resources whose content has not changed but whose block representation may improve (without a
-  full policy-version reindex).
+  `markdown_to_blocks()` logic improves, bumping `extractor_version` would enable selective
+  reprocessing of resources whose content has not changed but whose block representation may improve
+  (without a full policy-version reindex). **Not implemented.** The field is hardcoded to `"1"` in
+  both ingestors and in `store-libsql`'s resource upsert, and the skip-check never reads it — see
+  [docs/architecture.md](../docs/architecture.md#known-gaps) gap #8, which owns this gap's status.
+
+  Conditional GET makes that gap cost more than gap #8's framing suggests, and the suppression rule
+  above is why. Gap #8 describes a missed re-extraction: a parser change that leaves the extracted
+  bytes identical does not re-index. With conditional headers in play the failure starts one step
+  earlier and is not limited to identical output — an unchanged origin answers 304 before any parser
+  runs at all, so a parser improvement cannot reach an already-indexed URL resource regardless of
+  what it would have produced. The suppression rule names `extractor_version` as a designated join
+  point precisely for this; until the field carries a real value there is nothing to join, and only
+  a `policy_version` bump reaches those resources.
 
 ### Metadata-only update
 
@@ -201,16 +218,27 @@ by a fixed ceiling well above any realistic feed window, and the caller subtract
 before taking its 25. The ceiling is what keeps the query bounded: `max_entries` is optional and
 defaults to unbounded, so the seen-set has no principled size of its own.
 
-**Guards (normative).** "Did not observe" is only a meaningful signal when the run actually
-enumerated the feed's window, so the sweep inherits **both guards** of the presumed-gone sweep
-above, for the same reasons: an `Enumeration::Incomplete` run performs no liveness sweep, and
-neither does a run that observed **none** of the source's previously indexed URIs. The second guard
-is what reconciles this section with the feed-document 304 short-circuit
-([02-domain-model.md](02-domain-model.md), "Conditional GET and pruning"): a run whose feed document
-answered 304 fires zero entry callbacks, so its seen-set is empty and the sweep does not run. That
-is the correct outcome, not merely a safe one — an unchanged feed document means an unchanged
-window, so no entry can have aged out since the last run, and there is nothing new to probe. The
-sweep resumes on the next run in which the feed document actually changes.
+**Guards (normative).** The sweep inherits **one** of the presumed-gone sweep's two guards, not
+both, because the two sweeps infer different things from the same seen-set. The presumed-gone sweep
+deletes on absence, so an untrustworthy seen-set is an untrustworthy delete signal. Here absence
+only selects who gets _probed_; the delete needs a confirmed 404/410 from the origin. Probing an
+entry that is in fact still in the window costs one conditional request and deletes nothing.
+
+- **Guard 1 — incomplete enumeration — still suppresses the sweep entirely.** A run that could not
+  read the source's window knows nothing about which entries it holds, so every previously indexed
+  URI would look aged-out and the source's whole document set would queue for probing, 25 per run,
+  off a signal already known to be broken.
+- **Guard 2 — the zero-seen backstop — does not apply.** A run whose feed document answered 304
+  fires zero entry callbacks, so its seen-set is empty ([02-domain-model.md](02-domain-model.md),
+  "Conditional GET and pruning"); the sweep runs anyway. Suppressing it there starves the mechanism
+  in precisely the case it exists for: a feed goes quiet, its document stops changing, every
+  subsequent run 304s, and the aged-out backlog is never probed again — the sweep being the only
+  thing that could ever shrink it. Running is safe because both bounds that make the sweep safe at
+  all are independent of the seen-set: it deletes only on a confirmed 404/410, and it probes at most
+  25 candidates per run per source, none more often than the recheck floor allows. An empty seen-set
+  subtracts nothing from the candidate list, which is the right answer for a 304'd run — the window
+  is unchanged, so nothing aged out _during_ this run, and every candidate the query returns had
+  already aged out before it began.
 
 **Ordering:** the sweep runs **after** the source's ordinary ingestion pass completes, so the
 seen-set it partitions against is final and the run's own freshly-observed entries can never be
@@ -249,10 +277,12 @@ boundary the feed ingestor already applies to entry links ([02-domain-model.md](
 "Destination policy (entry links)") — never the unrestricted fetcher used for the
 operator-configured feed URL itself.
 
-Prunes fold into the existing `docs_deleted`, and the sweep additionally reports how many candidates
-it probed as its own counter (`feed_entries_liveness_checked`), so a run distinguishes "deleted
-because this run didn't see it" (the ordinary confirmed/presumed-gone paths) from "deleted because a
-liveness probe confirmed it gone", and shows the probe work done even when nothing was deleted.
+Prunes fold into the existing `docs_deleted`, which stays a single total: a run does **not** report
+how many of its deletions the liveness sweep caused. The sweep's own counter,
+`feed_entries_liveness_checked`, counts probe _attempts_ — so it shows the work done even on a run
+that deleted nothing, but it cannot be subtracted from `docs_deleted` to attribute a cause, since
+most attempts end in a 304 or a 200 rather than a delete. Deletion-cause attribution needs a counter
+of its own and is deliberately left out.
 
 ## 2. Extraction (v1 matrix)
 
