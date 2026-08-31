@@ -880,3 +880,19 @@ none reads exactly as it always has.
 §3), so the CLI sends the real policy and the daemon's job engine honors it exactly as the embedded
 path does. Stopping the daemon before indexing is no longer required for `--delete` or for `index`
 in general.
+
+### `localdb index` — feed liveness sweep
+
+A feed source's entries falling out of the feed's window are never, on their own, a deletion signal
+(see [04-search-pipeline.md](04-search-pipeline.md) §1's feed exemption). Under `--delete`, a
+bounded liveness sweep instead probes a batch of aged-out entries' own links and prunes only the
+ones a probe positively confirms gone (404/410) — see [04-search-pipeline.md](04-search-pipeline.md)
+§1 "Aged-out feed entries: the liveness sweep" for the batch cap, recheck floor, and per-outcome
+rules. Prunes this performs fold into `docs_deleted` like any other delete; the number of candidates
+it probed this run — regardless of whether any were deleted — is its own counter,
+`feed_entries_liveness_checked`, present in `--json` output unconditionally (default 0) and folded
+into the human-readable summary as `, N feed entries checked for liveness` only when non-zero, the
+same append-only-when-nonzero convention `docs_deleted`/`docs_prunable`/`docs_metadata_updated`
+already follow. Always 0 for a non-feed source and for any run without `--delete` — there is no free
+preview signal for this mechanism, since the sweep can only learn anything by making a network
+request per candidate.

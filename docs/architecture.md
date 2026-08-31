@@ -465,48 +465,45 @@ extraction defect (see
   deliberate: it needs a broken producer, whereas indexing running headers and page-number folios as
   content happened on every well-formed tagged PDF.
 
-**10. Feed sources are exempt from the delete-sweep — there is no entry pruning.** A feed exposes
-only its most recent entries, so an entry falling out of the feed does not mean it was deleted
-upstream: treating it as a delete would wipe most of a feed's indexed history on a normal fetch, and
-a feed `304` (or a transient empty parse) would zero out every entry in one sweep. The ingestion
-pipeline's delete-sweep therefore skips `ingestor_kind = feed` sources entirely — entries once
-indexed stay indexed indefinitely, even after they scroll off the feed, until the whole source is
-removed (`source remove`, which still cascades normally). Pruning truly-dead entry URLs (404/410) is
-a follow-up issue.
+**10. ~~Feed sources are exempt from the delete-sweep — there is no entry pruning~~ — RESOLVED.**
+([#171](https://github.com/dokterbob/localdb/issues/171)) A feed exposes only its most recent
+entries, so an entry falling out of the feed does not by itself mean it was deleted upstream:
+treating it as a delete would wipe most of a feed's indexed history on a normal fetch, and a feed
+`304` (or a transient empty parse) would zero out every entry in one sweep. The ingestion pipeline's
+presumed-gone delete-sweep therefore still skips `ingestor_kind = feed` sources entirely, exactly as
+before — **that exemption is unchanged by this resolution and remains correct**: an entry merely
+scrolling off the feed window is still never, on its own, treated as a deletion signal.
 
-Pruning entries whose own links a probe confirms 404/410 is part of
-[#171](https://github.com/dokterbob/localdb/issues/171)'s liveness sweep (see
+What's resolved is entry pruning itself. A bounded liveness sweep now runs under `--delete`: it
+probes a batch of entries this run did not observe against their own stored link, and deletes only
+the ones a probe positively confirms gone (404/410) — the confirmed-gone bucket, not the
+presumed-gone one, so it never infers a delete from absence. "Did not observe" is not the same as
+"aged out of the window", and the sweep does not claim it is: a run whose feed document answered 304
+observes nothing at all, so an entry the window still lists can be probed and, on a confirmed
+404/410, pruned. See
 [specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md)
-§1 "Aged-out feed entries: the liveness sweep"); the sweep-exemption itself is unaffected and stays
-exactly as described above.
+§1 "Aged-out feed entries: the liveness sweep" for the batch cap (25 candidates/source/run), recheck
+floor (`max(refresh_interval, 24h)`), and per-outcome rules (`Gone` deletes; `NotModified`/
+`Downloaded` refresh the stored validators and the throttle clock without deleting or re-indexing;
+`Blocked` or a transport error leaves the resource untouched).
 
-**11. Conditional-GET state (`ETag`) is captured only when a feed entry link is fetched, and even
-then it's never read back and reused; `Last-Modified` is not persisted at all.** `capture_etag` on
-`ResourceEnrichment` defaults to `false` (`ingest/src/url_pipeline.rs:120-123`), and every ordinary
-`url` source uses that default (`ingest/src/url_ingestor.rs:94`), so `Resource.external_etag` is
-always `None` there. The feed root fetch discards the response's `etag` outright
-(`ingest/src/feed_ingestor.rs:138-141`). In the default discovery mode (`fetch_full_content: true`)
-the feed root never becomes a `Resource`; in single-document mode (`fetch_full_content: false`) it
-does become one, but `build_resource` still hardcodes `external_etag` to `None`
-(`ingest/src/url_pipeline.rs:346-354`). Only feed entry links set `capture_etag: true`
-(`ingest/src/feed_ingestor.rs:503-514`), so a successful entry fetch captures `external_etag` and
-writes it to `resources.external_etag` (`store-libsql/src/tenant/write.rs`) — but every real
-ingestion call site (`ingest/src/url_pipeline.rs`, `ingest/src/feed_ingestor.rs`) still builds a
-fresh `FetchMetadata::default()` for each fetch instead of reading that persisted value back, so
-`fetch::http`'s existing `If-None-Match`/`If-Modified-Since` support (`fetch/src/lib.rs`) is never
-exercised: every `localdb index` re-fetches every URL and every feed entry in full. There is no
-`resources` column for `Last-Modified` at all. A follow-up issue covers adding `ETag` capture for
-`url` sources and the feed-root fetch (and threading it into `build_resource` for single-document
-mode), round-tripping the persisted `external_etag` (and adding `Last-Modified` persistence) into
-`FetchMetadata` on the next fetch, together with delete-on-404/410 pruning (previous item).
-
-That follow-up is [#171](https://github.com/dokterbob/localdb/issues/171): it adds
-`resources.external_last_modified` and persists/replays both validators for `url` sources and feed
-entry links, adds `sources.feed_etag`/`sources.feed_last_modified` so the feed-root fetch is
-conditional too (threaded into `build_resource` for single-document mode), subject to the
-`policy_version` suppression rule in
-[specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md)
-§1 "Incremental re-index".
+**11. ~~Conditional-GET state (`ETag`) is captured only when a feed entry link is fetched, and even
+then it's never read back and reused; `Last-Modified` is not persisted at all~~ — RESOLVED.**
+([#171](https://github.com/dokterbob/localdb/issues/171)) `url` sources and feed entry links now
+capture both `external_etag` and `external_last_modified` (`resources.external_last_modified`,
+schema v8) on every successful fetch, and replay them as `If-None-Match`/`If-Modified-Since` on the
+next run (`IngestCallback::lookup_fetch_metadata`), subject to the same `policy_version` suppression
+rule as before
+([specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md)
+§1 "Incremental re-index"). The feed root fetch is conditional too:
+`sources.feed_etag`/`sources.feed_last_modified` (also schema v8) persist the feed document's own
+validators — the only place they can live, since the feed document never becomes a `Resource` in
+discovery mode — and `FeedIngestor` replays them on every run, including in single-document mode,
+where they're now stamped onto the `Resource` it builds instead of the previous hardcoded `None`. A
+304 anywhere in this chain folds any rotated validator over what was already stored (silence about a
+validator means unchanged, not "clear it"); a 200 fully replaces the stored validators, even with
+both `None`, since a fresh full representation's silence means the origin stopped offering that
+validator.
 
 **12. A store containing a `kind = 'feed'` source cannot be opened by an older binary that predates
 the Feed ingestor.** `sources.ingestor_kind` decoding is a hard match over the known `IngestorKind`
