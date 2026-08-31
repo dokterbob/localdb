@@ -539,7 +539,7 @@ fn catch_panic<T>(
 ///
 /// `Serialize`/`Deserialize` are derived because this type is embedded in
 /// [`IngestionResult`], which crosses the SSE wire boundary via
-/// [`crate::progress::ProgressEvent::SourceFinished`] (issue #83).
+/// [`crate::progress::ProgressEvent::SourceFinished`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FetchMetadata {
     /// ETag value from the previous response.

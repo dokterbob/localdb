@@ -2359,6 +2359,49 @@ async fn feed_document_200_reports_response_validators() {
     );
 }
 
+/// The asymmetry between a 200 and a 304, pinned on its riskier half. A 304
+/// carries no body, so silence about a validator means "unchanged" and the
+/// stored value is kept. A 200 is a complete fresh representation, so
+/// silence means the origin is no longer offering that validator and the
+/// stored value must be cleared — otherwise the next run replays a validator
+/// this origin never issued, and an origin that answers `412`/`200` to a
+/// stale `If-None-Match` would be sent one indefinitely.
+///
+/// Every other 200 test starts from nothing stored, so all of them would
+/// still pass if the clearing were dropped and a 200 merely folded like a
+/// 304 does.
+#[tokio::test]
+async fn feed_document_200_without_validators_clears_the_stored_ones() {
+    let feed_xml = rss2_feed("", "");
+    let mut script = HashMap::new();
+    script.insert(
+        "https://feed.example.com/feed.xml".to_string(),
+        ScriptedOutcome::text(&feed_xml),
+    );
+    let (ingestor, _fetcher) = ingestor_with(script);
+    let source = source_with_validators(
+        "https://feed.example.com/feed.xml",
+        true,
+        FetchMetadata {
+            etag: Some("\"stale-etag\"".to_string()),
+            last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string()),
+        },
+    );
+    let mut cb = RecordingCallback::default();
+    let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+    assert_eq!(
+        result.document_validators,
+        Some(FetchMetadata {
+            etag: None,
+            last_modified: None,
+        }),
+        "a headerless 200 must report an empty FetchMetadata — `Some` so the \
+         stored validators are replaced, and empty so they are cleared rather \
+         than folded"
+    );
+}
+
 #[tokio::test]
 async fn feed_document_bare_304_reports_nothing() {
     let mut script = HashMap::new();

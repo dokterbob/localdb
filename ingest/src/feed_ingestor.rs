@@ -435,11 +435,14 @@ impl Ingestor for FeedIngestor {
                 &enrichment,
             );
             // Single-doc mode's `Resource` *is* the feed document, so its
-            // own `resources.external_etag`/`external_last_modified` are the
-            // right home for the validators this fetch just observed —
-            // distinct from `sources.feed_etag`/`feed_last_modified` above,
-            // which exist only for discovery mode (no `Resource` to carry
-            // them there). `document_etag`/`document_last_modified` are only
+            // own `resources.external_etag`/`external_last_modified` are a
+            // natural home for the validators this fetch just observed.
+            // Both modes still report them upward into
+            // `sources.feed_etag`/`feed_last_modified` as well, and that
+            // copy — not this one — is what the next run replays, in either
+            // mode; the `sources` columns are simply the *only* possible
+            // home in discovery mode, where no `Resource` exists to carry
+            // them. `document_etag`/`document_last_modified` are only
             // ever populated by a `Downloaded` response — `NotModified`
             // returns early above, before this branch runs at all — so this
             // always mirrors a fresh 200, never a folded 304 value.
