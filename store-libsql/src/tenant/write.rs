@@ -244,6 +244,69 @@ async fn update_resource_metadata_inner(
     Ok(())
 }
 
+/// Record a feed liveness probe's outcome for one resource: refresh its
+/// stored conditional-GET validators and `last_checked_at`, nothing else.
+/// Backs `RetrievalStore::touch_resource_liveness`.
+///
+/// Deliberately does NOT touch `index_updated_at` — see that trait method's
+/// doc comment for why: a liveness probe writes no content and no metadata,
+/// so bumping the "we last wrote this resource's stored state" clock would
+/// misreport it as re-written. `last_checked_at` (schema v8) is its own
+/// column for exactly this reason.
+pub(crate) async fn touch_resource_liveness(
+    store: &TenantStore,
+    store_id: &str,
+    resource_id: &str,
+    etag: Option<&str>,
+    last_modified: Option<&str>,
+) -> Result<(), Error> {
+    ensure_store_id(store, store_id, "touch_resource_liveness")?;
+    let tx = store.conn().write_tx().await?;
+    let result =
+        touch_resource_liveness_inner(&tx, store_id, resource_id, etag, last_modified).await;
+    finish_write_tx(tx, result).await
+}
+
+async fn touch_resource_liveness_inner(
+    conn: &Connection,
+    store_id: &str,
+    resource_id: &str,
+    etag: Option<&str>,
+    last_modified: Option<&str>,
+) -> Result<(), Error> {
+    // One write-time clock reading for this write, mirroring
+    // `update_resource_metadata_inner`'s single `now_rfc3339()` call — but
+    // bound to `last_checked_at`, never `index_updated_at`; see this
+    // function's doc comment.
+    let last_checked_at = localdb_core::ingestion::now_rfc3339();
+    let rows_affected = conn
+        .execute(
+            "UPDATE resources SET
+                 external_etag          = ?,
+                 external_last_modified = ?,
+                 last_checked_at        = ?
+             WHERE store_id = ? AND id = ?",
+            params![
+                etag,
+                last_modified,
+                last_checked_at.as_str(),
+                store_id.to_string(),
+                resource_id.to_string(),
+            ],
+        )
+        .await
+        .map_err(map_libsql_err)?;
+    if rows_affected == 0 {
+        // The row vanished — a concurrent delete raced this probe. Report it
+        // rather than silently succeeding, mirroring
+        // `update_resource_metadata_inner`'s same guard.
+        return Err(Error::ResourceNotFound {
+            id: resource_id.to_string(),
+        });
+    }
+    Ok(())
+}
+
 pub(crate) async fn upsert_blocks(
     store: &TenantStore,
     resource_id: &str,

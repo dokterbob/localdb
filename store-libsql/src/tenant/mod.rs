@@ -3,8 +3,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use localdb_core::ingestion::DocumentRecord;
 use localdb_core::{
-    ChunkRecord, Error, MetadataFilter, ResourceRecord, RetrievalStore, SearchResult, StoreStats,
-    VectorEncoding,
+    ChunkRecord, Error, MetadataFilter, ResourceRecord, RetrievalStore, SearchResult,
+    StaleFeedResource, StoreStats, VectorEncoding,
 };
 
 use crate::connection::LibsqlDb;
@@ -132,6 +132,27 @@ impl RetrievalStore for TenantStore {
 
     async fn list_indexed_documents(&self) -> Result<Vec<DocumentRecord>, Error> {
         read::list_indexed_documents(self).await
+    }
+
+    async fn list_stale_feed_resources(
+        &self,
+        store_id: &str,
+        source_id: &str,
+        checked_before: &str,
+        limit: usize,
+    ) -> Result<Vec<StaleFeedResource>, Error> {
+        ensure_store_id(self, store_id, "list_stale_feed_resources")?;
+        read::list_stale_feed_resources(self, source_id, checked_before, limit).await
+    }
+
+    async fn touch_resource_liveness(
+        &self,
+        store_id: &str,
+        resource_id: &str,
+        etag: Option<&str>,
+        last_modified: Option<&str>,
+    ) -> Result<(), Error> {
+        write::touch_resource_liveness(self, store_id, resource_id, etag, last_modified).await
     }
 
     async fn update_resource_metadata(

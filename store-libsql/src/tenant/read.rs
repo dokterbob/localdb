@@ -2,7 +2,7 @@ use libsql::params;
 use localdb_core::ingestion::DocumentRecord;
 use localdb_core::{
     compute_metadata_hash, content_hash, ChunkRecord, Error, Metadata, MetadataFilter,
-    ResourceRecord, SearchResult, StoreStats, VectorEncoding,
+    ResourceRecord, SearchResult, StaleFeedResource, StoreStats, VectorEncoding,
 };
 
 use super::rows::{row_to_block, row_to_chunk_record_strict};
@@ -445,6 +445,54 @@ pub(crate) async fn list_indexed_documents(
             metadata_hash,
             external_etag,
             external_last_modified,
+        });
+    }
+    Ok(out)
+}
+
+/// List feed liveness sweep candidates. Backs
+/// `RetrievalStore::list_stale_feed_resources`.
+///
+/// `last_checked_at IS NULL OR last_checked_at < ?` catches both
+/// never-checked rows and ones past the caller's recheck floor;
+/// `ORDER BY last_checked_at ASC` alone already puts `NULL` first in SQLite
+/// (verified: SQLite treats `NULL` as sorting lower than any non-`NULL`
+/// value under a plain `ASC`/no explicit `NULLS FIRST|LAST`), which is
+/// exactly "never-checked leading" — no `CASE`/`COALESCE` needed to spell
+/// that out.
+pub(crate) async fn list_stale_feed_resources(
+    store: &TenantStore,
+    source_id: &str,
+    checked_before: &str,
+    limit: usize,
+) -> Result<Vec<StaleFeedResource>, Error> {
+    let conn = store.conn().reader();
+    let mut rows = conn
+        .query(
+            "SELECT id, uri, external_etag, external_last_modified
+             FROM resources
+             WHERE store_id = ?
+               AND source_id = ?
+               AND ingestor_kind = 'feed'
+               AND (last_checked_at IS NULL OR last_checked_at < ?)
+             ORDER BY last_checked_at ASC
+             LIMIT ?",
+            params![
+                store.store_id().to_string(),
+                source_id.to_string(),
+                checked_before.to_string(),
+                limit as i64,
+            ],
+        )
+        .await
+        .map_err(map_libsql_err)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(map_libsql_err)? {
+        out.push(StaleFeedResource {
+            resource_id: row.get(0).map_err(map_libsql_err)?,
+            uri: row.get(1).map_err(map_libsql_err)?,
+            external_etag: row.get(2).map_err(map_libsql_err)?,
+            external_last_modified: row.get(3).map_err(map_libsql_err)?,
         });
     }
     Ok(out)
