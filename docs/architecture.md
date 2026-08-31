@@ -480,7 +480,12 @@ the ones a probe positively confirms gone (404/410) — the confirmed-gone bucke
 presumed-gone one, so it never infers a delete from absence. "Did not observe" is not the same as
 "aged out of the window", and the sweep does not claim it is: a run whose feed document answered 304
 observes nothing at all, so an entry the window still lists can be probed and, on a confirmed
-404/410, pruned. See
+404/410, pruned. A link-less entry has no link to probe at all — it is stored under a synthetic
+`{feed_url}#entry:{id}` URI — and is deliberately never a candidate: the query excludes every URI
+carrying a fragment, since HTTP never sends one on the wire and probing it verbatim would hit the
+feed root instead. Neither is the feed's own document, which in single-document mode is stored as a
+resource like any other: it is the one feed resource carrying no `external_id`, and the query
+requires one — otherwise a 404/410 on the feed URL would delete the source's whole index. See
 [specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md)
 §1 "Aged-out feed entries: the liveness sweep" for the batch cap (25 candidates/source/run), recheck
 floor (`max(refresh_interval, 24h)`), and per-outcome rules (`Gone` deletes; `NotModified`/

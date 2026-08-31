@@ -287,6 +287,23 @@ by a fixed ceiling well above any realistic feed window, and the caller subtract
 before taking its 25. The ceiling is what keeps the query bounded: `max_entries` is optional and
 defaults to unbounded, so the seen-set has no principled size of its own.
 
+**Fragment URIs are never candidates.** A link-less entry is stored under a synthetic
+`{feed_url}#entry:{id}` URI ([02-domain-model.md](02-domain-model.md), "General connector pattern").
+HTTP never sends a fragment on the wire, so probing that URI verbatim would actually request the
+feed root, not the entry — a 404/410 there would delete the entry's resource on a signal that has
+nothing to do with it. The candidate query excludes every URI carrying a `#`, which also excludes a
+_real_ entry link that legitimately carries a fragment (`https://example.com/post#section`): that
+entry can never be pruned by this mechanism. Both exclusions are deliberate and correct in the same
+direction as the "Deletes" trade-off above — retention bias is the safe failure.
+
+**Only `http`/`https` URIs are candidates.** A feed entry's `<link>` need not be an HTTP URL —
+`mailto:` and `ftp:` parse fine, and such an entry is indexed from its embedded content under that
+very URI. Handing one to the HTTP fetcher can only fail, so it is never a wrong delete; the cost is
+that it burns one of the run's 25 probe slots, on every run for as long as the entry stays aged out,
+on a request that could not have resolved anything. The candidate query filters by scheme for the
+same reason it filters fragments: an unprobeable URI should never become a candidate in the first
+place.
+
 **Guards (normative).** The sweep inherits **one** of the presumed-gone sweep's two guards, not
 both, because the two sweeps infer different things from the same seen-set. The presumed-gone sweep
 deletes on absence, so an untrustworthy seen-set is an untrustworthy delete signal. Here absence

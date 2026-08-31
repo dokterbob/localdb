@@ -589,6 +589,21 @@ pub trait RetrievalStore: Send + Sync + 'static {
     /// leading" — implementations should rely on that rather than adding a
     /// `CASE`/`COALESCE` to spell it out.
     ///
+    /// **Must exclude every URI carrying a fragment.** A link-less feed
+    /// entry is stored under a synthetic `{feed_url}#entry:{id}` URI
+    /// (specs/02-domain-model.md's "General connector pattern"); HTTP never
+    /// sends a fragment on the wire, so probing that URI verbatim would
+    /// actually request the feed root, and a 404/410 there would delete the
+    /// entry's resource on a signal that has nothing to do with it. This
+    /// must be enforced here, not as a post-filter over the returned list —
+    /// filtering downstream would leave those rows permanently eligible
+    /// (nothing ever advances their `last_checked_at`) and they would keep
+    /// occupying `limit` slots forever. The accepted cost — a real entry
+    /// link that legitimately carries a fragment is also excluded, and can
+    /// never be pruned by this mechanism — is deliberate: deletion here is
+    /// asymmetric, so retention bias is the safe failure. See
+    /// `store-libsql`'s implementation for the exact SQL.
+    ///
     /// The default implementation returns an empty list, mirroring
     /// `upsert_blocks`'s no-op default below: `FakeStore` and any store that
     /// predates the liveness sweep report no candidates, and the sweep

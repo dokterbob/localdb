@@ -35,7 +35,11 @@ async fn add_feed_source(backend: &SqliteBackend) {
         .unwrap();
 }
 
-/// A minimal feed-entry `ChunkRecord` fixture, owned by `src-feed`.
+/// A minimal **discovered feed entry** `ChunkRecord` fixture, owned by
+/// `src-feed` and stamped with an `external_id` the way `FeedIngestor`
+/// stamps every entry it yields — which is what makes it a liveness
+/// candidate at all. See `feed_root_chunk_record` for the one feed resource
+/// that carries none.
 fn feed_chunk_record(resource_id: &str, uri: &str) -> ChunkRecord {
     ChunkRecord {
         id: format!("{resource_id}-chunk"),
@@ -62,8 +66,18 @@ fn feed_chunk_record(resource_id: &str, uri: &str) -> ChunkRecord {
         window_block_seqs: vec![],
         date_original: None,
         date_parsed: None,
-        external_id: None,
+        external_id: Some(format!("urn:entry:{resource_id}")),
         external_etag: None,
+    }
+}
+
+/// The feed's own document as single-document mode
+/// (`fetch_full_content: false`) stores it: a `feed` resource under the feed
+/// URL, and the only one with no `external_id`.
+fn feed_root_chunk_record(resource_id: &str, uri: &str) -> ChunkRecord {
+    ChunkRecord {
+        external_id: None,
+        ..feed_chunk_record(resource_id, uri)
     }
 }
 
@@ -202,6 +216,136 @@ async fn list_stale_feed_resources_respects_limit_oldest_first() {
         .unwrap();
     let ids: Vec<&str> = candidates.iter().map(|c| c.resource_id.as_str()).collect();
     assert_eq!(ids, vec!["feed-1", "feed-2"]);
+}
+
+/// A link-less feed entry is stored under a synthetic
+/// `{feed_url}#entry:{id}` URI (specs/02-domain-model.md's "General
+/// connector pattern"). HTTP never sends a fragment on the wire, so probing
+/// that URI verbatim would actually request the feed root rather than the
+/// entry — a 404/410 there would delete the entry's resource on a signal
+/// that has nothing to do with it. The candidate query must exclude it even
+/// though it is the oldest (NULL `last_checked_at`) row in the table, so it
+/// never consumes a batch-cap slot either.
+#[tokio::test]
+async fn list_stale_feed_resources_excludes_fragment_uris() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("localdb.db");
+    let backend = backend_with_store_and_source(&path).await;
+    add_feed_source(&backend).await;
+    let handle = backend.retrieval_store("store-1").await.unwrap();
+
+    handle
+        .upsert_chunks(vec![feed_chunk_record(
+            "feed-fragment",
+            "https://feed.example.com/feed.xml#entry:entry-1",
+        )])
+        .await
+        .unwrap();
+    handle
+        .upsert_chunks(vec![feed_chunk_record(
+            "feed-real-link",
+            "https://a.example.com/",
+        )])
+        .await
+        .unwrap();
+
+    let candidates = handle
+        .list_stale_feed_resources("store-1", "src-feed", "2099-01-01T00:00:00Z", 10)
+        .await
+        .unwrap();
+
+    let ids: Vec<&str> = candidates.iter().map(|c| c.resource_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["feed-real-link"],
+        "a URI carrying a fragment must never be returned as a candidate, even though it \
+         is the oldest (never-checked) row: {candidates:?}"
+    );
+}
+
+/// In single-document mode the feed document itself is stored as a resource,
+/// under the feed URL, with `ingestor_kind = 'feed'` — so it matches every
+/// other predicate in the candidate query. Were it a candidate, a 404/410 on
+/// the feed URL would delete the source's entire index through a mechanism
+/// meant to prune a single entry. `external_id IS NOT NULL` is what separates
+/// it from the entries: every discovered entry is stamped with the entry's own
+/// id, the feed root with none. The filter is SQL, so only a real-DB test can
+/// prove it.
+#[tokio::test]
+async fn list_stale_feed_resources_excludes_the_feed_root() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("localdb.db");
+    let backend = backend_with_store_and_source(&path).await;
+    add_feed_source(&backend).await;
+    let handle = backend.retrieval_store("store-1").await.unwrap();
+
+    handle
+        .upsert_chunks(vec![feed_root_chunk_record(
+            "feed-root",
+            "https://feed.example.com/feed.xml",
+        )])
+        .await
+        .unwrap();
+    handle
+        .upsert_chunks(vec![feed_chunk_record(
+            "feed-entry",
+            "https://a.example.com/",
+        )])
+        .await
+        .unwrap();
+
+    let candidates = handle
+        .list_stale_feed_resources("store-1", "src-feed", "2099-01-01T00:00:00Z", 10)
+        .await
+        .unwrap();
+
+    let ids: Vec<&str> = candidates.iter().map(|c| c.resource_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["feed-entry"],
+        "the feed's own document must never be a liveness candidate: {candidates:?}"
+    );
+}
+
+/// A feed entry's `<link>` need not be an HTTP URL. `Uri::parse` accepts
+/// `mailto:` and `ftp:`, and the feed ingestor indexes such an entry from its
+/// embedded content under that very URI. Handing one to the HTTP fetcher can
+/// only fail — never a 404/410, so never a wrong delete — but it burns one of
+/// the run's 25 probe slots, every run, on a request that could not have told
+/// us anything. The query excludes them by scheme.
+#[tokio::test]
+async fn list_stale_feed_resources_excludes_non_http_schemes() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("localdb.db");
+    let backend = backend_with_store_and_source(&path).await;
+    add_feed_source(&backend).await;
+    let handle = backend.retrieval_store("store-1").await.unwrap();
+
+    for (id, uri) in [
+        ("feed-mailto", "mailto:someone@example.com"),
+        ("feed-ftp", "ftp://ftp.example.com/pub/paper.txt"),
+        ("feed-file", "file:///home/user/notes.md"),
+        ("feed-http", "http://a.example.com/"),
+        ("feed-https", "https://b.example.com/"),
+    ] {
+        handle
+            .upsert_chunks(vec![feed_chunk_record(id, uri)])
+            .await
+            .unwrap();
+    }
+
+    let candidates = handle
+        .list_stale_feed_resources("store-1", "src-feed", "2099-01-01T00:00:00Z", 10)
+        .await
+        .unwrap();
+
+    let mut ids: Vec<&str> = candidates.iter().map(|c| c.resource_id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec!["feed-http", "feed-https"],
+        "only URIs an HTTP probe can actually resolve may become candidates: {candidates:?}"
+    );
 }
 
 /// Scoped by `source_id`, not just `store_id`: a second feed source's own

@@ -6766,18 +6766,37 @@ mod tests {
             struct LivenessRow {
                 resource_id: String,
                 uri: String,
+                external_id: Option<String>,
                 external_etag: Option<String>,
                 external_last_modified: Option<String>,
                 last_checked_at: Option<String>,
             }
 
+            /// A discovered feed entry: stamped with the entry's own id, as
+            /// `FeedIngestor` stamps every entry it yields.
             fn row(resource_id: &str, uri: &str, last_checked_at: Option<&str>) -> LivenessRow {
                 LivenessRow {
                     resource_id: resource_id.to_string(),
                     uri: uri.to_string(),
+                    external_id: Some(format!("urn:entry:{resource_id}")),
                     external_etag: None,
                     external_last_modified: None,
                     last_checked_at: last_checked_at.map(str::to_string),
+                }
+            }
+
+            /// The feed's own document, as single-document mode
+            /// (`fetch_full_content: false`) stores it: a `feed` resource
+            /// under the feed URL, and the only one carrying no
+            /// `external_id`.
+            fn feed_root_row(
+                resource_id: &str,
+                uri: &str,
+                last_checked_at: Option<&str>,
+            ) -> LivenessRow {
+                LivenessRow {
+                    external_id: None,
+                    ..row(resource_id, uri, last_checked_at)
                 }
             }
 
@@ -6900,6 +6919,17 @@ mod tests {
                     let rows = self.rows.lock().await;
                     let mut candidates: Vec<&LivenessRow> = rows
                         .iter()
+                        // A URI carrying a fragment (a link-less entry's
+                        // synthetic `{feed_url}#entry:{id}`) is never a
+                        // candidate — mirrors `store-libsql`'s
+                        // `instr(uri, '#') = 0` and the `uri LIKE
+                        // 'http(s)://%'` scheme filter in the real query.
+                        .filter(|r| !r.uri.contains('#'))
+                        .filter(|r| r.uri.starts_with("http://") || r.uri.starts_with("https://"))
+                        // Only discovered entries. The feed's own document
+                        // carries no `external_id` — mirrors the real
+                        // query's `external_id IS NOT NULL`.
+                        .filter(|r| r.external_id.is_some())
                         .filter(|r| {
                             r.last_checked_at
                                 .as_deref()
@@ -7336,6 +7366,102 @@ mod tests {
                     result.feed_entries_liveness_checked as usize,
                     FEED_LIVENESS_BATCH_LIMIT
                 );
+            }
+
+            // -------------------------------------------------------------
+            // Fragment URIs (link-less entries)
+            // -------------------------------------------------------------
+
+            /// A link-less entry's synthetic `{feed_url}#entry:{id}` URI must
+            /// never be probed, even when it is the oldest (never-checked)
+            /// candidate and the feed root would answer 404: HTTP never sends
+            /// a fragment on the wire, so probing it verbatim would actually
+            /// request the feed root, and a positive `Gone` there must not
+            /// delete the entry's resource.
+            #[tokio::test]
+            async fn fragment_uri_candidate_is_never_fetched_or_deleted() {
+                let store = LivenessStore::new(vec![row(
+                    "r-fragment",
+                    "https://feed.example.com/feed.xml#entry:entry-1",
+                    None, // never-checked — would otherwise sort first
+                )]);
+                let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::Gone);
+                let mut doc_index = DocumentIndex::new();
+                let seen = std::collections::HashSet::new();
+                let mut result = IngestionResult::default();
+
+                run_feed_liveness_sweep(
+                    "src-1",
+                    "store-1",
+                    None,
+                    &seen,
+                    &mut doc_index,
+                    &store,
+                    &fetcher,
+                    &mut result,
+                )
+                .await
+                .unwrap();
+
+                assert!(
+                    fetcher.calls.lock().await.is_empty(),
+                    "a fragment URI must never be fetched — a fragment is never sent on \
+                     the wire, so the request would actually hit the feed root"
+                );
+                assert_eq!(result.feed_entries_liveness_checked, 0);
+                assert_eq!(
+                    result.docs_deleted, 0,
+                    "the entry's resource must not be deleted on a signal that has \
+                     nothing to do with it"
+                );
+                assert_eq!(
+                    store.rows.lock().await.len(),
+                    1,
+                    "the resource must still exist in the store after the sweep"
+                );
+            }
+
+            /// The feed's own document, in single-document mode, is a
+            /// `feed` resource under the feed URL — so it matches every
+            /// candidate predicate except the one that exists for it. A
+            /// 404/410 on the feed URL would otherwise delete the source's
+            /// entire index through a mechanism written to prune a single
+            /// entry.
+            #[tokio::test]
+            async fn feed_root_candidate_is_never_fetched_or_deleted() {
+                let store = LivenessStore::new(vec![feed_root_row(
+                    "r-feed-root",
+                    "https://feed.example.com/feed.xml",
+                    None, // never-checked — would otherwise sort first
+                )]);
+                let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::Gone);
+                let mut doc_index = DocumentIndex::new();
+                let seen = std::collections::HashSet::new();
+                let mut result = IngestionResult::default();
+
+                run_feed_liveness_sweep(
+                    "src-1",
+                    "store-1",
+                    None,
+                    &seen,
+                    &mut doc_index,
+                    &store,
+                    &fetcher,
+                    &mut result,
+                )
+                .await
+                .unwrap();
+
+                assert!(
+                    fetcher.calls.lock().await.is_empty(),
+                    "the feed's own document must never be probed by the entry sweep"
+                );
+                assert_eq!(result.feed_entries_liveness_checked, 0);
+                assert_eq!(
+                    result.docs_deleted, 0,
+                    "a 404 on the feed URL must not delete a single-document index"
+                );
+                assert_eq!(store.rows.lock().await.len(), 1);
             }
 
             // -------------------------------------------------------------

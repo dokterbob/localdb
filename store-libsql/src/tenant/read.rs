@@ -460,6 +460,50 @@ pub(crate) async fn list_indexed_documents(
 /// value under a plain `ASC`/no explicit `NULLS FIRST|LAST`), which is
 /// exactly "never-checked leading" — no `CASE`/`COALESCE` needed to spell
 /// that out.
+///
+/// `instr(uri, '#') = 0` excludes every URI carrying a fragment, in SQL
+/// rather than as a post-filter in `core::ingestion`. A link-less feed entry
+/// is stored under a synthetic `{feed_url}#entry:{id}` URI
+/// (specs/02-domain-model.md's "General connector pattern"); HTTP never
+/// sends a fragment on the wire, so probing that URI verbatim would actually
+/// request the feed root, and a 404/410 there would delete the entry's
+/// resource on a signal that has nothing to do with the entry. Filtering
+/// this in Rust instead would leave such rows matching the WHERE clause
+/// forever — nothing ever advances their `last_checked_at` — so they would
+/// keep being re-selected and re-skipped, permanently occupying slots in the
+/// caller's batch cap. Excluding them here means they never become
+/// candidates at all.
+///
+/// The accepted cost: a *real* entry link that legitimately carries a
+/// fragment (`https://example.com/post#section`) is also excluded, and so
+/// can never be pruned by this mechanism. That is deliberate and is the
+/// correct direction to err — deletion here is asymmetric (a wrong delete
+/// costs a full re-index, a missed one costs a stale hit;
+/// specs/04-search-pipeline.md §1 "Deletes"), so retention bias is the safe
+/// failure.
+///
+/// `external_id IS NOT NULL` excludes the feed's own document. In
+/// single-document mode (`fetch_full_content: false`) the feed itself is
+/// stored as a resource, under the feed URL, with `ingestor_kind = 'feed'` —
+/// so it satisfies every other predicate here, and a 404/410 on the feed URL
+/// would delete the source's entire index through a mechanism written to
+/// prune one entry. Discovered entries are stamped with the entry's own id;
+/// the feed root is the one feed resource that carries none, which is what
+/// makes this a one-predicate separation with no new column. A legacy row
+/// whose `external_id` was never captured is excluded by the same predicate
+/// and can never be pruned by this mechanism — the same retention-biased
+/// failure direction as the two filters above.
+///
+/// The scheme filter beside it is the same argument for a different shape of
+/// unprobeable URI. `Uri::parse` accepts `mailto:` and `ftp:` links, and the
+/// feed ingestor indexes such an entry from its embedded content under that
+/// very URI. Handing one to an HTTP fetcher can only fail — never a 404/410,
+/// so never a delete, but it burns one of the run's 25 probe slots on a
+/// request that could not have told us anything, every run, for as long as
+/// the entry is aged out. Filtered here rather than in Rust for the same
+/// reason as the fragment: `last_checked_at` does advance on a transport
+/// failure, so these would rotate rather than jam, but they would still
+/// crowd out candidates a probe could actually resolve.
 pub(crate) async fn list_stale_feed_resources(
     store: &TenantStore,
     source_id: &str,
@@ -474,6 +518,9 @@ pub(crate) async fn list_stale_feed_resources(
              WHERE store_id = ?
                AND source_id = ?
                AND ingestor_kind = 'feed'
+               AND external_id IS NOT NULL
+               AND instr(uri, '#') = 0
+               AND (uri LIKE 'http://%' OR uri LIKE 'https://%')
                AND (last_checked_at IS NULL OR last_checked_at < ?)
              ORDER BY last_checked_at ASC
              LIMIT ?",
