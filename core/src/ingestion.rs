@@ -1735,7 +1735,20 @@ async fn run_feed_liveness_sweep(
     let floor_secs = refresh_interval_secs
         .unwrap_or(0)
         .max(FEED_LIVENESS_MIN_RECHECK_SECS as u64);
-    let checked_before = (Utc::now() - chrono::Duration::seconds(floor_secs as i64))
+    // `refresh_interval_secs` is an unvalidated `u64` from config (no upper
+    // bound is enforced in `core::config::refresh::validate_refresh_interval`),
+    // so it must not be cast with `as i64`: a value above `i64::MAX` wraps
+    // negative, pushing `checked_before` into the future and making every
+    // resource a candidate — the opposite of this floor's purpose. Saturate
+    // every step instead of only the cast: `chrono::Duration::seconds` itself
+    // panics above `i64::MAX / 1_000`, and subtracting from `Utc::now()` can
+    // in principle underflow past the representable range.
+    let floor_secs_i64 = i64::try_from(floor_secs).unwrap_or(i64::MAX);
+    let recheck_window =
+        chrono::Duration::try_seconds(floor_secs_i64).unwrap_or(chrono::Duration::MAX);
+    let checked_before = Utc::now()
+        .checked_sub_signed(recheck_window)
+        .unwrap_or(chrono::DateTime::<Utc>::MIN_UTC)
         .to_rfc3339_opts(SecondsFormat::Secs, true);
 
     let candidates: Vec<StaleFeedResource> = store
@@ -7277,6 +7290,85 @@ mod tests {
                 assert!(
                     fetcher.calls.lock().await.is_empty(),
                     "a 30-day configured refresh interval must raise the floor above the bare 24h default"
+                );
+            }
+
+            /// A `refresh_interval_secs` above `i64::MAX` must not overflow
+            /// the `as i64` cast the recheck-floor computation used to use: a
+            /// wrapped-negative value would push `checked_before` into the
+            /// future, making every resource a candidate — the opposite of
+            /// the throttle's purpose. A resource checked one minute ago must
+            /// stay well inside any correctly computed floor regardless of
+            /// how large the configured interval is.
+            #[tokio::test]
+            async fn recheck_floor_with_u64_max_refresh_interval_never_lands_in_the_future() {
+                let one_minute_ago = (Utc::now() - chrono::Duration::seconds(60))
+                    .to_rfc3339_opts(SecondsFormat::Secs, true);
+                let store = LivenessStore::new(vec![row(
+                    "r1",
+                    "https://a.example.com/",
+                    Some(&one_minute_ago),
+                )]);
+                let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::Gone);
+                let mut doc_index = DocumentIndex::new();
+                let seen = std::collections::HashSet::new();
+                let mut result = IngestionResult::default();
+
+                run_feed_liveness_sweep(
+                    "src-1",
+                    "store-1",
+                    Some(u64::MAX),
+                    &seen,
+                    &mut doc_index,
+                    &store,
+                    &fetcher,
+                    &mut result,
+                )
+                .await
+                .unwrap();
+
+                assert!(
+                    fetcher.calls.lock().await.is_empty(),
+                    "an overflowing refresh_interval_secs must never push checked_before into \
+                     the future — that would make every resource a candidate"
+                );
+            }
+
+            /// `refresh_interval_secs: Some(0)` must not drop the recheck
+            /// floor below the bare 24h minimum — the `.max(...)` call
+            /// guards this, but only if the value it is maxed against
+            /// actually reaches `checked_before` afterward.
+            #[tokio::test]
+            async fn recheck_floor_with_zero_configured_refresh_interval_never_drops_below_24h() {
+                let twenty_three_hours_ago = (Utc::now() - chrono::Duration::hours(23))
+                    .to_rfc3339_opts(SecondsFormat::Secs, true);
+                let store = LivenessStore::new(vec![row(
+                    "r1",
+                    "https://a.example.com/",
+                    Some(&twenty_three_hours_ago),
+                )]);
+                let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::Gone);
+                let mut doc_index = DocumentIndex::new();
+                let seen = std::collections::HashSet::new();
+                let mut result = IngestionResult::default();
+
+                run_feed_liveness_sweep(
+                    "src-1",
+                    "store-1",
+                    Some(0),
+                    &seen,
+                    &mut doc_index,
+                    &store,
+                    &fetcher,
+                    &mut result,
+                )
+                .await
+                .unwrap();
+
+                assert!(
+                    fetcher.calls.lock().await.is_empty(),
+                    "a configured refresh_interval_secs of 0 must not drop the recheck floor \
+                     below the bare 24h minimum"
                 );
             }
 
