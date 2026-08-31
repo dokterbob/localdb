@@ -21,8 +21,8 @@ use ingest::FileIngestor;
 use localdb_core::block::{IngestorKind, Resource};
 use localdb_core::embedder::FakeEmbedder;
 use localdb_core::ingestion::{
-    run_source_ingestion, DeletionPolicy, DocumentIndex, DocumentRecord, FetchMetadata,
-    IngestionConfig, SourceIngestionDeps, UnreachableFetcher,
+    run_source_ingestion, DocumentIndex, DocumentRecord, FetchMetadata, IngestionConfig,
+    SourceIngestionDeps,
 };
 use localdb_core::ingestor::{IngestCallback, IngestResult, IngestSource, Ingestor, SkipReason};
 use localdb_core::store::FakeStore;
@@ -286,17 +286,7 @@ async fn reindex_with_new_date_extraction_self_heals_as_metadata_only_update() {
     // Run 1: the "pre-#251" state — no date on the resource yet.
     let mut doc_index = DocumentIndex::new();
     let ingestor1 = ScriptedIngestor::new(vec![resource_without_date]);
-    let deps1 = SourceIngestionDeps {
-        doc_index: &mut doc_index,
-        store: &store,
-        embedder: &embedder,
-        config: &config,
-        progress: None,
-        deletion: DeletionPolicy::Retain,
-        document_validators: FetchMetadata::default(),
-        stored_inputs_digest: None,
-        fetcher: &UnreachableFetcher,
-    };
+    let deps1 = SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config);
     let result1 = run_source_ingestion(&source, &ingestor1, deps1)
         .await
         .unwrap();
@@ -314,17 +304,7 @@ async fn reindex_with_new_date_extraction_self_heals_as_metadata_only_update() {
     // Run 2: "the new extraction is now active" — same bytes, but this time
     // the resource carries the date the real parser chain actually found.
     let ingestor2 = ScriptedIngestor::new(vec![resource_with_date]);
-    let deps2 = SourceIngestionDeps {
-        doc_index: &mut doc_index,
-        store: &store,
-        embedder: &embedder,
-        config: &config,
-        progress: None,
-        deletion: DeletionPolicy::Retain,
-        document_validators: FetchMetadata::default(),
-        stored_inputs_digest: None,
-        fetcher: &UnreachableFetcher,
-    };
+    let deps2 = SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config);
     let result2 = run_source_ingestion(&source, &ingestor2, deps2)
         .await
         .unwrap();

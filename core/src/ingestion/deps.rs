@@ -280,3 +280,43 @@ pub struct SourceIngestionDeps<'a> {
     /// run under [`DeletionPolicy::Retain`].
     pub fetcher: &'a dyn UrlFetcher,
 }
+
+#[cfg(any(test, feature = "test-support"))]
+impl<'a> SourceIngestionDeps<'a> {
+    /// Build a `SourceIngestionDeps` for the four fields nearly every test
+    /// cares about, defaulting the rest to what the overwhelming majority of
+    /// call sites across `core`'s and `ingest`'s test suites already wrote by
+    /// hand: `progress: None` (no progress sink under test), `deletion:
+    /// DeletionPolicy::Retain` (matching the type's own opt-in-deletion
+    /// default — tests that exercise the delete-sweep or the feed liveness
+    /// sweep, which only run under `Prune`, override it explicitly),
+    /// `document_validators: FetchMetadata::default()` and
+    /// `stored_inputs_digest: None` (no prior conditional-GET state), and
+    /// `fetcher: &UnreachableFetcher` (the sweep never runs, so the fetcher
+    /// is never dereferenced — see `UnreachableFetcher`'s own doc comment).
+    ///
+    /// A call site that needs a non-default value for any of these five
+    /// still uses a plain struct literal (or struct-update syntax over this
+    /// constructor, `SourceIngestionDeps { deletion: DeletionPolicy::Prune,
+    /// ..SourceIngestionDeps::for_test(...) }`) — this constructor exists to
+    /// remove the boilerplate at the sites that don't vary it, not to hide
+    /// the field from sites that do.
+    pub fn for_test(
+        doc_index: &'a mut DocumentIndex,
+        store: &'a dyn RetrievalStore,
+        embedder: &'a dyn Embedder,
+        config: &'a IngestionConfig,
+    ) -> Self {
+        Self {
+            doc_index,
+            store,
+            embedder,
+            config,
+            progress: None,
+            deletion: DeletionPolicy::Retain,
+            document_validators: FetchMetadata::default(),
+            stored_inputs_digest: None,
+            fetcher: &UnreachableFetcher,
+        }
+    }
+}

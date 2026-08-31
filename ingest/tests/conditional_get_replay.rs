@@ -18,8 +18,8 @@ use ingest::{FeedIngestor, UrlIngestor};
 use localdb_core::embedder::FakeEmbedder;
 use localdb_core::error::Error;
 use localdb_core::ingestion::{
-    run_source_ingestion, DeletionPolicy, DocumentIndex, FetchMetadata, FetchResult,
-    IngestionConfig, SourceIngestionDeps, UnreachableFetcher, UrlFetcher,
+    run_source_ingestion, DocumentIndex, FetchMetadata, FetchResult, IngestionConfig,
+    SourceIngestionDeps, UrlFetcher,
 };
 use localdb_core::parser::{ParsedDocument, Parser, Probe};
 use localdb_core::store::FakeStore;
@@ -145,17 +145,7 @@ async fn url_source_replays_stored_validators_on_second_run() {
     run_source_ingestion(
         &source,
         &ingestor,
-        SourceIngestionDeps {
-            doc_index: &mut doc_index,
-            store: &store,
-            embedder: &embedder,
-            config: &config,
-            progress: None,
-            deletion: DeletionPolicy::Retain,
-            document_validators: FetchMetadata::default(),
-            stored_inputs_digest: None,
-            fetcher: &UnreachableFetcher,
-        },
+        SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config),
     )
     .await
     .unwrap();
@@ -163,17 +153,7 @@ async fn url_source_replays_stored_validators_on_second_run() {
     run_source_ingestion(
         &source,
         &ingestor,
-        SourceIngestionDeps {
-            doc_index: &mut doc_index,
-            store: &store,
-            embedder: &embedder,
-            config: &config,
-            progress: None,
-            deletion: DeletionPolicy::Retain,
-            document_validators: FetchMetadata::default(),
-            stored_inputs_digest: None,
-            fetcher: &UnreachableFetcher,
-        },
+        SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config),
     )
     .await
     .unwrap();
@@ -243,17 +223,7 @@ async fn feed_entry_link_replays_stored_validators_on_second_run() {
     run_source_ingestion(
         &source,
         &ingestor,
-        SourceIngestionDeps {
-            doc_index: &mut doc_index,
-            store: &store,
-            embedder: &embedder,
-            config: &config,
-            progress: None,
-            deletion: DeletionPolicy::Retain,
-            document_validators: FetchMetadata::default(),
-            stored_inputs_digest: None,
-            fetcher: &UnreachableFetcher,
-        },
+        SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config),
     )
     .await
     .unwrap();
@@ -261,17 +231,7 @@ async fn feed_entry_link_replays_stored_validators_on_second_run() {
     run_source_ingestion(
         &source,
         &ingestor,
-        SourceIngestionDeps {
-            doc_index: &mut doc_index,
-            store: &store,
-            embedder: &embedder,
-            config: &config,
-            progress: None,
-            deletion: DeletionPolicy::Retain,
-            document_validators: FetchMetadata::default(),
-            stored_inputs_digest: None,
-            fetcher: &UnreachableFetcher,
-        },
+        SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config),
     )
     .await
     .unwrap();
@@ -583,17 +543,7 @@ async fn a_304_that_writes_reports_a_metadata_update_not_a_skip() {
     let first = run_source_ingestion(
         &source,
         &ingestor,
-        SourceIngestionDeps {
-            doc_index: &mut doc_index,
-            store: &store,
-            embedder: &embedder,
-            config: &config,
-            fetcher: &UnreachableFetcher,
-            progress: None,
-            deletion: DeletionPolicy::Retain,
-            document_validators: FetchMetadata::default(),
-            stored_inputs_digest: None,
-        },
+        SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config),
     )
     .await
     .unwrap();
@@ -608,17 +558,7 @@ async fn a_304_that_writes_reports_a_metadata_update_not_a_skip() {
     let second = run_source_ingestion(
         &source,
         &ingestor,
-        SourceIngestionDeps {
-            doc_index: &mut doc_index,
-            store: &store,
-            embedder: &embedder,
-            config: &config,
-            fetcher: &UnreachableFetcher,
-            progress: None,
-            deletion: DeletionPolicy::Retain,
-            document_validators: FetchMetadata::default(),
-            stored_inputs_digest: None,
-        },
+        SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config),
     )
     .await
     .unwrap();
@@ -671,17 +611,7 @@ async fn a_304_whose_metadata_write_fails_reports_an_error_not_a_skip() {
     run_source_ingestion(
         &source,
         &ingestor,
-        SourceIngestionDeps {
-            doc_index: &mut doc_index,
-            store: &store,
-            embedder: &embedder,
-            config: &config,
-            fetcher: &UnreachableFetcher,
-            progress: None,
-            deletion: DeletionPolicy::Retain,
-            document_validators: FetchMetadata::default(),
-            stored_inputs_digest: None,
-        },
+        SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config),
     )
     .await
     .unwrap();
@@ -694,17 +624,7 @@ async fn a_304_whose_metadata_write_fails_reports_an_error_not_a_skip() {
     let second = run_source_ingestion(
         &source,
         &ingestor,
-        SourceIngestionDeps {
-            doc_index: &mut doc_index,
-            store: &store,
-            embedder: &embedder,
-            config: &config,
-            fetcher: &UnreachableFetcher,
-            progress: None,
-            deletion: DeletionPolicy::Retain,
-            document_validators: FetchMetadata::default(),
-            stored_inputs_digest: None,
-        },
+        SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config),
     )
     .await
     .unwrap();
@@ -816,17 +736,7 @@ async fn a_moved_last_modified_on_an_unchanged_200_is_persisted_and_replayed() {
             run_source_ingestion(
                 &source,
                 &ingestor,
-                SourceIngestionDeps {
-                    doc_index: &mut doc_index,
-                    store: &store,
-                    embedder: &embedder,
-                    config: &config,
-                    progress: None,
-                    deletion: DeletionPolicy::Retain,
-                    document_validators: FetchMetadata::default(),
-                    stored_inputs_digest: None,
-                    fetcher: &UnreachableFetcher,
-                },
+                SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config),
             )
             .await
             .unwrap()

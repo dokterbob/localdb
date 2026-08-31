@@ -2094,17 +2094,7 @@ mod unified_pipeline {
             kept_uri, "Kept.", &source.id, store_id,
         ))]);
 
-        let deps = SourceIngestionDeps {
-            doc_index: &mut doc_index,
-            store: &store,
-            embedder: &embedder,
-            config: &config,
-            progress: None,
-            deletion: DeletionPolicy::Retain,
-            document_validators: FetchMetadata::default(),
-            stored_inputs_digest: None,
-            fetcher: &UnreachableFetcher,
-        };
+        let deps = SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config);
         let result = run_source_ingestion(&source, &ingestor, deps)
             .await
             .unwrap();
@@ -2157,17 +2147,7 @@ mod unified_pipeline {
         doc_index.upsert(record.clone());
 
         let ingestor = FakeIngestor::new(vec![ScriptStep::Gone(url.to_string())]);
-        let deps = SourceIngestionDeps {
-            doc_index: &mut doc_index,
-            store: &store,
-            embedder: &embedder,
-            config: &config,
-            progress: None,
-            deletion: DeletionPolicy::Retain,
-            document_validators: FetchMetadata::default(),
-            stored_inputs_digest: None,
-            fetcher: &UnreachableFetcher,
-        };
+        let deps = SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config);
         let result = run_source_ingestion(&source, &ingestor, deps)
             .await
             .unwrap();
@@ -2209,17 +2189,7 @@ mod unified_pipeline {
         doc_index.upsert(record.clone());
 
         let ingestor = FakeIngestor::incomplete("source root is not reachable: /volumes/archive");
-        let deps = SourceIngestionDeps {
-            doc_index: &mut doc_index,
-            store: &store,
-            embedder: &embedder,
-            config: &config,
-            progress: None,
-            deletion: DeletionPolicy::Retain,
-            document_validators: FetchMetadata::default(),
-            stored_inputs_digest: None,
-            fetcher: &UnreachableFetcher,
-        };
+        let deps = SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config);
         let result = run_source_ingestion(&source, &ingestor, deps)
             .await
             .unwrap();
@@ -5733,17 +5703,7 @@ mod unified_pipeline {
                 "https://a.example.com/".to_string(),
                 SkipReason::Unchanged,
             )]);
-            let deps = SourceIngestionDeps {
-                doc_index: &mut doc_index,
-                store: &store,
-                embedder: &embedder,
-                config: &config,
-                progress: None,
-                deletion: DeletionPolicy::Retain,
-                document_validators: FetchMetadata::default(),
-                stored_inputs_digest: None,
-                fetcher: &UnreachableFetcher,
-            };
+            let deps = SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config);
             run_source_ingestion(&source, &ingestor, deps)
                 .await
                 .unwrap();
