@@ -456,9 +456,14 @@ impl HttpUrlFetcher {
     /// One fidelity limit, inherent to returning `String`: a header carrying
     /// RFC 9110 obs-text (bytes 0x80-0xFF) is legal to receive but is not
     /// valid UTF-8, so `to_str()` rejects it and the validator comes back
-    /// `None`. That degrades to an unconditional re-fetch — the same outcome
-    /// as never having stored a validator — rather than to a replayed value
-    /// the origin would not recognize, which is the safe direction to fail.
+    /// `None` rather than as a value the origin would not recognize. Both
+    /// arms then fail toward extra work rather than toward staleness, by
+    /// different routes: on the 200 arm the `None` replaces whatever was
+    /// stored, since a 200 is a full fresh representation, so the next
+    /// request goes out unconditional. On the 304 arm it folds, leaving the
+    /// stored validator untouched, so the next request stays conditional
+    /// against a value the origin does still recognize. Neither route can
+    /// produce a 304 against a representation this store never indexed.
     fn extract_validators(response: &reqwest::Response) -> (Option<String>, Option<String>) {
         let etag = response
             .headers()
