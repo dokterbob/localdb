@@ -409,7 +409,7 @@ async fn upsert_resource_added_at_survives_policy_reindex() {
 
     let first = chunk_record("2020-01-01T00:00:00Z", Some("2020-01-01T00:00:00Z"));
     handle
-        .upsert_chunks_and_blocks("store-1", "doc-1", vec![first], &[], None)
+        .upsert_chunks_and_blocks("store-1", "doc-1", vec![first], &[], None, None)
         .await
         .unwrap();
     let (added_at_1, _, _) = resource_row(&backend, "doc-1").await;
@@ -418,7 +418,7 @@ async fn upsert_resource_added_at_survives_policy_reindex() {
     // acquisition time) and modified_at, same resource_id.
     let second = chunk_record("2026-08-26T00:00:00Z", Some("2026-08-20T00:00:00Z"));
     handle
-        .upsert_chunks_and_blocks("store-1", "doc-1", vec![second], &[], Some("doc-1"))
+        .upsert_chunks_and_blocks("store-1", "doc-1", vec![second], &[], Some("doc-1"), None)
         .await
         .unwrap();
     let (added_at_2, modified_at_2, index_updated_at_2) = resource_row(&backend, "doc-1").await;
@@ -553,6 +553,7 @@ async fn metadata_only_update_does_not_touch_chunks_embeddings_or_fts() {
         metadata: new_metadata.clone(),
         external_id: Some("urn:entry:9".to_string()),
         external_etag: Some("\"etag-9\"".to_string()),
+        external_last_modified: None,
         modified_at: Some("2026-08-01T00:00:00Z".to_string()),
         date_original: Some("2026-07-30".to_string()),
         date_parsed: Some("2026-07-30".to_string()),
@@ -622,6 +623,7 @@ async fn metadata_only_update_bumps_index_updated_at() {
         metadata: Metadata::default(),
         external_id: None,
         external_etag: None,
+        external_last_modified: None,
         modified_at: Some("2026-07-01T00:00:00Z".to_string()),
         date_original: None,
         date_parsed: None,
@@ -656,6 +658,7 @@ async fn update_resource_metadata_errors_when_no_row_matches() {
         metadata: Metadata::default(),
         external_id: None,
         external_etag: None,
+        external_last_modified: None,
         modified_at: Some("2026-08-01T00:00:00Z".to_string()),
         date_original: None,
         date_parsed: None,

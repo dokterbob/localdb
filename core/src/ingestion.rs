@@ -68,6 +68,18 @@ pub struct DocumentRecord {
     /// extension point) so a future addition (e.g. #269's
     /// `extractor_version`) is a small struct change, not a redesign.
     pub metadata_hash: String,
+    /// Raw HTTP `ETag` validator captured from the last successful fetch of
+    /// this resource (`url` sources and feed entry links only; `None`
+    /// otherwise). Replayed as `If-None-Match` on the next fetch of the same
+    /// URI — see `IngestCallback::lookup_fetch_metadata` — subject to the
+    /// suppression rule: only when `policy_version` still matches the run's.
+    /// See specs/04-search-pipeline.md §1.
+    pub external_etag: Option<String>,
+    /// Raw HTTP `Last-Modified` validator, replayed as `If-Modified-Since`
+    /// under the same conditions as `external_etag`. Unlike `external_etag`,
+    /// not an input to `core::ids::compute_metadata_hash` — see
+    /// specs/02-domain-model.md §2.
+    pub external_last_modified: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1183,6 +1195,7 @@ pub async fn index_resource(
             records,
             &resource.blocks,
             replaces_resource_id,
+            resource.external_last_modified.as_deref(),
         )
         .await?;
 
@@ -1591,6 +1604,7 @@ impl IngestCallback for PipelineCallback<'_> {
                     metadata: derived.metadata,
                     external_id: resource.external_id.clone(),
                     external_etag: resource.external_etag.clone(),
+                    external_last_modified: resource.external_last_modified.clone(),
                     modified_at: derived.modified_at,
                     date_original: derived.date_original,
                     date_parsed: derived.date_parsed,
@@ -1621,6 +1635,8 @@ impl IngestCallback for PipelineCallback<'_> {
                     content_hash: existing.content_hash.clone(),
                     policy_version: existing.policy_version.clone(),
                     metadata_hash: derived.metadata_hash,
+                    external_etag: resource.external_etag.clone(),
+                    external_last_modified: resource.external_last_modified.clone(),
                 });
                 self.result.docs_metadata_updated += 1;
                 self.emit(crate::progress::ProgressEvent::DocumentFinished {
@@ -1668,6 +1684,8 @@ impl IngestCallback for PipelineCallback<'_> {
                     content_hash: resource.content_hash.clone(),
                     policy_version: self.config.policy_version.clone(),
                     metadata_hash,
+                    external_etag: resource.external_etag.clone(),
+                    external_last_modified: resource.external_last_modified.clone(),
                 });
                 self.emit(crate::progress::ProgressEvent::DocumentFinished {
                     uri,
@@ -1809,6 +1827,8 @@ mod tests {
             content_hash: "hash-1".to_string(),
             policy_version: "v1".to_string(),
             metadata_hash: "mhash-1".to_string(),
+            external_etag: None,
+            external_last_modified: None,
         };
         idx.upsert(rec.clone());
         let found = idx.get("file:///test.md").unwrap();
@@ -1825,6 +1845,8 @@ mod tests {
             content_hash: "hash-1".to_string(),
             policy_version: "v1".to_string(),
             metadata_hash: "mhash-1".to_string(),
+            external_etag: None,
+            external_last_modified: None,
         };
         idx.upsert(rec);
         let removed = idx.remove("file:///test.md");
@@ -2545,6 +2567,7 @@ mod tests {
                 uri: Uri::parse(uri).unwrap_or_else(|| panic!("invalid test uri: {uri}")),
                 external_id: None,
                 external_etag: None,
+                external_last_modified: None,
                 content_hash: hash,
                 title: None,
                 mime: Some("text/markdown".to_string()),
@@ -2602,6 +2625,8 @@ mod tests {
                 content_hash: resource.content_hash.clone(),
                 policy_version: config.policy_version.clone(),
                 metadata_hash,
+                external_etag: resource.external_etag.clone(),
+                external_last_modified: resource.external_last_modified.clone(),
             }
         }
 
@@ -4879,6 +4904,7 @@ mod tests {
                 records: Vec<ChunkRecord>,
                 blocks: &[crate::block::Block],
                 replaces_resource_id: Option<&str>,
+                _external_last_modified: Option<&str>,
             ) -> Result<usize, Error> {
                 self.upsert_calls.lock().await.push((
                     store_id.to_string(),

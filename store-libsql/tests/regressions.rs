@@ -303,6 +303,7 @@ async fn indexed_resource_persists_ingestion_time_not_feed_date_in_added_at() {
         uri: Uri::parse(uri).unwrap(),
         external_id: None,
         external_etag: None,
+        external_last_modified: None,
         content_hash: hash,
         title: Some("Old post".to_string()),
         mime: Some("text/markdown".to_string()),

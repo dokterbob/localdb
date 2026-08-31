@@ -355,6 +355,7 @@ pub(crate) fn build_resource(
         uri: uri.clone(),
         external_id: enrich.external_id.clone(),
         external_etag: None,
+        external_last_modified: None,
         content_hash: hash,
         title,
         mime,

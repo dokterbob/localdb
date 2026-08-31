@@ -734,6 +734,7 @@ mod tests {
             uri,
             external_id: None,
             external_etag: None,
+            external_last_modified: None,
             content_hash: hash,
             title: None,
             mime: Some("text/markdown".to_string()),

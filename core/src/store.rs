@@ -230,6 +230,10 @@ pub struct ResourceRecord {
     pub external_id: Option<String>,
     /// The source's own change-detection token. See `ChunkRecord::external_etag`.
     pub external_etag: Option<String>,
+    /// Raw HTTP `Last-Modified` conditional-GET validator, beside
+    /// `external_etag`. See `Resource::external_last_modified` — not an
+    /// input to `core::ids::compute_metadata_hash`.
+    pub external_last_modified: Option<String>,
     /// The resource's own claimed modification time (RFC 3339). `None` when
     /// the source makes no such claim — see `ChunkRecord::modified_at`.
     pub modified_at: Option<String>,
@@ -634,6 +638,15 @@ pub trait RetrievalStore: Send + Sync + 'static {
     /// (libsql) override wraps the delete and both upserts in a single
     /// database transaction, guaranteeing that a write failure rolls back
     /// the delete along with the insert.
+    ///
+    /// `external_last_modified` is the resource's raw HTTP `Last-Modified`
+    /// conditional-GET validator (`Resource::external_last_modified`), a
+    /// trailing parameter rather than a `ChunkRecord` field: unlike
+    /// `external_etag`, it is deliberately not denormalized onto every chunk
+    /// row (see `ChunkRecord`'s doc comment), since only the owning
+    /// resource row needs it. The default implementation below has nowhere
+    /// to persist it (no `ChunkRecord`/`upsert_blocks` column carries it) and
+    /// ignores it; only `TenantStore` writes it.
     async fn upsert_chunks_and_blocks(
         &self,
         store_id: &str,
@@ -641,7 +654,9 @@ pub trait RetrievalStore: Send + Sync + 'static {
         records: Vec<ChunkRecord>,
         blocks: &[crate::block::Block],
         replaces_resource_id: Option<&str>,
+        external_last_modified: Option<&str>,
     ) -> Result<usize, Error> {
+        let _ = external_last_modified;
         if let Some(old_id) = replaces_resource_id {
             self.delete_by_resource(old_id).await?;
         }
@@ -861,6 +876,11 @@ impl RetrievalStore for FakeStore {
                     chunk.external_etag.as_deref(),
                     chunk.modified_at.as_deref(),
                 ),
+                external_etag: chunk.external_etag.clone(),
+                // `ChunkRecord` deliberately carries no
+                // `external_last_modified` (see `upsert_chunks_and_blocks`'s
+                // doc comment) — `FakeStore` has nowhere to keep it.
+                external_last_modified: None,
             });
         }
         Ok(seen.into_values().collect())
@@ -1085,7 +1105,7 @@ pub mod conformance {
             vec![0.0, 1.0],
         )];
         let written = store
-            .upsert_chunks_and_blocks("store-1", "doc-b", new_records, &[], Some("doc-a"))
+            .upsert_chunks_and_blocks("store-1", "doc-b", new_records, &[], Some("doc-a"), None)
             .await
             .unwrap();
         assert_eq!(written, 1, "should report 1 written chunk for doc-b");
@@ -1129,7 +1149,7 @@ pub mod conformance {
             vec![0.0, 1.0],
         )];
         let written = store
-            .upsert_chunks_and_blocks("store-1", "doc-1", new_records, &[], Some("doc-1"))
+            .upsert_chunks_and_blocks("store-1", "doc-1", new_records, &[], Some("doc-1"), None)
             .await
             .unwrap();
         assert_eq!(written, 1, "should report 1 written chunk");

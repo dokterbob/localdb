@@ -136,8 +136,16 @@ impl RetrievalStore for TenantStore {
         records: Vec<localdb_core::ChunkRecord>,
         blocks: &[localdb_core::block::Block],
         replaces_resource_id: Option<&str>,
+        external_last_modified: Option<&str>,
     ) -> Result<usize, localdb_core::Error> {
-        write::upsert_chunks_and_blocks(self, resource_id, records, blocks, replaces_resource_id)
-            .await
+        write::upsert_chunks_and_blocks(
+            self,
+            resource_id,
+            records,
+            blocks,
+            replaces_resource_id,
+            external_last_modified,
+        )
+        .await
     }
 }

@@ -307,10 +307,17 @@ pub(crate) async fn list_indexed_documents(
     // state `index_resource`/`update_resource_metadata` write, or a
     // rehydrated `DocumentIndex` would disagree with the in-process one
     // about whether a resource's metadata changed (issue #176).
+    // `external_etag`/`external_last_modified` are ALSO kept on the returned
+    // `DocumentRecord` itself (not just consumed here for the hash) — they
+    // are the stored conditional-GET validators
+    // `IngestCallback::lookup_fetch_metadata` replays on the next fetch, and
+    // this is the one place that rehydrates `DocumentIndex` across process
+    // restarts.
     let mut rows = conn
         .query(
             "SELECT id, uri, content_hash, policy_version, source_id,
-                    metadata_json, external_id, external_etag, modified_at
+                    metadata_json, external_id, external_etag, modified_at,
+                    external_last_modified
              FROM resources WHERE store_id = ?",
             params![store.store_id().to_string()],
         )
@@ -323,6 +330,7 @@ pub(crate) async fn list_indexed_documents(
         let external_id: Option<String> = row.get(6).map_err(map_libsql_err)?;
         let external_etag: Option<String> = row.get(7).map_err(map_libsql_err)?;
         let modified_at: Option<String> = row.get(8).map_err(map_libsql_err)?;
+        let external_last_modified: Option<String> = row.get(9).map_err(map_libsql_err)?;
 
         // Deliberately re-parsed here (rather than delegating to
         // `parse_metadata_json_lenient`, the precedent `rows.rs` uses for
@@ -366,6 +374,8 @@ pub(crate) async fn list_indexed_documents(
             policy_version: row.get(3).map_err(map_libsql_err)?,
             source_id: row.get(4).map_err(map_libsql_err)?,
             metadata_hash,
+            external_etag,
+            external_last_modified,
         });
     }
     Ok(out)

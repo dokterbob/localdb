@@ -56,7 +56,11 @@ pub(crate) async fn upsert_chunks(
     }
     let count = records.len();
     let tx = store.conn().write_tx().await?;
-    let result = upsert_chunks_inner(&tx, &records, store.encoding())
+    // The plain (non-`_and_blocks`) path carries no `Resource`, so it has no
+    // `external_last_modified` value to give — see `upsert_chunks_inner`'s
+    // `ON CONFLICT` comment for why `None` here can never clobber a value
+    // `upsert_chunks_and_blocks` already stored for the same resource_id.
+    let result = upsert_chunks_inner(&tx, &records, store.encoding(), None)
         .await
         .map(|()| count);
     finish_write_tx(tx, result).await
@@ -219,20 +223,22 @@ async fn update_resource_metadata_inner(
     let rows_affected = conn
         .execute(
             "UPDATE resources SET
-                 metadata_json    = ?,
-                 title            = ?,
-                 external_id      = ?,
-                 external_etag    = ?,
-                 modified_at      = ?,
-                 date_original    = ?,
-                 date_parsed      = ?,
-                 index_updated_at = ?
+                 metadata_json         = ?,
+                 title                 = ?,
+                 external_id           = ?,
+                 external_etag         = ?,
+                 external_last_modified = ?,
+                 modified_at           = ?,
+                 date_original         = ?,
+                 date_parsed           = ?,
+                 index_updated_at      = ?
              WHERE store_id = ? AND id = ?",
             params![
                 metadata_json.as_str(),
                 title,
                 record.external_id.as_deref(),
                 record.external_etag.as_deref(),
+                record.external_last_modified.as_deref(),
                 record.modified_at.as_deref(),
                 record.date_original.as_deref(),
                 record.date_parsed.as_deref(),
@@ -270,6 +276,7 @@ async fn upsert_chunks_inner(
     conn: &Connection,
     records: &[ChunkRecord],
     encoding: VectorEncoding,
+    external_last_modified: Option<&str>,
 ) -> Result<(), Error> {
     // Track which (store_id, resource_id) pairs we've already upserted in this
     // batch so we don't issue duplicate resource upserts.
@@ -293,8 +300,9 @@ async fn upsert_chunks_inner(
                 "INSERT INTO resources (store_id, id, source_id, ingestor_kind, resource_kind,
                      uri, title, mime, content_hash, added_at, modified_at, index_updated_at,
                      origin_store, policy_version, metadata_json, extractor_version,
-                     date_original, date_parsed, external_id, external_etag)
-                 VALUES (?, ?, ?, ?, 'document', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '1', ?, ?, ?, ?)
+                     date_original, date_parsed, external_id, external_etag,
+                     external_last_modified)
+                 VALUES (?, ?, ?, ?, 'document', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '1', ?, ?, ?, ?, ?)
                  ON CONFLICT(store_id, id) DO UPDATE SET
                      source_id        = excluded.source_id,
                      ingestor_kind    = excluded.ingestor_kind,
@@ -311,6 +319,19 @@ async fn upsert_chunks_inner(
                      date_parsed      = excluded.date_parsed,
                      external_id      = excluded.external_id,
                      external_etag    = excluded.external_etag",
+                // `external_last_modified` is deliberately absent from the
+                // `ON CONFLICT` SET list above: unlike `external_etag`
+                // (denormalized onto every `ChunkRecord`, so a plain
+                // `upsert_chunks` call always carries the right value), it
+                // arrives only via this function's own parameter, which the
+                // plain (non-`_and_blocks`) `upsert_chunks` caller below
+                // always passes `None` for. Including it in `ON CONFLICT`
+                // would let that caller silently null out a validator
+                // `upsert_chunks_and_blocks` previously stored for a
+                // resource_id it happens to touch again. The `_and_blocks`
+                // replace path never hits this conflict branch anyway — it
+                // deletes the old row before inserting — so restricting the
+                // column to the plain `INSERT` values loses nothing there.
                 params![
                     record.store_id.as_str(),
                     record.resource_id.as_str(), // id column
@@ -330,6 +351,7 @@ async fn upsert_chunks_inner(
                     record.date_parsed.as_deref(),
                     record.external_id.as_deref(),
                     record.external_etag.as_deref(),
+                    external_last_modified,
                 ],
             )
             .await
@@ -434,6 +456,7 @@ pub(crate) async fn upsert_chunks_and_blocks(
     records: Vec<ChunkRecord>,
     blocks: &[localdb_core::block::Block],
     replaces_resource_id: Option<&str>,
+    external_last_modified: Option<&str>,
 ) -> Result<usize, localdb_core::Error> {
     for record in &records {
         if record.store_id != store.store_id() {
@@ -463,7 +486,7 @@ pub(crate) async fn upsert_chunks_and_blocks(
                 delete_document_inner(&tx, store.store_id(), old_id).await?;
             }
         }
-        upsert_chunks_inner(&tx, &records, store.encoding()).await?;
+        upsert_chunks_inner(&tx, &records, store.encoding(), external_last_modified).await?;
         upsert_blocks_inner(&tx, store.store_id(), resource_id, blocks).await?;
         Ok(count)
     }
