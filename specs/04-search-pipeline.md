@@ -352,6 +352,9 @@ observed it.
   re-index anyway, and the correct side to err on.
 - `Blocked` or a transport error is not evidence about the entry, so nothing about the resource's
   content, metadata, or validators moves.
+- A store write failure for one candidate (e.g. a concurrent delete racing the probe) is logged and
+  the sweep moves on to the next candidate — it does not abort the batch and discard the stats
+  already computed for the candidates processed alongside it.
 
 **What a probe writes (normative).** Every outcome above except the delete converges on a single
 `RetrievalStore::touch_resource_liveness` call, which writes exactly three columns —

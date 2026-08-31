@@ -1877,14 +1877,28 @@ async fn run_feed_liveness_sweep(
                 // delete.
                 let etag = etag.or(candidate.external_etag);
                 let last_modified = last_modified.or(candidate.external_last_modified);
-                store
+                // A per-candidate failure here (e.g. a concurrent delete
+                // racing this probe) must not abort the whole source and
+                // discard the run's already-computed stats for the
+                // candidates already processed — the transport-error and
+                // `Blocked` handling elsewhere in this loop apply the same
+                // rule: log and move on to the next candidate.
+                if let Err(e) = store
                     .touch_resource_liveness(
                         store_id,
                         &candidate.resource_id,
                         etag.as_deref(),
                         last_modified.as_deref(),
                     )
-                    .await?;
+                    .await
+                {
+                    tracing::debug!(
+                        uri = %candidate.uri,
+                        error = %e,
+                        "feed liveness sweep: touch_resource_liveness failed, leaving \
+                         resource untouched"
+                    );
+                }
             }
             FetchResult::Downloaded {
                 etag,
@@ -1901,22 +1915,40 @@ async fn run_feed_liveness_sweep(
                 // this pipeline (a 200 is a full fresh representation, so
                 // silence about a validator means the origin stopped
                 // offering it, not "unchanged").
-                store
+                //
+                // A per-candidate failure here must not abort the whole
+                // source, for the same reason as the `NotModified` arm
+                // above: log and move on to the next candidate.
+                if let Err(e) = store
                     .touch_resource_liveness(
                         store_id,
                         &candidate.resource_id,
                         etag.as_deref(),
                         last_modified.as_deref(),
                     )
-                    .await?;
+                    .await
+                {
+                    tracing::debug!(
+                        uri = %candidate.uri,
+                        error = %e,
+                        "feed liveness sweep: touch_resource_liveness failed, leaving \
+                         resource untouched"
+                    );
+                }
             }
             FetchResult::Blocked => {
                 // Neither evidence of anything, like a transport error —
-                // leave it untouched. In production `fetcher` here is
-                // already the public-only client (see
-                // `SourceIngestionDeps::fetcher`), so this should be
-                // unreachable, but `FetchResult` is matched exhaustively
-                // regardless.
+                // leave it untouched. This arm is reachable in production:
+                // `fetcher` here is the public-only client (see
+                // `SourceIngestionDeps::fetcher`), and a real entry link
+                // that resolves to a non-globally-routable address (an
+                // internal/LAN link — specs/02-domain-model.md's
+                // "Destination policy (entry links)") is refused exactly
+                // like it would be on the ordinary ingestion pass. A
+                // fragment URI (a link-less entry's synthetic
+                // `{feed_url}#entry:{id}`) can no longer drive this arm —
+                // it never becomes a candidate in the first place
+                // (`RetrievalStore::list_stale_feed_resources`).
             }
         }
     }
@@ -6988,6 +7020,10 @@ mod tests {
                 delete_calls: tokio::sync::Mutex<Vec<String>>,
                 touch_calls: tokio::sync::Mutex<Vec<TouchCall>>,
                 list_calls: std::sync::atomic::AtomicUsize,
+                /// Resource IDs `touch_resource_liveness` fails for —
+                /// simulates a concurrent delete racing the probe, without
+                /// having to actually race one.
+                fail_touch_for: std::collections::HashSet<String>,
             }
 
             impl LivenessStore {
@@ -6997,6 +7033,14 @@ mod tests {
                         delete_calls: tokio::sync::Mutex::new(Vec::new()),
                         touch_calls: tokio::sync::Mutex::new(Vec::new()),
                         list_calls: std::sync::atomic::AtomicUsize::new(0),
+                        fail_touch_for: std::collections::HashSet::new(),
+                    }
+                }
+
+                fn new_with_touch_failure(rows: Vec<LivenessRow>, fail_for: &str) -> Self {
+                    Self {
+                        fail_touch_for: std::iter::once(fail_for.to_string()).collect(),
+                        ..Self::new(rows)
                     }
                 }
 
@@ -7138,6 +7182,11 @@ mod tests {
                         etag.map(str::to_string),
                         last_modified.map(str::to_string),
                     ));
+                    if self.fail_touch_for.contains(resource_id) {
+                        return Err(Error::ResourceNotFound {
+                            id: resource_id.to_string(),
+                        });
+                    }
                     let mut rows = self.rows.lock().await;
                     if let Some(r) = rows.iter_mut().find(|r| r.resource_id == resource_id) {
                         r.external_etag = etag.map(str::to_string);
@@ -7377,6 +7426,64 @@ mod tests {
                 assert_eq!(result.feed_entries_liveness_checked, 1);
                 assert!(store.delete_calls.lock().await.is_empty());
                 assert!(store.touch_calls.lock().await.is_empty());
+            }
+
+            /// A per-candidate `touch_resource_liveness` failure (e.g. a
+            /// concurrent delete racing the probe) must not abort the whole
+            /// source and discard the stats already computed for candidates
+            /// processed alongside it — the transport-error and `Blocked`
+            /// arms beside this one already handle their own failures per
+            /// candidate; this must be consistent with them.
+            #[tokio::test]
+            async fn touch_resource_liveness_failure_does_not_abort_remaining_candidates() {
+                let store = LivenessStore::new_with_touch_failure(
+                    vec![
+                        row(
+                            "r-fails",
+                            "https://a.example.com/",
+                            Some("2020-01-01T00:00:00Z"),
+                        ),
+                        row(
+                            "r-succeeds",
+                            "https://b.example.com/",
+                            Some("2020-01-02T00:00:00Z"),
+                        ),
+                    ],
+                    "r-fails",
+                );
+                let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::NotModified);
+                let mut doc_index = DocumentIndex::new();
+                let seen = std::collections::HashSet::new();
+                let mut result = IngestionResult::default();
+
+                run_feed_liveness_sweep(
+                    "src-1",
+                    "store-1",
+                    None,
+                    &seen,
+                    &mut doc_index,
+                    &store,
+                    &fetcher,
+                    &mut result,
+                )
+                .await
+                .unwrap();
+
+                assert_eq!(
+                    fetcher.calls.lock().await.len(),
+                    2,
+                    "the failing candidate must not stop the loop from reaching the next one"
+                );
+                assert_eq!(
+                    result.feed_entries_liveness_checked, 2,
+                    "both candidates must still be counted, including the one whose touch \
+                     failed"
+                );
+                assert_eq!(
+                    store.touch_calls.lock().await.len(),
+                    2,
+                    "touch_resource_liveness must still be attempted for both candidates"
+                );
             }
 
             // -------------------------------------------------------------
