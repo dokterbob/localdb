@@ -289,6 +289,81 @@ pub struct SearchResult {
 }
 
 // ---------------------------------------------------------------------------
+// DateAxis — which of the four date signals a date filter bounds
+// ---------------------------------------------------------------------------
+
+/// Which of the four date axes (specs/02-domain-model.md §"Date axes
+/// (normative)") a [`MetadataFilter::DateAfter`]/[`MetadataFilter::DateBefore`]
+/// bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DateAxis {
+    /// `resources.added_at` — when we first indexed this resource version.
+    Added,
+    /// `resources.index_updated_at` — when we last wrote its stored state.
+    Updated,
+    /// `resources.modified_at` — the source's own claim about last change.
+    Modified,
+    /// `resources.date_parsed` — the document's own Dublin Core `dc:date`.
+    Document,
+}
+
+impl DateAxis {
+    /// All four axes, in the order §"Date axes (normative)" lists them.
+    pub const ALL: [DateAxis; 4] = [
+        DateAxis::Added,
+        DateAxis::Updated,
+        DateAxis::Modified,
+        DateAxis::Document,
+    ];
+
+    /// The public name shared by every surface (CLI flags, MCP tool params,
+    /// HTTP query params). Deliberately "document", not "date_parsed" or
+    /// "date" — it must never leak the storage column name.
+    pub fn name(&self) -> &'static str {
+        match self {
+            DateAxis::Added => "added",
+            DateAxis::Updated => "updated",
+            DateAxis::Modified => "modified",
+            DateAxis::Document => "document",
+        }
+    }
+
+    /// The `resources` column this axis reads/filters on.
+    pub fn column(&self) -> &'static str {
+        match self {
+            DateAxis::Added => "added_at",
+            DateAxis::Updated => "index_updated_at",
+            DateAxis::Modified => "modified_at",
+            DateAxis::Document => "date_parsed",
+        }
+    }
+
+    /// The Rust-side value for this axis on a `ChunkRecord`. Backs the
+    /// in-process (`FakeStore`/test-support) matching path in
+    /// [`MetadataFilter::matches`] only — the real (libsql) backend filters
+    /// entirely in SQL via [`DateAxis::column`] and never calls this.
+    ///
+    /// `DateAxis::Updated` always returns `None`: `index_updated_at` is
+    /// stamped by the store itself at write time — both
+    /// `upsert_chunks_inner` and `update_resource_metadata_inner` in
+    /// `store-libsql/src/tenant/write.rs` compute it fresh from
+    /// `now_rfc3339()` and never read a record-supplied value — so no
+    /// `ChunkRecord` field could ever agree with what actually lands in the
+    /// column. Returning `None` here (which `matches` treats as "fails every
+    /// bound") is the honest answer: a populated field would silently
+    /// diverge between `FakeStore` (authoritative) and the real backend
+    /// (write-ignored).
+    fn value_of<'a>(&self, record: &'a ChunkRecord) -> Option<&'a str> {
+        match self {
+            DateAxis::Added => Some(record.fetched_at.as_str()),
+            DateAxis::Updated => None,
+            DateAxis::Modified => record.modified_at.as_deref(),
+            DateAxis::Document => record.date_parsed.as_deref(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MetadataFilter — pushed down to the backend
 // ---------------------------------------------------------------------------
 
@@ -301,10 +376,10 @@ pub enum MetadataFilter {
     Mime(String),
     /// Filter by URI prefix.
     UriPrefix(String),
-    /// Filter: fetched_at >= value (RFC 3339 string).
-    FetchedAfter(String),
-    /// Filter: fetched_at <= value (RFC 3339 string).
-    FetchedBefore(String),
+    /// Inclusive lower bound on `axis`.
+    DateAfter { axis: DateAxis, value: String },
+    /// Inclusive upper bound on `axis`.
+    DateBefore { axis: DateAxis, value: String },
     /// Filter by source ID.
     SourceId(UlidId),
     /// Filter by document ID.
@@ -318,8 +393,40 @@ impl MetadataFilter {
         match self {
             MetadataFilter::Mime(mime) => record.mime.as_deref() == Some(mime.as_str()),
             MetadataFilter::UriPrefix(prefix) => record.uri.starts_with(prefix.as_str()),
-            MetadataFilter::FetchedAfter(ts) => record.fetched_at.as_str() >= ts.as_str(),
-            MetadataFilter::FetchedBefore(ts) => record.fetched_at.as_str() <= ts.as_str(),
+            // NULL fails every bound (no `Some(v)` to compare), matching
+            // SQL's `NULL >= 'x'` falsy behavior for the nullable
+            // `modified_at`/`date_parsed` axes — see this type's doc comment
+            // and specs/02-domain-model.md §"Date axes (normative)".
+            MetadataFilter::DateAfter { axis, value } => {
+                axis.value_of(record).is_some_and(|v| v >= value.as_str())
+            }
+            MetadataFilter::DateBefore { axis, value } => axis.value_of(record).is_some_and(|v| {
+                // The two operands widen under DIFFERENT rules, because they
+                // become partial-width for different reasons:
+                //
+                // - The BOUND is whatever a caller supplied, so it can be
+                //   partial on ANY axis. It is always widened. Without this,
+                //   an inclusive `added_before: "2026"` excludes every
+                //   resource added during 2026: a longer string sorts after
+                //   its own prefix, so `"2026-06-10T12:00:00Z" <= "2026"` is
+                //   false.
+                // - The STORED value is only partial-width on `Document`
+                //   (`date_parsed` is normalized to exactly 4, 7, or 10 chars
+                //   by `crate::dates::parse_partial_iso8601`);
+                //   `Added`/`Updated`/`Modified` are always full RFC 3339.
+                //   Widening those would be a no-op, so it is skipped —
+                //   matching the SQL side, which pays for a `CASE` over the
+                //   column only on `Document`.
+                //
+                // This arm MUST stay in lockstep with `build_filter_clauses`
+                // in `store-libsql/src/tenant/sql.rs`, which mirrors exactly
+                // this split.
+                let bound = crate::dates::widen_date_upper_bound(value);
+                match axis {
+                    DateAxis::Document => crate::dates::widen_date_upper_bound(v) <= bound,
+                    _ => v <= bound.as_str(),
+                }
+            }),
             MetadataFilter::SourceId(id) => &record.source_id == id,
             MetadataFilter::ResourceId(id) => &record.resource_id == id,
             MetadataFilter::PolicyVersion(v) => &record.policy_version == v,
@@ -1131,6 +1238,18 @@ pub mod conformance {
         let results = store.dense_search(&[1.0, 0.0], 10, &filter).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].chunk.id, "chunk-1");
+
+        // The BM25 leg is a genuine, separate code path from dense_search
+        // (its own SQL query in `store-libsql`, its own filter-clause splice
+        // point in `FakeStore`) — exercise it too rather than trusting the
+        // dense leg's coverage to stand in for it.
+        let bm25_results = store.bm25_search("file", 10, &filter).await.unwrap();
+        assert_eq!(
+            bm25_results.len(),
+            1,
+            "BM25 should also filter by URI prefix"
+        );
+        assert_eq!(bm25_results[0].chunk.id, "chunk-1");
     }
 
     /// Test: metadata filter values are bound as SQL parameters, never
@@ -1461,6 +1580,310 @@ pub mod conformance {
         );
     }
 
+    /// Test: multiple filters of different kinds combine with AND — a chunk
+    /// matching only one of `Mime` and `DateAfter{Added}` must be excluded,
+    /// not returned on a partial match.
+    pub async fn test_metadata_filter_and_combination(store: &dyn RetrievalStore) {
+        let mut both = make_record(
+            "chunk-both",
+            "doc-both",
+            "store-1",
+            "matches both filters",
+            vec![1.0, 0.0],
+        );
+        both.mime = Some("text/markdown".to_string());
+        both.fetched_at = "2026-06-10T00:00:00Z".to_string();
+
+        let mut mime_only = make_record(
+            "chunk-mime-only",
+            "doc-mime-only",
+            "store-1",
+            "right mime, wrong date",
+            vec![0.9, 0.1],
+        );
+        mime_only.mime = Some("text/markdown".to_string());
+        mime_only.fetched_at = "2026-01-01T00:00:00Z".to_string();
+
+        let mut date_only = make_record(
+            "chunk-date-only",
+            "doc-date-only",
+            "store-1",
+            "right date, wrong mime",
+            vec![0.1, 0.9],
+        );
+        date_only.mime = Some("text/html".to_string());
+        date_only.fetched_at = "2026-06-10T00:00:00Z".to_string();
+
+        store
+            .upsert_chunks(vec![both, mime_only, date_only])
+            .await
+            .unwrap();
+
+        let filters = vec![
+            MetadataFilter::Mime("text/markdown".to_string()),
+            MetadataFilter::DateAfter {
+                axis: DateAxis::Added,
+                value: "2026-03-01T00:00:00Z".to_string(),
+            },
+        ];
+        let results = store.dense_search(&[1.0, 0.0], 10, &filters).await.unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "only the chunk matching BOTH filters should be returned, got {results:?}"
+        );
+        assert_eq!(results[0].chunk.id, "chunk-both");
+    }
+
+    /// Test: a chunk with `None` for a nullable date axis (`modified_at`,
+    /// `date_parsed`) is excluded by BOTH bound directions, even under a
+    /// maximally permissive bound (`"0000"` for `DateAfter`, `"9999"` for
+    /// `DateBefore`) that would otherwise trivially satisfy almost any
+    /// comparison. Run against the real backend, this is also the test that
+    /// proves the SQL `CASE`/`length(NULL)` fall-through in
+    /// `DateBefore{Document}` preserves NULL-exclusion rather than
+    /// accidentally matching everything.
+    ///
+    /// `DateAxis::Updated` is deliberately excluded — see `DateAxis::
+    /// value_of`'s doc comment: no code path ever produces a NULL there, so
+    /// it isn't a reachable state to test.
+    pub async fn test_date_filter_null_axis_value_excluded(store: &dyn RetrievalStore) {
+        for axis in [DateAxis::Modified, DateAxis::Document] {
+            let axis_name = axis.name();
+            let id = format!("chunk-{axis_name}-null");
+            let resource_id = format!("doc-{axis_name}-null");
+            let mut record = make_record(
+                &id,
+                &resource_id,
+                "store-1",
+                "no axis value",
+                vec![1.0, 0.0],
+            );
+            match axis {
+                DateAxis::Modified => record.modified_at = None,
+                DateAxis::Document => record.date_parsed = None,
+                DateAxis::Added | DateAxis::Updated => unreachable!("not in this loop's set"),
+            }
+            store.upsert_chunks(vec![record]).await.unwrap();
+
+            let after = vec![MetadataFilter::DateAfter {
+                axis,
+                value: "0000".to_string(),
+            }];
+            let after_results = store.dense_search(&[1.0, 0.0], 10, &after).await.unwrap();
+            assert!(
+                after_results.is_empty(),
+                "{axis_name}: a NULL value must be excluded by DateAfter(\"0000\"), got \
+                 {after_results:?}"
+            );
+
+            let before = vec![MetadataFilter::DateBefore {
+                axis,
+                value: "9999".to_string(),
+            }];
+            let before_results = store.dense_search(&[1.0, 0.0], 10, &before).await.unwrap();
+            assert!(
+                before_results.is_empty(),
+                "{axis_name}: a NULL value must be excluded by DateBefore(\"9999\"), got \
+                 {before_results:?}"
+            );
+
+            store.delete_by_resource(&resource_id).await.unwrap();
+        }
+    }
+
+    /// Regression test for the `DateBefore{Document}` widening rule: a chunk
+    /// with a bare-year `date_parsed = "2024"` must be
+    /// EXCLUDED by `DateBefore{Document, "2024-06-01"}` (its widened latest
+    /// instant, December 31st, is later than the bound's widened latest
+    /// instant, June 1st), INCLUDED by `DateBefore{Document, "2024-12-31"}`
+    /// (both widen to the same day), and INCLUDED by
+    /// `DateAfter{Document, "2023-12-31"}` (`DateAfter` needs no widening —
+    /// see `core::dates::widen_date_upper_bound`'s doc comment — and `"2024"`
+    /// already sorts after `"2023-12-31"` as a plain string).
+    /// Test: a partial `DateBefore` bound on a full-timestamp axis must
+    /// include the whole period it names, not exclude it.
+    ///
+    /// The bound is caller-supplied, so it can be partial on any axis, while
+    /// `added_at` always holds a full RFC 3339 timestamp. Comparing the two
+    /// raw would exclude everything: a longer string sorts after its own
+    /// prefix, so `"2026-06-10T12:00:00Z" <= "2026"` is false. Widening the
+    /// bound to the latest instant its precision allows is what makes an
+    /// inclusive upper bound actually inclusive.
+    pub async fn test_date_filter_partial_bound_on_timestamp_axis(store: &dyn RetrievalStore) {
+        let mut record = make_record(
+            "chunk-added-2026",
+            "doc-added-2026",
+            "store-1",
+            "added mid 2026",
+            vec![1.0, 0.0],
+        );
+        record.fetched_at = "2026-06-10T12:00:00Z".to_string();
+        store.upsert_chunks(vec![record]).await.unwrap();
+
+        // Every bound below names a period that CONTAINS the stored instant,
+        // so each must match. Before the bound was widened, all three
+        // returned nothing.
+        for bound in ["2026", "2026-06", "2026-06-10"] {
+            let filters = vec![MetadataFilter::DateBefore {
+                axis: DateAxis::Added,
+                value: bound.to_string(),
+            }];
+            let results = store.dense_search(&[1.0, 0.0], 10, &filters).await.unwrap();
+            assert_eq!(
+                results.len(),
+                1,
+                "DateBefore{{Added, {bound:?}}} must include a resource added \
+                 2026-06-10T12:00:00Z — the bound names a period containing it"
+            );
+        }
+
+        // A bound naming an earlier period must still exclude it, so the
+        // widening cannot be over-broad.
+        for bound in ["2025", "2026-05", "2026-06-09"] {
+            let filters = vec![MetadataFilter::DateBefore {
+                axis: DateAxis::Added,
+                value: bound.to_string(),
+            }];
+            let results = store.dense_search(&[1.0, 0.0], 10, &filters).await.unwrap();
+            assert!(
+                results.is_empty(),
+                "DateBefore{{Added, {bound:?}}} must exclude a resource added later"
+            );
+        }
+    }
+
+    pub async fn test_date_filter_document_axis_partial_precision_widening(
+        store: &dyn RetrievalStore,
+    ) {
+        let mut record = make_record(
+            "chunk-partial-2024",
+            "doc-partial-2024",
+            "store-1",
+            "bare year dc:date",
+            vec![1.0, 0.0],
+        );
+        record.date_parsed = Some("2024".to_string());
+        store.upsert_chunks(vec![record]).await.unwrap();
+
+        let excluding = vec![MetadataFilter::DateBefore {
+            axis: DateAxis::Document,
+            value: "2024-06-01".to_string(),
+        }];
+        let excluded = store
+            .dense_search(&[1.0, 0.0], 10, &excluding)
+            .await
+            .unwrap();
+        assert!(
+            excluded.is_empty(),
+            "bare-year 2024 must be EXCLUDED by DateBefore(Document, 2024-06-01), got {excluded:?}"
+        );
+
+        let including_before = vec![MetadataFilter::DateBefore {
+            axis: DateAxis::Document,
+            value: "2024-12-31".to_string(),
+        }];
+        let included_before = store
+            .dense_search(&[1.0, 0.0], 10, &including_before)
+            .await
+            .unwrap();
+        assert_eq!(
+            included_before.len(),
+            1,
+            "bare-year 2024 must be INCLUDED by DateBefore(Document, 2024-12-31), got \
+             {included_before:?}"
+        );
+
+        let including_after = vec![MetadataFilter::DateAfter {
+            axis: DateAxis::Document,
+            value: "2023-12-31".to_string(),
+        }];
+        let included_after = store
+            .dense_search(&[1.0, 0.0], 10, &including_after)
+            .await
+            .unwrap();
+        assert_eq!(
+            included_after.len(),
+            1,
+            "bare-year 2024 must be INCLUDED by DateAfter(Document, 2023-12-31), got \
+             {included_after:?}"
+        );
+    }
+
+    /// Table-driven round trip over the three axes that carry a
+    /// caller-supplied literal (`Added`, `Modified`, `Document`). Each axis
+    /// gets an "old" and a "new" chunk; `DateAfter` on a midpoint bound must
+    /// match only the new chunk, `DateBefore` on the same bound only the old
+    /// one.
+    ///
+    /// `DateAxis::Updated` is deliberately excluded from this table — see
+    /// `DateAxis::value_of`'s doc comment: the store always stamps its own
+    /// write-time clock for that axis, so no fixed literal a test supplies
+    /// ever reaches the persisted value, and a uniform fixed-literal
+    /// round-trip can't exercise it. See
+    /// `test_date_filter_updated_axis_now_relative` (store-libsql-only, using
+    /// now-relative bounds) for that axis's own dedicated coverage.
+    pub async fn test_date_filter_per_axis_round_trip(store: &dyn RetrievalStore) {
+        for axis in [DateAxis::Added, DateAxis::Modified, DateAxis::Document] {
+            let axis_name = axis.name();
+            let old_id = format!("chunk-{axis_name}-old");
+            let new_id = format!("chunk-{axis_name}-new");
+            let old_doc = format!("doc-{axis_name}-old");
+            let new_doc = format!("doc-{axis_name}-new");
+
+            let mut old = make_record(&old_id, &old_doc, "store-1", "old", vec![1.0, 0.0]);
+            let mut new = make_record(&new_id, &new_doc, "store-1", "new", vec![0.5, 0.5]);
+            match axis {
+                DateAxis::Added => {
+                    old.fetched_at = "2026-01-01T00:00:00Z".to_string();
+                    new.fetched_at = "2026-06-10T00:00:00Z".to_string();
+                }
+                DateAxis::Modified => {
+                    old.modified_at = Some("2026-01-01T00:00:00Z".to_string());
+                    new.modified_at = Some("2026-06-10T00:00:00Z".to_string());
+                }
+                DateAxis::Document => {
+                    old.date_parsed = Some("2026-01-01".to_string());
+                    new.date_parsed = Some("2026-06-10".to_string());
+                }
+                DateAxis::Updated => unreachable!("not in this loop's set"),
+            }
+            store.upsert_chunks(vec![old, new]).await.unwrap();
+
+            let after = vec![MetadataFilter::DateAfter {
+                axis,
+                value: "2026-03-01T00:00:00Z".to_string(),
+            }];
+            let after_results = store.dense_search(&[1.0, 0.0], 10, &after).await.unwrap();
+            let after_ids: Vec<&str> = after_results.iter().map(|r| r.chunk.id.as_str()).collect();
+            assert_eq!(
+                after_ids,
+                vec![new_id.as_str()],
+                "{axis_name}: DateAfter should match only the new chunk"
+            );
+
+            let before = vec![MetadataFilter::DateBefore {
+                axis,
+                value: "2026-03-01T00:00:00Z".to_string(),
+            }];
+            let before_results = store.dense_search(&[1.0, 0.0], 10, &before).await.unwrap();
+            let before_ids: Vec<&str> =
+                before_results.iter().map(|r| r.chunk.id.as_str()).collect();
+            assert_eq!(
+                before_ids,
+                vec![old_id.as_str()],
+                "{axis_name}: DateBefore should match only the old chunk"
+            );
+
+            // Clean up before the next axis's iteration: `make_record`'s
+            // defaults populate every axis's field (e.g. a fixed
+            // `modified_at`), so a record left over from this axis could
+            // otherwise spuriously match a later axis's filter.
+            store.delete_by_resource(&old_doc).await.unwrap();
+            store.delete_by_resource(&new_doc).await.unwrap();
+        }
+    }
+
     /// Run a subset of the conformance suite that does not require a pre-built FTS index.
     ///
     /// The store must be freshly created (empty) when this is called.
@@ -1572,6 +1995,36 @@ mod tests {
     async fn fake_store_metadata_filter_uri_prefix() {
         let store = FakeStore::new();
         test_metadata_filter_uri_prefix(&store).await;
+    }
+
+    #[tokio::test]
+    async fn fake_store_metadata_filter_and_combination() {
+        let store = FakeStore::new();
+        test_metadata_filter_and_combination(&store).await;
+    }
+
+    #[tokio::test]
+    async fn fake_store_date_filter_null_axis_value_excluded() {
+        let store = FakeStore::new();
+        test_date_filter_null_axis_value_excluded(&store).await;
+    }
+
+    #[tokio::test]
+    async fn fake_store_date_filter_partial_bound_on_timestamp_axis() {
+        let store = FakeStore::new();
+        test_date_filter_partial_bound_on_timestamp_axis(&store).await;
+    }
+
+    #[tokio::test]
+    async fn fake_store_date_filter_document_axis_partial_precision_widening() {
+        let store = FakeStore::new();
+        test_date_filter_document_axis_partial_precision_widening(&store).await;
+    }
+
+    #[tokio::test]
+    async fn fake_store_date_filter_per_axis_round_trip() {
+        let store = FakeStore::new();
+        test_date_filter_per_axis_round_trip(&store).await;
     }
 
     #[tokio::test]
@@ -1728,9 +2181,10 @@ mod tests {
 
         store.upsert_chunks(vec![r1, r2]).await.unwrap();
 
-        let filter = vec![MetadataFilter::FetchedAfter(
-            "2026-03-01T00:00:00Z".to_string(),
-        )];
+        let filter = vec![MetadataFilter::DateAfter {
+            axis: DateAxis::Added,
+            value: "2026-03-01T00:00:00Z".to_string(),
+        }];
         let results = store.dense_search(&[1.0, 0.0], 10, &filter).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].chunk.id, "new");
@@ -1778,13 +2232,27 @@ mod tests {
         assert!(MetadataFilter::UriPrefix("file:///".to_string()).matches(&record));
         assert!(!MetadataFilter::UriPrefix("https://".to_string()).matches(&record));
 
-        assert!(MetadataFilter::FetchedAfter("2026-06-01T00:00:00Z".to_string()).matches(&record));
-        assert!(!MetadataFilter::FetchedAfter("2026-06-11T00:00:00Z".to_string()).matches(&record));
+        assert!(MetadataFilter::DateAfter {
+            axis: DateAxis::Added,
+            value: "2026-06-01T00:00:00Z".to_string(),
+        }
+        .matches(&record));
+        assert!(!MetadataFilter::DateAfter {
+            axis: DateAxis::Added,
+            value: "2026-06-11T00:00:00Z".to_string(),
+        }
+        .matches(&record));
 
-        assert!(MetadataFilter::FetchedBefore("2026-07-01T00:00:00Z".to_string()).matches(&record));
-        assert!(
-            !MetadataFilter::FetchedBefore("2026-06-01T00:00:00Z".to_string()).matches(&record)
-        );
+        assert!(MetadataFilter::DateBefore {
+            axis: DateAxis::Added,
+            value: "2026-07-01T00:00:00Z".to_string(),
+        }
+        .matches(&record));
+        assert!(!MetadataFilter::DateBefore {
+            axis: DateAxis::Added,
+            value: "2026-06-01T00:00:00Z".to_string(),
+        }
+        .matches(&record));
 
         assert!(MetadataFilter::SourceId("src-1".to_string()).matches(&record));
         assert!(!MetadataFilter::SourceId("src-2".to_string()).matches(&record));

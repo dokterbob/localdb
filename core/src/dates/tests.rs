@@ -1,4 +1,6 @@
-use super::{is_canonical_timestamp, parse_date_or_datetime, parse_partial_iso8601};
+use super::{
+    is_canonical_timestamp, parse_date_or_datetime, parse_partial_iso8601, widen_date_upper_bound,
+};
 
 #[test]
 fn bare_year() {
@@ -221,6 +223,76 @@ fn rejects_garbage_and_empty() {
     assert_eq!(parse_date_or_datetime("not-a-date"), None);
     assert_eq!(parse_date_or_datetime("2026-13"), None);
     assert_eq!(parse_date_or_datetime("2026-06-00"), None);
+}
+
+// ---------------------------------------------------------------------------
+// widen_date_upper_bound
+// ---------------------------------------------------------------------------
+
+#[test]
+fn widen_year_only() {
+    assert_eq!(widen_date_upper_bound("2024"), "2024-12-31T23:59:59Z");
+}
+
+#[test]
+fn widen_year_month() {
+    assert_eq!(widen_date_upper_bound("2024-06"), "2024-06-31T23:59:59Z");
+}
+
+#[test]
+fn widen_full_date() {
+    assert_eq!(widen_date_upper_bound("2024-06-10"), "2024-06-10T23:59:59Z");
+}
+
+/// Anything already 20+ chars (a full RFC 3339 datetime, or longer) is
+/// returned unchanged — only the three partial-precision widths (4/7/10) are
+/// widened.
+#[test]
+fn widen_full_datetime_is_unchanged() {
+    assert_eq!(
+        widen_date_upper_bound("2024-06-10T14:30:00Z"),
+        "2024-06-10T14:30:00Z"
+    );
+}
+
+/// An unrecognized length falls through unchanged too — `widen_date_upper_bound`
+/// never errors, it just declines to widen shapes it doesn't recognize.
+#[test]
+fn widen_unrecognized_length_is_unchanged() {
+    assert_eq!(widen_date_upper_bound("bogus"), "bogus");
+}
+
+/// The load-bearing cross-width comparisons that prove the After/Before
+/// asymmetry the widening exists to fix, for a bare-year stored value
+/// (`"2024"`) against two full-date bounds in the same year.
+///
+/// `DateAfter` needs no widening at all (a short prefix always sorts less
+/// than a longer string it prefixes), so a bare year correctly fails to
+/// satisfy `>=` a mid-year bound — the year alone cannot confirm the
+/// resource is on-or-after June 1st.
+///
+/// `DateBefore` widens **both** operands (`core::store::MetadataFilter::
+/// matches`'s `DateAxis::Document` arm, and the equivalent SQL `CASE` in
+/// `store-libsql/src/tenant/sql.rs`, both widen the stored value as well as
+/// the bound — this function alone only performs one side of that): a
+/// stored `"2024"`, widened, lands on `2024-12-31T23:59:59Z` — after a
+/// `2024-06-01` bound (also widened, to `2024-06-01T23:59:59Z`), so it is
+/// correctly excluded there, but before a `2024-12-31` bound (widened to the
+/// same instant), so it is correctly included there.
+#[test]
+fn cross_width_after_before_asymmetry() {
+    assert!("2024" < "2024-06-01");
+
+    let year_widened = widen_date_upper_bound("2024");
+    assert!(
+        year_widened > widen_date_upper_bound("2024-06-01"),
+        "a bare year widened to Dec 31 must sort after a June 1 bound widened to its own day"
+    );
+    assert!(
+        year_widened <= widen_date_upper_bound("2024-12-31"),
+        "a bare year widened to Dec 31 must sort at-or-before a Dec 31 bound widened to the \
+         same day"
+    );
 }
 
 // ---------------------------------------------------------------------------

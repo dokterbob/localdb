@@ -120,6 +120,40 @@ and future:
    whose Dublin Core date is missing or unparsed stays missing on those fields; it is never
    backfilled from an index-side clock or vice versa.
 
+**Filtering (normative).** Every axis is filterable via
+`MetadataFilter::DateAfter`/`DateBefore { axis: DateAxis, value }` (`core::store::DateAxis`), one
+inclusive bound per call: `DateAfter` is `>=`, `DateBefore` is `<=`. `DateAxis`'s four variants have
+public names distinct from the column names above — `added` (Index added), `updated` (Index
+updated), `modified` (Source-claimed changed-at), `document` (Document date) — deliberately, so a
+filter's public name never leaks storage detail. A `None`/`NULL` axis value (the nullable
+`modified_at`/`date_parsed` fields) fails **every** bound in **both** directions — the single most
+surprising behavior of this feature: a document with no claimed `modified_at` is never returned by a
+`modified`-axis filter at any bound, not just an unsatisfiable one. `DateAxis::Updated` is
+SQL-pushdown-only: it filters correctly against the real backend, but has no Rust-side round-trip on
+a `ChunkRecord`, because the store always stamps `index_updated_at` with its own write-time clock
+rather than accepting a caller-supplied value (see the "Index updated" row above).
+
+`DateBefore` widens to the latest instant consistent with a value's own precision
+(`core::dates::widen_date_upper_bound`) before comparing, because a short prefix always sorts less
+than a longer string it prefixes. The two operands widen under different rules, since they become
+partial for different reasons:
+
+- **The bound is always widened, on every axis.** It is whatever the caller supplied, so it can be
+  partial regardless of what the axis stores. Without widening, an inclusive `added_before: "2026"`
+  would exclude every resource added during 2026 — `"2026-06-10T12:00:00Z" <= "2026"` is false.
+- **The stored value is widened only on the `document` axis**, the only one whose column can hold a
+  partial value (`date_parsed` is normalized to a bare `"YYYY"`, `"YYYY-MM"`, or full `"YYYY-MM-DD"`
+  — see `core::dates::parse_partial_iso8601`). `added`, `updated` and `modified` always hold
+  full-width RFC 3339 per the canonical form above, so widening them would be a no-op and is
+  skipped.
+
+`DateAfter` needs no widening in either operand: a short prefix already sorts below any longer bound
+it cannot confirm, which is the correct conservative reading.
+
+The widening is calendar-unaware — `"YYYY-MM"` always widens to day 31 regardless of the real month
+length, because `"31"` string-compares at or above any real day-of-month and SQLite cannot run
+per-row calendar arithmetic without a registered custom function.
+
 ### Block
 
 A typed, ordered unit of content within a resource.
@@ -429,15 +463,27 @@ Every resource and every chunk carries:
 
 **Write path.** A chunk's `fetched_at` is always taken from its resource's `added_at`, never its
 `modified_at` — it is persisted as `resources.added_at`, and that is the column
-`MetadataFilter::FetchedAfter`/`FetchedBefore` filter on and every citation's
-`provenance.fetched_at` reports.
+`MetadataFilter::DateAfter`/`DateBefore { axis: DateAxis::Added, .. }` filter on and every
+citation's `provenance.fetched_at` reports.
 
-**Surface exposure.** Citations expose only the "index added" axis: every citation's
-`provenance.fetched_at` (§6) and `MetadataFilter::FetchedAfter`/`FetchedBefore` report and filter on
-`added_at` — never `modified_at`, `index_updated_at`, or `date_original`/`date_parsed`. The other
-three axes (§2's "Date axes (normative)") are document-level surfaces, not citation fields:
-`date_original`, `date_parsed`, and `index_updated_at` are returned by
-`document get`/`document list` (`DocumentInfo`, specs/05-surfaces.md §2-4), not by search citations.
+**Surface exposure.** Three separate claims, which are easily conflated and are kept distinct here:
+
+1. `CitationProvenance.fetched_at` (§6) reports exactly one axis — "index added" (`added_at`) — and
+   no other. `CitationProvenance` carries no field for `modified_at`, `index_updated_at`, or
+   `date_parsed`; those three are absent from every citation, on every surface.
+2. `Citation.metadata` (§6, populated from the chunk's own `metadata_json`) already carries the raw
+   Dublin Core `dc:date` on every citation, on every surface — `metadata.dublin_core().date` is
+   exactly `date_original` before `core::dates::parse_partial_iso8601` normalizes it into
+   `date_parsed`. So `date_original` is **not** absent from citations — only `date_parsed` and
+   `index_updated_at` are (see point 1). `document get`/`document list` (`DocumentInfo`,
+   specs/05-surfaces.md §2-4) are the only surface that returns those two directly.
+3. Search filtering is not limited to the "index added" axis: `MetadataFilter::DateAfter`/
+   `DateBefore` take a `DateAxis` (`added` | `updated` | `modified` | `document`, §2's "Date axes
+   (normative)"), so a query can scope on any of the four, regardless of which axis is (or isn't)
+   visible on the resulting citation. A `None`/`NULL` axis value fails every bound in both
+   directions, and a `document`-axis `DateBefore` bound is widened to the latest instant its
+   precision allows before comparing (§2's "Date axes (normative)" §"Filtering" for both rules in
+   full).
 
 ## 5. Conversations and non-document resources
 

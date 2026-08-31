@@ -276,3 +276,44 @@ pub fn parse_date_or_datetime(raw: &str) -> Option<String> {
     // other value this function cannot represent.
     is_canonical_timestamp(&normalized).then_some(normalized)
 }
+
+/// Widen a date/datetime bound to the latest instant consistent with its own
+/// precision, for use as the upper bound of a `DateAxis::Document`
+/// `MetadataFilter::DateBefore` comparison.
+///
+/// In fixed-width ISO 8601 a proper prefix always sorts *less than* the
+/// string it prefixes (`"2026-06-10" < "2026-06-10T09:00:00Z"`), which makes
+/// a plain `<=` comparison correct for `DateAfter` but backwards for
+/// `DateBefore`: `--document-before 2026-06-10` would otherwise exclude every
+/// timestamp later that same day. Widening the bound to the latest instant
+/// its own precision could mean fixes the direction without needing real
+/// calendar math.
+///
+/// Deliberately calendar-**unaware**: `"YYYY-MM"` always widens to day `31`
+/// regardless of the real month length, because the literal string `"31"`
+/// still string-compares `>=` any real two-digit day, and SQLite cannot run
+/// per-row calendar math without a registered custom function.
+///
+/// **Keep this in lockstep with the SQL-side `CASE`** in
+/// `store-libsql/src/tenant/sql.rs`'s `build_filter_clauses` — both widen the
+/// exact same way, keyed on exactly the same string lengths (4 / 7 / 10). A
+/// future edit here that isn't mirrored there (or vice versa) will make the
+/// Rust-side (`FakeStore`) and libsql-side results disagree on the same
+/// filter.
+///
+/// Keyed on string length, not parsing — every input `date_parsed` can hold
+/// is already validated and canonical (see `parse_partial_iso8601`), so a
+/// length check is sufficient and avoids a second parse:
+/// - length 4 (`"YYYY"`) → append `"-12-31T23:59:59Z"`.
+/// - length 7 (`"YYYY-MM"`) → append `"-31T23:59:59Z"`.
+/// - length 10 (`"YYYY-MM-DD"`) → append `"T23:59:59Z"`.
+/// - anything else (already a full-width datetime, or an unrecognized shape)
+///   → returned unchanged.
+pub fn widen_date_upper_bound(value: &str) -> String {
+    match value.len() {
+        4 => format!("{value}-12-31T23:59:59Z"),
+        7 => format!("{value}-31T23:59:59Z"),
+        10 => format!("{value}T23:59:59Z"),
+        _ => value.to_string(),
+    }
+}

@@ -76,7 +76,7 @@ pub use source::source_row_to_source;
 #[cfg(any(test, feature = "test-support"))]
 pub use store::FakeStore;
 pub use store::{
-    ChunkRecord, MetadataFilter, ResourceRecord, RetrievalStore, SearchResult, StoreStats,
+    ChunkRecord, DateAxis, MetadataFilter, ResourceRecord, RetrievalStore, SearchResult, StoreStats,
 };
 pub use types::{
     validate_dc_meta_key, validate_msg_meta_key, AclEntry, BackendConfig, Chunk, ChunkingConfig,
