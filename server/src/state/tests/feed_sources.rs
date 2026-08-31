@@ -92,10 +92,9 @@ async fn add_feed_source_refresh_is_accepted_and_surfaced() {
 }
 
 #[tokio::test]
-async fn add_feed_source_does_not_register_with_url_scheduler() {
-    // Feed refresh is persisted+validated but inert (#116) — the
-    // scheduler stays url-only, same stub status as pre-existing url
-    // refresh scheduling.
+async fn add_feed_source_registers_with_url_scheduler() {
+    // A feed source with a refresh interval registers with the scheduler on
+    // the same terms as a url source, so it actually gets polled.
     let (_dir, state) = make_state().await;
     state.add_store("notes", "private").await.unwrap();
     state
@@ -108,7 +107,7 @@ async fn add_feed_source_does_not_register_with_url_scheduler() {
         )
         .await
         .unwrap();
-    assert_eq!(state.scheduler_source_count().await, 0);
+    assert_eq!(state.scheduler_source_count().await, 1);
 }
 
 #[tokio::test]
@@ -174,11 +173,21 @@ async fn remove_store_unregisters_all_sources() {
         )
         .await
         .unwrap();
-    assert_eq!(state.scheduler_source_count().await, 2);
+    state
+        .add_source(
+            "notes",
+            "feed",
+            serde_json::json!({ "url": "https://example.com/feed.xml" }),
+            "prose",
+            Some("3h"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(state.scheduler_source_count().await, 3);
     state.remove_store("notes").await.unwrap();
     assert_eq!(
         state.scheduler_source_count().await,
         0,
-        "url_scheduler should have 0 sources after remove_store"
+        "url_scheduler should have 0 sources (url and feed alike) after remove_store"
     );
 }

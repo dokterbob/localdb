@@ -28,9 +28,42 @@ pub(in crate::state::tests) async fn make_state() -> (TempDir, AppState) {
     (dir, state)
 }
 
+/// Like [`make_state`], but also attaches this state's own scheduler to
+/// itself — the same two-step wiring `build_daemon_state` performs in the
+/// real daemon — so a scheduler tick can run a refresh job through to
+/// completion instead of failing with "no state attached".
+pub(in crate::state::tests) async fn make_attached_state() -> (TempDir, AppState) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut yaml_config = RawConfig::default();
+    yaml_config.defaults.indexing.embedding = localdb_core::config::schema::EmbeddingPolicy {
+        provider: "fake".to_string(),
+        model: "default".to_string(),
+    };
+    let queue = JobQueue::new();
+    let scheduler = UrlRefreshScheduler::new(queue.clone());
+    let state = AppState::new(
+        yaml_config,
+        dir.path().to_path_buf(),
+        dir.path().join("models"),
+        queue,
+        scheduler.clone(),
+    )
+    .await
+    .unwrap();
+    scheduler.attach_state(state.clone()).await;
+    (dir, state)
+}
+
 impl AppState {
     pub(in crate::state::tests) async fn scheduler_source_count(&self) -> usize {
         self.inner.url_scheduler.source_count().await
+    }
+
+    /// Drive one scheduler tick against this state's own `url_scheduler`,
+    /// submitting refresh jobs for any due source through the same code
+    /// path the daemon's background loop uses.
+    pub(in crate::state::tests) async fn tick_scheduler(&self) {
+        self.inner.url_scheduler.tick().await;
     }
 
     /// Number of times this `AppState`'s embedder cache has actually called
