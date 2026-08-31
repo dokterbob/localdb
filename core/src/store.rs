@@ -577,7 +577,16 @@ pub trait RetrievalStore: Send + Sync + 'static {
     /// owned by `(store_id, source_id)` with `ingestor_kind = "feed"` whose
     /// `last_checked_at` is either unset (never probed) or older than
     /// `checked_before`, ordered oldest first with never-checked rows
-    /// leading, capped at `limit`. Backs the feed liveness sweep
+    /// leading, capped at `limit`.
+    ///
+    /// `limit` is the caller's *query* budget, deliberately larger than the
+    /// number of candidates it will actually probe: this query cannot see
+    /// the run's in-memory seen-set, so the caller over-fetches and
+    /// subtracts that set itself. Returning fewer rows than `limit` when
+    /// more match is therefore not an allowed optimization — it would
+    /// silently reintroduce the starvation the over-fetch exists to avoid.
+    ///
+    /// Backs the feed liveness sweep
     /// (specs/04-search-pipeline.md §1 "Aged-out feed entries: the liveness
     /// sweep"); the sweep itself, including its own guards and the
     /// distinction between "aged out of the window" and "still in it," lives

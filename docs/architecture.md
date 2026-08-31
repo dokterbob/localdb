@@ -487,10 +487,13 @@ feed root instead. Neither is the feed's own document, which in single-document 
 resource like any other: it is the one feed resource carrying no `external_id`, and the query
 requires one — otherwise a 404/410 on the feed URL would delete the source's whole index. See
 [specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md)
-§1 "Aged-out feed entries: the liveness sweep" for the batch cap (25 candidates/source/run), recheck
-floor (`max(refresh_interval, 24h)`), and per-outcome rules (`Gone` deletes; `NotModified`/
-`Downloaded` refresh the stored validators and the throttle clock without deleting or re-indexing;
-`Blocked` or a transport error leaves the resource untouched).
+§1 "Aged-out feed entries: the liveness sweep" for the batch cap (25 candidates probed per source
+per run), recheck floor (`max(refresh_interval, 24h)`), and per-outcome rules: `Gone` deletes;
+`NotModified` refreshes the stored validators and the throttle clock; a `200` advances the clock
+alone, keeping the stored validators, since caching the fresh ones would describe a body the sweep
+discarded; `Blocked` and transport errors move nothing but the clock. `last_checked_at` therefore
+means "when we last attempted a probe", which is what keeps the oldest-first rotation fair —
+otherwise a set of permanently-blocked entries would lead the query forever.
 
 **11. ~~Conditional-GET state (`ETag`) is captured only when a feed entry link is fetched, and even
 then it's never read back and reused; `Last-Modified` is not persisted at all~~ — RESOLVED.**

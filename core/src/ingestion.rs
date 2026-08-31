@@ -1764,6 +1764,13 @@ const FEED_LIVENESS_BATCH_LIMIT: usize = 25;
 /// value.
 const FEED_LIVENESS_MIN_RECHECK_SECS: i64 = 24 * 60 * 60;
 
+/// Ceiling on how far the candidate query may over-fetch to compensate for
+/// the seen-set it cannot see (see [`run_feed_liveness_sweep`]). Chosen well
+/// above any realistic feed window, and fixed rather than derived, because
+/// `max_entries` is optional and defaults to unbounded — the seen-set has no
+/// principled size of its own to scale by.
+const FEED_LIVENESS_OVERFETCH_CAP: usize = 500;
+
 /// The feed liveness sweep (specs/04-search-pipeline.md §1 "Aged-out feed
 /// entries: the liveness sweep"). For a `SourceSpec::Feed` source, probes a
 /// bounded batch of feed-discovered resources this run did not observe —
@@ -1812,145 +1819,173 @@ async fn run_feed_liveness_sweep(
         .unwrap_or(chrono::DateTime::<Utc>::MIN_UTC)
         .to_rfc3339_opts(SecondsFormat::Secs, true);
 
+    // The batch cap counts candidates actually *probed*, not rows returned.
+    // The query orders oldest-`last_checked_at` first and knows nothing
+    // about this run's in-memory seen-set, so a run whose freshly-observed
+    // entries happen to sort oldest would fill a SQL-side `LIMIT 25`
+    // entirely with entries it had just seen and probe nothing at all —
+    // permanently, for a feed whose whole window sorts that way. Over-fetch
+    // by the seen-set's size, subtract it here, then take the real 25.
+    let query_limit = FEED_LIVENESS_BATCH_LIMIT
+        .saturating_add(seen.len())
+        .min(FEED_LIVENESS_OVERFETCH_CAP);
     let candidates: Vec<StaleFeedResource> = store
-        .list_stale_feed_resources(
-            store_id,
-            source_id,
-            &checked_before,
-            FEED_LIVENESS_BATCH_LIMIT,
-        )
+        .list_stale_feed_resources(store_id, source_id, &checked_before, query_limit)
         .await?;
 
-    for candidate in candidates {
+    let mut ctx = LivenessProbeContext {
+        store_id,
+        doc_index,
+        store,
+        fetcher,
+        result,
+    };
+    for candidate in candidates
+        .into_iter()
         // Still inside the feed's window — this run's own ingestion pass
         // already observed it, so it hasn't aged out at all. Reachable when
         // a currently-live entry's `last_checked_at` happens to be unset or
         // stale (it has simply never been probed before, or was probed long
         // ago while still current); probing it here would be redundant with
         // the ordinary ingestion pass that already just ran for it.
-        if seen.contains(&candidate.uri) {
-            continue;
+        .filter(|candidate| !seen.contains(&candidate.uri))
+        .take(FEED_LIVENESS_BATCH_LIMIT)
+    {
+        probe_liveness_candidate(&mut ctx, candidate).await?;
+    }
+
+    Ok(())
+}
+
+/// Everything [`probe_liveness_candidate`] needs beyond the candidate
+/// itself, bundled so splitting the sweep in two moves the parameter list
+/// rather than duplicating it.
+struct LivenessProbeContext<'a> {
+    store_id: &'a str,
+    doc_index: &'a mut DocumentIndex,
+    store: &'a dyn RetrievalStore,
+    fetcher: &'a dyn UrlFetcher,
+    result: &'a mut IngestionResult,
+}
+
+/// Probe one aged-out feed entry and record the outcome.
+///
+/// Every outcome except a confirmed 404/410 converges on a single
+/// `touch_resource_liveness` call; the only thing an outcome decides is
+/// which validators go with it. `last_checked_at` therefore advances on
+/// **every attempt** — the normative meaning of that column
+/// (specs/04-search-pipeline.md §1). It has to: the candidate query is
+/// oldest-first, so leaving an unreachable candidate's timestamp where it
+/// was would put it back at the head of the next query, and a source with
+/// `FEED_LIVENESS_BATCH_LIMIT` or more permanently-blocked entries would
+/// re-probe that same stuck set forever while no other candidate ever
+/// reached a batch.
+///
+/// `Err` is returned only for a failure that makes continuing the sweep
+/// meaningless (a failed delete); per-candidate write failures are logged
+/// and skipped, so one racing delete cannot discard the stats already
+/// computed for the candidates processed alongside it.
+async fn probe_liveness_candidate(
+    ctx: &mut LivenessProbeContext<'_>,
+    candidate: StaleFeedResource,
+) -> Result<(), Error> {
+    let stored = FetchMetadata {
+        etag: candidate.external_etag.clone(),
+        last_modified: candidate.external_last_modified.clone(),
+    };
+
+    // Counted for every candidate an attempt is made for, regardless of
+    // outcome — see `IngestionResult::feed_entries_liveness_checked`'s
+    // doc comment.
+    ctx.result.feed_entries_liveness_checked += 1;
+
+    let refreshed = match ctx.fetcher.fetch(&candidate.uri, &stored).await {
+        Err(e) => {
+            // A transport error is evidence of nothing about the entry, so
+            // nothing about its content, metadata or validators moves — only
+            // the clock, so the rotation stays fair.
+            tracing::debug!(
+                uri = %candidate.uri,
+                error = %e,
+                "feed liveness sweep: fetch error, advancing only the probe clock"
+            );
+            stored
         }
-
-        let metadata = FetchMetadata {
-            etag: candidate.external_etag.clone(),
-            last_modified: candidate.external_last_modified.clone(),
-        };
-
-        // Counted for every candidate an attempt is made for, regardless of
-        // outcome — see `IngestionResult::feed_entries_liveness_checked`'s
-        // doc comment.
-        result.feed_entries_liveness_checked += 1;
-
-        let fetch_result = match fetcher.fetch(&candidate.uri, &metadata).await {
-            Ok(r) => r,
-            Err(e) => {
-                // A transport error is evidence of nothing — leave the
-                // resource and its `last_checked_at` untouched so it's
-                // eligible again next run, exactly like `Blocked` below.
-                tracing::debug!(
-                    uri = %candidate.uri,
-                    error = %e,
-                    "feed liveness sweep: fetch error, leaving resource untouched"
-                );
-                continue;
+        Ok(FetchResult::Gone) => {
+            ctx.doc_index.remove(&candidate.uri);
+            let deleted = ctx.store.delete_by_resource(&candidate.resource_id).await?;
+            if deleted > 0 {
+                ctx.result.docs_deleted += 1;
             }
-        };
-
-        match fetch_result {
-            FetchResult::Gone => {
-                doc_index.remove(&candidate.uri);
-                let deleted = store.delete_by_resource(&candidate.resource_id).await?;
-                if deleted > 0 {
-                    result.docs_deleted += 1;
-                }
-            }
-            FetchResult::NotModified {
-                etag,
-                last_modified,
-            } => {
-                // A bare 304 means unchanged; fold any rotated validator
-                // over what was already stored rather than reporting a
-                // partial value that would read as "clear it" — mirrors the
-                // feed document's own 304 handling
-                // (`ingest::FeedIngestor::ingest`). Still there, so not a
-                // delete.
-                let etag = etag.or(candidate.external_etag);
-                let last_modified = last_modified.or(candidate.external_last_modified);
-                // A per-candidate failure here (e.g. a concurrent delete
-                // racing this probe) must not abort the whole source and
-                // discard the run's already-computed stats for the
-                // candidates already processed — the transport-error and
-                // `Blocked` handling elsewhere in this loop apply the same
-                // rule: log and move on to the next candidate.
-                if let Err(e) = store
-                    .touch_resource_liveness(
-                        store_id,
-                        &candidate.resource_id,
-                        etag.as_deref(),
-                        last_modified.as_deref(),
-                    )
-                    .await
-                {
-                    tracing::debug!(
-                        uri = %candidate.uri,
-                        error = %e,
-                        "feed liveness sweep: touch_resource_liveness failed, leaving \
-                         resource untouched"
-                    );
-                }
-            }
-            FetchResult::Downloaded {
-                etag,
-                last_modified,
-                ..
-            } => {
-                // Deliberately not re-indexed: an aged-out entry's
-                // feed-sourced metadata (title, author, per-entry date) is
-                // long gone, and re-indexing from the bare page alone would
-                // silently degrade the stored resource rather than improve
-                // it. Only the validators and the throttle clock move,
-                // replacing what was stored wholesale — even with both
-                // `None` — exactly like a fresh 200 does everywhere else in
-                // this pipeline (a 200 is a full fresh representation, so
-                // silence about a validator means the origin stopped
-                // offering it, not "unchanged").
-                //
-                // A per-candidate failure here must not abort the whole
-                // source, for the same reason as the `NotModified` arm
-                // above: log and move on to the next candidate.
-                if let Err(e) = store
-                    .touch_resource_liveness(
-                        store_id,
-                        &candidate.resource_id,
-                        etag.as_deref(),
-                        last_modified.as_deref(),
-                    )
-                    .await
-                {
-                    tracing::debug!(
-                        uri = %candidate.uri,
-                        error = %e,
-                        "feed liveness sweep: touch_resource_liveness failed, leaving \
-                         resource untouched"
-                    );
-                }
-            }
-            FetchResult::Blocked => {
-                // Neither evidence of anything, like a transport error —
-                // leave it untouched. This arm is reachable in production:
-                // `fetcher` here is the public-only client (see
-                // `SourceIngestionDeps::fetcher`), and a real entry link
-                // that resolves to a non-globally-routable address (an
-                // internal/LAN link — specs/02-domain-model.md's
-                // "Destination policy (entry links)") is refused exactly
-                // like it would be on the ordinary ingestion pass. A
-                // fragment URI (a link-less entry's synthetic
-                // `{feed_url}#entry:{id}`) can no longer drive this arm —
-                // it never becomes a candidate in the first place
-                // (`RetrievalStore::list_stale_feed_resources`).
+            return Ok(());
+        }
+        Ok(FetchResult::NotModified {
+            etag,
+            last_modified,
+        }) => {
+            // A bare 304 means unchanged; fold any rotated validator over
+            // what was already stored rather than reporting a partial value
+            // that would read as "clear it" — mirrors the feed document's
+            // own 304 handling (`ingest::FeedIngestor::ingest`). Still
+            // there, so not a delete.
+            FetchMetadata {
+                etag: etag.or(stored.etag),
+                last_modified: last_modified.or(stored.last_modified),
             }
         }
+        Ok(FetchResult::Downloaded { .. }) => {
+            // The body is deliberately discarded: an aged-out entry's
+            // feed-sourced metadata (title, author, per-entry date) is long
+            // gone, and re-indexing from the bare page alone would silently
+            // degrade the stored resource rather than improve it.
+            //
+            // The response's *validators* are discarded with it, and that is
+            // the whole point. Storing them would leave the resource
+            // pointing at a representation this store never indexed: the
+            // next probe would answer 304, and if the entry ever re-entered
+            // the feed window that 304 would suppress the reindex of the
+            // changed content indefinitely. Replaying the stored validators
+            // instead costs a full 200 at every recheck on an entry that
+            // genuinely changed — pure overhead on something the sweep does
+            // not re-index anyway, and the correct side to err on.
+            stored
+        }
+        Ok(FetchResult::Blocked) => {
+            // Neither evidence of anything, like a transport error — only
+            // the clock moves. This arm is reachable in production:
+            // `fetcher` here is the public-only client (see
+            // `SourceIngestionDeps::fetcher`), and a real entry link that
+            // resolves to a non-globally-routable address (an internal/LAN
+            // link — specs/02-domain-model.md's "Destination policy (entry
+            // links)") is refused exactly like it would be on the ordinary
+            // ingestion pass. A fragment URI (a link-less entry's synthetic
+            // `{feed_url}#entry:{id}`) can no longer drive this arm — it
+            // never becomes a candidate in the first place
+            // (`RetrievalStore::list_stale_feed_resources`).
+            stored
+        }
+    };
+
+    // A per-candidate failure here (e.g. a concurrent delete racing this
+    // probe) must not abort the whole source and discard the run's
+    // already-computed stats for the candidates already processed: log and
+    // move on to the next candidate.
+    if let Err(e) = ctx
+        .store
+        .touch_resource_liveness(
+            ctx.store_id,
+            &candidate.resource_id,
+            refreshed.etag.as_deref(),
+            refreshed.last_modified.as_deref(),
+        )
+        .await
+    {
+        tracing::debug!(
+            uri = %candidate.uri,
+            error = %e,
+            "feed liveness sweep: touch_resource_liveness failed, leaving \
+             resource untouched"
+        );
     }
 
     Ok(())
@@ -7033,6 +7068,22 @@ mod tests {
                 }
             }
 
+            /// Same, but with a validator already stored — the state every
+            /// "what does the sweep write back" assertion needs, since a
+            /// row with no stored validator cannot distinguish "kept what
+            /// was there" from "wrote nothing".
+            fn row_with_etag(
+                resource_id: &str,
+                uri: &str,
+                last_checked_at: Option<&str>,
+                etag: &str,
+            ) -> LivenessRow {
+                LivenessRow {
+                    external_etag: Some(etag.to_string()),
+                    ..row(resource_id, uri, last_checked_at)
+                }
+            }
+
             /// A minimal `RetrievalStore` double for the liveness sweep: an
             /// in-memory candidate table plus call recorders, so tests can
             /// assert both the sweep's *decisions* (delete vs. touch vs.
@@ -7048,6 +7099,9 @@ mod tests {
                 delete_calls: tokio::sync::Mutex<Vec<String>>,
                 touch_calls: tokio::sync::Mutex<Vec<TouchCall>>,
                 list_calls: std::sync::atomic::AtomicUsize,
+                /// The `limit` the last `list_stale_feed_resources` call
+                /// asked for — what pins the over-fetch arithmetic.
+                last_limit: std::sync::atomic::AtomicUsize,
                 /// Resource IDs `touch_resource_liveness` fails for —
                 /// simulates a concurrent delete racing the probe, without
                 /// having to actually race one.
@@ -7061,6 +7115,7 @@ mod tests {
                         delete_calls: tokio::sync::Mutex::new(Vec::new()),
                         touch_calls: tokio::sync::Mutex::new(Vec::new()),
                         list_calls: std::sync::atomic::AtomicUsize::new(0),
+                        last_limit: std::sync::atomic::AtomicUsize::new(0),
                         fail_touch_for: std::collections::HashSet::new(),
                     }
                 }
@@ -7074,6 +7129,26 @@ mod tests {
 
                 fn list_call_count(&self) -> usize {
                     self.list_calls.load(std::sync::atomic::Ordering::SeqCst)
+                }
+
+                /// The `limit` the last candidate query asked for, or
+                /// `None` if no query has run.
+                fn last_query_limit(&self) -> Option<usize> {
+                    match self.last_limit.load(std::sync::atomic::Ordering::SeqCst) {
+                        0 => None,
+                        n => Some(n),
+                    }
+                }
+
+                /// The stored row for `resource_id`, as the sweep left it.
+                async fn row_state(&self, resource_id: &str) -> LivenessRow {
+                    self.rows
+                        .lock()
+                        .await
+                        .iter()
+                        .find(|r| r.resource_id == resource_id)
+                        .expect("row must still exist")
+                        .clone()
                 }
             }
 
@@ -7161,6 +7236,8 @@ mod tests {
                 ) -> Result<Vec<StaleFeedResource>, Error> {
                     self.list_calls
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    self.last_limit
+                        .store(limit, std::sync::atomic::Ordering::SeqCst);
                     let rows = self.rows.lock().await;
                     let mut candidates: Vec<&LivenessRow> = rows
                         .iter()
@@ -7240,6 +7317,9 @@ mod tests {
             struct ScriptedFetcher {
                 default_outcome: ScriptedFetchOutcome,
                 calls: tokio::sync::Mutex<Vec<String>>,
+                /// The `FetchMetadata` each call received, in call order —
+                /// what proves *which* validator a later probe replays.
+                replayed: tokio::sync::Mutex<Vec<FetchMetadata>>,
             }
 
             impl ScriptedFetcher {
@@ -7247,6 +7327,7 @@ mod tests {
                     Self {
                         default_outcome,
                         calls: tokio::sync::Mutex::new(Vec::new()),
+                        replayed: tokio::sync::Mutex::new(Vec::new()),
                     }
                 }
             }
@@ -7256,9 +7337,10 @@ mod tests {
                 async fn fetch(
                     &self,
                     url: &str,
-                    _metadata: &FetchMetadata,
+                    metadata: &FetchMetadata,
                 ) -> Result<FetchResult, Error> {
                     self.calls.lock().await.push(url.to_string());
+                    self.replayed.lock().await.push(metadata.clone());
                     match self.default_outcome {
                         ScriptedFetchOutcome::Gone => Ok(FetchResult::Gone),
                         ScriptedFetchOutcome::NotModified => Ok(FetchResult::NotModified {
@@ -7358,83 +7440,217 @@ mod tests {
             /// records a call, so a passing assertion on `touch_calls` alone
             /// (no other store method touched) already proves no re-index
             /// happened.
-            #[tokio::test]
-            async fn downloaded_candidate_is_touched_not_deleted_and_not_reindexed() {
-                let store = LivenessStore::new(vec![row(
-                    "r1",
-                    "https://a.example.com/",
-                    Some(&old_timestamp()),
-                )]);
-                let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::Downloaded);
+            /// Run the sweep once over `store` with `fetcher`, no seen-set
+            /// and no configured refresh interval — the shape almost every
+            /// single-candidate test below wants.
+            async fn sweep_once(
+                store: &LivenessStore,
+                fetcher: &ScriptedFetcher,
+            ) -> IngestionResult {
                 let mut doc_index = DocumentIndex::new();
                 let seen = std::collections::HashSet::new();
                 let mut result = IngestionResult::default();
-
                 run_feed_liveness_sweep(
                     "src-1",
                     "store-1",
                     None,
                     &seen,
                     &mut doc_index,
-                    &store,
-                    &fetcher,
+                    store,
+                    fetcher,
                     &mut result,
                 )
                 .await
                 .unwrap();
+                result
+            }
+
+            /// A `200` refreshes the clock and **nothing else**: the
+            /// response's own validators are discarded along with the body
+            /// they describe. Caching them would leave the resource pointing
+            /// at a representation this store never indexed, so a later
+            /// probe would answer 304 — and if the entry ever re-entered the
+            /// feed window, that 304 would suppress the reindex of the
+            /// changed content indefinitely.
+            #[tokio::test]
+            async fn downloaded_candidate_keeps_its_stored_validators() {
+                let store = LivenessStore::new(vec![row_with_etag(
+                    "r1",
+                    "https://a.example.com/",
+                    Some(&old_timestamp()),
+                    "\"stored\"",
+                )]);
+                let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::Downloaded);
+
+                let result = sweep_once(&store, &fetcher).await;
 
                 assert_eq!(result.docs_deleted, 0);
                 assert!(store.delete_calls.lock().await.is_empty());
-                let touches = store.touch_calls.lock().await;
+                let touches = store.touch_calls.lock().await.clone();
                 assert_eq!(touches.len(), 1);
                 assert_eq!(touches[0].0, "r1");
-                assert_eq!(touches[0].1.as_deref(), Some("\"fresh\""));
+                assert_eq!(
+                    touches[0].1.as_deref(),
+                    Some("\"stored\""),
+                    "the response's own \"fresh\" ETag describes a body the sweep threw \
+                     away, so it must never be stored"
+                );
+
+                let after = store.row_state("r1").await;
+                assert_eq!(after.external_etag.as_deref(), Some("\"stored\""));
+                assert!(
+                    after.last_checked_at.as_deref() > Some(old_timestamp().as_str()),
+                    "the probe clock is the one thing a 200 does move"
+                );
             }
 
+            /// The consequence, stated as the loop it breaks: a second probe
+            /// of the same candidate replays the **old** validator, so the
+            /// origin keeps answering 200 with the changed content rather
+            /// than 304ing against something never indexed.
             #[tokio::test]
-            async fn blocked_candidate_is_left_completely_untouched() {
-                let store = LivenessStore::new(vec![row(
+            async fn a_second_probe_replays_the_pre_probe_validator() {
+                let store = LivenessStore::new(vec![row_with_etag(
                     "r1",
                     "https://a.example.com/",
                     Some(&old_timestamp()),
+                    "\"stored\"",
+                )]);
+                let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::Downloaded);
+
+                sweep_once(&store, &fetcher).await;
+                // Wind the clock back so the recheck floor lets it through
+                // again, without sleeping out a real 24h window.
+                store.rows.lock().await[0].last_checked_at = Some(old_timestamp());
+                sweep_once(&store, &fetcher).await;
+
+                let replayed = fetcher.replayed.lock().await.clone();
+                assert_eq!(replayed.len(), 2);
+                assert_eq!(
+                    replayed[1].etag.as_deref(),
+                    Some("\"stored\""),
+                    "replaying the response's fresh ETag here would 304 forever \
+                     against content this store never indexed"
+                );
+            }
+
+            /// `Blocked` is evidence of nothing about the entry, so nothing
+            /// about its content, metadata or validators moves — but the
+            /// clock does. The candidate query is oldest-first, so a stuck
+            /// candidate that kept its old timestamp would lead every
+            /// subsequent query and starve the rest of the batch.
+            #[tokio::test]
+            async fn blocked_candidate_advances_only_the_probe_clock() {
+                let store = LivenessStore::new(vec![row_with_etag(
+                    "r1",
+                    "https://a.example.com/",
+                    Some(&old_timestamp()),
+                    "\"stored\"",
                 )]);
                 let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::Blocked);
-                let mut doc_index = DocumentIndex::new();
-                let seen = std::collections::HashSet::new();
-                let mut result = IngestionResult::default();
 
-                run_feed_liveness_sweep(
-                    "src-1",
-                    "store-1",
-                    None,
-                    &seen,
-                    &mut doc_index,
-                    &store,
-                    &fetcher,
-                    &mut result,
-                )
-                .await
-                .unwrap();
+                let result = sweep_once(&store, &fetcher).await;
 
                 assert_eq!(result.docs_deleted, 0);
                 assert_eq!(
                     result.feed_entries_liveness_checked, 1,
-                    "still counted as probed even though nothing moved"
+                    "still counted as probed"
                 );
                 assert!(store.delete_calls.lock().await.is_empty());
-                assert!(store.touch_calls.lock().await.is_empty());
+                let touches = store.touch_calls.lock().await.clone();
+                assert_eq!(touches.len(), 1);
+                assert_eq!(touches[0].1.as_deref(), Some("\"stored\""));
+                let after = store.row_state("r1").await;
+                assert_eq!(after.external_etag.as_deref(), Some("\"stored\""));
+                assert!(after.last_checked_at.as_deref() > Some(old_timestamp().as_str()));
             }
 
             #[tokio::test]
-            async fn transport_error_leaves_the_resource_untouched() {
-                let store = LivenessStore::new(vec![row(
+            async fn transport_error_advances_only_the_probe_clock() {
+                let store = LivenessStore::new(vec![row_with_etag(
                     "r1",
                     "https://a.example.com/",
                     Some(&old_timestamp()),
+                    "\"stored\"",
                 )]);
                 let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::TransportError);
+
+                let result = sweep_once(&store, &fetcher).await;
+
+                assert_eq!(result.docs_deleted, 0);
+                assert_eq!(result.feed_entries_liveness_checked, 1);
+                assert!(store.delete_calls.lock().await.is_empty());
+                let touches = store.touch_calls.lock().await.clone();
+                assert_eq!(touches.len(), 1);
+                assert_eq!(touches[0].1.as_deref(), Some("\"stored\""));
+                let after = store.row_state("r1").await;
+                assert_eq!(after.external_etag.as_deref(), Some("\"stored\""));
+                assert!(after.last_checked_at.as_deref() > Some(old_timestamp().as_str()));
+            }
+
+            /// Starvation, run end to end: a source whose whole batch is
+            /// permanently blocked must not re-probe the same
+            /// `FEED_LIVENESS_BATCH_LIMIT` candidates forever. Because every
+            /// attempt advances the clock, the second run reaches the ones
+            /// the first could not.
+            #[tokio::test]
+            async fn a_blocked_batch_does_not_starve_the_candidates_behind_it() {
+                let rows: Vec<LivenessRow> = (0..30)
+                    .map(|i| {
+                        row_with_etag(
+                            &format!("r{i}"),
+                            &format!("https://a.example.com/{i}"),
+                            // Distinct, ordered timestamps so the query has
+                            // an unambiguous "oldest first" to work from.
+                            Some(&format!("2020-01-01T00:00:{i:02}Z")),
+                            "\"stored\"",
+                        )
+                    })
+                    .collect();
+                let store = LivenessStore::new(rows);
+                let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::Blocked);
+
+                sweep_once(&store, &fetcher).await;
+                sweep_once(&store, &fetcher).await;
+
+                let probed: std::collections::HashSet<String> =
+                    fetcher.calls.lock().await.iter().cloned().collect();
+                assert!(
+                    probed.len() > FEED_LIVENESS_BATCH_LIMIT,
+                    "the second run must reach candidates the first could not; \
+                     got {} distinct URLs across two runs",
+                    probed.len()
+                );
+                // Nothing but the clock moved for any of them.
+                for i in 0..30 {
+                    let after = store.row_state(&format!("r{i}")).await;
+                    assert_eq!(after.external_etag.as_deref(), Some("\"stored\""));
+                }
+            }
+
+            /// The batch cap counts candidates *probed*, not rows returned.
+            /// The store query cannot see the run's seen-set, so a SQL-side
+            /// `LIMIT 25` over a window whose freshly-observed entries sort
+            /// oldest would hand back 25 already-seen rows and the sweep
+            /// would probe nothing at all — permanently.
+            #[tokio::test]
+            async fn a_seen_heavy_window_still_yields_real_probes() {
+                let rows: Vec<LivenessRow> = (0..30)
+                    .map(|i| {
+                        row(
+                            &format!("r{i}"),
+                            &format!("https://a.example.com/{i}"),
+                            Some(&format!("2020-01-01T00:00:{i:02}Z")),
+                        )
+                    })
+                    .collect();
+                let store = LivenessStore::new(rows);
+                let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::NotModified);
+                // The 25 oldest — exactly what a SQL-side cap would return.
+                let seen: std::collections::HashSet<String> = (0..FEED_LIVENESS_BATCH_LIMIT)
+                    .map(|i| format!("https://a.example.com/{i}"))
+                    .collect();
                 let mut doc_index = DocumentIndex::new();
-                let seen = std::collections::HashSet::new();
                 let mut result = IngestionResult::default();
 
                 run_feed_liveness_sweep(
@@ -7450,10 +7666,52 @@ mod tests {
                 .await
                 .unwrap();
 
-                assert_eq!(result.docs_deleted, 0);
-                assert_eq!(result.feed_entries_liveness_checked, 1);
-                assert!(store.delete_calls.lock().await.is_empty());
-                assert!(store.touch_calls.lock().await.is_empty());
+                let calls = fetcher.calls.lock().await.clone();
+                assert_eq!(
+                    calls.len(),
+                    5,
+                    "the five aged-out entries behind the seen-set must be probed: {calls:?}"
+                );
+                assert!(
+                    calls.iter().all(|u| !seen.contains(u)),
+                    "no entry this run already observed may be probed"
+                );
+            }
+
+            /// The over-fetch has a ceiling, so a pathologically large
+            /// seen-set cannot turn one query into an unbounded one.
+            #[tokio::test]
+            async fn the_over_fetch_is_capped() {
+                let store = LivenessStore::new(vec![row(
+                    "r1",
+                    "https://a.example.com/",
+                    Some(&old_timestamp()),
+                )]);
+                let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::NotModified);
+                let seen: std::collections::HashSet<String> = (0..10_000)
+                    .map(|i| format!("https://seen.example.com/{i}"))
+                    .collect();
+                let mut doc_index = DocumentIndex::new();
+                let mut result = IngestionResult::default();
+
+                run_feed_liveness_sweep(
+                    "src-1",
+                    "store-1",
+                    None,
+                    &seen,
+                    &mut doc_index,
+                    &store,
+                    &fetcher,
+                    &mut result,
+                )
+                .await
+                .unwrap();
+
+                assert_eq!(
+                    store.last_query_limit(),
+                    Some(FEED_LIVENESS_OVERFETCH_CAP),
+                    "the seen-set's own size must never become the query's limit"
+                );
             }
 
             /// A per-candidate `touch_resource_liveness` failure (e.g. a
