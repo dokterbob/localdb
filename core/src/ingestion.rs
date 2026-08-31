@@ -488,6 +488,39 @@ impl SweepSuppression {
     }
 }
 
+/// Remove one URI's indexed content, or — under [`DeletionPolicy::Retain`] —
+/// merely count it as prunable.
+///
+/// Shared by the two removal paths in [`run_source_ingestion`], which differ
+/// only in *which* URIs they hand here: the confirmed-gone path passes URIs
+/// the origin answered 404/410 for, the presumed-gone sweep passes URIs this
+/// run never observed. What happens to a URI once one of them has decided is
+/// identical, and stating it twice invites the two to drift.
+///
+/// The liveness sweep deliberately does not route through this: it already
+/// holds the candidate's `resource_id` from its own store query, so it never
+/// needs `doc_index.remove`'s return value, and it runs only under
+/// [`DeletionPolicy::Prune`] so it has no retaining branch to share.
+async fn prune_or_count(
+    uri: &str,
+    deletion: DeletionPolicy,
+    doc_index: &mut DocumentIndex,
+    store: &dyn RetrievalStore,
+    result: &mut IngestionResult,
+) -> Result<(), Error> {
+    if deletion == DeletionPolicy::Retain {
+        result.docs_prunable += 1;
+        return Ok(());
+    }
+    if let Some(old_record) = doc_index.remove(uri) {
+        let deleted = store.delete_by_resource(&old_record.resource_id).await?;
+        if deleted > 0 {
+            result.docs_deleted += 1;
+        }
+    }
+    Ok(())
+}
+
 /// Run the unified ingestion pipeline for one source, driven by a caller-supplied
 /// `&dyn Ingestor` (issue #117; specs/01-architecture.md §1).
 ///
@@ -649,16 +682,7 @@ pub async fn run_source_ingestion(
         if !owned_by_this_source {
             continue;
         }
-        if deletion == DeletionPolicy::Retain {
-            result.docs_prunable += 1;
-            continue;
-        }
-        if let Some(old_record) = doc_index.remove(uri) {
-            let deleted = store.delete_by_resource(&old_record.resource_id).await?;
-            if deleted > 0 {
-                result.docs_deleted += 1;
-            }
-        }
+        prune_or_count(uri, deletion, doc_index, store, &mut result).await?;
     }
 
     // Delete-sweep: any URI known to this source's doc_index that was neither
@@ -768,16 +792,7 @@ pub async fn run_source_ingestion(
                 if seen.contains(&uri) || gone.contains(&uri) {
                     continue;
                 }
-                if deletion == DeletionPolicy::Retain {
-                    result.docs_prunable += 1;
-                    continue;
-                }
-                if let Some(old_record) = doc_index.remove(&uri) {
-                    let deleted = store.delete_by_resource(&old_record.resource_id).await?;
-                    if deleted > 0 {
-                        result.docs_deleted += 1;
-                    }
-                }
+                prune_or_count(&uri, deletion, doc_index, store, &mut result).await?;
             }
         }
     } else if deletion == DeletionPolicy::Prune {

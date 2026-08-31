@@ -1172,17 +1172,8 @@ mod unified_pipeline {
         ]);
 
         let mut doc_index = DocumentIndex::new();
-        let deps = SourceIngestionDeps {
-            doc_index: &mut doc_index,
-            store: &store,
-            embedder: &embedder,
-            config: &config,
-            progress: None,
-            deletion: DeletionPolicy::Prune,
-            document_validators: FetchMetadata::default(),
-            stored_inputs_digest: None,
-            fetcher: &UnreachableFetcher,
-        };
+        let deps =
+            SourceIngestionDeps::for_test_pruning(&mut doc_index, &store, &embedder, &config);
         let result = run_source_ingestion(&source, &ingestor, deps)
             .await
             .unwrap();
@@ -1227,17 +1218,8 @@ mod unified_pipeline {
         ]);
 
         let mut doc_index = DocumentIndex::new();
-        let deps = SourceIngestionDeps {
-            doc_index: &mut doc_index,
-            store: &store,
-            embedder: &embedder,
-            config: &config,
-            progress: None,
-            deletion: DeletionPolicy::Prune,
-            document_validators: FetchMetadata::default(),
-            stored_inputs_digest: None,
-            fetcher: &UnreachableFetcher,
-        };
+        let deps =
+            SourceIngestionDeps::for_test_pruning(&mut doc_index, &store, &embedder, &config);
         let result = run_source_ingestion(&source, &ingestor, deps)
             .await
             .unwrap();
@@ -1494,17 +1476,8 @@ mod unified_pipeline {
         let resource = make_resource(uri, text, &source.id, store_id);
         let ingestor = FakeIngestor::new(vec![ScriptStep::Resource(resource)]);
 
-        let deps = SourceIngestionDeps {
-            doc_index: &mut doc_index,
-            store: &store,
-            embedder: &embedder,
-            config: &config,
-            progress: None,
-            deletion: DeletionPolicy::Prune,
-            document_validators: FetchMetadata::default(),
-            stored_inputs_digest: None,
-            fetcher: &UnreachableFetcher,
-        };
+        let deps =
+            SourceIngestionDeps::for_test_pruning(&mut doc_index, &store, &embedder, &config);
         let result = run_source_ingestion(&source, &ingestor, deps)
             .await
             .unwrap();
@@ -1548,17 +1521,8 @@ mod unified_pipeline {
         let new_resource_id = resource.id.clone();
         let ingestor = FakeIngestor::new(vec![ScriptStep::Resource(resource)]);
 
-        let deps = SourceIngestionDeps {
-            doc_index: &mut doc_index,
-            store: &store,
-            embedder: &embedder,
-            config: &config_v2,
-            progress: None,
-            deletion: DeletionPolicy::Prune,
-            document_validators: FetchMetadata::default(),
-            stored_inputs_digest: None,
-            fetcher: &UnreachableFetcher,
-        };
+        let deps =
+            SourceIngestionDeps::for_test_pruning(&mut doc_index, &store, &embedder, &config_v2);
         let result = run_source_ingestion(&source, &ingestor, deps)
             .await
             .unwrap();
@@ -1615,17 +1579,8 @@ mod unified_pipeline {
                 store_id,
             )),
         ]);
-        let deps1 = SourceIngestionDeps {
-            doc_index: &mut doc_index1,
-            store: &store,
-            embedder: &embedder,
-            config: &config,
-            progress: None,
-            deletion: DeletionPolicy::Prune,
-            document_validators: FetchMetadata::default(),
-            stored_inputs_digest: None,
-            fetcher: &UnreachableFetcher,
-        };
+        let deps1 =
+            SourceIngestionDeps::for_test_pruning(&mut doc_index1, &store, &embedder, &config);
         let result1 = run_source_ingestion(&source, &ingestor1, deps1)
             .await
             .unwrap();
@@ -1652,17 +1607,8 @@ mod unified_pipeline {
                 store_id,
             )),
         ]);
-        let deps2 = SourceIngestionDeps {
-            doc_index: &mut doc_index2,
-            store: &store,
-            embedder: &embedder,
-            config: &config,
-            progress: None,
-            deletion: DeletionPolicy::Prune,
-            document_validators: FetchMetadata::default(),
-            stored_inputs_digest: None,
-            fetcher: &UnreachableFetcher,
-        };
+        let deps2 =
+            SourceIngestionDeps::for_test_pruning(&mut doc_index2, &store, &embedder, &config);
         let result2 = run_source_ingestion(&source, &ingestor2, deps2)
             .await
             .unwrap();
@@ -1716,17 +1662,8 @@ mod unified_pipeline {
         let kept_resource = make_resource(kept_uri, "Kept content.", &source.id, store_id);
         let ingestor = FakeIngestor::new(vec![ScriptStep::Resource(kept_resource)]);
 
-        let deps = SourceIngestionDeps {
-            doc_index: &mut doc_index,
-            store: &store,
-            embedder: &embedder,
-            config: &config,
-            progress: None,
-            deletion: DeletionPolicy::Prune,
-            document_validators: FetchMetadata::default(),
-            stored_inputs_digest: None,
-            fetcher: &UnreachableFetcher,
-        };
+        let deps =
+            SourceIngestionDeps::for_test_pruning(&mut doc_index, &store, &embedder, &config);
         let result = run_source_ingestion(&source, &ingestor, deps)
             .await
             .unwrap();
@@ -1793,17 +1730,8 @@ mod unified_pipeline {
         );
         let ingestor = FakeIngestor::new(vec![ScriptStep::Resource(empty_resource)]);
 
-        let deps = SourceIngestionDeps {
-            doc_index: &mut doc_index,
-            store: &store,
-            embedder: &embedder,
-            config: &config,
-            progress: None,
-            deletion: DeletionPolicy::Prune,
-            document_validators: FetchMetadata::default(),
-            stored_inputs_digest: None,
-            fetcher: &UnreachableFetcher,
-        };
+        let deps =
+            SourceIngestionDeps::for_test_pruning(&mut doc_index, &store, &embedder, &config);
         let result = run_source_ingestion(&source, &ingestor, deps)
             .await
             .unwrap();
@@ -1858,17 +1786,8 @@ mod unified_pipeline {
         // when its root is an unmounted volume.
         let ingestor = FakeIngestor::incomplete("source root is not reachable: /volumes/archive");
 
-        let deps = SourceIngestionDeps {
-            doc_index: &mut doc_index,
-            store: &store,
-            embedder: &embedder,
-            config: &config,
-            progress: None,
-            deletion: DeletionPolicy::Prune,
-            document_validators: FetchMetadata::default(),
-            stored_inputs_digest: None,
-            fetcher: &UnreachableFetcher,
-        };
+        let deps =
+            SourceIngestionDeps::for_test_pruning(&mut doc_index, &store, &embedder, &config);
         let result = run_source_ingestion(&source, &ingestor, deps)
             .await
             .unwrap();
@@ -1931,17 +1850,8 @@ mod unified_pipeline {
         // A well-behaved-looking run that nevertheless yielded nothing.
         let ingestor = FakeIngestor::new(vec![ScriptStep::Discovered(0)]);
 
-        let deps = SourceIngestionDeps {
-            doc_index: &mut doc_index,
-            store: &store,
-            embedder: &embedder,
-            config: &config,
-            progress: None,
-            deletion: DeletionPolicy::Prune,
-            document_validators: FetchMetadata::default(),
-            stored_inputs_digest: None,
-            fetcher: &UnreachableFetcher,
-        };
+        let deps =
+            SourceIngestionDeps::for_test_pruning(&mut doc_index, &store, &embedder, &config);
         let result = run_source_ingestion(&source, &ingestor, deps)
             .await
             .unwrap();
@@ -1989,17 +1899,8 @@ mod unified_pipeline {
         doc_index.upsert(a);
 
         let ingestor = FakeIngestor::new(vec![ScriptStep::Discovered(0)]);
-        let deps = SourceIngestionDeps {
-            doc_index: &mut doc_index,
-            store: &store,
-            embedder: &embedder,
-            config: &config,
-            progress: None,
-            deletion: DeletionPolicy::Prune,
-            document_validators: FetchMetadata::default(),
-            stored_inputs_digest: None,
-            fetcher: &UnreachableFetcher,
-        };
+        let deps =
+            SourceIngestionDeps::for_test_pruning(&mut doc_index, &store, &embedder, &config);
 
         let (result, captured) = run_capturing_logs(&source, &ingestor, deps).await;
         result.unwrap();
@@ -2039,17 +1940,8 @@ mod unified_pipeline {
         let kept_resource = make_resource(kept_uri, "Kept.", &source.id, store_id);
         let ingestor = FakeIngestor::new(vec![ScriptStep::Resource(kept_resource)]);
 
-        let deps = SourceIngestionDeps {
-            doc_index: &mut doc_index,
-            store: &store,
-            embedder: &embedder,
-            config: &config,
-            progress: None,
-            deletion: DeletionPolicy::Prune,
-            document_validators: FetchMetadata::default(),
-            stored_inputs_digest: None,
-            fetcher: &UnreachableFetcher,
-        };
+        let deps =
+            SourceIngestionDeps::for_test_pruning(&mut doc_index, &store, &embedder, &config);
         let result = run_source_ingestion(&source, &ingestor, deps)
             .await
             .unwrap();
@@ -2230,17 +2122,8 @@ mod unified_pipeline {
         doc_index.upsert(foreign.clone());
 
         let ingestor = FakeIngestor::new(vec![ScriptStep::Discovered(0)]);
-        let deps = SourceIngestionDeps {
-            doc_index: &mut doc_index,
-            store: &store,
-            embedder: &embedder,
-            config: &config,
-            progress: None,
-            deletion: DeletionPolicy::Prune,
-            document_validators: FetchMetadata::default(),
-            stored_inputs_digest: None,
-            fetcher: &UnreachableFetcher,
-        };
+        let deps =
+            SourceIngestionDeps::for_test_pruning(&mut doc_index, &store, &embedder, &config);
         let result = run_source_ingestion(&source, &ingestor, deps)
             .await
             .unwrap();
@@ -2357,17 +2240,8 @@ mod unified_pipeline {
             &source.id,
             store_id,
         ))]);
-        let deps = SourceIngestionDeps {
-            doc_index: &mut doc_index,
-            store: &store,
-            embedder: &embedder,
-            config: &config,
-            progress: None,
-            deletion: DeletionPolicy::Prune,
-            document_validators: FetchMetadata::default(),
-            stored_inputs_digest: None,
-            fetcher: &UnreachableFetcher,
-        };
+        let deps =
+            SourceIngestionDeps::for_test_pruning(&mut doc_index, &store, &embedder, &config);
         let result = run_source_ingestion(&source, &ingestor, deps)
             .await
             .unwrap();
@@ -2482,17 +2356,8 @@ mod unified_pipeline {
             &source.id,
             store_id,
         ))]);
-        let deps = SourceIngestionDeps {
-            doc_index: &mut doc_index,
-            store: &store,
-            embedder: &embedder,
-            config: &config,
-            progress: None,
-            deletion: DeletionPolicy::Prune,
-            document_validators: FetchMetadata::default(),
-            stored_inputs_digest: None,
-            fetcher: &UnreachableFetcher,
-        };
+        let deps =
+            SourceIngestionDeps::for_test_pruning(&mut doc_index, &store, &embedder, &config);
         let result = run_source_ingestion(&source, &ingestor, deps)
             .await
             .unwrap();
@@ -2597,17 +2462,8 @@ mod unified_pipeline {
             &source_a.id,
             store_id,
         ))]);
-        let deps = SourceIngestionDeps {
-            doc_index: &mut doc_index,
-            store: &store,
-            embedder: &embedder,
-            config: &config,
-            progress: None,
-            deletion: DeletionPolicy::Prune,
-            document_validators: FetchMetadata::default(),
-            stored_inputs_digest: None,
-            fetcher: &UnreachableFetcher,
-        };
+        let deps =
+            SourceIngestionDeps::for_test_pruning(&mut doc_index, &store, &embedder, &config);
         let result = run_source_ingestion(&source_a, &ingestor, deps)
             .await
             .unwrap();
@@ -2718,17 +2574,8 @@ mod unified_pipeline {
         // Sweep source A only (its directory is empty; B does not run
         // this cycle — e.g. `index --source A`).
         let ingestor = FakeIngestor::new(vec![]);
-        let deps = SourceIngestionDeps {
-            doc_index: &mut doc_index,
-            store: &store,
-            embedder: &embedder,
-            config: &config,
-            progress: None,
-            deletion: DeletionPolicy::Prune,
-            document_validators: FetchMetadata::default(),
-            stored_inputs_digest: None,
-            fetcher: &UnreachableFetcher,
-        };
+        let deps =
+            SourceIngestionDeps::for_test_pruning(&mut doc_index, &store, &embedder, &config);
         let result = run_source_ingestion(&source_a, &ingestor, deps)
             .await
             .unwrap();
@@ -2778,17 +2625,8 @@ mod unified_pipeline {
             SkipReason::Unchanged,
         )]);
 
-        let deps = SourceIngestionDeps {
-            doc_index: &mut doc_index,
-            store: &store,
-            embedder: &embedder,
-            config: &config,
-            progress: None,
-            deletion: DeletionPolicy::Prune,
-            document_validators: FetchMetadata::default(),
-            stored_inputs_digest: None,
-            fetcher: &UnreachableFetcher,
-        };
+        let deps =
+            SourceIngestionDeps::for_test_pruning(&mut doc_index, &store, &embedder, &config);
         let result = run_source_ingestion(&source, &ingestor, deps)
             .await
             .unwrap();
@@ -2845,17 +2683,8 @@ mod unified_pipeline {
         // the sweep guards.
         let ingestor = FakeIngestor::new(vec![ScriptStep::Gone(url.to_string())]);
 
-        let deps = SourceIngestionDeps {
-            doc_index: &mut doc_index,
-            store: &store,
-            embedder: &embedder,
-            config: &config,
-            progress: None,
-            deletion: DeletionPolicy::Prune,
-            document_validators: FetchMetadata::default(),
-            stored_inputs_digest: None,
-            fetcher: &UnreachableFetcher,
-        };
+        let deps =
+            SourceIngestionDeps::for_test_pruning(&mut doc_index, &store, &embedder, &config);
         let result = run_source_ingestion(&source, &ingestor, deps)
             .await
             .unwrap();
@@ -2946,17 +2775,8 @@ mod unified_pipeline {
         // Modified, or the entry simply having scrolled off the feed's
         // window. Silence, carrying no information.
         let feed_ingestor = FakeIngestor::new(vec![]);
-        let deps = SourceIngestionDeps {
-            doc_index: &mut doc_index,
-            store: &store,
-            embedder: &embedder,
-            config: &config,
-            progress: None,
-            deletion: DeletionPolicy::Prune,
-            document_validators: FetchMetadata::default(),
-            stored_inputs_digest: None,
-            fetcher: &UnreachableFetcher,
-        };
+        let deps =
+            SourceIngestionDeps::for_test_pruning(&mut doc_index, &store, &embedder, &config);
         let feed_result = run_source_ingestion(&feed_source, &feed_ingestor, deps)
             .await
             .unwrap();
@@ -2979,17 +2799,8 @@ mod unified_pipeline {
         // The url source's fetch came back 404/410 — knowledge, reported
         // positively.
         let url_ingestor = FakeIngestor::new(vec![ScriptStep::Gone(url_uri.to_string())]);
-        let deps = SourceIngestionDeps {
-            doc_index: &mut doc_index,
-            store: &store,
-            embedder: &embedder,
-            config: &config,
-            progress: None,
-            deletion: DeletionPolicy::Prune,
-            document_validators: FetchMetadata::default(),
-            stored_inputs_digest: None,
-            fetcher: &UnreachableFetcher,
-        };
+        let deps =
+            SourceIngestionDeps::for_test_pruning(&mut doc_index, &store, &embedder, &config);
         let url_result = run_source_ingestion(&url_source, &url_ingestor, deps)
             .await
             .unwrap();
@@ -3099,17 +2910,8 @@ mod unified_pipeline {
         ]);
 
         let mut doc_index = DocumentIndex::new();
-        let deps = SourceIngestionDeps {
-            doc_index: &mut doc_index,
-            store: &store,
-            embedder: &embedder,
-            config: &config,
-            progress: None,
-            deletion: DeletionPolicy::Prune,
-            document_validators: FetchMetadata::default(),
-            stored_inputs_digest: None,
-            fetcher: &UnreachableFetcher,
-        };
+        let deps =
+            SourceIngestionDeps::for_test_pruning(&mut doc_index, &store, &embedder, &config);
         let result = run_source_ingestion(&source, &ingestor, deps)
             .await
             .unwrap();
@@ -3165,17 +2967,12 @@ mod unified_pipeline {
         let ingestor = FakeIngestor::new(vec![ScriptStep::Resource(changed)]);
 
         let failing_embedder = FailingEmbedder;
-        let deps = SourceIngestionDeps {
-            doc_index: &mut doc_index,
-            store: &store,
-            embedder: &failing_embedder,
-            config: &config,
-            progress: None,
-            deletion: DeletionPolicy::Prune,
-            document_validators: FetchMetadata::default(),
-            stored_inputs_digest: None,
-            fetcher: &UnreachableFetcher,
-        };
+        let deps = SourceIngestionDeps::for_test_pruning(
+            &mut doc_index,
+            &store,
+            &failing_embedder,
+            &config,
+        );
         let result = run_source_ingestion(&source, &ingestor, deps)
             .await
             .unwrap();
@@ -4730,22 +4527,7 @@ mod unified_pipeline {
                 Some(&old_timestamp()),
             )]);
             let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::Gone);
-            let mut doc_index = DocumentIndex::new();
-            let seen = std::collections::HashSet::new();
-            let mut result = IngestionResult::default();
-
-            run_feed_liveness_sweep(
-                "src-1",
-                "store-1",
-                None,
-                &seen,
-                &mut doc_index,
-                &store,
-                &fetcher,
-                &mut result,
-            )
-            .await
-            .unwrap();
+            let result = sweep_once(&store, &fetcher).await;
 
             assert_eq!(result.docs_deleted, 1);
             assert_eq!(result.feed_entries_liveness_checked, 1);
@@ -4761,22 +4543,7 @@ mod unified_pipeline {
                 Some(&old_timestamp()),
             )]);
             let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::NotModified);
-            let mut doc_index = DocumentIndex::new();
-            let seen = std::collections::HashSet::new();
-            let mut result = IngestionResult::default();
-
-            run_feed_liveness_sweep(
-                "src-1",
-                "store-1",
-                None,
-                &seen,
-                &mut doc_index,
-                &store,
-                &fetcher,
-                &mut result,
-            )
-            .await
-            .unwrap();
+            let result = sweep_once(&store, &fetcher).await;
 
             assert_eq!(result.docs_deleted, 0);
             assert_eq!(result.feed_entries_liveness_checked, 1);
@@ -5086,22 +4853,7 @@ mod unified_pipeline {
                 "r-fails",
             );
             let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::NotModified);
-            let mut doc_index = DocumentIndex::new();
-            let seen = std::collections::HashSet::new();
-            let mut result = IngestionResult::default();
-
-            run_feed_liveness_sweep(
-                "src-1",
-                "store-1",
-                None,
-                &seen,
-                &mut doc_index,
-                &store,
-                &fetcher,
-                &mut result,
-            )
-            .await
-            .unwrap();
+            let result = sweep_once(&store, &fetcher).await;
 
             assert_eq!(
                 fetcher.calls.lock().await.len(),
@@ -5133,22 +4885,7 @@ mod unified_pipeline {
             let store =
                 LivenessStore::new(vec![row("r1", "https://a.example.com/", Some(&recent))]);
             let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::Gone);
-            let mut doc_index = DocumentIndex::new();
-            let seen = std::collections::HashSet::new();
-            let mut result = IngestionResult::default();
-
-            run_feed_liveness_sweep(
-                "src-1",
-                "store-1",
-                None,
-                &seen,
-                &mut doc_index,
-                &store,
-                &fetcher,
-                &mut result,
-            )
-            .await
-            .unwrap();
+            let result = sweep_once(&store, &fetcher).await;
 
             assert!(
                 fetcher.calls.lock().await.is_empty(),
@@ -5332,22 +5069,7 @@ mod unified_pipeline {
 
             let store = LivenessStore::new(rows);
             let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::NotModified);
-            let mut doc_index = DocumentIndex::new();
-            let seen = std::collections::HashSet::new();
-            let mut result = IngestionResult::default();
-
-            run_feed_liveness_sweep(
-                "src-1",
-                "store-1",
-                None,
-                &seen,
-                &mut doc_index,
-                &store,
-                &fetcher,
-                &mut result,
-            )
-            .await
-            .unwrap();
+            let result = sweep_once(&store, &fetcher).await;
 
             let calls = fetcher.calls.lock().await.clone();
             assert_eq!(calls.len(), FEED_LIVENESS_BATCH_LIMIT);
@@ -5379,22 +5101,7 @@ mod unified_pipeline {
                 None, // never-checked — would otherwise sort first
             )]);
             let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::Gone);
-            let mut doc_index = DocumentIndex::new();
-            let seen = std::collections::HashSet::new();
-            let mut result = IngestionResult::default();
-
-            run_feed_liveness_sweep(
-                "src-1",
-                "store-1",
-                None,
-                &seen,
-                &mut doc_index,
-                &store,
-                &fetcher,
-                &mut result,
-            )
-            .await
-            .unwrap();
+            let result = sweep_once(&store, &fetcher).await;
 
             assert!(
                 fetcher.calls.lock().await.is_empty(),
@@ -5511,17 +5218,8 @@ mod unified_pipeline {
             seed_doc_index_owned_by(&mut doc_index, &source.id, "https://a.example.com/");
 
             let ingestor = FakeIngestor::incomplete("feed unreachable");
-            let deps = SourceIngestionDeps {
-                doc_index: &mut doc_index,
-                store: &store,
-                embedder: &embedder,
-                config: &config,
-                progress: None,
-                deletion: DeletionPolicy::Prune,
-                document_validators: FetchMetadata::default(),
-                stored_inputs_digest: None,
-                fetcher: &UnreachableFetcher,
-            };
+            let deps =
+                SourceIngestionDeps::for_test_pruning(&mut doc_index, &store, &embedder, &config);
             run_source_ingestion(&source, &ingestor, deps)
                 .await
                 .unwrap();
@@ -5662,17 +5360,8 @@ mod unified_pipeline {
             seed_doc_index_owned_by(&mut doc_index, &source.id, "https://a.example.com/");
 
             let ingestor = FakeIngestor::incomplete("feed unreachable");
-            let deps = SourceIngestionDeps {
-                doc_index: &mut doc_index,
-                store: &store,
-                embedder: &embedder,
-                config: &config,
-                progress: None,
-                deletion: DeletionPolicy::Prune,
-                document_validators: FetchMetadata::default(),
-                stored_inputs_digest: None,
-                fetcher: &UnreachableFetcher,
-            };
+            let deps =
+                SourceIngestionDeps::for_test_pruning(&mut doc_index, &store, &embedder, &config);
 
             let (result, captured) = run_capturing_logs(&source, &ingestor, deps).await;
             result.unwrap();

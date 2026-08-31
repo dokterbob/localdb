@@ -1,5 +1,5 @@
-//! Per-resource indexing: chunk → embed → upsert (issue #117's pipeline
-//! shape; specs/01-architecture.md §1).
+//! Per-resource indexing: chunk → embed → upsert (specs/01-architecture.md
+//! §1).
 //!
 //! [`index_resource`] is the post-extraction half — the `Resource` it is
 //! handed already has final blocks, metadata, and `content_hash`; all
@@ -34,8 +34,8 @@ use crate::types::{Chunk, Provenance, Source, SourceRef};
 /// `prose` preset is scaled; `code` already uses a char budget.
 ///
 /// `pub(in crate::ingestion)`, not private: its tests live in the sibling
-/// `ingestion::tests` module (issue #213's sibling-tests convention), which
-/// needs to reach it despite not being a descendant of this module.
+/// `ingestion::tests` module, which needs to reach it despite not being a
+/// descendant of this module.
 pub(in crate::ingestion) fn scale_to_chars(config: &ChunkerConfig) -> ChunkerConfig {
     if config.preset != "prose" {
         return config.clone();
@@ -174,8 +174,8 @@ fn derive_resource_state(resource: &Resource) -> DerivedResourceState {
 ///   store's configured prose chunker) is used.
 ///
 /// `pub(in crate::ingestion)`, not private: its tests live in the sibling
-/// `ingestion::tests` module (issue #213's sibling-tests convention), which
-/// needs to reach it despite not being a descendant of this module.
+/// `ingestion::tests` module, which needs to reach it despite not being a
+/// descendant of this module.
 pub(in crate::ingestion) fn effective_chunker_config(
     source_preset: &str,
     base_chunker: &ChunkerConfig,

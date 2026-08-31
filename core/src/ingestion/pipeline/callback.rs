@@ -70,7 +70,81 @@ pub(in crate::ingestion) struct PipelineCallback<'a> {
     pub(in crate::ingestion) skip_error_count: usize,
 }
 
+/// What each metadata-refresh hook is refreshing, named once so the read
+/// failure, the write failure and the log line for one hook cannot drift into
+/// describing it three different ways.
+const VALIDATORS: &str = "conditional-GET validators";
+const CONNECTOR_METADATA: &str = "source-supplied metadata";
+
 impl PipelineCallback<'_> {
+    /// Read the resource row both metadata-refresh hooks rewrite.
+    ///
+    /// `Err` carries the outcome the caller must return: `Unchanged` for a
+    /// missing row — a concurrent delete, the same race the `doc_index` miss
+    /// each hook checks first tolerates — and `Failed` for a read error, so a
+    /// refresh that could not even read reports as an error rather than a
+    /// clean skip.
+    ///
+    /// `what` names the refresh in the message and selects no behavior. It is
+    /// the same constant the caller passes to `persist_metadata_write` a few
+    /// lines later, so a read failure and a write failure for one hook can
+    /// never describe themselves differently.
+    async fn read_persisted_record(
+        &self,
+        uri: &str,
+        resource_id: &str,
+        what: &str,
+    ) -> Result<crate::store::ResourceRecord, MetadataWriteOutcome> {
+        match self
+            .store
+            .get_resource_record(&self.config.store_id, resource_id)
+            .await
+        {
+            Ok(Some(record)) => Ok(record),
+            Ok(None) => Err(MetadataWriteOutcome::Unchanged),
+            Err(e) => {
+                let msg = format!("error reading resource '{uri}' to refresh {what}: {e}");
+                tracing::warn!("{msg}");
+                Err(MetadataWriteOutcome::Failed(msg))
+            }
+        }
+    }
+
+    /// The write tail both metadata-refresh hooks share: persist the record,
+    /// and on success cache the `DocumentRecord` the hook derived for it.
+    ///
+    /// The two hooks share this and the read above, and nothing between them:
+    /// each keeps its own derivation and its own unchanged-condition, because
+    /// those genuinely differ — one folds a validator pair and compares it
+    /// directly, the other merges a connector's claim and compares a metadata
+    /// hash. Folding those together would need a flag that selects behavior,
+    /// which is worse than the two explicit hooks. `what` is a label for the
+    /// warning and selects nothing.
+    ///
+    /// A failed write leaves `doc_index` untouched on purpose, exactly like
+    /// `on_resource`'s metadata-only branch: the stale cached hash is what
+    /// makes the next run retry the write.
+    async fn persist_metadata_write(
+        &mut self,
+        uri: &str,
+        resource_id: &str,
+        record: &crate::store::ResourceRecord,
+        updated: DocumentRecord,
+        what: &str,
+    ) -> MetadataWriteOutcome {
+        if let Err(e) = self
+            .store
+            .update_resource_metadata(&self.config.store_id, resource_id, record)
+            .await
+        {
+            let msg = format!("error persisting refreshed {what} for '{uri}': {e}");
+            tracing::warn!("{msg}");
+            return MetadataWriteOutcome::Failed(msg);
+        }
+        self.doc_index.upsert(updated);
+        MetadataWriteOutcome::Written
+    }
+
     fn emit(&self, event: crate::progress::ProgressEvent) {
         if let Some(sink) = &self.progress {
             sink(event);
@@ -432,21 +506,11 @@ impl IngestCallback for PipelineCallback<'_> {
         // and `DocumentRecord` carries only the hash, not what was hashed.
         let resource_id = existing.resource_id.clone();
         let persisted = match self
-            .store
-            .get_resource_record(&self.config.store_id, &resource_id)
+            .read_persisted_record(&uri_str, &resource_id, VALIDATORS)
             .await
         {
-            Ok(Some(record)) => record,
-            // No row: a concurrent delete, same race the `doc_index` miss
-            // above tolerates.
-            Ok(None) => return MetadataWriteOutcome::Unchanged,
-            Err(e) => {
-                let msg = format!(
-                    "error reading resource '{uri_str}' to refresh conditional-GET validators: {e}"
-                );
-                tracing::warn!("{msg}");
-                return MetadataWriteOutcome::Failed(msg);
-            }
+            Ok(record) => record,
+            Err(outcome) => return outcome,
         };
 
         let record = crate::store::ResourceRecord {
@@ -471,7 +535,7 @@ impl IngestCallback for PipelineCallback<'_> {
                 external_last_modified: new_last_modified,
                 ..existing
             },
-            "refreshed conditional-GET validators",
+            VALIDATORS,
         )
         .await
     }
@@ -526,19 +590,11 @@ impl IngestCallback for PipelineCallback<'_> {
 
         let resource_id = existing.resource_id.clone();
         let persisted = match self
-            .store
-            .get_resource_record(&self.config.store_id, &resource_id)
+            .read_persisted_record(&uri_str, &resource_id, CONNECTOR_METADATA)
             .await
         {
-            Ok(Some(record)) => record,
-            Ok(None) => return MetadataWriteOutcome::Unchanged,
-            Err(e) => {
-                let msg = format!(
-                    "error reading resource '{uri_str}' to refresh source-supplied metadata: {e}"
-                );
-                tracing::warn!("{msg}");
-                return MetadataWriteOutcome::Failed(msg);
-            }
+            Ok(record) => record,
+            Err(outcome) => return outcome,
         };
 
         let mut metadata = persisted.metadata;
@@ -583,43 +639,8 @@ impl IngestCallback for PipelineCallback<'_> {
                 metadata_hash,
                 ..existing
             },
-            "refreshed source-supplied metadata",
+            CONNECTOR_METADATA,
         )
         .await
-    }
-}
-
-impl PipelineCallback<'_> {
-    /// The write tail both metadata-refresh hooks share: persist the record,
-    /// and on success cache the `DocumentRecord` the hook derived for it.
-    ///
-    /// Only the tail is shared. Each hook keeps its own read, its own
-    /// derivation and its own unchanged-condition, because those genuinely
-    /// differ — one folds a validator pair and compares it directly, the
-    /// other merges a connector's claim and compares a metadata hash. `what`
-    /// names the refresh in the warning; it selects no behavior.
-    ///
-    /// A failed write leaves `doc_index` untouched on purpose, exactly like
-    /// `on_resource`'s metadata-only branch: the stale cached hash is what
-    /// makes the next run retry the write.
-    async fn persist_metadata_write(
-        &mut self,
-        uri: &str,
-        resource_id: &str,
-        record: &crate::store::ResourceRecord,
-        updated: DocumentRecord,
-        what: &str,
-    ) -> MetadataWriteOutcome {
-        if let Err(e) = self
-            .store
-            .update_resource_metadata(&self.config.store_id, resource_id, record)
-            .await
-        {
-            let msg = format!("error persisting {what} for '{uri}': {e}");
-            tracing::warn!("{msg}");
-            return MetadataWriteOutcome::Failed(msg);
-        }
-        self.doc_index.upsert(updated);
-        MetadataWriteOutcome::Written
     }
 }

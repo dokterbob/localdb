@@ -296,11 +296,11 @@ impl<'a> SourceIngestionDeps<'a> {
     /// is never dereferenced — see `UnreachableFetcher`'s own doc comment).
     ///
     /// A call site that needs a non-default value for any of these five
-    /// still uses a plain struct literal (or struct-update syntax over this
-    /// constructor, `SourceIngestionDeps { deletion: DeletionPolicy::Prune,
-    /// ..SourceIngestionDeps::for_test(...) }`) — this constructor exists to
-    /// remove the boilerplate at the sites that don't vary it, not to hide
-    /// the field from sites that do.
+    /// still uses a plain struct literal, or struct-update syntax over this
+    /// constructor — this constructor exists to remove the boilerplate at the
+    /// sites that don't vary it, not to hide the field from sites that do.
+    /// `deletion` is the one field varied often enough to get a constructor
+    /// of its own; see [`Self::for_test_pruning`].
     pub fn for_test(
         doc_index: &'a mut DocumentIndex,
         store: &'a dyn RetrievalStore,
@@ -317,6 +317,26 @@ impl<'a> SourceIngestionDeps<'a> {
             document_validators: FetchMetadata::default(),
             stored_inputs_digest: None,
             fetcher: &UnreachableFetcher,
+        }
+    }
+
+    /// [`Self::for_test`] with `deletion: DeletionPolicy::Prune`.
+    ///
+    /// A separate constructor rather than a boolean parameter, and rather
+    /// than leaving these sites on struct-update syntax: `deletion` is the
+    /// one field the test suites genuinely split on — every sweep test needs
+    /// `Prune`, since neither the delete-sweep nor the feed liveness sweep
+    /// does anything under `Retain` — and naming it in the constructor says
+    /// at the call site which of the two a test is exercising.
+    pub fn for_test_pruning(
+        doc_index: &'a mut DocumentIndex,
+        store: &'a dyn RetrievalStore,
+        embedder: &'a dyn Embedder,
+        config: &'a IngestionConfig,
+    ) -> Self {
+        Self {
+            deletion: DeletionPolicy::Prune,
+            ..Self::for_test(doc_index, store, embedder, config)
         }
     }
 }

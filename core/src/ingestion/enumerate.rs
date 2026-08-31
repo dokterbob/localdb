@@ -201,8 +201,8 @@ fn build_glob_set(patterns: &[String]) -> Result<GlobSet, Error> {
 /// Thin wrapper used only by unit tests: match a single pattern against a path.
 ///
 /// `pub(in crate::ingestion)`, not private: its tests live in the sibling
-/// `ingestion::tests` module (issue #213's sibling-tests convention), which
-/// needs to reach it despite not being a descendant of this module.
+/// `ingestion::tests` module, which needs to reach it despite not being a
+/// descendant of this module.
 #[cfg(test)]
 pub(in crate::ingestion) fn glob_match(pattern: &str, path: &str) -> bool {
     let Ok(set) = build_glob_set(&[pattern.to_string()]) else {
