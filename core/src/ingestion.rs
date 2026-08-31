@@ -1327,6 +1327,38 @@ pub struct SourceIngestionDeps<'a> {
     pub fetcher: &'a dyn UrlFetcher,
 }
 
+/// Why the delete-sweep (path/url) or the feed liveness sweep (feed) was
+/// suppressed this run — guard 1 or guard 2, documented at the
+/// `suppressed_because` computation in `run_source_ingestion` below.
+///
+/// The two guards are logged at the same level for path/url sources: either
+/// one means a run that should have produced full evidence didn't, which is
+/// anomalous regardless of which guard caught it. For a feed source under
+/// `--delete`, only `IncompleteEnumeration` keeps that meaning — the
+/// zero-seen backstop is the routine steady state there (the feed
+/// document's own 304 short-circuit fires zero entry callbacks), so the
+/// feed branch logs it at a lower level. See the two log call sites below.
+enum SweepSuppression {
+    /// Guard 1 — the ingestor itself reported it could not observe the
+    /// source. Always anomalous.
+    IncompleteEnumeration(String),
+    /// Guard 2 — a run that claimed complete enumeration nonetheless
+    /// observed none of the source's previously owned URIs.
+    ZeroSeen,
+}
+
+impl SweepSuppression {
+    /// The reason clause both suppression warnings interpolate.
+    fn reason(&self) -> &str {
+        match self {
+            SweepSuppression::IncompleteEnumeration(reason) => reason,
+            SweepSuppression::ZeroSeen => {
+                "this run observed none of the documents this source owns"
+            }
+        }
+    }
+}
+
 /// Run the unified ingestion pipeline for one source, driven by a caller-supplied
 /// `&dyn Ingestor` (issue #117; specs/01-architecture.md §1).
 ///
@@ -1562,7 +1594,9 @@ pub async fn run_source_ingestion(
         // This is the guard that fires for the reported incident:
         // `/Volumes/Archive` unmounted, `FileIngestor` enumerated zero
         // files, and the sweep deleted every document the source owned.
-        Enumeration::Incomplete { reason } => Some(reason.clone()),
+        Enumeration::Incomplete { reason } => {
+            Some(SweepSuppression::IncompleteEnumeration(reason.clone()))
+        }
         // Guard 2 — zero-seen backstop, source-shape-agnostic. Even with a
         // *complete* enumeration claimed, a source that previously owned
         // documents and observed none of them this run is far more likely
@@ -1580,7 +1614,7 @@ pub async fn run_source_ingestion(
         // deleted or renamed in one run keeps its stale documents until
         // the source is re-created. The warning below says so.
         Enumeration::Complete if !owned_uris.is_empty() && !any_owned_uri_seen => {
-            Some("this run observed none of the documents this source owns".to_string())
+            Some(SweepSuppression::ZeroSeen)
         }
         Enumeration::Complete => None,
     };
@@ -1597,7 +1631,7 @@ pub async fn run_source_ingestion(
                  the source really is empty now, remove and re-add it \
                  (`localdb source remove` / `localdb source add`) and reindex.",
                 source_location(source),
-                reason,
+                reason.reason(),
                 owned_uris.len(),
             );
         } else {
@@ -1625,38 +1659,65 @@ pub async fn run_source_ingestion(
         // this mechanism — there is no free preview signal for it the way
         // `docs_prunable` is one for the presumed-gone sweep, since the only
         // way to learn anything here is a network request per candidate.
-        if let Some(reason) = &suppressed_because {
-            tracing::warn!(
-                source_id = %source.id,
-                location = %source_location(source),
-                "skipping feed liveness sweep for source at '{}': {}. This is \
-                 the same signal that suppresses the presumed-gone sweep for \
-                 path/url sources above; for a feed source it is most often \
-                 the feed document's own 304 short-circuit — an unchanged \
-                 feed document means an unchanged window, so nothing could \
-                 have aged out of it since the last run.",
-                source_location(source),
-                reason,
-            );
-        } else {
-            let refresh_interval_secs = match &source.spec {
-                SourceSpec::Feed {
+        match &suppressed_because {
+            // Guard 1 stays anomalous for a feed exactly as it is for
+            // path/url sources: the ingestor itself failed to observe the
+            // source, which is never routine.
+            Some(reason @ SweepSuppression::IncompleteEnumeration(_)) => {
+                tracing::warn!(
+                    source_id = %source.id,
+                    location = %source_location(source),
+                    "skipping feed liveness sweep for source at '{}': {}. This is \
+                     the same signal that suppresses the presumed-gone sweep for \
+                     path/url sources above; for a feed source it is most often \
+                     the feed document's own 304 short-circuit — an unchanged \
+                     feed document means an unchanged window, so nothing could \
+                     have aged out of it since the last run.",
+                    source_location(source),
+                    reason.reason(),
+                );
+            }
+            // Guard 2's zero-seen backstop is the routine steady state for a
+            // feed under `--delete`: the overwhelmingly common cause is the
+            // feed document's own 304, which is exactly what conditional GET
+            // exists to produce and fires zero entry callbacks. Warning on
+            // every routine run trains operators to ignore the level
+            // entirely, so this stays at `debug!`; only guard 1 above still
+            // warns.
+            Some(reason @ SweepSuppression::ZeroSeen) => {
+                tracing::debug!(
+                    source_id = %source.id,
+                    location = %source_location(source),
+                    "skipping feed liveness sweep for source at '{}': {}. This is \
+                     the same signal that suppresses the presumed-gone sweep for \
+                     path/url sources above; for a feed source it is most often \
+                     the feed document's own 304 short-circuit — an unchanged \
+                     feed document means an unchanged window, so nothing could \
+                     have aged out of it since the last run.",
+                    source_location(source),
+                    reason.reason(),
+                );
+            }
+            None => {
+                let refresh_interval_secs = match &source.spec {
+                    SourceSpec::Feed {
+                        refresh_interval_secs,
+                        ..
+                    } => *refresh_interval_secs,
+                    _ => None,
+                };
+                run_feed_liveness_sweep(
+                    &source.id,
+                    &source.store_id,
                     refresh_interval_secs,
-                    ..
-                } => *refresh_interval_secs,
-                _ => None,
-            };
-            run_feed_liveness_sweep(
-                &source.id,
-                &source.store_id,
-                refresh_interval_secs,
-                &seen,
-                doc_index,
-                store,
-                fetcher,
-                &mut result,
-            )
-            .await?;
+                    &seen,
+                    doc_index,
+                    store,
+                    fetcher,
+                    &mut result,
+                )
+                .await?;
+            }
         }
     }
 
@@ -3260,6 +3321,53 @@ mod tests {
         use crate::uri::Uri;
 
         // -----------------------------------------------------------------
+        // Log-level capture (suppressed-sweep tests below assert on the
+        // actual emitted level, not just on behavior)
+        // -----------------------------------------------------------------
+
+        /// A minimal `MakeWriter` capturing formatted log lines into a
+        /// shared buffer, installed via `tracing::subscriber::set_default`
+        /// — scoped to the current task rather than
+        /// `set_global_default`, mirroring
+        /// `server::daemon::tests::rejected_logging`'s same pattern.
+        #[derive(Clone, Default)]
+        struct LogBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for LogBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        /// Installs a thread-local subscriber capturing every line at
+        /// `DEBUG` and above; drop the returned guard when done observing.
+        fn capture_logs() -> (LogBuf, tracing::subscriber::DefaultGuard) {
+            let buf = LogBuf::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(buf.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::DEBUG)
+                .finish();
+            let guard = tracing::subscriber::set_default(subscriber);
+            (buf, guard)
+        }
+
+        fn captured_text(buf: &LogBuf) -> String {
+            String::from_utf8(buf.0.lock().unwrap().clone()).unwrap()
+        }
+
+        // -----------------------------------------------------------------
         // Fixtures
         // -----------------------------------------------------------------
 
@@ -4362,6 +4470,58 @@ mod tests {
                     .unwrap();
                 assert!(!chunks.is_empty(), "chunks for {} must survive", record.uri);
             }
+        }
+
+        /// This behavior must stay exactly as it is: for a path/url source,
+        /// the zero-seen backstop is the same shape of "this run should have
+        /// produced full evidence and didn't" as guard 1, so it warns
+        /// unconditionally, regardless of the feed branch's own move to
+        /// `debug!` for the same guard (feed's routine steady state is a
+        /// 304, which has no equivalent here).
+        #[tokio::test]
+        async fn zero_seen_suppression_on_a_path_source_still_logs_at_warn() {
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let store_id = "store-1";
+            let config = make_ingestion_config(store_id);
+            let source = make_source_with_preset(store_id, "prose");
+
+            let a = seed_indexed(
+                &store,
+                &embedder,
+                &config,
+                &source,
+                "file:///docs/a.md",
+                "Alpha.",
+            )
+            .await;
+            let mut doc_index = DocumentIndex::new();
+            doc_index.upsert(a);
+
+            let ingestor = FakeIngestor::new(vec![ScriptStep::Discovered(0)]);
+            let deps = SourceIngestionDeps {
+                doc_index: &mut doc_index,
+                store: &store,
+                embedder: &embedder,
+                config: &config,
+                progress: None,
+                deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
+                fetcher: &UnreachableFetcher,
+            };
+
+            let (buf, guard) = capture_logs();
+            run_source_ingestion(&source, &ingestor, deps)
+                .await
+                .unwrap();
+            drop(guard);
+
+            let captured = captured_text(&buf);
+            assert!(
+                captured.contains("WARN") && captured.contains("skipping delete-sweep"),
+                "the path/url zero-seen backstop must still log at WARN, unchanged by \
+                 the feed branch's move to debug for the same guard; captured: {captured}"
+            );
         }
 
         /// Guard 2 must not over-suppress: seeing *any* owned URI licenses the
@@ -7675,6 +7835,94 @@ mod tests {
                     store.list_call_count(),
                     0,
                     "a zero-seen run must suppress the liveness sweep"
+                );
+            }
+
+            /// The routine case: a feed under `--delete` whose document
+            /// answered 304 must not warn on every run — that trains
+            /// operators to ignore the level. It still logs, just at
+            /// `debug!`, and never at `warn!` for this cause.
+            #[tokio::test]
+            async fn zero_seen_guard_on_a_feed_logs_at_debug_not_warn() {
+                let source = make_feed_source("store-1");
+                let config = make_ingestion_config("store-1");
+                let store = LivenessStore::new(vec![row(
+                    "r1",
+                    "https://a.example.com/",
+                    Some(&old_timestamp()),
+                )]);
+                let embedder = FakeEmbedder::new(4);
+                let mut doc_index = DocumentIndex::new();
+                seed_doc_index_owned_by(&mut doc_index, &source.id, "https://a.example.com/");
+
+                let ingestor = FakeIngestor::new(vec![]);
+                let deps = SourceIngestionDeps {
+                    doc_index: &mut doc_index,
+                    store: &store,
+                    embedder: &embedder,
+                    config: &config,
+                    progress: None,
+                    deletion: DeletionPolicy::Prune,
+                    document_validators: FetchMetadata::default(),
+                    fetcher: &UnreachableFetcher,
+                };
+
+                let (buf, guard) = capture_logs();
+                run_source_ingestion(&source, &ingestor, deps)
+                    .await
+                    .unwrap();
+                drop(guard);
+
+                let captured = captured_text(&buf);
+                assert!(
+                    captured.contains("DEBUG") && captured.contains("skipping feed liveness sweep"),
+                    "the routine feed-304 zero-seen backstop must log at DEBUG; captured: {captured}"
+                );
+                assert!(
+                    !captured.contains("WARN"),
+                    "must not also warn for the same routine suppression; captured: {captured}"
+                );
+            }
+
+            /// The anomalous case must keep warning even on the feed branch:
+            /// an ingestor that could not observe its source at all is never
+            /// routine, regardless of source kind.
+            #[tokio::test]
+            async fn incomplete_enumeration_guard_on_a_feed_still_logs_at_warn() {
+                let source = make_feed_source("store-1");
+                let config = make_ingestion_config("store-1");
+                let store = LivenessStore::new(vec![row(
+                    "r1",
+                    "https://a.example.com/",
+                    Some(&old_timestamp()),
+                )]);
+                let embedder = FakeEmbedder::new(4);
+                let mut doc_index = DocumentIndex::new();
+                seed_doc_index_owned_by(&mut doc_index, &source.id, "https://a.example.com/");
+
+                let ingestor = FakeIngestor::incomplete("feed unreachable");
+                let deps = SourceIngestionDeps {
+                    doc_index: &mut doc_index,
+                    store: &store,
+                    embedder: &embedder,
+                    config: &config,
+                    progress: None,
+                    deletion: DeletionPolicy::Prune,
+                    document_validators: FetchMetadata::default(),
+                    fetcher: &UnreachableFetcher,
+                };
+
+                let (buf, guard) = capture_logs();
+                run_source_ingestion(&source, &ingestor, deps)
+                    .await
+                    .unwrap();
+                drop(guard);
+
+                let captured = captured_text(&buf);
+                assert!(
+                    captured.contains("WARN") && captured.contains("skipping feed liveness sweep"),
+                    "an incomplete enumeration is genuinely anomalous and must still warn; \
+                     captured: {captured}"
                 );
             }
 

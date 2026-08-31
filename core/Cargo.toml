@@ -37,6 +37,7 @@ humantime = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
 tempfile = "3"
+tracing-subscriber = { workspace = true }
 localdb-extract = { path = "../extract" }
 # Self dev-dependency, `test-support` feature only: `core/tests/*.rs`
 # integration tests link against this crate as an ordinary dependency (no
