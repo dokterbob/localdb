@@ -43,11 +43,28 @@ Resources also carry:
   sources and feed entry links (`resources.external_etag`, `resources.external_last_modified`).
   Whichever the origin supplied on the last successful fetch is replayed byte-exact — including
   quotes and any `W/` weak-validator prefix — as `If-None-Match`/`If-Modified-Since` on the next
-  fetch of the same URI. A 304 response means the content and metadata are unchanged by definition:
-  the resource is skipped without re-download or re-extraction. RFC 9111 requires storing whichever
-  validators a 304 response itself carries, so a 304 bearing a refreshed `ETag`/`Last-Modified`
-  still updates the stored columns — content and metadata are unchanged, so this never triggers a
-  `metadata_hash` recompute or a re-chunk, only the two validator columns move.
+  fetch of the same URI. A 304 response means the origin's own representation is unchanged: the
+  resource is skipped without re-download or re-extraction.
+
+  It says nothing, however, about metadata a **connector** supplies out of band — a feed's title,
+  byline and publication date for an entry, which arrive with every read of the feed regardless of
+  what that entry's link answers. That claim is re-merged onto the persisted metadata on a 304
+  (`IngestCallback::on_metadata_refreshed`) under the same merge rule the index-time path applies,
+  and persisted **only when the merged result actually differs** — an unchanged entry performs no
+  write at all, which is what keeps a 304 cheap in the common case. Without this a feed correcting
+  an entry's byline would never land for as long as the linked page itself stayed unchanged, which
+  for an aging entry is indefinitely. The merge rule is deliberately asymmetric and identical on
+  both paths: a connector title only fills a gap the extraction left, while byline, date and
+  provenance overwrite it — a feed knows an entry's author better than the linked page's markup
+  does, and does not know the page's title better than the page does.
+
+  RFC 9111 requires storing whichever validators a 304 response itself carries, so a 304 bearing a
+  refreshed `ETag`/`Last-Modified` still updates the stored columns. No re-chunk follows — the
+  content is unchanged by definition — but `metadata_hash` **is** recomputed and rewritten alongside
+  them, because `external_etag` is one of `compute_metadata_hash`'s own inputs ("Metadata-only
+  update" below). Leaving it stale would desync the in-memory `DocumentIndex` from what a
+  rehydration of that same row computes, and the next run would then read a `metadata_hash` mismatch
+  on a resource nothing had changed about and take the metadata-only-update branch for no reason.
 
   > **Suppression rule (normative).** Conditional headers are sent **only** when the stored
   > resource's `policy_version` equals the run's. A 304 returns no bytes, so a resource that would
@@ -176,6 +193,14 @@ floor of `max(refresh_interval, 24h)` below which a resource is not re-probed at
 how long it has been aged out. A feed source with no `refresh_interval_secs` configured — the common
 case — therefore uses the bare 24h floor.
 
+The batch cap counts candidates **actually probed**, not rows the store returned. The oldest-first
+query cannot see the run's in-memory seen-set, so applying the cap in SQL alone would let a run
+whose freshly-observed entries happen to sort oldest fill the whole batch with entries it had just
+seen and probe nothing at all. The query therefore over-fetches by the size of the seen-set, bounded
+by a fixed ceiling well above any realistic feed window, and the caller subtracts the seen-set
+before taking its 25. The ceiling is what keeps the query bounded: `max_entries` is optional and
+defaults to unbounded, so the seen-set has no principled size of its own.
+
 **Guards (normative).** "Did not observe" is only a meaningful signal when the run actually
 enumerated the feed's window, so the sweep inherits **both guards** of the presumed-gone sweep
 above, for the same reasons: an `Enumeration::Incomplete` run performs no liveness sweep, and
@@ -194,10 +219,25 @@ mistaken for aged-out candidates.
 **Per candidate**, the resource's stored validators are replayed against its link:
 
 - `Gone` (404/410) deletes the resource.
-- `NotModified` or a `200` refreshes the stored validators and `last_checked_at`, but does **not**
-  delete — the entry is still there.
-- `Blocked` or a transport error leaves the resource untouched: neither is evidence of anything, so
-  neither the validators nor `last_checked_at` change, and the candidate is eligible again next run.
+- `NotModified` refreshes the stored validators and `last_checked_at`, but does **not** delete — the
+  entry is still there.
+- A `200` advances `last_checked_at` **only**, rewriting the candidate's already-stored validators
+  unchanged. The fresh validators the response carried are deliberately discarded, because the body
+  they describe is discarded too (see below). Storing them would point the resource's validators at
+  a representation this store never indexed: the next probe would answer 304, and if the entry ever
+  re-entered the feed window that 304 would suppress the reindex of the changed content
+  indefinitely. The price is that a genuinely-changed aged-out entry keeps paying a full `200` at
+  every recheck instead of converging on a cheap 304 — pure overhead on an entry the sweep does not
+  re-index anyway, and the correct side to err on.
+- `Blocked` or a transport error is not evidence about the entry, so nothing about the resource's
+  content, metadata, or validators moves.
+
+**`last_checked_at` means "when we last attempted a probe" (normative)** — not "when we last
+successfully reached the origin". It advances on **every** outcome above except the delete, blocked
+and transport-error outcomes included, and it is the only thing those two outcomes move. That is
+what makes the oldest-first ordering a fair rotation: were an unreachable candidate left holding its
+old timestamp, a source with 25 or more permanently-blocked entries would lead the query forever and
+no other candidate would ever reach a batch.
 
 A `200` here is **not** re-indexed — deliberately out of scope. An aged-out entry's feed-sourced
 metadata (title, author, per-entry publication date) is long gone once the entry has fallen out of
