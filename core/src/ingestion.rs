@@ -205,6 +205,13 @@ pub struct IngestionResult {
     /// update is not a content skip, but it is also not a full `docs_indexed`
     /// re-index, so it gets its own counter rather than overloading either.
     pub docs_metadata_updated: u64,
+    /// Refreshed validators for a feed source's own top-level document, to
+    /// persist onto `sources.feed_etag`/`feed_last_modified` — threaded
+    /// straight from [`crate::ingestor::IngestResult::document_validators`].
+    /// `None` for every non-feed source, and for a feed source whose run
+    /// left the stored validators untouched (a bare 304, or no document
+    /// fetch at all).
+    pub document_validators: Option<FetchMetadata>,
 }
 
 /// Whether an ingestion run may remove documents from the store.
@@ -529,7 +536,11 @@ fn catch_panic<T>(
 // ---------------------------------------------------------------------------
 
 /// Metadata from a previous URL fetch, used for conditional GET.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` are derived because this type is embedded in
+/// [`IngestionResult`], which crosses the SSE wire boundary via
+/// [`crate::progress::ProgressEvent::SourceFinished`] (issue #83).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FetchMetadata {
     /// ETag value from the previous response.
     pub etag: Option<String>,
@@ -1236,6 +1247,13 @@ pub struct SourceIngestionDeps<'a> {
     /// Whether this run may remove documents. Defaults to
     /// [`DeletionPolicy::Retain`] — deletion is opt-in.
     pub deletion: DeletionPolicy,
+    /// Conditional-GET validators stored for the source's own top-level
+    /// document (`sources.feed_etag`/`feed_last_modified`), forwarded
+    /// verbatim into [`IngestSource::document_validators`]. The caller reads
+    /// these directly off the `SourceRow` it already holds — this type has
+    /// no store handle of its own to look them up with. Meaningless for any
+    /// non-feed source; defaults to an empty [`FetchMetadata`].
+    pub document_validators: FetchMetadata,
 }
 
 /// Run the unified ingestion pipeline for one source, driven by a caller-supplied
@@ -1278,6 +1296,7 @@ pub async fn run_source_ingestion(
         config,
         progress,
         deletion,
+        document_validators,
     } = deps;
 
     let ingest_config = serde_json::to_value(&source.spec).map_err(|e| Error::Internal {
@@ -1291,6 +1310,7 @@ pub async fn run_source_ingestion(
         ingestor_kind: ingestor.kind(),
         config: ingest_config,
         policy_version: config.policy_version.clone(),
+        document_validators,
     };
 
     if let Some(sink) = &progress {
@@ -1348,6 +1368,8 @@ pub async fn run_source_ingestion(
          report exactly one SkipReason::Error skip",
         source.id, ingest_result.errors, skip_error_count
     );
+
+    result.document_validators = ingest_result.document_validators.clone();
 
     // Confirmed deletions first, and unconditionally: a URI reported via
     // `on_gone` was positively established as absent at the origin (an HTTP
@@ -3049,6 +3071,7 @@ mod tests {
                     resources_skipped: skipped,
                     errors,
                     enumeration: self.enumeration.clone(),
+                    document_validators: None,
                 })
             }
         }
@@ -3149,6 +3172,7 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -3201,6 +3225,7 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -3288,6 +3313,7 @@ mod tests {
                 config: &config,
                 progress: Some(sink),
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -3381,6 +3407,7 @@ mod tests {
                 config: &config,
                 progress: Some(sink),
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
             };
             run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -3461,6 +3488,7 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -3512,6 +3540,7 @@ mod tests {
                 config: &config_v2,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -3576,6 +3605,7 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
             };
             let result1 = run_source_ingestion(&source, &ingestor1, deps1)
                 .await
@@ -3610,6 +3640,7 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
             };
             let result2 = run_source_ingestion(&source, &ingestor2, deps2)
                 .await
@@ -3671,6 +3702,7 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -3745,6 +3777,7 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -3808,6 +3841,7 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -3878,6 +3912,7 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -3935,6 +3970,7 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -3987,6 +4023,7 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Retain,
+                document_validators: FetchMetadata::default(),
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -4048,6 +4085,7 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Retain,
+                document_validators: FetchMetadata::default(),
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -4098,6 +4136,7 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Retain,
+                document_validators: FetchMetadata::default(),
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -4146,6 +4185,7 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -4270,6 +4310,7 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -4392,6 +4433,7 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -4504,6 +4546,7 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
             };
             let result = run_source_ingestion(&source_a, &ingestor, deps)
                 .await
@@ -4622,6 +4665,7 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
             };
             let result = run_source_ingestion(&source_a, &ingestor, deps)
                 .await
@@ -4679,6 +4723,7 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -4743,6 +4788,7 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -4841,6 +4887,7 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
             };
             let feed_result = run_source_ingestion(&feed_source, &feed_ingestor, deps)
                 .await
@@ -4871,6 +4918,7 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
             };
             let url_result = run_source_ingestion(&url_source, &url_ingestor, deps)
                 .await
@@ -4988,6 +5036,7 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -5051,6 +5100,7 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await

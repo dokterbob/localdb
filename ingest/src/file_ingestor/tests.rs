@@ -1,5 +1,6 @@
 use super::*;
 use crate::support::test_doubles::RecordingCallback;
+use localdb_core::ingestion::FetchMetadata;
 use localdb_core::parser::{ChainParser, ParsedDocument};
 
 /// A minimal parser for tests: accepts everything, returns the bytes as Markdown.
@@ -93,6 +94,7 @@ fn source_with_root(root: &str) -> IngestSource {
         store_id: "store-1".to_string(),
         ingestor_kind: IngestorKind::File,
         config: serde_json::json!({"root": root}),
+        document_validators: FetchMetadata::default(),
     }
 }
 

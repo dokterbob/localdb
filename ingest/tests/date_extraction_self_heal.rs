@@ -21,8 +21,8 @@ use ingest::FileIngestor;
 use localdb_core::block::{IngestorKind, Resource};
 use localdb_core::embedder::FakeEmbedder;
 use localdb_core::ingestion::{
-    run_source_ingestion, DeletionPolicy, DocumentIndex, DocumentRecord, IngestionConfig,
-    SourceIngestionDeps,
+    run_source_ingestion, DeletionPolicy, DocumentIndex, DocumentRecord, FetchMetadata,
+    IngestionConfig, SourceIngestionDeps,
 };
 use localdb_core::ingestor::{IngestCallback, IngestResult, IngestSource, Ingestor, SkipReason};
 use localdb_core::store::FakeStore;
@@ -64,6 +64,7 @@ async fn extract_real_resource(dir: &std::path::Path, filename: &str, bytes: &[u
         ingestor_kind: IngestorKind::File,
         config: serde_json::json!({ "root": dir.to_string_lossy() }),
         policy_version: "policy-v1".to_string(),
+        document_validators: FetchMetadata::default(),
     };
     let mut callback = CapturingCallback::default();
     ingestor.ingest(&source, &mut callback).await.unwrap();
@@ -113,6 +114,7 @@ impl Ingestor for ScriptedIngestor {
             resources_skipped: 0,
             errors: 0,
             enumeration: Default::default(),
+            document_validators: None,
         })
     }
 }
@@ -291,6 +293,7 @@ async fn reindex_with_new_date_extraction_self_heals_as_metadata_only_update() {
         config: &config,
         progress: None,
         deletion: DeletionPolicy::Retain,
+        document_validators: FetchMetadata::default(),
     };
     let result1 = run_source_ingestion(&source, &ingestor1, deps1)
         .await
@@ -316,6 +319,7 @@ async fn reindex_with_new_date_extraction_self_heals_as_metadata_only_update() {
         config: &config,
         progress: None,
         deletion: DeletionPolicy::Retain,
+        document_validators: FetchMetadata::default(),
     };
     let result2 = run_source_ingestion(&source, &ingestor2, deps2)
         .await

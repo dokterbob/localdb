@@ -45,6 +45,8 @@ fn make_path_source(id: &str, store_id: &str, root: &str) -> SourceRow {
         refresh: None,
         created_at: "2026-06-25T12:00:00Z".to_string(),
         config_json: None,
+        feed_etag: None,
+        feed_last_modified: None,
     }
 }
 
@@ -61,6 +63,8 @@ fn make_url_source(id: &str, store_id: &str, url: &str) -> SourceRow {
         refresh: Some("24h".to_string()),
         created_at: "2026-06-25T12:00:00Z".to_string(),
         config_json: None,
+        feed_etag: None,
+        feed_last_modified: None,
     }
 }
 
@@ -77,6 +81,8 @@ fn make_feed_source(id: &str, store_id: &str, url: &str, config_json: Option<&st
         refresh: Some("24h".to_string()),
         created_at: "2026-06-25T12:00:00Z".to_string(),
         config_json: config_json.map(|s| s.to_string()),
+        feed_etag: None,
+        feed_last_modified: None,
     }
 }
 
@@ -715,6 +721,132 @@ async fn check_constraint_allows_feed_kind_with_null_root_and_url() {
         "CHECK constraint must accept kind='feed' with NULL root and url; got: {:?}",
         result.err()
     );
+}
+
+// ---------------------------------------------------------------------------
+// sources.feed_etag / sources.feed_last_modified
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn feed_source_round_trips_feed_etag_and_feed_last_modified() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    let mut s = make_feed_source("src-1", "store-1", "https://example.com/feed.xml", None);
+    s.feed_etag = Some("\"abc\"".to_string());
+    s.feed_last_modified = Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string());
+    api.upsert_source(&s).await.unwrap();
+
+    let got = api.get_source("src-1").await.unwrap().unwrap();
+    assert_eq!(got.feed_etag.as_deref(), Some("\"abc\""));
+    assert_eq!(
+        got.feed_last_modified.as_deref(),
+        Some("Wed, 21 Oct 2015 07:28:00 GMT")
+    );
+}
+
+#[tokio::test]
+async fn feed_source_with_null_feed_validators_round_trips() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    // `make_feed_source` already leaves both columns `None` — assert it
+    // explicitly rather than relying on that as an incidental default.
+    let s = make_feed_source("src-1", "store-1", "https://example.com/feed.xml", None);
+    assert_eq!(s.feed_etag, None);
+    assert_eq!(s.feed_last_modified, None);
+    api.upsert_source(&s).await.unwrap();
+
+    let got = api.get_source("src-1").await.unwrap().unwrap();
+    assert_eq!(got.feed_etag, None);
+    assert_eq!(got.feed_last_modified, None);
+}
+
+/// The positive case the `job_exec` validator-refresh persistence hop
+/// depends on: re-upserting an existing source id with the *same* url must
+/// let refreshed `feed_etag`/`feed_last_modified` values through.
+#[tokio::test]
+async fn upsert_source_same_id_same_url_updates_feed_validators() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    let mut s = make_feed_source("src-1", "store-1", "https://example.com/feed.xml", None);
+    s.feed_etag = Some("\"v1\"".to_string());
+    api.upsert_source(&s).await.unwrap();
+
+    s.feed_etag = Some("\"v2\"".to_string());
+    s.feed_last_modified = Some("Thu, 22 Oct 2015 07:28:00 GMT".to_string());
+    api.upsert_source(&s).await.unwrap();
+
+    let got = api.get_source("src-1").await.unwrap().unwrap();
+    assert_eq!(got.feed_etag.as_deref(), Some("\"v2\""));
+    assert_eq!(
+        got.feed_last_modified.as_deref(),
+        Some("Thu, 22 Oct 2015 07:28:00 GMT")
+    );
+}
+
+/// The invalidation guard (specs/02-domain-model.md's Feed connector,
+/// "Conditional GET and pruning"): a stored validator is only meaningful
+/// against the origin that issued it, so re-upserting an existing source id
+/// with a *different* url must null both columns — enforced in
+/// `upsert_source`'s SQL itself (`ON CONFLICT`'s `CASE WHEN sources.url IS
+/// excluded.url`), not left to each caller to remember. The caller here
+/// deliberately still passes non-null values for both columns, proving the
+/// guard overrides what was asked for, not just what a well-behaved caller
+/// would have passed.
+#[tokio::test]
+async fn upsert_source_same_id_changed_url_nulls_feed_validators() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    let mut s = make_feed_source("src-1", "store-1", "https://example.com/old-feed.xml", None);
+    s.feed_etag = Some("\"stale\"".to_string());
+    s.feed_last_modified = Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string());
+    api.upsert_source(&s).await.unwrap();
+
+    // Edit the url in place and re-upsert with the same id — carrying the
+    // old validators forward as a naive caller might.
+    s.url = Some("https://example.com/new-feed.xml".to_string());
+    api.upsert_source(&s).await.unwrap();
+
+    let got = api.get_source("src-1").await.unwrap().unwrap();
+    assert_eq!(got.url.as_deref(), Some("https://example.com/new-feed.xml"));
+    assert_eq!(
+        got.feed_etag, None,
+        "a changed url must null feed_etag even if the caller passed a value"
+    );
+    assert_eq!(
+        got.feed_last_modified, None,
+        "a changed url must null feed_last_modified even if the caller passed a value"
+    );
+}
+
+/// Mirror image of the guard above, for a path source's always-`None` url:
+/// SQLite `NULL = NULL` is unknown, not true, so the `CASE` must compare
+/// with `IS` — otherwise a path source's url "changing" from NULL to NULL
+/// on every re-upsert would spuriously null its (inapplicable, always-`None`
+/// in practice) feed columns too.
+#[tokio::test]
+async fn upsert_source_same_id_both_urls_null_preserves_feed_columns() {
+    let (_dir, api) = make_api().await;
+    api.upsert_store(&make_store("store-1", "notes"))
+        .await
+        .unwrap();
+    let mut s = make_path_source("src-1", "store-1", "/docs");
+    s.feed_etag = Some("\"irrelevant-but-present\"".to_string());
+    api.upsert_source(&s).await.unwrap();
+
+    // Re-upsert unchanged (url stays None both times).
+    api.upsert_source(&s).await.unwrap();
+
+    let got = api.get_source("src-1").await.unwrap().unwrap();
+    assert_eq!(got.url, None);
+    assert_eq!(got.feed_etag.as_deref(), Some("\"irrelevant-but-present\""));
 }
 
 mod documents;

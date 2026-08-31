@@ -56,6 +56,8 @@ async fn seed_store(db: &SqliteBackend, store_id: &str, chunks: Vec<ChunkRecord>
         refresh: None,
         created_at: "2026-06-25T12:00:00Z".to_string(),
         config_json: None,
+        feed_etag: None,
+        feed_last_modified: None,
     })
     .await
     .unwrap();

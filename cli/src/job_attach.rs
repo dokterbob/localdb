@@ -835,6 +835,8 @@ mod tests {
                 refresh: None,
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 config_json: None,
+                feed_etag: None,
+                feed_last_modified: None,
             })
             .await
             .unwrap();

@@ -39,7 +39,8 @@ use localdb_core::{
     chunker::ChunkerConfig,
     config::{policy::compute_policy_version, schema::RawConfig},
     ingestion::{
-        run_source_ingestion, DeletionPolicy, DocumentIndex, IngestionConfig, SourceIngestionDeps,
+        run_source_ingestion, DeletionPolicy, DocumentIndex, FetchMetadata, IngestionConfig,
+        SourceIngestionDeps,
     },
     ingestor::Ingestor,
     source_row_to_source, Embedder, Error, IndexJobScope, IndexJobStats, ProgressSink, SourceRow,
@@ -283,6 +284,18 @@ pub async fn run_job(
             &entry_fetcher,
         );
 
+        // The feed document's own conditional-GET validators (distinct from
+        // an entry's per-resource ones): read directly off the `SourceRow`
+        // this loop already holds, mirroring `source_row_to_source(rt_source)`
+        // just above rather than adding a lookup `run_source_ingestion`
+        // itself has no store handle to perform. Harmless for path/url
+        // sources — `feed_etag`/`feed_last_modified` are never populated for
+        // them, and only `FeedIngestor` ever reads this field.
+        let document_validators = FetchMetadata {
+            etag: rt_source.feed_etag.clone(),
+            last_modified: rt_source.feed_last_modified.clone(),
+        };
+
         let source_deps = SourceIngestionDeps {
             doc_index: &mut doc_index,
             store: handle.as_ref(),
@@ -290,6 +303,7 @@ pub async fn run_job(
             config: &cfg,
             progress: progress.clone(),
             deletion,
+            document_validators,
         };
 
         match run_source_ingestion(&source, ingestor.as_ref(), source_deps).await {
@@ -303,6 +317,26 @@ pub async fn run_job(
                 stats.chunks_written += r.chunks_written;
                 stats.unsupported_format_count += r.unsupported_format_count;
                 stats.error_count += r.error_count;
+
+                // Mirrors the `policy_version` self-heal above: a cache-state
+                // write, never allowed to fail the run. `r.document_validators`
+                // is `None` for every non-feed source and for a feed run that
+                // left the stored validators untouched (a bare 304, or no
+                // document fetch at all this run).
+                if let Some(validators) = &r.document_validators {
+                    let updated = SourceRow {
+                        feed_etag: validators.etag.clone(),
+                        feed_last_modified: validators.last_modified.clone(),
+                        ..rt_source.clone()
+                    };
+                    if let Err(e) = backend.upsert_source(&updated).await {
+                        tracing::warn!(
+                            "job_exec: failed to persist refreshed feed validators for source '{}': {}",
+                            rt_source.id,
+                            e
+                        );
+                    }
+                }
             }
             Err(e) => {
                 stats.error_count += 1;

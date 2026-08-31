@@ -152,6 +152,7 @@ async fn url_source_replays_stored_validators_on_second_run() {
             config: &config,
             progress: None,
             deletion: DeletionPolicy::Retain,
+            document_validators: FetchMetadata::default(),
         },
     )
     .await
@@ -167,6 +168,7 @@ async fn url_source_replays_stored_validators_on_second_run() {
             config: &config,
             progress: None,
             deletion: DeletionPolicy::Retain,
+            document_validators: FetchMetadata::default(),
         },
     )
     .await
@@ -243,6 +245,7 @@ async fn feed_entry_link_replays_stored_validators_on_second_run() {
             config: &config,
             progress: None,
             deletion: DeletionPolicy::Retain,
+            document_validators: FetchMetadata::default(),
         },
     )
     .await
@@ -258,6 +261,7 @@ async fn feed_entry_link_replays_stored_validators_on_second_run() {
             config: &config,
             progress: None,
             deletion: DeletionPolicy::Retain,
+            document_validators: FetchMetadata::default(),
         },
     )
     .await

@@ -63,6 +63,22 @@ pub struct SourceRow {
     /// here even for feed sources — it stays in the `refresh` column as the
     /// single source of truth read directly by the scheduler.
     pub config_json: Option<String>,
+    /// The feed document's own conditional-GET `ETag`, when one is stored.
+    ///
+    /// Populated only for feed sources, and only once a run has actually
+    /// fetched the feed document with a 200 or 304 response that carried
+    /// one. In discovery mode the feed document itself never becomes a
+    /// `Resource` — there is no `resources` row to hang a validator on — so
+    /// these columns live here instead (specs/02-domain-model.md's Feed
+    /// connector, "Conditional GET and pruning"). Distinct from an entry's
+    /// own `resources.external_etag`, which this column has no bearing on.
+    /// Must be nulled whenever the source's `url` changes: a validator is
+    /// only meaningful against the origin that issued it.
+    pub feed_etag: Option<String>,
+    /// The feed document's own conditional-GET `Last-Modified`, alongside
+    /// [`Self::feed_etag`]. Same population rule, same null-on-URL-change
+    /// requirement.
+    pub feed_last_modified: Option<String>,
 }
 
 /// One row of `StoreBackend::largest_tables`: an on-disk table's name and its

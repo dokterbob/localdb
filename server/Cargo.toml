@@ -56,6 +56,14 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tracing-subscriber = { workspace = true }
 
+# Local HTTP server for `run_job`'s real-ingestion tests over a feed source
+# (job_exec/tests/feed_validator_persistence.rs) — `run_job`'s fetchers are
+# concrete `HttpUrlFetcher`s, not a trait object, so exercising conditional
+# GET end to end needs a real (if local) HTTP origin rather than a scripted
+# fake. Already resolved in the workspace lockfile as `fetch`'s own dev
+# dependency; this only newly depends on it directly.
+wiremock = "0.6"
+
 # Client-side transport for the `/mcp` route's round-trip integration test
 # (server/tests/mcp_route.rs) — not used by any non-test code, which only
 # ever gets a concrete tower::Service back from `mcp::build_streamable_http_service`.

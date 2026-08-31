@@ -300,6 +300,15 @@ pub struct IngestSource {
     /// into produced `Resource`s and may use it for incremental-skip checks
     /// (a policy change invalidates previously indexed content).
     pub policy_version: String,
+    /// Conditional-GET validators stored for the source's own top-level
+    /// document (`sources.feed_etag`/`feed_last_modified`), to replay on the
+    /// next fetch of that document. Consulted only by [`crate::block::IngestorKind::Feed`]
+    /// — the feed document itself, not an entry's linked page, which has its
+    /// own per-resource validators reached through
+    /// [`IngestCallback::lookup_fetch_metadata`] instead. Other ingestor
+    /// kinds ignore this field. Empty (`FetchMetadata::default()`) means "no
+    /// prior validators known", identical to a first-ever fetch.
+    pub document_validators: crate::ingestion::FetchMetadata,
 }
 
 /// Whether an ingestion run saw the source's *complete* current contents.
@@ -337,6 +346,15 @@ pub struct IngestResult {
     /// [`Enumeration::Complete`], so an ingestor that always enumerates
     /// exhaustively (`UrlIngestor`, `FeedIngestor`) needs no change.
     pub enumeration: Enumeration,
+    /// Refreshed validators for the source's own top-level document, to
+    /// persist onto `sources.feed_etag`/`feed_last_modified` — the mirror
+    /// image of [`IngestSource::document_validators`]. `None` means "leave
+    /// whatever is stored alone" (no document fetch happened, or a bare 304
+    /// carried no rotated validator); `Some` — even with both fields `None`
+    /// inside — means "replace the stored validators with this," which is
+    /// how a fresh 200 that dropped a previously-sent header clears it.
+    /// Populated only by [`crate::block::IngestorKind::Feed`].
+    pub document_validators: Option<crate::ingestion::FetchMetadata>,
 }
 
 #[cfg(test)]
@@ -385,6 +403,7 @@ mod tests {
             store_id: "store-1".to_string(),
             ingestor_kind: IngestorKind::File,
             config: serde_json::json!({ "root": "/tmp/docs" }),
+            document_validators: crate::ingestion::FetchMetadata::default(),
         };
         assert_eq!(source.ingestor_kind, IngestorKind::File);
     }
@@ -409,6 +428,7 @@ mod tests {
         // #156: an ingestor that says nothing about enumeration completeness
         // is claiming a complete view — the sweep-licensing default.
         assert_eq!(result.enumeration, Enumeration::Complete);
+        assert_eq!(result.document_validators, None);
     }
 
     /// A callback that overrides nothing but `on_resource` (the only

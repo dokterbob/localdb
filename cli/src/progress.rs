@@ -645,6 +645,7 @@ mod tests {
                 docs_prunable: 0,
                 docs_metadata_updated: 0,
                 error_count: 0,
+                document_validators: None,
             },
         });
 
@@ -689,6 +690,7 @@ mod tests {
                 docs_prunable: 0,
                 docs_metadata_updated: 0,
                 error_count: 0,
+                document_validators: None,
             },
         });
 
@@ -739,6 +741,7 @@ mod tests {
                 docs_prunable: 0,
                 docs_metadata_updated: 0,
                 error_count: 0,
+                document_validators: None,
             },
         });
 
