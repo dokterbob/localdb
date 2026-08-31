@@ -157,8 +157,10 @@ async fn feed_source_without_refresh_is_tracked_but_never_due() {
         .unwrap();
     assert_eq!(state.scheduler_source_count().await, 1);
 
+    // `tick()` awaits `queue.submit(...)` inline for every due record, so
+    // once this returns there is no in-flight submission left to wait out —
+    // an empty queue here is a settled result, not a race won.
     state.tick_scheduler().await;
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     assert!(
         state.job_queue().list_jobs().await.is_empty(),

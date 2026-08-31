@@ -533,13 +533,17 @@ connector (it already applied to two `url` sources, or a `path`/`url` collision,
 is not fixed by this work; the feed connector's discovery mode just makes the collision more likely
 in practice, since feeds routinely link to pages users have also added directly.
 
-**14. Feed `refresh` is accepted, persisted, and validated but does not do anything yet.** Unlike
-`url` sources — whose `refresh_interval_secs` the daemon's `UrlRefreshScheduler`
-(`server/src/scheduler.rs`) reads back and acts on, submitting real refresh jobs through the job
-queue — feed sources are never registered with the scheduler (`server/src/daemon.rs` registers
-`SourceKind::Url` only, and `server/src/state.rs` documents the exclusion), so a feed's `refresh`
-value round-trips through config and the API without triggering anything. Extending scheduler
-registration to feed sources is part of [#171](https://github.com/dokterbob/localdb/issues/171).
+**14. ~~Feed `refresh` is accepted, persisted, and validated but does not do anything yet~~ —
+RESOLVED.** ([#171](https://github.com/dokterbob/localdb/issues/171)) Feed sources are now
+registered with the daemon's `UrlRefreshScheduler` on the same terms as `url` sources, through both
+registration points: the startup loop that re-registers existing sources (`spawn_url_scheduler` in
+`server/src/daemon.rs`) and the live registration for a source added while the daemon is already
+running (`AppState::add_source` in `server/src/state.rs`). The scheduler itself needed no change —
+it registers by `source_id`/`store_name` and never took a source kind — so a feed's persisted
+`refresh` interval now drives a real periodic poll through the job queue. Scheduled refreshes run
+under `DeletionPolicy::Retain` regardless of source kind, so background polling never deletes;
+removal stays opt-in via `localdb index --delete`. **Operator note:** a feed source configured with
+a `refresh` interval before this landed starts polling as soon as the daemon is upgraded.
 
 **15. ~~Enrichment metadata changes don't persist while content is unchanged~~ — RESOLVED.**
 ([#176](https://github.com/dokterbob/localdb/issues/176)) The skip-check (`core/src/ingestion.rs`,
