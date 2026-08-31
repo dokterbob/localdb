@@ -1,8 +1,13 @@
 use super::*;
-use crate::embedder::FakeEmbedder;
+use crate::block::Resource;
+use crate::embedder::{DocumentChunks, Embedder, FakeEmbedder};
 use crate::ids::content_hash;
 use crate::ids::resource_id;
-use crate::store::FakeStore;
+use crate::ingestion::enumerate::glob_match;
+use crate::ingestion::liveness::{FEED_LIVENESS_BATCH_LIMIT, FEED_LIVENESS_OVERFETCH_CAP};
+use crate::ingestion::pipeline::{effective_chunker_config, scale_to_chars};
+use crate::ingestor::{IngestCallback, MetadataWriteOutcome, SkipReason};
+use crate::store::{ChunkRecord, FakeStore, StaleFeedResource};
 use crate::types::{SourceKind, SourceSpec};
 
 fn make_ingestion_config(store_id: &str) -> IngestionConfig {
