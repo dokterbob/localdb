@@ -114,11 +114,12 @@ exactly the conflation hazard this table exists to teach against. It sits adjace
 the one point that matters: a liveness probe writes no content and no metadata, so folding it into
 `index_updated_at` would report a document as re-written when it was only pinged. Keeping it off
 `DateAxis` is that same judgement one layer up — it is probe-throttle bookkeeping, not a claim about
-the document, and it is `NULL` for every resource that is not an aged-out feed entry the sweep has
-reached. Under the `NULL` rule in "Filtering" below, a filter on it would silently exclude nearly
-every document in a mixed store. Revisiting it needs two things that are not true today: semantics
-that have stopped moving, and a demonstrated operator need that the `--json` index summary's
-`feed_entries_liveness_checked` counter does not already meet.
+the document, and it is `NULL` for every resource no probe has reached — everything outside a feed
+source, and every feed entry a `--delete` run has not yet picked as a candidate. Under the `NULL`
+rule in "Filtering" below, a filter on it would silently exclude nearly every document in a mixed
+store. Revisiting it needs two things that are not true today: semantics that have stopped moving,
+and a demonstrated operator need that the `--json` index summary's `feed_entries_liveness_checked`
+counter does not already meet.
 
 Two rules follow directly from the "Never receives" column and hold across every ingestor, present
 and future:
@@ -387,14 +388,33 @@ and a changed feed URL is a new origin.
 > settled in one place, next to the guard's normative definition:
 > [04-search-pipeline.md](04-search-pipeline.md) §1 "Aged-out feed entries: the liveness sweep".
 
-While an entry is still _inside_ the feed's window, a `Gone` (404/410) result on its link keeps
-falling back to the feed's own embedded content exactly as today — the feed is still vouching for
-that URI, so the link's disappearance from the web is not by itself a deletion signal. Only once an
-entry has aged _out_ of the window does the liveness sweep consider it at all, and only a confirmed
-404/410 there deletes it. The feed connector's existing exemption from the presumed-gone
-delete-sweep is unchanged by any of this: an entry merely scrolling off the window is still never a
-delete on its own. See [04-search-pipeline.md](04-search-pipeline.md) §1 "Deletes" for the sweep
-mechanics and the liveness sweep's own rules.
+While an entry is still _inside_ the feed's window and a run actually reads that window, a `Gone`
+(404/410) result on its link keeps falling back to the feed's own embedded content exactly as today
+— the feed is still vouching for that URI, so the link's disappearance from the web is not by itself
+a deletion signal. The feed connector's existing exemption from the presumed-gone delete-sweep is
+unchanged by any of this: an entry merely scrolling off the window is still never a delete on its
+own.
+
+Window membership does **not**, however, protect an entry from the liveness sweep, and this spec
+does not claim it does. The sweep's candidates are the entries a run did not observe, and a run
+whose feed document answered 304 observes none of them — its seen-set is empty (above), so it
+carries no membership information at all, and nothing persists membership to consult instead. Under
+`--delete`, a confirmed 404/410 on an entry's own link therefore prunes that entry whether or not
+the feed still lists it. Two things bound that, and they are what make it acceptable: `--delete`
+itself, without which the sweep issues no requests and deletes nothing, and the requirement for a
+positive 404/410 from the entry's own origin — absence is still never, on its own, a delete.
+
+The accepted cost is that those two rules disagree about the same entry. A still-listed entry whose
+link answers 404/410 persistently is pruned by a `--delete` run, recreated from the feed's embedded
+content on the next run where the feed document changes, and pruned again by the next `--delete` run
+— paying a full re-chunk and re-embed on every recreation. Making a `Gone` link stop the fallback
+would collapse the two rules into one and let the deletion stick, but it drops entries from
+full-text feeds whose links 404 while their XML carries the whole post, and it changes behaviour
+that predates conditional GET here; [#323](https://github.com/dokterbob/localdb/issues/323) carries
+that decision. Until it lands the trade-off is disclosed, not mitigated.
+
+See [04-search-pipeline.md](04-search-pipeline.md) §1 "Aged-out feed entries: the liveness sweep"
+for the candidate rule and the bounds above, and §1 "Deletes" for the surrounding sweep mechanics.
 
 ### §2a. BlockKind
 

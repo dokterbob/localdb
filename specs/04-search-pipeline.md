@@ -207,8 +207,20 @@ fetches, and reports nothing pruned or prunable for this mechanism.
 aged out of the feed's window — ordered oldest `last_checked_at` first, with never-checked resources
 leading. It is bounded twice: a batch cap of **25 candidates per run per source**, and a recheck
 floor of `max(refresh_interval, 24h)` below which a resource is not re-probed at all, regardless of
-how long it has been aged out. A feed source with no `refresh_interval_secs` configured — the common
-case — therefore uses the bare 24h floor.
+how long it has gone unobserved. A feed source with no `refresh_interval_secs` configured — the
+common case — therefore uses the bare 24h floor.
+
+**"Did not observe" is not "aged out of the window" (normative).** This section is named for the
+case it exists to serve, not for a precondition it can enforce. A run that read the feed's window
+and did not see an entry did watch that entry age out; a run whose feed document answered 304 fires
+zero entry callbacks and observed _nothing_, so every one of that source's entries is a candidate,
+including entries the window still lists. Nothing persists window membership, so the two cases are
+indistinguishable to the candidate query, and the sweep does not pretend otherwise. What makes that
+safe is that absence only selects who gets _probed_: the delete needs a 404/410 confirmed by the
+entry's own origin, and the mechanism as a whole needs `--delete`. The cost it accepts — an entry
+pruned this way is recreated from the feed's embedded content on the next run where the feed
+document changes, then pruned again — is stated with its ticket in
+[02-domain-model.md](02-domain-model.md) §2, "Conditional GET and pruning".
 
 The batch cap counts candidates **actually probed**, not rows the store returned. The oldest-first
 query cannot see the run's in-memory seen-set, so applying the cap in SQL alone would let a run
@@ -222,12 +234,13 @@ defaults to unbounded, so the seen-set has no principled size of its own.
 both, because the two sweeps infer different things from the same seen-set. The presumed-gone sweep
 deletes on absence, so an untrustworthy seen-set is an untrustworthy delete signal. Here absence
 only selects who gets _probed_; the delete needs a confirmed 404/410 from the origin. Probing an
-entry that is in fact still in the window costs one conditional request and deletes nothing.
+entry that is in fact still in the window costs one conditional request and deletes it only if that
+entry's own origin says it is gone ("Did not observe" above).
 
 - **Guard 1 — incomplete enumeration — still suppresses the sweep entirely.** A run that could not
   read the source's window knows nothing about which entries it holds, so every previously indexed
-  URI would look aged-out and the source's whole document set would queue for probing, 25 per run,
-  off a signal already known to be broken.
+  URI would become a candidate and the source's whole document set would queue for probing, 25 per
+  run, off a signal already known to be broken.
 - **Guard 2 — the zero-seen backstop — does not apply.** A run whose feed document answered 304
   fires zero entry callbacks, so its seen-set is empty ([02-domain-model.md](02-domain-model.md),
   "Conditional GET and pruning"); the sweep runs anyway. Suppressing it there starves the mechanism
@@ -236,13 +249,13 @@ entry that is in fact still in the window costs one conditional request and dele
   thing that could ever shrink it. Running is safe because both bounds that make the sweep safe at
   all are independent of the seen-set: it deletes only on a confirmed 404/410, and it probes at most
   25 candidates per run per source, none more often than the recheck floor allows. An empty seen-set
-  subtracts nothing from the candidate list, which is the right answer for a 304'd run — the window
-  is unchanged, so nothing aged out _during_ this run, and every candidate the query returns had
-  already aged out before it began.
+  subtracts nothing from the candidate list, so a 304'd run offers every one of the source's entries
+  as a candidate, window members included — the direct consequence of having no membership record to
+  consult, bounded by the delete rule rather than by the candidate rule ("Candidates" above).
 
 **Ordering:** the sweep runs **after** the source's ordinary ingestion pass completes, so the
-seen-set it partitions against is final and the run's own freshly-observed entries can never be
-mistaken for aged-out candidates.
+seen-set it partitions against is final and no entry a run observed is ever probed on the run that
+observed it.
 
 **Per candidate**, the resource's stored validators are replayed against its link:
 

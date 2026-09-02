@@ -474,7 +474,7 @@ indexed stay indexed indefinitely, even after they scroll off the feed, until th
 removed (`source remove`, which still cascades normally). Pruning truly-dead entry URLs (404/410) is
 a follow-up issue.
 
-Pruning aged-out entries confirmed 404/410 is part of
+Pruning entries whose own links a probe confirms 404/410 is part of
 [#171](https://github.com/dokterbob/localdb/issues/171)'s liveness sweep (see
 [specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md)
 §1 "Aged-out feed entries: the liveness sweep"); the sweep-exemption itself is unaffected and stays
