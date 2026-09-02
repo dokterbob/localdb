@@ -152,6 +152,8 @@ async fn url_source_replays_stored_validators_on_second_run() {
             config: &config,
             progress: None,
             deletion: DeletionPolicy::Retain,
+            document_validators: FetchMetadata::default(),
+            stored_inputs_digest: None,
         },
     )
     .await
@@ -167,6 +169,8 @@ async fn url_source_replays_stored_validators_on_second_run() {
             config: &config,
             progress: None,
             deletion: DeletionPolicy::Retain,
+            document_validators: FetchMetadata::default(),
+            stored_inputs_digest: None,
         },
     )
     .await
@@ -189,10 +193,11 @@ async fn url_source_replays_stored_validators_on_second_run() {
     );
 }
 
-/// Same proof, for a feed **entry link** — the feed document's own fetch is
-/// deliberately excluded from replay in this stage (Stage 5), so this
-/// asserts specifically on the entry link URL's received metadata, not the
-/// feed document URL's.
+/// Same proof, for a feed **entry link**. Entry links replay through
+/// `IngestCallback::lookup_fetch_metadata`, off their own `resources` row —
+/// a different mechanism from the feed document's, which replays off the
+/// `sources` row instead. This asserts specifically on the entry link URL's
+/// received metadata, not the feed document URL's.
 #[tokio::test]
 async fn feed_entry_link_replays_stored_validators_on_second_run() {
     let store_id = "store-1";
@@ -243,6 +248,8 @@ async fn feed_entry_link_replays_stored_validators_on_second_run() {
             config: &config,
             progress: None,
             deletion: DeletionPolicy::Retain,
+            document_validators: FetchMetadata::default(),
+            stored_inputs_digest: None,
         },
     )
     .await
@@ -258,6 +265,8 @@ async fn feed_entry_link_replays_stored_validators_on_second_run() {
             config: &config,
             progress: None,
             deletion: DeletionPolicy::Retain,
+            document_validators: FetchMetadata::default(),
+            stored_inputs_digest: None,
         },
     )
     .await
@@ -279,13 +288,18 @@ async fn feed_entry_link_replays_stored_validators_on_second_run() {
         "the second run must replay exactly what the first run's entry-link fetch captured"
     );
 
-    // The feed document's own fetch is unconditional in this stage (its
-    // conditional GET is Stage 5) — every call replays nothing.
+    // The feed document replays off `sources.feed_etag`/`feed_last_modified`,
+    // which only `job_exec`'s persistence hop ever writes. This test drives
+    // `run_source_ingestion` directly and passes an empty
+    // `document_validators` on both runs, so nothing is carried between them
+    // — a property of this harness, not of the feed document's own
+    // conditional GET, which is covered end to end in
+    // `server/src/job_exec/tests/feed_validator_persistence.rs`.
     let feed_received = fetcher.received_for(feed_url);
     assert_eq!(feed_received.len(), 2);
     assert!(
         feed_received.iter().all(|m| *m == FetchMetadata::default()),
-        "the feed document's own fetch must not replay a validator in this stage"
+        "this harness stores nothing between runs for the feed document"
     );
 }
 
@@ -572,6 +586,8 @@ async fn a_304_that_writes_reports_a_metadata_update_not_a_skip() {
             config: &config,
             progress: None,
             deletion: DeletionPolicy::Retain,
+            document_validators: FetchMetadata::default(),
+            stored_inputs_digest: None,
         },
     )
     .await
@@ -594,6 +610,8 @@ async fn a_304_that_writes_reports_a_metadata_update_not_a_skip() {
             config: &config,
             progress: None,
             deletion: DeletionPolicy::Retain,
+            document_validators: FetchMetadata::default(),
+            stored_inputs_digest: None,
         },
     )
     .await
@@ -654,6 +672,8 @@ async fn a_304_whose_metadata_write_fails_reports_an_error_not_a_skip() {
             config: &config,
             progress: None,
             deletion: DeletionPolicy::Retain,
+            document_validators: FetchMetadata::default(),
+            stored_inputs_digest: None,
         },
     )
     .await
@@ -674,6 +694,8 @@ async fn a_304_whose_metadata_write_fails_reports_an_error_not_a_skip() {
             config: &config,
             progress: None,
             deletion: DeletionPolicy::Retain,
+            document_validators: FetchMetadata::default(),
+            stored_inputs_digest: None,
         },
     )
     .await
@@ -793,6 +815,8 @@ async fn a_moved_last_modified_on_an_unchanged_200_is_persisted_and_replayed() {
                     config: &config,
                     progress: None,
                     deletion: DeletionPolicy::Retain,
+                    document_validators: FetchMetadata::default(),
+                    stored_inputs_digest: None,
                 },
             )
             .await

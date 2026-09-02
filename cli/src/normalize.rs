@@ -274,6 +274,9 @@ mod tests {
             refresh: None,
             created_at: now_rfc3339(),
             config_json: None,
+            feed_etag: None,
+            feed_last_modified: None,
+            feed_inputs_digest: None,
         };
         let core = source_row_to_core_source(&src);
         assert_eq!(core.id, "src-1");
@@ -301,6 +304,9 @@ mod tests {
             refresh: None,
             created_at: now_rfc3339(),
             config_json: None,
+            feed_etag: None,
+            feed_last_modified: None,
+            feed_inputs_digest: None,
         };
         let core = source_row_to_core_source(&src);
         match &core.spec {
@@ -324,6 +330,9 @@ mod tests {
             refresh: Some("24h".into()),
             created_at: now_rfc3339(),
             config_json: None,
+            feed_etag: None,
+            feed_last_modified: None,
+            feed_inputs_digest: None,
         };
         let core = source_row_to_core_source(&src);
         match &core.spec {
@@ -353,6 +362,9 @@ mod tests {
             refresh: Some("not-a-duration".into()),
             created_at: now_rfc3339(),
             config_json: None,
+            feed_etag: None,
+            feed_last_modified: None,
+            feed_inputs_digest: None,
         };
         let core = source_row_to_core_source(&src);
         match &core.spec {
@@ -379,6 +391,9 @@ mod tests {
             refresh: Some("1h".into()),
             created_at: now_rfc3339(),
             config_json: Some(r#"{"max_entries":25,"fetch_full_content":false}"#.into()),
+            feed_etag: None,
+            feed_last_modified: None,
+            feed_inputs_digest: None,
         };
         let core = source_row_to_core_source(&src);
         assert_eq!(core.kind, SourceKind::Feed);
@@ -413,6 +428,9 @@ mod tests {
             refresh: None,
             created_at: now_rfc3339(),
             config_json: None,
+            feed_etag: None,
+            feed_last_modified: None,
+            feed_inputs_digest: None,
         };
         let core = source_row_to_core_source(&src);
         match &core.spec {
@@ -445,6 +463,9 @@ mod tests {
             refresh: None,
             created_at: now_rfc3339(),
             config_json: Some("{not valid json".into()),
+            feed_etag: None,
+            feed_last_modified: None,
+            feed_inputs_digest: None,
         };
         let core = source_row_to_core_source(&src);
         match &core.spec {

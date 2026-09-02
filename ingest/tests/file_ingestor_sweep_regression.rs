@@ -68,8 +68,8 @@ use std::os::unix::fs::PermissionsExt;
 use localdb_core::embedder::FakeEmbedder;
 use localdb_core::ids::new_ulid;
 use localdb_core::ingestion::{
-    run_source_ingestion, DeletionPolicy, DocumentIndex, DocumentRecord, IngestionConfig,
-    SourceIngestionDeps,
+    run_source_ingestion, DeletionPolicy, DocumentIndex, DocumentRecord, FetchMetadata,
+    IngestionConfig, SourceIngestionDeps,
 };
 use localdb_core::store::FakeStore;
 use localdb_core::types::{Source, SourceKind, SourceSpec};
@@ -132,6 +132,8 @@ async fn transient_read_error_on_space_named_file_does_not_delete_it() {
             config: &config,
             progress: None,
             deletion: DeletionPolicy::Prune,
+            document_validators: FetchMetadata::default(),
+            stored_inputs_digest: None,
         };
         let result = run_source_ingestion(&source, &ingestor, deps)
             .await
@@ -193,6 +195,8 @@ async fn transient_read_error_on_space_named_file_does_not_delete_it() {
             config: &config,
             progress: None,
             deletion: DeletionPolicy::Prune,
+            document_validators: FetchMetadata::default(),
+            stored_inputs_digest: None,
         };
         run_source_ingestion(&source, &ingestor, deps).await
     };
@@ -262,6 +266,8 @@ async fn index_mutate_reindex(
             config: &config,
             progress: None,
             deletion: DeletionPolicy::Prune,
+            document_validators: FetchMetadata::default(),
+            stored_inputs_digest: None,
         };
         let first = run_source_ingestion(&source, &ingestor, deps)
             .await
@@ -286,6 +292,8 @@ async fn index_mutate_reindex(
         config: &config,
         progress: None,
         deletion: DeletionPolicy::Prune,
+        document_validators: FetchMetadata::default(),
+        stored_inputs_digest: None,
     };
     let second = run_source_ingestion(&source, &ingestor, deps)
         .await

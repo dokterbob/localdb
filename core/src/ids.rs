@@ -157,6 +157,42 @@ pub fn compute_metadata_hash(
     content_hash(&combined)
 }
 
+/// Digest of the **local** inputs that decide what a feed run produces from
+/// an unchanged feed document, stored on `sources.feed_inputs_digest`.
+///
+/// A conditional GET rests on the origin rotating its validator whenever its
+/// own representation changes (RFC 9110 §8.8.1). That contract binds the
+/// origin and nothing else — it knows nothing about our indexing policy, or
+/// whether we follow entry links, or how many entries we take. Without this
+/// digest, changing any of those against an unchanged feed produces a 304,
+/// the entry loop never runs, and not one entry is reprocessed under the new
+/// inputs. Comparing it before replaying the stored validators is what
+/// closes that. See `specs/02-domain-model.md`'s Feed connector,
+/// "Conditional GET and pruning".
+///
+/// The three inputs are exactly those that change a run's *output* for the
+/// same bytes. `refresh_interval_secs` is deliberately absent: it changes
+/// when a run happens, never what it produces. So is the feed URL — a
+/// changed URL is a new origin, and `upsert_source` nulls the whole cache
+/// for that case rather than relying on a digest comparison to catch it.
+///
+/// Same encoding discipline as [`compute_metadata_hash`]: `\x00` separators
+/// and [`encode_optional_field`], so an unbounded `max_entries` cannot
+/// collide with any bounded one.
+pub fn compute_feed_inputs_digest(
+    policy_version: &str,
+    fetch_full_content: bool,
+    max_entries: Option<u32>,
+) -> String {
+    let combined = format!(
+        "{}\x00{}\x00{}",
+        policy_version,
+        fetch_full_content,
+        encode_optional_field(max_entries.map(|n| n.to_string()).as_deref()),
+    );
+    content_hash(&combined)
+}
+
 /// Encode an optional hash-input field so `None` and `Some("")` produce
 /// distinct output: `Some(v)` becomes `\x01v`, `None` becomes the empty
 /// string. See [`compute_metadata_hash`]'s doc comment.
@@ -493,6 +529,48 @@ mod tests {
         assert_ne!(
             h_none, h_empty,
             "modified_at of None must hash differently from Some(\"\")"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // compute_feed_inputs_digest
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn feed_inputs_digest_is_stable_for_identical_inputs() {
+        assert_eq!(
+            compute_feed_inputs_digest("policy-v1", true, Some(10)),
+            compute_feed_inputs_digest("policy-v1", true, Some(10))
+        );
+    }
+
+    #[test]
+    fn feed_inputs_digest_changes_with_each_input_independently() {
+        let base = compute_feed_inputs_digest("policy-v1", true, Some(10));
+        assert_ne!(
+            base,
+            compute_feed_inputs_digest("policy-v2", true, Some(10))
+        );
+        assert_ne!(
+            base,
+            compute_feed_inputs_digest("policy-v1", false, Some(10))
+        );
+        assert_ne!(base, compute_feed_inputs_digest("policy-v1", true, Some(5)));
+        assert_ne!(base, compute_feed_inputs_digest("policy-v1", true, None));
+    }
+
+    #[test]
+    fn feed_inputs_digest_separators_prevent_field_bleed() {
+        // Without the \x00 separators these two would concatenate to the
+        // same string, and narrowing max_entries while renaming the policy
+        // could silently keep replaying a stale validator.
+        assert_ne!(
+            compute_feed_inputs_digest("a", true, Some(12)),
+            compute_feed_inputs_digest("a", true, Some(1))
+        );
+        assert_ne!(
+            compute_feed_inputs_digest("ab", true, None),
+            compute_feed_inputs_digest("a", true, None)
         );
     }
 }

@@ -377,6 +377,9 @@ impl DaemonAwareCommand for SourceAddCmd<'_> {
                     refresh: self.refresh.map(|s| s.to_string()),
                     created_at: now_rfc3339(),
                     config_json: parsed.config_json.clone(),
+                    feed_etag: None,
+                    feed_last_modified: None,
+                    feed_inputs_digest: None,
                 }
             } else {
                 SourceRow {
@@ -408,6 +411,9 @@ impl DaemonAwareCommand for SourceAddCmd<'_> {
                     refresh: self.refresh.map(|s| s.to_string()),
                     created_at: now_rfc3339(),
                     config_json: None,
+                    feed_etag: None,
+                    feed_last_modified: None,
+                    feed_inputs_digest: None,
                 }
             };
 
@@ -1048,6 +1054,9 @@ mod tests {
             refresh: None,
             created_at: now_rfc3339(),
             config_json: None,
+            feed_etag: None,
+            feed_last_modified: None,
+            feed_inputs_digest: None,
         }
     }
 
@@ -1099,6 +1108,9 @@ mod tests {
             refresh: refresh.map(str::to_string),
             created_at: now_rfc3339(),
             config_json: config_json.map(str::to_string),
+            feed_etag: None,
+            feed_last_modified: None,
+            feed_inputs_digest: None,
         }
     }
 
@@ -1115,6 +1127,9 @@ mod tests {
             refresh: refresh.map(str::to_string),
             created_at: now_rfc3339(),
             config_json: None,
+            feed_etag: None,
+            feed_last_modified: None,
+            feed_inputs_digest: None,
         }
     }
 
@@ -1131,6 +1146,9 @@ mod tests {
             refresh: None,
             created_at: now_rfc3339(),
             config_json: None,
+            feed_etag: None,
+            feed_last_modified: None,
+            feed_inputs_digest: None,
         }
     }
 

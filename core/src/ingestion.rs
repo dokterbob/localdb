@@ -174,7 +174,18 @@ pub struct IngestionConfig {
 /// `Serialize`/`Deserialize` are derived because this type is embedded in
 /// [`crate::progress::ProgressEvent::SourceFinished`], which crosses the
 /// SSE wire boundary (issue #83).
+///
+/// `#[serde(default)]` at the **struct** level, matching
+/// [`crate::types::IndexJobStats`], and for the same reason: this crosses a
+/// version boundary. `localdb index` attaches to a running daemon's SSE
+/// stream, and the two are not upgraded in lockstep — a newer CLI reading an
+/// older daemon's `SourceFinished` frame would otherwise fail the whole
+/// deserialize on the first field the daemon does not know about, dropping a
+/// frame the user is watching rather than reading it with zeros for the
+/// fields that are missing. Struct-level, not per-field, so every counter
+/// added later inherits it without anyone having to remember.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct IngestionResult {
     /// Total documents seen in the scan.
     pub docs_seen: u64,
@@ -205,6 +216,25 @@ pub struct IngestionResult {
     /// update is not a content skip, but it is also not a full `docs_indexed`
     /// re-index, so it gets its own counter rather than overloading either.
     pub docs_metadata_updated: u64,
+    /// Refreshed validators for a feed source's own top-level document, to
+    /// persist onto `sources.feed_etag`/`feed_last_modified` — threaded
+    /// straight from [`crate::ingestor::IngestResult::document_validators`].
+    /// `None` for every non-feed source, and for a feed source whose run
+    /// left the stored validators untouched (a bare 304, or no document
+    /// fetch at all).
+    pub document_validators: Option<FetchMetadata>,
+    /// The local-inputs digest in force for this run
+    /// (`crate::ids::compute_feed_inputs_digest`), to persist onto
+    /// `sources.feed_inputs_digest` **in the same hop** as
+    /// [`Self::document_validators`]. `None` for every non-feed source.
+    ///
+    /// Persisted only alongside the validators, never on its own: the two
+    /// are one fact — "these validators were captured under these inputs".
+    /// Recording new inputs against validators the run never refreshed would
+    /// mark the cache trustworthy for a reprocessing that did not happen,
+    /// and the next run would replay them and skip the entry loop, which is
+    /// the exact failure the digest exists to prevent.
+    pub document_inputs_digest: Option<String>,
 }
 
 /// Whether an ingestion run may remove documents from the store.
@@ -529,7 +559,11 @@ fn catch_panic<T>(
 // ---------------------------------------------------------------------------
 
 /// Metadata from a previous URL fetch, used for conditional GET.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` are derived because this type is embedded in
+/// [`IngestionResult`], which crosses the SSE wire boundary via
+/// [`crate::progress::ProgressEvent::SourceFinished`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FetchMetadata {
     /// ETag value from the previous response.
     pub etag: Option<String>,
@@ -1236,6 +1270,18 @@ pub struct SourceIngestionDeps<'a> {
     /// Whether this run may remove documents. Defaults to
     /// [`DeletionPolicy::Retain`] — deletion is opt-in.
     pub deletion: DeletionPolicy,
+    /// Conditional-GET validators stored for the source's own top-level
+    /// document (`sources.feed_etag`/`feed_last_modified`), forwarded
+    /// verbatim into [`IngestSource::document_validators`]. The caller reads
+    /// these directly off the `SourceRow` it already holds — this type has
+    /// no store handle of its own to look them up with. Meaningless for any
+    /// non-feed source; defaults to an empty [`FetchMetadata`].
+    pub document_validators: FetchMetadata,
+    /// The digest stored alongside those validators
+    /// (`sources.feed_inputs_digest`), read off the same `SourceRow`.
+    /// `None` means "inputs unknown" — a row predating the column — and is
+    /// treated as a mismatch. Meaningless for any non-feed source.
+    pub stored_inputs_digest: Option<String>,
 }
 
 /// Run the unified ingestion pipeline for one source, driven by a caller-supplied
@@ -1278,7 +1324,31 @@ pub async fn run_source_ingestion(
         config,
         progress,
         deletion,
+        document_validators,
+        stored_inputs_digest,
     } = deps;
+
+    // The origin's validator speaks for the origin's bytes. It cannot speak
+    // for our indexing policy, whether we follow entry links, or how many
+    // entries we take — so a change to any of those must not be allowed to
+    // hide behind a 304 that skips the entry loop entirely. Compared here,
+    // in `core`, rather than inside the feed ingestor: this mirrors
+    // `PipelineCallback::lookup_fetch_metadata`'s `policy_version`
+    // suppression one layer down, and keeps both halves of the same rule in
+    // the same crate. See `specs/02-domain-model.md`'s Feed connector,
+    // "Conditional GET and pruning".
+    let document_inputs_digest = feed_inputs_digest(source, config);
+    let document_validators = match &document_inputs_digest {
+        Some(current) if stored_inputs_digest.as_deref() != Some(current.as_str()) => {
+            tracing::debug!(
+                source_id = %source.id,
+                "feed inputs changed since the stored validators were captured; \
+                 fetching the feed document unconditionally"
+            );
+            FetchMetadata::default()
+        }
+        _ => document_validators,
+    };
 
     let ingest_config = serde_json::to_value(&source.spec).map_err(|e| Error::Internal {
         message: format!("failed to serialize source spec: {e}"),
@@ -1291,6 +1361,7 @@ pub async fn run_source_ingestion(
         ingestor_kind: ingestor.kind(),
         config: ingest_config,
         policy_version: config.policy_version.clone(),
+        document_validators,
     };
 
     if let Some(sink) = &progress {
@@ -1348,6 +1419,9 @@ pub async fn run_source_ingestion(
          report exactly one SkipReason::Error skip",
         source.id, ingest_result.errors, skip_error_count
     );
+
+    result.document_validators = ingest_result.document_validators.clone();
+    result.document_inputs_digest = document_inputs_digest;
 
     // Confirmed deletions first, and unconditionally: a URI reported via
     // `on_gone` was positively established as absent at the origin (an HTTP
@@ -1490,6 +1564,27 @@ pub async fn run_source_ingestion(
     }
 
     Ok(result)
+}
+
+/// The local-inputs digest for `source` under `config`, or `None` when the
+/// source has no feed document whose fetch could be made conditional.
+///
+/// The `None` return is what keeps every non-feed source out of the gate
+/// entirely: with no digest there is nothing to compare, nothing to
+/// suppress, and nothing to persist.
+fn feed_inputs_digest(source: &Source, config: &IngestionConfig) -> Option<String> {
+    match &source.spec {
+        crate::types::SourceSpec::Feed {
+            max_entries,
+            fetch_full_content,
+            ..
+        } => Some(crate::ids::compute_feed_inputs_digest(
+            &config.policy_version,
+            *fetch_full_content,
+            *max_entries,
+        )),
+        _ => None,
+    }
 }
 
 /// Human-readable "location" string for `ProgressEvent::SourceStarted`.
@@ -2170,6 +2265,63 @@ mod tests {
         let removed = idx.remove("file:///test.md");
         assert!(removed.is_some());
         assert!(idx.is_empty());
+    }
+
+    // ---------------------------------------------------------------------------
+    // IngestionResult wire compatibility
+    // ---------------------------------------------------------------------------
+
+    /// This type crosses a version boundary: `localdb index` attaches to a
+    /// running daemon's SSE stream, and the two are not upgraded together.
+    /// Without struct-level `#[serde(default)]` a newer CLI reading an older
+    /// daemon's `SourceFinished` frame fails the whole deserialize on the
+    /// first field the daemon never sent, dropping a frame the user is
+    /// watching.
+    ///
+    /// Asserted by deserializing an *empty* object, not by round-tripping a
+    /// populated one — a round trip passes with or without the attribute,
+    /// since it never omits a field.
+    #[test]
+    fn ingestion_result_deserializes_from_an_empty_object() {
+        let from_nothing: IngestionResult =
+            serde_json::from_str("{}").expect("every field must be optional on the wire");
+        let expected = IngestionResult::default();
+        assert_eq!(from_nothing.docs_seen, expected.docs_seen);
+        assert_eq!(from_nothing.docs_indexed, expected.docs_indexed);
+        assert_eq!(from_nothing.docs_skipped, expected.docs_skipped);
+        assert_eq!(from_nothing.docs_deleted, expected.docs_deleted);
+        assert_eq!(from_nothing.docs_prunable, expected.docs_prunable);
+        assert_eq!(
+            from_nothing.docs_metadata_updated,
+            expected.docs_metadata_updated
+        );
+        assert_eq!(from_nothing.chunks_written, expected.chunks_written);
+        assert_eq!(
+            from_nothing.unsupported_format_count,
+            expected.unsupported_format_count
+        );
+        assert_eq!(from_nothing.error_count, expected.error_count);
+        assert_eq!(
+            from_nothing.document_validators,
+            expected.document_validators
+        );
+        assert_eq!(
+            from_nothing.document_inputs_digest,
+            expected.document_inputs_digest
+        );
+    }
+
+    /// The other direction, which is the one that actually bites in
+    /// production: an *older* consumer must not choke on a field it has
+    /// never heard of. Serde ignores unknown keys by default, and nothing
+    /// on this type opts into `deny_unknown_fields` — pinned here so a
+    /// future contributor adding it has to argue with a failing test.
+    #[test]
+    fn ingestion_result_ignores_fields_it_does_not_know() {
+        let from_future: IngestionResult =
+            serde_json::from_str(r#"{"docs_seen":3,"docs_teleported":9}"#)
+                .expect("an unknown counter must not fail the frame");
+        assert_eq!(from_future.docs_seen, 3);
     }
 
     // ---------------------------------------------------------------------------
@@ -3049,6 +3201,7 @@ mod tests {
                     resources_skipped: skipped,
                     errors,
                     enumeration: self.enumeration.clone(),
+                    document_validators: None,
                 })
             }
         }
@@ -3149,6 +3302,8 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
+                stored_inputs_digest: None,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -3201,6 +3356,8 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
+                stored_inputs_digest: None,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -3288,6 +3445,8 @@ mod tests {
                 config: &config,
                 progress: Some(sink),
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
+                stored_inputs_digest: None,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -3381,6 +3540,8 @@ mod tests {
                 config: &config,
                 progress: Some(sink),
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
+                stored_inputs_digest: None,
             };
             run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -3461,6 +3622,8 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
+                stored_inputs_digest: None,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -3512,6 +3675,8 @@ mod tests {
                 config: &config_v2,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
+                stored_inputs_digest: None,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -3576,6 +3741,8 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
+                stored_inputs_digest: None,
             };
             let result1 = run_source_ingestion(&source, &ingestor1, deps1)
                 .await
@@ -3610,6 +3777,8 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
+                stored_inputs_digest: None,
             };
             let result2 = run_source_ingestion(&source, &ingestor2, deps2)
                 .await
@@ -3671,6 +3840,8 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
+                stored_inputs_digest: None,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -3745,6 +3916,8 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
+                stored_inputs_digest: None,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -3808,6 +3981,8 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
+                stored_inputs_digest: None,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -3878,6 +4053,8 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
+                stored_inputs_digest: None,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -3935,6 +4112,8 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
+                stored_inputs_digest: None,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -3987,6 +4166,8 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Retain,
+                document_validators: FetchMetadata::default(),
+                stored_inputs_digest: None,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -4048,6 +4229,8 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Retain,
+                document_validators: FetchMetadata::default(),
+                stored_inputs_digest: None,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -4098,6 +4281,8 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Retain,
+                document_validators: FetchMetadata::default(),
+                stored_inputs_digest: None,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -4146,6 +4331,8 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
+                stored_inputs_digest: None,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -4270,6 +4457,8 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
+                stored_inputs_digest: None,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -4392,6 +4581,8 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
+                stored_inputs_digest: None,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -4504,6 +4695,8 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
+                stored_inputs_digest: None,
             };
             let result = run_source_ingestion(&source_a, &ingestor, deps)
                 .await
@@ -4622,6 +4815,8 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
+                stored_inputs_digest: None,
             };
             let result = run_source_ingestion(&source_a, &ingestor, deps)
                 .await
@@ -4679,6 +4874,8 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
+                stored_inputs_digest: None,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -4743,6 +4940,8 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
+                stored_inputs_digest: None,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -4841,6 +5040,8 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
+                stored_inputs_digest: None,
             };
             let feed_result = run_source_ingestion(&feed_source, &feed_ingestor, deps)
                 .await
@@ -4871,6 +5072,8 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
+                stored_inputs_digest: None,
             };
             let url_result = run_source_ingestion(&url_source, &url_ingestor, deps)
                 .await
@@ -4988,6 +5191,8 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
+                stored_inputs_digest: None,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await
@@ -5051,6 +5256,8 @@ mod tests {
                 config: &config,
                 progress: None,
                 deletion: DeletionPolicy::Prune,
+                document_validators: FetchMetadata::default(),
+                stored_inputs_digest: None,
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
                 .await

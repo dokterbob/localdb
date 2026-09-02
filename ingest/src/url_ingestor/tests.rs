@@ -103,6 +103,7 @@ fn source_with_urls(urls: &[&str]) -> IngestSource {
         store_id: "store-1".to_string(),
         ingestor_kind: IngestorKind::Url,
         config: serde_json::json!({"urls": urls}),
+        document_validators: FetchMetadata::default(),
     }
 }
 
@@ -118,6 +119,7 @@ async fn missing_url_errors() {
         store_id: "store-1".to_string(),
         ingestor_kind: IngestorKind::Url,
         config: serde_json::json!({}),
+        document_validators: FetchMetadata::default(),
     };
     let mut cb = RecordingCallback::default();
     let result = ingestor.ingest(&source, &mut cb).await;
@@ -523,6 +525,7 @@ async fn resource_full_struct_equality_pins_pre_refactor_shape() {
         store_id: "store-pin".to_string(),
         ingestor_kind: IngestorKind::Url,
         config: serde_json::json!({"url": "https://example.com/pinned"}),
+        document_validators: FetchMetadata::default(),
     };
     let mut cb = RecordingCallback::default();
     let result = ingestor.ingest(&source, &mut cb).await.unwrap();

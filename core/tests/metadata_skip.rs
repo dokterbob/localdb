@@ -19,7 +19,7 @@ use localdb_core::embedder::FakeEmbedder;
 use localdb_core::ids::{content_hash, new_ulid, resource_id};
 use localdb_core::ingestion::{
     index_resource, run_source_ingestion, DeletionPolicy, DocumentIndex, DocumentRecord,
-    IndexOutcome, IndexResourceDeps, IngestionConfig, SourceIngestionDeps,
+    FetchMetadata, IndexOutcome, IndexResourceDeps, IngestionConfig, SourceIngestionDeps,
 };
 use localdb_core::ingestor::{IngestCallback, IngestResult, IngestSource, Ingestor};
 use localdb_core::metadata::{DocumentMetadata, DublinCoreMetadata, Metadata};
@@ -165,6 +165,7 @@ impl Ingestor for ScriptedIngestor {
             resources_skipped: 0,
             errors: 0,
             enumeration: Default::default(),
+            document_validators: None,
         })
     }
 }
@@ -321,6 +322,8 @@ async fn run_once(
         config,
         progress: None,
         deletion,
+        document_validators: FetchMetadata::default(),
+        stored_inputs_digest: None,
     };
     run_source_ingestion(source, &ingestor, deps).await.unwrap()
 }
@@ -622,6 +625,8 @@ async fn rehydrated_index_detects_metadata_only_change_across_restart() {
         config: &config,
         progress: None,
         deletion: DeletionPolicy::Retain,
+        document_validators: FetchMetadata::default(),
+        stored_inputs_digest: None,
     };
     let result1 = run_source_ingestion(&source, &ingestor1, deps1)
         .await
@@ -655,6 +660,8 @@ async fn rehydrated_index_detects_metadata_only_change_across_restart() {
         config: &config,
         progress: None,
         deletion: DeletionPolicy::Retain,
+        document_validators: FetchMetadata::default(),
+        stored_inputs_digest: None,
     };
     let result2 = run_source_ingestion(&source, &ingestor2, deps2)
         .await
@@ -1040,6 +1047,8 @@ async fn metadata_only_update_emits_metadata_updated_progress_event() {
         config: &config,
         progress: None,
         deletion: DeletionPolicy::Retain,
+        document_validators: FetchMetadata::default(),
+        stored_inputs_digest: None,
     };
     run_source_ingestion(&source, &ingestor1, deps1)
         .await
@@ -1069,6 +1078,8 @@ async fn metadata_only_update_emits_metadata_updated_progress_event() {
         config: &config,
         progress: Some(sink),
         deletion: DeletionPolicy::Retain,
+        document_validators: FetchMetadata::default(),
+        stored_inputs_digest: None,
     };
     run_source_ingestion(&source, &ingestor2, deps2)
         .await

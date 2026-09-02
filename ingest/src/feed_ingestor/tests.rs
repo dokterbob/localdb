@@ -45,6 +45,7 @@ enum ScriptedOutcome {
         bytes: Vec<u8>,
         content_type: Option<String>,
         etag: Option<String>,
+        last_modified: Option<String>,
         final_url: Option<String>,
     },
     /// A bare `NotModified` (both fields `None`) is the common case — a
@@ -65,6 +66,7 @@ impl ScriptedOutcome {
             bytes: body.as_bytes().to_vec(),
             content_type: None,
             etag: None,
+            last_modified: None,
             final_url: None,
         }
     }
@@ -74,6 +76,19 @@ impl ScriptedOutcome {
             bytes: body.as_bytes().to_vec(),
             content_type: None,
             etag: Some(etag.to_string()),
+            last_modified: None,
+            final_url: None,
+        }
+    }
+
+    /// Models a 200 whose response carries both conditional-GET validators —
+    /// for feed-document capture tests.
+    fn text_with_validators(body: &str, etag: &str, last_modified: &str) -> Self {
+        ScriptedOutcome::Downloaded {
+            bytes: body.as_bytes().to_vec(),
+            content_type: None,
+            etag: Some(etag.to_string()),
+            last_modified: Some(last_modified.to_string()),
             final_url: None,
         }
     }
@@ -86,6 +101,7 @@ impl ScriptedOutcome {
             bytes: body.as_bytes().to_vec(),
             content_type: None,
             etag: None,
+            last_modified: None,
             final_url: Some(final_url.to_string()),
         }
     }
@@ -98,6 +114,10 @@ impl ScriptedOutcome {
 struct ScriptedFetcher {
     script: HashMap<String, ScriptedOutcome>,
     calls: Mutex<Vec<String>>,
+    /// The `FetchMetadata` each call actually received, in call order,
+    /// paired with the URL — so a test can assert on what was *sent*, not
+    /// just the scripted outcome.
+    received: Mutex<Vec<(String, FetchMetadata)>>,
 }
 
 impl ScriptedFetcher {
@@ -105,6 +125,7 @@ impl ScriptedFetcher {
         Self {
             script,
             calls: Mutex::new(Vec::new()),
+            received: Mutex::new(Vec::new()),
         }
     }
 
@@ -116,23 +137,40 @@ impl ScriptedFetcher {
             .filter(|u| *u == url)
             .count()
     }
+
+    /// The most recent `FetchMetadata` sent for `url`, if it was ever
+    /// fetched.
+    fn last_received_for(&self, url: &str) -> Option<FetchMetadata> {
+        self.received
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|(u, _)| u == url)
+            .map(|(_, meta)| meta.clone())
+    }
 }
 
 #[async_trait::async_trait]
 impl UrlFetcher for ScriptedFetcher {
-    async fn fetch(&self, url: &str, _meta: &FetchMetadata) -> Result<FetchResult, Error> {
+    async fn fetch(&self, url: &str, meta: &FetchMetadata) -> Result<FetchResult, Error> {
         self.calls.lock().unwrap().push(url.to_string());
+        self.received
+            .lock()
+            .unwrap()
+            .push((url.to_string(), meta.clone()));
         match self.script.get(url) {
             Some(ScriptedOutcome::Downloaded {
                 bytes,
                 content_type,
                 etag,
+                last_modified,
                 final_url,
             }) => Ok(FetchResult::Downloaded {
                 bytes: bytes.clone(),
                 content_type: content_type.clone(),
                 etag: etag.clone(),
-                last_modified: None,
+                last_modified: last_modified.clone(),
                 final_url: final_url.clone(),
             }),
             Some(ScriptedOutcome::NotModified {
@@ -166,6 +204,20 @@ fn source_for(feed_url: &str, max_entries: Option<u32>, fetch_full_content: bool
         store_id: "store-1".to_string(),
         ingestor_kind: IngestorKind::Feed,
         config,
+        document_validators: FetchMetadata::default(),
+    }
+}
+
+/// Like [`source_for`], but with explicit stored validators for the feed
+/// document itself — for tests exercising conditional-GET replay.
+fn source_with_validators(
+    feed_url: &str,
+    fetch_full_content: bool,
+    document_validators: FetchMetadata,
+) -> IngestSource {
+    IngestSource {
+        document_validators,
+        ..source_for(feed_url, None, fetch_full_content)
     }
 }
 
@@ -250,6 +302,7 @@ async fn missing_url_config_errors() {
         store_id: "st".to_string(),
         ingestor_kind: IngestorKind::Feed,
         config: serde_json::json!({}),
+        document_validators: FetchMetadata::default(),
     };
     let mut cb = RecordingCallback::default();
     let result = ingestor.ingest(&source, &mut cb).await;
@@ -260,8 +313,10 @@ async fn missing_url_config_errors() {
 // Feed-level fetch outcomes
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn feed_level_not_modified_is_single_unchanged_skip_no_entry_callbacks() {
+/// Run a feed-document 304 in the given mode and hand back what the
+/// callback saw. The two modes disagree about one thing only — whether the
+/// feed document is a *document* — so they are worth reading side by side.
+async fn feed_level_304_in(fetch_full_content: bool) -> (IngestResult, RecordingCallback) {
     let mut script = HashMap::new();
     script.insert(
         "https://feed.example.com/feed.xml".to_string(),
@@ -271,19 +326,68 @@ async fn feed_level_not_modified_is_single_unchanged_skip_no_entry_callbacks() {
         },
     );
     let (ingestor, _fetcher) = ingestor_with(script);
-    let source = source_for("https://feed.example.com/feed.xml", None, true);
+    let source = source_for(
+        "https://feed.example.com/feed.xml",
+        None,
+        fetch_full_content,
+    );
     let mut cb = RecordingCallback::default();
     let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+    (result, cb)
+}
+
+/// In discovery mode the feed document never becomes a `Resource`, so a
+/// feed-level 304 must report **no document at all** — not even a skipped
+/// one.
+///
+/// `on_skipped` is not free: it increments `docs_seen` and `docs_skipped`
+/// and emits a full `DocumentStarted`/`DocumentFinished` pair, and those
+/// counters partition `docs_seen` (specs/04-search-pipeline.md). Reporting
+/// the feed document here would therefore count a document that does not
+/// exist — and since a healthy feed 304s on every run, that phantom is the
+/// steady state, not an edge. It is the same leak the rejected phantom
+/// zero-chunk `resources` row would have caused, one layer up.
+#[tokio::test]
+async fn feed_level_not_modified_in_discovery_mode_reports_no_document() {
+    let (result, cb) = feed_level_304_in(true).await;
 
     assert_eq!(result.resources_produced, 0);
     assert_eq!(result.errors, 0);
+    assert_eq!(
+        result.resources_skipped, 0,
+        "the feed document is not one of this mode's resources"
+    );
     assert!(
         cb.discovered.is_empty(),
         "no on_discovered on feed-level 304"
     );
     assert!(cb.resources.is_empty());
+    assert!(
+        cb.skipped.is_empty(),
+        "a discovery-mode feed 304 is a source-level event, not a document one: {:?}",
+        cb.skipped
+    );
+}
+
+/// The other mode, and the reason the check above is conditional rather than
+/// an unconditional removal: with `fetch_full_content: false` the feed
+/// document *is* the source's one resource, so its 304 is an ordinary
+/// unchanged skip and must still be reported as one.
+#[tokio::test]
+async fn feed_level_not_modified_in_single_document_mode_is_an_unchanged_skip() {
+    let (result, cb) = feed_level_304_in(false).await;
+
+    assert_eq!(result.resources_produced, 0);
+    assert_eq!(result.errors, 0);
+    assert_eq!(result.resources_skipped, 1);
+    assert!(cb.resources.is_empty());
     assert_eq!(cb.skipped.len(), 1);
     assert_eq!(cb.skipped[0].1, SkipReason::Unchanged);
+    assert_eq!(
+        cb.skipped[0].0.as_str(),
+        "https://feed.example.com/feed.xml",
+        "and it is the feed document itself that is reported"
+    );
 }
 
 /// A feed-level 404/410 is a complete no-op: zero errors, zero skips, zero
@@ -563,6 +667,7 @@ async fn iso_8859_1_fixture_decodes_correctly() {
             bytes: xml,
             content_type: None,
             etag: None,
+            last_modified: None,
             final_url: None,
         },
     );
@@ -602,6 +707,7 @@ async fn windows_1251_fixture_decodes_correctly() {
             bytes: xml,
             content_type: None,
             etag: None,
+            last_modified: None,
             final_url: None,
         },
     );
@@ -2228,5 +2334,257 @@ async fn single_doc_byline_inherits_feed_level_author() {
     assert!(
         text.contains("By Entry Author"),
         "the entry that declares its own author keeps it: {text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Feed-document conditional GET (sources.feed_etag / feed_last_modified)
+// ---------------------------------------------------------------------------
+//
+// The feed document itself never becomes a `Resource` in discovery mode, so
+// these validators live on the source row rather than a `resources` row (see
+// specs/02-domain-model.md's Feed connector, "Conditional GET and pruning").
+// `IngestSource::document_validators` carries what's stored in; a run
+// reports what it observed back via `IngestResult::document_validators` for
+// `run_source_ingestion` to thread into `IngestionResult` and `job_exec` to
+// persist.
+
+#[tokio::test]
+async fn feed_document_fetch_sends_stored_validators() {
+    let feed_xml = rss2_feed("", "");
+    let mut script = HashMap::new();
+    script.insert(
+        "https://feed.example.com/feed.xml".to_string(),
+        ScriptedOutcome::text(&feed_xml),
+    );
+    let (ingestor, fetcher) = ingestor_with(script);
+    let source = source_with_validators(
+        "https://feed.example.com/feed.xml",
+        true,
+        FetchMetadata {
+            etag: Some("\"stored-etag\"".to_string()),
+            last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string()),
+        },
+    );
+    let mut cb = RecordingCallback::default();
+    ingestor.ingest(&source, &mut cb).await.unwrap();
+
+    let sent = fetcher
+        .last_received_for("https://feed.example.com/feed.xml")
+        .expect("the feed document must have been fetched");
+    assert_eq!(
+        sent.etag.as_deref(),
+        Some("\"stored-etag\""),
+        "the stored ETag must be replayed on the feed document's own fetch"
+    );
+    assert_eq!(
+        sent.last_modified.as_deref(),
+        Some("Wed, 21 Oct 2015 07:28:00 GMT")
+    );
+}
+
+#[tokio::test]
+async fn feed_document_200_reports_response_validators() {
+    let feed_xml = rss2_feed("", "");
+    let mut script = HashMap::new();
+    script.insert(
+        "https://feed.example.com/feed.xml".to_string(),
+        ScriptedOutcome::text_with_validators(
+            &feed_xml,
+            "\"fresh-etag\"",
+            "Thu, 22 Oct 2015 07:28:00 GMT",
+        ),
+    );
+    let (ingestor, _fetcher) = ingestor_with(script);
+    let source = source_for("https://feed.example.com/feed.xml", None, true);
+    let mut cb = RecordingCallback::default();
+    let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+    assert_eq!(
+        result.document_validators,
+        Some(FetchMetadata {
+            etag: Some("\"fresh-etag\"".to_string()),
+            last_modified: Some("Thu, 22 Oct 2015 07:28:00 GMT".to_string()),
+        }),
+        "a 200 must report the response's own validators for persistence"
+    );
+}
+
+/// The asymmetry between a 200 and a 304, pinned on its riskier half. A 304
+/// carries no body, so silence about a validator means "unchanged" and the
+/// stored value is kept. A 200 is a complete fresh representation, so
+/// silence means the origin is no longer offering that validator and the
+/// stored value must be cleared — otherwise the next run replays a validator
+/// this origin never issued, and an origin that answers `412`/`200` to a
+/// stale `If-None-Match` would be sent one indefinitely.
+///
+/// Every other 200 test starts from nothing stored, so all of them would
+/// still pass if the clearing were dropped and a 200 merely folded like a
+/// 304 does.
+#[tokio::test]
+async fn feed_document_200_without_validators_clears_the_stored_ones() {
+    let feed_xml = rss2_feed("", "");
+    let mut script = HashMap::new();
+    script.insert(
+        "https://feed.example.com/feed.xml".to_string(),
+        ScriptedOutcome::text(&feed_xml),
+    );
+    let (ingestor, _fetcher) = ingestor_with(script);
+    let source = source_with_validators(
+        "https://feed.example.com/feed.xml",
+        true,
+        FetchMetadata {
+            etag: Some("\"stale-etag\"".to_string()),
+            last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string()),
+        },
+    );
+    let mut cb = RecordingCallback::default();
+    let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+    assert_eq!(
+        result.document_validators,
+        Some(FetchMetadata {
+            etag: None,
+            last_modified: None,
+        }),
+        "a headerless 200 must report an empty FetchMetadata — `Some` so the \
+         stored validators are replaced, and empty so they are cleared rather \
+         than folded"
+    );
+}
+
+#[tokio::test]
+async fn feed_document_bare_304_reports_nothing() {
+    let mut script = HashMap::new();
+    script.insert(
+        "https://feed.example.com/feed.xml".to_string(),
+        ScriptedOutcome::NotModified {
+            etag: None,
+            last_modified: None,
+        },
+    );
+    let (ingestor, _fetcher) = ingestor_with(script);
+    let source = source_with_validators(
+        "https://feed.example.com/feed.xml",
+        true,
+        FetchMetadata {
+            etag: Some("\"stored-etag\"".to_string()),
+            last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string()),
+        },
+    );
+    let mut cb = RecordingCallback::default();
+    let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+    assert_eq!(
+        result.document_validators, None,
+        "a bare 304 must report nothing, so the stored row is left untouched"
+    );
+}
+
+#[tokio::test]
+async fn feed_document_304_with_refreshed_etag_folds_over_stored_last_modified() {
+    let mut script = HashMap::new();
+    script.insert(
+        "https://feed.example.com/feed.xml".to_string(),
+        ScriptedOutcome::NotModified {
+            etag: Some("\"rotated-etag\"".to_string()),
+            last_modified: None,
+        },
+    );
+    let (ingestor, _fetcher) = ingestor_with(script);
+    let source = source_with_validators(
+        "https://feed.example.com/feed.xml",
+        true,
+        FetchMetadata {
+            etag: Some("\"stored-etag\"".to_string()),
+            last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string()),
+        },
+    );
+    let mut cb = RecordingCallback::default();
+    let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+    assert_eq!(
+        result.document_validators,
+        Some(FetchMetadata {
+            etag: Some("\"rotated-etag\"".to_string()),
+            last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string()),
+        }),
+        "a 304 that rotated only the ETag must fold in the stored Last-Modified \
+         rather than reporting it cleared"
+    );
+}
+
+#[tokio::test]
+async fn feed_document_304_with_refreshed_last_modified_folds_over_stored_etag() {
+    let mut script = HashMap::new();
+    script.insert(
+        "https://feed.example.com/feed.xml".to_string(),
+        ScriptedOutcome::NotModified {
+            etag: None,
+            last_modified: Some("Thu, 22 Oct 2015 07:28:00 GMT".to_string()),
+        },
+    );
+    let (ingestor, _fetcher) = ingestor_with(script);
+    let source = source_with_validators(
+        "https://feed.example.com/feed.xml",
+        true,
+        FetchMetadata {
+            etag: Some("\"stored-etag\"".to_string()),
+            last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string()),
+        },
+    );
+    let mut cb = RecordingCallback::default();
+    let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+    assert_eq!(
+        result.document_validators,
+        Some(FetchMetadata {
+            etag: Some("\"stored-etag\"".to_string()),
+            last_modified: Some("Thu, 22 Oct 2015 07:28:00 GMT".to_string()),
+        }),
+        "a 304 that rotated only Last-Modified must fold in the stored ETag \
+         rather than reporting it cleared"
+    );
+}
+
+#[tokio::test]
+async fn single_document_mode_stamps_feed_validators_onto_its_resource() {
+    let feed_xml = rss2_feed("", "");
+    let mut script = HashMap::new();
+    script.insert(
+        "https://feed.example.com/feed.xml".to_string(),
+        ScriptedOutcome::text_with_validators(
+            &feed_xml,
+            "\"doc-etag\"",
+            "Fri, 23 Oct 2015 07:28:00 GMT",
+        ),
+    );
+    let (ingestor, _fetcher) = ingestor_with(script);
+    // Single-doc mode: `fetch_full_content: false`.
+    let source = source_for("https://feed.example.com/feed.xml", None, false);
+    let mut cb = RecordingCallback::default();
+    let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+    assert_eq!(result.resources_produced, 1);
+    assert_eq!(cb.resources.len(), 1);
+    assert_eq!(
+        cb.resources[0].external_etag.as_deref(),
+        Some("\"doc-etag\""),
+        "the feed document's own validators belong on its Resource in single-doc mode"
+    );
+    assert_eq!(
+        cb.resources[0].external_last_modified.as_deref(),
+        Some("Fri, 23 Oct 2015 07:28:00 GMT")
+    );
+    // Discovery-mode's `sources.feed_etag`/`feed_last_modified` reporting is
+    // orthogonal to this — single-doc mode still reports via
+    // `result.document_validators` too, since the fetch that produced this
+    // Resource is the same fetch of the feed document.
+    assert_eq!(
+        result.document_validators,
+        Some(FetchMetadata {
+            etag: Some("\"doc-etag\"".to_string()),
+            last_modified: Some("Fri, 23 Oct 2015 07:28:00 GMT".to_string()),
+        })
     );
 }

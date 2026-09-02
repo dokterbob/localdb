@@ -103,9 +103,17 @@ impl Ingestor for FeedIngestor {
 
         let mut result = IngestResult::default();
 
+        // Replay whatever validators are stored on the source's own
+        // `sources.feed_etag`/`feed_last_modified` row — the feed document
+        // never becomes a `Resource`, so it has no `resources` row of its
+        // own to carry them (specs/02-domain-model.md's Feed connector,
+        // "Conditional GET and pruning"). Unlike entry-page replay
+        // (`IngestCallback::lookup_fetch_metadata`), this has no
+        // `policy_version` gate: the columns carry no policy_version of
+        // their own to compare against.
         let fetch_result = match self
             .feed_fetcher
-            .fetch(&feed_url, &FetchMetadata::default())
+            .fetch(&feed_url, &source.document_validators)
             .await
         {
             Ok(r) => r,
@@ -136,19 +144,76 @@ impl Ingestor for FeedIngestor {
         // those pinned to the *configured* URL is what stops a transient
         // redirect-target change from re-keying every link-less entry (see
         // specs/02-domain-model.md's "Feed connector" section).
-        let (bytes, effective_feed_url) = match fetch_result {
+        let (bytes, effective_feed_url, document_etag, document_last_modified) = match fetch_result
+        {
             FetchResult::Downloaded {
-                bytes, final_url, ..
-            } => (bytes, final_url.unwrap_or_else(|| feed_url.clone())),
-            FetchResult::NotModified {
-                etag: _,
-                last_modified: _,
+                bytes,
+                final_url,
+                etag,
+                last_modified,
+                ..
             } => {
+                // A 200 is a full, fresh representation: whatever validators
+                // it carries — even neither — fully replace what was stored,
+                // exactly like `url_pipeline::process_url`'s capture-on-200
+                // does for a resource's own `external_etag`/
+                // `external_last_modified`. Unlike a 304 there is nothing to
+                // fold: silence here means the origin isn't offering that
+                // validator any more, not "unchanged".
+                result.document_validators = Some(FetchMetadata {
+                    etag: etag.clone(),
+                    last_modified: last_modified.clone(),
+                });
+                (
+                    bytes,
+                    final_url.unwrap_or_else(|| feed_url.clone()),
+                    etag,
+                    last_modified,
+                )
+            }
+            FetchResult::NotModified {
+                etag,
+                last_modified,
+            } => {
+                // RFC 9111: a bare 304 (both `None`) means "unchanged" and
+                // must not be reported at all, so the stored row is left
+                // untouched. A 304 that rotated only one validator says
+                // nothing about the other — fold it over what was already
+                // sent (`source.document_validators`, the same values this
+                // fetch replayed) rather than reporting a partial value that
+                // would read as "clear it".
+                if etag.is_some() || last_modified.is_some() {
+                    result.document_validators = Some(FetchMetadata {
+                        etag: etag.or_else(|| source.document_validators.etag.clone()),
+                        last_modified: last_modified
+                            .or_else(|| source.document_validators.last_modified.clone()),
+                    });
+                }
                 // The "feed 304 => zero per-entry callbacks" case the core
-                // sweep exemption for `SourceSpec::Feed` protects: a single
-                // `Unchanged` skip, no entry-level callbacks at all.
-                callback.on_skipped(&feed_uri, SkipReason::Unchanged).await;
-                result.resources_skipped += 1;
+                // sweep exemption for `SourceSpec::Feed` protects.
+                //
+                // Whether the feed document is a *document* depends on the
+                // mode, and only on the mode. In single-document mode it is
+                // the source's one resource, so a 304 on it is an ordinary
+                // unchanged skip and is reported as one. In discovery mode it
+                // never becomes a `Resource` at all, so reporting it here
+                // would count a document that does not exist: `on_skipped`
+                // increments `docs_seen` and `docs_skipped` and emits a full
+                // `DocumentStarted`/`DocumentFinished` pair, and those
+                // counters partition `docs_seen`
+                // (specs/04-search-pipeline.md). Since a healthy feed 304s on
+                // every run, that phantom would be the steady state rather
+                // than an edge — the same leak the rejected phantom
+                // zero-chunk `resources` row would have caused, one layer up
+                // (specs/02-domain-model.md, "Conditional GET and pruning").
+                //
+                // Nothing else needs the callback in discovery mode: the
+                // feed URI is not one of the source's owned URIs, so leaving
+                // it out of `seen` changes no sweep decision.
+                if !fetch_full_content {
+                    callback.on_skipped(&feed_uri, SkipReason::Unchanged).await;
+                    result.resources_skipped += 1;
+                }
                 return Ok(result);
             }
             FetchResult::Gone => {
@@ -378,7 +443,7 @@ impl Ingestor for FeedIngestor {
                 provenance_source: Some(feed_url.clone()),
                 capture_conditional_get: false,
             };
-            let resource = build_resource(
+            let mut resource = build_resource(
                 source,
                 IngestorKind::Feed,
                 &feed_uri,
@@ -389,6 +454,20 @@ impl Ingestor for FeedIngestor {
                 Some("text/markdown".to_string()),
                 &enrichment,
             );
+            // Single-doc mode's `Resource` *is* the feed document, so its
+            // own `resources.external_etag`/`external_last_modified` are a
+            // natural home for the validators this fetch just observed.
+            // Both modes still report them upward into
+            // `sources.feed_etag`/`feed_last_modified` as well, and that
+            // copy — not this one — is what the next run replays, in either
+            // mode; the `sources` columns are simply the *only* possible
+            // home in discovery mode, where no `Resource` exists to carry
+            // them. `document_etag`/`document_last_modified` are only
+            // ever populated by a `Downloaded` response — `NotModified`
+            // returns early above, before this branch runs at all — so this
+            // always mirrors a fresh 200, never a folded 304 value.
+            resource.external_etag = document_etag;
+            resource.external_last_modified = document_last_modified;
             callback.on_resource(resource).await?;
             result.resources_produced += 1;
         }

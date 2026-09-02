@@ -85,6 +85,16 @@ impl StoreBackend for FakeBackend {
     ) -> Result<Option<SourceRow>, Error> {
         unimplemented!("not exercised by list_documents")
     }
+
+    async fn update_source_feed_cache(
+        &self,
+        _id: &str,
+        _feed_etag: Option<&str>,
+        _feed_last_modified: Option<&str>,
+        _feed_inputs_digest: Option<&str>,
+    ) -> Result<bool, Error> {
+        unimplemented!("not exercised by list_documents")
+    }
     async fn find_document(
         &self,
         _doc_id: &str,

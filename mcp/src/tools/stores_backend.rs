@@ -93,6 +93,16 @@ impl StoreBackend for StoresBackend {
         unimplemented!("not exercised via get_document")
     }
 
+    async fn update_source_feed_cache(
+        &self,
+        _id: &str,
+        _feed_etag: Option<&str>,
+        _feed_last_modified: Option<&str>,
+        _feed_inputs_digest: Option<&str>,
+    ) -> Result<bool, Error> {
+        unimplemented!("not exercised via get_document")
+    }
+
     async fn find_document(
         &self,
         doc_id: &str,

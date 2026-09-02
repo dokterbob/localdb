@@ -39,7 +39,8 @@ use localdb_core::{
     chunker::ChunkerConfig,
     config::{policy::compute_policy_version, schema::RawConfig},
     ingestion::{
-        run_source_ingestion, DeletionPolicy, DocumentIndex, IngestionConfig, SourceIngestionDeps,
+        run_source_ingestion, DeletionPolicy, DocumentIndex, FetchMetadata, IngestionConfig,
+        SourceIngestionDeps,
     },
     ingestor::Ingestor,
     source_row_to_source, Embedder, Error, IndexJobScope, IndexJobStats, ProgressSink, SourceRow,
@@ -283,6 +284,18 @@ pub async fn run_job(
             &entry_fetcher,
         );
 
+        // The feed document's own conditional-GET validators (distinct from
+        // an entry's per-resource ones): read directly off the `SourceRow`
+        // this loop already holds, mirroring `source_row_to_source(rt_source)`
+        // just above rather than adding a lookup `run_source_ingestion`
+        // itself has no store handle to perform. Harmless for path/url
+        // sources — `feed_etag`/`feed_last_modified` are never populated for
+        // them, and only `FeedIngestor` ever reads this field.
+        let document_validators = FetchMetadata {
+            etag: rt_source.feed_etag.clone(),
+            last_modified: rt_source.feed_last_modified.clone(),
+        };
+
         let source_deps = SourceIngestionDeps {
             doc_index: &mut doc_index,
             store: handle.as_ref(),
@@ -290,6 +303,8 @@ pub async fn run_job(
             config: &cfg,
             progress: progress.clone(),
             deletion,
+            document_validators,
+            stored_inputs_digest: rt_source.feed_inputs_digest.clone(),
         };
 
         match run_source_ingestion(&source, ingestor.as_ref(), source_deps).await {
@@ -303,6 +318,77 @@ pub async fn run_job(
                 stats.chunks_written += r.chunks_written;
                 stats.unsupported_format_count += r.unsupported_format_count;
                 stats.error_count += r.error_count;
+
+                // Mirrors the `policy_version` self-heal above: a cache-state
+                // write, never allowed to fail the run. `r.document_validators`
+                // is `None` for every non-feed source and for a feed run that
+                // left the stored validators untouched (a bare 304, or no
+                // document fetch at all this run).
+                //
+                // The inputs digest rides along in the same write rather than
+                // being persisted separately, because the two are one fact:
+                // "these validators were captured under these inputs". A
+                // digest written without fresh validators — after a fetch
+                // error, say — would declare the stored validators
+                // trustworthy under inputs nothing was ever reprocessed
+                // under, and the next run would replay them, 304, and skip
+                // the entry loop. That is exactly the failure the digest
+                // exists to prevent.
+                //
+                // Update-only, not `upsert_source`: this row was snapshotted
+                // when the job started, and a `source delete` landing since
+                // would make an upsert re-insert it — silently resurrecting
+                // a source the scheduler has already unregistered.
+                //
+                // `error_count == 0` extends the same pairing rule from the
+                // fetch to the run as a whole. A run whose feed document read
+                // fine but whose entry pass left an entry unindexed — a link
+                // that timed out, an index write that failed — is not
+                // reflected in the store, yet the feed XML listing that entry
+                // is unchanged. Storing its validators would let the next run
+                // 304 and never retry: the entry stays stranded until the feed
+                // document itself changes, which for an aging entry can be
+                // indefinitely. Withholding them costs a full feed-document
+                // refetch on each run while a broken entry persists — the
+                // cheap half of the work, since the entries' own
+                // resource-level validators still spare the expensive half.
+                // Gated here, in the one place that already pairs validators
+                // with the digest, so it covers pipeline-side failures as well
+                // as fetch ones.
+                if let Some(validators) = &r.document_validators {
+                    if r.error_count > 0 {
+                        tracing::debug!(
+                            "job_exec: source '{}' finished with {} error(s); withholding its \
+                             refreshed feed validators so the next run refetches the feed \
+                             document and retries the entries that failed",
+                            rt_source.id,
+                            r.error_count
+                        );
+                    } else {
+                        match backend
+                            .update_source_feed_cache(
+                                &rt_source.id,
+                                validators.etag.as_deref(),
+                                validators.last_modified.as_deref(),
+                                r.document_inputs_digest.as_deref(),
+                            )
+                            .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => tracing::debug!(
+                                "job_exec: source '{}' was deleted during the run; \
+                                 its refreshed feed validators have nowhere to go",
+                                rt_source.id
+                            ),
+                            Err(e) => tracing::warn!(
+                                "job_exec: failed to persist refreshed feed validators for \
+                                 source '{}': {}",
+                                rt_source.id,
+                                e
+                            ),
+                        }
+                    }
+                }
             }
             Err(e) => {
                 stats.error_count += 1;

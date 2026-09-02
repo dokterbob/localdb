@@ -717,6 +717,9 @@ mod tests {
             refresh: None,
             created_at: now_rfc3339(),
             config_json: None,
+            feed_etag: None,
+            feed_last_modified: None,
+            feed_inputs_digest: None,
         }
     }
 

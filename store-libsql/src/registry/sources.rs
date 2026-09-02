@@ -17,8 +17,9 @@ pub(crate) async fn upsert_source(db: &LibsqlDb, source: &SourceRow) -> Result<(
     })?;
     conn.execute(
         "INSERT INTO sources (id, store_id, kind, root, url, include, exclude,
-                preset, refresh, created_at, config_json)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                preset, refresh, created_at, config_json, feed_etag, feed_last_modified,
+                feed_inputs_digest)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                  store_id = excluded.store_id,
                  kind = excluded.kind,
@@ -28,7 +29,22 @@ pub(crate) async fn upsert_source(db: &LibsqlDb, source: &SourceRow) -> Result<(
                  exclude = excluded.exclude,
                  preset = excluded.preset,
                  refresh = excluded.refresh,
-                 config_json = excluded.config_json",
+                 config_json = excluded.config_json,
+                 -- A stored feed-document validator is only meaningful
+                 -- against the origin that issued it. `IS`, not `=`, so a
+                 -- path/url source's NULL url compares equal to itself
+                 -- instead of making the whole CASE unknown. Any caller
+                 -- that upserts an existing source id with a changed url
+                 -- gets both columns nulled here regardless of what it
+                 -- passed for them — the one enforcement point for every
+                 -- current and future writer, rather than a rule each
+                 -- caller must separately remember.
+                 feed_etag = CASE WHEN sources.url IS excluded.url
+                     THEN excluded.feed_etag ELSE NULL END,
+                 feed_last_modified = CASE WHEN sources.url IS excluded.url
+                     THEN excluded.feed_last_modified ELSE NULL END,
+                 feed_inputs_digest = CASE WHEN sources.url IS excluded.url
+                     THEN excluded.feed_inputs_digest ELSE NULL END",
         libsql::params![
             source.id.clone(),
             source.store_id.clone(),
@@ -41,6 +57,9 @@ pub(crate) async fn upsert_source(db: &LibsqlDb, source: &SourceRow) -> Result<(
             source.refresh.clone(),
             source.created_at.clone(),
             source.config_json.clone(),
+            source.feed_etag.clone(),
+            source.feed_last_modified.clone(),
+            source.feed_inputs_digest.clone(),
         ],
     )
     .await
@@ -55,6 +74,39 @@ pub(crate) async fn upsert_source(db: &LibsqlDb, source: &SourceRow) -> Result<(
         }
     })?;
     Ok(())
+}
+
+/// Update-only counterpart to [`upsert_source`] for the three feed
+/// transport-cache columns. Returns whether a row matched.
+///
+/// A plain `UPDATE`, not an upsert: the caller is an index job persisting
+/// state derived from a `SourceRow` it snapshotted at the start of the run,
+/// and a `source delete` landing in between would make an upsert re-insert
+/// the row it had just removed. Zero rows affected is that race and is
+/// reported as `Ok(false)`, not an error.
+pub(crate) async fn update_source_feed_cache(
+    db: &LibsqlDb,
+    id: &str,
+    feed_etag: Option<&str>,
+    feed_last_modified: Option<&str>,
+    feed_inputs_digest: Option<&str>,
+) -> Result<bool, Error> {
+    let conn = db.writer().await;
+    let n = conn
+        .execute(
+            "UPDATE sources
+                 SET feed_etag = ?, feed_last_modified = ?, feed_inputs_digest = ?
+                 WHERE id = ?",
+            libsql::params![
+                feed_etag.map(str::to_string),
+                feed_last_modified.map(str::to_string),
+                feed_inputs_digest.map(str::to_string),
+                id.to_string(),
+            ],
+        )
+        .await
+        .map_err(map_libsql_err)?;
+    Ok(n > 0)
 }
 
 pub(crate) async fn delete_source(db: &LibsqlDb, id: &str) -> Result<bool, Error> {
@@ -86,7 +138,7 @@ pub(crate) async fn get_source(db: &LibsqlDb, id: &str) -> Result<Option<SourceR
     let conn = db.reader();
     let mut rows = conn
         .query(
-            "SELECT id, store_id, kind, root, url, include, exclude, preset, refresh, created_at, config_json
+            "SELECT id, store_id, kind, root, url, include, exclude, preset, refresh, created_at, config_json, feed_etag, feed_last_modified, feed_inputs_digest
                  FROM sources WHERE id = ?",
             libsql::params![id.to_string()],
         )
@@ -102,7 +154,7 @@ pub(crate) async fn list_sources(db: &LibsqlDb, store_id: &str) -> Result<Vec<So
     let conn = db.reader();
     let mut rows = conn
         .query(
-            "SELECT id, store_id, kind, root, url, include, exclude, preset, refresh, created_at, config_json
+            "SELECT id, store_id, kind, root, url, include, exclude, preset, refresh, created_at, config_json, feed_etag, feed_last_modified, feed_inputs_digest
                  FROM sources WHERE store_id = ? ORDER BY created_at",
             libsql::params![store_id.to_string()],
         )
@@ -123,7 +175,7 @@ pub(crate) async fn find_source_by_root_or_url(
     let conn = db.reader();
     let mut rows = conn
         .query(
-            "SELECT id, store_id, kind, root, url, include, exclude, preset, refresh, created_at, config_json
+            "SELECT id, store_id, kind, root, url, include, exclude, preset, refresh, created_at, config_json, feed_etag, feed_last_modified, feed_inputs_digest
                  FROM sources WHERE store_id = ? AND (root = ? OR url = ?) LIMIT 1",
             libsql::params![store_id.to_string(), value.to_string(), value.to_string()],
         )

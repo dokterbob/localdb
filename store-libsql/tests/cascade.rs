@@ -60,6 +60,9 @@ async fn seed_store(db: &SqliteBackend, store_id: &str, n_chunks: usize) {
         refresh: None,
         created_at: "2026-06-25T12:00:00Z".to_string(),
         config_json: None,
+        feed_etag: None,
+        feed_last_modified: None,
+        feed_inputs_digest: None,
     })
     .await
     .unwrap();
@@ -240,6 +243,9 @@ async fn delete_feed_source_cascades_to_documents_and_chunks() {
         refresh: Some("24h".to_string()),
         created_at: "2026-06-25T12:00:00Z".to_string(),
         config_json: Some(r#"{"max_entries":null,"fetch_full_content":true}"#.to_string()),
+        feed_etag: None,
+        feed_last_modified: None,
+        feed_inputs_digest: None,
     })
     .await
     .unwrap();

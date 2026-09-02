@@ -636,6 +636,12 @@ impl AppState {
             refresh: refresh.map(|s| s.to_string()),
             created_at: now_rfc3339(),
             config_json,
+            // A freshly created source has no prior conditional-GET history
+            // to replay — only `job_exec`'s validator-refresh persistence
+            // hop ever writes these columns, against an existing row.
+            feed_etag: None,
+            feed_last_modified: None,
+            feed_inputs_digest: None,
         };
         self.inner.backend.upsert_source(&source_row).await?;
 
