@@ -361,7 +361,11 @@ impl HttpUrlFetcher {
         let status = response.status();
 
         if status == StatusCode::NOT_MODIFIED {
-            return Ok(FetchResult::NotModified);
+            let (etag, last_modified) = Self::extract_validators(&response);
+            return Ok(FetchResult::NotModified {
+                etag,
+                last_modified,
+            });
         }
 
         if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
@@ -411,17 +415,7 @@ impl HttpUrlFetcher {
 
         let final_url = effective_url.to_string();
 
-        let etag = response
-            .headers()
-            .get("etag")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-
-        let last_modified = response
-            .headers()
-            .get("last-modified")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+        let (etag, last_modified) = Self::extract_validators(&response);
 
         let content_type = response
             .headers()
@@ -447,6 +441,43 @@ impl HttpUrlFetcher {
             last_modified,
             final_url: Some(final_url),
         })
+    }
+
+    /// Read the `ETag` and `Last-Modified` validators off a response,
+    /// verbatim — no trimming, unquoting, or weak-prefix (`W/`)
+    /// normalization. Shared by both the 200 arm (validators to remember for
+    /// the *next* conditional request) and the 304 arm (validators the
+    /// origin just rotated, which RFC 9111 requires storing) so the two
+    /// extractions can never drift apart. Values are replayed byte-exact in
+    /// a later `If-None-Match`/`If-Modified-Since`; normalizing them here
+    /// would silently break conditional GET against origins that use weak
+    /// validators.
+    ///
+    /// One fidelity limit, inherent to returning `String`: a header carrying
+    /// RFC 9110 obs-text (bytes 0x80-0xFF) is legal to receive but is not
+    /// valid UTF-8, so `to_str()` rejects it and the validator comes back
+    /// `None` rather than as a value the origin would not recognize. Both
+    /// arms then fail toward extra work rather than toward staleness, by
+    /// different routes: on the 200 arm the `None` replaces whatever was
+    /// stored, since a 200 is a full fresh representation, so the next
+    /// request goes out unconditional. On the 304 arm it folds, leaving the
+    /// stored validator untouched, so the next request stays conditional
+    /// against a value the origin does still recognize. Neither route can
+    /// produce a 304 against a representation this store never indexed.
+    fn extract_validators(response: &reqwest::Response) -> (Option<String>, Option<String>) {
+        let etag = response
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        let last_modified = response
+            .headers()
+            .get("last-modified")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        (etag, last_modified)
     }
 
     /// Map the retry loop's terminal `Result` to `fetch`'s own return type —
@@ -682,7 +713,264 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(matches!(result, FetchResult::NotModified));
+        assert!(matches!(result, FetchResult::NotModified { .. }));
+    }
+
+    /// RFC 9111 allows an origin to rotate its `ETag` on a 304 even though
+    /// the body is unchanged; the new value must come through byte-exact so
+    /// the *next* conditional request replays it rather than the stale one
+    /// that was actually sent. Uses a value distinct from the request's
+    /// `If-None-Match` to prove this is the response's own header, not an
+    /// echo of what was sent.
+    #[tokio::test]
+    async fn test_304_carries_rotated_etag_verbatim() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/doc"))
+            .and(header("If-None-Match", "\"v1\""))
+            .respond_with(ResponseTemplate::new(304).insert_header("etag", "\"v2\""))
+            .mount(&server)
+            .await;
+
+        let fetcher = HttpUrlFetcher::new().expect("HttpUrlFetcher::new should succeed in tests");
+        let meta = FetchMetadata {
+            etag: Some("\"v1\"".to_string()),
+            last_modified: None,
+        };
+        let result = fetcher
+            .fetch(&format!("{}/doc", server.uri()), &meta)
+            .await
+            .unwrap();
+
+        match result {
+            FetchResult::NotModified {
+                etag,
+                last_modified,
+            } => {
+                assert_eq!(etag.as_deref(), Some("\"v2\""));
+                assert_eq!(last_modified, None);
+            }
+            other => panic!("expected NotModified, got {other:?}"),
+        }
+    }
+
+    /// Same as above but with a weak validator (`W/` prefix) — proving the
+    /// extraction does not strip or normalize it. A weak validator is a
+    /// legitimate `ETag` shape (RFC 9110 §8.8.1); stripping the prefix would
+    /// turn it into a strong one and change its meaning to the origin on
+    /// the next conditional request.
+    #[tokio::test]
+    async fn test_304_carries_rotated_weak_etag_verbatim() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/doc"))
+            .and(header("If-None-Match", "\"v1\""))
+            .respond_with(ResponseTemplate::new(304).insert_header("etag", "W/\"v2\""))
+            .mount(&server)
+            .await;
+
+        let fetcher = HttpUrlFetcher::new().expect("HttpUrlFetcher::new should succeed in tests");
+        let meta = FetchMetadata {
+            etag: Some("\"v1\"".to_string()),
+            last_modified: None,
+        };
+        let result = fetcher
+            .fetch(&format!("{}/doc", server.uri()), &meta)
+            .await
+            .unwrap();
+
+        match result {
+            FetchResult::NotModified {
+                etag,
+                last_modified,
+            } => {
+                assert_eq!(etag.as_deref(), Some("W/\"v2\""));
+                assert_eq!(last_modified, None);
+            }
+            other => panic!("expected NotModified, got {other:?}"),
+        }
+    }
+
+    /// A bare 304 — no `ETag`, no `Last-Modified` — is the common case. Both
+    /// fields must come back `None`, which callers must read as "keep
+    /// whatever validator is already stored", not "clear it".
+    #[tokio::test]
+    async fn test_304_with_no_validators_is_both_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/doc"))
+            .and(header("If-None-Match", "\"v1\""))
+            .respond_with(ResponseTemplate::new(304))
+            .mount(&server)
+            .await;
+
+        let fetcher = HttpUrlFetcher::new().expect("HttpUrlFetcher::new should succeed in tests");
+        let meta = FetchMetadata {
+            etag: Some("\"v1\"".to_string()),
+            last_modified: None,
+        };
+        let result = fetcher
+            .fetch(&format!("{}/doc", server.uri()), &meta)
+            .await
+            .unwrap();
+
+        match result {
+            FetchResult::NotModified {
+                etag,
+                last_modified,
+            } => {
+                assert_eq!(etag, None);
+                assert_eq!(last_modified, None);
+            }
+            other => panic!("expected NotModified, got {other:?}"),
+        }
+    }
+
+    /// A 304 can carry only `Last-Modified` (no `ETag` in play at all) —
+    /// the two validators are independent and either can be present alone.
+    #[tokio::test]
+    async fn test_304_carries_only_last_modified() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/doc"))
+            .and(header_exists("If-Modified-Since"))
+            .respond_with(
+                ResponseTemplate::new(304)
+                    .insert_header("last-modified", "Thu, 22 Oct 2025 07:28:00 GMT"),
+            )
+            .mount(&server)
+            .await;
+
+        let fetcher = HttpUrlFetcher::new().expect("HttpUrlFetcher::new should succeed in tests");
+        let meta = FetchMetadata {
+            etag: None,
+            last_modified: Some("Wed, 21 Oct 2025 07:28:00 GMT".to_string()),
+        };
+        let result = fetcher
+            .fetch(&format!("{}/doc", server.uri()), &meta)
+            .await
+            .unwrap();
+
+        match result {
+            FetchResult::NotModified {
+                etag,
+                last_modified,
+            } => {
+                assert_eq!(etag, None);
+                assert_eq!(
+                    last_modified.as_deref(),
+                    Some("Thu, 22 Oct 2025 07:28:00 GMT")
+                );
+            }
+            other => panic!("expected NotModified, got {other:?}"),
+        }
+    }
+
+    /// Both validators on one 304. The two extractions are independent
+    /// today, so this pins that they stay independent: a refactor that
+    /// folded them into a single header walk could return one and drop the
+    /// other and every single-header test above would still pass.
+    #[tokio::test]
+    async fn test_304_carries_both_validators() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/doc"))
+            .respond_with(
+                ResponseTemplate::new(304)
+                    .insert_header("etag", "\"v2\"")
+                    .insert_header("last-modified", "Thu, 22 Oct 2025 07:28:00 GMT"),
+            )
+            .mount(&server)
+            .await;
+
+        let fetcher = HttpUrlFetcher::new().expect("HttpUrlFetcher::new should succeed in tests");
+        let meta = FetchMetadata {
+            etag: Some("\"v1\"".to_string()),
+            last_modified: Some("Wed, 21 Oct 2025 07:28:00 GMT".to_string()),
+        };
+        let result = fetcher
+            .fetch(&format!("{}/doc", server.uri()), &meta)
+            .await
+            .unwrap();
+
+        match result {
+            FetchResult::NotModified {
+                etag,
+                last_modified,
+            } => {
+                assert_eq!(etag.as_deref(), Some("\"v2\""));
+                assert_eq!(
+                    last_modified.as_deref(),
+                    Some("Thu, 22 Oct 2025 07:28:00 GMT")
+                );
+            }
+            other => panic!("expected NotModified, got {other:?}"),
+        }
+    }
+
+    /// Byte-exactness is the contract these validators rest on, and an
+    /// entity-tag is an opaque octet sequence (RFC 9110 §8.8.3) — case is
+    /// significant, unlike the header *name*. A well-meaning
+    /// `.to_lowercase()` or other case folding in the extraction chain would
+    /// leave every other test here passing, since their fixture values are
+    /// caseless; this one catches it.
+    ///
+    /// Note what is deliberately *not* asserted: leading and trailing
+    /// whitespace. RFC 9110 §5.5 excludes surrounding OWS from the field
+    /// value, and the HTTP layer strips it before this code sees the header,
+    /// so preserving it is neither possible nor ours to promise.
+    #[tokio::test]
+    async fn test_304_validator_case_is_preserved() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/doc"))
+            .respond_with(ResponseTemplate::new(304).insert_header("etag", "W/\"AbC-XyZ\""))
+            .mount(&server)
+            .await;
+
+        let fetcher = HttpUrlFetcher::new().expect("HttpUrlFetcher::new should succeed in tests");
+        let result = fetcher
+            .fetch(&format!("{}/doc", server.uri()), &FetchMetadata::default())
+            .await
+            .unwrap();
+
+        match result {
+            FetchResult::NotModified { etag, .. } => {
+                assert_eq!(etag.as_deref(), Some("W/\"AbC-XyZ\""));
+            }
+            other => panic!("expected NotModified, got {other:?}"),
+        }
+    }
+
+    /// An origin may answer 304 even though no conditional header was sent —
+    /// misconfigured, or an intermediary answering from its own cache. The
+    /// arm must still parse rather than depending on a request-side
+    /// precondition.
+    #[tokio::test]
+    async fn test_304_without_conditional_request_still_parses() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/doc"))
+            .respond_with(ResponseTemplate::new(304).insert_header("etag", "\"v9\""))
+            .mount(&server)
+            .await;
+
+        let fetcher = HttpUrlFetcher::new().expect("HttpUrlFetcher::new should succeed in tests");
+        let result = fetcher
+            .fetch(&format!("{}/doc", server.uri()), &FetchMetadata::default())
+            .await
+            .unwrap();
+
+        match result {
+            FetchResult::NotModified {
+                etag,
+                last_modified,
+            } => {
+                assert_eq!(etag.as_deref(), Some("\"v9\""));
+                assert_eq!(last_modified, None);
+            }
+            other => panic!("expected NotModified, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -705,7 +993,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(matches!(result, FetchResult::NotModified));
+        assert!(matches!(result, FetchResult::NotModified { .. }));
     }
 
     #[tokio::test]

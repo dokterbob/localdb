@@ -140,7 +140,10 @@ impl Ingestor for FeedIngestor {
             FetchResult::Downloaded {
                 bytes, final_url, ..
             } => (bytes, final_url.unwrap_or_else(|| feed_url.clone())),
-            FetchResult::NotModified => {
+            FetchResult::NotModified {
+                etag: _,
+                last_modified: _,
+            } => {
                 // The "feed 304 => zero per-entry callbacks" case the core
                 // sweep exemption for `SourceSpec::Feed` protects: a single
                 // `Unchanged` skip, no entry-level callbacks at all.

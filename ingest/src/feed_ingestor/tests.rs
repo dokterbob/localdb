@@ -47,7 +47,13 @@ enum ScriptedOutcome {
         etag: Option<String>,
         final_url: Option<String>,
     },
-    NotModified,
+    /// A bare `NotModified` (both fields `None`) is the common case — a
+    /// 304 that carried no validators of its own. Non-`None` fields script
+    /// a 304 that rotated its `ETag`/`Last-Modified`.
+    NotModified {
+        etag: Option<String>,
+        last_modified: Option<String>,
+    },
     Gone,
     /// The destination guard refused this URL — no connection was made.
     Blocked,
@@ -129,7 +135,13 @@ impl UrlFetcher for ScriptedFetcher {
                 last_modified: None,
                 final_url: final_url.clone(),
             }),
-            Some(ScriptedOutcome::NotModified) => Ok(FetchResult::NotModified),
+            Some(ScriptedOutcome::NotModified {
+                etag,
+                last_modified,
+            }) => Ok(FetchResult::NotModified {
+                etag: etag.clone(),
+                last_modified: last_modified.clone(),
+            }),
             Some(ScriptedOutcome::Gone) => Ok(FetchResult::Gone),
             Some(ScriptedOutcome::Blocked) => Ok(FetchResult::Blocked),
             None => Err(Error::Internal {
@@ -253,7 +265,10 @@ async fn feed_level_not_modified_is_single_unchanged_skip_no_entry_callbacks() {
     let mut script = HashMap::new();
     script.insert(
         "https://feed.example.com/feed.xml".to_string(),
-        ScriptedOutcome::NotModified,
+        ScriptedOutcome::NotModified {
+            etag: None,
+            last_modified: None,
+        },
     );
     let (ingestor, _fetcher) = ingestor_with(script);
     let source = source_for("https://feed.example.com/feed.xml", None, true);

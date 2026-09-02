@@ -18,7 +18,7 @@
 //! results a single attempt can produce:
 //!
 //!   - `Ok(FetchResult::Downloaded { .. })` — success; stop.
-//!   - `Ok(FetchResult::NotModified)` — 304; stop (never retried).
+//!   - `Ok(FetchResult::NotModified { .. })` — 304; stop (never retried).
 //!   - `Ok(FetchResult::Gone)` — 404/410; stop (never retried).
 //!   - `Ok(FetchResult::Blocked)` — the SSRF guard refused the destination,
 //!     either at the preflight check or by [`is_blocked_error`] recovering it
