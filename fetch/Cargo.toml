@@ -14,7 +14,7 @@ description = "HTTP URL fetcher implementation for localdb ingestion"
 name = "fetch"
 
 [dependencies]
-localdb-core = { path = "../core", version = "0.1.0" }
+localdb-core = { path = "../core", version = "0.2.0" }
 async-trait = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # Real dependency, not just dev: `destination::GuardedResolver` resolves names

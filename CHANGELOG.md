@@ -4,6 +4,56 @@ All notable changes to this project are documented in this file.
 
 The format follows [Common Changelog](https://common-changelog.org).
 
+## [0.2.0] - 2026-09-02
+
+### Added
+
+- Search filters on the CLI, HTTP, and MCP surfaces: scope a query by path, MIME type, and any
+  of the four date axes (index added, index updated, source-claimed modified, document date)
+  ([#298](https://github.com/dokterbob/localdb/pull/298),
+  [#303](https://github.com/dokterbob/localdb/pull/303))
+- Document date metadata: `dc:date` extraction from PDF, EPUB, feed entries, Office documents
+  (DOCX/PPTX), HTML, and Markdown front matter, persisted as `date_original`/`date_parsed`
+  alongside `external_id`/`external_etag`, and surfaced on `localdb document get`,
+  `GET /v1/documents/{id}` and MCP `get_document`/`list_documents`
+  ([#278](https://github.com/dokterbob/localdb/pull/278),
+  [#279](https://github.com/dokterbob/localdb/pull/279),
+  [#280](https://github.com/dokterbob/localdb/pull/280),
+  [#282](https://github.com/dokterbob/localdb/pull/282),
+  [#286](https://github.com/dokterbob/localdb/pull/286))
+- Metadata-aware incremental indexing: a metadata-only change (a corrected feed date, a PDF
+  info-dict edit, a front-matter tweak) now updates the stored record in place instead of
+  re-embedding unchanged content ([#281](https://github.com/dokterbob/localdb/pull/281))
+- Feed refresh now does real conditional GET: ETag/Last-Modified validators are captured and
+  replayed for both feed entries and the feed document itself, feed sources are registered with
+  the background refresh scheduler so a configured `refresh` interval actually polls, and a
+  bounded liveness sweep prunes feed entries confirmed gone (404/410) under `--delete`
+  ([#307](https://github.com/dokterbob/localdb/pull/307),
+  [#308](https://github.com/dokterbob/localdb/pull/308),
+  [#309](https://github.com/dokterbob/localdb/pull/309),
+  [#310](https://github.com/dokterbob/localdb/pull/310),
+  [#311](https://github.com/dokterbob/localdb/pull/311),
+  [#312](https://github.com/dokterbob/localdb/pull/312))
+- Schema migrations v7 (`resources.index_updated_at`) and v8 (conditional-GET and liveness
+  columns), applied via `localdb db migrate`
+  ([#279](https://github.com/dokterbob/localdb/pull/279),
+  [#307](https://github.com/dokterbob/localdb/pull/307))
+
+### Changed
+
+- `localdb init` writes a real config and no longer promises a first-run model download it never
+  performed ([#256](https://github.com/dokterbob/localdb/pull/256))
+- `--json` error envelopes now print to stdout instead of stderr, matching success output; stderr
+  is diagnostic-only in `--json` mode ([#263](https://github.com/dokterbob/localdb/pull/263))
+- Prereleases no longer publish to the Homebrew tap, so `brew install dokterbob/localdb/localdb`
+  always resolves to the latest stable release
+  ([#328](https://github.com/dokterbob/localdb/pull/328))
+
+### Fixed
+
+- `localdb search` no longer swallows flags typed after the query as literal query text
+  ([#296](https://github.com/dokterbob/localdb/pull/296))
+
 ## [0.1.0] - 2026-08-18
 
 _First release._
