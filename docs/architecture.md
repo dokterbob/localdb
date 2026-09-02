@@ -424,6 +424,15 @@ and that document is not re-extracted. Threading a real per-parser `extractor_ve
 skip-check would close that last axis and is a deferred follow-up (cross-ref
 [#47](https://github.com/dokterbob/localdb/issues/47)).
 
+Conditional GET widens what this gap costs for URL-backed resources, beyond the byte-identical case
+above.
+[specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md)
+§1 spells it out: an unchanged origin answers 304 before any parser touches the bytes, so a parser
+improvement cannot reach an already-indexed URL resource at all — not merely the ones whose output
+would have been identical. The conditional-header suppression rule there names `extractor_version`
+as its designated join point for exactly this reason; until the field carries a real value, only a
+`policy_version` bump reaches those resources.
+
 **9. Residual PDF-extraction gaps.** `extract/src/pdf.rs` repairs several classes of upstream
 extraction defect (see
 [specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md)
@@ -465,6 +474,12 @@ indexed stay indexed indefinitely, even after they scroll off the feed, until th
 removed (`source remove`, which still cascades normally). Pruning truly-dead entry URLs (404/410) is
 a follow-up issue.
 
+Pruning entries whose own links a probe confirms 404/410 is part of
+[#171](https://github.com/dokterbob/localdb/issues/171)'s liveness sweep (see
+[specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md)
+§1 "Aged-out feed entries: the liveness sweep"); the sweep-exemption itself is unaffected and stays
+exactly as described above.
+
 **11. Conditional-GET state (`ETag`) is captured only when a feed entry link is fetched, and even
 then it's never read back and reused; `Last-Modified` is not persisted at all.** `capture_etag` on
 `ResourceEnrichment` defaults to `false` (`ingest/src/url_pipeline.rs:120-123`), and every ordinary
@@ -484,6 +499,14 @@ exercised: every `localdb index` re-fetches every URL and every feed entry in fu
 `url` sources and the feed-root fetch (and threading it into `build_resource` for single-document
 mode), round-tripping the persisted `external_etag` (and adding `Last-Modified` persistence) into
 `FetchMetadata` on the next fetch, together with delete-on-404/410 pruning (previous item).
+
+That follow-up is [#171](https://github.com/dokterbob/localdb/issues/171): it adds
+`resources.external_last_modified` and persists/replays both validators for `url` sources and feed
+entry links, adds `sources.feed_etag`/`sources.feed_last_modified` so the feed-root fetch is
+conditional too (threaded into `build_resource` for single-document mode), subject to the
+`policy_version` suppression rule in
+[specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md)
+§1 "Incremental re-index".
 
 **12. A store containing a `kind = 'feed'` source cannot be opened by an older binary that predates
 the Feed ingestor.** `sources.ingestor_kind` decoding is a hard match over the known `IngestorKind`

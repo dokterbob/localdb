@@ -39,12 +39,82 @@ observes a state where the old chunks are gone but the new ones failed to land.
 
 Resources also carry:
 
-- **`external_etag`:** for URL sources, the server-supplied ETag or Last-Modified value; used for
-  conditional GET to avoid re-fetching unchanged content.
+- **`external_etag`/`external_last_modified`:** the two stored conditional-GET validators for URL
+  sources and feed entry links (`resources.external_etag`, `resources.external_last_modified`).
+  Whichever the origin supplied on the last successful fetch is replayed byte-exact — including
+  quotes and any `W/` weak-validator prefix — as `If-None-Match`/`If-Modified-Since` on the next
+  fetch of the same URI. A 304 response means the origin's own representation is unchanged: the
+  resource is skipped without re-download or re-extraction.
+
+  It says nothing, however, about metadata a **connector** supplies out of band — a feed's title,
+  byline and publication date for an entry, which arrive with every read of the feed regardless of
+  what that entry's link answers. That claim is re-merged onto the persisted metadata on a 304
+  (`IngestCallback::on_metadata_refreshed`) under the same merge rule the index-time path applies,
+  and persisted **only when the merged result actually differs** — an unchanged entry performs no
+  write at all, which is what keeps a 304 cheap in the common case. Without this a feed correcting
+  an entry's byline would never land for as long as the linked page itself stayed unchanged, which
+  for an aging entry is indefinitely. The merge rule is deliberately asymmetric and identical on
+  both paths: a connector title only fills a gap the extraction left, while byline, date and
+  provenance overwrite it — a feed knows an entry's author better than the linked page's markup
+  does, and does not know the page's title better than the page does. That gap-fill is not stamped,
+  though, so once it has happened a title the feed supplied is indistinguishable from one the page's
+  markup produced, and a feed that later corrects the title can never land the correction behind a
+  304 — the same missing-provenance shape `creator` has, and ticketed alongside it
+  ([#324](https://github.com/dokterbob/localdb/issues/324), pairing with
+  [#320](https://github.com/dokterbob/localdb/issues/320)).
+
+  The refreshed claim is **not** confined to `Metadata`. A connector also supplies the entry's
+  `modified_at` and its `external_id`, which are stored as their own resource columns rather than as
+  metadata fields, and `on_metadata_refreshed` takes both alongside the enrichment. Both are
+  overwrite-class and authoritative exactly as passed — `None` included, so a connector that stops
+  claiming a `modified_at` withdraws it — and both are `compute_metadata_hash` inputs, so each one
+  participates in the differs-or-not comparison that gates the write. A 304 whose feed moved only an
+  entry's `modified_at` is therefore a write; a 304 that brings nothing new across metadata,
+  `modified_at` and `external_id` alike is not.
+
+  RFC 9111 requires storing whichever validators a 304 response itself carries, so a 304 bearing a
+  refreshed `ETag`/`Last-Modified` still updates the stored columns. No re-chunk follows — the
+  content is unchanged by definition — but `metadata_hash` **is** recomputed and rewritten alongside
+  them, because `external_etag` is one of `compute_metadata_hash`'s own inputs ("Metadata-only
+  update" below). Leaving it stale would desync the in-memory `DocumentIndex` from what a
+  rehydration of that same row computes, and the next run would then read a `metadata_hash` mismatch
+  on a resource nothing had changed about and take the metadata-only-update branch for no reason.
+
+  > **Suppression rule (normative).** Conditional headers are sent **only** when the stored
+  > resource's `policy_version` equals the run's. A 304 returns no bytes, so a resource that would
+  > need re-chunking under a changed policy could never be re-chunked if it were allowed to
+  > answer 304. This reuses the exact signal the skip-check already gates on
+  > (`PipelineCallback::on_resource`). Any future axis that can force reprocessing without a content
+  > change — a real `extractor_version`, a `Resource.mime` change — must join this same suppression
+  > check; this is the designated join point.
+
+  Validators are keyed to the **configured** URI, never to a redirect target — consistent with the
+  feed connector's pinned-identity rule ([02-domain-model.md](02-domain-model.md), "Feed
+  connector"). Usually the cost is only a missed cache hit: the redirect target's own validator
+  would have matched, and instead the configured URI is refetched in full. It is not purely an
+  optimization, though. A validator is scoped to the resource that issued it, and this key replays
+  one issued by whatever the configured URI resolved to on the last run against whatever it resolves
+  to now. If the redirect target changes and the new target happens to answer with the same opaque
+  `ETag` value, the origin returns 304 about a representation our stored bytes never came from, and
+  the change stays invisible until one side's validator moves. That window is accepted as remote
+  rather than closed — a collision needs two distinct targets behind one URI to pick the same
+  validator string — but it is a staleness risk, not merely a lost cache hit.
+
 - **`extractor_version`:** a version stamp on the parser/block-conversion logic. When parser or
-  `markdown_to_blocks()` logic improves, bumping `extractor_version` enables selective reprocessing
-  of resources whose content has not changed but whose block representation may improve (without a
-  full policy-version reindex).
+  `markdown_to_blocks()` logic improves, bumping `extractor_version` would enable selective
+  reprocessing of resources whose content has not changed but whose block representation may improve
+  (without a full policy-version reindex). **Not implemented.** The field is hardcoded to `"1"` in
+  both ingestors and in `store-libsql`'s resource upsert, and the skip-check never reads it — see
+  [docs/architecture.md](../docs/architecture.md#known-gaps) gap #8, which owns this gap's status.
+
+  Conditional GET makes that gap cost more than gap #8's framing suggests, and the suppression rule
+  above is why. Gap #8 describes a missed re-extraction: a parser change that leaves the extracted
+  bytes identical does not re-index. With conditional headers in play the failure starts one step
+  earlier and is not limited to identical output — an unchanged origin answers 304 before any parser
+  runs at all, so a parser improvement cannot reach an already-indexed URL resource regardless of
+  what it would have produced. The suppression rule names `extractor_version` as a designated join
+  point precisely for this; until the field carries a real value there is nothing to join, and only
+  a `policy_version` bump reaches those resources.
 
 ### Metadata-only update
 
@@ -133,6 +203,141 @@ removes it normally under `--delete`.
 [#156](https://github.com/dokterbob/localdb/issues/156) (source level, zero URIs enumerated) and
 [#185](https://github.com/dokterbob/localdb/issues/185) (resource level, zero blocks extracted) are
 one conflation — "unavailable" mistaken for "legitimately empty" — one layer apart.
+
+### Aged-out feed entries: the liveness sweep
+
+The liveness sweep sits in the **confirmed-gone** bucket above, not the presumed-gone one — it never
+deletes on absence, only on a positively confirmed 404/410. The feed connector's exemption from the
+presumed-gone sweep is unchanged by this and remains correct: an entry scrolling off the feed window
+is still never, on its own, treated as a deletion signal.
+
+It runs **only** for `SourceSpec::Feed` sources, and **only** under `DeletionPolicy::Prune`
+(`--delete`). Unlike the ordinary delete-sweep, it can only learn anything by making a network
+request against each candidate's stored link, so — stated explicitly — there is no free
+`docs_prunable` preview signal for it on a retaining run: a retaining run performs zero liveness
+fetches, and reports nothing pruned or prunable for this mechanism.
+
+**Candidates:** resources with `ingestor_kind = 'feed'` and a non-`NULL` `external_id` that this run
+did not observe, ordered oldest `last_checked_at` first, with never-checked resources leading. It is
+bounded twice: a batch cap of **25 candidates per run per source**, and a recheck floor of
+`max(refresh_interval, 24h)` below which a resource is not re-probed at all, regardless of how long
+it has gone unobserved. A feed source with no `refresh_interval_secs` configured — the common case —
+therefore uses the bare 24h floor.
+
+**"Did not observe" is not "aged out of the window" (normative).** This section is named for the
+case it exists to serve, not for a precondition it can enforce. A run that read the feed's window
+and did not see an entry did watch that entry age out; a run whose feed document answered 304 fires
+zero entry callbacks and observed _nothing_, so every one of that source's entries is a candidate,
+including entries the window still lists. Nothing persists window membership, so the two cases are
+indistinguishable to the candidate query, and the sweep does not pretend otherwise. What makes that
+safe is that absence only selects who gets _probed_: the delete needs a 404/410 confirmed by the
+entry's own origin, and the mechanism as a whole needs `--delete`. The cost it accepts — an entry
+pruned this way is recreated from the feed's embedded content on the next run where the feed
+document changes, then pruned again — is stated with its ticket in
+[02-domain-model.md](02-domain-model.md) §2, "Conditional GET and pruning".
+
+**The feed's own document is never a candidate.** In single-document mode
+(`fetch_full_content: false`) the feed document itself is stored as a resource, under the feed URL,
+with `ingestor_kind = 'feed'` — and it is the one such resource carrying no `external_id`, since
+every discovered entry is stamped with the entry's own id. Were it a candidate, a 404/410 on the
+feed URL would delete the source's entire index through a mechanism meant to prune a single entry,
+so the candidate query requires `external_id IS NOT NULL`. A legacy row whose `external_id` was
+never captured is excluded by that same predicate and can therefore never be pruned by this
+mechanism: retention bias is the safe failure direction here, as it is throughout "Deletes" above.
+
+The batch cap counts candidates **actually probed**, not rows the store returned. The oldest-first
+query cannot see the run's in-memory seen-set, so applying the cap in SQL alone would let a run
+whose freshly-observed entries happen to sort oldest fill the whole batch with entries it had just
+seen and probe nothing at all. The query therefore over-fetches by the size of the seen-set, bounded
+by a fixed ceiling well above any realistic feed window, and the caller subtracts the seen-set
+before taking its 25. The ceiling is what keeps the query bounded: `max_entries` is optional and
+defaults to unbounded, so the seen-set has no principled size of its own.
+
+**Guards (normative).** The sweep inherits **one** of the presumed-gone sweep's two guards, not
+both, because the two sweeps infer different things from the same seen-set. The presumed-gone sweep
+deletes on absence, so an untrustworthy seen-set is an untrustworthy delete signal. Here absence
+only selects who gets _probed_; the delete needs a confirmed 404/410 from the origin. Probing an
+entry that is in fact still in the window costs one conditional request and deletes it only if that
+entry's own origin says it is gone ("Did not observe" above).
+
+- **Guard 1 — incomplete enumeration — still suppresses the sweep entirely.** A run that could not
+  read the source's window knows nothing about which entries it holds, so every previously indexed
+  URI would become a candidate and the source's whole document set would queue for probing, 25 per
+  run, off a signal already known to be broken.
+- **Guard 2 — the zero-seen backstop — does not apply.** A run whose feed document answered 304
+  fires zero entry callbacks, so its seen-set is empty ([02-domain-model.md](02-domain-model.md),
+  "Conditional GET and pruning"); the sweep runs anyway. Suppressing it there starves the mechanism
+  in precisely the case it exists for: a feed goes quiet, its document stops changing, every
+  subsequent run 304s, and the aged-out backlog is never probed again — the sweep being the only
+  thing that could ever shrink it. Running is safe because both bounds that make the sweep safe at
+  all are independent of the seen-set: it deletes only on a confirmed 404/410, and it probes at most
+  25 candidates per run per source, none more often than the recheck floor allows. An empty seen-set
+  subtracts nothing from the candidate list, so a 304'd run offers every one of the source's entries
+  as a candidate, window members included — the direct consequence of having no membership record to
+  consult, bounded by the delete rule rather than by the candidate rule ("Candidates" above).
+
+**Ordering:** the sweep runs **after** the source's ordinary ingestion pass completes, so the
+seen-set it partitions against is final and no entry a run observed is ever probed on the run that
+observed it.
+
+**Per candidate**, the resource's stored validators are replayed against its link:
+
+- `Gone` (404/410) deletes the resource.
+- `NotModified` refreshes the stored validators and `last_checked_at`, but does **not** delete — the
+  entry is still there.
+- A `200` advances `last_checked_at` **only**, rewriting the candidate's already-stored validators
+  unchanged. The fresh validators the response carried are deliberately discarded, because the body
+  they describe is discarded too (see below). Storing them would point the resource's validators at
+  a representation this store never indexed: the next probe would answer 304, and if the entry ever
+  re-entered the feed window that 304 would suppress the reindex of the changed content
+  indefinitely. The price is that a genuinely-changed aged-out entry keeps paying a full `200` at
+  every recheck instead of converging on a cheap 304 — pure overhead on an entry the sweep does not
+  re-index anyway, and the correct side to err on.
+- `Blocked` or a transport error is not evidence about the entry, so nothing about the resource's
+  content, metadata, or validators moves.
+
+**What a probe writes (normative).** Every outcome above except the delete converges on a single
+`RetrievalStore::touch_resource_liveness` call, which writes exactly three columns —
+`external_etag`, `external_last_modified`, `last_checked_at` — and nothing else. It is deliberately
+**not** a metadata-only update ("Metadata-only update" above) and must not be routed through that
+contract: `resources.index_updated_at` does not bump, no `docs_metadata_updated` is counted, and no
+`DocOutcome` is emitted. A probe writes no content and no metadata, and `index_updated_at` means "we
+last wrote this resource's stored state" — public as `DocumentInfo.index_updated_at`
+([02-domain-model.md](02-domain-model.md) §2) — so bumping it would report a document as re-written
+when it was only pinged. Nothing desyncs by leaving it alone, because `metadata_hash` is never
+persisted (§2's `content_hash` row: it is compared against "a third, unstored value"). It is
+re-derived from `metadata_json` + `external_id` + `external_etag` + `modified_at` on every
+rehydration, so a rotated `external_etag` simply changes what the _next_ rehydration computes. The
+run's own in-memory copy is not read again either: the sweep runs last in its source's pass
+("Ordering" above) and touches that index only to drop a candidate it deleted.
+
+**`last_checked_at` means "when we last attempted a probe" (normative)** — not "when we last
+successfully reached the origin". It advances on **every** outcome above except the delete, blocked
+and transport-error outcomes included, and it is the only thing those two outcomes move. That is
+what makes the oldest-first ordering a fair rotation: were an unreachable candidate left holding its
+old timestamp, a source with 25 or more permanently-blocked entries would lead the query forever and
+no other candidate would ever reach a batch.
+
+A `200` here is **not** re-indexed — deliberately out of scope. An aged-out entry's feed-sourced
+metadata (title, author, per-entry publication date) is long gone once the entry has fallen out of
+the feed window, and re-indexing from the bare page alone would silently degrade the stored resource
+rather than improve it.
+
+Entry links are fetched through the **public-destination-only** fetcher — the same SSRF trust
+boundary the feed ingestor already applies to entry links ([02-domain-model.md](02-domain-model.md),
+"Destination policy (entry links)") — never the unrestricted fetcher used for the
+operator-configured feed URL itself.
+
+Prunes fold into the existing `docs_deleted`, which stays a single total: a run does **not** report
+how many of its deletions the liveness sweep caused. The sweep's own counter,
+`feed_entries_liveness_checked`, counts probe _attempts_ — carried per source in
+`IngestionResult.feed_entries_liveness_checked`, summed across a run's sources into
+`IndexJobStats.feed_entries_liveness_checked`, and reported as the CLI summary's
+`feed_entries_liveness_checked`, the same three-step channel `docs_metadata_updated` travels
+("Metadata-only update" above). It shows the work done even on a run that deleted nothing, but it
+cannot be subtracted from `docs_deleted` to attribute a cause, since most attempts end in a 304 or a
+200 rather than a delete. Deletion-cause attribution needs a counter of its own and is deliberately
+left out.
 
 ## 2. Extraction (v1 matrix)
 
