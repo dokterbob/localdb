@@ -190,10 +190,30 @@ impl Ingestor for FeedIngestor {
                     });
                 }
                 // The "feed 304 => zero per-entry callbacks" case the core
-                // sweep exemption for `SourceSpec::Feed` protects: a single
-                // `Unchanged` skip, no entry-level callbacks at all.
-                callback.on_skipped(&feed_uri, SkipReason::Unchanged).await;
-                result.resources_skipped += 1;
+                // sweep exemption for `SourceSpec::Feed` protects.
+                //
+                // Whether the feed document is a *document* depends on the
+                // mode, and only on the mode. In single-document mode it is
+                // the source's one resource, so a 304 on it is an ordinary
+                // unchanged skip and is reported as one. In discovery mode it
+                // never becomes a `Resource` at all, so reporting it here
+                // would count a document that does not exist: `on_skipped`
+                // increments `docs_seen` and `docs_skipped` and emits a full
+                // `DocumentStarted`/`DocumentFinished` pair, and those
+                // counters partition `docs_seen`
+                // (specs/04-search-pipeline.md). Since a healthy feed 304s on
+                // every run, that phantom would be the steady state rather
+                // than an edge — the same leak the rejected phantom
+                // zero-chunk `resources` row would have caused, one layer up
+                // (specs/02-domain-model.md, "Conditional GET and pruning").
+                //
+                // Nothing else needs the callback in discovery mode: the
+                // feed URI is not one of the source's owned URIs, so leaving
+                // it out of `seen` changes no sweep decision.
+                if !fetch_full_content {
+                    callback.on_skipped(&feed_uri, SkipReason::Unchanged).await;
+                    result.resources_skipped += 1;
+                }
                 return Ok(result);
             }
             FetchResult::Gone => {

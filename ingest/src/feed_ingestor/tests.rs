@@ -313,8 +313,10 @@ async fn missing_url_config_errors() {
 // Feed-level fetch outcomes
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn feed_level_not_modified_is_single_unchanged_skip_no_entry_callbacks() {
+/// Run a feed-document 304 in the given mode and hand back what the
+/// callback saw. The two modes disagree about one thing only — whether the
+/// feed document is a *document* — so they are worth reading side by side.
+async fn feed_level_304_in(fetch_full_content: bool) -> (IngestResult, RecordingCallback) {
     let mut script = HashMap::new();
     script.insert(
         "https://feed.example.com/feed.xml".to_string(),
@@ -324,19 +326,68 @@ async fn feed_level_not_modified_is_single_unchanged_skip_no_entry_callbacks() {
         },
     );
     let (ingestor, _fetcher) = ingestor_with(script);
-    let source = source_for("https://feed.example.com/feed.xml", None, true);
+    let source = source_for(
+        "https://feed.example.com/feed.xml",
+        None,
+        fetch_full_content,
+    );
     let mut cb = RecordingCallback::default();
     let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+    (result, cb)
+}
+
+/// In discovery mode the feed document never becomes a `Resource`, so a
+/// feed-level 304 must report **no document at all** — not even a skipped
+/// one.
+///
+/// `on_skipped` is not free: it increments `docs_seen` and `docs_skipped`
+/// and emits a full `DocumentStarted`/`DocumentFinished` pair, and those
+/// counters partition `docs_seen` (specs/04-search-pipeline.md). Reporting
+/// the feed document here would therefore count a document that does not
+/// exist — and since a healthy feed 304s on every run, that phantom is the
+/// steady state, not an edge. It is the same leak the rejected phantom
+/// zero-chunk `resources` row would have caused, one layer up.
+#[tokio::test]
+async fn feed_level_not_modified_in_discovery_mode_reports_no_document() {
+    let (result, cb) = feed_level_304_in(true).await;
 
     assert_eq!(result.resources_produced, 0);
     assert_eq!(result.errors, 0);
+    assert_eq!(
+        result.resources_skipped, 0,
+        "the feed document is not one of this mode's resources"
+    );
     assert!(
         cb.discovered.is_empty(),
         "no on_discovered on feed-level 304"
     );
     assert!(cb.resources.is_empty());
+    assert!(
+        cb.skipped.is_empty(),
+        "a discovery-mode feed 304 is a source-level event, not a document one: {:?}",
+        cb.skipped
+    );
+}
+
+/// The other mode, and the reason the check above is conditional rather than
+/// an unconditional removal: with `fetch_full_content: false` the feed
+/// document *is* the source's one resource, so its 304 is an ordinary
+/// unchanged skip and must still be reported as one.
+#[tokio::test]
+async fn feed_level_not_modified_in_single_document_mode_is_an_unchanged_skip() {
+    let (result, cb) = feed_level_304_in(false).await;
+
+    assert_eq!(result.resources_produced, 0);
+    assert_eq!(result.errors, 0);
+    assert_eq!(result.resources_skipped, 1);
+    assert!(cb.resources.is_empty());
     assert_eq!(cb.skipped.len(), 1);
     assert_eq!(cb.skipped[0].1, SkipReason::Unchanged);
+    assert_eq!(
+        cb.skipped[0].0.as_str(),
+        "https://feed.example.com/feed.xml",
+        "and it is the feed document itself that is reported"
+    );
 }
 
 /// A feed-level 404/410 is a complete no-op: zero errors, zero skips, zero
