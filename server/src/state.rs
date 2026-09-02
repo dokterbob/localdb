@@ -610,10 +610,8 @@ impl AppState {
             None => None,
         };
 
-        // #116: feed sources persist+validate `refresh` like url sources, but
-        // scheduler registration below stays url-only — feed refresh is
-        // inert until the scheduler is extended (same stub status as the
-        // pre-existing url refresh scheduling).
+        // Feed sources persist+validate `refresh` exactly like url sources,
+        // and are registered with the scheduler below on the same terms.
         if refresh.is_some()
             && kind_enum != localdb_core::types::SourceKind::Url
             && kind_enum != localdb_core::types::SourceKind::Feed
@@ -645,8 +643,11 @@ impl AppState {
         };
         self.inner.backend.upsert_source(&source_row).await?;
 
-        // Register URL sources with the scheduler so refresh runs without a restart.
-        if kind_enum == localdb_core::types::SourceKind::Url {
+        // Register URL and feed sources with the scheduler so refresh runs without a restart.
+        if matches!(
+            kind_enum,
+            localdb_core::types::SourceKind::Url | localdb_core::types::SourceKind::Feed
+        ) {
             if let Some(u) = url {
                 self.inner
                     .url_scheduler

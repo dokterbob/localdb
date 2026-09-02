@@ -176,7 +176,10 @@ fn spawn_url_scheduler(state: &AppState, url_scheduler: UrlRefreshScheduler) {
                 }
             };
             for source in sources {
-                if source.kind == localdb_core::types::SourceKind::Url {
+                if matches!(
+                    source.kind,
+                    localdb_core::types::SourceKind::Url | localdb_core::types::SourceKind::Feed
+                ) {
                     if let Some(url) = source.url {
                         let interval_secs =
                             source.refresh.as_deref().and_then(parse_refresh_interval);
