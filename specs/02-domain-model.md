@@ -384,16 +384,29 @@ and a changed feed URL is a new origin.
 >   liveness sweep excludes on ([04-search-pipeline.md](04-search-pipeline.md) §1, "The feed's own
 >   document is never a candidate").
 >
-> Neither direction is reconciled today; `source remove` is the only thing that clears either.
+> **A URL edit is the same unreconciled transition (normative, and the same gap).** Nulling the
+> cache columns above is all a URL edit does. Retargeting a source from feed A to feed B therefore
+> makes the next run read B from scratch and leaves every resource A produced exactly where it is,
+> and nothing reclaims them: feed sources are exempt from the presumed-gone delete-sweep
+> ("Retention" above), so absence prunes nothing; the liveness sweep probes them — a URL edit makes
+> every one of A's entries permanently unobserved — but deletes only on a confirmed 404/410, so an
+> old entry link that still serves `200` stays indexed forever; and if A was indexed in
+> single-document mode, its feed-root resource carries no `external_id` and is excluded from the
+> sweep outright. Both feeds are then mixed in one source's results permanently. This trigger is the
+> more ordinary of the two — editing a URL is routine config maintenance, where flipping
+> `fetch_full_content` is a deliberate change of indexing strategy — and the more damaging, because
+> A and B are unrelated content rather than two representations of the same feed.
+>
+> None of the three is reconciled today; `source remove` is the only thing that clears any of them.
 > [#319](https://github.com/dokterbob/localdb/issues/319) carries the fix. It is a gap rather than
 > an oversight in this gate: every delete this system performs is justified by evidence about the
 > _origin_ — a confirmed 404/410, or an absence from a source that enumerates exhaustively — and
 > this one would be justified by a change to **our own config**. That is a different kind of delete,
 > and it needs its own answer to a question the deletion model has no place for yet: whether it
-> applies without `--delete`. A mode flip is a replacement rather than a prune, which argues that it
-> should; `--delete` guarding every other delete argues that it should not. Reconciling on the wrong
-> side of that question silently drops a source's index on a config edit, so the gap is disclosed
-> rather than closed by guess.
+> applies without `--delete`. A mode flip or a retarget is a replacement rather than a prune, which
+> argues that it should; `--delete` guarding every other delete argues that it should not.
+> Reconciling on the wrong side of that question silently drops a source's index on a config edit,
+> so the gap is disclosed rather than closed by guess.
 >
 > **Partial entry passes withhold the validators too (normative).** The same pairing rule extends
 > past the fetch to the run as a whole: fresh feed-document validators are persisted only by a run

@@ -296,6 +296,21 @@ observed it.
 - `Blocked` or a transport error is not evidence about the entry, so nothing about the resource's
   content, metadata, or validators moves.
 
+**What a probe writes (normative).** Every outcome above except the delete converges on a single
+`RetrievalStore::touch_resource_liveness` call, which writes exactly three columns —
+`external_etag`, `external_last_modified`, `last_checked_at` — and nothing else. It is deliberately
+**not** a metadata-only update ("Metadata-only update" above) and must not be routed through that
+contract: `resources.index_updated_at` does not bump, no `docs_metadata_updated` is counted, and no
+`DocOutcome` is emitted. A probe writes no content and no metadata, and `index_updated_at` means "we
+last wrote this resource's stored state" — public as `DocumentInfo.index_updated_at`
+([02-domain-model.md](02-domain-model.md) §2) — so bumping it would report a document as re-written
+when it was only pinged. Nothing desyncs by leaving it alone, because `metadata_hash` is never
+persisted (§2's `content_hash` row: it is compared against "a third, unstored value"). It is
+re-derived from `metadata_json` + `external_id` + `external_etag` + `modified_at` on every
+rehydration, so a rotated `external_etag` simply changes what the _next_ rehydration computes. The
+run's own in-memory copy is not read again either: the sweep runs last in its source's pass
+("Ordering" above) and touches that index only to drop a candidate it deleted.
+
 **`last_checked_at` means "when we last attempted a probe" (normative)** — not "when we last
 successfully reached the origin". It advances on **every** outcome above except the delete, blocked
 and transport-error outcomes included, and it is the only thing those two outcomes move. That is
@@ -315,10 +330,14 @@ operator-configured feed URL itself.
 
 Prunes fold into the existing `docs_deleted`, which stays a single total: a run does **not** report
 how many of its deletions the liveness sweep caused. The sweep's own counter,
-`feed_entries_liveness_checked`, counts probe _attempts_ — so it shows the work done even on a run
-that deleted nothing, but it cannot be subtracted from `docs_deleted` to attribute a cause, since
-most attempts end in a 304 or a 200 rather than a delete. Deletion-cause attribution needs a counter
-of its own and is deliberately left out.
+`feed_entries_liveness_checked`, counts probe _attempts_ — carried per source in
+`IngestionResult.feed_entries_liveness_checked`, summed across a run's sources into
+`IndexJobStats.feed_entries_liveness_checked`, and reported as the CLI summary's
+`feed_entries_liveness_checked`, the same three-step channel `docs_metadata_updated` travels
+("Metadata-only update" above). It shows the work done even on a run that deleted nothing, but it
+cannot be subtracted from `docs_deleted` to attribute a cause, since most attempts end in a 304 or a
+200 rather than a delete. Deletion-cause attribution needs a counter of its own and is deliberately
+left out.
 
 ## 2. Extraction (v1 matrix)
 
