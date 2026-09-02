@@ -27,11 +27,12 @@ host-jobs = ["./release-checks"]
 # dist-manifest.json and pushes it to the tap.
 publish-jobs = ["./homebrew-tap-publish"]
 post-announce-jobs = ["./smoke-test"]
-# Prereleases run the full publish chain, tap included: the tap currently has
-# no users, and exercising homebrew-tap-publish end-to-end on an rc is the
-# point of cutting one. Revisit (flip to false) once the tap has real users,
-# so an rc formula never displaces a stable one for `brew install`.
-publish-prereleases = true
+# An rc tag still creates a GitHub Release marked "prerelease" with the full
+# set of artifacts (dist always does this) — this flag only gates the
+# homebrew-tap-publish job. Off, so an rc formula can never displace the
+# stable one in the tap: `brew install dokterbob/localdb/localdb` always
+# resolves to the latest stable release.
+publish-prereleases = false
 
 
 # The tap-publish job checks out this repo (render script + template) and

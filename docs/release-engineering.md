@@ -66,7 +66,20 @@ hand-maintained `workflow_call` workflows:
   (Add/Fix/Remove/…); docs/chore/ci/test commits are skipped. The release PR is hand-editable —
   curate the generated section before merging.
 - Version bumps are patch-level by default (the repo does not use conventional commits, so
-  release-plz cannot infer minor/major). Edit the version in the release PR for a bigger bump.
+  release-plz cannot infer minor/major). To cut a minor or major instead, push a commit to the
+  release PR's branch that edits, in the same commit:
+  1. `[workspace.package].version` in the root `Cargo.toml`.
+  2. Every internal path-dependency `version = "X.Y.Z"` requirement across the crate `Cargo.toml`s
+     (`cargo package` demands these stay in sync; release-plz normally owns them).
+  3. `Cargo.lock`, via `cargo update --workspace` (touches only workspace members, not third-party
+     dependency versions).
+  4. The new `CHANGELOG.md` section heading release-plz already generated (`## [X.Y.Z] - date`), to
+     match the version chosen above.
+
+  This must be the last step before merging: any other push to `main` in the meantime makes
+  release-plz refresh (or, if the PR now carries foreign commits, close and recreate) the release
+  PR, discarding the hand-edit — see the footgun below. Freeze merges to `main` between curating the
+  release PR and merging it.
 
 ## Release targets
 
@@ -175,12 +188,14 @@ does work — dist only needs the tag — but the changelog and version pins won
   inside the extracted standalone package, where path deps are stripped and our unpublished crates
   fail to resolve against crates.io. Reported upstream:
   [release-plz/release-plz#2995](https://github.com/release-plz/release-plz/issues/2995).
-- **Prereleases update the Homebrew tap** while `publish-prereleases = true` (set in
+- **Prereleases never touch the Homebrew tap** (`publish-prereleases = false` in
   `dist-workspace.toml`). To cut one: edit the release PR's version to `X.Y.Z-rc.N` (workspace
-  version + the internal dep requirements) — the resulting `vX.Y.Z-rc.N` tag makes dist mark the
-  GitHub Release as a prerelease automatically. Flip `publish-prereleases` off once the tap has real
-  users, or an rc formula will displace the stable one for `brew install`. After an rc, the next
-  release PR proposes a bump computed from the rc — edit it to the intended final version.
+  version + the internal dep requirements, same mechanics as a minor/major bump above) — the
+  resulting `vX.Y.Z-rc.N` tag makes dist mark the GitHub Release as a prerelease automatically, with
+  the full set of build artifacts, but `custom-homebrew-tap-publish` skips itself for it. That keeps
+  `brew install dokterbob/localdb/localdb` resolving to the latest stable release regardless of how
+  many rc tags have shipped since. After an rc, the next release PR proposes a bump computed from
+  the rc — edit it to the intended final version.
 
 ## Known gaps / future work
 
