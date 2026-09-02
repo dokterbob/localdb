@@ -1589,7 +1589,22 @@ impl IngestCallback for PipelineCallback<'_> {
                 // `index_resource` (which would otherwise duplicate it).
                 let derived = derive_resource_state(&resource);
 
-                if existing.metadata_hash == derived.metadata_hash {
+                // `external_last_modified` is compared on its own because
+                // it is deliberately not one of `compute_metadata_hash`'s
+                // inputs (specs/02-domain-model.md §2), so a hash comparison
+                // alone cannot see it move. A `Last-Modified`-only origin
+                // rotates exactly that field on an unchanged 200: without
+                // this the skip returns before the write, the stored
+                // validator stays at whatever the first run captured, and
+                // every run after replays an `If-Modified-Since` the origin
+                // has already moved past — a full re-download, every run,
+                // forever. The write is the metadata-only branch below,
+                // which already persists the field. Same reasoning
+                // `on_validators_refreshed` gives for comparing the
+                // validator pair rather than the hash.
+                if existing.metadata_hash == derived.metadata_hash
+                    && existing.external_last_modified == resource.external_last_modified
+                {
                     self.result.docs_skipped += 1;
                     self.emit(crate::progress::ProgressEvent::DocumentFinished {
                         uri,

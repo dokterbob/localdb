@@ -690,3 +690,154 @@ async fn a_304_whose_metadata_write_fails_reports_an_error_not_a_skip() {
     );
     assert_eq!(second.docs_metadata_updated, 0);
 }
+
+// ---------------------------------------------------------------------------
+// A `Last-Modified`-only origin (specs/04-search-pipeline.md §1)
+// ---------------------------------------------------------------------------
+
+/// An origin that issues no `ETag` and moves its `Last-Modified` on every
+/// response, while serving the same bytes throughout — the shape that makes
+/// the stored validator go stale without any hash input moving. Records the
+/// `FetchMetadata` each call received, like `ScriptedFetcher`.
+struct MovingLastModifiedFetcher {
+    body: Vec<u8>,
+    served: Mutex<usize>,
+    received: Mutex<Vec<FetchMetadata>>,
+}
+
+impl MovingLastModifiedFetcher {
+    fn new(body: &[u8]) -> Self {
+        Self {
+            body: body.to_vec(),
+            served: Mutex::new(0),
+            received: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn received(&self) -> Vec<FetchMetadata> {
+        self.received.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl UrlFetcher for MovingLastModifiedFetcher {
+    async fn fetch(&self, _url: &str, meta: &FetchMetadata) -> Result<FetchResult, Error> {
+        self.received.lock().unwrap().push(meta.clone());
+        let mut served = self.served.lock().unwrap();
+        *served += 1;
+        Ok(FetchResult::Downloaded {
+            bytes: self.body.clone(),
+            content_type: Some("text/markdown".to_string()),
+            etag: None,
+            last_modified: Some(format!("Wed, 0{} Oct 2015 07:28:00 GMT", *served)),
+            final_url: None,
+        })
+    }
+}
+
+struct ArcMovingLastModified(Arc<MovingLastModifiedFetcher>);
+#[async_trait]
+impl UrlFetcher for ArcMovingLastModified {
+    async fn fetch(&self, url: &str, meta: &FetchMetadata) -> Result<FetchResult, Error> {
+        self.0.fetch(url, meta).await
+    }
+}
+
+/// A `200` whose body and metadata are unchanged but whose `Last-Modified`
+/// moved must still persist the new validator.
+///
+/// `external_last_modified` is deliberately not a `compute_metadata_hash`
+/// input, so the incremental skip-check's hash comparison cannot see it move.
+/// With the hash alone deciding, this origin's second run took the plain-skip
+/// branch and wrote nothing: the stored validator stayed at run 1's value,
+/// and run 3 — and every run after it — replayed an `If-Modified-Since` the
+/// origin had already moved past, so a resource that never changes was
+/// downloaded in full forever. Three runs are the minimum that shows it: run
+/// 2 proves the write happens, run 3 proves what the write stored is what
+/// gets replayed.
+#[tokio::test]
+async fn a_moved_last_modified_on_an_unchanged_200_is_persisted_and_replayed() {
+    let store_id = "store-1";
+    let url = "https://example.com/doc";
+    let fetcher = Arc::new(MovingLastModifiedFetcher::new(b"# Doc\n\nBody text."));
+
+    let ingestor = UrlIngestor::new(
+        Box::new(PlainParser),
+        Box::new(ArcMovingLastModified(fetcher.clone())),
+    );
+    let source = Source {
+        id: "source-1".to_string(),
+        store_id: store_id.to_string(),
+        kind: SourceKind::Url,
+        spec: SourceSpec::Url {
+            url: url.to_string(),
+            refresh_interval_secs: None,
+        },
+        source_preset: "prose".to_string(),
+    };
+
+    let store = FakeStore::new();
+    let embedder = FakeEmbedder::new(4);
+    let config = make_config(store_id);
+    let mut doc_index = DocumentIndex::new();
+
+    macro_rules! run {
+        () => {
+            run_source_ingestion(
+                &source,
+                &ingestor,
+                SourceIngestionDeps {
+                    doc_index: &mut doc_index,
+                    store: &store,
+                    embedder: &embedder,
+                    config: &config,
+                    progress: None,
+                    deletion: DeletionPolicy::Retain,
+                },
+            )
+            .await
+            .unwrap()
+        };
+    }
+
+    let first = run!();
+    assert_eq!(first.docs_indexed, 1, "run 1 indexes the resource");
+
+    let second = run!();
+    assert_eq!(
+        second.docs_metadata_updated, 1,
+        "the moved Last-Modified is the only thing that changed, and it must be written"
+    );
+    assert_eq!(
+        second.docs_skipped, 0,
+        "a run that rewrote the validator is not a plain skip"
+    );
+    assert_eq!(second.chunks_written, 0, "and it re-chunks nothing");
+
+    let third = run!();
+    assert_eq!(third.docs_metadata_updated, 1);
+
+    let received = fetcher.received();
+    assert_eq!(received.len(), 3, "one fetch per run");
+    assert_eq!(
+        received[0],
+        FetchMetadata::default(),
+        "run 1 has nothing stored to replay"
+    );
+    assert_eq!(
+        received[1],
+        FetchMetadata {
+            etag: None,
+            last_modified: Some("Wed, 01 Oct 2015 07:28:00 GMT".to_string()),
+        },
+        "run 2 replays run 1's validator"
+    );
+    assert_eq!(
+        received[2],
+        FetchMetadata {
+            etag: None,
+            last_modified: Some("Wed, 02 Oct 2015 07:28:00 GMT".to_string()),
+        },
+        "run 3 must replay the validator run 2 stored, not run 1's stale one"
+    );
+}
