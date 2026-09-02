@@ -12,3 +12,6 @@ lcov.info
 # download but not redistributable, so not vendored. The redistributable
 # corpus PDFs and all expectation JSONs in that dir ARE committed.
 /extract/tests/fixtures/corpus/sewtha-sustainable-energy.pdf
+
+# Machine-local MCP server config (absolute paths).
+.mcp.json
