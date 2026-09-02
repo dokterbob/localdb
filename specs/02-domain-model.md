@@ -407,11 +407,17 @@ and a changed feed URL is a new origin.
 > validators. The 304 short-circuit on the feed document itself is a deliberate, accepted trade-off,
 > not a mitigated one. When the feed document returns 304, the entry loop does not run at all, so
 > zero entry callbacks fire that run — drift on an already-indexed entry's own _page_ goes unnoticed
-> for as long as the feed XML itself is unchanged. This is accepted because it rests on the same
-> contract conditional GET relies on everywhere else in the system: a compliant origin changes its
-> validator whenever any part of the representation changes (RFC 9110 §8.8.1). No cache-busting
-> forced refresh is provided. What a 304'd run's empty seen-set means for the liveness sweep is
-> settled in one place, next to the guard's normative definition:
+> for as long as the feed XML itself is unchanged. **In discovery mode that run reports no document
+> at all (normative):** the document counters partition `docs_seen`, and in discovery mode the feed
+> document is not a `Resource` and never becomes one, so reporting it as a skipped document would
+> count a document that does not exist — the same leak the rejected phantom `resources` row above
+> would have caused, one layer up. In single-document mode the feed document _is_ the resource, so
+> there it is reported as an ordinary unchanged skip. The 304 short-circuit is a source-level event
+> in one mode and a document-level one in the other, and only the mode decides which. This is
+> accepted because it rests on the same contract conditional GET relies on everywhere else in the
+> system: a compliant origin changes its validator whenever any part of the representation changes
+> (RFC 9110 §8.8.1). No cache-busting forced refresh is provided. What a 304'd run's empty seen-set
+> means for the liveness sweep is settled in one place, next to the guard's normative definition:
 > [04-search-pipeline.md](04-search-pipeline.md) §1 "Aged-out feed entries: the liveness sweep".
 
 While an entry is still _inside_ the feed's window and a run actually reads that window, a `Gone`
@@ -547,15 +553,18 @@ A unit of indexing work with observable state. Fields: `id` (ULID), `store_id`, 
 the type but currently unreachable: nothing constructs it, since `POST /v1/jobs` has no
 `resource_id` field), `state` (`pending` → `running` → `done` | `failed`), `stats`, `error`,
 timestamps. `stats` (`IndexJobStats`) carries `docs_seen`, `docs_indexed`, `docs_skipped` (unchanged
-content hash), `docs_deleted`, `docs_prunable` (would-have-been-deleted count under
-`DeletionPolicy::Retain`), `chunks_written`, `unsupported_format_count`, `error_count`, and
-`sources_count` (size of the job's resolved scope before processing, distinguishing "nothing to
-index" from "sources existed but nothing needed indexing"). Both embedded and daemon-submitted jobs
-run through the same async engine (`server::job_exec::run_job`, driven by a `JobQueue`) — the CLI's
-embedded mode spins up its own in-process, single-job `JobQueue` per invocation rather than running
-synchronously outside the job model; the daemon's `JobQueue` is long-lived and serves every job for
-the process's lifetime, one at a time per store (a per-store in-flight guard rejects a second
-concurrent submission with `index_in_progress`) ([05-surfaces.md](05-surfaces.md) §3).
+content hash), `docs_metadata_updated` (resource row rewritten in place, no chunks touched),
+`docs_deleted`, `docs_prunable` (would-have-been-deleted count under `DeletionPolicy::Retain`),
+`feed_entries_liveness_checked` (liveness candidates probed this run — §1 and
+[04-search-pipeline.md](04-search-pipeline.md) §1), `chunks_written`, `unsupported_format_count`,
+`error_count`, and `sources_count` (size of the job's resolved scope before processing,
+distinguishing "nothing to index" from "sources existed but nothing needed indexing"). Both embedded
+and daemon-submitted jobs run through the same async engine (`server::job_exec::run_job`, driven by
+a `JobQueue`) — the CLI's embedded mode spins up its own in-process, single-job `JobQueue` per
+invocation rather than running synchronously outside the job model; the daemon's `JobQueue` is
+long-lived and serves every job for the process's lifetime, one at a time per store (a per-store
+in-flight guard rejects a second concurrent submission with `index_in_progress`)
+([05-surfaces.md](05-surfaces.md) §3).
 
 ## 3. ID scheme
 
