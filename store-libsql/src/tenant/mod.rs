@@ -56,6 +56,36 @@ impl TenantStore {
     }
 }
 
+/// The one shape a tenant-boundary rejection takes: an `Internal` error under
+/// the correlation id every such rejection is recognized by.
+///
+/// It lives here, not beside any one caller, because the read side and the
+/// write side reject identically — a second copy of this literal is how the
+/// two would drift into reporting the same violation two ways.
+fn tenant_violation<T>(message: String) -> Result<T, Error> {
+    Err(Error::Internal {
+        message,
+        correlation_id: "store_handle_tenant_violation".to_string(),
+    })
+}
+
+/// Reject a caller-supplied `store_id` that is not the one this handle owns.
+///
+/// A `TenantStore` is a handle *on* one store, so a `store_id` parameter on
+/// any of its entry points is an assertion to check, never a value to trust:
+/// forwarding one into a `WHERE store_id = ?` unchecked would let a handle
+/// for one store read or write another store's rows. `method` names the
+/// caller in the message and selects no behavior.
+fn ensure_store_id(store: &TenantStore, requested: &str, method: &str) -> Result<(), Error> {
+    if requested == store.store_id() {
+        return Ok(());
+    }
+    tenant_violation(format!(
+        "{method} requested store_id '{requested}' but handle owns store_id '{handle}'",
+        handle = store.store_id()
+    ))
+}
+
 #[async_trait]
 impl RetrievalStore for TenantStore {
     async fn upsert_chunks(&self, records: Vec<ChunkRecord>) -> Result<usize, Error> {

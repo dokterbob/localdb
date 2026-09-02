@@ -7,8 +7,8 @@ use localdb_core::{
 
 use super::rows::{row_to_block, row_to_chunk_record_strict};
 use super::sql::{build_filter_clauses, escape_fts5_query};
-use super::TenantStore;
-use crate::connection::{map_libsql_err, parse_metadata_json_lenient};
+use super::{ensure_store_id, TenantStore};
+use crate::connection::map_libsql_err;
 use crate::vectors;
 
 // Column projection shared across all chunk queries.
@@ -305,11 +305,22 @@ pub(crate) async fn get_blocks_for_resource(
 /// it to serve this one caller would make every search row carry and parse
 /// three fields no search consumer reads. See
 /// `RetrievalStore::get_resource_record`.
+///
+/// Being a write payload rather than a display value is what sets its two
+/// error rules apart from every other read here: the caller's `store_id` is
+/// checked against the handle's instead of being forwarded into the `WHERE`
+/// clause, and a `metadata_json` column that does not decode is an error
+/// rather than a `Metadata::default()`. Both are spelled out at the point
+/// they apply below.
 pub(crate) async fn get_resource_record(
     store: &TenantStore,
     store_id: &str,
     resource_id: &str,
 ) -> Result<Option<ResourceRecord>, Error> {
+    // The only read in this file that is handed a `store_id` rather than
+    // taking the handle's own — the trait signature carries one because its
+    // write counterpart does. Checked, never forwarded unchecked.
+    ensure_store_id(store, store_id, "get_resource_record")?;
     let conn = store.conn().reader();
     let mut rows = conn
         .query(
@@ -324,13 +335,27 @@ pub(crate) async fn get_resource_record(
         return Ok(None);
     };
     let metadata_json: String = row.get(0).map_err(map_libsql_err)?;
+    // Strict, unlike the chunk-read precedent in `rows.rs`, because this is
+    // not a display path: what it returns becomes the *payload* of an
+    // `update_resource_metadata` call, and that rewrites every metadata
+    // column of the row. A lenient `Metadata::default()` here would therefore
+    // not merely misreport a corrupt row — it would overwrite whatever real
+    // metadata the row still holds with an empty one, on a 304 that changed
+    // nothing. Erroring leaves the row exactly as it stands and reports the
+    // failure instead: `read_persisted_record` maps a store error to
+    // `MetadataWriteOutcome::Failed`, which the run counts and prints. The
+    // lenient helper keeps serving the read-only callers (`rows.rs`,
+    // `registry/documents.rs`), where a default is a display fallback and
+    // nothing is written back from it.
+    let metadata: Metadata = serde_json::from_str(&metadata_json).map_err(|e| Error::Internal {
+        message: format!(
+            "resource '{resource_id}' has metadata_json that does not decode, so its row cannot \
+             be rebuilt without destroying it: {e}"
+        ),
+        correlation_id: "store_handle_resource_metadata".to_string(),
+    })?;
     Ok(Some(ResourceRecord {
-        // Lenient, matching the chunk-read precedent in `rows.rs`: a row whose
-        // metadata JSON no longer decodes still has real validators and dates
-        // worth preserving, and refusing the read would strand the caller's
-        // write forever. `list_indexed_documents` above is the one place that
-        // must *not* be lenient, because its output feeds a hash comparison.
-        metadata: parse_metadata_json_lenient(&metadata_json, resource_id),
+        metadata,
         external_id: row.get(1).map_err(map_libsql_err)?,
         external_etag: row.get(2).map_err(map_libsql_err)?,
         external_last_modified: row.get(3).map_err(map_libsql_err)?,

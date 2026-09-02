@@ -3,47 +3,11 @@
 use localdb_core::block::{Block, BlockKind};
 use localdb_core::metadata::{DocumentMetadata, DublinCoreMetadata, Metadata};
 use localdb_core::types::Span;
-use localdb_core::{ChunkRecord, Error, ResourceRecord, StoreBackend};
+use localdb_core::{Error, ResourceRecord, StoreBackend};
 use tempfile::tempdir;
 
-use super::common::backend_with_store_and_source;
+use super::common::{backend_with_store_and_source, chunk_record, resource_dates_and_external};
 use crate::SqliteBackend;
-
-/// A minimal, self-contained `ChunkRecord` fixture for `store-1`/`doc-1`
-/// (the store/source seeded by `backend_with_store_and_source`), with
-/// `fetched_at` and `modified_at` as explicit parameters so callers can
-/// distinguish them. `modified_at: None` writes a genuine no-claim resource
-/// (#283).
-fn chunk_record(fetched_at: &str, modified_at: Option<&str>) -> ChunkRecord {
-    ChunkRecord {
-        id: "chunk-1".to_string(),
-        resource_id: "doc-1".to_string(),
-        store_id: "store-1".to_string(),
-        text: "some chunk text".to_string(),
-        span: Span::new(0, 15),
-        heading_path: vec![],
-        embedding: vec![0.1, 0.2, 0.3, 0.4],
-        policy_version: "v1".to_string(),
-        fetched_at: fetched_at.to_string(),
-        modified_at: modified_at.map(str::to_string),
-        content_hash: "abc123".to_string(),
-        origin_store: "store-1".to_string(),
-        source_id: "src-1".to_string(),
-        ingestor_kind: "path".to_string(),
-        mime: Some("text/markdown".to_string()),
-        uri: "file:///docs/doc.md".to_string(),
-        metadata: Metadata::default(),
-        block_seq: 0,
-        seq_in_block: 0,
-        block_kind: None,
-        page: None,
-        window_block_seqs: vec![],
-        date_original: None,
-        date_parsed: None,
-        external_id: None,
-        external_etag: None,
-    }
-}
 
 /// Read `added_at`, `modified_at`, and `index_updated_at` straight off the
 /// `resources` row for `resource_id` — the columns `ChunkRecord`/`get_chunk`
@@ -70,38 +34,6 @@ async fn resource_row(
     )
 }
 
-/// Read `date_original`, `date_parsed`, `external_id`, and `external_etag`
-/// straight off the `resources` row for `resource_id` — write-only
-/// `ChunkRecord` stamps (`core::store::ChunkRecord`'s doc comment) that
-/// `get_chunk`/`CHUNK_COLS` never read back, so these tests go around the
-/// `RetrievalStore` trait for assertions, same posture as `resource_row`.
-async fn resource_dates_and_external(
-    backend: &SqliteBackend,
-    resource_id: &str,
-) -> (
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-) {
-    let conn = backend.conn.reader();
-    let mut rows = conn
-        .query(
-            "SELECT date_original, date_parsed, external_id, external_etag FROM resources \
-             WHERE store_id = 'store-1' AND id = ?",
-            libsql::params![resource_id.to_string()],
-        )
-        .await
-        .unwrap();
-    let row = rows.next().await.unwrap().expect("resource row must exist");
-    (
-        row.get(0).unwrap(),
-        row.get(1).unwrap(),
-        row.get(2).unwrap(),
-        row.get(3).unwrap(),
-    )
-}
-
 /// Read `external_last_modified` straight off the `resources` row —
 /// deliberately not a `ChunkRecord`/`get_chunk` column (see
 /// `RetrievalStore::upsert_chunks_and_blocks`'s doc comment), so this goes
@@ -120,74 +52,6 @@ async fn resource_external_last_modified(
         .unwrap();
     let row = rows.next().await.unwrap().expect("resource row must exist");
     row.get(0).unwrap()
-}
-
-/// Regression test for issue C4 on the tenant read path
-/// (`tenant::rows::row_to_chunk_record_strict`, via
-/// `connection::parse_metadata_json_lenient`): a resource row with
-/// syntactically invalid `metadata_json` must still be readable through
-/// `get_chunk` — falling back to `Metadata::default()` — rather than
-/// erroring the whole read. This exercises the same shared helper that
-/// `registry::documents::find_document` covers on the registry side
-/// (`registry::tests::find_document_tolerates_invalid_metadata_json`).
-#[tokio::test]
-async fn get_chunk_tolerates_invalid_metadata_json() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("localdb.db");
-    let backend = backend_with_store_and_source(&path).await;
-
-    let handle = backend.retrieval_store("store-1").await.unwrap();
-    let record = localdb_core::ChunkRecord {
-        id: "chunk-1".to_string(),
-        resource_id: "doc-1".to_string(),
-        store_id: "store-1".to_string(),
-        text: "some chunk text".to_string(),
-        span: Span::new(0, 15),
-        heading_path: vec![],
-        embedding: vec![0.1, 0.2, 0.3, 0.4],
-        policy_version: "v1".to_string(),
-        fetched_at: "2026-07-01T00:00:00Z".to_string(),
-        modified_at: Some("2026-07-01T00:00:00Z".to_string()),
-        content_hash: "abc123".to_string(),
-        origin_store: "store-1".to_string(),
-        source_id: "src-1".to_string(),
-        ingestor_kind: "path".to_string(),
-        mime: Some("text/markdown".to_string()),
-        uri: "file:///docs/doc.md".to_string(),
-        metadata: Metadata::default(),
-        block_seq: 0,
-        seq_in_block: 0,
-        block_kind: None,
-        page: None,
-        window_block_seqs: vec![],
-        date_original: None,
-        date_parsed: None,
-        external_id: None,
-        external_etag: None,
-    };
-    handle.upsert_chunks(vec![record]).await.unwrap();
-
-    // Corrupt the persisted metadata_json directly with syntactically
-    // invalid JSON.
-    let conn = backend.conn.writer().await;
-    conn.execute(
-        "UPDATE resources SET metadata_json = ? WHERE id = ?",
-        libsql::params!["{not valid json".to_string(), "doc-1".to_string()],
-    )
-    .await
-    .unwrap();
-    drop(conn);
-
-    let chunk = handle
-        .get_chunk("chunk-1")
-        .await
-        .unwrap()
-        .expect("chunk must still be found despite invalid metadata_json");
-    assert_eq!(
-        chunk.metadata,
-        Metadata::default(),
-        "invalid metadata_json must fall back to default metadata, not error the read"
-    );
 }
 
 /// Regression test for issue #217 step 5: `write::upsert_blocks` used to
@@ -837,109 +701,4 @@ async fn update_resource_metadata_errors_when_no_row_matches() {
             id: "does-not-exist".to_string()
         }
     );
-}
-
-// ---------------------------------------------------------------------------
-// get_resource_record (the read counterpart to update_resource_metadata)
-// ---------------------------------------------------------------------------
-
-/// The whole reason `get_resource_record` exists, pinned end to end.
-///
-/// A caller that rewrites one field of a resource row must read every other
-/// field back first, because `update_resource_metadata` rewrites all of them.
-/// The obvious read — `get_chunks_for_resource` — cannot serve: `CHUNK_COLS`
-/// omits `external_id`, `date_original` and `date_parsed` (write-only on
-/// `ChunkRecord` by design), so a record rebuilt from a chunk carries `None`
-/// for each and writes `NULL` over three real columns.
-///
-/// This drives the exact sequence `PipelineCallback::on_validators_refreshed`
-/// performs on a 304 — read, rotate the ETag, write back — and asserts the
-/// three columns survive. It has to live here rather than in `core`: the
-/// `FakeStore` double denormalizes every `ResourceRecord` field onto its
-/// chunks, so a chunk read there faithfully returns all three and the bug is
-/// invisible.
-#[tokio::test]
-async fn validator_rotation_through_get_resource_record_preserves_the_columns_chunks_drop() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("localdb.db");
-    let backend = backend_with_store_and_source(&path).await;
-    let handle = backend.retrieval_store("store-1").await.unwrap();
-
-    let mut seed = chunk_record("2026-07-01T00:00:00Z", Some("2026-07-01T00:00:00Z"));
-    seed.external_id = Some("urn:entry:42".to_string());
-    seed.external_etag = Some("\"v1\"".to_string());
-    seed.date_original = Some("2026-06-15T10:30:00Z".to_string());
-    seed.date_parsed = Some("2026-06-15".to_string());
-    handle.upsert_chunks(vec![seed]).await.unwrap();
-
-    // The projection gap this seam routes around: the chunk read reports
-    // `None` for all three despite the row holding real values.
-    let chunks = handle.get_chunks_for_resource("doc-1").await.unwrap();
-    let chunk = chunks.first().expect("the seeded chunk must be readable");
-    assert_eq!(chunk.external_id, None);
-    assert_eq!(chunk.date_original, None);
-    assert_eq!(chunk.date_parsed, None);
-
-    let persisted = handle
-        .get_resource_record("store-1", "doc-1")
-        .await
-        .unwrap()
-        .expect("the seeded resource row must be readable");
-    assert_eq!(persisted.external_id.as_deref(), Some("urn:entry:42"));
-    assert_eq!(persisted.external_etag.as_deref(), Some("\"v1\""));
-    assert_eq!(
-        persisted.date_original.as_deref(),
-        Some("2026-06-15T10:30:00Z")
-    );
-    assert_eq!(persisted.date_parsed.as_deref(), Some("2026-06-15"));
-
-    // The hook's write: rotate the ETag, carry everything else through.
-    let rotated = ResourceRecord {
-        external_etag: Some("\"v2\"".to_string()),
-        ..persisted
-    };
-    handle
-        .update_resource_metadata("store-1", "doc-1", &rotated)
-        .await
-        .unwrap();
-
-    let (date_original, date_parsed, external_id, external_etag) =
-        resource_dates_and_external(&backend, "doc-1").await;
-    assert_eq!(
-        external_etag.as_deref(),
-        Some("\"v2\""),
-        "the rotated validator must land"
-    );
-    assert_eq!(
-        external_id.as_deref(),
-        Some("urn:entry:42"),
-        "a validator refresh must not null external_id"
-    );
-    assert_eq!(
-        date_original.as_deref(),
-        Some("2026-06-15T10:30:00Z"),
-        "a validator refresh must not null date_original"
-    );
-    assert_eq!(
-        date_parsed.as_deref(),
-        Some("2026-06-15"),
-        "a validator refresh must not null date_parsed"
-    );
-}
-
-/// `Ok(None)`, not an error, for a resource this store has no row for — a
-/// concurrent delete racing a refresh is ordinary, and the callers treat it
-/// the same way they treat a `DocumentIndex` miss.
-#[tokio::test]
-async fn get_resource_record_returns_none_for_an_unknown_resource() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("localdb.db");
-    let backend = backend_with_store_and_source(&path).await;
-    let handle = backend.retrieval_store("store-1").await.unwrap();
-
-    assert!(handle
-        .get_resource_record("store-1", "does-not-exist")
-        .await
-        .unwrap()
-        .is_none());
 }

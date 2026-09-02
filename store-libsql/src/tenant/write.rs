@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use libsql::{params, Connection};
 use localdb_core::{ChunkRecord, Error, ResourceRecord, VectorEncoding};
 
-use super::TenantStore;
+use super::{ensure_store_id, tenant_violation, TenantStore};
 use crate::connection::{map_libsql_err, WriteTx};
 use crate::vectors;
 
@@ -145,12 +145,7 @@ async fn delete_chunks_and_blocks_inner(
 }
 
 pub(crate) async fn delete_by_store(store: &TenantStore, store_id: &str) -> Result<usize, Error> {
-    if store_id != store.store_id() {
-        return tenant_violation(format!(
-            "delete_by_store requested store_id '{store_id}' but handle owns store_id '{handle}'",
-            handle = store.store_id()
-        ));
-    }
+    ensure_store_id(store, store_id, "delete_by_store")?;
     let tx = store.conn().write_tx().await?;
     let result = delete_by_store_inner(&tx, store_id).await;
     finish_write_tx(tx, result).await
@@ -173,13 +168,6 @@ async fn delete_by_store_inner(conn: &Connection, store_id: &str) -> Result<usiz
     Ok(chunk_count as usize)
 }
 
-fn tenant_violation<T>(message: String) -> Result<T, Error> {
-    Err(Error::Internal {
-        message,
-        correlation_id: "store_handle_tenant_violation".to_string(),
-    })
-}
-
 /// Rewrite an existing resource row's metadata in place (issue #176's
 /// metadata-only incremental update) — no chunks/blocks/embeddings touched.
 ///
@@ -192,13 +180,7 @@ pub(crate) async fn update_resource_metadata(
     resource_id: &str,
     record: &ResourceRecord,
 ) -> Result<(), Error> {
-    if store_id != store.store_id() {
-        return tenant_violation(format!(
-            "update_resource_metadata requested store_id '{store_id}' but handle owns store_id \
-             '{handle}'",
-            handle = store.store_id()
-        ));
-    }
+    ensure_store_id(store, store_id, "update_resource_metadata")?;
     let tx = store.conn().write_tx().await?;
     let result = update_resource_metadata_inner(&tx, store_id, resource_id, record).await;
     finish_write_tx(tx, result).await
@@ -470,15 +452,12 @@ pub(crate) async fn upsert_chunks_and_blocks(
 ) -> Result<usize, localdb_core::Error> {
     for record in &records {
         if record.store_id != store.store_id() {
-            return Err(localdb_core::Error::Internal {
-                message: format!(
-                    "chunk '{id}' has store_id '{rec}' but handle owns store_id '{handle}'",
-                    id = record.id,
-                    rec = record.store_id,
-                    handle = store.store_id()
-                ),
-                correlation_id: "store_handle_tenant_violation".to_string(),
-            });
+            return tenant_violation(format!(
+                "chunk '{id}' has store_id '{rec}' but handle owns store_id '{handle}'",
+                id = record.id,
+                rec = record.store_id,
+                handle = store.store_id()
+            ));
         }
     }
     let count = records.len();
