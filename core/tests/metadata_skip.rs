@@ -20,6 +20,7 @@ use localdb_core::ids::{content_hash, new_ulid, resource_id};
 use localdb_core::ingestion::{
     index_resource, run_source_ingestion, DeletionPolicy, DocumentIndex, DocumentRecord,
     FetchMetadata, IndexOutcome, IndexResourceDeps, IngestionConfig, SourceIngestionDeps,
+    UnreachableFetcher,
 };
 use localdb_core::ingestor::{IngestCallback, IngestResult, IngestSource, Ingestor};
 use localdb_core::metadata::{DocumentMetadata, DublinCoreMetadata, Metadata};
@@ -324,6 +325,7 @@ async fn run_once(
         deletion,
         document_validators: FetchMetadata::default(),
         stored_inputs_digest: None,
+        fetcher: &UnreachableFetcher,
     };
     run_source_ingestion(source, &ingestor, deps).await.unwrap()
 }
@@ -618,16 +620,7 @@ async fn rehydrated_index_detects_metadata_only_change_across_restart() {
     let mut doc_index1 = DocumentIndex::new();
     let first = make_resource(uri, text, &source.id, store_id);
     let ingestor1 = ScriptedIngestor::new(vec![first]);
-    let deps1 = SourceIngestionDeps {
-        doc_index: &mut doc_index1,
-        store: &store,
-        embedder: &embedder,
-        config: &config,
-        progress: None,
-        deletion: DeletionPolicy::Retain,
-        document_validators: FetchMetadata::default(),
-        stored_inputs_digest: None,
-    };
+    let deps1 = SourceIngestionDeps::for_test(&mut doc_index1, &store, &embedder, &config);
     let result1 = run_source_ingestion(&source, &ingestor1, deps1)
         .await
         .unwrap();
@@ -653,16 +646,7 @@ async fn rehydrated_index_detects_metadata_only_change_across_restart() {
         Some("2026-06-10T12:00:00Z"),
     );
     let ingestor2 = ScriptedIngestor::new(vec![second]);
-    let deps2 = SourceIngestionDeps {
-        doc_index: &mut doc_index2,
-        store: &store,
-        embedder: &embedder,
-        config: &config,
-        progress: None,
-        deletion: DeletionPolicy::Retain,
-        document_validators: FetchMetadata::default(),
-        stored_inputs_digest: None,
-    };
+    let deps2 = SourceIngestionDeps::for_test(&mut doc_index2, &store, &embedder, &config);
     let result2 = run_source_ingestion(&source, &ingestor2, deps2)
         .await
         .unwrap();
@@ -1040,16 +1024,7 @@ async fn metadata_only_update_emits_metadata_updated_progress_event() {
     let mut doc_index = DocumentIndex::new();
     let first = make_resource(uri, text, &source.id, store_id);
     let ingestor1 = ScriptedIngestor::new(vec![first]);
-    let deps1 = SourceIngestionDeps {
-        doc_index: &mut doc_index,
-        store: &store,
-        embedder: &embedder,
-        config: &config,
-        progress: None,
-        deletion: DeletionPolicy::Retain,
-        document_validators: FetchMetadata::default(),
-        stored_inputs_digest: None,
-    };
+    let deps1 = SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config);
     run_source_ingestion(&source, &ingestor1, deps1)
         .await
         .unwrap();
@@ -1080,6 +1055,7 @@ async fn metadata_only_update_emits_metadata_updated_progress_event() {
         deletion: DeletionPolicy::Retain,
         document_validators: FetchMetadata::default(),
         stored_inputs_digest: None,
+        fetcher: &UnreachableFetcher,
     };
     run_source_ingestion(&source, &ingestor2, deps2)
         .await

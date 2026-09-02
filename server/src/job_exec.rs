@@ -305,6 +305,13 @@ pub async fn run_job(
             deletion,
             document_validators,
             stored_inputs_digest: rt_source.feed_inputs_digest.clone(),
+            // The feed liveness sweep's own probe of an aged-out entry's
+            // link must use the destination-restricted client — the same
+            // trust-boundary split `build_ingestor_for_spec` already
+            // applies when handing `entry_fetcher` to `FeedIngestor`
+            // itself, since a stale feed entry's stored link is exactly as
+            // untrusted now as it was when first discovered.
+            fetcher: &entry_fetcher,
         };
 
         match run_source_ingestion(&source, ingestor.as_ref(), source_deps).await {
@@ -315,6 +322,7 @@ pub async fn run_job(
                 stats.docs_deleted += r.docs_deleted;
                 stats.docs_prunable += r.docs_prunable;
                 stats.docs_metadata_updated += r.docs_metadata_updated;
+                stats.feed_entries_liveness_checked += r.feed_entries_liveness_checked;
                 stats.chunks_written += r.chunks_written;
                 stats.unsupported_format_count += r.unsupported_format_count;
                 stats.error_count += r.error_count;

@@ -246,6 +246,29 @@ pub struct ResourceRecord {
 }
 
 // ---------------------------------------------------------------------------
+// StaleFeedResource — feed liveness sweep candidate
+// ---------------------------------------------------------------------------
+
+/// A feed-discovered resource eligible for a liveness probe: this run did
+/// not observe it, so — from the store's point of view alone — it may have
+/// aged out of the feed's window. See
+/// `RetrievalStore::list_stale_feed_resources` and
+/// specs/04-search-pipeline.md §1 "Aged-out feed entries: the liveness
+/// sweep".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleFeedResource {
+    /// The resource's id (`resources.id`) — the key `delete_by_resource` and
+    /// `touch_resource_liveness` both take.
+    pub resource_id: String,
+    /// The resource's own URI — the entry link the sweep probes.
+    pub uri: String,
+    /// Stored `ETag` validator, replayed as `If-None-Match`.
+    pub external_etag: Option<String>,
+    /// Stored `Last-Modified` validator, replayed as `If-Modified-Since`.
+    pub external_last_modified: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // SearchResult
 // ---------------------------------------------------------------------------
 
@@ -549,6 +572,87 @@ pub trait RetrievalStore: Send + Sync + 'static {
     /// One record per distinct URI (first chunk wins). Implementations must NOT
     /// return the embedding column to avoid loading vectors for the entire store.
     async fn list_indexed_documents(&self) -> Result<Vec<DocumentRecord>, Error>;
+
+    /// List feed-discovered resources eligible for a liveness probe: rows
+    /// owned by `(store_id, source_id)` with `ingestor_kind = "feed"` whose
+    /// `last_checked_at` is either unset (never probed) or older than
+    /// `checked_before`, ordered oldest first with never-checked rows
+    /// leading, capped at `limit`.
+    ///
+    /// `limit` is the caller's *query* budget, deliberately larger than the
+    /// number of candidates it will actually probe: this query cannot see
+    /// the run's in-memory seen-set, so the caller over-fetches and
+    /// subtracts that set itself. Returning fewer rows than `limit` when
+    /// more match is therefore not an allowed optimization — it would
+    /// silently reintroduce the starvation the over-fetch exists to avoid.
+    ///
+    /// Backs the feed liveness sweep
+    /// (specs/04-search-pipeline.md §1 "Aged-out feed entries: the liveness
+    /// sweep"); the sweep itself, including its own guards and the
+    /// distinction between "aged out of the window" and "still in it," lives
+    /// in `crate::ingestion::run_source_ingestion` — this method is a plain
+    /// candidate lookup, not the sweep.
+    ///
+    /// A plain `ORDER BY last_checked_at ASC` already sorts SQLite `NULL`
+    /// before every non-`NULL` value, which is exactly "never-checked
+    /// leading" — implementations should rely on that rather than adding a
+    /// `CASE`/`COALESCE` to spell it out.
+    ///
+    /// **Must exclude every URI carrying a fragment.** A link-less feed
+    /// entry is stored under a synthetic `{feed_url}#entry:{id}` URI
+    /// (specs/02-domain-model.md's "General connector pattern"); HTTP never
+    /// sends a fragment on the wire, so probing that URI verbatim would
+    /// actually request the feed root, and a 404/410 there would delete the
+    /// entry's resource on a signal that has nothing to do with it. This
+    /// must be enforced here, not as a post-filter over the returned list —
+    /// filtering downstream would leave those rows permanently eligible
+    /// (nothing ever advances their `last_checked_at`) and they would keep
+    /// occupying `limit` slots forever. The accepted cost — a real entry
+    /// link that legitimately carries a fragment is also excluded, and can
+    /// never be pruned by this mechanism — is deliberate: deletion here is
+    /// asymmetric, so retention bias is the safe failure. See
+    /// `store-libsql`'s implementation for the exact SQL.
+    ///
+    /// The default implementation returns an empty list, mirroring
+    /// `upsert_blocks`'s no-op default below: `FakeStore` and any store that
+    /// predates the liveness sweep report no candidates, and the sweep
+    /// simply has nothing to do for them.
+    async fn list_stale_feed_resources(
+        &self,
+        store_id: &str,
+        source_id: &str,
+        checked_before: &str,
+        limit: usize,
+    ) -> Result<Vec<StaleFeedResource>, Error> {
+        let _ = (store_id, source_id, checked_before, limit);
+        Ok(Vec::new())
+    }
+
+    /// Record a liveness probe's outcome for one resource: refresh its
+    /// stored conditional-GET validators and `last_checked_at`, and nothing
+    /// else.
+    ///
+    /// **Must never write `index_updated_at`.** That column normatively
+    /// means "we last wrote this resource's stored state" and is publicly
+    /// exposed as `DocumentInfo::index_updated_at` (`localdb document get`,
+    /// `GET /v1/documents/{id}`, MCP `get_document`/`list_documents`). A
+    /// liveness probe writes no content and no metadata, so bumping that
+    /// column would misreport a merely-pinged resource as re-written — which
+    /// is exactly why schema v8 gave the throttle clock its own column
+    /// (`last_checked_at`) instead of reusing this one.
+    ///
+    /// The default implementation is a no-op, mirroring
+    /// `list_stale_feed_resources` above.
+    async fn touch_resource_liveness(
+        &self,
+        store_id: &str,
+        resource_id: &str,
+        etag: Option<&str>,
+        last_modified: Option<&str>,
+    ) -> Result<(), Error> {
+        let _ = (store_id, resource_id, etag, last_modified);
+        Ok(())
+    }
 
     /// Update an existing resource's metadata in place, without touching its
     /// chunks, blocks, or embeddings (issue #176's metadata-only incremental

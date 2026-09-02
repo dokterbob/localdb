@@ -19,8 +19,8 @@ use localdb_core::embedder::FakeEmbedder;
 use localdb_core::error::Error;
 use localdb_core::ids::compute_metadata_hash;
 use localdb_core::ingestion::{
-    run_source_ingestion, DeletionPolicy, DocumentIndex, FetchMetadata, FetchResult,
-    IngestionConfig, SourceIngestionDeps, UrlFetcher,
+    run_source_ingestion, DocumentIndex, FetchMetadata, FetchResult, IngestionConfig,
+    SourceIngestionDeps, UrlFetcher,
 };
 use localdb_core::metadata::DublinCoreMetadata;
 use localdb_core::parser::{ParsedDocument, Parser, Probe};
@@ -222,16 +222,7 @@ async fn run_two_feeds(first_feed: Vec<u8>, second_feed: Vec<u8>) -> (FakeStore,
         run_source_ingestion(
             &source,
             &ingestor,
-            SourceIngestionDeps {
-                doc_index: &mut doc_index,
-                store: &store,
-                embedder: &embedder,
-                config: &config,
-                progress: None,
-                deletion: DeletionPolicy::Retain,
-                document_validators: FetchMetadata::default(),
-                stored_inputs_digest: None,
-            },
+            SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config),
         )
         .await
         .unwrap();

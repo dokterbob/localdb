@@ -22,7 +22,7 @@ use localdb_core::error::Error;
 use localdb_core::ids::compute_feed_inputs_digest;
 use localdb_core::ingestion::{
     run_source_ingestion, DeletionPolicy, DocumentIndex, FetchMetadata, FetchResult,
-    IngestionConfig, IngestionResult, SourceIngestionDeps, UrlFetcher,
+    IngestionConfig, IngestionResult, SourceIngestionDeps, UnreachableFetcher, UrlFetcher,
 };
 use localdb_core::metadata::DublinCoreMetadata;
 use localdb_core::parser::{ParsedDocument, Parser, Probe};
@@ -188,6 +188,9 @@ async fn run_once(
                 last_modified: None,
             },
             stored_inputs_digest: stored_digest,
+            // Retaining run: the liveness sweep never fires, so this must
+            // never be reached.
+            fetcher: &UnreachableFetcher,
         },
     )
     .await

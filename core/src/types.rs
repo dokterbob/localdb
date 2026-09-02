@@ -544,6 +544,10 @@ pub struct IndexJobStats {
     /// rewritten in place — no chunks/embeddings touched. Mirrors
     /// `IngestionResult::docs_metadata_updated` (issue #176).
     pub docs_metadata_updated: u64,
+    /// Feed-discovered resources the liveness sweep probed this run.
+    /// Mirrors `IngestionResult::feed_entries_liveness_checked` — see its
+    /// doc comment for exactly what counts as "probed".
+    pub feed_entries_liveness_checked: u64,
     /// Chunks written to the retrieval backend.
     pub chunks_written: u64,
     /// Files that could not be indexed due to unsupported format.
