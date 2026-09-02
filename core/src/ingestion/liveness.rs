@@ -1,8 +1,15 @@
 //! The feed liveness sweep (specs/04-search-pipeline.md §1 "Aged-out feed
 //! entries: the liveness sweep"): for a `SourceSpec::Feed` source, probes a
-//! bounded batch of feed-discovered resources this run did not observe —
-//! entries aged out of the feed's window — against their stored link, and
-//! deletes only the ones a probe *positively confirms* gone (404/410).
+//! bounded batch of feed-discovered resources this run did not observe
+//! against their stored link, and deletes only the ones a probe *positively
+//! confirms* gone (404/410).
+//!
+//! "Did not observe" is the candidate rule; "aged out of the window" is the
+//! case it exists to serve, and the two are not the same. Nothing persists
+//! window membership, and a run whose feed document answered 304 observed
+//! nothing at all — so an entry the window still lists is a candidate on
+//! such a run. See the spec section named above; the bound is the delete
+//! rule, not the candidate rule.
 //!
 //! This sits in the confirmed-gone bucket alongside `IngestCallback::on_gone`
 //! (handled directly in `super::run_source_ingestion`), not the
@@ -68,9 +75,9 @@ pub(in crate::ingestion) const FEED_LIVENESS_OVERFETCH_CAP: usize = 500;
 
 /// The feed liveness sweep (specs/04-search-pipeline.md §1 "Aged-out feed
 /// entries: the liveness sweep"). For a `SourceSpec::Feed` source, probes a
-/// bounded batch of feed-discovered resources this run did not observe —
-/// entries aged out of the feed's window — against their stored link, and
-/// deletes only the ones a probe *positively confirms* gone (404/410).
+/// bounded batch of feed-discovered resources this run did not observe
+/// against their stored link, and deletes only the ones a probe *positively
+/// confirms* gone (404/410).
 ///
 /// This sits in the confirmed-gone bucket alongside `IngestCallback::on_gone`
 /// above, not the presumed-gone one: it never deletes on absence alone, only
@@ -79,25 +86,34 @@ pub(in crate::ingestion) const FEED_LIVENESS_OVERFETCH_CAP: usize = 500;
 /// an entry merely scrolling off the window is still never, on its own, a
 /// deletion signal; only a confirmed 404/410 on its own link is.
 ///
+/// What the candidate rule does *not* promise is that a candidate has aged
+/// out. Nothing persists window membership, so "did not observe" is all the
+/// query has, and on a feed-document 304 that is every entry the source
+/// owns. An entry the window still lists can therefore be probed and, on a
+/// confirmed 404/410, pruned — bounded by `--delete` (the caller gates on
+/// it) and by the origin's own answer, not by the candidate rule.
+///
 /// Callers must suppress this on an `Enumeration::Incomplete` run — a run
-/// that could not read the feed's window cannot tell an aged-out entry from
-/// one it never saw. A *zero-seen* run, by contrast, must still reach this
+/// that could not read the feed's window knows nothing at all about which
+/// entries it holds, so every previously indexed URI would queue for
+/// probing off a signal already known to be broken. A *zero-seen* run, by contrast, must still reach this
 /// function: that is the routine feed-304 case, and suppressing it starves
 /// the sweep exactly when a feed goes quiet (specs/04-search-pipeline.md §1
 /// "Guards"). See the call site in `run_source_ingestion`. This function
 /// performs no guard check of its own; it probes whatever
 /// [`RetrievalStore::list_stale_feed_resources`] returns, minus `seen`, up to
 /// [`FEED_LIVENESS_BATCH_LIMIT`].
-#[allow(clippy::too_many_arguments)]
+///
+/// The caller builds the [`LivenessProbeContext`] rather than handing over
+/// its five parts for this function to bundle: the bundle exists either way,
+/// since every candidate probe needs it, and building it one frame earlier
+/// is what keeps this signature to the four values that are actually this
+/// sweep's own — which source, how often, and what it already saw.
 pub(in crate::ingestion) async fn run_feed_liveness_sweep(
+    ctx: &mut LivenessProbeContext<'_>,
     source_id: &str,
-    store_id: &str,
     refresh_interval_secs: Option<u64>,
     seen: &std::collections::HashSet<String>,
-    doc_index: &mut DocumentIndex,
-    store: &dyn RetrievalStore,
-    fetcher: &dyn UrlFetcher,
-    result: &mut IngestionResult,
 ) -> Result<(), Error> {
     let floor_secs = refresh_interval_secs
         .unwrap_or(0)
@@ -128,43 +144,43 @@ pub(in crate::ingestion) async fn run_feed_liveness_sweep(
     let query_limit = FEED_LIVENESS_BATCH_LIMIT
         .saturating_add(seen.len())
         .min(FEED_LIVENESS_OVERFETCH_CAP);
-    let candidates: Vec<StaleFeedResource> = store
-        .list_stale_feed_resources(store_id, source_id, &checked_before, query_limit)
+    let candidates: Vec<StaleFeedResource> = ctx
+        .store
+        .list_stale_feed_resources(ctx.store_id, source_id, &checked_before, query_limit)
         .await?;
 
-    let mut ctx = LivenessProbeContext {
-        store_id,
-        doc_index,
-        store,
-        fetcher,
-        result,
-    };
     for candidate in candidates
         .into_iter()
-        // Still inside the feed's window — this run's own ingestion pass
-        // already observed it, so it hasn't aged out at all. Reachable when
-        // a currently-live entry's `last_checked_at` happens to be unset or
-        // stale (it has simply never been probed before, or was probed long
-        // ago while still current); probing it here would be redundant with
-        // the ordinary ingestion pass that already just ran for it.
+        // This run's own ingestion pass already observed this entry, so
+        // probing it here would only repeat what that pass just established.
+        // Reachable when a currently-live entry's `last_checked_at` happens
+        // to be unset or stale — it has simply never been probed, or was
+        // probed long ago while still current. Note this is all the sweep
+        // knows about window membership: on a run that observed nothing,
+        // this filter subtracts nothing.
         .filter(|candidate| !seen.contains(&candidate.uri))
         .take(FEED_LIVENESS_BATCH_LIMIT)
     {
-        probe_liveness_candidate(&mut ctx, candidate).await?;
+        probe_liveness_candidate(ctx, candidate).await?;
     }
 
     Ok(())
 }
 
-/// Everything [`probe_liveness_candidate`] needs beyond the candidate
-/// itself, bundled so splitting the sweep in two moves the parameter list
-/// rather than duplicating it.
-struct LivenessProbeContext<'a> {
-    store_id: &'a str,
-    doc_index: &'a mut DocumentIndex,
-    store: &'a dyn RetrievalStore,
-    fetcher: &'a dyn UrlFetcher,
-    result: &'a mut IngestionResult,
+/// Everything the sweep and each candidate probe need beyond the candidate
+/// itself: the store to query and write through, the fetcher to probe with,
+/// the index to keep in step, and the run's result to record into.
+///
+/// One bundle for both, deliberately. Splitting the sweep in two moved this
+/// parameter list rather than duplicating it, and having the caller
+/// construct it — see [`run_feed_liveness_sweep`] — keeps a second,
+/// structurally identical bundle from appearing beside it.
+pub(in crate::ingestion) struct LivenessProbeContext<'a> {
+    pub(in crate::ingestion) store_id: &'a str,
+    pub(in crate::ingestion) doc_index: &'a mut DocumentIndex,
+    pub(in crate::ingestion) store: &'a dyn RetrievalStore,
+    pub(in crate::ingestion) fetcher: &'a dyn UrlFetcher,
+    pub(in crate::ingestion) result: &'a mut IngestionResult,
 }
 
 /// Probe one aged-out feed entry and record the outcome.

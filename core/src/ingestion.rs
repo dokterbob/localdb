@@ -46,7 +46,7 @@ pub use deps::{
 pub use enumerate::{enumerate_path_source, FoundFile, PathEnumeration};
 pub use pipeline::{index_resource, IndexOutcome};
 
-use liveness::{feed_inputs_digest, run_feed_liveness_sweep};
+use liveness::{feed_inputs_digest, run_feed_liveness_sweep, LivenessProbeContext};
 use pipeline::PipelineCallback;
 
 // ---------------------------------------------------------------------------
@@ -756,12 +756,11 @@ pub async fn run_source_ingestion(
         // to be a broken connector than a source whose entire contents
         // vanished at once. This does not subsume guard 1: a connector
         // that enumerates 3 of 500 items before failing has a non-empty
-        // `seen` set, so only guard 1 protects the other 497. For a feed
-        // source specifically, this is also what reconciles the liveness
-        // sweep with the feed document's own 304 short-circuit: a 304 fires
-        // zero entry callbacks, so `seen` is empty and this guard fires —
-        // correctly, since an unchanged feed document means an unchanged
-        // window and nothing can have aged out since the last run.
+        // `seen` set, so only guard 1 protects the other 497. This guard is
+        // the presumed-gone sweep's alone: the feed liveness sweep below
+        // deliberately does not inherit it, because the two read the same
+        // empty seen-set for different purposes — here it would be a delete
+        // signal, there it only decides who gets probed.
         //
         // Deliberate trade-off: a source whose files really were all
         // deleted or renamed in one run keeps its stale documents until
@@ -814,9 +813,9 @@ pub async fn run_source_ingestion(
             // Guard 1 stays anomalous for a feed exactly as it is for
             // path/url sources: the ingestor itself failed to observe the
             // source, so it knows nothing about which entries the window
-            // holds. Every previously indexed URI would look aged out and the
-            // source's whole document set would queue for probing, 25 per
-            // run, off a signal already known to be broken.
+            // holds. Every previously indexed URI would become a candidate
+            // and the source's whole document set would queue for probing,
+            // 25 per run, off a signal already known to be broken.
             tracing::warn!(
                 source_id = %source.id,
                 location = %source_location(source),
@@ -842,10 +841,12 @@ pub async fn run_source_ingestion(
             // all are independent of the seen-set: it deletes only on a
             // confirmed 404/410, and it probes at most 25 candidates per run
             // per source, none more often than the recheck floor allows. An
-            // empty seen-set subtracts nothing from the candidate list, which
-            // is the right answer for a 304'd run — the window is unchanged,
-            // so nothing aged out *during* this run, and every candidate the
-            // query returns had already aged out before it began.
+            // empty seen-set subtracts nothing from the candidate list, so a
+            // 304'd run offers every one of the source's entries as a
+            // candidate, window members included — the direct consequence of
+            // having no persisted membership record, and bounded by the
+            // delete rule rather than by the candidate rule
+            // (specs/04-search-pipeline.md §1 "Candidates").
             let refresh_interval_secs = match &source.spec {
                 SourceSpec::Feed {
                     refresh_interval_secs,
@@ -853,17 +854,14 @@ pub async fn run_source_ingestion(
                 } => *refresh_interval_secs,
                 _ => None,
             };
-            run_feed_liveness_sweep(
-                &source.id,
-                &source.store_id,
-                refresh_interval_secs,
-                &seen,
+            let mut ctx = LivenessProbeContext {
+                store_id: &source.store_id,
                 doc_index,
                 store,
                 fetcher,
-                &mut result,
-            )
-            .await?;
+                result: &mut result,
+            };
+            run_feed_liveness_sweep(&mut ctx, &source.id, refresh_interval_secs, &seen).await?;
         }
     }
 

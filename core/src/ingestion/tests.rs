@@ -4,7 +4,9 @@ use crate::embedder::{DocumentChunks, Embedder, FakeEmbedder};
 use crate::ids::content_hash;
 use crate::ids::resource_id;
 use crate::ingestion::enumerate::glob_match;
-use crate::ingestion::liveness::{FEED_LIVENESS_BATCH_LIMIT, FEED_LIVENESS_OVERFETCH_CAP};
+use crate::ingestion::liveness::{
+    LivenessProbeContext, FEED_LIVENESS_BATCH_LIMIT, FEED_LIVENESS_OVERFETCH_CAP,
+};
 use crate::ingestion::pipeline::{effective_chunker_config, scale_to_chars};
 use crate::ingestor::{IngestCallback, MetadataWriteOutcome, SkipReason};
 use crate::store::{ChunkRecord, FakeStore, StaleFeedResource};
@@ -4551,33 +4553,41 @@ mod unified_pipeline {
             assert_eq!(store.touch_calls.lock().await.len(), 1);
         }
 
-        /// A 200 is touched (validators + `last_checked_at` refreshed),
-        /// never deleted, and — the point of this test — never
-        /// re-indexed: nothing in this test's `LivenessStore` exposes an
-        /// `upsert_chunks`/`upsert_chunks_and_blocks` write path that
-        /// records a call, so a passing assertion on `touch_calls` alone
-        /// (no other store method touched) already proves no re-index
-        /// happened.
-        /// Run the sweep once over `store` with `fetcher`, no seen-set
-        /// and no configured refresh interval — the shape almost every
-        /// single-candidate test below wants.
-        async fn sweep_once(store: &LivenessStore, fetcher: &ScriptedFetcher) -> IngestionResult {
+        /// Run the sweep once over `store` with `fetcher`, under
+        /// `refresh_interval_secs` and `seen`.
+        ///
+        /// The `DocumentIndex` is owned here rather than passed in: no test
+        /// in this module reads it back, because everything the sweep does
+        /// observably is recorded by `LivenessStore` and `ScriptedFetcher`.
+        async fn sweep(
+            store: &LivenessStore,
+            fetcher: &ScriptedFetcher,
+            refresh_interval_secs: Option<u64>,
+            seen: &std::collections::HashSet<String>,
+        ) -> IngestionResult {
             let mut doc_index = DocumentIndex::new();
-            let seen = std::collections::HashSet::new();
             let mut result = IngestionResult::default();
             run_feed_liveness_sweep(
+                &mut LivenessProbeContext {
+                    store_id: "store-1",
+                    doc_index: &mut doc_index,
+                    store,
+                    fetcher,
+                    result: &mut result,
+                },
                 "src-1",
-                "store-1",
-                None,
-                &seen,
-                &mut doc_index,
-                store,
-                fetcher,
-                &mut result,
+                refresh_interval_secs,
+                seen,
             )
             .await
             .unwrap();
             result
+        }
+
+        /// No seen-set and no configured refresh interval — the shape
+        /// almost every single-candidate test below wants.
+        async fn sweep_once(store: &LivenessStore, fetcher: &ScriptedFetcher) -> IngestionResult {
+            sweep(store, fetcher, None, &std::collections::HashSet::new()).await
         }
 
         /// A `200` refreshes the clock and **nothing else**: the
@@ -4765,21 +4775,8 @@ mod unified_pipeline {
             let seen: std::collections::HashSet<String> = (0..FEED_LIVENESS_BATCH_LIMIT)
                 .map(|i| format!("https://a.example.com/{i}"))
                 .collect();
-            let mut doc_index = DocumentIndex::new();
-            let mut result = IngestionResult::default();
 
-            run_feed_liveness_sweep(
-                "src-1",
-                "store-1",
-                None,
-                &seen,
-                &mut doc_index,
-                &store,
-                &fetcher,
-                &mut result,
-            )
-            .await
-            .unwrap();
+            sweep(&store, &fetcher, None, &seen).await;
 
             let calls = fetcher.calls.lock().await.clone();
             assert_eq!(
@@ -4806,21 +4803,8 @@ mod unified_pipeline {
             let seen: std::collections::HashSet<String> = (0..10_000)
                 .map(|i| format!("https://seen.example.com/{i}"))
                 .collect();
-            let mut doc_index = DocumentIndex::new();
-            let mut result = IngestionResult::default();
 
-            run_feed_liveness_sweep(
-                "src-1",
-                "store-1",
-                None,
-                &seen,
-                &mut doc_index,
-                &store,
-                &fetcher,
-                &mut result,
-            )
-            .await
-            .unwrap();
+            sweep(&store, &fetcher, None, &seen).await;
 
             assert_eq!(
                 store.last_query_limit(),
@@ -4908,22 +4892,9 @@ mod unified_pipeline {
                 Some(&twenty_five_hours_ago),
             )]);
             let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::Gone);
-            let mut doc_index = DocumentIndex::new();
             let seen = std::collections::HashSet::new();
-            let mut result = IngestionResult::default();
 
-            run_feed_liveness_sweep(
-                "src-1",
-                "store-1",
-                Some(30 * 24 * 60 * 60), // 30 days
-                &seen,
-                &mut doc_index,
-                &store,
-                &fetcher,
-                &mut result,
-            )
-            .await
-            .unwrap();
+            sweep(&store, &fetcher, Some(30 * 24 * 60 * 60), &seen).await; // 30 days
 
             assert!(
                 fetcher.calls.lock().await.is_empty(),
@@ -4948,22 +4919,9 @@ mod unified_pipeline {
                 Some(&one_minute_ago),
             )]);
             let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::Gone);
-            let mut doc_index = DocumentIndex::new();
             let seen = std::collections::HashSet::new();
-            let mut result = IngestionResult::default();
 
-            run_feed_liveness_sweep(
-                "src-1",
-                "store-1",
-                Some(u64::MAX),
-                &seen,
-                &mut doc_index,
-                &store,
-                &fetcher,
-                &mut result,
-            )
-            .await
-            .unwrap();
+            sweep(&store, &fetcher, Some(u64::MAX), &seen).await;
 
             assert!(
                 fetcher.calls.lock().await.is_empty(),
@@ -4986,22 +4944,9 @@ mod unified_pipeline {
                 Some(&twenty_three_hours_ago),
             )]);
             let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::Gone);
-            let mut doc_index = DocumentIndex::new();
             let seen = std::collections::HashSet::new();
-            let mut result = IngestionResult::default();
 
-            run_feed_liveness_sweep(
-                "src-1",
-                "store-1",
-                Some(0),
-                &seen,
-                &mut doc_index,
-                &store,
-                &fetcher,
-                &mut result,
-            )
-            .await
-            .unwrap();
+            sweep(&store, &fetcher, Some(0), &seen).await;
 
             assert!(
                 fetcher.calls.lock().await.is_empty(),
@@ -5018,23 +4963,10 @@ mod unified_pipeline {
                 Some(&old_timestamp()),
             )]);
             let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::Gone);
-            let mut doc_index = DocumentIndex::new();
             let mut seen = std::collections::HashSet::new();
             seen.insert("https://a.example.com/".to_string());
-            let mut result = IngestionResult::default();
 
-            run_feed_liveness_sweep(
-                "src-1",
-                "store-1",
-                None,
-                &seen,
-                &mut doc_index,
-                &store,
-                &fetcher,
-                &mut result,
-            )
-            .await
-            .unwrap();
+            let result = sweep(&store, &fetcher, None, &seen).await;
 
             assert!(
                 fetcher.calls.lock().await.is_empty(),
@@ -5134,22 +5066,9 @@ mod unified_pipeline {
                 None, // never-checked — would otherwise sort first
             )]);
             let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::Gone);
-            let mut doc_index = DocumentIndex::new();
             let seen = std::collections::HashSet::new();
-            let mut result = IngestionResult::default();
 
-            run_feed_liveness_sweep(
-                "src-1",
-                "store-1",
-                None,
-                &seen,
-                &mut doc_index,
-                &store,
-                &fetcher,
-                &mut result,
-            )
-            .await
-            .unwrap();
+            let result = sweep(&store, &fetcher, None, &seen).await;
 
             assert!(
                 fetcher.calls.lock().await.is_empty(),
