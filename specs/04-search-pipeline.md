@@ -203,12 +203,12 @@ request against each candidate's stored link, so — stated explicitly — there
 `docs_prunable` preview signal for it on a retaining run: a retaining run performs zero liveness
 fetches, and reports nothing pruned or prunable for this mechanism.
 
-**Candidates:** resources with `ingestor_kind = 'feed'` that this run did not observe — i.e. entries
-aged out of the feed's window — ordered oldest `last_checked_at` first, with never-checked resources
-leading. It is bounded twice: a batch cap of **25 candidates per run per source**, and a recheck
-floor of `max(refresh_interval, 24h)` below which a resource is not re-probed at all, regardless of
-how long it has gone unobserved. A feed source with no `refresh_interval_secs` configured — the
-common case — therefore uses the bare 24h floor.
+**Candidates:** resources with `ingestor_kind = 'feed'` and a non-`NULL` `external_id` that this run
+did not observe, ordered oldest `last_checked_at` first, with never-checked resources leading. It is
+bounded twice: a batch cap of **25 candidates per run per source**, and a recheck floor of
+`max(refresh_interval, 24h)` below which a resource is not re-probed at all, regardless of how long
+it has gone unobserved. A feed source with no `refresh_interval_secs` configured — the common case —
+therefore uses the bare 24h floor.
 
 **"Did not observe" is not "aged out of the window" (normative).** This section is named for the
 case it exists to serve, not for a precondition it can enforce. A run that read the feed's window
@@ -221,6 +221,15 @@ entry's own origin, and the mechanism as a whole needs `--delete`. The cost it a
 pruned this way is recreated from the feed's embedded content on the next run where the feed
 document changes, then pruned again — is stated with its ticket in
 [02-domain-model.md](02-domain-model.md) §2, "Conditional GET and pruning".
+
+**The feed's own document is never a candidate.** In single-document mode
+(`fetch_full_content: false`) the feed document itself is stored as a resource, under the feed URL,
+with `ingestor_kind = 'feed'` — and it is the one such resource carrying no `external_id`, since
+every discovered entry is stamped with the entry's own id. Were it a candidate, a 404/410 on the
+feed URL would delete the source's entire index through a mechanism meant to prune a single entry,
+so the candidate query requires `external_id IS NOT NULL`. A legacy row whose `external_id` was
+never captured is excluded by that same predicate and can therefore never be pruned by this
+mechanism: retention bias is the safe failure direction here, as it is throughout "Deletes" above.
 
 The batch cap counts candidates **actually probed**, not rows the store returned. The oldest-first
 query cannot see the run's in-memory seen-set, so applying the cap in SQL alone would let a run
