@@ -101,6 +101,62 @@ pub enum SkipReason {
     /// `Other`, which under-reported errors as skips). The string is a
     /// human-readable explanation (read error, parser error, parser panic).
     Error(String),
+    /// No new content, but the resource row *was* rewritten in place: a 304
+    /// carrying a rotated validator, or a connector re-supplying metadata
+    /// that moved on ([`MetadataWriteOutcome::Written`]).
+    ///
+    /// Distinct from [`Self::Unchanged`] because it is not a skip. It counts
+    /// toward `docs_metadata_updated`, exactly as the same write does when it
+    /// arrives through `on_resource`'s metadata-only branch — a URI counted
+    /// as both a skip and a metadata update would break the invariant that
+    /// the outcome counters partition `docs_seen`
+    /// (specs/04-search-pipeline.md).
+    MetadataUpdated,
+}
+
+/// What a metadata-refresh hook did to the store.
+///
+/// The two refresh hooks — [`IngestCallback::on_validators_refreshed`] and
+/// [`IngestCallback::on_metadata_refreshed`] — both run behind a 304, both
+/// may rewrite the resource row, and both may fail. Returning nothing left
+/// the caller reporting every 304 as a plain skip: a write that happened went
+/// uncounted, and a write that *failed* was reported as a clean skip, so the
+/// run's error count stayed zero while the metadata staleness persisted.
+///
+/// The caller folds the two outcomes with [`Self::merge`] and reports the URI
+/// exactly once, so the seen-set and the progress stream each see one event
+/// per URI regardless of how many hooks wrote.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum MetadataWriteOutcome {
+    /// Nothing needed writing: the incoming state matched what is stored.
+    /// Also the default for the trait's no-op implementations.
+    #[default]
+    Unchanged,
+    /// The resource row was rewritten in place.
+    Written,
+    /// The write was attempted and failed. The string is a human-readable
+    /// explanation, carried through to `SkipReason::Error`.
+    Failed(String),
+}
+
+impl MetadataWriteOutcome {
+    /// Fold the outcomes of two hooks over one URI into the single outcome
+    /// its caller reports, by severity: `Failed` outranks `Written`, which
+    /// outranks `Unchanged`.
+    ///
+    /// `Failed` wins because a run that failed a write must report an error
+    /// even when the other hook succeeded — the resource is left in a state
+    /// neither hook intended, and the next run has to retry. Between two
+    /// failures the first is kept; both name the same resource, and the
+    /// second's message adds nothing the first does not already surface.
+    pub fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (f @ Self::Failed(_), _) => f,
+            (_, f @ Self::Failed(_)) => f,
+            (Self::Written, _) | (_, Self::Written) => Self::Written,
+            _ => Self::Unchanged,
+        }
+    }
 }
 
 /// Callback for receiving resources during ingestion.
@@ -150,6 +206,87 @@ pub trait IngestCallback: Send {
     /// ingestor that merely fails to observe a locator must NOT call this;
     /// staying silent and letting the guarded sweep decide is correct there.
     async fn on_gone(&mut self, _uri: &Uri) {}
+
+    /// Look up conditional-GET validators stored from a previous successful
+    /// fetch of `uri`, to replay as `If-None-Match`/`If-Modified-Since` on
+    /// this fetch (`url` sources and feed entry links — see
+    /// `specs/04-search-pipeline.md` §1). The default empty `FetchMetadata`
+    /// means "no previous validators known," matching this trait's other
+    /// default-no-op methods so ingestors and test callbacks that don't need
+    /// replay can ignore it.
+    ///
+    /// `&mut self`, matching every other method on this trait, even though
+    /// this one is a pure lookup with nothing to record. A plain `&self`
+    /// looks like the better fit, and compiles standalone, but not through
+    /// `#[async_trait]`: a `&self` method desugars to a boxed future that
+    /// must be `Send`, which requires `&Self: Send`, which requires
+    /// `Self: Sync` — a bound this trait doesn't otherwise carry (its
+    /// `&mut self` methods only need `Self: Send`) and that every
+    /// implementor holding a `&mut DocumentIndex`-style field would have to
+    /// start satisfying too. `&mut self` avoids widening the trait's bounds
+    /// for one method's convenience; callers already hold
+    /// `&mut dyn IngestCallback`, so this costs them nothing.
+    async fn lookup_fetch_metadata(&mut self, _uri: &Uri) -> crate::ingestion::FetchMetadata {
+        crate::ingestion::FetchMetadata::default()
+    }
+
+    /// Called when a 304 Not Modified response itself carried a refreshed
+    /// validator (RFC 9111 requires storing one even though the body is
+    /// unchanged — see `FetchResult::NotModified`'s doc comment). `meta`
+    /// mirrors that variant's contract exactly: `None` in either field means
+    /// "unchanged, leave the stored value alone," never "clear it." The
+    /// default no-op matches every other optional signal on this trait.
+    ///
+    /// Returns what it did to the store, so the caller can report the URI as
+    /// a metadata update or an error rather than a plain skip — see
+    /// [`MetadataWriteOutcome`].
+    async fn on_validators_refreshed(
+        &mut self,
+        _uri: &Uri,
+        _meta: &crate::ingestion::FetchMetadata,
+    ) -> MetadataWriteOutcome {
+        MetadataWriteOutcome::Unchanged
+    }
+
+    /// Called when a connector re-supplies its own description of an
+    /// already-indexed resource whose *body* did not change — a feed entry
+    /// whose link answered 304 while the feed's own metadata for it moved
+    /// on.
+    ///
+    /// Without this, a 304 would freeze connector-supplied metadata forever:
+    /// the response carries no body, so there is nothing to re-parse and
+    /// nothing to route through `on_resource`, and a feed that corrects an
+    /// entry's author or publication date would never see the correction
+    /// land. `enrichment` is the connector's claim; the implementor layers
+    /// it onto the resource's *persisted* metadata via
+    /// [`crate::metadata::MetadataEnrichment::apply_to`], which is the same
+    /// merge the ingestor applies to freshly parsed metadata at index time —
+    /// so the two paths cannot drift into disagreeing about what a feed's
+    /// metadata means.
+    ///
+    /// `external_id` and `modified_at` are the connector's claims too, and
+    /// are passed separately because they live on the `Resource` rather than
+    /// inside `Metadata`. Both are authoritative: `None` means the connector
+    /// makes no claim, exactly as it would at index time, not "leave the
+    /// stored value alone."
+    ///
+    /// Deliberately separate from [`Self::on_validators_refreshed`] rather
+    /// than folded into a wider signature: a plain URL fetch has no
+    /// connector metadata at all and would otherwise pass empty claims on
+    /// every 304 forever. The default no-op matches every other optional
+    /// signal on this trait.
+    ///
+    /// Returns what it did to the store, on the same contract as
+    /// [`Self::on_validators_refreshed`] — see [`MetadataWriteOutcome`].
+    async fn on_metadata_refreshed(
+        &mut self,
+        _uri: &Uri,
+        _enrichment: &crate::metadata::MetadataEnrichment,
+        _external_id: Option<&str>,
+        _modified_at: Option<&str>,
+    ) -> MetadataWriteOutcome {
+        MetadataWriteOutcome::Unchanged
+    }
 }
 
 /// Source information passed to an ingestor.
@@ -272,5 +409,25 @@ mod tests {
         // #156: an ingestor that says nothing about enumeration completeness
         // is claiming a complete view — the sweep-licensing default.
         assert_eq!(result.enumeration, Enumeration::Complete);
+    }
+
+    /// A callback that overrides nothing but `on_resource` (the only
+    /// non-defaulted method) must still get an empty `FetchMetadata` back
+    /// from `lookup_fetch_metadata` — the conditional-GET replay seam is
+    /// opt-in, like every other hook on this trait.
+    #[tokio::test]
+    async fn lookup_fetch_metadata_default_is_empty() {
+        struct NoopCallback;
+        #[async_trait::async_trait]
+        impl IngestCallback for NoopCallback {
+            async fn on_resource(&mut self, _resource: Resource) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+        let mut cb = NoopCallback;
+        let uri = Uri::parse("https://example.com/doc").unwrap();
+        let meta = cb.lookup_fetch_metadata(&uri).await;
+        assert_eq!(meta.etag, None);
+        assert_eq!(meta.last_modified, None);
     }
 }

@@ -230,6 +230,10 @@ pub struct ResourceRecord {
     pub external_id: Option<String>,
     /// The source's own change-detection token. See `ChunkRecord::external_etag`.
     pub external_etag: Option<String>,
+    /// Raw HTTP `Last-Modified` conditional-GET validator, beside
+    /// `external_etag`. See `Resource::external_last_modified` — not an
+    /// input to `core::ids::compute_metadata_hash`.
+    pub external_last_modified: Option<String>,
     /// The resource's own claimed modification time (RFC 3339). `None` when
     /// the source makes no such claim — see `ChunkRecord::modified_at`.
     pub modified_at: Option<String>,
@@ -572,6 +576,32 @@ pub trait RetrievalStore: Send + Sync + 'static {
         record: &ResourceRecord,
     ) -> Result<(), Error>;
 
+    /// Single-row read of a resource's persisted metadata state — the read
+    /// counterpart to [`Self::update_resource_metadata`], returning exactly
+    /// the record that method writes.
+    ///
+    /// This exists because [`Self::get_chunks_for_resource`] cannot stand in
+    /// for it. A caller rebuilding a `ResourceRecord` in order to rewrite one
+    /// field needs the row's current value for every *other* field, and three
+    /// of them — `external_id`, `date_original`, `date_parsed` — are
+    /// write-only on `ChunkRecord` by design (see their doc comments): a
+    /// chunk read reports `None` for each regardless of what the row holds.
+    /// Building a record from a chunk and writing it back therefore nulls
+    /// those columns. Widening the chunk projection is not the fix — it also
+    /// backs `dense_search`/`bm25_search`, so every search result would carry
+    /// and parse fields nothing reads.
+    ///
+    /// Returns `Ok(None)` when no row matches `(store_id, resource_id)` — a
+    /// concurrent delete, or a resource this store never held. No default
+    /// implementation, for the same reason `update_resource_metadata` has
+    /// none: a store answering `None` unconditionally would silently turn
+    /// every caller into a no-op.
+    async fn get_resource_record(
+        &self,
+        store_id: &str,
+        resource_id: &str,
+    ) -> Result<Option<ResourceRecord>, Error>;
+
     /// Upsert a set of blocks for a document.
     ///
     /// The resource row identified by `resource_id` must already exist (written
@@ -634,6 +664,15 @@ pub trait RetrievalStore: Send + Sync + 'static {
     /// (libsql) override wraps the delete and both upserts in a single
     /// database transaction, guaranteeing that a write failure rolls back
     /// the delete along with the insert.
+    ///
+    /// `external_last_modified` is the resource's raw HTTP `Last-Modified`
+    /// conditional-GET validator (`Resource::external_last_modified`), a
+    /// trailing parameter rather than a `ChunkRecord` field: unlike
+    /// `external_etag`, it is deliberately not denormalized onto every chunk
+    /// row (see `ChunkRecord`'s doc comment), since only the owning
+    /// resource row needs it. The default implementation below has nowhere
+    /// to persist it (no `ChunkRecord`/`upsert_blocks` column carries it) and
+    /// ignores it; only `TenantStore` writes it.
     async fn upsert_chunks_and_blocks(
         &self,
         store_id: &str,
@@ -641,7 +680,9 @@ pub trait RetrievalStore: Send + Sync + 'static {
         records: Vec<ChunkRecord>,
         blocks: &[crate::block::Block],
         replaces_resource_id: Option<&str>,
+        external_last_modified: Option<&str>,
     ) -> Result<usize, Error> {
+        let _ = external_last_modified;
         if let Some(old_id) = replaces_resource_id {
             self.delete_by_resource(old_id).await?;
         }
@@ -666,6 +707,18 @@ pub struct FakeStore {
     /// `store_id`-agnostic lookup below — `FakeStore` is used single-store-at-
     /// a-time in tests, so `store_id` is accepted but not partitioned on).
     blocks: tokio::sync::RwLock<HashMap<String, Vec<crate::block::Block>>>,
+    /// Every `ResourceRecord` handed to `update_resource_metadata`, in call
+    /// order, paired with its `resource_id`.
+    ///
+    /// `FakeStore` otherwise models a resource's persisted state as the
+    /// denormalized fields on its `ChunkRecord`s, which is faithful for every
+    /// column `ChunkRecord` carries — but `external_last_modified` is
+    /// deliberately not one of them (it is routed through `ResourceRecord`
+    /// instead of becoming another per-chunk denormalized copy). Without this
+    /// log, a caller's choice of `external_last_modified` would be invisible
+    /// to any test using this store, so the preserve-vs-overwrite behavior on
+    /// a partially-populated update could not be pinned at all.
+    metadata_updates: tokio::sync::RwLock<Vec<(String, ResourceRecord)>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -675,7 +728,14 @@ impl FakeStore {
         Self {
             chunks: tokio::sync::RwLock::new(Vec::new()),
             blocks: tokio::sync::RwLock::new(HashMap::new()),
+            metadata_updates: tokio::sync::RwLock::new(Vec::new()),
         }
+    }
+
+    /// The `ResourceRecord`s passed to `update_resource_metadata`, in call
+    /// order. See the field's own comment for why this log exists.
+    pub async fn metadata_updates(&self) -> Vec<(String, ResourceRecord)> {
+        self.metadata_updates.read().await.clone()
     }
 }
 
@@ -861,6 +921,11 @@ impl RetrievalStore for FakeStore {
                     chunk.external_etag.as_deref(),
                     chunk.modified_at.as_deref(),
                 ),
+                external_etag: chunk.external_etag.clone(),
+                // `ChunkRecord` deliberately carries no
+                // `external_last_modified` (see `upsert_chunks_and_blocks`'s
+                // doc comment) — `FakeStore` has nowhere to keep it.
+                external_last_modified: None,
             });
         }
         Ok(seen.into_values().collect())
@@ -872,6 +937,10 @@ impl RetrievalStore for FakeStore {
         resource_id: &str,
         record: &ResourceRecord,
     ) -> Result<(), Error> {
+        self.metadata_updates
+            .write()
+            .await
+            .push((resource_id.to_string(), record.clone()));
         let mut chunks = self.chunks.write().await;
         let mut touched = false;
         for chunk in chunks
@@ -898,6 +967,37 @@ impl RetrievalStore for FakeStore {
                 id: resource_id.to_string(),
             })
         }
+    }
+
+    async fn get_resource_record(
+        &self,
+        store_id: &str,
+        resource_id: &str,
+    ) -> Result<Option<ResourceRecord>, Error> {
+        let chunks = self.chunks.read().await;
+        // `FakeStore` has no separate `resources` table: it denormalizes
+        // every resource-level field onto each chunk row, so the first
+        // matching chunk *is* the resource's persisted state. That is also
+        // why this double cannot reproduce the projection bug the real
+        // backend has — see `RetrievalStore::get_resource_record`.
+        let Some(chunk) = chunks
+            .iter()
+            .find(|c| c.store_id == store_id && c.resource_id == resource_id)
+        else {
+            return Ok(None);
+        };
+        Ok(Some(ResourceRecord {
+            metadata: chunk.metadata.clone(),
+            external_id: chunk.external_id.clone(),
+            external_etag: chunk.external_etag.clone(),
+            // `ChunkRecord` carries no `external_last_modified` (same
+            // limitation `list_indexed_documents` above records) — `FakeStore`
+            // has nowhere to keep it.
+            external_last_modified: None,
+            modified_at: chunk.modified_at.clone(),
+            date_original: chunk.date_original.clone(),
+            date_parsed: chunk.date_parsed.clone(),
+        }))
     }
 
     async fn upsert_blocks(
@@ -1085,7 +1185,7 @@ pub mod conformance {
             vec![0.0, 1.0],
         )];
         let written = store
-            .upsert_chunks_and_blocks("store-1", "doc-b", new_records, &[], Some("doc-a"))
+            .upsert_chunks_and_blocks("store-1", "doc-b", new_records, &[], Some("doc-a"), None)
             .await
             .unwrap();
         assert_eq!(written, 1, "should report 1 written chunk for doc-b");
@@ -1129,7 +1229,7 @@ pub mod conformance {
             vec![0.0, 1.0],
         )];
         let written = store
-            .upsert_chunks_and_blocks("store-1", "doc-1", new_records, &[], Some("doc-1"))
+            .upsert_chunks_and_blocks("store-1", "doc-1", new_records, &[], Some("doc-1"), None)
             .await
             .unwrap();
         assert_eq!(written, 1, "should report 1 written chunk");

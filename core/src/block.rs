@@ -48,6 +48,12 @@ pub struct Resource {
     /// Change detection token from the source system.
     pub external_etag: Option<String>,
 
+    /// Raw HTTP `Last-Modified` conditional-GET validator, beside
+    /// `external_etag`. See specs/02-domain-model.md §2: unlike
+    /// `external_etag`, this is deliberately not an input to
+    /// `core::ids::compute_metadata_hash`.
+    pub external_last_modified: Option<String>,
+
     /// blake3 of ordered block canonical texts concatenated.
     pub content_hash: String,
 
@@ -488,6 +494,7 @@ mod tests {
             uri: Uri::parse("file:///test.md").unwrap(),
             external_id: None,
             external_etag: None,
+            external_last_modified: None,
             content_hash: "hash123".to_string(),
             title: Some("Test".to_string()),
             mime: Some("text/markdown".to_string()),

@@ -84,6 +84,7 @@ fn make_resource_full(
         uri: Uri::parse(uri).unwrap_or_else(|| panic!("invalid test uri: {uri}")),
         external_id: external_id.map(str::to_string),
         external_etag: external_etag.map(str::to_string),
+        external_last_modified: None,
         content_hash: hash,
         title: title.map(str::to_string),
         mime: Some("text/markdown".to_string()),
@@ -274,6 +275,14 @@ impl RetrievalStore for RecordingStore {
         self.inner
             .update_resource_metadata(store_id, resource_id, record)
             .await
+    }
+
+    async fn get_resource_record(
+        &self,
+        store_id: &str,
+        resource_id: &str,
+    ) -> Result<Option<ResourceRecord>, Error> {
+        self.inner.get_resource_record(store_id, resource_id).await
     }
 
     async fn upsert_blocks(
@@ -745,6 +754,7 @@ async fn fake_store_update_resource_metadata_errors_on_unknown_resource() {
         metadata: Metadata::default(),
         external_id: None,
         external_etag: None,
+        external_last_modified: None,
         modified_at: Some("2026-06-10T12:00:00Z".to_string()),
         date_original: None,
         date_parsed: None,

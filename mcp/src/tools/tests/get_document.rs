@@ -213,7 +213,7 @@ async fn tool_get_document_reconstructs_table_without_duplicated_header() {
         .collect();
 
     store
-        .upsert_chunks_and_blocks(&store_id, &doc_id, chunk_records, &[block], None)
+        .upsert_chunks_and_blocks(&store_id, &doc_id, chunk_records, &[block], None, None)
         .await
         .unwrap();
 

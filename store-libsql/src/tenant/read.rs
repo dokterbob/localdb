@@ -2,12 +2,12 @@ use libsql::params;
 use localdb_core::ingestion::DocumentRecord;
 use localdb_core::{
     compute_metadata_hash, content_hash, ChunkRecord, Error, Metadata, MetadataFilter,
-    SearchResult, StoreStats, VectorEncoding,
+    ResourceRecord, SearchResult, StoreStats, VectorEncoding,
 };
 
 use super::rows::{row_to_block, row_to_chunk_record_strict};
 use super::sql::{build_filter_clauses, escape_fts5_query};
-use super::TenantStore;
+use super::{ensure_store_id, TenantStore};
 use crate::connection::map_libsql_err;
 use crate::vectors;
 
@@ -296,6 +296,75 @@ pub(crate) async fn get_blocks_for_resource(
     Ok(out)
 }
 
+/// Read one resource row's persisted metadata state, in exactly the shape
+/// `update_resource_metadata` writes it back.
+///
+/// Deliberately its own projection rather than a reuse of `CHUNK_COLS`: that
+/// projection omits `external_id`/`date_original`/`date_parsed` (write-only
+/// on `ChunkRecord`) and also backs `dense_search`/`bm25_search`, so widening
+/// it to serve this one caller would make every search row carry and parse
+/// three fields no search consumer reads. See
+/// `RetrievalStore::get_resource_record`.
+///
+/// Being a write payload rather than a display value is what sets its two
+/// error rules apart from every other read here: the caller's `store_id` is
+/// checked against the handle's instead of being forwarded into the `WHERE`
+/// clause, and a `metadata_json` column that does not decode is an error
+/// rather than a `Metadata::default()`. Both are spelled out at the point
+/// they apply below.
+pub(crate) async fn get_resource_record(
+    store: &TenantStore,
+    store_id: &str,
+    resource_id: &str,
+) -> Result<Option<ResourceRecord>, Error> {
+    // The only read in this file that is handed a `store_id` rather than
+    // taking the handle's own — the trait signature carries one because its
+    // write counterpart does. Checked, never forwarded unchecked.
+    ensure_store_id(store, store_id, "get_resource_record")?;
+    let conn = store.conn().reader();
+    let mut rows = conn
+        .query(
+            "SELECT metadata_json, external_id, external_etag, external_last_modified,
+                    modified_at, date_original, date_parsed
+             FROM resources WHERE store_id = ? AND id = ?",
+            params![store_id.to_string(), resource_id.to_string()],
+        )
+        .await
+        .map_err(map_libsql_err)?;
+    let Some(row) = rows.next().await.map_err(map_libsql_err)? else {
+        return Ok(None);
+    };
+    let metadata_json: String = row.get(0).map_err(map_libsql_err)?;
+    // Strict, unlike the chunk-read precedent in `rows.rs`, because this is
+    // not a display path: what it returns becomes the *payload* of an
+    // `update_resource_metadata` call, and that rewrites every metadata
+    // column of the row. A lenient `Metadata::default()` here would therefore
+    // not merely misreport a corrupt row — it would overwrite whatever real
+    // metadata the row still holds with an empty one, on a 304 that changed
+    // nothing. Erroring leaves the row exactly as it stands and reports the
+    // failure instead: `read_persisted_record` maps a store error to
+    // `MetadataWriteOutcome::Failed`, which the run counts and prints. The
+    // lenient helper keeps serving the read-only callers (`rows.rs`,
+    // `registry/documents.rs`), where a default is a display fallback and
+    // nothing is written back from it.
+    let metadata: Metadata = serde_json::from_str(&metadata_json).map_err(|e| Error::Internal {
+        message: format!(
+            "resource '{resource_id}' has metadata_json that does not decode, so its row cannot \
+             be rebuilt without destroying it: {e}"
+        ),
+        correlation_id: "store_handle_resource_metadata".to_string(),
+    })?;
+    Ok(Some(ResourceRecord {
+        metadata,
+        external_id: row.get(1).map_err(map_libsql_err)?,
+        external_etag: row.get(2).map_err(map_libsql_err)?,
+        external_last_modified: row.get(3).map_err(map_libsql_err)?,
+        modified_at: row.get(4).map_err(map_libsql_err)?,
+        date_original: row.get(5).map_err(map_libsql_err)?,
+        date_parsed: row.get(6).map_err(map_libsql_err)?,
+    }))
+}
+
 pub(crate) async fn list_indexed_documents(
     store: &TenantStore,
 ) -> Result<Vec<DocumentRecord>, Error> {
@@ -307,10 +376,17 @@ pub(crate) async fn list_indexed_documents(
     // state `index_resource`/`update_resource_metadata` write, or a
     // rehydrated `DocumentIndex` would disagree with the in-process one
     // about whether a resource's metadata changed (issue #176).
+    // `external_etag`/`external_last_modified` are ALSO kept on the returned
+    // `DocumentRecord` itself (not just consumed here for the hash) — they
+    // are the stored conditional-GET validators
+    // `IngestCallback::lookup_fetch_metadata` replays on the next fetch, and
+    // this is the one place that rehydrates `DocumentIndex` across process
+    // restarts.
     let mut rows = conn
         .query(
             "SELECT id, uri, content_hash, policy_version, source_id,
-                    metadata_json, external_id, external_etag, modified_at
+                    metadata_json, external_id, external_etag, modified_at,
+                    external_last_modified
              FROM resources WHERE store_id = ?",
             params![store.store_id().to_string()],
         )
@@ -323,6 +399,7 @@ pub(crate) async fn list_indexed_documents(
         let external_id: Option<String> = row.get(6).map_err(map_libsql_err)?;
         let external_etag: Option<String> = row.get(7).map_err(map_libsql_err)?;
         let modified_at: Option<String> = row.get(8).map_err(map_libsql_err)?;
+        let external_last_modified: Option<String> = row.get(9).map_err(map_libsql_err)?;
 
         // Deliberately re-parsed here (rather than delegating to
         // `parse_metadata_json_lenient`, the precedent `rows.rs` uses for
@@ -366,6 +443,8 @@ pub(crate) async fn list_indexed_documents(
             policy_version: row.get(3).map_err(map_libsql_err)?,
             source_id: row.get(4).map_err(map_libsql_err)?,
             metadata_hash,
+            external_etag,
+            external_last_modified,
         });
     }
     Ok(out)

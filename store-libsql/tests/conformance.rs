@@ -621,7 +621,7 @@ async fn replace_rolls_back_old_document_on_write_failure() {
     doc_b.source_id = "nonexistent-src".to_string();
 
     let result = handle
-        .upsert_chunks_and_blocks("store-1", "doc-b", vec![doc_b], &[], Some("doc-a"))
+        .upsert_chunks_and_blocks("store-1", "doc-b", vec![doc_b], &[], Some("doc-a"), None)
         .await;
     assert!(
         result.is_err(),
@@ -776,6 +776,7 @@ async fn upsert_chunks_and_blocks_rejects_cross_tenant_record() {
             )],
             &[],
             None,
+            None,
         )
         .await;
     assert!(matches!(
@@ -821,7 +822,7 @@ async fn upsert_chunks_and_blocks_writes_blocks_in_same_transaction() {
     ];
 
     let written = handle
-        .upsert_chunks_and_blocks("store-1", "doc-with-blocks", records, &blocks, None)
+        .upsert_chunks_and_blocks("store-1", "doc-with-blocks", records, &blocks, None, None)
         .await
         .unwrap();
     assert_eq!(written, 1);

@@ -304,6 +304,7 @@ impl Ingestor for FileIngestor {
                 uri: file.uri.clone(),
                 external_id: None,
                 external_etag: None,
+                external_last_modified: None,
                 content_hash: hash,
                 title,
                 mime,

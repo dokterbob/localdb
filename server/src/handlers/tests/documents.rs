@@ -183,7 +183,7 @@ async fn get_document_reconstructs_table_without_duplicated_header() {
         .retrieval_store(&store_id)
         .await
         .unwrap()
-        .upsert_chunks_and_blocks(&store_id, &doc_id, chunk_records, &[block], None)
+        .upsert_chunks_and_blocks(&store_id, &doc_id, chunk_records, &[block], None, None)
         .await
         .unwrap();
 

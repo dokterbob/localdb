@@ -62,7 +62,7 @@ pub use ingestion::{
 };
 pub use ingestor::{
     ConfigField, ConfigFieldType, Enumeration, IngestCallback, IngestResult, IngestSource,
-    Ingestor, IngestorConfig,
+    Ingestor, IngestorConfig, MetadataWriteOutcome,
 };
 pub use markdown_blocks::{heading_path_from_blocks, markdown_to_blocks};
 pub use metadata::{ConversationMetadata, DublinCoreMetadata, Metadata, TranscriptionMetadata};

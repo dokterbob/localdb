@@ -373,9 +373,10 @@ impl Ingestor for FeedIngestor {
                 title_fallback: Some(feed_title_text),
                 creator: Vec::new(),
                 date: None,
+                date_source: None,
                 modified_at_override,
                 provenance_source: Some(feed_url.clone()),
-                capture_etag: false,
+                capture_conditional_get: false,
             };
             let resource = build_resource(
                 source,
@@ -523,6 +524,11 @@ async fn process_discovery_entry(
             .published
             .or(entry.updated)
             .map(|d| d.to_rfc3339_opts(SecondsFormat::Secs, true)),
+        // Unconditional, unlike `date` above: an entry that has dropped its
+        // `<pubDate>` still needs the stamp, or the 304 seam cannot tell the
+        // date it wrote on an earlier run from one the linked page supplied,
+        // and a withdrawn feed date would stand forever.
+        date_source: Some("feed-entry".to_string()),
         // The feed's own modification claim, preferring `updated` (that's
         // what it means) over `published`; `dc.date` above keeps the
         // opposite preference (creation/publication semantics). Unlike
@@ -534,7 +540,7 @@ async fn process_discovery_entry(
             .or(entry.published)
             .map(|d| d.to_rfc3339_opts(SecondsFormat::Secs, true)),
         provenance_source: Some(feed_url.to_string()),
-        capture_etag: true,
+        capture_conditional_get: true,
     };
 
     let needs_fallback = if fetchable {

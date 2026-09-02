@@ -25,7 +25,9 @@ use crate::chunker::{chunk_blocks, CharSizer, ChunkSizer, ChunkerConfig, TokenSi
 use crate::embedder::{DocumentChunks, Embedder};
 use crate::error::Error;
 use crate::ids::new_ulid;
-use crate::ingestor::{Enumeration, IngestCallback, IngestSource, Ingestor, SkipReason};
+use crate::ingestor::{
+    Enumeration, IngestCallback, IngestSource, Ingestor, MetadataWriteOutcome, SkipReason,
+};
 use crate::metadata::Metadata;
 use crate::store::{ChunkRecord, RetrievalStore};
 use crate::types::{
@@ -68,6 +70,18 @@ pub struct DocumentRecord {
     /// extension point) so a future addition (e.g. #269's
     /// `extractor_version`) is a small struct change, not a redesign.
     pub metadata_hash: String,
+    /// Raw HTTP `ETag` validator captured from the last successful fetch of
+    /// this resource (`url` sources and feed entry links only; `None`
+    /// otherwise). Replayed as `If-None-Match` on the next fetch of the same
+    /// URI — see `IngestCallback::lookup_fetch_metadata` — subject to the
+    /// suppression rule: only when `policy_version` still matches the run's.
+    /// See specs/04-search-pipeline.md §1.
+    pub external_etag: Option<String>,
+    /// Raw HTTP `Last-Modified` validator, replayed as `If-Modified-Since`
+    /// under the same conditions as `external_etag`. Unlike `external_etag`,
+    /// not an input to `core::ids::compute_metadata_hash` — see
+    /// specs/02-domain-model.md §2.
+    pub external_last_modified: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -515,7 +529,7 @@ fn catch_panic<T>(
 // ---------------------------------------------------------------------------
 
 /// Metadata from a previous URL fetch, used for conditional GET.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FetchMetadata {
     /// ETag value from the previous response.
     pub etag: Option<String>,
@@ -1183,6 +1197,7 @@ pub async fn index_resource(
             records,
             &resource.blocks,
             replaces_resource_id,
+            resource.external_last_modified.as_deref(),
         )
         .await?;
 
@@ -1574,7 +1589,22 @@ impl IngestCallback for PipelineCallback<'_> {
                 // `index_resource` (which would otherwise duplicate it).
                 let derived = derive_resource_state(&resource);
 
-                if existing.metadata_hash == derived.metadata_hash {
+                // `external_last_modified` is compared on its own because
+                // it is deliberately not one of `compute_metadata_hash`'s
+                // inputs (specs/02-domain-model.md §2), so a hash comparison
+                // alone cannot see it move. A `Last-Modified`-only origin
+                // rotates exactly that field on an unchanged 200: without
+                // this the skip returns before the write, the stored
+                // validator stays at whatever the first run captured, and
+                // every run after replays an `If-Modified-Since` the origin
+                // has already moved past — a full re-download, every run,
+                // forever. The write is the metadata-only branch below,
+                // which already persists the field. Same reasoning
+                // `on_validators_refreshed` gives for comparing the
+                // validator pair rather than the hash.
+                if existing.metadata_hash == derived.metadata_hash
+                    && existing.external_last_modified == resource.external_last_modified
+                {
                     self.result.docs_skipped += 1;
                     self.emit(crate::progress::ProgressEvent::DocumentFinished {
                         uri,
@@ -1591,6 +1621,7 @@ impl IngestCallback for PipelineCallback<'_> {
                     metadata: derived.metadata,
                     external_id: resource.external_id.clone(),
                     external_etag: resource.external_etag.clone(),
+                    external_last_modified: resource.external_last_modified.clone(),
                     modified_at: derived.modified_at,
                     date_original: derived.date_original,
                     date_parsed: derived.date_parsed,
@@ -1621,6 +1652,8 @@ impl IngestCallback for PipelineCallback<'_> {
                     content_hash: existing.content_hash.clone(),
                     policy_version: existing.policy_version.clone(),
                     metadata_hash: derived.metadata_hash,
+                    external_etag: resource.external_etag.clone(),
+                    external_last_modified: resource.external_last_modified.clone(),
                 });
                 self.result.docs_metadata_updated += 1;
                 self.emit(crate::progress::ProgressEvent::DocumentFinished {
@@ -1668,6 +1701,8 @@ impl IngestCallback for PipelineCallback<'_> {
                     content_hash: resource.content_hash.clone(),
                     policy_version: self.config.policy_version.clone(),
                     metadata_hash,
+                    external_etag: resource.external_etag.clone(),
+                    external_last_modified: resource.external_last_modified.clone(),
                 });
                 self.emit(crate::progress::ProgressEvent::DocumentFinished {
                     uri,
@@ -1747,6 +1782,17 @@ impl IngestCallback for PipelineCallback<'_> {
                     outcome: crate::progress::DocOutcome::Skipped,
                 });
             }
+            SkipReason::MetadataUpdated => {
+                // Not a skip: the resource row was rewritten in place. Mirrors
+                // `on_resource`'s metadata-only branch exactly — same counter,
+                // same progress outcome — so a metadata write reads the same
+                // whether it arrived with a body or behind a 304.
+                self.result.docs_metadata_updated += 1;
+                self.emit(crate::progress::ProgressEvent::DocumentFinished {
+                    uri: uri.to_string(),
+                    outcome: crate::progress::DocOutcome::MetadataUpdated,
+                });
+            }
             SkipReason::Error(ref msg) => {
                 // C7/C8: processing failed but the item still exists — count
                 // it as an error (not a benign skip) so the CLI summary and
@@ -1764,6 +1810,296 @@ impl IngestCallback for PipelineCallback<'_> {
                 });
             }
         }
+    }
+
+    /// The suppression rule (normative) — specs/04-search-pipeline.md §1.
+    ///
+    /// Conditional headers are sent only when the stored resource's
+    /// `policy_version` equals this run's. A 304 returns no bytes, so a
+    /// resource that needs re-chunking under a changed policy could never be
+    /// re-chunked if it were allowed to answer 304 — the document would be
+    /// silently frozen at the old policy forever. This reuses the exact
+    /// signal `on_resource`'s own skip-check gates on a few dozen lines
+    /// above (`existing.policy_version == self.config.policy_version`), so
+    /// the two checks can never drift apart into disagreeing about whether a
+    /// resource is "current."
+    ///
+    /// **This is the designated join point.** Any future axis able to force
+    /// reprocessing without a content change (a real `extractor_version`
+    /// bump, a `Resource.mime` reclassification) must gate its own replay
+    /// suppression through this same check — bypassing it reintroduces
+    /// exactly the bug this comment describes, just under a different name.
+    async fn lookup_fetch_metadata(&mut self, uri: &Uri) -> FetchMetadata {
+        let Some(existing) = self.doc_index.get(uri.as_str()) else {
+            return FetchMetadata::default();
+        };
+        if existing.policy_version != self.config.policy_version {
+            return FetchMetadata::default();
+        }
+        FetchMetadata {
+            etag: existing.external_etag.clone(),
+            last_modified: existing.external_last_modified.clone(),
+        }
+    }
+
+    async fn on_validators_refreshed(
+        &mut self,
+        uri: &Uri,
+        meta: &FetchMetadata,
+    ) -> MetadataWriteOutcome {
+        // A bare 304 (both `None`) means "keep whatever is already stored"
+        // — never "clear it" (see `FetchResult::NotModified`'s doc comment).
+        // Nothing to persist.
+        if meta.etag.is_none() && meta.last_modified.is_none() {
+            return MetadataWriteOutcome::Unchanged;
+        }
+        let uri_str = uri.as_str().to_string();
+        let Some(existing) = self.doc_index.get(&uri_str).cloned() else {
+            // Nothing indexed for this URI under the current doc_index (a
+            // concurrent delete raced this fetch, or the liveness sweep is
+            // probing a URI this run's doc_index never loaded) — nothing to
+            // refresh.
+            return MetadataWriteOutcome::Unchanged;
+        };
+
+        let new_etag = meta.etag.clone().or_else(|| existing.external_etag.clone());
+        let new_last_modified = meta
+            .last_modified
+            .clone()
+            .or_else(|| existing.external_last_modified.clone());
+
+        // An origin is free to repeat the validator it already issued, and a
+        // well-behaved one does exactly that on every 304 for unchanged
+        // content — so this is the common case, not an edge. Writing anyway
+        // would rewrite the resource row and bump `index_updated_at` (public
+        // as `DocumentInfo.index_updated_at`) on a run that changed nothing.
+        //
+        // The comparison is on the validator pair itself, not on
+        // `compute_metadata_hash` as `on_metadata_refreshed` below uses:
+        // `external_last_modified` is deliberately not one of that hash's
+        // inputs (specs/02-domain-model.md §2), so a 304 rotating only
+        // `Last-Modified` produces an identical hash while still needing to
+        // be persisted. A hash guard here would silently drop it.
+        if new_etag == existing.external_etag
+            && new_last_modified == existing.external_last_modified
+        {
+            return MetadataWriteOutcome::Unchanged;
+        }
+
+        // RFC 9111 requires storing whichever validator(s) the 304 itself
+        // carried, but content and the resource's own metadata are
+        // unchanged by definition (a 304 has no body) — this never triggers
+        // a re-chunk or re-embed, and it never goes through `index_resource`
+        // or `on_resource`'s own metadata-only branch (neither has a
+        // `Resource` to work from here, only a `Uri` and a `FetchMetadata`).
+        //
+        // The subtle part: `external_etag` IS an input to
+        // `compute_metadata_hash`, but `external_last_modified` deliberately
+        // is not (specs/02-domain-model.md §2). `resources.external_etag` is
+        // about to change, and `list_indexed_documents` recomputes
+        // `metadata_hash` straight from that same column on every
+        // rehydration — so leaving the *cached* `metadata_hash` in
+        // `doc_index` unrefreshed would desync it from what a fresh
+        // rehydration computes for the same row. The next metadata-unchanged
+        // fetch for this URI would then see a spurious `metadata_hash`
+        // mismatch and route through a needless metadata-only update purely
+        // to correct a staleness this method introduced. So this recomputes
+        // and re-caches `metadata_hash` in lockstep with the rotated
+        // validator, over the resource's current persisted state —
+        // `update_resource_metadata` rewrites every column of that state, so
+        // every column it does not mean to change has to be read back first,
+        // and `DocumentRecord` carries only the hash, not what was hashed.
+        let resource_id = existing.resource_id.clone();
+        let persisted = match self
+            .store
+            .get_resource_record(&self.config.store_id, &resource_id)
+            .await
+        {
+            Ok(Some(record)) => record,
+            // No row: a concurrent delete, same race the `doc_index` miss
+            // above tolerates.
+            Ok(None) => return MetadataWriteOutcome::Unchanged,
+            Err(e) => {
+                let msg = format!(
+                    "error reading resource '{uri_str}' to refresh conditional-GET validators: {e}"
+                );
+                tracing::warn!("{msg}");
+                return MetadataWriteOutcome::Failed(msg);
+            }
+        };
+
+        let record = crate::store::ResourceRecord {
+            external_etag: new_etag.clone(),
+            external_last_modified: new_last_modified.clone(),
+            ..persisted
+        };
+        let metadata_hash = crate::ids::compute_metadata_hash(
+            &record.metadata,
+            record.external_id.as_deref(),
+            new_etag.as_deref(),
+            record.modified_at.as_deref(),
+        );
+
+        self.persist_metadata_write(
+            &uri_str,
+            &resource_id,
+            &record,
+            DocumentRecord {
+                metadata_hash,
+                external_etag: new_etag,
+                external_last_modified: new_last_modified,
+                ..existing
+            },
+            "refreshed conditional-GET validators",
+        )
+        .await
+    }
+
+    /// A 304 carries no body, so the connector's own metadata for the
+    /// resource — which it re-supplies on every run, independently of the
+    /// fetch — is the only thing that can have changed. Layer it back onto
+    /// the persisted state and write only if the result actually differs.
+    ///
+    /// The comparison is the point, not an optimization: an unchanged feed
+    /// entry is the overwhelmingly common case, and a blind write would turn
+    /// every 304 into a resource-row rewrite, bumping `index_updated_at`
+    /// (publicly visible as `DocumentInfo.index_updated_at`) on a run that
+    /// changed nothing. So this recomputes `metadata_hash` from the merged
+    /// state and returns early when it matches what is already cached —
+    /// exactly the equality the skip-check in `on_resource` performs, on the
+    /// same derivation, for the same reason.
+    ///
+    /// The merge runs against the *persisted* metadata rather than a fresh
+    /// parse, because there is no fresh parse to run. One consequence
+    /// follows from `MetadataEnrichment`'s title rule and is intended: a
+    /// connector title only fills a gap, so a feed that renames an entry
+    /// whose linked page supplied its own title changes nothing here — which
+    /// is what a full re-fetch would conclude too, since the page's title
+    /// would win again. Where the two paths do differ is the rarer case of a
+    /// page with no title of its own: the persisted title is then the
+    /// connector's previous one, no longer a gap, so a renamed entry keeps
+    /// the old title until its content changes. Erring toward keeping
+    /// extracted state is the safe direction; the overwrite-class fields
+    /// (`creator`, `date`, provenance, `external_id`, `modified_at`), where
+    /// staleness actually costs something, take the connector's current claim
+    /// — including the absence of one. A connector that stops claiming a
+    /// `date` it previously stamped retracts it (`MetadataEnrichment::
+    /// apply_to`), and `external_id`/`modified_at` are authoritative as
+    /// passed, `None` included. A connector that stops claiming a `creator`
+    /// is the one case that does not retract: `creator` carries no
+    /// provenance stamp, so there is no way to tell the connector's own
+    /// previous value from the extraction's.
+    async fn on_metadata_refreshed(
+        &mut self,
+        uri: &Uri,
+        enrichment: &crate::metadata::MetadataEnrichment,
+        external_id: Option<&str>,
+        modified_at: Option<&str>,
+    ) -> MetadataWriteOutcome {
+        let uri_str = uri.as_str().to_string();
+        let Some(existing) = self.doc_index.get(&uri_str).cloned() else {
+            // Nothing indexed for this URI under the current doc_index —
+            // same race `on_validators_refreshed` tolerates.
+            return MetadataWriteOutcome::Unchanged;
+        };
+
+        let resource_id = existing.resource_id.clone();
+        let persisted = match self
+            .store
+            .get_resource_record(&self.config.store_id, &resource_id)
+            .await
+        {
+            Ok(Some(record)) => record,
+            Ok(None) => return MetadataWriteOutcome::Unchanged,
+            Err(e) => {
+                let msg = format!(
+                    "error reading resource '{uri_str}' to refresh source-supplied metadata: {e}"
+                );
+                tracing::warn!("{msg}");
+                return MetadataWriteOutcome::Failed(msg);
+            }
+        };
+
+        let mut metadata = persisted.metadata;
+        enrichment.apply_to(metadata.dublin_core_mut());
+        // `date_original`/`date_parsed` are projections of the merged
+        // `dc.date`, re-derived here rather than carried over from the
+        // persisted record — the enrichment may have just replaced (or
+        // retracted) that date, and the two columns are what the `document`
+        // date axis filters on.
+        let date_original = metadata.dublin_core().date.clone();
+        let date_parsed = date_original
+            .as_deref()
+            .and_then(crate::dates::parse_partial_iso8601);
+        let external_id = external_id.map(str::to_string);
+        let modified_at = modified_at.map(str::to_string);
+
+        let metadata_hash = crate::ids::compute_metadata_hash(
+            &metadata,
+            external_id.as_deref(),
+            existing.external_etag.as_deref(),
+            modified_at.as_deref(),
+        );
+        if metadata_hash == existing.metadata_hash {
+            return MetadataWriteOutcome::Unchanged;
+        }
+
+        let record = crate::store::ResourceRecord {
+            metadata,
+            external_id,
+            external_etag: existing.external_etag.clone(),
+            external_last_modified: existing.external_last_modified.clone(),
+            modified_at,
+            date_original,
+            date_parsed,
+        };
+
+        self.persist_metadata_write(
+            &uri_str,
+            &resource_id,
+            &record,
+            DocumentRecord {
+                metadata_hash,
+                ..existing
+            },
+            "refreshed source-supplied metadata",
+        )
+        .await
+    }
+}
+
+impl PipelineCallback<'_> {
+    /// The write tail both metadata-refresh hooks share: persist the record,
+    /// and on success cache the `DocumentRecord` the hook derived for it.
+    ///
+    /// Only the tail is shared. Each hook keeps its own read, its own
+    /// derivation and its own unchanged-condition, because those genuinely
+    /// differ — one folds a validator pair and compares it directly, the
+    /// other merges a connector's claim and compares a metadata hash. `what`
+    /// names the refresh in the warning; it selects no behavior.
+    ///
+    /// A failed write leaves `doc_index` untouched on purpose, exactly like
+    /// `on_resource`'s metadata-only branch: the stale cached hash is what
+    /// makes the next run retry the write.
+    async fn persist_metadata_write(
+        &mut self,
+        uri: &str,
+        resource_id: &str,
+        record: &crate::store::ResourceRecord,
+        updated: DocumentRecord,
+        what: &str,
+    ) -> MetadataWriteOutcome {
+        if let Err(e) = self
+            .store
+            .update_resource_metadata(&self.config.store_id, resource_id, record)
+            .await
+        {
+            let msg = format!("error persisting {what} for '{uri}': {e}");
+            tracing::warn!("{msg}");
+            return MetadataWriteOutcome::Failed(msg);
+        }
+        self.doc_index.upsert(updated);
+        MetadataWriteOutcome::Written
     }
 }
 
@@ -1809,6 +2145,8 @@ mod tests {
             content_hash: "hash-1".to_string(),
             policy_version: "v1".to_string(),
             metadata_hash: "mhash-1".to_string(),
+            external_etag: None,
+            external_last_modified: None,
         };
         idx.upsert(rec.clone());
         let found = idx.get("file:///test.md").unwrap();
@@ -1825,6 +2163,8 @@ mod tests {
             content_hash: "hash-1".to_string(),
             policy_version: "v1".to_string(),
             metadata_hash: "mhash-1".to_string(),
+            external_etag: None,
+            external_last_modified: None,
         };
         idx.upsert(rec);
         let removed = idx.remove("file:///test.md");
@@ -2545,6 +2885,7 @@ mod tests {
                 uri: Uri::parse(uri).unwrap_or_else(|| panic!("invalid test uri: {uri}")),
                 external_id: None,
                 external_etag: None,
+                external_last_modified: None,
                 content_hash: hash,
                 title: None,
                 mime: Some("text/markdown".to_string()),
@@ -2602,6 +2943,8 @@ mod tests {
                 content_hash: resource.content_hash.clone(),
                 policy_version: config.policy_version.clone(),
                 metadata_hash,
+                external_etag: resource.external_etag.clone(),
+                external_last_modified: resource.external_last_modified.clone(),
             }
         }
 
@@ -4872,6 +5215,14 @@ mod tests {
                     .await
             }
 
+            async fn get_resource_record(
+                &self,
+                store_id: &str,
+                resource_id: &str,
+            ) -> Result<Option<crate::store::ResourceRecord>, Error> {
+                self.inner.get_resource_record(store_id, resource_id).await
+            }
+
             async fn upsert_chunks_and_blocks(
                 &self,
                 store_id: &str,
@@ -4879,6 +5230,7 @@ mod tests {
                 records: Vec<ChunkRecord>,
                 blocks: &[crate::block::Block],
                 replaces_resource_id: Option<&str>,
+                _external_last_modified: Option<&str>,
             ) -> Result<usize, Error> {
                 self.upsert_calls.lock().await.push((
                     store_id.to_string(),
@@ -5400,6 +5752,509 @@ mod tests {
                     "fetched_at must never be the feed-claimed modified_at"
                 );
             }
+        }
+
+        // -----------------------------------------------------------------
+        // 14. lookup_fetch_metadata — the conditional-GET replay seam and
+        //     its suppression rule (specs/04-search-pipeline.md §1)
+        // -----------------------------------------------------------------
+
+        /// A `PipelineCallback` wired to nothing but what
+        /// `lookup_fetch_metadata` itself touches (`doc_index` and
+        /// `config.policy_version`) — the store/embedder are never called on
+        /// this path, so `FakeStore`/`FakeEmbedder` stand in inertly.
+        fn make_pipeline_callback<'a>(
+            source: &'a Source,
+            doc_index: &'a mut DocumentIndex,
+            store: &'a FakeStore,
+            embedder: &'a FakeEmbedder,
+            config: &'a IngestionConfig,
+        ) -> PipelineCallback<'a> {
+            PipelineCallback {
+                source,
+                doc_index,
+                store,
+                embedder,
+                config,
+                progress: None,
+                result: IngestionResult::default(),
+                seen: std::collections::HashSet::new(),
+                gone: std::collections::HashSet::new(),
+                discovered_total: 0,
+                next_index: 0,
+                skip_error_count: 0,
+            }
+        }
+
+        #[tokio::test]
+        async fn lookup_fetch_metadata_returns_stored_validators_when_policy_matches() {
+            let store_id = "store-1";
+            let source = make_source_with_preset(store_id, "prose");
+            let config = make_ingestion_config(store_id);
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+
+            let mut doc_index = DocumentIndex::new();
+            doc_index.upsert(DocumentRecord {
+                uri: "https://example.com/doc".to_string(),
+                resource_id: "res-1".to_string(),
+                source_id: source.id.clone(),
+                content_hash: "hash-1".to_string(),
+                policy_version: config.policy_version.clone(),
+                metadata_hash: "mhash-1".to_string(),
+                external_etag: Some("\"abc\"".to_string()),
+                external_last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string()),
+            });
+
+            let mut callback =
+                make_pipeline_callback(&source, &mut doc_index, &store, &embedder, &config);
+            let uri = Uri::parse("https://example.com/doc").unwrap();
+            let meta = callback.lookup_fetch_metadata(&uri).await;
+
+            assert_eq!(meta.etag.as_deref(), Some("\"abc\""));
+            assert_eq!(
+                meta.last_modified.as_deref(),
+                Some("Wed, 21 Oct 2015 07:28:00 GMT")
+            );
+        }
+
+        /// The suppression rule, and the one behavior in this seam that must
+        /// never regress: a mismatched `policy_version` never replays a
+        /// stored validator. A 304 returns no bytes, so a
+        /// resource that needs re-chunking under a changed policy could
+        /// never be re-chunked if it were allowed to answer 304 — silently
+        /// freezing the document at the old policy forever.
+        #[tokio::test]
+        async fn lookup_fetch_metadata_returns_empty_when_policy_version_differs() {
+            let store_id = "store-1";
+            let source = make_source_with_preset(store_id, "prose");
+            let mut config = make_ingestion_config(store_id);
+            config.policy_version = "policy-v2".to_string();
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+
+            let mut doc_index = DocumentIndex::new();
+            doc_index.upsert(DocumentRecord {
+                uri: "https://example.com/doc".to_string(),
+                resource_id: "res-1".to_string(),
+                source_id: source.id.clone(),
+                content_hash: "hash-1".to_string(),
+                // Stored under the OLD policy — the run's config above is v2.
+                policy_version: "policy-v1".to_string(),
+                metadata_hash: "mhash-1".to_string(),
+                external_etag: Some("\"abc\"".to_string()),
+                external_last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string()),
+            });
+
+            let mut callback =
+                make_pipeline_callback(&source, &mut doc_index, &store, &embedder, &config);
+            let uri = Uri::parse("https://example.com/doc").unwrap();
+            let meta = callback.lookup_fetch_metadata(&uri).await;
+
+            assert_eq!(
+                meta.etag, None,
+                "a policy_version mismatch must suppress the stored ETag — replaying \
+                 it would let a 304 permanently freeze this resource at the old policy"
+            );
+            assert_eq!(meta.last_modified, None);
+        }
+
+        #[tokio::test]
+        async fn lookup_fetch_metadata_returns_empty_when_no_prior_record() {
+            let store_id = "store-1";
+            let source = make_source_with_preset(store_id, "prose");
+            let config = make_ingestion_config(store_id);
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let mut doc_index = DocumentIndex::new();
+
+            let mut callback =
+                make_pipeline_callback(&source, &mut doc_index, &store, &embedder, &config);
+            let uri = Uri::parse("https://example.com/never-indexed").unwrap();
+            let meta = callback.lookup_fetch_metadata(&uri).await;
+
+            assert_eq!(meta.etag, None);
+            assert_eq!(meta.last_modified, None);
+        }
+
+        // -----------------------------------------------------------------
+        // 15. on_validators_refreshed — persisting a 304-refreshed validator
+        // -----------------------------------------------------------------
+
+        /// Indexes `resource` (via `index_resource`, so it lands real chunks
+        /// in `store`) with `external_etag` overridden to `etag`, and seeds
+        /// `doc_index` with the matching `DocumentRecord` — mirroring what
+        /// `on_resource`'s own `Written` arm would have stamped, without
+        /// going through the callback (these tests exercise
+        /// `on_validators_refreshed` directly).
+        async fn seed_indexed_with_etag(
+            store: &FakeStore,
+            embedder: &FakeEmbedder,
+            config: &IngestionConfig,
+            source: &Source,
+            uri: &str,
+            text: &str,
+            etag: &str,
+        ) -> DocumentRecord {
+            let mut resource = make_resource(uri, text, &source.id, &config.store_id);
+            resource.external_etag = Some(etag.to_string());
+            let deps = IndexResourceDeps {
+                store,
+                embedder,
+                config,
+            };
+            let outcome = index_resource(&resource, source, None, &deps)
+                .await
+                .expect("seed index must succeed");
+            let metadata_hash = match outcome {
+                IndexOutcome::Written(_, hash) => hash,
+                IndexOutcome::Empty => panic!("seed_indexed_with_etag: must not chunk to empty"),
+            };
+            DocumentRecord {
+                uri: resource.uri.as_str().to_string(),
+                resource_id: resource.id.clone(),
+                source_id: source.id.clone(),
+                content_hash: resource.content_hash.clone(),
+                policy_version: config.policy_version.clone(),
+                metadata_hash,
+                external_etag: resource.external_etag.clone(),
+                external_last_modified: resource.external_last_modified.clone(),
+            }
+        }
+
+        #[tokio::test]
+        async fn on_validators_refreshed_with_rotated_etag_updates_stored_row() {
+            let store_id = "store-1";
+            let source = make_source_with_preset(store_id, "prose");
+            let config = make_ingestion_config(store_id);
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let uri_str = "https://example.com/rotating";
+            let text = "Stable content that never changes.";
+
+            let mut doc_index = DocumentIndex::new();
+            let seeded =
+                seed_indexed_with_etag(&store, &embedder, &config, &source, uri_str, text, "v1")
+                    .await;
+            let resource_id = seeded.resource_id.clone();
+            doc_index.upsert(seeded);
+
+            let mut callback =
+                make_pipeline_callback(&source, &mut doc_index, &store, &embedder, &config);
+            let uri = Uri::parse(uri_str).unwrap();
+            callback
+                .on_validators_refreshed(
+                    &uri,
+                    &FetchMetadata {
+                        etag: Some("v2".to_string()),
+                        last_modified: None,
+                    },
+                )
+                .await;
+
+            let chunks = store.get_chunks_for_resource(&resource_id).await.unwrap();
+            assert!(!chunks.is_empty());
+            assert!(
+                chunks
+                    .iter()
+                    .all(|c| c.external_etag.as_deref() == Some("v2")),
+                "the stored row must carry the rotated ETag the 304 itself reported"
+            );
+
+            let cached = callback.doc_index.get(uri_str).unwrap();
+            assert_eq!(cached.external_etag.as_deref(), Some("v2"));
+        }
+
+        #[tokio::test]
+        async fn on_validators_refreshed_bare_304_leaves_stored_row_untouched() {
+            let store_id = "store-1";
+            let source = make_source_with_preset(store_id, "prose");
+            let config = make_ingestion_config(store_id);
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let uri_str = "https://example.com/unchanged";
+            let text = "Stable content that never changes.";
+
+            let mut doc_index = DocumentIndex::new();
+            let seeded =
+                seed_indexed_with_etag(&store, &embedder, &config, &source, uri_str, text, "v1")
+                    .await;
+            let resource_id = seeded.resource_id.clone();
+            doc_index.upsert(seeded);
+
+            let mut callback =
+                make_pipeline_callback(&source, &mut doc_index, &store, &embedder, &config);
+            let uri = Uri::parse(uri_str).unwrap();
+            // A bare 304 — both fields None — must be read as "keep what's
+            // stored," never "clear it." `process_url` only calls
+            // `on_validators_refreshed` when at least one field is `Some`,
+            // but this pins the callback's own half of that contract too:
+            // it must be a no-op even if called directly with an empty
+            // `FetchMetadata`.
+            callback
+                .on_validators_refreshed(&uri, &FetchMetadata::default())
+                .await;
+
+            let chunks = store.get_chunks_for_resource(&resource_id).await.unwrap();
+            assert!(
+                chunks
+                    .iter()
+                    .all(|c| c.external_etag.as_deref() == Some("v1")),
+                "a bare 304 must leave the previously stored ETag untouched"
+            );
+            let cached = callback.doc_index.get(uri_str).unwrap();
+            assert_eq!(cached.external_etag.as_deref(), Some("v1"));
+        }
+
+        /// A 304 may rotate one validator and say nothing about the other.
+        /// RFC 9111 makes silence mean "unchanged", so the field the response
+        /// omitted must survive — dropping it would disable half of
+        /// conditional GET for that resource on every subsequent run.
+        ///
+        /// This asserts against the `ResourceRecord` actually handed to the
+        /// store rather than against read-back chunk state, because
+        /// `external_last_modified` is deliberately not a denormalized
+        /// `ChunkRecord` field and so has no per-chunk copy to read back.
+        #[tokio::test]
+        async fn on_validators_refreshed_preserves_the_validator_a_304_omitted() {
+            let store_id = "store-1";
+            let source = make_source_with_preset(store_id, "prose");
+            let config = make_ingestion_config(store_id);
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let uri_str = "https://example.com/partial";
+            let text = "Content whose validators rotate one at a time.";
+
+            let mut doc_index = DocumentIndex::new();
+            let mut seeded =
+                seed_indexed_with_etag(&store, &embedder, &config, &source, uri_str, text, "v1")
+                    .await;
+            seeded.external_last_modified = Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string());
+            doc_index.upsert(seeded);
+
+            let mut callback =
+                make_pipeline_callback(&source, &mut doc_index, &store, &embedder, &config);
+            let uri = Uri::parse(uri_str).unwrap();
+
+            // A 304 rotating only the ETag must leave Last-Modified alone.
+            callback
+                .on_validators_refreshed(
+                    &uri,
+                    &FetchMetadata {
+                        etag: Some("v2".to_string()),
+                        last_modified: None,
+                    },
+                )
+                .await;
+
+            let updates = store.metadata_updates().await;
+            let (_, record) = updates.last().expect("the refresh must reach the store");
+            assert_eq!(record.external_etag.as_deref(), Some("v2"));
+            assert_eq!(
+                record.external_last_modified.as_deref(),
+                Some("Wed, 21 Oct 2015 07:28:00 GMT"),
+                "a 304 that omitted Last-Modified must not clear the stored one"
+            );
+
+            // And the mirror image: rotating only Last-Modified must leave
+            // the ETag alone.
+            callback
+                .on_validators_refreshed(
+                    &uri,
+                    &FetchMetadata {
+                        etag: None,
+                        last_modified: Some("Thu, 22 Oct 2015 07:28:00 GMT".to_string()),
+                    },
+                )
+                .await;
+
+            let updates = store.metadata_updates().await;
+            let (_, record) = updates.last().expect("the refresh must reach the store");
+            assert_eq!(
+                record.external_etag.as_deref(),
+                Some("v2"),
+                "a 304 that omitted ETag must not clear the stored one"
+            );
+            assert_eq!(
+                record.external_last_modified.as_deref(),
+                Some("Thu, 22 Oct 2015 07:28:00 GMT")
+            );
+        }
+
+        /// A well-behaved origin repeats the validator it already issued on
+        /// every 304 for unchanged content, so this is the common case, not
+        /// an edge one. Writing anyway would rewrite the resource row and
+        /// bump `index_updated_at` — publicly visible as
+        /// `DocumentInfo.index_updated_at` — on a run that changed nothing.
+        ///
+        /// Asserted on the store's call log rather than on final state: a
+        /// blind rewrite of identical validators leaves the row looking
+        /// exactly the same, so a state assertion would pass with the guard
+        /// removed.
+        #[tokio::test]
+        async fn on_validators_refreshed_repeating_the_stored_validators_writes_nothing() {
+            let store_id = "store-1";
+            let source = make_source_with_preset(store_id, "prose");
+            let config = make_ingestion_config(store_id);
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let uri_str = "https://example.com/repeating";
+            let text = "Stable content that never changes.";
+
+            let mut doc_index = DocumentIndex::new();
+            let mut seeded =
+                seed_indexed_with_etag(&store, &embedder, &config, &source, uri_str, text, "v1")
+                    .await;
+            seeded.external_last_modified = Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string());
+            doc_index.upsert(seeded);
+
+            let mut callback =
+                make_pipeline_callback(&source, &mut doc_index, &store, &embedder, &config);
+            let uri = Uri::parse(uri_str).unwrap();
+            let outcome = callback
+                .on_validators_refreshed(
+                    &uri,
+                    &FetchMetadata {
+                        etag: Some("v1".to_string()),
+                        last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string()),
+                    },
+                )
+                .await;
+
+            assert_eq!(outcome, MetadataWriteOutcome::Unchanged);
+            assert!(
+                store.metadata_updates().await.is_empty(),
+                "a 304 repeating the validators already stored must not reach the store"
+            );
+        }
+
+        /// The half of the guard a `compute_metadata_hash` comparison would
+        /// have broken: `external_last_modified` is deliberately not one of
+        /// that hash's inputs, so a 304 rotating only `Last-Modified` yields
+        /// an identical hash while still needing to be persisted. The guard
+        /// compares the validator pair itself for exactly this reason.
+        #[tokio::test]
+        async fn on_validators_refreshed_rotating_only_last_modified_still_writes() {
+            let store_id = "store-1";
+            let source = make_source_with_preset(store_id, "prose");
+            let config = make_ingestion_config(store_id);
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let uri_str = "https://example.com/lm-only";
+            let text = "Stable content that never changes.";
+
+            let mut doc_index = DocumentIndex::new();
+            let mut seeded =
+                seed_indexed_with_etag(&store, &embedder, &config, &source, uri_str, text, "v1")
+                    .await;
+            seeded.external_last_modified = Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string());
+            doc_index.upsert(seeded);
+
+            let mut callback =
+                make_pipeline_callback(&source, &mut doc_index, &store, &embedder, &config);
+            let uri = Uri::parse(uri_str).unwrap();
+            let outcome = callback
+                .on_validators_refreshed(
+                    &uri,
+                    &FetchMetadata {
+                        etag: Some("v1".to_string()),
+                        last_modified: Some("Thu, 22 Oct 2015 07:28:00 GMT".to_string()),
+                    },
+                )
+                .await;
+
+            assert_eq!(outcome, MetadataWriteOutcome::Written);
+            let updates = store.metadata_updates().await;
+            let (_, record) = updates.last().expect("the refresh must reach the store");
+            assert_eq!(
+                record.external_last_modified.as_deref(),
+                Some("Thu, 22 Oct 2015 07:28:00 GMT")
+            );
+        }
+
+        /// `SkipReason::MetadataUpdated` is not a skip. It counts where
+        /// `on_resource`'s own metadata-only branch counts, so a metadata
+        /// write reads identically whether it arrived with a body or behind
+        /// a 304 — and never lands in `docs_skipped` as well, which would
+        /// break the partition of `docs_seen`.
+        #[tokio::test]
+        async fn on_skipped_metadata_updated_counts_as_an_update_not_a_skip() {
+            let store_id = "store-1";
+            let source = make_source_with_preset(store_id, "prose");
+            let config = make_ingestion_config(store_id);
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let mut doc_index = DocumentIndex::new();
+            let mut callback =
+                make_pipeline_callback(&source, &mut doc_index, &store, &embedder, &config);
+
+            let uri = Uri::parse("https://example.com/refreshed").unwrap();
+            callback.on_skipped(&uri, SkipReason::MetadataUpdated).await;
+
+            assert_eq!(callback.result.docs_metadata_updated, 1);
+            assert_eq!(callback.result.docs_skipped, 0);
+            assert_eq!(callback.result.error_count, 0);
+            assert_eq!(callback.result.docs_seen, 1);
+            assert!(
+                callback.seen.contains("https://example.com/refreshed"),
+                "a metadata-updated URI is still alive and must survive the delete-sweep"
+            );
+        }
+
+        /// The metadata_hash trap, pinned: `external_etag` IS an input to
+        /// `compute_metadata_hash`, so rotating it via a 304 refresh without
+        /// also refreshing the *cached* `metadata_hash` in `doc_index` would
+        /// desync the two. The next metadata-unchanged fetch (a normal 200
+        /// whose own reported ETag now matches what the 304 already
+        /// rotated to) would then see a spurious mismatch and route through
+        /// a needless metadata-only update — churn this test would catch as
+        /// a wrongly nonzero `docs_metadata_updated`.
+        #[tokio::test]
+        async fn on_validators_refreshed_keeps_metadata_hash_in_sync_no_churn_next_run() {
+            let store_id = "store-1";
+            let source = make_source_with_preset(store_id, "prose");
+            let config = make_ingestion_config(store_id);
+            let store = FakeStore::new();
+            let embedder = FakeEmbedder::new(4);
+            let uri_str = "https://example.com/no-churn";
+            let text = "Stable content that never changes.";
+
+            let mut doc_index = DocumentIndex::new();
+            let seeded =
+                seed_indexed_with_etag(&store, &embedder, &config, &source, uri_str, text, "v1")
+                    .await;
+            doc_index.upsert(seeded);
+
+            let mut callback =
+                make_pipeline_callback(&source, &mut doc_index, &store, &embedder, &config);
+            let uri = Uri::parse(uri_str).unwrap();
+            callback
+                .on_validators_refreshed(
+                    &uri,
+                    &FetchMetadata {
+                        etag: Some("v2".to_string()),
+                        last_modified: None,
+                    },
+                )
+                .await;
+
+            // A subsequent run's ordinary 200 fetch: identical content, and
+            // the origin now consistently reports the SAME "v2" ETag the
+            // 304 already rotated to.
+            let mut resource_next_run = make_resource(uri_str, text, &source.id, store_id);
+            resource_next_run.external_etag = Some("v2".to_string());
+            callback.on_resource(resource_next_run).await.unwrap();
+
+            assert_eq!(
+                callback.result.docs_skipped, 1,
+                "content and metadata are both unchanged relative to the refreshed \
+                 state — this must be an ordinary skip"
+            );
+            assert_eq!(
+                callback.result.docs_metadata_updated, 0,
+                "a correctly-synced metadata_hash must not churn a metadata-only \
+                 update on the very next unchanged fetch"
+            );
         }
     }
 }

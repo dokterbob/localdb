@@ -3,47 +3,11 @@
 use localdb_core::block::{Block, BlockKind};
 use localdb_core::metadata::{DocumentMetadata, DublinCoreMetadata, Metadata};
 use localdb_core::types::Span;
-use localdb_core::{ChunkRecord, Error, ResourceRecord, StoreBackend};
+use localdb_core::{Error, ResourceRecord, StoreBackend};
 use tempfile::tempdir;
 
-use super::common::backend_with_store_and_source;
+use super::common::{backend_with_store_and_source, chunk_record, resource_dates_and_external};
 use crate::SqliteBackend;
-
-/// A minimal, self-contained `ChunkRecord` fixture for `store-1`/`doc-1`
-/// (the store/source seeded by `backend_with_store_and_source`), with
-/// `fetched_at` and `modified_at` as explicit parameters so callers can
-/// distinguish them. `modified_at: None` writes a genuine no-claim resource
-/// (#283).
-fn chunk_record(fetched_at: &str, modified_at: Option<&str>) -> ChunkRecord {
-    ChunkRecord {
-        id: "chunk-1".to_string(),
-        resource_id: "doc-1".to_string(),
-        store_id: "store-1".to_string(),
-        text: "some chunk text".to_string(),
-        span: Span::new(0, 15),
-        heading_path: vec![],
-        embedding: vec![0.1, 0.2, 0.3, 0.4],
-        policy_version: "v1".to_string(),
-        fetched_at: fetched_at.to_string(),
-        modified_at: modified_at.map(str::to_string),
-        content_hash: "abc123".to_string(),
-        origin_store: "store-1".to_string(),
-        source_id: "src-1".to_string(),
-        ingestor_kind: "path".to_string(),
-        mime: Some("text/markdown".to_string()),
-        uri: "file:///docs/doc.md".to_string(),
-        metadata: Metadata::default(),
-        block_seq: 0,
-        seq_in_block: 0,
-        block_kind: None,
-        page: None,
-        window_block_seqs: vec![],
-        date_original: None,
-        date_parsed: None,
-        external_id: None,
-        external_etag: None,
-    }
-}
 
 /// Read `added_at`, `modified_at`, and `index_updated_at` straight off the
 /// `resources` row for `resource_id` — the columns `ChunkRecord`/`get_chunk`
@@ -70,104 +34,24 @@ async fn resource_row(
     )
 }
 
-/// Read `date_original`, `date_parsed`, `external_id`, and `external_etag`
-/// straight off the `resources` row for `resource_id` — write-only
-/// `ChunkRecord` stamps (`core::store::ChunkRecord`'s doc comment) that
-/// `get_chunk`/`CHUNK_COLS` never read back, so these tests go around the
-/// `RetrievalStore` trait for assertions, same posture as `resource_row`.
-async fn resource_dates_and_external(
+/// Read `external_last_modified` straight off the `resources` row —
+/// deliberately not a `ChunkRecord`/`get_chunk` column (see
+/// `RetrievalStore::upsert_chunks_and_blocks`'s doc comment), so this goes
+/// around the trait for assertions, same posture as `resource_dates_and_external`.
+async fn resource_external_last_modified(
     backend: &SqliteBackend,
     resource_id: &str,
-) -> (
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-) {
+) -> Option<String> {
     let conn = backend.conn.reader();
     let mut rows = conn
         .query(
-            "SELECT date_original, date_parsed, external_id, external_etag FROM resources \
-             WHERE store_id = 'store-1' AND id = ?",
+            "SELECT external_last_modified FROM resources WHERE store_id = 'store-1' AND id = ?",
             libsql::params![resource_id.to_string()],
         )
         .await
         .unwrap();
     let row = rows.next().await.unwrap().expect("resource row must exist");
-    (
-        row.get(0).unwrap(),
-        row.get(1).unwrap(),
-        row.get(2).unwrap(),
-        row.get(3).unwrap(),
-    )
-}
-
-/// Regression test for issue C4 on the tenant read path
-/// (`tenant::rows::row_to_chunk_record_strict`, via
-/// `connection::parse_metadata_json_lenient`): a resource row with
-/// syntactically invalid `metadata_json` must still be readable through
-/// `get_chunk` — falling back to `Metadata::default()` — rather than
-/// erroring the whole read. This exercises the same shared helper that
-/// `registry::documents::find_document` covers on the registry side
-/// (`registry::tests::find_document_tolerates_invalid_metadata_json`).
-#[tokio::test]
-async fn get_chunk_tolerates_invalid_metadata_json() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("localdb.db");
-    let backend = backend_with_store_and_source(&path).await;
-
-    let handle = backend.retrieval_store("store-1").await.unwrap();
-    let record = localdb_core::ChunkRecord {
-        id: "chunk-1".to_string(),
-        resource_id: "doc-1".to_string(),
-        store_id: "store-1".to_string(),
-        text: "some chunk text".to_string(),
-        span: Span::new(0, 15),
-        heading_path: vec![],
-        embedding: vec![0.1, 0.2, 0.3, 0.4],
-        policy_version: "v1".to_string(),
-        fetched_at: "2026-07-01T00:00:00Z".to_string(),
-        modified_at: Some("2026-07-01T00:00:00Z".to_string()),
-        content_hash: "abc123".to_string(),
-        origin_store: "store-1".to_string(),
-        source_id: "src-1".to_string(),
-        ingestor_kind: "path".to_string(),
-        mime: Some("text/markdown".to_string()),
-        uri: "file:///docs/doc.md".to_string(),
-        metadata: Metadata::default(),
-        block_seq: 0,
-        seq_in_block: 0,
-        block_kind: None,
-        page: None,
-        window_block_seqs: vec![],
-        date_original: None,
-        date_parsed: None,
-        external_id: None,
-        external_etag: None,
-    };
-    handle.upsert_chunks(vec![record]).await.unwrap();
-
-    // Corrupt the persisted metadata_json directly with syntactically
-    // invalid JSON.
-    let conn = backend.conn.writer().await;
-    conn.execute(
-        "UPDATE resources SET metadata_json = ? WHERE id = ?",
-        libsql::params!["{not valid json".to_string(), "doc-1".to_string()],
-    )
-    .await
-    .unwrap();
-    drop(conn);
-
-    let chunk = handle
-        .get_chunk("chunk-1")
-        .await
-        .unwrap()
-        .expect("chunk must still be found despite invalid metadata_json");
-    assert_eq!(
-        chunk.metadata,
-        Metadata::default(),
-        "invalid metadata_json must fall back to default metadata, not error the read"
-    );
+    row.get(0).unwrap()
 }
 
 /// Regression test for issue #217 step 5: `write::upsert_blocks` used to
@@ -409,7 +293,7 @@ async fn upsert_resource_added_at_survives_policy_reindex() {
 
     let first = chunk_record("2020-01-01T00:00:00Z", Some("2020-01-01T00:00:00Z"));
     handle
-        .upsert_chunks_and_blocks("store-1", "doc-1", vec![first], &[], None)
+        .upsert_chunks_and_blocks("store-1", "doc-1", vec![first], &[], None, None)
         .await
         .unwrap();
     let (added_at_1, _, _) = resource_row(&backend, "doc-1").await;
@@ -418,7 +302,7 @@ async fn upsert_resource_added_at_survives_policy_reindex() {
     // acquisition time) and modified_at, same resource_id.
     let second = chunk_record("2026-08-26T00:00:00Z", Some("2026-08-20T00:00:00Z"));
     handle
-        .upsert_chunks_and_blocks("store-1", "doc-1", vec![second], &[], Some("doc-1"))
+        .upsert_chunks_and_blocks("store-1", "doc-1", vec![second], &[], Some("doc-1"), None)
         .await
         .unwrap();
     let (added_at_2, modified_at_2, index_updated_at_2) = resource_row(&backend, "doc-1").await;
@@ -506,6 +390,118 @@ async fn upsert_resource_persists_external_id_and_external_etag() {
     );
 }
 
+/// `upsert_chunks_and_blocks`'s trailing `external_last_modified` parameter
+/// (not a `ChunkRecord` field — see its doc comment) lands on the `resources`
+/// row on a plain insert (`replaces_resource_id: None`).
+#[tokio::test]
+async fn upsert_chunks_and_blocks_persists_external_last_modified() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("localdb.db");
+    let backend = backend_with_store_and_source(&path).await;
+    let handle = backend.retrieval_store("store-1").await.unwrap();
+
+    let record = chunk_record("2026-07-01T00:00:00Z", None);
+    handle
+        .upsert_chunks_and_blocks(
+            "store-1",
+            "doc-1",
+            vec![record],
+            &[],
+            None,
+            Some("Wed, 21 Oct 2015 07:28:00 GMT"),
+        )
+        .await
+        .unwrap();
+
+    let stored = resource_external_last_modified(&backend, "doc-1").await;
+    assert_eq!(stored.as_deref(), Some("Wed, 21 Oct 2015 07:28:00 GMT"));
+}
+
+/// A content-changed replace (`replaces_resource_id: Some(old_id)`) deletes
+/// the old row before inserting the new one, so it always lands on the plain
+/// `INSERT` values — including a rotated `external_last_modified` — rather
+/// than the `ON CONFLICT` branch (which deliberately omits this column; see
+/// `upsert_chunks_inner`'s doc comment).
+#[tokio::test]
+async fn upsert_chunks_and_blocks_replace_updates_external_last_modified() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("localdb.db");
+    let backend = backend_with_store_and_source(&path).await;
+    let handle = backend.retrieval_store("store-1").await.unwrap();
+
+    let first = chunk_record("2026-07-01T00:00:00Z", None);
+    handle
+        .upsert_chunks_and_blocks(
+            "store-1",
+            "doc-1",
+            vec![first],
+            &[],
+            None,
+            Some("Wed, 21 Oct 2015 07:28:00 GMT"),
+        )
+        .await
+        .unwrap();
+
+    let mut second = chunk_record("2026-08-01T00:00:00Z", None);
+    second.text = "different chunk text entirely".to_string();
+    handle
+        .upsert_chunks_and_blocks(
+            "store-1",
+            "doc-1",
+            vec![second],
+            &[],
+            Some("doc-1"),
+            Some("Thu, 22 Oct 2015 07:28:00 GMT"),
+        )
+        .await
+        .unwrap();
+
+    let stored = resource_external_last_modified(&backend, "doc-1").await;
+    assert_eq!(stored.as_deref(), Some("Thu, 22 Oct 2015 07:28:00 GMT"));
+}
+
+/// `upsert_chunks_inner`'s `ON CONFLICT` deliberately includes
+/// `external_last_modified` (see its doc comment) so a same-resource-id
+/// replace via `upsert_chunks_and_blocks` (the policy-only-reindex case)
+/// lands a freshly-fetched validator. The flip side, pinned here: the plain
+/// (non-`_and_blocks`) `upsert_chunks` path has no per-call value for this
+/// column and always passes `None`, so it nulls the column out if it
+/// happens to hit an existing resource_id — the same contract
+/// `external_etag`/`modified_at`/the date columns already have for that
+/// same caller, not a special case for this one column.
+#[tokio::test]
+async fn plain_upsert_chunks_nulls_external_last_modified_like_its_sibling_columns() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("localdb.db");
+    let backend = backend_with_store_and_source(&path).await;
+    let handle = backend.retrieval_store("store-1").await.unwrap();
+
+    let first = chunk_record("2026-07-01T00:00:00Z", None);
+    handle
+        .upsert_chunks_and_blocks(
+            "store-1",
+            "doc-1",
+            vec![first],
+            &[],
+            None,
+            Some("Wed, 21 Oct 2015 07:28:00 GMT"),
+        )
+        .await
+        .unwrap();
+
+    // A plain `upsert_chunks` call for the SAME resource_id — the `ON
+    // CONFLICT` branch.
+    let second = chunk_record("2026-07-01T00:00:00Z", None);
+    handle.upsert_chunks(vec![second]).await.unwrap();
+
+    let stored = resource_external_last_modified(&backend, "doc-1").await;
+    assert_eq!(
+        stored, None,
+        "a plain upsert_chunks call has no value for this column and \
+         overwrites it with NULL, exactly like every sibling column"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // update_resource_metadata (issue #176: metadata-only incremental update)
 // ---------------------------------------------------------------------------
@@ -553,6 +549,7 @@ async fn metadata_only_update_does_not_touch_chunks_embeddings_or_fts() {
         metadata: new_metadata.clone(),
         external_id: Some("urn:entry:9".to_string()),
         external_etag: Some("\"etag-9\"".to_string()),
+        external_last_modified: None,
         modified_at: Some("2026-08-01T00:00:00Z".to_string()),
         date_original: Some("2026-07-30".to_string()),
         date_parsed: Some("2026-07-30".to_string()),
@@ -599,6 +596,38 @@ async fn metadata_only_update_does_not_touch_chunks_embeddings_or_fts() {
     assert_eq!(external_etag.as_deref(), Some("\"etag-9\""));
 }
 
+/// `update_resource_metadata`'s `ResourceRecord.external_last_modified`
+/// lands on the `resources` row, same write path as `external_etag` above.
+#[tokio::test]
+async fn update_resource_metadata_persists_external_last_modified() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("localdb.db");
+    let backend = backend_with_store_and_source(&path).await;
+    let handle = backend.retrieval_store("store-1").await.unwrap();
+
+    handle
+        .upsert_chunks(vec![chunk_record("2026-07-01T00:00:00Z", None)])
+        .await
+        .unwrap();
+
+    let update = ResourceRecord {
+        metadata: Metadata::default(),
+        external_id: None,
+        external_etag: Some("\"etag-9\"".to_string()),
+        external_last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string()),
+        modified_at: None,
+        date_original: None,
+        date_parsed: None,
+    };
+    handle
+        .update_resource_metadata("store-1", "doc-1", &update)
+        .await
+        .unwrap();
+
+    let stored = resource_external_last_modified(&backend, "doc-1").await;
+    assert_eq!(stored.as_deref(), Some("Wed, 21 Oct 2015 07:28:00 GMT"));
+}
+
 /// `index_updated_at` must still bump on a metadata-only update — the row
 /// really was rewritten, even though no chunk changed.
 #[tokio::test]
@@ -622,6 +651,7 @@ async fn metadata_only_update_bumps_index_updated_at() {
         metadata: Metadata::default(),
         external_id: None,
         external_etag: None,
+        external_last_modified: None,
         modified_at: Some("2026-07-01T00:00:00Z".to_string()),
         date_original: None,
         date_parsed: None,
@@ -656,6 +686,7 @@ async fn update_resource_metadata_errors_when_no_row_matches() {
         metadata: Metadata::default(),
         external_id: None,
         external_etag: None,
+        external_last_modified: None,
         modified_at: Some("2026-08-01T00:00:00Z".to_string()),
         date_original: None,
         date_parsed: None,

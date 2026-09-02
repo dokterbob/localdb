@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use libsql::{params, Connection};
 use localdb_core::{ChunkRecord, Error, ResourceRecord, VectorEncoding};
 
-use super::TenantStore;
+use super::{ensure_store_id, tenant_violation, TenantStore};
 use crate::connection::{map_libsql_err, WriteTx};
 use crate::vectors;
 
@@ -56,7 +56,11 @@ pub(crate) async fn upsert_chunks(
     }
     let count = records.len();
     let tx = store.conn().write_tx().await?;
-    let result = upsert_chunks_inner(&tx, &records, store.encoding())
+    // The plain (non-`_and_blocks`) path carries no `Resource`, so it has no
+    // `external_last_modified` value to give — see `upsert_chunks_inner`'s
+    // `ON CONFLICT` comment: `None` here nulls the column out if this call
+    // happens to hit an existing resource_id, same as every sibling column.
+    let result = upsert_chunks_inner(&tx, &records, store.encoding(), None)
         .await
         .map(|()| count);
     finish_write_tx(tx, result).await
@@ -141,12 +145,7 @@ async fn delete_chunks_and_blocks_inner(
 }
 
 pub(crate) async fn delete_by_store(store: &TenantStore, store_id: &str) -> Result<usize, Error> {
-    if store_id != store.store_id() {
-        return tenant_violation(format!(
-            "delete_by_store requested store_id '{store_id}' but handle owns store_id '{handle}'",
-            handle = store.store_id()
-        ));
-    }
+    ensure_store_id(store, store_id, "delete_by_store")?;
     let tx = store.conn().write_tx().await?;
     let result = delete_by_store_inner(&tx, store_id).await;
     finish_write_tx(tx, result).await
@@ -169,13 +168,6 @@ async fn delete_by_store_inner(conn: &Connection, store_id: &str) -> Result<usiz
     Ok(chunk_count as usize)
 }
 
-fn tenant_violation<T>(message: String) -> Result<T, Error> {
-    Err(Error::Internal {
-        message,
-        correlation_id: "store_handle_tenant_violation".to_string(),
-    })
-}
-
 /// Rewrite an existing resource row's metadata in place (issue #176's
 /// metadata-only incremental update) — no chunks/blocks/embeddings touched.
 ///
@@ -188,13 +180,7 @@ pub(crate) async fn update_resource_metadata(
     resource_id: &str,
     record: &ResourceRecord,
 ) -> Result<(), Error> {
-    if store_id != store.store_id() {
-        return tenant_violation(format!(
-            "update_resource_metadata requested store_id '{store_id}' but handle owns store_id \
-             '{handle}'",
-            handle = store.store_id()
-        ));
-    }
+    ensure_store_id(store, store_id, "update_resource_metadata")?;
     let tx = store.conn().write_tx().await?;
     let result = update_resource_metadata_inner(&tx, store_id, resource_id, record).await;
     finish_write_tx(tx, result).await
@@ -219,20 +205,22 @@ async fn update_resource_metadata_inner(
     let rows_affected = conn
         .execute(
             "UPDATE resources SET
-                 metadata_json    = ?,
-                 title            = ?,
-                 external_id      = ?,
-                 external_etag    = ?,
-                 modified_at      = ?,
-                 date_original    = ?,
-                 date_parsed      = ?,
-                 index_updated_at = ?
+                 metadata_json         = ?,
+                 title                 = ?,
+                 external_id           = ?,
+                 external_etag         = ?,
+                 external_last_modified = ?,
+                 modified_at           = ?,
+                 date_original         = ?,
+                 date_parsed           = ?,
+                 index_updated_at      = ?
              WHERE store_id = ? AND id = ?",
             params![
                 metadata_json.as_str(),
                 title,
                 record.external_id.as_deref(),
                 record.external_etag.as_deref(),
+                record.external_last_modified.as_deref(),
                 record.modified_at.as_deref(),
                 record.date_original.as_deref(),
                 record.date_parsed.as_deref(),
@@ -270,6 +258,7 @@ async fn upsert_chunks_inner(
     conn: &Connection,
     records: &[ChunkRecord],
     encoding: VectorEncoding,
+    external_last_modified: Option<&str>,
 ) -> Result<(), Error> {
     // Track which (store_id, resource_id) pairs we've already upserted in this
     // batch so we don't issue duplicate resource upserts.
@@ -293,8 +282,9 @@ async fn upsert_chunks_inner(
                 "INSERT INTO resources (store_id, id, source_id, ingestor_kind, resource_kind,
                      uri, title, mime, content_hash, added_at, modified_at, index_updated_at,
                      origin_store, policy_version, metadata_json, extractor_version,
-                     date_original, date_parsed, external_id, external_etag)
-                 VALUES (?, ?, ?, ?, 'document', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '1', ?, ?, ?, ?)
+                     date_original, date_parsed, external_id, external_etag,
+                     external_last_modified)
+                 VALUES (?, ?, ?, ?, 'document', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '1', ?, ?, ?, ?, ?)
                  ON CONFLICT(store_id, id) DO UPDATE SET
                      source_id        = excluded.source_id,
                      ingestor_kind    = excluded.ingestor_kind,
@@ -310,7 +300,30 @@ async fn upsert_chunks_inner(
                      date_original    = excluded.date_original,
                      date_parsed      = excluded.date_parsed,
                      external_id      = excluded.external_id,
-                     external_etag    = excluded.external_etag",
+                     external_etag    = excluded.external_etag,
+                     external_last_modified = excluded.external_last_modified",
+                // `external_last_modified` IS included in `ON CONFLICT`,
+                // same as every other column here: a same-resource-id
+                // replace (a policy-only reindex — see
+                // `delete_chunks_and_blocks_inner`'s doc comment for why
+                // that case keeps the `resources` row in place rather than
+                // deleting it first) hits this conflict branch, not a fresh
+                // `INSERT`, and must still land the freshly-fetched
+                // validator `upsert_chunks_and_blocks` was just given.
+                //
+                // The cost: the plain (non-`_and_blocks`) `upsert_chunks`
+                // below has no per-call value for this column (it isn't a
+                // `ChunkRecord` field — see this function's trailing
+                // parameter and `RetrievalStore::upsert_chunks_and_blocks`'s
+                // doc comment) and always passes `None`, so a bare
+                // `upsert_chunks` call that happens to hit an existing
+                // resource_id nulls this column out — exactly the same
+                // contract `external_etag`/`modified_at`/the date columns
+                // above already have for that same caller (each is fully
+                // overwritten by whatever the `ChunkRecord` says, with no
+                // "leave unchanged" option). `upsert_chunks` is not used by
+                // any production ingestion path today; only
+                // `upsert_chunks_and_blocks` is.
                 params![
                     record.store_id.as_str(),
                     record.resource_id.as_str(), // id column
@@ -330,6 +343,7 @@ async fn upsert_chunks_inner(
                     record.date_parsed.as_deref(),
                     record.external_id.as_deref(),
                     record.external_etag.as_deref(),
+                    external_last_modified,
                 ],
             )
             .await
@@ -434,18 +448,16 @@ pub(crate) async fn upsert_chunks_and_blocks(
     records: Vec<ChunkRecord>,
     blocks: &[localdb_core::block::Block],
     replaces_resource_id: Option<&str>,
+    external_last_modified: Option<&str>,
 ) -> Result<usize, localdb_core::Error> {
     for record in &records {
         if record.store_id != store.store_id() {
-            return Err(localdb_core::Error::Internal {
-                message: format!(
-                    "chunk '{id}' has store_id '{rec}' but handle owns store_id '{handle}'",
-                    id = record.id,
-                    rec = record.store_id,
-                    handle = store.store_id()
-                ),
-                correlation_id: "store_handle_tenant_violation".to_string(),
-            });
+            return tenant_violation(format!(
+                "chunk '{id}' has store_id '{rec}' but handle owns store_id '{handle}'",
+                id = record.id,
+                rec = record.store_id,
+                handle = store.store_id()
+            ));
         }
     }
     let count = records.len();
@@ -463,7 +475,7 @@ pub(crate) async fn upsert_chunks_and_blocks(
                 delete_document_inner(&tx, store.store_id(), old_id).await?;
             }
         }
-        upsert_chunks_inner(&tx, &records, store.encoding()).await?;
+        upsert_chunks_inner(&tx, &records, store.encoding(), external_last_modified).await?;
         upsert_blocks_inner(&tx, store.store_id(), resource_id, blocks).await?;
         Ok(count)
     }
