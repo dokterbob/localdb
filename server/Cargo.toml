@@ -14,13 +14,13 @@ description = "HTTP API daemon: axum REST API, file watching, job queue, unix so
 name = "server"
 
 [dependencies]
-localdb-core = { path = "../core", version = "0.1.1" }
-localdb-store-libsql = { path = "../store-libsql", version = "0.1.1" }
-localdb-embed = { path = "../embed", version = "0.1.1" }
-localdb-extract = { path = "../extract", version = "0.1.1" }
-localdb-fetch = { path = "../fetch", version = "0.1.1" }
-localdb-ingest = { path = "../ingest", version = "0.1.1" }
-localdb-mcp = { path = "../mcp", version = "0.1.1" }
+localdb-core = { path = "../core", version = "0.2.0" }
+localdb-store-libsql = { path = "../store-libsql", version = "0.2.0" }
+localdb-embed = { path = "../embed", version = "0.2.0" }
+localdb-extract = { path = "../extract", version = "0.2.0" }
+localdb-fetch = { path = "../fetch", version = "0.2.0" }
+localdb-ingest = { path = "../ingest", version = "0.2.0" }
+localdb-mcp = { path = "../mcp", version = "0.2.0" }
 async-trait = { workspace = true }
 axum = { workspace = true }
 # `axum_extra::extract::Query` (issue #187 review, finding F7): unlike
