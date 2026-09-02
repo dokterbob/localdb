@@ -20,7 +20,9 @@ use feed_rs::model::{Entry, Feed};
 use localdb_core::block::IngestorKind;
 use localdb_core::error::Error;
 use localdb_core::ingestion::{FetchMetadata, FetchResult, UrlFetcher};
-use localdb_core::ingestor::{IngestCallback, IngestResult, IngestSource, Ingestor, SkipReason};
+use localdb_core::ingestor::{
+    Enumeration, IngestCallback, IngestResult, IngestSource, Ingestor, SkipReason,
+};
 use localdb_core::metadata::DublinCoreMetadata;
 use localdb_core::parser::Parser;
 use localdb_core::uri::Uri;
@@ -132,6 +134,9 @@ impl Ingestor for FeedIngestor {
                     )
                     .await;
                 result.errors += 1;
+                result.enumeration = Enumeration::Incomplete {
+                    reason: format!("the feed document could not be fetched: {e}"),
+                };
                 return Ok(result);
             }
         };
@@ -235,6 +240,10 @@ impl Ingestor for FeedIngestor {
                 // persistently-gone feed be reclaimed belongs to issue #171
                 // (persist conditional-GET state and prune on 404/410).
                 tracing::info!(url = %feed_url, "FeedIngestor: feed is gone (404/410)");
+                result.enumeration = Enumeration::Incomplete {
+                    reason: "the feed document answered 404/410, so this run read no window"
+                        .to_string(),
+                };
                 return Ok(result);
             }
             FetchResult::Blocked => {
@@ -252,6 +261,9 @@ impl Ingestor for FeedIngestor {
                 // the right outcome for a refusal that says nothing about
                 // whether the feed still exists.
                 tracing::warn!(url = %feed_url, "FeedIngestor: feed destination blocked by fetch policy");
+                result.enumeration = Enumeration::Incomplete {
+                    reason: "the feed destination was blocked by fetch policy".to_string(),
+                };
                 return Ok(result);
             }
         };
@@ -309,6 +321,9 @@ impl Ingestor for FeedIngestor {
                     )
                     .await;
                 result.errors += 1;
+                result.enumeration = Enumeration::Incomplete {
+                    reason: format!("the feed document could not be parsed: {panic_msg}"),
+                };
                 return Ok(result);
             }
             Ok(Err(e)) => {
@@ -321,6 +336,9 @@ impl Ingestor for FeedIngestor {
                     )
                     .await;
                 result.errors += 1;
+                result.enumeration = Enumeration::Incomplete {
+                    reason: format!("the feed document could not be parsed: {e}"),
+                };
                 return Ok(result);
             }
             Ok(Ok(feed)) => feed,

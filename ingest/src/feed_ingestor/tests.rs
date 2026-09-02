@@ -367,6 +367,13 @@ async fn feed_level_not_modified_in_discovery_mode_reports_no_document() {
         "a discovery-mode feed 304 is a source-level event, not a document one: {:?}",
         cb.skipped
     );
+    assert!(
+        matches!(result.enumeration, Enumeration::Complete),
+        "a 304 is the one zero-callback outcome that DID observe the window — the origin \
+         said it is unchanged. Reporting Incomplete here would suppress the feed liveness \
+         sweep on every quiet run, which is precisely the case it exists for \
+         (specs/04-search-pipeline.md §1 \"Guards\")."
+    );
 }
 
 /// The other mode, and the reason the check above is conditional rather than
@@ -387,6 +394,13 @@ async fn feed_level_not_modified_in_single_document_mode_is_an_unchanged_skip() 
         cb.skipped[0].0.as_str(),
         "https://feed.example.com/feed.xml",
         "and it is the feed document itself that is reported"
+    );
+    assert!(
+        matches!(result.enumeration, Enumeration::Complete),
+        "a 304 is the one zero-callback outcome that DID observe the window — the origin \
+         said it is unchanged. Reporting Incomplete here would suppress the feed liveness \
+         sweep on every quiet run, which is precisely the case it exists for \
+         (specs/04-search-pipeline.md §1 \"Guards\")."
     );
 }
 
@@ -2587,4 +2601,57 @@ async fn single_document_mode_stamps_feed_validators_onto_its_resource() {
             last_modified: Some("Fri, 23 Oct 2015 07:28:00 GMT".to_string()),
         })
     );
+}
+
+// ---------------------------------------------------------------------------
+// Enumeration: which failures mean "this run never read the window"
+// ---------------------------------------------------------------------------
+
+/// Every early return that leaves the feed document unread must report
+/// `Enumeration::Incomplete`, because `Complete` is the `IngestResult`
+/// default and silence would otherwise read as "we saw the whole window and
+/// it holds nothing".
+///
+/// The consequence is not the presumed-gone delete-sweep — feed sources are
+/// exempt from that — but the feed liveness sweep, which under `--delete`
+/// probes entry links and prunes on a confirmed 404/410. Its one inherited
+/// guard keys on exactly this field. Without it, a run whose feed fetch or
+/// parse failed still swept: the seen-set is empty on such a run, so nothing
+/// excludes the entries the window still lists, and up to 25 of them get
+/// probed and pruned off an origin already known to be misbehaving. A
+/// successful run would have excluded every one of them.
+#[tokio::test]
+async fn a_run_that_never_read_the_window_reports_incomplete_enumeration() {
+    // (label, scripted feed-document outcome or None for a fetch error)
+    let cases: Vec<(&str, Option<ScriptedOutcome>)> = vec![
+        ("fetch error", None),
+        ("feed root 404/410", Some(ScriptedOutcome::Gone)),
+        ("destination blocked", Some(ScriptedOutcome::Blocked)),
+        (
+            "unparseable body",
+            Some(ScriptedOutcome::text("<rss><this is <<not valid xml")),
+        ),
+    ];
+
+    for (label, outcome) in cases {
+        let mut script = HashMap::new();
+        if let Some(o) = outcome {
+            script.insert("https://feed.example.com/feed.xml".to_string(), o);
+        }
+        let (ingestor, _fetcher) = ingestor_with(script);
+        let source = source_for("https://feed.example.com/feed.xml", None, true);
+        let mut cb = RecordingCallback::default();
+        let result = ingestor.ingest(&source, &mut cb).await.unwrap();
+
+        match &result.enumeration {
+            Enumeration::Incomplete { reason } => assert!(
+                !reason.is_empty(),
+                "{label}: the reason is interpolated into the suppression warning"
+            ),
+            Enumeration::Complete => panic!(
+                "{label}: this run never read the feed's window, so it must not claim \
+                 Complete — the liveness sweep would probe and prune off a broken signal"
+            ),
+        }
+    }
 }
