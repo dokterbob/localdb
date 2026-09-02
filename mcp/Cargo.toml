@@ -14,7 +14,7 @@ description = "MCP server (stdio and HTTP): read-only search, get_document, get_
 name = "mcp"
 
 [dependencies]
-localdb-core = { path = "../core", version = "0.1.0" }
+localdb-core = { path = "../core", version = "0.1.1" }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
