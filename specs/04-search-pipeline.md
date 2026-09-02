@@ -56,7 +56,21 @@ Resources also carry:
   for an aging entry is indefinitely. The merge rule is deliberately asymmetric and identical on
   both paths: a connector title only fills a gap the extraction left, while byline, date and
   provenance overwrite it — a feed knows an entry's author better than the linked page's markup
-  does, and does not know the page's title better than the page does.
+  does, and does not know the page's title better than the page does. That gap-fill is not stamped,
+  though, so once it has happened a title the feed supplied is indistinguishable from one the page's
+  markup produced, and a feed that later corrects the title can never land the correction behind a
+  304 — the same missing-provenance shape `creator` has, and ticketed alongside it
+  ([#324](https://github.com/dokterbob/localdb/issues/324), pairing with
+  [#320](https://github.com/dokterbob/localdb/issues/320)).
+
+  The refreshed claim is **not** confined to `Metadata`. A connector also supplies the entry's
+  `modified_at` and its `external_id`, which are stored as their own resource columns rather than as
+  metadata fields, and `on_metadata_refreshed` takes both alongside the enrichment. Both are
+  overwrite-class and authoritative exactly as passed — `None` included, so a connector that stops
+  claiming a `modified_at` withdraws it — and both are `compute_metadata_hash` inputs, so each one
+  participates in the differs-or-not comparison that gates the write. A 304 whose feed moved only an
+  entry's `modified_at` is therefore a write; a 304 that brings nothing new across metadata,
+  `modified_at` and `external_id` alike is not.
 
   RFC 9111 requires storing whichever validators a 304 response itself carries, so a 304 bearing a
   refreshed `ETag`/`Last-Modified` still updates the stored columns. No re-chunk follows — the
