@@ -369,6 +369,32 @@ and a changed feed URL is a new origin.
 > unconditionally: a validator captured before this gate existed carries no evidence about which
 > inputs produced it.
 >
+> **The gate forces reprocessing, not replacement (normative, and a known gap).** A digest mismatch
+> makes the next run read the feed again under the new inputs. It does **not** reconcile what the
+> _old_ inputs left in the store, and a `fetch_full_content` flip changes which resources a feed
+> produces at all — so both representations end up indexed, in either direction:
+>
+> - **discovery → single-document.** The feed document becomes one resource under the feed URL;
+>   every entry resource the source indexed before stays, because feed sources are exempt from the
+>   presumed-gone delete-sweep ("Retention" above) and no entry callback fires for them any more.
+>   The entries are then searchable twice — once on their own, once inside the single document's
+>   body.
+> - **single-document → discovery.** The old feed-root resource stays, and nothing can reclaim it:
+>   it is the one feed resource carrying no `external_id`, which is exactly the predicate the
+>   liveness sweep excludes on ([04-search-pipeline.md](04-search-pipeline.md) §1, "The feed's own
+>   document is never a candidate").
+>
+> Neither direction is reconciled today; `source remove` is the only thing that clears either.
+> [#319](https://github.com/dokterbob/localdb/issues/319) carries the fix. It is a gap rather than
+> an oversight in this gate: every delete this system performs is justified by evidence about the
+> _origin_ — a confirmed 404/410, or an absence from a source that enumerates exhaustively — and
+> this one would be justified by a change to **our own config**. That is a different kind of delete,
+> and it needs its own answer to a question the deletion model has no place for yet: whether it
+> applies without `--delete`. A mode flip is a replacement rather than a prune, which argues that it
+> should; `--delete` guarding every other delete argues that it should not. Reconciling on the wrong
+> side of that question silently drops a source's index on a config edit, so the gap is disclosed
+> rather than closed by guess.
+>
 > **Partial entry passes withhold the validators too (normative).** The same pairing rule extends
 > past the fetch to the run as a whole: fresh feed-document validators are persisted only by a run
 > that finished with **zero** errors. An entry that failed transiently — its link timed out, its
