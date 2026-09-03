@@ -8,6 +8,7 @@ use crate::ingestion::liveness::{
     LivenessProbeContext, FEED_LIVENESS_BATCH_LIMIT, FEED_LIVENESS_OVERFETCH_CAP,
 };
 use crate::ingestion::pipeline::{effective_chunker_config, scale_to_chars};
+use crate::ingestion::recheck::recheck_floor_start_rfc3339;
 use crate::ingestor::{IngestCallback, MetadataWriteOutcome, SkipReason};
 use crate::store::{ChunkRecord, FakeStore, StaleFeedResource};
 use crate::types::{SourceKind, SourceSpec};
@@ -4259,6 +4260,10 @@ mod unified_pipeline {
             /// The `limit` the last `list_stale_feed_resources` call
             /// asked for — what pins the over-fetch arithmetic.
             last_limit: std::sync::atomic::AtomicUsize,
+            /// The `checked_before` the last `list_stale_feed_resources`
+            /// call asked for — what proves the sweep derives its cutoff
+            /// from the shared recheck-floor helper.
+            last_checked_before: tokio::sync::Mutex<Option<String>>,
             /// Resource IDs `touch_resource_liveness` fails for —
             /// simulates a concurrent delete racing the probe, without
             /// having to actually race one.
@@ -4273,6 +4278,7 @@ mod unified_pipeline {
                     touch_calls: tokio::sync::Mutex::new(Vec::new()),
                     list_calls: std::sync::atomic::AtomicUsize::new(0),
                     last_limit: std::sync::atomic::AtomicUsize::new(0),
+                    last_checked_before: tokio::sync::Mutex::new(None),
                     fail_touch_for: std::collections::HashSet::new(),
                 }
             }
@@ -4295,6 +4301,12 @@ mod unified_pipeline {
                     0 => None,
                     n => Some(n),
                 }
+            }
+
+            /// The `checked_before` the last candidate query asked for, or
+            /// `None` if no query has run.
+            async fn last_checked_before(&self) -> Option<String> {
+                self.last_checked_before.lock().await.clone()
             }
 
             /// The stored row for `resource_id`, as the sweep left it.
@@ -4395,6 +4407,7 @@ mod unified_pipeline {
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 self.last_limit
                     .store(limit, std::sync::atomic::Ordering::SeqCst);
+                *self.last_checked_before.lock().await = Some(checked_before.to_string());
                 let rows = self.rows.lock().await;
                 let mut candidates: Vec<&LivenessRow> = rows
                     .iter()
@@ -4865,100 +4878,52 @@ mod unified_pipeline {
         // -------------------------------------------------------------
         // Throttle: recheck floor and `seen`
         // -------------------------------------------------------------
+        //
+        // The floor derivation itself — the bare 24h minimum, a configured
+        // `refresh_interval_secs` raising it, and the `u64::MAX` saturation
+        // case — is exercised directly against `recheck::recheck_floor_secs`
+        // / `recheck_floor_start` (pure, deterministic, no wall clock) in
+        // `core/src/ingestion/recheck/tests.rs`. What belongs here is only
+        // that the sweep actually *uses* that shared helper for its
+        // `checked_before` cutoff, rather than a derivation of its own that
+        // happens to agree with it today.
 
         #[tokio::test]
-        async fn candidate_newer_than_the_recheck_floor_is_never_fetched() {
-            // Checked a minute ago — well inside the bare 24h floor
-            // (`refresh_interval_secs: None`).
-            let recent = (Utc::now() - chrono::Duration::seconds(60))
-                .to_rfc3339_opts(SecondsFormat::Secs, true);
-            let store =
-                LivenessStore::new(vec![row("r1", "https://a.example.com/", Some(&recent))]);
-            let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::Gone);
-            let result = sweep_once(&store, &fetcher).await;
+        async fn sweep_derives_checked_before_from_the_shared_recheck_floor_helper() {
+            for refresh_interval_secs in [None, Some(30 * 24 * 60 * 60)] {
+                let store = LivenessStore::new(vec![row(
+                    "r1",
+                    "https://a.example.com/",
+                    Some(&old_timestamp()),
+                )]);
+                let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::NotModified);
+                let seen = std::collections::HashSet::new();
 
-            assert!(
-                fetcher.calls.lock().await.is_empty(),
-                "a resource checked well inside the recheck floor must never be fetched"
-            );
-            assert_eq!(result.feed_entries_liveness_checked, 0);
-        }
+                // `checked_before` is derived from `Utc::now()` inside the
+                // sweep, which this test cannot observe directly — bracket
+                // it between the helper's output for an instant just before
+                // and just after the sweep ran instead of asserting an
+                // exact value.
+                let before = Utc::now();
+                sweep(&store, &fetcher, refresh_interval_secs, &seen).await;
+                let after = Utc::now();
 
-        /// A configured `refresh_interval_secs` above the bare 24h floor
-        /// raises the effective floor — a resource checked 25h ago (past
-        /// the bare floor, but not past a configured 30-day one) must
-        /// still not be fetched.
-        #[tokio::test]
-        async fn configured_refresh_interval_raises_the_recheck_floor_above_24h() {
-            let twenty_five_hours_ago = (Utc::now() - chrono::Duration::hours(25))
-                .to_rfc3339_opts(SecondsFormat::Secs, true);
-            let store = LivenessStore::new(vec![row(
-                "r1",
-                "https://a.example.com/",
-                Some(&twenty_five_hours_ago),
-            )]);
-            let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::Gone);
-            let seen = std::collections::HashSet::new();
+                let lower = recheck_floor_start_rfc3339(before, refresh_interval_secs);
+                let upper = recheck_floor_start_rfc3339(after, refresh_interval_secs);
+                let actual = store
+                    .last_checked_before()
+                    .await
+                    .expect("list_stale_feed_resources must have been called");
 
-            sweep(&store, &fetcher, Some(30 * 24 * 60 * 60), &seen).await; // 30 days
-
-            assert!(
-                fetcher.calls.lock().await.is_empty(),
-                "a 30-day configured refresh interval must raise the floor above the bare 24h default"
-            );
-        }
-
-        /// A `refresh_interval_secs` above `i64::MAX` must not overflow
-        /// the `as i64` cast the recheck-floor computation used to use: a
-        /// wrapped-negative value would push `checked_before` into the
-        /// future, making every resource a candidate — the opposite of
-        /// the throttle's purpose. A resource checked one minute ago must
-        /// stay well inside any correctly computed floor regardless of
-        /// how large the configured interval is.
-        #[tokio::test]
-        async fn recheck_floor_with_u64_max_refresh_interval_never_lands_in_the_future() {
-            let one_minute_ago = (Utc::now() - chrono::Duration::seconds(60))
-                .to_rfc3339_opts(SecondsFormat::Secs, true);
-            let store = LivenessStore::new(vec![row(
-                "r1",
-                "https://a.example.com/",
-                Some(&one_minute_ago),
-            )]);
-            let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::Gone);
-            let seen = std::collections::HashSet::new();
-
-            sweep(&store, &fetcher, Some(u64::MAX), &seen).await;
-
-            assert!(
-                fetcher.calls.lock().await.is_empty(),
-                "an overflowing refresh_interval_secs must never push checked_before into \
-                 the future — that would make every resource a candidate"
-            );
-        }
-
-        /// `refresh_interval_secs: Some(0)` must not drop the recheck
-        /// floor below the bare 24h minimum — the `.max(...)` call
-        /// guards this, but only if the value it is maxed against
-        /// actually reaches `checked_before` afterward.
-        #[tokio::test]
-        async fn recheck_floor_with_zero_configured_refresh_interval_never_drops_below_24h() {
-            let twenty_three_hours_ago = (Utc::now() - chrono::Duration::hours(23))
-                .to_rfc3339_opts(SecondsFormat::Secs, true);
-            let store = LivenessStore::new(vec![row(
-                "r1",
-                "https://a.example.com/",
-                Some(&twenty_three_hours_ago),
-            )]);
-            let fetcher = ScriptedFetcher::new(ScriptedFetchOutcome::Gone);
-            let seen = std::collections::HashSet::new();
-
-            sweep(&store, &fetcher, Some(0), &seen).await;
-
-            assert!(
-                fetcher.calls.lock().await.is_empty(),
-                "a configured refresh_interval_secs of 0 must not drop the recheck floor \
-                 below the bare 24h minimum"
-            );
+                assert!(
+                    lower.as_str() <= actual.as_str() && actual.as_str() <= upper.as_str(),
+                    "checked_before ({actual}) for refresh_interval_secs \
+                     {refresh_interval_secs:?} must fall between the shared helper's cutoff \
+                     computed just before ({lower}) and just after ({upper}) the sweep ran \
+                     — i.e. the sweep must derive it from the same helper, not a \
+                     derivation of its own"
+                );
+            }
         }
 
         #[tokio::test]
