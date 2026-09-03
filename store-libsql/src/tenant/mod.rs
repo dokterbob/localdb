@@ -155,6 +155,10 @@ impl RetrievalStore for TenantStore {
         write::touch_resource_liveness(self, store_id, resource_id, etag, last_modified).await
     }
 
+    async fn touch_resource_checked(&self, store_id: &str, resource_id: &str) -> Result<(), Error> {
+        write::touch_resource_checked(self, store_id, resource_id).await
+    }
+
     async fn update_resource_metadata(
         &self,
         store_id: &str,
