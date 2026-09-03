@@ -99,6 +99,10 @@ fn ingestion_result_deserializes_from_an_empty_object() {
         from_nothing.docs_metadata_updated,
         expected.docs_metadata_updated
     );
+    assert_eq!(
+        from_nothing.docs_recheck_deferred,
+        expected.docs_recheck_deferred
+    );
     assert_eq!(from_nothing.chunks_written, expected.chunks_written);
     assert_eq!(
         from_nothing.unsupported_format_count,
@@ -126,6 +130,24 @@ fn ingestion_result_ignores_fields_it_does_not_know() {
         serde_json::from_str(r#"{"docs_seen":3,"docs_teleported":9}"#)
             .expect("an unknown counter must not fail the frame");
     assert_eq!(from_future.docs_seen, 3);
+}
+
+/// `docs_recheck_deferred` crosses the wire like every other counter here —
+/// present on the way out, defaulted to 0 on the way in from an older
+/// payload that never sent it (the case above already pins the latter).
+#[test]
+fn ingestion_result_docs_recheck_deferred_round_trips() {
+    let result = IngestionResult {
+        docs_recheck_deferred: 7,
+        ..IngestionResult::default()
+    };
+    let json = serde_json::to_string(&result).unwrap();
+    assert!(
+        json.contains(r#""docs_recheck_deferred":7"#),
+        "docs_recheck_deferred must serialize onto the wire: {json}"
+    );
+    let round_tripped: IngestionResult = serde_json::from_str(&json).unwrap();
+    assert_eq!(round_tripped.docs_recheck_deferred, 7);
 }
 
 // ---------------------------------------------------------------------------
@@ -5295,5 +5317,611 @@ mod unified_pipeline {
                  there is no free preview signal for this mechanism"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // T329 step 4 — touch wiring: advancing `last_checked_at` on every
+    // successful origin contact (specs/02-domain-model.md §2;
+    // specs/04-search-pipeline.md §1 "What a probe writes", "Recheck
+    // gate").
+    // -----------------------------------------------------------------
+
+    fn make_url_source(store_id: &str) -> Source {
+        Source {
+            id: new_ulid(),
+            store_id: store_id.to_string(),
+            kind: SourceKind::Url,
+            spec: SourceSpec::Url {
+                url: "https://example.com/page".to_string(),
+                refresh_interval_secs: None,
+            },
+            source_preset: "prose".to_string(),
+        }
+    }
+
+    fn make_feed_source_for_touch(store_id: &str) -> Source {
+        Source {
+            id: new_ulid(),
+            store_id: store_id.to_string(),
+            kind: SourceKind::Feed,
+            spec: SourceSpec::Feed {
+                url: "https://example.com/feed.xml".to_string(),
+                max_entries: None,
+                fetch_full_content: true,
+                refresh_interval_secs: None,
+            },
+            source_preset: "prose".to_string(),
+        }
+    }
+
+    /// Wraps a `FakeStore`, delegating every method straight through except
+    /// `touch_resource_checked`, which always fails — simulates a
+    /// concurrent delete racing the touch (`Error::ResourceNotFound`)
+    /// without having to actually race one.
+    struct TouchFailingStore {
+        inner: FakeStore,
+    }
+
+    impl TouchFailingStore {
+        fn new() -> Self {
+            Self {
+                inner: FakeStore::new(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RetrievalStore for TouchFailingStore {
+        async fn upsert_chunks(&self, records: Vec<ChunkRecord>) -> Result<usize, Error> {
+            self.inner.upsert_chunks(records).await
+        }
+
+        async fn delete_by_resource(&self, resource_id: &str) -> Result<usize, Error> {
+            self.inner.delete_by_resource(resource_id).await
+        }
+
+        async fn delete_by_store(&self, store_id: &str) -> Result<usize, Error> {
+            self.inner.delete_by_store(store_id).await
+        }
+
+        async fn dense_search(
+            &self,
+            query_vector: &[f32],
+            limit: usize,
+            filters: &[crate::store::MetadataFilter],
+        ) -> Result<Vec<crate::store::SearchResult>, Error> {
+            self.inner.dense_search(query_vector, limit, filters).await
+        }
+
+        async fn bm25_search(
+            &self,
+            query_text: &str,
+            limit: usize,
+            filters: &[crate::store::MetadataFilter],
+        ) -> Result<Vec<crate::store::SearchResult>, Error> {
+            self.inner.bm25_search(query_text, limit, filters).await
+        }
+
+        async fn stats(&self) -> Result<crate::store::StoreStats, Error> {
+            self.inner.stats().await
+        }
+
+        async fn get_chunk(&self, chunk_id: &str) -> Result<Option<ChunkRecord>, Error> {
+            self.inner.get_chunk(chunk_id).await
+        }
+
+        async fn get_chunks_for_resource(
+            &self,
+            resource_id: &str,
+        ) -> Result<Vec<ChunkRecord>, Error> {
+            self.inner.get_chunks_for_resource(resource_id).await
+        }
+
+        async fn list_indexed_documents(&self) -> Result<Vec<DocumentRecord>, Error> {
+            self.inner.list_indexed_documents().await
+        }
+
+        async fn update_resource_metadata(
+            &self,
+            store_id: &str,
+            resource_id: &str,
+            record: &crate::store::ResourceRecord,
+        ) -> Result<(), Error> {
+            self.inner
+                .update_resource_metadata(store_id, resource_id, record)
+                .await
+        }
+
+        async fn get_resource_record(
+            &self,
+            store_id: &str,
+            resource_id: &str,
+        ) -> Result<Option<crate::store::ResourceRecord>, Error> {
+            self.inner.get_resource_record(store_id, resource_id).await
+        }
+
+        async fn upsert_chunks_and_blocks(
+            &self,
+            store_id: &str,
+            resource_id: &str,
+            records: Vec<ChunkRecord>,
+            blocks: &[crate::block::Block],
+            replaces_resource_id: Option<&str>,
+            external_last_modified: Option<&str>,
+        ) -> Result<usize, Error> {
+            self.inner
+                .upsert_chunks_and_blocks(
+                    store_id,
+                    resource_id,
+                    records,
+                    blocks,
+                    replaces_resource_id,
+                    external_last_modified,
+                )
+                .await
+        }
+
+        async fn touch_resource_checked(
+            &self,
+            _store_id: &str,
+            resource_id: &str,
+        ) -> Result<(), Error> {
+            Err(Error::ResourceNotFound {
+                id: resource_id.to_string(),
+            })
+        }
+    }
+
+    // --- on_resource: Written arm -----------------------------------
+
+    #[tokio::test]
+    async fn on_resource_written_arm_touches_new_resource_id_for_feed_source() {
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let store_id = "store-1";
+        let config = make_ingestion_config(store_id);
+        let source = make_feed_source_for_touch(store_id);
+
+        let uri = "https://example.com/feed.xml#entry:1";
+        let resource = make_resource(uri, "Brand new entry.", &source.id, store_id);
+        let resource_id = resource.id.clone();
+
+        let ingestor = FakeIngestor::new(vec![ScriptStep::Resource(resource)]);
+        let mut doc_index = DocumentIndex::new();
+        let deps = SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config);
+        let result = run_source_ingestion(&source, &ingestor, deps)
+            .await
+            .unwrap();
+
+        assert_eq!(result.docs_indexed, 1);
+        assert_eq!(
+            store.last_checked_at(&resource_id).await,
+            Some(now_rfc3339()),
+            "a freshly written resource on a feed source must be touched"
+        );
+        assert_eq!(
+            doc_index.get(uri).and_then(|r| r.last_checked_at.clone()),
+            Some(now_rfc3339()),
+            "the in-memory doc_index record must carry the fresh stamp too"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_resource_written_arm_does_not_touch_for_path_source() {
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let store_id = "store-1";
+        let config = make_ingestion_config(store_id);
+        let source = make_source_with_preset(store_id, "prose");
+
+        let uri = "file:///docs/new.md";
+        let resource = make_resource(uri, "New content.", &source.id, store_id);
+        let resource_id = resource.id.clone();
+
+        let ingestor = FakeIngestor::new(vec![ScriptStep::Resource(resource)]);
+        let mut doc_index = DocumentIndex::new();
+        let deps = SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config);
+        let result = run_source_ingestion(&source, &ingestor, deps)
+            .await
+            .unwrap();
+
+        assert_eq!(result.docs_indexed, 1);
+        assert_eq!(
+            store.last_checked_at(&resource_id).await,
+            None,
+            "a path source must never be touched — it has no origin round trip"
+        );
+        assert!(doc_index.get(uri).unwrap().last_checked_at.is_none());
+    }
+
+    // --- on_resource: skip arm ----------------------------------------
+
+    #[tokio::test]
+    async fn on_resource_skip_arm_touches_for_url_source() {
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let store_id = "store-1";
+        let config = make_ingestion_config(store_id);
+        let source = make_url_source(store_id);
+
+        let uri = "https://example.com/page";
+        let record = seed_indexed(&store, &embedder, &config, &source, uri, "Stable body.").await;
+        let mut doc_index = DocumentIndex::new();
+        doc_index.upsert(record.clone());
+
+        let resource = make_resource(uri, "Stable body.", &source.id, store_id);
+        let ingestor = FakeIngestor::new(vec![ScriptStep::Resource(resource)]);
+        let deps = SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config);
+        let result = run_source_ingestion(&source, &ingestor, deps)
+            .await
+            .unwrap();
+
+        assert_eq!(result.docs_skipped, 1);
+        assert_eq!(
+            store.last_checked_at(&record.resource_id).await,
+            Some(now_rfc3339())
+        );
+        assert_eq!(
+            doc_index.get(uri).and_then(|r| r.last_checked_at.clone()),
+            Some(now_rfc3339())
+        );
+    }
+
+    #[tokio::test]
+    async fn on_resource_skip_arm_does_not_touch_for_path_source() {
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let store_id = "store-1";
+        let config = make_ingestion_config(store_id);
+        let source = make_source_with_preset(store_id, "prose");
+
+        let uri = "file:///docs/stable.md";
+        let record = seed_indexed(&store, &embedder, &config, &source, uri, "Stable body.").await;
+        let mut doc_index = DocumentIndex::new();
+        doc_index.upsert(record.clone());
+
+        let resource = make_resource(uri, "Stable body.", &source.id, store_id);
+        let ingestor = FakeIngestor::new(vec![ScriptStep::Resource(resource)]);
+        let deps = SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config);
+        let result = run_source_ingestion(&source, &ingestor, deps)
+            .await
+            .unwrap();
+
+        assert_eq!(result.docs_skipped, 1);
+        assert_eq!(store.last_checked_at(&record.resource_id).await, None);
+        assert!(doc_index.get(uri).unwrap().last_checked_at.is_none());
+    }
+
+    // --- on_resource: metadata-only arm --------------------------------
+
+    #[tokio::test]
+    async fn on_resource_metadata_only_arm_touches_for_feed_source() {
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let store_id = "store-1";
+        let config = make_ingestion_config(store_id);
+        let source = make_feed_source_for_touch(store_id);
+
+        let uri = "https://example.com/feed.xml#entry:2";
+        let record = seed_indexed(&store, &embedder, &config, &source, uri, "Body.").await;
+        let mut doc_index = DocumentIndex::new();
+        doc_index.upsert(record.clone());
+
+        let mut resource = make_resource(uri, "Body.", &source.id, store_id);
+        resource.external_id = Some("entry-2".to_string());
+        let ingestor = FakeIngestor::new(vec![ScriptStep::Resource(resource)]);
+        let deps = SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config);
+        let result = run_source_ingestion(&source, &ingestor, deps)
+            .await
+            .unwrap();
+
+        assert_eq!(result.docs_metadata_updated, 1);
+        assert_eq!(
+            store.last_checked_at(&record.resource_id).await,
+            Some(now_rfc3339())
+        );
+        assert_eq!(
+            doc_index.get(uri).and_then(|r| r.last_checked_at.clone()),
+            Some(now_rfc3339())
+        );
+    }
+
+    #[tokio::test]
+    async fn on_resource_metadata_only_arm_does_not_touch_for_path_source() {
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let store_id = "store-1";
+        let config = make_ingestion_config(store_id);
+        let source = make_source_with_preset(store_id, "prose");
+
+        let uri = "file:///docs/meta-only.md";
+        let record = seed_indexed(&store, &embedder, &config, &source, uri, "Body.").await;
+        let mut doc_index = DocumentIndex::new();
+        doc_index.upsert(record.clone());
+
+        let mut resource = make_resource(uri, "Body.", &source.id, store_id);
+        resource.external_id = Some("some-id".to_string());
+        let ingestor = FakeIngestor::new(vec![ScriptStep::Resource(resource)]);
+        let deps = SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config);
+        let result = run_source_ingestion(&source, &ingestor, deps)
+            .await
+            .unwrap();
+
+        assert_eq!(result.docs_metadata_updated, 1);
+        assert_eq!(store.last_checked_at(&record.resource_id).await, None);
+        assert!(doc_index.get(uri).unwrap().last_checked_at.is_none());
+    }
+
+    // --- on_skipped(Unchanged) ------------------------------------------
+
+    #[tokio::test]
+    async fn on_skipped_unchanged_touches_when_uri_in_doc_index_for_feed_source() {
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let store_id = "store-1";
+        let config = make_ingestion_config(store_id);
+        let source = make_feed_source_for_touch(store_id);
+
+        let uri = "https://example.com/feed.xml#entry:3";
+        let record = seed_indexed(&store, &embedder, &config, &source, uri, "Body.").await;
+        let mut doc_index = DocumentIndex::new();
+        doc_index.upsert(record.clone());
+
+        let ingestor = FakeIngestor::new(vec![ScriptStep::Skipped(
+            uri.to_string(),
+            SkipReason::Unchanged,
+        )]);
+        let deps = SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config);
+        run_source_ingestion(&source, &ingestor, deps)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.last_checked_at(&record.resource_id).await,
+            Some(now_rfc3339())
+        );
+        assert_eq!(
+            doc_index.get(uri).and_then(|r| r.last_checked_at.clone()),
+            Some(now_rfc3339())
+        );
+    }
+
+    #[tokio::test]
+    async fn on_skipped_unchanged_does_nothing_when_uri_not_in_doc_index() {
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let store_id = "store-1";
+        let config = make_ingestion_config(store_id);
+        let source = make_feed_source_for_touch(store_id);
+
+        // A liveness-sweep-style probe of a URI this run's own doc_index
+        // never loaded — nothing to touch, and this must not panic.
+        let uri = "https://example.com/feed.xml#entry:unknown";
+        let ingestor = FakeIngestor::new(vec![ScriptStep::Skipped(
+            uri.to_string(),
+            SkipReason::Unchanged,
+        )]);
+        let mut doc_index = DocumentIndex::new();
+        let deps = SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config);
+        let result = run_source_ingestion(&source, &ingestor, deps)
+            .await
+            .unwrap();
+
+        assert_eq!(result.docs_skipped, 1);
+        assert!(doc_index.get(uri).is_none());
+    }
+
+    #[tokio::test]
+    async fn on_skipped_unchanged_does_not_touch_for_path_source() {
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let store_id = "store-1";
+        let config = make_ingestion_config(store_id);
+        let source = make_source_with_preset(store_id, "prose");
+
+        let uri = "file:///docs/prefiltered.md";
+        let record = seed_indexed(&store, &embedder, &config, &source, uri, "Content.").await;
+        let mut doc_index = DocumentIndex::new();
+        doc_index.upsert(record.clone());
+
+        let ingestor = FakeIngestor::new(vec![ScriptStep::Skipped(
+            uri.to_string(),
+            SkipReason::Unchanged,
+        )]);
+        let deps = SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config);
+        run_source_ingestion(&source, &ingestor, deps)
+            .await
+            .unwrap();
+
+        assert_eq!(store.last_checked_at(&record.resource_id).await, None);
+        assert!(doc_index.get(uri).unwrap().last_checked_at.is_none());
+    }
+
+    // --- on_skipped(MetadataUpdated) ------------------------------------
+
+    #[tokio::test]
+    async fn on_skipped_metadata_updated_touches_when_uri_in_doc_index() {
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let store_id = "store-1";
+        let config = make_ingestion_config(store_id);
+        let source = make_url_source(store_id);
+
+        let uri = "https://example.com/page";
+        let record = seed_indexed(&store, &embedder, &config, &source, uri, "Body.").await;
+        let mut doc_index = DocumentIndex::new();
+        doc_index.upsert(record.clone());
+
+        let ingestor = FakeIngestor::new(vec![ScriptStep::Skipped(
+            uri.to_string(),
+            SkipReason::MetadataUpdated,
+        )]);
+        let deps = SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config);
+        let result = run_source_ingestion(&source, &ingestor, deps)
+            .await
+            .unwrap();
+
+        assert_eq!(result.docs_metadata_updated, 1);
+        assert_eq!(
+            store.last_checked_at(&record.resource_id).await,
+            Some(now_rfc3339())
+        );
+    }
+
+    // --- on_skipped(Fresh) -----------------------------------------------
+
+    #[tokio::test]
+    async fn on_skipped_fresh_counts_as_recheck_deferred_and_never_touches() {
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let store_id = "store-1";
+        let config = make_ingestion_config(store_id);
+        let source = make_feed_source_for_touch(store_id);
+
+        let uri = "https://example.com/feed.xml#entry:fresh";
+        let record = seed_indexed(&store, &embedder, &config, &source, uri, "Body.").await;
+        let mut doc_index = DocumentIndex::new();
+        doc_index.upsert(record.clone());
+
+        let ingestor = FakeIngestor::new(vec![ScriptStep::Skipped(
+            uri.to_string(),
+            SkipReason::Fresh,
+        )]);
+        let deps = SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config);
+        let result = run_source_ingestion(&source, &ingestor, deps)
+            .await
+            .unwrap();
+
+        assert_eq!(result.docs_skipped, 1);
+        assert_eq!(result.docs_recheck_deferred, 1);
+        assert_eq!(result.docs_seen, 1);
+        assert!(
+            doc_index.get(uri).is_some(),
+            "the entry is still alive and must survive the delete-sweep"
+        );
+        assert_eq!(
+            store.last_checked_at(&record.resource_id).await,
+            None,
+            "a gate skip must never advance the check clock"
+        );
+        assert!(doc_index.get(uri).unwrap().last_checked_at.is_none());
+    }
+
+    // --- never touch: Empty outcome, index errors, on_skipped(Error) ----
+
+    #[tokio::test]
+    async fn on_resource_empty_outcome_does_not_touch() {
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let store_id = "store-1";
+        let config = make_ingestion_config(store_id);
+        let source = make_feed_source_for_touch(store_id);
+
+        let uri = "https://example.com/feed.xml#entry:empty";
+        let old_record =
+            seed_indexed(&store, &embedder, &config, &source, uri, "Original body.").await;
+        let mut doc_index = DocumentIndex::new();
+        doc_index.upsert(old_record.clone());
+
+        let empty_resource = make_resource_with_blocks(uri, &source.id, store_id, vec![]);
+        let ingestor = FakeIngestor::new(vec![ScriptStep::Resource(empty_resource)]);
+        let deps = SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config);
+        let result = run_source_ingestion(&source, &ingestor, deps)
+            .await
+            .unwrap();
+
+        assert_eq!(result.docs_skipped, 1);
+        assert_eq!(store.last_checked_at(&old_record.resource_id).await, None);
+        assert!(doc_index.get(uri).unwrap().last_checked_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn on_resource_index_error_does_not_touch() {
+        let store = FakeStore::new();
+        let embedder = SelectiveFailEmbedder {
+            fail_marker: "FAIL_MARKER",
+            inner: FakeEmbedder::new(4),
+        };
+        let store_id = "store-1";
+        let config = make_ingestion_config(store_id);
+        let source = make_feed_source_for_touch(store_id);
+
+        let uri = "https://example.com/feed.xml#entry:bad";
+        let resource = make_resource(uri, "This has FAIL_MARKER in it.", &source.id, store_id);
+        let resource_id = resource.id.clone();
+        let ingestor = FakeIngestor::new(vec![ScriptStep::Resource(resource)]);
+        let mut doc_index = DocumentIndex::new();
+        let deps = SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config);
+        let result = run_source_ingestion(&source, &ingestor, deps)
+            .await
+            .unwrap();
+
+        assert_eq!(result.error_count, 1);
+        assert_eq!(store.last_checked_at(&resource_id).await, None);
+        assert!(doc_index.get(uri).is_none());
+    }
+
+    #[tokio::test]
+    async fn on_skipped_error_does_not_touch() {
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let store_id = "store-1";
+        let config = make_ingestion_config(store_id);
+        let source = make_feed_source_for_touch(store_id);
+
+        let uri = "https://example.com/feed.xml#entry:err";
+        let record = seed_indexed(&store, &embedder, &config, &source, uri, "Body.").await;
+        let mut doc_index = DocumentIndex::new();
+        doc_index.upsert(record.clone());
+
+        let ingestor = FakeIngestor::new(vec![ScriptStep::Skipped(
+            uri.to_string(),
+            SkipReason::Error("transient read failure".to_string()),
+        )]);
+        let deps = SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config);
+        let result = run_source_ingestion(&source, &ingestor, deps)
+            .await
+            .unwrap();
+
+        assert_eq!(result.error_count, 1);
+        assert_eq!(store.last_checked_at(&record.resource_id).await, None);
+        assert!(doc_index.get(uri).unwrap().last_checked_at.is_none());
+    }
+
+    // --- touch_resource_checked failure is swallowed ---------------------
+
+    /// A store's `touch_resource_checked` failing (a concurrent delete
+    /// racing the touch, most commonly) must not surface as an ingestion
+    /// error, and every other outcome counter must read exactly as it would
+    /// without the failure — mirroring how `touch_resource_liveness`
+    /// failures are swallowed in the feed liveness sweep.
+    #[tokio::test]
+    async fn touch_resource_checked_failure_is_swallowed_and_counters_are_unaffected() {
+        let store = TouchFailingStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let store_id = "store-1";
+        let config = make_ingestion_config(store_id);
+        let source = make_feed_source_for_touch(store_id);
+
+        let uri = "https://example.com/feed.xml#entry:racing-delete";
+        let resource = make_resource(uri, "Brand new entry.", &source.id, store_id);
+
+        let ingestor = FakeIngestor::new(vec![ScriptStep::Resource(resource)]);
+        let mut doc_index = DocumentIndex::new();
+        let deps = SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config);
+        let result = run_source_ingestion(&source, &ingestor, deps)
+            .await
+            .unwrap();
+
+        assert_eq!(result.docs_indexed, 1);
+        assert_eq!(
+            result.error_count, 0,
+            "a touch_resource_checked failure must never be counted as an \
+             ingestion error"
+        );
+        // The touch failed, so the in-memory record was never corrected off
+        // its post-upsert `None` — proving the failure really was swallowed
+        // rather than silently retried into success.
+        assert!(doc_index.get(uri).unwrap().last_checked_at.is_none());
     }
 }

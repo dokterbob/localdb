@@ -112,6 +112,18 @@ pub enum SkipReason {
     /// the outcome counters partition `docs_seen`
     /// (specs/04-search-pipeline.md).
     MetadataUpdated,
+    /// The feed entry recheck gate found this entry already known at the
+    /// run's policy, inside the recheck floor, with an unchanged feed claim
+    /// — so no HTTP request was made for it at all
+    /// (specs/04-search-pipeline.md §1 "Recheck gate").
+    ///
+    /// Distinct from [`Self::Unchanged`] because no origin contact happened:
+    /// unlike an actual 304, this must **never** advance `last_checked_at` —
+    /// doing so would slide the recheck floor forward on every gated run and
+    /// the entry would never be re-verified again. Counts toward
+    /// `docs_skipped`, same as [`Self::Unchanged`], plus the dedicated
+    /// `IngestionResult::docs_recheck_deferred` sub-counter.
+    Fresh,
 }
 
 /// What a metadata-refresh hook did to the store.
