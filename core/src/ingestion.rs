@@ -118,6 +118,14 @@ pub struct IngestionResult {
     /// update is not a content skip, but it is also not a full `docs_indexed`
     /// re-index, so it gets its own counter rather than overloading either.
     pub docs_metadata_updated: u64,
+    /// Sub-count of [`Self::docs_skipped`]: feed discovery entries the
+    /// recheck gate skipped without making an HTTP request at all
+    /// ([`crate::ingestor::SkipReason::Fresh`] —
+    /// specs/04-search-pipeline.md §1 "Recheck gate"). The `docs_seen`
+    /// partition is unchanged; `Fresh` is one more reason counted within
+    /// `docs_skipped`, not a new bucket alongside it. Always 0 for a
+    /// non-feed source.
+    pub docs_recheck_deferred: u64,
     /// Number of feed-discovered resources the liveness sweep probed this
     /// run — every candidate a fetch was actually attempted for, regardless
     /// of outcome (`Gone`, `NotModified`, `Downloaded`, `Blocked`, or a
