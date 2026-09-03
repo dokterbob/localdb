@@ -19,10 +19,11 @@
 //! `run_source_ingestion` calls into this module, and nothing outside
 //! `ingestion` needs to.
 
-use chrono::{SecondsFormat, Utc};
+use chrono::Utc;
 
 use crate::error::Error;
 use crate::ingestion::deps::{DocumentIndex, FetchMetadata, FetchResult, UrlFetcher};
+use crate::ingestion::recheck::recheck_floor_start_rfc3339;
 use crate::ingestion::{IngestionConfig, IngestionResult};
 use crate::store::{RetrievalStore, StaleFeedResource};
 use crate::types::Source;
@@ -57,13 +58,6 @@ pub(in crate::ingestion) fn feed_inputs_digest(
 /// sweep". `pub(in crate::ingestion)`: exercised directly by tests in the
 /// sibling `ingestion::tests` module.
 pub(in crate::ingestion) const FEED_LIVENESS_BATCH_LIMIT: usize = 25;
-
-/// Recheck floor for the feed liveness sweep, in seconds: a candidate is
-/// never re-probed more often than this, however long it has been aged out.
-/// A feed source's own `refresh_interval_secs` raises the effective floor
-/// when configured above this; the common unconfigured case uses this bare
-/// value.
-const FEED_LIVENESS_MIN_RECHECK_SECS: i64 = 24 * 60 * 60;
 
 /// Ceiling on how far the candidate query may over-fetch to compensate for
 /// the seen-set it cannot see (see [`run_feed_liveness_sweep`]). Chosen well
@@ -115,24 +109,11 @@ pub(in crate::ingestion) async fn run_feed_liveness_sweep(
     refresh_interval_secs: Option<u64>,
     seen: &std::collections::HashSet<String>,
 ) -> Result<(), Error> {
-    let floor_secs = refresh_interval_secs
-        .unwrap_or(0)
-        .max(FEED_LIVENESS_MIN_RECHECK_SECS as u64);
-    // `refresh_interval_secs` is an unvalidated `u64` from config (no upper
-    // bound is enforced in `core::config::refresh::validate_refresh_interval`),
-    // so it must not be cast with `as i64`: a value above `i64::MAX` wraps
-    // negative, pushing `checked_before` into the future and making every
-    // resource a candidate — the opposite of this floor's purpose. Saturate
-    // every step instead of only the cast: `chrono::Duration::seconds` itself
-    // panics above `i64::MAX / 1_000`, and subtracting from `Utc::now()` can
-    // in principle underflow past the representable range.
-    let floor_secs_i64 = i64::try_from(floor_secs).unwrap_or(i64::MAX);
-    let recheck_window =
-        chrono::Duration::try_seconds(floor_secs_i64).unwrap_or(chrono::Duration::MAX);
-    let checked_before = Utc::now()
-        .checked_sub_signed(recheck_window)
-        .unwrap_or(chrono::DateTime::<Utc>::MIN_UTC)
-        .to_rfc3339_opts(SecondsFormat::Secs, true);
+    // The floor and its saturation semantics are shared with the feed entry
+    // recheck gate (specs/04-search-pipeline.md §1 "Recheck gate" →
+    // "Floor") — see `recheck::recheck_floor_start` for why the derivation
+    // must saturate rather than cast.
+    let checked_before = recheck_floor_start_rfc3339(Utc::now(), refresh_interval_secs);
 
     // The batch cap counts candidates actually *probed*, not rows returned.
     // The query orders oldest-`last_checked_at` first and knows nothing
