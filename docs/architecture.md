@@ -491,9 +491,17 @@ requires one — otherwise a 404/410 on the feed URL would delete the source's w
 per run), recheck floor (`max(refresh_interval, 24h)`), and per-outcome rules: `Gone` deletes;
 `NotModified` refreshes the stored validators and the throttle clock; a `200` advances the clock
 alone, keeping the stored validators, since caching the fresh ones would describe a body the sweep
-discarded; `Blocked` and transport errors move nothing but the clock. `last_checked_at` therefore
-means "when we last attempted a probe", which is what keeps the oldest-first rotation fair —
-otherwise a set of permanently-blocked entries would lead the query forever.
+discarded; `Blocked` and transport errors move nothing but the clock — a deliberate, narrower
+exception to what the column means everywhere else, not a redefinition of it. `last_checked_at` is
+now the last time we successfully contacted the origin for a resource's URI (a `200` or `304` that
+left the store consistent), advanced by the feed entry loop, `url` sources, and single-document feed
+mode as well as the sweep; the sweep alone also advances it on `Blocked`/transport-error outcomes,
+so a set of permanently-blocked entries doesn't lead the oldest-first query forever. See
+[specs/02-domain-model.md](https://github.com/dokterbob/localdb/blob/main/specs/02-domain-model.md)
+§2's `last_checked_at` row and
+[specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md)
+§1 "What a probe writes" for the full rule, and gap #20 below for how this same column now also
+gates the entry loop itself.
 
 **11. ~~Conditional-GET state (`ETag`) is captured only when a feed entry link is fetched, and even
 then it's never read back and reused; `Last-Modified` is not persisted at all~~ — RESOLVED.**
@@ -512,6 +520,22 @@ where they're now stamped onto the `Resource` it builds instead of the previous 
 validator means unchanged, not "clear it"); a 200 fully replaces the stored validators, even with
 both `None`, since a fresh full representation's silence means the origin stopped offering that
 validator.
+
+Conditional GET alone still costs one round trip per feed entry per run — a `304` is cheap in bytes,
+not in requests. A recheck gate now sits in front of it for feed discovery entries: before
+`process_url` runs, `process_discovery_entry` skips the HTTP fetch entirely and reports the entry
+`docs_skipped`/`docs_recheck_deferred` when the entry is already known at the run's
+`policy_version`, its stored `last_checked_at` is within the recheck floor
+(`max(source.refresh_interval_secs, 24h)` — the same derivation the liveness sweep above uses), and
+the feed's current claim for the entry still reproduces its stored `metadata_hash`.
+`localdb index --refetch` bypasses the floor check and suppresses that run's feed-document
+validators, forcing a full recheck of a feed source's entries even when nothing looks stale; it is a
+no-op for `file`/`url` sources, since a `url` source's own refresh interval already is its check
+cadence. See
+[specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md)
+§1 "Recheck gate" and
+[specs/05-surfaces.md](https://github.com/dokterbob/localdb/blob/main/specs/05-surfaces.md) for
+`index --refetch` and `docs_recheck_deferred`.
 
 **12. A store containing a `kind = 'feed'` source cannot be opened by an older binary that predates
 the Feed ingestor.** `sources.ingestor_kind` decoding is a hard match over the known `IngestorKind`
@@ -621,6 +645,22 @@ to delete on an empty replacement, because it cannot tell a file that is now gen
 one whose extraction failed to produce anything this run. Truncating a file to zero bytes therefore
 leaves its old content searchable, and the run reports it as skipped. The escape hatch is clean and
 needs no new surface: delete the file, and the sweep removes it normally under `--delete`.
+
+**20. Drift on an aged-out entry is noticed at most once per recheck floor.** (accepted trade-off of
+the recheck gate, gap #11 above) A silent page edit a feed doesn't announce — no `updated` bump, no
+title or author change — is now caught only when the recheck floor elapses
+(`max(source.refresh_interval_secs, 24h)`), not on the very next run as before the gate existed.
+Three escape hatches reopen it early: `localdb index --refetch`; a feed-side `updated`, title, or
+author change, which changes the claim the gate compares against the stored `metadata_hash`; and a
+`policy_version` bump. Under `--delete`, this interacts with the liveness sweep (gap #10 above):
+when guard 2's zero-seen backstop fires on a `304`'d feed document, a sweep probe of a
+still-in-window entry advances that entry's `last_checked_at` exactly like an ordinary probe, so the
+entry loop's own turn for that entry — whenever the feed document next actually changes — is itself
+gate-skipped for the remainder of the floor. This is bounded, not open-ended: the sweep deliberately
+discards the fresh validators its own `200` outcome would otherwise cache, so the eventual
+entry-loop turn always lands on a full `200`, never a spuriously cheap `304`. See
+[specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md)
+§1 "Interaction with the recheck gate" (under "Aged-out feed entries: the liveness sweep").
 
 ---
 
