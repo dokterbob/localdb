@@ -654,6 +654,46 @@ pub trait RetrievalStore: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Advance `resources.last_checked_at` for one resource to now, and
+    /// write nothing else — not the validators, not `index_updated_at`.
+    ///
+    /// This is the single-column counterpart to [`Self::touch_resource_liveness`]
+    /// used *outside* the feed liveness sweep: the entry recheck gate's own
+    /// conditional-GET path, `url` sources, and single-document feed mode all
+    /// reach a `200` or `304` through their own ordinary write path (a full
+    /// reindex, a metadata-only update, or `on_validators_refreshed`'s
+    /// validator rotation) that already persists whatever validators moved —
+    /// so this call exists only to record that the origin was successfully
+    /// contacted, not to duplicate that write. See
+    /// specs/04-search-pipeline.md §1 "What a probe writes" for the split
+    /// between this method and the sweep's three-column
+    /// `touch_resource_liveness`, and specs/02-domain-model.md §2's
+    /// `last_checked_at` row for what the column means.
+    ///
+    /// **Must never write `index_updated_at`**, for the same reason
+    /// `touch_resource_liveness` must not: that column means "we last wrote
+    /// this resource's stored state" and is publicly exposed as
+    /// `DocumentInfo::index_updated_at`. A successful check that leaves
+    /// content and metadata unchanged writes nothing there — bumping it here
+    /// would report a merely-confirmed-live resource as re-written.
+    ///
+    /// Returns `Err(Error::ResourceNotFound)` when no row matches
+    /// `(store_id, resource_id)` — e.g. a concurrent delete raced the check.
+    /// Callers (the entry recheck gate, `url`-source and single-document-feed
+    /// write paths) log this at debug and swallow it: a vanished resource has
+    /// nothing left for the clock to throttle, and the row already having no
+    /// `doc_index` entry is what would make it re-checked anyway on the next
+    /// run.
+    ///
+    /// The default implementation is a no-op, mirroring
+    /// `touch_resource_liveness` above: `FakeStore` and any store predating
+    /// this write path report success and do nothing, which is correct for a
+    /// store with no `last_checked_at` column to advance.
+    async fn touch_resource_checked(&self, store_id: &str, resource_id: &str) -> Result<(), Error> {
+        let _ = (store_id, resource_id);
+        Ok(())
+    }
+
     /// Update an existing resource's metadata in place, without touching its
     /// chunks, blocks, or embeddings (issue #176's metadata-only incremental
     /// update — specs/04-search-pipeline.md).
@@ -823,6 +863,16 @@ pub struct FakeStore {
     /// to any test using this store, so the preserve-vs-overwrite behavior on
     /// a partially-populated update could not be pinned at all.
     metadata_updates: tokio::sync::RwLock<Vec<(String, ResourceRecord)>>,
+    /// `last_checked_at` values written by `touch_resource_checked`, keyed by
+    /// `resource_id`.
+    ///
+    /// `ChunkRecord` carries no `last_checked_at` column of its own (like
+    /// `external_last_modified`, it is deliberately not denormalized onto
+    /// every chunk row — see `store-libsql`'s `resources` table, the single
+    /// row a whole document's chunks share it from), so `FakeStore` keeps it
+    /// here instead and folds it onto `list_indexed_documents`'s
+    /// `DocumentRecord` output by `resource_id`.
+    last_checked: tokio::sync::RwLock<HashMap<String, String>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -833,6 +883,7 @@ impl FakeStore {
             chunks: tokio::sync::RwLock::new(Vec::new()),
             blocks: tokio::sync::RwLock::new(HashMap::new()),
             metadata_updates: tokio::sync::RwLock::new(Vec::new()),
+            last_checked: tokio::sync::RwLock::new(HashMap::new()),
         }
     }
 
@@ -840,6 +891,14 @@ impl FakeStore {
     /// order. See the field's own comment for why this log exists.
     pub async fn metadata_updates(&self) -> Vec<(String, ResourceRecord)> {
         self.metadata_updates.read().await.clone()
+    }
+
+    /// The `last_checked_at` value `touch_resource_checked` recorded for
+    /// `resource_id`, or `None` if it was never touched. Test-support
+    /// accessor so callers can assert a touch happened without going through
+    /// `list_indexed_documents`.
+    pub async fn last_checked_at(&self, resource_id: &str) -> Option<String> {
+        self.last_checked.read().await.get(resource_id).cloned()
     }
 }
 
@@ -1006,6 +1065,7 @@ impl RetrievalStore for FakeStore {
 
     async fn list_indexed_documents(&self) -> Result<Vec<DocumentRecord>, Error> {
         let chunks = self.chunks.read().await;
+        let last_checked = self.last_checked.read().await;
         let mut seen: HashMap<String, DocumentRecord> = HashMap::new();
         for chunk in chunks.iter() {
             seen.entry(chunk.uri.clone()).or_insert(DocumentRecord {
@@ -1030,9 +1090,29 @@ impl RetrievalStore for FakeStore {
                 // `external_last_modified` (see `upsert_chunks_and_blocks`'s
                 // doc comment) — `FakeStore` has nowhere to keep it.
                 external_last_modified: None,
+                last_checked_at: last_checked.get(&chunk.resource_id).cloned(),
             });
         }
         Ok(seen.into_values().collect())
+    }
+
+    async fn touch_resource_checked(&self, store_id: &str, resource_id: &str) -> Result<(), Error> {
+        let exists = self
+            .chunks
+            .read()
+            .await
+            .iter()
+            .any(|c| c.store_id == store_id && c.resource_id == resource_id);
+        if !exists {
+            return Err(Error::ResourceNotFound {
+                id: resource_id.to_string(),
+            });
+        }
+        self.last_checked
+            .write()
+            .await
+            .insert(resource_id.to_string(), crate::ingestion::now_rfc3339());
+        Ok(())
     }
 
     async fn update_resource_metadata(
@@ -2485,5 +2565,51 @@ mod tests {
 
         assert!(MetadataFilter::PolicyVersion("v1".to_string()).matches(&record));
         assert!(!MetadataFilter::PolicyVersion("v2".to_string()).matches(&record));
+    }
+
+    #[tokio::test]
+    async fn fake_store_touch_resource_checked_surfaces_in_list_indexed_documents() {
+        let store = FakeStore::new();
+        let record = make_test_record("chunk-1", "doc-1", "some text", vec![1.0, 0.0]);
+        store.upsert_chunks(vec![record]).await.unwrap();
+
+        let before = store.list_indexed_documents().await.unwrap();
+        assert_eq!(
+            before[0].last_checked_at, None,
+            "a resource that was never touched must report last_checked_at: None"
+        );
+        assert_eq!(store.last_checked_at("doc-1").await, None);
+
+        store
+            .touch_resource_checked("test-store", "doc-1")
+            .await
+            .unwrap();
+
+        assert!(
+            store.last_checked_at("doc-1").await.is_some(),
+            "the test-support accessor must surface the touch"
+        );
+        let after = store.list_indexed_documents().await.unwrap();
+        assert_eq!(
+            after[0].last_checked_at,
+            store.last_checked_at("doc-1").await,
+            "list_indexed_documents must surface the same value the accessor reports"
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_store_touch_resource_checked_errors_for_missing_resource() {
+        let store = FakeStore::new();
+
+        let err = store
+            .touch_resource_checked("test-store", "does-not-exist")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            Error::ResourceNotFound {
+                id: "does-not-exist".to_string()
+            }
+        );
     }
 }

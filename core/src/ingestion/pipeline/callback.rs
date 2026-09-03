@@ -249,6 +249,12 @@ impl IngestCallback for PipelineCallback<'_> {
                     metadata_hash: derived.metadata_hash,
                     external_etag: resource.external_etag.clone(),
                     external_last_modified: resource.external_last_modified.clone(),
+                    // A metadata-only update writes no content and touches no
+                    // validators, so it carries the row's existing check
+                    // clock forward rather than resetting it — this write
+                    // path does not itself advance `last_checked_at` (that is
+                    // the touch-wiring work, a later PR).
+                    last_checked_at: existing.last_checked_at.clone(),
                 });
                 self.result.docs_metadata_updated += 1;
                 self.emit(crate::progress::ProgressEvent::DocumentFinished {
@@ -298,6 +304,11 @@ impl IngestCallback for PipelineCallback<'_> {
                     metadata_hash,
                     external_etag: resource.external_etag.clone(),
                     external_last_modified: resource.external_last_modified.clone(),
+                    // A content change lands under a fresh `resource.id`
+                    // (specs/02-domain-model.md §2), a new row this write
+                    // path did not itself touch the check clock for — that
+                    // touch is the touch-wiring work, a later PR.
+                    last_checked_at: None,
                 });
                 self.emit(crate::progress::ProgressEvent::DocumentFinished {
                     uri,

@@ -386,7 +386,7 @@ pub(crate) async fn list_indexed_documents(
         .query(
             "SELECT id, uri, content_hash, policy_version, source_id,
                     metadata_json, external_id, external_etag, modified_at,
-                    external_last_modified
+                    external_last_modified, last_checked_at
              FROM resources WHERE store_id = ?",
             params![store.store_id().to_string()],
         )
@@ -400,6 +400,7 @@ pub(crate) async fn list_indexed_documents(
         let external_etag: Option<String> = row.get(7).map_err(map_libsql_err)?;
         let modified_at: Option<String> = row.get(8).map_err(map_libsql_err)?;
         let external_last_modified: Option<String> = row.get(9).map_err(map_libsql_err)?;
+        let last_checked_at: Option<String> = row.get(10).map_err(map_libsql_err)?;
 
         // Deliberately re-parsed here (rather than delegating to
         // `parse_metadata_json_lenient`, the precedent `rows.rs` uses for
@@ -445,6 +446,7 @@ pub(crate) async fn list_indexed_documents(
             metadata_hash,
             external_etag,
             external_last_modified,
+            last_checked_at,
         });
     }
     Ok(out)
