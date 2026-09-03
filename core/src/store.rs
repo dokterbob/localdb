@@ -632,13 +632,25 @@ pub trait RetrievalStore: Send + Sync + 'static {
     /// stored conditional-GET validators and `last_checked_at`, and nothing
     /// else.
     ///
+    /// The sweep is not the only writer of `last_checked_at`: the entry
+    /// recheck gate's own fetches, `url` sources, and single-document feed
+    /// mode advance the same column through [`Self::touch_resource_checked`]
+    /// below, which writes only that one column since their own write path
+    /// already persisted the validators. This method's own write is also the
+    /// column's one disclosed exception — it advances on `Blocked` and
+    /// transport-error outcomes too, not only on successful origin contact,
+    /// so the sweep's oldest-first candidate rotation stays fair rather than
+    /// getting stuck re-probing the same unreachable entries forever. See
+    /// specs/04-search-pipeline.md §1 "What a probe writes" and
+    /// specs/02-domain-model.md §2's `last_checked_at` row.
+    ///
     /// **Must never write `index_updated_at`.** That column normatively
     /// means "we last wrote this resource's stored state" and is publicly
     /// exposed as `DocumentInfo::index_updated_at` (`localdb document get`,
     /// `GET /v1/documents/{id}`, MCP `get_document`/`list_documents`). A
     /// liveness probe writes no content and no metadata, so bumping that
     /// column would misreport a merely-pinged resource as re-written — which
-    /// is exactly why schema v8 gave the throttle clock its own column
+    /// is exactly why schema v8 gave this clock its own column
     /// (`last_checked_at`) instead of reusing this one.
     ///
     /// The default implementation is a no-op, mirroring

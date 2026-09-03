@@ -742,6 +742,7 @@ Options:
       --json                Emit JSON output instead of human-readable text
       --strict              Exit with code 2 if any document failed extraction (never aborts mid-run)
       --delete              Remove indexed documents that no longer exist at their source
+      --refetch             Bypass the feed entry recheck gate and force a full recheck
   -s, --store <NAME>        Operate on these stores (repeatable); a filter, not a selector
   -y, --yes                 Skip confirmation prompts for destructive operations
   -h, --help                Print help (see more with '--help')
@@ -752,6 +753,17 @@ Options:
 ask. Without it, documents whose files were deleted (or whose URLs now 404) stay searchable, and the
 run reports how many could be pruned. With it, they're actually removed (`docs_deleted` in
 `--json`).
+
+**`--refetch`:** a feed discovery entry that is already known, inside its recheck floor
+(`max(source.refresh_interval_secs, 24h)`), and whose feed-supplied claim still reproduces its
+stored metadata is skipped with no HTTP request at all — see
+[specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md)
+§1 "Recheck gate". `--refetch` bypasses that floor check for the run and forces a full recheck of a
+feed source's entries even when nothing looks stale; it's a no-op for `file`/`url` sources, since
+those have no recheck gate to bypass. Deferred entries count in `docs_skipped` and additionally in
+`docs_recheck_deferred`, present in `--json` output unconditionally (default 0) and folded into the
+human-readable summary as `, N rechecks deferred` only when non-zero — always 0 on a `--refetch`
+run.
 
 Omit `--store` and every store in the database is indexed; pass `--store` (repeatable) to index only
 specific stores. Indexing more than one store prints a `[store]`-prefixed line per store plus a
