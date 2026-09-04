@@ -56,6 +56,14 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tracing-subscriber = { workspace = true }
 
+# `test-support` feature on our own already-normal dependency: unlocks
+# `SqliteBackend::set_last_checked_at_for_test` for
+# `job_exec/tests/feed_liveness_sweep.rs` (and any sibling that needs to
+# backdate `resources.last_checked_at` past the recheck floor). Mirrors
+# `ingest/Cargo.toml`'s identical pattern for `localdb-core`'s own
+# `test-support` feature.
+localdb-store-libsql = { path = "../store-libsql", features = ["test-support"] }
+
 # Local HTTP server for `run_job`'s real-ingestion tests over a feed source
 # (job_exec/tests/feed_validator_persistence.rs) — `run_job`'s fetchers are
 # concrete `HttpUrlFetcher`s, not a trait object, so exercising conditional

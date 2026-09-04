@@ -12,6 +12,14 @@ rust-version.workspace = true
 # package name is namespaced (crates.io collision hygiene — see docs/release-engineering.md).
 name = "store_libsql"
 
+[features]
+# Mirrors `localdb-core`'s own `test-support` feature (see
+# `core/Cargo.toml`): gates test-only escape hatches that reach past the
+# `RetrievalStore`/`StoreBackend` trait surface, for integration tests in
+# other crates (e.g. `server/src/job_exec/tests/`) that need them but don't
+# compile this crate's own `#[cfg(test)]` code.
+test-support = []
+
 [dependencies]
 localdb-core = { path = "../core", version = "0.1.0" }
 libsql = "0.10.0-pre.4"
