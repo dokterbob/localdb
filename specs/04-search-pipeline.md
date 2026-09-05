@@ -229,12 +229,14 @@ advances the column ([02-domain-model.md](02-domain-model.md) §2).
 exception — "What a probe writes" below), `last_checked_at` advances only on those same
 successful-contact outcomes, never on `SkipReason::Error`, `SkipReason::FetchError`,
 `SkipReason::ParseFailed`, `IndexOutcome::Empty`, an index-write error, `Blocked` (no origin contact
-happened), or `Gone` (the row no longer exists to touch). Each of those arms deliberately leaves
-`doc_index` stale so the next run retries the same URI; stamping `last_checked_at` there would let
-this gate suppress exactly that retry — and, for a feed whose document was refetched specifically to
-retry a previously-failed entry ([02-domain-model.md](02-domain-model.md) "Partial entry passes
-withhold the validators too"), would waste that refetch by gate-skipping the very entry it was
-refetched for.
+happened), or `Gone` (for a `url` source the row no longer exists to touch; a discovery-mode entry
+with usable embedded content instead retains its row via the fallback path, which reports through
+`on_resource_fallback` and likewise never advances the column). Each of those arms deliberately
+leaves `doc_index` stale so the next run retries the same URI; stamping `last_checked_at` there
+would let this gate suppress exactly that retry — and, for a feed whose document was refetched
+specifically to retry a previously-failed entry ([02-domain-model.md](02-domain-model.md) "Partial
+entry passes withhold the validators too"), would waste that refetch by gate-skipping the very entry
+it was refetched for.
 
 **Floor.** `max(source.refresh_interval_secs, 24h)` — precisely the liveness sweep's own derivation
 (`FEED_LIVENESS_MIN_RECHECK_SECS`, "Aged-out feed entries" below), extracted into one shared helper
@@ -246,12 +248,44 @@ interval is normally well under a day, the floor collapses to the bare 24h in pr
 per-source `recheck_interval` knob — "poll the feed hourly, recheck each entry weekly" — is reserved
 but not implemented; no config change accompanies this gate.
 
+**Due-entry revisit on a feed 304 (normative).** In discovery mode, a `304` on the feed document
+itself no longer ends the run at the feed level. `FeedIngestor::ingest` asks the callback
+(`due_entries_for_source`) for every entry this source has previously indexed whose stored
+`policy_version` no longer matches the run's, or whose `last_checked_at` is unset or older than the
+same floor defined above, and revisits each through the identical conditional-GET path the ordinary
+entry loop uses (`process_url`), replaying the entry's persisted feed-derived metadata (title,
+creators, date, `external_id`, `modified_at` — already on its resource row) as the connector's
+claim, since no parsed feed entry exists on this path.
+
+No embedded-content fallback is available here: `Unsupported`, `Empty`, and `Blocked` outcomes are
+reported as errors rather than silently degrading the stored resource. A `Gone` answer leaves the
+row untouched under `Retain`; reclaiming a confirmed-gone entry remains the liveness sweep's job
+under `--delete`.
+
+Entries whose URI is the synthetic link-less shape (`{feed_url}#entry:...`) are excluded — there is
+nothing to fetch.
+
+The revisit is capped per run at the same batch bound the liveness sweep uses (25, oldest-first by
+`last_checked_at`), so a long-idle source drains its backlog across successive runs instead of
+turning one quiet `304` into an unbounded fetch storm.
+
+This is what makes the floor an actual ceiling: without it, a feed that keeps answering `304` never
+re-verifies a single entry, however long it has gone unchecked.
+
 **Accepted cost.** A silent page edit the feed does not announce — no `updated` bump, no title or
-author change — is now noticed only after the floor elapses, not on the very next run as before this
-gate existed. Three escape hatches bypass it: `--refetch` ([05-surfaces.md](05-surfaces.md)), which
-bypasses check (c) for the run; a feed-side `updated`, title, or author change, which changes the
-claim compared in check (b) and reopens the gate on its own; and a `policy_version` bump, which
-fails check (a).
+author change — is noticed within one floor-length window of the origin's next successful contact:
+the ordinary entry loop on a fresh `200`, or the due-entry revisit above on a `304`, whichever comes
+first. It is never indefinitely deferred by a quiet feed. Three escape hatches bypass it:
+`--refetch` ([05-surfaces.md](05-surfaces.md)), which bypasses check (c) for the run; a feed-side
+`updated` or author change — or a title change, but only while the resource still has no stored
+title for the feed's fallback to fill — which changes the claim compared in check (b) and reopens
+the gate on its own; and a `policy_version` bump, which fails check (a).
+
+A discovery entry currently served from embedded feed content carries the same bounded-staleness
+cost one level down: if the entry's RSS description or Atom content changes with no accompanying
+metadata change, the new body is picked up only when the gate reopens — floor expiry or a claim
+change, same as above — because a feed that changes content without bumping `updated` is not
+announcing its own edit either.
 
 ### Deletes
 

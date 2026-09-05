@@ -377,30 +377,33 @@ later if a consumer demands it).
   a bool, default `false`; `true` bypasses the feed entry recheck gate's floor check and suppresses
   feed-document validators for the run, mirroring CLI `index --refetch`
   ([04-search-pipeline.md](04-search-pipeline.md) §1 "Recheck gate") — a non-bool value is
-  `invalid_request`, 400. `POST /jobs` → `202` + the created `IndexJob`. A second `POST /jobs` for a
-  store that already has a job queued or running is rejected with `index_in_progress`, 409 (§5) —
-  same-store submissions always conflict, regardless of worker count; a per-store in-flight guard is
-  reserved atomically at submit time, before the job is created, so two concurrent submissions for
-  the same store can never both proceed. Jobs for _different_ stores run concurrently, up to
-  `server.job_workers` workers sharing one queue (issue #208) — all workers pull from the same
-  channel, so cross-store jobs genuinely overlap while the per-store guard keeps same-store jobs
-  serialized no matter how many workers are configured. Embedded (non-daemon) CLI indexing always
-  runs its own single-worker queue and never reads `server.job_workers`. The URL-refresh scheduler
-  submits jobs through this same engine, not a separate code path. Clients poll `GET /jobs/{id}` for
-  the current `IndexJob` (state `pending`/`running`/`done`/`failed`, `stats`, `error`, `error_code`,
-  timestamps) or stream `GET /jobs/{id}/events` for live progress (below). Because job records are
-  ephemeral with bounded retention (above), `GET /jobs/{id}` for a job id that has aged out past the
-  terminal-job cap returns `404 job_not_found` — the same response as an id that never existed; a
-  client that stops polling a terminal job and comes back much later should not assume a `404` means
-  the id was invalid. `error_code` (issue #187 review, finding 3) is the failing `core::Error`'s
-  stable `code()` string (§5) when the job's `Failed` state came from a typed error — `null`/absent
-  for a synthetic queue-level failure (the queue itself full/closed, or the job's task panicking)
-  that never had one, and always absent on `done`. `error_code` + `error` round-trip through the
-  same `code -> Error` mapping a daemon HTTP error body's `code` field does (§5), so a
-  daemon-attached CLI client reconstructs the original typed error and exits with the same code an
-  equivalent embedded failure would, instead of collapsing every job failure to a generic internal
-  error. `#[serde(default)]`, so a daemon predating this field omits the key entirely rather than
-  sending `null`.
+  `invalid_request`, 400. A `refetch: true` submission requires the daemon to advertise the
+  `refetch` capability ("Daemon capability advertisement" below); the CLI checks this before sending
+  the request rather than relying on the daemon to reject it. `POST /jobs` → `202` + the created
+  `IndexJob`. A second `POST /jobs` for a store that already has a job queued or running is rejected
+  with `index_in_progress`, 409 (§5) — same-store submissions always conflict, regardless of worker
+  count; a per-store in-flight guard is reserved atomically at submit time, before the job is
+  created, so two concurrent submissions for the same store can never both proceed. Jobs for
+  _different_ stores run concurrently, up to `server.job_workers` workers sharing one queue (issue
+  #208) — all workers pull from the same channel, so cross-store jobs genuinely overlap while the
+  per-store guard keeps same-store jobs serialized no matter how many workers are configured.
+  Embedded (non-daemon) CLI indexing always runs its own single-worker queue and never reads
+  `server.job_workers`. The URL-refresh scheduler submits jobs through this same engine, not a
+  separate code path. Clients poll `GET /jobs/{id}` for the current `IndexJob` (state
+  `pending`/`running`/`done`/`failed`, `stats`, `error`, `error_code`, timestamps) or stream
+  `GET /jobs/{id}/events` for live progress (below). Because job records are ephemeral with bounded
+  retention (above), `GET /jobs/{id}` for a job id that has aged out past the terminal-job cap
+  returns `404 job_not_found` — the same response as an id that never existed; a client that stops
+  polling a terminal job and comes back much later should not assume a `404` means the id was
+  invalid. `error_code` (issue #187 review, finding 3) is the failing `core::Error`'s stable
+  `code()` string (§5) when the job's `Failed` state came from a typed error — `null`/absent for a
+  synthetic queue-level failure (the queue itself full/closed, or the job's task panicking) that
+  never had one, and always absent on `done`. `error_code` + `error` round-trip through the same
+  `code -> Error` mapping a daemon HTTP error body's `code` field does (§5), so a daemon-attached
+  CLI client reconstructs the original typed error and exits with the same code an equivalent
+  embedded failure would, instead of collapsing every job failure to a generic internal error.
+  `#[serde(default)]`, so a daemon predating this field omits the key entirely rather than sending
+  `null`.
 - **`DELETE /jobs/{id}`** (issue #218): requests cancellation of a queued or running job. `202` +
   the job's snapshot at the moment cancellation was requested — not a guarantee it has already
   stopped; poll `GET /jobs/{id}` or watch `GET /jobs/{id}/events` for the eventual terminal state.
@@ -510,8 +513,9 @@ later if a consumer demands it).
   clamp is needed on the way out.
 
 **Daemon capability advertisement (normative).** `GET /v1/status` returns a `features` array naming
-capabilities this daemon supports; it currently contains `search_filters`. A client MUST treat an
-absent or unrecognized name as unsupported — a daemon predating the field omits it entirely.
+capabilities this daemon supports; it currently contains `search_filters` and `refetch`. A client
+MUST treat an absent or unrecognized name as unsupported — a daemon predating the field omits it
+entirely.
 
 This exists because request bodies do not reject unknown fields, so a daemon older than a parameter
 silently ignores it and answers as though it had never been sent. For search filters that means
@@ -519,7 +523,10 @@ returning an unfiltered result set to a caller who asked for a narrow scope — 
 indistinguishable from a correct one. A client MUST therefore confirm support before sending a
 parameter whose absence changes the answer rather than merely omitting detail. `localdb search` does
 so only when a filter is actually set, and fails with `daemon_capability_unavailable` (exit 5)
-naming the fix instead of searching unfiltered.
+naming the fix instead of searching unfiltered. `localdb index --refetch` against a daemon MUST
+likewise confirm the `refetch` feature before submitting the job, failing with
+`daemon_capability_unavailable` (exit 5) naming the fix, because an older daemon would silently
+ignore the request's unknown `refetch` key and run an ordinary gated job while reporting success.
 
 ## 4. MCP
 
@@ -891,8 +898,10 @@ claim still reproduces its stored `metadata_hash` is skipped without making an H
 see [04-search-pipeline.md](04-search-pipeline.md) §1 "Recheck gate" for the three checks and the
 floor derivation. It counts like any other skip in `docs_skipped` (the `docs_seen` partition is
 unchanged) and additionally in its own sub-counter, `docs_recheck_deferred`, present in `--json`
-output unconditionally (default 0) and folded into the human-readable summary as
-`, N rechecks deferred` only when non-zero — the same append-only-when-nonzero convention
+output unconditionally (default 0) for any store with at least one source — a store with no sources
+keeps the legacy `{"status": "ok", "message": "no sources to index"}` shape instead, which carries
+no counters at all — and folded into the human-readable summary as `, N rechecks deferred` only when
+non-zero — the same append-only-when-nonzero convention
 `docs_deleted`/`docs_prunable`/`docs_metadata_updated`/`feed_entries_liveness_checked` already
 follow. Always 0 for a `file`/`url` source, since the gate applies to feed discovery entries only.
 `index --refetch` bypasses the floor check for the run, so `docs_recheck_deferred` is always 0 on a
