@@ -40,6 +40,21 @@ use crate::daemon_client::{daemon_request_async, encode_path_segment, CliContext
 // Embedded transport
 // ---------------------------------------------------------------------------
 
+/// The job-shaped parameters [`run_embedded_store_job`] needs, bundled to
+/// keep its own parameter list under clippy's arg-count lint — mirrors the
+/// `JobExecDeps`/`SourceIngestionDeps` precedent (`server::job_exec`,
+/// `core::ingestion::deps`) rather than growing yet another positional
+/// argument. Transport-specific handles the function borrows or mutates
+/// (`queue`, `config_loader`, `db`, `store_row`, `embedder`) stay separate
+/// arguments — this struct is only "what job to run," not "with what."
+pub(crate) struct RunEmbeddedStoreJobArgs<'a> {
+    pub scope: IndexJobScope,
+    pub deletion: DeletionPolicy,
+    pub refetch: bool,
+    pub mode: IndexErrorMode,
+    pub progress_label: Option<&'a str>,
+}
+
 /// Run one store's index job through the embedded engine: a local
 /// [`JobQueue`] submission of `job_exec::run_job`, with this process's own
 /// progress sink subscribed to the job's broadcast channel.
@@ -75,20 +90,23 @@ use crate::daemon_client::{daemon_request_async, encode_path_segment, CliContext
 /// tracing/correlating a run's own log lines even though `localdb job
 /// cancel` itself only ever targets a *daemon's* queue, never this
 /// throwaway embedded one.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_embedded_store_job(
     ctx: &CliContext,
     queue: &JobQueue,
     config_loader: &ConfigLoader,
     db: &AppDb,
     store_row: &StoreRow,
-    scope: IndexJobScope,
-    deletion: DeletionPolicy,
-    refetch: bool,
-    mode: IndexErrorMode,
     embedder: &mut Option<Arc<dyn Embedder>>,
-    progress_label: Option<&str>,
+    request: RunEmbeddedStoreJobArgs<'_>,
 ) -> Result<(IndexSummary, Option<String>), Error> {
+    let RunEmbeddedStoreJobArgs {
+        scope,
+        deletion,
+        refetch,
+        mode,
+        progress_label,
+    } = request;
+
     let sources = match job_exec::resolve_job_sources(db.backend(), &store_row.id, &scope).await {
         Ok(s) => s,
         Err(e) => {
@@ -291,6 +309,18 @@ async fn require_daemon_refetch_support(base_url: &str) -> Result<(), Error> {
     })
 }
 
+/// The job-shaped parameters [`run_daemon_store_job`] needs, bundled for the
+/// same reason as [`RunEmbeddedStoreJobArgs`] — see its doc comment.
+/// Transport-specific handles (`ctx`, `base_url`, `store_name`) stay separate
+/// arguments.
+pub(crate) struct RunDaemonStoreJobArgs<'a> {
+    pub source_id: Option<&'a str>,
+    pub deletion: DeletionPolicy,
+    pub refetch: bool,
+    pub mode: IndexErrorMode,
+    pub progress_label: Option<&'a str>,
+}
+
 /// Submit one index job to a running daemon for `store_name` and attach to
 /// it to completion (SSE, falling back to polling), returning the resulting
 /// `IndexSummary`.
@@ -316,17 +346,20 @@ async fn require_daemon_refetch_support(base_url: &str) -> Result<(), Error> {
 /// surface it too — `None` only on the two early-return paths before a job
 /// id is ever known (a submission failure, or a malformed submission
 /// response).
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_daemon_store_job(
     ctx: &CliContext,
     base_url: &str,
     store_name: &str,
-    source_id: Option<&str>,
-    deletion: DeletionPolicy,
-    refetch: bool,
-    mode: IndexErrorMode,
-    progress_label: Option<&str>,
+    request: RunDaemonStoreJobArgs<'_>,
 ) -> Result<(IndexSummary, Option<String>), Error> {
+    let RunDaemonStoreJobArgs {
+        source_id,
+        deletion,
+        refetch,
+        mode,
+        progress_label,
+    } = request;
+
     // Only paid for when `--refetch` is actually set — an ordinary gated run
     // never touches `/v1/status` for this. A daemon predating `refetch`
     // would otherwise silently ignore the request's unknown key and run a
@@ -812,12 +845,14 @@ mod tests {
             &config_loader,
             &db,
             &store,
-            unknown_scope.clone(),
-            DeletionPolicy::Retain,
-            false,
-            IndexErrorMode::StrictExit,
             &mut embedder,
-            None,
+            RunEmbeddedStoreJobArgs {
+                scope: unknown_scope.clone(),
+                deletion: DeletionPolicy::Retain,
+                refetch: false,
+                mode: IndexErrorMode::StrictExit,
+                progress_label: None,
+            },
         )
         .await
         .unwrap_err();
@@ -832,12 +867,14 @@ mod tests {
             &config_loader,
             &db,
             &store,
-            unknown_scope,
-            DeletionPolicy::Retain,
-            false,
-            IndexErrorMode::WarnAndContinue,
             &mut embedder,
-            None,
+            RunEmbeddedStoreJobArgs {
+                scope: unknown_scope,
+                deletion: DeletionPolicy::Retain,
+                refetch: false,
+                mode: IndexErrorMode::WarnAndContinue,
+                progress_label: None,
+            },
         )
         .await
         .unwrap();
@@ -914,12 +951,14 @@ mod tests {
             &config_loader,
             &db,
             &store,
-            IndexJobScope::Store,
-            DeletionPolicy::Retain,
-            false,
-            IndexErrorMode::WarnAndContinue,
             &mut embedder,
-            None,
+            RunEmbeddedStoreJobArgs {
+                scope: IndexJobScope::Store,
+                deletion: DeletionPolicy::Retain,
+                refetch: false,
+                mode: IndexErrorMode::WarnAndContinue,
+                progress_label: None,
+            },
         )
         .await
         .unwrap();
@@ -1015,11 +1054,13 @@ mod tests {
             &ctx,
             &base_url,
             "nonexistent-store",
-            None,
-            DeletionPolicy::Retain,
-            false,
-            IndexErrorMode::StrictExit,
-            None,
+            RunDaemonStoreJobArgs {
+                source_id: None,
+                deletion: DeletionPolicy::Retain,
+                refetch: false,
+                mode: IndexErrorMode::StrictExit,
+                progress_label: None,
+            },
         )
         .await
         .unwrap_err();
@@ -1032,11 +1073,13 @@ mod tests {
             &ctx,
             &base_url,
             "nonexistent-store",
-            None,
-            DeletionPolicy::Retain,
-            false,
-            IndexErrorMode::WarnAndContinue,
-            None,
+            RunDaemonStoreJobArgs {
+                source_id: None,
+                deletion: DeletionPolicy::Retain,
+                refetch: false,
+                mode: IndexErrorMode::WarnAndContinue,
+                progress_label: None,
+            },
         )
         .await
         .unwrap();
@@ -1242,11 +1285,13 @@ mod tests {
             &ctx,
             &base_url,
             "store-x",
-            None,
-            DeletionPolicy::Retain,
-            true, // --refetch
-            IndexErrorMode::StrictExit,
-            None,
+            RunDaemonStoreJobArgs {
+                source_id: None,
+                deletion: DeletionPolicy::Retain,
+                refetch: true, // --refetch
+                mode: IndexErrorMode::StrictExit,
+                progress_label: None,
+            },
         )
         .await
         .unwrap_err();
@@ -1294,11 +1339,13 @@ mod tests {
             &ctx,
             &base_url,
             "store-x",
-            None,
-            DeletionPolicy::Retain,
-            false, // no --refetch
-            IndexErrorMode::StrictExit,
-            None,
+            RunDaemonStoreJobArgs {
+                source_id: None,
+                deletion: DeletionPolicy::Retain,
+                refetch: false, // no --refetch
+                mode: IndexErrorMode::StrictExit,
+                progress_label: None,
+            },
         )
         .await
         .unwrap();
@@ -1324,11 +1371,13 @@ mod tests {
             &ctx,
             &base_url,
             "store-x",
-            None,
-            DeletionPolicy::Retain,
-            false,
-            IndexErrorMode::StrictExit,
-            None,
+            RunDaemonStoreJobArgs {
+                source_id: None,
+                deletion: DeletionPolicy::Retain,
+                refetch: false,
+                mode: IndexErrorMode::StrictExit,
+                progress_label: None,
+            },
         )
         .await
         .unwrap_err();
@@ -1346,11 +1395,13 @@ mod tests {
             &ctx,
             &base_url,
             "store-x",
-            None,
-            DeletionPolicy::Retain,
-            false,
-            IndexErrorMode::WarnAndContinue,
-            None,
+            RunDaemonStoreJobArgs {
+                source_id: None,
+                deletion: DeletionPolicy::Retain,
+                refetch: false,
+                mode: IndexErrorMode::WarnAndContinue,
+                progress_label: None,
+            },
         )
         .await
         .unwrap();
@@ -1519,11 +1570,13 @@ mod tests {
             &ctx,
             &base_url,
             "store-x",
-            None,
-            DeletionPolicy::Retain,
-            false,
-            IndexErrorMode::StrictExit,
-            None,
+            RunDaemonStoreJobArgs {
+                source_id: None,
+                deletion: DeletionPolicy::Retain,
+                refetch: false,
+                mode: IndexErrorMode::StrictExit,
+                progress_label: None,
+            },
         )
         .await
         .unwrap_err();
@@ -1539,11 +1592,13 @@ mod tests {
             &ctx,
             &base_url,
             "store-x",
-            None,
-            DeletionPolicy::Retain,
-            false,
-            IndexErrorMode::WarnAndContinue,
-            None,
+            RunDaemonStoreJobArgs {
+                source_id: None,
+                deletion: DeletionPolicy::Retain,
+                refetch: false,
+                mode: IndexErrorMode::WarnAndContinue,
+                progress_label: None,
+            },
         )
         .await
         .unwrap();

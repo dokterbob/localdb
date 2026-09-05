@@ -221,11 +221,13 @@ impl DaemonAwareCommand for IndexCmd<'_> {
                 ctx,
                 base_url,
                 name,
-                self.source_id,
-                self.deletion,
-                self.refetch,
-                IndexErrorMode::StrictExit,
-                label,
+                job_attach::RunDaemonStoreJobArgs {
+                    source_id: self.source_id,
+                    deletion: self.deletion,
+                    refetch: self.refetch,
+                    mode: IndexErrorMode::StrictExit,
+                    progress_label: label,
+                },
             )
             .await
             {
@@ -326,12 +328,14 @@ impl DaemonAwareCommand for IndexCmd<'_> {
                 config_loader,
                 db,
                 store_row,
-                scope,
-                self.deletion,
-                self.refetch,
-                IndexErrorMode::StrictExit,
                 &mut embedder,
-                label,
+                job_attach::RunEmbeddedStoreJobArgs {
+                    scope,
+                    deletion: self.deletion,
+                    refetch: self.refetch,
+                    mode: IndexErrorMode::StrictExit,
+                    progress_label: label,
+                },
             )
             .await
             {
