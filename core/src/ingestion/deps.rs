@@ -62,6 +62,15 @@ pub struct DocumentRecord {
     /// not an input to `core::ids::compute_metadata_hash` — see
     /// specs/02-domain-model.md §2.
     pub external_last_modified: Option<String>,
+    /// When we last successfully contacted the origin for this resource's
+    /// URI (RFC 3339, UTC) — a `200` or `304` that left the store consistent
+    /// for it — or `None` if no probe has ever reached it. Read by the entry
+    /// recheck gate (specs/04-search-pipeline.md §1 "Recheck gate") to decide
+    /// whether a discovery entry is due for another conditional GET at all.
+    /// See specs/02-domain-model.md §2's `last_checked_at` row for the full
+    /// set of write paths and the one write path deliberately excluded from
+    /// them.
+    pub last_checked_at: Option<String>,
 }
 
 /// In-memory index of previously-seen documents keyed by URI.

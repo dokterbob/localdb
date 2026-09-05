@@ -85,6 +85,57 @@ async fn get_chunk_tolerates_invalid_metadata_json() {
 }
 
 // ---------------------------------------------------------------------------
+// list_indexed_documents — last_checked_at
+// ---------------------------------------------------------------------------
+
+/// A freshly-indexed resource has never been checked, so `list_indexed_
+/// documents` must report `last_checked_at: None` for it; once
+/// `touch_resource_checked` runs, the same read must surface the value it
+/// wrote. This is the rehydration half of the contract `feed_liveness.rs`'s
+/// `touch_resource_checked_sets_last_checked_at_and_writes_nothing_else`
+/// pins from the write side.
+#[tokio::test]
+async fn list_indexed_documents_reports_last_checked_at_none_then_some() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("localdb.db");
+    let backend = backend_with_store_and_source(&path).await;
+    let handle = backend.retrieval_store("store-1").await.unwrap();
+
+    handle
+        .upsert_chunks(vec![chunk_record(
+            "2026-07-01T00:00:00Z",
+            Some("2026-07-01T00:00:00Z"),
+        )])
+        .await
+        .unwrap();
+
+    let before = handle.list_indexed_documents().await.unwrap();
+    let doc_before = before
+        .iter()
+        .find(|d| d.resource_id == "doc-1")
+        .expect("the seeded resource must be listed");
+    assert_eq!(
+        doc_before.last_checked_at, None,
+        "a resource that was never touched must report last_checked_at: None"
+    );
+
+    handle
+        .touch_resource_checked("store-1", "doc-1")
+        .await
+        .unwrap();
+
+    let after = handle.list_indexed_documents().await.unwrap();
+    let doc_after = after
+        .iter()
+        .find(|d| d.resource_id == "doc-1")
+        .expect("the seeded resource must still be listed");
+    assert!(
+        doc_after.last_checked_at.is_some(),
+        "touch_resource_checked's write must be visible through list_indexed_documents"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // get_resource_record (the read counterpart to update_resource_metadata)
 // ---------------------------------------------------------------------------
 

@@ -7,7 +7,7 @@ use localdb_core::types::SourceKind;
 use localdb_core::{ChunkRecord, Error, Metadata, SourceRow, StoreBackend};
 use tempfile::tempdir;
 
-use super::common::backend_with_store_and_source;
+use super::common::{add_store_and_source, backend_with_store_and_source, chunk_record};
 use crate::SqliteBackend;
 
 /// `backend_with_store_and_source` seeds only a path source (`src-1`); feed
@@ -511,5 +511,172 @@ async fn touch_resource_liveness_errors_when_no_row_matches() {
         Error::ResourceNotFound {
             id: "does-not-exist".to_string()
         }
+    );
+}
+
+// ---------------------------------------------------------------------------
+// touch_resource_checked — the entry-loop/`url`-source/single-doc-feed
+// counterpart to `touch_resource_liveness` above (specs/04-search-pipeline.md
+// §1 "What a probe writes"): a single-column write, outside the sweep.
+// ---------------------------------------------------------------------------
+
+/// The core contract: `touch_resource_checked` advances `last_checked_at` to
+/// a recent timestamp, leaves the validators and `index_updated_at`
+/// byte-for-byte as they were, and the write is visible through
+/// `list_indexed_documents`.
+#[tokio::test]
+async fn touch_resource_checked_sets_last_checked_at_and_writes_nothing_else() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("localdb.db");
+    let backend = backend_with_store_and_source(&path).await;
+    add_feed_source(&backend).await;
+    let handle = backend.retrieval_store("store-1").await.unwrap();
+
+    let mut record = feed_chunk_record("feed-1", "https://a.example.com/");
+    record.external_etag = Some("\"v1\"".to_string());
+    handle.upsert_chunks(vec![record]).await.unwrap();
+    // A prior liveness touch seeds `external_last_modified` — a column
+    // `upsert_chunks` alone cannot set (see `list_stale_feed_resources_
+    // round_trips_validators` above) — so the "leaves validators untouched"
+    // assertion below has something in both validator columns to disturb.
+    handle
+        .touch_resource_liveness(
+            "store-1",
+            "feed-1",
+            Some("\"v1\""),
+            Some("Wed, 21 Oct 2015 07:28:00 GMT"),
+        )
+        .await
+        .unwrap();
+
+    let (etag_before, last_modified_before, last_checked_before, index_updated_before) =
+        resource_liveness_columns(&backend, "feed-1").await;
+    assert!(
+        last_checked_before.is_some(),
+        "seeded by touch_resource_liveness above"
+    );
+
+    let before = chrono::Utc::now();
+    handle
+        .touch_resource_checked("store-1", "feed-1")
+        .await
+        .unwrap();
+    let after = chrono::Utc::now();
+
+    let (etag_after, last_modified_after, last_checked_after, index_updated_after) =
+        resource_liveness_columns(&backend, "feed-1").await;
+    assert_eq!(
+        etag_after, etag_before,
+        "touch_resource_checked must never write external_etag"
+    );
+    assert_eq!(
+        last_modified_after, last_modified_before,
+        "touch_resource_checked must never write external_last_modified"
+    );
+    assert_eq!(
+        index_updated_after, index_updated_before,
+        "touch_resource_checked must never bump index_updated_at"
+    );
+    let last_checked_after = last_checked_after.expect("touch_resource_checked must set it");
+    let parsed = chrono::DateTime::parse_from_rfc3339(&last_checked_after)
+        .expect("last_checked_at must be a valid RFC 3339 timestamp")
+        .with_timezone(&chrono::Utc);
+    assert!(
+        parsed >= before - chrono::Duration::seconds(1) && parsed <= after,
+        "last_checked_at ({parsed}) must be a recent timestamp, between {before} and {after}"
+    );
+
+    let documents = handle.list_indexed_documents().await.unwrap();
+    let doc = documents
+        .iter()
+        .find(|d| d.resource_id == "feed-1")
+        .expect("the touched resource must still be listed");
+    assert_eq!(
+        doc.last_checked_at.as_deref(),
+        Some(last_checked_after.as_str()),
+        "list_indexed_documents must surface the touched last_checked_at"
+    );
+}
+
+/// Zero-rows semantics mirror `touch_resource_liveness`'s own guard: a
+/// concurrent delete racing the check must be a reported error, never a
+/// silent no-op.
+#[tokio::test]
+async fn touch_resource_checked_errors_when_no_row_matches() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("localdb.db");
+    let backend = backend_with_store_and_source(&path).await;
+    add_feed_source(&backend).await;
+    let handle = backend.retrieval_store("store-1").await.unwrap();
+
+    let err = handle
+        .touch_resource_checked("store-1", "does-not-exist")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        Error::ResourceNotFound {
+            id: "does-not-exist".to_string()
+        }
+    );
+}
+
+/// A `TenantStore` handle rejects a `store_id` argument that is not its own
+/// — the same tenant-boundary check every other write on the trait performs
+/// — before it ever reaches the database.
+#[tokio::test]
+async fn touch_resource_checked_rejects_foreign_store_id() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("localdb.db");
+    let backend = backend_with_store_and_source(&path).await;
+    add_feed_source(&backend).await;
+    add_store_and_source(&backend, "store-2", "src-2", "/other").await;
+    let handle = backend.retrieval_store("store-1").await.unwrap();
+
+    let err = handle
+        .touch_resource_checked("store-2", "anything")
+        .await
+        .unwrap_err();
+    match err {
+        Error::Internal { correlation_id, .. } => {
+            assert_eq!(correlation_id, "store_handle_tenant_violation");
+        }
+        other => panic!("expected Error::Internal, got {other:?}"),
+    }
+}
+
+/// Even when the `store_id` argument matches the handle's own store (so the
+/// tenant-boundary check above passes), a resource that actually belongs to
+/// a different store must not be touchable: the `UPDATE ... WHERE store_id =
+/// ? AND id = ?` matches zero rows, which is the same `ResourceNotFound` a
+/// genuinely unknown resource id produces.
+#[tokio::test]
+async fn touch_resource_checked_cannot_touch_a_resource_owned_by_another_store() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("localdb.db");
+    let backend = backend_with_store_and_source(&path).await;
+    add_store_and_source(&backend, "store-2", "src-2", "/other").await;
+
+    let other = backend.retrieval_store("store-2").await.unwrap();
+    let mut seed = chunk_record("2026-07-01T00:00:00Z", Some("2026-07-01T00:00:00Z"));
+    seed.id = "chunk-2".to_string();
+    seed.resource_id = "doc-2".to_string();
+    seed.store_id = "store-2".to_string();
+    seed.origin_store = "store-2".to_string();
+    seed.source_id = "src-2".to_string();
+    seed.uri = "file:///other/doc.md".to_string();
+    other.upsert_chunks(vec![seed]).await.unwrap();
+
+    let handle = backend.retrieval_store("store-1").await.unwrap();
+    let err = handle
+        .touch_resource_checked("store-1", "doc-2")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        Error::ResourceNotFound {
+            id: "doc-2".to_string()
+        },
+        "a store-1 handle must not be able to touch store-2's resource, even under store-1's own id"
     );
 }
