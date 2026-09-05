@@ -17,8 +17,10 @@
 //! Split across sibling modules by responsibility: [`deps`] is the
 //! dependency-injection surface callers build; [`enumerate`] walks a `path`
 //! source's filesystem; [`pipeline`] indexes one already-extracted `Resource`
-//! (chunk → embed → upsert) and streams a source's resources into it; and
-//! [`liveness`] probes aged-out feed entries. This file keeps the run-level
+//! (chunk → embed → upsert) and streams a source's resources into it;
+//! [`liveness`] probes aged-out feed entries; and [`recheck`] derives the
+//! recheck floor the liveness sweep and (specs/04-search-pipeline.md §1
+//! "Recheck gate") the feed entry gate share. This file keeps the run-level
 //! orchestration that ties them together — [`run_source_ingestion`] plus its
 //! config/result/job-lifecycle types — so a reader who wants "what does one
 //! ingestion run do end to end" never has to leave it.
@@ -36,6 +38,7 @@ mod deps;
 mod enumerate;
 mod liveness;
 mod pipeline;
+mod recheck;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use deps::UnreachableFetcher;
