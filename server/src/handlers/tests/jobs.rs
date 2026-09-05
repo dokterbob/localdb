@@ -354,6 +354,109 @@ async fn create_job_rejects_invalid_deletion_policy() {
     assert_eq!(body["code"], "invalid_request");
 }
 
+// --- refetch (T329: --refetch / recheck gate) --------------------------
+
+/// A non-bool `refetch` (a type this field can never actually hold) is
+/// rejected the same way an out-of-range `deletion_policy` string is:
+/// `400 invalid_request`, not axum's own default `422`/plain-text
+/// `Json<T>` rejection — see `crate::error::ApiJson`'s doc comment.
+#[tokio::test]
+async fn create_job_rejects_non_bool_refetch() {
+    let (_dir, app) = make_app().await;
+    post_json(&app, "/v1/stores", json!({"name": "test"})).await;
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/jobs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"store_name": "test", "refetch": "yes"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(resp.into_body()).await;
+    assert_eq!(body["code"], "invalid_request");
+}
+
+/// `refetch: true` is accepted (202), and the completed job's `stats`
+/// exposes `docs_recheck_deferred` — always present, default 0 for a
+/// `path` source (the recheck gate only ever applies to feed discovery
+/// entries).
+#[tokio::test]
+async fn create_job_accepts_refetch_true_and_stats_include_docs_recheck_deferred() {
+    let (_dir, app) = make_app().await;
+
+    let content_dir = tempfile::tempdir().unwrap();
+    std::fs::write(content_dir.path().join("doc.md"), "alpha bravo charlie").unwrap();
+
+    post_json(&app, "/v1/stores", json!({"name": "test"})).await;
+    post_json(
+        &app,
+        "/v1/stores/test/sources",
+        json!({
+            "kind": "path",
+            "spec": {"root": content_dir.path().to_string_lossy()},
+        }),
+    )
+    .await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/jobs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"store_name": "test", "refetch": true}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let job = json_body(resp.into_body()).await;
+    let job_id = job["id"].as_str().unwrap().to_string();
+
+    let final_job = poll_job_to_terminal(&app, &job_id).await;
+    assert_eq!(
+        final_job["state"], "done",
+        "job should complete successfully: {:?}",
+        final_job
+    );
+    assert_eq!(
+        final_job["stats"]["docs_recheck_deferred"], 0,
+        "docs_recheck_deferred must be present (and 0 for a non-feed source): {:?}",
+        final_job["stats"]
+    );
+}
+
+/// Omitting `refetch` entirely defaults to `false` — the field must not be
+/// required.
+#[tokio::test]
+async fn create_job_without_refetch_field_defaults_to_false_and_still_succeeds() {
+    let (_dir, app) = make_app().await;
+    post_json(&app, "/v1/stores", json!({"name": "test"})).await;
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/jobs")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"store_name": "test"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+}
+
 /// Shared setup for the retain/delete pair below: a store with a `path`
 /// source over a directory containing two files, both indexed by an initial
 /// job, then one file removed from disk before the second job runs.

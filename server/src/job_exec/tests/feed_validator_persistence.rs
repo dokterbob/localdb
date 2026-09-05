@@ -93,6 +93,7 @@ async fn run_job_updates_source_row_after_200_and_leaves_it_untouched_after_bare
         &store,
         IndexJobScope::Store,
         DeletionPolicy::Retain,
+        false,
         JobExecDeps {
             backend: state.backend(),
             yaml: &yaml,
@@ -133,6 +134,7 @@ async fn run_job_updates_source_row_after_200_and_leaves_it_untouched_after_bare
         &store,
         IndexJobScope::Store,
         DeletionPolicy::Retain,
+        false,
         JobExecDeps {
             backend: state.backend(),
             yaml: &yaml,
@@ -232,6 +234,7 @@ async fn a_policy_change_forces_an_unconditional_feed_fetch() {
             store,
             IndexJobScope::Store,
             DeletionPolicy::Retain,
+            false,
             JobExecDeps {
                 backend: state.backend(),
                 yaml,
@@ -304,6 +307,117 @@ async fn a_policy_change_forces_an_unconditional_feed_fetch() {
     drop(dir);
 }
 
+/// T329: `--refetch` (`SourceIngestionDeps::refetch`) suppresses the feed
+/// document's own stored conditional-GET validators for the run, the same
+/// effect a `feed_inputs_digest` mismatch has above — `refetch: false`
+/// still replays a stored validator as a conditional GET; `refetch: true`
+/// fetches unconditionally instead.
+#[tokio::test]
+async fn refetch_true_bypasses_stored_feed_validators_refetch_false_still_replays_them() {
+    let server = MockServer::start().await;
+    let feed_url = format!("{}/feed.xml", server.uri());
+
+    let (dir, state) = test_state().await;
+    state.add_store("notes", "private").await.unwrap();
+    let source = state
+        .add_source(
+            "notes",
+            "feed",
+            serde_json::json!({ "url": feed_url, "fetch_full_content": false }),
+            "prose",
+            None,
+        )
+        .await
+        .unwrap();
+    let store = state
+        .backend()
+        .get_store_by_name("notes")
+        .await
+        .unwrap()
+        .unwrap();
+    let yaml = fake_yaml();
+
+    async fn index(
+        state: &crate::state::AppState,
+        store: &localdb_core::StoreRow,
+        yaml: &RawConfig,
+        refetch: bool,
+    ) {
+        run_job(
+            store,
+            IndexJobScope::Store,
+            DeletionPolicy::Retain,
+            refetch,
+            JobExecDeps {
+                backend: state.backend(),
+                yaml,
+                models_dir: state.models_dir(),
+                embedder: None,
+                fetchers: None,
+                progress: None,
+                on_source_error: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Whether the most recent `/feed.xml` request carried `If-None-Match`.
+    async fn last_request_was_conditional(server: &MockServer) -> bool {
+        let reqs = server.received_requests().await.expect("recording is on");
+        reqs.last()
+            .expect("at least one request")
+            .headers
+            .contains_key("if-none-match")
+    }
+
+    // Answers 304 to a conditional request carrying the stored ETag, and 200
+    // otherwise — so which branch a run took is readable off the recorded
+    // request headers.
+    Mock::given(method("GET"))
+        .and(path("/feed.xml"))
+        .and(header("if-none-match", "\"v1\""))
+        .respond_with(ResponseTemplate::new(304))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/feed.xml"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("etag", "\"v1\"")
+                .set_body_string(minimal_rss()),
+        )
+        .mount(&server)
+        .await;
+
+    // --- Run 1: nothing stored yet, so nothing to replay. ---
+    index(&state, &store, &yaml, false).await;
+    assert!(!last_request_was_conditional(&server).await);
+    let row = state
+        .backend()
+        .get_source(&source.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.feed_etag.as_deref(), Some("\"v1\""));
+
+    // --- Run 2: refetch: false still replays the stored validator. ---
+    index(&state, &store, &yaml, false).await;
+    assert!(
+        last_request_was_conditional(&server).await,
+        "refetch: false must still replay the stored validator as a conditional GET"
+    );
+
+    // --- Run 3: refetch: true suppresses it. ---
+    index(&state, &store, &yaml, true).await;
+    assert!(
+        !last_request_was_conditional(&server).await,
+        "refetch: true must bypass the stored validator and fetch unconditionally"
+    );
+
+    drop(dir);
+}
+
 /// A run that could not index an entry must not store the feed document's
 /// validators.
 ///
@@ -369,6 +483,7 @@ async fn a_run_that_could_not_index_an_entry_withholds_the_feed_validators() {
                 &store,
                 IndexJobScope::Store,
                 DeletionPolicy::Retain,
+                false,
                 JobExecDeps {
                     backend: state.backend(),
                     yaml: &yaml,
@@ -459,6 +574,156 @@ async fn a_run_that_could_not_index_an_entry_withholds_the_feed_validators() {
     assert!(
         row.feed_inputs_digest.is_some(),
         "the digest rides along with the validators"
+    );
+
+    drop(dir);
+}
+
+/// The withhold guard's other trigger (specs/04-search-pipeline.md §1
+/// "Due-entry revisit on a feed 304"): a feed 304 can itself rotate a
+/// validator (RFC 9111 permits, and requires storing, a fresh validator on a
+/// 304 response), which alone makes `document_validators = Some(..)`. That
+/// same run's due-entry loop — the one a 304 triggers — can independently
+/// leave an entry unindexed (no embedded-content fallback exists on that
+/// path, per `process_due_recheck_entry`'s doc comment in
+/// `ingest::feed_ingestor`). The pre-existing `r.error_count > 0` guard above
+/// is not specific to how the error arose, so it must withhold the rotated
+/// validator here exactly as
+/// `a_run_that_could_not_index_an_entry_withholds_the_feed_validators` proves
+/// it does for an ordinary discovery-loop failure — this is the scenario
+/// Codex's F-304-STARVATION review finding named specifically (a partial run
+/// must not let the next run 304 its way past a still-broken entry).
+#[tokio::test]
+async fn a_due_entry_loop_error_on_a_feed_304_withholds_the_rotated_validator() {
+    let server = MockServer::start().await;
+    let feed_url = format!("{}/feed.xml", server.uri());
+    let entry_url = format!("{}/entry-1", server.uri());
+    // A `<description>` so run 1 indexes the entry via its embedded-content
+    // fallback: the link is a loopback address, refused by the entry
+    // fetcher's public-destination-only guard exactly as
+    // `feed_liveness_sweep.rs`'s tests rely on for the same reason.
+    let rss_with_summary = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel><title>Feed</title><link>{server_uri}/</link><description>d</description><item><title>E1</title><link>{entry_url}</link><guid>{entry_url}</guid><description>A summary long enough to chunk into something.</description></item></channel></rss>"#,
+        server_uri = server.uri(),
+    );
+
+    let (dir, state) = test_state().await;
+    state.add_store("notes", "private").await.unwrap();
+    let source = state
+        .add_source(
+            "notes",
+            "feed",
+            serde_json::json!({ "url": feed_url, "fetch_full_content": true }),
+            "prose",
+            None,
+        )
+        .await
+        .unwrap();
+    let store = state
+        .backend()
+        .get_store_by_name("notes")
+        .await
+        .unwrap()
+        .unwrap();
+    let yaml = fake_yaml();
+
+    macro_rules! run {
+        () => {
+            run_job(
+                &store,
+                IndexJobScope::Store,
+                DeletionPolicy::Retain,
+                false,
+                JobExecDeps {
+                    backend: state.backend(),
+                    yaml: &yaml,
+                    models_dir: state.models_dir(),
+                    embedder: None,
+                    fetchers: None,
+                    progress: None,
+                    on_source_error: None,
+                },
+            )
+            .await
+            .unwrap()
+        };
+    }
+
+    // --- Run 1: the feed reads fine and its one entry indexes cleanly via
+    // its embedded-content fallback. Under T329's fallback-stamp fix
+    // (`on_resource_fallback` never calls `touch_resource_checked`), the
+    // entry's `last_checked_at` stays unset afterward — so it is already a
+    // due-entry candidate for run 2's revisit loop, with no explicit
+    // backdating needed (mirroring `feed_liveness_sweep.rs`'s identical run-1
+    // shape and its own comment on this point).
+    Mock::given(method("GET"))
+        .and(path("/feed.xml"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("etag", "\"feed-v1\"")
+                .set_body_string(rss_with_summary),
+        )
+        .mount(&server)
+        .await;
+
+    let (stats, _embedder) = run!();
+    assert_eq!(stats.error_count, 0, "run 1 must ingest cleanly");
+    assert_eq!(
+        stats.docs_indexed, 1,
+        "the entry must index via its embedded-content fallback"
+    );
+
+    let row = state
+        .backend()
+        .get_source(&source.id)
+        .await
+        .unwrap()
+        .expect("source must still exist");
+    assert_eq!(
+        row.feed_etag.as_deref(),
+        Some("\"feed-v1\""),
+        "a clean run must persist the feed document's ETag"
+    );
+
+    // --- Run 2: the feed answers 304 but rotates its ETag on the 304 itself
+    // (`FeedIngestor`'s `FetchResult::NotModified` handling folds a rotated
+    // validator into `document_validators` even though the body is
+    // unchanged). That alone would normally persist the new ETag — except
+    // the due-entry loop this 304 triggers revisits the entry backdated by
+    // nothing at all (its `last_checked_at` was never stamped in run 1), and
+    // its link is refused by the same destination guard — this time with no
+    // embedded fallback available, since the feed body was never re-fetched
+    // this run — so it counts as an error.
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/feed.xml"))
+        .and(header("if-none-match", "\"feed-v1\""))
+        .respond_with(ResponseTemplate::new(304).insert_header("etag", "\"feed-v2\""))
+        .mount(&server)
+        .await;
+
+    let (stats, _embedder) = run!();
+    assert_eq!(
+        stats.error_count, 1,
+        "the due-entry loop's blocked outcome (no embedded fallback on this path) must count \
+         as an error"
+    );
+    assert_eq!(
+        stats.docs_indexed, 0,
+        "run 2's feed 304 means the ordinary discovery loop never runs at all"
+    );
+
+    let row = state
+        .backend()
+        .get_source(&source.id)
+        .await
+        .unwrap()
+        .expect("source must still exist");
+    assert_eq!(
+        row.feed_etag.as_deref(),
+        Some("\"feed-v1\""),
+        "the rotated ETag from run 2's 304 must be withheld, not persisted, because the \
+         due-entry loop it triggered left an entry unindexed"
     );
 
     drop(dir);

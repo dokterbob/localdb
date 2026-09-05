@@ -176,6 +176,7 @@ async fn a_source_deleted_during_the_run_is_not_resurrected_by_the_cache_write()
         &store,
         IndexJobScope::Store,
         DeletionPolicy::Retain,
+        false,
         JobExecDeps {
             backend: wrapper.as_ref(),
             yaml: &yaml,
