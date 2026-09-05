@@ -165,12 +165,19 @@ fn relax_modified_at_and_add_index_updated_at_up(_ctx: &MigrationContext) -> Vec
 /// validator, stored verbatim and replayed byte-exact in `If-Modified-Since`
 /// — distinct from the `modified_at` date axis (a parsed, source-claimed
 /// change time) even once a future `Last-Modified` source lands there.
-/// `resources.last_checked_at` is the liveness sweep's own throttle clock —
-/// deliberately a separate column from `index_updated_at`, which normatively
-/// means "we last wrote this resource's stored state" and is exposed via
-/// `DocumentInfo.index_updated_at`; a liveness probe writes nothing, so
-/// reusing that column would misreport a merely-pinged resource as
-/// re-written. `sources.feed_etag`/`sources.feed_last_modified` are the feed
+/// `resources.last_checked_at` is the last successful origin contact for the
+/// resource's URI — a `200` or `304` that left the store consistent for it —
+/// advanced by the entry loop, `url` sources, single-document feed mode and
+/// the liveness sweep, with one deliberate exception: the liveness sweep
+/// alone also advances it on a `Blocked` or transport-error probe outcome, so
+/// a run of permanently-blocked entries doesn't monopolize the sweep's
+/// oldest-first candidate ordering forever. Deliberately a separate column
+/// from `index_updated_at`, which normatively means "we last wrote this
+/// resource's stored state" and is exposed via
+/// `DocumentInfo.index_updated_at`; a successful check that leaves content
+/// and metadata unchanged writes nothing there, so reusing that column would
+/// misreport a merely-checked resource as re-written.
+/// `sources.feed_etag`/`sources.feed_last_modified` are the feed
 /// document's own validators, kept on the `sources` row because in
 /// discovery mode the feed document itself never becomes a `Resource`.
 /// `sources.feed_inputs_digest` guards those two: it records the local
@@ -266,12 +273,17 @@ pub fn migrations() -> Vec<Migration> {
             name: "add_conditional_get_validators",
             summary: "adds resources.external_last_modified (raw HTTP Last-Modified \
                       conditional-GET validator, replayed byte-exact in If-Modified-Since) and \
-                      resources.last_checked_at (the liveness sweep's throttle clock, distinct \
-                      from index_updated_at because a probe writes nothing), plus \
-                      sources.feed_etag and sources.feed_last_modified (the feed document's own \
-                      validators, kept on sources since a feed document never becomes a \
-                      Resource in discovery mode) and sources.feed_inputs_digest (the local \
-                      inputs behind the last feed run, so a policy change stops those \
+                      resources.last_checked_at (last successful origin contact for the \
+                      resource's URI, advanced by the entry loop, url sources, single-document \
+                      feed mode and the liveness sweep, except the liveness sweep also advances \
+                      it on a Blocked or transport-error probe outcome, its one deliberate \
+                      exception, so permanently-blocked entries don't monopolize its \
+                      oldest-first ordering; distinct from index_updated_at because a \
+                      successful check that leaves content and metadata unchanged writes \
+                      nothing), plus sources.feed_etag and sources.feed_last_modified (the feed \
+                      document's own validators, kept on sources since a feed document never \
+                      becomes a Resource in discovery mode) and sources.feed_inputs_digest \
+                      (the local inputs behind the last feed run, so a policy change stops those \
                       validators being replayed); all five nullable, no default. Downgrading \
                       past this migration discards any accumulated validators, costing one full \
                       re-fetch of every URL and feed entry on the next upgrade",

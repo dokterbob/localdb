@@ -167,15 +167,26 @@ pub(in crate::ingestion) struct LivenessProbeContext<'a> {
 /// Probe one aged-out feed entry and record the outcome.
 ///
 /// Every outcome except a confirmed 404/410 converges on a single
-/// `touch_resource_liveness` call; the only thing an outcome decides is
-/// which validators go with it. `last_checked_at` therefore advances on
-/// **every attempt** — the normative meaning of that column
-/// (specs/04-search-pipeline.md §1). It has to: the candidate query is
-/// oldest-first, so leaving an unreachable candidate's timestamp where it
-/// was would put it back at the head of the next query, and a source with
-/// `FEED_LIVENESS_BATCH_LIMIT` or more permanently-blocked entries would
-/// re-probe that same stuck set forever while no other candidate ever
-/// reached a batch.
+/// `touch_resource_liveness` call, which writes exactly three columns —
+/// `external_etag`, `external_last_modified`, `last_checked_at` — and
+/// nothing else; the only thing an outcome decides is which validators go
+/// with it (specs/04-search-pipeline.md §1 "What a probe writes"). Unlike
+/// every other writer of `last_checked_at` — the feed entry loop, `url`
+/// sources, single-document feed mode — this sweep advances the column on
+/// **every attempt**, `Blocked` and transport errors included. That is a
+/// deliberate, narrower exception to the column's normal meaning ("last
+/// successful origin contact"), not a second definition of it: the
+/// candidate query is oldest-first, so leaving an unreachable candidate's
+/// timestamp where it was would put it back at the head of the next query,
+/// and a source with `FEED_LIVENESS_BATCH_LIMIT` or more
+/// permanently-blocked entries would re-probe that same stuck set forever
+/// while no other candidate ever reached a batch.
+///
+/// Because a `NotModified`/`200` touch here advances the same column the
+/// entry recheck gate reads, probing a still-in-window entry under this
+/// sweep also defers that entry's own turn in the entry loop for the rest
+/// of the recheck floor (specs/04-search-pipeline.md §1 "Interaction with
+/// the recheck gate").
 ///
 /// `Err` is returned only for a failure that makes continuing the sweep
 /// meaningless (a failed delete); per-candidate write failures are logged

@@ -248,6 +248,12 @@ async fn update_resource_metadata_inner(
 /// stored conditional-GET validators and `last_checked_at`, nothing else.
 /// Backs `RetrievalStore::touch_resource_liveness`.
 ///
+/// The liveness sweep is not the only writer of `last_checked_at`: the entry
+/// recheck gate's own fetches, `url` sources, and single-document feed mode
+/// advance the same column through the single-column `touch_resource_checked`
+/// below, which leaves the validator pair alone because those paths already
+/// wrote it through their own conditional-GET write.
+///
 /// Deliberately does NOT touch `index_updated_at` — see that trait method's
 /// doc comment for why: a liveness probe writes no content and no metadata,
 /// so bumping the "we last wrote this resource's stored state" clock would
