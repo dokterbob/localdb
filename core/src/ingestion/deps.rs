@@ -103,6 +103,20 @@ impl DocumentIndex {
         self.records.get(uri)
     }
 
+    /// Every record this index holds for one source — the due-entry
+    /// revisit's candidate pool (specs/04-search-pipeline.md §1 "Due-entry
+    /// revisit on a feed 304"), which must consider only entries the
+    /// requesting source itself last indexed, never another source's rows
+    /// sharing the same in-memory map.
+    pub fn for_source<'a>(
+        &'a self,
+        source_id: &'a str,
+    ) -> impl Iterator<Item = &'a DocumentRecord> {
+        self.records
+            .values()
+            .filter(move |r| r.source_id == source_id)
+    }
+
     /// Insert or update a record.
     pub fn upsert(&mut self, record: DocumentRecord) {
         self.records.insert(record.uri.clone(), record);

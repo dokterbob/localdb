@@ -14,8 +14,9 @@ use crate::block::Resource;
 use crate::embedder::Embedder;
 use crate::error::Error;
 use crate::ingestion::deps::{DocumentIndex, DocumentRecord, FetchMetadata, IndexResourceDeps};
+use crate::ingestion::liveness::FEED_LIVENESS_BATCH_LIMIT;
 use crate::ingestion::{now_rfc3339, IngestionConfig, IngestionResult};
-use crate::ingestor::{IngestCallback, MetadataWriteOutcome, SkipReason};
+use crate::ingestor::{DueRecheckEntry, IngestCallback, MetadataWriteOutcome, SkipReason};
 use crate::store::RetrievalStore;
 use crate::types::{Source, SourceSpec};
 use crate::uri::Uri;
@@ -946,5 +947,122 @@ impl IngestCallback for PipelineCallback<'_> {
             Ok(merged) => merged.metadata_hash != existing.metadata_hash,
             Err(_) => true,
         }
+    }
+
+    /// See `IngestCallback::due_entries_for_source`'s doc comment
+    /// (specs/04-search-pipeline.md §1 "Due-entry revisit on a feed 304").
+    /// Meaningful only for `SourceSpec::Feed` — every other source kind has
+    /// no feed-304 concept, so it returns nothing for them.
+    async fn due_entries_for_source(&mut self) -> Vec<DueRecheckEntry> {
+        let SourceSpec::Feed {
+            url: feed_url,
+            refresh_interval_secs,
+            ..
+        } = &self.source.spec
+        else {
+            return Vec::new();
+        };
+
+        // Same floor derivation `recheck_is_due`'s check (c) uses — the two
+        // mechanisms must never drift apart on what "inside the floor" means
+        // for the same column.
+        let floor = crate::ingestion::recheck::recheck_floor_start_rfc3339(
+            chrono::Utc::now(),
+            *refresh_interval_secs,
+        );
+
+        // A link-less entry is stored under the synthetic `{feed_url}#entry:`
+        // shape (`synthetic_entry_uri` in `ingest/src/feed_ingestor.rs`) —
+        // there is nothing to fetch at that locator, so it must never become
+        // a revisit candidate. `core` cannot call that function directly (it
+        // lives one layer up, in `ingest`), so this mirrors its exact prefix;
+        // the two must be kept in sync if that shape ever changes.
+        let synthetic_prefix = format!("{feed_url}#entry:");
+
+        let mut candidates: Vec<DocumentRecord> = self
+            .doc_index
+            .for_source(&self.source.id)
+            .filter(|r| !r.uri.starts_with(&synthetic_prefix))
+            .filter(|r| {
+                r.policy_version != self.config.policy_version
+                    || r.last_checked_at
+                        .as_deref()
+                        .is_none_or(|checked| checked < floor.as_str())
+            })
+            .cloned()
+            .collect();
+
+        // Oldest-first, `None` leading — the same ordering the liveness
+        // sweep's own candidate query uses, and for the same reason: a
+        // long-idle source drains its backlog across successive runs instead
+        // of being capped forever by whichever candidates happen to sort
+        // first.
+        candidates.sort_by(|a, b| a.last_checked_at.cmp(&b.last_checked_at));
+        // Same batch bound the liveness sweep uses
+        // (specs/04-search-pipeline.md §1 "Aged-out feed entries: the
+        // liveness sweep" → "Candidates") — one shared cap keeps a quiet
+        // feed's backlog bounded the same way on both paths.
+        candidates.truncate(FEED_LIVENESS_BATCH_LIMIT);
+
+        let mut out = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            // A store miss (a concurrent delete racing this revisit) or a
+            // read error skips the candidate silently — there is nothing to
+            // rebuild a claim from, and the next run's candidate query will
+            // simply no longer see it once the delete lands in `doc_index`.
+            let record = match self
+                .store
+                .get_resource_record(&self.config.store_id, &candidate.resource_id)
+                .await
+            {
+                Ok(Some(record)) => record,
+                Ok(None) => {
+                    tracing::debug!(
+                        uri = %candidate.uri,
+                        "due-entry revisit: resource record missing, likely a concurrent delete; skipping candidate"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        uri = %candidate.uri,
+                        error = %e,
+                        "due-entry revisit: error reading resource record; skipping candidate"
+                    );
+                    continue;
+                }
+            };
+            let Some(uri) = Uri::parse(&candidate.uri) else {
+                tracing::debug!(
+                    uri = %candidate.uri,
+                    "due-entry revisit: stored URI failed to reparse; skipping candidate"
+                );
+                continue;
+            };
+
+            // Rebuild the connector's claim from the resource's own
+            // persisted Dublin Core fields. `MetadataEnrichment::apply_to` is
+            // idempotent (see its doc comment), so feeding this back through
+            // the identical merge the ordinary entry loop uses reproduces
+            // exactly the stored state — "revisit with this claim" and "keep
+            // what is already stored" are the same operation here.
+            let dc = record.metadata.dublin_core();
+            let enrichment = crate::metadata::MetadataEnrichment {
+                title_fallback: dc.title.clone(),
+                creator: dc.creator.clone(),
+                date: dc.date.clone(),
+                date_source: dc.date_source.clone(),
+                provenance_source: dc.source.clone(),
+            };
+
+            out.push(DueRecheckEntry {
+                locator: candidate.uri.clone(),
+                uri,
+                enrichment,
+                external_id: record.external_id.clone(),
+                modified_at: record.modified_at.clone(),
+            });
+        }
+        out
     }
 }
