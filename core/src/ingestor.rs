@@ -182,6 +182,17 @@ impl MetadataWriteOutcome {
 pub trait IngestCallback: Send {
     async fn on_resource(&mut self, resource: Resource) -> Result<(), Error>;
 
+    /// Called for a resource that was NOT produced by a real fetch — the
+    /// feed connector's embedded-content fallback, built from content
+    /// already present in the feed document rather than a request to the
+    /// resource's own origin. No origin contact happened for it.
+    ///
+    /// The default delegates to [`Self::on_resource`], so implementors that
+    /// don't distinguish the two paths need no changes.
+    async fn on_resource_fallback(&mut self, resource: Resource) -> Result<(), Error> {
+        self.on_resource(resource).await
+    }
+
     /// Called once the ingestor knows how many items it will consider
     /// (after enumeration). Streaming ingestors that never know a total
     /// simply never call this.

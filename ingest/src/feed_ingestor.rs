@@ -702,7 +702,7 @@ async fn process_discovery_entry(
                     mime,
                     &enrichment,
                 );
-                callback.on_resource(resource).await?;
+                callback.on_resource_fallback(resource).await?;
                 result.resources_produced += 1;
             }
             None => {
