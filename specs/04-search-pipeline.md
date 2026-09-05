@@ -51,15 +51,19 @@ Resources also carry:
   what that entry's link answers. That claim is re-merged onto the persisted metadata on a 304
   (`IngestCallback::on_metadata_refreshed`) under the same merge rule the index-time path applies,
   and persisted **only when the merged result actually differs** — an unchanged entry performs no
-  write at all, which is what keeps a 304 cheap in the common case. Without this a feed correcting
-  an entry's byline would never land for as long as the linked page itself stayed unchanged, which
-  for an aging entry is indefinitely. The merge rule is deliberately asymmetric and identical on
-  both paths: a connector title only fills a gap the extraction left, while byline, date and
-  provenance overwrite it — a feed knows an entry's author better than the linked page's markup
-  does, and does not know the page's title better than the page does. That gap-fill is not stamped,
-  though, so once it has happened a title the feed supplied is indistinguishable from one the page's
-  markup produced, and a feed that later corrects the title can never land the correction behind a
-  304 — the same missing-provenance shape `creator` has, and ticketed alongside it
+  _metadata_ write. It is not writeless overall, though: every conditional GET that reaches this
+  point — a 304 or an unchanged 200 — also advances `last_checked_at`
+  ([02-domain-model.md](02-domain-model.md) §2) by exactly one single-column write. That single
+  column is what keeps a 304 cheap in the common case even though it is no longer a pure read; the
+  metadata and content columns are untouched, and only the origin-contact clock moves. Without this
+  a feed correcting an entry's byline would never land for as long as the linked page itself stayed
+  unchanged, which for an aging entry is indefinitely. The merge rule is deliberately asymmetric and
+  identical on both paths: a connector title only fills a gap the extraction left, while byline,
+  date and provenance overwrite it — a feed knows an entry's author better than the linked page's
+  markup does, and does not know the page's title better than the page does. That gap-fill is not
+  stamped, though, so once it has happened a title the feed supplied is indistinguishable from one
+  the page's markup produced, and a feed that later corrects the title can never land the correction
+  behind a 304 — the same missing-provenance shape `creator` has, and ticketed alongside it
   ([#324](https://github.com/dokterbob/localdb/issues/324), pairing with
   [#320](https://github.com/dokterbob/localdb/issues/320)).
 
@@ -120,7 +124,10 @@ Resources also carry:
   > answer 304. This reuses the exact signal the skip-check already gates on
   > (`PipelineCallback::on_resource`). Any future axis that can force reprocessing without a content
   > change — a real `extractor_version`, a `Resource.mime` change — must join this same suppression
-  > check; this is the designated join point.
+  > check; this is the designated join point. The recheck gate below ("Recheck gate") joins at this
+  > exact point too: its check (a) is a `doc_index` hit with matching `policy_version`, the same
+  > predicate this paragraph names, so a `policy_version` bump that would force a re-chunk also
+  > opens the recheck gate rather than leaving it to fall out of sync with the conditional-GET path.
 
   Validators are keyed to the **configured** URI, never to a redirect target — consistent with the
   feed connector's pinned-identity rule ([02-domain-model.md](02-domain-model.md), "Feed
@@ -181,6 +188,104 @@ Three outcomes follow from comparing incoming vs. stored state (issue #176):
   / the CLI summary's `docs_metadata_updated`, and reported per-document as
   `DocOutcome::MetadataUpdated`. The URI is marked `seen` exactly like an ordinary skip or a full
   reindex, so it is not eligible for the delete-sweep in the same run.
+
+### Recheck gate
+
+Applies to **feed discovery entries only** — never to `url` sources. A `url` source is one document
+per source; its own refresh interval already _is_ the check cadence, so there is nothing further to
+gate.
+
+For a fetchable discovery entry, before `process_url` runs, `process_discovery_entry`
+(`ingest/src/feed_ingestor.rs`) checks whether the entry can be reported fresh without contacting
+the origin at all. Three conditions must all hold, checked cheapest-first, the store read last:
+
+- **(a) known and current.** The entry's URI is present in `doc_index` and the stored
+  `policy_version` equals the run's — the exact predicate the "Suppression rule" above already gates
+  conditional headers on (`lookup_fetch_metadata`).
+- **(c) inside the floor.** The stored `last_checked_at` is within the recheck floor (below) of now.
+- **(b) claim reproduces the stored hash.** The feed's current claim for this entry — `external_id`,
+  `modified_at_override`, and the `MetadataEnrichment` the feed supplies — merged over the persisted
+  record reproduces the stored `metadata_hash` exactly, using the same read-only merge
+  `on_metadata_refreshed` (above) applies when it writes. A store miss on this read (a concurrent
+  delete racing the gate) is treated as opening the gate, not as a match.
+
+When all three hold, no HTTP request is made for the entry. It is reported via
+`on_skipped(SkipReason::Fresh)`, counted in `docs_skipped` — the `docs_seen` partition
+([02-domain-model.md](02-domain-model.md) §2) is unchanged; `Fresh` is one more reason within it,
+not a new bucket — and additionally in a new sub-counter, `docs_recheck_deferred`, carried the same
+three-step channel `feed_entries_liveness_checked` travels (below): `IngestionResult` →
+`IndexJobStats` → the CLI summary ([05-surfaces.md](05-surfaces.md)).
+
+Any entry that fails (a), (c), or (b) falls through to the conditional GET exactly as it did before
+this gate existed — nothing else about the entry loop changes.
+
+**Gate-skips never touch `last_checked_at` (normative).** Advancing it on a gate-skip would slide
+the floor forward on every gated run, and the entry would never be re-verified again. This is why
+`Fresh` needs its own `SkipReason` rather than reusing `Unchanged`: only an actual successful origin
+contact — `IndexOutcome::Written`, `SkipReason::Unchanged`, or `SkipReason::MetadataUpdated` —
+advances the column ([02-domain-model.md](02-domain-model.md) §2).
+
+**No-touch-on-error, restated (normative).** Outside the liveness sweep (which is its own disclosed
+exception — "What a probe writes" below), `last_checked_at` advances only on those same
+successful-contact outcomes, never on `SkipReason::Error`, `SkipReason::FetchError`,
+`SkipReason::ParseFailed`, `IndexOutcome::Empty`, an index-write error, `Blocked` (no origin contact
+happened), or `Gone` (for a `url` source the row no longer exists to touch; a discovery-mode entry
+with usable embedded content instead retains its row via the fallback path, which reports through
+`on_resource_fallback` and likewise never advances the column). Each of those arms deliberately
+leaves `doc_index` stale so the next run retries the same URI; stamping `last_checked_at` there
+would let this gate suppress exactly that retry — and, for a feed whose document was refetched
+specifically to retry a previously-failed entry ([02-domain-model.md](02-domain-model.md) "Partial
+entry passes withhold the validators too"), would waste that refetch by gate-skipping the very entry
+it was refetched for.
+
+**Floor.** `max(source.refresh_interval_secs, 24h)` — precisely the liveness sweep's own derivation
+(`FEED_LIVENESS_MIN_RECHECK_SECS`, "Aged-out feed entries" below), extracted into one shared helper
+so the two cannot drift apart. The rejected alternative — "refresh if set, else 24h", dropping the
+floor entirely whenever a source configures a shorter interval — fails on exactly the case this gate
+exists for: a `refresh: 15m` feed would then recheck every entry every 15 minutes, zero savings in
+precisely the daemon's own configuration. In the daemon, where a scheduled feed source's refresh
+interval is normally well under a day, the floor collapses to the bare 24h in practice. A future
+per-source `recheck_interval` knob — "poll the feed hourly, recheck each entry weekly" — is reserved
+but not implemented; no config change accompanies this gate.
+
+**Due-entry revisit on a feed 304 (normative).** In discovery mode, a `304` on the feed document
+itself no longer ends the run at the feed level. `FeedIngestor::ingest` asks the callback
+(`due_entries_for_source`) for every entry this source has previously indexed whose stored
+`policy_version` no longer matches the run's, or whose `last_checked_at` is unset or older than the
+same floor defined above, and revisits each through the identical conditional-GET path the ordinary
+entry loop uses (`process_url`), replaying the entry's persisted feed-derived metadata (title,
+creators, date, `external_id`, `modified_at` — already on its resource row) as the connector's
+claim, since no parsed feed entry exists on this path.
+
+No embedded-content fallback is available here: `Unsupported`, `Empty`, and `Blocked` outcomes are
+reported as errors rather than silently degrading the stored resource. A `Gone` answer leaves the
+row untouched under `Retain`; reclaiming a confirmed-gone entry remains the liveness sweep's job
+under `--delete`.
+
+Entries whose URI is the synthetic link-less shape (`{feed_url}#entry:...`) are excluded — there is
+nothing to fetch.
+
+The revisit is capped per run at the same batch bound the liveness sweep uses (25, oldest-first by
+`last_checked_at`), so a long-idle source drains its backlog across successive runs instead of
+turning one quiet `304` into an unbounded fetch storm.
+
+This is what makes the floor an actual ceiling: without it, a feed that keeps answering `304` never
+re-verifies a single entry, however long it has gone unchecked.
+
+**Accepted cost.** A silent page edit the feed does not announce — no `updated` bump, no title or
+author change — is noticed within one floor-length window of the origin's next successful contact:
+the ordinary entry loop on a fresh `200`, or the due-entry revisit above on a `304`, whichever comes
+first. It is never indefinitely deferred by a quiet feed. Three escape hatches bypass it:
+`--refetch` ([05-surfaces.md](05-surfaces.md)), which bypasses check (c) for the run; a feed-side
+`updated` or author change — or a title change, but only while the resource still has no stored
+title for the feed's fallback to fill — which changes the claim compared in check (b) and reopens
+the gate on its own; and a `policy_version` bump, which fails check (a).
+
+A discovery entry currently served from embedded feed content carries the same bounded-staleness
+cost one level down: if the entry's RSS description or Atom content changes with no accompanying
+metadata change, the new body is picked up only when the gate reopens — floor expiry or a claim
+change, same as above — because a feed that changes content without bumping `updated` is not
+announcing its own edit either.
 
 ### Deletes
 
@@ -256,7 +361,10 @@ did not observe, ordered oldest `last_checked_at` first, with never-checked reso
 bounded twice: a batch cap of **25 candidates per run per source**, and a recheck floor of
 `max(refresh_interval, 24h)` below which a resource is not re-probed at all, regardless of how long
 it has gone unobserved. A feed source with no `refresh_interval_secs` configured — the common case —
-therefore uses the bare 24h floor.
+therefore uses the bare 24h floor. This is the same floor, from the same shared helper, that the
+entry recheck gate above applies ("Recheck gate") — the two mechanisms probe and gate independently
+against one column, and the "Interaction with the recheck gate" note under "Guard 2" below discloses
+where their effects meet.
 
 **"Did not observe" is not "aged out of the window" (normative).** This section is named for the
 case it exists to serve, not for a precondition it can enforce. A run that read the feed's window
@@ -327,6 +435,22 @@ entry's own origin says it is gone ("Did not observe" above).
   as a candidate, window members included — the direct consequence of having no membership record to
   consult, bounded by the delete rule rather than by the candidate rule ("Candidates" above).
 
+**Interaction with the recheck gate (normative).** A window entry the sweep probes under this guard
+is not just probed — a `NotModified` or `200` outcome advances its `last_checked_at` like any other
+candidate ("What a probe writes" below), and that timestamp is the same column check (c) of the
+entry recheck gate ("Recheck gate" above) reads. A feed document that keeps 304ing therefore has a
+second-order effect beyond the empty seen-set above: once the sweep has probed a window entry, the
+entry loop — on the eventual run where the feed document does change and the entry loop runs again —
+gate-skips that same entry for the rest of the floor, deferring what would otherwise have been its
+own conditional-GET turn. Drift on that entry is noticed at most one floor late rather than on the
+very next run where the feed changes. This is bounded, not open-ended: the sweep deliberately
+discards the fresh validators its own `200` outcome receives ("Per candidate" below), so the stored
+validators stay whatever they were before the sweep touched the row — guaranteeing that whenever the
+entry loop's own turn does arrive, it lands on a full `200`, never a spuriously cheap `304`. No
+second column is introduced to distinguish a sweep-touch from an entry-loop-touch; both mean the
+same thing, "checked, as of this timestamp," and the gate does not need to know which mechanism
+wrote it.
+
 **Log level.** Both guards suppress the presumed-gone sweep at `warn` for path/url sources — see
 "Deletes" above. The feed liveness sweep warns only when the one guard it does inherit fires
 (incomplete enumeration). A zero-seen run logs nothing of its own here, because nothing is
@@ -371,12 +495,27 @@ rehydration, so a rotated `external_etag` simply changes what the _next_ rehydra
 run's own in-memory copy is not read again either: the sweep runs last in its source's pass
 ("Ordering" above) and touches that index only to drop a candidate it deleted.
 
-**`last_checked_at` means "when we last attempted a probe" (normative)** — not "when we last
-successfully reached the origin". It advances on **every** outcome above except the delete, blocked
-and transport-error outcomes included, and it is the only thing those two outcomes move. That is
-what makes the oldest-first ordering a fair rotation: were an unreachable candidate left holding its
-old timestamp, a source with 25 or more permanently-blocked entries would lead the query forever and
-no other candidate would ever reach a batch.
+Outside the sweep, the equivalent single-column write is `RetrievalStore::touch_resource_checked` —
+named in [02-domain-model.md](02-domain-model.md) §2's `last_checked_at` row — reached from the
+entry recheck gate's own conditional-GET path, `url` sources, and single-document feed mode. It
+writes only `last_checked_at`, deliberately not the validator pair: those are already written by
+whichever ordinary conditional-GET write path reached the successful outcome, so a second write of
+the same columns would be redundant, not merely harmless.
+
+**`last_checked_at` means last successful origin contact everywhere else, with one deliberate
+exception here (normative).** [02-domain-model.md](02-domain-model.md) §2 defines the column as when
+we last successfully contacted the origin — a `200` or `304` that left the store consistent — and
+every other write path (the entry recheck gate's own fetches, `url` sources, single-document feed
+mode) holds to exactly that: `Blocked` and transport errors never advance it there, because no
+origin contact happened. The liveness sweep does not follow that rule for its own writes: it
+advances the column on **every** outcome above except the delete, `Blocked` and transport-error
+outcomes included, and for those two it is the only thing that moves. That is a deliberate, narrower
+exception here, not a second definition of the column — it exists solely so the sweep's oldest-first
+ordering rotates fairly: were an unreachable candidate left holding its old timestamp, a source with
+25 or more permanently-blocked entries would lead the query forever and no other candidate would
+ever reach a batch. The cost this creates is the one disclosed above under "Guard 2": a sweep touch
+on an unreachable or unchanged window entry also satisfies the entry recheck gate's floor check,
+deferring that entry's own next real check by up to one floor.
 
 A `200` here is **not** re-indexed — deliberately out of scope. An aged-out entry's feed-sourced
 metadata (title, author, per-entry publication date) is long gone once the entry has fallen out of
