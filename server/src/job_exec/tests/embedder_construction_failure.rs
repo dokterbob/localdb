@@ -49,6 +49,7 @@ async fn run_job_propagates_an_embedder_construction_failure() {
         &store,
         IndexJobScope::Store,
         DeletionPolicy::Retain,
+        false,
         JobExecDeps {
             backend: state.backend(),
             yaml: &yaml,

@@ -26,6 +26,7 @@ async fn run_job_with_no_sources_returns_default_stats_and_passes_the_embedder_t
         &store,
         IndexJobScope::Store,
         DeletionPolicy::Retain,
+        false,
         JobExecDeps {
             backend: state.backend(),
             yaml: &yaml,

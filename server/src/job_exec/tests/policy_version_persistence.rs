@@ -146,6 +146,7 @@ async fn run_job_continues_when_persisting_the_refreshed_policy_version_fails() 
         &store,
         IndexJobScope::Store,
         DeletionPolicy::Retain,
+        false,
         JobExecDeps {
             backend: wrapper.as_ref(),
             yaml: &yaml,

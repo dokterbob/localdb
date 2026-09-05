@@ -61,6 +61,10 @@ use crate::daemon_client::{daemon_request_async, encode_path_segment, CliContext
 /// (`StrictExit`, `index`) or is swallowed into a warning
 /// (`WarnAndContinue`, `source add`'s auto-index).
 ///
+/// `refetch` is threaded straight into `job_exec::run_job`, unchanged — see
+/// its doc comment. `source add`'s auto-index always passes `false`: a
+/// newly-added source has no recheck-floor history to bypass.
+///
 /// Returns the job id alongside the summary —
 /// `Some(job.id)` whenever a job actually got submitted to the local queue,
 /// `None` on every early-return path above that (no sources to index, or a
@@ -80,6 +84,7 @@ pub(crate) async fn run_embedded_store_job(
     store_row: &StoreRow,
     scope: IndexJobScope,
     deletion: DeletionPolicy,
+    refetch: bool,
     mode: IndexErrorMode,
     embedder: &mut Option<Arc<dyn Embedder>>,
     progress_label: Option<&str>,
@@ -156,7 +161,7 @@ pub(crate) async fn run_embedded_store_job(
                     progress: Some(progress),
                     on_source_error: Some(on_source_error),
                 };
-                job_exec::run_job(&store_row_owned, scope_for_job, deletion, deps)
+                job_exec::run_job(&store_row_owned, scope_for_job, deletion, refetch, deps)
                     .await
                     .map(|(stats, _)| stats)
             }
@@ -287,6 +292,7 @@ pub(crate) async fn run_daemon_store_job(
     store_name: &str,
     source_id: Option<&str>,
     deletion: DeletionPolicy,
+    refetch: bool,
     mode: IndexErrorMode,
     progress_label: Option<&str>,
 ) -> Result<(IndexSummary, Option<String>), Error> {
@@ -304,6 +310,11 @@ pub(crate) async fn run_daemon_store_job(
         }
         .to_string(),
     );
+    // Sent unconditionally (even `false`), mirroring `deletion_policy`
+    // above: an explicit `false` is indistinguishable from the server's own
+    // default, but sending it either way keeps this request body a
+    // complete, self-describing snapshot of what the CLI asked for.
+    body["refetch"] = serde_json::Value::Bool(refetch);
 
     let submit_url = format!("{}/v1/jobs", base_url);
     let job_json = match daemon_request_async(reqwest::Method::POST, &submit_url, Some(body)).await
@@ -752,6 +763,7 @@ mod tests {
             &store,
             unknown_scope.clone(),
             DeletionPolicy::Retain,
+            false,
             IndexErrorMode::StrictExit,
             &mut embedder,
             None,
@@ -771,6 +783,7 @@ mod tests {
             &store,
             unknown_scope,
             DeletionPolicy::Retain,
+            false,
             IndexErrorMode::WarnAndContinue,
             &mut embedder,
             None,
@@ -852,6 +865,7 @@ mod tests {
             &store,
             IndexJobScope::Store,
             DeletionPolicy::Retain,
+            false,
             IndexErrorMode::WarnAndContinue,
             &mut embedder,
             None,
@@ -952,6 +966,7 @@ mod tests {
             "nonexistent-store",
             None,
             DeletionPolicy::Retain,
+            false,
             IndexErrorMode::StrictExit,
             None,
         )
@@ -968,6 +983,7 @@ mod tests {
             "nonexistent-store",
             None,
             DeletionPolicy::Retain,
+            false,
             IndexErrorMode::WarnAndContinue,
             None,
         )
@@ -1145,6 +1161,7 @@ mod tests {
             "store-x",
             None,
             DeletionPolicy::Retain,
+            false,
             IndexErrorMode::StrictExit,
             None,
         )
@@ -1166,6 +1183,7 @@ mod tests {
             "store-x",
             None,
             DeletionPolicy::Retain,
+            false,
             IndexErrorMode::WarnAndContinue,
             None,
         )
@@ -1338,6 +1356,7 @@ mod tests {
             "store-x",
             None,
             DeletionPolicy::Retain,
+            false,
             IndexErrorMode::StrictExit,
             None,
         )
@@ -1357,6 +1376,7 @@ mod tests {
             "store-x",
             None,
             DeletionPolicy::Retain,
+            false,
             IndexErrorMode::WarnAndContinue,
             None,
         )
