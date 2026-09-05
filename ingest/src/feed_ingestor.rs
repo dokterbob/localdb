@@ -21,7 +21,7 @@ use localdb_core::block::IngestorKind;
 use localdb_core::error::Error;
 use localdb_core::ingestion::{FetchMetadata, FetchResult, UrlFetcher};
 use localdb_core::ingestor::{
-    Enumeration, IngestCallback, IngestResult, IngestSource, Ingestor, SkipReason,
+    DueRecheckEntry, Enumeration, IngestCallback, IngestResult, IngestSource, Ingestor, SkipReason,
 };
 use localdb_core::metadata::DublinCoreMetadata;
 use localdb_core::parser::Parser;
@@ -218,6 +218,43 @@ impl Ingestor for FeedIngestor {
                 if !fetch_full_content {
                     callback.on_skipped(&feed_uri, SkipReason::Unchanged).await;
                     result.resources_skipped += 1;
+                } else {
+                    // Due-entry revisit (specs/04-search-pipeline.md §1
+                    // "Due-entry revisit on a feed 304"): the feed document
+                    // itself answered 304, so the ordinary entry loop below
+                    // never runs this turn — without this, a source that
+                    // keeps 304ing would never re-verify a single entry past
+                    // its recheck floor, however long it has gone unchecked.
+                    // `due_entries_for_source` already applies the floor and
+                    // the liveness sweep's batch cap, so every candidate
+                    // returned here is meant to be revisited now.
+                    // Deliberately no `callback.on_discovered(..)` call here,
+                    // matching the feed-level 304 itself a few lines up: a
+                    // discovery-mode feed 304 is a source-level event, not a
+                    // document-discovery one (pinned by
+                    // `feed_level_not_modified_in_discovery_mode_reports_no_document`),
+                    // and `discovered_total` already carries whatever the
+                    // *previous* successful parse last reported — reporting a
+                    // smaller due-entry-only count here would make it look
+                    // like this source suddenly shrank, rather than "the
+                    // document was unchanged, and N of its previously known
+                    // entries are due for a recheck."
+                    let due_entries = callback.due_entries_for_source().await;
+                    for candidate in &due_entries {
+                        process_due_recheck_entry(
+                            self.parser.as_ref(),
+                            // Entry links are third-party content, revisited
+                            // through the same restricted fetcher the
+                            // ordinary entry loop uses — see
+                            // `FeedIngestor::new`'s doc comment.
+                            self.entry_fetcher.as_ref(),
+                            candidate,
+                            source,
+                            callback,
+                            &mut result,
+                        )
+                        .await?;
+                    }
                 }
                 return Ok(result);
             }
@@ -746,6 +783,75 @@ async fn process_discovery_entry(
                 result.errors += 1;
             }
         }
+    }
+
+    Ok(())
+}
+
+/// Revisit one previously-indexed entry on a feed-level 304
+/// (specs/04-search-pipeline.md §1 "Due-entry revisit on a feed 304").
+/// Mirrors `process_discovery_entry` minus the parsed-`Entry`/
+/// embedded-fallback machinery: there is no parsed feed entry on this path
+/// (the feed body was never re-fetched), and `DueRecheckEntry` already
+/// carries the connector's claim rebuilt from the resource's own persisted
+/// metadata, so there is nothing to fall back to either.
+async fn process_due_recheck_entry(
+    parser: &dyn Parser,
+    fetcher: &dyn UrlFetcher,
+    candidate: &DueRecheckEntry,
+    source: &IngestSource,
+    callback: &mut dyn IngestCallback,
+    result: &mut IngestResult,
+) -> Result<(), Error> {
+    let enrichment = ResourceEnrichment {
+        external_id: candidate.external_id.clone(),
+        title_fallback: candidate.enrichment.title_fallback.clone(),
+        creator: candidate.enrichment.creator.clone(),
+        date: candidate.enrichment.date.clone(),
+        date_source: candidate.enrichment.date_source.clone(),
+        modified_at_override: candidate.modified_at.clone(),
+        provenance_source: candidate.enrichment.provenance_source.clone(),
+        capture_conditional_get: true,
+    };
+
+    let outcome = process_url(
+        parser,
+        fetcher,
+        &candidate.locator,
+        &candidate.uri,
+        source,
+        IngestorKind::Feed,
+        &enrichment,
+        callback,
+        result,
+    )
+    .await?;
+
+    // `Indexed`/`Unchanged`/`Gone`/`FetchError`/`ParseFailed` already
+    // self-report inside `process_url` — nothing extra to do here. `Gone`
+    // stays silent under `Retain`, leaving the row untouched; reclaiming a
+    // confirmed-gone entry stays the liveness sweep's job under `--delete`.
+    //
+    // `Unsupported`/`Empty`/`Blocked` are the three outcomes
+    // `process_discovery_entry` falls back to the entry's embedded content
+    // for — no such fallback exists here (no parsed `Entry` to fall back
+    // from), so they must be reported as errors rather than silently
+    // degrading the stored resource.
+    if matches!(
+        outcome,
+        UrlOutcome::Unsupported | UrlOutcome::Empty | UrlOutcome::Blocked
+    ) {
+        callback
+            .on_skipped(
+                &candidate.uri,
+                SkipReason::Error(
+                    "due-entry recheck: no fetchable content on this revisit, and no \
+                     embedded fallback exists on this path"
+                        .to_string(),
+                ),
+            )
+            .await;
+        result.errors += 1;
     }
 
     Ok(())
