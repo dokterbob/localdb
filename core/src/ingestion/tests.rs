@@ -1015,6 +1015,10 @@ mod unified_pipeline {
     enum ScriptStep {
         Discovered(usize),
         Resource(Resource),
+        /// A resource produced by an embedded-content fallback rather than a
+        /// real fetch — routes through `IngestCallback::on_resource_fallback`
+        /// instead of `on_resource`.
+        ResourceFallback(Resource),
         Skipped(String, SkipReason),
         /// Positively confirmed absent at the origin (404/410).
         Gone(String),
@@ -1068,6 +1072,10 @@ mod unified_pipeline {
                     ScriptStep::Discovered(n) => callback.on_discovered(n).await,
                     ScriptStep::Resource(r) => {
                         callback.on_resource(r).await?;
+                        produced += 1;
+                    }
+                    ScriptStep::ResourceFallback(r) => {
+                        callback.on_resource_fallback(r).await?;
                         produced += 1;
                     }
                     ScriptStep::Skipped(uri, reason) => {
@@ -5650,6 +5658,125 @@ mod unified_pipeline {
         assert_eq!(result.docs_metadata_updated, 1);
         assert_eq!(store.last_checked_at(&record.resource_id).await, None);
         assert!(doc_index.get(uri).unwrap().last_checked_at.is_none());
+    }
+
+    // --- on_resource_fallback: no origin contact happened ----------------
+    //
+    // A resource routed through `on_resource_fallback` (the feed connector's
+    // embedded-content fallback for Gone/Blocked/Unsupported/Empty/
+    // non-fetchable entries) never reached the entry's own origin, so it
+    // must never advance `last_checked_at` — regardless of source kind or
+    // which `on_resource` arm it would otherwise land in.
+
+    #[tokio::test]
+    async fn fallback_resource_never_stamps_last_checked_at() {
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let store_id = "store-1";
+        let config = make_ingestion_config(store_id);
+        let source = make_feed_source_for_touch(store_id);
+
+        let uri = "https://example.com/feed.xml#entry:fallback-new";
+        let resource = make_resource(uri, "Fallback body.", &source.id, store_id);
+        let resource_id = resource.id.clone();
+
+        let ingestor = FakeIngestor::new(vec![ScriptStep::ResourceFallback(resource)]);
+        let mut doc_index = DocumentIndex::new();
+        let deps = SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config);
+        let result = run_source_ingestion(&source, &ingestor, deps)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.docs_indexed, 1,
+            "a fallback resource is still indexed, just never touched"
+        );
+        assert_eq!(
+            store.last_checked_at(&resource_id).await,
+            None,
+            "no origin fetch happened for this resource — last_checked_at must stay untouched \
+             even though the source is a network source"
+        );
+        assert!(doc_index.get(uri).unwrap().last_checked_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn on_resource_fallback_still_indexes_and_updates_doc_index() {
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let store_id = "store-1";
+        let config = make_ingestion_config(store_id);
+        let source = make_feed_source_for_touch(store_id);
+
+        let uri = "https://example.com/feed.xml#entry:fallback-body";
+        let resource = make_resource(uri, "Fallback body text.", &source.id, store_id);
+        let resource_id = resource.id.clone();
+        let content_hash = resource.content_hash.clone();
+
+        let ingestor = FakeIngestor::new(vec![ScriptStep::ResourceFallback(resource)]);
+        let mut doc_index = DocumentIndex::new();
+        let deps = SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config);
+        let result = run_source_ingestion(&source, &ingestor, deps)
+            .await
+            .unwrap();
+
+        assert_eq!(result.docs_indexed, 1);
+        assert!(result.chunks_written > 0);
+        let indexed = doc_index
+            .get(uri)
+            .expect("fallback resource must be indexed exactly like on_resource would");
+        assert_eq!(indexed.resource_id, resource_id);
+        assert_eq!(indexed.content_hash, content_hash);
+        assert_eq!(indexed.policy_version, config.policy_version);
+        assert!(
+            !store
+                .get_chunks_for_resource(&resource_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the fallback resource's chunks must actually be written to the store"
+        );
+        // The only difference from `on_resource`'s own Written arm: no touch.
+        assert!(indexed.last_checked_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn fallback_rewrite_of_existing_resource_keeps_prior_last_checked_at() {
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let store_id = "store-1";
+        let config = make_ingestion_config(store_id);
+        let source = make_feed_source_for_touch(store_id);
+
+        let uri = "https://example.com/feed.xml#entry:fallback-rewrite";
+        let mut record = seed_indexed(&store, &embedder, &config, &source, uri, "Body.").await;
+        let prior_last_checked_at = "2020-01-01T00:00:00Z".to_string();
+        record.last_checked_at = Some(prior_last_checked_at.clone());
+        let mut doc_index = DocumentIndex::new();
+        doc_index.upsert(record.clone());
+
+        // Same content, changed connector metadata — routes through the
+        // metadata-only rewrite arm, which normally carries the prior check
+        // clock forward and then `touch_checked` would advance it.
+        let mut resource = make_resource(uri, "Body.", &source.id, store_id);
+        resource.external_id = Some("entry-fallback-rewrite".to_string());
+        let ingestor = FakeIngestor::new(vec![ScriptStep::ResourceFallback(resource)]);
+        let deps = SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config);
+        let result = run_source_ingestion(&source, &ingestor, deps)
+            .await
+            .unwrap();
+
+        assert_eq!(result.docs_metadata_updated, 1);
+        assert_eq!(
+            store.last_checked_at(&record.resource_id).await,
+            None,
+            "fallback must never touch the store's check clock"
+        );
+        assert_eq!(
+            doc_index.get(uri).and_then(|r| r.last_checked_at.clone()),
+            Some(prior_last_checked_at),
+            "the prior last_checked_at must be neither advanced nor cleared"
+        );
     }
 
     // --- on_skipped(Unchanged) ------------------------------------------

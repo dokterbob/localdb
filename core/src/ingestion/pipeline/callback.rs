@@ -217,11 +217,20 @@ impl PipelineCallback<'_> {
             total: self.discovered_total,
         });
     }
-}
 
-#[async_trait::async_trait]
-impl IngestCallback for PipelineCallback<'_> {
-    async fn on_resource(&mut self, resource: Resource) -> Result<(), Error> {
+    /// Shared body of `on_resource` and `on_resource_fallback`. Indexing,
+    /// `doc_index` updates, and counters are identical either way —
+    /// `fetched_from_origin` only gates whether a real 200/304/rewrite is
+    /// allowed to advance the check clock. `false` means the resource came
+    /// from the feed connector's embedded-content fallback, which never
+    /// contacted the entry's own origin: `is_network_source()` alone cannot
+    /// tell the two apart, since a fallback resource is produced under the
+    /// same `Feed` source spec as a real fetch.
+    async fn on_resource_impl(
+        &mut self,
+        resource: Resource,
+        fetched_from_origin: bool,
+    ) -> Result<(), Error> {
         let uri = resource.uri.as_str().to_string();
         self.seen.insert(uri.clone());
         self.result.docs_seen += 1;
@@ -262,8 +271,10 @@ impl IngestCallback for PipelineCallback<'_> {
                     // A real 200/304 reached the origin for this URI and left
                     // the store consistent for it — advance the check clock.
                     // `path` sources never reach here through a network round
-                    // trip, so the gate excludes them.
-                    if self.is_network_source() {
+                    // trip, so the gate excludes them; a fallback resource
+                    // never reached the origin either, so `fetched_from_origin`
+                    // excludes it too.
+                    if self.is_network_source() && fetched_from_origin {
                         self.touch_checked(&uri, &resource_id).await;
                     }
                     self.emit(crate::progress::ProgressEvent::DocumentFinished {
@@ -324,8 +335,11 @@ impl IngestCallback for PipelineCallback<'_> {
                 // The write above just persisted a 200/304's rewritten
                 // metadata — a successful origin contact — so advance the
                 // check clock the same way the unchanged-skip arm above
-                // does.
-                if self.is_network_source() {
+                // does. Gated on `fetched_from_origin` too: a fallback
+                // rewrite reached no origin, so the prior check clock (just
+                // carried forward into the upsert above) must survive
+                // untouched.
+                if self.is_network_source() && fetched_from_origin {
                     self.touch_checked(&uri, &resource_id).await;
                 }
                 self.emit(crate::progress::ProgressEvent::DocumentFinished {
@@ -386,8 +400,10 @@ impl IngestCallback for PipelineCallback<'_> {
                 });
                 // A content change is still a successful origin contact —
                 // advance the check clock the same way an unchanged 200/304
-                // does above.
-                if self.is_network_source() {
+                // does above. A fallback-produced resource never contacted
+                // the origin, so it starts (and, absent a later real fetch,
+                // stays) at `None`.
+                if self.is_network_source() && fetched_from_origin {
                     self.touch_checked(&uri, &resource.id).await;
                 }
                 self.emit(crate::progress::ProgressEvent::DocumentFinished {
@@ -411,6 +427,19 @@ impl IngestCallback for PipelineCallback<'_> {
         }
 
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl IngestCallback for PipelineCallback<'_> {
+    async fn on_resource(&mut self, resource: Resource) -> Result<(), Error> {
+        self.on_resource_impl(resource, true).await
+    }
+
+    /// See `on_resource_impl`'s doc comment — this is the fallback path,
+    /// `fetched_from_origin: false`.
+    async fn on_resource_fallback(&mut self, resource: Resource) -> Result<(), Error> {
+        self.on_resource_impl(resource, false).await
     }
 
     async fn on_discovered(&mut self, total: usize) {
