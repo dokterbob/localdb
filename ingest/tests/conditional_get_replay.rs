@@ -228,10 +228,20 @@ async fn feed_entry_link_replays_stored_validators_on_second_run() {
     .await
     .unwrap();
 
+    // This test's whole point is validator *replay*, which only happens on a
+    // fetch — the entry's claim (title, dates, author) is otherwise unchanged
+    // between runs, so without `refetch: true` the T329 recheck gate would
+    // gate-skip the entry link on run 2 (it's inside the floor and the feed's
+    // claim still matches) and there would be nothing to replay onto.
+    // `refetch: true` bypasses the gate's floor check, standing in for
+    // `localdb index --refetch`.
     run_source_ingestion(
         &source,
         &ingestor,
-        SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config),
+        SourceIngestionDeps {
+            refetch: true,
+            ..SourceIngestionDeps::for_test(&mut doc_index, &store, &embedder, &config)
+        },
     )
     .await
     .unwrap();

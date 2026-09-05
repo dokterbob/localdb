@@ -641,6 +641,40 @@ async fn process_discovery_entry(
     };
 
     let needs_fallback = if fetchable {
+        // Recheck gate (spec 04 "Recheck gate"): ask before spending an HTTP
+        // request on an entry this run already knows is unchanged. Sits
+        // here, before `process_url`, rather than inside it, because
+        // `process_url` is the shared per-locator pipeline that `url`
+        // sources also call, and `url` sources are deliberately ungated
+        // (spec 04 "Applies to feed discovery entries only" — a url
+        // source's own refresh interval is already its check cadence, so
+        // gating it too would suppress the only mechanism that checks it at
+        // all). The four values below are exactly what this same call's 304
+        // arm hands `on_metadata_refreshed` a few lines down inside
+        // `process_url`, so the gate compares against the identical claim a
+        // fetch would have used to refresh the store.
+        if !callback
+            .recheck_is_due(
+                uri,
+                &enrichment.metadata_enrichment(),
+                enrichment.external_id.as_deref(),
+                enrichment.modified_at_override.as_deref(),
+            )
+            .await
+        {
+            // A gate-skip is deliberately not a touch: `on_skipped(Fresh)`
+            // leaves `last_checked_at` alone (see `PipelineCallback`), or
+            // the recheck floor would slide forward on every run without
+            // the origin ever being asked again and the entry would never
+            // be re-verified. No fallback either: the embedded-content
+            // fallback below exists for a fetch that produced nothing
+            // (`Gone`/`Unsupported`/`Empty`/`Blocked`), which did not happen
+            // here — the entry is known and unchanged, not fetched-and-empty.
+            callback.on_skipped(uri, SkipReason::Fresh).await;
+            result.resources_skipped += 1;
+            return Ok(());
+        }
+
         // Asymmetric fallback (pinned): transient failures (FetchError,
         // ParseFailed) already reported themselves as errors — no fallback,
         // so the last good index stays put instead of flip-flopping between
