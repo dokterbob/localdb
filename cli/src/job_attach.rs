@@ -260,6 +260,37 @@ fn emit_source_error(mode: IndexErrorMode, source_id: &str, err: SourceError<'_>
 // Daemon transport
 // ---------------------------------------------------------------------------
 
+/// Fail unless the daemon at `base_url` advertises `refetch` support
+/// (specs/05-surfaces.md "Daemon capability advertisement").
+///
+/// Mirrors `cli::cmds::search::require_daemon_search_filter_support` exactly:
+/// absence is treated as unsupported — a daemon predating the `features`
+/// field omits it entirely — because an older daemon would otherwise
+/// silently drop the request's unknown `refetch` key (`CreateJobRequest` has
+/// no `deny_unknown_fields`) and run an ordinary gated job while reporting
+/// success, indistinguishable from a real `--refetch` run. Exits 5
+/// (unavailable) — the daemon is running and healthy, it just cannot do what
+/// was asked — and names the fix, since restarting it resolves this
+/// permanently.
+async fn require_daemon_refetch_support(base_url: &str) -> Result<(), Error> {
+    let url = format!("{base_url}/v1/status");
+    let status = daemon_request_async(reqwest::Method::GET, &url, None).await?;
+    let supported = status
+        .get("features")
+        .and_then(|f| f.as_array())
+        .is_some_and(|features| features.iter().any(|f| f.as_str() == Some("refetch")));
+
+    if supported {
+        return Ok(());
+    }
+    Err(Error::DaemonCapabilityUnavailable {
+        message: "the running daemon predates --refetch and would silently run an ordinary \
+                  gated job while reporting success; restart it (`localdb serve`) to use \
+                  --refetch against a daemon, or stop it to index in embedded mode"
+            .to_string(),
+    })
+}
+
 /// Submit one index job to a running daemon for `store_name` and attach to
 /// it to completion (SSE, falling back to polling), returning the resulting
 /// `IndexSummary`.
@@ -296,6 +327,26 @@ pub(crate) async fn run_daemon_store_job(
     mode: IndexErrorMode,
     progress_label: Option<&str>,
 ) -> Result<(IndexSummary, Option<String>), Error> {
+    // Only paid for when `--refetch` is actually set — an ordinary gated run
+    // never touches `/v1/status` for this. A daemon predating `refetch`
+    // would otherwise silently ignore the request's unknown key and run a
+    // normal gated job while reporting success, which is worse than
+    // refusing outright: the caller believes the recheck floor was bypassed
+    // when it never was.
+    if refetch {
+        if let Err(e) = require_daemon_refetch_support(base_url).await {
+            return if mode.warn() {
+                eprintln!(
+                    "warning: cannot submit auto-index job for store '{}': {}",
+                    store_name, e
+                );
+                Ok((IndexSummary::default(), None))
+            } else {
+                Err(e)
+            };
+        }
+    }
+
     let mut body = serde_json::json!({ "store_name": store_name });
     if let Some(sid) = source_id {
         body["source_id"] = serde_json::Value::String(sid.to_string());
@@ -1087,6 +1138,14 @@ mod tests {
         jobs_post: VecDeque<(u16, String)>,
         events: VecDeque<(u16, String)>,
         poll: VecDeque<(u16, String)>,
+        status: VecDeque<(u16, String)>,
+        /// Call counters, kept outside the outer `tokio::sync::Mutex` (via
+        /// their own `Arc`) so a test can clone them before moving
+        /// `MockResponses` into `spawn_mock_daemon` and still read them
+        /// afterward — proving a route was (or was never) hit, not just
+        /// inferring it from a response shape.
+        jobs_post_calls: Arc<StdMutex<u32>>,
+        status_calls: Arc<StdMutex<u32>>,
     }
 
     type SharedMockResponses = Arc<tokio::sync::Mutex<MockResponses>>;
@@ -1095,12 +1154,22 @@ mod tests {
         State(state): State<SharedMockResponses>,
         _body: axum::body::Bytes,
     ) -> (StatusCode, String) {
-        let (code, body) = state
-            .lock()
-            .await
+        let mut guard = state.lock().await;
+        *guard.jobs_post_calls.lock().unwrap() += 1;
+        let (code, body) = guard
             .jobs_post
             .pop_front()
             .unwrap_or((500, "{}".to_string()));
+        (StatusCode::from_u16(code).unwrap(), body)
+    }
+
+    async fn mock_status(State(state): State<SharedMockResponses>) -> (StatusCode, String) {
+        let mut guard = state.lock().await;
+        *guard.status_calls.lock().unwrap() += 1;
+        let (code, body) = guard
+            .status
+            .pop_front()
+            .unwrap_or((200, serde_json::json!({ "features": [] }).to_string()));
         (StatusCode::from_u16(code).unwrap(), body)
     }
 
@@ -1136,6 +1205,7 @@ mod tests {
             .route("/v1/jobs", post(mock_jobs_post))
             .route("/v1/jobs/{id}/events", get(mock_events))
             .route("/v1/jobs/{id}", get(mock_poll))
+            .route("/v1/status", get(mock_status))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1144,6 +1214,101 @@ mod tests {
             let _ = axum::serve(listener, router).await;
         });
         format!("http://{addr}")
+    }
+
+    /// Mirrors `cli::cmds::search`'s `require_daemon_search_filter_support`
+    /// precedent: a daemon whose `/v1/status` reports no `refetch` feature
+    /// (an empty `features` array — the shape an older daemon predating this
+    /// field would never even send, but also the shape a daemon that has the
+    /// field yet lacks the capability would send) must fail the whole call
+    /// with `DaemonCapabilityUnavailable` (exit 5) and never reach
+    /// `POST /v1/jobs` at all — submitting anyway would silently run an
+    /// ordinary gated job while reporting success, exactly the failure this
+    /// check exists to prevent.
+    #[tokio::test]
+    async fn run_daemon_store_job_refetch_without_the_feature_exits_5_and_never_posts_a_job() {
+        let ctx = test_ctx();
+        let jobs_post_calls = Arc::new(StdMutex::new(0));
+        let mut responses = MockResponses {
+            jobs_post_calls: jobs_post_calls.clone(),
+            ..Default::default()
+        };
+        responses
+            .status
+            .push_back((200, serde_json::json!({ "features": [] }).to_string()));
+        let base_url = spawn_mock_daemon(responses).await;
+
+        let err = run_daemon_store_job(
+            &ctx,
+            &base_url,
+            "store-x",
+            None,
+            DeletionPolicy::Retain,
+            true, // --refetch
+            IndexErrorMode::StrictExit,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, Error::DaemonCapabilityUnavailable { .. }),
+            "expected DaemonCapabilityUnavailable, got: {err:?}"
+        );
+        assert_eq!(err.exit_code(), 5);
+        assert_eq!(
+            *jobs_post_calls.lock().unwrap(),
+            0,
+            "must never POST /v1/jobs once the capability check has failed"
+        );
+    }
+
+    /// The converse of the test above: an ordinary run (no `--refetch`) must
+    /// never pay for the capability probe at all — mirroring
+    /// `require_daemon_search_filter_support`'s own "only when a filter is
+    /// actually set" gating for search. Proven by asserting `/v1/status` was
+    /// never hit while driving a real submit-attach-complete round trip
+    /// through the mock daemon.
+    #[tokio::test]
+    async fn run_daemon_store_job_without_refetch_never_probes_the_capability_endpoint() {
+        let ctx = test_ctx();
+        let status_calls = Arc::new(StdMutex::new(0));
+        let done_job = sample_job("job-9", IndexJobState::Done);
+        let mut responses = MockResponses {
+            status_calls: status_calls.clone(),
+            ..Default::default()
+        };
+        responses
+            .jobs_post
+            .push_back((202, serde_json::json!({ "id": "job-9" }).to_string()));
+        responses.events.push_back((
+            200,
+            format!(
+                "event: job\ndata: {}\n\n",
+                serde_json::to_string(&done_job).unwrap()
+            ),
+        ));
+        let base_url = spawn_mock_daemon(responses).await;
+
+        let (_summary, job_id) = run_daemon_store_job(
+            &ctx,
+            &base_url,
+            "store-x",
+            None,
+            DeletionPolicy::Retain,
+            false, // no --refetch
+            IndexErrorMode::StrictExit,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(job_id.as_deref(), Some("job-9"));
+        assert_eq!(
+            *status_calls.lock().unwrap(),
+            0,
+            "must never probe /v1/status when --refetch is not set"
+        );
     }
 
     #[tokio::test]

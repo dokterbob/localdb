@@ -32,6 +32,34 @@ async fn get_status_returns_daemon_true() {
     assert_eq!(body["daemon"], true);
 }
 
+/// specs/05-surfaces.md "Daemon capability advertisement": `features` must
+/// name `refetch` so `localdb index --refetch` against a daemon can confirm
+/// support before submitting a job whose gated recheck floor an older daemon
+/// would silently ignore (`CreateJobRequest` has no `deny_unknown_fields`).
+#[tokio::test]
+async fn status_advertises_refetch_feature() {
+    let (_dir, app) = make_app().await;
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp.into_body()).await;
+    let features = body["features"]
+        .as_array()
+        .expect("features must be an array");
+    let names: Vec<&str> = features.iter().filter_map(|f| f.as_str()).collect();
+    assert!(
+        names.contains(&"refetch"),
+        "expected 'refetch' in features, got: {names:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // A `StoreBackend` wrapper that lets a test fail `list_sources` for one
 // specific store id and/or record every store id `list_sources`/
