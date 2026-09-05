@@ -3,6 +3,7 @@
 //! Maps `localdb_core::Error` to HTTP status codes per specs/05-surfaces.md §5.
 
 use axum::{
+    extract::{rejection::JsonRejection, FromRequest, Request},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -54,6 +55,40 @@ fn error_response_message(err: &CoreError) -> String {
     err.raw_message()
         .map(str::to_string)
         .unwrap_or_else(|| err.to_string())
+}
+
+/// A JSON request body extractor whose deserialization failures round-trip
+/// through the same `ApiError` shape every other request-validation failure
+/// on this daemon does, rather than axum's own default `JsonRejection`
+/// response — plain text, and (for a data/type error, as opposed to a
+/// syntax error) `422` rather than `400`.
+///
+/// Every malformed field on a request body is `invalid_request`, `400` —
+/// the same status a semantically-invalid-but-well-typed value already gets
+/// (e.g. `CreateJobRequest.deletion_policy: "obliterate"`, rejected by
+/// `parse_deletion_policy`). Without this wrapper, a *type*-mismatched field
+/// (e.g. `refetch: "yes"` where a bool is expected) would be rejected by
+/// axum's `Json<T>` extractor itself, before the handler ever runs, and
+/// never see that treatment — specs/05-surfaces.md's `POST /v1/jobs` body
+/// documents `refetch`'s non-bool case as `invalid_request`/`400`
+/// explicitly, so this wrapper is what makes that true.
+pub struct ApiJson<T>(pub T);
+
+impl<S, T> FromRequest<S> for ApiJson<T>
+where
+    Json<T>: FromRequest<S, Rejection = JsonRejection>,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(Self(value)),
+            Err(rejection) => Err(ApiError(CoreError::InvalidRequest {
+                message: format!("invalid request body: {rejection}"),
+            })),
+        }
+    }
 }
 
 /// Map a `CoreError` to an HTTP status code per specs/05-surfaces.md §5.

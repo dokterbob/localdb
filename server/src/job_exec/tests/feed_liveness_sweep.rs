@@ -53,6 +53,7 @@ async fn run_once(
         store,
         IndexJobScope::Store,
         deletion,
+        false,
         JobExecDeps {
             backend: state.backend(),
             yaml,
@@ -137,14 +138,16 @@ async fn aged_out_entry_probe_goes_through_the_restricted_entry_fetcher() {
         "both entries must be indexed on run 1, via the embedded-content fallback"
     );
 
-    // Run 1's entry-loop index is itself a successful origin contact (T329:
-    // `PipelineCallback` now calls `touch_resource_checked` whenever a `url`/
-    // feed resource is indexed, metadata-updated, or reported unchanged —
-    // specs/04-search-pipeline.md §1 "Recheck gate"), so both entries'
-    // `last_checked_at` is already "now" by the time run 1 returns. Confirm
-    // that end to end through the real libsql store before relying on it:
-    // this is exactly the wiring the rest of this test's backdating step
-    // exists to work around.
+    // Both entries were indexed via the embedded-content fallback (their
+    // links are blocked, never a real origin contact), so `on_resource_fallback`
+    // — not `on_resource` — is what ran for them, and it never calls
+    // `touch_resource_checked` (specs/04-search-pipeline.md §1 "Recheck
+    // gate": only a real 200/304 origin contact stamps `last_checked_at`).
+    // Confirm that end to end through the real libsql store before relying
+    // on it: `last_checked_at IS NULL` is exactly what already makes
+    // `list_stale_feed_resources` treat a never-checked row as a candidate
+    // (see that query's own doc comment), which is what the rest of this
+    // test's backdating step below is set up to demonstrate explicitly.
     let retrieval_store = state.backend().retrieval_store(&store.id).await.unwrap();
     let indexed_after_run1 = retrieval_store.list_indexed_documents().await.unwrap();
     let entry_a_record = indexed_after_run1
@@ -154,18 +157,18 @@ async fn aged_out_entry_probe_goes_through_the_restricted_entry_fetcher() {
     assert!(
         indexed_after_run1
             .iter()
-            .all(|doc| doc.last_checked_at.is_some()),
-        "run 1's successful origin contact must stamp last_checked_at for every entry it indexed"
+            .all(|doc| doc.last_checked_at.is_none()),
+        "embedded-content fallback must never stamp last_checked_at for either entry"
     );
 
-    // A must be older than the recheck floor before the sweep will consider
-    // it a candidate — otherwise `list_stale_feed_resources` correctly
-    // excludes it as too-recently-checked, and this test would be asserting
-    // an artefact of run 1 and run 2 executing within the same instant, not
-    // production behaviour. Backdating past the floor is what makes "A
-    // scrolled off the feed window a while ago" true in wall-clock terms, on
-    // top of "A is absent from this run's feed" (already true via the
-    // narrowed mock below).
+    // Explicitly backdating (rather than relying on the NULL left by run 1)
+    // is what makes "A scrolled off the feed window a while ago" true in
+    // wall-clock terms, on top of "A is absent from this run's feed"
+    // (already true via the narrowed mock below) — a fixed past timestamp
+    // pins the sweep's candidate-selection behaviour on a stale
+    // `last_checked_at`, not merely a `NULL` one, so this test still proves
+    // something once a later fix (e.g. remembering fallback failures) stops
+    // leaving it `NULL`.
     sqlite_backend
         .set_last_checked_at_for_test(
             &store.id,

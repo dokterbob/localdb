@@ -142,6 +142,12 @@ pub async fn resolve_job_sources(
 /// Run one indexing job for `store_row`, scoped by `scope`, against real
 /// ingestion machinery.
 ///
+/// `refetch` (CLI `index --refetch` / HTTP `POST /v1/jobs`'s `refetch: true`)
+/// is threaded straight into each source's `SourceIngestionDeps::refetch`:
+/// it bypasses the feed entry recheck gate's floor check and suppresses the
+/// feed document's own conditional-GET validators for the run
+/// (specs/04-search-pipeline.md §1 "Recheck gate").
+///
 /// Returns the accumulated stats alongside the embedder actually used
 /// (`Some` as soon as one was built or reused, `None` only when the scope
 /// resolved to zero sources), so a caller running multiple jobs in sequence
@@ -151,6 +157,7 @@ pub async fn run_job(
     store_row: &StoreRow,
     scope: IndexJobScope,
     deletion: DeletionPolicy,
+    refetch: bool,
     deps: JobExecDeps<'_>,
 ) -> Result<(IndexJobStats, Option<Arc<dyn Embedder>>), Error> {
     let JobExecDeps {
@@ -306,10 +313,9 @@ pub async fn run_job(
             document_validators,
             stored_inputs_digest: rt_source.feed_inputs_digest.clone(),
             // `--refetch`'s bypass is threaded through `CreateJobRequest` →
-            // `run_scoped_job`/`run_job` → here. The job request body this
-            // loop reads from carries no such field, so every job submitted
-            // through the HTTP API runs without the bypass.
-            refetch: false,
+            // `run_scoped_job`/`run_job` → here, and through the CLI's own
+            // embedded path via `cli::job_attach::run_embedded_store_job`.
+            refetch,
             // The feed liveness sweep's own probe of an aged-out entry's
             // link must use the destination-restricted client — the same
             // trust-boundary split `build_ingestor_for_spec` already
@@ -327,6 +333,7 @@ pub async fn run_job(
                 stats.docs_deleted += r.docs_deleted;
                 stats.docs_prunable += r.docs_prunable;
                 stats.docs_metadata_updated += r.docs_metadata_updated;
+                stats.docs_recheck_deferred += r.docs_recheck_deferred;
                 stats.feed_entries_liveness_checked += r.feed_entries_liveness_checked;
                 stats.chunks_written += r.chunks_written;
                 stats.unsupported_format_count += r.unsupported_format_count;

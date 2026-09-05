@@ -46,6 +46,12 @@ pub(crate) struct IndexSummary {
     /// (specs/04-search-pipeline.md §1 "Aged-out feed entries: the liveness
     /// sweep"). Always 0 outside a `--delete` run against a feed source.
     feed_liveness_checked: u64,
+    /// Feed discovery entries the recheck gate skipped without an HTTP
+    /// request this run (specs/04-search-pipeline.md §1 "Recheck gate").
+    /// Counted inside `skipped` too — this is a sub-counter, not a separate
+    /// partition. Always 0 for a `file`/`url` source, and always 0 on a
+    /// `--refetch` run (the flag bypasses the gate's floor check).
+    recheck_deferred: u64,
 }
 
 impl IndexSummary {
@@ -63,6 +69,7 @@ impl IndexSummary {
         self.deleted += other.deleted;
         self.metadata_updated += other.metadata_updated;
         self.feed_liveness_checked += other.feed_liveness_checked;
+        self.recheck_deferred += other.recheck_deferred;
     }
 
     /// Build an `IndexSummary` from a completed job's `IndexJobStats`
@@ -87,6 +94,7 @@ impl IndexSummary {
             deleted: stats.docs_deleted,
             metadata_updated: stats.docs_metadata_updated,
             feed_liveness_checked: stats.feed_entries_liveness_checked,
+            recheck_deferred: stats.docs_recheck_deferred,
         }
     }
 }
@@ -151,7 +159,7 @@ pub(crate) struct StoreIndexOutcome {
     pub(crate) job_id: Option<String>,
 }
 
-/// `localdb index [--source <id>] [--strict]`
+/// `localdb index [--source <id>] [--strict] [--delete] [--refetch]`
 ///
 /// One-shot scan-and-index (embedded mode) or submits a job to the daemon.
 ///
@@ -159,9 +167,19 @@ pub(crate) struct StoreIndexOutcome {
 /// With `--strict`, exits 2 if any document failed extraction (run always completes).
 /// With `--delete`, removes documents that no longer exist at their source;
 /// without it nothing is ever removed (see `DeletionPolicy`).
-pub fn run_index(ctx: &CliContext, source_id: Option<&str>, strict: bool, delete: bool) {
+/// With `--refetch`, bypasses the feed entry recheck gate's floor check and
+/// suppresses that run's feed-document validators, forcing a full re-check
+/// of a feed source's entries even when nothing looks stale (a no-op for
+/// `file`/`url` sources) — specs/04-search-pipeline.md §1 "Recheck gate".
+pub fn run_index(
+    ctx: &CliContext,
+    source_id: Option<&str>,
+    strict: bool,
+    delete: bool,
+    refetch: bool,
+) {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    rt.block_on(run_index_async(ctx, source_id, strict, delete));
+    rt.block_on(run_index_async(ctx, source_id, strict, delete, refetch));
 }
 
 /// `index`'s table entry (issue #187 stage 5). Both transports were already
@@ -176,6 +194,7 @@ pub fn run_index(ctx: &CliContext, source_id: Option<&str>, strict: bool, delete
 struct IndexCmd<'a> {
     source_id: Option<&'a str>,
     deletion: DeletionPolicy,
+    refetch: bool,
 }
 
 impl DaemonAwareCommand for IndexCmd<'_> {
@@ -204,6 +223,7 @@ impl DaemonAwareCommand for IndexCmd<'_> {
                 name,
                 self.source_id,
                 self.deletion,
+                self.refetch,
                 IndexErrorMode::StrictExit,
                 label,
             )
@@ -308,6 +328,7 @@ impl DaemonAwareCommand for IndexCmd<'_> {
                 store_row,
                 scope,
                 self.deletion,
+                self.refetch,
                 IndexErrorMode::StrictExit,
                 &mut embedder,
                 label,
@@ -332,6 +353,7 @@ pub(crate) async fn run_index_async(
     source_id: Option<&str>,
     strict: bool,
     delete: bool,
+    refetch: bool,
 ) {
     let config_loader = load_config_scaffolded(ctx).await;
     let deletion = if delete {
@@ -342,10 +364,12 @@ pub(crate) async fn run_index_async(
 
     // D1/D6 (issue #187 stage 3): `--delete` is no longer refused against a
     // daemon (D6) — it is sent as `deletion_policy: "delete"` and the daemon
-    // now runs real ingestion (issue #187), so it can honor it.
+    // now runs real ingestion (issue #187), so it can honor it. `--refetch`
+    // travels the same way, as `refetch: true` on the same request body.
     let cmd = IndexCmd {
         source_id,
         deletion,
+        refetch,
     };
     let outcomes = dispatch(&cmd, ctx, &config_loader, || {
         open_app_db_or_exit(ctx, &config_loader)
@@ -481,6 +505,9 @@ fn format_summary_body(summary: &IndexSummary) -> String {
             summary.feed_liveness_checked
         ));
     }
+    if summary.recheck_deferred > 0 {
+        body.push_str(&format!(", {} rechecks deferred", summary.recheck_deferred));
+    }
     body
 }
 
@@ -533,6 +560,7 @@ fn summary_fields_json(summary: &IndexSummary, strict: bool) -> serde_json::Valu
         "docs_prunable": summary.prunable,
         "docs_metadata_updated": summary.metadata_updated,
         "feed_entries_liveness_checked": summary.feed_liveness_checked,
+        "docs_recheck_deferred": summary.recheck_deferred,
     })
 }
 
@@ -637,6 +665,7 @@ mod tests {
             deleted: 0,
             metadata_updated: 0,
             feed_liveness_checked: 0,
+            recheck_deferred: 0,
         }
     }
 
@@ -808,6 +837,59 @@ mod tests {
         assert_eq!(total_summary(&outcomes).feed_liveness_checked, 5);
     }
 
+    /// Same append-only-when-nonzero convention as `metadata_updated`/
+    /// `feed_liveness_checked` above: the base (zero) case stays
+    /// byte-identical to the pinned legacy format.
+    #[test]
+    fn render_index_text_omits_recheck_deferred_when_zero() {
+        let outcomes = vec![outcome("books", with_sources(3, 1, 6, 0, 0))];
+        assert_eq!(
+            render_index_text(&outcomes),
+            "Index complete: 3 indexed, 1 skipped, 6 chunks written, 0 unsupported, 0 errors"
+        );
+    }
+
+    #[test]
+    fn render_index_text_appends_recheck_deferred_when_nonzero() {
+        let mut summary = with_sources(3, 1, 6, 0, 0);
+        summary.recheck_deferred = 5;
+        let outcomes = vec![outcome("books", summary)];
+        assert_eq!(
+            render_index_text(&outcomes),
+            "Index complete: 3 indexed, 1 skipped, 6 chunks written, 0 unsupported, 0 errors, \
+             5 rechecks deferred"
+        );
+    }
+
+    /// Unlike the append-only-when-nonzero text rendering, `--json` carries
+    /// `docs_recheck_deferred` unconditionally (default 0) — specs/05-
+    /// surfaces.md "`localdb index` — recheck gate".
+    #[test]
+    fn render_index_json_always_includes_docs_recheck_deferred_field() {
+        let outcomes = vec![outcome("books", with_sources(3, 1, 6, 0, 0))];
+        let v = render_index_json(&outcomes, false);
+        assert_eq!(v["docs_recheck_deferred"], json!(0));
+    }
+
+    #[test]
+    fn render_index_json_includes_nonzero_docs_recheck_deferred_field() {
+        let mut summary = with_sources(3, 1, 6, 0, 0);
+        summary.recheck_deferred = 5;
+        let outcomes = vec![outcome("books", summary)];
+        let v = render_index_json(&outcomes, false);
+        assert_eq!(v["docs_recheck_deferred"], json!(5));
+    }
+
+    #[test]
+    fn total_summary_sums_recheck_deferred_across_stores() {
+        let mut a = with_sources(3, 1, 6, 0, 0);
+        a.recheck_deferred = 1;
+        let mut b = with_sources(1, 0, 2, 1, 2);
+        b.recheck_deferred = 4;
+        let outcomes = vec![outcome("a", a), outcome("b", b)];
+        assert_eq!(total_summary(&outcomes).recheck_deferred, 5);
+    }
+
     #[test]
     fn render_index_json_single_store_matches_legacy_flat_shape() {
         let outcomes = vec![outcome("books", with_sources(3, 1, 6, 0, 0))];
@@ -827,6 +909,7 @@ mod tests {
                 "docs_prunable": 0,
                 "docs_metadata_updated": 0,
                 "feed_entries_liveness_checked": 0,
+                "docs_recheck_deferred": 0,
             })
         );
         assert!(
@@ -893,6 +976,7 @@ mod tests {
                         "docs_prunable": 0,
                         "docs_metadata_updated": 0,
                         "feed_entries_liveness_checked": 0,
+                        "docs_recheck_deferred": 0,
                     },
                     {
                         "store": "notes",
@@ -906,6 +990,7 @@ mod tests {
                         "docs_prunable": 0,
                         "docs_metadata_updated": 0,
                         "feed_entries_liveness_checked": 0,
+                        "docs_recheck_deferred": 0,
                     },
                 ],
                 "total": {
@@ -919,6 +1004,7 @@ mod tests {
                     "docs_prunable": 0,
                     "docs_metadata_updated": 0,
                     "feed_entries_liveness_checked": 0,
+                    "docs_recheck_deferred": 0,
                 },
             })
         );

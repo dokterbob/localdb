@@ -93,6 +93,7 @@ async fn run_job_updates_source_row_after_200_and_leaves_it_untouched_after_bare
         &store,
         IndexJobScope::Store,
         DeletionPolicy::Retain,
+        false,
         JobExecDeps {
             backend: state.backend(),
             yaml: &yaml,
@@ -133,6 +134,7 @@ async fn run_job_updates_source_row_after_200_and_leaves_it_untouched_after_bare
         &store,
         IndexJobScope::Store,
         DeletionPolicy::Retain,
+        false,
         JobExecDeps {
             backend: state.backend(),
             yaml: &yaml,
@@ -232,6 +234,7 @@ async fn a_policy_change_forces_an_unconditional_feed_fetch() {
             store,
             IndexJobScope::Store,
             DeletionPolicy::Retain,
+            false,
             JobExecDeps {
                 backend: state.backend(),
                 yaml,
@@ -304,6 +307,117 @@ async fn a_policy_change_forces_an_unconditional_feed_fetch() {
     drop(dir);
 }
 
+/// T329: `--refetch` (`SourceIngestionDeps::refetch`) suppresses the feed
+/// document's own stored conditional-GET validators for the run, the same
+/// effect a `feed_inputs_digest` mismatch has above — `refetch: false`
+/// still replays a stored validator as a conditional GET; `refetch: true`
+/// fetches unconditionally instead.
+#[tokio::test]
+async fn refetch_true_bypasses_stored_feed_validators_refetch_false_still_replays_them() {
+    let server = MockServer::start().await;
+    let feed_url = format!("{}/feed.xml", server.uri());
+
+    let (dir, state) = test_state().await;
+    state.add_store("notes", "private").await.unwrap();
+    let source = state
+        .add_source(
+            "notes",
+            "feed",
+            serde_json::json!({ "url": feed_url, "fetch_full_content": false }),
+            "prose",
+            None,
+        )
+        .await
+        .unwrap();
+    let store = state
+        .backend()
+        .get_store_by_name("notes")
+        .await
+        .unwrap()
+        .unwrap();
+    let yaml = fake_yaml();
+
+    async fn index(
+        state: &crate::state::AppState,
+        store: &localdb_core::StoreRow,
+        yaml: &RawConfig,
+        refetch: bool,
+    ) {
+        run_job(
+            store,
+            IndexJobScope::Store,
+            DeletionPolicy::Retain,
+            refetch,
+            JobExecDeps {
+                backend: state.backend(),
+                yaml,
+                models_dir: state.models_dir(),
+                embedder: None,
+                fetchers: None,
+                progress: None,
+                on_source_error: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Whether the most recent `/feed.xml` request carried `If-None-Match`.
+    async fn last_request_was_conditional(server: &MockServer) -> bool {
+        let reqs = server.received_requests().await.expect("recording is on");
+        reqs.last()
+            .expect("at least one request")
+            .headers
+            .contains_key("if-none-match")
+    }
+
+    // Answers 304 to a conditional request carrying the stored ETag, and 200
+    // otherwise — so which branch a run took is readable off the recorded
+    // request headers.
+    Mock::given(method("GET"))
+        .and(path("/feed.xml"))
+        .and(header("if-none-match", "\"v1\""))
+        .respond_with(ResponseTemplate::new(304))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/feed.xml"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("etag", "\"v1\"")
+                .set_body_string(minimal_rss()),
+        )
+        .mount(&server)
+        .await;
+
+    // --- Run 1: nothing stored yet, so nothing to replay. ---
+    index(&state, &store, &yaml, false).await;
+    assert!(!last_request_was_conditional(&server).await);
+    let row = state
+        .backend()
+        .get_source(&source.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.feed_etag.as_deref(), Some("\"v1\""));
+
+    // --- Run 2: refetch: false still replays the stored validator. ---
+    index(&state, &store, &yaml, false).await;
+    assert!(
+        last_request_was_conditional(&server).await,
+        "refetch: false must still replay the stored validator as a conditional GET"
+    );
+
+    // --- Run 3: refetch: true suppresses it. ---
+    index(&state, &store, &yaml, true).await;
+    assert!(
+        !last_request_was_conditional(&server).await,
+        "refetch: true must bypass the stored validator and fetch unconditionally"
+    );
+
+    drop(dir);
+}
+
 /// A run that could not index an entry must not store the feed document's
 /// validators.
 ///
@@ -369,6 +483,7 @@ async fn a_run_that_could_not_index_an_entry_withholds_the_feed_validators() {
                 &store,
                 IndexJobScope::Store,
                 DeletionPolicy::Retain,
+                false,
                 JobExecDeps {
                     backend: state.backend(),
                     yaml: &yaml,

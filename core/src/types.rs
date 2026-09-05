@@ -548,6 +548,12 @@ pub struct IndexJobStats {
     /// Mirrors `IngestionResult::feed_entries_liveness_checked` — see its
     /// doc comment for exactly what counts as "probed".
     pub feed_entries_liveness_checked: u64,
+    /// Sub-count of [`Self::docs_skipped`]: feed discovery entries the
+    /// recheck gate skipped without making an HTTP request at all. Mirrors
+    /// `IngestionResult::docs_recheck_deferred` — see its doc comment for
+    /// exactly what counts as "deferred". Always 0 for a `file`/`url`
+    /// source.
+    pub docs_recheck_deferred: u64,
     /// Chunks written to the retrieval backend.
     pub chunks_written: u64,
     /// Files that could not be indexed due to unsupported format.

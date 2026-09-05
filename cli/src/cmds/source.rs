@@ -322,6 +322,7 @@ impl DaemonAwareCommand for SourceAddCmd<'_> {
                 store_name,
                 Some(src_id.as_str()),
                 DeletionPolicy::Retain,
+                false,
                 IndexErrorMode::WarnAndContinue,
                 None,
             )
@@ -478,6 +479,7 @@ impl DaemonAwareCommand for SourceAddCmd<'_> {
                 // A source being added for the first time has no indexed history
                 // to prune, and auto-index is not the place to remove anything.
                 DeletionPolicy::Retain,
+                false,
                 IndexErrorMode::WarnAndContinue,
                 &mut embedder,
                 None,

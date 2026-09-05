@@ -432,7 +432,9 @@ impl AppState {
     /// `UrlRefreshScheduler::tick` (#187 review, DRY finding): both ran this
     /// exact sequence — differing only in `deletion` (an HTTP caller's
     /// explicit policy vs. the scheduler's hardcoded `Retain`, issues
-    /// #156/#185) and in what happens to the result afterward (the HTTP path
+    /// #156/#185), `refetch` (an HTTP caller's explicit flag vs. the
+    /// scheduler's hardcoded `false` — a scheduled refresh is never the
+    /// `--refetch` bypass), and in what happens to the result afterward (the HTTP path
     /// returns it as the job's stats; the scheduler also stamps
     /// `last_refreshed` once it settles). Both call sites still resolve
     /// `sources` before deciding whether to build an embedder or fetch a
@@ -449,6 +451,7 @@ impl AppState {
         store_row: &StoreRow,
         scope: IndexJobScope,
         deletion: DeletionPolicy,
+        refetch: bool,
         progress: ProgressSink,
     ) -> Result<IndexJobStats, Error> {
         let yaml = self.yaml_config().await;
@@ -472,7 +475,7 @@ impl AppState {
             progress: Some(progress),
             on_source_error: None,
         };
-        job_exec::run_job(store_row, scope, deletion, deps)
+        job_exec::run_job(store_row, scope, deletion, refetch, deps)
             .await
             .map(|(stats, _embedder)| stats)
     }

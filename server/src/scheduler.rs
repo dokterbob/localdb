@@ -322,6 +322,7 @@ async fn run_refresh_job(
             &store_row,
             refresh_scope,
             localdb_core::DeletionPolicy::Retain,
+            false,
             progress,
         )
         .await
