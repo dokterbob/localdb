@@ -646,21 +646,32 @@ one whose extraction failed to produce anything this run. Truncating a file to z
 leaves its old content searchable, and the run reports it as skipped. The escape hatch is clean and
 needs no new surface: delete the file, and the sweep removes it normally under `--delete`.
 
-**20. Drift on an aged-out entry is noticed at most once per recheck floor.** (accepted trade-off of
-the recheck gate, gap #11 above) A silent page edit a feed doesn't announce — no `updated` bump, no
-title or author change — is now caught only when the recheck floor elapses
-(`max(source.refresh_interval_secs, 24h)`), not on the very next run as before the gate existed.
-Three escape hatches reopen it early: `localdb index --refetch`; a feed-side `updated`, title, or
-author change, which changes the claim the gate compares against the stored `metadata_hash`; and a
-`policy_version` bump. Under `--delete`, this interacts with the liveness sweep (gap #10 above):
-when guard 2's zero-seen backstop fires on a `304`'d feed document, a sweep probe of a
-still-in-window entry advances that entry's `last_checked_at` exactly like an ordinary probe, so the
-entry loop's own turn for that entry — whenever the feed document next actually changes — is itself
-gate-skipped for the remainder of the floor. This is bounded, not open-ended: the sweep deliberately
-discards the fresh validators its own `200` outcome would otherwise cache, so the eventual
-entry-loop turn always lands on a full `200`, never a spuriously cheap `304`. See
+**20. Drift on a feed entry is noticed at most once per recheck floor.** (accepted trade-off of the
+recheck gate, gap #11 above) This heading describes a **still-in-window** entry, not an aged-out
+one: an aged-out entry is never emitted by the entry loop at all (nothing persists window membership
+— gap #10 above), and the liveness sweep that can still touch it deliberately discards the body a
+`200` probe returns, so drift on a truly aged-out entry is never noticed at all unless it re-enters
+the feed window. For an entry still in the window, a silent page edit a feed doesn't announce — no
+`updated` bump, no title or author change — is caught within one floor-length window of the origin's
+next successful contact: the ordinary entry loop on a fresh `200`, or the due-entry revisit on a
+`304` (see below), whichever comes first. A feed that keeps answering `304` no longer defers a due
+entry indefinitely: the due-entry revisit walks entries this source has previously indexed past the
+recheck floor even when the feed document itself hasn't changed, capped at the same 25-per-run batch
+bound the liveness sweep uses. Three escape hatches reopen the gate early:
+`localdb index --refetch`; a feed-side `updated` or author change — or a title change, but only
+while the resource still has no stored title for the feed's fallback to fill, since
+`MetadataEnrichment::apply_to` only ever fills a missing title, never replaces one — which changes
+the claim the gate compares against the stored `metadata_hash`; and a `policy_version` bump. Under
+`--delete`, this interacts with the liveness sweep (gap #10 above): when guard 2's zero-seen
+backstop fires on a `304`'d feed document, a sweep probe of a still-in-window entry advances that
+entry's `last_checked_at` exactly like an ordinary probe, deferring by a full floor whichever
+mechanism would otherwise have rechecked it next — the ordinary entry loop's turn on a future `200`,
+or the due-entry revisit's own turn on a future `304`. This is bounded, not open-ended: the sweep
+deliberately discards the fresh validators its own `200` outcome would otherwise cache, so whichever
+mechanism's turn comes next always lands on a full `200`, never a spuriously cheap `304`. See
 [specs/04-search-pipeline.md](https://github.com/dokterbob/localdb/blob/main/specs/04-search-pipeline.md)
-§1 "Interaction with the recheck gate" (under "Aged-out feed entries: the liveness sweep").
+§1 "Due-entry revisit on a feed 304" and "Interaction with the recheck gate" (under "Aged-out feed
+entries: the liveness sweep").
 
 ---
 
