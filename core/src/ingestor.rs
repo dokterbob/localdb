@@ -171,6 +171,39 @@ impl MetadataWriteOutcome {
     }
 }
 
+/// One previously-indexed feed entry the due-entry revisit
+/// (specs/04-search-pipeline.md §1 "Due-entry revisit on a feed 304") has
+/// selected for another conditional GET, reconstructed entirely from
+/// persisted state — there is no parsed feed entry on this path, since the
+/// feed document itself answered `304`.
+///
+/// `enrichment`/`external_id`/`modified_at` mirror the connector's claim on
+/// the ordinary entry loop's contract ([`IngestCallback::recheck_is_due`],
+/// [`IngestCallback::on_metadata_refreshed`]): replaying the resource's own
+/// stored Dublin Core fields back through
+/// [`crate::metadata::MetadataEnrichment::apply_to`] reproduces exactly what
+/// is already there, because that merge is idempotent — so "revisit with
+/// this claim" and "keep the stored feed-derived metadata" are the same
+/// thing here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DueRecheckEntry {
+    /// The fetchable locator to pass to the `UrlFetcher`, exactly as
+    /// `process_url` takes it — for every candidate here this is the same
+    /// string as `uri`, since synthetic link-less and non-http(s) URIs are
+    /// excluded before this type is ever constructed.
+    pub locator: String,
+    /// The canonical `Uri`, matching `Resource::uri` and every other
+    /// `on_resource`-path identity.
+    pub uri: Uri,
+    /// The connector's claim, rebuilt from the resource's persisted Dublin
+    /// Core metadata.
+    pub enrichment: crate::metadata::MetadataEnrichment,
+    /// The resource's persisted `external_id`.
+    pub external_id: Option<String>,
+    /// The resource's persisted `modified_at`.
+    pub modified_at: Option<String>,
+}
+
 /// Callback for receiving resources during ingestion.
 ///
 /// This is the streaming interface: the ingestor calls `on_resource` for each
@@ -253,6 +286,37 @@ pub trait IngestCallback: Send {
         crate::ingestion::FetchMetadata::default()
     }
 
+    /// Asked by the feed ingestor for a fetchable discovery entry, before
+    /// any HTTP request is made for it (`process_discovery_entry` in
+    /// `ingest/src/feed_ingestor.rs`, ahead of `process_url` — see
+    /// `specs/04-search-pipeline.md` §1 "Recheck gate"). `true` means "go
+    /// fetch, conditional GET as usual"; `false` means "report
+    /// [`SkipReason::Fresh`] and make no request for this entry at all" —
+    /// the entry is already known at this run's policy, inside its recheck
+    /// floor, and the feed's current claim for it still reproduces what is
+    /// stored.
+    ///
+    /// `enrichment`, `external_id`, and `modified_at` are the feed's current
+    /// claim for the entry, on the same contract [`Self::on_metadata_refreshed`]
+    /// takes them under — an implementor typically merges them the same way
+    /// to decide whether the claim still matches. The default `true` means
+    /// every ingestor kind other than feed discovery, and every simple test
+    /// callback, keeps fetching exactly as it did before this hook existed —
+    /// this is purely an opt-in short-circuit for one connector.
+    ///
+    /// `&mut self`, matching every other method on this trait, for the same
+    /// `#[async_trait]`/`Sync`-bound reason [`Self::lookup_fetch_metadata`]'s
+    /// doc comment explains.
+    async fn recheck_is_due(
+        &mut self,
+        _uri: &Uri,
+        _enrichment: &crate::metadata::MetadataEnrichment,
+        _external_id: Option<&str>,
+        _modified_at: Option<&str>,
+    ) -> bool {
+        true
+    }
+
     /// Called when a 304 Not Modified response itself carried a refreshed
     /// validator (RFC 9111 requires storing one even though the body is
     /// unchanged — see `FetchResult::NotModified`'s doc comment). `meta`
@@ -309,6 +373,24 @@ pub trait IngestCallback: Send {
         _modified_at: Option<&str>,
     ) -> MetadataWriteOutcome {
         MetadataWriteOutcome::Unchanged
+    }
+
+    /// Asked by the feed ingestor when its own document answers `304`, for
+    /// every previously-indexed entry of this source that is due for another
+    /// conditional GET regardless (specs/04-search-pipeline.md §1 "Due-entry
+    /// revisit on a feed 304"): a stale `policy_version`, or a
+    /// `last_checked_at` that is unset or older than the same recheck floor
+    /// [`Self::recheck_is_due`]'s check (c) applies. Without this, a feed
+    /// that keeps answering `304` would never re-verify a single entry,
+    /// however long it has gone unchecked — the floor would gate but never
+    /// actually cap anything.
+    ///
+    /// The default returns nothing, matching every other optional signal on
+    /// this trait: every ingestor kind other than feed discovery has no
+    /// concept of "this source's other entries" to revisit, so opting in is
+    /// purely this one connector's decision.
+    async fn due_entries_for_source(&mut self) -> Vec<DueRecheckEntry> {
+        Vec::new()
     }
 }
 

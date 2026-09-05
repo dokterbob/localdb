@@ -325,6 +325,7 @@ async fn run_once(
         deletion,
         document_validators: FetchMetadata::default(),
         stored_inputs_digest: None,
+        refetch: false,
         fetcher: &UnreachableFetcher,
     };
     run_source_ingestion(source, &ingestor, deps).await.unwrap()
@@ -1055,6 +1056,7 @@ async fn metadata_only_update_emits_metadata_updated_progress_event() {
         deletion: DeletionPolicy::Retain,
         document_validators: FetchMetadata::default(),
         stored_inputs_digest: None,
+        refetch: false,
         fetcher: &UnreachableFetcher,
     };
     run_source_ingestion(&source, &ingestor2, deps2)

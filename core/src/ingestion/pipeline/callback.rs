@@ -14,8 +14,9 @@ use crate::block::Resource;
 use crate::embedder::Embedder;
 use crate::error::Error;
 use crate::ingestion::deps::{DocumentIndex, DocumentRecord, FetchMetadata, IndexResourceDeps};
+use crate::ingestion::liveness::FEED_LIVENESS_BATCH_LIMIT;
 use crate::ingestion::{now_rfc3339, IngestionConfig, IngestionResult};
-use crate::ingestor::{IngestCallback, MetadataWriteOutcome, SkipReason};
+use crate::ingestor::{DueRecheckEntry, IngestCallback, MetadataWriteOutcome, SkipReason};
 use crate::store::RetrievalStore;
 use crate::types::{Source, SourceSpec};
 use crate::uri::Uri;
@@ -68,6 +69,10 @@ pub(in crate::ingestion) struct PipelineCallback<'a> {
     /// `run_source_ingestion` (see the debug_assert there); NOT folded into
     /// `result.error_count` twice.
     pub(in crate::ingestion) skip_error_count: usize,
+    /// `localdb index --refetch`'s cache-busting escape hatch, threaded
+    /// straight from `SourceIngestionDeps::refetch`. Bypasses check (c) of
+    /// [`Self::recheck_is_due`] — see that method's doc comment.
+    pub(in crate::ingestion) refetch: bool,
 }
 
 /// What each metadata-refresh hook is refreshing, named once so the read
@@ -75,6 +80,21 @@ pub(in crate::ingestion) struct PipelineCallback<'a> {
 /// describing it three different ways.
 const VALIDATORS: &str = "conditional-GET validators";
 const CONNECTOR_METADATA: &str = "source-supplied metadata";
+const RECHECK_CLAIM: &str = "the recheck gate's claim comparison";
+
+/// What [`PipelineCallback::merge_metadata_claim`] computes: a connector's
+/// claim merged onto a resource's persisted metadata, without writing it
+/// anywhere. `metadata_hash` is `core::ids::compute_metadata_hash` over
+/// `metadata` plus the claim's `external_id`/`modified_at` and the
+/// resource's already-persisted `external_etag` — the same triple
+/// `on_metadata_refreshed` compares against `DocumentRecord::metadata_hash`
+/// to decide whether anything actually changed.
+struct MergedMetadata {
+    metadata: crate::metadata::Metadata,
+    date_original: Option<String>,
+    date_parsed: Option<String>,
+    metadata_hash: String,
+}
 
 impl PipelineCallback<'_> {
     /// Read the resource row both metadata-refresh hooks rewrite.
@@ -108,6 +128,64 @@ impl PipelineCallback<'_> {
                 Err(MetadataWriteOutcome::Failed(msg))
             }
         }
+    }
+
+    /// The read-only half of a metadata refresh: apply a connector's claim
+    /// (`enrichment`, `external_id`, `modified_at`) onto a resource's
+    /// *persisted* state — read fresh via [`Self::read_persisted_record`] —
+    /// and recompute what its `metadata_hash` would be under that merge,
+    /// without writing anything.
+    ///
+    /// Shared by [`Self::on_metadata_refreshed`], which writes when the
+    /// result differs from what `doc_index` has cached, and by
+    /// [`Self::recheck_is_due`]'s check (b), which only ever compares — the
+    /// same merge specs/04-search-pipeline.md §1 "Recheck gate" describes as
+    /// "using the same read-only merge `on_metadata_refreshed` applies when
+    /// it writes." Keeping one function under both callers means the two can
+    /// never drift into disagreeing about what a feed's current claim
+    /// resolves to.
+    ///
+    /// `Err` carries the same [`MetadataWriteOutcome`]
+    /// [`Self::read_persisted_record`] itself produces for a store miss or a
+    /// store read error; `read_persisted_record` already logs a read error,
+    /// so neither caller logs again for that case.
+    async fn merge_metadata_claim(
+        &self,
+        existing: &DocumentRecord,
+        enrichment: &crate::metadata::MetadataEnrichment,
+        external_id: Option<&str>,
+        modified_at: Option<&str>,
+        what: &str,
+    ) -> Result<MergedMetadata, MetadataWriteOutcome> {
+        let persisted = self
+            .read_persisted_record(&existing.uri, &existing.resource_id, what)
+            .await?;
+
+        let mut metadata = persisted.metadata;
+        enrichment.apply_to(metadata.dublin_core_mut());
+        // `date_original`/`date_parsed` are projections of the merged
+        // `dc.date`, re-derived here rather than carried over from the
+        // persisted record — the enrichment may have just replaced (or
+        // retracted) that date, and the two columns are what the `document`
+        // date axis filters on.
+        let date_original = metadata.dublin_core().date.clone();
+        let date_parsed = date_original
+            .as_deref()
+            .and_then(crate::dates::parse_partial_iso8601);
+
+        let metadata_hash = crate::ids::compute_metadata_hash(
+            &metadata,
+            external_id,
+            existing.external_etag.as_deref(),
+            modified_at,
+        );
+
+        Ok(MergedMetadata {
+            metadata,
+            date_original,
+            date_parsed,
+            metadata_hash,
+        })
     }
 
     /// The write tail both metadata-refresh hooks share: persist the record,
@@ -744,46 +822,31 @@ impl IngestCallback for PipelineCallback<'_> {
         };
 
         let resource_id = existing.resource_id.clone();
-        let persisted = match self
-            .read_persisted_record(&uri_str, &resource_id, CONNECTOR_METADATA)
+        let merged = match self
+            .merge_metadata_claim(
+                &existing,
+                enrichment,
+                external_id,
+                modified_at,
+                CONNECTOR_METADATA,
+            )
             .await
         {
-            Ok(record) => record,
+            Ok(merged) => merged,
             Err(outcome) => return outcome,
         };
-
-        let mut metadata = persisted.metadata;
-        enrichment.apply_to(metadata.dublin_core_mut());
-        // `date_original`/`date_parsed` are projections of the merged
-        // `dc.date`, re-derived here rather than carried over from the
-        // persisted record — the enrichment may have just replaced (or
-        // retracted) that date, and the two columns are what the `document`
-        // date axis filters on.
-        let date_original = metadata.dublin_core().date.clone();
-        let date_parsed = date_original
-            .as_deref()
-            .and_then(crate::dates::parse_partial_iso8601);
-        let external_id = external_id.map(str::to_string);
-        let modified_at = modified_at.map(str::to_string);
-
-        let metadata_hash = crate::ids::compute_metadata_hash(
-            &metadata,
-            external_id.as_deref(),
-            existing.external_etag.as_deref(),
-            modified_at.as_deref(),
-        );
-        if metadata_hash == existing.metadata_hash {
+        if merged.metadata_hash == existing.metadata_hash {
             return MetadataWriteOutcome::Unchanged;
         }
 
         let record = crate::store::ResourceRecord {
-            metadata,
-            external_id,
+            metadata: merged.metadata,
+            external_id: external_id.map(str::to_string),
             external_etag: existing.external_etag.clone(),
             external_last_modified: existing.external_last_modified.clone(),
-            modified_at,
-            date_original,
-            date_parsed,
+            modified_at: modified_at.map(str::to_string),
+            date_original: merged.date_original,
+            date_parsed: merged.date_parsed,
         };
 
         self.persist_metadata_write(
@@ -791,11 +854,215 @@ impl IngestCallback for PipelineCallback<'_> {
             &resource_id,
             &record,
             DocumentRecord {
-                metadata_hash,
+                metadata_hash: merged.metadata_hash,
                 ..existing
             },
             CONNECTOR_METADATA,
         )
         .await
+    }
+
+    /// The recheck gate (specs/04-search-pipeline.md §1 "Recheck gate"):
+    /// asked by the feed ingestor for a fetchable discovery entry before any
+    /// HTTP request is made for it. Three conditions, checked cheapest-first
+    /// with the store read last, must ALL hold for this to return `false`
+    /// ("report it fresh, skip the fetch"); any one failing falls through to
+    /// `true` ("go fetch"), exactly the conditional GET that ran before this
+    /// gate existed.
+    ///
+    /// - **(a) known and current.** `uri` is in `doc_index` and its stored
+    ///   `policy_version` equals this run's — the exact predicate
+    ///   [`Self::lookup_fetch_metadata`]'s own suppression rule gates
+    ///   conditional headers on, so a `policy_version` bump reopens both
+    ///   checks together rather than one at a time.
+    /// - **(c) inside the recheck floor.** `existing.last_checked_at` is
+    ///   `Some` and lies within `recheck::recheck_floor_start_rfc3339`'s
+    ///   floor of now. Both `last_checked_at` and the floor's own start are
+    ///   produced by `to_rfc3339_opts(SecondsFormat::Secs, true)` — RFC 3339,
+    ///   second precision, explicit `Z`/offset — which sorts
+    ///   lexicographically identically to chronological order, so the plain
+    ///   string comparison below is a valid `>=` test without parsing either
+    ///   side back into a `DateTime`. `self.refetch` (`--refetch`) bypasses
+    ///   this check unconditionally, the same escape hatch that also
+    ///   suppresses the feed document's own validators one layer up
+    ///   (`run_source_ingestion`).
+    /// - **(b) claim reproduces the stored hash.** The feed's current claim
+    ///   — `enrichment`/`external_id`/`modified_at` — merged over the
+    ///   persisted record via [`Self::merge_metadata_claim`] (the same
+    ///   read-only merge [`Self::on_metadata_refreshed`] applies when it
+    ///   writes) reproduces `existing.metadata_hash` exactly. A store miss
+    ///   or a store read error opens the gate — falling through to a fetch
+    ///   is always safe, so an ambiguous read must never be read as "fresh".
+    async fn recheck_is_due(
+        &mut self,
+        uri: &Uri,
+        enrichment: &crate::metadata::MetadataEnrichment,
+        external_id: Option<&str>,
+        modified_at: Option<&str>,
+    ) -> bool {
+        let uri_str = uri.as_str();
+
+        // (a) known and current — no store read needed either way.
+        let Some(existing) = self.doc_index.get(uri_str).cloned() else {
+            return true;
+        };
+        if existing.policy_version != self.config.policy_version {
+            return true;
+        }
+
+        // (c) inside the floor — still no store read.
+        if self.refetch {
+            return true;
+        }
+        let Some(last_checked_at) = existing.last_checked_at.as_deref() else {
+            return true;
+        };
+        let refresh_interval_secs = match &self.source.spec {
+            SourceSpec::Feed {
+                refresh_interval_secs,
+                ..
+            } => *refresh_interval_secs,
+            _ => None,
+        };
+        let floor = crate::ingestion::recheck::recheck_floor_start_rfc3339(
+            chrono::Utc::now(),
+            refresh_interval_secs,
+        );
+        if last_checked_at < floor.as_str() {
+            return true;
+        }
+
+        // (b) claim reproduces the stored hash — the store read, last
+        // because it is the only one of the three that isn't free.
+        match self
+            .merge_metadata_claim(
+                &existing,
+                enrichment,
+                external_id,
+                modified_at,
+                RECHECK_CLAIM,
+            )
+            .await
+        {
+            Ok(merged) => merged.metadata_hash != existing.metadata_hash,
+            Err(_) => true,
+        }
+    }
+
+    /// See `IngestCallback::due_entries_for_source`'s doc comment
+    /// (specs/04-search-pipeline.md §1 "Due-entry revisit on a feed 304").
+    /// Meaningful only for `SourceSpec::Feed` — every other source kind has
+    /// no feed-304 concept, so it returns nothing for them.
+    async fn due_entries_for_source(&mut self) -> Vec<DueRecheckEntry> {
+        let SourceSpec::Feed {
+            url: feed_url,
+            refresh_interval_secs,
+            ..
+        } = &self.source.spec
+        else {
+            return Vec::new();
+        };
+
+        // Same floor derivation `recheck_is_due`'s check (c) uses — the two
+        // mechanisms must never drift apart on what "inside the floor" means
+        // for the same column.
+        let floor = crate::ingestion::recheck::recheck_floor_start_rfc3339(
+            chrono::Utc::now(),
+            *refresh_interval_secs,
+        );
+
+        // A link-less entry is stored under the synthetic `{feed_url}#entry:`
+        // shape (`synthetic_entry_uri` in `ingest/src/feed_ingestor.rs`) —
+        // there is nothing to fetch at that locator, so it must never become
+        // a revisit candidate. `core` cannot call that function directly (it
+        // lives one layer up, in `ingest`), so this mirrors its exact prefix;
+        // the two must be kept in sync if that shape ever changes.
+        let synthetic_prefix = format!("{feed_url}#entry:");
+
+        let mut candidates: Vec<DocumentRecord> = self
+            .doc_index
+            .for_source(&self.source.id)
+            .filter(|r| !r.uri.starts_with(&synthetic_prefix))
+            .filter(|r| {
+                r.policy_version != self.config.policy_version
+                    || r.last_checked_at
+                        .as_deref()
+                        .is_none_or(|checked| checked < floor.as_str())
+            })
+            .cloned()
+            .collect();
+
+        // Oldest-first, `None` leading — the same ordering the liveness
+        // sweep's own candidate query uses, and for the same reason: a
+        // long-idle source drains its backlog across successive runs instead
+        // of being capped forever by whichever candidates happen to sort
+        // first.
+        candidates.sort_by(|a, b| a.last_checked_at.cmp(&b.last_checked_at));
+        // Same batch bound the liveness sweep uses
+        // (specs/04-search-pipeline.md §1 "Aged-out feed entries: the
+        // liveness sweep" → "Candidates") — one shared cap keeps a quiet
+        // feed's backlog bounded the same way on both paths.
+        candidates.truncate(FEED_LIVENESS_BATCH_LIMIT);
+
+        let mut out = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            // A store miss (a concurrent delete racing this revisit) or a
+            // read error skips the candidate silently — there is nothing to
+            // rebuild a claim from, and the next run's candidate query will
+            // simply no longer see it once the delete lands in `doc_index`.
+            let record = match self
+                .store
+                .get_resource_record(&self.config.store_id, &candidate.resource_id)
+                .await
+            {
+                Ok(Some(record)) => record,
+                Ok(None) => {
+                    tracing::debug!(
+                        uri = %candidate.uri,
+                        "due-entry revisit: resource record missing, likely a concurrent delete; skipping candidate"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        uri = %candidate.uri,
+                        error = %e,
+                        "due-entry revisit: error reading resource record; skipping candidate"
+                    );
+                    continue;
+                }
+            };
+            let Some(uri) = Uri::parse(&candidate.uri) else {
+                tracing::debug!(
+                    uri = %candidate.uri,
+                    "due-entry revisit: stored URI failed to reparse; skipping candidate"
+                );
+                continue;
+            };
+
+            // Rebuild the connector's claim from the resource's own
+            // persisted Dublin Core fields. `MetadataEnrichment::apply_to` is
+            // idempotent (see its doc comment), so feeding this back through
+            // the identical merge the ordinary entry loop uses reproduces
+            // exactly the stored state — "revisit with this claim" and "keep
+            // what is already stored" are the same operation here.
+            let dc = record.metadata.dublin_core();
+            let enrichment = crate::metadata::MetadataEnrichment {
+                title_fallback: dc.title.clone(),
+                creator: dc.creator.clone(),
+                date: dc.date.clone(),
+                date_source: dc.date_source.clone(),
+                provenance_source: dc.source.clone(),
+            };
+
+            out.push(DueRecheckEntry {
+                locator: candidate.uri.clone(),
+                uri,
+                enrichment,
+                external_id: record.external_id.clone(),
+                modified_at: record.modified_at.clone(),
+            });
+        }
+        out
     }
 }

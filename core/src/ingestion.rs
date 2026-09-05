@@ -574,6 +574,7 @@ pub async fn run_source_ingestion(
         deletion,
         document_validators,
         stored_inputs_digest,
+        refetch,
         fetcher,
     } = deps;
 
@@ -586,17 +587,31 @@ pub async fn run_source_ingestion(
     // suppression one layer down, and keeps both halves of the same rule in
     // the same crate. See `specs/02-domain-model.md`'s Feed connector,
     // "Conditional GET and pruning".
+    //
+    // `--refetch` takes the same suppression path unconditionally, ahead of
+    // the digest comparison: bypassing only the recheck gate (see
+    // `PipelineCallback::recheck_is_due`'s `refetch` check) would still
+    // dead-end at this feed document's own 304 before the entry loop ever
+    // ran, so the flag has to reach the entry loop through this same door.
     let document_inputs_digest = feed_inputs_digest(source, config);
-    let document_validators = match &document_inputs_digest {
-        Some(current) if stored_inputs_digest.as_deref() != Some(current.as_str()) => {
-            tracing::debug!(
-                source_id = %source.id,
-                "feed inputs changed since the stored validators were captured; \
-                 fetching the feed document unconditionally"
-            );
-            FetchMetadata::default()
+    let document_validators = if refetch {
+        tracing::debug!(
+            source_id = %source.id,
+            "--refetch requested; fetching the feed document unconditionally"
+        );
+        FetchMetadata::default()
+    } else {
+        match &document_inputs_digest {
+            Some(current) if stored_inputs_digest.as_deref() != Some(current.as_str()) => {
+                tracing::debug!(
+                    source_id = %source.id,
+                    "feed inputs changed since the stored validators were captured; \
+                     fetching the feed document unconditionally"
+                );
+                FetchMetadata::default()
+            }
+            _ => document_validators,
         }
-        _ => document_validators,
     };
 
     let ingest_config = serde_json::to_value(&source.spec).map_err(|e| Error::Internal {
@@ -633,6 +648,7 @@ pub async fn run_source_ingestion(
         discovered_total: 0,
         next_index: 0,
         skip_error_count: 0,
+        refetch,
     };
 
     let ingest_result = ingestor.ingest(&ingest_source, &mut callback).await?;
