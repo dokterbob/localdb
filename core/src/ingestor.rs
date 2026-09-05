@@ -253,6 +253,37 @@ pub trait IngestCallback: Send {
         crate::ingestion::FetchMetadata::default()
     }
 
+    /// Asked by the feed ingestor for a fetchable discovery entry, before
+    /// any HTTP request is made for it (`process_discovery_entry` in
+    /// `ingest/src/feed_ingestor.rs`, ahead of `process_url` — see
+    /// `specs/04-search-pipeline.md` §1 "Recheck gate"). `true` means "go
+    /// fetch, conditional GET as usual"; `false` means "report
+    /// [`SkipReason::Fresh`] and make no request for this entry at all" —
+    /// the entry is already known at this run's policy, inside its recheck
+    /// floor, and the feed's current claim for it still reproduces what is
+    /// stored.
+    ///
+    /// `enrichment`, `external_id`, and `modified_at` are the feed's current
+    /// claim for the entry, on the same contract [`Self::on_metadata_refreshed`]
+    /// takes them under — an implementor typically merges them the same way
+    /// to decide whether the claim still matches. The default `true` means
+    /// every ingestor kind other than feed discovery, and every simple test
+    /// callback, keeps fetching exactly as it did before this hook existed —
+    /// this is purely an opt-in short-circuit for one connector.
+    ///
+    /// `&mut self`, matching every other method on this trait, for the same
+    /// `#[async_trait]`/`Sync`-bound reason [`Self::lookup_fetch_metadata`]'s
+    /// doc comment explains.
+    async fn recheck_is_due(
+        &mut self,
+        _uri: &Uri,
+        _enrichment: &crate::metadata::MetadataEnrichment,
+        _external_id: Option<&str>,
+        _modified_at: Option<&str>,
+    ) -> bool {
+        true
+    }
+
     /// Called when a 304 Not Modified response itself carried a refreshed
     /// validator (RFC 9111 requires storing one even though the body is
     /// unchanged — see `FetchResult::NotModified`'s doc comment). `meta`
