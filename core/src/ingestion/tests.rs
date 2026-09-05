@@ -1344,6 +1344,7 @@ mod unified_pipeline {
             deletion: DeletionPolicy::Prune,
             document_validators: FetchMetadata::default(),
             stored_inputs_digest: None,
+            refetch: false,
             fetcher: &UnreachableFetcher,
         };
         let result = run_source_ingestion(&source, &ingestor, deps)
@@ -1438,6 +1439,7 @@ mod unified_pipeline {
             deletion: DeletionPolicy::Prune,
             document_validators: FetchMetadata::default(),
             stored_inputs_digest: None,
+            refetch: false,
             fetcher: &UnreachableFetcher,
         };
         run_source_ingestion(&source, &ingestor, deps)
@@ -3740,6 +3742,7 @@ mod unified_pipeline {
             discovered_total: 0,
             next_index: 0,
             skip_error_count: 0,
+            refetch: false,
         }
     }
 
@@ -5190,6 +5193,7 @@ mod unified_pipeline {
                 deletion: DeletionPolicy::Prune,
                 document_validators: FetchMetadata::default(),
                 stored_inputs_digest: None,
+                refetch: false,
                 fetcher: &ScriptedFetcher::new(ScriptedFetchOutcome::Gone),
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
@@ -5252,6 +5256,7 @@ mod unified_pipeline {
                 deletion: DeletionPolicy::Prune,
                 document_validators: FetchMetadata::default(),
                 stored_inputs_digest: None,
+                refetch: false,
                 fetcher: &ScriptedFetcher::new(ScriptedFetchOutcome::NotModified),
             };
             let result = run_source_ingestion(&source, &ingestor, deps)
@@ -6050,5 +6055,626 @@ mod unified_pipeline {
         // its post-upsert `None` — proving the failure really was swallowed
         // rather than silently retried into success.
         assert!(doc_index.get(uri).unwrap().last_checked_at.is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // T329 step 5 — the recheck gate: `IngestCallback::recheck_is_due`
+    // (specs/04-search-pipeline.md §1 "Recheck gate").
+    // -----------------------------------------------------------------
+
+    fn make_feed_source_with_refresh(store_id: &str, refresh_interval_secs: Option<u64>) -> Source {
+        Source {
+            id: new_ulid(),
+            store_id: store_id.to_string(),
+            kind: SourceKind::Feed,
+            spec: SourceSpec::Feed {
+                url: "https://example.com/feed.xml".to_string(),
+                max_entries: None,
+                fetch_full_content: true,
+                refresh_interval_secs,
+            },
+            source_preset: "prose".to_string(),
+        }
+    }
+
+    /// `now` minus `duration`, formatted the way `last_checked_at` is stored
+    /// and compared — `to_rfc3339_opts(SecondsFormat::Secs, true)`, the same
+    /// format `recheck::recheck_floor_start_rfc3339` produces, which is what
+    /// makes `recheck_is_due`'s check (c) a valid plain string comparison.
+    fn rfc3339_ago(duration: chrono::Duration) -> String {
+        (Utc::now() - duration).to_rfc3339_opts(SecondsFormat::Secs, true)
+    }
+
+    /// A minimal, otherwise-unpopulated `DocumentRecord` for a gate check
+    /// that must return `true` before ever reading the store: checks
+    /// (a)/(c)/`refetch` never dereference `resource_id`, `content_hash`, or
+    /// `metadata_hash`, so those fields are filler.
+    fn gate_doc_record(
+        source: &Source,
+        uri: &str,
+        policy_version: &str,
+        last_checked_at: Option<String>,
+    ) -> DocumentRecord {
+        DocumentRecord {
+            uri: uri.to_string(),
+            resource_id: "res-gate".to_string(),
+            source_id: source.id.clone(),
+            content_hash: "hash-gate".to_string(),
+            policy_version: policy_version.to_string(),
+            metadata_hash: "mhash-gate".to_string(),
+            external_etag: None,
+            external_last_modified: None,
+            last_checked_at,
+        }
+    }
+
+    /// `FakeStore` wrapper that panics if `get_resource_record` is ever
+    /// called — proves check (a), (c), or `refetch` rejected a candidate
+    /// without paying for the one store read `recheck_is_due` performs, per
+    /// its own doc comment ("cheapest-first, the store read last").
+    struct PanicOnResourceReadStore {
+        inner: FakeStore,
+    }
+
+    impl PanicOnResourceReadStore {
+        fn new() -> Self {
+            Self {
+                inner: FakeStore::new(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RetrievalStore for PanicOnResourceReadStore {
+        async fn upsert_chunks(&self, records: Vec<ChunkRecord>) -> Result<usize, Error> {
+            self.inner.upsert_chunks(records).await
+        }
+
+        async fn delete_by_resource(&self, resource_id: &str) -> Result<usize, Error> {
+            self.inner.delete_by_resource(resource_id).await
+        }
+
+        async fn delete_by_store(&self, store_id: &str) -> Result<usize, Error> {
+            self.inner.delete_by_store(store_id).await
+        }
+
+        async fn dense_search(
+            &self,
+            query_vector: &[f32],
+            limit: usize,
+            filters: &[crate::store::MetadataFilter],
+        ) -> Result<Vec<crate::store::SearchResult>, Error> {
+            self.inner.dense_search(query_vector, limit, filters).await
+        }
+
+        async fn bm25_search(
+            &self,
+            query_text: &str,
+            limit: usize,
+            filters: &[crate::store::MetadataFilter],
+        ) -> Result<Vec<crate::store::SearchResult>, Error> {
+            self.inner.bm25_search(query_text, limit, filters).await
+        }
+
+        async fn stats(&self) -> Result<crate::store::StoreStats, Error> {
+            self.inner.stats().await
+        }
+
+        async fn get_chunk(&self, chunk_id: &str) -> Result<Option<ChunkRecord>, Error> {
+            self.inner.get_chunk(chunk_id).await
+        }
+
+        async fn get_chunks_for_resource(
+            &self,
+            resource_id: &str,
+        ) -> Result<Vec<ChunkRecord>, Error> {
+            self.inner.get_chunks_for_resource(resource_id).await
+        }
+
+        async fn list_indexed_documents(&self) -> Result<Vec<DocumentRecord>, Error> {
+            self.inner.list_indexed_documents().await
+        }
+
+        async fn update_resource_metadata(
+            &self,
+            store_id: &str,
+            resource_id: &str,
+            record: &crate::store::ResourceRecord,
+        ) -> Result<(), Error> {
+            self.inner
+                .update_resource_metadata(store_id, resource_id, record)
+                .await
+        }
+
+        async fn get_resource_record(
+            &self,
+            _store_id: &str,
+            _resource_id: &str,
+        ) -> Result<Option<crate::store::ResourceRecord>, Error> {
+            panic!(
+                "get_resource_record must not be called once check (a), (c), or \
+                 `--refetch` already decided this candidate — the store read is \
+                 check (b), the last and only non-free one"
+            );
+        }
+
+        async fn upsert_chunks_and_blocks(
+            &self,
+            store_id: &str,
+            resource_id: &str,
+            records: Vec<ChunkRecord>,
+            blocks: &[crate::block::Block],
+            replaces_resource_id: Option<&str>,
+            external_last_modified: Option<&str>,
+        ) -> Result<usize, Error> {
+            self.inner
+                .upsert_chunks_and_blocks(
+                    store_id,
+                    resource_id,
+                    records,
+                    blocks,
+                    replaces_resource_id,
+                    external_last_modified,
+                )
+                .await
+        }
+    }
+
+    /// [`make_pipeline_callback`], generalized to any `&dyn RetrievalStore`
+    /// and with `refetch` exposed — needed for [`PanicOnResourceReadStore`],
+    /// which isn't a `FakeStore`, and for the `--refetch` bypass test.
+    fn make_pipeline_callback_over<'a>(
+        source: &'a Source,
+        doc_index: &'a mut DocumentIndex,
+        store: &'a dyn RetrievalStore,
+        embedder: &'a FakeEmbedder,
+        config: &'a IngestionConfig,
+        refetch: bool,
+    ) -> PipelineCallback<'a> {
+        PipelineCallback {
+            source,
+            doc_index,
+            store,
+            embedder,
+            config,
+            progress: None,
+            result: IngestionResult::default(),
+            seen: std::collections::HashSet::new(),
+            gone: std::collections::HashSet::new(),
+            discovered_total: 0,
+            next_index: 0,
+            skip_error_count: 0,
+            refetch,
+        }
+    }
+
+    // --- (a)/(c)/refetch: no store read needed --------------------------
+
+    #[tokio::test]
+    async fn recheck_is_due_true_when_uri_unknown() {
+        let store_id = "store-1";
+        let source = make_feed_source_with_refresh(store_id, None);
+        let config = make_ingestion_config(store_id);
+        let store = PanicOnResourceReadStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let mut doc_index = DocumentIndex::new();
+
+        let mut callback =
+            make_pipeline_callback_over(&source, &mut doc_index, &store, &embedder, &config, false);
+        let uri = Uri::parse("https://example.com/feed.xml#entry:never-seen").unwrap();
+        let due = callback
+            .recheck_is_due(
+                &uri,
+                &crate::metadata::MetadataEnrichment::default(),
+                None,
+                None,
+            )
+            .await;
+
+        assert!(due, "an entry never seen before must always be fetched");
+    }
+
+    #[tokio::test]
+    async fn recheck_is_due_true_when_policy_version_differs_and_skips_the_store_read() {
+        let store_id = "store-1";
+        let source = make_feed_source_with_refresh(store_id, None);
+        let config = make_ingestion_config(store_id); // policy-v1
+        let store = PanicOnResourceReadStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let uri_str = "https://example.com/feed.xml#entry:1";
+        let mut doc_index = DocumentIndex::new();
+        doc_index.upsert(gate_doc_record(
+            &source,
+            uri_str,
+            "policy-v0",
+            Some(rfc3339_ago(chrono::Duration::seconds(0))),
+        ));
+
+        let mut callback =
+            make_pipeline_callback_over(&source, &mut doc_index, &store, &embedder, &config, false);
+        let uri = Uri::parse(uri_str).unwrap();
+        let due = callback
+            .recheck_is_due(
+                &uri,
+                &crate::metadata::MetadataEnrichment::default(),
+                None,
+                None,
+            )
+            .await;
+
+        assert!(
+            due,
+            "a stale policy_version must reopen the gate, and must do so \
+             without reading the store — PanicOnResourceReadStore would have \
+             panicked otherwise"
+        );
+    }
+
+    #[tokio::test]
+    async fn recheck_is_due_true_when_last_checked_at_is_none() {
+        let store_id = "store-1";
+        let source = make_feed_source_with_refresh(store_id, None);
+        let config = make_ingestion_config(store_id);
+        let store = PanicOnResourceReadStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let uri_str = "https://example.com/feed.xml#entry:1";
+        let mut doc_index = DocumentIndex::new();
+        doc_index.upsert(gate_doc_record(
+            &source,
+            uri_str,
+            &config.policy_version,
+            None,
+        ));
+
+        let mut callback =
+            make_pipeline_callback_over(&source, &mut doc_index, &store, &embedder, &config, false);
+        let uri = Uri::parse(uri_str).unwrap();
+        let due = callback
+            .recheck_is_due(
+                &uri,
+                &crate::metadata::MetadataEnrichment::default(),
+                None,
+                None,
+            )
+            .await;
+
+        assert!(due, "an entry never yet checked must always be fetched");
+    }
+
+    #[tokio::test]
+    async fn recheck_is_due_true_when_last_checked_at_is_older_than_the_floor() {
+        let store_id = "store-1";
+        let source = make_feed_source_with_refresh(store_id, None);
+        let config = make_ingestion_config(store_id);
+        let store = PanicOnResourceReadStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let uri_str = "https://example.com/feed.xml#entry:1";
+        let mut doc_index = DocumentIndex::new();
+        doc_index.upsert(gate_doc_record(
+            &source,
+            uri_str,
+            &config.policy_version,
+            Some(rfc3339_ago(chrono::Duration::hours(25))),
+        ));
+
+        let mut callback =
+            make_pipeline_callback_over(&source, &mut doc_index, &store, &embedder, &config, false);
+        let uri = Uri::parse(uri_str).unwrap();
+        let due = callback
+            .recheck_is_due(
+                &uri,
+                &crate::metadata::MetadataEnrichment::default(),
+                None,
+                None,
+            )
+            .await;
+
+        assert!(
+            due,
+            "25h ago is past the bare 24h floor for a source with no \
+             configured refresh_interval_secs"
+        );
+    }
+
+    #[tokio::test]
+    async fn recheck_is_due_true_when_refetch_bypasses_the_floor_check() {
+        let store_id = "store-1";
+        let source = make_feed_source_with_refresh(store_id, None);
+        let config = make_ingestion_config(store_id);
+        let store = PanicOnResourceReadStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let uri_str = "https://example.com/feed.xml#entry:1";
+        let mut doc_index = DocumentIndex::new();
+        // Otherwise-fresh: checked a moment ago, well inside the floor.
+        doc_index.upsert(gate_doc_record(
+            &source,
+            uri_str,
+            &config.policy_version,
+            Some(rfc3339_ago(chrono::Duration::seconds(1))),
+        ));
+
+        let mut callback =
+            make_pipeline_callback_over(&source, &mut doc_index, &store, &embedder, &config, true);
+        let uri = Uri::parse(uri_str).unwrap();
+        let due = callback
+            .recheck_is_due(
+                &uri,
+                &crate::metadata::MetadataEnrichment::default(),
+                None,
+                None,
+            )
+            .await;
+
+        assert!(
+            due,
+            "--refetch must bypass the floor even for an entry checked a \
+             moment ago, and without reading the store"
+        );
+    }
+
+    // --- (b): reaches the store read -------------------------------------
+
+    /// Seed `store`/`doc_index` with one already-indexed feed entry via
+    /// `on_resource` — mirroring what an earlier run's `Written` arm left
+    /// behind, including a real `ResourceRecord` in `store` for check (b) to
+    /// read — then overwrite the cached `last_checked_at`, exactly as the
+    /// gate reads it. Returns the resource id, for a test that needs to
+    /// simulate a concurrent delete.
+    async fn seed_gate_candidate(
+        source: &Source,
+        doc_index: &mut DocumentIndex,
+        store: &FakeStore,
+        embedder: &FakeEmbedder,
+        config: &IngestionConfig,
+        uri: &str,
+        last_checked_at: String,
+    ) -> String {
+        let resource = make_resource(uri, "Stable body.", &source.id, &config.store_id);
+        {
+            let mut callback = make_pipeline_callback(source, doc_index, store, embedder, config);
+            callback.on_resource(resource).await.unwrap();
+        }
+        let mut record = doc_index.get(uri).unwrap().clone();
+        let resource_id = record.resource_id.clone();
+        record.last_checked_at = Some(last_checked_at);
+        doc_index.upsert(record);
+        resource_id
+    }
+
+    #[tokio::test]
+    async fn recheck_is_due_false_when_inside_the_floor_and_the_claim_matches() {
+        let store_id = "store-1";
+        let source = make_feed_source_with_refresh(store_id, None);
+        let config = make_ingestion_config(store_id);
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let uri = "https://example.com/feed.xml#entry:1";
+        let mut doc_index = DocumentIndex::new();
+        seed_gate_candidate(
+            &source,
+            &mut doc_index,
+            &store,
+            &embedder,
+            &config,
+            uri,
+            rfc3339_ago(chrono::Duration::seconds(1)),
+        )
+        .await;
+
+        let mut callback =
+            make_pipeline_callback(&source, &mut doc_index, &store, &embedder, &config);
+        let parsed_uri = Uri::parse(uri).unwrap();
+        // `make_resource`'s own claim, reproduced exactly: no title/author/
+        // date enrichment, no `external_id`, `modified_at` matching the
+        // seeded resource's default.
+        let due = callback
+            .recheck_is_due(
+                &parsed_uri,
+                &crate::metadata::MetadataEnrichment::default(),
+                None,
+                Some("2026-06-10T12:00:00Z"),
+            )
+            .await;
+
+        assert!(
+            !due,
+            "inside the floor with an unchanged claim must report fresh and \
+             skip the fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn recheck_is_due_true_when_the_feed_enrichment_changes_the_title() {
+        let store_id = "store-1";
+        let source = make_feed_source_with_refresh(store_id, None);
+        let config = make_ingestion_config(store_id);
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let uri = "https://example.com/feed.xml#entry:1";
+        let mut doc_index = DocumentIndex::new();
+        seed_gate_candidate(
+            &source,
+            &mut doc_index,
+            &store,
+            &embedder,
+            &config,
+            uri,
+            rfc3339_ago(chrono::Duration::seconds(1)),
+        )
+        .await;
+
+        let mut callback =
+            make_pipeline_callback(&source, &mut doc_index, &store, &embedder, &config);
+        let parsed_uri = Uri::parse(uri).unwrap();
+        let enrichment = crate::metadata::MetadataEnrichment {
+            title_fallback: Some("A New Title".to_string()),
+            ..Default::default()
+        };
+        let due = callback
+            .recheck_is_due(&parsed_uri, &enrichment, None, Some("2026-06-10T12:00:00Z"))
+            .await;
+
+        assert!(
+            due,
+            "a feed-side title change moves the merged hash — check (b) must \
+             reopen the gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn recheck_is_due_true_when_modified_at_differs() {
+        let store_id = "store-1";
+        let source = make_feed_source_with_refresh(store_id, None);
+        let config = make_ingestion_config(store_id);
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let uri = "https://example.com/feed.xml#entry:1";
+        let mut doc_index = DocumentIndex::new();
+        seed_gate_candidate(
+            &source,
+            &mut doc_index,
+            &store,
+            &embedder,
+            &config,
+            uri,
+            rfc3339_ago(chrono::Duration::seconds(1)),
+        )
+        .await;
+
+        let mut callback =
+            make_pipeline_callback(&source, &mut doc_index, &store, &embedder, &config);
+        let parsed_uri = Uri::parse(uri).unwrap();
+        let due = callback
+            .recheck_is_due(
+                &parsed_uri,
+                &crate::metadata::MetadataEnrichment::default(),
+                None,
+                Some("2099-01-01T00:00:00Z"),
+            )
+            .await;
+
+        assert!(
+            due,
+            "a feed-claimed modified_at that moved is part of the metadata \
+             hash — check (b) must reopen the gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn recheck_is_due_true_when_the_store_record_is_gone() {
+        let store_id = "store-1";
+        let source = make_feed_source_with_refresh(store_id, None);
+        let config = make_ingestion_config(store_id);
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let uri = "https://example.com/feed.xml#entry:1";
+        let mut doc_index = DocumentIndex::new();
+        let resource_id = seed_gate_candidate(
+            &source,
+            &mut doc_index,
+            &store,
+            &embedder,
+            &config,
+            uri,
+            rfc3339_ago(chrono::Duration::seconds(1)),
+        )
+        .await;
+        // Simulate a concurrent delete: the store no longer has a row for
+        // this resource, even though `doc_index` still does.
+        store.delete_by_resource(&resource_id).await.unwrap();
+
+        let mut callback =
+            make_pipeline_callback(&source, &mut doc_index, &store, &embedder, &config);
+        let parsed_uri = Uri::parse(uri).unwrap();
+        let due = callback
+            .recheck_is_due(
+                &parsed_uri,
+                &crate::metadata::MetadataEnrichment::default(),
+                None,
+                Some("2026-06-10T12:00:00Z"),
+            )
+            .await;
+
+        assert!(
+            due,
+            "a store miss on check (b)'s read must open the gate rather than \
+             be read as a match — falling through to a fetch is always safe"
+        );
+    }
+
+    #[tokio::test]
+    async fn recheck_is_due_false_when_inside_a_configured_refresh_interval() {
+        let store_id = "store-1";
+        let source = make_feed_source_with_refresh(store_id, Some(7 * 24 * 60 * 60_u64));
+        let config = make_ingestion_config(store_id);
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let uri = "https://example.com/feed.xml#entry:1";
+        let mut doc_index = DocumentIndex::new();
+        seed_gate_candidate(
+            &source,
+            &mut doc_index,
+            &store,
+            &embedder,
+            &config,
+            uri,
+            rfc3339_ago(chrono::Duration::days(2)),
+        )
+        .await;
+
+        let mut callback =
+            make_pipeline_callback(&source, &mut doc_index, &store, &embedder, &config);
+        let parsed_uri = Uri::parse(uri).unwrap();
+        let due = callback
+            .recheck_is_due(
+                &parsed_uri,
+                &crate::metadata::MetadataEnrichment::default(),
+                None,
+                Some("2026-06-10T12:00:00Z"),
+            )
+            .await;
+
+        assert!(
+            !due,
+            "2 days ago is inside a configured 7-day refresh_interval_secs floor"
+        );
+    }
+
+    #[tokio::test]
+    async fn recheck_is_due_true_when_past_a_configured_refresh_interval() {
+        let store_id = "store-1";
+        let source = make_feed_source_with_refresh(store_id, Some(7 * 24 * 60 * 60_u64));
+        let config = make_ingestion_config(store_id);
+        let store = FakeStore::new();
+        let embedder = FakeEmbedder::new(4);
+        let uri = "https://example.com/feed.xml#entry:1";
+        let mut doc_index = DocumentIndex::new();
+        seed_gate_candidate(
+            &source,
+            &mut doc_index,
+            &store,
+            &embedder,
+            &config,
+            uri,
+            rfc3339_ago(chrono::Duration::days(8)),
+        )
+        .await;
+
+        let mut callback =
+            make_pipeline_callback(&source, &mut doc_index, &store, &embedder, &config);
+        let parsed_uri = Uri::parse(uri).unwrap();
+        let due = callback
+            .recheck_is_due(
+                &parsed_uri,
+                &crate::metadata::MetadataEnrichment::default(),
+                None,
+                Some("2026-06-10T12:00:00Z"),
+            )
+            .await;
+
+        assert!(
+            due,
+            "8 days ago is past a configured 7-day refresh_interval_secs floor"
+        );
     }
 }

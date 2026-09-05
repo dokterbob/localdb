@@ -278,6 +278,19 @@ pub struct SourceIngestionDeps<'a> {
     /// `None` means "inputs unknown" — a row predating the column — and is
     /// treated as a mismatch. Meaningless for any non-feed source.
     pub stored_inputs_digest: Option<String>,
+    /// `localdb index --refetch`'s cache-busting escape hatch. Bypasses the
+    /// recheck gate's floor check (`IngestCallback::recheck_is_due`'s check
+    /// (c)) for this run, and — because bypassing only the gate would still
+    /// dead-end at the feed document's own 304 before the entry loop ever
+    /// ran — also suppresses this run's feed-document validators, exactly
+    /// as a `feed_inputs_digest` mismatch above does. `false` (the default)
+    /// leaves both checks untouched. Meaningless for any non-feed source:
+    /// a `url` source has no recheck gate to bypass, and a `path` source
+    /// has no origin round trip at all. See
+    /// specs/02-domain-model.md's Feed connector, "Partial entry passes
+    /// withhold the validators too", and specs/04-search-pipeline.md §1
+    /// "Recheck gate" → "Accepted cost".
+    pub refetch: bool,
     /// HTTP client for the feed liveness sweep's own probe of an aged-out
     /// feed entry's link. **Must be the public-destination-only fetcher**
     /// (`fetch::HttpUrlFetcher::new_public_only`) — an entry link is
@@ -300,11 +313,12 @@ impl<'a> SourceIngestionDeps<'a> {
     /// default — tests that exercise the delete-sweep or the feed liveness
     /// sweep, which only run under `Prune`, override it explicitly),
     /// `document_validators: FetchMetadata::default()` and
-    /// `stored_inputs_digest: None` (no prior conditional-GET state), and
+    /// `stored_inputs_digest: None` (no prior conditional-GET state),
+    /// `refetch: false` (no `--refetch` requested), and
     /// `fetcher: &UnreachableFetcher` (the sweep never runs, so the fetcher
     /// is never dereferenced — see `UnreachableFetcher`'s own doc comment).
     ///
-    /// A call site that needs a non-default value for any of these five
+    /// A call site that needs a non-default value for any of these fields
     /// still uses a plain struct literal, or struct-update syntax over this
     /// constructor — this constructor exists to remove the boilerplate at the
     /// sites that don't vary it, not to hide the field from sites that do.
@@ -325,6 +339,7 @@ impl<'a> SourceIngestionDeps<'a> {
             deletion: DeletionPolicy::Retain,
             document_validators: FetchMetadata::default(),
             stored_inputs_digest: None,
+            refetch: false,
             fetcher: &UnreachableFetcher,
         }
     }
