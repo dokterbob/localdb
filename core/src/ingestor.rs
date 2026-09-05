@@ -112,6 +112,18 @@ pub enum SkipReason {
     /// the outcome counters partition `docs_seen`
     /// (specs/04-search-pipeline.md).
     MetadataUpdated,
+    /// The feed entry recheck gate found this entry already known at the
+    /// run's policy, inside the recheck floor, with an unchanged feed claim
+    /// — so no HTTP request was made for it at all
+    /// (specs/04-search-pipeline.md §1 "Recheck gate").
+    ///
+    /// Distinct from [`Self::Unchanged`] because no origin contact happened:
+    /// unlike an actual 304, this must **never** advance `last_checked_at` —
+    /// doing so would slide the recheck floor forward on every gated run and
+    /// the entry would never be re-verified again. Counts toward
+    /// `docs_skipped`, same as [`Self::Unchanged`], plus the dedicated
+    /// `IngestionResult::docs_recheck_deferred` sub-counter.
+    Fresh,
 }
 
 /// What a metadata-refresh hook did to the store.
@@ -169,6 +181,17 @@ impl MetadataWriteOutcome {
 #[async_trait::async_trait]
 pub trait IngestCallback: Send {
     async fn on_resource(&mut self, resource: Resource) -> Result<(), Error>;
+
+    /// Called for a resource that was NOT produced by a real fetch — the
+    /// feed connector's embedded-content fallback, built from content
+    /// already present in the feed document rather than a request to the
+    /// resource's own origin. No origin contact happened for it.
+    ///
+    /// The default delegates to [`Self::on_resource`], so implementors that
+    /// don't distinguish the two paths need no changes.
+    async fn on_resource_fallback(&mut self, resource: Resource) -> Result<(), Error> {
+        self.on_resource(resource).await
+    }
 
     /// Called once the ingestor knows how many items it will consider
     /// (after enumeration). Streaming ingestors that never know a total

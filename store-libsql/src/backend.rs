@@ -131,3 +131,37 @@ impl StoreBackend for SqliteBackend {
         registry::diagnostics::largest_tables(&self.conn, limit).await
     }
 }
+
+/// Test-only escape hatch for backdating `resources.last_checked_at`
+/// directly, bypassing `RetrievalStore::touch_resource_checked`'s "advance to
+/// now" contract.
+///
+/// `touch_resource_checked`/`touch_resource_liveness` only ever move this
+/// column forward to the current time — by design, there is no store-API way
+/// to set it to an arbitrary past value. A test that needs to simulate a
+/// resource whose last successful check happened long enough ago to clear
+/// the recheck floor (specs/04-search-pipeline.md §1 "Recheck gate") has
+/// nothing else to reach for. `store-libsql`'s own tests reach the private
+/// `conn` field directly (same crate); this exists for integration tests in
+/// other crates — `server/src/job_exec/tests/feed_liveness_sweep.rs` — that
+/// can't.
+#[cfg(any(test, feature = "test-support"))]
+impl SqliteBackend {
+    /// Overwrite `resources.last_checked_at` for one resource. `value` is an
+    /// RFC 3339 timestamp string, or `None` to clear it back to `NULL`.
+    pub async fn set_last_checked_at_for_test(
+        &self,
+        store_id: &str,
+        resource_id: &str,
+        value: Option<&str>,
+    ) -> Result<(), Error> {
+        let conn = self.conn.writer().await;
+        conn.execute(
+            "UPDATE resources SET last_checked_at = ?1 WHERE store_id = ?2 AND id = ?3",
+            libsql::params![value, store_id, resource_id],
+        )
+        .await
+        .map_err(crate::connection::map_libsql_err)?;
+        Ok(())
+    }
+}

@@ -14,10 +14,10 @@ use crate::block::Resource;
 use crate::embedder::Embedder;
 use crate::error::Error;
 use crate::ingestion::deps::{DocumentIndex, DocumentRecord, FetchMetadata, IndexResourceDeps};
-use crate::ingestion::{IngestionConfig, IngestionResult};
+use crate::ingestion::{now_rfc3339, IngestionConfig, IngestionResult};
 use crate::ingestor::{IngestCallback, MetadataWriteOutcome, SkipReason};
 use crate::store::RetrievalStore;
-use crate::types::Source;
+use crate::types::{Source, SourceSpec};
 use crate::uri::Uri;
 
 use super::{derive_resource_state, index_resource, IndexOutcome};
@@ -145,6 +145,63 @@ impl PipelineCallback<'_> {
         MetadataWriteOutcome::Written
     }
 
+    /// Whether `self.source` is a network source (`url`/`feed`) — the only
+    /// kinds `last_checked_at` throttles a re-check against. `path` sources
+    /// mtime-skip in `FileIngestor` itself; there is no origin round trip
+    /// there for a check clock to mean anything about.
+    fn is_network_source(&self) -> bool {
+        matches!(
+            self.source.spec,
+            SourceSpec::Url { .. } | SourceSpec::Feed { .. }
+        )
+    }
+
+    /// Advance `last_checked_at` for `resource_id` — a `200` or `304` that
+    /// just left the store consistent for it — and, on success, mirror the
+    /// new timestamp onto `doc_index`'s in-memory record for `uri`, if one
+    /// exists, so a later gate check within the same run also sees it.
+    ///
+    /// `store.touch_resource_checked` computes its own `now_rfc3339()`
+    /// server-side; the in-memory stamp below is a second, independent call.
+    /// The two can disagree by a fraction of a second — harmless, since
+    /// nothing compares them against each other, only each against a floor
+    /// measured in hours.
+    ///
+    /// A store error (`Error::ResourceNotFound` from a concurrent delete
+    /// racing this call, most commonly) is logged at debug and swallowed —
+    /// mirroring how the feed liveness sweep treats a
+    /// `touch_resource_liveness` failure for one candidate (`liveness.rs`):
+    /// a vanished resource has nothing left for the clock to throttle, and
+    /// this never counts as an error.
+    ///
+    /// Callers gate on [`Self::is_network_source`] first. Deliberately
+    /// **not** called for `IndexOutcome::Empty`, an index-write error, a
+    /// metadata-write error, `SkipReason::Error`/`Unsupported`/`Other`/
+    /// `Fresh`, or `on_gone`: every one of those arms leaves `doc_index`
+    /// stale on purpose so the next run retries the same URI, and stamping
+    /// this clock there would let the recheck gate suppress exactly that
+    /// retry (specs/04-search-pipeline.md §1 "Recheck gate").
+    async fn touch_checked(&mut self, uri: &str, resource_id: &str) {
+        if let Err(e) = self
+            .store
+            .touch_resource_checked(&self.config.store_id, resource_id)
+            .await
+        {
+            tracing::debug!(
+                uri = %uri,
+                resource_id = %resource_id,
+                error = %e,
+                "touch_resource_checked failed, leaving last_checked_at untouched"
+            );
+            return;
+        }
+        if let Some(existing) = self.doc_index.get(uri) {
+            let mut updated = existing.clone();
+            updated.last_checked_at = Some(now_rfc3339());
+            self.doc_index.upsert(updated);
+        }
+    }
+
     fn emit(&self, event: crate::progress::ProgressEvent) {
         if let Some(sink) = &self.progress {
             sink(event);
@@ -160,11 +217,20 @@ impl PipelineCallback<'_> {
             total: self.discovered_total,
         });
     }
-}
 
-#[async_trait::async_trait]
-impl IngestCallback for PipelineCallback<'_> {
-    async fn on_resource(&mut self, resource: Resource) -> Result<(), Error> {
+    /// Shared body of `on_resource` and `on_resource_fallback`. Indexing,
+    /// `doc_index` updates, and counters are identical either way —
+    /// `fetched_from_origin` only gates whether a real 200/304/rewrite is
+    /// allowed to advance the check clock. `false` means the resource came
+    /// from the feed connector's embedded-content fallback, which never
+    /// contacted the entry's own origin: `is_network_source()` alone cannot
+    /// tell the two apart, since a fallback resource is produced under the
+    /// same `Feed` source spec as a real fetch.
+    async fn on_resource_impl(
+        &mut self,
+        resource: Resource,
+        fetched_from_origin: bool,
+    ) -> Result<(), Error> {
         let uri = resource.uri.as_str().to_string();
         self.seen.insert(uri.clone());
         self.result.docs_seen += 1;
@@ -200,7 +266,17 @@ impl IngestCallback for PipelineCallback<'_> {
                 if existing.metadata_hash == derived.metadata_hash
                     && existing.external_last_modified == resource.external_last_modified
                 {
+                    let resource_id = existing.resource_id.clone();
                     self.result.docs_skipped += 1;
+                    // A real 200/304 reached the origin for this URI and left
+                    // the store consistent for it — advance the check clock.
+                    // `path` sources never reach here through a network round
+                    // trip, so the gate excludes them; a fallback resource
+                    // never reached the origin either, so `fetched_from_origin`
+                    // excludes it too.
+                    if self.is_network_source() && fetched_from_origin {
+                        self.touch_checked(&uri, &resource_id).await;
+                    }
                     self.emit(crate::progress::ProgressEvent::DocumentFinished {
                         uri,
                         outcome: crate::progress::DocOutcome::Skipped,
@@ -242,21 +318,30 @@ impl IngestCallback for PipelineCallback<'_> {
                 }
                 self.doc_index.upsert(DocumentRecord {
                     uri: uri.clone(),
-                    resource_id,
+                    resource_id: resource_id.clone(),
                     source_id: existing.source_id.clone(),
                     content_hash: existing.content_hash.clone(),
                     policy_version: existing.policy_version.clone(),
                     metadata_hash: derived.metadata_hash,
                     external_etag: resource.external_etag.clone(),
                     external_last_modified: resource.external_last_modified.clone(),
-                    // A metadata-only update writes no content and touches no
-                    // validators, so it carries the row's existing check
-                    // clock forward rather than resetting it — this write
-                    // path does not itself advance `last_checked_at` (that is
-                    // the touch-wiring work, a later PR).
+                    // Carries the row's existing check clock forward;
+                    // `touch_checked` below then replaces it with the fresh
+                    // value for a network source, exactly as the Written
+                    // arm's own upsert-then-touch does.
                     last_checked_at: existing.last_checked_at.clone(),
                 });
                 self.result.docs_metadata_updated += 1;
+                // The write above just persisted a 200/304's rewritten
+                // metadata — a successful origin contact — so advance the
+                // check clock the same way the unchanged-skip arm above
+                // does. Gated on `fetched_from_origin` too: a fallback
+                // rewrite reached no origin, so the prior check clock (just
+                // carried forward into the upsert above) must survive
+                // untouched.
+                if self.is_network_source() && fetched_from_origin {
+                    self.touch_checked(&uri, &resource_id).await;
+                }
                 self.emit(crate::progress::ProgressEvent::DocumentFinished {
                     uri,
                     outcome: crate::progress::DocOutcome::MetadataUpdated,
@@ -305,11 +390,22 @@ impl IngestCallback for PipelineCallback<'_> {
                     external_etag: resource.external_etag.clone(),
                     external_last_modified: resource.external_last_modified.clone(),
                     // A content change lands under a fresh `resource.id`
-                    // (specs/02-domain-model.md §2), a new row this write
-                    // path did not itself touch the check clock for — that
-                    // touch is the touch-wiring work, a later PR.
+                    // (specs/02-domain-model.md §2); this upsert starts it at
+                    // `None` and `touch_checked` below immediately stamps it
+                    // for a network source — neither the INSERT list nor the
+                    // ON CONFLICT clause of `upsert_chunks_and_blocks` writes
+                    // this column, so without the touch the new row stays
+                    // NULL forever.
                     last_checked_at: None,
                 });
+                // A content change is still a successful origin contact —
+                // advance the check clock the same way an unchanged 200/304
+                // does above. A fallback-produced resource never contacted
+                // the origin, so it starts (and, absent a later real fetch,
+                // stays) at `None`.
+                if self.is_network_source() && fetched_from_origin {
+                    self.touch_checked(&uri, &resource.id).await;
+                }
                 self.emit(crate::progress::ProgressEvent::DocumentFinished {
                     uri,
                     outcome: crate::progress::DocOutcome::Indexed {
@@ -331,6 +427,19 @@ impl IngestCallback for PipelineCallback<'_> {
         }
 
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl IngestCallback for PipelineCallback<'_> {
+    async fn on_resource(&mut self, resource: Resource) -> Result<(), Error> {
+        self.on_resource_impl(resource, true).await
+    }
+
+    /// See `on_resource_impl`'s doc comment — this is the fallback path,
+    /// `fetched_from_origin: false`.
+    async fn on_resource_fallback(&mut self, resource: Resource) -> Result<(), Error> {
+        self.on_resource_impl(resource, false).await
     }
 
     async fn on_discovered(&mut self, total: usize) {
@@ -362,6 +471,18 @@ impl IngestCallback for PipelineCallback<'_> {
             SkipReason::Unchanged => {
                 // Still alive, just unchanged — never re-index, never sweep.
                 self.result.docs_skipped += 1;
+                // A real 304, or an unchanged 200, for a network source: the
+                // origin was successfully contacted. Only when this run's
+                // own `doc_index` actually has an entry for the URI — a
+                // liveness-sweep-style probe of a URI this run never loaded
+                // has nothing here to stamp.
+                if self.is_network_source() {
+                    if let Some(resource_id) =
+                        self.doc_index.get(uri).map(|r| r.resource_id.clone())
+                    {
+                        self.touch_checked(uri, &resource_id).await;
+                    }
+                }
                 self.emit(crate::progress::ProgressEvent::DocumentFinished {
                     uri: uri.to_string(),
                     outcome: crate::progress::DocOutcome::Skipped,
@@ -394,9 +515,32 @@ impl IngestCallback for PipelineCallback<'_> {
                 // same progress outcome — so a metadata write reads the same
                 // whether it arrived with a body or behind a 304.
                 self.result.docs_metadata_updated += 1;
+                // Same origin-contact reasoning as the `Unchanged` arm above.
+                if self.is_network_source() {
+                    if let Some(resource_id) =
+                        self.doc_index.get(uri).map(|r| r.resource_id.clone())
+                    {
+                        self.touch_checked(uri, &resource_id).await;
+                    }
+                }
                 self.emit(crate::progress::ProgressEvent::DocumentFinished {
                     uri: uri.to_string(),
                     outcome: crate::progress::DocOutcome::MetadataUpdated,
+                });
+            }
+            SkipReason::Fresh => {
+                // The recheck gate found this entry fresh and made no HTTP
+                // request at all — never a touch (see `touch_checked`'s doc
+                // comment): this is the arm that rationale most directly
+                // protects, since advancing the clock here would let the
+                // gate suppress its own next check forever. Still alive
+                // (marked seen above), so it survives the delete-sweep like
+                // every other skip reason.
+                self.result.docs_skipped += 1;
+                self.result.docs_recheck_deferred += 1;
+                self.emit(crate::progress::ProgressEvent::DocumentFinished {
+                    uri: uri.to_string(),
+                    outcome: crate::progress::DocOutcome::Skipped,
                 });
             }
             SkipReason::Error(ref msg) => {
