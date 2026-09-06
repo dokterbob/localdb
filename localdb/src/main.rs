@@ -193,6 +193,20 @@ pub enum Command {
         /// reports how many could be pruned.
         #[arg(long)]
         delete: bool,
+
+        /// Re-check every feed entry with the origin, ignoring the recheck
+        /// floor and the feed document's cached validators.
+        ///
+        /// Off by default: a feed discovery entry that is already known,
+        /// inside its recheck floor, and whose feed-supplied claim still
+        /// reproduces its stored metadata is skipped without an HTTP
+        /// request. `--refetch` bypasses that floor check for the run and
+        /// suppresses the feed document's own conditional-GET validators, so
+        /// a silent origin edit the feed never announced is noticed
+        /// immediately instead of at the next floor. A no-op for `file`/
+        /// `url` sources.
+        #[arg(long)]
+        refetch: bool,
     },
 
     /// Hybrid search with citations.
@@ -658,7 +672,8 @@ fn main() {
             source,
             strict,
             delete,
-        } => cli::run_index(&ctx, source.as_deref(), *strict, *delete),
+            refetch,
+        } => cli::run_index(&ctx, source.as_deref(), *strict, *delete, *refetch),
         Command::Search {
             query,
             limit,
@@ -1164,6 +1179,44 @@ mod tests {
             result.is_err(),
             "expected --dir to be rejected, but clap accepted it"
         );
+    }
+
+    /// `localdb index --refetch` parses and sets the flag.
+    #[test]
+    fn index_refetch_flag_parses() {
+        let cli = Cli::try_parse_from(["localdb", "index", "--refetch"]).unwrap();
+        match cli.command {
+            Command::Index { refetch, .. } => assert!(refetch),
+            other => panic!("expected Index command, got: {other:?}"),
+        }
+    }
+
+    /// `--refetch` is absent by default.
+    #[test]
+    fn index_without_refetch_flag_defaults_to_false() {
+        let cli = Cli::try_parse_from(["localdb", "index"]).unwrap();
+        match cli.command {
+            Command::Index { refetch, .. } => assert!(!refetch),
+            other => panic!("expected Index command, got: {other:?}"),
+        }
+    }
+
+    /// `--refetch` combines with `--delete` and the global `-s` store filter
+    /// without conflict.
+    #[test]
+    fn index_refetch_combined_with_delete_and_store_flag_parses() {
+        let cli = Cli::try_parse_from(["localdb", "-s", "notes", "index", "--refetch", "--delete"])
+            .unwrap();
+        assert_eq!(cli.stores, vec!["notes"]);
+        match cli.command {
+            Command::Index {
+                refetch, delete, ..
+            } => {
+                assert!(refetch);
+                assert!(delete);
+            }
+            other => panic!("expected Index command, got: {other:?}"),
+        }
     }
 
     /// `-s` short flag works as a subcommand-level option too.

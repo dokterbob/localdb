@@ -40,6 +40,21 @@ use crate::daemon_client::{daemon_request_async, encode_path_segment, CliContext
 // Embedded transport
 // ---------------------------------------------------------------------------
 
+/// The job-shaped parameters [`run_embedded_store_job`] needs, bundled to
+/// keep its own parameter list under clippy's arg-count lint — mirrors the
+/// `JobExecDeps`/`SourceIngestionDeps` precedent (`server::job_exec`,
+/// `core::ingestion::deps`) rather than growing yet another positional
+/// argument. Transport-specific handles the function borrows or mutates
+/// (`queue`, `config_loader`, `db`, `store_row`, `embedder`) stay separate
+/// arguments — this struct is only "what job to run," not "with what."
+pub(crate) struct RunEmbeddedStoreJobArgs<'a> {
+    pub scope: IndexJobScope,
+    pub deletion: DeletionPolicy,
+    pub refetch: bool,
+    pub mode: IndexErrorMode,
+    pub progress_label: Option<&'a str>,
+}
+
 /// Run one store's index job through the embedded engine: a local
 /// [`JobQueue`] submission of `job_exec::run_job`, with this process's own
 /// progress sink subscribed to the job's broadcast channel.
@@ -61,6 +76,10 @@ use crate::daemon_client::{daemon_request_async, encode_path_segment, CliContext
 /// (`StrictExit`, `index`) or is swallowed into a warning
 /// (`WarnAndContinue`, `source add`'s auto-index).
 ///
+/// `refetch` is threaded straight into `job_exec::run_job`, unchanged — see
+/// its doc comment. `source add`'s auto-index always passes `false`: a
+/// newly-added source has no recheck-floor history to bypass.
+///
 /// Returns the job id alongside the summary —
 /// `Some(job.id)` whenever a job actually got submitted to the local queue,
 /// `None` on every early-return path above that (no sources to index, or a
@@ -71,19 +90,23 @@ use crate::daemon_client::{daemon_request_async, encode_path_segment, CliContext
 /// tracing/correlating a run's own log lines even though `localdb job
 /// cancel` itself only ever targets a *daemon's* queue, never this
 /// throwaway embedded one.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_embedded_store_job(
     ctx: &CliContext,
     queue: &JobQueue,
     config_loader: &ConfigLoader,
     db: &AppDb,
     store_row: &StoreRow,
-    scope: IndexJobScope,
-    deletion: DeletionPolicy,
-    mode: IndexErrorMode,
     embedder: &mut Option<Arc<dyn Embedder>>,
-    progress_label: Option<&str>,
+    request: RunEmbeddedStoreJobArgs<'_>,
 ) -> Result<(IndexSummary, Option<String>), Error> {
+    let RunEmbeddedStoreJobArgs {
+        scope,
+        deletion,
+        refetch,
+        mode,
+        progress_label,
+    } = request;
+
     let sources = match job_exec::resolve_job_sources(db.backend(), &store_row.id, &scope).await {
         Ok(s) => s,
         Err(e) => {
@@ -156,7 +179,7 @@ pub(crate) async fn run_embedded_store_job(
                     progress: Some(progress),
                     on_source_error: Some(on_source_error),
                 };
-                job_exec::run_job(&store_row_owned, scope_for_job, deletion, deps)
+                job_exec::run_job(&store_row_owned, scope_for_job, deletion, refetch, deps)
                     .await
                     .map(|(stats, _)| stats)
             }
@@ -255,6 +278,49 @@ fn emit_source_error(mode: IndexErrorMode, source_id: &str, err: SourceError<'_>
 // Daemon transport
 // ---------------------------------------------------------------------------
 
+/// Fail unless the daemon at `base_url` advertises `refetch` support
+/// (specs/05-surfaces.md "Daemon capability advertisement").
+///
+/// Mirrors `cli::cmds::search::require_daemon_search_filter_support` exactly:
+/// absence is treated as unsupported — a daemon predating the `features`
+/// field omits it entirely — because an older daemon would otherwise
+/// silently drop the request's unknown `refetch` key (`CreateJobRequest` has
+/// no `deny_unknown_fields`) and run an ordinary gated job while reporting
+/// success, indistinguishable from a real `--refetch` run. Exits 5
+/// (unavailable) — the daemon is running and healthy, it just cannot do what
+/// was asked — and names the fix, since restarting it resolves this
+/// permanently.
+async fn require_daemon_refetch_support(base_url: &str) -> Result<(), Error> {
+    let url = format!("{base_url}/v1/status");
+    let status = daemon_request_async(reqwest::Method::GET, &url, None).await?;
+    let supported = status
+        .get("features")
+        .and_then(|f| f.as_array())
+        .is_some_and(|features| features.iter().any(|f| f.as_str() == Some("refetch")));
+
+    if supported {
+        return Ok(());
+    }
+    Err(Error::DaemonCapabilityUnavailable {
+        message: "the running daemon predates --refetch and would silently run an ordinary \
+                  gated job while reporting success; restart it (`localdb serve`) to use \
+                  --refetch against a daemon, or stop it to index in embedded mode"
+            .to_string(),
+    })
+}
+
+/// The job-shaped parameters [`run_daemon_store_job`] needs, bundled for the
+/// same reason as [`RunEmbeddedStoreJobArgs`] — see its doc comment.
+/// Transport-specific handles (`ctx`, `base_url`, `store_name`) stay separate
+/// arguments.
+pub(crate) struct RunDaemonStoreJobArgs<'a> {
+    pub source_id: Option<&'a str>,
+    pub deletion: DeletionPolicy,
+    pub refetch: bool,
+    pub mode: IndexErrorMode,
+    pub progress_label: Option<&'a str>,
+}
+
 /// Submit one index job to a running daemon for `store_name` and attach to
 /// it to completion (SSE, falling back to polling), returning the resulting
 /// `IndexSummary`.
@@ -280,16 +346,40 @@ fn emit_source_error(mode: IndexErrorMode, source_id: &str, err: SourceError<'_>
 /// surface it too — `None` only on the two early-return paths before a job
 /// id is ever known (a submission failure, or a malformed submission
 /// response).
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_daemon_store_job(
     ctx: &CliContext,
     base_url: &str,
     store_name: &str,
-    source_id: Option<&str>,
-    deletion: DeletionPolicy,
-    mode: IndexErrorMode,
-    progress_label: Option<&str>,
+    request: RunDaemonStoreJobArgs<'_>,
 ) -> Result<(IndexSummary, Option<String>), Error> {
+    let RunDaemonStoreJobArgs {
+        source_id,
+        deletion,
+        refetch,
+        mode,
+        progress_label,
+    } = request;
+
+    // Only paid for when `--refetch` is actually set — an ordinary gated run
+    // never touches `/v1/status` for this. A daemon predating `refetch`
+    // would otherwise silently ignore the request's unknown key and run a
+    // normal gated job while reporting success, which is worse than
+    // refusing outright: the caller believes the recheck floor was bypassed
+    // when it never was.
+    if refetch {
+        if let Err(e) = require_daemon_refetch_support(base_url).await {
+            return if mode.warn() {
+                eprintln!(
+                    "warning: cannot submit auto-index job for store '{}': {}",
+                    store_name, e
+                );
+                Ok((IndexSummary::default(), None))
+            } else {
+                Err(e)
+            };
+        }
+    }
+
     let mut body = serde_json::json!({ "store_name": store_name });
     if let Some(sid) = source_id {
         body["source_id"] = serde_json::Value::String(sid.to_string());
@@ -304,6 +394,11 @@ pub(crate) async fn run_daemon_store_job(
         }
         .to_string(),
     );
+    // Sent unconditionally (even `false`), mirroring `deletion_policy`
+    // above: an explicit `false` is indistinguishable from the server's own
+    // default, but sending it either way keeps this request body a
+    // complete, self-describing snapshot of what the CLI asked for.
+    body["refetch"] = serde_json::Value::Bool(refetch);
 
     let submit_url = format!("{}/v1/jobs", base_url);
     let job_json = match daemon_request_async(reqwest::Method::POST, &submit_url, Some(body)).await
@@ -750,11 +845,14 @@ mod tests {
             &config_loader,
             &db,
             &store,
-            unknown_scope.clone(),
-            DeletionPolicy::Retain,
-            IndexErrorMode::StrictExit,
             &mut embedder,
-            None,
+            RunEmbeddedStoreJobArgs {
+                scope: unknown_scope.clone(),
+                deletion: DeletionPolicy::Retain,
+                refetch: false,
+                mode: IndexErrorMode::StrictExit,
+                progress_label: None,
+            },
         )
         .await
         .unwrap_err();
@@ -769,11 +867,14 @@ mod tests {
             &config_loader,
             &db,
             &store,
-            unknown_scope,
-            DeletionPolicy::Retain,
-            IndexErrorMode::WarnAndContinue,
             &mut embedder,
-            None,
+            RunEmbeddedStoreJobArgs {
+                scope: unknown_scope,
+                deletion: DeletionPolicy::Retain,
+                refetch: false,
+                mode: IndexErrorMode::WarnAndContinue,
+                progress_label: None,
+            },
         )
         .await
         .unwrap();
@@ -850,11 +951,14 @@ mod tests {
             &config_loader,
             &db,
             &store,
-            IndexJobScope::Store,
-            DeletionPolicy::Retain,
-            IndexErrorMode::WarnAndContinue,
             &mut embedder,
-            None,
+            RunEmbeddedStoreJobArgs {
+                scope: IndexJobScope::Store,
+                deletion: DeletionPolicy::Retain,
+                refetch: false,
+                mode: IndexErrorMode::WarnAndContinue,
+                progress_label: None,
+            },
         )
         .await
         .unwrap();
@@ -950,10 +1054,13 @@ mod tests {
             &ctx,
             &base_url,
             "nonexistent-store",
-            None,
-            DeletionPolicy::Retain,
-            IndexErrorMode::StrictExit,
-            None,
+            RunDaemonStoreJobArgs {
+                source_id: None,
+                deletion: DeletionPolicy::Retain,
+                refetch: false,
+                mode: IndexErrorMode::StrictExit,
+                progress_label: None,
+            },
         )
         .await
         .unwrap_err();
@@ -966,10 +1073,13 @@ mod tests {
             &ctx,
             &base_url,
             "nonexistent-store",
-            None,
-            DeletionPolicy::Retain,
-            IndexErrorMode::WarnAndContinue,
-            None,
+            RunDaemonStoreJobArgs {
+                source_id: None,
+                deletion: DeletionPolicy::Retain,
+                refetch: false,
+                mode: IndexErrorMode::WarnAndContinue,
+                progress_label: None,
+            },
         )
         .await
         .unwrap();
@@ -1071,6 +1181,14 @@ mod tests {
         jobs_post: VecDeque<(u16, String)>,
         events: VecDeque<(u16, String)>,
         poll: VecDeque<(u16, String)>,
+        status: VecDeque<(u16, String)>,
+        /// Call counters, kept outside the outer `tokio::sync::Mutex` (via
+        /// their own `Arc`) so a test can clone them before moving
+        /// `MockResponses` into `spawn_mock_daemon` and still read them
+        /// afterward — proving a route was (or was never) hit, not just
+        /// inferring it from a response shape.
+        jobs_post_calls: Arc<StdMutex<u32>>,
+        status_calls: Arc<StdMutex<u32>>,
     }
 
     type SharedMockResponses = Arc<tokio::sync::Mutex<MockResponses>>;
@@ -1079,12 +1197,22 @@ mod tests {
         State(state): State<SharedMockResponses>,
         _body: axum::body::Bytes,
     ) -> (StatusCode, String) {
-        let (code, body) = state
-            .lock()
-            .await
+        let mut guard = state.lock().await;
+        *guard.jobs_post_calls.lock().unwrap() += 1;
+        let (code, body) = guard
             .jobs_post
             .pop_front()
             .unwrap_or((500, "{}".to_string()));
+        (StatusCode::from_u16(code).unwrap(), body)
+    }
+
+    async fn mock_status(State(state): State<SharedMockResponses>) -> (StatusCode, String) {
+        let mut guard = state.lock().await;
+        *guard.status_calls.lock().unwrap() += 1;
+        let (code, body) = guard
+            .status
+            .pop_front()
+            .unwrap_or((200, serde_json::json!({ "features": [] }).to_string()));
         (StatusCode::from_u16(code).unwrap(), body)
     }
 
@@ -1120,6 +1248,7 @@ mod tests {
             .route("/v1/jobs", post(mock_jobs_post))
             .route("/v1/jobs/{id}/events", get(mock_events))
             .route("/v1/jobs/{id}", get(mock_poll))
+            .route("/v1/status", get(mock_status))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1128,6 +1257,105 @@ mod tests {
             let _ = axum::serve(listener, router).await;
         });
         format!("http://{addr}")
+    }
+
+    /// Mirrors `cli::cmds::search`'s `require_daemon_search_filter_support`
+    /// precedent: a daemon whose `/v1/status` reports no `refetch` feature
+    /// (an empty `features` array — the shape an older daemon predating this
+    /// field would never even send, but also the shape a daemon that has the
+    /// field yet lacks the capability would send) must fail the whole call
+    /// with `DaemonCapabilityUnavailable` (exit 5) and never reach
+    /// `POST /v1/jobs` at all — submitting anyway would silently run an
+    /// ordinary gated job while reporting success, exactly the failure this
+    /// check exists to prevent.
+    #[tokio::test]
+    async fn run_daemon_store_job_refetch_without_the_feature_exits_5_and_never_posts_a_job() {
+        let ctx = test_ctx();
+        let jobs_post_calls = Arc::new(StdMutex::new(0));
+        let mut responses = MockResponses {
+            jobs_post_calls: jobs_post_calls.clone(),
+            ..Default::default()
+        };
+        responses
+            .status
+            .push_back((200, serde_json::json!({ "features": [] }).to_string()));
+        let base_url = spawn_mock_daemon(responses).await;
+
+        let err = run_daemon_store_job(
+            &ctx,
+            &base_url,
+            "store-x",
+            RunDaemonStoreJobArgs {
+                source_id: None,
+                deletion: DeletionPolicy::Retain,
+                refetch: true, // --refetch
+                mode: IndexErrorMode::StrictExit,
+                progress_label: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, Error::DaemonCapabilityUnavailable { .. }),
+            "expected DaemonCapabilityUnavailable, got: {err:?}"
+        );
+        assert_eq!(err.exit_code(), 5);
+        assert_eq!(
+            *jobs_post_calls.lock().unwrap(),
+            0,
+            "must never POST /v1/jobs once the capability check has failed"
+        );
+    }
+
+    /// The converse of the test above: an ordinary run (no `--refetch`) must
+    /// never pay for the capability probe at all — mirroring
+    /// `require_daemon_search_filter_support`'s own "only when a filter is
+    /// actually set" gating for search. Proven by asserting `/v1/status` was
+    /// never hit while driving a real submit-attach-complete round trip
+    /// through the mock daemon.
+    #[tokio::test]
+    async fn run_daemon_store_job_without_refetch_never_probes_the_capability_endpoint() {
+        let ctx = test_ctx();
+        let status_calls = Arc::new(StdMutex::new(0));
+        let done_job = sample_job("job-9", IndexJobState::Done);
+        let mut responses = MockResponses {
+            status_calls: status_calls.clone(),
+            ..Default::default()
+        };
+        responses
+            .jobs_post
+            .push_back((202, serde_json::json!({ "id": "job-9" }).to_string()));
+        responses.events.push_back((
+            200,
+            format!(
+                "event: job\ndata: {}\n\n",
+                serde_json::to_string(&done_job).unwrap()
+            ),
+        ));
+        let base_url = spawn_mock_daemon(responses).await;
+
+        let (_summary, job_id) = run_daemon_store_job(
+            &ctx,
+            &base_url,
+            "store-x",
+            RunDaemonStoreJobArgs {
+                source_id: None,
+                deletion: DeletionPolicy::Retain,
+                refetch: false, // no --refetch
+                mode: IndexErrorMode::StrictExit,
+                progress_label: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(job_id.as_deref(), Some("job-9"));
+        assert_eq!(
+            *status_calls.lock().unwrap(),
+            0,
+            "must never probe /v1/status when --refetch is not set"
+        );
     }
 
     #[tokio::test]
@@ -1143,10 +1371,13 @@ mod tests {
             &ctx,
             &base_url,
             "store-x",
-            None,
-            DeletionPolicy::Retain,
-            IndexErrorMode::StrictExit,
-            None,
+            RunDaemonStoreJobArgs {
+                source_id: None,
+                deletion: DeletionPolicy::Retain,
+                refetch: false,
+                mode: IndexErrorMode::StrictExit,
+                progress_label: None,
+            },
         )
         .await
         .unwrap_err();
@@ -1164,10 +1395,13 @@ mod tests {
             &ctx,
             &base_url,
             "store-x",
-            None,
-            DeletionPolicy::Retain,
-            IndexErrorMode::WarnAndContinue,
-            None,
+            RunDaemonStoreJobArgs {
+                source_id: None,
+                deletion: DeletionPolicy::Retain,
+                refetch: false,
+                mode: IndexErrorMode::WarnAndContinue,
+                progress_label: None,
+            },
         )
         .await
         .unwrap();
@@ -1336,10 +1570,13 @@ mod tests {
             &ctx,
             &base_url,
             "store-x",
-            None,
-            DeletionPolicy::Retain,
-            IndexErrorMode::StrictExit,
-            None,
+            RunDaemonStoreJobArgs {
+                source_id: None,
+                deletion: DeletionPolicy::Retain,
+                refetch: false,
+                mode: IndexErrorMode::StrictExit,
+                progress_label: None,
+            },
         )
         .await
         .unwrap_err();
@@ -1355,10 +1592,13 @@ mod tests {
             &ctx,
             &base_url,
             "store-x",
-            None,
-            DeletionPolicy::Retain,
-            IndexErrorMode::WarnAndContinue,
-            None,
+            RunDaemonStoreJobArgs {
+                source_id: None,
+                deletion: DeletionPolicy::Retain,
+                refetch: false,
+                mode: IndexErrorMode::WarnAndContinue,
+                progress_label: None,
+            },
         )
         .await
         .unwrap();

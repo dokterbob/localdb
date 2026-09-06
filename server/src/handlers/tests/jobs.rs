@@ -354,6 +354,159 @@ async fn create_job_rejects_invalid_deletion_policy() {
     assert_eq!(body["code"], "invalid_request");
 }
 
+// --- refetch (T329: --refetch / recheck gate) --------------------------
+
+/// A non-bool `refetch` (a type this field can never actually hold) is
+/// rejected the same way an out-of-range `deletion_policy` string is:
+/// `400 invalid_request`, not axum's own default `422`/plain-text
+/// `Json<T>` rejection — see `crate::error::ApiJson`'s doc comment.
+#[tokio::test]
+async fn create_job_rejects_non_bool_refetch() {
+    let (_dir, app) = make_app().await;
+    post_json(&app, "/v1/stores", json!({"name": "test"})).await;
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/jobs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"store_name": "test", "refetch": "yes"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(resp.into_body()).await;
+    assert_eq!(body["code"], "invalid_request");
+}
+
+/// A request without `content-type: application/json` never reaches body
+/// deserialization: `ApiJson` passes axum's stock `415` through untouched
+/// (the spec's error taxonomy has no code for it), the same response every
+/// plain-`Json` route on this daemon gives.
+#[tokio::test]
+async fn create_job_without_json_content_type_is_415_not_enveloped() {
+    let (_dir, app) = make_app().await;
+    post_json(&app, "/v1/stores", json!({"name": "test"})).await;
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/jobs")
+                .body(Body::from(json!({"store_name": "test"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
+
+/// A body over axum's default size limit likewise passes through as the
+/// stock `413`, not a misleading `invalid_request` 400 — the client's
+/// problem is the size, not the content.
+#[tokio::test]
+async fn create_job_with_oversized_body_is_413_not_enveloped() {
+    let (_dir, app) = make_app().await;
+    post_json(&app, "/v1/stores", json!({"name": "test"})).await;
+
+    // Valid JSON either way — over the default 2MB body limit, the bytes
+    // are never even read to find out.
+    let oversized = format!(
+        r#"{{"store_name": "test", "padding": "{}"}}"#,
+        "x".repeat(3 * 1024 * 1024)
+    );
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/jobs")
+                .header("content-type", "application/json")
+                .body(Body::from(oversized))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+/// `refetch: true` is accepted (202), and the completed job's `stats`
+/// exposes `docs_recheck_deferred` — always present, default 0 for a
+/// `path` source (the recheck gate only ever applies to feed discovery
+/// entries).
+#[tokio::test]
+async fn create_job_accepts_refetch_true_and_stats_include_docs_recheck_deferred() {
+    let (_dir, app) = make_app().await;
+
+    let content_dir = tempfile::tempdir().unwrap();
+    std::fs::write(content_dir.path().join("doc.md"), "alpha bravo charlie").unwrap();
+
+    post_json(&app, "/v1/stores", json!({"name": "test"})).await;
+    post_json(
+        &app,
+        "/v1/stores/test/sources",
+        json!({
+            "kind": "path",
+            "spec": {"root": content_dir.path().to_string_lossy()},
+        }),
+    )
+    .await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/jobs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"store_name": "test", "refetch": true}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let job = json_body(resp.into_body()).await;
+    let job_id = job["id"].as_str().unwrap().to_string();
+
+    let final_job = poll_job_to_terminal(&app, &job_id).await;
+    assert_eq!(
+        final_job["state"], "done",
+        "job should complete successfully: {:?}",
+        final_job
+    );
+    assert_eq!(
+        final_job["stats"]["docs_recheck_deferred"], 0,
+        "docs_recheck_deferred must be present (and 0 for a non-feed source): {:?}",
+        final_job["stats"]
+    );
+}
+
+/// Omitting `refetch` entirely defaults to `false` — the field must not be
+/// required.
+#[tokio::test]
+async fn create_job_without_refetch_field_defaults_to_false_and_still_succeeds() {
+    let (_dir, app) = make_app().await;
+    post_json(&app, "/v1/stores", json!({"name": "test"})).await;
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/jobs")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"store_name": "test"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+}
+
 /// Shared setup for the retain/delete pair below: a store with a `path`
 /// source over a directory containing two files, both indexed by an initial
 /// job, then one file removed from disk before the second job runs.

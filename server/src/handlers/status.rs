@@ -69,6 +69,13 @@ pub struct StatusResponse {
 /// /v1/search` honours [`localdb_core::SearchFilters`].
 pub const FEATURE_SEARCH_FILTERS: &str = "search_filters";
 
+/// Capability advertised by [`StatusResponse::features`] when `POST
+/// /v1/jobs` honours a request's `refetch` key (`localdb index --refetch`).
+/// An older daemon has no `deny_unknown_fields` on its job-request body, so
+/// it would silently drop the key and run an ordinary gated job while
+/// reporting success — the CLI must confirm this before submitting.
+pub const FEATURE_REFETCH: &str = "refetch";
+
 /// `GET /status` query params: a repeatable `?store=` scopes the response to
 /// specific stores, mirroring CLI `--store` (issue #187 review, finding F7).
 /// `Vec<String>` + `#[serde(default)]`, not `Option<Vec<_>>` —
@@ -148,7 +155,10 @@ pub async fn get_status(
         source_count,
         job_count: jobs.len(),
         stores,
-        features: vec![FEATURE_SEARCH_FILTERS.to_string()],
+        features: vec![
+            FEATURE_SEARCH_FILTERS.to_string(),
+            FEATURE_REFETCH.to_string(),
+        ],
         database: DatabaseStatus {
             path: db_path.display().to_string(),
             exists: db_size.main_bytes.is_some(),

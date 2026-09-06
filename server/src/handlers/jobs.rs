@@ -14,7 +14,7 @@ use localdb_core::{
     DeletionPolicy, Error as CoreError, IndexJob, IndexJobScope, IndexJobState, ProgressEvent,
 };
 
-use crate::error::ApiError;
+use crate::error::{ApiError, ApiJson};
 use crate::job_queue::{JobEvent, JobQueue};
 use crate::state::AppState;
 
@@ -30,6 +30,16 @@ pub struct CreateJobRequest {
     /// default.
     #[serde(default)]
     pub deletion_policy: Option<String>,
+    /// `false` (default): the feed entry recheck gate's floor check and the
+    /// feed document's own conditional-GET validators apply as normal.
+    /// `true` bypasses the floor check and suppresses those validators for
+    /// the run, forcing a full re-check of every feed source's entries even
+    /// when nothing looks stale — mirrors CLI `index --refetch`
+    /// (specs/04-search-pipeline.md §1 "Recheck gate"). A non-bool JSON
+    /// value is a 400 `invalid_request`, same as any other malformed field
+    /// on this body.
+    #[serde(default)]
+    pub refetch: bool,
 }
 
 fn parse_deletion_policy(raw: Option<&str>) -> Result<DeletionPolicy, ApiError> {
@@ -44,7 +54,7 @@ fn parse_deletion_policy(raw: Option<&str>) -> Result<DeletionPolicy, ApiError> 
 
 pub async fn create_job(
     State(state): State<AppState>,
-    Json(req): Json<CreateJobRequest>,
+    ApiJson(req): ApiJson<CreateJobRequest>,
 ) -> Result<(StatusCode, Json<IndexJob>), ApiError> {
     let deletion = parse_deletion_policy(req.deletion_policy.as_deref())?;
 
@@ -65,6 +75,7 @@ pub async fn create_job(
     };
 
     let job_scope_for_closure = scope.clone();
+    let refetch = req.refetch;
     // Clone the queue handle (cheap: Arc-based) before moving `state` into
     // the closure below — `state.job_queue()` borrows `state`, which would
     // otherwise conflict with the closure's move of `state` in the same
@@ -75,10 +86,16 @@ pub async fn create_job(
             // Shared with `UrlRefreshScheduler::tick` via
             // `AppState::run_scoped_job` (#187 review, DRY finding): resolve
             // sources, build/reuse the cached embedder only if there's
-            // something to index, and run the job. Only `deletion` differs
-            // between the two callers.
+            // something to index, and run the job. Only `deletion`/`refetch`
+            // differ between the two callers.
             state
-                .run_scoped_job(&store_row, job_scope_for_closure, deletion, progress)
+                .run_scoped_job(
+                    &store_row,
+                    job_scope_for_closure,
+                    deletion,
+                    refetch,
+                    progress,
+                )
                 .await
         })
         .await?;

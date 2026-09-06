@@ -53,6 +53,7 @@ async fn run_once(
         store,
         IndexJobScope::Store,
         deletion,
+        false,
         JobExecDeps {
             backend: state.backend(),
             yaml,
